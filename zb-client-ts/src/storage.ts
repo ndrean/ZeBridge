@@ -33,10 +33,24 @@ export interface Storage {
   /// filled once by `INSERT … SELECT … ORDER BY pk`, SQLite's external sorter doing
   /// the ordering on disk (measured: 43 s, 786 MB peak for 3M rows, but ~3× the table
   /// on disk while it runs). Absent or false, each window is sorted and applied on
-  /// its own: slower, bounded in memory AND disk — what a browser over OPFS wants,
-  /// since a wasm build's temp store is not known to reach the disk and its quota is
-  /// the thing that ran out. A host with a real filesystem (Node, a phone) says true.
+  /// its own: bounded in memory AND disk, but each window scatters across the whole
+  /// b-tree — in Chrome over OPFS that crawled to 2k rows/s past 750k rows. Node, a
+  /// phone, AND the browser say true: sqlite-wasm's OPFS VFS spills TEMP and the
+  /// sorter to OPFS files once `temp_store = FILE` is set (browser-storage.ts) —
+  /// 3M rows in 156 s in Chrome, 2.3 GB of OPFS transiently. Keep false only for an
+  /// engine whose temp store is memory with no way out.
   spillsTemp?: boolean;
+  /// §10ix: the temp files a heavy operation may leave behind, and their removal.
+  /// sqlite-wasm's OPFS VFS names its temp files (the TEMP database, the sorter's
+  /// spill) 16 random letters in the origin's root and tries to remove them on close
+  /// — and quietly fails to: 1.3 GB of orphans after a 3M-row seed in Chrome, gone
+  /// only when someone removed them by hand. `tempFiles` says what such files exist
+  /// now; `sweepTemp` removes the ones that appeared since and are closed (an open
+  /// one refuses removal and is left alone), and returns the bytes reclaimed. A
+  /// storage over a real filesystem, where the OS honours delete-on-close, leaves
+  /// both undefined.
+  tempFiles?(): Promise<Set<string>>;
+  sweepTemp?(before: Set<string>): Promise<number>;
   /// An Exec that CANNOT write (§10di): a second connection opened read-only, the
   /// libzb design. `query()` runs on it when present; when absent (one handle —
   /// the browser's OPFS, PGlite) the shell guards `query()` by statement shape

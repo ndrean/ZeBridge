@@ -2764,6 +2764,7 @@ export class ZeBridge {
               if (win.length) { await this.run(stageSql, JSON.stringify(win)); win = []; }
               this.seedProgress({ table, step: step.name, kind: step.kind, applied: n, total: stream.nrows, done: false });
             };
+            const tempBefore = await this.storage.tempFiles?.();
             try {
               await this.run('DROP TABLE IF EXISTS temp._zb_seed_stage');
               await this.run(`CREATE TEMP TABLE _zb_seed_stage (${colList})`);
@@ -2788,6 +2789,14 @@ export class ZeBridge {
               return null;
             } finally {
               try { await this.run('DROP TABLE IF EXISTS temp._zb_seed_stage'); } catch { /* the connection is going anyway */ }
+              // §10ix: what the stage and the sort left on disk (sqlite-wasm over OPFS
+              // orphans its temp files on close — 1.3 GB after this table in Chrome).
+              if (tempBefore && this.storage.sweepTemp) {
+                try {
+                  const bytes = await this.storage.sweepTemp(tempBefore);
+                  if (bytes) this.appendLog('SYS', `${table}: reclaimed ${(bytes / 1048576).toFixed(0)} MB of temp files left by the seed`, 'INFO');
+                } catch { /* best effort */ }
+              }
             }
             applied += n;
           } else if (stream) {

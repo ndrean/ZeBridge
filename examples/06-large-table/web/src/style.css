@@ -1,0 +1,33 @@
+body { font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 1rem; background: #121212; color: #e0e0e0; }
+#app { max-width: 720px; margin: 0 auto; }
+h1 { font-size: 1.2rem; margin: 0 0 0.2rem; }
+.sub { color: #999; font-size: 0.85rem; margin: 0 0 1rem; }
+.badge { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.8rem; font-weight: bold; }
+.badge.connected { background: #1b5e20; color: #81c784; }
+.badge.disconnected { background: #b71c1c; color: #ef9a9a; }
+.badge.connecting { background: #e65100; color: #ffcc80; }
+
+/* the startup state machine, as in 05-tables: each cell greens once */
+.phases { display: flex; gap: 0; list-style: none; margin: 0.8rem 0 0; padding: 0; font-size: 0.8rem; }
+.phases li { flex: 1; padding: 0.35rem 0.6rem; text-align: center; background: #2b2b2b; color: #888; border: 1px solid #3a3a3a; border-right: none; }
+.phases li:last-child { border-right: 1px solid #3a3a3a; }
+.phases li.done { background: #1b5e20; color: #d7ffd9; }
+
+/* the seed itself: one bar, and the clock next to it */
+.seed { margin: 1.2rem 0; padding: 1rem; background: #1c1c1c; border: 1px solid #333; border-radius: 6px; }
+.seed .row { display: flex; align-items: center; gap: 0.8rem; }
+.seed progress { flex: 1; height: 1.2rem; accent-color: #43a047; }
+.seed .clock { font-family: monospace; font-size: 1.6rem; min-width: 5.5rem; text-align: right; }
+.seed .detail { display: flex; justify-content: space-between; color: #aaa; font-size: 0.85rem; margin-top: 0.4rem; font-family: monospace; }
+.seed.idle { opacity: 0.6; }
+
+table.facts { border-collapse: collapse; font-size: 0.85rem; margin: 0.6rem 0; font-family: monospace; }
+table.facts td { padding: 0.15rem 0.8rem 0.15rem 0; color: #ccc; }
+table.facts td:first-child { color: #888; }
+
+button { background: #263238; color: #eceff1; border: 1px solid #455a64; border-radius: 4px; padding: 0.35rem 0.8rem; cursor: pointer; font-size: 0.85rem; }
+button:disabled { opacity: 0.4; cursor: default; }
+.actions { display: flex; gap: 0.6rem; margin: 0.8rem 0; }
+
+pre.log { background: #0d0d0d; border: 1px solid #2a2a2a; padding: 0.6rem; font-size: 0.75rem; max-height: 14rem; overflow: auto; color: #9e9e9e; white-space: pre-wrap; }
+pre.log .err { color: #ef9a9a; }

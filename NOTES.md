@@ -16180,8 +16180,8 @@ node:zlib, which streams both.
 (storage.ts) says whether the engine can hold a TEMP table larger than memory:
 better-sqlite3 (node.ts) and expo-sqlite (08-map/native `expo-storage.ts`) say true and
 get the staged path — TEMP heap append, one `INSERT … SELECT … ORDER BY pk`; the browser
-(browser-storage.ts, wa-sqlite on OPFS, `temp_store` in memory) says false and gets the
-per-window path — `sortRowsByKey` on each window, bounded RAM and bounded WAL, the b-tree
+(browser-storage.ts, sqlite-wasm on OPFS) said false at the time and got the
+per-window path — retired the same day, see "in Chrome" below — `sortRowsByKey` on each window, bounded RAM and bounded WAL, the b-tree
 scatter paid in time. The seeding code asks the seam; no example picks a path by hand.
 
 Measured, both in a Node process SHAPED like the host (fzstd + js-sha256 instead of
@@ -16217,4 +16217,74 @@ watched on a 3M-row table in Chrome. The RN example (08-map/native) is wired the
 What this leaves: the Chrome measurement itself (needs a big table in the list, and one
 database, not one per load), a device run of the RN path, and the disk trade of the
 staged path on a phone (3× the table transiently, §10ix above).
+
+### §10ix, in Chrome: the browser stages too (2026-09-24, later still)
+
+`examples/06-large-table/web` — one table, one bar, one clock: bob follows only
+`test_types`, seeds it into ONE durable OPFS file (not one per load), and prints the
+three facts at the end. Four runs before the number, each teaching something.
+
+**1. The seed died at 350–400k rows, and the error lied.** `cannot rollback - no
+transaction is active`: sqlocal rolls back on an error in the body and rethrows the
+ROLLBACK's error when that fails — which it does whenever SQLite already rolled back
+itself (the NOMEM / FULL / IOERR class). `browser-storage.ts` now keeps the body's error;
+the next run said `SQLITE_IOERR_WRITE (778): disk I/O error`, sqlite-wasm's wording for
+an OPFS `write()` that threw.
+
+**2. The write threw because of a Chrome setting, not a quota.** A plain worker writing
+an OPFS file at the same origin got `QuotaExceededError: No space available for this
+operation` after exactly 128 MiB with the 136 MB replica in place — and on a FRESH
+origin after exactly 268,435,456 bytes = 256 MiB — while `navigator.storage.estimate()`
+advertised 10.9 GB and chrome://quota-internals showed 57 GB available, a 368 GB pool.
+Not incognito, not the disk. The owner's Chrome has "delete data sites have saved when
+you close all windows" on: Chrome then enforces a fixed 256 MiB per origin that the
+estimate does not report. With `http://localhost` added under "allowed to save data",
+the same probe wrote 1.5 GB in 1.05 s. That cap is what "blew the OPFS quota" in
+05-tables — the fresh-database-per-load made it worse, it did not cause it.
+
+**3. Per-window does not scale over OPFS.** With the cap lifted, the per-window path
+(`spillsTemp: false`) ran: 450k rows at 30 s, 850k at 109 s, 950k at 179 s (that run
+had a 2 MB page cache, an experiment); with the 128 MiB cache back, 600k at 90 s, 750k
+at 168 s — decelerating from ~20k to ~2k rows/s and still falling. Aborted. The Node
+"browser-shaped" estimate (140 s) was wrong by an order of magnitude for the same
+reason the cache does not save it: every random page an upsert touches beyond the cache
+is an `Atomics.wait` round trip to the OPFS worker, and a 1 GB table is ~120k pages.
+
+**4. sqlite-wasm spills TEMP to OPFS.** The build is `TEMP_STORE=2` (memory unless told
+otherwise) — but `PRAGMA temp_store = FILE` works, and a 300 MB TEMP table became a
+319 MB file in the origin's OPFS root. So the browser can stage: `browser-storage.ts`
+sets the pragma and says `spillsTemp: true`, and the storage.ts comment that a wasm
+temp store "is not known to reach the disk" is retired. The run, Chrome 153, exact
+against PostgreSQL (3,055,002 / 3,055,002 / 138,916,285):
+
+| | |
+| --- | --- |
+| stage filled (3,055,002 rows appended) | ~60 s, ~65k rows/s |
+| sort + sequential insert (the bar at 100%, `done` false) | ~95 s |
+| seed, first window → `done` | **155.8 s → 19,613 rows/s** |
+| connect → CDC active | 188.6 s |
+| replica | 988 MB |
+| OPFS peak | ~2.3 GB: replica + TEMP database (665 MB) + sorter spill (641 MB) |
+| JS heap peak | 264 MB (the wasm heap is not in it) |
+
+Two things a host should know. The bar sits at 100% for a minute and a half during the
+sort: that is why `done` exists, and why the page says "the last stretch at 100% is the
+sort". And the temp files: after the seed the origin held the replica PLUS a 665 MB
+file — the TEMP database, `temp.page_count` 0, and removable by hand, i.e. closed and
+orphaned. sqlite-wasm's OPFS VFS does try `removeEntry` on close (delete-on-close), and
+loses a race with Chrome's release of the sync handle often enough: one run left the
+665 MB behind for good, the next run cleaned it up by itself. Two seam methods now
+(storage.ts): `tempFiles()` before the stage, `sweepTemp(before)` after — the browser's
+version toggles `temp_store` to close the temp b-tree outright (the stage is dropped by
+then, and the only other TEMP object, `_zbz_seen`, is created on use), then removes the
+temp-shaped files (16 letters, no extension) that appeared since, retrying the same race;
+and it sweeps orphans of earlier sessions once at open, since a reload mid-seed leaves
+1.3 GB behind. Verified on the page: a 203 MB TEMP table dropped and swept → only the
+replica in the origin, 7 ms.
+
+Also seen, not chased: right after the seed, both CDC consumers were declared deaf
+("idle 25 s while the stream advanced, stored 0, tail 9") and recreated — the 25 s were
+the page's own `count(DISTINCT uid)` over 3M rows holding the single connection. The
+guard did its job; a host that runs a heavy query on the replica's only connection
+should expect it.
 

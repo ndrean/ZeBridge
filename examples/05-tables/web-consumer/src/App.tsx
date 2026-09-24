@@ -105,10 +105,10 @@ const EFFECTIVE_PRINCIPAL = (CREDS && principalFromCreds(CREDS)) || PRINCIPAL;
 
 /// §10ix: streaming zstd for the seed. fzstd inflates plain frames chunk by chunk
 /// (the same hook as the React Native example); dictionary frames (deltas) stay on
-/// the buffered path because `zstdStreamDictionaries` is false. In the browser the
-/// storage does not spill TEMP tables (browser-storage.ts), so the client applies
-/// one sorted window at a time: bounded memory, ~3× slower than Node's staged path
-/// — hence the progress bar under the phases row.
+/// the buffered path because `zstdStreamDictionaries` is false. The browser storage
+/// spills TEMP to OPFS (browser-storage.ts), so a big base takes the staged path —
+/// 3M rows in 156 s in Chrome (06-large-table) — hence the progress bar under the
+/// phases row.
 const zstdStream = (chunks: AsyncIterable<Uint8Array>, dict?: Uint8Array): AsyncIterable<Uint8Array> => {
   if (dict) throw new Error('fzstd streams plain frames only');
   return (async function* () {
