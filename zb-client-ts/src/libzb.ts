@@ -2771,6 +2771,13 @@ export class ZeBridge {
                 try {
                   const bytes = await this.storage.sweepTemp(tempBefore);
                   if (bytes) this.appendLog('SYS', `${table}: reclaimed ${(bytes / 1048576).toFixed(0)} MB of temp files left by the seed`, 'INFO');
+                  else if (this.storage.tempFiles) {
+                    // Nothing went: either the VFS deleted its own on close (fine) or the
+                    // files are still open — say so, since the next open sweeps them.
+                    const left = await this.storage.tempFiles();
+                    const stayed = [...left].filter((n) => !tempBefore.has(n));
+                    if (stayed.length) this.appendLog('SYS', `${table}: ${stayed.length} temp file(s) of the seed still open — swept at the next open`, 'WARN');
+                  }
                 } catch { /* best effort */ }
               }
             }

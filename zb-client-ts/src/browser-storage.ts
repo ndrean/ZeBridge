@@ -28,8 +28,11 @@ const sweepOrphans = async (before: Set<string>, sized?: Map<string, number>): P
   for (const [name, h] of await opfsTempCandidates(root)) {
     if (before.has(name)) continue;
     if (!found.has(name)) found.set(name, (await h.getFile()).size);
-    for (let attempt = 0; attempt < 5; attempt++) {
-      try { await root.removeEntry(name); break; } catch { await sleep(100); }
+    // Backed off over ~6 s: on a loaded machine the VFS releases a closed file's
+    // handle later than half a second (measured 2026-09-24: 1.3 GB of temp files still
+    // in the origin when the facts were read, with the 5 × 100 ms of the first cut).
+    for (let attempt = 0; attempt < 12; attempt++) {
+      try { await root.removeEntry(name); break; } catch { await sleep(100 * (attempt + 1)); }
     }
   }
   // Reclaimed = what is gone now, whoever removed it — the VFS's delete-on-close
