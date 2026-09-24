@@ -8,9 +8,18 @@ import { wsconnect, headers, credsAuthenticator } from '@nats-io/nats-core';
 import { jetstream, jetstreamManager } from '@nats-io/jetstream';
 import { Kvm } from '@nats-io/kv';
 import { Objm } from '@nats-io/obj';
+import { createUser as nkeysCreateUser } from '@nats-io/nkeys';
 
 /// What the core-shell needs from a live connection — the dial may return any
 /// object honouring this shape (structural, like the storage Exec).
+/// The nkey pair a client enrols with: `publicKey` is what `GET /enroll` is asked for,
+/// `seed` is the private half the host keeps. libzb's `zb_create_user()` returns the
+/// same two fields.
+export interface UserKeyPair {
+  publicKey: string;
+  seed: string;
+}
+
 export interface JetStreamOpts {
   domain?: string;
 }
@@ -41,6 +50,10 @@ export interface Transport {
   connect(opts: Record<string, unknown>): Promise<any>;
   credsAuthenticator(creds: Uint8Array): unknown;
   headers(): any;
+  /// Generate an enrolment key pair. On the seam because the key format is NATS's,
+  /// not ZeBridge's — and because a port may have to reach its platform's own crypto
+  /// (React Native has no WebCrypto until a shim provides one, §10hs).
+  createUser(): UserKeyPair;
   /// `js.domain`: the JetStream domain to address — `$JS.<domain>.API.` instead of
   /// `$JS.API.` — when JetStream is reached across a leaf link. Absent is the
   /// server's own JetStream. Every factory takes it, since every one of them talks
@@ -66,5 +79,9 @@ export const natsTransport: Transport = {
   kv: (nc, bucket, opts, js) => new Kvm(jetstream(nc, js)).open(bucket, opts as any),
   objectStore: (nc, bucket, js) => new Objm(jetstream(nc, js)).open(bucket),
   objectStoreCreate: (nc, bucket, opts, js) => new Objm(jetstream(nc, js)).create(bucket, { max_age: opts.max_age_ns, description: 'ZeBridge answers (§10hq)' } as any),
+  createUser: () => {
+    const kp = nkeysCreateUser();
+    return { publicKey: kp.getPublicKey(), seed: new TextDecoder().decode(kp.getSeed()) };
+  },
   deliverPolicy: DELIVER_POLICY,
 };

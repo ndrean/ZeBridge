@@ -2,6 +2,9 @@
 /// the TS core. A port (Zig, …) writes its own thin runner over the SAME file —
 /// the fixtures are the spec, this file is just plumbing.
 import { test } from 'node:test';
+import { encode, decodeMulti } from '@msgpack/msgpack';
+import { parseChainHead, chainStageSql } from './core.ts';
+import { sha256 } from 'js-sha256';
 import { cdcValue, pgEngineValues, isBytes, pgArrayValues, sortRowsByKey, chainBulkSql, vecColsOf, vecLiteral, pgVectorValues } from './core.ts';
 
 test('a chunk in one statement through json_each, version-guarded (§10fc)', () => {
@@ -222,3 +225,63 @@ for (const c of fx.normalizeVersion) {
 for (const c of fx.hlcVersion) {
   test(`hlcVersion: ${c.name}`, () => assert.equal(hlcVersion(c.now, c.last, c.floor), c.out));
 }
+
+// §10ix: the chain document head, read by hand so the rows can be decoded as a stream.
+test('parseChainHead: a document the msgpack encoder wrote (fixmap, fixarray)', () => {
+  const doc = encode({ columns: ['uid', 'age'], rows: [[1, 'x'], [2, 'y']], gen: 7, kind: 'full', cutoff: 'c' });
+  const h = parseChainHead(doc);
+  assert.ok(h);
+  assert.deepEqual(h.columns, ['uid', 'age']);
+  assert.equal(h.nrows, 2);
+  // everything after the head is one value per row, then the tail's keys and values
+  const rest = [...decodeMulti(doc.subarray(h.offset))];
+  assert.deepEqual(rest.slice(0, 2), [[1, 'x'], [2, 'y']]);
+  assert.deepEqual(rest.slice(2), ['gen', 7, 'kind', 'full', 'cutoff', 'c']);
+});
+
+test('parseChainHead: the producer\'s spelling — array32 row count, a str8 column name', () => {
+  const name = 'a'.repeat(40);                       // > 31 bytes: str8, not fixstr
+  const head = new Uint8Array([
+    0x86,                                             // fixmap(6)
+    0xa7, ...Buffer.from('columns'),
+    0x91, 0xd9, name.length, ...Buffer.from(name),    // fixarray(1) [ str8 name ]
+    0xa4, ...Buffer.from('rows'),
+    0xdd, ...new Uint8Array(new Uint32Array([3_055_002]).buffer).reverse(), // array32, big-endian
+  ]);
+  const h = parseChainHead(head);
+  assert.ok(h);
+  assert.deepEqual(h.columns, [name]);
+  assert.equal(h.nrows, 3_055_002);
+  assert.equal(h.offset, head.length);
+});
+
+test('parseChainHead: short of the head is null (buffer more), not a chain document is null (fall back)', () => {
+  const doc = encode({ columns: ['uid'], rows: [[1]] });
+  for (let n = 0; n < doc.length; n++) {
+    // every prefix that stops before the row-count header must ask for more
+    const h = parseChainHead(doc.subarray(0, n));
+    if (h) { assert.ok(n >= 12, `parsed from only ${n} bytes`); break; }
+  }
+  assert.equal(parseChainHead(encode([1, 2, 3])), null);
+  assert.equal(parseChainHead(encode({ rows: [], columns: [] })), null); // keys in the wrong order
+});
+
+test('chainStageSql: the bulk picks into a keyless stage, no conflict clause', () => {
+  const sql = chainStageSql('_zb_seed_stage', ['uid', 'age']);
+  assert.equal(sql, `INSERT INTO _zb_seed_stage ("uid", "age") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?)`);
+  assert.ok(!/ON CONFLICT/.test(sql));
+});
+
+// §10ix: the streaming digest a browser or a phone uses in place of node:crypto. The
+// object store's digest is SHA-256 over the whole object; the streamed read folds chunks
+// in as they pass. This pins that js-sha256's incremental result IS Web Crypto's.
+test('streaming SHA-256 (js-sha256, chunked) equals crypto.subtle.digest (one shot)', async () => {
+  const bytes = new Uint8Array(300_007);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 2654435761) >>> 24;
+  const h = sha256.create();
+  for (let o = 0; o < bytes.length; o += 131_072) h.update(bytes.subarray(o, Math.min(o + 131_072, bytes.length)));
+  const chunked = new Uint8Array(h.arrayBuffer());
+  const oneShot = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  assert.deepEqual(chunked, oneShot);
+});
+

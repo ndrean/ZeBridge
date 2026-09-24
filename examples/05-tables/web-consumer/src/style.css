@@ -267,6 +267,15 @@ tbody tr:hover {
 .phases li:last-child { border-right: 1px solid #3a3a3a; }
 .phases li.done { background: #1b5e20; color: #d7ffd9; }
 
+/* ── seeding progress ──────────────────────────────────────────────────────
+   One row per table still seeding from the chain. Disappears when the table
+   is complete; the phases row above says "snapshot replayed" only after that. */
+.seeding { list-style: none; margin: 0.4rem 0 0; padding: 0; font-size: 0.8rem; }
+.seeding li { display: flex; align-items: center; gap: 0.6rem; padding: 0.2rem 0; }
+.seeding .name { min-width: 8rem; color: #ddd; font-family: monospace; }
+.seeding progress { flex: 1; height: 0.6rem; accent-color: #43a047; }
+.seeding .count { color: #999; white-space: nowrap; }
+
 /* ── the replica summary ───────────────────────────────────────────────────
    Counts, not rows. The grid this replaced queried 100 rows per table per
    second and rendered them, which is most of what made the UI thread the

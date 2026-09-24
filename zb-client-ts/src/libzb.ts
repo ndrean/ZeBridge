@@ -21,10 +21,9 @@
 /// path (one sqlocal connection — OPFS sync handles are exclusive, so a second
 /// read-only connection is not available here the way `libzebridge` native has one).
 
-import { createUser as nkeyCreateUser } from '@nats-io/nkeys';
 import { natsTransport } from './transport.ts';
-import type { Transport, TransportConnection, JetStreamOpts } from './transport.ts';
-import { decode, encode } from '@msgpack/msgpack';
+import type { Transport, TransportConnection, JetStreamOpts, UserKeyPair } from './transport.ts';
+import { decode, encode, decodeMultiStream } from '@msgpack/msgpack';
 import type { Storage, StorageFactory, Exec as StorageExec } from './storage.ts';
 
 import { sqliteDialect, type Dialect } from './dialect.ts';
@@ -38,7 +37,7 @@ import { heartbeatPayload,
   mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent,
   normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate,
-  isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, vecColsOf, pgVectorValues, vecLiteral, strictMissing,
+  isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, parseChainHead, chainStageSql, vecColsOf, pgVectorValues, vecLiteral, strictMissing,
   planCdcBulk, type CdcBulkTable, cdcValue,
 } from './core.ts';
 import type { VecCol } from './core.ts';
@@ -114,6 +113,24 @@ export interface ZeBridgeConfig {
   /// §10fb: rows per transaction when a chain step seeds a table (default 50 000;
   /// 0 = one transaction for the step). Bounds memory and how long the lock is held.
   seedChunkRows?: number;
+  /// §10ix (libzb `seed_streaming`): apply a chain step AS IT ARRIVES — chunks inflated
+  /// and decoded into windows of `seedChunkRows`, never the whole document. Measured on
+  /// a 3M-row base: 2.5 GB peak when the document was materialised whole (§10iw).
+  /// Node only for now — the inflate is node:zlib's zstd Transform; a browser, and a
+  /// host that installs its own one-shot `zstdDecompress`, stay on the buffered path.
+  /// Default false, like libzb.
+  seedStreaming?: boolean;
+  /// §10ix (libzb `seed_streaming_above`): stream only a step whose stored object is at
+  /// least this many bytes (default 8 MiB); below it the buffered path is cheaper.
+  seedStreamingAbove?: number;
+  /// §10ix: a STREAMING inflate — chunks in, inflated bytes out, as they flow. Node
+  /// needs nothing: node:zlib's zstd Transform, dictionaries included. Any other host
+  /// that wants `seedStreaming` supplies one; React Native's is fzstd's `Decompress`,
+  /// which does plain frames only — a full is one (the dictionary is trained FROM it),
+  /// so the object that matters streams, and dictionary steps (the deltas, small) take
+  /// the buffered path unless `zstdStreamDictionaries` says the hook handles them.
+  zstdDecompressStream?: (chunks: AsyncIterable<Uint8Array>, dict?: Uint8Array) => AsyncIterable<Uint8Array>;
+  zstdStreamDictionaries?: boolean;
   /// §10hc: apply a CDC batch through `core.planCdcBulk` — one statement per run of
   /// eligible events, the per-event path for the rest (default true; false = every
   /// event through `applyEvent`, the A/B for a measurement).
@@ -190,6 +207,13 @@ export type TableState = {
 /// 'snapshot' means "seeded" — the name predates the retirement of
 /// snapshot-on-demand and is kept for UI compatibility.
 export type Phase = 'connected' | 'migrated' | 'snapshot' | 'cdc';
+/// §10ix: one table being seeded, a window at a time. `applied` counts the step's rows
+/// handled so far, `total` the step's row count, `kind` the chain step's (full, delta).
+/// `done` is true only on the event after the step is fully in the table: on the staged
+/// path the rows are STAGED as they arrive and sorted into the table at the end, so
+/// `applied === total` arrives ~20 s before `done` on a 3M-row full — a host that shows
+/// a bar should read `done`, not the count, and say "sorting" in between.
+export interface SeedProgress { table: string; step: string; kind: string; applied: number; total: number; done: boolean }
 export type ConnStatus = 'connected' | 'disconnected' | 'connecting';
 
 interface BucketEntry {
@@ -263,9 +287,12 @@ type Exec = (q: string, ...params: any[]) => Promise<any[]>;
 /// host, and the host stores it (a keychain, IndexedDB, a 600 file) beside the JWT
 /// that `GET /enroll?code=…&user_pubkey=<publicKey>` mints for it. `credsFileText`
 /// then joins the two into what `config.creds` takes.
-export function createUser(): { publicKey: string; seed: string } {
-  const kp = nkeyCreateUser();
-  return { publicKey: kp.getPublicKey(), seed: new TextDecoder().decode(kp.getSeed()) };
+///
+/// Callable before any client exists — enrolment comes first — so it takes the
+/// transport rather than reading one off an instance. The default is the NATS seam;
+/// a port with its own crypto passes its own (§10s).
+export function createUser(transport: Transport = natsTransport): UserKeyPair {
+  return transport.createUser();
 }
 
 export function credsFileText(jwt: string, seed: string): string {
@@ -694,6 +721,18 @@ export class ZeBridge {
   public onPhase(cb: (p: Phase) => void): () => void {
     this.phaseHandlers.add(cb);
     return () => this.phaseHandlers.delete(cb);
+  }
+
+  private seedProgressHandlers = new Set<(p: SeedProgress) => void>();
+  /// §10ix: progress of a seed, window by window — what a host shows so a legitimate
+  /// minute-long seed does not look like a hang (it did, twice, before this existed).
+  /// Fires on every path: buffered, streamed per window, streamed and staged.
+  public onSeedProgress(cb: (p: SeedProgress) => void): () => void {
+    this.seedProgressHandlers.add(cb);
+    return () => this.seedProgressHandlers.delete(cb);
+  }
+  private seedProgress(p: SeedProgress) {
+    for (const cb of this.seedProgressHandlers) { try { cb(p); } catch { /* a host's listener must not break the seed */ } }
   }
 
   public onSuspended(cb: (table: string, reason: string | null) => void): () => void {
@@ -2276,6 +2315,146 @@ export class ZeBridge {
     return blob;
   }
 
+  /// §10ix: the streaming read of one plan step, or null for the buffered path —
+  /// streaming off, object under `seedStreamingAbove`, a host that is not Node (the
+  /// inflate is node:zlib's Transform), or a custom one-shot `zstdDecompress` hook.
+  private async chainStepStream(os: any, bucket: string, step: PlanStep, dictFor: (n: string) => Promise<Uint8Array>, table: string):
+    Promise<{ columns: string[]; nrows: number; rows: AsyncIterable<any[]>; tail: () => Promise<Record<string, any>> } | null> {
+    if (!this.config.seedStreaming) return null;
+    const hook = this.config.zstdDecompressStream;
+    if (!hook && !(globalThis as any).process?.versions?.node) return null;
+    // A dictionary step streams only when the inflater handles dictionaries: Node's
+    // does; a supplied hook says so itself.
+    if (step.dict && hook && this.config.zstdStreamDictionaries !== true) return null;
+    let src: { info: any; chunks: AsyncIterable<Uint8Array> } | null;
+    try { src = await this.objectChunkStream(os, bucket, step.name); }
+    catch (e) { this.appendLog('SYS', `${table}: chain object ${step.name} unreadable: ${e}`, 'ERROR'); return null; }
+    if (!src || src.info.size < (this.config.seedStreamingAbove ?? 8 * 1024 * 1024)) return null;
+    const dict = step.dict ? await dictFor(step.dict) : undefined;
+    const doc = await this.chainDocStream(await this.zstdChunkStream(src.chunks, dict));
+    if (!doc) { this.appendLog('SYS', `${table}: chain object ${step.name} is not a chain document — buffered path`, 'WARN'); return null; }
+    return doc;
+  }
+
+  /// §10ix: the object's chunks as they arrive, never assembled — the same bounded pull
+  /// as `objectBlob` (8 MiB in flight), each chunk yielded and dropped. The digest is
+  /// folded in as they pass and checked after the last one: a truncated or corrupt
+  /// object still fails, only after the rows it did deliver, and before the watermark
+  /// that would have made them count.
+  private async objectChunkStream(os: any, bucket: string, name: string): Promise<{ info: any; chunks: AsyncIterable<Uint8Array> } | null> {
+    const info = await os.info(name);
+    if (!info || info.deleted) return null;
+    const self = this;
+    async function* chunks(): AsyncGenerator<Uint8Array> {
+      if (!info.chunks || !info.size) return;
+      const hash = await self.streamingSha256();
+      const js = self.transport.jetstream(self.nc!, self.jsOpts());
+      const c = await js.consumers.get(`OBJ_${bucket}`, { filter_subjects: [`$O.${bucket}.C.${info.nuid}`] });
+      let n = 0, got = 0;
+      while (n < info.chunks) {
+        const iter = await c.fetch({ max_messages: Math.min(info.chunks - n, 64), expires: 30_000 });
+        let inThis = 0;
+        for await (const m of iter) {
+          hash.update(m.data); got += m.data.length; n++; inThis++;
+          yield m.data;
+          if (n >= info.chunks) break;
+        }
+        try { (iter as any).stop(); } catch { /* already ended */ }
+        if (inThis === 0) break;
+      }
+      if (n !== info.chunks || got !== info.size) throw new Error(`object ${name}: ${n}/${info.chunks} chunks, ${got}/${info.size} bytes`);
+      if (info.digest) {
+        const want = String(info.digest).replace(/^SHA-256=/, '').replace(/=+$/, '');
+        const have = hash.base64().replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        if (want !== have) throw new Error(`object ${name}: digest mismatch (${have} vs ${want})`);
+      }
+    }
+    return { info, chunks: chunks() };
+  }
+
+  /// §10ix: an incremental SHA-256 for the streaming read — node:crypto where it exists,
+  /// js-sha256 (pure, 11 KB) anywhere else: Web Crypto's `digest` takes one buffer, and a
+  /// streamed object is never one buffer.
+  private async streamingSha256(): Promise<{ update(c: Uint8Array): void; base64(): string }> {
+    const dynImport = new Function('m', 'return import(m)') as (m: string) => Promise<any>;
+    if ((globalThis as any).process?.versions?.node) {
+      const h = (await dynImport('node:crypto')).createHash('sha256');
+      return { update: (c) => h.update(c), base64: () => h.digest('base64') };
+    }
+    const { sha256 } = await import('js-sha256');
+    const h = sha256.create();
+    return {
+      update: (c) => h.update(c),
+      base64: () => btoa(String.fromCharCode(...new Uint8Array(h.arrayBuffer()))),
+    };
+  }
+
+  /// §10ix: inflate a chunk stream as it flows — node:zlib's zstd Transform, with the
+  /// step's dictionary when it has one. The first chunk is sniffed for the frame magic
+  /// (§10w): an object that is not zstd passes through untouched. Written into the
+  /// Transform by hand rather than `pipe`d, so a source error (a digest mismatch after
+  /// the last chunk) destroys the output and the reader sees it, instead of an end.
+  private async zstdChunkStream(chunks: AsyncIterable<Uint8Array>, dict?: Uint8Array): Promise<AsyncIterable<Uint8Array>> {
+    const it = chunks[Symbol.asyncIterator]();
+    const first = await it.next();
+    if (first.done) return (async function* () {})();
+    const head = first.value;
+    const rest = (async function* () { yield head; for (;;) { const r = await it.next(); if (r.done) return; yield r.value; } })();
+    if (!(head.length >= 4 && head[0] === 0x28 && head[1] === 0xb5 && head[2] === 0x2f && head[3] === 0xfd)) return rest;
+    if (this.config.zstdDecompressStream) return this.config.zstdDecompressStream(rest, dict);
+    const dynImport = new Function('m', 'return import(m)') as (m: string) => Promise<any>;
+    const [zlib, events] = await Promise.all([dynImport('node:zlib'), dynImport('node:events')]);
+    const out = zlib.createZstdDecompress(dict ? { dictionary: dict } : undefined);
+    void (async () => {
+      try {
+        for await (const c of rest) { if (!out.write(c)) await events.once(out, 'drain'); }
+        out.end();
+      } catch (e) { out.destroy(e as Error); }
+    })();
+    return out as AsyncIterable<Uint8Array>;
+  }
+
+  /// §10ix: a chain document decoded as it arrives. `core.parseChainHead` reads the
+  /// head by hand; every value after it is one row, which `decodeMultiStream` yields one
+  /// at a time; after `nrows` of them come the tail's alternating keys and values —
+  /// gen, kind, cutoff, version_column, prev_cutoff. Null if the stream ends inside
+  /// the head: not a chain document.
+  private async chainDocStream(inflated: AsyncIterable<Uint8Array>):
+    Promise<{ columns: string[]; nrows: number; rows: AsyncIterable<any[]>; tail: () => Promise<Record<string, any>> } | null> {
+    const it = inflated[Symbol.asyncIterator]();
+    let buf = new Uint8Array(0);
+    let head = parseChainHead(buf);
+    while (!head) {
+      const r = await it.next();
+      if (r.done) return null;
+      const nb = new Uint8Array(buf.length + r.value.length); nb.set(buf); nb.set(r.value, buf.length); buf = nb;
+      head = parseChainHead(buf);
+    }
+    const off = head.offset;
+    const after = (async function* () {
+      if (buf.length > off) yield buf.subarray(off);
+      for (;;) { const r = await it.next(); if (r.done) return; yield r.value; }
+    })();
+    const values = decodeMultiStream(after)[Symbol.asyncIterator]();
+    const nrows = head.nrows;
+    const rows = (async function* () {
+      for (let i = 0; i < nrows; i++) {
+        const r = await values.next();
+        if (r.done) throw new Error(`chain document ended after ${i} of ${nrows} rows`);
+        yield r.value as any[];
+      }
+    })();
+    const tail = async () => {
+      const t: Record<string, any> = {};
+      for (;;) {
+        const k = await values.next(); if (k.done) return t;
+        const v = await values.next(); if (v.done) return t;
+        t[String(k.value)] = v.value;
+      }
+    };
+    return { columns: head.columns, nrows, rows, tail };
+  }
+
   private async maybeZstd(b: Uint8Array, dict?: Uint8Array): Promise<Uint8Array> {
     if (b.length < 4 || b[0] !== 0x28 || b[1] !== 0xb5 || b[2] !== 0x2f || b[3] !== 0xfd) return b;
     if (this.config.zstdDecompress) return await this.config.zstdDecompress(b, dict);
@@ -2493,14 +2672,20 @@ export class ZeBridge {
     const applyPlan = async (plan: PlanStep[]): Promise<number | null> => {
       let applied = 0;
       for (const step of plan) {
-        const doc = await fetchDoc(step.name, step.dict);
-        if (!doc) return null; // pruned under us — caller re-reads
-        const cols: string[] = doc.columns ?? [];
+        // §10ix: a large step streams; anything else, or any host that cannot stream,
+        // takes the buffered path. Both apply through the same `applyWindow` below.
+        const stream = await this.chainStepStream(os, manifest.bucket, step, dictFor, table);
+        const doc = stream ? null : await fetchDoc(step.name, step.dict);
+        if (!stream && !doc) return null; // pruned under us — caller re-reads
+        const cols: string[] = (stream ? stream.columns : doc.columns) ?? [];
         if (!cols.length || !cols.every((c) => state.columns.includes(c))) {
           this.appendLog('SYS', `Generation ${step.name} for ${table} references columns the local schema lacks — falling back to snapshot`, 'WARNING');
           return null;
         }
-        const vcol: string = doc.version_column ?? manifest.version_column;
+        // The streaming path meets the object's version column in the TAIL, after the
+        // rows; the manifest's is the same column unless the schema moved under the cut,
+        // which the tail check reports.
+        const vcol: string = doc?.version_column ?? manifest.version_column;
         // core.chainUpsertSql: version-guarded when the object carries the
         // table's version column — LWW holds during seeding too.
         const q = chainUpsertSql(table, cols, state.pkCols,
@@ -2520,24 +2705,25 @@ export class ZeBridge {
         // lasts. The first chunk of a full runs the DELETE; a kill between chunks is
         // safe by the watermark rule (written after the last chunk, so a restart
         // plans the full again and begins with the DELETE).
-        const rows: any[][] = sortRowsByKey(doc.rows, pkIdx[0] ?? -1);
+        // §10ix: the buffered path sorts the whole table once; the streaming path sorts
+        // each window — libzb's trade (client.zig `seed_chunk_rows`): runs of ordered
+        // keys instead of one, slower for the b-tree, bounded in memory.
+        const keyIdx = pkIdx[0] ?? -1;
+        const rows: any[][] = stream ? [] : sortRowsByKey(doc.rows, keyIdx);
         const chunk = this.config.seedChunkRows ?? 50_000;
-        const size = chunk > 0 ? chunk : Math.max(rows.length, 1);
+        const size = chunk > 0 ? chunk : Math.max(stream ? stream.nrows : rows.length, 1);
         const sqlite = this.dialect.name === 'sqlite';
         // §10fc: on SQLite, a chunk is ONE statement — the live rows as JSON text through
         // json_each — unless a column is a BLOB (JSON has no bytes: row by row then).
         const bulk = sqlite && !(state.blobCols?.length) ? chainBulkSql(table, cols, state.pkCols, vcol && cols.includes(vcol) ? vcol : null) : null;
-        if (sqlite) { try { await this.run('PRAGMA cache_size = -131072'); } catch { /* an adapter that refuses PRAGMA: the default cache */ } }
-        try {
-          for (let from = 0; from < rows.length || (from === 0 && step.kind === 'full'); from += size) {
-            const to = Math.min(from + size, rows.length);
+        // One window, one transaction — the body both paths share.
+        const applyWindow = async (win: any[][], first: boolean) => {
             await this.transaction(async (txExec) => {
               // A full replaces the baseline wholesale; the DELETE shares the first
               // chunk's transaction so a crash mid-apply cannot leave an empty table.
-              if (step.kind === 'full' && from === 0) await txExec(`DELETE FROM ${table}`);
+              if (step.kind === 'full' && first) await txExec(`DELETE FROM ${table}`);
               const live: any[][] = [];
-              for (let n = from; n < to; n++) {
-                const row = rows[n];
+              for (const row of win) {
                 if (tombIdx >= 0 && tombstoned(state.tombstoneColumn, { [cols[tombIdx]]: row[tombIdx] })) {
                   const keyed: Record<string, unknown> = {};
                   state.pkCols.forEach((c, i) => { if (pkIdx[i] >= 0) keyed[c] = row[pkIdx[i]]; });
@@ -2556,12 +2742,91 @@ export class ZeBridge {
               }
               if (bulk && live.length) await txExec(bulk, JSON.stringify(live));
             });
-            if (to === from) break;
+        };
+        if (sqlite) { try { await this.run('PRAGMA cache_size = -131072'); } catch { /* an adapter that refuses PRAGMA: the default cache */ } }
+        try {
+          if (stream && sqlite && bulk && step.kind === 'full' && this.storage.spillsTemp === true) {
+            // §10ix: a streamed FULL on SQLite is STAGED, not sorted per window. Sorting
+            // each window scattered its inserts across the whole b-tree (measured: 50k
+            // windows, 141 s, sys 38.6 s — the scatter is kernel I/O — against 38.9 s
+            // buffered; 1M windows, 41.7 s, but 2.4 GB). Here every window is a heap
+            // append into a keyless TEMP table, and the real table is filled once,
+            // `SELECT … ORDER BY pk`, by SQLite's external sorter — bounded memory,
+            // sequential b-tree build, the order the buffered path had for free. The
+            // table stays intact until that last transaction, so a reader never sees
+            // it empty and a kill leaves the old rows with no watermark: safe by the
+            // same rule. Tombstoned rows are simply not staged — a full replaces all.
+            const colList = cols.map((c) => `"${c}"`).join(', ');
+            const order = state.pkCols.map((c) => `"${c}"`).join(', ');
+            const stageSql = chainStageSql('temp._zb_seed_stage', cols);
+            let win: any[][] = []; let n = 0;
+            const flush = async () => {
+              if (win.length) { await this.run(stageSql, JSON.stringify(win)); win = []; }
+              this.seedProgress({ table, step: step.name, kind: step.kind, applied: n, total: stream.nrows, done: false });
+            };
+            try {
+              await this.run('DROP TABLE IF EXISTS temp._zb_seed_stage');
+              await this.run(`CREATE TEMP TABLE _zb_seed_stage (${colList})`);
+              for await (const row of stream.rows) {
+                n++;
+                if (tombIdx >= 0 && tombstoned(state.tombstoneColumn, { [cols[tombIdx]]: row[tombIdx] })) continue;
+                win.push(row);
+                if (win.length >= size) await flush();
+              }
+              await flush();
+              const tail = await stream.tail();
+              if (tail.version_column && tail.version_column !== vcol) {
+                this.appendLog('SYS', `${table}: chain object ${step.name} names version column ${tail.version_column}, the manifest ${vcol} — the schema moved under the cut; applied with the manifest's`, 'WARN');
+              }
+              await this.transaction(async (txExec) => {
+                await txExec(`DELETE FROM ${table}`);
+                await txExec(`INSERT INTO ${table} (${colList}) SELECT ${colList} FROM temp._zb_seed_stage ORDER BY ${order}`);
+              });
+              this.seedProgress({ table, step: step.name, kind: step.kind, applied: n, total: stream.nrows, done: true });
+            } catch (e) {
+              this.appendLog('SYS', `${table}: chain object ${step.name} unreadable while streaming: ${e}`, 'ERROR');
+              return null;
+            } finally {
+              try { await this.run('DROP TABLE IF EXISTS temp._zb_seed_stage'); } catch { /* the connection is going anyway */ }
+            }
+            applied += n;
+          } else if (stream) {
+            let win: any[][] = []; let first = true; let n = 0;
+            try {
+              for await (const row of stream.rows) {
+                win.push(row); n++;
+                if (win.length >= size) {
+                  await applyWindow(sortRowsByKey(win, keyIdx), first); first = false; win = [];
+                  this.seedProgress({ table, step: step.name, kind: step.kind, applied: n, total: stream.nrows, done: false });
+                }
+              }
+              // The last partial window — or, for an empty full, the DELETE alone.
+              if (win.length || (first && step.kind === 'full')) { await applyWindow(sortRowsByKey(win, keyIdx), first); first = false; }
+              this.seedProgress({ table, step: step.name, kind: step.kind, applied: n, total: stream.nrows, done: true });
+              const tail = await stream.tail();
+              if (tail.version_column && tail.version_column !== vcol) {
+                this.appendLog('SYS', `${table}: chain object ${step.name} names version column ${tail.version_column}, the manifest ${vcol} — the schema moved under the cut; applied with the manifest's`, 'WARN');
+              }
+            } catch (e) {
+              // As fetchDoc: pruned under us, or corrupt (the digest is checked once the
+              // last chunk passed). Windows already applied are safe by the watermark
+              // rule — it is written after applyPlan returns, so a restart re-plans.
+              this.appendLog('SYS', `${table}: chain object ${step.name} unreadable while streaming: ${e}`, 'ERROR');
+              return null;
+            }
+            applied += n;
+          } else {
+            for (let from = 0; from < rows.length || (from === 0 && step.kind === 'full'); from += size) {
+              const to = Math.min(from + size, rows.length);
+              await applyWindow(rows.slice(from, to), from === 0);
+              this.seedProgress({ table, step: step.name, kind: step.kind, applied: to, total: rows.length, done: to >= rows.length });
+              if (to === from) break;
+            }
+            applied += rows.length;
           }
         } finally {
           if (sqlite) { try { await this.run('PRAGMA cache_size = -2000'); } catch { /* as above */ } }
         }
-        applied += doc.rows.length;
       }
       return applied;
     };

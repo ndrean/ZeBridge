@@ -7,9 +7,10 @@
 /// that claim — or breaking it — live, from the log the library already emits.
 /// Nothing on this page teaches silently.
 
-import { ZeBridge, credsFileText, principalFromCreds } from '../../../../zb-client-ts';
+import { ZeBridge, credsFileText, principalFromCreds, type SeedProgress } from '../../../../zb-client-ts';
 import { mergeRegisters } from 'zb-client-ts';
 import { nkeys } from '@nats-io/nats-core';
+import { Decompress } from 'fzstd';
 import { createSignal, onCleanup, For, Show } from 'solid-js';
 
 /// ⚠️ This module owns ONE client, one socket, one replica. An edit to this file must
@@ -102,6 +103,23 @@ const CREDS = await (async () => {
 /// are, not what the URL guessed.
 const EFFECTIVE_PRINCIPAL = (CREDS && principalFromCreds(CREDS)) || PRINCIPAL;
 
+/// §10ix: streaming zstd for the seed. fzstd inflates plain frames chunk by chunk
+/// (the same hook as the React Native example); dictionary frames (deltas) stay on
+/// the buffered path because `zstdStreamDictionaries` is false. In the browser the
+/// storage does not spill TEMP tables (browser-storage.ts), so the client applies
+/// one sorted window at a time: bounded memory, ~3× slower than Node's staged path
+/// — hence the progress bar under the phases row.
+const zstdStream = (chunks: AsyncIterable<Uint8Array>, dict?: Uint8Array): AsyncIterable<Uint8Array> => {
+  if (dict) throw new Error('fzstd streams plain frames only');
+  return (async function* () {
+    const out: Uint8Array[] = [];
+    const d = new Decompress((chunk: Uint8Array) => { out.push(chunk); });
+    for await (const c of chunks) { d.push(c); while (out.length) yield out.shift()!; }
+    d.push(new Uint8Array(0), true);
+    while (out.length) yield out.shift()!;
+  })();
+};
+
 /// THE instance. One replica, one socket, one outbox.
 const zb = new ZeBridge({
   natsUrl: NATS_URL,
@@ -110,9 +128,20 @@ const zb = new ZeBridge({
   password: PASSWORD,
   creds: CREDS,
   // §10hn: every published table, said out loud — nothing is followed by default.
-  tables: '*',
+  // Parents before children. NOT '*': that followed every published table, which
+  // includes the type-coverage fixture test_types — 3,055,002 rows on this tenant.
+  // libzb seeds that from the chain in 67.6 s (NOTES §10iw), so the chain carries it
+  // fine; a BROWSER is the problem — the replica is 1.04 GB against an OPFS quota,
+  // and this demo makes a fresh database per load, so each attempt left another one
+  // behind until the quota blew. A client should name what it holds.
+  tables: ['counter_public', 'counter_tenant', 'app_users', 'app_orders'],
   durable: DURABLE,
   engine: ENGINE,
+  // Objects under 8 MiB (the default `seedStreamingAbove`) still take the one-shot
+  // path — the four demo tables do; only a big base streams.
+  seedStreaming: true,
+  zstdDecompressStream: zstdStream,
+  zstdStreamDictionaries: false,
 });
 
 // Console handle for inspecting the local replica directly — the database lives in
@@ -179,6 +208,9 @@ export default function App() {
   const [health, setHealth] = createSignal<'up' | 'down' | 'unknown'>('unknown');
   const [phase, setPhase] = createSignal<Record<string, boolean>>({ connected: false, migrated: false, snapshot: false, cdc: false });
   const [suspended, setSuspended] = createSignal<Record<string, string>>({});
+  // §10ix: one entry per table currently seeding from the chain; cleared when its last
+  // window lands, so an idle app shows nothing here.
+  const [seeding, setSeeding] = createSignal<Record<string, SeedProgress>>({});
   const [tenant, setTenant] = createSignal<string>('—');
   const [outboxCount, setOutboxCount] = createSignal(0);
   const [heldCount, setHeldCount] = createSignal(0);
@@ -265,6 +297,11 @@ export default function App() {
 
   zb.onStatus((s) => setStatus(s));
   zb.onPhase((p) => setPhase((prev) => ({ ...prev, [p]: true })));
+  zb.onSeedProgress((p) => setSeeding((prev) => {
+    const next = { ...prev };
+    if (p.done) delete next[p.table]; else next[p.table] = p;
+    return next;
+  }));
   zb.onSuspended((table, reason) => setSuspended((prev) => {
     const next = { ...prev };
     if (reason === null) delete next[table]; else next[table] = reason;
@@ -597,6 +634,22 @@ export default function App() {
             {([key, label]) => <li classList={{ done: phase()[key] }}>{label}</li>}
           </For>
         </ul>
+        {/* The browser seeds bounded but slowly (one sorted window at a time into
+            OPFS): a 3M-row table is a couple of minutes, which reads as a hang
+            without this. Shown only while a table is seeding. */}
+        <Show when={Object.keys(seeding()).length > 0}>
+          <ul class="seeding">
+            <For each={Object.values(seeding())}>
+              {(p) => (
+                <li>
+                  <span class="name">{p.table}</span>
+                  <progress max={p.total} value={p.applied} />
+                  <span class="count">{p.applied.toLocaleString()} / {p.total.toLocaleString()} rows · {p.kind} {p.step}</span>
+                </li>
+              )}
+            </For>
+          </ul>
+        </Show>
         <p class="identity">
           principal <strong>{EFFECTIVE_PRINCIPAL}</strong> · tenant <strong>{tenant()}</strong> · client <strong>{zb.clientId}</strong>
           {' '}· engine <strong>{ENGINE}</strong> · outbox <strong>{outboxCount()}</strong> pending · held <strong>{heldCount()}</strong>

@@ -302,6 +302,49 @@ export function pgArrayLiteral(v: any[]): string {
 /// on a random b-tree page; sorted, the inserts append (libzb §10ez: the apply
 /// halved). Strings compare by code unit, numbers numerically; anything else keeps
 /// its place (the sort is stable). A copy of the row references, not of the rows.
+/// §10ix: the head of a chain document, read by hand. The producer's layout
+/// (generation_producer.zig `docHead`) is a map whose first two entries are
+/// `columns` (an array of names) and `rows` (an array whose COUNT is written before
+/// its elements) — so a client can learn the columns and the row count from the
+/// first few hundred bytes and decode every value after `offset` as one row, without
+/// holding the document. Null when `b` does not yet reach the end of the head (buffer
+/// more) or is not a chain document at all (the caller falls back). Accepts every
+/// msgpack spelling of a map, string and array header the producer could emit.
+export function parseChainHead(b: Uint8Array): { columns: string[]; nrows: number; offset: number } | null {
+  let p = 0;
+  const need = (n: number) => p + n <= b.length;
+  const dv = () => new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const str = (): string | null => {
+    if (!need(1)) return null;
+    const t = b[p]; let len: number, hl: number;
+    if (t >= 0xa0 && t <= 0xbf) { len = t & 0x1f; hl = 1; }
+    else if (t === 0xd9) { if (!need(2)) return null; len = b[p + 1]; hl = 2; }
+    else if (t === 0xda) { if (!need(3)) return null; len = dv().getUint16(p + 1); hl = 3; }
+    else return null;
+    if (!need(hl + len)) return null;
+    const s = new TextDecoder().decode(b.subarray(p + hl, p + hl + len)); p += hl + len; return s;
+  };
+  const arr = (): number | null => {
+    if (!need(1)) return null; const t = b[p];
+    if (t >= 0x90 && t <= 0x9f) { p += 1; return t & 0x0f; }
+    if (t === 0xdc) { if (!need(3)) return null; const n = dv().getUint16(p + 1); p += 3; return n; }
+    if (t === 0xdd) { if (!need(5)) return null; const n = dv().getUint32(p + 1); p += 5; return n; }
+    return null;
+  };
+  if (!need(1)) return null;
+  const t = b[p];
+  if (t >= 0x80 && t <= 0x8f) p += 1;
+  else if (t === 0xde) { if (!need(3)) return null; p += 3; }
+  else return null;
+  if (str() !== 'columns') return null;
+  const ncols = arr(); if (ncols === null) return null;
+  const columns: string[] = [];
+  for (let i = 0; i < ncols; i++) { const s = str(); if (s === null) return null; columns.push(s); }
+  if (str() !== 'rows') return null;
+  const nrows = arr(); if (nrows === null) return null;
+  return { columns, nrows, offset: p };
+}
+
 export function sortRowsByKey(rows: any[][], keyIdx: number): any[][] {
   if (keyIdx < 0 || rows.length < 2) return rows;
   const out = rows.slice();
@@ -537,6 +580,18 @@ export function chainUpsertSql(
 /// The conflict clause is the upsert's, so the version guard holds row by row. The
 /// `WHERE true` is SQLite's disambiguation of INSERT … SELECT … ON CONFLICT.
 /// Not for a table with a BLOB column (JSON has no bytes) nor for PostgreSQL.
+/// §10ix: the staging insert of a streamed FULL on SQLite — the same `json_extract`
+/// picks as `chainBulkSql`, into a keyless TEMP table, with no conflict clause: a heap
+/// append, no sort, no b-tree. The real table is filled once at the end, `SELECT …
+/// ORDER BY <pk>`, so SQLite's external sorter puts the rows in key order and the
+/// b-tree is built sequentially — the property the buffered path had from sorting the
+/// whole document in memory, without holding it.
+export function chainStageSql(stage: string, cols: string[]): string {
+  const colList = cols.map((c) => `"${c}"`).join(', ');
+  const picks = cols.map((_, i) => `json_extract(value, '$[${i}]')`).join(', ');
+  return `INSERT INTO ${stage} (${colList}) SELECT ${picks} FROM json_each(?)`;
+}
+
 export function chainBulkSql(
   table: string,
   cols: string[],

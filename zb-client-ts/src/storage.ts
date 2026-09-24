@@ -28,6 +28,15 @@ export interface Storage {
   /// MUST say so: the shell picks the descriptor's `pg` block, BIGINT bookkeeping
   /// and `session_replication_role` from it.
   dialect?: Dialect;
+  /// §10ix: whether the engine's temp store spills to a real disk. When true, a
+  /// streamed FULL is STAGED — windows appended to a TEMP table, the real table
+  /// filled once by `INSERT … SELECT … ORDER BY pk`, SQLite's external sorter doing
+  /// the ordering on disk (measured: 43 s, 786 MB peak for 3M rows, but ~3× the table
+  /// on disk while it runs). Absent or false, each window is sorted and applied on
+  /// its own: slower, bounded in memory AND disk — what a browser over OPFS wants,
+  /// since a wasm build's temp store is not known to reach the disk and its quota is
+  /// the thing that ran out. A host with a real filesystem (Node, a phone) says true.
+  spillsTemp?: boolean;
   /// An Exec that CANNOT write (§10di): a second connection opened read-only, the
   /// libzb design. `query()` runs on it when present; when absent (one handle —
   /// the browser's OPFS, PGlite) the shell guards `query()` by statement shape

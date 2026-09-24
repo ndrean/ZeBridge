@@ -14,6 +14,7 @@ export const browserStorage: StorageFactory = (dbName) => {
   void exec(`PRAGMA foreign_keys = ON;`);
   return {
     exec,
+    spillsTemp: false, // sqlite-wasm over OPFS: where a sort spills is not established, and the quota is what runs out
     transaction: (fn) =>
       sqlocal.transaction(async (tx) => {
         const txExec: Exec = (q, ...p) => (tx.sql as any)(q, ...p);

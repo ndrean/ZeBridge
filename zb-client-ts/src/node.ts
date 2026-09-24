@@ -83,6 +83,7 @@ export const nodeStorage: StorageFactory = (dbName) => {
 
   return {
     exec,
+    spillsTemp: true, // better-sqlite3 on a real filesystem: the sorter spills to disk
     readOnly,
     // better-sqlite3's own .transaction() is synchronous-only; the core's apply
     // paths are async. One connection, sequential use → manual BEGIN/COMMIT.

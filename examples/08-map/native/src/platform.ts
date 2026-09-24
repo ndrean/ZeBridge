@@ -5,7 +5,7 @@
 /// Imported for its side effects, FIRST, before anything touches the client.
 import 'react-native-get-random-values'; // crypto.getRandomValues, which `uuid` needs
 import * as Crypto from 'expo-crypto';
-import { decompress as zstdDecompress } from 'fzstd';
+import { decompress as zstdDecompress, Decompress } from 'fzstd';
 
 // `crypto.randomUUID` (the client id) and `crypto.subtle.digest` (the grammar hash).
 // React Native has neither; both are one call to expo-crypto.
@@ -47,4 +47,22 @@ if (!g.crypto.subtle) {
 export const zstd = (b: Uint8Array, dict?: Uint8Array) => {
   if (dict) throw new Error('zstd dictionary frames need a native decompressor; fzstd does plain frames only');
   return zstdDecompress(b);
+};
+
+/// §10ix: the same decoder, STREAMING — what lets a phone seed a large table without
+/// holding it. fzstd's `Decompress` takes chunks as they arrive and hands back inflated
+/// bytes block by block; the client decodes rows out of those and applies them in
+/// windows, so the table is never whole in memory (measured in Node with this exact
+/// pipeline, NOTES §10ix). Plain frames only, like `zstd` above: a FULL is one (the
+/// dictionary is trained from it), and dictionary steps stay on the buffered path
+/// because client.ts sets `zstdStreamDictionaries: false`.
+export const zstdStream = (chunks: AsyncIterable<Uint8Array>, dict?: Uint8Array): AsyncIterable<Uint8Array> => {
+  if (dict) throw new Error('fzstd streams plain frames only');
+  return (async function* () {
+    const out: Uint8Array[] = [];
+    const d = new Decompress((chunk: Uint8Array) => { out.push(chunk); });
+    for await (const c of chunks) { d.push(c); while (out.length) yield out.shift()!; }
+    d.push(new Uint8Array(0), true);
+    while (out.length) yield out.shift()!;
+  })();
 };

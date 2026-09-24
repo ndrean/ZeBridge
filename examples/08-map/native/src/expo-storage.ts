@@ -63,6 +63,7 @@ export const expoStorage: StorageFactory = (dbName: string): Storage => {
 
   return {
     exec,
+    spillsTemp: true, // expo-sqlite on the device's filesystem: a sort spills to disk, so a full is staged (§10ix)
     // No `readOnly`: expo-sqlite has no second read-only handle, so the shell guards
     // `query()` by statement shape instead (core.isReadOnlySql) — the same choice the
     // browser's OPFS and the PGlite adapters make.

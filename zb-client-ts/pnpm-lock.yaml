@@ -32,6 +32,9 @@ importers:
       '@nats-io/obj':
         specifier: 3.4.0
         version: 3.4.0
+      js-sha256:
+        specifier: ^0.11.1
+        version: 0.11.1
       sqlocal:
         specifier: ^0.18.0
         version: 0.18.0

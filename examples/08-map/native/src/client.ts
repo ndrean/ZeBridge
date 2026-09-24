@@ -4,7 +4,7 @@ import './platform';
 import { Platform } from 'react-native';
 import { ZeBridge } from 'zb-client-ts';
 import { expoStorage } from './expo-storage';
-import { zstd } from './platform';
+import { zstd, zstdStream } from './platform';
 
 /// ⚠️ A phone is not the dev machine, and the two emulators disagree about how to reach
 /// it. The iOS simulator shares the host's network stack, so `127.0.0.1` IS the Mac. The
@@ -42,5 +42,11 @@ export function makeClient() {
     heartbeatMs: 0,
     storage: expoStorage,
     zstdDecompress: zstd,
+    // §10ix: seed large tables as they arrive. The phone has a real filesystem, so
+    // expo-storage says `spillsTemp` and a full is STAGED — fast and bounded in RAM,
+    // at ~3× the table on disk while it runs. Deltas (dictionary frames) stay buffered.
+    seedStreaming: true,
+    zstdDecompressStream: zstdStream,
+    zstdStreamDictionaries: false,
   });
 }
