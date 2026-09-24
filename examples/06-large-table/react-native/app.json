@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": "ZeLargeTable",
+    "slug": "zelargetable",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "zelargetable",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "dev.zebridge.largetable",
+      "appleTeamId": "6UM77KAJ7Q"
+    },
+    "android": {
+      "package": "dev.zebridge.largetable"
+    },
+    "plugins": [
+      "expo-sqlite",
+      "./plugins/with-fmt-consteval"
+    ]
+  }
+}

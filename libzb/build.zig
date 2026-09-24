@@ -40,8 +40,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    // libzstd for DICTIONARY frames (§10x): std.compress.zstd parses a dictionary
-    // id but cannot use one; plain frames still decode through std.
+    // libzstd for the chain objects: streaming inflate of frames that state no
+    // content size (§10gi), at native speed — std.compress.zstd was 4.2 s for a
+    // 102 MB full (§10ez).
     const zstd_prefix: []const u8 = if (builtin.os.tag == .macos) "/opt/homebrew/opt/zstd" else "/usr";
     // §10iq: the HEADERS come from the pinned sources when vendoring, so translate-c
     // reads the same sqlite3.h and zstd.h that will actually be compiled in.
@@ -91,16 +92,14 @@ pub fn build(b: *std.Build) void {
     // silently drop DuckDB (§10hw).
     //
     // zstd's own build is a set of directories, not a single file: `common` is shared,
-    // `compress` and `decompress` are what libzb calls into. `dictBuilder` is NOT here
-    // — libzb loads dictionaries (ZSTD_*_loadDictionary) but never TRAINS one; that is
-    // the bridge's job, in its own binary.
+    // `compress` and `decompress` are what libzb calls into. `dictBuilder` is NOT here:
+    // nothing trains a dictionary any more (§10iy), and nothing loads one.
     // §10iq: zstd's sources, NAMED rather than globbed — a build should not depend on
     // what happens to be in a directory, and iterating one at configure time needs a
     // filesystem handle this Zig version does not hand out here.
     //
-    // `dictBuilder` is deliberately absent: libzb LOADS dictionaries
-    // (ZSTD_*_loadDictionary) but never trains one. Training is the bridge's job, in
-    // its own binary.
+    // `dictBuilder` is deliberately absent: no dictionary is trained or loaded anywhere
+    // since 2026-09-24 (§10iy).
     const android_api = b.option([]const u8, "android-api", "Android API level whose libc a shared build links (NDK sysroot)") orelse "29";
     const arch_include: ?[]const u8 = if (target.result.abi == .android or target.result.abi == .androideabi)
         target.result.linuxTriple(b.allocator) catch null
@@ -267,6 +266,10 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
         .linkage = if (static) .static else .dynamic,
     });
+    // §10iy: a static library another linker consumes must carry compiler-rt itself —
+    // Xcode's ld found `roundq` (f128, compiler-rt's) undefined in the force-loaded
+    // archive on the first iOS link.
+    lib.bundle_compiler_rt = true;
     b.installArtifact(lib);
 
     // §10iq: `zig build lib` — the LIBRARY on its own. The default step also builds

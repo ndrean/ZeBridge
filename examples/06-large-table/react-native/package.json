@@ -1,8 +1,9 @@
 {
-  "name": "zemap-native",
+  "name": "zelargetable-native",
   "private": true,
   "version": "0.1.0",
   "main": "index.js",
+  "description": "One big table, seeded from the chain on a phone \u2014 a progress bar and a timer (NOTES \u00a710ix)",
   "scripts": {
     "start": "expo start --dev-client",
     "prebuild": "expo prebuild --clean",
@@ -12,7 +13,6 @@
   },
   "dependencies": {
     "@babel/runtime": "^7.25.0",
-    "@maplibre/maplibre-react-native": "^10.0.0",
     "@msgpack/msgpack": "^3.0.0-beta.1",
     "@nats-io/jetstream": "^3.4.0",
     "@nats-io/kv": "^3.4.0",
@@ -20,6 +20,8 @@
     "@nats-io/obj": "3.4.0",
     "expo": "~52.0.0",
     "expo-crypto": "~14.0.1",
+    "expo-dev-client": "~5.0.0",
+    "expo-file-system": "~18.0.0",
     "expo-sqlite": "~15.1.4",
     "fzstd": "^0.1.1",
     "js-sha256": "^0.11.1",

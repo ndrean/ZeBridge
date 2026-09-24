@@ -51,6 +51,13 @@
 //! SKIP loudly instead of crashing.
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// §10iy: no stack-trace machinery on iOS. std.debug's SelfInfo wants
+/// `_dyld_get_image_header_containing_address`, which the iOS SDK does not export, and
+/// a force-loaded archive links every object — the phone build failed on it. A panic
+/// there traps; the host (Flutter) has nowhere to show a trace anyway.
+pub const panic = if (builtin.os.tag == .ios) std.debug.simple_panic else std.debug.FullPanic(std.debug.defaultPanic);
 const nats = @import("nats");
 const core = @import("core.zig");
 const client = @import("client.zig");
