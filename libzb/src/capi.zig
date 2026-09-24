@@ -28,7 +28,8 @@
 //!                                                                    // §10hj: ask a service on `query.<tenant>.<name>`; its reply verbatim
 //!   char* zb_client_ingest(uint64_t h, const char* table, const char* answer_json, const char* scope_json);
 //!                                                                    // §10hj: keep an answer ({"columns","rows"}) in an on-demand table → {"applied":n}
-//!   char* zb_client_poll(uint64_t h, uint64_t wait_ms);            // {"applied":n,"settled":n,…,"requests":[…]?,"unreadable":[…]?} — live tail, blocks ≤ wait_ms
+//!   char* zb_client_poll(uint64_t h, uint64_t wait_ms);            // {"applied":n,"settled":n,…,"requests":[…]?,"unreadable":[…]?,"unseeded":[…]?} — live tail, blocks ≤ wait_ms
+//!   const char* zb_last_error(void);                               // §10iz: the words behind the last 0 or NULL this thread got; NULL when the last call succeeded
 //!   char* zb_client_serve(uint64_t h, const char* opts_json);      // §10hp: answer query.<tenant>.<name> in a queue group → {"serving":n}
 //!   char* zb_client_reply(uint64_t h, uint64_t id, const char* answer_json);  // §10hp: answer one request from poll
 //!   char* zb_client_join(uint64_t h, const char* tenant);          // {"tenants":[…]} — follow one more tenant (§10fn)
@@ -392,17 +393,49 @@ const ClientBox = struct {
 /// returned — a richer error channel is worth adding the day a host needs to
 /// distinguish "bad credentials" from "no broker".
 export fn zb_client_connect(opts_json: ?[*:0]const u8) u64 {
-    const text = std.mem.span(opts_json orelse return 0);
+    const text = std.mem.span(opts_json orelse {
+        setLastError("zb_client_connect failed: NoOptions", .{});
+        return 0;
+    });
     // §10hw: the doc above promised the reason was logged; it was swallowed. A bare 0
     // with no line is the worst failure this ABI can produce, because the host has
-    // nothing at all to search for.
+    // nothing at all to search for. §10iz: and a line on stderr is not enough either —
+    // a phone has no stderr anyone reads — so the words are kept for `zb_last_error`.
     const box = openBox(std.heap.c_allocator, text) catch |err| {
         std.debug.print("zb_client_connect failed: {s}\n", .{@errorName(err)});
+        setLastError("zb_client_connect failed: {s}", .{@errorName(err)});
         return 0;
     };
     const h = clients.insert(box);
-    if (h == 0) box.destroy(std.heap.c_allocator); // table full: do not leak it
+    if (h == 0) {
+        box.destroy(std.heap.c_allocator); // table full: do not leak it
+        setLastError("zb_client_connect failed: HandleTableFull", .{});
+        return 0;
+    }
+    clearLastError();
     return h;
+}
+
+/// §10iz: the words behind a bare `0` or `NULL`. Per thread, like `errno`; set by the
+/// call that failed, cleared by the next `zb_client_connect` that succeeds. A host
+/// wrapper reads it into its exception — the Dart and Python ones do.
+threadlocal var last_error_buf: [512]u8 = undefined;
+threadlocal var last_error_len: usize = 0;
+
+fn setLastError(comptime fmt: []const u8, args: anytype) void {
+    const room = last_error_buf[0 .. last_error_buf.len - 1];
+    const s = std.fmt.bufPrint(room, fmt, args) catch room;
+    last_error_len = s.len;
+    last_error_buf[s.len] = 0;
+}
+
+fn clearLastError() void {
+    last_error_len = 0;
+}
+
+export fn zb_last_error() ?[*:0]const u8 {
+    if (last_error_len == 0) return null;
+    return last_error_buf[0..last_error_len :0].ptr;
 }
 
 /// Everything fallible, in a function that can actually RETURN an error.
@@ -712,7 +745,24 @@ fn syncJson(a: std.mem.Allocator, b: *ClientBox) ![]const u8 {
     try out.put(a, "tenant", .{ .string = r.tenant });
     try out.put(a, "tenants", try tenantsJson(a, r.tenants));
     try out.put(a, "first", .{ .bool = r.first });
+    // §10iz: always present here, empty when every followed table seeded — the host's
+    // "usable" test is this list, not the absence of a stderr line.
+    try out.put(a, "unseeded", try unseededJson(a, b));
     return try core.valueToString(a, .{ .object = out });
+}
+
+/// §10iz: `[{"table":…,"reason":…}]` — what the last seed pass could not seed and why
+/// (the error name libzb printed), one entry per table, gone once it seeds.
+fn unseededJson(a: std.mem.Allocator, b: *ClientBox) !std.json.Value {
+    var arr = std.json.Array.init(a);
+    var it = b.c.unseeded.iterator();
+    while (it.next()) |e| {
+        var one: std.json.ObjectMap = .empty;
+        try one.put(a, "table", .{ .string = e.key_ptr.* });
+        try one.put(a, "reason", .{ .string = e.value_ptr.* });
+        try arr.append(.{ .object = one });
+    }
+    return .{ .array = arr };
 }
 
 fn tenantsJson(a: std.mem.Allocator, tenants: []const []const u8) !std.json.Value {
@@ -850,6 +900,8 @@ fn pollJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
     var seeded = std.json.Array.init(a);
     for (r.seeded) |t| try seeded.append(.{ .string = t });
     try out.put(a, "seeded", .{ .array = seeded });
+    // §10iz: only while something is unseeded — a quiet poll's report stays small.
+    if (b.c.unseeded.count() > 0) try out.put(a, "unseeded", try unseededJson(a, b));
 
     // §10hp: the questions this client was asked, when it serves any. Each must be
     // answered with `zb_client_reply(h, id, answer_json)`.
@@ -980,6 +1032,14 @@ export fn zb_client_flush_outbox(handle: u64, wait_ms: u64) ?[*:0]u8 {
     defer arena.deinit();
     const out = flushJson(arena.allocator(), b, wait_ms) catch |err| return errJson(@errorName(err));
     return dupeZ(out);
+}
+
+test "zb_last_error: the words behind a 0 handle (§10iz)" {
+    try std.testing.expectEqual(@as(u64, 0), zb_client_connect("not json"));
+    const e = zb_last_error() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.startsWith(u8, std.mem.span(e), "zb_client_connect failed: "));
+    try std.testing.expectEqual(@as(u64, 0), zb_client_connect(null));
+    try std.testing.expectEqualStrings("zb_client_connect failed: NoOptions", std.mem.span(zb_last_error().?));
 }
 
 test "smoke: seed gate through the dispatch layer" {

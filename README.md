@@ -1258,8 +1258,9 @@ That is the whole contract for an app author. A callback to implement by table, 
 | verb | what it does | returns |
 | --- | --- | --- |
 | `zb_client_connect(opts_json)` | opens the replica and the socket | a handle, `0` on failure |
-| `zb_client_sync(h)` | the first step after open: resolves the tenant, applies the schemas, seeds the tables, drains the streams | `{"tenant": …, "first": bool}` |
-| `zb_client_poll(h, wait_ms)` | waits up to `wait_ms` for CDC, applies what arrived, retries what was held, collects verdicts | `{"applied", "settled", "changed_tables", "seeded"}` |
+| `zb_client_sync(h)` | the first step after open: resolves the tenant, applies the schemas, seeds the tables, drains the streams | `{"tenant": …, "first": bool, "unseeded": [{"table", "reason"}]}` — an empty `unseeded` is what "usable" means |
+| `zb_client_poll(h, wait_ms)` | waits up to `wait_ms` for CDC, applies what arrived, retries what was held, collects verdicts | `{"applied", "settled", "changed_tables", "seeded"}`, plus `"unseeded"` while any table is |
+| `zb_last_error()` | the words behind the last `0` or `NULL` this thread got (`errno`-style) | a C string, `NULL` after a success |
 | `zb_client_flush_outbox(h, wait_ms)` | sends the outbox and waits up to `wait_ms` for verdicts | `{"sent", "settled", "verdicts": {…}}` |
 | `zb_client_query(h, sql, params_json)` | a read against the replica | `{"columns": […], "rows": [[…], …]}` |
 | `zb_client_mutate(h, table, op, key_json, values_json)` | one write: optimistic locally, sent at once | `{"msgId": …}` |
@@ -1288,6 +1289,7 @@ reason is the C ABI, not a choice:
 | send the outbox | `flushOutbox()` | `zb_client_flush_outbox(h, wait_ms)` |
 | receive changes | `onChange(table, cb)` | `zb_client_poll(h, wait_ms)` — a C ABI cannot take a closure, so the host drives the loop |
 | was I banned | `revoked` (a field) | `zb_client_revoked(h)` — `1` revoked, `0` live, `-1` unknown handle |
+| why did it fail | the `Error` thrown, the `SYS` log line | `zb_last_error()` after a `0`/`NULL`; `unseeded` in the sync and poll reports |
 | stop | `close()` | `zb_client_close(h)` |
 
 C-only by necessity: `zb_free` (no GC), `zb_abi_version`, and `zb_client_live` (open

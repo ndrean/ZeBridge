@@ -93,6 +93,13 @@ class _SeedScreenState extends State<SeedScreen> {
       _clock.stop();
       _tick?.cancel();
       _worker = w;
+      // §10iz: "usable" is a claim about the table, not about the call returning.
+      final failed = w.unseeded.where((u) => u['table'] == table).toList();
+      if (failed.isNotEmpty) {
+        setState(() { _phase = 'failed'; _error = '$table: seeding failed: ${failed.first['reason']} — libzb retries at each poll'; });
+        _say('not seeded after ${_secs(_clock.elapsedMilliseconds)}: ${failed.first['reason']}');
+        return;
+      }
       setState(() => _phase = 'usable');
       _say('usable after ${_secs(_clock.elapsedMilliseconds)} (tenant ${w.tenant})');
 

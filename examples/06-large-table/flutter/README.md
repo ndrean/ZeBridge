@@ -49,9 +49,11 @@ What `ios/Flutter/*.xcconfig` carries, and why (each was a failed link or launch
 * `-force_load` on the slice: nothing references the `zb_*` symbols by name (Dart looks
   them up at run time through `DynamicLibrary.process()`), so the linker would drop
   every object;
-* `STRIP_STYLE = non-global` and `-exported_symbol "_zb_*"`: a release build strips an
-  app's globals — the simulator debug build found the symbols, the phone's release
-  build did not (`dlsym … symbol not found`);
+* `STRIP_STYLE = non-global` and `-exported_symbol "_zb_*"`, in `Release.xcconfig`
+  ONLY: a release build strips an app's globals — the simulator debug build found the
+  symbols, the phone's release build did not (`dlsym … symbol not found`). Not in
+  Debug: Xcode runs a debug app from a "debug dylib" whose entry point must stay
+  exported, and the list made the stub abort at launch;
 * `DEVELOPMENT_TEAM`: a personal Apple team signs the device build.
 
 ## Android
@@ -64,8 +66,13 @@ Zig cannot synthesise Android's libc (NOTES §10ir), so libzb is built as a stat
 archive — position-independent on Android targets, `libzb/build.zig` — and the NDK's
 `clang --shared -Wl,--whole-archive` makes the `.so` dart:ffi loads from
 `android/app/src/main/jniLibs/arm64-v8a/` (git-ignored). The manifest declares
-`INTERNET`. Built and packaged on 2026-09-24; not yet run on a phone — the one at hand
-enforces a 24-hour wait before it accepts a new debugging computer.
+`INTERNET`. Built and packaged on 2026-09-24; installed on a moto e20 (Android 11 Go, 1.8 GB)
+that then enforced a 24-hour wait before accepting a new debugging computer — and the
+app did not open from its icon. Without adb the reason is unread; the suspect is the
+ABI: `arm64-v8a` is the only slice libzb builds today (64-bit atomics in libzb and
+nats.zig; `tool/build-libzb-android.sh` says why), and a 2 GB Go phone may run a
+32-bit userspace, where Android loads the armeabi-v7a Flutter engine and finds no
+library. `adb shell getprop ro.product.cpu.abilist` settles it.
 
 And in `ios/Runner/Info.plist`, `NSLocalNetworkUsageDescription`: without it iOS
 refuses connections to LAN addresses silently — `zb_client_connect` returned 0 with no

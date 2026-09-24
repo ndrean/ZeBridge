@@ -43,6 +43,9 @@ typedef ZbClientPollDart = ffi.Pointer<Utf8> Function(
 typedef ZbFreeC = ffi.Void Function(ffi.Pointer<Utf8> p);
 typedef ZbFreeDart = void Function(ffi.Pointer<Utf8> p);
 
+typedef ZbLastErrorC = ffi.Pointer<Utf8> Function();
+typedef ZbLastErrorDart = ffi.Pointer<Utf8> Function();
+
 class PollReport {
   final int applied;
   final int settled;
@@ -86,6 +89,7 @@ class ZeBridge {
   static late ZbClientFlushDart _flush;
   static late ZbClientPollDart _poll;
   static late ZbFreeDart _free;
+  static late ZbLastErrorDart _lastError;
 
   static void init() {
     String libPath = '';
@@ -116,6 +120,7 @@ class ZeBridge {
     _poll = _lib.lookupFunction<ZbClientPollC, ZbClientPollDart>(
         'zb_client_poll');
     _free = _lib.lookupFunction<ZbFreeC, ZbFreeDart>('zb_free');
+    _lastError = _lib.lookupFunction<ZbLastErrorC, ZbLastErrorDart>('zb_last_error');
   }
 
   late int _handle;
@@ -127,7 +132,11 @@ class ZeBridge {
     malloc.free(optsC);
 
     if (_handle == 0) {
-      throw Exception('Failed to open ZeBridge client');
+      // §10iz: the words behind the 0 — libzb keeps them for zb_last_error(). Before
+      // this an iPhone showed "Failed to open ZeBridge client" for a missing
+      // local-network permission and nothing said so.
+      final why = _lastError();
+      throw Exception(why == ffi.nullptr ? 'zb_client_connect failed' : why.toDartString());
     }
   }
 

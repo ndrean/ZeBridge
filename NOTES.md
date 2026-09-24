@@ -16399,3 +16399,32 @@ bar the TS hosts have.
 
 Pending from this: the client's retry-from-scratch on a deterministic step error
 (it re-downloaded 3M rows before excluding the table); a device run; Android.
+
+## §10iz — the C ABI says why (2026-09-24)
+
+"Usable in 15.8 s" over 0 rows (§10iy) was two silences: `zb_client_connect` returned
+a bare `0` — the reason on a stderr no phone shows — and `zb_client_sync` returned
+`{tenant, first}` after a seed that had failed, the failure being one printed line. A
+host cannot be honest with what it cannot read.
+
+* `zb_last_error()`: the words behind the last `0` or `NULL` this thread got,
+  `errno`-style — set by the call that failed (`zb_client_connect failed: <error>`),
+  cleared by the next success, `NULL` otherwise. The Dart wrappers (05-tables and
+  06-large-table) put it in the exception.
+* `unseeded: [{table, reason}]` in `zb_client_sync`'s report — always there, empty when
+  every followed table is in the replica — and in `zb_client_poll`'s while any is. The
+  client keeps one entry per table (`rememberUnseeded`, the error name of the last
+  failed seed), removed when the table seeds. The worker isolate passes it up; the
+  seed screen refuses "usable" when its table is in it and shows
+  `test_types: seeding failed: Timeout — libzb retries at each poll` instead of a clock.
+
+The TS vocabulary already had both (the `Error` thrown, the `SYS` line
+`could not be seeded and are excluded`); README's table names the C equivalents. One
+unit test: a non-JSON option string gives `0` and `zb_last_error()` starts with
+`zb_client_connect failed: `.
+
+Same day, the Android phone: a moto e20 (Unisoc, 1.8 GB, eMMC) — libzb built for it
+(§10ir's archive, position-independent, linked into `libzbcore.so` by the NDK's clang,
+`tool/build-libzb-android.sh`), the APK installed, and then the phone's 24-hour wait
+before it accepts a new debugging computer. The run is tomorrow's; the app runs from
+its icon without adb.

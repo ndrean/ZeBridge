@@ -27,11 +27,15 @@ import 'dart:isolate';
 import 'zebridge.dart';
 
 class ZeBridgeWorker {
-  ZeBridgeWorker._(this._toWorker, this._fromWorker, this.tenant);
+  ZeBridgeWorker._(this._toWorker, this._fromWorker, this.tenant, this.unseeded);
 
   final SendPort _toWorker;
   final ReceivePort _fromWorker;
   final String tenant;
+  /// §10iz: what the first sync could not seed — `[{table, reason}]`, libzb's own
+  /// words. Empty means every followed table is in the replica. A host that shows
+  /// "usable" without reading this showed "usable in 15.8 s" over 0 rows once.
+  final List<Map<String, dynamic>> unseeded;
 
   final _reports = StreamController<PollReport>.broadcast();
   final _pending = <int, Completer<dynamic>>{};
@@ -83,7 +87,12 @@ class ZeBridgeWorker {
         _workerMain, _Boot(fromWorker.sendPort, options, pollWaitMs));
     final info = await ready.future;
     worker = ZeBridgeWorker._(
-        toWorker!, fromWorker, (info['tenant'] as String?) ?? '—');
+        toWorker!,
+        fromWorker,
+        (info['tenant'] as String?) ?? '—',
+        ((info['unseeded'] as List?) ?? const [])
+            .map((e) => Map<String, dynamic>.from(e as Map))
+            .toList());
     // keep the subscription alive with the worker
     worker._sub = sub;
     return worker;
@@ -158,7 +167,7 @@ Future<void> _workerMain(_Boot boot) async {
     ZeBridge.init();
     zb = ZeBridge(boot.options);
     final info = zb.sync();
-    toUi.send({'type': 'ready', 'tenant': info['tenant']});
+    toUi.send({'type': 'ready', 'tenant': info['tenant'], 'unseeded': info['unseeded']});
   } catch (e) {
     toUi.send({'type': 'fatal', 'error': e.toString()});
     commands.close();

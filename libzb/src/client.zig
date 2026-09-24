@@ -278,6 +278,12 @@ pub const SyncClient = struct {
     schema_kv: ?@import("nats").KV = null,
     /// §10df: a descriptor arrived with a higher seed_epoch — seed on the next poll.
     reseed_pending: bool = false,
+    /// §10iz: what kept each table unseeded — the error name of its last failed seed,
+    /// by table; an entry leaves when the table seeds. `zb_client_sync` and
+    /// `zb_client_poll` report it as `unseeded`, so a host never calls a replica
+    /// "usable" over a stderr line it cannot see (the iPhone said "usable in 15.8 s"
+    /// with 0 rows). Keys in the client arena, one per table at most.
+    unseeded: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
     schema_watch: ?@import("nats").KVWatcher = null,
     last_version: []const u8 = "",
     last_version_buf: [64]u8 = undefined,
@@ -436,6 +442,19 @@ pub const SyncClient = struct {
             ib.deinit();
             self.tail_inbox = null;
         }
+    }
+
+    /// §10iz: one entry per table; the reason is an error name (static), the key is
+    /// duplicated once into the client arena and reused after that.
+    fn rememberUnseeded(self: *SyncClient, table: []const u8, reason: []const u8) void {
+        const gop = self.unseeded.getOrPut(self.aa(), table) catch return;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.aa().dupe(u8, table) catch {
+                _ = self.unseeded.swapRemove(table);
+                return;
+            };
+        }
+        gop.value_ptr.* = reason;
     }
 
     fn aa(self: *SyncClient) std.mem.Allocator {
@@ -1336,11 +1355,13 @@ pub const SyncClient = struct {
                 self.reseed_pending = false;
                 const ok = if (self.applyChain(table, tenant)) |_| !self.reseed_pending else |err| blk: {
                     std.debug.print("{s}: seeding failed: {s} — retried at the next poll\n", .{ table, @errorName(err) });
+                    self.rememberUnseeded(table, @errorName(err));
                     break :blk false;
                 };
                 self.reseed_pending = pending_before or self.reseed_pending or !ok;
                 const has_chain = (try self.st.query(a, "SELECT tbl FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } })).len > 0;
                 if (ok and has_chain) {
+                    _ = self.unseeded.swapRemove(table);
                     covered = true;
                     if (report_a) |ra_| if (seeded_map) |sm| {
                         if (!sm.contains(table)) sm.put(ra_, ra_.dupe(u8, table) catch table, {}) catch {};
