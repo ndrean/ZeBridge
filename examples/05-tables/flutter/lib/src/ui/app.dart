@@ -32,6 +32,11 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // The worker owns the libzb handle and the poll loop (zebridge_worker.dart);
   // this screen only sends it commands and listens to its reports.
+  /// The principal this demo connects as. Named once: the creds file, the replica
+  /// path and the label on screen all derive from it, so they cannot drift apart
+  /// the way they did (the screen read "alice" while the client was bob).
+  static const String principal = 'bob';
+
   ZeBridgeWorker? zb;
   StreamSubscription? reportsSub;
   bool isConnected = false;
@@ -87,10 +92,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // Dev copy: the file straight from the repository, like the library path.
       final worker = await ZeBridgeWorker.spawn({
         "natsUrl": "nats://127.0.0.1:4222",
-        "credsPath": "/Users/nevendrean/code/zig/ZeBridge/scripts/native/creds/bob.creds",
-        "dbPath": "${Directory.systemTemp.path}/zb-flutter-bob.sqlite3",
-        "principal": "bob",
-        "tables": ["test_types", "counter_public", "counter_tenant", "app_users", "app_orders"],
+        "credsPath":
+            "/Users/nevendrean/code/zig/ZeBridge/scripts/native/creds/$principal.creds",
+        "dbPath": "${Directory.systemTemp.path}/zb-flutter-$principal.sqlite3",
+        "principal": principal,
+        // Parents before children (app_users before app_orders): the seed applies
+        // them in order. NOT test_types — not because the chain cannot carry it
+        // (measured: 3,055,002 rows seed in 67.6 s, 317 MB peak RSS, a 1.04 GB
+        // replica — NOTES §10iw) but because it is a type-coverage fixture the
+        // benchmarks write into, and a demo of four small tables has no business
+        // spending a minute and a gigabyte on it.
+        "tables": ["counter_public", "counter_tenant", "app_users", "app_orders"],
         "seedStreaming": true,
       });
       if (!mounted) {
@@ -200,8 +212,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _bumpTenantCounter(int delta) async {
     final w = zb;
     if (w == null) return;
-    final String uid = counterTenant['uid'] ??
-        '00000000-0000-4000-8000-8b0b2beac0df'; // hardcoded alice tenant ID for now
+    // The id comes from the seed: counter_tenant carries ONE row per tenant, each
+    // with its own uid (acme …45fd71afc0df, globex …0a09748ec0df). A hardcoded
+    // fallback used to sit here — a third id belonging to neither — so an empty
+    // replica would have inserted a duplicate counter for this tenant under an id
+    // nobody owns. An empty map means the seed has not delivered the row yet, and
+    // waiting is the only correct answer.
+    final String? seeded = counterTenant['uid'] as String?;
+    if (seeded == null) {
+      setState(() => lastError =
+          'counter_tenant has not seeded yet for "$tenant" — nothing to bump');
+      return;
+    }
+    final String uid = seeded;
     if (counterTenant.isEmpty) {
       final v = DateTime.now().toUtc().toIso8601String();
       await w.mutate('counter_tenant', 'INSERT', {'uid': uid}, {
@@ -288,7 +311,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Principal: alice · Tenant: $tenant',
+            Text('Principal: $principal · Tenant: $tenant',
                 style: const TextStyle(fontWeight: FontWeight.bold)),
             if (lastError != null)
               Text(lastError!, style: const TextStyle(color: Colors.red)),
