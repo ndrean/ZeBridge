@@ -16280,7 +16280,10 @@ then, and the only other TEMP object, `_zbz_seen`, is created on use), then remo
 temp-shaped files (16 letters, no extension) that appeared since, retrying the same race;
 and it sweeps orphans of earlier sessions once at open, since a reload mid-seed leaves
 1.3 GB behind. Verified on the page: a 203 MB TEMP table dropped and swept → only the
-replica in the origin, 7 ms.
+replica in the origin, 7 ms. ⚠️ `navigator.storage.estimate().usage` is not the way to
+check: it read 2.40 GB with the origin holding one 1,036 MB file — Chrome's quota
+accounting is a cached figure that does not shrink on `removeEntry` until Chrome
+recounts. List the root; the page does.
 
 Also seen, not chased: right after the seed, both CDC consumers were declared deaf
 ("idle 25 s while the stream advanced, stored 0, tail 9") and recreated — the 25 s were

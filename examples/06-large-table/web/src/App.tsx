@@ -61,7 +61,7 @@ window.zb = zb;
 const fmt = (n: number) => n.toLocaleString('en-US');
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
 type Line = { text: string; err: boolean };
-type Facts = { count: number; distinct?: number; sum?: number; dbBytes?: number; heapPeak?: number };
+type Facts = { count: number; distinct?: number; sum?: number; dbBytes?: number; heapPeak?: number; files?: string[] };
 
 export default function App() {
   const [status, setStatus] = createSignal<ConnStatus>('disconnected');
@@ -108,7 +108,16 @@ export default function App() {
       ? await zb.query('SELECT count(*) AS count, count(DISTINCT uid) AS "distinct", sum(age) AS sum FROM test_types')
       : await zb.query(`SELECT count(*) AS count FROM ${TABLE}`);
     const est = await navigator.storage?.estimate?.().catch(() => undefined);
-    setFacts({ count: Number(row.count), distinct: row.distinct != null ? Number(row.distinct) : undefined, sum: row.sum != null ? Number(row.sum) : undefined, dbBytes: est?.usage, heapPeak: heapPeak || undefined });
+    // What the origin actually holds — the replica, and any temp file sqlite-wasm's
+    // VFS left behind (16 random letters; the client sweeps them, §10ix).
+    const files: string[] = [];
+    try {
+      const root = await navigator.storage.getDirectory();
+      for await (const [name, h] of (root as any).entries()) {
+        if (h.kind === 'file') files.push(`${name} ${((await h.getFile()).size / 1e6).toFixed(0)} MB`);
+      }
+    } catch { /* not listable: fine */ }
+    setFacts({ count: Number(row.count), distinct: row.distinct != null ? Number(row.distinct) : undefined, sum: row.sum != null ? Number(row.sum) : undefined, dbBytes: est?.usage, heapPeak: heapPeak || undefined, files });
   }
 
   onMount(() => {
@@ -169,8 +178,9 @@ export default function App() {
               <Show when={f().distinct !== undefined}><tr><td>distinct uid</td><td>{fmt(f().distinct!)}</td></tr></Show>
               <Show when={f().sum !== undefined}><tr><td>sum(age)</td><td>{fmt(f().sum!)}</td></tr></Show>
               <tr><td>total, connect → usable</td><td>{secs(elapsed())}</td></tr>
-              <Show when={f().dbBytes}><tr><td>OPFS usage</td><td>{(f().dbBytes! / 1e9).toFixed(2)} GB</td></tr></Show>
+              <Show when={f().dbBytes}><tr><td>OPFS usage</td><td>{(f().dbBytes! / 1e9).toFixed(2)} GB by <code>storage.estimate()</code> — Chrome's accounting, which does not shrink when files are removed until it recounts; the files row below is what is there</td></tr></Show>
               <Show when={f().heapPeak}><tr><td>JS heap peak</td><td>{(f().heapPeak! / 1e6).toFixed(0)} MB (heap only — see the task manager)</td></tr></Show>
+              <Show when={f().files?.length}><tr><td>OPFS files</td><td>{f().files!.join(' · ')}</td></tr></Show>
             </tbody>
           </table>
         )}
