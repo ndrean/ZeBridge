@@ -36,7 +36,7 @@ delivers it, not from the tap. That row is a jsonb map of registers — `start` 
 each with its writer's stamp and name — over a plain LWW row: the phone writes its own
 registers merged into the document it last saw (`mergeRegisters`, the library's own rule
 through `zb_call`), and reconciles until the row contains what it wrote. Open the web
-consumer (`examples/06-web-consumer`, its "One route, two editors" panel) as another
+consumer (`examples/05-tables/web-consumer`, its "One route, two editors" panel) as another
 principal and move the end while the phone moves the start: both land. Move the same end
 on both: the later stamp wins on every replica, and the loser's pin jumps. The table comes
 from `examples/08-map/load_routes.py --create`; `scripts/scenarios/route_crdt.py` is the
@@ -47,7 +47,7 @@ same war between two libzb clients, asserted.
 
 ## Threading
 
-`lib/zebridge.dart` is the FFI card, `lib/zebridge_worker.dart` the worker from the 05-mobile example: ONE long-lived isolate owns the libzb handle and runs the poll loop; sync, poll, query, mutate, flush and close all happen there, the UI isolate only sends messages and receives reports.
+`lib/zebridge.dart` is the FFI card, `lib/zebridge_worker.dart` the worker from the 05-tables example: ONE long-lived isolate owns the libzb handle and runs the poll loop; sync, poll, query, mutate, flush and close all happen there, the UI isolate only sends messages and receives reports.
 
 💡 A libzb handle is **not thread-safe**, so `Isolate.run` around each poll is the wrong shape: the poll would block on one thread while the UI thread still queried and mutated the same handle.
 

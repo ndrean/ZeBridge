@@ -39,7 +39,7 @@ import 'package:vector_tile_renderer/vector_tile_renderer.dart'
 import 'zebridge.dart' show PollReport;
 import 'zebridge_worker.dart';
 
-// Dev copy: the repository paths, like 05-mobile. A shipped app bundles the creds it
+// Dev copy: the repository paths, like 05-tables. A shipped app bundles the creds it
 // enrolled.
 const _repo = '/Users/nevendrean/code/zig/ZeBridge';
 // `omar`, a demo principal of the dev stack (its tenant is `kilo`); the `mapper` of the

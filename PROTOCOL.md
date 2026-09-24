@@ -1959,33 +1959,19 @@ tiebreak_col  = 'last_writer'   -- tiebreak
 | tiebreak | `client_id` | `tiebreak_col`, optional | the bridge, from the field |
 | primary key | `key` | from the catalog | the client, in `data` |
 
-⚠️ The bridge stamps the version and tiebreak columns **from the envelope**, and ignores
-them in `data`. A client that sets `last_writer` directly is not honoured — otherwise it
-could claim any identity when a tie is broken, which is the same forgery the version column
-is protected from.
+⚠️ The bridge stamps the version and tiebreak columns **from the envelope**, and ignores them in `data`. A client that sets `last_writer` directly is not honoured — otherwise it could claim any identity when a tie is broken, which is the same forgery the version column is protected from.
 
-**2. A version column that changes on every write.** `updated_at` by default; set per
-table in the catalogue (`version_col`). Its *type* decides whether LWW is sound — see §7.3, and note the
-common case (`timestamp without time zone`) is the one with caveats.
+**2. A version column that changes on every write.** `updated_at` by default; set per table in the catalogue (`version_col`). Its *type* decides whether LWW is sound — see §7.3, and note the common case (`timestamp without time zone`) is the one with caveats.
 
 **2b. A tiebreak column, if equal versions are possible.** ✅ `tiebreak_col` in the catalogue.
-Without one, two writes carrying the *same* version are both **refused** — which is not a
-resolution: two replicas each holding the other's row refuse each other forever, silently.
-With one, the higher `client_id` wins, and the winner's id is stored so the comparison is
-`(version, client_id)` as §7.3 describes.
+Without one, two writes carrying the *same* version are both **refused** — which is not a resolution: two replicas each holding the other's row refuse each other forever, silently.
+With one, the higher `client_id` wins, and the winner's id is stored so the comparison is `(version, client_id)` as §7.3 describes.
 
-⚠️ Ties are the **normal** case for an integer version column — two clients that read the
-same value both send `stored + 1` — and happen with timestamps whenever two writes land in
-the same microsecond. A `timestamptz(6)` table with one writer may never need this; a
-counter-versioned table needs it immediately.
+⚠️ Ties are the **normal** case for an integer version column — two clients that read the same value both send `stored + 1` — and happen with timestamps whenever two writes land in the same microsecond. A `timestamptz(6)` table with one writer may never need this; a counter-versioned table needs it immediately.
 
-Verified order-independent: the higher id wins whether it arrives first or second, which is
-the property that makes replicas converge rather than race.
+Verified order-independent: the higher id wins whether it arrives first or second, which is the property that makes replicas converge rather than race.
 
-**3. A tombstone column, if deletes must survive offline clients.** Without one a delete is
-physical, and an offline client's queued edit **resurrects the row** — there is no "row not
-found" on this path (see below). With one, the delete is a soft delete that LWW can
-overrule. Configured as that table's `tombstone_col` in the catalogue (§7.5).
+**3. A tombstone column, if deletes must survive offline clients.** Without one a delete is physical, and an offline client's queued edit **resurrects the row** — there is no "row not found" on this path (see below). With one, the delete is a soft delete that LWW can overrule. Configured as that table's `tombstone_col` in the catalogue (§7.5).
 
 **4. A grant.** `bridge_writer` starts with no table privileges, deliberately:
 
@@ -2391,7 +2377,7 @@ UPDATE/DELETE check, but a replica still cannot identify a row.
 * `libzb/` — the same core in Zig, behind a C ABI (`zb_call`, one JSON entry point), with
   a Python runner that answers the same fixtures; a SQLite client on top (`client.zig`)
   drives the read and write paths against the live stack and is the soak harness.
-* `examples/06-web-consumer/` — SolidJS in the browser over WebSocket, JWT credentials by default
+* `examples/05-tables/web-consumer/` — SolidJS in the browser over WebSocket, JWT credentials by default
   (`?auth=password` for a pre-operator broker). Implements §3–§7 in full through the
   library: it pops on `accepted` / `stale`, and on `row_deleted` / `rejected` reverts the
   local row (guarded — only if nothing else has touched it since) before popping,
@@ -2410,7 +2396,7 @@ UPDATE/DELETE check, but a replica still cannot identify a row.
 * `examples/02-python-consumer/` — a Python consumer of the read path.
 * `consumer/` — an Elixir application used as a PostgreSQL-side producer (`PgProducer`:
   CRUD, bulk, streams of writes) to drive the stack under load.
-* `examples/06-web-consumer/zb-mutate.mjs` — the smallest end-to-end write: one envelope, and the
+* `examples/05-tables/web-consumer/zb-mutate.mjs` — the smallest end-to-end write: one envelope, and the
   verdict it produced. Useful as a first check that ingress is alive at all, since a
   verdict distinguishes "refused" from "never arrived", which silence does not.
 * `emitter/` — Elixir producer used to generate load and drive chaos tests.
@@ -2422,7 +2408,7 @@ storage adapter once and writes no engine-specific code: `mutate()`, `query()`, 
 outbox, verdicts, seeding, the tombstone rule and the UPDATE rule are identical.
 
 Two engines are supported in the browser today: SQLite over OPFS (the default) and
-PGlite — PostgreSQL compiled to WASM (`?engine=pglite` in `examples/06-web-consumer`, adapter at
+PGlite — PostgreSQL compiled to WASM (`?engine=pglite` in `examples/05-tables/web-consumer`, adapter at
 `zb-client-ts/pglite`). PGlite is "PG to PG": the CDC wire already carries PostgreSQL's
 own text forms (`{a,b}`, JSON, `t`/`f`), which SQLite stores as text and PGlite parses
 natively — so `query()` returns a real array for `text[]`, an object for `jsonb`, and
