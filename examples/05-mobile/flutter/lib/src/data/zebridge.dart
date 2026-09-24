@@ -3,45 +3,45 @@ import 'dart:convert';
 import 'package:ffi/ffi.dart';
 import 'dart:io';
 
-typedef zb_client_open_C = ffi.Uint64 Function(ffi.Pointer<Utf8> opts_json);
-typedef zb_client_open_Dart = int Function(ffi.Pointer<Utf8> opts_json);
+typedef ZbClientOpenC = ffi.Uint64 Function(ffi.Pointer<Utf8> optsJson);
+typedef ZbClientOpenDart = int Function(ffi.Pointer<Utf8> optsJson);
 
-typedef zb_client_close_C = ffi.Int32 Function(ffi.Uint64 handle);
-typedef zb_client_close_Dart = int Function(int handle);
+typedef ZbClientCloseC = ffi.Int32 Function(ffi.Uint64 handle);
+typedef ZbClientCloseDart = int Function(int handle);
 
-typedef zb_client_sync_C = ffi.Pointer<Utf8> Function(ffi.Uint64 handle);
-typedef zb_client_sync_Dart = ffi.Pointer<Utf8> Function(int handle);
+typedef ZbClientSyncC = ffi.Pointer<Utf8> Function(ffi.Uint64 handle);
+typedef ZbClientSyncDart = ffi.Pointer<Utf8> Function(int handle);
 
-typedef zb_client_query_C = ffi.Pointer<Utf8> Function(
+typedef ZbClientQueryC = ffi.Pointer<Utf8> Function(
     ffi.Uint64 handle, ffi.Pointer<Utf8> sql, ffi.Pointer<Utf8> params);
-typedef zb_client_query_Dart = ffi.Pointer<Utf8> Function(
+typedef ZbClientQueryDart = ffi.Pointer<Utf8> Function(
     int handle, ffi.Pointer<Utf8> sql, ffi.Pointer<Utf8> params);
 
-typedef zb_client_mutate_C = ffi.Pointer<Utf8> Function(
+typedef ZbClientMutateC = ffi.Pointer<Utf8> Function(
     ffi.Uint64 handle,
     ffi.Pointer<Utf8> table,
     ffi.Pointer<Utf8> op,
-    ffi.Pointer<Utf8> key_json,
-    ffi.Pointer<Utf8> values_json);
-typedef zb_client_mutate_Dart = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8> keyJson,
+    ffi.Pointer<Utf8> valuesJson);
+typedef ZbClientMutateDart = ffi.Pointer<Utf8> Function(
     int handle,
     ffi.Pointer<Utf8> table,
     ffi.Pointer<Utf8> op,
-    ffi.Pointer<Utf8> key_json,
-    ffi.Pointer<Utf8> values_json);
+    ffi.Pointer<Utf8> keyJson,
+    ffi.Pointer<Utf8> valuesJson);
 
-typedef zb_client_flush_C = ffi.Pointer<Utf8> Function(
-    ffi.Uint64 handle, ffi.Uint64 wait_ms);
-typedef zb_client_flush_Dart = ffi.Pointer<Utf8> Function(
-    int handle, int wait_ms);
+typedef ZbClientFlushC = ffi.Pointer<Utf8> Function(
+    ffi.Uint64 handle, ffi.Uint64 waitMs);
+typedef ZbClientFlushDart = ffi.Pointer<Utf8> Function(
+    int handle, int waitMs);
 
-typedef zb_client_poll_C = ffi.Pointer<Utf8> Function(
-    ffi.Uint64 handle, ffi.Uint64 wait_ms);
-typedef zb_client_poll_Dart = ffi.Pointer<Utf8> Function(
-    int handle, int wait_ms);
+typedef ZbClientPollC = ffi.Pointer<Utf8> Function(
+    ffi.Uint64 handle, ffi.Uint64 waitMs);
+typedef ZbClientPollDart = ffi.Pointer<Utf8> Function(
+    int handle, int waitMs);
 
-typedef zb_free_C = ffi.Void Function(ffi.Pointer<Utf8> p);
-typedef zb_free_Dart = void Function(ffi.Pointer<Utf8> p);
+typedef ZbFreeC = ffi.Void Function(ffi.Pointer<Utf8> p);
+typedef ZbFreeDart = void Function(ffi.Pointer<Utf8> p);
 
 class PollReport {
   final int applied;
@@ -78,14 +78,14 @@ String _reason(Map decoded) {
 
 class ZeBridge {
   static late ffi.DynamicLibrary _lib;
-  static late zb_client_open_Dart _open;
-  static late zb_client_close_Dart _close;
-  static late zb_client_sync_Dart _sync;
-  static late zb_client_query_Dart _query;
-  static late zb_client_mutate_Dart _mutate;
-  static late zb_client_flush_Dart _flush;
-  static late zb_client_poll_Dart _poll;
-  static late zb_free_Dart _free;
+  static late ZbClientOpenDart _open;
+  static late ZbClientCloseDart _close;
+  static late ZbClientSyncDart _sync;
+  static late ZbClientQueryDart _query;
+  static late ZbClientMutateDart _mutate;
+  static late ZbClientFlushDart _flush;
+  static late ZbClientPollDart _poll;
+  static late ZbFreeDart _free;
 
   static void init() {
     String libPath = '';
@@ -101,21 +101,21 @@ class ZeBridge {
 
     _lib = ffi.DynamicLibrary.open(libPath);
 
-    _open = _lib.lookupFunction<zb_client_open_C, zb_client_open_Dart>(
-        'zb_client_open');
-    _close = _lib.lookupFunction<zb_client_close_C, zb_client_close_Dart>(
+    _open = _lib.lookupFunction<ZbClientOpenC, ZbClientOpenDart>(
+        'zb_client_connect');
+    _close = _lib.lookupFunction<ZbClientCloseC, ZbClientCloseDart>(
         'zb_client_close');
-    _sync = _lib.lookupFunction<zb_client_sync_C, zb_client_sync_Dart>(
+    _sync = _lib.lookupFunction<ZbClientSyncC, ZbClientSyncDart>(
         'zb_client_sync');
-    _query = _lib.lookupFunction<zb_client_query_C, zb_client_query_Dart>(
+    _query = _lib.lookupFunction<ZbClientQueryC, ZbClientQueryDart>(
         'zb_client_query');
-    _mutate = _lib.lookupFunction<zb_client_mutate_C, zb_client_mutate_Dart>(
+    _mutate = _lib.lookupFunction<ZbClientMutateC, ZbClientMutateDart>(
         'zb_client_mutate');
-    _flush = _lib.lookupFunction<zb_client_flush_C, zb_client_flush_Dart>(
-        'zb_client_flush');
-    _poll = _lib.lookupFunction<zb_client_poll_C, zb_client_poll_Dart>(
+    _flush = _lib.lookupFunction<ZbClientFlushC, ZbClientFlushDart>(
+        'zb_client_flush_outbox');
+    _poll = _lib.lookupFunction<ZbClientPollC, ZbClientPollDart>(
         'zb_client_poll');
-    _free = _lib.lookupFunction<zb_free_C, zb_free_Dart>('zb_free');
+    _free = _lib.lookupFunction<ZbFreeC, ZbFreeDart>('zb_free');
   }
 
   late int _handle;
