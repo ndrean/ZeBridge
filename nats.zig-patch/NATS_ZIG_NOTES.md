@@ -725,6 +725,38 @@ a line an earlier one added: `nextSubject` — `shared-pull-inbox`, then `jetstr
 rebuilt from upstream by cumulative hunk subsets; each patch is the exact diff between two
 consecutive states. Chronological order:
 
+## 18. `fetch` waits for the batch when the caller says so (2026-09-24)
+
+**How it appeared**
+
+`fetch` returns 1 ms after its first message (§13's contract: one CDC event, at once).
+An object reader pulls `batch` chunks that are contiguous and always all coming, and
+over any real network they do not land within a millisecond of each other. ZeBridge's
+libzb on an iPhone over Wi-Fi: `fetch(8)` returned with one chunk, the reader asked for
+eight more while seven were still in flight, and so on — nats-server's `connz` showed
+59 requests in a few seconds, 513 chunks delivered, 42 MB pending on the phone's
+connection, then `Slow Consumer (Pending Bytes)` and the connection cut, three times
+in a row, on a 100 MB object it never got a third of. Loopback never showed it: there
+the eight chunks arrive inside the idle window every time.
+
+**Change** (`18-nats.zig-fetch-idle-after-first.patch`, 2 hunks, 1 file)
+
+`src/jetstream.zig` — `idle_after_first: Io.Timeout = fetch_idle_after_first` on
+`PullSubscription`, and `fetch` reads it instead of the constant. Every existing caller
+keeps the 1 ms; an object reader sets it to its fetch timeout and a fetch returns with
+the batch, or the deadline. libzb's `ObjectPull` does (ZeBridge §10iy).
+
+**Verified**
+
+```bash
+nats.zig-patch/new-patch.sh fetch-idle-after-first
+# wrote 18-nats.zig-fetch-idle-after-first.patch (2 hunks, 1 files)
+# ✅ 18 patches: upstream d4cd40d + series == working tree (src, tests)
+```
+
+Live: the iPhone seed that was cut three times ran through — ZeBridge §10iy has the
+number.
+
 | series | ledger | topic |
 | --- | --- | --- |
 | 01 | §16 | direct-get-subject-form (2026-08-27) |
@@ -744,6 +776,7 @@ consecutive states. Chronological order:
 | 15 | §13 | inbox-prefix |
 | 16 | §14 | objstore-max-age |
 | 17 | §15 | jetstream-domain |
+| 18 | §18 | fetch-idle-after-first |
 
 Hunk and file counts quoted in older entries describe the old files; the series' own
 counts are in each file. `check-series.sh` and `new-patch.sh` are the workflow from here.
@@ -752,7 +785,7 @@ counts are in each file. `check-series.sh` and `new-patch.sh` are the workflow f
 
 ```bash
 nats.zig-patch/check-series.sh
-# ✅ 17 patches: upstream d4cd40d + series == working tree (src, tests)
+# ✅ 18 patches: upstream d4cd40d + series == working tree (src, tests)
 nats.zig-patch/new-patch.sh probe
 # nothing to cut: the working tree equals upstream + the series
 ```

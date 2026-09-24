@@ -1,0 +1,30 @@
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+index 52dc083..f6dec11 100644
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -429,6 +429,16 @@ pub const MessageBatch = struct {
+ const fetch_idle_after_first: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } };
+ 
+ pub const PullSubscription = struct {
++    /// How long `fetch` keeps collecting after its first message — `fetch_idle_after_first`
++    /// (1 ms) unless the owner says otherwise. A CDC tail wants the 1 ms: one event, at
++    /// once. An OBJECT reader wants the opposite: its `batch` chunks are contiguous and
++    /// always all coming, and returning after the first one over a link where they do not
++    /// land within a millisecond (any real network) makes the caller ask for the next
++    /// batch while the rest of this one is still in flight — measured from an iPhone on
++    /// Wi-Fi: 59 requests in a few seconds, 513 chunks delivered, 42 MB pending on the
++    /// server, `Slow Consumer (Pending Bytes)`, connection cut. Set it to the fetch
++    /// timeout and a fetch returns with the batch, or the deadline.
++    idle_after_first: Io.Timeout = fetch_idle_after_first,
+     /// JetStream context
+     js: JetStream,
+     /// Stream name
+@@ -630,7 +640,7 @@ pub const PullSubscription = struct {
+                     try messages.append(self.js.nc.allocator, js_msg_ptr);
+                     // Something arrived: from here on wait only for what is already in flight.
+                     if (messages.items.len == 1) {
+-                        receive_deadline = fetch_idle_after_first.toDeadline(self.js.nc.io);
++                        receive_deadline = self.idle_after_first.toDeadline(self.js.nc.io);
+                     }
+                 }
+             } else |err| switch (err) {

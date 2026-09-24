@@ -48,6 +48,7 @@ pub const ObjectPull = struct {
     eof: bool = false,
 
     const batch_size: usize = 8;
+    const fetch_timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(10_000), .clock = .awake } };
     const Ctr = struct {
         var n = std.atomic.Value(u32).init(0);
     };
@@ -74,6 +75,12 @@ pub const ObjectPull = struct {
         cfg.durable_name = cname;
         cfg.inactive_threshold = 30 * std.time.ns_per_s;
         const sub = try t.js.pullSubscribe(chunk_subject, cname, .{ .stream = stream, .config = cfg });
+        // §10iy: wait for the WHOLE batch. nats.zig's fetch returns 1 ms after its first
+        // message (right for a CDC tail); over Wi-Fi the 8 chunks of a batch do not land
+        // within a millisecond, so `read` got one, asked for eight more, and the server
+        // ended up with dozens of requests in flight for one reader — 42 MB pending, cut
+        // as a slow consumer, on an iPhone that never got past a third of the object.
+        sub.idle_after_first = fetch_timeout;
         return .{ .a = a, .sub = sub, .chunks = info.chunks, .size = info.size, .digest = info.digest };
     }
 
@@ -109,7 +116,7 @@ pub const ObjectPull = struct {
                 break;
             }
             const want: usize = @min(batch_size, self.chunks - self.chunk_index);
-            self.batch = try self.sub.fetch(want, .{ .duration = .{ .raw = .fromMilliseconds(10_000), .clock = .awake } });
+            self.batch = try self.sub.fetch(want, fetch_timeout);
             if (self.batch.?.messages.len == 0) return error.ObjectTruncated;
         }
         return 0;
