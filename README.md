@@ -89,7 +89,7 @@ Defaults are `BASE_BUF=12` (4 KB/row), `RING_BUFFER_COUNT=32768`and `MAX_COLUMNS
 
 **Observability**: production-ready out of the box. It exposes standard Prometheus metrics for performance tracking and structured logs optimized for Loki and Grafana dashboards. The metrics are all owned by the daemon, meaning metrics from its Postgres catalogue and self reflecting metrics.
 
-See the detailed file [TELEMETRY.md](#telemetry.md)
+See the detailed file [OBSERVABILITY_TELEMETRY.md](OBSERVABILITY_TELEMETRY.md)
 
 **Status**: More than an experiment. Chaos and live tested, early adoption stage but not battle tested.
 

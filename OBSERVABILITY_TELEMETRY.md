@@ -11,6 +11,37 @@ flowchart LR
     B -->|GET <br>/health <br>/status| client
 ```
 
+Scrape `/metrics` (Prometheus exposition) on `BRIDGE_PORT`.
+`/status` carries the same numbers as JSON.
+
+Both are served by a thread that keeps answering through every outage below — that is deliberate, and `pg_restart.py` asserts it.
+
+| metric | it claims | moved by | proven by |
+| --- | --- | --- | --- |
+| `bridge_connected` | the WAL stream is attached | any PostgreSQL outage (0 while down, 1 after self-reconnect) | `pg_restart.py` |
+| `bridge_pg_reconnects_total` | PostgreSQL sessions re-established | backend kills, cluster restarts | `pg_restart.py`, `chaos.py` |
+| `bridge_nats_reconnects_total` | broker SESSIONS re-established, at the transport — nats.zig's `reconnected_cb` counts the library's silent self-heals, the publisher's fresh-connection fallback adds its disjoint share (§10cn). NOT a broker-restart count: adjacent bounces merge into one down period, honestly | broker kill + return, even idle bounces | `churn.py` (metric == log ground truth), `nats_outage.py` |
+| `bridge_queue_usage_percent` | events held in the ring, right now | broker gone under load: climbs as the ring fills, 0 again after the drain. Three writers: post-flush, the halt loop, the periodic tick (§10cd) | `cascade.py` |
+| `bridge_wal_confirmed_lag_bytes` | WAL PostgreSQL retains that this bridge has not confirmed — THE backlog number | any outage that stops acking; collapses on recovery. Samples on the monitor's 30 s cadence | `cascade.py` |
+| `bridge_wal_lag_bytes` | WAL retained from `restart_lsn` — a disk-pressure number that only moves at checkpoints. NOT a backlog gauge; a healthy bridge plateaus at a few MB | slot pressure | (definitional; see the field's comment) |
+| `bridge_slot_active` | PostgreSQL shows our slot streaming | bridge down or stepped aside → 0 | `downtime.py` |
+| `bridge_cdc_events_published_total` | ROW events acked by JetStream — trusted arithmetic, equals rows delivered | any write reaching CDC | `slot_contest.py` (flow-through), README burst method |
+| `bridge_schema_events_published_total` | KV/schema traffic, kept OUT of the row counter | DDL, suspensions, drops | `livebirth.py`, `legacybait.py` |
+| `bridge_refused_tables` | tables currently suspended or refused — the COUNT | `row_too_large` and structural refusals; falls on the live lift | `suspension_lift.py`, `legacybait.py` |
+| `bridge_refused_table{table,reason}` | the NAMED refusal series (§10cg): 1 while refused, an explicit 0 after a lift in this process; the family vanishes on restart — which also cleared every ban, so absence and truth agree. psql twin: `SELECT tbl, suspended_reason FROM zebridge_catalogue WHERE suspended;` (§10cf — a bridge dump, live while the bridge lives, pruned at boot) | every refusal transition | `suspension_lift.py` |
+| `bridge_refused_events_dropped_total` | events dropped for refused tables | writes hitting a suspended table | `suspension_lift.py` |
+| `bridge_nats_publish_ack_seconds_total` / `bridge_nats_publishes_total` | summed publish→PubAck wall time / count (mean = quotient) | load; the ack changes of §10cb ride on these being honest | README burst method |
+| `bridge_gc_total_reaped_total` / `bridge_gc_last_sweep_timestamp_seconds` | sweeper activity, read off the watermark row's own CDC event — the sweeper stays a pure PG client | sweeper passes; survives a PostgreSQL restart under the daemon | `sweeper_restart.py`, `reaps.py` |
+| `bridge_last_ack_lsn` | the position THIS bridge confirmed — never the server's WAL head (the conflation that once silently skipped a downtime's changes) | every ack; jumps with the §10cb drained fast-ack | `txn_kill.py`, `pg_restart.py` |
+| `bridge_uptime_seconds`, `bridge_cpu_seconds_total`, `bridge_max_rss_bytes` | process vitals | always | (trivially live) |
+| `/health` → 200 | the PROCESS is up **and will exit when replication dies** — a FATAL sets the global stop since §10bu, so a lying 200 cannot outlive the failure | fatal paths | `stream_full.py` |
+
+> **Alert on `bridge_connected == 0` and on `bridge_wal_confirmed_lag_bytes` growth**, not on `/health` alone — health says "process alive", and a process can be alive and parked (that is its correct behaviour during a broker outage).
+
+> `bridge_queue_usage_percent` and `bridge_wal_confirmed_lag_bytes` tick on their own cadences (periodic tick; 30 s WAL monitor). A panel averaging over <1 min windows will alias; 1–2 min windows read true.
+
+> The pair to watch during a broker outage is queue% (the dam filling) THEN confirmed lag (PostgreSQL taking the overflow): §10cd's cascade in two panels.
+
 **Metrics and logs**: Alert on the metric, read the log for the detail.
 
 | | Prometheus (`/metrics`) | Loki (log lines) |
@@ -22,14 +53,12 @@ flowchart LR
 
 _Prometheus physically cannot hold the table name or the fix. Loki can, but is poor at counting and alerting on rates_.
 
-
 Data emitted by ZeBridge are self-reflection, or owned by ZeBridge (public.zebridge_catalogue in Postgres).
 
-Two exceptions: 
+Two exceptions:
 
-* the consumer fleet count signaling themselves via NATS, a small complement to the NATS-exporter data connected to the NATS server, scraped by Prometheus, 
-* the number of slots on the owned publication (for left-overs: Postgres will keep retaining all the WAL data generated beyond the possibly abandoned slot point). The same inventory from a shell: `bridge --view-slots`; the cure: `bridge --drop-slot <slot>` (README, [CLI](README.md#cli)).
-
+- the consumer fleet count signaling themselves via NATS, a small complement to the NATS-exporter data connected to the NATS server, scraped by Prometheus,
+- the number of slots on the owned publication (for left-overs: Postgres will keep retaining all the WAL data generated beyond the possibly abandoned slot point). The same inventory from a shell: `bridge --view-slots`; the cure: `bridge --drop-slot <slot>` (README, [CLI](README.md#cli)).
 
 ---
 
@@ -117,20 +146,20 @@ The four worth alerting on:
 
 💡 **How do you read the lag**? The two lag metrics are not the same.
 
-*  `bridge_wal_lag_bytes` measures from the slot's `restart_lsn`, which PostgreSQL only advances at `CHECKPOINT` — so it plateaus at a few MB on a perfectly healthy bridge and cannot tell you whether the bridge is keeping up.
+- `bridge_wal_lag_bytes` measures from the slot's `restart_lsn`, which PostgreSQL only advances at `CHECKPOINT` — so it plateaus at a few MB on a perfectly healthy bridge and cannot tell you whether the bridge is keeping up.
 
-* `bridge_wal_confirmed_lag_bytes` measures from `confirmed_flush_lsn`, which moves the moment the bridge ACKs.
+- `bridge_wal_confirmed_lag_bytes` measures from `confirmed_flush_lsn`, which moves the moment the bridge ACKs.
 
 ❗️ Alert on the confirmed one for "the bridge is stuck", on the retained one for "the disk will fill".
 
 **How busy is the bridge**?
 
-* `bridge_queue_usage_percent` is the ring buffer's fill level: sustained high values mean NATS is not draining as fast as PostgreSQL produces, and the bridge is about to back-pressure the WAL reader.
-* `bridge_cpu_seconds_total` is a counter over all threads, so `rate(bridge_cpu_seconds_total[1m])` gives cores used — `0.31` is a third of a core,
+- `bridge_queue_usage_percent` is the ring buffer's fill level: sustained high values mean NATS is not draining as fast as PostgreSQL produces, and the bridge is about to back-pressure the WAL reader.
+- `bridge_cpu_seconds_total` is a counter over all threads, so `rate(bridge_cpu_seconds_total[1m])` gives cores used — `0.31` is a third of a core,
 `1.0` is one core saturated, and a single-threaded reader that pins a whole core is telling you it is the bottleneck.
 The same figure appears _in the log_ as `cpu=31%` on each `LOOP` line, which beats trying to isolate one process in `htop`.
-* `rate(bridge_nats_publish_ack_seconds_total[1m]) / rate(bridge_nats_publishes_total[1m])` is the mean time a JetStream publish waits for its PubAck — the NATS side of "who is slow" when `bridge_queue_usage_percent` climbs.
-* `bridge_max_rss_bytes` is peak RSS: expect it to sit near `2^BASE_BUF × RING_BUFFER_COUNT` plus metadata, since the slab is pre-allocated at startup.
+- `rate(bridge_nats_publish_ack_seconds_total[1m]) / rate(bridge_nats_publishes_total[1m])` is the mean time a JetStream publish waits for its PubAck — the NATS side of "who is slow" when `bridge_queue_usage_percent` climbs.
+- `bridge_max_rss_bytes` is peak RSS: expect it to sit near `2^BASE_BUF × RING_BUFFER_COUNT` plus metadata, since the slab is pre-allocated at startup.
 
 **Configure Prometheus to scrape this endpoint**:
 
@@ -222,6 +251,7 @@ Rotate it, or it grows forever:
 <br>
 
 Under `systemd`, skip the redirect entirely: `journald` captures stderr, and `journalctl -u zebridge -p warning` gives the severity filter for free.
+
 ### Structured Log Metrics (for Grafana Alloy/Loki)
 
 As said, ZeBridge writes **every log line to stderr**, including the periodic metric line below (every 15 seconds) and any panic with its stack trace.
@@ -300,6 +330,5 @@ Returns:
 ```
 
 Status: `200 OK` when bridge HTTP server is running.
-
 
 ---
