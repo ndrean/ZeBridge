@@ -18,7 +18,7 @@ DEADLINE = 10.0
 PSQL = psql_cmd("-c")
 lib = load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
-lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
 lib.zb_client_close.argtypes = [ctypes.c_uint64]
 for n, a in (("sync", []), ("poll", [ctypes.c_uint64])):
     f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
@@ -32,7 +32,7 @@ def pg(sql):
 
 db = "/tmp/zb-bench-poll.sqlite3"
 rm_sqlite(db)
-h = lib.zb_client_open(json.dumps({"natsUrl": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
+h = lib.zb_client_connect(json.dumps({"natsUrl": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
     "dbPath": db, "principal": "omar", "clientId": "py-bench",
     "tables": ["users", "salaries", "test_types"]}).encode())
 uid = str(uuid.uuid4())

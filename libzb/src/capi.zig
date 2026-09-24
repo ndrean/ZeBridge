@@ -5,10 +5,13 @@
 //!   void     zb_free(char* p);
 //!   int      zb_abi_version(void);
 //!
-//!   uint64_t zb_client_open(const char* opts_json);   // 0 on failure
+//!   char*    zb_create_user(void);                     // {"publicKey":"U…","seed":"SU…"}
+//!   char*    zb_creds_file_text(const char* jwt, const char* seed);  // the .creds text
+//!   uint64_t zb_client_connect(const char* opts_json);   // 0 on failure
 //!   int      zb_client_close(uint64_t handle);        // 0 ok, 1 unknown handle
 //!   int      zb_client_wipe(uint64_t handle);         // close AND delete the replica files — explicit, never automatic (§10dl)
-//!   int      zb_client_live(void);                    // open clients, for tests
+//!   int      zb_client_revoked(uint64_t h);           // 1 revoked, 0 live, -1 unknown handle
+//!   int      zb_client_live(void);                    // open handles in-process, for tests
 //!
 //! The index card (NOTES §10), one JSON string in and one out, freed via zb_free.
 //! Every call answers `{"error":"<Name>"}` on failure and never a NULL except for a
@@ -20,7 +23,7 @@
 //!   char* zb_client_mutate(uint64_t h, const char* table, const char* op,
 //!       // key_json addresses the row; an INSERT's values_json carries the WHOLE row, key included (the bridge builds it from data)
 //!                          const char* key_json, const char* values_json);   // {"msgId":…}
-//!   char* zb_client_flush(uint64_t h, uint64_t wait_ms);           // {"sent":n,"settled":n}
+//!   char* zb_client_flush_outbox(uint64_t h, uint64_t wait_ms);    // {"sent":n,"settled":n}
 //!   char* zb_client_request(uint64_t h, const char* subject, const char* payload_json, uint64_t timeout_ms);
 //!                                                                    // §10hj: ask a service on `query.<tenant>.<name>`; its reply verbatim
 //!   char* zb_client_ingest(uint64_t h, const char* table, const char* answer_json, const char* scope_json);
@@ -48,6 +51,7 @@
 //! SKIP loudly instead of crashing.
 
 const std = @import("std");
+const nats = @import("nats");
 const core = @import("core.zig");
 const client = @import("client.zig");
 const handles = @import("handles.zig");
@@ -375,16 +379,18 @@ const ClientBox = struct {
     }
 };
 
-/// Open a client. `opts_json` mirrors `client.Options`; 0 means it did not open, and
-/// the reason is logged rather than returned — a richer error channel is worth adding
-/// the day a host needs to distinguish "bad credentials" from "no broker".
-export fn zb_client_open(opts_json: ?[*:0]const u8) u64 {
+/// Connect a client — the C ABI's name for zb-client-ts's `new ZeBridge(cfg).connect()`,
+/// which a C ABI cannot split into a constructor and a call. `opts_json` mirrors
+/// `client.Options`; 0 means it did not connect, and the reason is logged rather than
+/// returned — a richer error channel is worth adding the day a host needs to
+/// distinguish "bad credentials" from "no broker".
+export fn zb_client_connect(opts_json: ?[*:0]const u8) u64 {
     const text = std.mem.span(opts_json orelse return 0);
     // §10hw: the doc above promised the reason was logged; it was swallowed. A bare 0
     // with no line is the worst failure this ABI can produce, because the host has
     // nothing at all to search for.
     const box = openBox(std.heap.c_allocator, text) catch |err| {
-        std.debug.print("zb_client_open failed: {s}\n", .{@errorName(err)});
+        std.debug.print("zb_client_connect failed: {s}\n", .{@errorName(err)});
         return 0;
     };
     const h = clients.insert(box);
@@ -582,8 +588,87 @@ export fn zb_grammar_json() ?[*:0]u8 {
     return dupeZ(client.grammar_json);
 }
 
+/// Assemble the text of a `.creds` file from a JWT and a seed — zb-client-ts's
+/// `credsFileText(jwt, seed)`, byte for byte, and the same layout `nsc` writes and
+/// `bridge --init-nats` emits for `bridge.creds`. The last step of enrolment: the host
+/// generated the pair (`zb_create_user`), traded the public half for a JWT at
+/// `GET /enroll`, and now joins them into what `zb_client_connect` reads.
+///
+/// Store the result where the platform keeps secrets (Keychain, Keystore, a 600 file).
+/// Refuses a `seed` that is not an `S`-prefixed nkey: passing the two arguments the
+/// wrong way round is the mistake this catches, and it is silent otherwise.
+///
+/// Free the result with `zb_free`.
+export fn zb_creds_file_text(jwt: ?[*:0]const u8, seed: ?[*:0]const u8) ?[*:0]u8 {
+    const j = std.mem.span(jwt orelse return errJson("NoJwt"));
+    const sd = std.mem.span(seed orelse return errJson("NoSeed"));
+    if (j.len == 0) return errJson("NoJwt");
+    if (sd.len == 0 or sd[0] != 'S') return errJson("NotASeed");
+    const a = std.heap.c_allocator;
+    const text = std.fmt.allocPrint(a,
+        \\-----BEGIN NATS USER JWT-----
+        \\{s}
+        \\------END NATS USER JWT------
+        \\
+        \\************************* IMPORTANT *************************
+        \\NKEY Seed printed below can be used to sign and prove identity.
+        \\NKEYs are sensitive and should be treated as secrets.
+        \\
+        \\-----BEGIN USER NKEY SEED-----
+        \\{s}
+        \\------END USER NKEY SEED------
+        \\
+        \\*************************************************************
+        \\
+    , .{ j, sd }) catch return errJson("OutOfMemory");
+    defer a.free(text);
+    return dupeZ(text);
+}
+
+/// Whether this client was REVOKED by the operator — zb-client-ts's `revoked` field.
+/// Set when the ban arrives on `mutation_ack.<principal>.revoked` (§10dm): the socket
+/// is dropped and every later call answers `Revoked`. A host that is suddenly idle
+/// asks this to learn why, because a revoked client looks exactly like a quiet one.
+/// The rows stay: wiping them is the application's explicit act (`zb_client_wipe`).
+///
+/// `1` revoked, `0` live, `-1` unknown handle — an `int`, not JSON, so a host can poll
+/// it without allocating.
+export fn zb_client_revoked(handle: u64) c_int {
+    const b = lookup(handle) orelse return -1;
+    return if (b.c.revoked) 1 else 0;
+}
+
+/// How many client handles are open IN THIS PROCESS. A leak check for tests
+/// (`abuse.py` asserts it returns to 0) — NOT a revocation check, which is
+/// `zb_client_revoked` above.
 export fn zb_client_live() c_int {
     return @intCast(clients.liveCount());
+}
+
+/// Generate the nkey pair a client enrols with — zb-client-ts's `createUser()`, and
+/// the same `{"publicKey","seed"}` shape. The SEED is the private half: it never
+/// leaves the host, and the host stores it (Keychain, Keystore, a 600 file) beside
+/// the JWT that `GET /enroll?code=…&user_pubkey=<publicKey>` mints for it. The two
+/// together are the `.creds` a later `zb_client_connect` reads.
+///
+/// Free the result with `zb_free`.
+export fn zb_create_user() ?[*:0]u8 {
+    // Its own Io: key generation is a leaf call with no client attached, so there is
+    // no transport whose event loop it could borrow.
+    var threaded: std.Io.Threaded = .init(std.heap.c_allocator, .{});
+    defer threaded.deinit();
+    const kp = std.crypto.sign.Ed25519.KeyPair.generate(threaded.io());
+    var seed_buf: [nats.nkeys.seed_text_len]u8 = undefined;
+    const seed = nats.nkeys.encodeSeed(.user, &kp.secret_key.seed(), &seed_buf);
+    // Round-tripped like `bridge --gen-nkey`: derive the public text from the seed
+    // TEXT about to be returned, so a seed that cannot be read back never escapes.
+    var skp = nats.nkeys.SeedKeyPair.fromSeed(seed) catch return errJson("KeyEncodeFailed");
+    defer skp.wipe();
+    var pub_buf: [nats.nkeys.public_key_text_len]u8 = undefined;
+    const public = skp.publicKeyText(&pub_buf);
+    var out: [256]u8 = undefined;
+    const j = std.fmt.bufPrint(&out, "{{\"publicKey\":\"{s}\",\"seed\":\"{s}\"}}", .{ public, seed }) catch return errJson("KeyEncodeFailed");
+    return dupeZ(j);
 }
 
 // ── the index card ────────────────────────────────────────────────────────────
@@ -881,7 +966,8 @@ export fn zb_client_ingest(handle: u64, table: ?[*:0]const u8, answer_json: ?[*:
     return dupeZ(out);
 }
 
-export fn zb_client_flush(handle: u64, wait_ms: u64) ?[*:0]u8 {
+/// Send the outbox and wait up to `wait_ms` for verdicts — zb-client-ts's `flushOutbox()`.
+export fn zb_client_flush_outbox(handle: u64, wait_ms: u64) ?[*:0]u8 {
     const b = lookup(handle) orelse return errJson("UnknownHandle");
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();

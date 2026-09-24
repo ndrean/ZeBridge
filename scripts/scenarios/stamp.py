@@ -69,7 +69,7 @@ async def main():
         # quote ~5k/s on), measured simultaneously with ingress.
         lib = _env.load_lib()
         lib.zb_free.argtypes = [ctypes.c_void_p]
-        lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+        lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
         lib.zb_client_close.argtypes = [ctypes.c_uint64]
         for fn, a in [("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p])]:
             f = getattr(lib, "zb_client_" + fn)
@@ -90,7 +90,7 @@ async def main():
                 os.remove(cdb + suf)
             except FileNotFoundError:
                 pass
-        h = lib.zb_client_open(json.dumps({
+        h = lib.zb_client_connect(json.dumps({
             "natsUrl": zb.nats_server(), "credsPath": zb.creds_for(who),
             "dbPath": cdb,
             "principal": who, "clientId": "stamp-consumer",

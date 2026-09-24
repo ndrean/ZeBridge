@@ -13,7 +13,7 @@ from _env import load_lib, psql_cmd, creds, rm_sqlite
 PSQL = psql_cmd("-c")
 lib = load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
-lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
 lib.zb_client_close.restype, lib.zb_client_close.argtypes = ctypes.c_int, [ctypes.c_uint64]
 for name, args in (("sync", []), ("query", [ctypes.c_char_p, ctypes.c_char_p]),
                    ("mutate", [ctypes.c_char_p] * 4), ("flush", [ctypes.c_uint64]), ("poll", [ctypes.c_uint64])):
@@ -30,7 +30,7 @@ def q(h, sql, params=()):
 
 db = "/tmp/zb-tail.sqlite3"
 rm_sqlite(db)
-h = lib.zb_client_open(json.dumps({
+h = lib.zb_client_connect(json.dumps({
     "natsUrl": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
     "dbPath": db, "principal": "omar",
     "clientId": "py-tail", "tables": ["users", "salaries", "test_types"]}).encode())
@@ -75,7 +75,7 @@ try:
 
     # 3. this client's own write: mutate, flush with NO wait, let poll sweep the verdict and tail the echo
     take(lib.zb_client_mutate(h, b"test_types", b"DELETE", json.dumps({"uid": uid}).encode(), None))
-    f = take(lib.zb_client_flush(h, 0))
+    f = take(lib.zb_client_flush_outbox(h, 0))
     settled = f.get("settled", 0); t0 = time.monotonic()
     while settled == 0 and time.monotonic() - t0 < 10:
         r = take(lib.zb_client_poll(h, 1000)); settled += r.get("settled", 0)

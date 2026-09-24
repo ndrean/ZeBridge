@@ -37,7 +37,7 @@ def main():
 
     lib = ctypes.CDLL(str(LIB))
     lib.zb_free.argtypes = [ctypes.c_void_p]
-    lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+    lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
     lib.zb_client_close.argtypes = [ctypes.c_uint64]
     for n, extra in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p]),
                      ("request", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint64]), ("ingest", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]),
@@ -50,7 +50,7 @@ def main():
         finally:
             lib.zb_free(ptr)
 
-    h = lib.zb_client_open(json.dumps({"natsUrl": a.url, "credsPath": a.creds, "principal": a.principal, "dbPath": a.db,
+    h = lib.zb_client_connect(json.dumps({"natsUrl": a.url, "credsPath": a.creds, "principal": a.principal, "dbPath": a.db,
                                        "ondemandTables": [TABLE], "clientId": "poi-phone", "heartbeatMs": 0}).encode())
     if not h:
         sys.exit("open failed")
@@ -114,7 +114,7 @@ def edit_story(lib, take, h, a, lat, lng):
 
     def flush_and_wait(what):
         t0 = time.time()
-        fl = take(lib.zb_client_flush(h, 8000))
+        fl = take(lib.zb_client_flush_outbox(h, 8000))
         print(f"  {what}: flushed {fl} in {(time.time() - t0) * 1000:.0f} ms")
         time.sleep(1.5)  # the service's replica applies the CDC echo
 

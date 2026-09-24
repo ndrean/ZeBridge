@@ -23,7 +23,7 @@ class Lib:
             sys.exit(f"{LIBZB} missing — cd libzb && zig build -Doptimize=ReleaseFast")
         self.lib = lib = ctypes.CDLL(str(LIBZB))
         lib.zb_free.argtypes = [ctypes.c_void_p]
-        lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+        lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
         lib.zb_client_close.argtypes = [ctypes.c_uint64]
         # ⚠️ Every verb's types, at open: a `flush` called before any `mutate` used to run
         # with ctypes' default int return — a 64-bit pointer cut to 32 bits, then read as
@@ -34,7 +34,7 @@ class Lib:
                      ("mutate_at", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p])):
             f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
         lib.zb_client_wipe.restype, lib.zb_client_wipe.argtypes = ctypes.c_int, [ctypes.c_uint64]
-        self.h = lib.zb_client_open(json.dumps({
+        self.h = lib.zb_client_connect(json.dumps({
             "natsUrl": zb.nats_server(), "credsPath": str(creds) if creds else zb.creds_for(principal), "dbPath": db,
             "principal": principal, "clientId": client_id, "tables": list(tables), "heartbeatMs": 0,
             **({"dbUrl": db_url} if db_url else {}), **({"seedStreaming": True} if seed_streaming else {}),
@@ -75,7 +75,7 @@ class Lib:
         if version is None: return self.take(lib.zb_client_mutate(*args))
         return self.take(lib.zb_client_mutate_at(*args, version.encode()))
     def flush(self, wait_ms=2000):
-        return self.take(self.lib.zb_client_flush(self.h, wait_ms))
+        return self.take(self.lib.zb_client_flush_outbox(self.h, wait_ms))
     def close(self): self.lib.zb_client_close(self.h)
     def wipe(self):
         """The explicit wipe (§10dl): close and delete the replica files."""

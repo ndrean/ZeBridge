@@ -42,7 +42,7 @@ sys.path.insert(0, sys.argv[1] + "/libzb/python")
 import _env
 lib = _env.load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
-lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
 lib.zb_client_close.argtypes = [ctypes.c_uint64]
 for n, a in (("sync", []), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
     f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
@@ -50,7 +50,7 @@ def take(p):
     try: return json.loads(ctypes.string_at(p).decode())
     finally: lib.zb_free(p)
 cfg = json.loads(sys.argv[2])
-h = lib.zb_client_open(json.dumps(cfg).encode())
+h = lib.zb_client_connect(json.dumps(cfg).encode())
 if not h:
     print("OPEN-FAILED", flush=True); sys.exit(2)
 print("SYNC-START", flush=True)      # the parent's kill window opens here

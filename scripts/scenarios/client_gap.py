@@ -39,7 +39,7 @@ def main() -> int:
     stream = zb.TOPOLOGY["cdc_streams"][STREAM_KEY] + tenant
     lib = _env.load_lib()
     lib.zb_free.argtypes = [ctypes.c_void_p]
-    lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+    lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
     lib.zb_client_close.argtypes = [ctypes.c_uint64]
     for n, a in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
         f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
@@ -49,7 +49,7 @@ def main() -> int:
         finally: lib.zb_free(p)
 
     db = f"/tmp/zb-client-gap-{os.getpid()}.sqlite3"
-    h = lib.zb_client_open(json.dumps({"natsUrl": zb.nats_server(), "credsPath": zb.creds_for(who), "dbPath": db, "principal": who, "clientId": "py-client-gap", "tables": ["users", TABLE]}).encode())
+    h = lib.zb_client_connect(json.dumps({"natsUrl": zb.nats_server(), "credsPath": zb.creds_for(who), "dbPath": db, "principal": who, "clientId": "py-client-gap", "tables": ["users", TABLE]}).encode())
     if not h:
         sys.exit("libzb client could not open (cd libzb && zig build; is the stack up?)")
     failed = 0

@@ -8,7 +8,7 @@ from _env import load_lib, psql_cmd, creds, rm_sqlite
 PSQL = psql_cmd("-v", "ON_ERROR_STOP=1", "-c")
 lib = load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
-lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
 lib.zb_client_close.argtypes = [ctypes.c_uint64]
 for n, a in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
     f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
@@ -44,7 +44,7 @@ pg(f"CREATE TABLE public.{PROBE} (uid uuid PRIMARY KEY, txt text, updated_at tim
    f"SELECT * FROM zebridge_enable('public.{PROBE}', version_col => 'updated_at', public_reason => 'migrate_poll probe', "
    f"publication => '{pub}', dry_run => false)")
 time.sleep(2)  # the descriptor for the newborn reaches $KV.schemas
-h = lib.zb_client_open(json.dumps({
+h = lib.zb_client_connect(json.dumps({
     "natsUrl": os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), "credsPath": creds("omar"),
     "dbPath": db, "principal": "omar", "clientId": "py-migrate-poll",
     "tables": ["users", "test_types", PROBE], "heartbeatMs": 0}).encode())

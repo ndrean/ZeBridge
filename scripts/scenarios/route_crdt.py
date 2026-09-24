@@ -64,7 +64,7 @@ class Editor:
         self.rewrites += 1
 
     def poll(self):
-        self.lib.take(self.lib.lib.zb_client_flush(self.lib.h, 200))
+        self.lib.take(self.lib.lib.zb_client_flush_outbox(self.lib.h, 200))
         return self.lib.take(self.lib.lib.zb_client_poll(self.lib.h, 200))
 
     def reconcile(self) -> bool:

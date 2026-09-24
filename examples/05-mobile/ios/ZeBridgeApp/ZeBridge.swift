@@ -18,7 +18,7 @@ class ZeBridge: ObservableObject {
         }
         
         jsonStr.withCString { cStr in
-            self.handle = zb_client_open(cStr)
+            self.handle = zb_client_connect(cStr)
         }
         
         if self.handle == 0 {
@@ -134,7 +134,7 @@ class ZeBridge: ObservableObject {
     
     func flush(waitMs: UInt64) {
         guard handle != 0 else { return }
-        if let resPtr = zb_client_flush(handle, waitMs) {
+        if let resPtr = zb_client_flush_outbox(handle, waitMs) {
             zb_free(resPtr)
         }
     }

@@ -46,7 +46,7 @@ def log_has(s):
     return s in open(LOG, errors="replace").read()
 lib = load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
-lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
 lib.zb_client_close.argtypes = [ctypes.c_uint64]
 for n, a in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
     f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
@@ -57,7 +57,7 @@ DBS = []
 def open_client(tables, tag):
     db = f"/tmp/zb-live-{tag}.sqlite3"
     rm_sqlite(db); DBS.append(db)
-    h = lib.zb_client_open(json.dumps({"natsUrl": NATS_URL, "credsPath": creds("omar"), "dbPath": db, "principal": "omar", "clientId": "py-live-" + tag, "tables": tables}).encode())
+    h = lib.zb_client_connect(json.dumps({"natsUrl": NATS_URL, "credsPath": creds("omar"), "dbPath": db, "principal": "omar", "clientId": "py-live-" + tag, "tables": tables}).encode())
     if not h:
         sys.exit(f"open failed for client '{tag}' (is the native stack up?)")
     return h

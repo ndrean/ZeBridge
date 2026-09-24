@@ -141,7 +141,7 @@ class ZeBridge {
     _lib = ffi.DynamicLibrary.open(libPath);
 
     _open =
-        _lib.lookupFunction<ZbClientOpenC, ZbClientOpenDart>('zb_client_open');
+        _lib.lookupFunction<ZbClientOpenC, ZbClientOpenDart>('zb_client_connect');
     _close = _lib
         .lookupFunction<ZbClientCloseC, ZbClientCloseDart>('zb_client_close');
     _sync =
@@ -151,7 +151,7 @@ class ZeBridge {
     _mutate = _lib.lookupFunction<ZbClientMutateC, ZbClientMutateDart>(
         'zb_client_mutate');
     _flush = _lib
-        .lookupFunction<ZbClientFlushC, ZbClientFlushDart>('zb_client_flush');
+        .lookupFunction<ZbClientFlushC, ZbClientFlushDart>('zb_client_flush_outbox');
     _join = _lib
         .lookupFunction<ZbClientTenantC, ZbClientTenantDart>('zb_client_join');
     _leave = _lib

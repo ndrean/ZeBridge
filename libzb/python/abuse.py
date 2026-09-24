@@ -22,7 +22,7 @@ import ctypes, json, os, sys, threading
 from _env import load_lib, rm_sqlite
 
 lib = load_lib()
-lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
 lib.zb_client_close.restype, lib.zb_client_close.argtypes = ctypes.c_int, [ctypes.c_uint64]
 lib.zb_client_live.restype = ctypes.c_int
 
@@ -49,7 +49,7 @@ try:
     # init fails at `connect`, AFTER the database is open — the case that leaked a live
     # sqlite3* before the errdefer chain was made exact. 200 of them, so a leak is loud.
     for i in range(200):
-        h = lib.zb_client_open(opts(f"/tmp/zb-abuse-{i % 4}.sqlite3"))
+        h = lib.zb_client_connect(opts(f"/tmp/zb-abuse-{i % 4}.sqlite3"))
         check("open against a dead broker returns 0", h == 0) if i == 0 else None
     check("200 failed opens leave no live client", lib.zb_client_live() == 0)
 
@@ -68,7 +68,7 @@ try:
     def hammer():
         for _ in range(500):
             lib.zb_client_close(1)          # a plausible-looking handle that names nothing
-            lib.zb_client_open(opts("/tmp/zb-abuse-thread.sqlite3"))
+            lib.zb_client_connect(opts("/tmp/zb-abuse-thread.sqlite3"))
     threads = [threading.Thread(target=hammer) for _ in range(4)]
     [t.start() for t in threads]
     [t.join() for t in threads]

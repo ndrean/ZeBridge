@@ -21,6 +21,7 @@
 /// path (one sqlocal connection — OPFS sync handles are exclusive, so a second
 /// read-only connection is not available here the way `libzebridge` native has one).
 
+import { createUser as nkeyCreateUser } from '@nats-io/nkeys';
 import { natsTransport } from './transport.ts';
 import type { Transport, TransportConnection, JetStreamOpts } from './transport.ts';
 import { decode, encode } from '@msgpack/msgpack';
@@ -257,9 +258,26 @@ type Exec = (q: string, ...params: any[]) => Promise<any[]>;
 /// generated the pair itself).
 // foreignKeyFailureKind lives in core.ts (§10s) — the three measured SQLite messages.
 
+/// Generate the nkey pair a client enrols with — libzb's `zb_create_user()`, and the
+/// same `{publicKey, seed}` shape. The SEED is the private half: it never leaves the
+/// host, and the host stores it (a keychain, IndexedDB, a 600 file) beside the JWT
+/// that `GET /enroll?code=…&user_pubkey=<publicKey>` mints for it. `credsFileText`
+/// then joins the two into what `config.creds` takes.
+export function createUser(): { publicKey: string; seed: string } {
+  const kp = nkeyCreateUser();
+  return { publicKey: kp.getPublicKey(), seed: new TextDecoder().decode(kp.getSeed()) };
+}
+
 export function credsFileText(jwt: string, seed: string): string {
-  return `-----BEGIN NATS USER JWT-----\n${jwt}\n------END NATS USER JWT------\n\n` +
-         `-----BEGIN USER NKEY SEED-----\n${seed}\n------END USER NKEY SEED------\n`;
+  // The layout `nsc` writes and `bridge --init-nats` emits, byte for byte — libzb's
+  // `zb_creds_file_text` produces the same. The warning block is not decoration: this
+  // text is what a dev looks at when wondering whether the file is a secret.
+  return `-----BEGIN NATS USER JWT-----\n${jwt}\n------END NATS USER JWT------\n` +
+         `\n************************* IMPORTANT *************************\n` +
+         `NKEY Seed printed below can be used to sign and prove identity.\n` +
+         `NKEYs are sensitive and should be treated as secrets.\n\n` +
+         `-----BEGIN USER NKEY SEED-----\n${seed}\n------END USER NKEY SEED------\n` +
+         `\n*************************************************************\n`;
 }
 
 /// The JWT's own name claim — the creds are AUTHORITATIVE for the principal:

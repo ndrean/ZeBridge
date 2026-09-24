@@ -44,12 +44,12 @@ class ZigResponder:
         self.label = label
         self.lib = lib = ctypes.CDLL(str(LIBZB))
         lib.zb_free.argtypes = [ctypes.c_void_p]
-        lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+        lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
         lib.zb_client_close.argtypes = [ctypes.c_uint64]
         for n, a in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p]),
                      ("serve", [ctypes.c_char_p]), ("reply", [ctypes.c_uint64, ctypes.c_char_p])):
             f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
-        self.h = lib.zb_client_open(json.dumps({
+        self.h = lib.zb_client_connect(json.dumps({
             "natsUrl": zb.nats_server(), "credsPath": zb.creds_for("pois"), "principal": "pois",
             "dbPath": db, "tables": [TABLE], "clientId": f"serve-{label}", "heartbeatMs": 0}).encode())
         if not self.h:

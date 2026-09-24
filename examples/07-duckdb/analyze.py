@@ -32,12 +32,12 @@ class Replica:
     def __init__(self):
         self.lib = lib = ctypes.CDLL(LIB)
         lib.zb_free.argtypes = [ctypes.c_void_p]
-        lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+        lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
         lib.zb_client_close.argtypes = [ctypes.c_uint64]
         for name, args in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
             f = getattr(lib, "zb_client_" + name); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + args
         opts = {"natsUrl": NATS_URL, "credsPath": CREDS, "dbPath": DB, "principal": PRINCIPAL, "clientId": "duckdb-job", "tables": TABLES, "heartbeatMs": 0}
-        self.h = lib.zb_client_open(json.dumps(opts).encode())
+        self.h = lib.zb_client_connect(json.dumps(opts).encode())
         if not self.h: sys.exit("libzb open failed (NATS_URL, creds, library path?)")
 
     def _take(self, p):

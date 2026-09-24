@@ -90,7 +90,7 @@ async def main():
 
     lib = _env.load_lib()
     lib.zb_free.argtypes = [ctypes.c_void_p]
-    lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+    lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
     lib.zb_client_close.argtypes = [ctypes.c_uint64]
     for n, a in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
         f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
@@ -109,7 +109,7 @@ async def main():
             if not bridge.wait_for_log("fleet monitor started", timeout=10):
                 zb.bad("no fleet monitor in the probe"); return 1
 
-            h = lib.zb_client_open(json.dumps({
+            h = lib.zb_client_connect(json.dumps({
                 "natsUrl": zb.nats_server(), "credsPath": zb.creds_for(WHO),
                 "dbPath": db,
                 "principal": WHO, "clientId": "py-fleet", "tables": ["users", TABLE],

@@ -7,7 +7,7 @@ from _env import load_lib, psql_cmd, creds, rm_sqlite
 PSQL = psql_cmd("-v", "ON_ERROR_STOP=1", "-c")
 lib = load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
-lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
 lib.zb_client_close.argtypes = [ctypes.c_uint64]
 for n, a in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
     f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
@@ -30,7 +30,7 @@ def check(label, cond):
 
 db = "/tmp/zb-migrate.sqlite3"
 rm_sqlite(db)
-h = lib.zb_client_open(json.dumps({"natsUrl": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
+h = lib.zb_client_connect(json.dumps({"natsUrl": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
     "dbPath": db, "principal": "omar", "clientId": "py-migrate", "tables": ["users", "salaries", "test_types"]}).encode())
 uid = str(uuid.uuid4())
 try:

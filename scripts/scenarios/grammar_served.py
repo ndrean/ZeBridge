@@ -53,7 +53,7 @@ def main() -> int:
     lib = _env.load_lib()
     lib.zb_free.argtypes = [ctypes.c_void_p]
     lib.zb_grammar_hash.restype = ctypes.c_void_p
-    lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+    lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
     lib.zb_client_close.argtypes = [ctypes.c_uint64]
     for n, a in (("sync", []), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
         f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
@@ -72,7 +72,7 @@ def main() -> int:
     _env.rm_sqlite(db)
     opts = {"natsUrl": zb.nats_server(), "credsPath": zb.creds_for("omar"), "dbPath": db,
             "principal": "omar", "clientId": "py-grammar-served", "tables": ["users"]}
-    h = lib.zb_client_open(json.dumps({**opts, "grammarHash": served_hash}).encode())
+    h = lib.zb_client_connect(json.dumps({**opts, "grammarHash": served_hash}).encode())
     if not h:
         zb.bad("a client given the served hash could not open"); return failed + 1
     try:
@@ -85,7 +85,7 @@ def main() -> int:
     finally:
         lib.zb_client_close(h)
         _env.rm_sqlite(db)
-    forked = lib.zb_client_open(json.dumps({**opts, "grammarHash": "f" * 64}).encode())
+    forked = lib.zb_client_connect(json.dumps({**opts, "grammarHash": "f" * 64}).encode())
     if forked == 0:
         zb.ok("a client handed another protocol's hash is REFUSED at open — a fork is loud, not a silent subscription to nothing")
     else:

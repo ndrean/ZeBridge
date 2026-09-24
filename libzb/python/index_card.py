@@ -11,12 +11,12 @@ from _env import load_lib, creds, rm_sqlite
 
 lib = load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
-lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
 lib.zb_client_close.restype, lib.zb_client_close.argtypes = ctypes.c_int, [ctypes.c_uint64]
 lib.zb_client_sync.restype, lib.zb_client_sync.argtypes = ctypes.c_void_p, [ctypes.c_uint64]
 lib.zb_client_query.restype, lib.zb_client_query.argtypes = ctypes.c_void_p, [ctypes.c_uint64, ctypes.c_char_p, ctypes.c_char_p]
 lib.zb_client_mutate.restype, lib.zb_client_mutate.argtypes = ctypes.c_void_p, [ctypes.c_uint64, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
-lib.zb_client_flush.restype, lib.zb_client_flush.argtypes = ctypes.c_void_p, [ctypes.c_uint64, ctypes.c_uint64]
+lib.zb_client_flush_outbox.restype, lib.zb_client_flush_outbox.argtypes = ctypes.c_void_p, [ctypes.c_uint64, ctypes.c_uint64]
 
 def take(p):
     """Read a returned C string as JSON and free it — the caller owns every result."""
@@ -36,7 +36,7 @@ def query(h, sql, params=()):
 db = "/tmp/zb-index-card.sqlite3"
 rm_sqlite(db)
 
-h = lib.zb_client_open(json.dumps({
+h = lib.zb_client_connect(json.dumps({
     "natsUrl": "nats://127.0.0.1:4222",
     "credsPath": creds("omar"),
     "dbPath": db,
@@ -69,13 +69,13 @@ try:
         "price": "1234.56789012", "temperature": 36.6, "tenant_id": s.get("tenant"), "inserted_at": now, "updated_at": now,
     }).encode()))
     check(f"mutate: queued {m.get('msgId', m)}", "msgId" in m)
-    f = take(lib.zb_client_flush(h, 4000))
+    f = take(lib.zb_client_flush_outbox(h, 4000))
     check(f"flush: sent={f.get('sent')} settled={f.get('settled')}", f.get("settled", 0) >= 1)
     take(lib.zb_client_sync(h))  # the CDC echo
     row = query(h, "SELECT some_text, tags, last_writer FROM test_types WHERE uid = ?", [uid])
     check(f"the echo is in the replica: {row[0] if row else None}", bool(row) and row[0]["last_writer"] == "py-index-card")
     take(lib.zb_client_mutate(h, b"test_types", b"DELETE", json.dumps({"uid": uid}).encode(), None))
-    f2 = take(lib.zb_client_flush(h, 4000)); take(lib.zb_client_sync(h))
+    f2 = take(lib.zb_client_flush_outbox(h, 4000)); take(lib.zb_client_sync(h))
     gone = query(h, "SELECT count(*) AS n FROM test_types WHERE uid = ?", [uid])[0]["n"]
     check(f"DELETE settled ({f2.get('settled')}) and the tombstone rule removed the row locally: {gone} left", gone == 0)
     bad = take(lib.zb_client_sync(0))

@@ -78,7 +78,7 @@ class Client:
 
     def __init__(self, lib, url: str, db: pathlib.Path, name: str):
         self.lib, self.db, self.name = lib, db, name
-        self.h = lib.zb_client_open(json.dumps({
+        self.h = lib.zb_client_connect(json.dumps({
             "natsUrl": url, "dbPath": str(db), "tables": [TABLE], "heartbeatMs": 0,
             "clientId": name, "principal": "incremental", "seedStreaming": True,
         }).encode())
@@ -242,7 +242,7 @@ def main() -> int:
 
         lib = ctypes.CDLL(str(LIBZB))
         lib.zb_free.argtypes = [ctypes.c_void_p]
-        lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+        lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
         lib.zb_client_close.argtypes = [ctypes.c_uint64]
         lib.zb_call.restype, lib.zb_call.argtypes = ctypes.c_void_p, [ctypes.c_char_p, ctypes.c_char_p]
         for n, extra in (("sync", []), ("poll", [ctypes.c_uint64])):

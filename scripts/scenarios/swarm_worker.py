@@ -33,7 +33,7 @@ SUPPLIERS = [tuple(x.split("|", 1)) for x in os.environ.get("ZB_SUPPLIERS", "").
 
 lib = _env.load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
-lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
 lib.zb_client_close.argtypes = [ctypes.c_uint64]
 for fn, a in [("sync", []), ("poll", [ctypes.c_uint64]), ("flush", [ctypes.c_uint64]),
               ("query", [ctypes.c_char_p, ctypes.c_char_p]),
@@ -78,7 +78,7 @@ def send(h, table, op, key, values=None):
 
 def main():
     creds = os.path.join(_env.CREDS_DIR, f"{P}.creds")
-    h = lib.zb_client_open(json.dumps({
+    h = lib.zb_client_connect(json.dumps({
         "natsUrl": os.environ.get("NATS_URL", "nats://127.0.0.1:4222"),
         "credsPath": creds, "dbPath": DB,
         "principal": P, "clientId": f"py-swarm-{WID}",
@@ -157,7 +157,7 @@ def main():
                          {"rating": tick, "updated_at": now})
             else:
                 send(h, "test_types", "DELETE", {"uid": trio[0]})
-            take(lib.zb_client_flush(h, 200))
+            take(lib.zb_client_flush_outbox(h, 200))
             tick += 1
             if tick % 15 == 0:
                 print(f"[w{WID}] tick {tick} sent={counters['sent']} errs={counters['sendErrors']} "
@@ -183,7 +183,7 @@ def main():
         outbox = -1
         deadline = time.monotonic() + SETTLE_S
         while time.monotonic() < deadline:
-            take(lib.zb_client_flush(h, 1000))
+            take(lib.zb_client_flush_outbox(h, 1000))
             take(lib.zb_client_poll(h, 500))
             r = query(h, "SELECT count(*) AS n FROM _zebridge_outbox")
             outbox = r[0]["n"] if r else -1

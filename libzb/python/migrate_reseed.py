@@ -9,7 +9,7 @@ from _env import load_lib, psql_cmd, creds, rm_sqlite
 PSQL = psql_cmd("-v", "ON_ERROR_STOP=1", "-c"); PSQLQ = psql_cmd("-At", "-c")
 lib = load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
-lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
 lib.zb_client_close.argtypes = [ctypes.c_uint64]
 for n, a in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
     f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
@@ -31,7 +31,7 @@ def check(label, cond):
     global ok; ok &= bool(cond); print(("  ✓ " if cond else "  ✗ ") + label)
 db = "/tmp/zb-migrate-reseed.sqlite3"; rm_sqlite(db)
 uid = str(uuid.uuid4())
-h = lib.zb_client_open(json.dumps({
+h = lib.zb_client_connect(json.dumps({
     "natsUrl": os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), "credsPath": creds("omar"),
     "dbPath": db, "principal": "omar", "clientId": "py-migrate-reseed",
     "tables": ["users", "test_types"], "heartbeatMs": 0}).encode())

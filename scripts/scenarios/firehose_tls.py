@@ -250,7 +250,7 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
     pg = pg_now() if load_done is None else {}
     lib = ctypes.CDLL(str(LIBZB))
     lib.zb_free.argtypes = [ctypes.c_void_p]
-    lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+    lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
     lib.zb_client_close.argtypes = [ctypes.c_uint64]
     for n, extra in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
         f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + extra
@@ -297,7 +297,7 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
 
     threading.Thread(target=sample_file, daemon=True).start()
     t0 = time.time()
-    h = lib.zb_client_open(json.dumps({"natsUrl": url, "dbPath": str(db), "tables": [TABLE], "heartbeatMs": 0, "engine": engine,
+    h = lib.zb_client_connect(json.dumps({"natsUrl": url, "dbPath": str(db), "tables": [TABLE], "heartbeatMs": 0, "engine": engine,
                                        "clientId": "firehose-check", "principal": "firehose", "seedStreaming": True}).encode())
     if not h:
         return {"error": "open failed"}

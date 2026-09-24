@@ -1256,14 +1256,42 @@ That is the whole contract for an app author. A callback to implement by table, 
 
 | verb | what it does | returns |
 | --- | --- | --- |
-| `zb_client_open(opts_json)` | opens the replica and the socket | a handle, `0` on failure |
+| `zb_client_connect(opts_json)` | opens the replica and the socket | a handle, `0` on failure |
 | `zb_client_sync(h)` | the first step after open: resolves the tenant, applies the schemas, seeds the tables, drains the streams | `{"tenant": …, "first": bool}` |
 | `zb_client_poll(h, wait_ms)` | waits up to `wait_ms` for CDC, applies what arrived, retries what was held, collects verdicts | `{"applied", "settled", "changed_tables", "seeded"}` |
-| `zb_client_flush(h, wait_ms)` | sends the outbox and waits up to `wait_ms` for verdicts | `{"sent", "settled", "verdicts": {…}}` |
+| `zb_client_flush_outbox(h, wait_ms)` | sends the outbox and waits up to `wait_ms` for verdicts | `{"sent", "settled", "verdicts": {…}}` |
 | `zb_client_query(h, sql, params_json)` | a read against the replica | `{"columns": […], "rows": [[…], …]}` |
 | `zb_client_mutate(h, table, op, key_json, values_json)` | one write: optimistic locally, sent at once | `{"msgId": …}` |
 | `zb_client_close(h)` | closes the socket and the replica | `0` |
 
+**Enrolling, in any language.** Three steps, the same three everywhere — the HTTP call
+stays with the host, which has its own stack and receives the invite through its own
+channel:
+
+1. `createUser()` / `zb_create_user()` → `{publicKey, seed}`. The seed is private and
+   never leaves the device.
+2. `GET /enroll?code=<invite>&user_pubkey=<publicKey>` → a signed JWT.
+3. `credsFileText(jwt, seed)` / `zb_creds_file_text(jwt, seed)` → the `.creds` text.
+   Store it where the platform keeps secrets, and hand it to `connect`.
+
+**One vocabulary, two libraries.** The names are zb-client-ts's, so an app author — or a
+model reading the code — learns one API and can write either. Where they differ, the
+reason is the C ABI, not a choice:
+
+| concept | zb-client-ts | libzb (C ABI) |
+| --- | --- | --- |
+| make the enrolment keypair | `createUser()` | `zb_create_user()` |
+| assemble the `.creds` | `credsFileText(jwt, seed)` | `zb_creds_file_text(jwt, seed)` |
+| start | `new ZeBridge(cfg)` then `connect()` | `zb_client_connect(opts_json)` — C has no constructor, so one call does both |
+| read, write, ask, answer, absorb | `query` `mutate` `request` `serve` `ingest` | `zb_client_query` `zb_client_mutate` `zb_client_request` `zb_client_serve` `zb_client_ingest` |
+| send the outbox | `flushOutbox()` | `zb_client_flush_outbox(h, wait_ms)` |
+| receive changes | `onChange(table, cb)` | `zb_client_poll(h, wait_ms)` — a C ABI cannot take a closure, so the host drives the loop |
+| was I banned | `revoked` (a field) | `zb_client_revoked(h)` — `1` revoked, `0` live, `-1` unknown handle |
+| stop | `close()` | `zb_client_close(h)` |
+
+C-only by necessity: `zb_free` (no GC), `zb_abi_version`, and `zb_client_live` (open
+handles in this process — a leak check for tests, and not to be confused with
+`zb_client_revoked`).
 Beside them: `zb_client_mutate_at` (a write with the caller's own version stamp), `zb_client_wipe` (the explicit wipe: close and delete the replica files), `zb_grammar_hash` and `zb_grammar_json` (what this build of the library speaks), `zb_client_live` and `zb_abi_version`.
 
 **How data crosses.** Everything is a C string of JSON, in and out, so a binding is three declarations in any language with an FFI. One value is not JSON-shaped: a BLOB column (`bytea`, a PostGIS geometry) comes back from `zb_client_query` as `{"$bin": "<base64>"}` and is written the same way in a mutation's values. Two ownership rules make it safe:

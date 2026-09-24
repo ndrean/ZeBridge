@@ -62,7 +62,7 @@ FUELS = ("Gazole", "SP95", "SP98", "E10", "E85", "GPLc")
 def load_lib():
     lib = ctypes.CDLL(str(LIB))
     lib.zb_free.argtypes = [ctypes.c_void_p]
-    lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+    lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
     lib.zb_client_close.argtypes = [ctypes.c_uint64]
     for n, extra in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p]),
                      ("serve", [ctypes.c_char_p]), ("reply", [ctypes.c_uint64, ctypes.c_char_p])):
@@ -75,7 +75,7 @@ class Card:
 
     def __init__(self, lib, opts: dict):
         self.lib = lib
-        self.h = lib.zb_client_open(json.dumps(opts).encode())
+        self.h = lib.zb_client_connect(json.dumps(opts).encode())
         if not self.h:
             sys.exit("libzb: open failed")
 

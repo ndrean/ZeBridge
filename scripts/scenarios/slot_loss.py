@@ -59,7 +59,7 @@ def main() -> int:
 
     lib = _env.load_lib()
     lib.zb_free.argtypes = [ctypes.c_void_p]
-    lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+    lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
     lib.zb_client_close.argtypes = [ctypes.c_uint64]
     for n, a in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
         f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
@@ -80,7 +80,7 @@ def main() -> int:
         with zb.Bridge(LOG) as bridge:
             if not bridge.wait_for_log("Replication started successfully", timeout=40):
                 zb.bad("probe bridge did not start"); return 1
-            h = lib.zb_client_open(json.dumps({"natsUrl": zb.nats_server(), "credsPath": zb.creds_for(who), "dbPath": db, "principal": who, "clientId": "py-slot-loss", "tables": ["users", TABLE]}).encode())
+            h = lib.zb_client_connect(json.dumps({"natsUrl": zb.nats_server(), "credsPath": zb.creds_for(who), "dbPath": db, "principal": who, "clientId": "py-slot-loss", "tables": ["users", TABLE]}).encode())
             if not h:
                 zb.bad("libzb client could not open"); return 1
             take(lib.zb_client_sync(h)); take(lib.zb_client_poll(h, 500))
