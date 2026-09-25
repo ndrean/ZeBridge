@@ -16626,8 +16626,29 @@ the library detects the platform or takes one flag, and libzb and zb-client-ts u
 same option names (today: `creds` vs `credsPath`, `seedStreamingAbove` vs
 `seedStreamingAboveBytes`, `storage`/`durable` vs `dbPath`, no `clientId` in TS).
 
-What this leaves: libzb's live apply on random keys; zb-client-ts's React Native entry
-(storage, crypto, zstd chosen by the library; no Metro stubs); the native module as an
-installable package; one option vocabulary for both clients.
+**One constructor, one vocabulary (built the same day).** zb-client-ts's core imports no
+platform code; an entry per platform (node, browser, react-native) registers storage,
+zstd, the NATS dial and what the runtime lacks, and package.json `exports` lets the
+bundler pick it. Both clients take the same options with the same defaults (CLIENTS.md):
+`creds` (text — libzb through nats.zig patch 19) or `credsPath`, `dbPath` (default
+`zebridge_<principal>.sqlite3`), `clientId` (default `c-<random>`),
+`seedStreamingAboveBytes`; `durable` is gone. The examples lost their platform glue: two
+identical `expo-storage.ts`, two `platform.ts`, the Metro stubs, three fzstd streams,
+zstd-wasm. Verified on the iPhone 12 after the change: RN + zb-client-ts 313.3 s
+(316.5 s before), RN + libzb 35.7 s with the creds passed as text.
+
+Found on the way: expo-sqlite's `closeAsync` frees the connection under a statement still
+reading rows — "wipe & seed again" during the app's 3M-row facts query crashed the app
+(SIGSEGV in `columnName`); the adapter now waits for statements in flight before closing.
+And the app's libzb is a COPY (the xcframework): a stale one, built before `creds`
+existed, sat in `connect` for minutes with no NATS connection attempt — where the Mac
+fails at once with AuthorizationViolation. Unexplained; the console
+(`xcrun devicectl device process launch --console`) is how to look next time.
+
+What this leaves: the native module as an installable package with a versioned libzb (an
+app should know when its copy is older than its code); `serve.py` check F1, failing since
+answer compression (§10ip, 2026-09-22): a raw asker must read zstd, and "too large" needs
+an answer still large once compressed; revalidating fast-moving tables against today's
+changes; libzb's live apply on random keys.
 (Done the same day: the replica identity for read-only tables, f96cf47; the benchmark
 tables dropped.)
