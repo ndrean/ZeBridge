@@ -71,6 +71,14 @@ def rls(table: str) -> bool:
     return sql(f"SELECT relrowsecurity FROM pg_class WHERE oid = 'public.{table}'::regclass").stdout.strip() == "t"
 
 
+def identity(table: str) -> str:
+    """The replica-identity index's columns, comma-joined; empty under the default."""
+    return sql(f"""SELECT string_agg(a.attname, ',' ORDER BY k.ord) FROM pg_index i
+                   JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                   WHERE i.indrelid = 'public.{table}'::regclass AND i.indisreplident""").stdout.strip()
+
+
 async def main():
     failed = 0
 
@@ -117,6 +125,11 @@ async def main():
         check("1. a read-only tenant table enables: RLS on, catalogue tenant_col=tenant_id, published, reads scoped",
               not errors and rls("ro_tenant") and cat == "tenant_id" and published("ro_tenant") and reads,
               f"errors={errors} rls={rls('ro_tenant')} catalogue={cat!r} published={published('ro_tenant')} reads_step={reads}")
+        # Until 2026-09-25 only the write path moved the identity, and the bridge refused
+        # every read-only tenant table with `tenant_not_in_replica_identity`.
+        check("1b. …and its replica identity carries the tenant: (tenant_id, uid)",
+              identity("ro_tenant") == "tenant_id,uid" and any(r[0] == "replica identity" and r[1] == "done" for r in rows),
+              f"identity={identity('ro_tenant')!r} rows={[r for r in rows if r[0] == 'replica identity']}")
 
         # 2. the same as a dry run
         rows = enable("ro_dry", f"tenant_col => 'tenant_id', publication => '{PUB}'")
@@ -125,6 +138,9 @@ async def main():
               not errors and not rls("ro_dry") and not published("ro_dry")
               and sql("SELECT count(*) FROM public.zebridge_catalogue WHERE tbl = 'ro_dry'").stdout.strip() == "0",
               f"errors={errors} rls={rls('ro_dry')} published={published('ro_dry')}")
+        check("2b. …and says it would move the replica identity, without doing it",
+              any(r[0] == "replica identity" and r[1] == "would" for r in rows) and identity("ro_dry") == "",
+              f"identity={identity('ro_dry')!r} rows={[r for r in rows if r[0] == 'replica identity']}")
 
         # 3. nullable tenant column
         rows = enable("ro_null", f"tenant_col => 'tenant_id', publication => '{PUB}', dry_run => false")
@@ -146,6 +162,11 @@ async def main():
         check("5. a writable tenant table still enables with grants, guards and write scoping",
               not errors and {"grants", "guards", "rls"} <= steps and rls("rw_tenant") and published("rw_tenant"),
               f"errors={errors} steps={sorted(steps)}")
+        # §10ja: advice, never a refusal — clients mint the keys of a writable table.
+        advice = [r for r in rows if r[0] == "key order"]
+        check("5b. …and a writable uuid key with no uuidv7() default gets the key-order advice",
+              len(advice) == 1 and advice[0][1] == "advice" and "uuidv7()" in advice[0][2],
+              f"advice={advice}")
 
         # 6. public read-only table
         rows = enable("ro_public", f"public_reason => 'scenario: readable by every consumer', publication => '{PUB}', dry_run => false")

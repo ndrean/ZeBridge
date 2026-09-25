@@ -220,11 +220,13 @@ constrains it:
 | every `NOT NULL` column has a `DEFAULT`, or the client sends it | the schema descriptor carries no nullability | writes fail; the client learns only from the rejection |
 | ✅ tenant column inside the **replica identity** | a DELETE carries only the replica identity — a tenant outside it means deletes cannot be routed | ✅ preflight refuses the table (`tenant_not_in_replica_identity`) |
 
-Call `zebridge_scope_writes_by_tenant('public.orders', 'tenant_id')` (§1.2) — **not** the
-raw SQL directly. It performs exactly this fix when the tenant column isn't already covered
+Enable the table with `zebridge_enable(..., tenant_col => 'tenant_id')`, read-only or
+writable — **not** the raw SQL directly. Its scoping call (`zebridge_scope_writes_by_tenant`,
+§1.2, or `zebridge_scope_reads_by_tenant` for a read-only table) performs exactly this fix,
+through `zebridge_tenant_replica_identity`, when the tenant column isn't already covered
 (`CREATE UNIQUE INDEX ... (tenant_id, <pk>)`, `ALTER TABLE ... REPLICA IDENTITY USING INDEX
 ...`, no primary-key change needed), idempotently, but also enables RLS and installs the
-write-scoping policies in the same call — the part a hand-written version of just the index
+scoping policies in the same call — the part a hand-written version of just the index
 and identity statements leaves silently missing. That composition is the whole reason this
 is a function and not a snippet: the two-statement fix alone was tried and left a table with
 correct CDC routing and an entirely unscoped write path.

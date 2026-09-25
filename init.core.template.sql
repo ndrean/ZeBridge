@@ -65,6 +65,62 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${POSTGRES_READER_USER};
 -- Ensure bridge user gets SELECT permissions on all FUTURE tables created by the DB owner
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${POSTGRES_READER_USER};
 
+-- Put the tenant column inside the table's REPLICA IDENTITY: a unique index on
+-- (tenant, primary key), made the identity. Returns the column list it set (or, with
+-- dry_run, would set), NULL when the identity already covers the tenant.
+--
+-- ⚠️ Every tenant table needs it, read-only or writable. A DELETE carries only the
+-- identity columns — by default the primary key alone — so without the tenant it cannot
+-- be routed to a tenant subject, and PostgreSQL refuses UPDATE and DELETE once a
+-- publication filters on the tenant. The bridge refuses such a table at boot
+-- (`tenant_not_in_replica_identity`). Lives in core, not init.write, because a
+-- read-only-profile database needs it too; it used to exist only on the write path,
+-- and a read-only tenant table came out of zebridge_enable refused (2026-09-25).
+-- The caller checks that the tenant column exists and is NOT NULL.
+CREATE OR REPLACE FUNCTION public.zebridge_tenant_replica_identity(
+    tbl regclass, tenant_col name, dry_run boolean DEFAULT false
+) RETURNS text AS $$
+DECLARE
+    ri_kind  "char";
+    covered  boolean;
+    pk_cols  name[];
+    idx_name name;
+    col_list text;
+BEGIN
+    SELECT relreplident INTO ri_kind FROM pg_class WHERE oid = tbl;
+    IF ri_kind = 'f' THEN
+        RETURN NULL;                           -- FULL carries every column
+    END IF;
+    SELECT coalesce(bool_or(a.attname = tenant_col), false) INTO covered
+    FROM pg_index i
+    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+    WHERE i.indrelid = tbl
+      AND ((ri_kind = 'd' AND i.indisprimary) OR (ri_kind = 'i' AND i.indisreplident));
+    IF covered THEN
+        RETURN NULL;
+    END IF;
+
+    SELECT array_agg(a.attname ORDER BY k.ord) INTO pk_cols
+    FROM pg_index i
+    JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+    WHERE i.indrelid = tbl AND i.indisprimary;
+    IF pk_cols IS NULL THEN
+        RAISE EXCEPTION '% has no primary key, so no replica identity can cover %', tbl, tenant_col;
+    END IF;
+
+    idx_name := (SELECT relname FROM pg_class WHERE oid = tbl) || '_zb_ri';
+    col_list := quote_ident(tenant_col) || ', ' ||
+                (SELECT string_agg(quote_ident(c), ', ') FROM unnest(pk_cols) c);
+    IF NOT dry_run THEN
+        EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %s (%s)', idx_name, tbl, col_list);
+        EXECUTE format('ALTER TABLE %s REPLICA IDENTITY USING INDEX %I', tbl, idx_name);
+        RAISE NOTICE 'replica identity of % moved to (%) so its rows route by tenant', tbl, col_list;
+    END IF;
+    RETURN col_list;
+END;
+$$ LANGUAGE plpgsql;
+
 -- Scope the reader's SELECT by tenant, for the snapshot path — see PROTOCOL.md "The
 -- Connection Flow" Step 0, NOTES.md §1.12 part 1
 --
@@ -111,6 +167,9 @@ BEGIN
                      AND attnum > 0 AND NOT attisdropped AND attnotnull) THEN
         RAISE EXCEPTION 'tenant column %.% must exist and be NOT NULL', tbl, tenant_col;
     END IF;
+
+    -- A tenant table's CDC routes by the tenant, reads scoped or not.
+    PERFORM public.zebridge_tenant_replica_identity(tbl, tenant_col);
 
     EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', tbl);
 
@@ -1748,6 +1807,7 @@ DECLARE
     cur_list   name[];
     verb       text := CASE WHEN dry_run THEN 'would' ELSE 'done' END;
     r           record;
+    ri_cols     text;
 BEGIN
     -- ── the publication must be NAMED, and may only be created on request ─────
     --
@@ -1881,6 +1941,20 @@ BEGIN
         RETURN;
     END IF;
 
+    -- A tenant table routes its CDC by the tenant, so the tenant must be in the replica
+    -- identity — the scoping functions below put it there. Planned now, while nothing is
+    -- applied: the row below reports it, and a table with no primary key (no identity to
+    -- extend) is an ERROR row here rather than an exception halfway through.
+    IF tenant_col IS NOT NULL THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_index WHERE indrelid = tbl AND indisprimary) THEN
+            RETURN QUERY SELECT 'preflight', 'ERROR',
+                format('%s has no primary key: no replica identity can carry %I, and the bridge '
+                       'refuses a keyless table anyway', tbl, tenant_col);
+            RETURN;
+        END IF;
+        ri_cols := public.zebridge_tenant_replica_identity(tbl, tenant_col, dry_run => true);
+    END IF;
+
     -- ── writes, guards and RLS come FIRST, because the guard demands it ───────
     IF writable THEN
         IF NOT dry_run THEN EXECUTE format('SELECT public.zebridge_grant_edge_writes(%L::regclass)', tbl); END IF;
@@ -1921,6 +1995,39 @@ BEGIN
             format('zebridge_scope_reads_by_tenant(%L, %L) — snapshot reads scoped; '
                    'CDC stays scoped by the subject, not RLS (RLS cannot see it)',
                    tbl::text, tenant_col);
+    END IF;
+
+    -- Done inside the scoping call above, writable or read-only.
+    IF tenant_col IS NOT NULL THEN
+        RETURN QUERY SELECT 'replica identity',
+            CASE WHEN ri_cols IS NULL THEN 'ok' ELSE verb END,
+            CASE WHEN ri_cols IS NULL
+                 THEN format('already carries %I: deletes route by tenant', tenant_col)
+                 ELSE format('unique index %s_zb_ri on (%s), made the replica identity: deletes route by tenant',
+                             short, ri_cols) END;
+    END IF;
+
+    -- ── key order: advice, never a refusal (§10ja) ────────────────────────────
+    -- Clients mint the keys of a writable table. A random uuid scatters every replica's
+    -- key index on live inserts; a time-ordered one appends. Seeds do not care — the
+    -- producer writes every chain object in key order — so a read-only table, or a
+    -- bigint key (already ordered), gets nothing here.
+    IF writable THEN
+        FOR r IN
+            SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) AS def
+            FROM pg_index i
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+            LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+            WHERE i.indrelid = tbl AND i.indisprimary AND a.atttypid = 'uuid'::regtype
+              AND coalesce(pg_get_expr(d.adbin, d.adrelid), '') NOT ILIKE '%uuidv7(%'
+        LOOP
+            RETURN QUERY SELECT 'key order', 'advice',
+                format('%s.%I is a uuid defaulting to %s. Clients mint keys for a writable table: '
+                       'mint uuid v7, and ALTER TABLE %s ALTER COLUMN %I SET DEFAULT uuidv7(). '
+                       'Time-ordered keys append to every replica''s index instead of scattering it: '
+                       'live apply measured 4-11x faster (NOTES §10ja). Existing keys can stay.',
+                       tbl, r.attname, coalesce(r.def, 'nothing'), tbl, r.attname);
+        END LOOP;
     END IF;
 
     -- ── the width guard: both doors, one trigger ──────────────────────────────

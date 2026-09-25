@@ -76,7 +76,7 @@ GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_WRITER_USER};
 -- there, and the bridge sends the same bookkeeping over DATABASE_WRITER_URL instead
 -- (NOTES §10cz) — so the writer needs exactly the reader's bookkeeping privileges.
 GRANT SELECT, INSERT, DELETE ON public.zebridge_generations TO ${POSTGRES_WRITER_USER};
-GRANT UPDATE (has_full, dict, full_dict_object, dict_ratio, retired_at, has_checkpoint, ckpt_lower, ckpt_dict_object, obj_bytes) ON public.zebridge_generations TO ${POSTGRES_WRITER_USER};  -- §10gf/§10gq, the reader's column grant
+GRANT UPDATE (has_full, retired_at, has_checkpoint, ckpt_lower, obj_bytes, full_sorted, ckpt_sorted) ON public.zebridge_generations TO ${POSTGRES_WRITER_USER};  -- §10gf/§10gq, the reader's column grant
 GRANT SELECT ON public.zebridge_limits TO ${POSTGRES_WRITER_USER};  -- the registration reads MIN and its previous row around the call
 GRANT EXECUTE ON FUNCTION public.zebridge_register_limits(text, name, integer, boolean) TO ${POSTGRES_WRITER_USER};
 GRANT EXECUTE ON FUNCTION public.zebridge_set_suspended(text, text) TO ${POSTGRES_WRITER_USER};
@@ -456,12 +456,6 @@ $$ LANGUAGE plpgsql;
 -- airtight writes and no read isolation whatsoever.
 CREATE OR REPLACE FUNCTION public.zebridge_scope_writes_by_tenant(tbl regclass, tenant_col name)
 RETURNS void AS $$
-DECLARE
-    ri_kind  "char";
-    covered  boolean;
-    pk_cols  name[];
-    idx_name name;
-    col_list text;
 BEGIN
     -- NOT NULL because a replica-identity index requires it, and because a nullable tenant
     -- is a row no policy matches and no subject can carry.
@@ -472,43 +466,8 @@ BEGIN
     END IF;
 
     -- ⚠️ The tenant column must be inside the REPLICA IDENTITY, or the table is refused
-    -- with `tenant_not_in_replica_identity` and nothing replicates.
-    --
-    -- A DELETE carries only the replica-identity columns — under the default that is the
-    -- primary key alone. Inserts and updates would route to the right tenant subject and
-    -- deletes could not route at all, so a deleted row would stay in every replica that
-    -- held it, with no later event able to remove it. Silent, permanent divergence.
-    SELECT relreplident INTO ri_kind FROM pg_class WHERE oid = tbl;
-    IF ri_kind = 'f' THEN
-        covered := true;                       -- FULL carries every column
-    ELSE
-        SELECT coalesce(bool_or(a.attname = tenant_col), false) INTO covered
-        FROM pg_index i
-        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-        WHERE i.indrelid = tbl
-          AND ((ri_kind = 'd' AND i.indisprimary) OR (ri_kind = 'i' AND i.indisreplident));
-    END IF;
-
-    IF NOT covered THEN
-        SELECT array_agg(a.attname ORDER BY k.ord) INTO pk_cols
-        FROM pg_index i
-        JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
-        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-        WHERE i.indrelid = tbl AND i.indisprimary;
-
-        IF pk_cols IS NULL THEN
-            RAISE EXCEPTION '% has no primary key, so no replica identity can cover %',
-                            tbl, tenant_col;
-        END IF;
-
-        idx_name := replace(tbl::text, '.', '_') || '_zb_ri';
-        col_list := quote_ident(tenant_col) || ', ' ||
-                    array_to_string(ARRAY(SELECT quote_ident(c) FROM unnest(pk_cols) c), ', ');
-        EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %s (%s)', idx_name, tbl, col_list);
-        EXECUTE format('ALTER TABLE %s REPLICA IDENTITY USING INDEX %I', tbl, idx_name);
-        RAISE NOTICE 'replica identity of % moved to (%) so deletes can be routed by tenant',
-                     tbl, col_list;
-    END IF;
+    -- with `tenant_not_in_replica_identity` and nothing replicates (init.core).
+    PERFORM public.zebridge_tenant_replica_identity(tbl, tenant_col);
 
     EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', tbl);
 
@@ -726,12 +685,6 @@ CREATE OR REPLACE FUNCTION public.zebridge_scope_publication_to_one_tenant(
     tenant_value text,
     publication  name
 ) RETURNS void AS $$
-DECLARE
-    ri_kind  "char";
-    covered  boolean;
-    pk_cols  name[];
-    idx_name name;
-    col_list text;
 BEGIN
     IF tbl::text IN ('zebridge_ddl_events','public.zebridge_ddl_events') THEN
         RAISE EXCEPTION 'refusing to publish %: it is the bridge''s own DDL tracker', tbl;
@@ -748,33 +701,7 @@ BEGIN
     -- 2. The tenant must be inside the replica identity, or PostgreSQL refuses every
     --    UPDATE and DELETE once the publication carries a filter on it — including the
     --    application's own writes.
-    SELECT relreplident INTO ri_kind FROM pg_class WHERE oid = tbl;
-    IF ri_kind = 'f' THEN
-        covered := true;
-    ELSE
-        SELECT coalesce(bool_or(a.attname = tenant_col), false) INTO covered
-        FROM pg_index i
-        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-        WHERE i.indrelid = tbl
-          AND ((ri_kind = 'd' AND i.indisprimary) OR (ri_kind = 'i' AND i.indisreplident));
-    END IF;
-
-    IF NOT covered THEN
-        SELECT array_agg(a.attname ORDER BY k.ord) INTO pk_cols
-        FROM pg_index i
-        JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
-        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-        WHERE i.indrelid = tbl AND i.indisprimary;
-        IF pk_cols IS NULL THEN
-            RAISE EXCEPTION '% has no primary key; the bridge refuses such a table anyway', tbl;
-        END IF;
-        idx_name := (SELECT relname FROM pg_class WHERE oid = tbl) || '_zb_ri';
-        col_list := quote_ident(tenant_col) || ', ' ||
-                    (SELECT string_agg(quote_ident(c), ', ') FROM unnest(pk_cols) c);
-        EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %s (%s)', idx_name, tbl, col_list);
-        EXECUTE format('ALTER TABLE %s REPLICA IDENTITY USING INDEX %I', tbl, idx_name);
-        RAISE NOTICE 'replica identity of % moved to (%) so the tenant filter is legal', tbl, col_list;
-    END IF;
+    PERFORM public.zebridge_tenant_replica_identity(tbl, tenant_col);
 
     -- 3. Per-TABLE, idempotent: this runs once per (table, tenant) and the policies do not
     --    vary by tenant — the mapping table does.
