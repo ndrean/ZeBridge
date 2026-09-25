@@ -124,6 +124,15 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
         const batch = args.object.get("batch").?.array;
         return try std.fmt.allocPrint(a, "{d}", .{core.advancePosition(stored, batch)});
     }
+    if (eq(u8, name, "caughtUp")) {
+        const g = struct {
+            fn u(o: Value, k: []const u8) u64 {
+                const v = o.object.get(k) orelse return 0;
+                return if (v == .integer) @intCast(v.integer) else 0;
+            }
+        };
+        return try std.fmt.allocPrint(a, "{d}", .{core.caughtUpPosition(g.u(args, "pos"), g.u(args, "lastSeq"), g.u(args, "numPending"), g.u(args, "numAckPending"), g.u(args, "deliveredCount"), g.u(args, "delivered"))});
+    }
     if (eq(u8, name, "fkKind")) {
         const msg = args.object.get("message").?.string;
         if (core.foreignKeyFailureKind(msg)) |k| {

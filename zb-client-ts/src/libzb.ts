@@ -30,7 +30,7 @@ import { sqliteDialect, type Dialect } from './dialect.ts';
 import { v7 as uuidv7 } from 'uuid';
 import { heartbeatPayload,
   seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica as coreFullPredates,
-  scopeSeeding, advancePosition, foreignKeyFailureKind, lsnToNumber, pgTsToWire, tableSet,
+  scopeSeeding, advancePosition, caughtUpPosition, foreignKeyFailureKind, lsnToNumber, pgTsToWire, tableSet,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgEngineValues, chainUpsertSql, chainRowParams,
   type SqlStep,
   fkClausesFor, createTableSteps, rebuildSteps, diffColumns, keyShape, typeShape, retypedColumns, isReadOnlySql,
@@ -3325,11 +3325,32 @@ export class ZeBridge {
                 // over: some waiting and none delivered is deaf; none waiting is idle; a
                 // consumer the server no longer knows is gone, recreated as before.
                 const stored = this.globalSyncState.seq[streamName] ?? 0;
+                // The stream's end FIRST, then the consumer: see caughtUpPosition.
+                let lastSeq = 0;
+                try { lastSeq = (await jsm.streams.info(streamName))?.state?.last_seq ?? 0; } catch { /* keep 0: no move */ }
                 let pending = -1;
-                try { pending = (await jsm.consumers.info(streamName, curName))?.num_pending ?? 0; } catch { /* gone */ }
+                let ci: any = null;
+                try { ci = await jsm.consumers.info(streamName, curName); pending = ci?.num_pending ?? 0; } catch { /* gone */ }
                 if (pending !== 0) {
                   this.appendLog('SYS', `${streamName}: consumer idle 25s with ${pending < 0 ? 'no consumer on the server' : `${pending} message(s) waiting`} (stored ${stored}) — deaf; recreating`, 'WARNING');
                   try { itRef.stop(); } catch { /* already ended */ }
+                  return;
+                }
+                // §10ja: idle and caught up — the position is the stream's end, or a
+                // consumer filtered to other tables' silence stays at 0 and the next
+                // launch reads that as a gap.
+                const to = caughtUpPosition(stored, lastSeq, {
+                  numPending: pending, numAckPending: ci?.num_ack_pending ?? 1,
+                  deliveredCount: ci?.delivered?.consumer_seq ?? 1, delivered: ci?.delivered?.stream_seq ?? Number.MAX_SAFE_INTEGER,
+                });
+                if (to > (this.globalSyncState.seq[streamName] ?? 0)) {
+                  this.globalSyncState.seq[streamName] = to;
+                  lastSeen = Math.max(lastSeen, to);
+                  await this.run(
+                    `INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?)
+                     ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
+                    streamName, to,
+                  );
                 }
               } catch { /* stream info unavailable mid-outage — keep waiting */ }
             })();

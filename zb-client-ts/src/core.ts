@@ -220,6 +220,22 @@ export function advancePosition(stored: number, batchSeqs: number[]): number {
   return batchSeqs.reduce((m, s) => Math.max(m, s ?? 0), stored);
 }
 
+/// §10ja: how far a CAUGHT-UP consumer has read. A consumer filtered to this client's
+/// tables never sees the other tables' messages, so its position stays at the last
+/// message it was handed (0 on a stream none of its tables writes to) and the next
+/// launch reads "position 0, stream first 9632" as a gap. With nothing pending it has
+/// seen every message for its subjects up to the stream's end: that is the position.
+/// ⚠️ `lastSeq` must be read BEFORE the consumer's info — then `numPending = 0` covers
+/// it — and nothing handed over past `pos`, nothing unacked, says all it was handed is
+/// applied. `deliveredCount` is the consumer's own sequence: a consumer that delivered
+/// nothing still reports `delivered` = its start - 1 (measured: 9631 on a fresh one,
+/// position 0), which is no message in flight. Any doubt keeps `pos`; never backwards.
+export function caughtUpPosition(pos: number, lastSeq: number, c: { numPending: number; numAckPending: number; deliveredCount: number; delivered: number }): number {
+  if (lastSeq <= pos) return pos;
+  if (c.numPending !== 0 || c.numAckPending !== 0 || (c.deliveredCount > 0 && c.delivered > pos)) return pos;
+  return lastSeq;
+}
+
 // ─── FK failure classification (§10h) ────────────────────────────────────────
 
 /// Is this failure "the parent is not here YET" rather than "this row is wrong"?

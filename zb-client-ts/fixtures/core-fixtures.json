@@ -1101,6 +1101,68 @@
       "next": 863
     }
   ],
+  "caughtUp": [
+    {
+      "name": "§10ja: a filtered consumer that saw nothing and is caught up takes the stream's end",
+      "pos": 0,
+      "lastSeq": 9700,
+      "numPending": 0,
+      "numAckPending": 0,
+      "deliveredCount": 0,
+      "delivered": 0,
+      "next": 9700
+    },
+    {
+      "name": "a fresh consumer that delivered nothing reports delivered = start - 1: no message in flight",
+      "pos": 0,
+      "lastSeq": 9633,
+      "numPending": 0,
+      "numAckPending": 0,
+      "deliveredCount": 0,
+      "delivered": 9631,
+      "next": 9633
+    },
+    {
+      "name": "messages waiting for these subjects: stay",
+      "pos": 120,
+      "lastSeq": 9700,
+      "numPending": 3,
+      "numAckPending": 0,
+      "deliveredCount": 4,
+      "delivered": 120,
+      "next": 120
+    },
+    {
+      "name": "handed over but not acked: stay",
+      "pos": 120,
+      "lastSeq": 9700,
+      "numPending": 0,
+      "numAckPending": 2,
+      "deliveredCount": 5,
+      "delivered": 122,
+      "next": 120
+    },
+    {
+      "name": "delivered past the stored position (still applying): stay",
+      "pos": 120,
+      "lastSeq": 9700,
+      "numPending": 0,
+      "numAckPending": 0,
+      "deliveredCount": 6,
+      "delivered": 130,
+      "next": 120
+    },
+    {
+      "name": "never backwards (a stream reset is the restart rule's job)",
+      "pos": 9800,
+      "lastSeq": 9700,
+      "numPending": 0,
+      "numAckPending": 0,
+      "deliveredCount": 9,
+      "delivered": 9800,
+      "next": 9800
+    }
+  ],
   "fkKind": [
     {
       "name": "missing parent row",

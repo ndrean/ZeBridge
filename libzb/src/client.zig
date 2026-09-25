@@ -308,7 +308,11 @@ pub const SyncClient = struct {
     const Tail = struct {
         stream: []const u8,
         sub: *@import("nats").PullSubscription,
+        /// When `caughtUpTo` last asked the server about this idle tail (§10ja).
+        caught_up_check_ms: i64 = 0,
     };
+    /// An idle tail asks at most this often whether it is caught up: two requests.
+    const caught_up_every_ms: i64 = 25_000;
     const Dark = struct { retry_at_ms: i64, backoff_ms: i64 };
     const dark_backoff_first_ms: i64 = 5_000;
     const dark_backoff_max_ms: i64 = 60_000;
@@ -2486,6 +2490,28 @@ pub const SyncClient = struct {
     /// prune until 2026-09-25, and answered with a re-seed: a client following
     /// test_types_v7 re-fetched 3M rows three times because test_types_v4 got a burst.
     /// Stream info unreadable → a hole: the conservative answer, as before.
+    /// §10ja: how far a CAUGHT-UP consumer has read. A consumer filtered to this
+    /// client's tables sees none of the other tables' messages, so its position stays
+    /// at the last message it was handed — 0 on a stream where none of its tables has
+    /// written — and the next launch reads "position 0, stream first 9632" as a gap.
+    /// When the consumer has nothing pending, it has seen every message for its
+    /// subjects up to the stream's end, and that is the position.
+    ///
+    /// ⚠️ The order is the safety. `last_seq` is read FIRST; then `num_pending = 0`
+    /// says nothing for these subjects waits at or before it. `delivered <= pos` and
+    /// no unacked message say that everything handed over is applied and persisted.
+    /// Any doubt answers `pos`: the next check asks again.
+    fn caughtUpTo(self: *SyncClient, stream: []const u8, consumer: []const u8, pos: u64) u64 {
+        var si = self.t.js.getStreamInfo(stream) catch return pos;
+        defer si.deinit();
+        const last = si.value.state.last_seq;
+        if (last <= pos) return pos;
+        var ci = self.t.js.getConsumerInfo(stream, consumer) catch return pos;
+        defer ci.deinit();
+        const c = ci.value;
+        return core.caughtUpPosition(pos, last, c.num_pending, c.num_ack_pending, c.delivered.consumer_seq, c.delivered.stream_seq);
+    }
+
     fn prunedAfter(self: *SyncClient, stream: []const u8, pos: u64) bool {
         var info = self.t.js.getStreamInfo(stream) catch return true;
         defer info.deinit();
@@ -2563,6 +2589,7 @@ pub const SyncClient = struct {
             }
             _ = try self.applyBatch(null, stream, batch.messages, last, &max_seq, null);
         }
+        max_seq = self.caughtUpTo(stream, sub.consumer_name, max_seq);
         if (max_seq > last) try self.persistSeq(stream, max_seq);
         std.debug.print("{s}: drained to seq {d}\n", .{ stream, max_seq });
         return false;
@@ -3103,7 +3130,19 @@ pub const SyncClient = struct {
             for (mb.messages) |m| {
                 if (std.mem.eql(u8, m.metadata.stream, stream)) try mine.append(a, m);
             }
-            if (mine.items.len == 0) continue;
+            if (mine.items.len == 0) {
+                // Idle this poll: now and then, take the position to the stream's end
+                // if the consumer is caught up (§10ja).
+                if (self.isDark(stream)) continue;
+                const tl = self.tailFor(stream) catch continue;
+                const now = nowMillis();
+                if (now - tl.caught_up_check_ms < caught_up_every_ms) continue;
+                tl.caught_up_check_ms = now;
+                const pos = try self.storedSeq(stream);
+                const to = self.caughtUpTo(stream, tl.sub.consumer_name, pos);
+                if (to > pos) try self.persistSeq(stream, to);
+                continue;
+            }
             const last = try self.storedSeq(stream);
             // §10ei: the gap rule, LIVE. The next message this tail is handed is `last + 1`
             // unless the stream pruned under the consumer while the host did not poll —

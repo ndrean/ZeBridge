@@ -291,6 +291,16 @@ pub fn advancePosition(stored: i64, batch: std.json.Array) i64 {
     return m;
 }
 
+/// core.ts caughtUpPosition (§10ja): the position of a caught-up consumer — the
+/// stream's `last_seq`, read before the consumer's info, when nothing is pending,
+/// nothing is unacked and nothing handed over is past `pos` (`delivered_count` 0: a
+/// fresh consumer's `delivered` is its start - 1, no message). Otherwise `pos`.
+pub fn caughtUpPosition(pos: u64, last_seq: u64, num_pending: u64, num_ack_pending: u64, delivered_count: u64, delivered: u64) u64 {
+    if (last_seq <= pos) return pos;
+    if (num_pending != 0 or num_ack_pending != 0 or (delivered_count > 0 and delivered > pos)) return pos;
+    return last_seq;
+}
+
 // ─── the apply SQL builders ─────────────────────────────────────────────────
 
 /// §10ex: the one object that is NOT JSON text — bytes, as `{"$bin": "<base64>"}`

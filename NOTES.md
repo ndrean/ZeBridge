@@ -16574,10 +16574,24 @@ generators on Hermes), msgpack decode, then the window re-encoded as one JSON st
 Decoding a chunk of rows synchronously is the lever left for zb-client-ts; libzb (35 s)
 stays out of reach.
 
+**The browser with the direct path:** 39 s for the same 3,055,002 rows (Chrome, OPFS),
+JS heap peak 220 MB, replica 1.036 GB, exact. It was 160.5 s staged (§10ix).
+
+**A caught-up consumer's position (both clients).** A consumer filtered to this
+client's tables never sees the other tables' messages, so its stored position stayed
+at the last message it was handed — 0 on `CDC_PUBLIC` for a client following one tenant
+table — and every launch logged "Gap detected … CDC_PUBLIC: local 0, stream first 9632"
+and re-planned from the watermark. `core.caughtUpPosition`: read the stream's
+`last_seq` FIRST, then the consumer; nothing pending, nothing unacked, nothing handed
+over past the position → the position is `last_seq`. zb-client-ts applies it in the
+tail's 25 s idle check, libzb at the end of each drain and on an idle tail (at most every
+25 s). ⚠️ A consumer that delivered nothing still reports `delivered.stream_seq` =
+its start - 1 (9631 on a fresh one): the first version read that as a message in flight
+and never moved; `delivered.consumer_seq = 0` is the tell. Measured on a Node client
+following `note_t`: 0 → 9634 after 45 s idle, and the relaunch says "No CDC gap".
+
 What this leaves: libzb's live apply on random keys; a batched row decode in
 zb-client-ts; `wipe()` racing a `connect()` in progress (`libzb.ts` reads `this.nc` after
-`close()` nulled it: a harmless TypeError in the log); a filtered consumer that never received a
-message keeps position 0, so every launch logs "Gap detected" on `CDC_PUBLIC` and
-re-plans from the watermark (0 rows, ~100 ms): advance the position when caught up.
+`close()` nulled it: a harmless TypeError in the log).
 (Done the same day: the replica identity for read-only tables, f96cf47; the benchmark
 tables dropped.)

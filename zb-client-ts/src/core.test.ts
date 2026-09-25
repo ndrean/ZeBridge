@@ -67,7 +67,7 @@ import {
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgArrayLiteral, chainUpsertSql, chainRowParams,
   planCdcBulk,
   seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica, scopeSeeding, tableSet, mergeRegisters,
-  advancePosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
+  advancePosition, caughtUpPosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
   outboxWatermarkGate,
   heartbeatPayload,
   keyShape, typeShape, retypedColumns, isReadOnlySql,
@@ -114,6 +114,9 @@ for (const c of fx.scope) {
 }
 for (const c of fx.position) {
   test(`position: ${c.name}`, () => assert.equal(advancePosition(c.stored, c.batch), c.next));
+}
+for (const c of fx.caughtUp) {
+  test(`caughtUp: ${c.name}`, () => assert.equal(caughtUpPosition(c.pos, c.lastSeq, c), c.next));
 }
 for (const c of fx.fkKind) {
   test(`fkKind: ${c.name}`, () => assert.equal(foreignKeyFailureKind(new Error(c.message)), c.kind));
