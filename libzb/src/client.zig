@@ -2475,6 +2475,19 @@ pub const SyncClient = struct {
         return try self.t.js.pullSubscribe(null, cname, .{ .stream = stream, .config = cfg, .inbox = shared });
     }
 
+    /// §10ja: is a jump in stream sequence past `pos` a hole? Only if the stream no longer
+    /// holds the message right after it. A consumer filtered to this client's tables
+    /// (§10gm) is handed the next message that MATCHES, so on a tenant stream shared by
+    /// several tables every write to a table it does not follow is a jump — read as a
+    /// prune until 2026-09-25, and answered with a re-seed: a client following
+    /// test_types_v7 re-fetched 3M rows three times because test_types_v4 got a burst.
+    /// Stream info unreadable → a hole: the conservative answer, as before.
+    fn prunedAfter(self: *SyncClient, stream: []const u8, pos: u64) bool {
+        var info = self.t.js.getStreamInfo(stream) catch return true;
+        defer info.deinit();
+        return info.value.state.first_seq > pos + 1;
+    }
+
     /// §10gm: the drain, with the gap rule the live tail already had. A stream that
     /// prunes faster than this client applies leaves the drain reading the oldest message
     /// the server still holds, and the server says nothing — measured at 100k events a
@@ -2535,10 +2548,11 @@ pub const SyncClient = struct {
             };
             defer batch.deinit();
             if (batch.messages.len == 0) break;
-            // The gap rule (§10ei), here too: sequences are contiguous, so the next
-            // message is the position + 1 unless the stream pruned under the consumer.
+            // The gap rule (§10ei), here too — on a jump, and only if the stream no longer
+            // holds what follows the position (§10ja: a filtered consumer jumps over the
+            // other tables' messages as a matter of course).
             const first_here = batch.messages[0].metadata.sequence.stream;
-            if (max_seq > 0 and first_here > max_seq + 1) {
+            if (max_seq > 0 and first_here > max_seq + 1 and self.prunedAfter(stream, max_seq)) {
                 if (max_seq > last) try self.persistSeq(stream, max_seq);
                 std.debug.print("{s}: {d} message(s) pruned under the drain (position {d}, delivered {d})\n", .{ stream, first_here - max_seq - 1, max_seq, first_here });
                 return true;
@@ -3087,9 +3101,11 @@ pub const SyncClient = struct {
             }
             if (mine.items.len == 0) continue;
             const last = try self.storedSeq(stream);
-            // §10ei: the gap rule, LIVE. Stream sequences are contiguous and this tail
-            // reads the whole stream, so the next message is `last + 1` — unless the
-            // stream pruned under the consumer while the host did not poll. The server
+            // §10ei: the gap rule, LIVE. The next message this tail is handed is `last + 1`
+            // unless the stream pruned under the consumer while the host did not poll —
+            // or (§10ja) the consumer is filtered to this client's tables and skipped
+            // other tables' messages, which is no hole at all: `prunedAfter` asks the
+            // stream which of the two a jump is. The server
             // continues from the oldest it holds and says nothing; the numbering does.
             // Measured: a client idle 267 s against a 263 s window resumed past twelve
             // messages, two deletes among them, and disagreed with PostgreSQL until it
@@ -3098,7 +3114,7 @@ pub const SyncClient = struct {
             // A chain that predates the stream leaves the hole OPEN: the position stays
             // below it, the batch is not acked, and the next poll asks again.
             const first_here = mine.items[0].metadata.sequence.stream;
-            if (last > 0 and first_here > last + 1) {
+            if (last > 0 and first_here > last + 1 and self.prunedAfter(stream, last)) {
                 std.debug.print("{s}: {d} message(s) pruned under the live consumer (position {d}, delivered {d}) — taking the gap: re-seeding the tables routed to it\n", .{ stream, first_here - last - 1, last, first_here });
                 self.reseed_pending = false;
                 self.gapAndSeed(report_a, &seeded_map) catch |err| std.debug.print("{s}: re-seed after the hole failed: {s}\n", .{ stream, @errorName(err) });

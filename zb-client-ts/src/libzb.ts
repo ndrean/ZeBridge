@@ -2545,6 +2545,19 @@ export class ZeBridge {
     return p;
   }
 
+  /// §10ja: is a jump in stream sequence past `pos` a hole? Only if the stream no longer
+  /// holds the message right after it — a consumer filtered to this client's tables
+  /// skips the other tables' messages on a shared tenant stream, and each write to one
+  /// of them used to read as a prune and cost a re-seed. Info unreadable → a hole.
+  private async prunedAfter(jsm: any, stream: string, pos: number): Promise<boolean> {
+    try {
+      const first = (await jsm.streams.info(stream))?.state?.first_seq;
+      return typeof first !== 'number' || first > pos + 1;
+    } catch {
+      return true;
+    }
+  }
+
   private async applyGenerationsOnce(table: string): Promise<boolean> {
     const GEN = this.config.grammar.generations;
     if (!GEN || !this.nc) return false;
@@ -3181,13 +3194,15 @@ export class ZeBridge {
           // clients dead in the §10cs soak). `curIter` is nulled the moment its
           // for-await returns; a null iterator means "recreate first".
           let curIter: typeof iter | null = iter;
+          let curName: string = ci.name;
           let curPending: number | null = ci.num_pending ?? null;
           let attempt = 0;
-          // §10ei: the last sequence this tail was handed — the gap rule, LIVE. Stream
-          // sequences are contiguous and the tail reads the whole stream, so the next
-          // message is `lastSeen + 1`; anything beyond it is a hole the stream pruned
-          // under the consumer (a tab throttled in the background, a slow apply), and
-          // the server says nothing. libzb measured it first: twelve messages, two
+          // §10ei: the last sequence this tail was handed — the gap rule, LIVE. The next
+          // message is `lastSeen + 1` unless the stream pruned under the consumer (a tab
+          // throttled in the background, a slow apply) and the server says nothing — or
+          // (§10ja) the consumer is filtered to this client's tables and jumped over
+          // other tables' messages, which is no hole: on a jump the stream is asked
+          // whether it still holds what follows the position. libzb measured it first: twelve messages, two
           // deletes, a replica that disagreed until reopened.
           let lastSeen = last;
           let holeFound = false;
@@ -3197,10 +3212,16 @@ export class ZeBridge {
             await new Promise((r) => setTimeout(r, 1000));
             try {
               const resumeFrom = this.globalSyncState.seq[streamName] ?? 0;
+              // The same filter as the first consumer (§10ja: the recreation used to drop
+              // it, and the tail then read every table on the stream).
+              const filters2 = this.cdcFilters(streamName);
               const ci2 = await jsm.consumers.add(streamName, {
                 deliver_policy: resumeFrom > 0 ? this.transport.deliverPolicy.byStartSequence : this.transport.deliverPolicy.all,
                 opt_start_seq: resumeFrom > 0 ? resumeFrom + 1 : undefined,
+                ...(filters2.length === 1 ? { filter_subject: filters2[0] } : {}),
+                ...(filters2.length > 1 ? { filter_subjects: filters2 } : {}),
               });
+              curName = ci2.name;
               const consumer2 = await js.consumers.get(streamName, ci2.name);
               curPending = ci2.num_pending ?? null;
               curIter = await consumer2.consume();
@@ -3293,10 +3314,18 @@ export class ZeBridge {
             if (Date.now() - lastMsgAt < 25_000) return;
             void (async () => {
               try {
-                const tail = (await jsm.streams.info(streamName))?.state?.last_seq ?? 0;
+                // §10ja: ask the CONSUMER, not the stream. "The stream's last sequence is
+                // past my position" is always true for a consumer filtered to this
+                // client's tables (other tables advance the stream), and for a stream
+                // whose messages all aged out — both read as deaf every 25 s, for ever.
+                // The consumer's own `num_pending` counts the messages it should hand
+                // over: some waiting and none delivered is deaf; none waiting is idle; a
+                // consumer the server no longer knows is gone, recreated as before.
                 const stored = this.globalSyncState.seq[streamName] ?? 0;
-                if (tail > stored) {
-                  this.appendLog('SYS', `${streamName}: consumer idle 25s while the stream advanced (stored ${stored}, tail ${tail}) — deaf; recreating`, 'WARNING');
+                let pending = -1;
+                try { pending = (await jsm.consumers.info(streamName, curName))?.num_pending ?? 0; } catch { /* gone */ }
+                if (pending !== 0) {
+                  this.appendLog('SYS', `${streamName}: consumer idle 25s with ${pending < 0 ? 'no consumer on the server' : `${pending} message(s) waiting`} (stored ${stored}) — deaf; recreating`, 'WARNING');
                   try { itRef.stop(); } catch { /* already ended */ }
                 }
               } catch { /* stream info unavailable mid-outage — keep waiting */ }
@@ -3305,7 +3334,7 @@ export class ZeBridge {
           try {
           for await (const msg of curIter) {
             lastMsgAt = Date.now();
-            if (lastSeen > 0 && msg.seq > lastSeen + 1) {
+            if (lastSeen > 0 && msg.seq > lastSeen + 1 && await this.prunedAfter(jsm, streamName, lastSeen)) {
               this.appendLog('SYS', `${streamName}: ${msg.seq - lastSeen - 1} message(s) pruned under the live consumer (position ${lastSeen}, delivered ${msg.seq}) — taking the gap: re-seeding the tables routed to it`, 'WARNING');
               holeFound = true;
               try { itRef.stop(); } catch { /* already ended */ }
