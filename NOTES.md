@@ -16551,7 +16551,13 @@ the device and had hidden it. `metro.config.js` serves the throwing stub for the
 browser-only specifiers (`@bokuweb/zstd-wasm`, `./pglite-storage.ts`,
 `./browser-storage.ts`).
 
-What this leaves: `zebridge_enable` creating the replica identity for read-only tables;
-libzb's live apply on random keys; the RN slowdown's cause; a libzb native module for
-RN; the benchmark tables `test_types_v4` / `test_types_v7` (~2.5 GB in PostgreSQL) are
-the owner's to keep or drop.
+**RN with libzb (same day).** A native module (examples/06-large-table/react-native,
+`modules/zb-native`: Expo Modules API, Swift, one serial queue) calls libzb's C ABI from
+React Native. Same iPhone 12, same table: **35.0 s**, against Flutter + libzb 34.7 /
+39.1 s and RN + zb-client-ts 518 s. The host framework costs nothing; RN's gap was all
+per-row JavaScript. libzb and expo-sqlite both carry SQLite, so libzb is prelinked
+(`ld -r -exported_symbol '_zb_*'`) and keeps its SQLite, zstd and nats private.
+
+What this leaves: libzb's live apply on random keys; the cause of the RN + TS slowdown.
+(Done the same day: the replica identity for read-only tables, f96cf47; the benchmark
+tables dropped.)

@@ -1,7 +1,8 @@
 # 06-large-table / react-native — one big table, seeded on a phone
 
-The same seed-only page as `../web`, on React Native through **zb-client-ts** — nothing
-of ours compiled for the phone (the host layer is `examples/08-map/native`'s:
+The same seed-only page as `../web`, on React Native, with two engines behind a toggle:
+**zb-client-ts** in JavaScript, and **libzb** (the C client, Zig inside) through a native
+module. The zb-client-ts engine has nothing of ours compiled for the phone (the host layer is `examples/08-map/native`'s:
 `src/platform.ts`, `src/expo-storage.ts`, `metro.config.js`, and its README explains
 each piece). bob follows `test_types` (3,055,002 rows on tenant globex), seeds it from
 the generation chain into expo-sqlite, and prints the three facts checked against
@@ -13,13 +14,15 @@ rows / distinct uid / sum(age)   →   3,055,002 / 3,055,002 / 138,916,285
 
 ## How the seed runs on a phone
 
-`seedStreaming: true` with fzstd as the streaming decompressor; the storage says
-`spillsTemp: true` (a real filesystem), so the client takes the **staged** path: every
-window appended to a TEMP table, the real table filled once by
-`INSERT … SELECT … ORDER BY pk` — SQLite sorting on disk, the b-tree built
-sequentially. Bounded RAM; about 3× the table on disk while it runs. The bar reaches
-100% when the stage is full; the sort and the insert run after that with `done` still
-false.
+zb-client-ts: `seedStreaming: true` with fzstd as the streaming decompressor. The
+producer writes every chain object in key order and says so (`"sorted": true` in the
+manifest), so each window goes straight into the table. A step without that flag takes
+the **staged** path instead, because the storage says `spillsTemp: true`: windows
+appended to a TEMP table, the real table filled once by `INSERT … SELECT … ORDER BY pk`.
+
+libzb: one `sync` call streams, inflates, decodes and applies in Zig, on the module's
+own queue. JS keeps the clock and asks for the facts. No bar: libzb reports nothing
+until `sync` returns. It has its own database file, `zebridge_bob_libzb.sqlite3`.
 
 ## Run it
 
@@ -31,7 +34,25 @@ Expo Go will not do — expo-sqlite is native, so this is a development build.
     EXPO_PUBLIC_CREDS="$(cat ../../../scripts/native/creds/bob.creds)" pnpm ios
     EXPO_PUBLIC_CREDS="$(cat ../../../scripts/native/creds/bob.creds)" pnpm android
 
-⚠️ `ws://`, not `nats://` — NATS over WebSocket, port 8080. The iOS simulator reaches
+For the libzb engine, build the library first, and give it the TCP URL too:
+
+    tool/build-libzb-ios.sh        # ../flutter's zig build, then prelinked → modules/zb-native/ios/ZbCore.xcframework
+    (cd ios && pod install)        # picks up modules/zb-native (ZbNative)
+    EXPO_PUBLIC_NATS_URL=ws://<mac>:8080 EXPO_PUBLIC_ZB_NATS_URL=nats://<mac>:4222 \
+    EXPO_PUBLIC_ZB_ENGINE=libzb EXPO_PUBLIC_CREDS="$(cat ../../../scripts/native/creds/bob.creds)" \
+      npx expo run:ios --device <udid> --configuration Release --no-bundler
+
+⚠️ The prelink is why libzb and expo-sqlite fit in one app. Both carry SQLite; linked
+as they are, the two copies clash, or libzb's calls land in expo's build.
+`ld -r -exported_symbol '_zb_*'` keeps libzb's SQLite, zstd and nats private to it.
+
+⚠️ Measure a Release build. Hermes compiles its bytecode ahead of time there, and the
+browser-only imports of zb-client-ts (PGlite, sqlite-wasm, zstd-wasm) are stubbed in
+`metro.config.js` because that compiler rejects their `import.meta`. If `expo run:ios`
+fails to install, `xcrun devicectl device install app --device <udid> <the .app>`.
+
+⚠️ `ws://`, not `nats://` — zb-client-ts speaks NATS over WebSocket, port 8080; libzb
+speaks TCP, port 4222. The iOS simulator reaches
 the Mac as `127.0.0.1`, the Android emulator as `10.0.2.2` (resolved at run time in
 `src/client.ts`); a real device needs the Mac's LAN address in `EXPO_PUBLIC_NATS_URL`.
 
@@ -46,7 +67,20 @@ One database, `zebridge_bob.sqlite3` in the app's SQLite directory, kept across
 launches: a second launch finds the table seeded and only tails. "wipe & seed again"
 deletes it and starts over.
 
-## Measured (2026-09-24, Expo SDK 52 / RN 0.76 / Hermes)
+## Measured on the iPhone 12, 2026-09-25 (sorted chain)
+
+| | connect → usable | replica |
+| --- | --- | --- |
+| **RN + libzb** (native module, Release) | **35.0 s** | 1.02 GB |
+| Flutter + libzb (`../flutter`) | 34.7 s, 39.1 s | 1.02 GB |
+| RN + zb-client-ts (Release) | 518 s | 1.04 GB |
+
+All three exact: 3,055,002 / 3,055,002 / 138,916,285. RN with libzb matches Flutter
+with libzb, so the host framework costs nothing; the 15× gap is per-row JavaScript on
+Hermes (no JIT): fzstd, msgpack, parameter arrays. The TS rate also fell as it went
+(7.1k → 5.4k rows/s per 500k), cause not measured. NOTES §10ja.
+
+## Measured (2026-09-24, Expo SDK 52 / RN 0.76 / Hermes, unsorted chain, staged)
 
 | | iPhone 17 simulator | Android emulator (API 36) | **iPhone 12 (A14, iOS 26.6)** |
 | --- | --- | --- | --- |

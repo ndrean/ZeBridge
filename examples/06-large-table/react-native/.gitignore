@@ -1,4 +1,6 @@
 node_modules/
-ios/
-android/
+/ios/
+/android/
 .expo/
+# built by tool/build-libzb-ios.sh
+modules/zb-native/ios/ZbCore.xcframework/

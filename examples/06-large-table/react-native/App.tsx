@@ -3,13 +3,16 @@
 /// TEMP table on the device's filesystem, sorted once by SQLite into the real table.
 /// Nothing else — no mutation. The three facts at the end (rows, distinct keys, a sum)
 /// are the ones the Node, libzb and browser seeds are checked with against PostgreSQL,
-/// so a run here is a measurement.
+/// so a run here is a measurement. The toggle at the top runs the same seed through
+/// libzb instead (src/libzb-seed.tsx, a native module): same phone, same table, the
+/// engine is the only difference.
 import { useEffect, useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as FileSystem from 'expo-file-system';
 import { defaultDatabaseDirectory } from 'expo-sqlite';
 import type { ConnStatus, Phase, SeedProgress, ZeBridge } from 'zb-client-ts';
 import { makeClient, PRINCIPAL, TABLE } from './src/client';
+import { LibzbSeed } from './src/libzb-seed';
 
 const fmt = (n: number) => n.toLocaleString('en-US');
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
@@ -17,7 +20,25 @@ type Line = { text: string; err: boolean };
 type Facts = { count: number; distinct?: number; sum?: number; dbBytes?: number };
 const PHASES: [Phase, string][] = [['connected', 'NATS'], ['migrated', 'schema'], ['snapshot', 'snapshot'], ['cdc', 'CDC']];
 
+type Engine = 'ts' | 'libzb';
+
 export default function App() {
+  const [engine, setEngine] = useState<Engine>(process.env.EXPO_PUBLIC_ZB_ENGINE === 'libzb' ? 'libzb' : 'ts');
+  return (
+    <View style={s.root}>
+      <View style={s.engines}>
+        {(['ts', 'libzb'] as const).map((e) => (
+          <Pressable key={e} onPress={() => setEngine(e)} style={[s.engine, engine === e && s.engineOn]}>
+            <Text style={[s.engineText, engine === e && s.engineTextOn]}>{e === 'ts' ? 'zb-client-ts' : 'libzb'}</Text>
+          </Pressable>
+        ))}
+      </View>
+      {engine === 'ts' ? <TsSeed /> : <LibzbSeed />}
+    </View>
+  );
+}
+
+function TsSeed() {
   const zbRef = useRef<ZeBridge | null>(null);
   const [status, setStatus] = useState<ConnStatus>('disconnected');
   const [phase, setPhase] = useState<Record<Phase, boolean>>({ connected: false, migrated: false, snapshot: false, cdc: false });
@@ -107,7 +128,7 @@ export default function App() {
     : phase.cdc ? 'no seed needed — the table was already in the replica' : 'waiting for the first window…';
 
   return (
-    <View style={s.root}>
+    <View style={{ flex: 1 }}>
       <View style={s.head}>
         <Text style={s.title}>ZeBridge — one large table</Text>
         <Text style={[s.badge, s[status]]}>{status}</Text>
@@ -161,6 +182,11 @@ const Fact = ({ k, v }: { k: string; v: string }) => (
 
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#121212', paddingTop: 56, paddingHorizontal: 14 },
+  engines: { flexDirection: 'row', marginBottom: 10 },
+  engine: { flex: 1, paddingVertical: 6, alignItems: 'center', backgroundColor: '#2b2b2b', borderWidth: 1, borderColor: '#3a3a3a' },
+  engineOn: { backgroundColor: '#0d47a1' },
+  engineText: { color: '#888', fontSize: 12 },
+  engineTextOn: { color: '#e3f2fd', fontWeight: '700' },
   head: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   title: { color: '#e0e0e0', fontSize: 18, fontWeight: '700' },
   badge: { paddingHorizontal: 7, paddingVertical: 2, borderRadius: 4, fontSize: 12, fontWeight: '700', overflow: 'hidden' },
