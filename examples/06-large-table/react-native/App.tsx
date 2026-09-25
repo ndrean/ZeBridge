@@ -47,6 +47,9 @@ function TsSeed() {
   const [progress, setProgress] = useState<SeedProgress | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [seedMs, setSeedMs] = useState<number | null>(null);
+  /// Rows of every finished step: a chain can be a full and a delta, and the rate is
+  /// over all of them (the last step alone — a 12-row delta — read as 0 rows/s).
+  const [seedRows, setSeedRows] = useState(0);
   const [facts, setFacts] = useState<Facts | null>(null);
   const [lines, setLines] = useState<Line[]>([]);
   const [busy, setBusy] = useState(false);
@@ -76,6 +79,8 @@ function TsSeed() {
     setElapsed(0);
     setRunning(true);
     let seedT0 = 0;
+    let rowsDone = 0;
+    setSeedRows(0);
     const dbDir = defaultDatabaseDirectory.startsWith('file://') ? defaultDatabaseDirectory : `file://${defaultDatabaseDirectory}`;
     const rec = TRACE ? makeRecorder(`${dbDir}/${zb.dbName}`) : null;
     const stopClock = () => setRunning(false);
@@ -110,7 +115,7 @@ function TsSeed() {
         if (!seedT0) { seedT0 = Date.now(); rec?.start(); }
         void rec?.progress(p.applied, p.done);
         setProgress(p);
-        if (p.done) setSeedMs(Date.now() - seedT0);
+        if (p.done) { rowsDone += p.total; setSeedRows(rowsDone); setSeedMs(Date.now() - seedT0); }
       }),
       zb.onLog((topic, data, level) => {
         if (topic !== 'SYS') return;
@@ -158,7 +163,7 @@ function TsSeed() {
         </View>
         <Text style={s.detail}>{detail}</Text>
         {seedMs !== null && progress && (
-          <Text style={s.detail}>seed {secs(seedMs)} · {fmt(Math.round(progress.total / (seedMs / 1000)))} rows/s</Text>
+          <Text style={s.detail}>seed {secs(seedMs)} · {fmt(seedRows)} rows · {fmt(Math.round(seedRows / (seedMs / 1000)))} rows/s</Text>
         )}
       </View>
 

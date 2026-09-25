@@ -74,6 +74,8 @@ export default function App() {
   const [progress, setProgress] = createSignal<SeedProgress | null>(null);
   const [elapsed, setElapsed] = createSignal(0);
   const [seedMs, setSeedMs] = createSignal<number | null>(null);
+  // Rows of every finished step (a full and a delta): the last step alone read as 0 rows/s.
+  const [seedRows, setSeedRows] = createSignal(0);
   const [facts, setFacts] = createSignal<Facts | null>(null);
   const [lines, setLines] = createSignal<Line[]>([]);
   const [busy, setBusy] = createSignal(false);
@@ -95,7 +97,7 @@ export default function App() {
     if (p.table !== TABLE) return;
     if (!seedT0) seedT0 = performance.now();
     setProgress(p);
-    if (p.done) setSeedMs(performance.now() - seedT0);
+    if (p.done) { setSeedRows(seedRows() + p.total); setSeedMs(performance.now() - seedT0); }
   });
   zb.onLog((topic, data, level) => {
     if (topic !== 'SYS') return;
@@ -170,7 +172,7 @@ export default function App() {
             </Show>
           </span>
           <span>
-            <Show when={seedMs() !== null}>seed {secs(seedMs()!)} · {fmt(Math.round(progress()!.total / (seedMs()! / 1000)))} rows/s</Show>
+            <Show when={seedMs() !== null}>seed {secs(seedMs()!)} · {fmt(seedRows())} rows · {fmt(Math.round(seedRows() / (seedMs()! / 1000)))} rows/s</Show>
           </span>
         </div>
       </div>
