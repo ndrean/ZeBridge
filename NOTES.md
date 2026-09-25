@@ -16565,7 +16565,8 @@ on the iPhone 12. JS is 85–90 % of it: 13.0 s per 100k early, 15.7 s by 2.6M. 
 ~280 GCs per 100k, and Hermes reports GC time near zero. Only the CPU time of the same
 work grows. The phone then locked for two minutes (iOS suspended the app), and right
 after it JS ran at 10.5 s per 100k, faster than at the start. The run: 573.8 s connect →
-usable with the pause, about 455 s without it.
+usable with the pause, about 455 s without it. A rerun without a pause: seed 426.8 s, connect →
+seeded 434 s, JS 11.1 → 13.5 s per 100k, SQLite flat.
 
 The base cost is the per-row pipeline: Hermes allocated 32 GB for 3M rows (~10 KB and
 ~130 µs of JS per row) — stacked async iterators, one `await` per row per layer (Babel
@@ -16575,6 +16576,8 @@ stays out of reach.
 
 What this leaves: libzb's live apply on random keys; a batched row decode in
 zb-client-ts; `wipe()` racing a `connect()` in progress (`libzb.ts` reads `this.nc` after
-`close()` nulled it: a harmless TypeError in the log).
+`close()` nulled it: a harmless TypeError in the log); a filtered consumer that never received a
+message keeps position 0, so every launch logs "Gap detected" on `CDC_PUBLIC` and
+re-plans from the watermark (0 rows, ~100 ms): advance the position when caught up.
 (Done the same day: the replica identity for read-only tables, f96cf47; the benchmark
 tables dropped.)

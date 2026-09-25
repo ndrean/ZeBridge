@@ -14,6 +14,7 @@ import type { ConnStatus, Phase, SeedProgress, ZeBridge } from 'zb-client-ts';
 import { makeClient, PRINCIPAL, TABLE } from './src/client';
 import { LibzbSeed } from './src/libzb-seed';
 import { makeRecorder, TRACE } from './src/seed-trace';
+import { fileLog } from './src/app-log';
 
 const fmt = (n: number) => n.toLocaleString('en-US');
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
@@ -78,7 +79,8 @@ function TsSeed() {
     const dbDir = defaultDatabaseDirectory.startsWith('file://') ? defaultDatabaseDirectory : `file://${defaultDatabaseDirectory}`;
     const rec = TRACE ? makeRecorder(`${dbDir}/${zb.dbName}`) : null;
     const stopClock = () => setRunning(false);
-    const log = (text: string, err = false) => setLines((prev) => [...prev.slice(-199), { text, err }]);
+    const log = (text: string, err = false) => { fileLog('ts', text, err); setLines((prev) => [...prev.slice(-199), { text, err }]); };
+    log(`— start (${PRINCIPAL}, ${TABLE})`);
 
     /// After the table is usable: the three facts (`SELECT count(*), count(DISTINCT uid),
     /// sum(age) FROM test_types` on the tenant — 3,055,002 / 3,055,002 / 138,916,285 on

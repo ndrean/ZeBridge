@@ -8,6 +8,7 @@ import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-n
 import * as FileSystem from 'expo-file-system';
 import Zb from '../modules/zb-native';
 import { PRINCIPAL, TABLE } from './client';
+import { fileLog } from './app-log';
 
 /// libzb speaks NATS over TCP (4222), not WebSocket: its own URL.
 const HOST = Platform.OS === 'android' ? '10.0.2.2' : '127.0.0.1';
@@ -42,8 +43,9 @@ export function LibzbSeed() {
 
   useEffect(() => {
     let closed = false;
-    const log = (text: string, err = false) => setLines((prev) => [...prev.slice(-199), { text, err }]);
+    const log = (text: string, err = false) => { fileLog('libzb', text, err); setLines((prev) => [...prev.slice(-199), { text, err }]); };
     setFacts(null); setLines([]); setPhase('starting');
+    log(`— start (${PRINCIPAL}, ${TABLE})`);
     (async () => {
       if (!CREDS) throw new Error("set EXPO_PUBLIC_CREDS to the principal's creds file contents");
       // libzb wants a creds FILE; the text is an app secret baked in at build time.

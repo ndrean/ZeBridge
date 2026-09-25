@@ -87,6 +87,8 @@ JS, Hermes GC and heap, WAL size, every 100k rows — to the app's Documents:
     xcrun devicectl device copy from --device <udid> --domain-type appDataContainer \
       --domain-identifier dev.zebridge.largetable --source Documents/seed-trace.tsv --destination .
 
+The screen's log goes to `Documents/app-log.txt` the same way (both engines, timestamped).
+
 Keep the screen on while measuring: a locked phone suspends the app and the pause
 lands in the time.
 
