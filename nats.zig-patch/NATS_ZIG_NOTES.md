@@ -777,6 +777,7 @@ number.
 | 16 | §14 | objstore-max-age |
 | 17 | §15 | jetstream-domain |
 | 18 | §18 | fetch-idle-after-first |
+| 19 | §19 | creds-content |
 
 Hunk and file counts quoted in older entries describe the old files; the series' own
 counts are in each file. `check-series.sh` and `new-patch.sh` are the workflow from here.
@@ -799,4 +800,42 @@ the kind of anachronism only a per-state build catches. One unit test is flaky: 
 once in ~4–6 runs, at a different state each time and on the unchanged final tree too, so
 it is not the series; six further runs passed and it never printed its name. Recorded, not
 hidden.
+
+## 19. Credentials from memory, not only from a file (2026-09-25)
+
+**How it appeared**
+
+ZeBridge gives both of its clients one option vocabulary (§10ja), and zb-client-ts
+takes the credentials as text: a browser or a phone app holds what `/enroll` returned
+and has no file to point at. libzb could only pass `user_creds`, a path, so the Flutter
+and React Native apps wrote the creds to disk first just to have one. nats.zig parses a
+.creds file's content already (`creds.parse`); only the option to hand it over was
+missing.
+
+**Change** (`19-nats.zig-creds-content.patch`, 4 hunks, 2 files)
+
+`src/connection.zig` — `user_creds_content: ?[]const u8`: the content of a .creds file,
+owned by the caller and kept alive for the connection (every handshake reads it). Used
+when `user_creds` is not set, in both places `user_creds` is read: the up-front check
+(a malformed content fails before dialing, like an unreadable file) and the handshake.
+
+`tests/auth_test.zig` — "jwt credentials content authentication" (the fixture's bytes,
+against the JWT server) and "malformed credentials content fails before connecting".
+
+**Verified**
+
+```bash
+nats.zig-patch/new-patch.sh creds-content
+# wrote 19-nats.zig-creds-content.patch (4 hunks, 2 files)
+# ✅ 19 patches: upstream d4cd40d + series == working tree (src, tests)
+```
+
+`zig build test-unit`: 135/135 on the first run; on a second run one TLS reconnect test
+timed out (a handshake timeout under load, nothing of this patch). The e2e suite did not
+run: on OrbStack its `waitForHealthyServices` timed out at 10 s with all ten containers
+reporting healthy, and `beforeAll`'s `docker compose up -d` started nothing until run by
+hand — an environment problem, recorded, not fixed here. The two new tests are
+therefore unrun; the live proof is ZeBridge's: libzb connecting to the dev stack with
+`"creds": <bob.creds text>` synced as bob on tenant globex, and garbage content was
+refused before any socket (`MissingUserJwt`).
 

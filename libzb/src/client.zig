@@ -36,6 +36,8 @@ pub fn grammarHashHex(buf: *[64]u8) []const u8 {
 pub const Options = struct {
     url: []const u8,
     creds_path: []const u8,
+    /// The credentials as text — the option both clients call `creds`. Empty: none.
+    creds: []const u8 = "",
     /// The grammar hash the host RECEIVED — from the /enroll payload beside the JWT, or
     /// GET /grammar's header. When set, a mismatch refuses to open: this library is
     /// built for another protocol than the bridge it is pointed at. Unset skips the
@@ -378,7 +380,7 @@ pub const SyncClient = struct {
             try std.fmt.allocPrint(self.aa(), "_INBOX.{s}", .{opts.principal})
         else
             "_INBOX";
-        self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = if (opts.creds_path.len > 0) opts.creds_path else null, .inbox_prefix = inbox_prefix, .js_domain = opts.js_domain });
+        self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = if (opts.creds_path.len > 0) opts.creds_path else null, .creds = if (opts.creds.len > 0) opts.creds else null, .inbox_prefix = inbox_prefix, .js_domain = opts.js_domain });
         errdefer self.t.deinit();
 
         return self;

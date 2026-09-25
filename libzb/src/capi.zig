@@ -34,7 +34,7 @@
 //!   char* zb_client_reply(uint64_t h, uint64_t id, const char* answer_json);  // §10hp: answer one request from poll
 //!   char* zb_client_join(uint64_t h, const char* tenant);          // {"tenants":[…]} — follow one more tenant (§10fn)
 //!   char* zb_client_leave(uint64_t h, const char* tenant);         // {"tenants":[…]} — drop one: its rows, watermarks, tail
-//! `opts_json`: natsUrl, credsPath, dbPath, principal, tables (array, parents first — or
+//! `opts_json`: natsUrl, creds (the .creds text) or credsPath (a file), dbPath, principal, tables (array, parents first — or
 //! the string "*": every published table, §10hn; absent: nothing is followed),
 //! ondemandTables (§10hj: schema yes, seed and tail no — filled by `zb_client_ingest`;
 //! a name in both lists is on-demand),
@@ -429,6 +429,7 @@ const ClientBox = struct {
     c: *client.SyncClient,
     url: [:0]u8,
     creds: [:0]u8,
+    creds_text: []u8,
     grammar_hash: ?[]u8,
     js_domain: ?[]u8,
     db: [:0]u8,
@@ -442,6 +443,8 @@ const ClientBox = struct {
         self.c.deinit();
         a.free(self.url);
         a.free(self.creds);
+        std.crypto.secureZero(u8, self.creds_text); // a secret: not left in freed memory
+        a.free(self.creds_text);
         if (self.grammar_hash) |g| a.free(g);
         if (self.js_domain) |d| a.free(d);
         a.free(self.db);
@@ -538,6 +541,10 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     errdefer a.free(url);
     const creds = try a.dupeZ(u8, str.get(o, "credsPath", ""));
     errdefer a.free(creds);
+    // "creds": the credentials as text (what /enroll hands an app) — the same option as
+    // zb-client-ts's. Kept for the connection's life: every reconnect reads it.
+    const creds_text = try a.dupe(u8, str.get(o, "creds", ""));
+    errdefer a.free(creds_text);
     // "grammarHash": what the host received beside its creds (§10dq). Empty = unchecked.
     const gh_raw = str.get(o, "grammarHash", "");
     const grammar_hash: ?[]u8 = if (gh_raw.len > 0) try a.dupe(u8, gh_raw) else null;
@@ -627,6 +634,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         .c = try client.SyncClient.init(a, .{
             .url = url,
             .creds_path = creds,
+            .creds = creds_text,
             .grammar_hash = grammar_hash,
             .js_domain = js_domain,
             .heartbeat_ms = heartbeat_ms,
@@ -644,6 +652,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         }),
         .url = url,
         .creds = creds,
+        .creds_text = creds_text,
         .grammar_hash = grammar_hash,
         .js_domain = js_domain,
         .db = db,

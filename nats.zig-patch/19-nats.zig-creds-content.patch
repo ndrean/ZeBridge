@@ -1,0 +1,79 @@
+diff --git a/src/connection.zig b/src/connection.zig
+index 3bff17b..3ea3913 100644
+--- a/src/connection.zig
++++ b/src/connection.zig
+@@ -416,6 +416,11 @@ pub const ConnectionOptions = struct {
+     /// credentials are picked up automatically. Takes precedence over
+     /// `user_jwt` and `nkey_seed`.
+     user_creds: ?[]const u8 = null,
++    /// The CONTENTS of a credentials (.creds) file, for a host that holds them in
++    /// memory (an app that received them at enrollment) rather than on disk. Used when
++    /// `user_creds` is not set; the caller owns the bytes and keeps them alive for the
++    /// connection's lifetime (every handshake reads them).
++    user_creds_content: ?[]const u8 = null,
+     /// User JWT to present in CONNECT. Requires `nkey_seed` or
+     /// `nkey_sign_cb` for signing the server nonce.
+     user_jwt: ?[]const u8 = null,
+@@ -706,6 +711,10 @@ pub const Connection = struct {
+             const credentials = try creds_mod.parse(content);
+             var seed_kp = try nkeys.SeedKeyPair.fromSeed(credentials.seed);
+             seed_kp.wipe();
++        } else if (self.options.user_creds_content) |content| {
++            const credentials = try creds_mod.parse(content);
++            var seed_kp = try nkeys.SeedKeyPair.fromSeed(credentials.seed);
++            seed_kp.wipe();
+         } else {
+             if (self.options.user_jwt != null and self.options.nkey_seed == null and self.options.nkey_sign_cb == null) {
+                 // A JWT alone cannot authenticate; the nonce must be signed.
+@@ -2339,6 +2348,10 @@ pub const Connection = struct {
+             const credentials = try creds_mod.parse(content);
+             jwt = credentials.jwt;
+             signing_seed = credentials.seed;
++        } else if (self.options.user_creds_content) |content| {
++            const credentials = try creds_mod.parse(content);
++            jwt = credentials.jwt;
++            signing_seed = credentials.seed;
+         } else if (self.options.user_jwt) |user_jwt| {
+             jwt = user_jwt;
+             signing_seed = self.options.nkey_seed;
+diff --git a/tests/auth_test.zig b/tests/auth_test.zig
+index d8396b2..7a4ec7f 100644
+--- a/tests/auth_test.zig
++++ b/tests/auth_test.zig
+@@ -240,6 +240,36 @@ test "jwt credentials file authentication" {
+     try conn.flush();
+ }
+ 
++test "jwt credentials content authentication" {
++    const io = std.testing.io;
++
++    // The same fixture, handed over as bytes: an app that holds its creds in memory.
++    const content = try std.Io.Dir.cwd().readFileAlloc(io, test_creds_path, std.testing.allocator, .limited(1024 * 1024));
++    defer std.testing.allocator.free(content);
++
++    const opts = nats.ConnectionOptions{
++        .user_creds_content = content,
++    };
++
++    const conn = try utils.createConnection(io, .jwt_auth, opts);
++    defer utils.closeConnection(conn);
++
++    try conn.publish("test.auth.jwt.content", "jwt content authenticated");
++    try conn.flush();
++}
++
++test "malformed credentials content fails before connecting" {
++    const io = std.testing.io;
++
++    const opts = nats.ConnectionOptions{
++        .user_creds_content = "not a creds file",
++    };
++
++    // Even the unused port works here: the content is parsed before dialing.
++    const result = utils.createConnection(io, .unknown, opts);
++    try std.testing.expect(std.meta.isError(result));
++}
++
+ test "jwt inline with nkey seed authentication" {
+     const io = std.testing.io;
+ 

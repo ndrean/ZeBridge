@@ -12,6 +12,9 @@ pub const ConnectOptions = struct {
     url: []const u8,
     /// Path to a .creds file (operator/JWT mode) — wins over user/password.
     creds_path: ?[]const u8 = null,
+    /// The same credentials as TEXT, for a host that holds them in memory (nats.zig
+    /// patch 19). Used when `creds_path` is not set; must outlive the connection.
+    creds: ?[]const u8 = null,
     user: ?[]const u8 = null,
     password: ?[]const u8 = null,
     /// §10hm: the prefix of every inbox this connection generates — reply subjects,
@@ -180,6 +183,7 @@ pub const Transport = struct {
         errdefer allocator.destroy(self.conn);
         self.conn.* = nats.Connection.init(allocator, io, .{
             .user_creds = opts.creds_path,
+            .user_creds_content = opts.creds,
             .user = opts.user,
             .password = opts.password,
             .inbox_prefix = opts.inbox_prefix,
