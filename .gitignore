@@ -97,3 +97,6 @@ examples/08-map/poi-ocm.json
 # Python bytecode, anywhere (the three per-directory rules above are covered by this one)
 __pycache__/
 *.pyc
+
+# Lockfiles stay local (2026-09-26): every example and package regenerates its own with pnpm install.
+pnpm-lock.yaml
