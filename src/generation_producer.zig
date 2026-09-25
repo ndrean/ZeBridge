@@ -999,6 +999,12 @@ pub const GenerationProducer = struct {
             defer c.PQclear(res);
             break :blk if (c.PQntuples(res) > 0) try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0))) else "*";
         };
+        // §10ja: every chain object is written in primary-key order. A replica's key index
+        // then takes each window as an append instead of a scatter — measured in Node on
+        // 3M rows, one window at a time: 115 s arriving in heap order on random keys, 21 s
+        // arriving sorted — and a client need not stage and re-sort what PostgreSQL can
+        // hand over in order, once per object instead of once per client.
+        const order_by = try pkOrderBy(alloc, pgc, table_z);
 
         // ── last generation and last full, from the producer's own memory ────
         var last_gen: i64 = 0;
@@ -1584,9 +1590,9 @@ pub const GenerationProducer = struct {
             // full was 15 MiB for four live rows. The DELTA keeps its tombstoned rows:
             // that is the delete signal for a client catching up.
             const sql = if (tcol.len > 0)
-                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ cols_sel, table, tcol })
+                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL{s}", .{ cols_sel, table, tcol, order_by })
             else
-                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
+                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"{s}", .{ cols_sel, table, order_by });
             const t_f = utils.unixMillis();
             full_obj = try putChainObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol, "full", null);
             ph.full += utils.unixMillis() - t_f;
@@ -1602,7 +1608,7 @@ pub const GenerationProducer = struct {
         var delta_obj: ?FullObject = null;
         var delta_rows: usize = 0;
         if (build_delta) {
-            const sql = try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" >= {s}", .{ cols_sel, table, vcol, lower_bound.? });
+            const sql = try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" >= {s}{s}", .{ cols_sel, table, vcol, lower_bound.?, order_by });
             const delta_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-delta", .{ table, gen });
             const t_q = utils.unixMillis();
             delta_obj = try putChainObject(alloc, self.allocator, pgc, &store, delta_name, sql, gen, cutoff_version, vcol, "delta", last_cutoff);
@@ -1640,9 +1646,9 @@ pub const GenerationProducer = struct {
             log.info("🧬 '{s}'/'{s}': the delta carries {d} of the table's {d} row(s) — a full is cheaper for every client catching up; cutting one alongside", .{ tenant, table, delta_rows, table_rows });
             build_full = true;
             const sql = if (tcol.len > 0)
-                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ cols_sel, table, tcol })
+                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL{s}", .{ cols_sel, table, tcol, order_by })
             else
-                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
+                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"{s}", .{ cols_sel, table, order_by });
             const t_f = utils.unixMillis();
             full_obj = try putChainObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol, "full", null);
             ph.full += utils.unixMillis() - t_f;
@@ -1991,6 +1997,12 @@ pub const GenerationProducer = struct {
             defer c.PQclear(res);
             break :blk if (c.PQntuples(res) > 0) try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0))) else "*";
         };
+        // §10ja: every chain object is written in primary-key order. A replica's key index
+        // then takes each window as an append instead of a scatter — measured in Node on
+        // 3M rows, one window at a time: 115 s arriving in heap order on random keys, 21 s
+        // arriving sorted — and a client need not stage and re-sort what PostgreSQL can
+        // hand over in order, once per object instead of once per client.
+        const order_by = try pkOrderBy(alloc, pgc, table_z);
 
         // ── the snapshot, taken right after the pair's newest generation ──────
         var gen_l: i64 = 0;
@@ -2104,11 +2116,11 @@ pub const GenerationProducer = struct {
         const obj_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-{s}", .{ table, gen_l, if (j.kind == .checkpoint) "ckpt" else "full" });
         const sql = if (j.kind == .checkpoint) blk: {
             const lower_lit = try std.mem.replaceOwned(u8, alloc, ckpt_lower, "'", "''");
-            break :blk try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" >= '{s}'::timestamptz", .{ cols_sel, table, j.vcol, lower_lit });
+            break :blk try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" >= '{s}'::timestamptz{s}", .{ cols_sel, table, j.vcol, lower_lit, order_by });
         } else if (j.tcol.len > 0)
-            try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ cols_sel, table, j.tcol })
+            try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL{s}", .{ cols_sel, table, j.tcol, order_by })
         else
-            try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
+            try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"{s}", .{ cols_sel, table, order_by });
         var full_rows: usize = 0;
         // §10gi: written to the store while COPY reads, inside the snapshot.
         const bucket = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.generation_bucket_prefix, tenant });
@@ -2631,6 +2643,21 @@ fn FullStreamOf(comptime Source: type) type {
     };
 }
 const FullStream = FullStreamOf(CopyReader);
+
+/// §10ja: ` ORDER BY "k1", "k2"` for the table's primary key, in index order — empty
+/// when there is none (the producer only follows tables that have one).
+fn pkOrderBy(alloc: std.mem.Allocator, pgc: *c.PGconn, table_z: [:0]const u8) ![]const u8 {
+    const params = [_]?[*:0]const u8{table_z.ptr};
+    const res = try GenerationProducer.queryOnePub(pgc, "SELECT COALESCE(string_agg(quote_ident(a.attname), ', ' ORDER BY k.ord), '') " ++
+        "FROM pg_index i JOIN pg_class cl ON cl.oid = i.indrelid JOIN pg_namespace ns ON ns.oid = cl.relnamespace " ++
+        "CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) " ++
+        "JOIN pg_attribute a ON a.attrelid = cl.oid AND a.attnum = k.attnum " ++
+        "WHERE ns.nspname = 'public' AND cl.relname = $1 AND i.indisprimary", &params);
+    defer c.PQclear(res);
+    const cols = std.mem.span(c.PQgetvalue(res, 0, 0));
+    if (cols.len == 0) return "";
+    return try std.fmt.allocPrint(alloc, " ORDER BY {s}", .{cols});
+}
 
 fn compressZstd(alloc: std.mem.Allocator, src: []const u8, level: c_int) ![]u8 {
     const bound = c.ZSTD_compressBound(src.len);

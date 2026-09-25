@@ -956,7 +956,7 @@ carried, and repetition is free — every row is a version-guarded upsert or a d
 | | where | why |
 | --- | --- | --- |
 | **Manifest** | `generations` KV, key `<tenant>.<table>` | One small JSON document naming the chain: the base, the checkpoints, the deltas, the cutoff. Last-value-per-key makes discovery one read. |
-| **Objects** | `gen-<tenant>` object store | The payloads: MessagePack rows in a **zstd frame** — detected by the standard 4-byte magic (`28 B5 2F FD`), never by a manifest field, so a manifest referencing objects from both eras stays readable and no object is ever rewritten. Chunked by the object store itself (128 KB): no NATS `max_payload` limit applies to a seed. |
+| **Objects** | `gen-<tenant>` object store | The payloads: MessagePack rows **in primary-key order** in a **zstd frame** — detected by the standard 4-byte magic (`28 B5 2F FD`), never by a manifest field, so a manifest referencing objects from both eras stays readable and no object is ever rewritten. Chunked by the object store itself (128 KB): no NATS `max_payload` limit applies to a seed. |
 
 ⚠️ **Every level is written as a stream** — COPY reads, MessagePack encodes, zstd
 compresses and the object store uploads, all at once, so the producer never holds a whole
