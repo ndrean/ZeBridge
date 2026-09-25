@@ -573,7 +573,8 @@ def run(tmp: pathlib.Path, tls: bool, seconds: int, rate: int, index: bool = Fal
         fell_during = sum(1 for l in lines if "fell off" in l and "during the build" in l and f"'{TABLE}'" in l)
         cut_pat = re.compile(rf"g(\d+) for '_default'/'{TABLE}': ([a-z+]+) → .* in (\d+) ms")
         # §10gx: both artifacts are one streamed phase now (count, copy, encode, zstd, upload).
-        ph_pat = re.compile(r"phases: full \(count\+copy\+encode\+zstd\+upload\) (\d+) ms, delta \(count\+copy\+encode\+zstd\+upload\) (\d+) ms, dictionary (\d+) ms — (\d+) full row\(s\), (\d+) delta row")
+        # §10iy: no dictionary phase any more (the line lost it 2026-09-24).
+        ph_pat = re.compile(r"phases: full \(count\+copy\+encode\+zstd\+upload\) (\d+) ms, delta \(count\+copy\+encode\+zstd\+upload\) (\d+) ms — (\d+) full row\(s\), (\d+) delta row")
         cuts = []
         for i, l in enumerate(lines):
             m = cut_pat.search(l)
@@ -581,7 +582,7 @@ def run(tmp: pathlib.Path, tls: bool, seconds: int, rate: int, index: bool = Fal
                 ph = ph_pat.search(lines[i + 1])
                 if ph:
                     cuts.append({"gen": int(m.group(1)), "kind": m.group(2), "build": int(m.group(3)), "upload": 0, "query": int(ph.group(2)),
-                                 "full": int(ph.group(1)), "full_rows": int(ph.group(4)), "delta_rows": int(ph.group(5))})
+                                 "full": int(ph.group(1)), "full_rows": int(ph.group(3)), "delta_rows": int(ph.group(4))})
         (run_dir / "rss.csv").write_text("unix_s,rss_kib\n" + "".join(f"{t:.1f},{k}\n" for t, k in zip(sampler.rss_t, sampler.rss_kib)))
         verified = verify_chain(cli, run_dir, load_end) if VERIFY else None
         if client_thread is not None:

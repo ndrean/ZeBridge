@@ -1745,7 +1745,13 @@ pub const GenerationProducer = struct {
         };
         defer kv.deinit();
         const key = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ tenant, table });
-        const seq_frag: []const u8 = if (cutoff_seq > 0)
+        // §10ja: whenever the stream was READ — its `created` is set — even at seq 0. A
+        // chain cut on an empty, brand-new stream says "0": a client that later finds the
+        // stream starting past 1 knows this chain predates it and waits for the next one.
+        // Without the field that client could not tell, took the tail from the oldest
+        // message left, and never applied what had been pruned (the firehose at 50k,
+        // libzb opened 30 s in: 2,065 messages, a hole in the replica).
+        const seq_frag: []const u8 = if (stream_created.len > 0)
             try std.fmt.allocPrint(alloc, "\"cutoff_seq\":{d},\"cdc_stream\":\"{s}\",\"cdc_stream_created\":\"{s}\",", .{ cutoff_seq, cdc_stream, stream_created })
         else
             "";

@@ -1802,7 +1802,10 @@ pub const SyncClient = struct {
         // cut before a recreate: its seq means nothing here and gates nothing. Without
         // the field, the `restarted` heuristic (cutoff beyond last_seq) stands in.
         var gate_seq: i64 = cutoff_seq;
-        if (cdc_stream.len > 0 and cutoff_seq > 0) {
+        // §10ja (core.ts's shell): checked whenever the field is PRESENT, 0 included — a
+        // chain cut on an empty stream predates a stream that now starts past 1.
+        const has_cutoff_seq = man.object.get("cutoff_seq") != null;
+        if (cdc_stream.len > 0 and has_cutoff_seq) {
             if (self.t.js.getStreamInfo(cdc_stream)) |info_c| {
                 var info = info_c;
                 defer info.deinit();

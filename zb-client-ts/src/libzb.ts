@@ -2591,7 +2591,11 @@ export class ZeBridge {
     // What the seed gate may anchor on: the manifest's cutoff_seq — unless the stream
     // restarted under us and this manifest predates the restart (see `restarted`).
     let gateSeq = typeof manifest.cutoff_seq === 'number' && manifest.cutoff_seq > 0 ? manifest.cutoff_seq : 0;
-    if (typeof manifest.cutoff_seq === 'number' && manifest.cutoff_seq > 0 && manifest.cdc_stream) {
+    // §10ja: checked whenever the field is PRESENT — 0 included. A chain cut on an empty,
+    // brand-new stream says 0, and on a stream that now starts past 1 it predates it: the
+    // events between were pruned, and seeding it then tailing from the oldest message left
+    // would leave them out for good.
+    if (typeof manifest.cutoff_seq === 'number' && manifest.cutoff_seq >= 0 && manifest.cdc_stream) {
       try {
         const jsm = await this.transport.jetstreamManager(this.nc!, this.jsOpts());
         const info = await jsm.streams.info(manifest.cdc_stream);

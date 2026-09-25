@@ -211,7 +211,8 @@ def run(tmp: pathlib.Path, tls: bool, index: bool | None = None) -> dict:
         full = None
         deadline = time.perf_counter() + float(os.environ.get("ZB_CHAIN_WAIT", "300"))
         pat = re.compile(r"g(\d+) for '[^']*'/'bench_users': [a-z+]*full .* in (\d+) ms")
-        phases = re.compile(r"phases: copy\+decode\+encode (\d+) ms, dictionary (\d+) ms, zstd (\d+) ms, upload (\d+) ms — (\d+) full row")
+        # §10gx/§10iy: one streamed phase (count, copy, encode, zstd, upload), no dictionary.
+        phases = re.compile(r"phases: full \(count\+copy\+encode\+zstd\+upload\) (\d+) ms, delta \(count\+copy\+encode\+zstd\+upload\) (\d+) ms — (\d+) full row")
         sizes = re.compile(r"'bench_users': g\d+ [a-z+]*full (\d+) -> (\d+) bytes")
         while time.perf_counter() < deadline and full is None:
             lines = log.read_text(errors="replace").splitlines()
@@ -221,15 +222,15 @@ def run(tmp: pathlib.Path, tls: bool, index: bool | None = None) -> dict:
                     continue
                 for nxt in lines[i + 1:i + 4]:
                     ph = phases.search(nxt)
-                    if ph and int(ph.group(5)) >= TOTAL:
+                    if ph and int(ph.group(3)) >= TOTAL:
                         size = None
                         for prev in reversed(lines[max(0, i - 4):i + 1]):
                             sm = sizes.search(prev)
                             if sm:
                                 size = int(sm.group(2))
                                 break
-                        full = {"build_ms": int(m.group(2)), "encode_ms": int(ph.group(1)), "zstd_ms": int(ph.group(3)),
-                                "upload_ms": int(ph.group(4)), "rows": int(ph.group(5)), "bytes": size}
+                        full = {"build_ms": int(m.group(2)), "encode_ms": int(ph.group(1)), "zstd_ms": None,
+                                "upload_ms": None, "rows": int(ph.group(3)), "bytes": size}
             time.sleep(1)
         loop = [l for l in log.read_text(errors="replace").splitlines() if "LOOP " in l][-3:]
         return {"name": name, "rate": TOTAL / (t_last - t_first), "drain_s": t_last - t_first, "load_s": load_s,
@@ -265,16 +266,16 @@ def main() -> int:
         else:
             results = [run(tmp, tls=False), run(tmp, tls=True)]
         print(f"\n{TOTAL:,} rows, {STATEMENTS} transactions of {PER}")
-        print(f"{'':16} {'events/s':>10} {'drain':>8} {'bridge CPU':>11} {'NATS CPU':>9} {'WAL':>9} | {'full chain':>10} {'upload':>9} {'object':>9}")
+        print(f"{'':16} {'events/s':>10} {'drain':>8} {'bridge CPU':>11} {'NATS CPU':>9} {'WAL':>9} | {'full chain':>10} {'stream':>9} {'object':>9}")
         for r in results:
             f = r["full"] or {}
             obj = f"{f['bytes'] / 1e6:.1f} MB" if f.get("bytes") else "?"
             print(f"{r['name']:16} {r['rate']:>10,.0f} {r['drain_s']:>7.1f}s {r['bridge_cpu']:>10.1f}s {r['nats_cpu']:>8.1f}s {r['wal'] / 2**20:>6.0f} MB | "
-                  f"{(str(f.get('build_ms')) + ' ms') if f else 'not seen':>10} {(str(f.get('upload_ms')) + ' ms') if f else '':>9} {obj:>9}")
+                  f"{(str(f.get('build_ms')) + ' ms') if f else 'not seen':>10} {(str(f.get('encode_ms')) + ' ms') if f else '':>9} {obj:>9}")
         p, t = results[0], results[-1]
         if not runs: print(f"TLS/plain: rate x{t['rate'] / p['rate']:.2f}, bridge CPU x{t['bridge_cpu'] / max(p['bridge_cpu'], 0.01):.2f}, "
               f"NATS CPU x{t['nats_cpu'] / max(p['nats_cpu'], 0.01):.2f}"
-              + (f", chain upload x{t['full']['upload_ms'] / max(p['full']['upload_ms'], 1):.2f}" if p["full"] and t["full"] else ""))
+              + (f", chain build x{t['full']['build_ms'] / max(p['full']['build_ms'], 1):.2f}" if p["full"] and t["full"] else ""))
         for r in results:
             print(f"{r['name']} LOOP tail: " + " || ".join(l.split('LOOP ', 1)[-1] for l in r["loop"]))
         return 0
