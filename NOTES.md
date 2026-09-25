@@ -16431,3 +16431,97 @@ Same day, the Android phone: a moto e20 (Unisoc, 1.8 GB, eMMC) — libzb built f
 `tool/build-libzb-android.sh`), the APK installed, and then the phone's 24-hour wait
 before it accepts a new debugging computer. The run is tomorrow's; the app runs from
 its icon without adb.
+
+## §10ja — key order: time-ordered keys, a sorted full, and two false alarms (2026-09-25)
+
+The question: would a uuidv7 key remove the client-side sort of §10ix? It turned into a
+measurement of where the ordering cost lives, a producer change, and two client bugs.
+
+**Why order matters at all.** A replica table is a rowid table with `PRIMARY KEY (uid)`,
+so SQLite keeps two b-trees: the rows (by rowid — always an append) and an automatic
+unique index on `uid`. With random keys every insert lands on a random leaf of that
+index; once it outgrows the page cache each insert is a page read and a later write-back.
+Sorted input makes every insert the rightmost one. Correctness never depended on order.
+
+**The fixtures.** `test_types_v7`: the 3,055,024 rows of `test_types`, keys built from
+each row's `inserted_at` (48-bit ms) plus a counter, filled in one sorted insert BEFORE
+`zebridge_enable` (no CDC, no triggers), primary key built after — correlation of `uid`
+with physical order 1.000, the ceiling. Then churned the way production would: 10% of
+rows updated (non-HOT: the version index), 1% tombstoned, VACUUM, 2% inserted with keys
+minted up to 72 h back and 0.2% up to 14 days back (late phones), 3% fresh — correlation
+**0.667**. `test_types_v4`: the same rows, random keys, heap in insertion order —
+correlation 0.019. (The original `test_types` reads 0.80 on `inserted_at` after the
+firehose's churn — real tables drift.) Two notes on the fixture: its counter keys
+compress to 0.6 bytes where a real `uuidv7()` takes 13.4 (random v4: 19.3), so the v7
+full's 44.5 MB against 103 MB overstates; ~83 MB is the honest figure with real keys.
+And `zebridge_enable` read-only did not create the `(tenant, pk)` replica identity the
+bridge requires — it refused the table (`tenant_not_in_replica_identity`) until it was
+added by hand. Open.
+
+**Seeds, Node, one full of ~3.1–3.7M rows, all exact against PostgreSQL:**
+
+| zb-client-ts | random, heap order | v7 ceiling | v7 churned | **random, producer-sorted** |
+| --- | --- | --- | --- | --- |
+| one window at a time | 114.5 s (34 s sys) | 21.2 s | 25.6 s | **26.3 s (2.7 s sys)** |
+| staged | 32.0 s | 28.2 s | 30.5 s | 34.2 s |
+| libzb (staged, ReleaseFast) | 21.7 s | 21.8 s | 24.0 s | 24.9 s |
+
+Sorted arrival turns the simple path into the fastest one — no TEMP table, no final sort,
+no 3× disk, no temp files — and it does not need v7: the producer's sort gives it to
+random keys too. libzb stages everything, so arrival order is irrelevant to it by design.
+Chrome, churned v7, one window at a time: 84.9 / 94.3 s against 139.2 s staged — the
+first 2.85M rows at ~65k rows/s, the displaced tail (updated tuples and late inserts sit
+at the end of the heap) slower. ⚠️ `libzb 67.6 s` in §10iw was a **Debug** build;
+ReleaseFast seeds the same table in ~22 s.
+
+**The producer sorts every chain object.** `pkOrderBy` (the primary key from
+`pg_index`, in index order) ends every full, lane full, checkpoint and delta `SELECT`.
+Cost in PostgreSQL, full table in cache: +0.1 s on v7 (108k buffer reads, the index
+follows the heap) against +0.8 s on random keys (3.08M buffer reads, one per row — on a
+cold cache those are random disk reads). The price on random keys is compression: the
+v4 full grew from 129 MB (15%) to **160 MB (19%)** — rows inserted together no longer
+sit together. With time-ordered keys key order is time order and nothing is lost.
+
+**Live apply — the everyday cost.** 300,000 inserts into ~3.7M-row replicas, drained as
+CDC, exact, healthy disk:
+
+| | random keys | v7 | |
+| --- | --- | --- | --- |
+| libzb | 77.5 s (12.6 s CPU) | 6.7 s | 11.5× |
+| zb-client-ts (Node) | 21.2 s | 5.5 s | 3.9× |
+
+This is where v7 pays regardless of how fulls are cut: every live insert on a big
+replica appends instead of scattering. libzb on random keys waits on I/O (77 s wall on
+12.6 s CPU) — most likely WAL checkpoints writing back scattered pages; §10he's pragma
+test was on a smaller replica. Open.
+
+⚠️ **A disk that fills skews everything.** Mid-afternoon the benchmark replicas in the
+scratch directory had taken the Mac to 2.6 GB free; libzb's zstd inflate went from 2.8 s
+to 7.5 s and every run slowed 1.5–4×. Those runs were discarded and repeated at 34 GB
+free. Delete replicas between runs.
+
+**False gap (libzb and zb-client-ts, fixed).** A client's CDC consumer on a tenant
+stream is filtered to its tables (§10gm), so every write to another table of the tenant
+is a jump in stream sequence. Both clients read a jump as "the stream pruned under me"
+(§10ei) and re-seeded: the v7 clients re-fetched 3M rows three times because v4 got a
+burst; any app following some of a tenant's tables stalled its live tail for up to a
+cadence whenever another one was written. `prunedAfter(stream, pos)` now asks the stream
+on a jump: `first_seq ≤ pos + 1` means the skipped messages exist and are other tables'.
+Pinned by `scripts/scenarios/filtered_gap.py` — which first PASSED on the unfixed code
+(a small table's re-seed changes nothing a query sees); it now captures libzb's own
+stderr and fails on "pruned under": verified failing without the fix, passing with it.
+
+**Deaf-consumer watchdog (zb-client-ts, fixed).** The same flaw in another guard:
+"nothing for 25 s and the stream's last sequence is past my position" is always true for
+a filtered consumer, and for a stream whose messages all aged out — a page following
+only `test_types_v7` recreated its `CDC_PUBLIC` consumer every 25 s for ever. The guard
+now asks the consumer (`num_pending`): waiting messages undelivered is deaf, none is
+idle, no consumer is gone. And the recreated consumer had lost its filter — it carries
+it again. Verified in Chrome: 116 s idle, no recreation.
+
+What this leaves: clients taking the direct path when a step is known to be sorted (a
+manifest flag, or a cheap per-window check with the staged path as fallback);
+`zebridge_enable` creating the replica identity for read-only tables; libzb's live
+apply on random keys; the benchmark tables `test_types_v4` / `test_types_v7` (~2.5 GB
+in PostgreSQL) are the owner's to keep or drop.
+

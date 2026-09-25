@@ -7,6 +7,7 @@
 /// checked against PostgreSQL, so a run here is a measurement.
 
 import { ZeBridge, type SeedProgress, type Phase, type ConnStatus } from '../../../../zb-client-ts';
+import { browserStorage } from '../../../../zb-client-ts/src/browser-storage.ts';
 import { Decompress } from 'fzstd';
 import { createSignal, onMount, onCleanup, For, Show } from 'solid-js';
 
@@ -24,6 +25,9 @@ const BRIDGE_URL = '/bridge';
 const _qs = new URLSearchParams(location.search);
 const PRINCIPAL = _qs.get('principal') ?? 'bob';
 const TABLE = _qs.get('table') ?? 'test_types';
+/// `?spill=0`: one sorted window at a time instead of the staged path — for measuring
+/// what arrival order does to each (NOTES §10ja).
+const SPILL = _qs.get('spill') !== '0';
 const CREDS = await fetch(`/creds/${PRINCIPAL}.creds`).then((r) => (r.ok ? r.text() : undefined)).catch(() => undefined);
 
 /// fzstd inflates plain frames chunk by chunk — and every chain object is one.
@@ -49,6 +53,7 @@ const zb = new ZeBridge({
   tables: [TABLE],
   durable: true,
   engine: 'sqlite',
+  ...(SPILL ? {} : { storage: (n: string) => ({ ...browserStorage(n), spillsTemp: false }) }),
   seedStreaming: true,
   zstdDecompressStream: zstdStream,
 });
@@ -104,8 +109,8 @@ export default function App() {
   /// heap peak sampled during the seed (Chrome only; wasm and OPFS are not in it —
   /// the browser's task manager has the process figure).
   async function measure() {
-    const [row] = TABLE === 'test_types'
-      ? await zb.query('SELECT count(*) AS count, count(DISTINCT uid) AS "distinct", sum(age) AS sum FROM test_types')
+    const [row] = TABLE.startsWith('test_types')
+      ? await zb.query(`SELECT count(*) AS count, count(DISTINCT uid) AS "distinct", sum(age) AS sum FROM ${TABLE} WHERE tenant_id = 'globex'`)
       : await zb.query(`SELECT count(*) AS count FROM ${TABLE}`);
     const est = await navigator.storage?.estimate?.().catch(() => undefined);
     // What the origin actually holds — the replica, and any temp file sqlite-wasm's

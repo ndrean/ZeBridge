@@ -40,6 +40,9 @@ storage.
 
 `window.zb` is the client, for `zb.query('PRAGMA journal_mode')` and the like.
 
+`?table=<name>` follows another table (`test_types_v7`, NOTES §10ja); `?spill=0` forces
+the one-window-at-a-time path instead of staging, to measure what arrival order does.
+
 ## How the seed runs in a browser
 
 `seedStreaming: true` with fzstd as `zstdDecompressStream`: object chunks are inflated
