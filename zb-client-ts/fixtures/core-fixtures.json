@@ -75,6 +75,32 @@
       "drops": false
     },
     {
+      "name": "§10ja: a stream event with no seq anchor (a chain cut on an empty stream) is never dropped by lsn",
+      "ev": {
+        "seq": 25,
+        "stream": "CDC_PUBLIC",
+        "lsn": 1000
+      },
+      "anchor": {
+        "seedLsn": 5000
+      },
+      "drops": false
+    },
+    {
+      "name": "§10ja: a seq anchor on ANOTHER stream does not let the lsn gate this one",
+      "ev": {
+        "seq": 25,
+        "stream": "CDC_PUBLIC",
+        "lsn": 1000
+      },
+      "anchor": {
+        "seedSeq": 862,
+        "seedStream": "CDC_kilo",
+        "seedLsn": 5000
+      },
+      "drops": false
+    },
+    {
       "name": "legacy seedLsn: strictly below drops",
       "ev": {
         "lsn": 4999

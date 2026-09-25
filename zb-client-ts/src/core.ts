@@ -79,8 +79,14 @@ export function tombstoned(tombstoneColumn: string | null, data: unknown): boole
 }
 
 export function seedGateDrops(ev: CoreEvent, anchor: SeedAnchor): boolean {
-  if (typeof anchor.seedSeq === 'number' && anchor.seedStream) {
-    return ev.stream === anchor.seedStream && typeof ev.seq === 'number' && ev.seq <= anchor.seedSeq;
+  // §10ja: an event that carries its stream sequence is gated by the sequence anchor
+  // ALONE. Without one on its stream — a chain cut on an empty, brand-new stream ships
+  // no cutoff_seq — it applies: a transaction in flight during the cut has lsns below
+  // the cutoff and commits after the snapshot (finding 7), so the lsn gate dropped the
+  // first 2,342 rows of a 10,000-row insert under the firehose. Applying twice is what
+  // the upsert absorbs; dropping is a hole. libzb's shell already did this.
+  if (typeof ev.seq === 'number' && ev.stream) {
+    return typeof anchor.seedSeq === 'number' && anchor.seedStream === ev.stream && ev.seq <= anchor.seedSeq;
   }
   return typeof anchor.seedLsn === 'number' && typeof ev.lsn === 'number' && ev.lsn < anchor.seedLsn;
 }

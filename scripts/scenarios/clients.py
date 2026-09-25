@@ -29,7 +29,7 @@ class Lib:
         # with ctypes' default int return — a 64-bit pointer cut to 32 bits, then read as
         # a C string (SIGSEGV in the host, blamed on the library for an hour).
         for n, a in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p]),
-                     ("flush", [ctypes.c_uint64]), ("mutate", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]),
+                     ("flush_outbox", [ctypes.c_uint64]), ("mutate", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]),
                      ("join", [ctypes.c_char_p]), ("leave", [ctypes.c_char_p]),
                      ("mutate_at", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p])):
             f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a

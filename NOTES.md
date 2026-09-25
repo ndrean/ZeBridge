@@ -16660,7 +16660,32 @@ query (one serial queue per module) — the facts' `count(DISTINCT uid)` over 3M
 compressed, past the 256 KB inline limit) and the raw asker reads zstd. expo-crypto left
 the RN apps.
 
-What this leaves: revalidating fast-moving tables against today's changes; libzb's live
-apply on random keys; zb-react-native for Android.
+**Fast-moving tables, revalidated.** `incremental` 12/12 (deltas, checkpoints, the base,
+past the gc watermark with a reaped row). `firehose_tls --runs plain:on --seconds 90 --rate
+10000 --client-at 30 --ts-client-at 30 --verify`: margin min 635, never negative; the
+final chain seeds and replays exact; libzb, opened mid-load, 900,000 rows, exact. And one
+loss: zb-client-ts ended 2,342 rows short, all in batch 0 — the first second's 10,000-row
+INSERT, while its position said the stream was read to the end.
+
+The cause predates today. The boot chain was cut on a brand-new, EMPTY stream: last_seq 0,
+so the producer shipped no `cutoff_seq` (0 also means "unknown") and zb-client-ts fell back
+to the lsn gate. Batch 0's INSERT was in flight during the cut: its rows' lsns are below the
+cutoff (WAL is written before commit), the snapshot never saw them, and the gate dropped the
+first 2,342 as "in the chain" — finding 7, through the back door. libzb's shell never gated a
+stream event by lsn; its core rule did, and zb-client-ts used the core rule. `seedGateDrops`
+(both cores, two fixtures): an event carrying its stream sequence is gated by the sequence
+anchor alone — none on its stream, nothing dropped; applying twice is what the upsert
+absorbs. The same firehose after the fix: both clients 900,000 rows, exact; zb-client-ts
+caught up in 76.3 s. `stream_wipe` (a chain from a previous stream incarnation, "gating
+nothing" — which the TS client now does) passes.
+
+`scripts/scenarios/clients.py` bound `zb_client_flush`, renamed `zb_client_flush_outbox` on
+2026-09-24: every scenario opening a libzb client through it (25 of them) failed at start
+since. `seed_stream` with it fixed: the streaming seed of 3M rows 11.8 s at 216 MB, the
+whole-object seed 11.6 s at 1,052 MB — sorted objects stream as fast as they load whole.
+
+What this leaves: the chain's capacity at 50k–150k rows/s (the owner's question); libzb's
+live apply on random keys; zb-react-native for Android; a full live battery run, now that
+the 25 scenarios on clients.py work again.
 (Done the same day: the replica identity for read-only tables, f96cf47; the benchmark
 tables dropped.)

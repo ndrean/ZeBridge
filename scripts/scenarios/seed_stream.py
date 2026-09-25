@@ -15,8 +15,9 @@ other's — the inflated document is what the streaming path never holds — and
 log says which steps streamed (the full; the deltas, a few hundred bytes, take the
 whole-object path under the default threshold); with the threshold raised above
 the full's size no step streams and the peak is the whole-object path's again.
-Times are printed; the streaming seed is expected about twice as slow (the rows
-are written twice, and sorted on disk).
+Times are printed; a sorted chain object (§10ja) streams straight into the table, as fast
+as the whole-object seed (11.8 s against 11.6 s for 3M rows); an unsorted one is staged —
+its rows written twice and sorted on disk — about twice as slow.
 """
 import argparse, json, os, resource, subprocess, sys, time
 import zb

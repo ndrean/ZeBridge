@@ -269,13 +269,13 @@ pub fn tombstoned(tombstone_col: ?[]const u8, data: Value) bool {
 
 /// core.ts seedGateDrops (findings 7 + 10).
 pub fn seedGateDrops(ev: Value, anchor: Value) bool {
-    const seed_seq = getInt(anchor, "seedSeq");
-    const seed_stream = getStr(anchor, "seedStream");
-    if (seed_seq != null and seed_stream != null) {
-        const ev_stream = getStr(ev, "stream") orelse return false;
-        const ev_seq = getInt(ev, "seq") orelse return false;
-        return std.mem.eql(u8, ev_stream, seed_stream.?) and ev_seq <= seed_seq.?;
-    }
+    // §10ja (core.ts): an event with its stream sequence is gated by the sequence anchor
+    // alone — never by lsn, whose in-flight transactions commit after the snapshot.
+    if (getInt(ev, "seq")) |ev_seq| if (getStr(ev, "stream")) |ev_stream| {
+        const seed_seq = getInt(anchor, "seedSeq") orelse return false;
+        const seed_stream = getStr(anchor, "seedStream") orelse return false;
+        return std.mem.eql(u8, ev_stream, seed_stream) and ev_seq <= seed_seq;
+    };
     const seed_lsn = getInt(anchor, "seedLsn") orelse return false;
     const ev_lsn = getInt(ev, "lsn") orelse return false;
     return ev_lsn < seed_lsn;
