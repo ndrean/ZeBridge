@@ -2286,6 +2286,12 @@ pub const EventProcessor = struct {
                 defer c.PQclear(pr);
                 if (c.PQresultStatus(pr) == c.PGRES_TUPLES_OK and c.PQntuples(pr) > 0 and std.mem.eql(u8, std.mem.span(c.PQgetvalue(pr, 0, 0)), "f")) {
                     log.info("'{s}' no longer exists — no descriptor published, its tombstone stands", .{clean_table});
+                    // The documented retirement is DROP TABLE, then the catalogue DELETE
+                    // (MIGRATIONS.md). The DROP lifts any refusal; the DELETE then lands
+                    // here via the catalogue reload, which refused the table as
+                    // `no_cdc_subject` — and `logStatus` repeated it for a table that
+                    // no longer exists (2026-09-25). Nothing is left to refuse.
+                    self.refused.clear(clean_table);
                     continue;
                 }
             }
