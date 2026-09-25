@@ -15,6 +15,7 @@ import { makeClient, PRINCIPAL, TABLE } from './src/client';
 import { LibzbSeed } from './src/libzb-seed';
 import { makeRecorder, TRACE } from './src/seed-trace';
 import { fileLog } from './src/app-log';
+import { ZSTD_ENGINE } from './src/platform';
 
 const fmt = (n: number) => n.toLocaleString('en-US');
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
@@ -85,7 +86,7 @@ function TsSeed() {
     const rec = TRACE ? makeRecorder(`${dbDir}/${zb.dbName}`) : null;
     const stopClock = () => setRunning(false);
     const log = (text: string, err = false) => { fileLog('ts', text, err); setLines((prev) => [...prev.slice(-199), { text, err }]); };
-    log(`— start (${PRINCIPAL}, ${TABLE})`);
+    log(`— start (${PRINCIPAL}, ${TABLE}, zstd: ${ZSTD_ENGINE})`);
 
     /// After the table is usable: the three facts (`SELECT count(*), count(DISTINCT uid),
     /// sum(age) FROM test_types` on the tenant — 3,055,002 / 3,055,002 / 138,916,285 on

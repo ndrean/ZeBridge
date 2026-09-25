@@ -6,6 +6,7 @@
 import 'react-native-get-random-values'; // crypto.getRandomValues, which `uuid` needs
 import * as Crypto from 'expo-crypto';
 import { decompress as zstdDecompress, Decompress } from 'fzstd';
+import { requireOptionalNativeModule } from 'expo';
 
 // `crypto.randomUUID` (the client id) and `crypto.subtle.digest` (the grammar hash).
 // React Native has neither; both are one call to expo-crypto.
@@ -41,13 +42,13 @@ if (!g.crypto.subtle) {
 /// and does plain frames — which every chain object is, since the per-era dictionary
 /// went on 2026-09-24 (NOTES §10iy; until then a delta was a dictionary frame and
 /// needed a native decoder here).
-export const zstd = (b: Uint8Array) => zstdDecompress(b);
+const fzstdOnce = (b: Uint8Array) => zstdDecompress(b);
 
 /// §10ix: the same decoder, STREAMING — what lets a phone seed a large table without
 /// holding it. fzstd's `Decompress` takes chunks as they arrive and hands back inflated
 /// bytes block by block; the client decodes rows out of those and applies them in
 /// windows, so the table is never whole in memory (measured, NOTES §10ix).
-export const zstdStream = (chunks: AsyncIterable<Uint8Array>): AsyncIterable<Uint8Array> => {
+const fzstdStream = (chunks: AsyncIterable<Uint8Array>): AsyncIterable<Uint8Array> => {
   return (async function* () {
     const out: Uint8Array[] = [];
     const d = new Decompress((chunk: Uint8Array) => { out.push(chunk); });
@@ -56,3 +57,37 @@ export const zstdStream = (chunks: AsyncIterable<Uint8Array>): AsyncIterable<Uin
     while (out.length) yield out.shift()!;
   })();
 };
+
+/// §10ja: libzb's zstd through the app's native module (modules/zb-native), when it is
+/// in the build: fzstd in JS was ~40 % of the seed's JS time. Synchronous calls, one
+/// chunk at a time; bytes cross as arguments only (ZbNativeModule.swift).
+/// `EXPO_PUBLIC_ZB_ZSTD=fzstd` keeps the JavaScript decoder, to compare.
+type ZbZstd = { zstdNew(): number; zstdPush(id: number, c: Uint8Array): number; zstdTake(id: number, d: Uint8Array): void; zstdFree(id: number): void };
+const native = process.env.EXPO_PUBLIC_ZB_ZSTD === 'fzstd' ? null : requireOptionalNativeModule<ZbZstd>('ZbNative');
+const hasNative = typeof native?.zstdNew === 'function';
+
+const nativeOnce = (b: Uint8Array): Uint8Array => {
+  const id = native!.zstdNew();
+  try {
+    const n = native!.zstdPush(id, b);
+    const out = new Uint8Array(n);
+    if (n) native!.zstdTake(id, out);
+    return out;
+  } finally { native!.zstdFree(id); }
+};
+
+const nativeStream = (chunks: AsyncIterable<Uint8Array>): AsyncIterable<Uint8Array> => {
+  return (async function* () {
+    const id = native!.zstdNew();
+    try {
+      for await (const c of chunks) {
+        const n = native!.zstdPush(id, c);
+        if (n) { const out = new Uint8Array(n); native!.zstdTake(id, out); yield out; }
+      }
+    } finally { native!.zstdFree(id); }
+  })();
+};
+
+export const ZSTD_ENGINE = hasNative ? 'libzb (native)' : 'fzstd (JS)';
+export const zstd = hasNative ? nativeOnce : fzstdOnce;
+export const zstdStream = hasNative ? nativeStream : fzstdStream;

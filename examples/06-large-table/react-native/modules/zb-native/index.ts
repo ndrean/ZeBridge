@@ -8,6 +8,11 @@ declare class ZbNativeModule extends NativeModule {
   poll(handle: string, waitMs: number): Promise<string>;
   query(handle: string, sql: string, paramsJson: string): Promise<string>;
   close(handle: string): Promise<number>;
+  // libzb's streaming zstd, synchronous (see ZbNativeModule.swift).
+  zstdNew(): number;
+  zstdPush(id: number, chunk: Uint8Array): number;
+  zstdTake(id: number, dest: Uint8Array): void;
+  zstdFree(id: number): void;
 }
 
 export default requireNativeModule<ZbNativeModule>('ZbNative');

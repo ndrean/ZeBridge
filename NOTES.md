@@ -16612,7 +16612,22 @@ lost connection and re-synced a client being closed: the RN app's "wipe & seed a
 raced the database delete and stopped dead, once in two. `close()` now clears `this.nc`
 first; `connect()` keeps its own connection and stops quietly when it was closed.
 
-What this leaves: libzb's live apply on random keys; native zstd for zb-client-ts on RN
-(a `ZbNative` call into libzb's), the largest single JS cost.
+**libzb's zstd for zb-client-ts on RN.** Three C ABI calls, `zb_zstd_new` / `_push` /
+`_free` (plain frames: possible since §10iy removed the dictionary; tested against the
+`zstd` CLI at chunk sizes 1 byte to whole, two frames back to back, a corrupt frame).
+The RN example's native module exposes them as synchronous `zstdPush` / `zstdTake`:
+bytes cross JSI only as arguments, zero-copy. iPhone 12: seed 393.8 → 309.8 s (−21 %),
+connect → usable ~316 s, JS 7.5–10 s per 100k rows. Less than the jitless profile's
+~40 %: V8 without its JIT decodes zstd slower than Hermes does.
+
+⚠️ Measured in the EXAMPLE app, which now carries platform glue a developer should never
+write (platform.ts, expo-storage.ts, Metro stubs, the native module). The owner's rule:
+the library detects the platform or takes one flag, and libzb and zb-client-ts use the
+same option names (today: `creds` vs `credsPath`, `seedStreamingAbove` vs
+`seedStreamingAboveBytes`, `storage`/`durable` vs `dbPath`, no `clientId` in TS).
+
+What this leaves: libzb's live apply on random keys; zb-client-ts's React Native entry
+(storage, crypto, zstd chosen by the library; no Metro stubs); the native module as an
+installable package; one option vocabulary for both clients.
 (Done the same day: the replica identity for read-only tables, f96cf47; the benchmark
 tables dropped.)

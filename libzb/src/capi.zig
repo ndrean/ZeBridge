@@ -60,6 +60,7 @@ const builtin = @import("builtin");
 /// there traps; the host (Flutter) has nowhere to show a trace anyway.
 pub const panic = if (builtin.os.tag == .ios) std.debug.simple_panic else std.debug.FullPanic(std.debug.defaultPanic);
 const nats = @import("nats");
+const C = @import("c");
 const core = @import("core.zig");
 const client = @import("client.zig");
 const handles = @import("handles.zig");
@@ -82,6 +83,65 @@ export fn zb_abi_version() c_int {
 
 export fn zb_free(p: ?[*:0]u8) void {
     if (p) |ptr| std.c.free(ptr);
+}
+
+// ── zstd for a host's own decoder (§10ja) ─────────────────────────────────────
+//
+// A host that decodes chain objects itself — zb-client-ts on a phone, through a native
+// module — can inflate them here instead of in JavaScript (fzstd was ~40 % of its seed).
+// Plain frames only: chain objects carry no dictionary since §10iy. Streaming: push the
+// compressed bytes as they arrive, take what they inflate to. libzb's own ZSTD_* symbols
+// are private to it once prelinked, hence these three.
+
+/// A streaming decoder; null if zstd could not allocate one. Freed with zb_zstd_free.
+export fn zb_zstd_new() ?*anyopaque {
+    return @ptrCast(C.ZSTD_createDCtx());
+}
+
+export fn zb_zstd_free(ctx: ?*anyopaque) void {
+    if (ctx) |d| _ = C.ZSTD_freeDCtx(@ptrCast(d));
+}
+
+/// Inflate `len` bytes of the stream. 0 with `*out` a malloc'd buffer of `*out_len`
+/// bytes, freed with zb_free (`*out` null when these bytes completed nothing); -1 on
+/// corrupt input, with the reason in zb_last_error.
+export fn zb_zstd_push(ctx: ?*anyopaque, src: ?[*]const u8, len: usize, out: *?[*]u8, out_len: *usize) c_int {
+    out.* = null;
+    out_len.* = 0;
+    const d: *C.ZSTD_DCtx = @ptrCast(ctx orelse {
+        setLastError("zb_zstd_push: no decoder", .{});
+        return -1;
+    });
+    var cap: usize = @max(len *| 8, 128 * 1024);
+    var buf: [*]u8 = @ptrCast(std.c.malloc(cap) orelse return -1);
+    var n: usize = 0;
+    var in: C.ZSTD_inBuffer = .{ .src = src, .size = len, .pos = 0 };
+    while (true) {
+        if (n == cap) {
+            cap *= 2;
+            buf = @ptrCast(std.c.realloc(buf, cap) orelse {
+                std.c.free(buf);
+                return -1;
+            });
+        }
+        var ob: C.ZSTD_outBuffer = .{ .dst = buf + n, .size = cap - n, .pos = 0 };
+        const r = C.ZSTD_decompressStream(d, &ob, &in);
+        if (C.ZSTD_isError(r) != 0) {
+            setLastError("zstd: {s}", .{std.mem.span(C.ZSTD_getErrorName(r))});
+            std.c.free(buf);
+            return -1;
+        }
+        n += ob.pos;
+        // All input taken and room left over: nothing more comes out of these bytes.
+        if (in.pos == in.size and ob.pos < ob.size) break;
+    }
+    if (n == 0) {
+        std.c.free(buf);
+        return 0;
+    }
+    out.* = buf;
+    out_len.* = n;
+    return 0;
 }
 
 fn dupeZ(s: []const u8) ?[*:0]u8 {
