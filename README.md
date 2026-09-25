@@ -49,9 +49,10 @@ The `TS` library uses a push model for reactivity whilst the C ABI library uses 
 
 **Consumers**: The client library can be integrated across a wide range of runtime environments.
 
-* Mobile Native Apps: Utilizing native SQLite with file system storage.
-* Browsers and Webapps: Leveraging OPFS support for SQLite-WASM or PGlite.
-* Backend Services /  micro-VM: For example, a warm micro-VM  with DuckDB following Postgres. A  subscribed client runs one command and the micro-VM runs analytics against data stored in Postgres without reaching Postgres, and responds back via NATS. Zero cost for PostgreSQL.
+* Mobile Native Apps: Utilizing native SQLite with file system storage: React Native running the TS or C library, Flutter running the C library with an SQLite replica.
+* Desktop apps: Flutter running the C library with an SQLite replica.
+* Browsers and Webapps: Leveraging OPFS support for SQLite-WASM or PGlite via the TS library.
+* Backend Services /  micro-VM: For example, a warm micro-VM  with the columnar in-process dataabase DuckDB following Postgres. A  subscribed client runs one query command and the micro-VM runs analytics, or geospatial or timebased queries against data synced from Postgres without reaching Postgres, and responds back via NATS. Zero cost for PostgreSQL, no PostGIS nor TiemScaleDB extension used, whilst running analytic, spatial and timebased queries in a synced fork.
 
 **Design**: This tool is built to keep synchronized replicas of a large volume of small to medium consumers via the NATS message broker with small to medium Postgres databases.
 The daemon is engineered to be light (~4 MB executable), fast, secure, stateless with near instant startup.
@@ -1158,7 +1159,7 @@ await zb.connect();
 
 Once you call `connect()`, it subscribes, receives, applies and fires your callbacks on its own: you do nothing.
 
-Storage, zstd and the NATS dial come from the platform: better-sqlite3 and TCP on Node, sqlite-wasm on OPFS and WebSocket in the browser, expo-sqlite and WebSocket on React Native. The replica lives at `dbPath`, by default `zebridge_<principal>.sqlite3`, kept across reloads — which is what an outbox needs: a write queued while the socket was down must still be there after the page comes back. A fresh name per load (`dbPath: \`zebridge_${Date.now()}.sqlite3\``) is a clean room for a dev loop. `engine` defaults to SQLite; `'pglite'` (browser and Node) loads PostgreSQL-in-process on demand, and a SQLite consumer never downloads it. libzb takes the same options (CLIENTS.md).
+Storage, zstd and the NATS dial come from the platform: better-sqlite3 and TCP on Node, sqlite-wasm on OPFS and WebSocket in the browser, expo-sqlite and WebSocket on React Native. The replica lives at `dbPath`, by default `zebridge_<principal>.sqlite3`, kept across reloads — which is what an outbox needs: a write queued while the socket was down must still be there after the page comes back. A fresh name per load (`dbPath: \`zebridge_${Date.now()}.sqlite3\``) is a clean room for a dev loop.`engine` defaults to SQLite; `'pglite'` (browser and Node) loads PostgreSQL-in-process on demand, and a SQLite consumer never downloads it. libzb takes the same options (CLIENTS.md).
 
 **Query**: `query(sql)` — read your local database directly. Any SQL: joins, aggregates, offline. The replica _is_ the API.
 
