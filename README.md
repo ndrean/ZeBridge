@@ -1145,19 +1145,20 @@ Developers handle their own OAuth onboarding strategy. With the credentials, the
 **Constructor**: describe your infrastructure and the user in `new ZeBridge()` and `connect()`.
 
 ```js
+import { ZeBridge } from 'zb-client-ts';   // the bundler picks the Node, browser or React Native entry
+
 const zb = new ZeBridge({
   natsUrl: 'my-domain',
-  engine: 'sqlite',
-  durable: true,
   principal: "alice",
   creds: credsText,   // the .creds file's text (JWT + seed), from your own onboarding
+  tables: ['orders'],
 })
 await zb.connect();
 ```
 
 Once you call `connect()`, it subscribes, receives, applies and fires your callbacks on its own: you do nothing.
 
-`durable` defaults to true: the replica is a stable per-principal file that survives a reload, which is what an outbox needs — a write queued while the socket was down must still be there after the page comes back. `durable: false` gives a fresh replica per load, the shape a dev loop wants and nothing else. `engine` defaults to SQLite; `'pglite'` loads PostgreSQL-in-the-browser on demand, and a SQLite consumer never downloads it.
+Storage, zstd and the NATS dial come from the platform: better-sqlite3 and TCP on Node, sqlite-wasm on OPFS and WebSocket in the browser, expo-sqlite and WebSocket on React Native. The replica lives at `dbPath`, by default `zebridge_<principal>.sqlite3`, kept across reloads — which is what an outbox needs: a write queued while the socket was down must still be there after the page comes back. A fresh name per load (`dbPath: \`zebridge_${Date.now()}.sqlite3\``) is a clean room for a dev loop. `engine` defaults to SQLite; `'pglite'` (browser and Node) loads PostgreSQL-in-process on demand, and a SQLite consumer never downloads it. libzb takes the same options (CLIENTS.md).
 
 **Query**: `query(sql)` — read your local database directly. Any SQL: joins, aggregates, offline. The replica _is_ the API.
 
@@ -1457,7 +1458,7 @@ The one case it loses is when it arrives late with an older stamp than an edit t
 
 * **Browser SQLite (one OPFS connection)**: Enforced. the library owns the single connection and hands the app a **read-only** handle — a direct write is simply unreachable.  today.
 * **Mobile and microservice SQLite**: Enforced. SQLite is the only mobile engine, and there the library does not own the connection the same way — so the lock moves into the schema: an **initial migration** makes the app-facing tables read-only (views + triggers) and routes writes through the library's own path. ➡ Enforced by the schema, not the handle.
-* **PGlite:** a supported engine (`?engine=pglite` in examples/05-tables/web-consumer; adapter at `zb-client-ts/pglite`, dialect seam in `zb-client-ts/src/dialect.ts`). The library owns PGlite's single in-memory connection exactly as it owns the OPFS one, so the same handle-level lock applies.
+* **PGlite:** a supported engine (`?engine=pglite` in examples/05-tables/web-consumer; `engine: 'pglite'`, dialect seam in `zb-client-ts/src/dialect.ts`). The library owns PGlite's single in-memory connection exactly as it owns the OPFS one, so the same handle-level lock applies.
 * **Local Postgres (microservice):** the same choice as PGlite, ➡ schema-enforced.
 
 The rule is the same everywhere; the _mechanism_ that guarantees it is engine-specific. It is why the library — not a set of naming conventions — is the API.

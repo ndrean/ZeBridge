@@ -19,27 +19,34 @@ lifecycle lesson learned in one is not silently missing from the other.
 
 ## The configuration keys, side by side
 
-The same idea carries the same name; where the two cannot share one, the difference is
-in kind, not spelling.
+One vocabulary: the same key means the same thing in libzb's `opts_json` and in
+zb-client-ts's `new ZeBridge(opts)`, with the same default. An app passes what is about
+the app; what differs between platforms (storage, zstd, the NATS dial, crypto) the
+library decides — libzb by being native, zb-client-ts by its platform entry, which the
+bundler picks from package.json `exports` (`node`, `browser`, `react-native`).
 
 | key | libzb (`opts_json`) | zb-client-ts (`ZeBridgeConfig`) |
 | --- | --- | --- |
 | `natsUrl` | ✅ | ✅ |
-| the credential | `credsPath`, a file the library reads | `creds`, the file's CONTENT — a browser has no file to point at |
+| `creds` | ✅ the .creds TEXT (nats.zig patch 19) | ✅ |
+| `credsPath` | ✅ a .creds file | ✅ where there is a filesystem (Node) |
 | `principal` | ✅ | ✅ (also the inbox prefix on both, §10hm) |
 | `password` | — (creds only) | ✅ dev shape, user/password |
 | `grammarHash` | ✅ refuses to open on a mismatch | ✅ |
-| `grammar` / `bridgeUrl` | — (compiled in) | ✅ the grammar object, or the bridge to fetch it from |
+| `bridgeUrl` | — (the grammar is compiled in) | ✅ where to fetch the grammar hash |
 | `tables`, `ondemandTables` | ✅ list or `"*"` | ✅ the same rule (§10hn) |
-| the replica | `dbPath` (SQLite or DuckDB file), `dbUrl` (PostgreSQL) | `storage` factory; `engine` `sqlite` \| `pglite` |
-| `engine` | `sqlite` \| `duckdb`; `dbUrl` implies postgres | `sqlite` \| `pglite` |
-| `clientId` | ✅ stable across restarts, the msg_id prefix and tiebreak value | — generated per instance (`c-<random>`): the tiebreak value changes on every restart, the outbox's stored msg_ids do not |
+| `dbPath` | ✅ SQLite or DuckDB file | ✅ a file (Node, React Native) or an OPFS name (browser) |
+| — default | `zebridge_<principal>.sqlite3`, kept across runs | the same |
+| `dbUrl` | ✅ a PostgreSQL replica (§10fd) | — |
+| `engine` | `sqlite` \| `duckdb` | `sqlite` \| `pglite` (browser, Node) |
+| `clientId` | ✅ the msg_id prefix and tiebreak value; default `c-<random>` | the same |
 | `heartbeatMs` | ✅ (0 = off) | ✅ |
 | `seedChunkRows` | ✅ | ✅ |
-| `seedStreaming`, `seedStreamingAboveBytes` | ✅ §10fh, the phone's bounded seed | — (the whole object is read; §10hn bounds the read to 8 MiB per pull) |
-| `bulkCdc`, `bulkStatement`, `cdcBatchEvents` | — (the DuckDB path is always bulk, SQLite per event; §10hg) | ✅ §10gp knobs |
-| `durable` | — (host-driven) | ✅ durable consumers |
-| `transport`, `connect`, `zstdDecompress` | — (linked) | ✅ the seams |
+| `seedStreaming`, `seedStreamingAboveBytes` | ✅ | ✅ |
+| `jsDomain` | ✅ | ✅ |
+| `bulkCdc`, `bulkStatement`, `cdcBatchEvents` | — (the DuckDB path is always bulk, SQLite per event; §10hg) | ✅ tuning (§10gp) |
+| `platform` | — (one build per platform) | asserts the entry the bundler picked |
+| `storage`, `transport`, `connect`, `zstdDecompress`, `zstdDecompressStream`, `zstdCompress` | — | overrides, for a test or a storage of your own; an app never needs them |
 
 ## Pinned by fixtures — identical by construction
 

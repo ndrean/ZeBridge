@@ -1,11 +1,10 @@
-/// The client, wired for a phone — the same host layer as examples/08-map/native
-/// (platform.ts, expo-storage.ts), which explains each piece. Only the table differs:
-/// this app follows ONE big table and nothing else.
-import './platform';
+/// The client for this app: what is about the APP — the NATS URL, who we are, which
+/// table. Storage (expo-sqlite), zstd (libzb's native decoder when the app has the
+/// ZbNative module, fzstd otherwise) and the crypto Hermes lacks come from zb-client-ts's
+/// react-native entry, which Metro picks by itself.
 import { Platform } from 'react-native';
 import { ZeBridge } from 'zb-client-ts';
-import { expoStorage } from './expo-storage';
-import { zstd, zstdStream } from './platform';
+import { expoStorage } from 'zb-client-ts/react-native';
 import { TRACE, traced } from './seed-trace';
 
 /// The iOS simulator shares the Mac's network; the Android emulator reaches it as
@@ -19,7 +18,7 @@ export const PRINCIPAL = process.env.EXPO_PUBLIC_PRINCIPAL ?? 'bob';
 export const TABLE = process.env.EXPO_PUBLIC_TABLE ?? 'test_types';
 
 /// The creds are an app secret: `EXPO_PUBLIC_CREDS="$(cat …/bob.creds)"` at build time.
-const CREDS = process.env.EXPO_PUBLIC_CREDS ?? '';
+export const CREDS = process.env.EXPO_PUBLIC_CREDS ?? '';
 
 export function makeClient() {
   if (!CREDS) throw new Error("set EXPO_PUBLIC_CREDS to the principal's creds file contents");
@@ -28,17 +27,10 @@ export function makeClient() {
     principal: PRINCIPAL,
     creds: CREDS,
     tables: [TABLE],
-    // ONE database, kept across launches: a second launch finds the table seeded and
-    // only tails. "wipe & seed again" is the button.
-    durable: true,
     heartbeatMs: 0,
-    storage: TRACE ? traced(expoStorage) : expoStorage,
-    zstdDecompress: zstd,
-    // §10ix: the base streams in as it arrives and is STAGED — expo-storage says
-    // `spillsTemp`, so windows are appended to a TEMP table and the real table is
-    // filled once, sorted by SQLite on disk: bounded RAM, ~3× the table on disk while
-    // it runs.
+    // §10ix: the base streams in as it arrives, a window at a time — bounded memory.
     seedStreaming: true,
-    zstdDecompressStream: zstdStream,
+    // EXPO_PUBLIC_ZB_TRACE=1: the same storage, timed (src/seed-trace.ts).
+    ...(TRACE ? { storage: traced(expoStorage) } : {}),
   });
 }

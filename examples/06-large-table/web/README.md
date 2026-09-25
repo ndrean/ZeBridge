@@ -45,7 +45,7 @@ the one-window-at-a-time path instead of staging, to measure what arrival order 
 
 ## How the seed runs in a browser
 
-`seedStreaming: true` with fzstd as `zstdDecompressStream`: object chunks are inflated
+`seedStreaming: true`, and the library's browser entry inflates with fzstd: object chunks are inflated
 and decoded as they arrive, never the whole document. The browser storage sets
 `PRAGMA temp_store = FILE` and declares `spillsTemp: true` — sqlite-wasm's OPFS VFS
 spills TEMP tables and the sorter to OPFS files — so the client takes the staged path:

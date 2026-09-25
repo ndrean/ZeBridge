@@ -13,8 +13,6 @@
 /// Env: NATS_URL, ZB_PRINCIPAL, ZB_CREDS, ZB_TABLE, ZB_DB, ZB_ENGINE (sqlite|pglite).
 import { readFileSync } from 'node:fs';
 import { ZeBridge } from 'zb-client-ts';
-import { nodeStorage, nodeConnect } from 'zb-client-ts/node';
-import { makePgliteStorage } from 'zb-client-ts/pglite';
 
 const REPO = new URL('../../', import.meta.url).pathname;
 const PRINCIPAL = process.env.ZB_PRINCIPAL ?? 'omar';
@@ -34,10 +32,8 @@ const zb = new ZeBridge({
   heartbeatMs: Number(process.env.ZB_HEARTBEAT_MS ?? 30_000), // PROTOCOL §9
   // §10hn: every published table, said out loud — nothing is followed by default.
   tables: process.env.ZB_TABLES ? process.env.ZB_TABLES.split(',').map((t) => t.trim()).filter(Boolean) : '*',
-  durable: true,
-  // ── the two seams ──
-  storage: ENGINE === 'pglite' ? makePgliteStorage({ persist: true, dataDir: '/tmp' }) : nodeStorage,
-  connect: nodeConnect,
+  dbPath: DB,
+  engine: ENGINE === 'pglite' ? 'pglite' : 'sqlite',
 });
 
 // Only the lifecycle lines: CDC fires one log per event and would bury the report.

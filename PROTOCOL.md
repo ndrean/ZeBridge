@@ -2382,9 +2382,9 @@ UPDATE/DELETE check, but a replica still cannot identify a row.
 
   The replica database name is timestamped by default — a fresh database every load, so
   the dev loop always exercises schema, seeding and CDC from empty. `?durable=1` (or
-  `VITE_DURABLE`) opts into a stable, per-principal name instead, which is what makes
-  `_zebridge_outbox` actually durable across reloads rather than rebuilt-away with
-  everything else.
+  `VITE_DURABLE`) keeps the library's default `dbPath`, a stable per-principal name,
+  which is what makes `_zebridge_outbox` actually durable across reloads rather than
+  rebuilt-away with everything else.
 * `examples/04-node-consumer/` — a Node service on the same library: better-sqlite3 over
   TCP by default, `ZB_ENGINE=pglite` for a persisted PostgreSQL replica. Seeds, follows
   CDC, writes one full typed row through `mutate()` and reads it back.
@@ -2403,8 +2403,8 @@ storage adapter once and writes no engine-specific code: `mutate()`, `query()`, 
 outbox, verdicts, seeding, the tombstone rule and the UPDATE rule are identical.
 
 Two engines are supported in the browser today: SQLite over OPFS (the default) and
-PGlite — PostgreSQL compiled to WASM (`?engine=pglite` in `examples/05-tables/web-consumer`, adapter at
-`zb-client-ts/pglite`). PGlite is "PG to PG": the CDC wire already carries PostgreSQL's
+PGlite — PostgreSQL compiled to WASM (`engine: 'pglite'`; `?engine=pglite` in
+`examples/05-tables/web-consumer`). PGlite is "PG to PG": the CDC wire already carries PostgreSQL's
 own text forms (`{a,b}`, JSON, `t`/`f`), which SQLite stores as text and PGlite parses
 natively — so `query()` returns a real array for `text[]`, an object for `jsonb`, and
 `numeric(20,8)` keeps its decimals.
@@ -2430,9 +2430,10 @@ adapter:
 | a local write's array values | text as sent | array literal `{a,b}` |
 | post-seed foreign-key check | `PRAGMA foreign_key_check` | one anti-join per constraint from `pg_constraint` |
 
-Persistence follows the same switch on both: a fresh database per load by default,
-a stable per-principal one under `durable` (an OPFS file for SQLite, `idb://` for
-PGlite).
+Persistence is the same on both: the replica lives at `dbPath` (an OPFS file for
+SQLite, `idb://` for PGlite), by default the stable per-principal
+`zebridge_<principal>.sqlite3`; the example page passes a timestamped name unless
+`?durable=1`.
 
 Restart and replay are exercised by the Node consumer's persisted replica (a second run
 resumes from its stored positions with nothing re-seeded) and by libzb's soak.

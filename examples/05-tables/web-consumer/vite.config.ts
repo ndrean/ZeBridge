@@ -1,17 +1,6 @@
-import { createLogger, defineConfig } from 'vite';
+import { defineConfig } from 'vite';
 import solidPlugin from 'vite-plugin-solid';
 
-// zstd-wasm ships `.js.map` files whose `sources` name TypeScript the package does not
-// publish. Excluded from pre-bundling (its `.wasm` URL needs that), the package is
-// served file by file and the dev server warns once per file that the sources are
-// missing. Nothing in the page is affected — a debugger stepping into zstd-wasm sees
-// its JavaScript instead of its TypeScript — so that one warning is dropped here.
-const logger = createLogger();
-const warn = logger.warn;
-logger.warn = (msg, opts) => {
-  if (msg.includes('points to missing source files') && msg.includes('zstd-wasm')) return;
-  warn(msg, opts);
-};
 
 /// Where the stack actually is. Defaults are the NATIVE dev loop's ports; the
 /// compose stack publishes elsewhere and is free to move, so both are env vars:
@@ -29,7 +18,6 @@ const BRIDGE_ORIGIN = process.env.ZB_BRIDGE_ORIGIN ?? 'http://127.0.0.1:27434';
 const NATS_WS_ORIGIN = process.env.ZB_NATS_WS_ORIGIN ?? 'ws://127.0.0.1:8080';
 
 export default defineConfig({
-  customLogger: logger,
   plugins: [solidPlugin()],
   server: {
     port: 5173,
@@ -74,9 +62,7 @@ export default defineConfig({
   optimizeDeps: {
     // PGlite ships its WASM/fs assets next to its module; pre-bundling breaks the
     // relative asset URLs, same class of problem as sqlocal's worker below.
-    // zstd-wasm too (since the library imports it itself, 2026-09-10): its .wasm is
-    // fetched by `new URL('./zstd.wasm', import.meta.url)` next to the module.
-    exclude: ['sqlocal', '@electric-sql/pglite', '@bokuweb/zstd-wasm']
+    exclude: ['sqlocal', '@electric-sql/pglite']
   },
   resolve: {
     // zb-client-ts is a linked (symlinked) package; without dedupe its imports
@@ -85,9 +71,6 @@ export default defineConfig({
     // — vite resolves that under /node_modules/ but serves the SPA index.html
     // (200, text/html) for the /@fs/ form, so the worker dies silently and every
     // DB call hangs. Dedupe pins the shared runtime deps to this package's copies.
-    // zstd-wasm joined the list the day the library began importing it itself: its
-    // copy under zb-client-ts/node_modules/.pnpm is outside the serving allow list
-    // (403 on the .wasm, "wasm streaming compile failed"); this package's copy is not.
-    dedupe: ['sqlocal', '@electric-sql/pglite', '@bokuweb/zstd-wasm', '@nats-io/nats-core', '@nats-io/jetstream', '@nats-io/kv', '@nats-io/obj', '@msgpack/msgpack', 'uuid'],
+    dedupe: ['sqlocal', '@electric-sql/pglite', 'fzstd', '@nats-io/nats-core', '@nats-io/jetstream', '@nats-io/kv', '@nats-io/obj', '@msgpack/msgpack', 'uuid'],
   }
 });

@@ -4,12 +4,18 @@
   "private": true,
   "type": "module",
   "description": "ZeBridge client library: local SQLite replica synchronized over NATS/JetStream",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "src/entry-browser.ts",
+  "types": "src/entry-browser.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./node": "./src/node.ts",
-    "./pglite": "./src/pglite-storage.ts",
+    ".": {
+      "react-native": "./src/entry-react-native.ts",
+      "browser": "./src/entry-browser.ts",
+      "node": "./src/entry-node.ts",
+      "default": "./src/entry-browser.ts"
+    },
+    "./node": "./src/entry-node.ts",
+    "./browser": "./src/entry-browser.ts",
+    "./react-native": "./src/entry-react-native.ts",
     "./storage": "./src/storage.ts"
   },
   "scripts": {
@@ -17,7 +23,6 @@
     "test": "node --experimental-strip-types --test src/core.test.ts"
   },
   "dependencies": {
-    "@bokuweb/zstd-wasm": "^0.0.27",
     "@electric-sql/pglite": "0.5.8",
     "@msgpack/msgpack": "^3.0.0-beta.1",
     "@nats-io/jetstream": "^3.4.0",
@@ -25,6 +30,7 @@
     "@nats-io/nats-core": "^3.4.0",
     "@nats-io/nkeys": "^2.0.3",
     "@nats-io/obj": "3.4.0",
+    "fzstd": "^0.1.1",
     "js-sha256": "^0.11.1",
     "sqlocal": "^0.18.0",
     "uuid": "^14.0.1"
@@ -38,7 +44,9 @@
   },
   "peerDependencies": {
     "@nats-io/transport-node": ">=3",
-    "better-sqlite3": ">=11"
+    "better-sqlite3": ">=11",
+    "expo-sqlite": ">=15",
+    "react-native-get-random-values": ">=1.11"
   },
   "peerDependenciesMeta": {
     "better-sqlite3": {
@@ -46,6 +54,13 @@
     },
     "@nats-io/transport-node": {
       "optional": true
+    },
+    "expo-sqlite": {
+      "optional": true
+    },
+    "react-native-get-random-values": {
+      "optional": true
     }
-  }
+  },
+  "react-native": "src/entry-react-native.ts"
 }

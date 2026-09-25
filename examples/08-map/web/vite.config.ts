@@ -25,13 +25,13 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    // Both fetch assets relative to their own module URL; pre-bundling breaks that.
-    exclude: ['sqlocal', '@bokuweb/zstd-wasm'],
+    // sqlocal fetches its worker relative to its own module URL; pre-bundling breaks that.
+    exclude: ['sqlocal'],
   },
   resolve: {
     // zb-client-ts is linked: without dedupe its imports resolve inside its own
     // node_modules and are served over /@fs/ URLs, where sqlocal's extensionless
     // worker URL silently returns the SPA's index.html and every DB call hangs.
-    dedupe: ['sqlocal', '@bokuweb/zstd-wasm', '@nats-io/nats-core', '@nats-io/jetstream', '@nats-io/kv', '@nats-io/obj', '@msgpack/msgpack', 'uuid'],
+    dedupe: ['sqlocal', 'fzstd', '@nats-io/nats-core', '@nats-io/jetstream', '@nats-io/kv', '@nats-io/obj', '@msgpack/msgpack', 'uuid'],
   },
 });

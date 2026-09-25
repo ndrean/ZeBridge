@@ -56,7 +56,8 @@ export function makePgliteStorage(opts: PgliteStorageOptions = {}): StorageFacto
     // apparently in place). An object as the first argument keeps them; `dataDir`
     // inside it selects persistence.
     const idbName = `/pglite/${dbName}`;
-    const nodeDir = `${opts.dataDir ?? '.'}/${dbName}`;
+    // A `dbPath` that is already a path stays one; a bare name goes under `dataDir`.
+    const nodeDir = dbName.includes('/') ? dbName : `${opts.dataDir ?? '.'}/${dbName}`;
     const location = !opts.persist ? undefined : isNode ? nodeDir : `idb://${dbName}`;
     const pg = new PGlite({
       ...(location ? { dataDir: location } : {}),

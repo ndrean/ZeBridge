@@ -1,10 +1,8 @@
-/// The client, wired for a phone. Everything platform-shaped is a parameter: the
-/// storage, the decompressor, the connection. Nothing here is a fork of the library.
-import './platform';
+/// The client for this app: what is about the APP — the NATS URL, who we are, which
+/// tables. Storage (expo-sqlite), zstd and the crypto Hermes lacks come from
+/// zb-client-ts's react-native entry, which Metro picks by itself.
 import { Platform } from 'react-native';
 import { ZeBridge } from 'zb-client-ts';
-import { expoStorage } from './expo-storage';
-import { zstd, zstdStream } from './platform';
 
 /// ⚠️ A phone is not the dev machine, and the two emulators disagree about how to reach
 /// it. The iOS simulator shares the host's network stack, so `127.0.0.1` IS the Mac. The
@@ -40,12 +38,7 @@ export function makeClient() {
     tables: ['routes'],
     ondemandTables: ['charge_points'],
     heartbeatMs: 0,
-    storage: expoStorage,
-    zstdDecompress: zstd,
-    // §10ix: seed large tables as they arrive. The phone has a real filesystem, so
-    // expo-storage says `spillsTemp` and a full is STAGED — fast and bounded in RAM,
-    // at ~3× the table on disk while it runs.
+    // §10ix: seed large tables as they arrive, a window at a time — bounded memory.
     seedStreaming: true,
-    zstdDecompressStream: zstdStream,
   });
 }

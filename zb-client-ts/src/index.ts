@@ -7,5 +7,6 @@ export * from './core.ts';
 export * from './transport.ts';
 export * from './libzb.ts';
 export * from './dialect.ts';
-// The PGlite adapter is NOT re-exported here: importing it pulls the WASM engine
-// into every consumer. It lives at `zb-client-ts/pglite`, opt-in per host.
+export type { Platform, PlatformName } from './platform.ts';
+// The platform itself (storage, zstd, transport) comes from the entry the bundler
+// picks — entry-node.ts, entry-browser.ts, entry-react-native.ts — never from here.

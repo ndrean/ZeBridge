@@ -554,8 +554,6 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     const jd_raw = str.get(o, "jsDomain", "");
     const js_domain: ?[]u8 = if (jd_raw.len > 0) try a.dupe(u8, jd_raw) else null;
     errdefer if (js_domain) |d| a.free(d);
-    const db = try a.dupeZ(u8, str.get(o, "dbPath", "zb.sqlite3"));
-    errdefer a.free(db);
     // dbUrl (§10fd): a PostgreSQL replica instead of the SQLite file.
     const db_url_raw = str.get(o, "dbUrl", "");
     const db_url: ?[:0]u8 = if (db_url_raw.len > 0) try a.dupeZ(u8, db_url_raw) else null;
@@ -565,7 +563,18 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     const engine: client.storage.Engine = if (std.mem.eql(u8, engine_s, "duckdb")) .duckdb else .sqlite;
     const principal = try a.dupeZ(u8, str.get(o, "principal", ""));
     errdefer a.free(principal);
-    const client_id = try a.dupeZ(u8, str.get(o, "clientId", "zig-client"));
+    // The same defaults as zb-client-ts: one replica per principal, kept across runs;
+    // a random client id per instance (it prefixes every mutation's msg_id — a fixed
+    // default would give every client that omits it the same prefix).
+    const db_opt = str.get(o, "dbPath", "");
+    const db = if (db_opt.len > 0) try a.dupeZ(u8, db_opt) else try std.fmt.allocPrintSentinel(a, "zebridge_{s}.sqlite3", .{principal}, 0);
+    errdefer a.free(db);
+    const cid_opt = str.get(o, "clientId", "");
+    const client_id = if (cid_opt.len > 0) try a.dupeZ(u8, cid_opt) else blk: {
+        var r: [4]u8 = undefined;
+        std.Io.Threaded.global_single_threaded.io().random(&r); // as nats.zig nuid.zig
+        break :blk try std.fmt.allocPrintSentinel(a, "c-{x}", .{&r}, 0);
+    };
     errdefer a.free(client_id);
     // heartbeatMs: the fleet beat (§10dc); 0 disables. Default matches client.zig.
     const heartbeat_ms: u64 = blk: {

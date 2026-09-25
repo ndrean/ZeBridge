@@ -2,9 +2,9 @@
 
 The same seed-only page as `../web`, on React Native, with two engines behind a toggle:
 **zb-client-ts** in JavaScript, and **libzb** (the C client, Zig inside) through a native
-module. The zb-client-ts engine has nothing of ours compiled for the phone (the host layer is `examples/08-map/native`'s:
-`src/platform.ts`, `src/expo-storage.ts`, `metro.config.js`, and its README explains
-each piece). bob follows `test_types` (3,055,002 rows on tenant globex), seeds it from
+module. The zb-client-ts engine is `new ZeBridge(opts)` and nothing else: the library's
+react-native entry brings expo-sqlite, the crypto Hermes lacks and zstd — libzb's native
+decoder through this app's ZbNative module, fzstd without it. bob follows `test_types` (3,055,002 rows on tenant globex), seeds it from
 the generation chain into expo-sqlite, and prints the three facts checked against
 PostgreSQL:
 
@@ -46,10 +46,10 @@ For the libzb engine, build the library first, and give it the TCP URL too:
 as they are, the two copies clash, or libzb's calls land in expo's build.
 `ld -r -exported_symbol '_zb_*'` keeps libzb's SQLite, zstd and nats private to it.
 
-⚠️ Measure a Release build. Hermes compiles its bytecode ahead of time there, and the
-browser-only imports of zb-client-ts (PGlite, sqlite-wasm, zstd-wasm) are stubbed in
-`metro.config.js` because that compiler rejects their `import.meta`. If `expo run:ios`
-fails to install, `xcrun devicectl device install app --device <udid> <the .app>`.
+⚠️ Measure a Release build: Hermes compiles its bytecode ahead of time there. If
+`expo run:ios` fails to install, `xcrun devicectl device install app --device <udid>
+<the .app>`. (`metro.config.js` only links zb-client-ts from outside the app — a
+monorepo matter; the library sends no browser code to React Native.)
 
 ⚠️ `ws://`, not `nats://` — zb-client-ts speaks NATS over WebSocket, port 8080; libzb
 speaks TCP, port 4222. The iOS simulator reaches

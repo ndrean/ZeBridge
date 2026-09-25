@@ -8,9 +8,6 @@ importers:
 
   .:
     dependencies:
-      '@bokuweb/zstd-wasm':
-        specifier: ^0.0.27
-        version: 0.0.27
       '@msgpack/msgpack':
         specifier: ^3.0.0-beta.1
         version: 3.1.3
@@ -134,9 +131,6 @@ packages:
   '@babel/types@7.29.8':
     resolution: {integrity: sha512-Vj1jF3cPfxg7OAfoI7QnVKLoILlm2JF9pnVHrX8qx7AHMiYWT+NDAA7jChlNgRS4WTLc/fD1lXLmPixluj+3Gg==}
     engines: {node: '>=6.9.0'}
-
-  '@bokuweb/zstd-wasm@0.0.27':
-    resolution: {integrity: sha512-GDm2uOTK3ESjnYmSeLQifJnBsRCWajKLvN32D2ZcQaaCIJI/Hse9s74f7APXjHit95S10UImsRGkTsbwHmrtmg==}
 
   '@jridgewell/gen-mapping@0.3.13':
     resolution: {integrity: sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==}
@@ -783,8 +777,6 @@ snapshots:
     dependencies:
       '@babel/helper-string-parser': 7.29.7
       '@babel/helper-validator-identifier': 7.29.7
-
-  '@bokuweb/zstd-wasm@0.0.27': {}
 
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:

@@ -8,9 +8,6 @@ importers:
 
   .:
     dependencies:
-      '@bokuweb/zstd-wasm':
-        specifier: ^0.0.27
-        version: 0.0.27
       '@electric-sql/pglite':
         specifier: 0.5.8
         version: 0.5.8
@@ -137,9 +134,6 @@ packages:
   '@babel/types@7.29.8':
     resolution: {integrity: sha512-Vj1jF3cPfxg7OAfoI7QnVKLoILlm2JF9pnVHrX8qx7AHMiYWT+NDAA7jChlNgRS4WTLc/fD1lXLmPixluj+3Gg==}
     engines: {node: '>=6.9.0'}
-
-  '@bokuweb/zstd-wasm@0.0.27':
-    resolution: {integrity: sha512-GDm2uOTK3ESjnYmSeLQifJnBsRCWajKLvN32D2ZcQaaCIJI/Hse9s74f7APXjHit95S10UImsRGkTsbwHmrtmg==}
 
   '@electric-sql/pglite@0.5.8':
     resolution: {integrity: sha512-n9tsbUOhwx2epK1V0ZG9Ar4SHWUju04dhmzZXiSBXwBoleOvIfals33NAaWgagQVAL4Rbvx/Ptsu3P+pA09f6Q==}
@@ -783,8 +777,6 @@ snapshots:
     dependencies:
       '@babel/helper-string-parser': 7.29.7
       '@babel/helper-validator-identifier': 7.29.7
-
-  '@bokuweb/zstd-wasm@0.0.27': {}
 
   '@electric-sql/pglite@0.5.8': {}
 

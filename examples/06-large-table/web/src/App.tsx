@@ -8,7 +8,6 @@
 
 import { ZeBridge, type SeedProgress, type Phase, type ConnStatus } from '../../../../zb-client-ts';
 import { browserStorage } from '../../../../zb-client-ts/src/browser-storage.ts';
-import { Decompress } from 'fzstd';
 import { createSignal, onMount, onCleanup, For, Show } from 'solid-js';
 
 /// One client, one socket, one replica: a hot update must reload, not re-run this scope.
@@ -30,18 +29,7 @@ const TABLE = _qs.get('table') ?? 'test_types';
 const SPILL = _qs.get('spill') !== '0';
 const CREDS = await fetch(`/creds/${PRINCIPAL}.creds`).then((r) => (r.ok ? r.text() : undefined)).catch(() => undefined);
 
-/// fzstd inflates plain frames chunk by chunk — and every chain object is one.
-const zstdStream = (chunks: AsyncIterable<Uint8Array>): AsyncIterable<Uint8Array> => {
-  return (async function* () {
-    const out: Uint8Array[] = [];
-    const d = new Decompress((chunk: Uint8Array) => { out.push(chunk); });
-    for await (const c of chunks) { d.push(c); while (out.length) yield out.shift()!; }
-    d.push(new Uint8Array(0), true);
-    while (out.length) yield out.shift()!;
-  })();
-};
-
-/// ⚠️ `durable: true` — ONE database, `zebridge_<principal>.sqlite3` in OPFS, not a
+/// ⚠️ The default `dbPath` — ONE database, `zebridge_<principal>.sqlite3` in OPFS, not a
 /// fresh file per load. A 1 GB replica per reload is how 05-tables blew its quota. A
 /// second load finds the table seeded and only tails; "wipe & reload" is how you
 /// seed again.
@@ -51,11 +39,9 @@ const zb = new ZeBridge({
   principal: PRINCIPAL,
   creds: CREDS,
   tables: [TABLE],
-  durable: true,
   engine: 'sqlite',
   ...(SPILL ? {} : { storage: (n: string) => ({ ...browserStorage(n), spillsTemp: false }) }),
   seedStreaming: true,
-  zstdDecompressStream: zstdStream,
 });
 
 /// A console handle for probing the replica (`zb.query('PRAGMA journal_mode')`) —

@@ -48,15 +48,12 @@ export function LibzbSeed() {
     log(`— start (${PRINCIPAL}, ${TABLE})`);
     (async () => {
       if (!CREDS) throw new Error("set EXPO_PUBLIC_CREDS to the principal's creds file contents");
-      // libzb wants a creds FILE; the text is an app secret baked in at build time.
-      const credsUri = `${dir}${PRINCIPAL}.creds`;
-      await FileSystem.writeAsStringAsync(credsUri, CREDS);
       const fresh = !(await FileSystem.getInfoAsync(dir + DB_FILE)).exists;
       log(fresh ? 'fresh replica — the seed is the whole table' : 'replica present — no seed unless the chain moved');
       log(`connecting to ${NATS_URL} as ${PRINCIPAL}, following [${TABLE}]`);
       t0Ref.current = Date.now(); setElapsed(0); setRunning(true); setPhase('connect + seed');
       const h = await Zb.connect(JSON.stringify({
-        natsUrl: NATS_URL, credsPath: credsUri.replace(/^file:\/\//, ''), dbPath,
+        natsUrl: NATS_URL, creds: CREDS, dbPath,
         principal: PRINCIPAL, tables: [TABLE], seedStreaming: true,
       }));
       if (closed) { await Zb.close(h); return; }

@@ -6,27 +6,12 @@ no `.xcframework`. That is the whole reason this app exists (NOTES §10ih).
 
 ## Why not the Flutter app
 
-libzb is a Zig library that links SQLite, zstd and libpq. A phone build has to find all
-three for its own architecture, and neither the iOS SDK nor the Android NDK ships zstd.
-`-Dlibpq=false` removed one (§10ig); the other two need vendoring. Meanwhile the
-TypeScript client needs **one storage adapter** — `src/expo-storage.ts`, 90 lines — and
-three small shims. The framework was never the obstacle; a C toolchain is.
-
-## What had to be supplied
-
-| gap | filled by |
-| --- | --- |
-| SQLite | `expo-sqlite`, behind the library's own `Storage` contract |
-| `crypto.randomUUID`, `crypto.subtle.digest` | `expo-crypto`, in `src/platform.ts` |
-| `crypto.getRandomValues` | `react-native-get-random-values` |
-| zstd | `fzstd`, passed as the `zstdDecompress` option |
-
-⚠️ The zstd one would have been a wall. The library's last-resort decompressor is a
-WebAssembly module and React Native's engine cannot run WebAssembly — but it is a config
-option, so supplying one means the WASM import is never reached. `fzstd` is pure
-JavaScript and handles plain frames — which every chain object is since the per-era
-dictionary was removed (NOTES §10iy; until then a delta was a dictionary frame and this
-app could only follow tables whose chains had none).
+The TypeScript client needs nothing from this app but its options: zb-client-ts's
+react-native entry — picked by Metro through the `react-native` export condition —
+brings the storage (expo-sqlite), zstd (fzstd, or libzb's native decoder when the app
+has the ZbNative module, as 06-large-table/react-native does), and the crypto Hermes
+lacks (`crypto.randomUUID`, `crypto.subtle.digest`). The app installs the two native
+packages that entry needs, `expo-sqlite` and `react-native-get-random-values`.
 
 ## Run it
 

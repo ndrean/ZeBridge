@@ -22,6 +22,7 @@
 /// read-only connection is not available here the way `libzebridge` native has one).
 
 import { natsTransport } from './transport.ts';
+import { currentPlatform, type Platform, type PlatformName } from './platform.ts';
 import type { Transport, TransportConnection, JetStreamOpts, UserKeyPair } from './transport.ts';
 import { decode, encode, decodeMulti } from '@msgpack/msgpack';
 import type { Storage, StorageFactory, Exec as StorageExec } from './storage.ts';
@@ -66,21 +67,31 @@ export interface ZeBridgeConfig {
   natsUrl: string;
   principal: string;
   password?: string;
-  /// Chain objects may arrive as zstd frames (detected by the 4-byte magic —
-  /// no manifest field, so mixed old/new chains keep working). Node decodes
-  /// via node:zlib automatically; a BROWSER host must supply this hook (the
-  /// web consumer passes fzstd's decompress). Absent where needed, seeding
-  /// fails LOUDLY naming the fix — never by feeding zstd bytes to msgpack.
+  /// Override the platform's zstd (platform.ts). An app never needs to: Node inflates
+  /// with node:zlib, the browser with fzstd, React Native with libzb's native decoder
+  /// when the app has it, else fzstd.
   zstdDecompress?: (b: Uint8Array) => Uint8Array | Promise<Uint8Array>;
-  /// §10ip: compress a query ANSWER before it travels. Optional and only used when this
-  /// client SERVES: a host that cannot compress simply answers uncompressed, and every
-  /// asking client reads both. Node needs nothing here — `node:zlib` has zstd and is
-  /// used automatically.
+  /// §10ip: override how a query ANSWER is compressed when this client SERVES. A host
+  /// without a compressor answers uncompressed, and every asking client reads both.
   zstdCompress?: (b: Uint8Array) => Uint8Array | Promise<Uint8Array>;
-  /// Operator/JWT mode: the CONTENT of a .creds file (user JWT + nkey seed).
-  /// When set it wins over user/password — the JWT carries the permissions
-  /// (scoped signing key), so no server conf names this principal at all.
+  /// Operator/JWT mode: the CONTENT of a .creds file (user JWT + nkey seed) — what
+  /// /enroll returns. When set it wins over user/password — the JWT carries the
+  /// permissions (scoped signing key), so no server conf names this principal at all.
+  /// libzb takes the same option.
   creds?: string;
+  /// The same credentials as a FILE, where there is a filesystem (Node). libzb: same.
+  credsPath?: string;
+  /// Where the replica lives: a file on Node and React Native, an OPFS database name in
+  /// the browser. Default `zebridge_<principal>.sqlite3`, kept across runs (libzb: the
+  /// same default). A fresh name per run — `zebridge_${Date.now()}.sqlite3` — is a
+  /// clean room.
+  dbPath?: string;
+  /// Stable across restarts: it prefixes every mutation's msg_id. Default: a random one
+  /// per instance. libzb: same.
+  clientId?: string;
+  /// Assert the platform. The bundler already picks the entry (package.json `exports`:
+  /// react-native, browser, node); this only refuses a build that loaded another one.
+  platform?: PlatformName;
   /// The grammar hash this client RECEIVED — from the /enroll payload beside the JWT,
   /// or the bridge's `X-Grammar-Hash` header. When set, a mismatch refuses to connect:
   /// this library is built for another protocol than the bridge it is pointed at.
@@ -113,21 +124,16 @@ export interface ZeBridgeConfig {
   /// §10fb: rows per transaction when a chain step seeds a table (default 50 000;
   /// 0 = one transaction for the step). Bounds memory and how long the lock is held.
   seedChunkRows?: number;
-  /// §10ix (libzb `seed_streaming`): apply a chain step AS IT ARRIVES — chunks inflated
-  /// and decoded into windows of `seedChunkRows`, never the whole document. Measured on
-  /// a 3M-row base: 2.5 GB peak when the document was materialised whole (§10iw).
-  /// Node only for now — the inflate is node:zlib's zstd Transform; a browser, and a
-  /// host that installs its own one-shot `zstdDecompress`, stay on the buffered path.
+  /// §10ix (libzb: same name): apply a chain step AS IT ARRIVES — chunks inflated and
+  /// decoded into windows of `seedChunkRows`, never the whole document. Measured on a
+  /// 3M-row base: 2.5 GB peak when the document was materialised whole (§10iw).
   /// Default false, like libzb.
   seedStreaming?: boolean;
-  /// §10ix (libzb `seed_streaming_above`): stream only a step whose stored object is at
-  /// least this many bytes (default 8 MiB); below it the buffered path is cheaper.
-  seedStreamingAbove?: number;
-  /// §10ix: a STREAMING inflate — chunks in, inflated bytes out, as they flow. Node
-  /// needs nothing (node:zlib's zstd Transform); any other host that wants
-  /// `seedStreaming` supplies one — a browser's and React Native's is fzstd's
-  /// `Decompress`. Every chain object is a plain frame (the per-era dictionary went on
-  /// 2026-09-24, NOTES §10iy), so a plain-frames decoder covers the whole chain.
+  /// §10ix (libzb: same name): stream only a step whose stored object is at least this
+  /// many bytes (default 8 MiB); below it the buffered path is cheaper.
+  seedStreamingAboveBytes?: number;
+  /// Override the platform's STREAMING inflate (chunks in, inflated bytes out). Every
+  /// chain object is a plain frame (NOTES §10iy), so any plain-frames decoder will do.
   zstdDecompressStream?: (chunks: AsyncIterable<Uint8Array>) => AsyncIterable<Uint8Array>;
   /// §10hc: apply a CDC batch through `core.planCdcBulk` — one statement per run of
   /// eligible events, the per-event path for the rest (default true; false = every
@@ -141,11 +147,11 @@ export interface ZeBridgeConfig {
   /// last-in-flight rule still bound latency). One commit per 430-event message
   /// applied 24k rows/s on the firehose replica; fifty messages per commit, 59k.
   cdcBatchEvents?: number;
-  durable?: boolean;
+  /// 'sqlite' (default) or 'pglite' (browser and Node). libzb: 'sqlite' or 'duckdb'.
   engine?: 'sqlite' | 'pglite';
-  /// The two seams (NOTES §10). Defaults are the browser: sqlocal/OPFS storage
-  /// and a NATS WebSocket dial. A Node host injects better-sqlite3 + TCP
-  /// (`zb-client-ts/node`); any other host brings its own pair.
+  /// Override the two seams (NOTES §10) — for a test, or a storage of your own. The
+  /// platform provides both: better-sqlite3 + TCP on Node, sqlite-wasm on OPFS (or
+  /// PGlite) + WebSocket in the browser, expo-sqlite + WebSocket on React Native.
   storage?: StorageFactory;
   connect?: (opts: any) => Promise<TransportConnection>;
 }
@@ -417,12 +423,18 @@ export class ZeBridge {
   private recountTimer?: ReturnType<typeof setTimeout>;
 
   private config: ZeBridgeConfig;
+  private platform: Platform;
 
   constructor(config: ZeBridgeConfig) {
     this.config = config;
     config.grammar = GRAMMAR;
-    if (config.durable === undefined) {
-      config.durable = true;
+    this.platform = currentPlatform();
+    if (config.platform && config.platform !== this.platform.name) {
+      throw new Error(`zb-client-ts: platform '${config.platform}' asked, but this build loaded the '${this.platform.name}' entry — import from 'zb-client-ts/${config.platform}'`);
+    }
+    if (!config.creds && config.credsPath) {
+      if (!this.platform.readText) throw new Error(`zb-client-ts: credsPath needs a filesystem; on ${this.platform.name} pass the creds text as \`creds\``);
+      config.creds = this.platform.readText(config.credsPath);
     }
     // The creds win over the passed principal — kills the mismatch class where
     // config says bob but the JWT says omar (every publish would just bounce).
@@ -430,12 +442,9 @@ export class ZeBridge {
       const fromJwt = principalFromCreds(config.creds);
       if (fromJwt && fromJwt !== config.principal) config.principal = fromJwt;
     }
-    // A fresh OPFS file per load by default — the project's own clean-room dev
-    // convention; `durable` opts into the stable per-principal name that makes the
-    // outbox meaningful across reloads.
-    this.dbName = config.durable
-      ? `zebridge_${config.principal}.sqlite3`
-      : `zebridge_${Date.now()}.sqlite3`;
+    if (config.clientId) this.clientIdValue = config.clientId;
+    // The same default as libzb: one replica per principal, kept across runs.
+    this.dbName = config.dbPath ?? `zebridge_${config.principal}.sqlite3`;
     
     this.transport = config.transport ?? natsTransport;
     this.outboxInitPromise = new Promise((resolve) => { this.resolveOutboxInit = resolve; });
@@ -444,16 +453,7 @@ export class ZeBridge {
   private async initializeStorage() {
     if (this.storage) return; // already initialized
     
-    let factory = this.config.storage;
-    if (!factory) {
-      if (this.config.engine === 'pglite') {
-        const { makePgliteStorage } = await import('./pglite-storage.ts');
-        factory = makePgliteStorage({ persist: this.config.durable });
-      } else {
-        const { browserStorage } = await import('./browser-storage.ts');
-        factory = browserStorage;
-      }
-    }
+    const factory = this.config.storage ?? await this.platform.storage({ dbPath: this.dbName, engine: this.config.engine });
 
     this.storage = factory(this.dbName);
     this.dialect = this.storage.dialect ?? sqliteDialect;
@@ -578,16 +578,8 @@ export class ZeBridge {
     if (b.length < 512) return b;           // a frame header would be most of it
     try {
       let out: Uint8Array | null = null;
-      if (this.config.zstdCompress) {
-        out = await this.config.zstdCompress(b);
-      } else {
-        const proc = (globalThis as any).process;
-        if (proc?.versions?.node) {
-          const dynImport = new Function('m', 'return import(m)') as (m: string) => Promise<any>;
-          const zlib = await dynImport('node:zlib');
-          if (typeof zlib.zstdCompressSync === 'function') out = new Uint8Array(zlib.zstdCompressSync(b));
-        }
-      }
+      const compress = this.config.zstdCompress ?? this.platform.zstdCompress;
+      if (compress) out = await compress(b);
       return out && out.length < b.length ? out : b;
     } catch {
       return b;   // a host without a compressor answers uncompressed; every asker reads both
@@ -743,6 +735,10 @@ export class ZeBridge {
   public uuid(): string { return uuidv7(); }
   public get tenant(): string { return this.tenantValue; }
   public get clientId(): string { return this.clientIdValue; }
+  /// Which platform entry this client runs on, and its zstd decoder — for a log line.
+  public get platformInfo(): { name: PlatformName; zstd: string } {
+    return { name: this.platform.name, zstd: this.platform.zstdName() };
+  }
   /// Events held back waiting for a schema newer than they are.
   public get heldCount(): number { return this.fkHeld.length; }
   /// Events held waiting for a PARENT ROW — a foreign key whose target has not
@@ -801,7 +797,7 @@ export class ZeBridge {
       this.emitStatus('connecting');
       this.appendLog('SYS', `Connecting to NATS at ${this.config.natsUrl}...`);
 
-      const dial = this.config.connect ?? this.transport.connect;
+      const dial = this.config.connect ?? this.platform.connect ?? this.transport.connect;
       this.nc = await dial({
         servers: this.config.natsUrl,
         ...(this.config.creds
@@ -2326,17 +2322,14 @@ export class ZeBridge {
   }
 
   /// §10ix: the streaming read of one plan step, or null for the buffered path —
-  /// streaming off, object under `seedStreamingAbove`, a host that is not Node (the
-  /// inflate is node:zlib's Transform), or a custom one-shot `zstdDecompress` hook.
+  /// streaming off, or an object under `seedStreamingAboveBytes`.
   private async chainStepStream(os: any, bucket: string, step: PlanStep, table: string):
     Promise<{ columns: string[]; nrows: number; batches: AsyncIterable<any[][]>; tail: () => Promise<Record<string, any>> } | null> {
     if (!this.config.seedStreaming) return null;
-    const hook = this.config.zstdDecompressStream;
-    if (!hook && !(globalThis as any).process?.versions?.node) return null;
     let src: { info: any; chunks: AsyncIterable<Uint8Array> } | null;
     try { src = await this.objectChunkStream(os, bucket, step.name); }
     catch (e) { this.appendLog('SYS', `${table}: chain object ${step.name} unreadable: ${e}`, 'ERROR'); return null; }
-    if (!src || src.info.size < (this.config.seedStreamingAbove ?? 8 * 1024 * 1024)) return null;
+    if (!src || src.info.size < (this.config.seedStreamingAboveBytes ?? 8 * 1024 * 1024)) return null;
     const doc = await this.chainDocStream(await this.zstdChunkStream(src.chunks));
     if (!doc) { this.appendLog('SYS', `${table}: chain object ${step.name} is not a chain document — buffered path`, 'WARN'); return null; }
     return doc;
@@ -2378,18 +2371,11 @@ export class ZeBridge {
     return { info, chunks: chunks() };
   }
 
-  /// §10ix: an incremental SHA-256 for the streaming read — node:crypto where it exists,
-  /// js-sha256 (pure, 11 KB) anywhere else: Web Crypto's `digest` takes one buffer, and a
+  /// §10ix: an incremental SHA-256 for the streaming read — the platform's (node:crypto on
+  /// Node), else js-sha256 (pure, 11 KB): Web Crypto's `digest` takes one buffer, and a
   /// streamed object is never one buffer.
   private async streamingSha256(): Promise<{ update(c: Uint8Array): void; base64(): string }> {
-    if ((globalThis as any).process?.versions?.node) {
-      // Inside the Node branch, like the other three: Hermes (React Native) cannot
-      // compile `new Function` and threw `SyntaxError: Invalid expression encountered`
-      // at the first streamed seed on a phone (2026-09-24), before any hashing.
-      const dynImport = new Function('m', 'return import(m)') as (m: string) => Promise<any>;
-      const h = (await dynImport('node:crypto')).createHash('sha256');
-      return { update: (c) => h.update(c), base64: () => h.digest('base64') };
-    }
+    if (this.platform.sha256Stream) return this.platform.sha256Stream();
     const { sha256 } = await import('js-sha256');
     const h = sha256.create();
     return {
@@ -2398,11 +2384,9 @@ export class ZeBridge {
     };
   }
 
-  /// §10ix: inflate a chunk stream as it flows — node:zlib's zstd Transform, or the
-  /// host's hook. The first chunk is sniffed for the frame magic
-  /// (§10w): an object that is not zstd passes through untouched. Written into the
-  /// Transform by hand rather than `pipe`d, so a source error (a digest mismatch after
-  /// the last chunk) destroys the output and the reader sees it, instead of an end.
+  /// §10ix: inflate a chunk stream as it flows — the platform's decoder, or the config's
+  /// override. The first chunk is sniffed for the frame magic (§10w): an object that is
+  /// not zstd passes through untouched.
   private async zstdChunkStream(chunks: AsyncIterable<Uint8Array>): Promise<AsyncIterable<Uint8Array>> {
     const it = chunks[Symbol.asyncIterator]();
     const first = await it.next();
@@ -2410,18 +2394,9 @@ export class ZeBridge {
     const head = first.value;
     const rest = (async function* () { yield head; for (;;) { const r = await it.next(); if (r.done) return; yield r.value; } })();
     if (!(head.length >= 4 && head[0] === 0x28 && head[1] === 0xb5 && head[2] === 0x2f && head[3] === 0xfd)) return rest;
-    if (this.config.zstdDecompressStream) return this.config.zstdDecompressStream(rest);
-    const dynImport = new Function('m', 'return import(m)') as (m: string) => Promise<any>;
-    const [zlib, events] = await Promise.all([dynImport('node:zlib'), dynImport('node:events')]);
-    const out = zlib.createZstdDecompress();
-    void (async () => {
-      try {
-        for await (const c of rest) { if (!out.write(c)) await events.once(out, 'drain'); }
-        out.end();
-      } catch (e) { out.destroy(e as Error); }
-    })();
-    return out as AsyncIterable<Uint8Array>;
+    return (this.config.zstdDecompressStream ?? this.platform.zstdDecompressStream)(rest);
   }
+
 
   /// §10ix: a chain document decoded as it arrives. `core.parseChainHead` reads the
   /// head by hand; every value after it is one row, handed out in batches (all the
@@ -2484,39 +2459,13 @@ export class ZeBridge {
     return { columns: head.columns, nrows, batches, tail };
   }
 
+  /// A zstd frame (sniffed by its magic, §10w) inflated by the platform or the override;
+  /// anything else as it is.
   private async maybeZstd(b: Uint8Array): Promise<Uint8Array> {
     if (b.length < 4 || b[0] !== 0x28 || b[1] !== 0xb5 || b[2] !== 0x2f || b[3] !== 0xfd) return b;
-    if (this.config.zstdDecompress) return await this.config.zstdDecompress(b);
-    // Node default, written so a BROWSER tsconfig/bundler never sees the node
-    // module: globalThis probe + Function-constructed dynamic import.
-    const proc = (globalThis as any).process;
-    if (proc?.versions?.node) {
-      const dynImport = new Function('m', 'return import(m)') as (m: string) => Promise<any>;
-      const zlib = await dynImport('node:zlib');
-      return new Uint8Array(zlib.zstdDecompressSync(b));
-    }
-    // Browser default
-    const g = globalThis as any;
-    if (!g.__zbZstd) {
-      g.__zbZstd = import('@bokuweb/zstd-wasm').then(async (mod) => {
-        await mod.init();
-        return mod;
-      });
-    }
-    const mod = await g.__zbZstd;
-    // §10gi: a full is written as a stream, so its frame states no content size, and
-    // zstd-wasm then sizes the output at `defaultHeapSize` (1 MiB by default) and fails
-    // past it. It has no streaming decoder: start at 8× the compressed size and double
-    // until the document fits. A frame that states its size ignores the option.
-    const limit = 2 ** 31;
-    for (let heap = Math.max(1 << 20, b.length * 8); ; heap *= 2) {
-      try {
-        return mod.decompress(b, { defaultHeapSize: heap });
-      } catch (e) {
-        if (heap * 2 > limit) throw e;
-      }
-    }
+    return await (this.config.zstdDecompress ?? this.platform.zstdDecompress)(b);
   }
+
 
   /// grammar.json's `subjects.mutation_ack_prefix` — the verdict channel's first token.
   /// The literal `mutation_ack` used to be hardcoded at three sites; the grammar is

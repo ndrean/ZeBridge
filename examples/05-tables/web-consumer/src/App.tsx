@@ -10,7 +10,6 @@
 import { ZeBridge, credsFileText, principalFromCreds, type SeedProgress } from '../../../../zb-client-ts';
 import { mergeRegisters } from 'zb-client-ts';
 import { nkeys } from '@nats-io/nats-core';
-import { Decompress } from 'fzstd';
 import { createSignal, onCleanup, For, Show } from 'solid-js';
 
 /// ⚠️ This module owns ONE client, one socket, one replica. An edit to this file must
@@ -103,21 +102,6 @@ const CREDS = await (async () => {
 /// are, not what the URL guessed.
 const EFFECTIVE_PRINCIPAL = (CREDS && principalFromCreds(CREDS)) || PRINCIPAL;
 
-/// §10ix: streaming zstd for the seed. fzstd inflates plain frames chunk by chunk (the
-/// same hook as the React Native example), and every chain object is one. The browser
-/// storage spills TEMP to OPFS (browser-storage.ts), so a big base takes the staged
-/// path — 3M rows in 156 s in Chrome (06-large-table) — hence the progress bar under
-/// the phases row.
-const zstdStream = (chunks: AsyncIterable<Uint8Array>): AsyncIterable<Uint8Array> => {
-  return (async function* () {
-    const out: Uint8Array[] = [];
-    const d = new Decompress((chunk: Uint8Array) => { out.push(chunk); });
-    for await (const c of chunks) { d.push(c); while (out.length) yield out.shift()!; }
-    d.push(new Uint8Array(0), true);
-    while (out.length) yield out.shift()!;
-  })();
-};
-
 /// THE instance. One replica, one socket, one outbox.
 const zb = new ZeBridge({
   natsUrl: NATS_URL,
@@ -133,12 +117,13 @@ const zb = new ZeBridge({
   // and this demo makes a fresh database per load, so each attempt left another one
   // behind until the quota blew. A client should name what it holds.
   tables: ['counter_public', 'counter_tenant', 'app_users', 'app_orders'],
-  durable: DURABLE,
+  // The clean-room convention: a fresh OPFS database per load, unless ?durable=1.
+  dbPath: DURABLE ? undefined : `zebridge_${Date.now()}.sqlite3`,
   engine: ENGINE,
-  // Objects under 8 MiB (the default `seedStreamingAbove`) still take the one-shot
-  // path — the four demo tables do; only a big base streams.
+  // Objects under 8 MiB (the default `seedStreamingAboveBytes`) still take the one-shot
+  // path — the four demo tables do; only a big base streams, and the progress bar
+  // under the phases row shows it.
   seedStreaming: true,
-  zstdDecompressStream: zstdStream,
 });
 
 // Console handle for inspecting the local replica directly — the database lives in

@@ -17,8 +17,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { ZeBridge } from 'zb-client-ts';
-import { nodeStorage, nodeConnect } from 'zb-client-ts/node';
-import { makePgliteStorage } from 'zb-client-ts/pglite';
 
 const REPO = new URL('../../', import.meta.url).pathname;
 const SPEC: { wid: string; principal: string; tenant: string; db: string; engine: string; report: string }[] =
@@ -40,10 +38,8 @@ async function runClient(c: (typeof SPEC)[number], stagger: number): Promise<voi
     creds: readFileSync(`${REPO}scripts/native/creds/${c.principal}.creds`, 'utf8'),
     grammar: GRAMMAR,
     tables: '*', // §10hn: every published table, said out loud
-    storage: c.engine === 'pglite'
-      ? makePgliteStorage({ persist: true, dataDir: c.db })
-      : (_: string) => nodeStorage(c.db),
-    connect: nodeConnect,
+    dbPath: c.db,
+    engine: c.engine === 'pglite' ? 'pglite' : 'sqlite',
   });
   zb.onLog((t: string, d: any, level: string) => {
     const s = typeof d === 'string' ? d : JSON.stringify(d);

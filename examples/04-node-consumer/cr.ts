@@ -1,10 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { ZeBridge } from 'zb-client-ts';
-import { nodeStorage, nodeConnect } from 'zb-client-ts/node';
 const R = new URL('../../', import.meta.url).pathname;
 const zb = new ZeBridge({ natsUrl:'nats://127.0.0.1:4222', principal:'omar',
   creds: readFileSync(`${R}scripts/native/creds/omar.creds`,'utf8'),
-  tables:'*', durable:true, storage:nodeStorage, connect:nodeConnect });
+  tables:'*' });
 zb.onLog((t:string,d:any,l:string)=>{ if (t.startsWith('cdc.')) return;
   console.log(`[${l}] ${(typeof d==='string'?d:JSON.stringify(d)).slice(0,120)}`);});
 await zb.connect(); await new Promise(r=>setTimeout(r, Number(process.env.WAIT_MS ?? 15000)));

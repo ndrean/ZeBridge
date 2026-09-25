@@ -9,7 +9,6 @@
 /// but may not subscribe there, which is the point of the role (§10hk).
 import { readFileSync } from 'node:fs';
 import { ZeBridge } from 'zb-client-ts';
-import { nodeStorage, nodeConnect } from 'zb-client-ts/node';
 
 const REPO = new URL('../../', import.meta.url).pathname;
 const PRINCIPAL = process.env.ZB_PRINCIPAL ?? 'pois';
@@ -23,8 +22,7 @@ const zb = new ZeBridge({
   creds: readFileSync(process.env.ZB_CREDS ?? `${REPO}scripts/native/creds/${PRINCIPAL}.creds`, 'utf8'),
   tables: TABLES,
   heartbeatMs: 0,
-  storage: (_: string) => nodeStorage(process.env.ZB_DB ?? `/tmp/zb-serve-${PRINCIPAL}-${Date.now()}.sqlite3`),
-  connect: nodeConnect,
+  dbPath: process.env.ZB_DB ?? `/tmp/zb-serve-${PRINCIPAL}-${Date.now()}.sqlite3`,
 });
 
 await zb.connect();

@@ -1,7 +1,6 @@
 /// The storage adapter for React Native: `expo-sqlite` behind the client's own
-/// `Storage` contract (zb-client-ts/src/storage.ts). This is the ONLY thing a phone
-/// needed that the library did not already have — no Zig, no cross-compilation, no
-/// NDK. The Node adapter is 109 lines and does the same job over better-sqlite3.
+/// `Storage` contract (storage.ts), used by the react-native entry. The Node adapter
+/// (node.ts) does the same job over better-sqlite3.
 ///
 /// ⚠️ THE CONTRACT IS SERIALISATION. The core drives several lanes at once (one CDC
 /// consumer per stream, plus the write path), so `transaction` and `exec` can be
@@ -9,7 +8,7 @@
 /// "cannot start a transaction within a transaction" and drops whole batches. The
 /// promise chain below is the whole fix, exactly as in node.ts.
 import * as SQLite from 'expo-sqlite';
-import type { Exec, Storage, StorageFactory } from 'zb-client-ts/storage';
+import type { Exec, Storage, StorageFactory } from './storage.ts';
 
 /// Binding is SEMANTICS, not a detail, which is why node.ts spells it out too:
 /// expo-sqlite binds null, numbers, strings and Uint8Array. A JS boolean and

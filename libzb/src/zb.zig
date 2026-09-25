@@ -22,7 +22,7 @@ const Args = struct {
     creds: []const u8 = "",
     principal: []const u8 = "",
     tables: []const u8 = "",
-    db: [:0]const u8 = "zb.sqlite3",
+    db: [:0]const u8 = "", // default zebridge_<principal>.sqlite3, as both clients
     db_url: ?[:0]const u8 = null,
     engine: client.storage.Engine = .sqlite,
     once: bool = false,
@@ -83,6 +83,7 @@ pub fn main(init: std.process.Init) !u8 {
         usage();
         return 2;
     }
+    if (args.db.len == 0) args.db = try std.fmt.allocPrintSentinel(a, "zebridge_{s}.sqlite3", .{args.principal}, 0);
     var tables: std.ArrayListUnmanaged([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, args.tables, ',');
     while (it.next()) |t| if (t.len > 0) try tables.append(a, t);

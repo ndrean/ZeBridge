@@ -15,8 +15,6 @@ import { ZeBridge } from 'zb-client-ts';
 // `{"$bin": "<base64>"}` marker the C ABI uses, so a host reads both clients alike.
 const bytesAsMarker = (row: any) =>
   Object.fromEntries(Object.entries(row).map(([k, v]) => [k, v instanceof Uint8Array ? { $bin: Buffer.from(v).toString('base64') } : v]));
-import { nodeStorage, nodeConnect } from 'zb-client-ts/node';
-import { makePgliteStorage } from 'zb-client-ts/pglite';
 
 const REPO = new URL('../../', import.meta.url).pathname;
 const PRINCIPAL = process.env.ZB_PRINCIPAL ?? 'omar';
@@ -29,10 +27,9 @@ const zb = new ZeBridge({
   principal: PRINCIPAL,
   creds: readFileSync(process.env.ZB_CREDS ?? `${REPO}scripts/native/creds/${PRINCIPAL}.creds`, 'utf8'),
   heartbeatMs: 0,
-  durable: true,
   tables: process.env.ZB_TABLES ? process.env.ZB_TABLES.split(',').map((t) => t.trim()).filter(Boolean) : '*', // §10hn
-  storage: ENGINE === 'pglite' ? makePgliteStorage({ persist: true, dataDir: DB }) : (_: string) => nodeStorage(DB),
-  connect: nodeConnect,
+  dbPath: DB,
+  engine: ENGINE === 'pglite' ? 'pglite' : 'sqlite',
 });
 // Lifecycle lines to stderr (the scenario greps them); CDC is one line per event.
 zb.onLog((t: string, d: any, level: string) => {
