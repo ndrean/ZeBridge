@@ -16684,8 +16684,41 @@ nothing" — which the TS client now does) passes.
 since. `seed_stream` with it fixed: the streaming seed of 3M rows 11.8 s at 216 MB, the
 whole-object seed 11.6 s at 1,052 MB — sorted objects stream as fast as they load whole.
 
-What this leaves: the chain's capacity at 50k–150k rows/s (the owner's question); libzb's
-live apply on random keys; zb-react-native for Android; a full live battery run, now that
-the 25 scenarios on clients.py work again.
+**The chain's capacity, redone after §10ja** (`firehose_tls --runs plain:on --seconds 120
+--verify`, insert N rows/s then update them the next second, CDC cap 256 MiB, cadence 60 s,
+`RING_BUFFER_COUNT=200000 BASE_BUF=11`). The owner's model: the spike PG → CDC → NATS at
+~5 µs an event, a chain build at ~2.4 µs a row with its ORDER BY — twice as fast, so a
+table at 50k–100k events/s keeps its chain. Measured, on the producer fixed below:
+
+| `--rate` | events/s reached | holes (negative margin samples) | min margin | cuts (early) | largest background full | slot lag max |
+| --- | --- | --- | --- | --- | --- | --- |
+| spike (burst_tls, 2M rows) | 185,702 — 5.4 µs/event | — | — | — | — | — |
+| 25,000 | 49,778 | 0 of 122 | +567 | 21 (18) | 0.6 s | 26 MiB |
+| 37,500 | 74,673 | 0 of 126 | +380 | 31 (29) | 10.9 s, ~4.5M rows | 33 MiB |
+| 50,000 | 88,964 | 0 of 141 | +368 | 44 (42) | 14.6 s, ~6M rows | 85 MiB |
+| 75,000 | 116,210 (PostgreSQL's one session: 153 s for a 120 s load) | 2 of 162 | −383 | 67 (65), 1 fell off before a cut | 21.9 s, ~9M rows (2.4 µs/row) | 171 MiB |
+
+Up to ~90k events/s the chain has no hole; at ~116k it loses the race for two seconds.
+`--verify` exact at every rate.
+
+Two fixes got there. **The boot chain was never watched:** cut on an empty stream at
+`cutoff_seq` 0, which `recordCut` skipped, so no edge trigger fired for the pair and the
+boot chain predated the stream for up to ~50 s (13,166 messages at 100k) until a cadence
+cut — invisible until the manifest carried the 0 (the sampler skipped chains without the
+field). Now a cut is recorded whenever the stream was read. Before/after at 50k: 48 → 0
+negative samples; 75k: 57 → 0; 100k: 60 → 0. **libzb's poll re-seeded past its own
+batch:** after a hole it re-seeded, then applied the batch fetched before the re-seed and
+persisted its max seq over the healed position — backwards (18136 → 11197) — and read the
+next message as a hole, for ever. The part the new chain covers is acked, not applied.
+
+Clients at these rates, opened 30 s into the load: zb-client-ts converged exactly at every
+rate (137 s at 50k, 176 s at 75k, 384 s at 100k — gaps healed through the chain, as the
+incremental-fulls plan promises). libzb converged at 50k; at 100k, after the fix, it got to
+5.1M of 6M and stopped after a 224 s re-seed (2.1M rows at ~9,400 rows/s into a 3M-row
+replica) — open, being sampled.
+
+What this leaves: libzb's stop after a long re-seed; libzb's live apply on random keys (the
+9,400 rows/s above); zb-react-native for Android; a full live battery run, now that the 25
+scenarios on clients.py work again.
 (Done the same day: the replica identity for read-only tables, f96cf47; the benchmark
 tables dropped.)
