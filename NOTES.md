@@ -16717,8 +16717,15 @@ incremental-fulls plan promises). libzb converged at 50k; at 100k, after the fix
 5.1M of 6M and stopped after a 224 s re-seed (2.1M rows at ~9,400 rows/s into a 3M-row
 replica) — open, being sampled.
 
+**The live battery, 34/34** (run after the capacity work, the dev slot recovered with
+`ZB_FEED_RESTART=1` — the ladder's ~60 GB of WAL had invalidated it while the dev bridge was
+stopped, as the harness asks; keep it running instead). Three client-role scenarios —
+writable, rowsize, keys — first read every schema as '': `zb.nats_cli` ran the `nats` CLI as
+omar, whose grant covers replies under `_INBOX.omar.>` only (§10hm), and the CLI's default
+`_INBOX.` was refused, so each KV get timed out. It now passes the principal's inbox
+prefix, read from the creds' JWT.
+
 What this leaves: libzb's stop after a long re-seed; libzb's live apply on random keys (the
-9,400 rows/s above); zb-react-native for Android; a full live battery run, now that the 25
-scenarios on clients.py work again.
+9,400 rows/s above); zb-react-native for Android.
 (Done the same day: the replica identity for read-only tables, f96cf47; the benchmark
 tables dropped.)

@@ -14,6 +14,7 @@ Everything below derives from that, and from `grammar.json`, `zebridge_catalogue
 """
 
 import asyncio
+import base64
 import json
 import os
 import pathlib
@@ -389,6 +390,18 @@ class Bridge:
             return None
 
 
+def _creds_principal(path: str) -> str | None:
+    """The `name` claim of a .creds file's user JWT — the principal, as both clients
+    derive it (principalFromCreds)."""
+    try:
+        text = pathlib.Path(path).read_text()
+        jwt = text.split("-----BEGIN NATS USER JWT-----")[1].split("------END NATS USER JWT------")[0].strip()
+        payload = jwt.split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))).get("name") or None
+    except Exception:
+        return None
+
+
 def nats_cli(*args, seed_file=None) -> subprocess.CompletedProcess:
     """Shell out to the `nats` CLI, which is the only thing that can create a stream
     with the exact config nats-init uses — nats-py's add_stream would round-trip it
@@ -396,6 +409,13 @@ def nats_cli(*args, seed_file=None) -> subprocess.CompletedProcess:
     creds = os.environ.get("NATS_CREDS")
     if creds:
         auth = ["--creds", creds]
+        # §10hm: a principal's grant covers replies under its OWN inbox prefix only
+        # (`_INBOX.<principal>.>`); the CLI's default `_INBOX.` is refused, and every
+        # request — a KV get included — then times out and reads as empty. Measured
+        # 2026-09-25: writable, rowsize and keys read '' for every schema as omar.
+        who = _creds_principal(creds)
+        if who:
+            auth += ["--inbox-prefix", f"_INBOX.{who}"]
     else:
         # Legacy nkey path: the seed file is a secret — 0600, and gone at exit.
         if seed_file is None:
