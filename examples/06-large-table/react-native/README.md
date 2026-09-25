@@ -78,7 +78,17 @@ deletes it and starts over.
 All three exact: 3,055,002 / 3,055,002 / 138,916,285. RN with libzb matches Flutter
 with libzb, so the host framework costs nothing; the 15× gap is per-row JavaScript on
 Hermes (no JIT): fzstd, msgpack, parameter arrays. The TS rate also fell as it went
-(7.1k → 5.4k rows/s per 500k), cause not measured. NOTES §10ja.
+(7.1k → 5.4k rows/s per 500k): the phone heating up. A trace shows the same work per row
+throughout and JS faster after a two-minute pause than at the start (NOTES §10ja).
+
+`EXPO_PUBLIC_ZB_TRACE=1` writes where the zb-client-ts seed spends its time — SQLite vs
+JS, Hermes GC and heap, WAL size, every 100k rows — to the app's Documents:
+
+    xcrun devicectl device copy from --device <udid> --domain-type appDataContainer \
+      --domain-identifier dev.zebridge.largetable --source Documents/seed-trace.tsv --destination .
+
+Keep the screen on while measuring: a locked phone suspends the app and the pause
+lands in the time.
 
 ## Measured (2026-09-24, Expo SDK 52 / RN 0.76 / Hermes, unsorted chain, staged)
 

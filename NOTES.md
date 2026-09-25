@@ -16558,6 +16558,23 @@ React Native. Same iPhone 12, same table: **35.0 s**, against Flutter + libzb 34
 per-row JavaScript. libzb and expo-sqlite both carry SQLite, so libzb is prelinked
 (`ld -r -exported_symbol '_zb_*'`) and keeps its SQLite, zstd and nats private.
 
-What this leaves: libzb's live apply on random keys; the cause of the RN + TS slowdown.
+**Why RN + zb-client-ts slows down: heat, not the code.** A trace (`EXPO_PUBLIC_ZB_TRACE=1`,
+examples/06-large-table/react-native `src/seed-trace.ts`, every 100k rows) split the seed
+on the iPhone 12. JS is 85–90 % of it: 13.0 s per 100k early, 15.7 s by 2.6M. SQLite
+(statements and COMMITs) stays at 1.2–2.2 s, the heap at 38–63 MB, the WAL at 17 MB,
+~280 GCs per 100k, and Hermes reports GC time near zero. Only the CPU time of the same
+work grows. The phone then locked for two minutes (iOS suspended the app), and right
+after it JS ran at 10.5 s per 100k, faster than at the start. The run: 573.8 s connect →
+usable with the pause, about 455 s without it.
+
+The base cost is the per-row pipeline: Hermes allocated 32 GB for 3M rows (~10 KB and
+~130 µs of JS per row) — stacked async iterators, one `await` per row per layer (Babel
+generators on Hermes), msgpack decode, then the window re-encoded as one JSON string.
+Decoding a chunk of rows synchronously is the lever left for zb-client-ts; libzb (35 s)
+stays out of reach.
+
+What this leaves: libzb's live apply on random keys; a batched row decode in
+zb-client-ts; `wipe()` racing a `connect()` in progress (`libzb.ts` reads `this.nc` after
+`close()` nulled it: a harmless TypeError in the log).
 (Done the same day: the replica identity for read-only tables, f96cf47; the benchmark
 tables dropped.)

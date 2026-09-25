@@ -6,6 +6,7 @@ import { Platform } from 'react-native';
 import { ZeBridge } from 'zb-client-ts';
 import { expoStorage } from './expo-storage';
 import { zstd, zstdStream } from './platform';
+import { TRACE, traced } from './seed-trace';
 
 /// The iOS simulator shares the Mac's network; the Android emulator reaches it as
 /// 10.0.2.2. Resolved at run time so one bundle serves both (08-map, §10io). A real
@@ -31,7 +32,7 @@ export function makeClient() {
     // only tails. "wipe & seed again" is the button.
     durable: true,
     heartbeatMs: 0,
-    storage: expoStorage,
+    storage: TRACE ? traced(expoStorage) : expoStorage,
     zstdDecompress: zstd,
     // §10ix: the base streams in as it arrives and is STAGED — expo-storage says
     // `spillsTemp`, so windows are appended to a TEMP table and the real table is

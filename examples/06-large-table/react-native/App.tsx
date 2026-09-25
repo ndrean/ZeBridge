@@ -13,6 +13,7 @@ import { defaultDatabaseDirectory } from 'expo-sqlite';
 import type { ConnStatus, Phase, SeedProgress, ZeBridge } from 'zb-client-ts';
 import { makeClient, PRINCIPAL, TABLE } from './src/client';
 import { LibzbSeed } from './src/libzb-seed';
+import { makeRecorder, TRACE } from './src/seed-trace';
 
 const fmt = (n: number) => n.toLocaleString('en-US');
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
@@ -74,6 +75,8 @@ function TsSeed() {
     setElapsed(0);
     setRunning(true);
     let seedT0 = 0;
+    const dbDir = defaultDatabaseDirectory.startsWith('file://') ? defaultDatabaseDirectory : `file://${defaultDatabaseDirectory}`;
+    const rec = TRACE ? makeRecorder(`${dbDir}/${zb.dbName}`) : null;
     const stopClock = () => setRunning(false);
     const log = (text: string, err = false) => setLines((prev) => [...prev.slice(-199), { text, err }]);
 
@@ -102,7 +105,8 @@ function TsSeed() {
       }),
       zb.onSeedProgress((p) => {
         if (p.table !== TABLE) return;
-        if (!seedT0) seedT0 = Date.now();
+        if (!seedT0) { seedT0 = Date.now(); rec?.start(); }
+        void rec?.progress(p.applied, p.done);
         setProgress(p);
         if (p.done) setSeedMs(Date.now() - seedT0);
       }),
