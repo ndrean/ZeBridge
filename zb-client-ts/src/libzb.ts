@@ -2698,7 +2698,7 @@ export class ZeBridge {
         // each window — libzb's trade (client.zig `seed_chunk_rows`): runs of ordered
         // keys instead of one, slower for the b-tree, bounded in memory.
         const keyIdx = pkIdx[0] ?? -1;
-        const rows: any[][] = stream ? [] : sortRowsByKey(doc.rows, keyIdx);
+        const rows: any[][] = stream ? [] : step.sorted ? doc.rows : sortRowsByKey(doc.rows, keyIdx);
         const chunk = this.config.seedChunkRows ?? 50_000;
         const size = chunk > 0 ? chunk : Math.max(stream ? stream.nrows : rows.length, 1);
         const sqlite = this.dialect.name === 'sqlite';
@@ -2734,7 +2734,10 @@ export class ZeBridge {
         };
         if (sqlite) { try { await this.run('PRAGMA cache_size = -131072'); } catch { /* an adapter that refuses PRAGMA: the default cache */ } }
         try {
-          if (stream && sqlite && bulk && step.kind === 'full' && this.storage.spillsTemp === true) {
+          // §10ja: a step the producer cut in key order goes straight in, a window at a
+          // time — each window appends to the key index, so staging would only write every
+          // row twice (measured: 26 s direct against 34 s staged, 3.66M rows).
+          if (stream && sqlite && bulk && step.kind === 'full' && this.storage.spillsTemp === true && !step.sorted) {
             // §10ix: a streamed FULL on SQLite is STAGED, not sorted per window. Sorting
             // each window scattered its inserts across the whole b-tree (measured: 50k
             // windows, 141 s, sys 38.6 s — the scatter is kernel I/O — against 38.9 s
@@ -2801,12 +2804,12 @@ export class ZeBridge {
               for await (const row of stream.rows) {
                 win.push(row); n++;
                 if (win.length >= size) {
-                  await applyWindow(sortRowsByKey(win, keyIdx), first); first = false; win = [];
+                  await applyWindow(step.sorted ? win : sortRowsByKey(win, keyIdx), first); first = false; win = [];
                   this.seedProgress({ table, step: step.name, kind: step.kind, applied: n, total: stream.nrows, done: false });
                 }
               }
               // The last partial window — or, for an empty full, the DELETE alone.
-              if (win.length || (first && step.kind === 'full')) { await applyWindow(sortRowsByKey(win, keyIdx), first); first = false; }
+              if (win.length || (first && step.kind === 'full')) { await applyWindow(step.sorted ? win : sortRowsByKey(win, keyIdx), first); first = false; }
               this.seedProgress({ table, step: step.name, kind: step.kind, applied: n, total: stream.nrows, done: true });
               const tail = await stream.tail();
               if (tail.version_column && tail.version_column !== vcol) {

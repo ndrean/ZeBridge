@@ -47,8 +47,15 @@ const fs = require('node:fs');
 // iOS had happened to load the same path. `extraNodeModules` only catches what normal
 // resolution MISSES, and the walk up from zb-client-ts/src does not miss it.
 const bare = /^(?!\.|\/|node:)[^/]+(\/[^/]+)?/;
+const browserOnly = /^(@bokuweb\/zstd-wasm|\.\/pglite-storage\.ts|\.\/browser-storage\.ts)$/;
 config.resolver.resolveRequest = (context, moduleName, platform) => {
   if (moduleName.startsWith('node:')) return { type: 'sourceFile', filePath: stub };
+  // The library's browser-only defaults: the zstd fallback and the storage picked when
+  // the host passes none. This app passes `zstdDecompress` (fzstd) and its own storage,
+  // so these imports are never reached, but Metro bundles them anyway: zstd-wasm
+  // resolved to its Node entry (`fs/promises`), and the Release step's Hermes compiler
+  // rejects the Emscripten `import.meta.url` in PGlite/sqlite-wasm (2026-09-25).
+  if (browserOnly.test(moduleName)) return { type: 'sourceFile', filePath: stub };
   const m = bare.exec(moduleName);
   if (m && !context.originModulePath.startsWith(appModules) && fs.existsSync(path.join(appModules, m[0]))) {
     return (defaultResolve ?? context.resolveRequest)({ ...context, originModulePath: path.join(__dirname, 'index.js') }, moduleName, platform);

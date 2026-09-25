@@ -16519,9 +16519,39 @@ now asks the consumer (`num_pending`): waiting messages undelivered is deaf, non
 idle, no consumer is gone. And the recreated consumer had lost its filter — it carries
 it again. Verified in Chrome: 116 s idle, no recreation.
 
-What this leaves: clients taking the direct path when a step is known to be sorted (a
-manifest flag, or a cheap per-window check with the staged path as fallback);
-`zebridge_enable` creating the replica identity for read-only tables; libzb's live
-apply on random keys; the benchmark tables `test_types_v4` / `test_types_v7` (~2.5 GB
-in PostgreSQL) are the owner's to keep or drop.
+**The direct path (built the same day).** Every chain object the producer writes is
+sorted (above), and it now says so: `zebridge_generations` records `delta_sorted`,
+`full_sorted`, `ckpt_sorted` (false for anything written before), and the manifest entry
+carries `"sorted": true`. Both clients read the flag per step: a sorted step skips the
+staging table and the client-side sort and goes straight into the replica; an unflagged
+step keeps the old path. No migration: old and new chains coexist.
 
+test_types (random v4 keys, 3,055,002 rows, a sorted full), all rows and sums checked:
+
+| client | before (unsorted, staged) | sorted, direct |
+| --- | --- | --- |
+| zb-client-ts, Node, Mac | — | 21.9 s |
+| libzb ReleaseFast, Mac | — | 24.2 s (apply 11.9 s) |
+| Flutter/libzb, iPhone 12 | 70.8 / 62.9 s | 34.7 / 39.1 s |
+| RN/zb-client-ts, iPhone 12 | 725 s (Debug) | 518 s (Release) |
+
+The iPhone halves for libzb: staging cost an extra 1 GB write and read that the Mac's
+SSD hid. RN gains 29 %, but the RN row mixes two changes (Debug → Release, staged →
+direct). Its rate falls slowly (7.1k → 5.4k rows/s per 500k) where unsorted inserts
+collapse; the cause is not measured (Hermes GC is the suspect, since Flutter on the same
+SQLite does not slow down). RN is bound by per-row JavaScript on an engine with no JIT —
+fzstd, msgpack, parameter arrays — not by SQLite. The lever for RN is libzb behind a
+native module, not key order.
+
+The RN Release build first failed: Hermes compiles the whole bundle ahead of time and
+rejects `import.meta.url`, which the browser storages (PGlite, sqlite-wasm) carry.
+They were in the bundle because `libzb.ts` imports a default storage with `import()`,
+and Metro bundles every `import()` it can resolve. The Debug bundle is parsed lazily on
+the device and had hidden it. `metro.config.js` serves the throwing stub for the
+browser-only specifiers (`@bokuweb/zstd-wasm`, `./pglite-storage.ts`,
+`./browser-storage.ts`).
+
+What this leaves: `zebridge_enable` creating the replica identity for read-only tables;
+libzb's live apply on random keys; the RN slowdown's cause; a libzb native module for
+RN; the benchmark tables `test_types_v4` / `test_types_v7` (~2.5 GB in PostgreSQL) are
+the owner's to keep or drop.

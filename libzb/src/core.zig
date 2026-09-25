@@ -82,6 +82,13 @@ fn getStr(v: Value, key: []const u8) ?[]const u8 {
     return if (f == .string) f.string else null;
 }
 
+/// §10ja: a plan step carries `"sorted": true` when the manifest entry does — the
+/// object's rows are in primary-key order and apply without staging or sorting.
+fn putSorted(a: std.mem.Allocator, step: *std.json.ObjectMap, entry: Value) !void {
+    if (entry != .object) return;
+    if (entry.object.get("sorted")) |v| if (v == .bool and v.bool) try step.put(a, "sorted", .{ .bool = true });
+}
+
 fn getInt(v: Value, key: []const u8) ?i64 {
     if (v != .object) return null;
     const f = v.object.get(key) orelse return null;
@@ -996,6 +1003,7 @@ pub fn planFromManifest(a: std.mem.Allocator, man: Value, watermark: ?[]const u8
     var fstep: std.json.ObjectMap = .empty;
     try fstep.put(a, "name", .{ .string = getStr(b, "object") orelse "" });
     try fstep.put(a, "kind", .{ .string = "full" });
+    try putSorted(a, &fstep, b);
     try plan.append(.{ .object = fstep });
     const base_gen = getInt(b, "gen") orelse 0;
     for (checkpoints.items) |ck| {
@@ -1012,6 +1020,7 @@ fn checkpointStep(a: std.mem.Allocator, ck: Value) !Value {
     var step: std.json.ObjectMap = .empty;
     try step.put(a, "name", .{ .string = getStr(ck, "object") orelse "" });
     try step.put(a, "kind", .{ .string = "checkpoint" });
+    try putSorted(a, &step, ck);
     return .{ .object = step };
 }
 
@@ -1019,6 +1028,7 @@ fn deltaStep(a: std.mem.Allocator, d: Value) !Value {
     var step: std.json.ObjectMap = .empty;
     try step.put(a, "name", .{ .string = getStr(d, "object") orelse "" });
     try step.put(a, "kind", .{ .string = "delta" });
+    try putSorted(a, &step, d);
     return .{ .object = step };
 }
 

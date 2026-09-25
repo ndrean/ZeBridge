@@ -2014,7 +2014,11 @@ pub const SyncClient = struct {
         // 11 s; the staged sort keeps the order the b-tree wants, at the cost of the
         // rows written twice. On PostgreSQL the chunks go in as they come — COPY into
         // a heap needs no order.
-        const staged = self.st.engine == .sqlite;
+        // §10ja: a step the producer cut in key order is applied as it arrives — each chunk
+        // appends to the key index, and staging would write every row twice for an order
+        // the rows already have.
+        const step_sorted = if (step.object.get("sorted")) |v| v == .bool and v.bool else false;
+        const staged = self.st.engine == .sqlite and !step_sorted;
         const stage_batch: usize = 64;
         if (staged) {
             self.st.execSimple("DROP TABLE IF EXISTS temp._zbz_stage") catch {};

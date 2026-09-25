@@ -659,6 +659,50 @@
           "kind": "delta"
         }
       ]
+    },
+    {
+      "name": "§10ja: a step whose manifest entry says sorted carries it; others stay bare",
+      "manifest": {
+        "full": {
+          "gen": 5,
+          "object": "t-g5-full",
+          "cutoff": "2026-09-25 10:00:00+00",
+          "sorted": true
+        },
+        "checkpoints": [],
+        "deltas": [
+          {
+            "gen": 6,
+            "object": "t-g6-delta",
+            "prev_cutoff": "2026-09-25 10:00:00+00",
+            "cutoff": "2026-09-25 10:05:00+00"
+          },
+          {
+            "gen": 7,
+            "object": "t-g7-delta",
+            "prev_cutoff": "2026-09-25 10:05:00+00",
+            "cutoff": "2026-09-25 10:10:00+00",
+            "sorted": true
+          }
+        ]
+      },
+      "watermark": null,
+      "plan": [
+        {
+          "name": "t-g5-full",
+          "kind": "full",
+          "sorted": true
+        },
+        {
+          "name": "t-g6-delta",
+          "kind": "delta"
+        },
+        {
+          "name": "t-g7-delta",
+          "kind": "delta",
+          "sorted": true
+        }
+      ]
     }
   ],
   "fullPredates": [

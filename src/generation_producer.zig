@@ -1694,10 +1694,13 @@ pub const GenerationProducer = struct {
         // Retire BEFORE rendering: the manifest below is built from the rows that survive.
         try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keepFrom(gen, self.chain_depth, if (build_full) gen else last_full_gen), self.retire_grace_s, self.retire_windows, self.checkpoint_s > 0, if (build_full) gen else 0);
         var deltas_json: std.ArrayList(u8) = .empty;
+        // §10ja: whether the base this manifest names was cut in key order — a client
+        // then applies it without staging. Objects cut before 2026-09-25 were not.
+        var full_sorted_m = false;
         {
             const keep_from = try utils.allocPrintZ(alloc, "{d}", .{keepFrom(gen, self.chain_depth, if (build_full) gen else last_full_gen)});
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, keep_from.ptr };
-            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, ''), has_full " ++
+            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, ''), has_full, delta_sorted, full_sorted " ++
                 "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen > $3 AND retired_at IS NULL ORDER BY gen", &params);
             defer c.PQclear(res);
             const n: usize = @intCast(c.PQntuples(res));
@@ -1709,9 +1712,11 @@ pub const GenerationProducer = struct {
                 if (hasf) {
                     full_gen_m = std.fmt.parseInt(i64, g, 10) catch 0;
                     full_cutoff_m = try alloc.dupe(u8, cutoff);
+                    full_sorted_m = c.PQgetvalue(res, @intCast(i), 5)[0] == 't';
                 }
                 if (prev.len > 0) {
-                    const frag = try std.fmt.allocPrint(alloc, "{s}{{\"gen\":{s},\"object\":\"{s}-g{s}-delta\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\"}}", .{ if (deltas_json.items.len > 0) "," else "", g, table, g, prev, cutoff });
+                    const sorted_frag: []const u8 = if (c.PQgetvalue(res, @intCast(i), 4)[0] == 't') ",\"sorted\":true" else "";
+                    const frag = try std.fmt.allocPrint(alloc, "{s}{{\"gen\":{s},\"object\":\"{s}-g{s}-delta\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\"{s}}}", .{ if (deltas_json.items.len > 0) "," else "", g, table, g, prev, cutoff, sorted_frag });
                     try deltas_json.appendSlice(alloc, frag);
                 }
             }
@@ -1719,9 +1724,10 @@ pub const GenerationProducer = struct {
         if (build_full) {
             full_gen_m = gen;
             full_cutoff_m = cutoff_version;
+            full_sorted_m = true;
         }
         if (build_delta) {
-            const frag = try std.fmt.allocPrint(alloc, "{s}{{\"gen\":{d},\"object\":\"{s}-g{d}-delta\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\"}}", .{ if (deltas_json.items.len > 0) "," else "", gen, table, gen, last_cutoff.?, cutoff_version });
+            const frag = try std.fmt.allocPrint(alloc, "{s}{{\"gen\":{d},\"object\":\"{s}-g{d}-delta\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\",\"sorted\":true}}", .{ if (deltas_json.items.len > 0) "," else "", gen, table, gen, last_cutoff.?, cutoff_version });
             try deltas_json.appendSlice(alloc, frag);
         }
 
@@ -1749,7 +1755,7 @@ pub const GenerationProducer = struct {
             "";
         const manifest = try std.fmt.allocPrint(alloc, "{{\"gen\":{d},\"seed_epoch\":{d},\"bucket\":\"{s}\",{s}{s}\"cutoff_version\":\"{s}\",\"cutoff_lsn\":\"{s}\"," ++
             "\"version_column\":\"{s}\"," ++
-            "\"full\":{{\"gen\":{d},\"object\":\"{s}-g{d}-full\",\"cutoff\":\"{s}\"}},\"checkpoints\":{s},\"deltas\":[{s}]}}", .{ gen, cat_epoch, bucket, seq_frag, gc_frag, cutoff_version, lsn, vcol, full_gen_m, table, full_gen_m, full_cutoff_m, ckpts_json, deltas_json.items });
+            "\"full\":{{\"gen\":{d},\"object\":\"{s}-g{d}-full\",\"cutoff\":\"{s}\"{s}}},\"checkpoints\":{s},\"deltas\":[{s}]}}", .{ gen, cat_epoch, bucket, seq_frag, gc_frag, cutoff_version, lsn, vcol, full_gen_m, table, full_gen_m, full_cutoff_m, if (full_sorted_m) ",\"sorted\":true" else "", ckpts_json, deltas_json.items });
         _ = try kv.put(key, manifest, .{});
 
         // ── objects and manifest live: NOW the row becomes the producer's memory ──
@@ -1768,8 +1774,8 @@ pub const GenerationProducer = struct {
             const shape_z = try alloc.dupeZ(u8, col_shape);
             const relid_z: ?[*:0]const u8 = if (cur_relid.len > 0) (try alloc.dupeZ(u8, cur_relid)).ptr else null;
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", count_z, del_z.ptr, epoch_z.ptr, shape_z.ptr, relid_z, floor_z, filenode_z, obj_bytes_z };
-            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, row_count, del_count, seed_epoch, col_shape, relid, open_xact_floor, filenode, obj_bytes) " ++
-                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, $8::bigint, $9::bigint, $10::integer, $11, $12::oid, $13::timestamptz, $14::oid, $15::bigint) " ++
+            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, row_count, del_count, seed_epoch, col_shape, relid, open_xact_floor, filenode, obj_bytes, delta_sorted, full_sorted) " ++
+                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, $8::bigint, $9::bigint, $10::integer, $11, $12::oid, $13::timestamptz, $14::oid, $15::bigint, true, $7::boolean) " ++
                 "ON CONFLICT (tenant, tbl, gen) DO NOTHING", &params);
             c.PQclear(res);
         }
@@ -2168,13 +2174,13 @@ pub const GenerationProducer = struct {
             const lower_z = try alloc.dupeZ(u8, ckpt_lower);
             const bytes_z = try utils.allocPrintZ(alloc, "{d}", .{fo.z_bytes});
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_l_z.ptr, lower_z.ptr, bytes_z.ptr };
-            const res = try queryOne(bkc, "UPDATE public.zebridge_generations SET has_checkpoint = true, ckpt_lower = $4::timestamptz, obj_bytes = $5::bigint " ++
+            const res = try queryOne(bkc, "UPDATE public.zebridge_generations SET has_checkpoint = true, ckpt_sorted = true, ckpt_lower = $4::timestamptz, obj_bytes = $5::bigint " ++
                 "WHERE tenant=$1 AND tbl=$2 AND gen=$3", &params);
             c.PQclear(res);
         } else {
             const bytes_z = try utils.allocPrintZ(alloc, "{d}", .{fo.z_bytes});
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_l_z.ptr, bytes_z.ptr };
-            const res = try queryOne(bkc, "UPDATE public.zebridge_generations SET has_full = true, obj_bytes = $4::bigint " ++
+            const res = try queryOne(bkc, "UPDATE public.zebridge_generations SET has_full = true, full_sorted = true, obj_bytes = $4::bigint " ++
                 "WHERE tenant=$1 AND tbl=$2 AND gen=$3", &params);
             c.PQclear(res);
         }
@@ -2195,7 +2201,7 @@ pub const GenerationProducer = struct {
         var deltas: std.json.Array = .init(alloc);
         {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, (try utils.allocPrintZ(alloc, "{d}", .{keep_from})).ptr };
-            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, '') " ++
+            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, ''), delta_sorted " ++
                 "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen > $3 AND retired_at IS NULL ORDER BY gen", &params);
             defer c.PQclear(res);
             for (0..@as(usize, @intCast(c.PQntuples(res)))) |i| {
@@ -2207,6 +2213,7 @@ pub const GenerationProducer = struct {
                 try d.put(alloc, "object", .{ .string = try std.fmt.allocPrint(alloc, "{s}-g{d}-delta", .{ table, g }) });
                 try d.put(alloc, "prev_cutoff", .{ .string = try alloc.dupe(u8, prev) });
                 try d.put(alloc, "cutoff", .{ .string = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 1))) });
+                if (c.PQgetvalue(res, @intCast(i), 3)[0] == 't') try d.put(alloc, "sorted", .{ .bool = true });
                 try deltas.append(.{ .object = d });
             }
         }
@@ -2216,6 +2223,7 @@ pub const GenerationProducer = struct {
             try full_obj.put(alloc, "gen", .{ .integer = gen_l });
             try full_obj.put(alloc, "object", .{ .string = obj_name });
             try full_obj.put(alloc, "cutoff", .{ .string = cutoff_l });
+            try full_obj.put(alloc, "sorted", .{ .bool = true });
             try root.put(alloc, "full", .{ .object = full_obj });
         }
         // §10gt: the checkpoints above the chain's full, oldest first — the middle level a
@@ -2763,7 +2771,7 @@ fn checkpointsJson(alloc: std.mem.Allocator, bkc: *c.PGconn, table: []const u8, 
     var out: std.json.Array = .init(alloc);
     const gen_z = try utils.allocPrintZ(alloc, "{d}", .{full_gen});
     const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_z.ptr };
-    const res = GenerationProducer.queryOnePub(bkc, "SELECT gen, cutoff_version::text, COALESCE(ckpt_lower::text, '') " ++
+    const res = GenerationProducer.queryOnePub(bkc, "SELECT gen, cutoff_version::text, COALESCE(ckpt_lower::text, ''), ckpt_sorted " ++
         "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_checkpoint AND retired_at IS NULL AND gen > $3 ORDER BY gen", &params) catch return out;
     defer c.PQclear(res);
     for (0..@as(usize, @intCast(c.PQntuples(res)))) |i| {
@@ -2773,6 +2781,7 @@ fn checkpointsJson(alloc: std.mem.Allocator, bkc: *c.PGconn, table: []const u8, 
         try ck.put(alloc, "object", .{ .string = try std.fmt.allocPrint(alloc, "{s}-g{d}-ckpt", .{ table, g }) });
         try ck.put(alloc, "lower", .{ .string = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 2))) });
         try ck.put(alloc, "cutoff", .{ .string = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 1))) });
+        if (c.PQgetvalue(res, @intCast(i), 3)[0] == 't') try ck.put(alloc, "sorted", .{ .bool = true });
         try out.append(.{ .object = ck });
     }
     return out;

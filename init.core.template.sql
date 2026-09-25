@@ -706,6 +706,12 @@ ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS open_xact_floor
 -- the previous checkpoint's cutoff, or the base's.
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS has_checkpoint boolean NOT NULL DEFAULT false;
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS ckpt_lower timestamptz;
+-- §10ja: whether each object this row carries was cut in primary-key order. The manifest
+-- says `"sorted": true` for those, and a client applies them without staging or sorting.
+-- False for everything cut before 2026-09-25 — those objects stay readable as they were.
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS delta_sorted boolean NOT NULL DEFAULT false;
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS full_sorted boolean NOT NULL DEFAULT false;
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS ckpt_sorted boolean NOT NULL DEFAULT false;
 -- §10gw: the compressed size of the full or checkpoint attached to this row. The base is
 -- rebuilt when the checkpoints since it outweigh it — a client applying them would
 -- otherwise pay more than a reload — and that comparison needs both sides on the record.
@@ -743,7 +749,7 @@ GRANT SELECT, INSERT, DELETE ON public.zebridge_generations TO ${POSTGRES_READER
 -- full or a checkpoint, and its retirement. The background lane attaches to an existing
 -- generation's row; the cut itself (cutoff_version, cutoff_lsn, prev_cutoff, the counts,
 -- the epoch, the shape) stays unwritable once inserted.
-GRANT UPDATE (has_full, retired_at, has_checkpoint, ckpt_lower, obj_bytes) ON public.zebridge_generations TO ${POSTGRES_READER_USER};
+GRANT UPDATE (has_full, retired_at, has_checkpoint, ckpt_lower, obj_bytes, full_sorted, ckpt_sorted) ON public.zebridge_generations TO ${POSTGRES_READER_USER};
 
 -- §10gl: the start of the oldest transaction open in this database, for the generation
 -- producer's delta floor. pg_stat_activity hides other roles' sessions from the reader
