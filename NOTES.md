@@ -16635,7 +16635,8 @@ bundler pick it. Both clients take the same options with the same defaults (CLIE
 `seedStreamingAboveBytes`; `durable` is gone. The examples lost their platform glue: two
 identical `expo-storage.ts`, two `platform.ts`, the Metro stubs, three fzstd streams,
 zstd-wasm. Verified on the iPhone 12 after the change: RN + zb-client-ts 313.3 s
-(316.5 s before), RN + libzb 35.7 s with the creds passed as text.
+(316.5 s before), RN + libzb 35.7 s with the creds passed as text; Chrome 38.1 s
+(39 s before), its fzstd now the library's.
 
 Found on the way: expo-sqlite's `closeAsync` frees the connection under a statement still
 reading rows — "wipe & seed again" during the app's 3M-row facts query crashed the app
