@@ -1294,18 +1294,20 @@ pub const GenerationProducer = struct {
         // fell off forces a build even when nothing moved.
         // The previous manifest's cut: the edge watch's memory of a pair this tick does
         // not rebuild (§10eq), and the fall-off test (§10ei).
+        // −1: no previous cut known. 0 is a real cut — on an empty, brand-new stream
+        // (§10ja) — and falls off the moment the stream prunes its first message.
         const prev_cut: i64 = blk: {
-            if (last_gen == 0) break :blk 0;
-            var kvb = js.kvBucket(self.topo.kv_generations) catch break :blk 0;
+            if (last_gen == 0) break :blk -1;
+            var kvb = js.kvBucket(self.topo.kv_generations) catch break :blk -1;
             defer kvb.deinit();
             const mkey = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ tenant, table });
-            var entry = kvb.get(mkey) catch break :blk 0;
+            var entry = kvb.get(mkey) catch break :blk -1;
             defer entry.deinit();
-            const man = std.json.parseFromSliceLeaky(std.json.Value, alloc, entry.value, .{}) catch break :blk 0;
-            if (man != .object) break :blk 0;
-            break :blk if (man.object.get("cutoff_seq")) |v| (if (v == .integer) v.integer else 0) else 0;
+            const man = std.json.parseFromSliceLeaky(std.json.Value, alloc, entry.value, .{}) catch break :blk -1;
+            if (man != .object) break :blk -1;
+            break :blk if (man.object.get("cutoff_seq")) |v| (if (v == .integer) v.integer else -1) else -1;
         };
-        const chain_fell_off: bool = prev_cut > 0 and stream_first > 1 and prev_cut + 1 < @as(i64, @intCast(stream_first));
+        const chain_fell_off: bool = prev_cut >= 0 and stream_first > 1 and prev_cut + 1 < @as(i64, @intCast(stream_first));
         if (chain_fell_off) log.warn("🧬 '{s}'/'{s}': chain g{d} fell off {s} (its cutoff is below the stream's oldest message, seq {d}) — a returning client could not splice; cutting a delta with a fresh cut point", .{ tenant, table, last_gen, cdc_stream, stream_first });
 
         // ── §10gl: the next delta's floor, read JUST BEFORE the snapshot ────
@@ -1462,7 +1464,7 @@ pub const GenerationProducer = struct {
                     c.PQclear(rb);
                     // §10eq: a skipped pair still has a cut to watch — the previous
                     // one, with a conservative build time until this process builds it.
-                    if (prev_cut > 0) self.recordCut(tenant, table, vcol, tcol, guarded, cdc_stream, @intCast(prev_cut), 100, false) catch {};
+                    if (prev_cut >= 0) self.recordCut(tenant, table, vcol, tcol, guarded, cdc_stream, @intCast(prev_cut), 100, false) catch {};
                     return;
                 }
                 // §10ej: nothing moved but the chain fell off the stream — the repair
@@ -1787,7 +1789,8 @@ pub const GenerationProducer = struct {
         }
 
         // §10eq: the edge watch's memory of this pair.
-        self.recordCut(tenant, table, vcol, tcol, guarded, cdc_stream, cutoff_seq, utils.unixMillis() - build_started_ms, true) catch |err| log.debug("🧬 cut not recorded: {}", .{err});
+        // The stream only when it was READ: a cut at seq 0 is a cut to watch (§10ja).
+        self.recordCut(tenant, table, vcol, tcol, guarded, if (stream_created.len > 0) cdc_stream else "", cutoff_seq, utils.unixMillis() - build_started_ms, true) catch |err| log.debug("🧬 cut not recorded: {}", .{err});
         if (build_full) self.recordFullBuild(tenant, table, utils.unixMillis() - build_started_ms);
 
         // ── 6. (pruning ran before the manifest was rendered — see pruneChain) ──
@@ -1829,7 +1832,11 @@ pub const GenerationProducer = struct {
     /// lifted); false for a cut only observed on a skipped pair (the clock keeps
     /// what it had, or starts now if this process never saw the pair).
     fn recordCut(self: *GenerationProducer, tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8, guarded: bool, stream: []const u8, cutoff_seq: u64, build_ms: i64, just_cut: bool) !void {
-        if (cutoff_seq == 0 or stream.len == 0) return;
+        // §10ja: a cut at seq 0 — the boot chain on an empty stream — is watched like any
+        // other. Skipping it left the pair with no cut record: no edge trigger could fire,
+        // and under a firehose the boot chain predated the stream for ~50 s (5,609
+        // messages at 50k events/s) until a cadence cut came. `stream` empty = not read.
+        if (stream.len == 0) return;
         const key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ tenant, table });
         self.cuts_lock.lock();
         defer self.cuts_lock.unlock();

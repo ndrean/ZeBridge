@@ -3148,7 +3148,7 @@ pub const SyncClient = struct {
                 if (to > pos) try self.persistSeq(stream, to);
                 continue;
             }
-            const last = try self.storedSeq(stream);
+            var last = try self.storedSeq(stream);
             // §10ei: the gap rule, LIVE. The next message this tail is handed is `last + 1`
             // unless the stream pruned under the consumer while the host did not poll —
             // or (§10ja) the consumer is filtered to this client's tables and skipped
@@ -3169,6 +3169,24 @@ pub const SyncClient = struct {
                 if (self.reseed_pending) {
                     std.debug.print("{s}: the hole stays open — waiting for the producer's next generation before moving past it\n", .{stream});
                     continue;
+                }
+                // §10ja: the batch in hand was fetched BEFORE this re-seed, and the chain
+                // just applied is newer than all of it — the heal moved the position to
+                // the stream's oldest message, which under a firehose is far past this
+                // batch (a 108 s re-seed at 100k: position 10175 → 18136, batch 11098..
+                // 11197). Applied, its old events land over the newer chain and its max
+                // seq overwrites the healed position — backwards (11197) — so the next
+                // message reads as a hole: re-seed, again, for ever. What the chain covers
+                // is acked, not applied; zb-client-ts drops the batch in hand the same way.
+                const healed = try self.storedSeq(stream);
+                if (healed > last) {
+                    var beyond: std.ArrayListUnmanaged(*@import("nats").JetStreamMessage) = .empty;
+                    for (mine.items) |m| {
+                        if (m.metadata.sequence.stream > healed) try beyond.append(a, m) else m.ack() catch {};
+                    }
+                    mine = beyond;
+                    last = healed;
+                    if (mine.items.len == 0) continue;
                 }
             }
             var max_seq = last;
