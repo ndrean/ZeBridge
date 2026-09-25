@@ -2965,10 +2965,13 @@ export class ZeBridge {
         this.reach('snapshot');
       } else {
         const untouched = this.syncedTables.size - tablesToSeed.size;
+        // An empty replica — nothing seeded, no position anywhere — is a first run, the
+        // normal start after an install or a wipe: said as such, not as a gap.
+        const firstRun = seededBefore.size === 0 && scoped.gapped.every((g) => streamGaps[g].stored === 0);
         this.appendLog('SYS',
-          `${gapDetail.length ? `Gap detected or first run! ${gapDetail.join('; ')}. ` : ''}` +
+          `${firstRun ? 'First run — ' : gapDetail.length ? `Gap detected! ${gapDetail.join('; ')}. ` : ''}` +
           `Seeding ${tablesToSeed.size} table(s) [${[...tablesToSeed].join(', ')}]` +
-          `${untouched > 0 ? `; ${untouched} table(s) resume untouched` : ''}`, 'WARNING');
+          `${untouched > 0 ? `; ${untouched} table(s) resume untouched` : ''}`, firstRun ? 'INFO' : 'WARNING');
 
         const seedPromises: Promise<void>[] = [];
 

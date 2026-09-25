@@ -40,7 +40,7 @@ export const expoStorage: StorageFactory = (dbName: string): Storage => {
     return dbp;
   };
 
-  const exec: Exec = async (q, ...params) => {
+  const run: Exec = async (q, ...params) => {
     const db = await open();
     const text = q.trim().replace(/;\s*$/, '');
     // A PRAGMA that reads answers rows; one that sets does not.
@@ -59,6 +59,22 @@ export const expoStorage: StorageFactory = (dbName: string): Storage => {
   };
 
   let queue: Promise<void> = Promise.resolve();
+
+  // ⚠️ Every statement in flight, so that closing waits for them. expo-sqlite's
+  // `closeAsync` frees the connection while a statement may still be reading its rows
+  // on the native queue — measured 2026-09-25: "wipe & seed again" during a 3M-row
+  // `count(DISTINCT uid)` crashed the app (SIGSEGV in expo-sqlite's `columnName`, on a
+  // freed handle). Closing refuses new statements, then waits for these.
+  const inflight = new Set<Promise<unknown>>();
+  let closing = false;
+  const exec: Exec = (q, ...params) => {
+    if (closing) return Promise.reject(new Error('zb-client-ts: the replica is being closed'));
+    const p = run(q, ...params);
+    inflight.add(p);
+    const done = () => { inflight.delete(p); };
+    p.then(done, done);
+    return p;
+  };
 
   return {
     exec,
@@ -81,15 +97,22 @@ export const expoStorage: StorageFactory = (dbName: string): Storage => {
       return run;
     },
     deleteDatabaseFile: async () => {
-      if (dbp) {
-        const db = await dbp;
-        await db.closeAsync();
-        dbp = null;
-      }
+      closing = true;
       try {
-        await SQLite.deleteDatabaseAsync(dbName);
-      } catch {
-        /* absent is fine */
+        await Promise.allSettled([...inflight]);
+        await queue; // a transaction between two of its statements
+        if (dbp) {
+          const db = await dbp;
+          await db.closeAsync();
+          dbp = null;
+        }
+        try {
+          await SQLite.deleteDatabaseAsync(dbName);
+        } catch {
+          /* absent is fine */
+        }
+      } finally {
+        closing = false;
       }
     },
   };
