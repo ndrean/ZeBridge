@@ -8,6 +8,7 @@
 /// Needs a RESPONDER credential: a client principal may ASK (`query.<tenant>.<name>`)
 /// but may not subscribe there, which is the point of the role (§10hk).
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { ZeBridge } from 'zb-client-ts';
 
 const REPO = new URL('../../', import.meta.url).pathname;
@@ -71,7 +72,9 @@ await zb.serve({
     /// the asking tenant's bucket, and the asker sees an ordinary answer.
     big: (q: any) => {
       const n = Number(q?.rows ?? 20000);
-      return { rows: Array.from({ length: n }, (_, i) => [i, `row ${i} ${'x'.repeat(40)}`]), count: n, answered_by: LABEL };
+      // The same rows as serve.py's libzb responder: a hex digest each, which stays large
+      // compressed — answers are compressed before inline-or-object is decided (§10ip).
+      return { rows: Array.from({ length: n }, (_, i) => [i, `row ${i} ${createHash('sha256').update(String(i)).digest('hex')}`]), count: n, answered_by: LABEL };
     },
   },
 });

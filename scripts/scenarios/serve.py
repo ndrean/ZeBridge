@@ -21,10 +21,13 @@ each KIND at once, in ONE queue group, and asks them.
      tenant's bucket and arrives WHOLE, both ways round: a libzb responder answering a
      zb-client-ts asker, and the reverse. A raw NATS client sees the envelope, which is
      what proves the object path was taken rather than a big message squeezing through.
+     Answers are compressed before inline-or-object is decided (§10ip), so the large
+     answer's rows carry hex digests (816 KB compressed) and the raw asker reads zstd.
 
 Usage:  scripts/scenarios/.venv/bin/python scripts/scenarios/serve.py
 """
-import asyncio, ctypes, json, os, pathlib, subprocess, sys, tempfile, time
+import asyncio, ctypes, hashlib, json, os, pathlib, subprocess, sys, tempfile, time
+from compression import zstd  # Python 3.14: answers travel as zstd frames (§10ip)
 
 import nats
 import zb
@@ -75,7 +78,10 @@ class ZigResponder:
             if q["name"] == "zigbig":
                 # §10hq: deliberately past one message — the library turns it into an object.
                 n = int((q.get("payload") or {}).get("rows", 20000))
-                ans = {"rows": [[i, f"row {i} " + "x" * 40] for i in range(n)], "count": n, "answered_by": self.label}
+                # §10ip: answers are compressed before inline-or-object is decided, so
+                # a "too large" answer must stay large compressed. Hex digests shrink by
+                # about half; "x" * 40 shrank 20:1 and every answer went inline.
+                ans = {"rows": [[i, f"row {i} " + hashlib.sha256(str(i).encode()).hexdigest()] for i in range(n)], "count": n, "answered_by": self.label}
             else:
                 rows = self.take(self.lib.zb_client_query(self.h, f"SELECT count(*) AS n FROM {TABLE}".encode(), b"[]"))
                 ans = {"table": TABLE, "count": rows["rows"][0][0] if rows.get("rows") else None, "answered_by": self.label}
@@ -89,7 +95,9 @@ class ZigResponder:
 
 async def ask(nc, name: str, payload: dict, timeout=5.0):
     r = await nc.request(f"query.{TENANT}.{name}", json.dumps(payload).encode(), timeout=timeout)
-    return json.loads(r.data)
+    # A raw asker reads both forms (§10ip): JSON, or a zstd frame of it (magic 28 b5 2f fd).
+    data = zstd.decompress(r.data) if r.data[:4] == b"\x28\xb5\x2f\xfd" else r.data
+    return json.loads(data)
 
 
 async def main() -> int:
