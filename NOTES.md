@@ -16590,8 +16590,29 @@ its start - 1 (9631 on a fresh one): the first version read that as a message in
 and never moved; `delivered.consumer_seq = 0` is the tell. Measured on a Node client
 following `note_t`: 0 → 9634 after 45 s idle, and the relaunch says "No CDC gap".
 
-What this leaves: libzb's live apply on random keys; a batched row decode in
-zb-client-ts; `wipe()` racing a `connect()` in progress (`libzb.ts` reads `this.nc` after
-`close()` nulled it: a harmless TypeError in the log).
+**Rows in batches, and where RN's JS time really goes.** zb-client-ts decoded a streamed
+chain object one row per `await`, through `decodeMultiStream` and a generator of its own.
+Now `core.msgpackScan` finds every complete row in the bytes at hand (at most 4,096) and
+`msgpackDecodeScanned` decodes them in one call (an array32 header in front): one await
+per batch. iPhone 12, RN Release: seed 426.8 → 393.8 s, connect → usable 434 → 401 s,
+Hermes allocations 32 → 23.6 GB. Node: 21.9 → 20.7 s. Under `node --jitless` old and new
+are the same (66.6 / 66.8 s): V8's async generators are native, Hermes runs Babel's.
+Chrome: 39 s either way; its sampled heap peak moved 220 → 333 → 380 MB between runs,
+while Node's live heap after a forced GC stays at 40 MB old and new — GC timing, not
+retention.
+
+A jitless profile with the phone's decompressor (fzstd) shows what is left: fzstd ~40 %
+of the time, msgpack strings to JS strings ~24 % (short strings decode a character at a
+time), SQLite ~16 %. Both big ones are native work in libzb (35 s on the same phone).
+
+**Closing a client while it works.** `close()` set `this.nc = null` only after the close
+resolved. A `connect()` still seeding then read `this.nc.closed` (TypeError in the log),
+and the status loop saw its iterator end with the connection still set, took it for a
+lost connection and re-synced a client being closed: the RN app's "wipe & seed again"
+raced the database delete and stopped dead, once in two. `close()` now clears `this.nc`
+first; `connect()` keeps its own connection and stops quietly when it was closed.
+
+What this leaves: libzb's live apply on random keys; native zstd for zb-client-ts on RN
+(a `ZbNative` call into libzb's), the largest single JS cost.
 (Done the same day: the replica identity for read-only tables, f96cf47; the benchmark
 tables dropped.)

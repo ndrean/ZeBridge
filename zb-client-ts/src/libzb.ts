@@ -23,7 +23,7 @@
 
 import { natsTransport } from './transport.ts';
 import type { Transport, TransportConnection, JetStreamOpts, UserKeyPair } from './transport.ts';
-import { decode, encode, decodeMultiStream } from '@msgpack/msgpack';
+import { decode, encode, decodeMulti } from '@msgpack/msgpack';
 import type { Storage, StorageFactory, Exec as StorageExec } from './storage.ts';
 
 import { sqliteDialect, type Dialect } from './dialect.ts';
@@ -37,7 +37,7 @@ import { heartbeatPayload,
   mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent,
   normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate,
-  isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, parseChainHead, chainStageSql, vecColsOf, pgVectorValues, vecLiteral, strictMissing,
+  isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, parseChainHead, msgpackScan, msgpackDecodeScanned, chainStageSql, vecColsOf, pgVectorValues, vecLiteral, strictMissing,
   planCdcBulk, type CdcBulkTable, cdcValue,
 } from './core.ts';
 import type { VecCol } from './core.ts';
@@ -813,6 +813,11 @@ export class ZeBridge {
         // grant covers every reply, watcher and pull this client opens.
         inboxPrefix: `_INBOX.${this.config.principal}`,
       });
+      // This call's own connection. `close()` (or `wipe()`) may run while the awaits
+      // below are in flight — the seed can take minutes — and it nulls `this.nc`;
+      // everything after them must then stop, not read a connection that is gone
+      // ("cannot read property 'closed' of null", 2026-09-25, a wipe during connect).
+      const nc = this.nc;
 
       this.emitStatus('connected');
       this.reach('connected');
@@ -837,6 +842,10 @@ export class ZeBridge {
         void this.sendHeartbeat();
       }
       await this.subscribeStreams();
+      if (this.nc !== nc) {
+        this.appendLog('SYS', 'closed while connecting — this connect() stops here', 'INFO');
+        return;
+      }
       this.reach('cdc');
 
       // Anything queued while disconnected goes out now — including writes made in a
@@ -887,7 +896,7 @@ export class ZeBridge {
 
       // The terminal reason, named (§10dl): closed() resolves with the error that
       // ended the connection — an auth verdict reads as such, not as a bare close.
-      const closedP: Promise<unknown> | undefined = (this.nc as any).closed?.();
+      const closedP: Promise<unknown> | undefined = (nc as any).closed?.();
       void closedP?.then((err: any) => {
         if (err) this.appendLog('SYS', `NATS connection closed by the server: ${err?.message ?? err}`, 'ERROR');
       });
@@ -928,10 +937,15 @@ export class ZeBridge {
     clearInterval(this.hbIntervalId);
     clearTimeout(this.recountTimer);
     clearTimeout(this.rebaseTimer ?? undefined);
-    if (this.nc) {
-      await this.nc.close();
-      this.nc = null;
-    }
+    // `this.nc` is cleared BEFORE the close is awaited: every loop that asks `this.nc`
+    // whether to go on (the status loop, the tails, a connect() in flight) must see the
+    // close at once. Cleared after, the status loop saw its iterator end with the
+    // connection still set, took it for a lost connection and re-synced a client being
+    // closed — racing wipe()'s database delete, which never finished (2026-09-25, the
+    // RN app's "wipe & seed again" stopped dead).
+    const nc = this.nc;
+    this.nc = null;
+    if (nc) await nc.close();
   }
 
   // ─── internals ────────────────────────────────────────────────────────────
@@ -2315,7 +2329,7 @@ export class ZeBridge {
   /// streaming off, object under `seedStreamingAbove`, a host that is not Node (the
   /// inflate is node:zlib's Transform), or a custom one-shot `zstdDecompress` hook.
   private async chainStepStream(os: any, bucket: string, step: PlanStep, table: string):
-    Promise<{ columns: string[]; nrows: number; rows: AsyncIterable<any[]>; tail: () => Promise<Record<string, any>> } | null> {
+    Promise<{ columns: string[]; nrows: number; batches: AsyncIterable<any[][]>; tail: () => Promise<Record<string, any>> } | null> {
     if (!this.config.seedStreaming) return null;
     const hook = this.config.zstdDecompressStream;
     if (!hook && !(globalThis as any).process?.versions?.node) return null;
@@ -2410,12 +2424,13 @@ export class ZeBridge {
   }
 
   /// §10ix: a chain document decoded as it arrives. `core.parseChainHead` reads the
-  /// head by hand; every value after it is one row, which `decodeMultiStream` yields one
-  /// at a time; after `nrows` of them come the tail's alternating keys and values —
+  /// head by hand; every value after it is one row, handed out in batches (all the
+  /// complete rows of the bytes at hand); after `nrows` of them come the tail's
+  /// alternating keys and values —
   /// gen, kind, cutoff, version_column, prev_cutoff. Null if the stream ends inside
   /// the head: not a chain document.
   private async chainDocStream(inflated: AsyncIterable<Uint8Array>):
-    Promise<{ columns: string[]; nrows: number; rows: AsyncIterable<any[]>; tail: () => Promise<Record<string, any>> } | null> {
+    Promise<{ columns: string[]; nrows: number; batches: AsyncIterable<any[][]>; tail: () => Promise<Record<string, any>> } | null> {
     const it = inflated[Symbol.asyncIterator]();
     let buf = new Uint8Array(0);
     let head = parseChainHead(buf);
@@ -2425,29 +2440,48 @@ export class ZeBridge {
       const nb = new Uint8Array(buf.length + r.value.length); nb.set(buf); nb.set(r.value, buf.length); buf = nb;
       head = parseChainHead(buf);
     }
-    const off = head.offset;
-    const after = (async function* () {
-      if (buf.length > off) yield buf.subarray(off);
-      for (;;) { const r = await it.next(); if (r.done) return; yield r.value; }
-    })();
-    const values = decodeMultiStream(after)[Symbol.asyncIterator]();
     const nrows = head.nrows;
-    const rows = (async function* () {
-      for (let i = 0; i < nrows; i++) {
-        const r = await values.next();
-        if (r.done) throw new Error(`chain document ended after ${i} of ${nrows} rows`);
-        yield r.value as any[];
+    // §10ja: rows in BATCHES — every complete row of the bytes at hand, found by
+    // `msgpackScan` and decoded in one call; the partial one waits for the next chunk.
+    // One await per chunk, not one per row through `decodeMultiStream`'s generator
+    // and ours (on Hermes, Babel's async generators: most of the seed's JS time).
+    let carry: Uint8Array = buf.subarray(head.offset);
+    let got = 0;
+    const BATCH = 4096;
+    const batches = (async function* () {
+      for (;;) {
+        // At most BATCH rows decoded at a time: a large chunk (the browser's are) is
+        // several batches, or its rows all sit decoded beside the window being built
+        // (measured: Chrome's heap peak 220 → 333 MB uncapped).
+        while (carry.length && got < nrows) {
+          const { end, count } = msgpackScan(carry, Math.min(nrows - got, BATCH));
+          if (!count) break;
+          const rows = msgpackDecodeScanned(decode, carry, end, count) as any[][];
+          got += count;
+          carry = carry.subarray(end);
+          yield rows;
+        }
+        if (got >= nrows) return;
+        const r = await it.next();
+        if (r.done) throw new Error(`chain document ended after ${got} of ${nrows} rows`);
+        if (carry.length) {
+          const nb = new Uint8Array(carry.length + r.value.length); nb.set(carry); nb.set(r.value, carry.length); carry = nb;
+        } else carry = r.value;
       }
     })();
+    // After the rows, the tail's alternating keys and values — small; read to the end of
+    // the stream, which is also what checks the object's digest.
     const tail = async () => {
+      const parts: Uint8Array[] = [carry];
+      for (;;) { const r = await it.next(); if (r.done) break; parts.push(r.value); }
+      const all = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+      let o = 0; for (const p of parts) { all.set(p, o); o += p.length; }
+      const vals = [...decodeMulti(all)];
       const t: Record<string, any> = {};
-      for (;;) {
-        const k = await values.next(); if (k.done) return t;
-        const v = await values.next(); if (v.done) return t;
-        t[String(k.value)] = v.value;
-      }
+      for (let i = 0; i + 1 < vals.length; i += 2) t[String(vals[i])] = vals[i + 1];
+      return t;
     };
-    return { columns: head.columns, nrows, rows, tail };
+    return { columns: head.columns, nrows, batches, tail };
   }
 
   private async maybeZstd(b: Uint8Array): Promise<Uint8Array> {
@@ -2760,11 +2794,13 @@ export class ZeBridge {
             try {
               await this.run('DROP TABLE IF EXISTS temp._zb_seed_stage');
               await this.run(`CREATE TEMP TABLE _zb_seed_stage (${colList})`);
-              for await (const row of stream.rows) {
-                n++;
-                if (tombIdx >= 0 && tombstoned(state.tombstoneColumn, { [cols[tombIdx]]: row[tombIdx] })) continue;
-                win.push(row);
-                if (win.length >= size) await flush();
+              for await (const batch of stream.batches) {
+                for (const row of batch) {
+                  n++;
+                  if (tombIdx >= 0 && tombstoned(state.tombstoneColumn, { [cols[tombIdx]]: row[tombIdx] })) continue;
+                  win.push(row);
+                  if (win.length >= size) await flush();
+                }
               }
               await flush();
               const tail = await stream.tail();
@@ -2801,11 +2837,13 @@ export class ZeBridge {
           } else if (stream) {
             let win: any[][] = []; let first = true; let n = 0;
             try {
-              for await (const row of stream.rows) {
-                win.push(row); n++;
-                if (win.length >= size) {
-                  await applyWindow(step.sorted ? win : sortRowsByKey(win, keyIdx), first); first = false; win = [];
-                  this.seedProgress({ table, step: step.name, kind: step.kind, applied: n, total: stream.nrows, done: false });
+              for await (const batch of stream.batches) {
+                for (const row of batch) {
+                  win.push(row); n++;
+                  if (win.length >= size) {
+                    await applyWindow(step.sorted ? win : sortRowsByKey(win, keyIdx), first); first = false; win = [];
+                    this.seedProgress({ table, step: step.name, kind: step.kind, applied: n, total: stream.nrows, done: false });
+                  }
                 }
               }
               // The last partial window — or, for an empty full, the DELETE alone.

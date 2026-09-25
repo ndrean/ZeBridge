@@ -124,7 +124,8 @@ function TsSeed() {
   const wipe = async () => {
     const zb = zbRef.current; if (!zb) return;
     setBusy(true);
-    try { await zb.wipe(); } finally { setBusy(false); }
+    // A failed wipe must not freeze the screen: say so, and start the next run anyway.
+    try { await zb.wipe(); } catch (e) { fileLog('ts', `wipe failed: ${e}`, true); } finally { setBusy(false); }
     setGen((g) => g + 1);
   };
 

@@ -2,8 +2,8 @@
 /// the TS core. A port (Zig, …) writes its own thin runner over the SAME file —
 /// the fixtures are the spec, this file is just plumbing.
 import { test } from 'node:test';
-import { encode, decodeMulti } from '@msgpack/msgpack';
-import { parseChainHead, chainStageSql } from './core.ts';
+import { encode, decode, decodeMulti } from '@msgpack/msgpack';
+import { parseChainHead, chainStageSql, msgpackScan, msgpackDecodeScanned } from './core.ts';
 import { sha256 } from 'js-sha256';
 import { cdcValue, pgEngineValues, isBytes, pgArrayValues, sortRowsByKey, chainBulkSql, vecColsOf, vecLiteral, pgVectorValues } from './core.ts';
 
@@ -288,3 +288,34 @@ test('streaming SHA-256 (js-sha256, chunked) equals crypto.subtle.digest (one sh
   assert.deepEqual(chunked, oneShot);
 });
 
+
+// §10ja: the streamed seed decodes a chunk of rows at once; the scanner must count
+// exactly the complete values at ANY cut, or a row is lost or decoded half.
+test('msgpackScan: at every cut, only complete values count — every type and size class', () => {
+  const vals: unknown[] = [0, 127, -1, -32, -33, 128, 255, 256, 65535, 65536, 2 ** 32, -(2 ** 31) - 1, 1.5, 2 ** 53 - 1,
+    null, true, false, '', 'a'.repeat(31), 'b'.repeat(32), 'c'.repeat(255), 'd'.repeat(256), 'e'.repeat(70_000),
+    new Uint8Array(3), new Uint8Array(300), new Uint8Array(70_000), new Date(1e12), new Date(1_700_000_000_000), new Date(-1e12),
+    [], [1, [2, [3, {}]]], Array.from({ length: 20 }, (_, i) => i), Array.from({ length: 70_000 }, () => 1),
+    { a: 1, b: [2, 'x'], c: { d: null } }, Object.fromEntries(Array.from({ length: 20 }, (_, i) => ['k' + i, i])),
+    ['row', 42, 3.25, null, 'z'.repeat(40), new Uint8Array(16)]];
+  const parts = vals.map((v) => encode(v));
+  const bounds: number[] = [];
+  let off = 0;
+  for (const p of parts) { off += p.length; bounds.push(off); }
+  const all = new Uint8Array(off);
+  let o = 0;
+  for (const p of parts) { all.set(p, o); o += p.length; }
+  const cuts = new Set<number>();
+  for (let c = 0; c <= all.length; c += c < 2000 ? 1 : 97) cuts.add(c);
+  for (const b of bounds) for (const d of [-1, 0, 1]) if (b + d >= 0 && b + d <= all.length) cuts.add(b + d);
+  for (const cut of cuts) {
+    const { end, count } = msgpackScan(all.subarray(0, cut), 1e9);
+    const expect = bounds.filter((b) => b <= cut).length;
+    assert.equal(count, expect, `cut ${cut}`);
+    assert.equal(end, expect ? bounds[expect - 1] : 0, `cut ${cut}`);
+  }
+  assert.deepEqual(msgpackScan(all, 3), { end: bounds[2], count: 3 });
+  const { end, count } = msgpackScan(all, 1e9);
+  assert.deepEqual(msgpackDecodeScanned(decode, all, end, count), vals.map((v) => decode(encode(v))));
+  assert.throws(() => msgpackScan(new Uint8Array([0xc1]), 1), /not a type/);
+});

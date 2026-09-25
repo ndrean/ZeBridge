@@ -361,6 +361,71 @@ export function parseChainHead(b: Uint8Array): { columns: string[]; nrows: numbe
   return { columns, nrows, offset: p };
 }
 
+/// §10ja: how many COMPLETE msgpack values `b` holds from its start (at most `max`),
+/// and where the last one ends — without decoding them. The streamed seed decodes a
+/// chunk of rows at once with it: one `decode` per chunk instead of one `await` per row
+/// through an async generator, which was most of the seed's JS time on Hermes (~130 µs
+/// a row on the iPhone 12). A value cut by the end of `b` is not counted: the caller
+/// keeps the bytes from `end` and appends the next chunk.
+export function msgpackScan(b: Uint8Array, max: number): { end: number; count: number } {
+  const n = b.length;
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  let end = 0;
+  let count = 0;
+  while (count < max) {
+    let p = end;
+    let need = 1; // values still to skip at any depth: an array adds its length, a map twice
+    while (need > 0) {
+      if (p >= n) return { end, count };
+      const t = b[p];
+      need--;
+      let size: number; // header + payload, once the header is known to be in `b`
+      if (t <= 0x7f || t >= 0xe0) size = 1; // fixint
+      else if (t <= 0x8f) { need += 2 * (t & 0x0f); size = 1; } // fixmap
+      else if (t <= 0x9f) { need += t & 0x0f; size = 1; } // fixarray
+      else if (t <= 0xbf) size = 1 + (t & 0x1f); // fixstr
+      else {
+        switch (t) {
+          case 0xc0: case 0xc2: case 0xc3: size = 1; break; // nil, false, true
+          case 0xcc: case 0xd0: size = 2; break;
+          case 0xcd: case 0xd1: size = 3; break;
+          case 0xce: case 0xd2: case 0xca: size = 5; break;
+          case 0xcf: case 0xd3: case 0xcb: size = 9; break;
+          case 0xd4: size = 3; break; case 0xd5: size = 4; break; case 0xd6: size = 6; break; // fixext 1/2/4
+          case 0xd7: size = 10; break; case 0xd8: size = 18; break; // fixext 8/16
+          case 0xc4: case 0xd9: if (p + 2 > n) return { end, count }; size = 2 + b[p + 1]; break; // bin8, str8
+          case 0xc5: case 0xda: if (p + 3 > n) return { end, count }; size = 3 + dv.getUint16(p + 1); break;
+          case 0xc6: case 0xdb: if (p + 5 > n) return { end, count }; size = 5 + dv.getUint32(p + 1); break;
+          case 0xc7: if (p + 2 > n) return { end, count }; size = 3 + b[p + 1]; break; // ext8
+          case 0xc8: if (p + 3 > n) return { end, count }; size = 4 + dv.getUint16(p + 1); break;
+          case 0xc9: if (p + 5 > n) return { end, count }; size = 6 + dv.getUint32(p + 1); break;
+          case 0xdc: if (p + 3 > n) return { end, count }; need += dv.getUint16(p + 1); size = 3; break; // array16
+          case 0xdd: if (p + 5 > n) return { end, count }; need += dv.getUint32(p + 1); size = 5; break;
+          case 0xde: if (p + 3 > n) return { end, count }; need += 2 * dv.getUint16(p + 1); size = 3; break; // map16
+          case 0xdf: if (p + 5 > n) return { end, count }; need += 2 * dv.getUint32(p + 1); size = 5; break;
+          default: throw new Error(`msgpack: byte 0x${t.toString(16)} is not a type`); // 0xc1
+        }
+      }
+      p += size;
+    }
+    if (p > n) return { end, count }; // the last payload runs past `b`
+    end = p;
+    count++;
+  }
+  return { end, count };
+}
+
+/// The `count` values `msgpackScan` found in `b[0, end)`, decoded in ONE call: prefixed
+/// with an array32 header they are a single array. The copy is a memcpy; a generator
+/// per value is what this replaces.
+export function msgpackDecodeScanned(decode: (b: Uint8Array) => unknown, b: Uint8Array, end: number, count: number): any[] {
+  const h = new Uint8Array(5 + end);
+  h[0] = 0xdd;
+  new DataView(h.buffer).setUint32(1, count);
+  h.set(b.subarray(0, end), 5);
+  return decode(h) as any[];
+}
+
 export function sortRowsByKey(rows: any[][], keyIdx: number): any[][] {
   if (keyIdx < 0 || rows.length < 2) return rows;
   const out = rows.slice();
