@@ -16,10 +16,11 @@ const { getDefaultConfig } = require('expo/metro-config');
 const path = require('node:path');
 
 const client = path.resolve(__dirname, '../../../zb-client-ts');
+const native = path.resolve(__dirname, '../../../zb-react-native'); // libzb's Expo module, linked too
 const appModules = path.resolve(__dirname, 'node_modules');
 
 const config = getDefaultConfig(__dirname);
-config.watchFolders = [client];
+config.watchFolders = [client, native];
 config.resolver.unstable_enableSymlinks = true;
 // ⚠️ THE ACTUAL CAUSE of `Unable to resolve "@nats-io/nats-core"`. That package declares
 // NO `main` and no `module` — only an `exports` map — and Metro does not read `exports`

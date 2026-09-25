@@ -16646,10 +16646,21 @@ existed, sat in `connect` for minutes with no NATS connection attempt — where 
 fails at once with AuthorizationViolation. Unexplained; the console
 (`xcrun devicectl device process launch --console`) is how to look next time.
 
-What this leaves: the native module as an installable package with a versioned libzb (an
-app should know when its copy is older than its code); `serve.py` check F1, failing since
-answer compression (§10ip, 2026-09-22): a raw asker must read zstd, and "too large" needs
-an answer still large once compressed; revalidating fast-moving tables against today's
-changes; libzb's live apply on random keys.
+**zb-react-native, and a libzb that says its version.** The Expo module left the example
+for a package (`zb-react-native/`: Swift, header, podspec, a typed `Libzb` API with the
+zb-client-ts option names, `scripts/build-ios.sh`). `libzb/abi.json` holds the ABI version
+(2), the exported functions and the connect options; `python/abi_check.py` (offline
+battery: `abi`) fails when the code changes without a bump or a pin disagrees, and the
+package refuses, at its first call, a built-in libzb whose `zb_abi_version()` is not its
+own. iPhone 12 through the package: 39.1 s. A wipe on its screen waits behind the running
+query (one serial queue per module) — the facts' `count(DISTINCT uid)` over 3M rows took
+~2 minutes there, which read as "the button does nothing"; the wipe now says it waits.
+
+`serve.py` F1 again tests the object path: the large answers carry hex digests (816 KB
+compressed, past the 256 KB inline limit) and the raw asker reads zstd. expo-crypto left
+the RN apps.
+
+What this leaves: revalidating fast-moving tables against today's changes; libzb's live
+apply on random keys; zb-react-native for Android.
 (Done the same day: the replica identity for read-only tables, f96cf47; the benchmark
 tables dropped.)

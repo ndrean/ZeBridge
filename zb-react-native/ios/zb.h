@@ -9,6 +9,7 @@ int         zb_client_close(uint64_t handle);
 char       *zb_client_sync(uint64_t handle);            // JSON, freed with zb_free
 char       *zb_client_poll(uint64_t handle, uint64_t wait_ms);
 char       *zb_client_query(uint64_t handle, const char *sql, const char *params_json);
+int         zb_abi_version(void);                     // libzb/abi.json's version
 const char *zb_last_error(void);                        // owned by libzb, not freed
 void        zb_free(char *p);
 

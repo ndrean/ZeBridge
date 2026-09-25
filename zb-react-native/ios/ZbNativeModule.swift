@@ -10,6 +10,12 @@ public class ZbNativeModule: Module {
   public func definition() -> ModuleDefinition {
     Name("ZbNative")
 
+    // The ABI of the libzb built into this app (libzb/abi.json); src/index.ts compares it
+    // with the one its code was written for before the first call.
+    Function("abiVersion") { () -> Int in
+      Int(zb_abi_version())
+    }
+
     AsyncFunction("connect") { (opts: String) throws -> String in
       let h = zb_client_connect(opts)
       if h == 0 { throw ZbException(Self.lastError() ?? "zb_client_connect failed") }

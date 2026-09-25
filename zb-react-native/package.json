@@ -1,0 +1,14 @@
+{
+  "name": "zb-react-native",
+  "version": "0.1.0",
+  "private": true,
+  "description": "libzb — the ZeBridge C client — for React Native: an Expo module with the library built in",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "build:ios": "scripts/build-ios.sh"
+  },
+  "peerDependencies": {
+    "expo": ">=52"
+  }
+}

@@ -34,17 +34,14 @@ Expo Go will not do — expo-sqlite is native, so this is a development build.
     EXPO_PUBLIC_CREDS="$(cat ../../../scripts/native/creds/bob.creds)" pnpm ios
     EXPO_PUBLIC_CREDS="$(cat ../../../scripts/native/creds/bob.creds)" pnpm android
 
-For the libzb engine, build the library first, and give it the TCP URL too:
+libzb comes from the `zb-react-native` package (the repo's `zb-react-native/`, linked
+here). Build its library first, and give the libzb engine the TCP URL too:
 
-    tool/build-libzb-ios.sh        # ../flutter's zig build, then prelinked → modules/zb-native/ios/ZbCore.xcframework
-    (cd ios && pod install)        # picks up modules/zb-native (ZbNative)
+    ../../../zb-react-native/scripts/build-ios.sh   # → zb-react-native/ios/ZbCore.xcframework
+    (cd ios && pod install)                          # autolinking picks up ZbNative
     EXPO_PUBLIC_NATS_URL=ws://<mac>:8080 EXPO_PUBLIC_ZB_NATS_URL=nats://<mac>:4222 \
     EXPO_PUBLIC_ZB_ENGINE=libzb EXPO_PUBLIC_CREDS="$(cat ../../../scripts/native/creds/bob.creds)" \
       npx expo run:ios --device <udid> --configuration Release --no-bundler
-
-⚠️ The prelink is why libzb and expo-sqlite fit in one app. Both carry SQLite; linked
-as they are, the two copies clash, or libzb's calls land in expo's build.
-`ld -r -exported_symbol '_zb_*'` keeps libzb's SQLite, zstd and nats private to it.
 
 ⚠️ Measure a Release build: Hermes compiles its bytecode ahead of time there. If
 `expo run:ios` fails to install, `xcrun devicectl device install app --device <udid>

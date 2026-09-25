@@ -77,8 +77,12 @@ const Value = std.json.Value;
 /// that is doing something this API has not been asked for yet, and gets a clean 0.
 var clients: handles.Table(ClientBox, 64) = .{};
 
+/// The ABI version — libzb/abi.json's `version`, which python/abi_check.py keeps in
+/// step with what this file exports and what `openBox` reads.
+pub const abi_version: c_int = 2;
+
 export fn zb_abi_version() c_int {
-    return 1;
+    return abi_version;
 }
 
 export fn zb_free(p: ?[*:0]u8) void {

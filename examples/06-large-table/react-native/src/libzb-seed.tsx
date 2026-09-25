@@ -1,12 +1,12 @@
-/// The same seed through libzb — the C client, Zig inside — behind a native module
-/// (modules/zb-native). What the Flutter app does over dart:ffi, from JavaScript:
+/// The same seed through libzb — the C client, Zig inside — from the zb-react-native
+/// package. What the Flutter app does over dart:ffi, from JavaScript:
 /// `connect`, then one `sync` that streams the chain and applies it in Zig. JS only
 /// keeps the clock and asks for the three facts. libzb reports nothing while `sync`
 /// runs, so there is no bar.
 import { useEffect, useRef, useState } from 'react';
 import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as FileSystem from 'expo-file-system';
-import Zb from '../modules/zb-native';
+import { Libzb } from 'zb-react-native';
 import { PRINCIPAL, TABLE } from './client';
 import { fileLog } from './app-log';
 
@@ -22,7 +22,7 @@ const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
 type Facts = { count: number; distinct: number; sum: number; dbBytes?: number };
 
 export function LibzbSeed() {
-  const handleRef = useRef<string | null>(null);
+  const clientRef = useRef<Libzb | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [running, setRunning] = useState(false);
   const [phase, setPhase] = useState('starting');
@@ -52,37 +52,39 @@ export function LibzbSeed() {
       log(fresh ? 'fresh replica — the seed is the whole table' : 'replica present — no seed unless the chain moved');
       log(`connecting to ${NATS_URL} as ${PRINCIPAL}, following [${TABLE}]`);
       t0Ref.current = Date.now(); setElapsed(0); setRunning(true); setPhase('connect + seed');
-      const h = await Zb.connect(JSON.stringify({
+      const zb = await Libzb.connect({
         natsUrl: NATS_URL, creds: CREDS, dbPath,
         principal: PRINCIPAL, tables: [TABLE], seedStreaming: true,
-      }));
-      if (closed) { await Zb.close(h); return; }
-      handleRef.current = h;
+      });
+      if (closed) { await zb.close(); return; }
+      clientRef.current = zb;
       // The first sync is schema, seed and positions: the clock stops at "usable".
-      const report = JSON.parse(await Zb.sync(h));
+      const report = await zb.sync();
       setRunning(false);
       const ms = Date.now() - t0Ref.current;
       const failed = (report.unseeded ?? []).filter((u: { table: string }) => u.table === TABLE);
       if (failed.length) { setPhase('failed'); log(`not seeded after ${secs(ms)}: ${failed[0].reason}`, true); return; }
       setPhase('usable');
       log(`usable after ${secs(ms)} (tenant ${report.tenant ?? '—'})`);
-      const q = JSON.parse(await Zb.query(h, `SELECT count(*), count(DISTINCT uid), sum(age) FROM ${TABLE}`, '[]'));
+      const q = await zb.query(`SELECT count(*), count(DISTINCT uid), sum(age) FROM ${TABLE}`);
       const [count, distinct, sum] = q.rows[0].map(Number);
       const info = await FileSystem.getInfoAsync(dir + DB_FILE);
       setFacts({ count, distinct, sum, dbBytes: info.exists ? info.size : undefined });
     })().catch((e) => { setRunning(false); setPhase('failed'); log(String(e?.message ?? e), true); });
     return () => {
       closed = true;
-      const h = handleRef.current; handleRef.current = null;
-      if (h) void Zb.close(h);
+      const zb = clientRef.current; clientRef.current = null;
+      if (zb) void zb.close();
     };
   }, [gen]);
 
   const wipe = async () => {
     setBusy(true);
     try {
-      const h = handleRef.current; handleRef.current = null;
-      if (h) await Zb.close(h);
+      const zb = clientRef.current; clientRef.current = null;
+      // libzb runs one call at a time per module (a serial queue): a close waits for the
+      // running query — the facts' count(DISTINCT uid) over 3M rows is ~2 minutes here.
+      if (zb) { fileLog('libzb', 'wipe: closing after the running query'); setLines((prev) => [...prev, { text: 'wipe: closing after the running query…', err: false }]); await zb.close(); }
       for (const suffix of ['', '-wal', '-shm', '-journal']) {
         await FileSystem.deleteAsync(dir + DB_FILE + suffix, { idempotent: true });
       }

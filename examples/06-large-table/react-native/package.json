@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "main": "index.js",
-  "description": "One big table, seeded from the chain on a phone — a progress bar and a timer (NOTES §10ix)",
+  "description": "One big table, seeded from the chain on a phone \u2014 a progress bar and a timer (NOTES \u00a710ix)",
   "scripts": {
     "start": "expo start --dev-client",
     "prebuild": "expo prebuild --clean",
@@ -28,7 +28,8 @@
     "react-native": "0.76.9",
     "react-native-get-random-values": "~1.11.0",
     "uuid": "^14.0.1",
-    "zb-client-ts": "link:../../../zb-client-ts"
+    "zb-client-ts": "link:../../../zb-client-ts",
+    "zb-react-native": "link:../../../zb-react-native"
   },
   "devDependencies": {
     "@types/react": "~18.3.12",
