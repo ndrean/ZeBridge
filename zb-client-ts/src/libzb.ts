@@ -378,6 +378,13 @@ export class ZeBridge {
   private failed = new Set<string>();
   private suspendedMap = new Map<string, string>();
   private globalSyncState: { lsn: number; seq: Record<string, number> } = { lsn: 0, seq: {} };
+  /// §10jc: per stream, the generation of the ONE live tail. `subscribeStreams` runs on a
+  /// reconnect, a status-loop restart, an RTT recovery and after a hole, and each run opened
+  /// a new tail while the previous one kept going — measured on an iPhone: two tails on one
+  /// stream after an RTT recovery, applying the same events and racing the position. A tail
+  /// whose generation is no longer current stops at its next message, without flushing or
+  /// acking what it holds; the current one re-reads that from the stored position.
+  private tailGen = new Map<string, number>();
 
   /// `version` is the stamp the write carries: the CDC echo that confirms it is the
   /// row bearing THAT stamp, not any row on the same key (§10dt).
@@ -3209,6 +3216,9 @@ export class ZeBridge {
         this.appendLog('SYS', `CDC consumer on ${streamName} (from seq ${last || 'all'}, ${ci.num_pending ?? '?'} messages pending, consumer setup took ${setupMs}ms)`, 'INFO');
 
         const iter = await consumer.consume();
+        const myGen = (this.tailGen.get(streamName) ?? 0) + 1;
+        this.tailGen.set(streamName, myGen);
+        const superseded = () => this.tailGen.get(streamName) !== myGen;
         void (async () => {
           // The tail must OUTLIVE its consumer. A consumer born into reconnect churn
           // can go DEAF — created "from seq N, 0 pending" and never delivering again
@@ -3237,7 +3247,7 @@ export class ZeBridge {
           // deletes, a replica that disagreed until reopened.
           let lastSeen = last;
           let holeFound = false;
-          while (this.nc) {
+          while (this.nc && !superseded()) {
           if (!curIter) {
             attempt++;
             await new Promise((r) => setTimeout(r, 1000));
@@ -3400,6 +3410,12 @@ export class ZeBridge {
           }, 10_000);
           try {
           for await (const msg of curIter) {
+            if (superseded()) {
+              this.appendLog('SYS', `${streamName}: tail ${curName} superseded by a newer tail — stopping without applying what it holds`, 'INFO');
+              batch = []; batchMsgs = [];
+              try { itRef.stop(); } catch { /* already ended */ }
+              break;
+            }
             lastMsgAt = Date.now();
             // §10jc test hook (as libzb's): every Nth delivery discarded on arrival — not
             // applied, not acked, its delivery sequence never seen: a loss in transit.
@@ -3479,6 +3495,7 @@ export class ZeBridge {
             // Contained, whatever it is: a tail must never take the process down.
             this.appendLog('SYS', `${streamName}: tail iterator errored (${e}) — will recreate`, 'ERROR');
           } finally { clearInterval(idleGuard); }
+          if (superseded()) { batch = []; batchMsgs = []; break; }
           await flushBatch();
           curIter = null; // consumed — never iterate it again (see above)
           if (!this.nc) break;
