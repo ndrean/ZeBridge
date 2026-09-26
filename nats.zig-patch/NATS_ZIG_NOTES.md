@@ -955,3 +955,23 @@ byte cap), or silent for the grace after its expiry.
 **Verified**: `zig build test-unit` 135/135; ZeBridge's delivery-loss test exact; the iPhone at
 40k events/s with four SIGKILLs: 0 slow-consumer disconnects, 0 connection resets, 153/153
 batches exact, converged 170 s after the load (285 s before patches 21-24).
+
+## 25. It compiles for 32-bit ARM (2026-09-26)
+
+**How it appeared**
+
+A moto e20 (Android 11 Go, 1.8 GB) runs a 32-bit userspace (`abilist`: armeabi-v7a,
+armeabi): Android loads the armeabi-v7a Flutter engine and needs a 32-bit libzb, which never
+compiled — `std.atomic.Value(u64)` is refused on 32-bit ARM by Zig 0.16 whatever the CPU
+("expected 32-bit integer type or smaller"), and three u64/usize mixes.
+
+**Change** (`25-nats.zig-arm32.patch`)
+
+`src/atomic_u64.zig` — `AtomicU64`: `std.atomic.Value(u64)` where usize is 64-bit, else a
+spin-locked u64 with the four operations used (load, store, fetchAdd, fetchSub); the six
+64-bit counters of `connection.zig` and `subscription.zig` use it. `nuid.zig`,
+`jetstream_kv.zig`, `jetstream_objstore.zig`: explicit casts (an object larger than a 32-bit
+address space fails as OutOfMemory). A test for the locked form.
+
+**Verified**: `zig build test-unit` 136/136; libzb builds for `arm-linux-androideabi` with
+`-Dcpu=cortex_a7` (libzb itself needed no change); the Flutter app starts on the moto e20.

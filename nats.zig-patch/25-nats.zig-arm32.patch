@@ -1,0 +1,183 @@
+diff --git asrc/atomic_u64.zig b/src/atomic_u64.zig
+new file mode 100644
+index 0000000..b97e1ce
+--- /dev/null
++++ b/src/atomic_u64.zig
+@@ -0,0 +1,63 @@
++//! A 64-bit counter for every target. `std.atomic.Value(u64)` does not compile on 32-bit
++//! ARM in Zig 0.16 ("expected 32-bit integer type or smaller"), and Android Go phones run
++//! a 32-bit userspace (a moto e20: armeabi-v7a only, ZeBridge §10jc). On such targets the
++//! value sits behind a spin lock with the same four operations the connection and the
++//! subscriptions use; they are touched once per message and never contended enough for a
++//! lock to matter. On 64-bit targets it IS `std.atomic.Value(u64)`.
++const std = @import("std");
++
++pub const AtomicU64 = if (@bitSizeOf(usize) >= 64) std.atomic.Value(u64) else Locked;
++
++const Locked = struct {
++    raw: u64,
++    lock: std.atomic.Value(u32) = .init(0),
++
++    pub fn init(v: u64) Locked {
++        return .{ .raw = v };
++    }
++
++    fn acquire(self: *Locked) void {
++        while (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
++    }
++
++    fn release(self: *Locked) void {
++        self.lock.store(0, .release);
++    }
++
++    pub fn load(self: *const Locked, comptime _: std.builtin.AtomicOrder) u64 {
++        const m: *Locked = @constCast(self);
++        m.acquire();
++        defer m.release();
++        return m.raw;
++    }
++
++    pub fn store(self: *Locked, v: u64, comptime _: std.builtin.AtomicOrder) void {
++        self.acquire();
++        defer self.release();
++        self.raw = v;
++    }
++
++    pub fn fetchAdd(self: *Locked, v: u64, comptime _: std.builtin.AtomicOrder) u64 {
++        self.acquire();
++        defer self.release();
++        const old = self.raw;
++        self.raw +%= v;
++        return old;
++    }
++
++    pub fn fetchSub(self: *Locked, v: u64, comptime _: std.builtin.AtomicOrder) u64 {
++        self.acquire();
++        defer self.release();
++        const old = self.raw;
++        self.raw -%= v;
++        return old;
++    }
++};
++
++test "AtomicU64: the locked form behaves like the atomic one" {
++    var a = Locked.init(5);
++    try std.testing.expectEqual(@as(u64, 5), a.fetchAdd(3, .acq_rel));
++    try std.testing.expectEqual(@as(u64, 8), a.fetchSub(2, .acq_rel));
++    a.store(1 << 40, .release);
++    try std.testing.expectEqual(@as(u64, 1 << 40), a.load(.acquire));
++}
+diff --git a/src/connection.zig b/src/connection.zig
+index 3ea3913..5736663 100644
+--- a/src/connection.zig
++++ b/src/connection.zig
+@@ -12,6 +12,7 @@
+ // limitations under the License.
+ 
+ const std = @import("std");
++const AtomicU64 = @import("atomic_u64.zig").AtomicU64;
+ const net = std.Io.net;
+ const Allocator = std.mem.Allocator;
+ const ArrayList = std.ArrayList;
+@@ -535,7 +536,7 @@ pub const Connection = struct {
+     write_buffer: WriteBuffer,
+ 
+     // Subscriptions
+-    next_sid: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
++    next_sid: AtomicU64 = AtomicU64.init(1),
+     subscriptions: std.AutoHashMap(u64, *Subscription),
+     // Guards `subscriptions`. Acquired after `mutex` when both are held; see
+     // the lock-order note on `mutex`.
+diff --git a/src/jetstream_kv.zig b/src/jetstream_kv.zig
+index 30ca218..7acde3d 100644
+--- a/src/jetstream_kv.zig
++++ b/src/jetstream_kv.zig
+@@ -264,7 +264,7 @@ pub const KVWatcher = struct {
+                 self.received += 1;
+                 // Set init_pending from first message if not set
+                 if (self.init_pending == 0) {
+-                    self.init_pending = delta;
++                    self.init_pending = @intCast(delta); // usize on 32-bit targets; a pending count fits
+                 }
+                 // Check completion: received > initPending OR delta == 0 (match C logic)
+                 if (self.received > self.init_pending or delta == 0) {
+diff --git a/src/jetstream_objstore.zig b/src/jetstream_objstore.zig
+index 3e0555e..eea181f 100644
+--- a/src/jetstream_objstore.zig
++++ b/src/jetstream_objstore.zig
+@@ -613,7 +613,8 @@ pub const ObjectStore = struct {
+         const arena_allocator = arena.allocator();
+ 
+         // Allocate buffer for complete object based on size from info
+-        const data = try arena_allocator.alloc(u8, result.info.size);
++        // usize on 32-bit targets: an object larger than the address space cannot be held whole.
++        const data = try arena_allocator.alloc(u8, std.math.cast(usize, result.info.size) orelse return error.OutOfMemory);
+ 
+         // Read all data from the streaming result
+         var total_read: usize = 0;
+diff --git a/src/nuid.zig b/src/nuid.zig
+index f6cfd0b..1620dcc 100644
+--- a/src/nuid.zig
++++ b/src/nuid.zig
+@@ -111,7 +111,7 @@ fn encodeBase36(value: u64, buffer: []u8) void {
+     // Fill buffer from right to left
+     while (i > 0) {
+         i -= 1;
+-        buffer[i] = DIGITS[val % BASE];
++        buffer[i] = DIGITS[@intCast(val % BASE)];
+         val /= BASE;
+     }
+ }
+diff --git a/src/root.zig b/src/root.zig
+index c6017f5..0e8d70d 100644
+--- a/src/root.zig
++++ b/src/root.zig
+@@ -97,6 +97,7 @@ pub const creds = @import("creds.zig");
+ test {
+     std.testing.refAllDecls(@This());
+     _ = @import("net_util.zig");
++    _ = @import("atomic_u64.zig");
+     // The TLS tests run a real tls.zig server, which the stub module does
+     // not provide; with TLS compiled out the whole file is skipped.
+     if (@import("build_options").use_tls) {
+diff --git a/src/subscription.zig b/src/subscription.zig
+index ba3fd08..6811bca 100644
+--- a/src/subscription.zig
++++ b/src/subscription.zig
+@@ -12,6 +12,7 @@
+ // limitations under the License.
+ 
+ const std = @import("std");
++const AtomicU64 = @import("atomic_u64.zig").AtomicU64;
+ const xsync = @import("xsync");
+ const Io = std.Io;
+ const io_util = @import("io_util.zig");
+@@ -58,14 +59,14 @@ pub const Subscription = struct {
+ 
+     // Track pending messages and bytes for both sync and async subscriptions
+     pending_msgs: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+-    pending_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
++    pending_bytes: AtomicU64 = AtomicU64.init(0),
+ 
+     // Slow-consumer protection: when either pending limit is exceeded,
+     // incoming messages for this subscription are dropped and counted
+     // (0 = unlimited). Defaults match nats.go.
+     pending_msgs_limit: std.atomic.Value(u32) = std.atomic.Value(u32).init(default_pending_msgs_limit),
+-    pending_bytes_limit: std.atomic.Value(u64) = std.atomic.Value(u64).init(default_pending_bytes_limit),
+-    dropped_msgs: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
++    pending_bytes_limit: AtomicU64 = AtomicU64.init(default_pending_bytes_limit),
++    dropped_msgs: AtomicU64 = AtomicU64.init(0),
+     slow_consumer: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+     // Armed when a synchronous subscription enters a slow-consumer episode;
+     // consumed by the next synchronous receive. Multiple episodes before a
+@@ -73,8 +74,8 @@ pub const Subscription = struct {
+     sc_error_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+ 
+     // Autounsubscribe state
+-    max_msgs: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // 0 means no limit
+-    delivered_msgs: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
++    max_msgs: AtomicU64 = AtomicU64.init(0), // 0 means no limit
++    delivered_msgs: AtomicU64 = AtomicU64.init(0),
+ 
+     // Drain state
+     draining: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
