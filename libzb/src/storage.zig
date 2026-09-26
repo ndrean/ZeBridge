@@ -106,6 +106,13 @@ pub const Storage = struct {
         var self = Storage{ .db = db.? };
         // The handle is acquired; a failing pragma below must not leak it.
         errdefer _ = c.sqlite3_close(self.db);
+        // 16 KB pages for a database THIS open creates (an existing file keeps its own:
+        // in WAL mode the pragma is a no-op). §10ja, measured 2026-09-26 on a 4.5M-row
+        // replica with random keys, 300k live inserts, cold file: 22.7 s on 4 KB pages,
+        // 9.8 s on 16 KB. A random-key insert reads one index leaf per probe and a leaf
+        // four times larger holds four times the keys, so a cold replica reads a quarter
+        // of the pages; warm, 10.4 → 8.9 s. The seed is unchanged (~5 µs a row).
+        self.execSimple("PRAGMA page_size = 16384;") catch {};
         self.execSimple("PRAGMA journal_mode = WAL;") catch {};
         // §10he: measured on the firehose replica, 35% of the CDC thread sat in COMMIT —
         // 27% in the automatic WAL checkpoint (an fsync of the main file every 1,000 WAL
@@ -301,6 +308,23 @@ pub const Storage = struct {
     /// pair per `BEGIN`, `COMMIT` and `PRAGMA`. Most such statements return no rows;
     /// `PRAGMA journal_mode` returns one short text cell, which this covers. A
     /// statement that returns more than fits is a misuse of execSimple — use `query`.
+    /// SQLite's page-cache counters since the last call (they reset on read): hits,
+    /// misses (a page read from the OS — the file, or its cache), pages written. On the
+    /// other engines, zeros. The live-apply diagnosis of 2026-09-26 (NOTES §10ja): a
+    /// random-key insert into a large replica is a miss per index probe, and a miss on a
+    /// cold file is a disk read — the whole cost, and invisible without this.
+    pub const CacheStats = struct { hit: i64 = 0, miss: i64 = 0, write: i64 = 0 };
+    pub fn cacheStats(self: *Storage) CacheStats {
+        if (self.engine != .sqlite) return .{};
+        var out: CacheStats = .{};
+        var hi: c_int = 0;
+        var cur: c_int = 0;
+        if (c.sqlite3_db_status(self.db, c.SQLITE_DBSTATUS_CACHE_HIT, &cur, &hi, 1) == c.SQLITE_OK) out.hit = cur;
+        if (c.sqlite3_db_status(self.db, c.SQLITE_DBSTATUS_CACHE_MISS, &cur, &hi, 1) == c.SQLITE_OK) out.miss = cur;
+        if (c.sqlite3_db_status(self.db, c.SQLITE_DBSTATUS_CACHE_WRITE, &cur, &hi, 1) == c.SQLITE_OK) out.write = cur;
+        return out;
+    }
+
     pub fn execSimple(self: *Storage, sql: []const u8) Error!void {
         // ⚠️ One execution, ever. This used to try a 256-byte stack buffer first and, on
         // OutOfMemory, run the statement AGAIN through an arena — but the buffer can run

@@ -8,6 +8,11 @@ import type { Exec, StorageFactory } from './storage.ts';
 
 export const nodeStorage: StorageFactory = (dbName) => {
   const db = new Database(dbName);
+  // 16 KB pages for a replica THIS open creates (an existing file keeps its own; the
+  // pragma is a no-op once in WAL mode). §10ja, 2026-09-26: a random-key live insert
+  // reads one index leaf per probe, and a 16 KB leaf holds four times the keys of a
+  // 4 KB one — libzb's cold 300k-insert drain into a 4.5M-row replica went 22.7 → 9.8 s.
+  db.pragma('page_size = 16384');
   db.pragma('journal_mode = WAL');
   // §10he: the commit's fsync and the automatic checkpoint every 1,000 WAL pages were a
   // third of libzb's CDC thread on the firehose replica; the same defaults apply here.

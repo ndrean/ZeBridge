@@ -2645,6 +2645,8 @@ pub const SyncClient = struct {
         // ones, which are held DURABLY in `_zbz_inbox` below (§10de finding 1).
         var ba = std.heap.ArenaAllocator.init(self.a);
         defer ba.deinit();
+        const t_batch = msNow();
+        if (trace_enabled) _ = self.st.cacheStats(); // reset: the counters below are this batch's
 
         // ONE transaction for the whole batch — the same lesson the TS client has
         // in writing: N autocommits each pay a full SQLite commit/fsync, one
@@ -2754,6 +2756,10 @@ pub const SyncClient = struct {
             };
         };
         for (messages) |m| m.ack() catch {};
+        if (trace_enabled) {
+            const cs = self.st.cacheStats();
+            tr("{s}: batch of {d} message(s), {d} event(s) applied in {d} ms — page cache: {d} hit, {d} miss, {d} written", .{ stream, messages.len, offered, msNow() - t_batch, cs.hit, cs.miss, cs.write });
+        }
         return offered;
     }
 

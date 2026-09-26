@@ -31,6 +31,10 @@ export const expoStorage: StorageFactory = (dbName: string): Storage => {
         // logged, indistinguishable from a network problem. Five seconds then an error
         // is always better than waiting for ever.
         await db.execAsync('PRAGMA busy_timeout = 5000');
+        // 16 KB pages for a replica this open creates (see node.ts; a no-op on an
+        // existing file). iOS's own page size, and a quarter of the index reads on a
+        // random-key live insert (§10ja).
+        await db.execAsync('PRAGMA page_size = 16384');
         await db.execAsync('PRAGMA journal_mode = WAL');
         await db.execAsync('PRAGMA synchronous = NORMAL');
         await db.execAsync('PRAGMA foreign_keys = ON');
