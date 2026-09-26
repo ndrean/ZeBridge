@@ -367,6 +367,8 @@ pub const SyncClient = struct {
     /// that stops polling for longer gets a fresh consumer at the stored position —
     /// the reaped one answers the next fetch with `NoResponders` (nats.zig patch).
     const tail_inactive_ns: u64 = 120 * std.time.ns_per_s;
+    /// §10jc: the byte cap on every pull request (tail and drain), see `tailInbox`.
+    const pull_max_bytes: u64 = 8 * 1024 * 1024;
 
     /// Acquire in order, and register the matching release BEFORE the next acquire.
     ///
@@ -2632,7 +2634,9 @@ pub const SyncClient = struct {
             cfg.deliver_policy = .all;
         }
         std.debug.print("{s}: tail consumer {s} from seq {d}\n", .{ stream, cname, cfg.opt_start_seq orelse 0 });
-        return try self.t.js.pullSubscribe(null, cname, .{ .stream = stream, .config = cfg, .inbox = shared });
+        const sub = try self.t.js.pullSubscribe(null, cname, .{ .stream = stream, .config = cfg, .inbox = shared });
+        sub.max_bytes = pull_max_bytes; // §10jc: the drain's own requests too (see `tailInbox`)
+        return sub;
     }
 
     /// §10ja: is a jump in stream sequence past `pos` a hole? Only if the stream no longer
@@ -3044,6 +3048,11 @@ pub const SyncClient = struct {
         // costs a re-seed. A valve four times wider: reached only when something is wrong,
         // never in the steady state.
         self.tail_inbox.?.inbox_subscription.setPendingLimits(500_000, 256 * 1024 * 1024);
+        // §10jc: and never ask the server for more than 8 MB per request — overlapping
+        // requests over a slow link otherwise pass its 64 MB per-connection queue and the
+        // server closes the connection (an iPhone on Wi-Fi: 66 disconnects, every
+        // delivery in flight lost each time).
+        self.tail_inbox.?.max_bytes = pull_max_bytes;
         return self.tail_inbox.?;
     }
 

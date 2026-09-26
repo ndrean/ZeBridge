@@ -18,7 +18,9 @@ const CREDS = process.env.EXPO_PUBLIC_CREDS ?? '';
 /// Its own file: the two engines never share a replica.
 const DB_FILE = `zebridge_${PRINCIPAL}_libzb.sqlite3`;
 
-const fmt = (n: number) => n.toLocaleString('en-US');
+// A missing number (an empty table's sum is NULL) is "—", never a throw: an uncaught
+// error in a render is a native abort in a Release build (§10jc).
+const fmt = (n: number | undefined | null) => (n == null || Number.isNaN(n) ? '—' : n.toLocaleString('en-US'));
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
 type Facts = { count: number; distinct?: number; sum: number; dbBytes?: number };
 

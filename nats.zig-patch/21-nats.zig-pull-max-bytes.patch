@@ -1,0 +1,43 @@
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+index b1eb7f1..15849e2 100644
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -439,6 +439,13 @@ pub const PullSubscription = struct {
+     /// server, `Slow Consumer (Pending Bytes)`, connection cut. Set it to the fetch
+     /// timeout and a fetch returns with the batch, or the deadline.
+     idle_after_first: Io.Timeout = fetch_idle_after_first,
++    /// The most bytes one pull request may ask the server for (null: the server's own
++    /// limit). The server queues a request's messages for this connection at once, and
++    /// over a slow link overlapping requests exceed its per-connection `max_pending`
++    /// (64 MB): it then CLOSES the connection and every delivery in flight is lost
++    /// (measured: an iPhone on Wi-Fi, 100 × 250 KB messages per request, disconnected 66
++    /// times as a slow consumer). A cap keeps the queue bounded.
++    max_bytes: ?u64 = null,
+     /// JetStream context
+     js: JetStream,
+     /// Stream name
+@@ -534,6 +541,7 @@ pub const PullSubscription = struct {
+         const timeout_duration = timeout.toDurationFromNow(self.js.nc.io);
+         const request = FetchRequest{
+             .batch = if (want > 0) want else batch,
++            .max_bytes = self.max_bytes,
+             .expires = if (timeout_duration) |duration| @intCast(duration.raw.toNanoseconds()) else null,
+         };
+ 
+@@ -736,6 +744,8 @@ pub const PullInbox = struct {
+     inbox_prefix: []u8,
+     fetch_id_counter: u64 = 0,
+     mutex: xsync.Mutex = .init,
++    /// As `PullSubscription.max_bytes`, for every consumer's request on this inbox.
++    max_bytes: ?u64 = null,
+ 
+     pub fn deinit(self: *PullInbox) void {
+         self.inbox_subscription.deinit();
+@@ -784,6 +794,7 @@ pub const PullInbox = struct {
+         if (want > 0) {
+             const request_json = try jsonStringifyAlloc(a, FetchRequest{
+                 .batch = want,
++                .max_bytes = self.max_bytes,
+                 .expires = if (timeout_duration) |d| @intCast(d.raw.toNanoseconds()) else null,
+             }, .{ .emit_null_optional_fields = false });
+             defer a.free(request_json);

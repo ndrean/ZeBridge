@@ -874,3 +874,45 @@ nats.zig-patch/new-patch.sh pull-deficit
 `zig build test-unit`: 135/135. The live proof is ZeBridge's firehose at 37.5k and 50k
 rows/s with both clients live (§10jb): the inbox depth before a pull, the poll errors and
 the re-seed count, before and after.
+
+## 21. A pull request can cap its bytes (2026-09-26)
+
+**How it appeared**
+
+libzb on an iPhone over Wi-Fi: nats-server disconnected it 66 times as a "Slow Consumer
+(Pending Bytes)". A pull request of 100 CDC messages is 20–25 MB; the server queues a
+request's messages for the connection at once, and requests overlap (a fetch returns after
+its first message, patch 18; the next poll asks again, patch 20 counting only what already
+ARRIVED). Over a link of a few MB/s the queue passed the server's per-connection
+`max_pending` (64 MB) and the server closed the connection — every delivery in flight lost,
+re-sent only after `ack_wait`, out of order.
+
+**Change** (`21-nats.zig-pull-max-bytes.patch`, 4 hunks, 1 file)
+
+`src/jetstream.zig` — `PullSubscription.max_bytes` and `PullInbox.max_bytes` (default null:
+unchanged), sent as the request's `max_bytes`. The server then stops a request at that many
+bytes (409 "Message Size Exceeds MaxBytes" ends it, handled as before).
+
+**Verified**: `zig build test-unit` 135/135; libzb sets 8 MB on its tail inbox and its drain
+consumers (ZeBridge §10jc).
+
+## 22. One outstanding pull request per consumer (2026-09-26)
+
+**How it appeared**
+
+Patch 21's byte cap bounded one request, not how many were open. `fetch` returns after its
+first message (patch 18) and the next fetch asked again (patch 20 counts only what already
+ARRIVED), so an iPhone polling once a second held a dozen 8 MB requests at once over Wi-Fi:
+still 44 disconnects as a slow consumer after patch 21.
+
+**Change** (`22-nats.zig-pull-one-request.patch`, src/jetstream.zig)
+
+`PullSubscription` keeps its one outstanding request (reply subject, messages still owed,
+deadline). `PullSubscription.fetch` and `PullInbox.fetch` send a new request only when the
+last has delivered everything, ended with a status (404/408/409/503), or expired; data
+messages are counted against the consumer their ack metadata names. Patch 20's deficit
+arithmetic is gone with it (the inbox now only ever holds the current request's rest).
+
+**Verified**: `zig build test-unit` 135/135; ZeBridge's delivery-loss test exact on the Mac
+(138 simulated losses); the iPhone at 40k events/s with four SIGKILLs: 0 disconnects (the
+server's slow-consumer count unchanged), 153 of 153 batches exact.

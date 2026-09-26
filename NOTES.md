@@ -16924,3 +16924,13 @@ re-seeds at 40k and converges ~285 s after it. On the way:
   batch is compared with PostgreSQL. Pre-fix libzb: 43 of 62 batches wrong. Fixed: libzb
   (164 lost, 122 recreations) and zb-client-ts (107 lost) exact.
 
+**The cause of the phone's losses was the transport** (same day, after a979bfd). nats-server
+had disconnected the iPhone 110 times as a "Slow Consumer (Pending Bytes)": pull requests of
+100 CDC messages (20–25 MB) piled up over Wi-Fi — a fetch returns after its first message and
+the next poll asked again — past the server's 64 MB per-connection queue, and each
+disconnect lost every delivery in flight. The strict-order rule above made those losses
+harmless; nats.zig patches 21 (`max_bytes` on a pull request; libzb sets 8 MB) and 22 (one
+outstanding request per consumer) remove them. The iPhone at 40k events/s with four
+SIGKILLs: 0 disconnects, 153 of 153 batches exact. The price: a catch-up now alternates
+transfer and apply (91.8 s for a 1.3M-row first seed against 32 s before) — next.
+
