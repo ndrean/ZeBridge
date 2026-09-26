@@ -367,8 +367,14 @@ pub const SyncClient = struct {
     /// that stops polling for longer gets a fresh consumer at the stored position —
     /// the reaped one answers the next fetch with `NoResponders` (nats.zig patch).
     const tail_inactive_ns: u64 = 120 * std.time.ns_per_s;
-    /// §10jc: the byte cap on every pull request (tail and drain), see `tailInbox`.
-    const pull_max_bytes: u64 = 8 * 1024 * 1024;
+    /// §10jc: the byte cap on every pull request (tail and drain), see `tailInbox`. Two
+    /// requests may be outstanding (`pull_depth`), so up to twice this is in flight, and
+    /// nats-server must write it to the client within its write deadline (10 s): at 8 MB a
+    /// moto e20 on Wi-Fi (under ~1.6 MB/s read) was cut as a slow consumer six times in a
+    /// run ("WriteDeadline of 10s exceeded with 16 MB"). 2 MB keeps a slow link under the
+    /// deadline down to ~0.4 MB/s, and costs a fast one nothing: at a 75 ms round trip a
+    /// few MB/s need well under 1 MB in flight.
+    const pull_max_bytes: u64 = 2 * 1024 * 1024;
 
     /// Acquire in order, and register the matching release BEFORE the next acquire.
     ///
