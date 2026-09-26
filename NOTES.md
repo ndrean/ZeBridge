@@ -16970,4 +16970,11 @@ burst at a few thousand events/s on an iPhone 12.
   burst + 90 s at 5k events/s, four kills, 0 disconnects, exact (4,552,000 rows, sum
   204,649,720 — the app's check against PostgreSQL; a release build's files cannot be
   copied out), converged 774 s after the load.
+* **RN + zb-client-ts on the e20** (65e54f4): it runs. Two fixes first. A release build
+  refused `ws://` ("CLEARTEXT communication not permitted"); a config plugin allows it on
+  the dev LAN. And the TS object reader pulled 64 chunks (8 MiB) at a time: the JS thread,
+  busy applying, left the WebSocket undrained for 10 s and nats-server cut it. 16 chunks
+  (2 MiB), libzb's bound, and it held. A 200k-row seed took 10.3 s, exact; an 836k-row seed
+  was too slow in JS on this phone to wait for, so no TS kill test here. On a budget
+  Android phone the heavy path belongs to libzb.
 
