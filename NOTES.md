@@ -16818,3 +16818,68 @@ scattering (§10ja above), and the phone tiers are unmeasured for live apply.
 What this leaves: zb-react-native for Android.
 (Done the same day: the replica identity for read-only tables, f96cf47; the benchmark
 tables dropped.)
+
+## §10jb — a busy table, two ways in: a cold arrival and a live client (2026-09-26)
+
+The capacity question of §10ja, asked from the client's side. Two shapes, both in
+`firehose_tls.py` now: **A, cold arrival** — a 2M-row burst (1,000-row transactions, as
+fast as PostgreSQL goes), then the sustained load, the clients opened 30 s in; **B, live
+client** — a replica of 1M rows, seeded and drained *before* anything happens, then a 5 s
+burst at PostgreSQL's rate, then the sustained load. The load is N inserts plus N updates a
+second (2N events/s) for 120 s; CDC cap 256 MiB, cadence 60 s, `RING_BUFFER_COUNT=200000
+BASE_BUF=11`. Everything on one Mac: PostgreSQL, nats-server, the bridge, both clients and
+the harness. Lag is the replica's row count every 2 s against PostgreSQL's own timeline
+(psql echoes every commit); *live* is within three seconds of inserts. `--verify` seeded a
+fresh replica from the final chain in every run: exact, every time.
+
+**What PostgreSQL gives for a burst**: 101k–143k rows/s in 1,000-row transactions. The
+ring never filled (zero "Ring buffer full" lines in any bridge log; a full ring would
+back-pressure the WAL reader, not drop — `acquireAndFillSlot`).
+
+**A — cold arrival** (clients opened at 30 s, converged = exact against PostgreSQL):
+
+| rows/s | events/s | chain holes | libzb: converged, re-seeds | zb-client-ts: converged, re-seeds |
+| --- | --- | --- | --- | --- |
+| 25,000 | 59k | 1 sample (−266, during the 134k rows/s burst) | 163 s, 5 | 131 s, 6 |
+| 50,000 | 90k | 0 | 294 s, 29 | 253 s, 6 |
+
+**B — live client** (back live: seconds after the burst ended; lag p50/p90 over the
+sustained phase, in seconds of inserts; live samples; re-seeds; converged):
+
+| rows/s | events/s | libzb | zb-client-ts |
+| --- | --- | --- | --- |
+| 15,000 | 33k | back in 6.4 s; 0 / 0.6 s; 59 of 65 live; 0 re-seeds | back in 13.0 s; 0.2 / 1.0 s; 54 of 62; 0 |
+| 25,000 | 52k | back in 6.5–12.8 s; 1.0 / 3.9 s; 46–50 of 64; 0 | never; 5.6–7.9 / 18–22 s; 1–2 of 62; 2 |
+| 37,500 | 74k | never; 6.4 / 8.0 s; 4 of 64; 17 (154 s) | never; 8.5 / 12 s; 1 of 62; 15 (153 s) |
+| 50,000 | 94–100k | never; 5.0 / 7.0 s; 14 of 77; 34 (212 s) | never; 18 / 29 s; 1 of 75; 10 (220 s) |
+
+Reading it. The bridge side is PostgreSQL-bound and the chain held without a hole at every
+sustained rate; the one negative sample was a 2M-row burst at 134k rows/s, past the ~90k
+events/s the chain keeps up with (§10ja), and the clients healed it. The clients' live
+ceilings on this shared machine: **libzb ~50k events/s** — live through a 5 s burst at
+120k rows/s and back within 7–13 s, no re-seed — and **zb-client-ts ~33k events/s**.
+Above its ceiling a client falls off the 256 MiB window (~6 s at 100k events/s), re-seeds
+from the chain (650k–850k rows in 5–8 s) and falls off again — the interval between two
+re-seeds is the window — and converges within 60–90 s of the load's end. libzb's shorter
+re-seed cycles show as more re-seeds than the TS client's for the same convergence.
+
+**A slow consumer that was not the client's speed.** Two of the first four B runs had
+libzb's poll return `SlowConsumer` (and the harness abandoned it after five). The inbox
+depth, traced before every pull: 231–234 messages, ~45 MB of 256 KB CDC messages, before
+154 of 163 fetches — a hair under nats.zig's 64 MB pending limit, past which the
+connection drops the message and the reader sees a gap. Cause: `fetch` returns once
+messages stop for 1 ms (patch 18) while the server keeps sending the rest of the request,
+and the next poll asked for a full batch on top of it. nats.zig patch 20: a pull fetch
+asks for `batch − queued`, nothing when the queue alone fills the batch (both pull paths).
+After: 0–100 queued, no errors, exact convergence at 37.5k and 50k with both clients live;
+libzb's tail inbox also gets a 256 MB valve. `ZB_TAIL_TRACE=1` prints the inbox depth and
+the batch's bytes per fetch.
+
+The harness: `--burst-rows N` / `--burst-seconds S`, `--client-before` /
+`--ts-client-before`; each client's result carries `lag` (max, at the burst's end,
+`back_live_s`, `sustained_lag_s_p50/p90`, live samples, re-seeds, the series), libzb's
+stderr in `libzb-client.log`, poll errors counted and never fatal. Burst rows carry a
+negative `batch`, so the per-batch comparison covers them.
+
+What this leaves: the phone tiers under B (unmeasured); zb-react-native for Android.
+
