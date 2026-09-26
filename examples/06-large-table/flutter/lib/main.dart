@@ -17,13 +17,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
 
+import 'src/data/zebridge.dart' show PollReport;
 import 'src/data/zebridge_worker.dart';
 
 /// The simulator shares the Mac's network; a real phone needs the Mac's LAN address:
 ///   flutter run -d `<device>` --dart-define=ZB_NATS_URL=nats://192.168.1.11:4222
 const natsUrl = String.fromEnvironment('ZB_NATS_URL', defaultValue: 'nats://127.0.0.1:4222');
 const principal = 'bob'; // on globex, the tenant that holds the fixture
-const table = 'test_types';
+/// The table to follow: `--dart-define=ZB_TABLE=fire_types` for the capacity scenarios
+/// (NOTES §10jc), `test_types` — the 3M-row fixture — by default.
+const table = String.fromEnvironment('ZB_TABLE', defaultValue: 'test_types');
 
 void main() => runApp(const MaterialApp(
       debugShowCheckedModeBanner: false,
@@ -45,6 +48,10 @@ class _SeedScreenState extends State<SeedScreen> {
   Map<String, dynamic>? _facts;
   String _dbPath = '';
   final _log = <String>[];
+  // §10jc: after the seed the worker keeps polling (it follows the table live); what it
+  // applied since, for the screen.
+  StreamSubscription<PollReport>? _reportsSub;
+  int _applied = 0, _polls = 0, _pollErrors = 0;
 
   @override
   void initState() {
@@ -55,6 +62,7 @@ class _SeedScreenState extends State<SeedScreen> {
   @override
   void dispose() {
     _tick?.cancel();
+    _reportsSub?.cancel();
     _worker?.close();
     super.dispose();
   }
@@ -103,9 +111,17 @@ class _SeedScreenState extends State<SeedScreen> {
       setState(() => _phase = 'usable');
       _say('usable after ${_secs(_clock.elapsedMilliseconds)} (tenant ${w.tenant})');
 
-      final rows = await w.query('SELECT count(*) AS count, count(DISTINCT uid) AS "distinct", sum(age) AS sum FROM $table');
-      final size = File(_dbPath).existsSync() ? File(_dbPath).lengthSync() : 0;
-      setState(() => _facts = {...rows.first, 'bytes': size});
+      await _check();
+      _reportsSub = w.reports.listen((r) {
+        _polls++;
+        _applied += r.applied;
+        if (r.error != null) {
+          _pollErrors++;
+          _say('poll: ${r.error}');
+        }
+        if (r.seeded.isNotEmpty) _say('re-seeded: ${r.seeded.join(', ')}');
+        setState(() {});
+      });
     } catch (e) {
       _clock.stop();
       _tick?.cancel();
@@ -113,8 +129,24 @@ class _SeedScreenState extends State<SeedScreen> {
     }
   }
 
+  /// count and sum now (DISTINCT only on the fixture: minutes on millions of rows).
+  Future<void> _check() async {
+    final w = _worker;
+    if (w == null) return;
+    final rows = await w.query(table == 'test_types'
+        ? 'SELECT count(*) AS count, count(DISTINCT uid) AS "distinct", sum(age) AS sum FROM $table'
+        : 'SELECT count(*) AS count, NULL AS "distinct", sum(age) AS sum FROM $table');
+    final size = File(_dbPath).existsSync() ? File(_dbPath).lengthSync() : 0;
+    setState(() => _facts = {...rows.first, 'bytes': size});
+  }
+
   /// Close, delete the replica (and SQLite's side files), start over.
   Future<void> _wipe() async {
+    await _reportsSub?.cancel();
+    _reportsSub = null;
+    _applied = 0;
+    _polls = 0;
+    _pollErrors = 0;
     await _worker?.close();
     _worker = null;
     for (final suffix in ['', '-wal', '-shm', '-journal']) {
@@ -126,6 +158,7 @@ class _SeedScreenState extends State<SeedScreen> {
 
   static String _secs(int ms) => '${(ms / 1000).toStringAsFixed(1)} s';
   static String _n(Object? v) {
+    if (v == null) return '—'; // an empty table's sum is NULL
     final n = int.tryParse('$v') ?? 0;
     return n.toString().replaceAllMapped(RegExp(r'(\d)(?=(\d{3})+$)'), (m) => '${m[1]},');
   }
@@ -143,7 +176,7 @@ class _SeedScreenState extends State<SeedScreen> {
             const Text('ZeBridge — one large table, libzb',
                 style: TextStyle(color: Color(0xFFE0E0E0), fontSize: 18, fontWeight: FontWeight.w700)),
             const SizedBox(height: 4),
-            const Text('test_types as bob, seeded from the generation chain by the C client: streamed, '
+            const Text('$table as bob, seeded from the generation chain by the C client: streamed, '
                 'sorted per window, applied in Zig. One database, kept across launches.',
                 style: TextStyle(color: Color(0xFF999999), fontSize: 12)),
             const SizedBox(height: 14),
@@ -167,7 +200,7 @@ class _SeedScreenState extends State<SeedScreen> {
             const SizedBox(height: 12),
             if (_facts != null) ...[
               _fact('rows', _n(_facts!['count']), mono, dim),
-              _fact('distinct uid', _n(_facts!['distinct']), mono, dim),
+              if (_facts!['distinct'] != null) _fact('distinct uid', _n(_facts!['distinct']), mono, dim),
               _fact('sum(age)', _n(_facts!['sum']), mono, dim),
               _fact('connect → usable', _secs(_clock.elapsedMilliseconds), mono, dim),
               _fact('replica', '${((_facts!['bytes'] as int) / 1e9).toStringAsFixed(2)} GB', mono, dim),
@@ -176,10 +209,21 @@ class _SeedScreenState extends State<SeedScreen> {
             if (_error != null)
               Text(_error!, style: mono.copyWith(color: const Color(0xFFEF9A9A))),
             const SizedBox(height: 6),
-            OutlinedButton(
-              onPressed: _phase == 'connect + seed' ? null : _wipe,
-              child: const Text('wipe & seed again'),
-            ),
+            if (_polls > 0)
+              Text('following: ${_n(_applied)} event(s) applied in ${_n(_polls)} report(s)${_pollErrors > 0 ? ', $_pollErrors error(s)' : ''}',
+                  style: dim),
+            const SizedBox(height: 6),
+            Row(children: [
+              OutlinedButton(
+                onPressed: _phase == 'connect + seed' ? null : _wipe,
+                child: const Text('wipe & seed again'),
+              ),
+              const SizedBox(width: 10),
+              OutlinedButton(
+                onPressed: _facts == null ? null : _check,
+                child: const Text('check (count, sum)'),
+              ),
+            ]),
             const SizedBox(height: 10),
             Expanded(
               child: Container(
