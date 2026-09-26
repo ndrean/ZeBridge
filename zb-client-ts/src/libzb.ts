@@ -43,6 +43,14 @@ import { heartbeatPayload,
 } from './core.ts';
 import type { VecCol } from './core.ts';
 import type { PlanStep } from './core.ts';
+
+/// §10jc: how long the server keeps a tail consumer with no pull outstanding —
+/// libzb's `tail_inactive_ns`, the same number. Unset, nats-server's ephemeral default
+/// of 5 s applies, and a phone applying one 20,000-event batch spends longer than that
+/// between pulls: the server deleted the consumer, the deaf watchdog found it gone 25 s
+/// later and recreated it — every ~50 s on an iPhone 12 at 10k events/s, a third of the
+/// time spent not reading. Measured 2026-09-26.
+const TAIL_INACTIVE_NS = 120 * 1_000_000_000;
 import GRAMMAR_JSON from './grammar.json' with { type: 'json' };
 
 /// §10dq: the wire grammar, compiled in — a copy of `src/grammar.json` pinned
@@ -3169,6 +3177,7 @@ export class ZeBridge {
           // One filter is understood by every server; several need nats-server >= 2.10.
           ...(filters.length === 1 ? { filter_subject: filters[0] } : {}),
           ...(filters.length > 1 ? { filter_subjects: filters } : {}),
+          inactive_threshold: TAIL_INACTIVE_NS,
         });
         const consumer = await js.consumers.get(streamName, ci.name);
         const setupMs = Math.round(performance.now() - setupStart);
@@ -3217,6 +3226,7 @@ export class ZeBridge {
                 opt_start_seq: resumeFrom > 0 ? resumeFrom + 1 : undefined,
                 ...(filters2.length === 1 ? { filter_subject: filters2[0] } : {}),
                 ...(filters2.length > 1 ? { filter_subjects: filters2 } : {}),
+                inactive_threshold: TAIL_INACTIVE_NS,
               });
               curName = ci2.name;
               const consumer2 = await js.consumers.get(streamName, ci2.name);
