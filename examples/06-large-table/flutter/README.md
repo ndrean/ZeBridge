@@ -65,14 +65,19 @@ What `ios/Flutter/*.xcconfig` carries, and why (each was a failed link or launch
 Zig cannot synthesise Android's libc (NOTES §10ir), so libzb is built as a static
 archive — position-independent on Android targets, `libzb/build.zig` — and the NDK's
 `clang --shared -Wl,--whole-archive` makes the `.so` dart:ffi loads from
-`android/app/src/main/jniLibs/arm64-v8a/` (git-ignored). The manifest declares
-`INTERNET`. Built and packaged on 2026-09-24; installed on a moto e20 (Android 11 Go, 1.8 GB)
-that then enforced a 24-hour wait before accepting a new debugging computer — and the
-app did not open from its icon. Without adb the reason is unread; the suspect is the
-ABI: `arm64-v8a` is the only slice libzb builds today (64-bit atomics in libzb and
-nats.zig; `tool/build-libzb-android.sh` says why), and a 2 GB Go phone may run a
-32-bit userspace, where Android loads the armeabi-v7a Flutter engine and finds no
-library. `adb shell getprop ro.product.cpu.abilist` settles it.
+`android/app/src/main/jniLibs/<abi>/` (git-ignored). The manifest declares `INTERNET`.
+
+Two slices: `arm64-v8a`, and `armeabi-v7a` for the 32-bit userspace of Android Go phones
+(`adb shell getprop ro.product.cpu.abilist` says which a phone runs). The 32-bit one needs
+nats.zig patch 25 (no 64-bit atomics on 32-bit ARM in Zig) and names its CPU
+(`-Dcpu=cortex_a7`: plain `arm` means pre-v7 to Zig).
+
+**Measured on a moto e20** (2026-09-26): Android 11 Go, 1.8 GB RAM (~680 MB available),
+eMMC storage, 32-bit userspace. `fire_types`, a fresh replica of 3,245,000 rows: **534 s**,
+exact (rows and sum). The app stayed at ~250 MB (PSS) throughout — the seed streams a
+window at a time, so a 1.5 GB replica needs a fraction of that in RAM; storage speed, not
+memory, sets the time. It needed the object reader's resume (libzb 44ad312): applying one
+window on eMMC took longer than the reader consumer's old 30 s idle limit.
 
 And in `ios/Runner/Info.plist`, `NSLocalNetworkUsageDescription`: without it iOS
 refuses connections to LAN addresses silently — `zb_client_connect` returned 0 with no
