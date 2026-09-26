@@ -40,6 +40,12 @@ pub const ConnectOptions = struct {
 pub const ObjectPull = struct {
     a: std.mem.Allocator,
     sub: *nats.PullSubscription,
+    /// To reopen the reader where it stopped (see `read`): the transport, the object's
+    /// stream and chunk subject, and the stream sequence of the next chunk (0: from the start).
+    t: *Transport,
+    stream: []const u8,
+    chunk_subject: []const u8,
+    next_seq: u64 = 0,
     chunks: u32,
     size: u64,
     digest: []const u8,
@@ -70,13 +76,26 @@ pub const ObjectPull = struct {
         const info = (try std.json.parseFromSliceLeaky(Info, a, msg.data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }));
         if (info.deleted) return error.ObjectNotFound;
         const chunk_subject = try std.fmt.allocPrint(a, "$O.{s}.C.{s}", .{ bucket, info.nuid });
-        // Named like the CDC consumers (pid + counter), reaped by the server after
-        // 30 s idle: the client JWT has no CONSUMER.DELETE grant (see openConsumer).
+        const sub = try openChunks(t, a, stream, chunk_subject, 0);
+        return .{ .a = a, .sub = sub, .t = t, .stream = stream, .chunk_subject = chunk_subject, .chunks = info.chunks, .size = info.size, .digest = info.digest };
+    }
+
+    /// The chunk reader's pull consumer, from `start_seq` (0: the first chunk). Named like
+    /// the CDC consumers (pid + counter), reaped by the server when idle: the client JWT has
+    /// no CONSUMER.DELETE grant (see openConsumer). 5 min, not 30 s: a streamed seed reads a
+    /// window, then sorts and applies it before reading on, and on a slow phone (a moto e20,
+    /// eMMC) that took longer than 30 s — the consumer was reaped and the next read failed
+    /// with NoResponders, the seed with it. `read` also reopens here if it happens anyway.
+    fn openChunks(t: *Transport, a: std.mem.Allocator, stream: []const u8, chunk_subject: []const u8, start_seq: u64) !*nats.PullSubscription {
         const cname = try std.fmt.allocPrint(a, "zbo{d}x{d}", .{ std.c.getpid(), Ctr.n.fetchAdd(1, .monotonic) });
         var cfg: nats.ConsumerConfig = .{ .ack_policy = .none, .deliver_policy = .all };
+        if (start_seq > 0) {
+            cfg.deliver_policy = .by_start_sequence;
+            cfg.opt_start_seq = start_seq;
+        }
         cfg.name = cname;
         cfg.durable_name = cname;
-        cfg.inactive_threshold = 30 * std.time.ns_per_s;
+        cfg.inactive_threshold = 5 * 60 * std.time.ns_per_s;
         const sub = try t.js.pullSubscribe(chunk_subject, cname, .{ .stream = stream, .config = cfg });
         // §10iy: wait for the WHOLE batch. nats.zig's fetch returns 1 ms after its first
         // message (right for a CDC tail); over Wi-Fi the 8 chunks of a batch do not land
@@ -84,7 +103,7 @@ pub const ObjectPull = struct {
         // ended up with dozens of requests in flight for one reader — 42 MB pending, cut
         // as a slow consumer, on an iPhone that never got past a third of the object.
         sub.idle_after_first = fetch_timeout;
-        return .{ .a = a, .sub = sub, .chunks = info.chunks, .size = info.size, .digest = info.digest };
+        return sub;
     }
 
     pub fn deinit(self: *ObjectPull) void {
@@ -102,6 +121,7 @@ pub const ObjectPull = struct {
                     @memcpy(dest[0..n], data[self.pos..][0..n]);
                     self.pos += n;
                     if (self.pos >= data.len) {
+                        self.next_seq = b.messages[self.bi].metadata.sequence.stream + 1;
                         self.hasher.update(data);
                         self.bi += 1;
                         self.pos = 0;
@@ -119,7 +139,24 @@ pub const ObjectPull = struct {
                 break;
             }
             const want: usize = @min(batch_size, self.chunks - self.chunk_index);
-            self.batch = try self.sub.fetch(want, fetch_timeout);
+            // The consumer can be gone (reaped while the caller applied a window, or a
+            // lost connection): reopen it at the next chunk and read on — a few times in
+            // a row at most, then the failure is real.
+            var reopened: u8 = 0;
+            self.batch = while (true) {
+                break self.sub.fetch(want, fetch_timeout) catch |err| switch (err) {
+                    error.NoResponders, error.ConsumerSequenceMismatch => {
+                        if (reopened >= 5) return err;
+                        reopened += 1;
+                        std.debug.print("object reader: consumer gone at chunk {d} of {d} ({s}) — reopening from stream seq {d}\n", .{ self.chunk_index, self.chunks, @errorName(err), self.next_seq });
+                        const fresh = try openChunks(self.t, self.a, self.stream, self.chunk_subject, self.next_seq);
+                        self.sub.deinit();
+                        self.sub = fresh;
+                        continue;
+                    },
+                    else => return err,
+                };
+            };
             if (self.batch.?.messages.len == 0) return error.ObjectTruncated;
         }
         return 0;
