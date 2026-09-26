@@ -16934,3 +16934,11 @@ outstanding request per consumer) remove them. The iPhone at 40k events/s with f
 SIGKILLs: 0 disconnects, 153 of 153 batches exact. The price: a catch-up now alternates
 transfer and apply (91.8 s for a 1.3M-row first seed against 32 s before) — next.
 
+**Catch-up speed, and the last disconnect** (35b8ede and after). One request at a time made a
+phone's catch-up alternate transfer and apply: 91.8 s for a 1.3M-row first seed. Two requests
+outstanding (patch 23, `pull_depth` 2): 53.7 s. One disconnect remained in a drain: a slot
+freed at its `expires` (0.9 s) while its 8 MB were still crossing the Wi-Fi (1.6 s); each
+delivery now keeps its request open 2 s more (patch 24). The iPhone at 40k events/s with four
+SIGKILLs: 0 disconnects, 0 lost deliveries, 153/153 batches exact, converged 170 s after the
+load (285 s this morning).
+

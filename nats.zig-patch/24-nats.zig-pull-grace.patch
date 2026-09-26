@@ -1,0 +1,38 @@
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+index 7f4de51..1ae1837 100644
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -428,6 +428,10 @@ pub const MessageBatch = struct {
+ /// ZeBridge's libzb, 10 ms here made a 13 ms row, 1 ms makes it 3 ms.
+ const fetch_idle_after_first: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } };
+ 
++/// How long a pull request stays open after its last delivered message (see
++/// `requestDelivered`): the server may still be sending what it queued before `expires`.
++const request_grace: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(2000), .clock = .awake } };
++
+ /// One outstanding pull request of a `PullSubscription` (see `reqs`).
+ const PullRequest = struct {
+     reply: [160]u8 = undefined,
+@@ -585,7 +589,21 @@ pub const PullSubscription = struct {
+         }
+         if (oldest) |o| {
+             o.left -= 1;
+-            if (o.left == 0) o.reply_len = 0;
++            if (o.left == 0) {
++                o.reply_len = 0;
++            } else {
++                // Still arriving: the request is not over while its messages are on the
++                // wire, whatever its `expires` said. The server queues a request's messages
++                // at once; over a link slower than that (an 8 MB request at ~5 MB/s takes
++                // 1.6 s, its `expires` was 0.9 s) the slot used to free while data was still
++                // in flight, the next fetch asked again, and the bytes in flight grew past
++                // `pull_depth × max_bytes` — one more slow-consumer disconnect on the phone.
++                // Each delivery keeps the request open for `request_grace` more.
++                const grace = request_grace.toDeadline(self.js.nc.io);
++                const cur = o.deadline.toDurationFromNow(self.js.nc.io);
++                const ext = grace.toDurationFromNow(self.js.nc.io);
++                if (cur == null or (ext != null and ext.?.raw.toNanoseconds() > cur.?.raw.toNanoseconds())) o.deadline = grace;
++            }
+         }
+     }
+ 

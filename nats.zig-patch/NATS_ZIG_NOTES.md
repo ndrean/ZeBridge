@@ -936,3 +936,22 @@ subjects become `<prefix><fetch>x<i>y<k>`. Bytes in flight: at most `pull_depth 
 TLS test fail); ZeBridge's delivery-loss test exact; the iPhone's 1.3M-row first seed
 53.7 s (was 91.8 s), exact. One slow-consumer disconnect remained during that seed's
 drain — being measured.
+
+## 24. A pull request stays open while its messages arrive (2026-09-26)
+
+**How it appeared**
+
+After patch 23 one slow-consumer disconnect remained, during a phone's drain. A request's
+slot freed at its `expires` (0.9 s for libzb's drain), but the server queues a request's
+messages at once and 8 MB over ~5 MB/s Wi-Fi takes 1.6 s: the slot freed with data still on
+the wire, the next fetch asked again, and the bytes in flight passed `pull_depth × max_bytes`.
+
+**Change** (`24-nats.zig-pull-grace.patch`, src/jetstream.zig)
+
+Each delivered message extends its request's deadline to at least now + `request_grace`
+(2 s). A request frees when fully delivered, ended by a status (408 at expiry, 409 at the
+byte cap), or silent for the grace after its expiry.
+
+**Verified**: `zig build test-unit` 135/135; ZeBridge's delivery-loss test exact; the iPhone at
+40k events/s with four SIGKILLs: 0 slow-consumer disconnects, 0 connection resets, 153/153
+batches exact, converged 170 s after the load (285 s before patches 21-24).
