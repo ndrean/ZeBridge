@@ -42,6 +42,9 @@ export default function App() {
 
 function TsSeed() {
   const zbRef = useRef<ZeBridge | null>(null);
+  /// §10jc: the facts again on demand, while the client keeps tailing — what scenario B
+  /// compares with PostgreSQL once the harness says the phone caught up.
+  const measureRef = useRef<(() => Promise<void>) | null>(null);
   const [status, setStatus] = useState<ConnStatus>('disconnected');
   const [phase, setPhase] = useState<Record<Phase, boolean>>({ connected: false, migrated: false, snapshot: false, cdc: false });
   const [progress, setProgress] = useState<SeedProgress | null>(null);
@@ -93,13 +96,13 @@ function TsSeed() {
     const measure = async () => {
       const [row] = TABLE === 'test_types'
         ? await zb.query('SELECT count(*) AS count, count(DISTINCT uid) AS "distinct", sum(age) AS sum FROM test_types')
-        : await zb.query(`SELECT count(*) AS count FROM ${TABLE}`);
+        : await zb.query(`SELECT count(*) AS count, sum(age) AS sum FROM ${TABLE}`);
       let dbBytes: number | undefined;
       try {
-        // Android's expo-file-system wants a file:// URI; iOS takes either.
-        const dir = defaultDatabaseDirectory.startsWith('file://') ? defaultDatabaseDirectory : `file://${defaultDatabaseDirectory}`;
-        const info = await FileSystem.getInfoAsync(`${dir}/${zb.dbName}`);
-        if (info.exists) dbBytes = info.size;
+        // SQLite's own size: getInfoAsync MD5s the whole file (§10jc — a 1.8 GB replica
+        // read into memory is an iOS memory kill).
+        const [r] = await zb.query('SELECT page_count * page_size AS bytes FROM pragma_page_count(), pragma_page_size()');
+        dbBytes = Number(r.bytes);
       } catch { /* the size is a nicety */ }
       setFacts({ count: Number(row.count), distinct: row.distinct != null ? Number(row.distinct) : undefined, sum: row.sum != null ? Number(row.sum) : undefined, dbBytes });
     };
@@ -108,7 +111,7 @@ function TsSeed() {
       zb.onStatus(setStatus),
       zb.onPhase((p) => {
         setPhase((prev) => ({ ...prev, [p]: true }));
-        if (p === 'cdc') { stopClock(); void measure().catch((e) => log(`measure failed: ${e}`, true)); }
+        if (p === 'cdc') { stopClock(); measureRef.current = measure; void measure().catch((e) => log(`measure failed: ${e}`, true)); }
       }),
       zb.onSeedProgress((p) => {
         if (p.table !== TABLE) return;
@@ -179,6 +182,10 @@ function TsSeed() {
 
       <Pressable style={[s.button, busy && s.buttonOff]} onPress={wipe} disabled={busy}>
         <Text style={s.buttonText}>wipe & seed again</Text>
+      </Pressable>
+      <Pressable style={[s.button, !measureRef.current && s.buttonOff]} disabled={!measureRef.current}
+        onPress={() => { const m = measureRef.current; if (m) void m().catch((e) => fileLog('ts', `check failed: ${e}`, true)); }}>
+        <Text style={s.buttonText}>check (count, sum)</Text>
       </Pressable>
 
       <ScrollView style={s.log}>

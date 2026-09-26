@@ -10,6 +10,11 @@ const FILE = `${FileSystem.documentDirectory}app-log.txt`;
 const MAX = 2000;
 const lines: string[] = [];
 let timer: ReturnType<typeof setTimeout> | null = null;
+/// The previous launch's log is kept as app-log.prev.txt: a launch after a jetsam kill
+/// used to overwrite the one file that said what the killed process was doing.
+const moved = FileSystem.deleteAsync(`${FileSystem.documentDirectory}app-log.prev.txt`, { idempotent: true })
+  .then(() => FileSystem.moveAsync({ from: FILE, to: `${FileSystem.documentDirectory}app-log.prev.txt` }))
+  .catch(() => { /* no previous log */ });
 
 export function fileLog(engine: string, text: string, err = false) {
   lines.push(`${new Date().toISOString()} ${engine}${err ? ' ERROR' : ''} ${text}`);
@@ -17,6 +22,6 @@ export function fileLog(engine: string, text: string, err = false) {
   if (timer) return;
   timer = setTimeout(() => {
     timer = null;
-    FileSystem.writeAsStringAsync(FILE, lines.join('\n') + '\n').catch(() => { /* the next line retries */ });
+    void moved.then(() => FileSystem.writeAsStringAsync(FILE, lines.join('\n') + '\n')).catch(() => { /* the next line retries */ });
   }, 500);
 }

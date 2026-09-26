@@ -2,11 +2,12 @@
 /// package. What the Flutter app does over dart:ffi, from JavaScript:
 /// `connect`, then one `sync` that streams the chain and applies it in Zig. JS only
 /// keeps the clock and asks for the three facts. libzb reports nothing while `sync`
-/// runs, so there is no bar.
+/// runs, so there is no bar. Once usable it keeps following: `poll` in a loop (§10jc),
+/// the way a host drives libzb — the harness reads its consumer from nats-server.
 import { useEffect, useRef, useState } from 'react';
 import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as FileSystem from 'expo-file-system';
-import { Libzb } from 'zb-react-native';
+import { Libzb, ZbNative } from 'zb-react-native';
 import { PRINCIPAL, TABLE } from './client';
 import { fileLog } from './app-log';
 
@@ -19,7 +20,7 @@ const DB_FILE = `zebridge_${PRINCIPAL}_libzb.sqlite3`;
 
 const fmt = (n: number) => n.toLocaleString('en-US');
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
-type Facts = { count: number; distinct: number; sum: number; dbBytes?: number };
+type Facts = { count: number; distinct?: number; sum: number; dbBytes?: number };
 
 export function LibzbSeed() {
   const clientRef = useRef<Libzb | null>(null);
@@ -30,7 +31,22 @@ export function LibzbSeed() {
   const [lines, setLines] = useState<{ text: string; err: boolean }[]>([]);
   const [busy, setBusy] = useState(false);
   const [gen, setGen] = useState(0);
+  const [follow, setFollow] = useState<{ applied: number; polls: number; errors: number } | null>(null);
   const t0Ref = useRef(0);
+
+  /// count and sum now (the table's DISTINCT only on the fixture: it takes minutes on 3M rows).
+  const check = async () => {
+    const zb = clientRef.current; if (!zb) return;
+    const q = await zb.query(TABLE === 'test_types'
+      ? `SELECT count(*), count(DISTINCT uid), sum(age) FROM ${TABLE}`
+      : `SELECT count(*), NULL, sum(age) FROM ${TABLE}`);
+    const [count, distinct, sum] = q.rows[0].map((v: unknown) => (v == null ? undefined : Number(v)));
+    // The size from SQLite itself: expo-file-system's getInfoAsync MD5s the whole file
+    // (it tests for the `md5` KEY, which is always passed), and a 1.8 GB replica read into
+    // memory got the app killed by iOS at 2.1 GB — at every launch (§10jc).
+    const bytes = await zb.query(`SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()`);
+    setFacts({ count: count!, distinct, sum: sum!, dbBytes: Number(bytes.rows[0][0]) });
+  };
 
   useEffect(() => {
     if (!running) return;
@@ -48,7 +64,13 @@ export function LibzbSeed() {
     log(`— start (${PRINCIPAL}, ${TABLE})`);
     (async () => {
       if (!CREDS) throw new Error("set EXPO_PUBLIC_CREDS to the principal's creds file contents");
-      const fresh = !(await FileSystem.getInfoAsync(dir + DB_FILE)).exists;
+      // libzb's own lines (seeded, gap healed, seed anchor, one per fetch and batch with the
+      // peak RSS) appended to Documents/libzb-stderr.log — the phone has no terminal.
+      if (process.env.EXPO_PUBLIC_ZB_TRACE_LIBZB === '1') {
+        ZbNative.captureStderr(dir.replace(/^file:\/\//, '') + 'libzb-stderr.log', true);
+      }
+      // A directory listing, not getInfoAsync: that one MD5s the file (see `check`).
+      const fresh = !(await FileSystem.readDirectoryAsync(dir)).includes(DB_FILE);
       log(fresh ? 'fresh replica — the seed is the whole table' : 'replica present — no seed unless the chain moved');
       log(`connecting to ${NATS_URL} as ${PRINCIPAL}, following [${TABLE}]`);
       t0Ref.current = Date.now(); setElapsed(0); setRunning(true); setPhase('connect + seed');
@@ -66,10 +88,18 @@ export function LibzbSeed() {
       if (failed.length) { setPhase('failed'); log(`not seeded after ${secs(ms)}: ${failed[0].reason}`, true); return; }
       setPhase('usable');
       log(`usable after ${secs(ms)} (tenant ${report.tenant ?? '—'})`);
-      const q = await zb.query(`SELECT count(*), count(DISTINCT uid), sum(age) FROM ${TABLE}`);
-      const [count, distinct, sum] = q.rows[0].map(Number);
-      const info = await FileSystem.getInfoAsync(dir + DB_FILE);
-      setFacts({ count, distinct, sum, dbBytes: info.exists ? info.size : undefined });
+      await check();
+      // §10jc: follow — one poll at a time, a second of wait each; a re-seed or an error
+      // is logged, the loop goes on until the tab closes or wipes.
+      let applied = 0, polls = 0, errors = 0;
+      while (!closed && clientRef.current === zb) {
+        const r = await zb.poll(1000);
+        polls++;
+        applied += r.applied ?? 0;
+        if (r.error) { errors++; log(`poll: ${r.error}`, true); }
+        if (r.seeded?.length) log(`re-seeded: ${r.seeded.join(', ')}`);
+        if (polls % 2 === 0 || r.error) setFollow({ applied, polls, errors });
+      }
     })().catch((e) => { setRunning(false); setPhase('failed'); log(String(e?.message ?? e), true); });
     return () => {
       closed = true;
@@ -109,14 +139,21 @@ export function LibzbSeed() {
       {facts && (
         <View style={s.facts}>
           <Fact k="rows" v={fmt(facts.count)} />
-          <Fact k="distinct uid" v={fmt(facts.distinct)} />
+          {facts.distinct !== undefined && <Fact k="distinct uid" v={fmt(facts.distinct)} />}
           <Fact k="sum(age)" v={fmt(facts.sum)} />
           <Fact k="connect → usable" v={secs(elapsed)} />
           {facts.dbBytes !== undefined && <Fact k="replica" v={`${(facts.dbBytes / 1e9).toFixed(2)} GB`} />}
         </View>
       )}
+      {follow && (
+        <Text style={s.detail}>following: {fmt(follow.applied)} event(s) applied in {fmt(follow.polls)} poll(s){follow.errors ? `, ${follow.errors} error(s)` : ''}</Text>
+      )}
       <Pressable style={[s.button, busy && s.buttonOff]} onPress={wipe} disabled={busy}>
         <Text style={s.buttonText}>wipe & seed again</Text>
+      </Pressable>
+      <Pressable style={[s.button, (busy || !facts) && s.buttonOff]} disabled={busy || !facts}
+        onPress={() => void check().catch((e) => fileLog('libzb', `check failed: ${e}`, true))}>
+        <Text style={s.buttonText}>check (count, sum)</Text>
       </Pressable>
       <ScrollView style={s.log}>
         {lines.map((l, i) => <Text key={i} style={[s.logLine, l.err && s.logErr]}>{l.text}</Text>)}
