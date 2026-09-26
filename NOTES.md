@@ -16770,7 +16770,51 @@ attached-full manifest (50k: `full_gen` 26 under `manifest_gen` 44) and came out
 rows, 0 missing, 0 extra, 0 wrong. The trace's seed anchors equal the manifest's
 `cutoff_seq` at every seed.
 
-What this leaves: libzb's live apply on random keys (the 9,400 rows/s above);
-zb-react-native for Android.
+**libzb's live apply on random keys, found and fixed (2026-09-26).** The §10ja figure —
+300,000 inserts into a 3.7M-row v4 replica, libzb 77.5 s against zb-client-ts 21.2 s —
+was never SQLite configuration: both clients run WAL, `synchronous = NORMAL`,
+`wal_autocheckpoint = 10000`, one transaction per batch; a Python replica of libzb's exact
+statement over a copy of the table did the 300k in 15–20 s warm, 24–32 s cold, whatever
+the cache size (2 MB–256 MB), transaction size (100–100k), mmap or key order. The
+`live2.sh` split told the rest: 2.65 s user, 9.97 s sys, 77.5 s real. Sampled at 1 ms
+while draining the same load on the dev stack (`test_types_v4` rebuilt): of 26,000
+samples 11,600 sit in `pread` under `sqlite3BtreeIndexMoveto → readDbPage` — the index
+probe of each insert reading a leaf from disk — and 7,000 in the WAL write and checkpoint.
+The replica was cold (the seed's pages evicted by the load); warmed with `cat` first the
+same drain took 14.2 s, cold 42.7 s. The TS client's 21 s was a warmer file, not better
+code.
+
+Two random b-trees per insert, then one; 4 KB leaves, then 16 KB:
+
+| 300k random-key inserts, drained | cold file | warm file |
+| --- | --- | --- |
+| as measured (two indexes, 4 KB pages) | 42.7 s | 14.2 s |
+| without the mirrored `(tenant, pk)` index | 22.7 s | 10.4 s |
+| … and 16 KB pages (fresh replica, 4.55M rows) | **9.8 s** | **8.9 s** |
+
+* **The descriptor no longer names the tenant replica identity.** `<t>_zb_ri` is the
+  UNIQUE `(tenant, pk)` index the bridge requires of a tenant-scoped table (preflight).
+  A replica holds one tenant, so on the client it says nothing the primary key does not,
+  and every live insert paid a second random leaf read and a second dirty page for it.
+  Both descriptor paths (the DDL trigger's and the boot query's — the two-path lesson of
+  §10c, again) skip an index whose columns are exactly the tenant column plus the pk
+  columns; a public table's indexes are untouched. Clients drop an index the descriptor
+  stopped naming (`indexSyncPlan`, both clients): libzb dropped it on its first sync,
+  the trace showed 2.1 page misses a row become 1.8, and the cold drain halved.
+* **16 KB pages for a replica the client creates** (libzb `storage.open`, zb-client-ts
+  Node and Expo; a no-op on an existing file, which keeps its own; the browser's OPFS
+  build left alone). A random-key insert reads one leaf per probe, and a leaf four times
+  larger holds four times the keys: a quarter of the cold reads. Python first (16 KB:
+  6.3 s cold twice against 11.5–15.2 at 4 KB; 8 KB was oddly worse both times), then
+  libzb: 22.7 → 9.8 s cold, 10.4 → 8.9 s warm, the seed unchanged at ~5 µs a row.
+* **The trace counts the page cache.** With `ZB_TAIL_TRACE=1` every applied batch prints
+  SQLite's `hit / miss / written` (`sqlite3_db_status`, reset per batch) with its wall
+  time: one line said "one miss per index probe" where two days of guessing had not.
+
+What is left of the gap: the drain's remaining 9 s is the WAL write and the checkpoint's
+fsyncs (the warm sample), the same on any key type; uuidv7 keys still win by not
+scattering (§10ja above), and the phone tiers are unmeasured for live apply.
+
+What this leaves: zb-react-native for Android.
 (Done the same day: the replica identity for read-only tables, f96cf47; the benchmark
 tables dropped.)

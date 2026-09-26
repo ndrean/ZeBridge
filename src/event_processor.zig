@@ -1749,6 +1749,13 @@ pub const EventProcessor = struct {
         // PostgreSQL/PGlite and SQLite (NOTES §10c). Absent on a database whose
         // trigger predates the field, which reads as "no indexes" — the same answer
         // the descriptor gave before it existed.
+        // ⚠️ Except the replica identity of a tenant-scoped table — the UNIQUE (tenant, pk)
+        // index the bridge requires (`<t>_zb_ri`, preflight). A replica holds ONE tenant,
+        // so on the client that index says nothing the primary key does not, and it costs
+        // a second random b-tree on every live insert: measured 2026-09-26 on a 3M-row
+        // replica with random keys, half of the page reads and half of the dirty pages
+        // (NOTES §10ja). Clients drop an index the descriptor no longer names.
+        const tenant_col: ?[]const u8 = if (self.tenant_rules.get(clean_table)) |rule| (if (rule.len > 0) rule[0] else null) else null;
         if (parsed.value.object.get("indexes")) |ix| {
             if (ix == .array) {
                 try json_str.appendSlice(arena, ",\"indexes\":[");
@@ -1760,6 +1767,10 @@ pub const EventProcessor = struct {
                     if (ix_name != .string or ix_cols != .array or ix_cols.array.items.len == 0) continue;
                     const uniq = entry.object.get("unique");
                     const is_uniq = uniq != null and uniq.? == .bool and uniq.?.bool;
+                    if (is_uniq and isTenantIdentityIndex(ix_cols.array.items, tenant_col, pk_cols)) {
+                        log.debug("descriptor '{s}': index '{s}' is the tenant replica identity — not mirrored on clients", .{ clean_table, ix_name.string });
+                        continue;
+                    }
 
                     if (emitted > 0) try json_str.appendSlice(arena, ",");
                     try json_str.appendSlice(arena, try std.fmt.allocPrint(
@@ -2535,6 +2546,14 @@ pub const EventProcessor = struct {
             );
             const ix_result = c.PQexec(conn, ix_query.ptr);
             defer c.PQclear(ix_result);
+            // The tenant replica identity is not mirrored (see packDdlToSlot): the pk
+            // names as the query above returned them, for the same predicate.
+            const boot_tenant_col: ?[]const u8 = if (self.tenant_rules.get(clean_table)) |rule| (if (rule.len > 0) rule[0] else null) else null;
+            var boot_pk: std.ArrayList([]const u8) = .empty;
+            {
+                var i: i32 = 0;
+                while (i < pk_rows) : (i += 1) try boot_pk.append(arena, std.mem.span(c.PQgetvalue(pk_result, i, 0)));
+            }
             try json_str.appendSlice(arena, ",\"indexes\":[");
             if (c.PQresultStatus(ix_result) == c.PGRES_TUPLES_OK) {
                 const ix_rows = c.PQntuples(ix_result);
@@ -2543,6 +2562,15 @@ pub const EventProcessor = struct {
                 while (ix_i < ix_rows) : (ix_i += 1) {
                     const cols_csv = std.mem.span(c.PQgetvalue(ix_result, ix_i, 2));
                     if (cols_csv.len == 0) continue;
+                    if (std.mem.eql(u8, std.mem.span(c.PQgetvalue(ix_result, ix_i, 1)), "t")) {
+                        var names: std.ArrayList([]const u8) = .empty;
+                        var split = std.mem.splitScalar(u8, cols_csv, ',');
+                        while (split.next()) |cname| if (cname.len > 0) try names.append(arena, cname);
+                        if (isTenantIdentityIndexNames(names.items, boot_tenant_col, boot_pk.items)) {
+                            log.debug("descriptor '{s}': index '{s}' is the tenant replica identity — not mirrored on clients", .{ clean_table, std.mem.span(c.PQgetvalue(ix_result, ix_i, 0)) });
+                            continue;
+                        }
+                    }
                     if (ix_emitted > 0) try json_str.appendSlice(arena, ",");
                     try json_str.appendSlice(arena, try std.fmt.allocPrint(
                         arena,
@@ -2702,3 +2730,53 @@ pub const EventProcessor = struct {
         }
     }
 };
+
+/// The (tenant, pk…) UNIQUE index a tenant-scoped table carries as its replica
+/// identity: exactly the tenant column plus every primary-key column, in any order.
+fn isTenantIdentityIndexNames(cols: []const []const u8, tenant_col: ?[]const u8, pk_cols: []const []const u8) bool {
+    const tc = tenant_col orelse return false;
+    if (pk_cols.len == 0 or cols.len != pk_cols.len + 1) return false;
+    var tenant_seen = false;
+    for (cols) |cname| {
+        if (std.mem.eql(u8, cname, tc)) {
+            tenant_seen = true;
+            continue;
+        }
+        var in_pk = false;
+        for (pk_cols) |pc| if (std.mem.eql(u8, pc, cname)) {
+            in_pk = true;
+        };
+        if (!in_pk) return false;
+    }
+    return tenant_seen;
+}
+
+/// The same over the DDL trigger's JSON (strings only; anything else is not that index).
+fn isTenantIdentityIndex(cols: []const std.json.Value, tenant_col: ?[]const u8, pk_cols: []const std.json.Value) bool {
+    var cbuf: [16][]const u8 = undefined;
+    var pbuf: [16][]const u8 = undefined;
+    if (cols.len > cbuf.len or pk_cols.len > pbuf.len) return false;
+    for (cols, 0..) |cv, i| {
+        if (cv != .string) return false;
+        cbuf[i] = cv.string;
+    }
+    for (pk_cols, 0..) |pv, i| {
+        if (pv != .string) return false;
+        pbuf[i] = pv.string;
+    }
+    return isTenantIdentityIndexNames(cbuf[0..cols.len], tenant_col, pbuf[0..pk_cols.len]);
+}
+
+test "isTenantIdentityIndex: the (tenant, pk) unique index and nothing else" {
+    const S = std.json.Value;
+    const pk = [_]S{.{ .string = "uid" }};
+    const ri = [_]S{ .{ .string = "tenant_id" }, .{ .string = "uid" } };
+    const ri_rev = [_]S{ .{ .string = "uid" }, .{ .string = "tenant_id" } };
+    const other = [_]S{ .{ .string = "tenant_id" }, .{ .string = "email" } };
+    const wider = [_]S{ .{ .string = "tenant_id" }, .{ .string = "uid" }, .{ .string = "age" } };
+    try std.testing.expect(isTenantIdentityIndex(&ri, "tenant_id", &pk));
+    try std.testing.expect(isTenantIdentityIndex(&ri_rev, "tenant_id", &pk));
+    try std.testing.expect(!isTenantIdentityIndex(&other, "tenant_id", &pk));
+    try std.testing.expect(!isTenantIdentityIndex(&wider, "tenant_id", &pk));
+    try std.testing.expect(!isTenantIdentityIndex(&ri, null, &pk)); // a public table: mirror everything
+}
