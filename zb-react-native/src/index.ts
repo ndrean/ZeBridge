@@ -10,7 +10,7 @@
 /// compares its ABI with this code's (src/abi.ts): a copy older or newer than the code is
 /// refused with the fix, not left to misbehave — an app once kept a libzb built before
 /// `creds` existed, and it sat in connect for minutes (NOTES §10ja).
-import { requireNativeModule } from 'expo';
+import { requireOptionalNativeModule } from 'expo';
 import { ZB_ABI } from './abi';
 
 type Native = {
@@ -27,13 +27,25 @@ type Native = {
   zstdFree(id: number): void;
 };
 
-export const ZbNative = requireNativeModule<Native>('ZbNative');
+/// The native module, or null where this package has no native side (Android, today).
+/// Required OPTIONALLY: an app that merely imports the package — a screen offering libzb
+/// next to zb-client-ts — must still start there; `requireNativeModule` threw at import and
+/// took the whole app down on Android. Using libzb without it throws `native()`'s error.
+export const ZbNative: Native | null = requireOptionalNativeModule<Native>('ZbNative');
+
+/// libzb is embedded in this app (iOS today).
+export const libzbAvailable = ZbNative !== null;
+
+function native(): Native {
+  if (!ZbNative) throw new Error('zb-react-native: libzb is not built for this platform (iOS only today) — use zb-client-ts here');
+  return ZbNative;
+}
 
 let abiChecked = false;
 /// Throws when the embedded libzb is not the ABI this package was written for.
 export function assertAbi(): void {
   if (abiChecked) return;
-  const got = ZbNative.abiVersion();
+  const got = native().abiVersion();
   if (got !== ZB_ABI) {
     throw new Error(`zb-react-native: the embedded libzb is ABI ${got}, this package is ABI ${ZB_ABI} — rebuild it (zb-react-native/scripts/build-ios.sh), then the app`);
   }
@@ -69,24 +81,24 @@ export class Libzb {
 
   static async connect(opts: LibzbOptions): Promise<Libzb> {
     assertAbi();
-    return new Libzb(await ZbNative.connect(JSON.stringify(opts)));
+    return new Libzb(await native().connect(JSON.stringify(opts)));
   }
 
   /// The first sync is schema, seed and positions: the table is usable after it.
   async sync(): Promise<any> {
-    return JSON.parse(await ZbNative.sync(this.handle));
+    return JSON.parse(await native().sync(this.handle));
   }
 
   /// The live tail: applies what arrived, waiting up to `waitMs` for it.
   async poll(waitMs = 500): Promise<any> {
-    return JSON.parse(await ZbNative.poll(this.handle, waitMs));
+    return JSON.parse(await native().poll(this.handle, waitMs));
   }
 
   async query(sql: string, params: unknown[] = []): Promise<QueryResult> {
-    return JSON.parse(await ZbNative.query(this.handle, sql, JSON.stringify(params)));
+    return JSON.parse(await native().query(this.handle, sql, JSON.stringify(params)));
   }
 
   async close(): Promise<void> {
-    await ZbNative.close(this.handle);
+    await native().close(this.handle);
   }
 }

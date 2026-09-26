@@ -350,6 +350,14 @@ function outboxVersionOf(row: { payload?: string }): string | null {
   }
 }
 
+
+/// §10jc: chunks asked for per object pull. nats.js takes ONE bound per request, count or
+/// bytes; a chunk is at most 128 KiB, so 16 is 2 MiB, libzb's bound (a byte bound sized
+/// from the payload refused full chunks: their wire size counts the headers too). At 64
+/// (8 MiB) the moto e20's JS thread, busy applying, left a WebSocket undrained for 10 s and
+/// nats-server cut it ("WriteDeadline of 10s exceeded with 145 chunks of 8266295 bytes").
+const OBJECT_PULL_CHUNKS = 16;
+
 export class ZeBridge {
   public readonly dbName: string;
   public sql: StorageExec = async () => { throw new Error('Not connected'); };
@@ -2317,13 +2325,10 @@ export class ZeBridge {
     // cut the connection as a slow consumer ("Slow Consumer Detected: MaxPending of
     // 67108864 Exceeded", twice, once per attempt — 24 then 18 chunks arrived). libzb
     // reads a few chunks per pull (§10fh) and never trips it; so does this now: at
-    // most 8 MiB in flight per request, the loop asking again until the last chunk.
+    // most OBJECT_PULL_CHUNKS in flight per request, the loop asking again until the last chunk.
     while (parts.length < info.chunks) {
       const remaining = info.chunks - parts.length;
-      // nats.js takes ONE bound per request, count or bytes. Count: a chunk is at most
-      // 128 KiB, so 64 of them is the 8 MiB; a byte bound sized from the payload refused
-      // full chunks, whose wire size counts the headers too ("exceeds maxbytes").
-      const iter = await c.fetch({ max_messages: Math.min(remaining, 64), expires: 30_000 });
+      const iter = await c.fetch({ max_messages: Math.min(remaining, OBJECT_PULL_CHUNKS), expires: 30_000 });
       let inThis = 0;
       for await (const m of iter) {
         parts.push(m.data); got += m.data.length; inThis++;
@@ -2365,7 +2370,7 @@ export class ZeBridge {
   }
 
   /// §10ix: the object's chunks as they arrive, never assembled — the same bounded pull
-  /// as `objectBlob` (8 MiB in flight), each chunk yielded and dropped. The digest is
+  /// as `objectBlob` (OBJECT_PULL_CHUNKS in flight), each chunk yielded and dropped. The digest is
   /// folded in as they pass and checked after the last one: a truncated or corrupt
   /// object still fails, only after the rows it did deliver, and before the watermark
   /// that would have made them count.
@@ -2380,7 +2385,7 @@ export class ZeBridge {
       const c = await js.consumers.get(`OBJ_${bucket}`, { filter_subjects: [`$O.${bucket}.C.${info.nuid}`] });
       let n = 0, got = 0;
       while (n < info.chunks) {
-        const iter = await c.fetch({ max_messages: Math.min(info.chunks - n, 64), expires: 30_000 });
+        const iter = await c.fetch({ max_messages: Math.min(info.chunks - n, OBJECT_PULL_CHUNKS), expires: 30_000 });
         let inThis = 0;
         for await (const m of iter) {
           hash.update(m.data); got += m.data.length; n++; inThis++;

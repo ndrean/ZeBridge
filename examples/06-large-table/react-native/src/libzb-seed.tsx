@@ -7,7 +7,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as FileSystem from 'expo-file-system';
-import { Libzb, ZbNative } from 'zb-react-native';
+import { Libzb, ZbNative, libzbAvailable } from 'zb-react-native';
 import { PRINCIPAL, TABLE } from './client';
 import { fileLog } from './app-log';
 
@@ -65,11 +65,12 @@ export function LibzbSeed() {
     setFacts(null); setLines([]); setPhase('starting');
     log(`— start (${PRINCIPAL}, ${TABLE})`);
     (async () => {
+      if (!libzbAvailable) { setPhase('libzb is not built for this platform (iOS only) — use the zb-client-ts tab'); return; }
       if (!CREDS) throw new Error("set EXPO_PUBLIC_CREDS to the principal's creds file contents");
       // libzb's own lines (seeded, gap healed, seed anchor, one per fetch and batch with the
       // peak RSS) appended to Documents/libzb-stderr.log — the phone has no terminal.
       if (process.env.EXPO_PUBLIC_ZB_TRACE_LIBZB === '1') {
-        ZbNative.captureStderr(dir.replace(/^file:\/\//, '') + 'libzb-stderr.log', true);
+        ZbNative?.captureStderr(dir.replace(/^file:\/\//, '') + 'libzb-stderr.log', true);
       }
       // A directory listing, not getInfoAsync: that one MD5s the file (see `check`).
       const fresh = !(await FileSystem.readDirectoryAsync(dir)).includes(DB_FILE);
