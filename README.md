@@ -138,6 +138,7 @@ ZeBridge supports restricting the columns in a publication. Currently, this will
   * [Two pillars](#two-pillars)
   * [The backend and the frontend in short](#the-backend-and-the-front-end-in-short)
   * [Architecture Example](#architecture-example)
+  * [Testing](#testing)
 * [The daemon](#the-daemon)
   * [Catching up: the chain and the stream](#catching-up-the-chain-and-the-stream)
   * [Schemas & Migrations](#schemas--migrations)
@@ -409,6 +410,49 @@ This can serve the following clients:
 * browsers with a local `PGlite` (or `SQLite`) replica that connects over WSS to NATS,
 * mobiles with their native in-process `SQLite` replica that connects to NATS over TLS,
 * a warm micro-VM with an in-process `DuckDB` replica for fast analytics that connects to NATS over TLS.
+
+### Testing
+
+Measured figures, not estimates. PostgreSQL, nats-server and the bridge run on one Mac; the phones reach it over home Wi-Fi. Every run ends with the replica checked against PostgreSQL (row count and a column sum, or batch by batch), and every run below was exact. The details and the harnesses are in NOTES §10ja–§10jc (`scripts/scenarios/`).
+
+#### PostgreSQL to NATS
+
+| what | measured |
+| --- | --- |
+| PostgreSQL burst, 1,000-row transactions | 101k–143k rows/s; the bridge's ring never filled |
+| catch-up chain (the objects in NATS object storage) | keeps up to ~90k events/s without a hole |
+| a live client on the same Mac, libzb | ~50k events/s; back live 7–13 s after a 5 s burst at 120k rows/s |
+| a live client on the same Mac, zb-client-ts (Node) | ~33k events/s |
+
+Above its ceiling a client falls behind the stream, seeds again from the chain and converges within 60–90 s of the load's end.
+
+#### Seeding a replica
+
+A 3.1M-row table, about 1 GB on disk.
+
+| client | device | time |
+| --- | --- | --- |
+| libzb | Mac | 25 s |
+| zb-client-ts (Node) | Mac | 26 s |
+| libzb, from React Native or Flutter | iPhone 12 | 35 s |
+| zb-client-ts, from React Native | iPhone 12 | 518 s |
+| libzb, from Flutter (3.2M rows) | moto e20 | 534 s, at ~250 MB of RAM |
+| zb-client-ts, from React Native (200k rows) | moto e20 | 10 s |
+
+The moto e20 is a 32-bit Android Go phone with 1.8 GB of RAM and eMMC storage: it builds a 1.5 GB replica while the app stays at ~250 MB of RAM, because libzb streams the seed a window at a time. The gap between libzb and zb-client-ts on a phone is per-row JavaScript, not the phone: the host framework (React Native or Flutter) costs nothing.
+
+#### A live phone under load, killed four times
+
+A seeded replica, then a 5 s burst at PostgreSQL's rate, then 90 s of sustained load; the app is force-killed and relaunched four times during it.
+
+| device | client | load | batches | disconnects | converged after the load |
+| --- | --- | --- | --- | --- | --- |
+| iPhone 12 | libzb, React Native | 40k events/s | 153 of 153 exact | 0 | 170 s |
+| iPhone 12 | libzb, Flutter | 40k events/s | 183 of 183 exact | 0 | 172 s |
+| iPhone 12 | zb-client-ts, React Native | 2k events/s, after a 588k-row burst | exact (878,000 rows) | 0 | 300 s |
+| moto e20 | libzb, Flutter | 5k events/s | exact (4,552,000 rows) | 0 | 774 s |
+
+An iPhone 12 with libzb stays live at 10k events/s and applies about 12k events/s. Above that it falls behind and converges once the load stops.
 
 ## The daemon
 
