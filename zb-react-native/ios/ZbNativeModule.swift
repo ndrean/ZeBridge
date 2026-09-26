@@ -16,6 +16,17 @@ public class ZbNativeModule: Module {
       Int(zb_abi_version())
     }
 
+    // Diagnostics: libzb speaks on stderr (seeded, gap healed, seed anchor, pruned under)
+    // and an app has no terminal. Appends stderr to `path`, line-buffered, for the rest of
+    // the process; `trace` turns on ZB_TAIL_TRACE (a line per fetch and per applied batch)
+    // for clients connected after this call.
+    Function("captureStderr") { (path: String, trace: Bool) -> Bool in
+      if trace { setenv("ZB_TAIL_TRACE", "1", 1) }
+      guard freopen(path, "a", stderr) != nil else { return false }
+      setvbuf(stderr, nil, _IOLBF, 0)
+      return true
+    }
+
     AsyncFunction("connect") { (opts: String) throws -> String in
       let h = zb_client_connect(opts)
       if h == 0 { throw ZbException(Self.lastError() ?? "zb_client_connect failed") }

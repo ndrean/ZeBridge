@@ -15,6 +15,7 @@ import { ZB_ABI } from './abi';
 
 type Native = {
   abiVersion(): number;
+  captureStderr(path: string, trace: boolean): boolean;
   connect(optsJson: string): Promise<string>;
   sync(handle: string): Promise<string>;
   poll(handle: string, waitMs: number): Promise<string>;

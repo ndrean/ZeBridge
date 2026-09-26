@@ -2758,7 +2758,7 @@ pub const SyncClient = struct {
         for (messages) |m| m.ack() catch {};
         if (trace_enabled) {
             const cs = self.st.cacheStats();
-            tr("{s}: batch of {d} message(s), {d} event(s) applied in {d} ms — page cache: {d} hit, {d} miss, {d} written", .{ stream, messages.len, offered, msNow() - t_batch, cs.hit, cs.miss, cs.write });
+            tr("{s}: batch of {d} message(s) [{d}..{d}], {d} event(s) applied in {d} ms — page cache: {d} hit, {d} miss, {d} written; peak RSS {d} MB", .{ stream, messages.len, if (messages.len > 0) messages[0].metadata.sequence.stream else 0, if (messages.len > 0) messages[messages.len - 1].metadata.sequence.stream else 0, offered, msNow() - t_batch, cs.hit, cs.miss, cs.write, maxRssMb() });
         }
         return offered;
     }
@@ -5005,7 +5005,8 @@ fn maxRssMb() u64 {
     var ru: std.c.rusage = undefined;
     if (std.c.getrusage(0, &ru) != 0) return 0;
     const raw: u64 = @intCast(ru.maxrss);
-    return if (@import("builtin").os.tag == .macos) raw / (1 << 20) else raw / 1024;
+    // Darwin (macOS and iOS alike) reports bytes; Linux and Android kilobytes.
+    return if (@import("builtin").os.tag.isDarwin()) raw / (1 << 20) else raw / 1024;
 }
 
 fn msNow() i64 {
