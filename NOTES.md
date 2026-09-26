@@ -16942,3 +16942,12 @@ delivery now keeps its request open 2 s more (patch 24). The iPhone at 40k event
 SIGKILLs: 0 disconnects, 0 lost deliveries, 153/153 batches exact, converged 170 s after the
 load (285 s this morning).
 
+**zb-client-ts on the phone** (same day). Its tail is nats.js's `consume()`, not nats.zig: over
+Wi-Fi it caused no slow-consumer disconnect. Its weakness there was elsewhere: after an RTT
+check failed and "recovered", `subscribeStreams` opened a second tail on the stream while
+the first kept going — two tails applying the same events, racing the position (d7a7e41: a
+per-stream tail generation; a superseded tail stops without applying what it holds). Then:
+a 5 s burst (588k rows at 115k rows/s) + 90 s at 1k rows/s, four SIGKILLs — exact (878,000
+rows), one tail, 0 disconnects, converged 300 s after the load: the JS client absorbs a
+burst at a few thousand events/s on an iPhone 12.
+
