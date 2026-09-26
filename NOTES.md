@@ -16759,8 +16759,18 @@ up after themselves whichever way they end (`teardown_on_signal`: SIGTERM/INT/HU
 database; `ZB_KEEP` keeps logs and replicas only — the scratch JetStream stores go, the
 scratch database and slot always go).
 
+One suspicion from the hunt, checked and dropped: that the background full's attach
+leaves the manifest's top-level fields stale. It does not. The attach reads the manifest
+under the same pair gate as the delta lane (the only other writer), replaces `full`,
+`checkpoints` and `deltas` from the rows, and keeps `gen`, `cutoff_seq`, `cutoff_version`
+— which describe the chain's HEAD, the newest delta, and the attach does not move the
+head (PROTOCOL: `full.gen` is L, deltas above L cover the rest). `keepFrom` lists every
+delta above the full. Proof in the runs: every `--verify` fresh replica was seeded from an
+attached-full manifest (50k: `full_gen` 26 under `manifest_gen` 44) and came out 6,000,000
+rows, 0 missing, 0 extra, 0 wrong. The trace's seed anchors equal the manifest's
+`cutoff_seq` at every seed.
+
 What this leaves: libzb's live apply on random keys (the 9,400 rows/s above);
-zb-react-native for Android; the producer's attach path may leave the manifest's
-top-level fields stale (a watermark oddity seen in the trace, low).
+zb-react-native for Android.
 (Done the same day: the replica identity for read-only tables, f96cf47; the benchmark
 tables dropped.)
