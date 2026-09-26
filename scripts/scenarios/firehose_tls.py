@@ -65,6 +65,10 @@ CAP_BYTES = 256 * 1024 * 1024
 VERIFY = False
 CLIENT = False
 CLIENT_AT = None  # seconds into the load (--client-at)
+CLIENT_BEFORE = False  # §10jb: the libzb client opens BEFORE the load and is live when it starts
+TS_CLIENT_BEFORE = False
+BURST_ROWS = 0  # §10jb: a burst in front of the sustained load — N rows as fast as PostgreSQL goes…
+BURST_SECONDS = 0.0  # …or for S seconds (1,000-row statements, one transaction each, like burst_tls)
 TS_CLIENT_AT = None  # the same for zb-client-ts (--ts-client-at)
 NODE_DIR = pathlib.Path(__file__).resolve().parents[2] / "examples" / "04-node-consumer"
 LIBZB = pathlib.Path(__file__).resolve().parents[2] / "libzb" / "zig-out" / "lib" / ("libzbcore.dylib" if sys.platform == "darwin" else "libzbcore.so")
@@ -104,8 +108,91 @@ def load_sql(path: pathlib.Path, seconds: int, rate: int):
             f"FROM generate_series({lo}, {lo + rate - 1}) AS i;")
         if sec > 0:
             lines.append(f"UPDATE public.{TABLE} SET age = age + 1, updated_at = now() WHERE batch = {sec - 1};")
+        lines.append(f"\\echo S{sec}")  # §10jb: this second's rows are committed — the PG timeline, exactly
         lines.append(f"SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM (:'t0'::timestamptz + interval '{sec + 1} seconds') - clock_timestamp())));")
     path.write_text("\n".join(lines) + "\n")
+
+
+def burst(rows: int, seconds: float, pg_marks: list, base_rows: int) -> dict:
+    """§10jb: the burst in front of the load — whatever PostgreSQL gives. 1,000-row INSERTs,
+    one transaction each (the shape of burst_tls's 185k events/s spike), fed to one psql
+    until `rows` are in or `seconds` have passed. Each statement is followed by an echo, so
+    the feeder knows when it COMMITTED (the pipe buffers what psql has not run yet) and the
+    PG timeline gets an exact (time, rows) mark per statement. Rows carry batch -(k+1)."""
+    proc = subprocess.Popen([bt.PSQL, bt.db_url(bt.ADMIN_URL, bt.DB), "-X", "-q"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    done = {"k": 0}
+    def reader():
+        for line in proc.stdout:
+            if line.startswith("B"):
+                done["k"] = int(line[1:]) + 1
+                pg_marks.append((time.time(), base_rows + done["k"] * 1000))
+    threading.Thread(target=reader, daemon=True).start()
+    t0 = time.time()
+    k = 0
+    while (rows and k * 1000 < rows) or (seconds and time.time() - t0 < seconds and not rows):
+        # Never more than a few statements ahead of what psql has COMMITTED: a timed burst
+        # ends when the time is up, not when the pipe's backlog has drained (the smoke run
+        # asked for 3 s and got 4.8).
+        while k - done["k"] > 8:
+            time.sleep(0.002)
+        lo = k * 1000
+        proc.stdin.write(
+            f"INSERT INTO public.{TABLE} (batch, age, temperature, price, is_true, some_text, tags, matrix, metadata, last_writer, inserted_at, updated_at) "
+            f"SELECT {-(k + 1)}, i % 90, 20 + (i % 100) / 10.0, ((i % 1000) + 0.5)::numeric, i % 2 = 0, format('burst-%s', lpad(i::text, 10, '0')), "
+            f"ARRAY['burst'], ARRAY[[i, 1], [2, 3]], jsonb_build_object('src', 'burst', 'i', i), 'firehose', now(), now() "
+            f"FROM generate_series({lo}, {lo + 999}) AS i;\n\\echo B{k}\n")
+        k += 1
+        proc.stdin.flush()
+    proc.stdin.close()
+    proc.wait(timeout=600)
+    err = proc.stderr.read()
+    end = time.time()
+    return {"rows": done["k"] * 1000, "seconds": round(end - t0, 1), "rows_per_s": int(done["k"] * 1000 / max(end - t0, 0.001)),
+            "statements": k, "errors": [l for l in err.splitlines() if "ERROR" in l][:3], "end": end}
+
+
+def pg_rows_at(pg_marks: list, t: float) -> int | None:
+    """PostgreSQL's row count at time t: the last mark at or before it (marks are commits)."""
+    n = None
+    for mt, mn in pg_marks:
+        if mt <= t:
+            n = mn
+        else:
+            break
+    return n
+
+
+def lag_report(client_marks: list, pg_marks: list, burst_end: float | None, load_end: float, rate: int) -> dict:
+    """§10jb: how far a client sat behind PostgreSQL, from its own replica's row count
+    every 2 s against the PG timeline. `live` means within three seconds of inserts.
+    `back_live_s`: seconds after the burst ended until the client was live again (two
+    consecutive samples); None if it never was before the load ended.
+    `reseeds`: drops in the replica's row count — a wipe, i.e. the client fell off the
+    stream and took the chain."""
+    lags = []
+    for t, n in client_marks:
+        p = pg_rows_at(pg_marks, t)
+        if p is not None:
+            lags.append((t, p - n))
+    reseeds = sum(1 for a, b in zip(client_marks, client_marks[1:]) if b[1] < a[1])
+    live = lambda lag: lag <= 3 * max(rate, 1)  # within three seconds of inserts (2 s samples, ~1 s of publish delay)
+    back_live = None
+    if burst_end is not None:
+        after = [(t, l) for t, l in lags if burst_end <= t <= load_end]
+        for (t, l), (_, l2) in zip(after, after[1:]):
+            if live(l) and live(l2):  # two consecutive samples: not a lucky one
+                back_live = round(t - burst_end, 1)
+                break
+    during = [(t, l) for t, l in lags if t <= load_end]
+    after_burst = [l for t, l in during if burst_end is None or t >= burst_end + 10]  # the sustained phase proper
+    q = lambda xs, f: (sorted(xs)[min(len(xs) - 1, int(f * len(xs)))] / max(rate, 1)) if xs else None
+    t_ref = client_marks[0][0] if client_marks else 0.0
+    return {"max_lag_rows": max((l for _, l in during), default=None),
+            "lag_at_burst_end": next((l for t, l in lags if burst_end is not None and t >= burst_end), None),
+            "back_live_s": back_live,
+            "sustained_lag_s_p50": q(after_burst, 0.5), "sustained_lag_s_p90": q(after_burst, 0.9),  # lag in seconds of PostgreSQL inserts
+            "live_samples": sum(1 for _, l in during if live(l)), "samples": len(during), "reseeds": reseeds,
+            "series": [(round(t - t_ref, 1), l) for t, l in lags]}
 
 
 def apply_rate(marks: list) -> int | None:
@@ -129,7 +216,8 @@ def apply_rate(marks: list) -> int | None:
     return int((best[-1][1] - best[0][1]) / (best[-1][0] - best[0][0]))
 
 
-def ts_client_check(url: str, run_dir: pathlib.Path, start_at: float, load_done: threading.Event, catch_up_s: int = 900) -> dict:
+def ts_client_check(url: str, run_dir: pathlib.Path, start_at: float, load_done: threading.Event, catch_up_s: int = 900,
+                    live: threading.Event | None = None, live_rows: int = 0) -> dict:
     """§10gn: the same measurement for zb-client-ts (Node, SQLite through
     `examples/04-node-consumer/follow-worker.ts`). The follower writes its own replica file;
     this reads it directly and compares with PostgreSQL per batch, as for libzb."""
@@ -183,6 +271,8 @@ def ts_client_check(url: str, run_dir: pathlib.Path, start_at: float, load_done:
             n = rows_now()
             if n >= 0:
                 marks.append((time.time(), n))
+                if live is not None and n >= live_rows:
+                    live.set()  # §10jb: seeded and drained — the load may start
             time.sleep(2)
             continue
         if not pg:
@@ -209,11 +299,11 @@ def ts_client_check(url: str, run_dir: pathlib.Path, start_at: float, load_done:
             "pg_rows": sum(n for n, _ in pg.values()), "client_rows": sum(n for n, _ in got.values()),
             "batches": len(pg), "batches_wrong": len(diff), "first_wrong": [(b, pg.get(b), got.get(b)) for b in diff[:5]],
             "gaps": text.count("pruned"), "reseeds": text.count("seeded"),
-            "sqlite_mib": db.stat().st_size // 2**20 if db.exists() else 0}
+            "sqlite_mib": db.stat().st_size // 2**20 if db.exists() else 0, "marks": marks}
 
 
 def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wait_s: int = 150, catch_up_s: int = 900,
-                 load_done: threading.Event | None = None) -> dict:
+                 load_done: threading.Event | None = None, live: threading.Event | None = None) -> dict:
     """§10gl: what a real client gets. libzb through its C ABI (the Flutter/iOS path),
     SQLite, streaming seed; opened once a cut after the load exists, so the chain covers
     every write and CDC carries only what came after. Seed time is `sync`; then `poll`
@@ -296,6 +386,11 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
             time.sleep(2)
 
     threading.Thread(target=sample_file, daemon=True).start()
+    # §10jb: libzb speaks on stderr (seeded, gap healed, pruned under, tail deaf) — into the
+    # run dir for the whole client session; the harness's own stderr goes along with it.
+    saved_fd = os.dup(2)
+    err_fd = os.open(str(run_dir / "libzb-client.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    os.dup2(err_fd, 2)
     t0 = time.time()
     h = lib.zb_client_connect(json.dumps({"natsUrl": url, "dbPath": str(db), "tables": [TABLE], "heartbeatMs": 0, "engine": engine,
                                        "clientId": "firehose-check", "principal": "firehose", "seedStreaming": True}).encode())
@@ -304,6 +399,8 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
     try:
         synced = take(lib.zb_client_sync(h))
         seed_s = time.time() - t0
+        if live is not None:
+            live.set()  # seeded and drained: `sync` returns caught up
         # A failed seed is retried by libzb at the next poll, the way an app sees it: keep
         # polling and say it happened (§10gl: a full pruned while the client read it).
         sync_error = synced.get("error")
@@ -315,9 +412,7 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
             p = take(lib.zb_client_poll(h, 1000))
             polls += 1
             if p.get("error"):
-                errors.append(p["error"])
-                if len(errors) > 5:
-                    break
+                errors.append(p["error"])  # §10jb: counted, not fatal — libzb reopens; convergence is the verdict
             if load_done is not None and not load_done.is_set():
                 during_load_polls += 1
                 end = time.time() + catch_up_s  # the budget runs from the end of the load
@@ -337,11 +432,15 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
                 "polls_during_load": during_load_polls, "apply_rows_s": apply_rate(marks),
                 "pg_rows": sum(n for n, _ in pg.values()), "client_rows": sum(n for n, _ in got.values()),
                 "batches": len(pg), "batches_wrong": len(diff),
-                "first_wrong": [(b, pg.get(b), got.get(b)) for b in diff[:5]], "poll_errors": errors[:5],
-                "sqlite_mib": db.stat().st_size // 2**20 if db.exists() else 0}
+                "first_wrong": [(b, pg.get(b), got.get(b)) for b in diff[:5]], "poll_errors": errors[:5], "poll_error_count": len(errors),
+                "sqlite_mib": db.stat().st_size // 2**20 if db.exists() else 0, "marks": marks,
+                "log": {k: (run_dir / "libzb-client.log").read_text(errors="replace").count(k) for k in ("seeded", "pruned under", "gap healed", "tail deaf", "hole")} if (run_dir / "libzb-client.log").exists() else {}}
     finally:
         sampling.clear()
         lib.zb_client_close(h)
+        os.dup2(saved_fd, 2)
+        os.close(err_fd)
+        os.close(saved_fd)
 
 
 def verify_chain(cli: list, tmp: pathlib.Path, load_end: float, wait_s: int = 150) -> dict:
@@ -532,28 +631,57 @@ def run(tmp: pathlib.Path, tls: bool, seconds: int, rate: int, index: bool = Fal
         pub0 = bt.published()
         lsn0 = bt.psql("SELECT pg_current_wal_lsn()").stdout.strip()
         b0, n0 = bt.cpu_seconds(bridge.pid), bt.cpu_seconds(nats_proc.pid)
-        t0 = time.perf_counter()
         load_done = threading.Event()
+        # §10jb: PostgreSQL's row count over time, from the commits themselves (the burst's
+        # echoes, the load's per-second echoes) — what a client's lag is measured against.
+        pg_marks: list = [(time.time(), preload)]
+        base_rows = preload
         client_box: dict = {}
         client_thread = None
         ts_box: dict = {}
         ts_thread = None
-        if TS_CLIENT_AT is not None:
+        live_lib, live_ts = threading.Event(), threading.Event()
+        if TS_CLIENT_AT is not None or TS_CLIENT_BEFORE:
             def ts_mid_load():
-                ts_box["r"] = ts_client_check(client_url, run_dir, TS_CLIENT_AT, load_done)
+                ts_box["r"] = ts_client_check(client_url, run_dir, 0.0 if TS_CLIENT_BEFORE else TS_CLIENT_AT, load_done, live=live_ts, live_rows=preload)
             ts_thread = threading.Thread(target=ts_mid_load, daemon=True)
             ts_thread.start()
-        if CLIENT_AT is not None:
+        if CLIENT_AT is not None or CLIENT_BEFORE:
             def client_mid_load():
-                time.sleep(CLIENT_AT)
-                client_box["r"] = client_check(cli, client_url, run_dir, 0.0, load_done=load_done)
+                if not CLIENT_BEFORE:
+                    time.sleep(CLIENT_AT)
+                client_box["r"] = client_check(cli, client_url, run_dir, 0.0, load_done=load_done, live=live_lib)
             client_thread = threading.Thread(target=client_mid_load, daemon=True)
             client_thread.start()
-        r = subprocess.run([bt.PSQL, bt.db_url(bt.ADMIN_URL, bt.DB), "-X", "-f", str(sql)], capture_output=True, text=True)
+        # §10jb: a client opened BEFORE the load is live (seeded, drained) when the load starts.
+        for ev, who, on in ((live_lib, "libzb", CLIENT_BEFORE), (live_ts, "zb-client-ts", TS_CLIENT_BEFORE)):
+            if on and not ev.wait(300):
+                sys.exit(f"{name}: the {who} client was not live 300 s after opening")
+        t0 = time.perf_counter()
+        burst_r = None
+        burst_end = None
+        if BURST_ROWS or BURST_SECONDS:
+            burst_r = burst(BURST_ROWS, BURST_SECONDS, pg_marks, base_rows)
+            base_rows += burst_r["rows"]
+            burst_end = burst_r.pop("end")
+        load_proc = subprocess.Popen([bt.PSQL, bt.db_url(bt.ADMIN_URL, bt.DB), "-X", "-f", str(sql)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        load_err: list = []
+        def load_reader():
+            for line in load_proc.stdout:
+                if line.startswith("S"):
+                    try:
+                        pg_marks.append((time.time(), base_rows + (int(line[1:]) + 1) * rate))
+                    except ValueError:
+                        pass
+        def load_err_reader():
+            load_err.extend(load_proc.stderr.read().splitlines())
+        threading.Thread(target=load_reader, daemon=True).start()
+        threading.Thread(target=load_err_reader, daemon=True).start()
+        load_proc.wait()
         load_done.set()
         load_s = time.perf_counter() - t0
-        if r.returncode != 0:
-            sys.exit(f"{name}: the load failed: {r.stderr[-600:]}")
+        if load_proc.returncode != 0:
+            sys.exit(f"{name}: the load failed: {chr(10).join(load_err)[-600:]}")
         load_end = time.time()
         pub1 = bt.published()
         wal_written = int(bt.psql(f"SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '{lsn0}')").stdout.strip() or 0)
@@ -610,8 +738,15 @@ def run(tmp: pathlib.Path, tls: bool, seconds: int, rate: int, index: bool = Fal
             published_indexes = [f"unreadable: {schema_raw[:80]!r}"]
         good = [s for s in sampler.samples if s.get("margin") is not None]
         pruned = [s for s in good if s["first"] > 1]
-        load_errors = [l for l in r.stderr.splitlines() if "ERROR" in l or "FATAL" in l]
-        return {"name": name, "load_s": load_s, "events": pub1 - pub0, "wal_written": wal_written,
+        load_errors = [l for l in load_err if "ERROR" in l or "FATAL" in l]
+        # §10jb: each client's lag against the PG timeline, its marks to a CSV, not the result.
+        (run_dir / "pg_marks.csv").write_text("unix_s,rows\n" + "".join(f"{t:.1f},{n}\n" for t, n in pg_marks))
+        for who, res in (("libzb", client), ("ts", ts_client)):
+            if res and "marks" in res:
+                marks = res.pop("marks")
+                (run_dir / f"{who}-marks.csv").write_text("unix_s,rows\n" + "".join(f"{t:.1f},{n}\n" for t, n in marks))
+                res["lag"] = lag_report(marks, pg_marks, burst_end, load_end, rate)
+        return {"name": name, "load_s": load_s, "events": pub1 - pub0, "wal_written": wal_written, "burst": burst_r,
                 "leaks": leak_lines, "run_dir": str(run_dir), "client": client, "ts_client": ts_client,
                 "rss_max_mib": max(sampler.rss_kib, default=0) // 1024, "rss_med_mib": (statistics.median(sampler.rss_kib) // 1024) if sampler.rss_kib else 0,
                 "slot_lag_max_mib": max(sampler.slot_lag, default=0) // 2**20, "slot_lag_med_mib": (statistics.median(sampler.slot_lag) // 2**20) if sampler.slot_lag else 0, "load_errors": load_errors, "slept_s": watch.slept_s(), "rows": rows, "bridge_cpu": b1 - b0, "nats_cpu": n1 - n0,
@@ -644,14 +779,20 @@ def main() -> int:
     ap.add_argument("--client", action="store_true", help="after the load, a libzb client seeds and follows, compared with PostgreSQL per batch (§10gl)")
     ap.add_argument("--verify", action="store_true", help="after the load, seed from the chain in Python and compare with PostgreSQL (§10gf)")
     ap.add_argument("--preload", type=int, default=0, help="static rows in the table before the bridge boots (§10gd)")
+    ap.add_argument("--burst-rows", type=int, default=0, help="§10jb: a burst of this many rows (1,000-row transactions, as fast as PostgreSQL goes) before the sustained load")
+    ap.add_argument("--burst-seconds", type=float, default=0.0, help="§10jb: a burst for this many seconds instead")
+    ap.add_argument("--client-before", action="store_true", help="§10jb: open the libzb client before the load and start only once it is live (seeded and drained)")
+    ap.add_argument("--ts-client-before", action="store_true", help="§10jb: the same for zb-client-ts")
     a = ap.parse_args()
+    global CLIENT_BEFORE, TS_CLIENT_BEFORE, BURST_ROWS, BURST_SECONDS
+    CLIENT_BEFORE, TS_CLIENT_BEFORE, BURST_ROWS, BURST_SECONDS = a.client_before, a.ts_client_before, a.burst_rows, a.burst_seconds
     global CAP_BYTES, VERIFY
     VERIFY = a.verify
     global CLIENT, CLIENT_AT
     CLIENT_AT = a.client_at
     global TS_CLIENT_AT
     TS_CLIENT_AT = a.ts_client_at
-    CLIENT = a.client or a.client_at is not None or a.ts_client_at is not None
+    CLIENT = a.client or a.client_at is not None or a.ts_client_at is not None or a.client_before or a.ts_client_before
     CAP_BYTES = a.cap_mib * 1024 * 1024
     bt.teardown_on_signal()
     bt.sweep_leftovers("zb_burst_tls_", "zb_firehose_tls_")
@@ -690,6 +831,9 @@ def main() -> int:
                           f"build ms median {statistics.median(c['build'] for c in ks):.0f}, max {max(c['build'] for c in ks)}; "
                           f"delta rows median {statistics.median(c['delta_rows'] for c in ks):.0f}")
             print(f"  indexes in the published schema: {r['published_indexes']}")
+            if r.get("burst"):
+                b = r["burst"]
+                print(f"  burst: {b['rows']:,} rows in {b['seconds']} s — {b['rows_per_s']:,} rows/s in {b['statements']} transactions{'; errors ' + str(b['errors']) if b['errors'] else ''}")
             if r.get("verified") is not None:
                 print(f"  chain check: {r['verified']}")
             if r.get("client") is not None:
