@@ -2862,6 +2862,13 @@ pub const SyncClient = struct {
     fn tailInbox(self: *SyncClient) !*@import("nats").PullInbox {
         if (self.tail_inbox) |ib| return ib;
         self.tail_inbox = try self.t.js.pullInbox();
+        // §10jb: the inbox holds what the server sent and this thread has not fetched —
+        // at most about two batches since nats.zig patch 20 requests only the deficit. The
+        // library's 64 MB byte limit was one message from a drop at 75k events/s (~45 MB
+        // held, 256 KB messages); past it a message is DROPPED, which reads as a gap and
+        // costs a re-seed. A valve four times wider: reached only when something is wrong,
+        // never in the steady state.
+        self.tail_inbox.?.inbox_subscription.setPendingLimits(500_000, 256 * 1024 * 1024);
         return self.tail_inbox.?;
     }
 
@@ -3174,6 +3181,10 @@ pub const SyncClient = struct {
         const subs = subs_list.items;
         const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(@intCast(@max(1, wait_ms))), .clock = .awake } };
         var applied: usize = 0;
+        // §10jb: what the shared inbox already holds before this pull is requested — a
+        // queue that climbs across polls is a pull requested on top of one still arriving.
+        const q_msgs = (try self.tailInbox()).inbox_subscription.pending_msgs.load(.acquire);
+        const q_bytes = (try self.tailInbox()).inbox_subscription.pending_bytes.load(.acquire);
         var mb = (try self.tailInbox()).fetch(subs, 100, t) catch |err| switch (err) {
             // EVERY tail's consumer is gone (a long pause past inactive_threshold):
             // re-open them all at the stored positions; the next poll reads. One that
@@ -3214,7 +3225,9 @@ pub const SyncClient = struct {
             if (trace_enabled) {
                 const lo: u64 = if (mine.items.len > 0) mine.items[0].metadata.sequence.stream else 0;
                 const hi: u64 = if (mine.items.len > 0) mine.items[mine.items.len - 1].metadata.sequence.stream else 0;
-                tr("{s}: fetched {d} msg(s) [{d}..{d}] of {d} in the batch, position {d}", .{ stream, mine.items.len, lo, hi, mb.messages.len, try self.storedSeq(stream) });
+                var bytes: usize = 0;
+                for (mine.items) |m| bytes += m.msg.data.len;
+                tr("{s}: fetched {d} msg(s) [{d}..{d}] of {d} in the batch ({d} KiB), position {d}; inbox held {d} msg(s) / {d} KiB before the pull", .{ stream, mine.items.len, lo, hi, mb.messages.len, bytes / 1024, try self.storedSeq(stream), q_msgs, q_bytes / 1024 });
             }
             if (mine.items.len == 0) {
                 // Idle this poll: now and then, ask the server about the tail (§10ja) —

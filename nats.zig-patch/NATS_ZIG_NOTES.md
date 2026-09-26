@@ -839,3 +839,38 @@ therefore unrun; the live proof is ZeBridge's: libzb connecting to the dev stack
 `"creds": <bob.creds text>` synced as bob on tenant globex, and garbage content was
 refused before any socket (`MissingUserJwt`).
 
+
+## 20. A pull fetch asks only for what the inbox does not already hold (2026-09-26)
+
+**How it appeared**
+
+libzb's live tail, following a table written at 75k–100k events/s from an already-live
+replica (ZeBridge §10jb), reported `SlowConsumer` from `PullInbox.fetch` in two runs of
+four, each time followed by a gap and a re-seed. The inbox depth, traced before every
+pull, explained it: 231–234 messages (~45 MB of 256 KB CDC messages) queued before 154
+of 163 fetches. `fetch` returns once messages stop for `idle_after_first` (patch 18); the
+server keeps sending the rest of that request into the inbox; the next fetch requested a
+full batch on top of it. Steady state: more than two batches queued, a hair under the
+subscription's 64 MB pending limit — and past that limit the connection DROPS the
+message, which a JetStream reader can only see as a hole.
+
+**Change** (`20-nats.zig-pull-deficit.patch`, 4 hunks, 1 file)
+
+`src/jetstream.zig` — `PullSubscription.fetch` and `PullInbox.fetch` read the inbox
+subscription's `pending_msgs` first and request `batch − queued` (the shared inbox splits
+`queued` evenly over its consumers); when the queue alone fills the batch no request is
+sent and the fetch returns from the queue. The collection loop's bound is the caller's
+`batch`, which the queue's share and the request's share make up together. Status frames
+count as queued too — harmless: the idle window returns the fetch as before.
+
+**Verified**
+
+```bash
+nats.zig-patch/new-patch.sh pull-deficit
+# wrote 20-nats.zig-pull-deficit.patch (4 hunks, 1 files)
+# ✅ 20 patches: upstream d4cd40d + series == working tree (src, tests)
+```
+
+`zig build test-unit`: 135/135. The live proof is ZeBridge's firehose at 37.5k and 50k
+rows/s with both clients live (§10jb): the inbox depth before a pull, the poll errors and
+the re-seed count, before and after.

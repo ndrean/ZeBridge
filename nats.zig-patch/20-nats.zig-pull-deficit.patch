@@ -1,0 +1,109 @@
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+index f6dec11..b1eb7f1 100644
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -521,24 +521,36 @@ pub const PullSubscription = struct {
+         const reply_subject = try std.fmt.allocPrint(self.js.nc.allocator, "{s}{d}", .{ self.inbox_prefix, fetch_id });
+         defer self.js.nc.allocator.free(reply_subject);
+ 
++        // ⚠️ Ask only for what the inbox does not already hold. A fetch returns once its
++        // messages stop arriving for `idle_after_first`; whatever the server still sends
++        // for that request lands in the inbox afterwards. Requesting a full batch on top
++        // of it, fetch after fetch, kept a steady backlog of more than two batches in the
++        // inbox (measured: 231–234 messages, ~45 MB, before nearly every pull at 75k
++        // events/s) — a hair under the subscription's pending limit, and any extra tipped
++        // it into a slow-consumer drop, i.e. a gap. The queue supplies what it holds; the
++        // request is for the rest, and none when the queue alone fills the batch.
++        const queued: usize = self.inbox_subscription.pending_msgs.load(.acquire);
++        const want: usize = if (queued >= batch) 0 else batch - queued;
+         const timeout_duration = timeout.toDurationFromNow(self.js.nc.io);
+         const request = FetchRequest{
+-            .batch = batch,
++            .batch = if (want > 0) want else batch,
+             .expires = if (timeout_duration) |duration| @intCast(duration.raw.toNanoseconds()) else null,
+         };
+ 
+-        // Serialize the fetch request to JSON
+-        const request_json = try jsonStringifyAlloc(self.js.nc.allocator, request, .{
+-            .emit_null_optional_fields = false,
+-        });
+-        defer self.js.nc.allocator.free(request_json);
++        if (want > 0) {
++            // Serialize the fetch request to JSON
++            const request_json = try jsonStringifyAlloc(self.js.nc.allocator, request, .{
++                .emit_null_optional_fields = false,
++            });
++            defer self.js.nc.allocator.free(request_json);
+ 
+-        // Build the full API subject
+-        const api_subject = try self.js.apiSubject(self.js.nc.allocator, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.stream_name, self.consumer_name });
+-        defer self.js.nc.allocator.free(api_subject);
++            // Build the full API subject
++            const api_subject = try self.js.apiSubject(self.js.nc.allocator, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.stream_name, self.consumer_name });
++            defer self.js.nc.allocator.free(api_subject);
+ 
+-        // Send the pull request with reply subject
+-        try self.js.nc.publishRequest(api_subject, reply_subject, request_json);
++            // Send the pull request with reply subject
++            try self.js.nc.publishRequest(api_subject, reply_subject, request_json);
++        }
+ 
+         // Collect messages
+         var messages = std.ArrayList(*JetStreamMessage).empty;
+@@ -562,8 +574,9 @@ pub const PullSubscription = struct {
+         // this reply subject and dropped by the guard below on a later fetch.
+         var receive_deadline = timeout.toDeadline(self.js.nc.io);
+ 
+-        // Collect messages until batch is complete or timeout
+-        while (!batch_complete and messages.items.len < request.batch) {
++        // Collect messages until batch is complete or timeout — the caller's batch, which
++        // the queue's share and the request's share make up together.
++        while (!batch_complete and messages.items.len < batch) {
+             if (self.inbox_subscription.nextMsgTimeout(receive_deadline)) |raw_msg| {
+                 log.debug("Message: subject={s}, reply={s}, data='{s}'", .{ raw_msg.subject, raw_msg.reply orelse "none", raw_msg.data });
+ 
+@@ -760,17 +773,26 @@ pub const PullInbox = struct {
+             made += 1;
+         }
+ 
++        // The deficit only, as in `PullSubscription.fetch`: what the shared inbox already
++        // holds is split evenly over the consumers (whose messages they are cannot be
++        // known before reading them); a queue that alone fills `batch × subs` sends no
++        // request at all and the fetch returns from the queue.
++        const cap = batch * subs.len;
++        const queued: usize = self.inbox_subscription.pending_msgs.load(.acquire);
++        const want: usize = if (queued >= cap) 0 else batch - queued / subs.len;
+         const timeout_duration = timeout.toDurationFromNow(self.js.nc.io);
+-        const request_json = try jsonStringifyAlloc(a, FetchRequest{
+-            .batch = batch,
+-            .expires = if (timeout_duration) |d| @intCast(d.raw.toNanoseconds()) else null,
+-        }, .{ .emit_null_optional_fields = false });
+-        defer a.free(request_json);
+-
+-        for (subs, 0..) |sub, i| {
+-            const api_subject = try sub.nextSubject(a);
+-            defer a.free(api_subject);
+-            try self.js.nc.publishRequest(api_subject, replies[i], request_json);
++        if (want > 0) {
++            const request_json = try jsonStringifyAlloc(a, FetchRequest{
++                .batch = want,
++                .expires = if (timeout_duration) |d| @intCast(d.raw.toNanoseconds()) else null,
++            }, .{ .emit_null_optional_fields = false });
++            defer a.free(request_json);
++
++            for (subs, 0..) |sub, i| {
++                const api_subject = try sub.nextSubject(a);
++                defer a.free(api_subject);
++                try self.js.nc.publishRequest(api_subject, replies[i], request_json);
++            }
+         }
+ 
+         const gone = try a.alloc(bool, subs.len);
+@@ -786,7 +808,6 @@ pub const PullInbox = struct {
+         errdefer for (messages.items) |m| m.deinit();
+ 
+         var receive_deadline = timeout.toDeadline(self.js.nc.io);
+-        const cap = batch * subs.len;
+ 
+         while (open > 0 and messages.items.len < cap) {
+             const raw_msg = self.inbox_subscription.nextMsgTimeout(receive_deadline) catch |err| switch (err) {
