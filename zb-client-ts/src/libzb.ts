@@ -51,6 +51,11 @@ import type { PlanStep } from './core.ts';
 /// later and recreated it — every ~50 s on an iPhone 12 at 10k events/s, a third of the
 /// time spent not reading. Measured 2026-09-26.
 const TAIL_INACTIVE_NS = 120 * 1_000_000_000;
+
+/// §10jc test hook: ZB_TEST_DROP_DELIVERY=N (Node only) discards every Nth delivery as if
+/// lost in transit. 0: off.
+const TEST_DROP_EVERY = Number((typeof process !== 'undefined' && process.env?.ZB_TEST_DROP_DELIVERY) || 0);
+let testDropCount = 0;
 import GRAMMAR_JSON from './grammar.json' with { type: 'json' };
 
 /// §10dq: the wire grammar, compiled in — a copy of `src/grammar.json` pinned
@@ -373,6 +378,7 @@ export class ZeBridge {
   private failed = new Set<string>();
   private suspendedMap = new Map<string, string>();
   private globalSyncState: { lsn: number; seq: Record<string, number> } = { lsn: 0, seq: {} };
+
   /// `version` is the stamp the write carries: the CDC echo that confirms it is the
   /// row bearing THAT stamp, not any row on the same key (§10dt).
   private pendingWrites = new Map<string, { table: string; id: number | string; at: number; version?: string | null }>();
@@ -1017,6 +1023,12 @@ export class ZeBridge {
     // A replica from before §10df: the column is added; refused, harmlessly, on one that has it.
     try { await this.run(`ALTER TABLE _zebridge_generations ADD COLUMN seed_epoch INTEGER NOT NULL DEFAULT 0`); } catch { /* present */ }
     try { await this.run(`ALTER TABLE _zebridge_stream_seq ADD COLUMN created TEXT`); } catch { /* present */ }
+    // §10jc: the seed gate persisted with its watermark (it died with the process: a
+    // client killed after a re-seed re-applied, on relaunch, what its chain already
+    // carried in newer versions).
+    try { await this.run(`ALTER TABLE _zebridge_generations ADD COLUMN seed_seq ${this.dialect.int64}`); } catch { /* present */ }
+    try { await this.run(`ALTER TABLE _zebridge_generations ADD COLUMN seed_stream TEXT`); } catch { /* present */ }
+
     for (const r of await this.run(`SELECT stream, created FROM _zebridge_stream_seq WHERE created IS NOT NULL`)) this.streamCreated.set(String(r.stream), String(r.created));
     // §10dg: the shape this replica BUILT each table with (core.keyShape/typeShape) —
     // the record a re-key or a re-type is detected against.
@@ -1536,6 +1548,7 @@ export class ZeBridge {
                  !(await this.foreignKeysDiffer(table, fkClauses)) && !(await this.strictMissing(table))) {
         await recordShape();
         this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
+        await this.restoreSeedGate(table);
         this.reach('migrated');
         this.scheduleRecount();
         // ⚠️ NOT a no-op path for indexes. Adding an index in PostgreSQL changes no
@@ -1598,6 +1611,7 @@ export class ZeBridge {
       await recordShape();
 
       this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
+      await this.restoreSeedGate(table);
       // Both registration paths mark the phase — a strip that lies is worse than none.
       this.reach('migrated');
       this.scheduleRecount();
@@ -2875,13 +2889,24 @@ export class ZeBridge {
     }
     await this.pruneInboxSeeded(table, state.lsn);
     await this.run(
-      `INSERT INTO _zebridge_generations (tbl, watermark, cutoff_lsn, seed_epoch) VALUES (?, ?, ?, ?)
-       ON CONFLICT(tbl) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch`,
-      table, manifest.cutoff_version, state.lsn, state.seedEpoch ?? 0,
+      `INSERT INTO _zebridge_generations (tbl, watermark, cutoff_lsn, seed_epoch, seed_seq, seed_stream) VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(tbl) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch,
+         seed_seq = excluded.seed_seq, seed_stream = excluded.seed_stream`,
+      table, manifest.cutoff_version, state.lsn, state.seedEpoch ?? 0, state.seedSeq ?? null, state.seedStream ?? null,
     );
     this.triggerChange(table);
     this.appendLog('SYS', `Seeded ${table} from generation chain g${manifest.gen} (${applied} row(s), watermark ${manifest.cutoff_version} @ ${manifest.cutoff_lsn})`, 'INFO');
     return true;
+  }
+
+  /// §10jc: the seed gate of the chain this replica last applied, back from the replica.
+  private async restoreSeedGate(table: string) {
+    const st = this.syncedTables.get(table);
+    if (!st || typeof st.seedSeq === 'number') return;
+    try {
+      const [r] = (await this.run(`SELECT seed_seq, seed_stream FROM _zebridge_generations WHERE tbl = ?`, table)) as any[];
+      if (r && r.seed_seq != null && r.seed_stream) { st.seedSeq = Number(r.seed_seq); st.seedStream = String(r.seed_stream); }
+    } catch { /* a replica from before the columns: no gate to restore */ }
   }
 
   // ── the main orchestration: gap check → seed → CDC ────────────────────────
@@ -3242,6 +3267,13 @@ export class ZeBridge {
           }
           let processedSinceStart = 0;
           let caughtUpLogged = curPending === 0;
+          // §10jc: this consumer's delivery numbering (+1 per delivery, by the server). A
+          // jump is a delivery lost in transit: what came before it is applied, nothing
+          // after it is (neither applied nor acked), and the tail is recreated from the
+          // position — the server re-sends from the lost message on, IN ORDER. Applying
+          // past the gap and filling it later lost updates: the lost message is older than
+          // what followed (an INSERT re-sent over its own later UPDATE, 5 batches).
+          let cseq = 0;
           const progressEvery = 2000;
 
           // Batched into ONE transaction per flush: N autocommits each pay OPFS
@@ -3340,6 +3372,13 @@ export class ZeBridge {
                   try { itRef.stop(); } catch { /* already ended */ }
                   return;
                 }
+                // §10jc: nothing in hand, yet deliveries unacknowledged — lost in transit;
+                // the server re-sends them only after ack_wait. Recreate from the position.
+                if ((ci?.num_ack_pending ?? 0) > 0 && batch.length === 0) {
+                  this.appendLog('SYS', `${streamName}: consumer idle 25s with ${ci.num_ack_pending} delivery(ies) unacknowledged — lost in transit; recreating from ${stored}`, 'WARNING');
+                  try { itRef.stop(); } catch { /* already ended */ }
+                  return;
+                }
                 // §10ja: idle and caught up — the position is the stream's end, or a
                 // consumer filtered to other tables' silence stays at 0 and the next
                 // launch reads that as a gap.
@@ -3362,6 +3401,28 @@ export class ZeBridge {
           try {
           for await (const msg of curIter) {
             lastMsgAt = Date.now();
+            // §10jc test hook (as libzb's): every Nth delivery discarded on arrival — not
+            // applied, not acked, its delivery sequence never seen: a loss in transit.
+            if (TEST_DROP_EVERY > 0 && ++testDropCount % TEST_DROP_EVERY === 0) {
+              this.appendLog('SYS', `test: delivery of seq ${msg.seq} discarded as lost in transit`, 'WARNING');
+              continue;
+            }
+            // §10jc: a lost delivery is a jump in the consumer's own numbering: stop here —
+            // this message and whatever follows stay unacked, the batch in hand is flushed
+            // after the loop, and the tail is recreated from the position.
+            const dseq = Number(msg.info?.deliverySequence ?? 0);
+            if (dseq > cseq + 1) {
+              this.appendLog('SYS', `${streamName}: delivery lost in transit on ${curName} (consumer seq ${dseq} after ${cseq}) — applying up to the gap, then recreating the tail from the position`, 'WARNING');
+              try { itRef.stop(); } catch { /* already ended */ }
+              break;
+            }
+            if (dseq > cseq) cseq = dseq;
+            // §10jc: at or below the position is a redelivery — acked, never re-applied.
+            const posNow = Math.max(this.globalSyncState.seq[streamName] ?? 0, advancePosition(0, batchMsgs.map((bm) => bm.seq ?? 0)));
+            if (msg.seq <= posNow) {
+              msg.ack();
+              continue;
+            }
             if (lastSeen > 0 && msg.seq > lastSeen + 1 && await this.prunedAfter(jsm, streamName, lastSeen)) {
               this.appendLog('SYS', `${streamName}: ${msg.seq - lastSeen - 1} message(s) pruned under the live consumer (position ${lastSeen}, delivered ${msg.seq}) — taking the gap: re-seeding the tables routed to it`, 'WARNING');
               holeFound = true;

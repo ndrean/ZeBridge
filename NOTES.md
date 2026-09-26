@@ -16883,3 +16883,44 @@ negative `batch`, so the per-batch comparison covers them.
 
 What this leaves: the phone tiers under B (unmeasured); zb-react-native for Android.
 
+## §10jc — the phone under scenario B, and a lost delivery (2026-09-26)
+
+Scenario B with an iPhone 12 as the client (`scripts/scenarios/phone_live.py`, dev stack,
+table `fire_types` on globex, measured from the phone's consumer on nats-server): libzb is
+live at 10k events/s (lag p50 0 s, back live 23 s after a 5 s burst at 85k rows/s),
+applies ~12k events/s, converges 98 s after a load at 20k, falls off the 1 GiB stream and
+re-seeds at 40k and converges ~285 s after it. On the way:
+
+* **Memory kills (2.1 GB) were the example app, not libzb**: expo-file-system's
+  `getInfoAsync` MD5s the whole file whenever the `md5` key is present, and the Swift layer
+  always passes it — asking a 1.8 GB replica for its size (or existence) read it into
+  memory, at every launch. Size from SQLite, existence from a directory listing (ef15b12).
+* **zb-client-ts's tail consumer had the server's 5 s ephemeral default**; a phone applying
+  one batch spends longer between pulls, and the consumer was deleted every ~50 s (92a3df9).
+* **Lost updates and missing rows, both clients.** A pull consumer can lose a delivery in
+  transit (a reset link, a killed process) and re-send it only after `ack_wait`, out of
+  order. The clients kept position = highest sequence applied, so a consumer gone before
+  the redelivery (a drain's end, a kill) left the message unread for ever: 25,914 rows
+  missing; and a redelivered older row image applied over a newer one: 76,132 lost
+  updates. The seed gate's anchor, kept in memory only, died with a killed process too.
+
+  The rule now, both clients: **apply strictly in stream order.** Each delivery's consumer
+  sequence (+1 per delivery) is checked; a jump is a lost delivery — what precedes it is
+  applied, nothing after it (neither applied nor acked), and the consumer is recreated
+  from the position so the server re-sends from the lost message on. Anything at or below
+  the position is a redelivery, acked and skipped. A drain that would end, or a tail idle
+  25 s, with deliveries unacknowledged recreates too. The seed anchor is persisted with the
+  watermark (`anchor_stream`/`anchor_seq`, `seed_seq`/`seed_stream`).
+
+  The first attempt applied past the gap and recorded what it applied "above" the position
+  — wrong: the lost message is older than what followed it (an INSERT re-sent over its own
+  later UPDATE), and zb-client-ts lost 5 batches of updates that way; libzb passed only by
+  timing. Not a version guard either: `now()` is the transaction start, not commit order
+  (§10gp).
+
+  Pinned by `scripts/scenarios/delivery_loss.sh [zb|ts] [N]`: a test hook
+  (`ZB_TEST_DROP_DELIVERY=N`, both clients) discards every Nth delivery as lost in transit,
+  the follower is SIGKILLed four times during a 5 s burst + 60 s at 20k events/s, and every
+  batch is compared with PostgreSQL. Pre-fix libzb: 43 of 62 batches wrong. Fixed: libzb
+  (164 lost, 122 recreations) and zb-client-ts (107 lost) exact.
+

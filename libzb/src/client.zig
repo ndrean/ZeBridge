@@ -105,6 +105,31 @@ pub const Options = struct {
 
 const SeedAnchor = struct { stream: []const u8, seq: u64, lsn: i64 };
 
+/// §10jc: what this client applies from one stream stays IN STREAM ORDER. A pull
+/// consumer can lose a delivery in transit (a reset link, a phone killed mid-fetch) and
+/// hand it over again only after `ack_wait`, out of order; the position (highest seq
+/// applied) had moved past it, the consumer was gone by then (a drain's end, a kill), the
+/// new one started at position + 1, and the message was never read — measured on an
+/// iPhone at 40k events/s: 25,914 rows missing; and a redelivered older row image applied
+/// after a newer one lost 76,132 updates in another run.
+///
+/// Every delivery's CONSUMER sequence (+1 per delivery, by the server) is checked: a jump
+/// is a lost delivery. What precedes it is applied; nothing after it is — not applied, not
+/// acked — and the consumer is recreated from the position, so the server re-sends from
+/// the lost message on, in order. Applying past a gap and filling it later is NOT
+/// equivalent: the lost message is older than what followed it (an INSERT lost, its
+/// UPDATE a second later applied, the INSERT re-sent on top: the row went back to the
+/// insert's image — measured in zb-client-ts, 5 batches). Anything at or below the
+/// position is a redelivery: acked, never re-applied.
+const Flow = struct {
+    /// The consumer the sequence belongs to; another name resets `cseq`.
+    consumer: []const u8 = "",
+    /// The highest consumer sequence seen from `consumer` (0: none yet).
+    cseq: u64 = 0,
+    /// A delivery was lost: this consumer is recreated from the position.
+    gap: bool = false,
+};
+
 const BulkStats = struct {
     bulked: usize = 0,
     statements: usize = 0,
@@ -159,6 +184,11 @@ const TableState = struct {
 };
 
 var trace_enabled: bool = false;
+/// §10jc test hook: every Nth delivery is discarded on arrival — not applied, not acked,
+/// its consumer sequence never seen — exactly what a delivery lost in transit looks like
+/// from here. The server re-sends it after ack_wait, out of order. 0: off.
+var test_drop_every: u64 = 0;
+var test_drop_count: u64 = 0;
 fn tr(comptime fmt: []const u8, args: anytype) void {
     if (trace_enabled) std.debug.print("trace: " ++ fmt ++ "\n", args);
 }
@@ -313,6 +343,8 @@ pub const SyncClient = struct {
     /// The ONE inbox every tail answers into (nats.zig `PullInbox`): `poll` is a single
     /// wait over all streams, ended by the first message from any of them.
     tail_inbox: ?*@import("nats").PullInbox = null,
+    /// §10jc: per stream, the contiguity of what was applied (`Flow`). Keys in the arena.
+    flows: std.StringArrayHashMapUnmanaged(Flow) = .empty,
 
     const Tail = struct {
         stream: []const u8,
@@ -354,6 +386,7 @@ pub const SyncClient = struct {
         // per stream, what applying did to the position, how many events the seed gate
         // dropped, what the server said in the idle check (§10ja, the deaf tail hunt).
         trace_enabled = std.c.getenv("ZB_TAIL_TRACE") != null;
+        test_drop_every = if (std.c.getenv("ZB_TEST_DROP_DELIVERY")) |v| (std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0) else 0;
 
         self.* = .{
             .a = a,
@@ -420,6 +453,7 @@ pub const SyncClient = struct {
         var sit = self.sent_at.iterator();
         while (sit.next()) |e| self.a.free(e.key_ptr.*);
         self.sent_at.deinit(self.a);
+        self.flows.deinit(self.a);
         self.ro.close();
         self.st.close();
         self.arena.deinit();
@@ -1011,6 +1045,12 @@ pub const SyncClient = struct {
             try execDdl(&self.st, "ALTER TABLE _zbz_generations RENAME TO _zbz_generations_v1");
         }
         try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_generations (tbl TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT '', watermark TEXT, cutoff_lsn INTEGER, seed_epoch INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tbl, tenant))");
+        // §10jc: the seed gate's anchor, persisted with the watermark it belongs to. Kept
+        // in memory only, it died with the process: a client killed after a re-seed and
+        // before its tail passed the chain's cutoff re-applied, on relaunch, events the
+        // chain already carried in newer versions. (Existing replicas gain the columns.)
+        execDdl(&self.st, "ALTER TABLE _zbz_generations ADD COLUMN anchor_stream TEXT") catch {};
+        execDdl(&self.st, "ALTER TABLE _zbz_generations ADD COLUMN anchor_seq INTEGER") catch {};
         if (cols.len > 0 and !has_tenant) {
             const old = try self.st.query(a, "SELECT tbl, watermark, cutoff_lsn, seed_epoch FROM _zbz_generations_v1", &.{});
             for (old) |r| {
@@ -1129,9 +1169,27 @@ pub const SyncClient = struct {
             st.seed_epoch = fresh.seed_epoch;
         } else {
             try self.states.put(ca, try ca.dupe(u8, table), fresh);
+            // §10jc: the anchors of the chains this replica already applied, back from the
+            // replica — a relaunch after a re-seed keeps its seed gate.
+            try self.loadAnchors(a, table);
             // Born under the live watch (enabled after this client connected): it has
             // no watermark and nothing asked for its seed — the next poll does.
             self.reseed_pending = true;
+        }
+    }
+
+    fn loadAnchors(self: *SyncClient, a: std.mem.Allocator, table: []const u8) !void {
+        const st = self.states.getPtr(table) orelse return;
+        const rows = self.st.query(a, "SELECT anchor_stream, anchor_seq, cutoff_lsn FROM _zbz_generations WHERE tbl = ? AND anchor_seq IS NOT NULL AND anchor_seq > 0", &.{.{ .text = table }}) catch return;
+        for (rows) |r| {
+            if (r.len < 3 or r[0] != .text or r[1] != .integer) continue;
+            const lsn: i64 = if (r[2] == .integer) r[2].integer else 0;
+            var replaced = false;
+            for (st.anchors.items) |*an| if (std.mem.eql(u8, an.stream, r[0].text)) {
+                if (@as(i64, @intCast(an.seq)) < r[1].integer) an.* = .{ .stream = an.stream, .seq = @intCast(r[1].integer), .lsn = lsn };
+                replaced = true;
+            };
+            if (!replaced) try st.anchors.append(self.aa(), .{ .stream = try self.aa().dupe(u8, r[0].text), .seq = @intCast(r[1].integer), .lsn = lsn });
         }
     }
 
@@ -1270,6 +1328,76 @@ pub const SyncClient = struct {
         var qa = std.heap.ArenaAllocator.init(self.a);
         defer qa.deinit();
         _ = try self.st.query(qa.allocator(), "INSERT INTO _zbz_stream_seq (stream, last_seq) VALUES (?, ?) ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq", &.{ .{ .text = stream }, .{ .integer = @intCast(seq) } });
+    }
+
+    /// §10jc: the stream's `Flow`.
+    fn flowFor(self: *SyncClient, stream: []const u8) !*Flow {
+        if (self.flows.getPtr(stream)) |f| return f;
+        try self.flows.put(self.a, try self.aa().dupe(u8, stream), .{});
+        return self.flows.getPtr(stream).?;
+    }
+
+    /// §10jc: before any apply — redeliveries acked and dropped; at a lost delivery the
+    /// batch stops (the rest neither applied nor acked). `consumer` is the one just fetched
+    /// from: a message carrying another name is a straggler of a consumer dropped after a
+    /// gap (the shared inbox still held it) — left unacked too; the new consumer re-sends
+    /// it in order.
+    fn admit(self: *SyncClient, a: std.mem.Allocator, stream: []const u8, consumer: []const u8, msgs: []const *@import("nats").JetStreamMessage) ![]const *@import("nats").JetStreamMessage {
+        const f = try self.flowFor(stream);
+        if (!std.mem.eql(u8, f.consumer, consumer)) {
+            f.consumer = try self.aa().dupe(u8, consumer);
+            f.cseq = 0; // a new consumer numbers its deliveries from 1
+            f.gap = false;
+        }
+        const pos = try self.storedSeq(stream);
+        var keep: std.ArrayListUnmanaged(*@import("nats").JetStreamMessage) = .empty;
+        var dups: usize = 0;
+        var stragglers: usize = 0;
+        for (msgs) |m| {
+            if (f.gap) break;
+            if (test_drop_every > 0) {
+                test_drop_count += 1;
+                if (test_drop_count % test_drop_every == 0) {
+                    std.debug.print("test: delivery of seq {d} (consumer seq {d}) discarded as lost in transit\n", .{ m.metadata.sequence.stream, m.metadata.sequence.consumer });
+                    continue;
+                }
+            }
+            if (!std.mem.eql(u8, m.metadata.consumer, consumer)) {
+                stragglers += 1;
+                continue;
+            }
+            const c = m.metadata.sequence.consumer;
+            if (c > f.cseq + 1) {
+                f.gap = true;
+                std.debug.print("{s}: delivery lost in transit on {s} (consumer seq {d} after {d}) — applying up to the gap, then recreating the consumer from the position\n", .{ stream, consumer, c, f.cseq });
+                break;
+            }
+            if (c > f.cseq) f.cseq = c;
+            if (m.metadata.sequence.stream <= pos) {
+                m.ack() catch {};
+                dups += 1;
+                continue;
+            }
+            try keep.append(a, m);
+        }
+        if (dups > 0 or stragglers > 0) tr("{s}: {d} redelivery(ies) acked, not applied; {d} straggler(s) of a dropped consumer left (position {d})", .{ stream, dups, stragglers, pos });
+        return keep.items;
+    }
+
+    /// Inside an apply's transaction: the position follows the batch (in order, §10jc).
+    fn positionAfter(self: *SyncClient, stream: []const u8, last: u64, max_seq: u64, messages: []const *@import("nats").JetStreamMessage) !void {
+        _ = messages;
+        if (max_seq > last) try self.persistSeq(stream, max_seq);
+    }
+
+    /// §10jc: a gap closes by recreating the consumer from the position: forget the old
+    /// consumer's numbering. The caller opens the new one.
+    fn resetFlow(self: *SyncClient, stream: []const u8) void {
+        if (self.flows.getPtr(stream)) |f| {
+            f.gap = false;
+            f.cseq = 0;
+            f.consumer = "";
+        }
     }
 
     // ─── step 2: the gap rule (per stream) + scoped seeding (§10n) ──────────
@@ -1969,7 +2097,8 @@ pub const SyncClient = struct {
                 self.seen_floor = self.seen_floor_buf[0..floor.len];
             }
         }
-        _ = try self.st.query(a, "INSERT INTO _zbz_generations (tbl, tenant, watermark, cutoff_lsn, seed_epoch) VALUES (?, ?, ?, ?, ?) ON CONFLICT(tbl, tenant) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch", &.{ .{ .text = table }, .{ .text = tenant }, .{ .text = cv }, .{ .integer = seed_lsn }, .{ .integer = st.seed_epoch } });
+        const anchor_seq: i64 = if (cdc_stream.len > 0 and gate_seq > 0) gate_seq else 0;
+        _ = try self.st.query(a, "INSERT INTO _zbz_generations (tbl, tenant, watermark, cutoff_lsn, seed_epoch, anchor_stream, anchor_seq) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tbl, tenant) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch, anchor_stream = excluded.anchor_stream, anchor_seq = excluded.anchor_seq", &.{ .{ .text = table }, .{ .text = tenant }, .{ .text = cv }, .{ .integer = seed_lsn }, .{ .integer = st.seed_epoch }, .{ .text = cdc_stream }, .{ .integer = anchor_seq } });
         // A held event at or below the seed's LSN is inside the chain just applied:
         // superseded, not waiting (the TS client's pruneInboxSeeded).
         try pruneInboxSeeded(&self.st, a, table, seed_lsn);
@@ -2551,6 +2680,15 @@ pub const SyncClient = struct {
         return info.value.state.first_seq;
     }
 
+    /// §10jc: deliveries the server counts as outstanding on `consumer`. Everything this
+    /// client received is acked after its COMMIT, so once it has nothing in hand this is
+    /// what was lost in transit. Unreadable: 0 (the drain ends as before).
+    fn unackedOn(self: *SyncClient, stream: []const u8, consumer: []const u8) u64 {
+        var ci = self.t.js.getConsumerInfo(stream, consumer) catch return 0;
+        defer ci.deinit();
+        return ci.value.num_ack_pending;
+    }
+
     fn prunedAfter(self: *SyncClient, stream: []const u8, pos: u64) bool {
         var info = self.t.js.getStreamInfo(stream) catch return true;
         defer info.deinit();
@@ -2585,7 +2723,9 @@ pub const SyncClient = struct {
         var sub = try self.openConsumer(stream, 30 * std.time.ns_per_s, null);
         defer sub.deinit(); // the server reaps the consumer itself — see openConsumer
 
-        var max_seq: u64 = last;
+        // §10jc: recreations of the consumer after a lost delivery (bounded: a link losing
+        // deliveries on every batch would otherwise drain for ever).
+        var gap_reopens: u32 = 0;
         // ONE reopen if the consumer dies under us mid-drain (a 409 under 12
         // concurrent seeding clients, §10cq): the position is the client's, so a
         // fresh consumer resumes exactly where the last batch left off. A second
@@ -2604,7 +2744,21 @@ pub const SyncClient = struct {
             // status IS a returned error, so this arm is the exit and the length check
             // is a belt for a partial-batch `fetch` that returns nothing (it cannot).
             var batch = sub.fetch(100, .{ .duration = .{ .raw = .fromMilliseconds(900), .clock = .awake } }) catch |err| switch (err) {
-                error.Timeout => break, // the expiry: caught up to the tail
+                error.Timeout => {
+                    // The expiry: caught up to the tail — unless the server still counts
+                    // deliveries this client never received (§10jc: all it received is
+                    // acked). Those are lost in transit: recreate from the position.
+                    if (gap_reopens < 50 and self.unackedOn(stream, sub.consumer_name) > 0) {
+                        std.debug.print("{s}: drain idle with deliveries unacknowledged on {s} — lost in transit; recreating the consumer from position {d}\n", .{ stream, sub.consumer_name, try self.storedSeq(stream) });
+                        gap_reopens += 1;
+                        self.resetFlow(stream);
+                        const fresh = try self.openConsumer(stream, 30 * std.time.ns_per_s, null);
+                        sub.deinit();
+                        sub = fresh;
+                        continue;
+                    }
+                    break;
+                },
                 error.ConsumerSequenceMismatch, error.NoResponders => {
                     if (reopened) return err;
                     reopened = true;
@@ -2622,18 +2776,36 @@ pub const SyncClient = struct {
             // other tables' messages as a matter of course).
             // Every consecutive pair, not the first message alone (firstHole, §10ja): what
             // precedes the hole is applied, the position follows it, and the caller re-seeds.
-            if (self.firstHole(stream, max_seq, batch.messages)) |j| {
-                if (j > 0) _ = try self.applyBatch(null, stream, batch.messages[0..j], last, &max_seq, null);
-                const first_here = batch.messages[j].metadata.sequence.stream;
-                if (max_seq > last) try self.persistSeq(stream, max_seq);
-                std.debug.print("{s}: {d} message(s) pruned under the drain (position {d}, delivered {d})\n", .{ stream, first_here - max_seq - 1, max_seq, first_here });
+            var ba = std.heap.ArenaAllocator.init(self.a);
+            defer ba.deinit();
+            // §10jc: duplicates out, a lost delivery flagged — before the hole scan, which
+            // must not read a redelivered old message as the batch's predecessor.
+            const keep = try self.admit(ba.allocator(), stream, sub.consumer_name, batch.messages);
+            const pos = try self.storedSeq(stream);
+            if (self.firstHole(stream, pos, keep)) |j| {
+                var ms = pos;
+                if (j > 0) _ = try self.applyBatch(null, stream, keep[0..j], pos, &ms, null);
+                const at = try self.storedSeq(stream);
+                const first_here = keep[j].metadata.sequence.stream;
+                std.debug.print("{s}: {d} message(s) pruned under the drain (position {d}, delivered {d})\n", .{ stream, first_here - at - 1, at, first_here });
                 return true;
             }
-            _ = try self.applyBatch(null, stream, batch.messages, last, &max_seq, null);
+            var ms = pos;
+            if (keep.len > 0) _ = try self.applyBatch(null, stream, keep, pos, &ms, null);
+            if ((try self.flowFor(stream)).gap and gap_reopens < 50) {
+                std.debug.print("{s}: recreating the drain's consumer from position {d} after a lost delivery\n", .{ stream, try self.storedSeq(stream) });
+                gap_reopens += 1;
+                self.resetFlow(stream);
+                const fresh = try self.openConsumer(stream, 30 * std.time.ns_per_s, null);
+                sub.deinit();
+                sub = fresh;
+            }
         }
-        max_seq = self.caughtUpTo(stream, sub.consumer_name, max_seq);
-        if (max_seq > last) try self.persistSeq(stream, max_seq);
-        std.debug.print("{s}: drained to seq {d}\n", .{ stream, max_seq });
+        const at = try self.storedSeq(stream);
+        const to = self.caughtUpTo(stream, sub.consumer_name, at);
+        if (to > at) try self.persistSeq(stream, to);
+        std.debug.print("{s}: drained to seq {d}\n", .{ stream, @max(to, at) });
+        _ = last;
         return false;
     }
 
@@ -2724,7 +2896,7 @@ pub const SyncClient = struct {
                     }
                     if (seq > cx.max_seq.*) cx.max_seq.* = seq;
                 }
-                if (cx.max_seq.* > cx.last) try cx.client.persistSeq(cx.stream, cx.max_seq.*);
+                try cx.client.positionAfter(cx.stream, cx.last, cx.max_seq.*, cx.messages);
             }
         };
         var offered: usize = 0;
@@ -2767,6 +2939,7 @@ pub const SyncClient = struct {
     /// A held event is held durably as in the batch path; a refused one is printed and
     /// skipped, never poisoning its neighbours. The position is persisted last.
     fn applyBatchIsolated(self: *SyncClient, report_a: ?std.mem.Allocator, stream: []const u8, messages: []const *@import("nats").JetStreamMessage, max_seq: *u64, changed_map: ?*std.StringArrayHashMapUnmanaged(void), offered: *usize) !void {
+        const pos_before = max_seq.*;
         var ba = std.heap.ArenaAllocator.init(self.a);
         defer ba.deinit();
         const a = ba.allocator();
@@ -2847,12 +3020,14 @@ pub const SyncClient = struct {
         const Pos = struct {
             client: *SyncClient,
             stream: []const u8,
+            last: u64,
             seq: u64,
+            messages: []const *@import("nats").JetStreamMessage,
             fn apply(cx: @This(), _: *storage.Storage) !void {
-                try cx.client.persistSeq(cx.stream, cx.seq);
+                try cx.client.positionAfter(cx.stream, cx.last, cx.seq, cx.messages);
             }
         };
-        try self.st.transaction(Pos{ .client = self, .stream = stream, .seq = max_seq.* }, Pos.apply);
+        try self.st.transaction(Pos{ .client = self, .stream = stream, .last = pos_before, .seq = max_seq.*, .messages = messages }, Pos.apply);
         std.debug.print("{s}: isolated replay of {d} message(s): {d} applied, {d} held, {d} refused\n", .{ stream, messages.len, applied, held, refused });
     }
 
@@ -2978,6 +3153,9 @@ pub const SyncClient = struct {
         const c = ci.value;
         tr("{s}: idle {d} s, position {d}; server: first {d} last {d}; consumer {s}: pending {d}, ack_pending {d}, delivered {d} (stream seq {d})", .{ stream, @divTrunc(idle_ms, 1000), pos, si.value.state.first_seq, last, consumer, c.num_pending, c.num_ack_pending, c.delivered.consumer_seq, c.delivered.stream_seq });
         if (c.num_pending > 0 and idle_ms >= tail_watch_ms) return .{ .deaf = c.num_pending };
+        // §10jc: nothing in hand, yet deliveries unacknowledged — lost in transit, and the
+        // server re-sends them only after ack_wait, out of order. Reopen from the position.
+        if (c.num_ack_pending > 0 and idle_ms >= tail_watch_ms) return .{ .deaf = c.num_ack_pending };
         if (last <= pos) return .{ .fine = pos };
         return .{ .fine = core.caughtUpPosition(pos, last, c.num_pending, c.num_ack_pending, c.delivered.consumer_seq, c.delivered.stream_seq) };
     }
@@ -3253,6 +3431,9 @@ pub const SyncClient = struct {
             }
             if (self.tailFor(stream)) |tl| tl.delivered_ms = nowMillis() else |_| {}
             var last = try self.storedSeq(stream);
+            // §10jc: duplicates out and a lost delivery flagged, before anything else.
+            const cons_name: []const u8 = if (self.tailFor(stream)) |t2| t2.sub.consumer_name else |_| "";
+            const admitted = try self.admit(a, stream, cons_name, mine.items);
             // §10ei: the gap rule, LIVE. The next message this tail is handed is `last + 1`
             // unless the stream pruned under the consumer while the host did not poll —
             // or (§10ja) the consumer is filtered to this client's tables and skipped
@@ -3267,7 +3448,7 @@ pub const SyncClient = struct {
             // what the chain already carries. A chain that predates the stream leaves the
             // hole OPEN: the position stays below it, the rest is not acked, and the next
             // poll asks again.
-            var pending: []const *@import("nats").JetStreamMessage = mine.items;
+            var pending: []const *@import("nats").JetStreamMessage = admitted;
             while (pending.len > 0) {
                 const cut = self.firstHole(stream, last, pending);
                 if (cut) |j| if (j > 0) {
@@ -3315,6 +3496,13 @@ pub const SyncClient = struct {
                 applied += offered;
                 tr("{s}: offered {d} event(s), gated {d}, position {d} → {d}", .{ stream, offered, self.gated - gated_before, last, max_seq });
                 break;
+            }
+            // §10jc: a delivery lost — this tail is closed; the next poll reopens it from the
+            // position and the server re-sends from the lost message on, in order.
+            if ((try self.flowFor(stream)).gap) {
+                std.debug.print("{s}: reopening the tail from position {d} after a lost delivery\n", .{ stream, try self.storedSeq(stream) });
+                self.dropTail(stream);
+                self.resetFlow(stream);
             }
         }
         if (applied > 0) self.retryHeld(report_a, &changed_map);
@@ -3579,7 +3767,7 @@ pub const SyncClient = struct {
             if (self.rebase.count() > 0) self.rebase_due = true;
         }
         if (bulked > 0 or singles > 0) self.bulk_stats.add(bulked, statements, singles);
-        if (cx.max_seq.* > cx.last) try self.persistSeq(cx.stream, cx.max_seq.*);
+        try self.positionAfter(cx.stream, cx.last, cx.max_seq.*, cx.messages);
     }
 
     /// An UPDATE for a row that is HERE is applied as an UPDATE (core.planUpdate —

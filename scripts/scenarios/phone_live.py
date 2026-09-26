@@ -84,8 +84,27 @@ def setup(preload: int):
         time.sleep(1)
     else:
         sys.exit("no chain for the table after 10 minutes — is the dev bridge running?")
+    # The re-creation's DDL events can still move the table's seed epoch after that first
+    # chain (a client then drops its watermark and waits for a full at the new epoch):
+    # ready means a chain AT the descriptor's epoch, the pair unchanged for 15 s.
+    stable, prev = 0, None
+    for _ in range(900):
+        try:
+            d = json.loads(subprocess.run(NATS + ["kv", "get", "schemas", TABLE, "--raw"], capture_output=True, text=True, timeout=10).stdout)
+            m = json.loads(subprocess.run(NATS + ["kv", "get", "generations", f"{TENANT}.{TABLE}", "--raw"], capture_output=True, text=True, timeout=10).stdout)
+            pair = (d.get("seed_epoch", 0), m.get("seed_epoch", 0), m.get("gen"))
+        except Exception:
+            pair = None
+        ok = pair is not None and pair[0] == pair[1]
+        stable = stable + 1 if ok and pair == prev else 0
+        prev = pair
+        if stable >= 15:
+            break
+        time.sleep(1)
+    else:
+        sys.exit(f"the table's seed epoch never settled with a chain at it (last: {prev})")
     n, s = pg_facts()
-    print(f"chain g1 is out. PostgreSQL: {n:,} rows, sum(age) {s:,}. Open the app following {TABLE} and let it seed.")
+    print(f"chain g{prev[2]} at seed epoch {prev[0]} is out. PostgreSQL: {n:,} rows, sum(age) {s:,}. Open the app following {TABLE} and let it seed.")
 
 
 def teardown():
