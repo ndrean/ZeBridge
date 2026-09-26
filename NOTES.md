@@ -16951,3 +16951,23 @@ a 5 s burst (588k rows at 115k rows/s) + 90 s at 1k rows/s, four SIGKILLs — ex
 rows), one tail, 0 disconnects, converged 300 s after the load: the JS client absorbs a
 burst at a few thousand events/s on an iPhone 12.
 
+**Android: a moto e20** (same day). Android 11 Go, 1.8 GB (~680 MB available), eMMC, and a
+32-bit userspace (`abilist`: armeabi-v7a) — libzb had never compiled for it. nats.zig patch
+25: six 64-bit atomic counters fall back to a spin lock where Zig 0.16 has no 64-bit atomics
+(32-bit ARM, whatever the CPU), three u64/usize casts; libzb itself needed no change, the
+32-bit build names its CPU (`-Dcpu=cortex_a7`). Then, in order:
+
+* **A fresh seed failed with NoResponders**: the chain-object reader's consumer idled 30 s
+  while the phone applied one window on eMMC, and the server reaped it. The reader now
+  resumes at the next chunk's stream sequence and idles 5 min (44ad312). 3,245,000 rows in
+  534 s, exact, the app at ~250 MB throughout (a 1.5 GB replica, streamed a window at a time).
+* **Slow-consumer disconnects again, a different limit**: "WriteDeadline of 10s exceeded
+  with 16 MB" — nats-server gives a client 10 s to take its queue, and two 8 MB requests in
+  flight did not fit the e20's under-1.6 MB/s. 2 MB per request (3b0cc1d): a slow link holds
+  down to ~0.4 MB/s, a fast one loses nothing (at a 75 ms round trip a few MB/s need well
+  under 1 MB in flight).
+* Kill test (`scripts/scenarios/android_kill.sh`, `am force-stop` + relaunch over adb): 5 s
+  burst + 90 s at 5k events/s, four kills, 0 disconnects, exact (4,552,000 rows, sum
+  204,649,720 — the app's check against PostgreSQL; a release build's files cannot be
+  copied out), converged 774 s after the load.
+
