@@ -34,7 +34,7 @@ Measured per run, plain then TLS, identical otherwise:
   --runs tls:on:defer:async:nogen a fifth field turns the generation producer off (§10gi: the
                           CDC path's memory alone).
   ZB_VMMAP=1              every 20 s, `vmmap -summary` of the bridge into the run directory
-                          (with ZB_KEEP=1 to keep it): which regions hold the resident memory.
+                          (with ZB_KEEP=1 to keep the run dir; the scratch database and slot always go).
   ZB_LEAKS=1               the bridge runs with MallocStackLogging, and once the load is over and a
                           cadence has passed, `leaks` scans it twice, a cadence apart, into the
                           run directory (§10gi). Slower bridge: never together with a measured run.
@@ -653,6 +653,8 @@ def main() -> int:
     TS_CLIENT_AT = a.ts_client_at
     CLIENT = a.client or a.client_at is not None or a.ts_client_at is not None
     CAP_BYTES = a.cap_mib * 1024 * 1024
+    bt.teardown_on_signal()
+    bt.sweep_leftovers("zb_burst_tls_", "zb_firehose_tls_")
     bt.keep_awake()
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="zb_firehose_tls_"))
     try:
@@ -698,9 +700,13 @@ def main() -> int:
                   f"min {r['min_margin']}, negative {r['holes']}; sampler errors {r['errors']}")
         return 0
     finally:
-        if not os.environ.get("ZB_KEEP"):
+        # ZB_KEEP keeps the run dir (logs, replicas, objects) — the scratch database and
+        # slot always go; a killed run gets here too (teardown_on_signal).
+        if os.environ.get("ZB_KEEP"):
+            bt.prune_stores(tmp)
+        else:
             shutil.rmtree(tmp, ignore_errors=True)
-            bt.psql(f"DROP DATABASE IF EXISTS {bt.DB}", db=None, stop=False)
+        bt.drop_scratch()
 
 
 if __name__ == "__main__":

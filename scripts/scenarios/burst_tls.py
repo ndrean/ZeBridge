@@ -66,6 +66,45 @@ def published() -> int:
         return -1
 
 
+def teardown_on_signal() -> None:
+    """A killed run tears down like a finished one: SIGTERM, SIGINT and SIGHUP become
+    SystemExit, so every `finally` runs — the scratch bridge, nats-server and psql load
+    are stopped, the slot and the database dropped. Without it a `pkill` left them all
+    behind, and the scratch database (2.5 GB) and an inactive slot retaining WAL sat on
+    the dev cluster (2026-09-26)."""
+    import signal
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda s, _f: sys.exit(128 + s))
+
+
+def sweep_leftovers(*prefixes: str) -> None:
+    """What a previous run killed too hard may have left: its scratch processes (the
+    bridge on p_burst, the scratch nats-servers, the psql load, the TS follower), its
+    temp dirs, its slot and its database — gone before this run starts. The patterns
+    name the scratch stack only; the dev bridge (`--pub my_pub`) is not matched."""
+    for pat in (rf"bridge --pub {PUB} ", r"nats-server -c .*/zb_(burst|firehose)_tls_", rf"psql .*{DB}", r"follow-worker\.ts"):
+        subprocess.run(["pkill", "-f", pat], capture_output=True)
+    for prefix in prefixes:
+        for d in pathlib.Path(tempfile.gettempdir()).glob(prefix + "*"):
+            shutil.rmtree(d, ignore_errors=True)
+    drop_scratch()
+
+
+def prune_stores(tmp: pathlib.Path) -> None:
+    """Under ZB_KEEP the run dir stays for its logs and replicas — not for the scratch
+    JetStream stores (each `<name>.conf` has its store_dir at `<tmp>/<name>`: the CDC
+    stream, the object bucket, the manifests — gigabytes that nothing reads back)."""
+    for conf in tmp.glob("*.conf"):
+        shutil.rmtree(tmp / conf.stem, ignore_errors=True)
+
+
+def drop_scratch() -> None:
+    """The scratch slot and database, dropped — the slot first: an inactive slot retains
+    WAL for the whole cluster, and the database cannot go while its slot is active."""
+    psql(f"SELECT pg_drop_replication_slot('{SLOT}') FROM pg_replication_slots WHERE slot_name = '{SLOT}'", db=None, stop=False)
+    psql(f"DROP DATABASE IF EXISTS {DB}", db=None, stop=False)
+
+
 def keep_awake():
     """§10ge: macOS idle sleep froze three benchmark runs mid-load (pmset log: sleep at
     14:54:04, wake 14:57:39, inside a firehose run). PostgreSQL's pacing follows the wall
@@ -90,8 +129,7 @@ class SleepWatch:
 
 
 def setup_database():
-    psql(f"SELECT pg_drop_replication_slot('{SLOT}') FROM pg_replication_slots WHERE slot_name = '{SLOT}'", db=None, stop=False)
-    psql(f"DROP DATABASE IF EXISTS {DB}", db=None, stop=False)
+    drop_scratch()
     r = psql(f"CREATE DATABASE {DB}", db=None)
     if r.returncode != 0:
         sys.exit(f"cannot create {DB}: {r.stderr}")
@@ -251,9 +289,11 @@ def main() -> int:
             sys.exit(f"{tool} not on PATH")
     if not BRIDGE.exists():
         sys.exit("build the bridge first: zig build -Doptimize=ReleaseFast")
+    teardown_on_signal()
+    sweep_leftovers("zb_burst_tls_", "zb_firehose_tls_")
     keep_awake()
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="zb_burst_tls_"))
-    keep = os.environ.get("ZB_KEEP")
+    keep = os.environ.get("ZB_KEEP")  # keeps the run dir (logs, replicas) — never the database or the slot
     try:
         setup_database()
         runs = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--runs=")), None)
@@ -280,9 +320,11 @@ def main() -> int:
             print(f"{r['name']} LOOP tail: " + " || ".join(l.split('LOOP ', 1)[-1] for l in r["loop"]))
         return 0
     finally:
-        if not keep:
+        if keep:
+            prune_stores(tmp)
+        else:
             shutil.rmtree(tmp, ignore_errors=True)
-            psql(f"DROP DATABASE IF EXISTS {DB}", db=None, stop=False)
+        drop_scratch()
 
 
 if __name__ == "__main__":
