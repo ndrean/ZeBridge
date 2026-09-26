@@ -1,0 +1,231 @@
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+index eb44d2b..7f4de51 100644
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -428,6 +428,16 @@ pub const MessageBatch = struct {
+ /// ZeBridge's libzb, 10 ms here made a 13 ms row, 1 ms makes it 3 ms.
+ const fetch_idle_after_first: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } };
+ 
++/// One outstanding pull request of a `PullSubscription` (see `reqs`).
++const PullRequest = struct {
++    reply: [160]u8 = undefined,
++    reply_len: usize = 0,
++    /// Messages the request still owes (the server serves a consumer's requests oldest first).
++    left: usize = 0,
++    deadline: Io.Timeout = .none,
++    order: u64 = 0,
++};
++
+ pub const PullSubscription = struct {
+     /// How long `fetch` keeps collecting after its first message — `fetch_idle_after_first`
+     /// (1 ms) unless the owner says otherwise. A CDC tail wants the 1 ms: one event, at
+@@ -455,10 +465,14 @@ pub const PullSubscription = struct {
+     /// server's 64 MB per-connection queue and was disconnected as a slow consumer every
+     /// few seconds, losing every delivery in flight (ZeBridge §10jc). One outstanding
+     /// request bounds the bytes in flight by `max_bytes`, whatever the link.
+-    req_reply: [160]u8 = undefined,
+-    req_reply_len: usize = 0,
+-    req_left: usize = 0,
+-    req_deadline: Io.Timeout = .none,
++    reqs: [2]PullRequest = .{ .{}, .{} },
++    req_order: u64 = 0,
++    /// How many requests may be outstanding at once, at most 2. 1: the caller's apply
++    /// and the next transfer alternate. 2: the next request downloads while the caller
++    /// applies the last batch — on an iPhone over Wi-Fi a catch-up whose transfer and
++    /// apply each take ~1.5 s per 8 MB goes about twice as fast. Bytes in flight stay
++    /// bounded by `pull_depth × max_bytes`.
++    pull_depth: usize = 1,
+     /// JetStream context
+     js: JetStream,
+     /// Stream name
+@@ -525,33 +539,72 @@ pub const PullSubscription = struct {
+         }
+     }
+ 
+-    /// The outstanding request still owes messages and has not expired.
+-    fn requestOpen(self: *PullSubscription) bool {
+-        if (self.req_reply_len == 0 or self.req_left == 0) return false;
+-        const d = self.req_deadline.toDurationFromNow(self.js.nc.io) orelse return false;
+-        return d.raw.toNanoseconds() > 0;
++    /// A request still owes messages and has not expired (an expired one is forgotten).
++    fn slotOpen(self: *PullSubscription, r: *PullRequest) bool {
++        if (r.reply_len == 0 or r.left == 0) return false;
++        const d = r.deadline.toDurationFromNow(self.js.nc.io) orelse {
++            r.reply_len = 0;
++            return false;
++        };
++        if (d.raw.toNanoseconds() <= 0) {
++            r.reply_len = 0;
++            return false;
++        }
++        return true;
+     }
+ 
+-    fn requestReply(self: *const PullSubscription) []const u8 {
+-        return self.req_reply[0..self.req_reply_len];
++    /// Fewer requests outstanding than `pull_depth` allows.
++    fn wantsRequest(self: *PullSubscription) bool {
++        var n: usize = 0;
++        for (&self.reqs) |*r| {
++            if (self.slotOpen(r)) n += 1;
++        }
++        return n < @min(@max(self.pull_depth, 1), self.reqs.len);
+     }
+ 
+     fn requestStart(self: *PullSubscription, reply: []const u8, batch: usize, deadline: Io.Timeout) void {
+-        const n = @min(reply.len, self.req_reply.len);
+-        @memcpy(self.req_reply[0..n], reply[0..n]);
+-        self.req_reply_len = n;
+-        self.req_left = batch;
+-        self.req_deadline = deadline;
++        for (&self.reqs) |*r| {
++            if (self.slotOpen(r)) continue;
++            const n = @min(reply.len, r.reply.len);
++            @memcpy(r.reply[0..n], reply[0..n]);
++            r.reply_len = n;
++            r.left = batch;
++            r.deadline = deadline;
++            self.req_order += 1;
++            r.order = self.req_order;
++            return;
++        }
+     }
+ 
++    /// A data message: owed by the OLDEST open request.
+     fn requestDelivered(self: *PullSubscription) void {
+-        if (self.req_left > 0) self.req_left -= 1;
+-        if (self.req_left == 0) self.req_reply_len = 0;
++        var oldest: ?*PullRequest = null;
++        for (&self.reqs) |*r| {
++            if (r.reply_len == 0 or r.left == 0) continue;
++            if (oldest == null or r.order < oldest.?.order) oldest = r;
++        }
++        if (oldest) |o| {
++            o.left -= 1;
++            if (o.left == 0) o.reply_len = 0;
++        }
+     }
+ 
+-    fn requestEnd(self: *PullSubscription) void {
+-        self.req_reply_len = 0;
+-        self.req_left = 0;
++    fn hasReply(self: *const PullSubscription, subject: []const u8) bool {
++        for (&self.reqs) |*r| {
++            if (r.reply_len > 0 and std.mem.eql(u8, r.reply[0..r.reply_len], subject)) return true;
++        }
++        return false;
++    }
++
++    /// A terminal status for the request answering on `subject`.
++    fn requestEndReply(self: *PullSubscription, subject: []const u8) void {
++        for (&self.reqs) |*r| {
++            if (r.reply_len > 0 and std.mem.eql(u8, r.reply[0..r.reply_len], subject)) {
++                r.reply_len = 0;
++                r.left = 0;
++                return;
++            }
++        }
+     }
+ 
+     pub fn fetch(self: *PullSubscription, batch: usize, timeout: Io.Timeout) !MessageBatch {
+@@ -563,10 +616,10 @@ pub const PullSubscription = struct {
+         try self.mutex.lock(self.js.nc.io);
+         defer self.mutex.unlock(self.js.nc.io);
+ 
+-        // One outstanding request (see `req_reply`): a new one only when the last has
+-        // delivered everything, ended with a status, or expired. The inbox then holds only
+-        // the current request's messages, which this fetch collects first.
+-        if (!self.requestOpen()) {
++        // At most `pull_depth` requests outstanding (see `reqs`): a new one only while
++        // fewer are open — delivered in full, ended with a status, or expired. The inbox
++        // holds only what the open ones already sent, which this fetch collects first.
++        while (self.wantsRequest()) {
+             self.fetch_id_counter += 1;
+             const new_reply = try std.fmt.allocPrint(self.js.nc.allocator, "{s}{d}", .{ self.inbox_prefix, self.fetch_id_counter });
+             defer self.js.nc.allocator.free(new_reply);
+@@ -585,9 +638,6 @@ pub const PullSubscription = struct {
+             try self.js.nc.publishRequest(api_subject, new_reply, request_json);
+             self.requestStart(new_reply, batch, timeout.toDeadline(self.js.nc.io));
+         }
+-        const reply_subject = try self.js.nc.allocator.dupe(u8, self.requestReply());
+-        defer self.js.nc.allocator.free(reply_subject);
+-
+         // Collect messages
+         var messages = std.ArrayList(*JetStreamMessage).empty;
+         defer messages.deinit(self.js.nc.allocator);
+@@ -633,12 +683,12 @@ pub const PullSubscription = struct {
+                 // e2e suite catches exactly that. Status frames are addressed to the inbox
+                 // (`HMSG _INBOX.<prefix>.<fetch_id>`), so they can be attributed, and they
+                 // are the only ones this loop treats as terminal.
+-                if (raw_msg.status_code > 0 and !std.mem.eql(u8, raw_msg.subject, reply_subject)) {
++                if (raw_msg.status_code > 0 and !self.hasReply(raw_msg.subject)) {
+                     raw_msg.deinit();
+                     continue;
+                 }
+ 
+-                if (raw_msg.status_code > 0 and raw_msg.status_code != STATUS_CONTROL) self.requestEnd();
++                if (raw_msg.status_code > 0 and raw_msg.status_code != STATUS_CONTROL) self.requestEndReply(raw_msg.subject);
+                 if (raw_msg.status_code == STATUS_NOT_FOUND) {
+                     // No messages available (404, a no_wait pull): "nothing before the
+                     // deadline", the same answer as an expiry.
+@@ -799,23 +849,17 @@ pub const PullInbox = struct {
+         self.fetch_id_counter += 1;
+         const fetch_id = self.fetch_id_counter;
+ 
+-        // One reply subject per consumer: `<prefix><fetch>x<i>` — a single token, as
+-        // the wildcard requires — so a status frame names the consumer it answers.
+-        const replies = try a.alloc([]u8, subs.len);
+-        var made: usize = 0;
+-        defer {
+-            for (replies[0..made]) |r| a.free(r);
+-            a.free(replies);
+-        }
+-        // One outstanding request per consumer (see `PullSubscription.req_reply`): a
+-        // consumer whose request still owes messages and has not expired is not asked
+-        // again — the inbox receives the rest of it; the others get a new request.
++        // At most `pull_depth` requests outstanding per consumer (see
++        // `PullSubscription.reqs`); a new request only while fewer are open. Reply subjects
++        // `<prefix><fetch>x<i>y<k>` — one token, as the wildcard requires — so a status
++        // frame names the request (and so the consumer) it answers.
+         const cap = batch * subs.len;
+         const timeout_duration = timeout.toDurationFromNow(self.js.nc.io);
+         for (subs, 0..) |sub, i| {
+             if (sub.inbox_subscription != self.inbox_subscription) return error.NotOnThisInbox;
+-            if (!sub.requestOpen()) {
+-                const new_reply = try std.fmt.allocPrint(a, "{s}{d}x{d}", .{ self.inbox_prefix, fetch_id, i });
++            var k: usize = 0;
++            while (sub.wantsRequest()) : (k += 1) {
++                const new_reply = try std.fmt.allocPrint(a, "{s}{d}x{d}y{d}", .{ self.inbox_prefix, fetch_id, i, k });
+                 defer a.free(new_reply);
+                 const request_json = try jsonStringifyAlloc(a, FetchRequest{
+                     .batch = batch,
+@@ -828,8 +872,6 @@ pub const PullInbox = struct {
+                 try self.js.nc.publishRequest(api_subject, new_reply, request_json);
+                 sub.requestStart(new_reply, batch, timeout.toDeadline(self.js.nc.io));
+             }
+-            replies[i] = try a.dupe(u8, sub.requestReply());
+-            made += 1;
+         }
+ 
+         const gone = try a.alloc(bool, subs.len);
+@@ -852,15 +894,16 @@ pub const PullInbox = struct {
+                 error.Canceled, error.ConnectionClosed, error.SlowConsumer => return err,
+             };
+             if (raw_msg.status_code > 0) {
+-                // Which pull does this frame answer? A stale one (earlier fetch) is dropped.
+-                const idx: ?usize = for (replies, 0..) |r, i| {
+-                    if (std.mem.eql(u8, raw_msg.subject, r)) break i;
++                // Which request does this frame answer? One no longer open (an earlier,
++                // finished one) is dropped.
++                const idx: ?usize = for (subs, 0..) |sub, i| {
++                    if (sub.hasReply(raw_msg.subject)) break i;
+                 } else null;
+                 const code = raw_msg.status_code;
++                if (idx) |hit| if (code != STATUS_CONTROL) subs[hit].requestEndReply(raw_msg.subject);
+                 raw_msg.deinit();
+                 const i = idx orelse continue;
+                 if (code == STATUS_CONTROL) continue; // heartbeat
+-                subs[i].requestEnd();
+                 if (done[i]) continue;
+                 if (code == STATUS_NO_RESPONSE) gone[i] = true;
+                 // 404, 408, 409, 503 — all terminal for this consumer's pull.

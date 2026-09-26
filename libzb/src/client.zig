@@ -2636,6 +2636,10 @@ pub const SyncClient = struct {
         std.debug.print("{s}: tail consumer {s} from seq {d}\n", .{ stream, cname, cfg.opt_start_seq orelse 0 });
         const sub = try self.t.js.pullSubscribe(null, cname, .{ .stream = stream, .config = cfg, .inbox = shared });
         sub.max_bytes = pull_max_bytes; // §10jc: the drain's own requests too (see `tailInbox`)
+        // §10jc: two requests outstanding — the next 8 MB downloads while this client
+        // applies the last batch (a phone's catch-up alternated the two: 91.8 s for a
+        // 1.3M-row first seed where the link alone would take about half).
+        sub.pull_depth = 2;
         return sub;
     }
 

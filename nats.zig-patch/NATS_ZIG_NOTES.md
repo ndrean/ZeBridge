@@ -916,3 +916,23 @@ arithmetic is gone with it (the inbox now only ever holds the current request's 
 **Verified**: `zig build test-unit` 135/135; ZeBridge's delivery-loss test exact on the Mac
 (138 simulated losses); the iPhone at 40k events/s with four SIGKILLs: 0 disconnects (the
 server's slow-consumer count unchanged), 153 of 153 batches exact.
+
+## 23. Up to two outstanding pull requests (2026-09-26)
+
+**How it appeared**
+
+With one request at a time (patch 22) a phone's catch-up alternated transfer and apply —
+~1.5 s each per 8 MB on an iPhone 12 over Wi-Fi: a 1.3M-row first seed took 91.8 s.
+
+**Change** (`23-nats.zig-pull-depth.patch`, src/jetstream.zig)
+
+`PullSubscription.pull_depth` (default 1: unchanged; at most 2). The one tracked request
+becomes two slots; a fetch issues requests while fewer than `pull_depth` are open; a data
+message is owed by the OLDEST open request (the server serves a consumer's requests in
+order); a status frame ends the request whose reply subject it names. `PullInbox` reply
+subjects become `<prefix><fetch>x<i>y<k>`. Bytes in flight: at most `pull_depth × max_bytes`.
+
+**Verified**: `zig build test-unit` 135/135 (three runs; one earlier run had the known flaky
+TLS test fail); ZeBridge's delivery-loss test exact; the iPhone's 1.3M-row first seed
+53.7 s (was 91.8 s), exact. One slow-consumer disconnect remained during that seed's
+drain — being measured.
