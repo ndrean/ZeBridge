@@ -158,6 +158,11 @@ const TableState = struct {
     seed_epoch: i64 = 0,
 };
 
+var trace_enabled: bool = false;
+fn tr(comptime fmt: []const u8, args: anytype) void {
+    if (trace_enabled) std.debug.print("trace: " ++ fmt ++ "\n", args);
+}
+
 pub const SyncClient = struct {
     a: std.mem.Allocator,
     arena: std.heap.ArenaAllocator, // client-lifetime allocations (states, grammar)
@@ -280,6 +285,8 @@ pub const SyncClient = struct {
     schema_kv: ?@import("nats").KV = null,
     /// §10df: a descriptor arrived with a higher seed_epoch — seed on the next poll.
     reseed_pending: bool = false,
+    /// Events the seed gate dropped, for the trace.
+    gated: usize = 0,
     /// §10iz: what kept each table unseeded — the error name of its last failed seed,
     /// by table; an entry leaves when the table seeds. `zb_client_sync` and
     /// `zb_client_poll` report it as `unseeded`, so a host never calls a replica
@@ -310,11 +317,17 @@ pub const SyncClient = struct {
     const Tail = struct {
         stream: []const u8,
         sub: *@import("nats").PullSubscription,
-        /// When `caughtUpTo` last asked the server about this idle tail (§10ja).
-        caught_up_check_ms: i64 = 0,
+        /// When the idle watch last asked the server about this tail (§10ja).
+        watch_ms: i64 = 0,
+        /// When this consumer last handed a message over — or was opened.
+        delivered_ms: i64 = 0,
     };
-    /// An idle tail asks at most this often whether it is caught up: two requests.
-    const caught_up_every_ms: i64 = 25_000;
+    /// An idle tail asks the server at most this often: is it caught up (the position
+    /// moves to the stream's end), gone (reaped: reopen), or DEAF — messages pending on
+    /// the server and nothing delivered for this long (reopen, and say so). The same
+    /// guard zb-client-ts has had since §10cq; libzb fetched from a deaf consumer for
+    /// 416 polls under the firehose (§10ja).
+    const tail_watch_ms: i64 = 25_000;
     const Dark = struct { retry_at_ms: i64, backoff_ms: i64 };
     const dark_backoff_first_ms: i64 = 5_000;
     const dark_backoff_max_ms: i64 = 60_000;
@@ -337,6 +350,10 @@ pub const SyncClient = struct {
     pub fn init(a: std.mem.Allocator, opts: Options) !*SyncClient {
         const self = try a.create(SyncClient);
         errdefer a.destroy(self);
+        // ZB_TAIL_TRACE=1: the tail path narrated on stderr — what each fetch returned
+        // per stream, what applying did to the position, how many events the seed gate
+        // dropped, what the server said in the idle check (§10ja, the deaf tail hunt).
+        trace_enabled = std.c.getenv("ZB_TAIL_TRACE") != null;
 
         self.* = .{
             .a = a,
@@ -1933,6 +1950,7 @@ pub const SyncClient = struct {
         if (cdc_stream.len > 0) {
             var anchor: SeedAnchor = .{ .stream = try self.aa().dupe(u8, cdc_stream), .seq = 0, .lsn = seed_lsn };
             if (gate_seq > 0) anchor.seq = @intCast(gate_seq);
+            tr("{s}: seed anchor on {s}: seq {d} (chain g{d} cutoff_seq {d}, watermark {s}, position {d})", .{ table, cdc_stream, anchor.seq, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, if (man.object.get("cutoff_version")) |v| (if (v == .string) v.string else "?") else "?", pos });
             var replaced = false;
             for (st.anchors.items) |*an| if (std.mem.eql(u8, an.stream, cdc_stream)) {
                 an.* = anchor;
@@ -2495,26 +2513,42 @@ pub const SyncClient = struct {
     /// prune until 2026-09-25, and answered with a re-seed: a client following
     /// test_types_v7 re-fetched 3M rows three times because test_types_v4 got a burst.
     /// Stream info unreadable → a hole: the conservative answer, as before.
-    /// §10ja: how far a CAUGHT-UP consumer has read. A consumer filtered to this
-    /// client's tables sees none of the other tables' messages, so its position stays
-    /// at the last message it was handed — 0 on a stream where none of its tables has
-    /// written — and the next launch reads "position 0, stream first 9632" as a gap.
-    /// When the consumer has nothing pending, it has seen every message for its
-    /// subjects up to the stream's end, and that is the position.
-    ///
-    /// ⚠️ The order is the safety. `last_seq` is read FIRST; then `num_pending = 0`
-    /// says nothing for these subjects waits at or before it. `delivered <= pos` and
-    /// no unacked message say that everything handed over is applied and persisted.
-    /// Any doubt answers `pos`: the next check asks again.
+    /// The drain's end: the position a caught-up consumer may move to (§10ja).
     fn caughtUpTo(self: *SyncClient, stream: []const u8, consumer: []const u8, pos: u64) u64 {
-        var si = self.t.js.getStreamInfo(stream) catch return pos;
-        defer si.deinit();
-        const last = si.value.state.last_seq;
-        if (last <= pos) return pos;
-        var ci = self.t.js.getConsumerInfo(stream, consumer) catch return pos;
-        defer ci.deinit();
-        const c = ci.value;
-        return core.caughtUpPosition(pos, last, c.num_pending, c.num_ack_pending, c.delivered.consumer_seq, c.delivered.stream_seq);
+        return switch (self.tailHealth(stream, consumer, pos, 0)) {
+            .fine => |to| to,
+            else => pos,
+        };
+    }
+
+    /// §10ja: where the first HOLE opens in a batch — the index of the first message
+    /// whose predecessor (the position, for the first one) is not the message right
+    /// before it, AND the stream no longer holds what followed that predecessor. One
+    /// stream-info request per batch with a jump; a filtered consumer's jumps over other
+    /// tables' messages (§10gm) still hold in the stream and are not holes. A stream that
+    /// prunes while the server delivers a batch of 100 opens a hole INSIDE the batch as
+    /// easily as before it: checking the first message alone, libzb applied 100 messages
+    /// spanning 259 sequences and moved its position past the 159 it never saw — 41 of
+    /// 120 batches lost with a healthy-looking tail (the firehose at 100k events/s).
+    /// zb-client-ts checks every message; so does this now.
+    fn firstHole(self: *SyncClient, stream: []const u8, position: u64, msgs: []const *@import("nats").JetStreamMessage) ?usize {
+        var prev = position;
+        var first_seq: ?u64 = null;
+        for (msgs, 0..) |m, i| {
+            const sq = m.metadata.sequence.stream;
+            if (prev > 0 and sq > prev + 1) {
+                if (first_seq == null) first_seq = self.streamFirst(stream) orelse std.math.maxInt(u64); // unreadable: a hole, as prunedAfter
+                if (first_seq.? > prev + 1) return i;
+            }
+            prev = sq;
+        }
+        return null;
+    }
+
+    fn streamFirst(self: *SyncClient, stream: []const u8) ?u64 {
+        var info = self.t.js.getStreamInfo(stream) catch return null;
+        defer info.deinit();
+        return info.value.state.first_seq;
     }
 
     fn prunedAfter(self: *SyncClient, stream: []const u8, pos: u64) bool {
@@ -2586,8 +2620,11 @@ pub const SyncClient = struct {
             // The gap rule (§10ei), here too — on a jump, and only if the stream no longer
             // holds what follows the position (§10ja: a filtered consumer jumps over the
             // other tables' messages as a matter of course).
-            const first_here = batch.messages[0].metadata.sequence.stream;
-            if (max_seq > 0 and first_here > max_seq + 1 and self.prunedAfter(stream, max_seq)) {
+            // Every consecutive pair, not the first message alone (firstHole, §10ja): what
+            // precedes the hole is applied, the position follows it, and the caller re-seeds.
+            if (self.firstHole(stream, max_seq, batch.messages)) |j| {
+                if (j > 0) _ = try self.applyBatch(null, stream, batch.messages[0..j], last, &max_seq, null);
+                const first_here = batch.messages[j].metadata.sequence.stream;
                 if (max_seq > last) try self.persistSeq(stream, max_seq);
                 std.debug.print("{s}: {d} message(s) pruned under the drain (position {d}, delivered {d})\n", .{ stream, first_here - max_seq - 1, max_seq, first_here });
                 return true;
@@ -2880,7 +2917,7 @@ pub const SyncClient = struct {
         }
         const sub = try self.openConsumer(stream, tail_inactive_ns, try self.tailInbox());
         errdefer sub.deinit();
-        try self.tails.append(self.aa(), .{ .stream = stream, .sub = sub });
+        try self.tails.append(self.aa(), .{ .stream = stream, .sub = sub, .delivered_ms = nowMillis() });
         return &self.tails.items[self.tails.items.len - 1];
     }
 
@@ -2898,6 +2935,38 @@ pub const SyncClient = struct {
         const fresh = try self.openConsumer(t.stream, tail_inactive_ns, try self.tailInbox());
         t.sub.deinit();
         t.sub = fresh;
+        t.delivered_ms = nowMillis();
+        t.watch_ms = 0;
+    }
+
+    /// What the server says about an idle tail's consumer (§10ja).
+    const TailHealth = union(enum) {
+        /// Caught up, or nothing to say: the position it may move to (unchanged: `pos`).
+        fine: u64,
+        /// Messages pending on the server for this consumer, and it delivered nothing
+        /// for a watch interval: deaf.
+        deaf: u64,
+        /// The server no longer knows the consumer (reaped, or the stream went).
+        gone,
+    };
+
+    fn tailHealth(self: *SyncClient, stream: []const u8, consumer: []const u8, pos: u64, idle_ms: i64) TailHealth {
+        var si = self.t.js.getStreamInfo(stream) catch |e| {
+            tr("{s}: idle check — stream info failed ({s})", .{ stream, @errorName(e) });
+            return .{ .fine = pos };
+        };
+        defer si.deinit();
+        const last = si.value.state.last_seq;
+        var ci = self.t.js.getConsumerInfo(stream, consumer) catch |e| {
+            tr("{s}: idle check — consumer {s} info failed ({s}): gone", .{ stream, consumer, @errorName(e) });
+            return .gone;
+        };
+        defer ci.deinit();
+        const c = ci.value;
+        tr("{s}: idle {d} s, position {d}; server: first {d} last {d}; consumer {s}: pending {d}, ack_pending {d}, delivered {d} (stream seq {d})", .{ stream, @divTrunc(idle_ms, 1000), pos, si.value.state.first_seq, last, consumer, c.num_pending, c.num_ack_pending, c.delivered.consumer_seq, c.delivered.stream_seq });
+        if (c.num_pending > 0 and idle_ms >= tail_watch_ms) return .{ .deaf = c.num_pending };
+        if (last <= pos) return .{ .fine = pos };
+        return .{ .fine = core.caughtUpPosition(pos, last, c.num_pending, c.num_ack_pending, c.delivered.consumer_seq, c.delivered.stream_seq) };
     }
 
     /// A request taken off a queue subscription and handed to the host: the id the host
@@ -3104,6 +3173,7 @@ pub const SyncClient = struct {
             // re-open them all at the stored positions; the next poll reads. One that
             // cannot be re-opened is set aside rather than failing the rest.
             error.NoResponders => {
+                tr("fetch → NoResponders: every tail's consumer is gone — reopening all", .{});
                 for (live.items) |stream| {
                     const tl = self.tailFor(stream) catch |e| {
                         self.markDark(stream, e);
@@ -3135,62 +3205,98 @@ pub const SyncClient = struct {
             for (mb.messages) |m| {
                 if (std.mem.eql(u8, m.metadata.stream, stream)) try mine.append(a, m);
             }
+            if (trace_enabled) {
+                const lo: u64 = if (mine.items.len > 0) mine.items[0].metadata.sequence.stream else 0;
+                const hi: u64 = if (mine.items.len > 0) mine.items[mine.items.len - 1].metadata.sequence.stream else 0;
+                tr("{s}: fetched {d} msg(s) [{d}..{d}] of {d} in the batch, position {d}", .{ stream, mine.items.len, lo, hi, mb.messages.len, try self.storedSeq(stream) });
+            }
             if (mine.items.len == 0) {
-                // Idle this poll: now and then, take the position to the stream's end
-                // if the consumer is caught up (§10ja).
+                // Idle this poll: now and then, ask the server about the tail (§10ja) —
+                // caught up (the position moves to the stream's end), gone, or deaf.
                 if (self.isDark(stream)) continue;
                 const tl = self.tailFor(stream) catch continue;
                 const now = nowMillis();
-                if (now - tl.caught_up_check_ms < caught_up_every_ms) continue;
-                tl.caught_up_check_ms = now;
+                if (now - tl.watch_ms < tail_watch_ms) continue;
+                tl.watch_ms = now;
                 const pos = try self.storedSeq(stream);
-                const to = self.caughtUpTo(stream, tl.sub.consumer_name, pos);
-                if (to > pos) try self.persistSeq(stream, to);
+                switch (self.tailHealth(stream, tl.sub.consumer_name, pos, now - tl.delivered_ms)) {
+                    .fine => |to| if (to > pos) try self.persistSeq(stream, to),
+                    .deaf => |pending| {
+                        std.debug.print("{s}: tail deaf — {d} message(s) pending on the server for {s}, nothing delivered for {d} s (position {d}); reopening\n", .{ stream, pending, tl.sub.consumer_name, @divTrunc(now - tl.delivered_ms, 1000), pos });
+                        self.reopenTail(tl) catch |e| self.markDark(stream, e);
+                    },
+                    .gone => {
+                        std.debug.print("{s}: tail consumer {s} gone from the server (position {d}) — reopening\n", .{ stream, tl.sub.consumer_name, pos });
+                        self.reopenTail(tl) catch |e| self.markDark(stream, e);
+                    },
+                }
                 continue;
             }
+            if (self.tailFor(stream)) |tl| tl.delivered_ms = nowMillis() else |_| {}
             var last = try self.storedSeq(stream);
             // §10ei: the gap rule, LIVE. The next message this tail is handed is `last + 1`
             // unless the stream pruned under the consumer while the host did not poll —
             // or (§10ja) the consumer is filtered to this client's tables and skipped
-            // other tables' messages, which is no hole at all: `prunedAfter` asks the
-            // stream which of the two a jump is. The server
+            // other tables' messages, which is no hole at all: `firstHole` asks the
+            // stream which of the two a jump is, for EVERY consecutive pair of the batch
+            // (a stream pruning under a delivery opens holes inside it too). The server
             // continues from the oldest it holds and says nothing; the numbering does.
             // Measured: a client idle 267 s against a 263 s window resumed past twelve
             // messages, two deletes among them, and disagreed with PostgreSQL until it
-            // was reopened. A hole is §7's gap taken now: re-seed what rides this stream,
-            // then apply the batch — the seed gate drops what the chain already carries.
-            // A chain that predates the stream leaves the hole OPEN: the position stays
-            // below it, the batch is not acked, and the next poll asks again.
-            const first_here = mine.items[0].metadata.sequence.stream;
-            if (last > 0 and first_here > last + 1 and self.prunedAfter(stream, last)) {
-                std.debug.print("{s}: {d} message(s) pruned under the live consumer (position {d}, delivered {d}) — taking the gap: re-seeding the tables routed to it\n", .{ stream, first_here - last - 1, last, first_here });
-                self.reseed_pending = false;
-                self.gapAndSeed(report_a, &seeded_map) catch |err| std.debug.print("{s}: re-seed after the hole failed: {s}\n", .{ stream, @errorName(err) });
-                if (self.reseed_pending) {
-                    std.debug.print("{s}: the hole stays open — waiting for the producer's next generation before moving past it\n", .{stream});
+            // was reopened. A hole is §7's gap taken now: what precedes it is applied,
+            // then re-seed what rides this stream, then the rest — the seed gate drops
+            // what the chain already carries. A chain that predates the stream leaves the
+            // hole OPEN: the position stays below it, the rest is not acked, and the next
+            // poll asks again.
+            var pending: []const *@import("nats").JetStreamMessage = mine.items;
+            while (pending.len > 0) {
+                const cut = self.firstHole(stream, last, pending);
+                if (cut) |j| if (j > 0) {
+                    // Contiguous up to the hole: applied first, the position follows.
+                    var ms: u64 = last;
+                    const gb = self.gated;
+                    const off = try self.applyBatch(report_a, stream, pending[0..j], last, &ms, &changed_map);
+                    applied += off;
+                    tr("{s}: offered {d} event(s) before a hole, gated {d}, position {d} → {d}", .{ stream, off, self.gated - gb, last, ms });
+                    last = ms;
+                    pending = pending[j..];
                     continue;
-                }
-                // §10ja: the batch in hand was fetched BEFORE this re-seed, and the chain
-                // just applied is newer than all of it — the heal moved the position to
-                // the stream's oldest message, which under a firehose is far past this
-                // batch (a 108 s re-seed at 100k: position 10175 → 18136, batch 11098..
-                // 11197). Applied, its old events land over the newer chain and its max
-                // seq overwrites the healed position — backwards (11197) — so the next
-                // message reads as a hole: re-seed, again, for ever. What the chain covers
-                // is acked, not applied; zb-client-ts drops the batch in hand the same way.
-                const healed = try self.storedSeq(stream);
-                if (healed > last) {
-                    var beyond: std.ArrayListUnmanaged(*@import("nats").JetStreamMessage) = .empty;
-                    for (mine.items) |m| {
-                        if (m.metadata.sequence.stream > healed) try beyond.append(a, m) else m.ack() catch {};
+                };
+                if (cut != null) {
+                    const first_here = pending[0].metadata.sequence.stream;
+                    std.debug.print("{s}: {d} message(s) pruned under the live consumer (position {d}, delivered {d}) — taking the gap: re-seeding the tables routed to it\n", .{ stream, first_here - last - 1, last, first_here });
+                    self.reseed_pending = false;
+                    self.gapAndSeed(report_a, &seeded_map) catch |err| std.debug.print("{s}: re-seed after the hole failed: {s}\n", .{ stream, @errorName(err) });
+                    if (self.reseed_pending) {
+                        std.debug.print("{s}: the hole stays open — waiting for the producer's next generation before moving past it\n", .{stream});
+                        break;
                     }
-                    mine = beyond;
-                    last = healed;
-                    if (mine.items.len == 0) continue;
+                    // §10ja: the batch in hand was fetched BEFORE this re-seed, and the chain
+                    // just applied is newer than all of it — the heal moved the position to
+                    // the stream's oldest message, which under a firehose is far past this
+                    // batch (a 108 s re-seed at 100k: position 10175 → 18136, batch 11098..
+                    // 11197). Applied, its old events land over the newer chain and its max
+                    // seq overwrites the healed position — backwards (11197) — so the next
+                    // message reads as a hole: re-seed, again, for ever. What the chain covers
+                    // is acked, not applied; zb-client-ts drops the batch in hand the same way.
+                    const healed = try self.storedSeq(stream);
+                    if (healed > last) {
+                        var beyond: std.ArrayListUnmanaged(*@import("nats").JetStreamMessage) = .empty;
+                        for (pending) |m| {
+                            if (m.metadata.sequence.stream > healed) try beyond.append(a, m) else m.ack() catch {};
+                        }
+                        pending = beyond.items;
+                        last = healed;
+                        continue; // the rest, scanned again
+                    }
                 }
+                var max_seq = last;
+                const gated_before = self.gated;
+                const offered = try self.applyBatch(report_a, stream, pending, last, &max_seq, &changed_map);
+                applied += offered;
+                tr("{s}: offered {d} event(s), gated {d}, position {d} → {d}", .{ stream, offered, self.gated - gated_before, last, max_seq });
+                break;
             }
-            var max_seq = last;
-            applied += try self.applyBatch(report_a, stream, mine.items, last, &max_seq, &changed_map);
         }
         if (applied > 0) self.retryHeld(report_a, &changed_map);
         self.drainRebase();
@@ -3206,13 +3312,19 @@ pub const SyncClient = struct {
         // still inside every chain applied).
         if (seq != 0) {
             for (st.anchors.items) |an| if (an.seq > 0 and std.mem.eql(u8, an.stream, stream)) {
-                if (seq <= an.seq) return;
+                if (seq <= an.seq) {
+                    self.gated += 1;
+                    return;
+                }
             };
         } else if (st.anchors.items.len > 0) {
             var floor: i64 = std.math.maxInt(i64);
             for (st.anchors.items) |an| floor = @min(floor, an.lsn);
             const lsn: i64 = if (ev.object.get("lsn")) |v| (if (v == .integer) v.integer else 0) else 0;
-            if (lsn != 0 and lsn < floor) return;
+            if (lsn != 0 and lsn < floor) {
+                self.gated += 1;
+                return;
+            }
         }
 
         const op = if (ev.object.get("operation")) |v| (if (v == .string) v.string else "") else "";

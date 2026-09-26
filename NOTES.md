@@ -16725,7 +16725,42 @@ omar, whose grant covers replies under `_INBOX.omar.>` only (§10hm), and the CL
 `_INBOX.` was refused, so each KV get timed out. It now passes the principal's inbox
 prefix, read from the creds' JWT.
 
-What this leaves: libzb's stop after a long re-seed; libzb's live apply on random keys (the
-9,400 rows/s above); zb-react-native for Android.
+**libzb's stop at 100k, found (2026-09-26).** Not a stop after the re-seed — a hole
+INSIDE a fetched batch. The live tail checked the gap rule (`prunedAfter`: stream
+first_seq > position+1) on a batch's FIRST message only; a batch of 100 with a hole at
+message 37 applied 37..99 as if consecutive, persisted the max seq, and the rows the
+stream had lost were gone from the replica for ever — 5.1M of 6M. At 50k the stream never
+lost a message mid-batch (256 MiB holds ~12 s of CDC); at 100k (~6 s) it did, within a
+second. Why zb-client-ts never showed it: its consumer receives one message per callback,
+so its check runs on every consecutive pair by construction. libzb now does the same:
+`firstHole` walks every pair of a batch against the position; a hole splits the batch —
+the prefix is applied, the rest is re-seeded through the chain, the part the new chain
+covers acked (not applied), the remainder applied — in a loop until the batch is
+consumed. The drain path has the same split.
+
+Two watches came with it, and are kept: a tail watchdog every 25 s idle (`tailHealth`:
+fine / deaf — pending > 0 for 25 s with nothing delivered → the consumer is reopened /
+gone → reopened), and `ZB_TAIL_TRACE=1` — one line per fetch (seqs, offered/gated,
+position), per seed anchor, per server view. Both were how the wrong hypotheses were
+ruled out (the reap, the shared inbox, the caught-up rule): none ever fired mid-load.
+
+Verified: firehose 100k, both clients opened at 30 s — libzb 6,000,000 rows exact, caught
+up 248 s (zb-client-ts 253 s); filtered_gap, client_gap (297 s), shared_gap (77 s) ✓;
+libzb 29/32, parity 226.
+
+Two operational lessons from the night, for the record. The disk filled (28 GB → 351 MiB:
+43 GB of Zig caches plus kept firehose run dirs at 8 GB each); a run was invalidated
+("no space left on device" on consumer create) and the DEV nats-server's `KV_generations`
+filestore kept refusing writes for 7 hours after 64 GB were freed (reads fine, object puts
+fine): every producer build timed out at the manifest put, client_gap and shared_gap
+failed on "never caught up". A nats-server restart cured it. And the harnesses now clean
+up after themselves whichever way they end (`teardown_on_signal`: SIGTERM/INT/HUP → the
+`finally` runs; `sweep_leftovers` at start: previous run dirs, scratch processes, slot,
+database; `ZB_KEEP` keeps logs and replicas only — the scratch JetStream stores go, the
+scratch database and slot always go).
+
+What this leaves: libzb's live apply on random keys (the 9,400 rows/s above);
+zb-react-native for Android; the producer's attach path may leave the manifest's
+top-level fields stale (a watermark oddity seen in the trace, low).
 (Done the same day: the replica identity for read-only tables, f96cf47; the benchmark
 tables dropped.)
