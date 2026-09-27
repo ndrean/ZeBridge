@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sensor chart</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font: 14px/1.45 system-ui, sans-serif;
+        --bg: #ffffff; --fg: #1f2328; --muted: #656d76; --line: #d0d7de;
+        --raw: #9ecbff; --avg: #0969da; --tag: #1f6feb;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root { --bg: #0d1117; --fg: #e6edf3; --muted: #8d96a0; --line: #30363d; --raw: #2f5c8f; --avg: #58a6ff; }
+      }
+      body { margin: 0; background: var(--bg); color: var(--fg); display: grid; grid-template-rows: auto 1fr auto; height: 100dvh; }
+      header { display: flex; gap: 14px; align-items: center; padding: 8px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+      header h1 { font-size: 15px; margin: 0 6px 0 0; font-weight: 600; }
+      .tag { background: var(--tag); color: #fff; border-radius: 10px; padding: 1px 8px; font-size: 12px; }
+      label { color: var(--muted); }
+      input, select { font: inherit; }
+      input[type=number] { width: 4.5em; }
+      main { position: relative; min-height: 0; padding: 8px 16px; }
+      canvas { width: 100%; height: 100%; display: block; }
+      .legend { position: absolute; top: 14px; right: 26px; font-size: 12px; color: var(--muted); }
+      .legend b { display: inline-block; width: 18px; height: 3px; vertical-align: middle; margin: 0 4px 0 12px; }
+      footer { padding: 6px 16px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Sensor chart <span class="tag" id="who">connecting…</span></h1>
+      <label>sensor <input id="sensor" type="number" min="0" value="0" /></label>
+      <label>bucket
+        <select id="bucket">
+          <option value="100" selected>100 ms</option>
+          <option value="250">250 ms</option>
+          <option value="1000">1 s</option>
+        </select>
+      </label>
+      <label>moving average over
+        <select id="window">
+          <option value="1">1 s</option>
+          <option value="2" selected>2 s</option>
+          <option value="5">5 s</option>
+          <option value="10">10 s</option>
+        </select>
+      </label>
+      <label>span
+        <select id="span">
+          <option value="10">10 s</option>
+          <option value="30" selected>30 s</option>
+          <option value="60">60 s</option>
+        </select>
+      </label>
+    </header>
+    <main>
+      <canvas id="chart"></canvas>
+      <div class="legend"><b style="background: var(--raw)"></b>bucket average<b style="background: var(--avg)"></b>moving average</div>
+    </main>
+    <footer id="status">starting…</footer>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

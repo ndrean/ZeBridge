@@ -26,9 +26,10 @@ a UUIDv7). The queries, the parameters the asker sends, and what comes back:
       → rows, sum(value) (to check the replica against PostgreSQL), the newest reading's
         time, and its age when the question was answered: the pipeline's lag (sensor →
         NATS → bridge → PostgreSQL → CDC → replica), plus at most the gap between two readings
-  moving_avg  {"kind": "temperature", "window_s": 10, "since_s": 60, "sensor_id": null, "series": false}
-      → per sensor, one-second buckets and the average over the last window_s seconds of
-        buckets; the latest point per sensor, or the whole series of one sensor
+  moving_avg  {"kind": "temperature", "window_s": 10, "since_s": 60, "sensor_id": null, "series": false, "bucket_ms": 1000}
+      → per sensor, buckets of bucket_ms (100 ms to 60 s) and the average over the last
+        window_s seconds of buckets; the latest point per sensor, or the whole series of
+        one sensor. 100 ms buckets show a 2 s wave itself; 1 s buckets average half of it.
   per_minute  {"kind": "temperature", "minutes": 10}
       → one row per minute: readings, sensors, avg/min/max/stddev — what a continuous
         aggregate materializes, recomputed on demand (a few ms at these sizes)
@@ -140,28 +141,33 @@ def freshness(card: Card, tenant: str, q: dict) -> dict:
 
 def moving_avg(card: Card, tenant: str, q: dict) -> dict:
     kind = kind_of(q)
-    # window_s one-second buckets: the current one and window_s - 1 before it. A RANGE
-    # frame includes both ends, so "N SECOND PRECEDING" would hold N + 1 buckets.
+    # window_s seconds of buckets: the current one and the ones before it within the window.
+    # A RANGE frame includes both ends, so the frame reaches back window - one bucket; with
+    # 1 s buckets and window_s 10 that is 9 s, ten buckets.
     window = bounded(q, "window_s", 10, 1, 3600)   # inlined in the frame clause: validated as an int
     since = bounded(q, "since_s", 60, 1, 86400)
+    bucket = bounded(q, "bucket_ms", 1000, 100, 60000)
+    if (window * 1000) % bucket:
+        raise ValueError("window_s must be a whole number of buckets")
     sensor = q.get("sensor_id")
     series = bool(q.get("series", False)) and sensor is not None
     now = time.time()
-    # From `since` seconds ago up to the start of the current second: a bucket still
+    # From `since` seconds ago up to the start of the current bucket: a bucket still
     # filling would drag the average.
+    current = math.floor(now * 1000 / bucket) * bucket / 1000
     where = "tenant_id = ? AND kind = ? AND event_id >= ?::UUID AND event_id < ?::UUID"
-    params = [tenant, kind, v7_boundary(now - since), v7_boundary(math.floor(now))]
+    params = [tenant, kind, v7_boundary(now - since), v7_boundary(current)]
     if sensor is not None:
         where += " AND sensor_id = ?"
         params.append(int(sensor))
     last = "" if series else "QUALIFY row_number() OVER (PARTITION BY sensor_id ORDER BY t DESC) = 1"
-    sql = (f"WITH b AS (SELECT sensor_id, time_bucket(INTERVAL 1 SECOND, {TS}) AS t, avg(value) AS v, count(*) AS n "
+    sql = (f"WITH b AS (SELECT sensor_id, time_bucket(INTERVAL {bucket} MILLISECOND, {TS}) AS t, avg(value) AS v, count(*) AS n "
            f"FROM {TABLE} WHERE deleted_at IS NULL AND {where} GROUP BY ALL), "
            f"m AS (SELECT *, avg(v) OVER (PARTITION BY sensor_id ORDER BY t "
-           f"RANGE BETWEEN INTERVAL {window - 1} SECOND PRECEDING AND CURRENT ROW) AS ma FROM b) "
+           f"RANGE BETWEEN INTERVAL {window * 1000 - bucket} MILLISECOND PRECEDING AND CURRENT ROW) AS ma FROM b) "
            f"SELECT sensor_id, epoch_ms(t), round(v, 3), n, round(ma, 3) FROM m {last} ORDER BY sensor_id, t")
     r = card.query(sql, params)
-    return {"kind": kind, "window_s": window, "columns": ["sensor_id", "t_ms", "avg_1s", "n", "moving_avg"],
+    return {"kind": kind, "window_s": window, "bucket_ms": bucket, "columns": ["sensor_id", "t_ms", "avg", "n", "moving_avg"],
             "rows": [[num(x) for x in row] for row in r["rows"]]}
 
 

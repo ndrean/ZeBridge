@@ -47,6 +47,8 @@ $PY examples/09-event/ask.py alarms '{"kind": "temperature", "above": 30}'
 
 `provision.py teardown` drops the table.
 
+To see the curves, [`web/`](web/README.md) draws one sensor live in a browser: the 2 s wave in 100 ms buckets and its moving average.
+
 ## Part 1 — the emitter: publish a mutation
 
 A real sensor would sit behind MQTT or an HTTP gateway. To keep the example simple, `sensors.py` opens its own NATS connection with `nats-py` and publishes directly. It logs in as `bob`, a client of the tenant `globex`.
@@ -246,7 +248,7 @@ answer = take(lib.zb_client_request(h, b"query.globex.moving_avg", b'{"kind": "h
 | name | parameters | answer |
 | --- | --- | --- |
 | `freshness` | none | rows, `sum(value)`, the newest reading's time, and its age when answered |
-| `moving_avg` | `kind`, `window_s` 10, `since_s` 60, `sensor_id`, `series` | per sensor, 1 s buckets and their moving average; the latest point, or one sensor's series |
+| `moving_avg` | `kind`, `window_s` 10, `since_s` 60, `sensor_id`, `series`, `bucket_ms` 1000 | per sensor, buckets of `bucket_ms` (100 ms to 60 s) and their moving average over `window_s`; the latest point, or one sensor's series |
 | `per_minute` | `kind`, `minutes` 10 | per minute: readings, sensors, avg, min, max, stddev |
 | `alarms` | `kind`, `above` 30, `since_s` 60 | the sensors above a threshold: how many readings, the highest, the last |
 

@@ -54,7 +54,7 @@ const TAIL_INACTIVE_NS = 120 * 1_000_000_000;
 
 /// §10jc test hook: ZB_TEST_DROP_DELIVERY=N (Node only) discards every Nth delivery as if
 /// lost in transit. 0: off.
-const TEST_DROP_EVERY = Number((typeof process !== 'undefined' && process.env?.ZB_TEST_DROP_DELIVERY) || 0);
+const TEST_DROP_EVERY = Number((globalThis as any).process?.env?.ZB_TEST_DROP_DELIVERY || 0); // no Node types in a browser build
 let testDropCount = 0;
 import GRAMMAR_JSON from './grammar.json' with { type: 'json' };
 
