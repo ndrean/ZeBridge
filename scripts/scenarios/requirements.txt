@@ -3,3 +3,5 @@
 nats-py>=2.15
 nkeys>=0.2
 msgpack>=1.0
+# examples/09-event MQTT devices (mqtt_sensors.py): the plain MQTT client a device would use.
+paho-mqtt>=2.1

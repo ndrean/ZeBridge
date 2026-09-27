@@ -210,6 +210,21 @@ nsc add user --account ZEBRIDGE --name pois -K "$SK_RESPONDER" --tag "tenant:kil
 nsc add user --account ZEBRIDGE --name events -K "$SK_RESPONDER" --tag "tenant:globex" --tag "tenant:acme" \
     --tag "tenant:tango" --tag "tenant:kilo" 2>/dev/null || echo "events exists"
 
+# ── MQTT (examples/09-event, the `mqtt` block of nats-server-jwt.conf) ───────
+#
+# mqtt_globex: a DEVICE. MQTT cannot sign the server's nonce, so in operator mode the device
+# sends its JWT as the MQTT password (any non-empty user name) and the JWT must be a BEARER
+# token; MQTT connections only; it may publish its tenant's readings and nothing else
+# (topic sensors/globex/<sensor>/<kind> arrives as the subject sensors.globex.<sensor>.<kind>).
+# mqttgw: the GATEWAY (examples/09-event/mqtt_gateway.py) that turns those readings into
+# mutations, as itself. Both signed by the account IDENTITY key, like zbdoctor below: a
+# role-scoped signing key would replace these permissions with its template.
+nsc add user --account ZEBRIDGE --name mqtt_globex --bearer --allow-pub "sensors.globex.>" 2>/dev/null || echo "mqtt_globex exists"
+nsc edit user --account ZEBRIDGE --name mqtt_globex --conn-type MQTT >/dev/null 2>&1 || true
+nsc add user --account ZEBRIDGE --name mqttgw \
+    --allow-sub "sensors.globex.>" --allow-sub "mutation_ack.mqttgw.>" --allow-sub "_INBOX.mqttgw.>" \
+    --allow-pub "mutation.mqttgw.>" 2>/dev/null || echo "mqttgw exists"
+
 # ── the auditor: zbdoctor's own principal, read-only by construction ────────
 #
 # ⚠️ Minted WITHOUT -K, i.e. signed by the account IDENTITY key. Both signing
@@ -238,7 +253,7 @@ nsc add user --account ZEBRIDGE --name zbdoctor \
     --allow-pub "\$JS.API.DIRECT.GET.>" \
     --allow-sub "_INBOX.>" 2>/dev/null || echo "zbdoctor exists"
 
-for u in bridge alice bob mary nina omar guest pois events zbdoctor; do
+for u in bridge alice bob mary nina omar guest pois events mqtt_globex mqttgw zbdoctor; do
   nsc generate creds --account ZEBRIDGE --name "$u" > "$CREDS/$u.creds"
 done
 chmod 600 "$CREDS"/*.creds

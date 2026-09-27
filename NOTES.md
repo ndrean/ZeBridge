@@ -17021,3 +17021,25 @@ first and failed: the client's oldest-first attribution of messages to requests 
 After: delivery-loss PASS, 62/62 batches exact, 104 lost deliveries recovered, four kills.
 The phones never hit it at 2 MB because their CDC batches were small; the Mac's burst of
 ~100k rows/s makes the 256 KB batches that fill a request in eight messages.
+
+## §10jf — MQTT devices through nats-server, and a ban that outlives its revocation (2026-09-27)
+
+nats-server speaks MQTT 3.1.1 (`mqtt { port: 1883 }` in nats-server-jwt.conf). In operator
+mode a device cannot sign the nonce, so it sends a BEARER JWT as its password;
+`mqtt_globex` (MQTT connections only, publish `sensors.globex.>` only) and the gateway
+`mqttgw` are minted by jwt-bootstrap.sh with the account identity key. An MQTT publish
+cannot be a mutation (no headers, no envelope), so `examples/09-event/mqtt_gateway.py`
+listens on `sensors.globex.>` in a queue group and writes each reading as `mqttgw`, keyed by
+a UUIDv7 built from the device's `ts_ms`. Measured: 20 paho-mqtt devices at 1,000/s, newest
+reading 8 ms old at p50 (11 at p90) from the DEVICE's timestamp — the same as the direct
+NATS sensors; 140,000 rows exact across QoS 0 JSON and QoS 1 bare runs. A device
+publishing another tenant's topic: "Publish Violation", logged against its MQTT client id.
+
+**The revocation gap.** Tearing down the example deleted the `events` principal's last
+tenant mapping, which is how an operator revokes: the bridge published
+`mutation_ack.events.revoked`, which `MUTATIONS` retains for its 2 h max-age. Re-inserting
+the mapping did not lift it: the next event service read the retained ban at connect and
+hung up (`sync: Revoked`). Worked around by purging that one subject; the example's
+teardown now keeps its principals' mappings. Open: re-granting a revoked principal should
+lift the ban (the bridge purging `mutation_ack.<p>.revoked` when the first mapping comes
+back), or `--unrevoke` should exist; today a re-grant is a silent lockout for up to 2 h.

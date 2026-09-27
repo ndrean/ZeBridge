@@ -8,7 +8,7 @@ The example has three parts, and this page walks through them in order:
 2. **The backend** (PostgreSQL + the bridge + NATS): writes the row, answers the sender with a verdict, and publishes the row's change (CDC) to a stream.
 3. **The event service** (`event_service.py`): Python driving `libzbcore.dylib`, the libzb library. It keeps a DuckDB copy of the table and answers questions, all in one thread.
 
-A fourth script, `ask.py`, asks the questions.
+A fourth script, `ask.py`, asks the questions. Part 4 adds MQTT devices: nats-server speaks MQTT itself, and a small gateway turns their readings into rows.
 
 ```mermaid
 flowchart TD
@@ -45,7 +45,7 @@ $PY examples/09-event/ask.py per_minute '{"kind": "pressure", "minutes": 5}'
 $PY examples/09-event/ask.py alarms '{"kind": "temperature", "above": 30}'
 ```
 
-`provision.py teardown` drops the table.
+`provision.py teardown` drops the table. It keeps the service's and the gateway's tenant mappings: deleting a principal's last mapping revokes it, and the bridge's retained ban would lock out the next run's service.
 
 To see the curves, [`web/`](web/README.md) draws one sensor live in a browser: the 2 s wave in 100 ms buckets and its moving average.
 
@@ -242,6 +242,57 @@ ZB_DB=/tmp/events-2.duckdb $PY examples/09-event/event_service.py --label second
 ```python
 answer = take(lib.zb_client_request(h, b"query.globex.moving_avg", b'{"kind": "humidity"}', 5000))
 ```
+
+## Part 4 — MQTT devices
+
+Many sensors speak MQTT, not NATS. nats-server speaks MQTT 3.1.1 itself, so a device can publish to the same server with a stock MQTT client. Three pieces make that work.
+
+**The listener.** One block in the server's configuration (`scripts/native/nats-server-jwt.conf`); MQTT needs JetStream, which is already on:
+
+```text
+mqtt {
+  port: 1883
+}
+```
+
+**The device's credential.** In operator mode a NATS client proves who it is by signing a challenge from the server, and MQTT has no way to do that. So an MQTT device sends its JWT as the MQTT password, with any non-empty user name, and the JWT must be marked *bearer*. `jwt-bootstrap.sh` mints one per tenant; `mqtt_globex` may connect over MQTT only, and may only publish its tenant's readings:
+
+```sh
+nsc add user --account ZEBRIDGE --name mqtt_globex --bearer --allow-pub "sensors.globex.>"
+nsc edit user --account ZEBRIDGE --name mqtt_globex --conn-type MQTT
+```
+
+**The gateway.** The MQTT topic `sensors/globex/7/temperature` arrives in NATS as the subject `sensors.globex.7.temperature`, so any NATS subscriber sees it. It cannot be a mutation as it stands: MQTT carries no headers, and a mutation needs `Nats-Msg-Id` and a full row. `mqtt_gateway.py` listens on `sensors.globex.>` in a queue group and writes each reading as its own principal, `mqttgw`, which `provision.py` maps to globex:
+
+```python
+async def on_reading(m):                     # sensors.<tenant>.<sensor_id>.<kind>
+    _, tenant, sensor_id, kind = m.subject.split(".")
+    value, ms = reading(m.data, now_ms)      # a bare number, or {"value": v, "ts_ms": t}
+    eid = uuid7_at(ms)                       # the device's time becomes the row's key
+    await js.publish("mutation.mqttgw.sensor_events.insert",
+                     msgpack.packb({"key": {"event_id": str(eid)}, "data": row, "version": stamp}),
+                     headers={"Nats-Msg-Id": eid.hex})
+```
+
+The device sends either a bare number, stamped by the gateway on arrival, or JSON with its own time in milliseconds, which becomes the row's UUIDv7. From there the row takes the same path as the others: bridge, PostgreSQL, CDC, the DuckDB copy.
+
+```sh
+$PY examples/09-event/mqtt_gateway.py &                 # MQTT readings → mutations
+$PY examples/09-event/mqtt_sensors.py                   # 20 MQTT devices × 50/s, JSON with the device time
+$PY examples/09-event/mqtt_sensors.py --qos 1 --bare    # acknowledged delivery, bare numbers
+```
+
+Two layers keep tenants apart. A device that publishes another tenant's topic is refused by the server, which logs `Publish Violation - Subject "sensors.acme.7.temperature"` against the device's MQTT client id. The gateway may only subscribe to its own tenant's readings, and PostgreSQL's row-level security checks every row it writes.
+
+Measured on the same Mac, 20 MQTT devices at 1,000 readings/s for 60 s, each device on its own MQTT connection:
+
+| | direct NATS sensors | MQTT devices through the gateway |
+| --- | --- | --- |
+| readings written | 60,000 of 60,000 | 60,000 of 60,000 |
+| newest reading's age, p50 / p90 | 9 / 11 ms | 8 / 11 ms |
+| question round trip, p50 | 4.4 ms | 6.0 ms |
+
+The age is measured from the device's own timestamp, so the MQTT hop and the gateway together add nothing visible. The copy matched PostgreSQL exactly after both runs and a QoS 1 run with bare numbers: 140,000 rows, the same `sum(value)`.
 
 ## The queries
 
