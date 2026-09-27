@@ -102,6 +102,8 @@ async def main():
     ap.add_argument("--principal", default="bob")
     ap.add_argument("--creds", default="", help="default scripts/native/creds/<principal>.creds")
     ap.add_argument("--sensors", type=int, default=20)
+    ap.add_argument("--first-id", type=int, default=0, help="the first sensor_id: several processes, disjoint ids")
+    ap.add_argument("--ack-file", default="", help="also write every ack latency (ms), one per line, to merge runs")
     ap.add_argument("--period-ms", type=float, default=20.0)
     ap.add_argument("--seconds", type=float, default=60.0)
     ap.add_argument("--wave-s", type=float, default=2.0, help="the period of each sensor's cosine")
@@ -115,8 +117,9 @@ async def main():
     async def on_verdict(m):
         msg_id = m.subject.rsplit(".", 1)[-1]
         t = st.sent_at.pop(msg_id, None)
-        if t is not None:
-            st.ack_ms.append((time.monotonic() - t) * 1000)
+        if t is None:
+            return  # another process's write: every sensors.py of a principal hears all its verdicts
+        st.ack_ms.append((time.monotonic() - t) * 1000)
         try:
             status = json.loads(m.data).get("status", "?")
         except Exception:
@@ -130,7 +133,8 @@ async def main():
 
     start = time.monotonic()
     until = start + a.seconds
-    tasks = [asyncio.create_task(sensor(js, st, a.principal, i, a.period_ms / 1000, a.wave_s, until)) for i in range(a.sensors)]
+    tasks = [asyncio.create_task(sensor(js, st, a.principal, a.first_id + i, a.period_ms / 1000, a.wave_s, until))
+             for i in range(a.sensors)]
 
     async def report():
         while True:
@@ -146,6 +150,9 @@ async def main():
         await asyncio.sleep(0.1)
     rep.cancel()
     print("done  " + st.line(a.seconds), flush=True)
+    if a.ack_file:
+        with open(a.ack_file, "w") as f:
+            f.write("\n".join(f"{x:.3f}" for x in st.ack_ms))
     missing = st.sent - sum(st.verdicts.values())
     if missing:
         print(f"⚠️ {missing:,} writes without a verdict yet", flush=True)

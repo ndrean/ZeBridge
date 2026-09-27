@@ -269,6 +269,36 @@ The newest reading's age measures the whole path: sensor, NATS, bridge, PostgreS
 
 After both runs PostgreSQL and the DuckDB copy agreed exactly: 359,996 rows, the same `sum(value)`. One sensor's 1 s average swung by about a degree each second, as the 2 s wave predicts, while its moving average stayed within 0.3 of the base. That average held 11 buckets at the time, the off-by-one since fixed; 10 buckets hold exactly five waves, so the wave cancels fully.
 
+## The ramp: how far one Mac goes
+
+The bridge does not write one row per transaction. Each ingress **lane** pulls up to 64 mutations at once and applies them in one pipelined transaction, with one WAL flush; every mutation still sets its own principal, so row-level security holds per row. `ZB_INGRESS_LANES` (1 to 8, default 1) runs several lanes on the same stream, each with its own PostgreSQL and NATS connections.
+
+`ramp.sh N [seconds]` runs one step: N sensors, one `sensors.py` process per 100 sensors, plus `ask.py watch`. It merges the ack latencies of every write and samples the `MUTATIONS` backlog every 2 s:
+
+```sh
+examples/09-event/ramp.sh 400 30      # 400 sensors × 50/s = 20,000 readings/s for 30 s
+```
+
+Measured 2026-09-27, 30 s per step, the bridge built ReleaseFast and restarted with each lane count. Everything on one Mac (10 cores, 16 GB), the sensor processes included:
+
+| lanes | readings/s asked | accepted/s | refused | ack p50 / p99 | newest age p50 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 10,000 | 8,535 | 15% | 592 / 620 ms | 595 ms |
+| 2 | 10,000 | 10,000 | 0 | 4.9 / 14.8 ms | 10 ms |
+| 2 | 20,000 | 14,149 | 29% | 355 / 410 ms | 356 ms |
+| 4 | 20,000 | 20,000 | 0 | 11.4 / 59.1 ms | 17 ms |
+| 4 | 30,000 | 19,527 | 35% | 250 / 393 ms | 262 ms |
+| 8 | 30,000 | 22,681 | 24% | 216 / 331 ms | 212 ms |
+
+Reading it:
+
+* **Below a lane count's ceiling, nothing queues.** The backlog stays near zero and the newest reading is 10 to 17 ms old.
+* **Above it, the queue fills and then refuses.** The `MUTATIONS` stream keeps at most 5,000 waiting writes per subject (`MUTATION_BACKLOG_PER_PRINCIPAL`), and all the sensors write as `bob` on one subject. Once full, a publish is refused with code 503 (`maximum messages per subject exceeded`), and every accepted write waits behind a full queue: the ack and the newest age jump to hundreds of milliseconds together. The cap is per principal on purpose: one writer cannot flood the ingress for everyone else.
+* **One lane takes about 8,500 writes/s, two about 14,000, four about 19,500.** Eight reached 22,700 with the CPU at 0% idle: past four lanes the limit was the Mac, running PostgreSQL, NATS, the bridge, the service and six Python sensor processes at once.
+* **The DuckDB copy kept up at every step.** The service applied up to 22,900 changes/s, and after the whole ramp PostgreSQL and the copy agreed exactly: 3,515,172 rows, the same `sum(value)`.
+
+So 400 sensors at 50 readings a second, or 20,000 sensors at one a second, fit with four lanes on this machine. The same load from many principals would also spread the 5,000-write cap: it counts per subject, and the principal is in the subject.
+
 ## Compared with TimescaleDB
 
 | TimescaleDB | here |
