@@ -454,6 +454,17 @@ A seeded replica, then a 5 s burst at PostgreSQL's rate, then 90 s of sustained 
 
 An iPhone 12 with libzb stays live at 10k events/s and applies about 12k events/s. Above that it falls behind and converges once the load stops.
 
+#### Sensors to a DuckDB replica
+
+Simulated sensors write a reading every 20 ms through the bridge; a libzb service keeps a DuckDB replica and answers time-series questions (freshness, moving average, per-minute aggregates) over NATS ([examples/09-event](examples/09-event/README.md)). "Newest age" is how old the newest reading was when the service answered: the whole path from sensor to NATS, bridge, PostgreSQL, CDC and replica.
+
+| sensors | readings/s | writes accepted | write verdict p50 / p99 | newest age p50 | question round trip p50 |
+| --- | --- | --- | --- | --- | --- |
+| 20 | 1,000 | 60,000 of 60,000 | 1.8 / 3.0 ms | 9 ms | 4.4 ms |
+| 100 | 5,000 | 299,996 of 299,996 | 3.5 / 14.1 ms | 11 ms | 6.7 ms |
+
+After both runs the replica and PostgreSQL held the same 359,996 rows and the same sum of values.
+
 ## The daemon
 
 Once the DBA has migrated the Zebridge functions into Postgres, checked for the compliance of the database, configured NATS with the needed streams and buckets, you are ready to run ZeBridge, the first pillar of the architecture, a long running background process, connected to Postgres and to NATS.
