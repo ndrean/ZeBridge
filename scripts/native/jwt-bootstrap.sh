@@ -205,6 +205,8 @@ done
 nsc add user --account ZEBRIDGE --name guest -K "$SK_CLIENT" 2>/dev/null || echo "guest exists"
 # pois: the POI service (examples/08-map/poi_service.py), a responder for kilo and the open tenant.
 nsc add user --account ZEBRIDGE --name pois -K "$SK_RESPONDER" --tag "tenant:kilo" 2>/dev/null || echo "pois exists"
+# events: the sensor-events service (examples/09-event/event_service.py), a responder for globex.
+nsc add user --account ZEBRIDGE --name events -K "$SK_RESPONDER" --tag "tenant:globex" 2>/dev/null || echo "events exists"
 
 # ── the auditor: zbdoctor's own principal, read-only by construction ────────
 #
@@ -234,7 +236,7 @@ nsc add user --account ZEBRIDGE --name zbdoctor \
     --allow-pub "\$JS.API.DIRECT.GET.>" \
     --allow-sub "_INBOX.>" 2>/dev/null || echo "zbdoctor exists"
 
-for u in bridge alice bob mary nina omar guest pois zbdoctor; do
+for u in bridge alice bob mary nina omar guest pois events zbdoctor; do
   nsc generate creds --account ZEBRIDGE --name "$u" > "$CREDS/$u.creds"
 done
 chmod 600 "$CREDS"/*.creds
