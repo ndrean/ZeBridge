@@ -6,14 +6,13 @@
 /// from its DuckDB replica; PostgreSQL never sees the question. `zb.request` unpacks a
 /// compressed answer, or one stored as an object, by itself.
 ///
-///   ?principal=bob&tenant=globex   (default)      ?principal=alice&tenant=acme
+///   ?principal=bob   (its tenant, globex, by default)      ?principal=alice   (acme)
 ///
 /// A tenant's page can only ask about its own tenant: NATS refuses the publish otherwise.
 import { ZeBridge } from 'zb-client-ts';
 
 const qs = new URLSearchParams(location.search);
 const PRINCIPAL = qs.get('principal') ?? 'bob';
-const TENANT = qs.get('tenant') ?? 'globex';
 const KINDS = ['temperature', 'humidity', 'pressure'] as const;
 const UNITS = { temperature: '°C', humidity: '%', pressure: 'hPa' } as const;
 
@@ -35,7 +34,13 @@ const zb = new ZeBridge({
   ondemandTables: ['sensor_events'], // the schema, no rows: the page only asks
 });
 await zb.connect();
+// The principal's own tenant, from the `tenants` bucket, unless the URL asks for another —
+// which NATS refuses: a question can only be published for the asker's own tenant.
+const TENANT = qs.get('tenant') ?? zb.tenant;
 el('who').textContent = `${PRINCIPAL} · ${TENANT}`;
+const refusedHint = TENANT !== zb.tenant
+  ? ` ${PRINCIPAL} belongs to ${zb.tenant}: NATS refuses questions about ${TENANT}, so none reaches the service.`
+  : ' Is event_service.py running?';
 
 type Row = [number, number, number, number, number]; // sensor_id, t_ms, bucket avg, n, moving avg
 let series: Row[] = [];
@@ -60,10 +65,10 @@ async function askSeries() {
       window_s: Number(windowIn.value),
       bucket_ms: Number(bucketIn.value),
     });
-    if (ans?.error) statusEl.textContent = `moving_avg: ${ans.error}`;
+    if (ans?.error) statusEl.textContent = `moving_avg: ${ans.error}.${refusedHint}`;
     else { series = ans.rows as Row[]; lastAsk = { ms: performance.now() - t0, db: ans.ms }; }
   } catch (e) {
-    statusEl.textContent = `moving_avg: ${e}`;
+    statusEl.textContent = `moving_avg: no answer (${e}).${refusedHint}`;
   } finally {
     asking = false;
   }
@@ -71,12 +76,12 @@ async function askSeries() {
 }
 
 async function askFreshness() {
-  try { fresh = await zb.request(`query.${TENANT}.freshness`, {}); } catch { fresh = null; }
+  try { fresh = await zb.request(`query.${TENANT}.freshness`, {}); } catch (e) { fresh = { error: String(e) }; }
   const f = fresh && !fresh.error ? fresh : null;
   statusEl.textContent = f
     ? `${TENANT}: ${f.rows.toLocaleString()} readings · newest ${f.age_ms} ms old · ${f.last_10s_per_s.toLocaleString()} readings/s` +
       ` · chart question ${lastAsk.ms.toFixed(0)} ms round trip (${lastAsk.db} ms in DuckDB)`
-    : `freshness: ${fresh?.error ?? 'no answer — is event_service.py running?'}`;
+    : `freshness: no answer (${fresh?.error ?? 'none'}).${refusedHint}`;
 }
 
 // ── drawing ─────────────────────────────────────────────────────────────────

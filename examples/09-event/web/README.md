@@ -12,10 +12,10 @@ The event service and some sensors must be running (see [the example's README](.
 
 ```sh
 pnpm install --ignore-workspace     # the repo's pnpm-workspace.yaml lists no packages
-pnpm dev                            # http://localhost:5176/?principal=bob&tenant=globex
+pnpm dev                            # http://localhost:5176/?principal=bob
 ```
 
-`?principal=` and `?tenant=` pick who asks. A principal can only ask about its own tenant: `?principal=alice&tenant=acme` works, `?principal=alice&tenant=globex` is refused by NATS before the service sees it.
+`?principal=` picks who asks, and the page asks about that principal's own tenant (bob: globex, alice: acme). `?tenant=` can name another, to see the refusal: with `?principal=alice&tenant=globex` the footer reads "Permissions Violation for Publish to query.globex.moving_avg", because NATS refuses the question before the service sees it.
 
 The page talks only to its own origin, as in `08-map/web`: Vite proxies the NATS websocket at `/nats`, and `public/creds` is a symlink to `scripts/native/creds`.
 
