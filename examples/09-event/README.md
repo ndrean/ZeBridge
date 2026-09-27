@@ -2,13 +2,14 @@
 
 Simulated sensors send a reading every 20 ms. The readings are stored in PostgreSQL, copied to a DuckDB file, and a small service answers questions about them: how fresh is the data, what is the moving average, what happened each minute. PostgreSQL stores the rows and never runs one of those queries.
 
-The example has three parts, and this page walks through them in order:
+The example has four parts, and this page walks through them in order:
 
 1. **The emitter** (`sensors.py`): a plain NATS connection that publishes each reading as a *mutation*, a request to write a row.
 2. **The backend** (PostgreSQL + the bridge + NATS): writes the row, answers the sender with a verdict, and publishes the row's change (CDC) to a stream.
 3. **The event service** (`event_service.py`): Python driving `libzbcore.dylib`, the libzb library. It keeps a DuckDB copy of the table and answers questions, all in one thread.
+4. **MQTT devices** (`mqtt_sensors.py`, `mqtt_gateway.py`): the same readings from plain MQTT clients. nats-server speaks MQTT itself, and a small gateway turns each reading into a mutation.
 
-A fourth script, `ask.py`, asks the questions. Part 4 adds MQTT devices: nats-server speaks MQTT itself, and a small gateway turns their readings into rows.
+`ask.py` asks the questions, and [`web/`](web/README.md) draws them in a browser.
 
 ```mermaid
 flowchart TD
@@ -17,6 +18,8 @@ flowchart TD
     BE -->|" <br>mutation_ack.{principal}.msg_id<br>"| S
     ask.py --> |"query.{tenant}.{query_name}"| ES
     ES --> |answer<br>inbox| ask.py
+    M(mqtt_sensors.py<br>MQTT devices) --> |"<br>MQTT :1883<br>sensors/{tenant}/{sensor}/{kind}<br>"| GW(mqtt_gateway.py<br>readings to mutations)
+    GW --> |"<br>mutation.mqttgw.{table}.insert<br>"| BE
 
 ```
 
@@ -35,6 +38,13 @@ $PY examples/09-event/provision.py           # create the table; waits until the
 $PY examples/09-event/event_service.py &     # part 3: the DuckDB copy and the answers
 $PY examples/09-event/sensors.py &           # part 1: 20 sensors × 50 readings/s, for 60 s
 $PY examples/09-event/ask.py watch           # ask every second; prints the lag and a moving average
+```
+
+The same readings from MQTT devices instead of `sensors.py` (part 4; the dev nats-server listens for MQTT on port 1883):
+
+```sh
+$PY examples/09-event/mqtt_gateway.py &      # MQTT readings → mutations, as the principal mqttgw
+$PY examples/09-event/mqtt_sensors.py        # 20 MQTT devices × 50 readings/s, for 60 s
 ```
 
 One question at a time:
