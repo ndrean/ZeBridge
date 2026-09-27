@@ -17108,3 +17108,23 @@ a prefix. Separate processes so the bucket credentials live in the uploader alon
 upload never stalls a query. New in libzb: a declared schema per time table (no PostgreSQL
 catalogue), payload decoding and validation instead of the CDC envelope, the archive-first
 seed. PostgreSQL + the bridge join only when business data is replicated alongside.
+
+**Prior art (a web search the same day; READMEs and summaries read, no code run — a map,
+not a verdict).** The UPLOADER half exists several times over:
+* garm-ai/sink (github.com/garm-ai/sink) — NATS JetStream drained into micro-batched ZSTD
+  Parquet on S3-compatible storage, hive-partitioned so DuckDB reads it as is; batches of
+  250,000 rows or five minutes (ours: ~10 s).
+* Redpanda Connect, formerly Benthos (github.com/redpanda-data/connect) — a `nats_jetstream`
+  input, a `parquet_encode` processor with a declared schema, an `aws_s3` output.
+* Cloudflare Pipelines (developers.cloudflare.com/pipelines) — managed, on R2, Parquet or
+  Iceberg with SQL transforms; ingests over HTTP or Workers, not NATS.
+Around the QUERY side:
+* ingestr (getbruin.com/docs/ingestr/supported-sources/nats.html) — copies a JetStream
+  subject into a DuckDB file; batch ingestion, not a live-updating service.
+* Arc (news.ycombinator.com/item?id=45505407) — a time-series warehouse with DuckDB
+  analytics and its own ingest API; a central server, not an embedded library.
+Not found: one component that follows the live stream in exact order, seeds from the
+Parquet archive up to sequence N and continues from N+1, and answers operator-defined
+queries over NATS with tenancy enforced by subject permissions — the part libzb already
+mostly has. garm-ai/sink or Redpanda Connect could stand in for the uploader meanwhile,
+or serve as the comparison when ours is built.
