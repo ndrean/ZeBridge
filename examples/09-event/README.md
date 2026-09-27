@@ -10,19 +10,14 @@ The example has three parts, and this page walks through them in order:
 
 A fourth script, `ask.py`, asks the questions.
 
-```txt
-                ①  mutation.bob.sensor_events.insert
- sensors.py ─────────────────────────────────────────▶ ┌────────────────────────┐
-     ▲                                                 │  NATS  ◀──▶  bridge    │
-     └──────── ②  mutation_ack.bob.<msg_id> ────────── │               ▲  │     │
-                                                       │     WAL (CDC) │  │ SQL │
-                                                       │               │  ▼     │
-                                                       │         PostgreSQL     │
-                                                       └───────────┬────────────┘
-                ③  cdc.globex.sensor_events.insert                  │
- event_service.py ◀─────────────────────────────────────────────────┘
- (libzb + DuckDB)  ◀── ④  query.globex.<name> ──── ask.py
-                   ──── ⑤  answer, to ask.py's inbox ──▶
+```mermaid
+flowchart TD
+    BE(Backend) --> |"<br>cdc.{tenant}.{table}.insert<br>"| ES("event_service.py<br>Python in-process Duckdb<br>hardcoded query_names")
+    S(sensors.py<br>emitters) --> |"<br>mutation.{principal}.{table}.insert"<br> | BE
+    BE -->|" <br>mutation_ack.{principal}.msg_id<br>"| S
+    ask.py --> |"query.{tenant}.{query_name}"| ES
+    ES --> |answer<br>inbox| ask.py
+
 ```
 
 The data model follows TimescaleDB's [events-uuidv7](https://github.com/timescale/timescaledb/tree/main/docs/getting-started/events-uuidv7) walkthrough: each row's key is a UUIDv7, and a UUIDv7 carries the time it was made.
@@ -152,7 +147,8 @@ flowchart LR
     libzb -->|"connect, serve,<br>reply to the asker's inbox"| NATS
 ```
 
-`event_service.py` loads `libzbcore.dylib` with `ctypes`. Every libzb call takes a handle and JSON text, and returns JSON text that the caller frees with `zb_free`:
+`event_service.py` loads `libzbcore.dylib` with `ctypes`.
+Every libzb call takes a handle and JSON text, and returns JSON text that the caller frees with `zb_free`:
 
 ```python
 lib = ctypes.CDLL("libzb/zig-out/lib/libzbcore.dylib")
@@ -201,21 +197,27 @@ while True:
 And one of the queries, a 10-second moving average per sensor:
 
 ```python
+def v7_boundary(t):                  # the smallest UUIDv7 of a moment (epoch seconds)
+    h = f"{int(t * 1000):012x}"
+    return f"{h[:8]}-{h[8:12]}-7000-8000-000000000000"
+
 def moving_avg(card, q):
     return card.query("""
         WITH b AS (SELECT sensor_id,
                           time_bucket(INTERVAL 1 SECOND, uuid_extract_timestamp(event_id)) AS t,
                           avg(value) AS v
                    FROM sensor_events
-                   WHERE kind = ? AND uuid_extract_timestamp(event_id) >= now() - INTERVAL 60 SECOND
+                   WHERE kind = ? AND event_id >= ?::UUID
                    GROUP BY ALL)
         SELECT sensor_id, t, v,
                avg(v) OVER (PARTITION BY sensor_id ORDER BY t
                             RANGE BETWEEN INTERVAL 10 SECOND PRECEDING AND CURRENT ROW) AS moving_avg
-        FROM b""", [q.get("kind", "temperature")])
+        FROM b""", [q.get("kind", "temperature"), v7_boundary(time.time() - 60)])
 ```
 
-**Why one thread.** `poll` does two jobs: it writes the next batch of changes into DuckDB, and it hands over the questions that arrived. The loop then answers them before the next `poll`. Writes and reads never overlap, so no lock is needed. This also fits DuckDB, which allows only one process to write a file: the process that writes the copy is the one that reads it.
+The time filter compares the key itself with the smallest UUIDv7 of "60 seconds ago". It could extract the time from every key instead, `uuid_extract_timestamp(event_id) >= …`, and get the same rows, but slower: see [the boundary](#the-uuidv7-boundary) below.
+
+**Why one thread.** `poll` does two jobs: it writes the next batch of changes into DuckDB, and it hands over the questions that arrived. The loop then answers them before the next `poll`. Writes and reads never overlap, so no lock is needed. This also fits DuckDB, which **allows only one process to write a file**: the process that writes the copy is the one that reads it.
 
 **Where the answers go.** A question is a NATS request: the asker listens on a private inbox, and `reply` publishes the answer there as a plain message, not into a stream. libzb compresses the answer first. An answer over 256 KiB is stored as an object instead, and the reply carries its name; the asker's libzb fetches it without the asker noticing.
 
@@ -265,16 +267,29 @@ After both runs PostgreSQL and the DuckDB copy agreed exactly: 359,996 rows, the
 | `time_bucket` | DuckDB's `time_bucket` |
 | continuous aggregate | `per_minute`, recomputed on each question |
 | columnstore compression | DuckDB's own columnar storage |
-| `to_uuidv7_boundary` | none built in; a five-line macro does it (below) |
+| `to_uuidv7_boundary` | none built in; a small function does it (below) |
 | retention policy | a job that sets `deleted_at`; the sweeper removes the rows |
 | queries on the primary | queries on a copy; PostgreSQL only stores |
 
-DuckDB has no `to_uuidv7_boundary`. This macro builds the smallest UUIDv7 of a moment:
+### The UUIDv7 boundary
+
+TimescaleDB's `to_uuidv7_boundary(t)` gives the smallest UUIDv7 of a moment: its millisecond, then version 7, variant 10 and zeros. DuckDB has none, and the service cannot create a macro: `zb_client_query` runs reads only. So `event_service.py` builds the boundary in Python, `v7_boundary(t)` above, and binds it as a parameter. Building it from an epoch number also keeps time zones out of the comparison.
+
+Every time filter in the service is written `event_id >= ?::UUID`. DuckDB keeps a min and max key for each block of rows, so it can skip a whole block from those two numbers. A function of the key, such as `uuid_extract_timestamp(event_id) >= t`, hides them, and every row is read. The newest reading is found the same way, as `max(event_id)`, with the time extracted once.
+
+Measured on 20M synthetic readings, keeping the last 200k, both forms returning the same rows:
+
+| query | extracting the time | the boundary |
+| --- | --- | --- |
+| count and average | 19.3 ms | 1.3 ms |
+| 10 s moving average | 31.3 ms | 13.7 ms |
+
+The moving average gains less because its window still runs over every row that passes the filter. The gain relies on rows sitting in the file roughly in key order, which holds here: sensors mint their keys as they read, and the copy appends them as they arrive.
+
+Outside the service, in a DuckDB shell that can create objects, the same boundary is a macro:
 
 ```sql
 CREATE MACRO to_uuidv7_boundary(ts) AS (
   WITH h AS (SELECT lpad(printf('%x', epoch_ms(ts)), 12, '0') AS x)
   SELECT (x[1:8] || '-' || x[9:12] || '-7000-8000-000000000000')::UUID FROM h);
 ```
-
-Filtering with `event_id >= to_uuidv7_boundary(t)` instead of `uuid_extract_timestamp(event_id) >= t` lets DuckDB skip whole blocks of rows by their min and max key. On 20M rows it took a time filter from 51 ms to 4 ms.
