@@ -975,3 +975,36 @@ address space fails as OutOfMemory). A test for the locked form.
 
 **Verified**: `zig build test-unit` 136/136; libzb builds for `arm-linux-androideabi` with
 `-Dcpu=cortex_a7` (libzb itself needed no change); the Flutter app starts on the moto e20.
+
+## 26. A "Message Size Exceeds MaxBytes" end is routine (2026-09-27)
+
+**How it appeared**
+
+ZeBridge's delivery-loss test (a libzb follower, every 41st delivery discarded, killed four
+times under 20k events/s) stopped converging: the follower exited with
+`error: ConsumerSequenceMismatch` a few batches after recreating its consumer. A diagnostic
+printed every 409's Description: all 19 were "Message Size Exceeds MaxBytes". Since patch 21
+a request carries `max_bytes` (libzb: 2 MB) and CDC batch messages are up to 256 KB, so the
+server ends a request with that 409 every few messages — the routine end of a request, not a
+consumer problem. `fetch` mapped every 409 to `ConsumerSequenceMismatch` and returned it
+whenever it arrived before any message of the current fetch (the previous fetch took the
+request's messages; its 409 opened the next one).
+
+**Change** (`26-nats.zig-max-bytes-end.patch`)
+
+`src/jetstream.zig`: the request-sending loop moves into `sendRequests` so `fetch` can send
+one mid-loop. A 409 whose Description is "Message Size Exceeds MaxBytes" completes the batch
+when the fetch holds messages; with none, a replacement request goes out and the fetch keeps
+waiting — at most `max_bytes_empty_ends` (3) times in a row, because a message larger than
+`max_bytes` itself ends every request that way and re-asking would loop until the deadline.
+Every other 409 (Consumer Deleted, Exceeded MaxWaiting, …) is still an error.
+
+A first version told the cases apart per request (did the ended request deliver anything?)
+using the oldest-first attribution of patch 22: the diagnostic showed requests ending
+max-bytes with "nothing delivered" by that count, and the follower still exited. Which
+request a message answers is the server's business; the bounded count needs no guess.
+
+**Verified**: `zig build test-unit` passes; ZeBridge's delivery-loss test PASS — 62/62
+batches exact (1,282,000 rows), 104 deliveries lost and recovered, four kills, no
+`ConsumerSequenceMismatch` (before: the follower exited twice per run and the run never
+converged).

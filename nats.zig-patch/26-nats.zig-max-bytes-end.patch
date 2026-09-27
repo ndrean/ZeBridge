@@ -1,0 +1,109 @@
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+index 1ae1837..51a8dee 100644
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -433,6 +433,11 @@ const fetch_idle_after_first: Io.Timeout = .{ .duration = .{ .raw = .fromMillise
+ const request_grace: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(2000), .clock = .awake } };
+ 
+ /// One outstanding pull request of a `PullSubscription` (see `reqs`).
++/// Patch 26: how many "Message Size Exceeds MaxBytes" ends one fetch answers with a new
++/// request while it holds no message. A routine end is followed by messages at once; three
++/// in a row with nothing mean the next message is larger than `max_bytes` itself.
++const max_bytes_empty_ends: u8 = 3;
++
+ const PullRequest = struct {
+     reply: [160]u8 = undefined,
+     reply_len: usize = 0,
+@@ -625,18 +630,9 @@ pub const PullSubscription = struct {
+         }
+     }
+ 
+-    pub fn fetch(self: *PullSubscription, batch: usize, timeout: Io.Timeout) !MessageBatch {
+-        if (batch == 0) return error.InvalidBatchSize;
+-        // A shared inbox is read by `PullInbox.fetch` only: reading it here would
+-        // consume the other consumers' replies.
+-        if (!self.owns_inbox) return error.SharedInbox;
+-
+-        try self.mutex.lock(self.js.nc.io);
+-        defer self.mutex.unlock(self.js.nc.io);
+-
+-        // At most `pull_depth` requests outstanding (see `reqs`): a new one only while
+-        // fewer are open — delivered in full, ended with a status, or expired. The inbox
+-        // holds only what the open ones already sent, which this fetch collects first.
++    /// Sends pull requests while a slot is open (`pull_depth`, patch 23) — at the start of a
++    /// fetch, and again inside it when a request ended with room for another (patch 26).
++    fn sendRequests(self: *PullSubscription, batch: usize, timeout: Io.Timeout) !void {
+         while (self.wantsRequest()) {
+             self.fetch_id_counter += 1;
+             const new_reply = try std.fmt.allocPrint(self.js.nc.allocator, "{s}{d}", .{ self.inbox_prefix, self.fetch_id_counter });
+@@ -656,6 +652,21 @@ pub const PullSubscription = struct {
+             try self.js.nc.publishRequest(api_subject, new_reply, request_json);
+             self.requestStart(new_reply, batch, timeout.toDeadline(self.js.nc.io));
+         }
++    }
++
++    pub fn fetch(self: *PullSubscription, batch: usize, timeout: Io.Timeout) !MessageBatch {
++        if (batch == 0) return error.InvalidBatchSize;
++        // A shared inbox is read by `PullInbox.fetch` only: reading it here would
++        // consume the other consumers' replies.
++        if (!self.owns_inbox) return error.SharedInbox;
++
++        try self.mutex.lock(self.js.nc.io);
++        defer self.mutex.unlock(self.js.nc.io);
++
++        // At most `pull_depth` requests outstanding (see `reqs`): a new one only while
++        // fewer are open — delivered in full, ended with a status, or expired. The inbox
++        // holds only what the open ones already sent, which this fetch collects first.
++        try self.sendRequests(batch, timeout);
+         // Collect messages
+         var messages = std.ArrayList(*JetStreamMessage).empty;
+         defer messages.deinit(self.js.nc.allocator);
+@@ -663,6 +674,8 @@ pub const PullSubscription = struct {
+ 
+         var batch_complete = false;
+         var fetch_error: ?anyerror = null;
++        // Patch 26: max-bytes ends met with nothing in hand, in a row (see the 409 branch).
++        var empty_ends: u8 = 0;
+ 
+         // Convert the timeout to an absolute deadline so that receiving a
+         // message (or a heartbeat) does not re-arm the full timeout.
+@@ -735,8 +748,38 @@ pub const PullSubscription = struct {
+                     batch_complete = true;
+                     break;
+                 } else if (raw_msg.status_code == STATUS_MAX_BYTES) {
+-                    // Consumer sequence mismatch
++                    // ⚠️ 409 means several things; its Description says which. "Message
++                    // Size Exceeds MaxBytes" is the ROUTINE end of one request that carries
++                    // `max_bytes` (patch 21): the next message did not fit what the request
++                    // had left. At a 2 MB cap and 256 KB CDC batches that is every few
++                    // messages. Reported as an error it ended the caller's fetch with
++                    // `ConsumerSequenceMismatch` whenever it arrived before any message —
++                    // and a CLI follower exited on it (ZeBridge NOTES §10je). Now: with
++                    // messages in hand the batch is complete, as for the expiry; with none,
++                    // a replacement request goes out at once and the fetch keeps waiting.
++                    // A message larger than `max_bytes` itself ends EVERY request this way
++                    // with nothing delivered; re-asking would loop until the deadline. So a
++                    // fetch re-asks at most `max_bytes_empty_ends` times in a row with
++                    // nothing in hand, then reports it. (Telling the two apart per request
++                    // does not work: which request a message answers is the server's
++                    // business, and the client's oldest-first guess measured wrong.) Every
++                    // other 409 (Consumer Deleted, Exceeded MaxWaiting, …) stays an error.
++                    const routine = if (raw_msg.headerGet("Description")) |d|
++                        std.mem.eql(u8, std.mem.trim(u8, d, " \t"), "Message Size Exceeds MaxBytes")
++                    else
++                        false;
+                     raw_msg.deinit();
++                    if (routine) {
++                        if (messages.items.len > 0) {
++                            batch_complete = true;
++                            break;
++                        }
++                        if (empty_ends < max_bytes_empty_ends) {
++                            empty_ends += 1;
++                            try self.sendRequests(batch, timeout);
++                            continue;
++                        }
++                    }
+                     fetch_error = error.ConsumerSequenceMismatch;
+                     batch_complete = true;
+                     break;

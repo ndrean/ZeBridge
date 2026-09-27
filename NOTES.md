@@ -17004,3 +17004,20 @@ the default 100), `ZB_INGRESS_LANES` is read once into the runtime config, and p
 checks `limit ≥ lanes + 1 + 4`, warning with the `ALTER ROLE` to run — proven by booting 8
 lanes against the old 8 ("needs 13"). `connbudget.py` does the same arithmetic from the
 environment; PASS at 20, the bite test refusing 3 of 22.
+
+## §10je — a pull request's routine end was reported as an error (2026-09-27)
+
+The void delivery-loss run of §10jc, rerun with the 2 MB pull cap: the libzb follower exited
+with `ConsumerSequenceMismatch` a few batches after recreating its consumer, twice per run,
+and the harness waited for ever on a consumer that no longer existed. Every 409 the server
+sent was "Message Size Exceeds MaxBytes": with `max_bytes` on each request (patch 21) and
+256 KB CDC batches, a request ends that way every few messages. nats.zig mapped every 409
+to `ConsumerSequenceMismatch` and returned it when it arrived before the fetch held a
+message. nats.zig patch 26: that 409 ends the request, not the fetch — a new request goes
+out, at most three times in a row with nothing delivered (a message larger than the cap
+itself), and every other 409 stays an error. A per-request "did it deliver?" test was tried
+first and failed: the client's oldest-first attribution of messages to requests is a guess.
+
+After: delivery-loss PASS, 62/62 batches exact, 104 lost deliveries recovered, four kills.
+The phones never hit it at 2 MB because their CDC batches were small; the Mac's burst of
+~100k rows/s makes the 256 KB batches that fill a request in eight messages.
