@@ -13,7 +13,7 @@ flowchart LR
      subgraph VPN["VPN"]
         PG[("Postgres")]
         subgraph Localhost ["VPS"]
-            Bridge(("ZeBridge"))
+            Bridge(("daemon"))
             NATS[("NATS")]
         end
         PG <--> Bridge
@@ -24,9 +24,9 @@ flowchart LR
 
 
     subgraph Edge["Consumer"]
-        Lib(("libzb"))
+        Lib(("library"))
         SQL[("SQLite<br>PGlite/PG<br>DuckDB")]
-        App["mobile<br>browser<br>microVM"]
+        App["mobile<br>browser<br>service"]
         Lib <-->SQL
         Lib <-->App
 
@@ -37,7 +37,7 @@ flowchart LR
     style NATS fill:#10b981,stroke:#059669,color:#000
 ```
 
-**Local_DB supported flavours**: standard `SQLite`, `PGlite` or `PostgreSQL` and `DuckDB`.
+**Local_DB supported flavours**: standard `SQLite`, `PGlite` or `PostgreSQL` and optional `DuckDB` support.
 
 **How does it work?**: The bridge architecture is split into two core components: a daemon and a client library that makes syncing a breeze.
 
@@ -49,17 +49,17 @@ The `TS` library uses a push model for reactivity whilst the C ABI library uses 
 
 **Consumers**: The client library can be integrated across a wide range of runtime environments.
 
-* Mobile Native Apps: Utilizing native SQLite with file system storage: React Native running the TS or C library, Flutter running the C library with an SQLite replica.
-* Desktop apps: Flutter running the C library with an SQLite replica.
+* Mobile Native Apps: Utilizing native file system storage: React Native running the TypeScript or C ABI library, Flutter running the C ABI library, with an SQLite replica.
+* Desktop apps: Flutter running the C ABI library with an SQLite replica.
 * Browsers and Webapps: Leveraging OPFS support for SQLite-WASM or PGlite via the TS library.
-* Backend Services /  micro-VM: For example, a warm micro-VM  with the columnar in-process dataabase DuckDB following Postgres. A  subscribed client runs one query command and the micro-VM runs analytics, or geospatial or timebased queries against data synced from Postgres without reaching Postgres, and responds back via NATS. Zero cost for PostgreSQL, no PostGIS nor TiemScaleDB extension used, whilst running analytic, spatial and timebased queries in a synced fork.
+* Backend Services /  micro-VM: For example, a warm micro-VM  with the columnar in-process database DuckDB following Postgres. A  client runs one query command using the library and the micro-VM runs analytics, or geospatial or timebased queries against data synced from Postgres, without reaching Postgres, and responds back via NATS. Zero cost for PostgreSQL, no PostGIS nor TiemScaleDB extension used, whilst running analytic, spatial and timebased queries in a synced fork.
 
 **Design**: This tool is built to keep synchronized replicas of a large volume of small to medium consumers via the NATS message broker with small to medium Postgres databases.
 The daemon is engineered to be light (~4 MB executable), fast, secure, stateless with near instant startup.
 
 * **Performance**: On a machine with colocated Postgres, ZeBridge and NATS, you can expect to push sustained rates of 50-100k req/s into NATS, ready to be consumed. You can expect a sustained rate of 5-20k mut/s writes back to Postgres,  boundary scoped.
-The consumer's local database ingress/egress for events depends a lot upon your device. Values around 50k evt/s can be reached.
-The client library can seed at rates around 150-200k rows/s, and  it applies auto-streaming by chunks for large tables as we target constrained hosts.
+The consumer's local database ingress for events depends a lot upon your device. Values around 90k evt/s can be reached.
+The client library can seed at rates up to 100k rows/s, and  it applies auto-streaming by chunks for large tables as we target constrained hosts.
 The prefered topology is NATS over TLS instead of terminating TLS at a reverse-proxy. Every client can join NATS over TLS and NATS and Zebridge communicate over TLS too.
 Trust is earned. Test first. See [SPEED_TEST.md](#speed_test.md)
 * **Multiple instances**: run several instances of ZeBridge on the same Postgres publication, each with its own slot (and port). This enables you to follow large slow moving tables independently from small tables with heavy changes and optimize memory usage.
@@ -200,9 +200,9 @@ Two independent questions. **Which library** depends on whether the host can lin
 | host | library | artifact | needs installed |
 | -- | -- | -- | -- |
 | Flutter desktop | libzb, vendored | `.dylib` / `.so` | nothing |
-| a service in Python, Go, Rust, Zig… | libzb, vendored | `.dylib` / `.so` | only its own engine, if it uses one |
+| a service in Python, Go, Java, Elixir… | libzb, vendored | `.dylib` / `.so` | only its own engine, if it uses one |
 | React Native (iOS **and** Android) | zb-client-ts | — | nothing native |
-| browser, Node, Electron, Deno, Bun | zb-client-ts | — | nothing |
+| browser, Node, Electron, Bun, React Native | zb-client-ts | — | nothing |
 | native Swift on iOS | libzb, vendored | **static** `.a` | nothing |
 | native Kotlin on Android | libzb, vendored | **static** `.a`, linked into your JNI `.so` | nothing |
 
@@ -215,21 +215,16 @@ binary smaller. On a phone nothing is installed, so everything travels inside th
     # sqlite + zstd compiled IN
 ```
 
-`-Dvendor` compiles both from sources pinned by hash in `build.zig.zon`, so a build does
-not depend on what a package manager happens to have installed, and cross-compiles for
-whatever target is asked for. It costs about 1.8 MB.
+`-Dvendor` compiles both from sources pinned by hash in `build.zig.zon`, so a build does not depend on what a package manager happens to have installed, and cross-compiles for whatever target is asked for. It costs about 1.8 MB.
 
 Both phones take the **static** archive, for different reasons: iOS links archives or
-frameworks into the app, and on Android your own JNI shim is the `.so` with libzb linked
-into it. See `examples/08-map/native/README.md` for the exact commands, and NOTES §10ir.
+frameworks into the app, and on Android your own JNI shim is the `.so` with libzb linked into it.
+See `examples/08-map/native/README.md` for the exact commands, and NOTES §10ir.
 
-⚠️ Do not compare an archive against a shared library — 22 MB of `.a` is 4 MB once
-linked, for identical code. Object files keep every symbol, nothing is dead-stripped, and
-the linker pulls only what an app references.
+⚠️ Do not compare an archive against a shared library — 22 MB of `.a` is 4 MB once linked, for identical code. Object files keep every symbol, nothing is dead-stripped, and the linker pulls only what an app references.
 
 JavaScript hosts need no native build at all. That is why the React Native app in
-`examples/08-map/native` runs on both phones with one storage adapter and three small
-shims, while libzb was still learning to cross-compile.
+`examples/08-map/native` runs on both phones with one storage adapter and three small shims, while libzb was still learning to cross-compile.
 
 ### The complete setup steps at a glance
 
@@ -416,6 +411,10 @@ This can serve the following clients:
 Measured figures, not estimates. PostgreSQL, nats-server and the bridge run on one Mac; the phones reach it over home Wi-Fi. Every run ends with the replica checked against PostgreSQL (row count and a column sum, or batch by batch), and every run below was exact. The details and the harnesses are in NOTES §10ja–§10jc (`scripts/scenarios/`).
 
 #### PostgreSQL to NATS
+
+A Postgres CDC event takes ~5µs/event to land into a NATS stream through zebridge (all colocated, PG, zebridge, NATS, plain TCP).
+ZeBridge builds an image of a Postgres table at ~2.5µs/row into a NATS object storage: twice faster.
+The client builds his local table locally automatically via the client library.
 
 | what | measured |
 | --- | --- |

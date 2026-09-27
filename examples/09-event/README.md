@@ -250,9 +250,11 @@ answer = take(lib.zb_client_request(h, b"query.globex.moving_avg", b'{"kind": "h
 
 The newest reading's age measures the whole path: sensor, NATS, bridge, PostgreSQL, CDC, DuckDB. The newest reading comes from whichever sensor sent last, so the age adds at most the gap between two readings: about 1 ms with 20 sensors, 0.2 ms with 100.
 
-## Measured (2026-09-27)
+## First measurements
 
 **Test.** Two 60-second runs of `sensors.py`, one after the other: 20 sensors, then 100. Each sensor sends a reading every 20 ms, from its own random starting point within the period. On average that is one reading every 1 ms, then one every 200 µs. The second run did not reset anything: it started with the first run's 60,000 rows in PostgreSQL and in the DuckDB file.
+
+In the other test, we ramp up and use the parallelised threads.
 
 **Conditions.** Everything on one Mac: PostgreSQL 18, nats-server, the bridge, the service and the sensors.
 
@@ -270,6 +272,8 @@ The newest reading's age measures the whole path: sensor, NATS, bridge, PostgreS
 After both runs PostgreSQL and the DuckDB copy agreed exactly: 359,996 rows, the same `sum(value)`. One sensor's 1 s average swung by about a degree each second, as the 2 s wave predicts, while its moving average stayed within 0.3 of the base. That average held 11 buckets at the time, the off-by-one since fixed; 10 buckets hold exactly five waves, so the wave cancels fully.
 
 ## The ramp: how far one Mac goes
+
+Restart the bridge with  `ZB_INGRESS_LANES=1..8`.
 
 The bridge does not write one row per transaction. Each ingress **lane** pulls up to 64 mutations at once and applies them in one pipelined transaction, with one WAL flush; every mutation still sets its own principal, so row-level security holds per row. `ZB_INGRESS_LANES` (1 to 8, default 1) runs several lanes on the same stream, each with its own PostgreSQL and NATS connections.
 
