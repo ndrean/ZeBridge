@@ -9,11 +9,14 @@
 #     drop-every  ZB_TEST_DROP_DELIVERY: every Nth delivery discarded as lost (0 = kills only)
 #
 # The follower is SIGKILLed every 15 s during the load and restarted on the same replica.
+# ZB_FOLLOWER_URL (default nats://127.0.0.1:4222) points the follower elsewhere — e.g. the
+# Mac's LAN address, shaped by slowlink.sh, while the bridge stays on 127.0.0.1.
 # PASS: every batch's count and sum(age) equal PostgreSQL's.
 set -u
 R=$(cd "$(dirname "$0")/../.." && pwd); cd "$R"
 ZB=${1:-libzb/zig-out/rf/bin/zb}
 DROP=${2:-41}
+URL=${ZB_FOLLOWER_URL:-nats://127.0.0.1:4222}
 W=${ZB_RUN_DIR:-/tmp/zb-delivery-loss}; rm -rf "$W"; mkdir -p "$W"
 set -a; . ./.env.admin; . ./.env.bridge; set +a
 PY=scripts/scenarios/.venv/bin/python
@@ -21,10 +24,10 @@ $PY scripts/scenarios/phone_live.py setup --preload 200000 | tail -1
 follow() {
   if [ "$ZB" = ts ]; then
     (cd examples/04-node-consumer && ZB_TEST_DROP_DELIVERY=$DROP ZB_DB="$W/replica.sqlite3" ZB_CREDS="$R/scripts/native/creds/bob.creds" \
-      ZB_PRINCIPAL=bob ZB_TABLES=fire_types NATS_URL=nats://127.0.0.1:4222 \
+      ZB_PRINCIPAL=bob ZB_TABLES=fire_types NATS_URL="$URL" \
       exec node --experimental-strip-types follow-worker.ts < /dev/null >> "$W/zb.log" 2>&1) &
   else
-    ZB_TEST_DROP_DELIVERY=$DROP ZB_TAIL_TRACE=1 "$ZB" sync --creds scripts/native/creds/bob.creds --principal bob \
+    ZB_TEST_DROP_DELIVERY=$DROP ZB_TAIL_TRACE=1 "$ZB" sync --url "$URL" --creds scripts/native/creds/bob.creds --principal bob \
       --tables fire_types --db "$W/replica.sqlite3" --stream --poll-ms 200 >> "$W/zb.log" 2>&1 &
   fi
   echo $! > "$W/zb.pid"
