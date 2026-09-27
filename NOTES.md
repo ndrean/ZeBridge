@@ -17043,3 +17043,35 @@ hung up (`sync: Revoked`). Worked around by purging that one subject; the exampl
 teardown now keeps its principals' mappings. Open: re-granting a revoked principal should
 lift the ban (the bridge purging `mutation_ack.<p>.revoked` when the first mapping comes
 back), or `--unrevoke` should exist; today a re-grant is a silent lockout for up to 2 h.
+
+## §10jg — TODO: telemetry should not live in PostgreSQL (2026-09-27, design, not built)
+
+09-event writes every reading into PostgreSQL and mirrors it into DuckDB. For raw telemetry
+that is the wrong shape, and the owner and I agreed to keep it here as a future TODO.
+
+**The problem.** A replica is an exact mirror, so PostgreSQL cannot keep a short window while
+DuckDB keeps the history: retention deletes in PostgreSQL flow down as CDC and delete the
+same rows in every copy, and a partition drop or TRUNCATE makes the bridge cut a fresh base
+that wipes every copy. The chain also covers only what PostgreSQL still holds, so a new copy
+could never load older history. Meanwhile PostgreSQL is the costly part for telemetry: the
+mutation path takes ~20k writes/s here, and 20k/s is 1.7 billion rows a day in a row store,
+where DuckDB and Parquet compress it columnar.
+
+**What PostgreSQL adds on this path**: per-row authorization (RLS), one order (the WAL),
+deduplication with a verdict, and joins with business data. A JetStream stream already gives
+the order and the deduplication; for readings nobody edits that is most of it.
+
+**The direction: split by the kind of data.**
+* Business data (sensors, tenants, thresholds — edited, small) stays on PostgreSQL + the
+  bridge, as today.
+* Readings (append-only) go MQTT/NATS → a JetStream stream kept for hours → DuckDB services
+  that consume it in order, append in bulk, and roll Parquet files to object storage. A new
+  copy loads the Parquet archive, then follows the stream.
+* The DuckDB service holds both — the replicated registry and the streamed readings — so one
+  query joins them ("alarms for the sensors of building 7").
+
+**To build**: a libzb mode that follows a raw subject instead of CDC (ordered, deduplicated
+by stream sequence, bulk append), Parquet rolling and an archive-first seed; then 09-event
+shows both paths side by side. Alternative considered and set aside: an append-only table
+mode whose PostgreSQL retention is not replicated as deletes, plus Parquet-first seeding —
+it keeps PostgreSQL on the hot path and its write ceiling.
