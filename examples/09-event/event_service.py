@@ -136,6 +136,8 @@ def freshness(card: Card, q: dict) -> dict:
 
 def moving_avg(card: Card, q: dict) -> dict:
     kind = kind_of(q)
+    # window_s one-second buckets: the current one and window_s - 1 before it. A RANGE
+    # frame includes both ends, so "N SECOND PRECEDING" would hold N + 1 buckets.
     window = bounded(q, "window_s", 10, 1, 3600)   # inlined in the frame clause: validated as an int
     since = bounded(q, "since_s", 60, 1, 86400)
     sensor = q.get("sensor_id")
@@ -151,7 +153,7 @@ def moving_avg(card: Card, q: dict) -> dict:
     sql = (f"WITH b AS (SELECT sensor_id, time_bucket(INTERVAL 1 SECOND, {TS}) AS t, avg(value) AS v, count(*) AS n "
            f"FROM {TABLE} WHERE deleted_at IS NULL AND {where} GROUP BY ALL), "
            f"m AS (SELECT *, avg(v) OVER (PARTITION BY sensor_id ORDER BY t "
-           f"RANGE BETWEEN INTERVAL {window} SECOND PRECEDING AND CURRENT ROW) AS ma FROM b) "
+           f"RANGE BETWEEN INTERVAL {window - 1} SECOND PRECEDING AND CURRENT ROW) AS ma FROM b) "
            f"SELECT sensor_id, epoch_ms(t), round(v, 3), n, round(ma, 3) FROM m {last} ORDER BY sensor_id, t")
     r = card.query(sql, params)
     return {"kind": kind, "window_s": window, "columns": ["sensor_id", "t_ms", "avg_1s", "n", "moving_avg"],

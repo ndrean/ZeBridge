@@ -211,9 +211,11 @@ def moving_avg(card, q):
                    GROUP BY ALL)
         SELECT sensor_id, t, v,
                avg(v) OVER (PARTITION BY sensor_id ORDER BY t
-                            RANGE BETWEEN INTERVAL 10 SECOND PRECEDING AND CURRENT ROW) AS moving_avg
+                            RANGE BETWEEN INTERVAL 9 SECOND PRECEDING AND CURRENT ROW) AS moving_avg
         FROM b""", [q.get("kind", "temperature"), v7_boundary(time.time() - 60)])
 ```
+
+The window holds 10 one-second buckets: the current one and the 9 before it. A `RANGE` frame includes both ends, so `10 SECOND PRECEDING` would reach an 11th bucket; the service writes `window_s - 1`.
 
 The time filter compares the key itself with the smallest UUIDv7 of "60 seconds ago". It could extract the time from every key instead, `uuid_extract_timestamp(event_id) >= …`, and get the same rows, but slower: see [the boundary](#the-uuidv7-boundary) below.
 
@@ -246,18 +248,26 @@ answer = take(lib.zb_client_request(h, b"query.globex.moving_avg", b'{"kind": "h
 | `per_minute` | `kind`, `minutes` 10 | per minute: readings, sensors, avg, min, max, stddev |
 | `alarms` | `kind`, `above` 30, `since_s` 60 | the sensors above a threshold: how many readings, the highest, the last |
 
-The newest reading's age measures the whole path: sensor, NATS, bridge, PostgreSQL, CDC, DuckDB. Since the sensors send every 20 ms, the age also includes up to one period.
+The newest reading's age measures the whole path: sensor, NATS, bridge, PostgreSQL, CDC, DuckDB. The newest reading comes from whichever sensor sent last, so the age adds at most the gap between two readings: about 1 ms with 20 sensors, 0.2 ms with 100.
 
 ## Measured (2026-09-27)
 
-Everything on one Mac: PostgreSQL 18, nats-server, the bridge, the service and the sensors. Two 60-second runs in a row on the same copy. "Newest age" is sampled every second while the sensors write.
+**Test.** Two 60-second runs of `sensors.py`, one after the other: 20 sensors, then 100. Each sensor sends a reading every 20 ms, from its own random starting point within the period. On average that is one reading every 1 ms, then one every 200 µs. The second run did not reset anything: it started with the first run's 60,000 rows in PostgreSQL and in the DuckDB file.
 
-| sensors | readings/s | verdicts | ack p50 / p99 | newest age p50 / p90 | question round trip p50 |
+**Conditions.** Everything on one Mac: PostgreSQL 18, nats-server, the bridge, the service and the sensors.
+
+**How each number is taken:**
+
+* **Ack**: in `sensors.py`, for every write, the time from just before the publish to the bridge's verdict on `mutation_ack`. p50 is the median, p99 the time 99% of writes stayed under.
+* **Newest age**: in the service, when it answers `freshness`: its clock minus the millisecond in the newest key. `ask.py watch` asks once a second, about 60 samples per run, counting only samples where a new reading had arrived.
+* **Question round trip**: in `ask.py`, around each of those `freshness` requests: the question out, the service's work, the answer back.
+
+| sensors | readings/s | verdicts | ack p50 / p99 | newest age ("freshness") p50 / p90 | question round trip p50 |
 | --- | --- | --- | --- | --- | --- |
-| 20 | 1,000 | 60,000 accepted | 1.8 / 3.0 ms | 9 ms | 4.4 ms |
+| 20 | 1,000 | 60,000 accepted | 1.8 / 3.0 ms | 9 / 11 ms | 4.4 ms |
 | 100 | 5,000 | 299,996 accepted | 3.5 / 14.1 ms | 11 / 13 ms | 6.7 ms |
 
-After both runs PostgreSQL and the DuckDB copy agreed exactly: 359,996 rows, the same `sum(value)`. One sensor's 1 s average swung by about a degree each second, as the 2 s wave predicts, while its 10 s moving average stayed within 0.3 of the base.
+After both runs PostgreSQL and the DuckDB copy agreed exactly: 359,996 rows, the same `sum(value)`. One sensor's 1 s average swung by about a degree each second, as the 2 s wave predicts, while its moving average stayed within 0.3 of the base. That average held 11 buckets at the time, the off-by-one since fixed; 10 buckets hold exactly five waves, so the wave cancels fully.
 
 ## Compared with TimescaleDB
 
