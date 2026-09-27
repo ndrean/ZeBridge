@@ -17075,3 +17075,23 @@ by stream sequence, bulk append), Parquet rolling and an archive-first seed; the
 shows both paths side by side. Alternative considered and set aside: an append-only table
 mode whose PostgreSQL retention is not replicated as deletes, plus Parquet-first seeding —
 it keeps PostgreSQL on the hot path and its write ceiling.
+
+**Refined the same day (the owner's design): no PostgreSQL round trip at all for readings.**
+Sensor → NATS (MQTT :1883 or :4222) → a JetStream stream → DuckDB services. PostgreSQL leaves
+the telemetry path; the chain's pattern (periodic snapshot + live stream) moves to Parquet:
+* A background ARCHIVER (one writer: a durable consumer or a leader) rolls the stream into
+  Parquet every ~10 s into an S3/R2 bucket, under `tenant=/date=/hour=` prefixes, each file
+  named with its stream-sequence range. A compaction job merges them hourly, then daily
+  (10 s files are 8,640 per tenant per day). Bucket credentials stay with the archiver.
+* A REGISTRY entry per time table — `time_tables: [{"table": "sensor_events", "url":
+  "https://r2…", "schema": …, "archived_to_seq": N}]`, in a NATS KV bucket or a catalogue
+  row — tells a starting service where the history is.
+* A starting SERVICE loads the Parquet up to sequence N, then follows the stream from N+1:
+  no gap, no duplicate, the chain's cutoff rule. The stream must keep more than a few
+  archive periods (the "window ≥ 2 × cadence" inequality again).
+* Authorization moves wholly to NATS subjects (a device publishes only its tenant's
+  subject — proven over MQTT in §10jf); the consumer validates payloads and dead-letters
+  bad ones, since no PostgreSQL constraint is left to refuse them.
+* The live path shrinks from five hops (sensor, NATS, bridge, PostgreSQL, CDC) to two.
+Business data (sensor registry, tenants, thresholds) stays on PostgreSQL + the bridge, and
+the DuckDB service joins the two.
