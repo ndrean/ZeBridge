@@ -17139,3 +17139,15 @@ it as one HTTPS `PUT` — S3 and R2 are HTTPS APIs. Authorize it either by signi
 uploader (AWS Signature V4: HMAC-SHA256 over the request, Zig std) or, better, with
 short-lived PRE-SIGNED URLs issued by a trusted service per object path, so the uploader
 holds no long-lived bucket credential. libzb then needs no DuckDB extension at all.
+
+**…in chunks for the large files (the owner's correction).** A compacted hourly or daily
+file runs to hundreds of MB or more: it goes up as an S3/R2 MULTIPART upload —
+`CreateMultipartUpload` (an upload id), `UploadPart` per chunk (≥ 5 MiB except the last, at
+most 10,000 parts), `CompleteMultipartUpload` (the object appears only then, whole), or
+`AbortMultipartUpload`. The uploader streams parts as DuckDB writes the file, holds bounded
+memory, and retries one failed part rather than the file — what a flaky link needs. The
+object not existing until Complete is also the handoff's atomicity: a starting service
+never sees a half-uploaded compacted file, and the registry moves after Complete. Pre-signed
+URLs still apply, one per part number. The ~10 s rolling files (hundreds of KB at
+1,000 readings/s) stay single PUTs: below the 5 MiB minimum part. (Limits from the S3 API
+as known, not re-checked against current R2 docs.)
