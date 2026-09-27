@@ -100,3 +100,5 @@ __pycache__/
 
 # Lockfiles stay local (2026-09-26): every example and package regenerates its own with pnpm install.
 pnpm-lock.yaml
+examples/08-map/prix-des-carburants-en-france-flux-instantane-v2.csv
+zb.sqlite*
