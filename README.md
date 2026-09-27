@@ -58,7 +58,7 @@ The `TS` library uses a push model for reactivity whilst the C ABI library uses 
 The daemon is engineered to be light (~4 MB executable), fast, secure, stateless with near instant startup.
 
 * **Performance**: On a machine with colocated Postgres, ZeBridge and NATS, you can expect to push sustained rates of 50-100k req/s into NATS, ready to be consumed. You can expect a sustained rate of 5-20k mut/s writes back to Postgres,  boundary scoped.
-The consumer's local database ingress for events depends a lot upon your device. Values around 90k evt/s can be reached.
+The consumer's local database ingress for events depends a lot upon your device. Values around 50k evt/s can be reached.
 The client library can seed at rates up to 100k rows/s, and  it applies auto-streaming by chunks for large tables as we target constrained hosts.
 The prefered topology is NATS over TLS instead of terminating TLS at a reverse-proxy. Every client can join NATS over TLS and NATS and Zebridge communicate over TLS too.
 Trust is earned. Test first. See [SPEED_TEST.md](#speed_test.md)
