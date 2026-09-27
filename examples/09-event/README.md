@@ -97,6 +97,18 @@ This part runs on its own; the example only creates the table. For each mutation
 4. It answers on `mutation_ack.bob.<msg_id>`: `accepted`, `stale`, `rejected`, and so on.
 5. PostgreSQL's write-ahead log (WAL) records the new row. The bridge reads it through a replication slot and publishes the change on `cdc.globex.sensor_events.insert` in the stream `CDC_globex`. Several rows can share one message (the `.batch` subject).
 
+**tenant: globex**
+
+```mermaid
+flowchart LR
+    N[(NATS)] -->|"MUTATIONS stream<br>mutation.{principal}.{table}.insert"| B[bridge]
+    B -->|"INSERT … ON CONFLICT<br>RLS: tenant_id = f(principal)"| P[("Postgres<br>tbl: sensor_events<br>pub: my_pub")]
+    P -.-> WAL("WAL<br>slot: my_slot")
+    WAL -->|CDC| B
+    B -->|"MUTATIONS stream<br>mutation_ack.{principal}.{msg_id}"| N
+    B -->|"CDC_{tenant} stream<br>cdc.{tenant}.{table}.{op}"| N
+```
+
 The bridge also cuts a **chain** every few minutes: compressed snapshots and deltas of the table in a NATS object store. A new replica loads the chain first, then follows the stream from where the chain ends.
 
 The table, created by `provision.py`:
@@ -111,8 +123,14 @@ CREATE TABLE public.sensor_events (
     updated_at timestamptz NOT NULL DEFAULT now(), -- the version: the newer write wins
     deleted_at timestamptz                         -- set instead of deleting the row
 );
-SELECT zebridge_enable('public.sensor_events', tenant_col => 'tenant_id', writable => true,
-    version_col => 'updated_at', tombstone_col => 'deleted_at', publication => 'my_pub', dry_run => false);
+SELECT zebridge_enable('public.sensor_events',
+    tenant_col => 'tenant_id',
+    writable => true,
+    version_col => 'updated_at',
+    tombstone_col => 'deleted_at',
+    publication => 'my_pub',
+    dry_run => false
+);
 ```
 
 `zebridge_enable` does the setup: grants, row-level security, the index the bridge needs, the catalogue row, and adding the table to the publication. `provision.py` also maps the service's principal `events` to `globex`, so libzb knows which tenant it follows.
@@ -122,6 +140,17 @@ There is no timestamp column. PostgreSQL 18 and DuckDB both read the time back w
 `deleted_at` is the tombstone. A retention job would set it on old readings. The delete then travels like any other change, and the bridge's sweeper removes the row later.
 
 ## Part 3 — the event service: libzb from Python
+
+```mermaid
+flowchart LR
+    subgraph ES [Python event service, one thread]
+        PY[Python loop] -->|"sync, serve, poll,<br>query, reply"| libzb
+        libzb -->|"sync: seed from the chain<br>poll: apply a CDC batch"| DDB[(DuckDB)]
+        DDB -->|query: rows| libzb
+    end
+    NATS -->|"chain, CDC batches,<br>questions"| libzb
+    libzb -->|"connect, serve,<br>reply to the asker's inbox"| NATS
+```
 
 `event_service.py` loads `libzbcore.dylib` with `ctypes`. Every libzb call takes a handle and JSON text, and returns JSON text that the caller frees with `zb_free`:
 
