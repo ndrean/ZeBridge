@@ -17128,3 +17128,14 @@ Parquet archive up to sequence N and continues from N+1, and answers operator-de
 queries over NATS with tenancy enforced by subject permissions — the part libzb already
 mostly has. garm-ai/sink or Redpanda Connect could stand in for the uploader meanwhile,
 or serve as the comparison when ours is built.
+
+**Shipping the files: DuckDB makes them, plain HTTPS ships them (checked the same day).**
+`parquet` is built into DuckDB (STATICALLY_LINKED); `httpfs` is NOT in the Homebrew
+libduckdb that libzb links (no httpfs symbols) — on the dev Mac it loads from a copy
+downloaded once into `~/.duckdb/extensions/v1.5.5/osx_arm64/`. A fresh server, container or
+phone would download it at first use: offline it fails, and it depends on DuckDB's extension
+site. So the uploader writes each Parquet file locally (`COPY … TO`, no extension) and sends
+it as one HTTPS `PUT` — S3 and R2 are HTTPS APIs. Authorize it either by signing in the
+uploader (AWS Signature V4: HMAC-SHA256 over the request, Zig std) or, better, with
+short-lived PRE-SIGNED URLs issued by a trusted service per object path, so the uploader
+holds no long-lived bucket credential. libzb then needs no DuckDB extension at all.
