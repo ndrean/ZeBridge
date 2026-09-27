@@ -24,7 +24,8 @@ TABLE, TENANT = "sensor_events", "globex"
 
 
 class Asker:
-    def __init__(self, url: str, creds: str, principal: str, db: str):
+    def __init__(self, url: str, creds: str, principal: str, db: str, tenant: str = TENANT):
+        self.tenant = tenant
         lib = ctypes.CDLL(str(LIB))
         lib.zb_free.argtypes = [ctypes.c_void_p]
         lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
@@ -46,7 +47,7 @@ class Asker:
 
     def ask(self, name: str, payload: dict, timeout_ms: int = 5000) -> tuple[dict, float]:
         t0 = time.perf_counter()
-        ans = self.take(self.lib.zb_client_request(self.h, f"query.{TENANT}.{name}".encode(), json.dumps(payload).encode(), timeout_ms))
+        ans = self.take(self.lib.zb_client_request(self.h, f"query.{self.tenant}.{name}".encode(), json.dumps(payload).encode(), timeout_ms))
         return ans, (time.perf_counter() - t0) * 1000
 
     def close(self):
@@ -95,13 +96,14 @@ def main():
     ap.add_argument("payload", nargs="?", default="{}", help="the question's parameters, JSON")
     ap.add_argument("--url", default=os.environ.get("NATS_URL", "nats://127.0.0.1:4222"))
     ap.add_argument("--principal", default="bob")
+    ap.add_argument("--tenant", default=TENANT, help="the tenant to ask about (the principal's own; NATS refuses another)")
     ap.add_argument("--creds", default="", help="default scripts/native/creds/<principal>.creds")
     ap.add_argument("--db", default="/tmp/events-asker.sqlite3", help="the asker's own (empty) local store")
     ap.add_argument("--seconds", type=float, default=60, help="watch: how long")
     ap.add_argument("--every", type=float, default=1.0, help="watch: seconds between samples")
     ap.add_argument("--sensor", type=int, default=0, help="watch: the sensor whose moving average is shown")
     a = ap.parse_args()
-    asker = Asker(a.url, a.creds or str(ROOT / "scripts/native/creds" / f"{a.principal}.creds"), a.principal, a.db)
+    asker = Asker(a.url, a.creds or str(ROOT / "scripts/native/creds" / f"{a.principal}.creds"), a.principal, a.db, a.tenant)
     try:
         if a.query == "watch":
             watch(asker, a.seconds, a.every, a.sensor)

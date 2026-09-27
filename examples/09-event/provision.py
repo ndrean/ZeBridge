@@ -21,6 +21,9 @@ PSQL = os.environ.get("PSQL", "/opt/homebrew/opt/postgresql@18/bin/psql")
 ADMIN_URL = os.environ.get("ADMIN_DATABASE_URL", "postgres://postgres@127.0.0.1:5432/postgres")
 TABLE, TENANT = "sensor_events", "globex"
 SERVICE = "events"  # the responder principal of event_service.py
+# The tenants the service answers for: the four client tenants of the dev stack (bob and
+# mary globex, alice acme, nina tango, omar kilo). Its credential carries one tag per tenant.
+SERVICE_TENANTS = ("globex", "acme", "tango", "kilo")
 NATS = ["nats", "--creds", str(ROOT / "scripts/native/creds/bridge.creds"), "--inbox-prefix", "_INBOX.bridge",
         "-s", os.environ.get("NATS_URL", "nats://127.0.0.1:4222")]
 BRIDGE_LOG = ROOT / "scripts/native/bridge.log"
@@ -61,7 +64,8 @@ def setup():
     # The service's principal needs its tenant, like any reader of a tenant-scoped table:
     # NATS lets `events` in (its credential's tag), this row tells libzb which tenant it
     # follows (it reaches the `tenants` KV bucket through the WAL).
-    psql(f"INSERT INTO public.zebridge_user_tenants (principal, tenant_id) VALUES ('{SERVICE}', '{TENANT}') ON CONFLICT DO NOTHING")
+    rows = ", ".join(f"('{SERVICE}', '{t}')" for t in SERVICE_TENANTS)
+    psql(f"INSERT INTO public.zebridge_user_tenants (principal, tenant_id) VALUES {rows} ON CONFLICT DO NOTHING")
     print(f"{TABLE}: created on {TENANT}, writable; waiting for its first chain (up to one cadence)…", flush=True)
     # Ready = a chain whose seed epoch equals the table descriptor's, unchanged for 15 s:
     # the table's own DDL events can still move the epoch just after the first cut.
@@ -86,7 +90,7 @@ def setup():
 
 def teardown():
     psql(f"DROP TABLE IF EXISTS public.{TABLE}")
-    psql(f"DELETE FROM public.zebridge_user_tenants WHERE principal = '{SERVICE}' AND tenant_id = '{TENANT}'")
+    psql(f"DELETE FROM public.zebridge_user_tenants WHERE principal = '{SERVICE}'")
     print(f"{TABLE} dropped; the bridge prunes its catalogue row and chain", flush=True)
 
 

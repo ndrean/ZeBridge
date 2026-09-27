@@ -184,13 +184,13 @@ card = Card(lib, {"natsUrl": "nats://127.0.0.1:4222",
 card.sync()
 
 # 3. Announce the questions this service answers, in the queue group "events".
-card.serve(["globex"], ["alarms", "freshness", "moving_avg", "per_minute"], "events")
+card.serve(["globex", "acme", "tango", "kilo"], ["alarms", "freshness", "moving_avg", "per_minute"], "events")
 
 # 4. The loop. One thread does everything, one step at a time.
 while True:
     report = card.poll(50)          # apply the next CDC batch to DuckDB (or wait ≤ 50 ms)
     for q in report.get("requests", []):                   # questions that arrived meanwhile
-        answer = QUERIES[q["name"]](card, q["payload"])    # each runs card.query(sql, params)
+        answer = QUERIES[q["name"]](card, q["tenant"], q["payload"])  # the tenant: from the subject
         card.reply(q["id"], answer)                        # back to the asker
 ```
 
@@ -201,21 +201,23 @@ def v7_boundary(t):                  # the smallest UUIDv7 of a moment (epoch se
     h = f"{int(t * 1000):012x}"
     return f"{h[:8]}-{h[8:12]}-7000-8000-000000000000"
 
-def moving_avg(card, q):
+def moving_avg(card, tenant, q):
     return card.query("""
         WITH b AS (SELECT sensor_id,
                           time_bucket(INTERVAL 1 SECOND, uuid_extract_timestamp(event_id)) AS t,
                           avg(value) AS v
                    FROM sensor_events
-                   WHERE kind = ? AND event_id >= ?::UUID
+                   WHERE tenant_id = ? AND kind = ? AND event_id >= ?::UUID
                    GROUP BY ALL)
         SELECT sensor_id, t, v,
                avg(v) OVER (PARTITION BY sensor_id ORDER BY t
                             RANGE BETWEEN INTERVAL 9 SECOND PRECEDING AND CURRENT ROW) AS moving_avg
-        FROM b""", [q.get("kind", "temperature"), v7_boundary(time.time() - 60)])
+        FROM b""", [tenant, q.get("kind", "temperature"), v7_boundary(time.time() - 60)])
 ```
 
 The window holds 10 one-second buckets: the current one and the 9 before it. A `RANGE` frame includes both ends, so `10 SECOND PRECEDING` would reach an 11th bucket; the service writes `window_s - 1`.
+
+The first filter is the tenant. One DuckDB file holds every tenant the service follows, and the tenant comes from the subject the question arrived on, `query.<tenant>.<name>`, which NATS only lets an asker publish for its own tenant. Never from the payload: that is whatever the asker wrote.
 
 The time filter compares the key itself with the smallest UUIDv7 of "60 seconds ago". It could extract the time from every key instead, `uuid_extract_timestamp(event_id) >= …`, and get the same rows, but slower: see [the boundary](#the-uuidv7-boundary) below.
 
@@ -229,7 +231,7 @@ The time filter compares the key itself with the smallest UUIDv7 of "60 seconds 
 ZB_DB=/tmp/events-2.duckdb $PY examples/09-event/event_service.py --label second
 ```
 
-**The credential.** `events` is a *responder*: it can read `globex` like a client and answer `globex` questions, but it cannot write.
+**The credential.** `events` is a *responder*: it can read its tenants like a client and answer their questions, but it cannot write. Its NATS credential carries one tag per tenant (globex, acme, tango, kilo), and `provision.py` maps it to the same tenants in PostgreSQL, which is how libzb knows what to follow.
 
 ### Asking
 
@@ -301,7 +303,26 @@ Reading it:
 * **One lane takes about 8,500 writes/s, two about 14,000, four about 19,500.** Eight reached 22,700 with the CPU at 0% idle: past four lanes the limit was the Mac, running PostgreSQL, NATS, the bridge, the service and six Python sensor processes at once.
 * **The DuckDB copy kept up at every step.** The service applied up to 22,900 changes/s, and after the whole ramp PostgreSQL and the copy agreed exactly: 3,515,172 rows, the same `sum(value)`.
 
-So 400 sensors at 50 readings a second, or 20,000 sensors at one a second, fit with four lanes on this machine. The same load from many principals would also spread the 5,000-write cap: it counts per subject, and the principal is in the subject.
+So 400 sensors at 50 readings a second, or 20,000 sensors at one a second, fit with four lanes on this machine.
+
+### Several tenants
+
+The same ramp with the writers spread over tenants: `PRINCIPALS` lists principal:tenant pairs, one sensor process each, and the service answers every tenant from one DuckDB file. Each question is filtered on the tenant in its subject, and NATS refuses a question about another tenant: alice asking `query.globex.freshness` gets a permissions violation before anything reaches the service.
+
+```sh
+PRINCIPALS=bob:globex,alice:acme,nina:tango,omar:kilo examples/09-event/ramp.sh 400
+```
+
+Four lanes, 30 s per step, each run ending with a per-tenant check of the copy against PostgreSQL:
+
+| writers | readings/s asked | accepted/s | refused | ack p50 / p99 | newest age p50 | largest queue |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4 principals, 4 tenants | 20,000 | 20,000 | 0 | 12.6 / 62.7 ms | 40 ms | 459 |
+| 5 principals, 4 tenants | 25,000 | 21,605 | 14% | 1,173 / 1,279 ms | 1,208 ms | 24,744 |
+
+* **Below the ceiling, tenants cost a little lag, not throughput.** 20,000 writes/s were absorbed as with one tenant, but the newest reading was 40 ms old instead of 17: the service drains four CDC streams in its one loop.
+* **Above it, principals trade refusals for delay.** Each principal has its own 5,000-write queue, so five of them hold up to 25,000 waiting writes. One principal at 30,000/s had 35% refused and waited about 250 ms; five principals at 25,000/s had 14% refused but waited about 1.2 s. The queue is the deployment's choice: `MUTATION_BACKLOG_PER_PRINCIPAL` sets its depth.
+* **Every tenant ended exact**, at both steps.
 
 ## Compared with TimescaleDB
 

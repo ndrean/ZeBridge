@@ -5,13 +5,18 @@
     ZB_DB=/tmp/events-2.duckdb scripts/scenarios/.venv/bin/python examples/09-event/event_service.py --label second
 
 One process, one connection, one loop, as in 08-map. libzb follows `sensor_events` into a
-DuckDB file (the seed from the chain, then CDC) and answers `query.globex.<name>` in the
-queue group "events" from that same file. The process that writes the replica is the one
+DuckDB file (the seed from the chain, then CDC) and answers `query.<tenant>.<name>` in the
+queue group "events" from that same file, for every tenant in `--tenants`. The process that writes the replica is the one
 that reads it: DuckDB allows one writer per file, and nothing else ever opens it. A second
 instance (its own file) joins the queue group and the server spreads the questions.
 
-The credential is `events`, a RESPONDER: it reads globex like a client and may answer its
-queries, but cannot write (scripts/native/jwt-bootstrap.sh mints it, tag tenant:globex).
+The credential is `events`, a RESPONDER: it reads its tenants like a client and may answer
+their queries, but cannot write (scripts/native/jwt-bootstrap.sh mints it, one tag per
+tenant; provision.py maps it to them in PostgreSQL).
+
+⚠️ One file holds every tenant's rows, so every query filters on the tenant the question
+arrived on — `query.<tenant>.…`, a subject NATS let the asker publish to, never a field of
+the payload. A query without that filter would answer acme's question with globex's data.
 
 What TimescaleDB does with a hypertable and a continuous aggregate, this does on the
 replica with plain SQL. The reading's time is its key (`uuid_extract_timestamp(event_id)`,
@@ -19,9 +24,8 @@ a UUIDv7). The queries, the parameters the asker sends, and what comes back:
 
   freshness   {}
       → rows, sum(value) (to check the replica against PostgreSQL), the newest reading's
-        time, and its age when the question was answered: with
-        sensors writing every 20 ms, that age is the pipeline's lag (sensor → NATS → bridge
-        → PostgreSQL → CDC → replica), plus at most one period
+        time, and its age when the question was answered: the pipeline's lag (sensor →
+        NATS → bridge → PostgreSQL → CDC → replica), plus at most the gap between two readings
   moving_avg  {"kind": "temperature", "window_s": 10, "since_s": 60, "sensor_id": null, "series": false}
       → per sensor, one-second buckets and the average over the last window_s seconds of
         buckets; the latest point per sensor, or the whole series of one sensor
@@ -122,19 +126,19 @@ def bounded(q: dict, key: str, default: int, lo: int, hi: int) -> int:
     return v
 
 
-def freshness(card: Card, q: dict) -> dict:
+def freshness(card: Card, tenant: str, q: dict) -> dict:
     now = time.time()
     # The newest reading is the largest key: one extraction, not one per row.
     r = card.query(f"SELECT count(*), epoch_ms(uuid_extract_timestamp(max(event_id))), "
                    f"count(*) FILTER (WHERE event_id >= ?::UUID), round(sum(value), 3) "
-                   f"FROM {TABLE} WHERE deleted_at IS NULL", [v7_boundary(now - 10)])
+                   f"FROM {TABLE} WHERE deleted_at IS NULL AND tenant_id = ?", [v7_boundary(now - 10), tenant])
     rows, newest, last10, total = (num(x) for x in r["rows"][0])
     now_ms = now * 1000
     return {"rows": rows, "newest_ms": newest, "age_ms": round(now_ms - newest, 1) if newest else None,
             "last_10s_per_s": round((last10 or 0) / 10, 1), "sum_value": total}
 
 
-def moving_avg(card: Card, q: dict) -> dict:
+def moving_avg(card: Card, tenant: str, q: dict) -> dict:
     kind = kind_of(q)
     # window_s one-second buckets: the current one and window_s - 1 before it. A RANGE
     # frame includes both ends, so "N SECOND PRECEDING" would hold N + 1 buckets.
@@ -145,7 +149,8 @@ def moving_avg(card: Card, q: dict) -> dict:
     now = time.time()
     # From `since` seconds ago up to the start of the current second: a bucket still
     # filling would drag the average.
-    where, params = "kind = ? AND event_id >= ?::UUID AND event_id < ?::UUID", [kind, v7_boundary(now - since), v7_boundary(math.floor(now))]
+    where = "tenant_id = ? AND kind = ? AND event_id >= ?::UUID AND event_id < ?::UUID"
+    params = [tenant, kind, v7_boundary(now - since), v7_boundary(math.floor(now))]
     if sensor is not None:
         where += " AND sensor_id = ?"
         params.append(int(sensor))
@@ -160,24 +165,24 @@ def moving_avg(card: Card, q: dict) -> dict:
             "rows": [[num(x) for x in row] for row in r["rows"]]}
 
 
-def per_minute(card: Card, q: dict) -> dict:
+def per_minute(card: Card, tenant: str, q: dict) -> dict:
     kind = kind_of(q)
     minutes = bounded(q, "minutes", 10, 1, 1440)
     r = card.query(f"SELECT epoch_ms(time_bucket(INTERVAL 1 MINUTE, {TS})) AS m, count(*), count(DISTINCT sensor_id), "
                    f"round(avg(value), 3), round(min(value), 3), round(max(value), 3), round(stddev(value), 3) "
-                   f"FROM {TABLE} WHERE deleted_at IS NULL AND kind = ? AND event_id >= ?::UUID "
-                   f"GROUP BY m ORDER BY m", [kind, v7_boundary(time.time() - minutes * 60)])
+                   f"FROM {TABLE} WHERE deleted_at IS NULL AND tenant_id = ? AND kind = ? AND event_id >= ?::UUID "
+                   f"GROUP BY m ORDER BY m", [tenant, kind, v7_boundary(time.time() - minutes * 60)])
     return {"kind": kind, "columns": ["minute_ms", "readings", "sensors", "avg", "min", "max", "stddev"],
             "rows": [[num(x) for x in row] for row in r["rows"]]}
 
 
-def alarms(card: Card, q: dict) -> dict:
+def alarms(card: Card, tenant: str, q: dict) -> dict:
     kind = kind_of(q)
     above = float(q.get("above", 30))
     since = bounded(q, "since_s", 60, 1, 86400)
     r = card.query(f"SELECT sensor_id, count(*), round(max(value), 3), epoch_ms(uuid_extract_timestamp(max(event_id))) "
-                   f"FROM {TABLE} WHERE deleted_at IS NULL AND kind = ? AND value > ? AND event_id >= ?::UUID "
-                   f"GROUP BY sensor_id ORDER BY 2 DESC", [kind, above, v7_boundary(time.time() - since)])
+                   f"FROM {TABLE} WHERE deleted_at IS NULL AND tenant_id = ? AND kind = ? AND value > ? AND event_id >= ?::UUID "
+                   f"GROUP BY sensor_id ORDER BY 2 DESC", [tenant, kind, above, v7_boundary(time.time() - since)])
     return {"kind": kind, "above": above, "columns": ["sensor_id", "readings", "highest", "last_ms"],
             "rows": [[num(x) for x in row] for row in r["rows"]]}
 
@@ -185,11 +190,11 @@ def alarms(card: Card, q: dict) -> dict:
 QUERIES = {"freshness": freshness, "moving_avg": moving_avg, "per_minute": per_minute, "alarms": alarms}
 
 
-def serve(card: Card, tenant: str, queue: str, label: str) -> None:
-    r = card.serve([tenant], sorted(QUERIES), queue)
+def serve(card: Card, tenants: list[str], queue: str, label: str) -> None:
+    r = card.serve(tenants, sorted(QUERIES), queue)
     if "error" in r:
         sys.exit(f"serve refused: {r['error']}")
-    print(f"answering {sorted(QUERIES)} on query.{tenant}.* in queue group {queue!r}", flush=True)
+    print(f"answering {sorted(QUERIES)} for {tenants} in queue group {queue!r} ({r['serving']} subjects)", flush=True)
     applied = served = 0
     last = time.time()
     while True:
@@ -203,7 +208,8 @@ def serve(card: Card, tenant: str, queue: str, label: str) -> None:
             fn = QUERIES.get(req["name"])
             t0 = time.perf_counter()
             try:
-                ans = fn(card, req.get("payload") or {}) if fn else {"error": f"unknown query {req['name']!r}", "known": sorted(QUERIES)}
+                # The tenant comes from the subject the question arrived on, never the payload.
+                ans = fn(card, req["tenant"], req.get("payload") or {}) if fn else {"error": f"unknown query {req['name']!r}", "known": sorted(QUERIES)}
             except Exception as e:  # a bad parameter is the asker's problem
                 ans = {"error": f"{type(e).__name__}: {e}"}
             ans["ms"] = round((time.perf_counter() - t0) * 1000, 2)
@@ -222,7 +228,7 @@ def main():
     ap.add_argument("--creds", default=str(ROOT / "scripts/native/creds/events.creds"))
     ap.add_argument("--principal", default="events")
     ap.add_argument("--db", default=os.environ.get("ZB_DB", "/tmp/events-service.duckdb"))
-    ap.add_argument("--tenant", default="globex")
+    ap.add_argument("--tenants", default="globex,acme,tango,kilo", help="the tenants to answer for, comma-separated")
     ap.add_argument("--queue", default="events")
     ap.add_argument("--label", default=f"{socket.gethostname()}:{os.getpid()}")
     a = ap.parse_args()
@@ -234,7 +240,7 @@ def main():
     if s.get("error"):
         sys.exit(f"sync: {s['error']}")
     print(f"replica {a.db}: {json.dumps(s)[:200]} in {time.time() - t0:.1f} s", flush=True)
-    serve(card, a.tenant, a.queue, a.label)
+    serve(card, [t.strip() for t in a.tenants.split(",") if t.strip()], a.queue, a.label)
 
 
 if __name__ == "__main__":

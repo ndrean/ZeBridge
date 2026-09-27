@@ -11,6 +11,12 @@
 #
 # Needs the dev stack, the table (provision.py) and event_service.py running. The bridge's
 # ingress lanes are set where it starts: ZB_INGRESS_LANES=1..8 (default 1).
+#
+# PRINCIPALS spreads the sensor processes round-robin over writers, principal:tenant pairs
+# (default bob:globex). With several, each principal has its own MUTATIONS subject — its own
+# 5,000-write queue cap — and each tenant its own CDC stream; the run ends with a per-tenant
+# check, the service's copy against PostgreSQL, asked as a principal of that tenant:
+#   PRINCIPALS=bob:globex,mary:globex,alice:acme,nina:tango,omar:kilo examples/09-event/ramp.sh 500
 set -u
 R=$(cd "$(dirname "$0")/../.." && pwd); cd "$R"
 N=${1:?usage: ramp.sh SENSORS [SECONDS]}; S=${2:-30}
@@ -18,11 +24,13 @@ OUT=${RAMP_OUT:-/tmp/zb-ramp}/s$N; rm -rf "$OUT"; mkdir -p "$OUT"
 PY=scripts/scenarios/.venv/bin/python
 NATS=(nats --creds scripts/native/creds/bridge.creds --inbox-prefix _INBOX.bridge -s "${NATS_URL:-nats://127.0.0.1:4222}")
 
+IFS=, read -r -a PAIRS <<< "${PRINCIPALS:-bob:globex}"
 procs=$(( (N + 99) / 100 ))
 for ((p = 0; p < procs; p++)); do
   n=$(( N - p * 100 )); [ "$n" -gt 100 ] && n=100
+  pair=${PAIRS[$(( p % ${#PAIRS[@]} ))]}
   $PY -u examples/09-event/sensors.py --sensors "$n" --first-id $(( p * 100 )) --seconds "$S" \
-      --ack-file "$OUT/ack$p.txt" > "$OUT/sensors$p.log" 2>&1 &
+      --principal "${pair%%:*}" --tenant "${pair##*:}" --ack-file "$OUT/ack$p.txt" > "$OUT/sensors$p.log" 2>&1 &
 done
 $PY -u examples/09-event/ask.py watch --seconds $(( S + 3 )) > "$OUT/watch.log" 2>&1 &
 
@@ -64,3 +72,20 @@ print("  " + (age[-1] if age else "no watch summary"))
 for r in refusal[:3]:
     print(f"  refusal: {r}")
 EOF
+
+# Per tenant: the service's copy against PostgreSQL (count and sum), asked as the first
+# principal of each tenant — a question can only be asked for the asker's own tenant.
+sleep 3
+seen=" "
+for pair in "${PAIRS[@]}"; do
+  pr=${pair%%:*}; tn=${pair##*:}
+  case "$seen" in *" $tn "*) continue ;; esac
+  seen="$seen$tn "
+  pg=$(psql "${ADMIN_DATABASE_URL:?load .env.admin}" -XtA -F' ' -c \
+       "SELECT count(*), round(sum(value)::numeric, 3) FROM sensor_events WHERE tenant_id = '$tn' AND deleted_at IS NULL")
+  svc=$($PY examples/09-event/ask.py freshness --principal "$pr" --tenant "$tn" --db "/tmp/events-asker-$pr.sqlite3" 2>/dev/null |
+        python3 -c 'import sys,json; j=json.load(sys.stdin); print(j.get("rows"), j.get("sum_value"))' 2>/dev/null)
+  read -r pc ps <<< "$pg"; read -r sc ss <<< "$svc"
+  if [ "$pc" = "$sc" ] && python3 -c "import sys; sys.exit(0 if abs(float('$ps') - float('$ss')) < 0.01 else 1)" 2>/dev/null; then v=exact; else v=DIFFERS; fi
+  echo "  tenant $tn: PostgreSQL $pc rows, sum $ps | service $sc rows, sum $ss — $v"
+done

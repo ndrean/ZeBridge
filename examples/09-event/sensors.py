@@ -58,7 +58,7 @@ class Stats:
                 f"ack p50 {p(0.5):.1f} ms p99 {p(0.99):.1f} ms  publish errors {self.pub_errors}")
 
 
-async def sensor(js, st: Stats, principal: str, sid: int, period: float, wave: float, until: float):
+async def sensor(js, st: Stats, principal: str, tenant: str, sid: int, period: float, wave: float, until: float):
     kind, base, amp, noise, spike = KINDS[sid % len(KINDS)]
     phase = random.uniform(0, 2 * math.pi)
     # The walk: each step pulls 0.1% back toward 0 (at 50 readings a second it drifts over
@@ -80,7 +80,7 @@ async def sensor(js, st: Stats, principal: str, sid: int, period: float, wave: f
         reading = base + drift + amp * math.cos(2 * math.pi * now / wave + phase) + random.gauss(0, noise)
         if random.random() < 1 / 2000:
             reading += spike
-        row = {"event_id": str(eid), "tenant_id": TENANT, "sensor_id": sid, "kind": kind,
+        row = {"event_id": str(eid), "tenant_id": tenant, "sensor_id": sid, "kind": kind,
                "value": round(reading, 3), "updated_at": iso(now)}
         msg_id = eid.hex  # a subject token: no dots
         st.sent_at[msg_id] = time.monotonic()
@@ -100,6 +100,7 @@ async def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default=os.environ.get("NATS_URL", "nats://127.0.0.1:4222"))
     ap.add_argument("--principal", default="bob")
+    ap.add_argument("--tenant", default="globex", help="the principal's tenant: every row carries it (RLS refuses another)")
     ap.add_argument("--creds", default="", help="default scripts/native/creds/<principal>.creds")
     ap.add_argument("--sensors", type=int, default=20)
     ap.add_argument("--first-id", type=int, default=0, help="the first sensor_id: several processes, disjoint ids")
@@ -129,11 +130,11 @@ async def main():
     await nc.subscribe(f"mutation_ack.{a.principal}.*", cb=on_verdict)
     rate = a.sensors * 1000 / a.period_ms
     print(f"{a.sensors} sensors × every {a.period_ms:g} ms = {rate:,.0f} readings/s for {a.seconds:g} s, "
-          f"as {a.principal} on {TENANT}", flush=True)
+          f"as {a.principal} on {a.tenant}", flush=True)
 
     start = time.monotonic()
     until = start + a.seconds
-    tasks = [asyncio.create_task(sensor(js, st, a.principal, a.first_id + i, a.period_ms / 1000, a.wave_s, until))
+    tasks = [asyncio.create_task(sensor(js, st, a.principal, a.tenant, a.first_id + i, a.period_ms / 1000, a.wave_s, until))
              for i in range(a.sensors)]
 
     async def report():
