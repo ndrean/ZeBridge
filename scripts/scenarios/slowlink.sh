@@ -20,8 +20,12 @@ set -eu
 ANCHOR=com.apple/zb-shape
 TOKEN_FILE=/var/tmp/zb-slowlink.token
 DOWN=7101; UP=7102
-LAN=${ZB_LAN_IP:-$(ipconfig getifaddr en0 || true)}
-[ -n "$LAN" ] || { echo "no LAN address on en0: set ZB_LAN_IP"; exit 1; }
+# The address of the interface the default route uses (Wi-Fi or Ethernet, whichever is
+# active), not a fixed en0. `sudo` drops the caller's environment, so an override goes on
+# sudo's own command line: sudo ZB_LAN_IP=192.168.1.11 scripts/scenarios/slowlink.sh start
+IFACE=$(/sbin/route -n get default 2>/dev/null | awk '/interface:/ {print $2; exit}')
+LAN=${ZB_LAN_IP:-$( [ -n "$IFACE" ] && /usr/sbin/ipconfig getifaddr "$IFACE" 2>/dev/null || true)}
+[ -n "$LAN" ] || { echo "no LAN address (default route via '${IFACE:-none}'): sudo ZB_LAN_IP=<address> $0 $*"; exit 1; }
 
 case "${1:-}" in
 start)
@@ -35,7 +39,7 @@ start)
   if [ ! -s "$TOKEN_FILE" ]; then
     pfctl -E 2>&1 | sed -n 's/.*[Tt]oken *: *\([0-9][0-9]*\).*/\1/p' > "$TOKEN_FILE"
   fi
-  echo "shaping NATS ↔ $LAN: ${BW} Mbit/s, ${DELAY} ms each way, ${LOSS} loss toward the client"
+  echo "shaping NATS ↔ $LAN (${IFACE:-set by ZB_LAN_IP}): ${BW} Mbit/s, ${DELAY} ms each way, ${LOSS} loss toward the client"
   echo "connect the client to nats://$LAN:4222; 127.0.0.1 is untouched. Stop: sudo $0 stop"
   ;;
 status)
