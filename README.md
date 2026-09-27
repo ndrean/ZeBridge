@@ -465,6 +465,19 @@ Simulated sensors write a reading every 20 ms through the bridge; a libzb servic
 
 After both runs the replica and PostgreSQL held the same 359,996 rows and the same sum of values.
 
+Then a ramp of the write path. The bridge applies edge writes in batches of up to 64 per transaction, on 1 to 8 parallel lanes (`ZB_INGRESS_LANES`). Each step ran 30 s, all on the same Mac, the simulated sensors included:
+
+| lanes | readings/s sent | accepted/s | refused | write verdict p50 / p99 | newest age p50 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 10,000 | 8,535 | 15% | 592 / 620 ms | 595 ms |
+| 2 | 10,000 | 10,000 | 0 | 4.9 / 14.8 ms | 10 ms |
+| 2 | 20,000 | 14,149 | 29% | 355 / 410 ms | 356 ms |
+| 4 | 20,000 | 20,000 | 0 | 11.4 / 59.1 ms | 17 ms |
+| 4 | 30,000 | 19,527 | 35% | 250 / 393 ms | 262 ms |
+| 8 | 30,000 | 22,681 | 24% | 216 / 331 ms | 212 ms |
+
+With 4 lanes the Mac absorbed 20,000 writes/s: 20,000 sensors sending one reading a second, each followed into DuckDB about 17 ms after it was sent. Past a lane count's ceiling the writes queue, and at 5,000 waiting writes per principal the stream refuses more, so the delay jumps to hundreds of milliseconds. At 8 lanes the CPU was saturated: the limit was the machine, not the bridge. The DuckDB replica kept up throughout, and after the ramp it matched PostgreSQL exactly: 3,515,172 rows, the same sum.
+
 ## The daemon
 
 Once the DBA has migrated the Zebridge functions into Postgres, checked for the compliance of the database, configured NATS with the needed streams and buckets, you are ready to run ZeBridge, the first pillar of the architecture, a long running background process, connected to Postgres and to NATS.
