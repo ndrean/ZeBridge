@@ -17095,3 +17095,16 @@ the telemetry path; the chain's pattern (periodic snapshot + live stream) moves 
 * The live path shrinks from five hops (sensor, NATS, bridge, PostgreSQL, CDC) to two.
 Business data (sensor registry, tenants, thresholds) stays on PostgreSQL + the bridge, and
 the DuckDB service joins the two.
+
+**Its process shape (the owner's): another daemon, two processes, one library.** A NATS
+server, plus (1) a slow UPLOADER and (2) a long-running QUERY process, both on libzb with
+DuckDB embedded. The query process follows the raw stream in order (§10jc's strict-order
+follower, nats.zig's capped pulls and patch 26 reused), appends in bulk, and answers the
+live queries the operator designs in-process over `serve`/`poll`/`reply`, as
+event_service.py does today. The uploader is the same library in another mode: it follows
+the stream into a small buffer table and every ~10 s `COPY … TO` a Parquet file named by its
+sequence range, straight to S3/R2 through DuckDB's httpfs; compaction is the same COPY over
+a prefix. Separate processes so the bucket credentials live in the uploader alone and a slow
+upload never stalls a query. New in libzb: a declared schema per time table (no PostgreSQL
+catalogue), payload decoding and validation instead of the CDC envelope, the archive-first
+seed. PostgreSQL + the bridge join only when business data is replicated alongside.
