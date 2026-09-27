@@ -70,14 +70,19 @@ def main():
         failed += 1
 
     # ── 1b. coherence: the writer budget must FIT its own consumers ───────────
-    # mutation listener (1) + the sweeper's reserved slot (1) + the 4 enroll
-    # permits. A limit lowered below that lets an enrollment burst starve edge
-    # writes — the drift only this check (and the bridge's boot 🔌 warning) sees.
-    if writer > 0 and writer < 2 + 4:
-        zb.bad(f"writer limit {writer} < 2 + 4 enroll permits — an enroll burst can starve the mutation listener/sweeper")
+    # one connection per mutation listener lane (ZB_INGRESS_LANES, the bridge's
+    # setting; 1 when unset) + the sweeper's reserved slot (1) + the 4 enroll
+    # permits. A limit below that lets an enrollment burst starve edge writes, or
+    # the lanes the sweeper — the drift only this check (and the bridge's boot 🔌
+    # warning) sees. The template's 20 fits the maximum, 8 lanes.
+    lanes = max(1, min(8, int(os.environ.get("ZB_INGRESS_LANES", "1") or 1)))
+    needs = lanes + 1 + 4
+    if writer > 0 and writer < needs:
+        zb.bad(f"writer limit {writer} < {needs} ({lanes} ingress lane(s) + sweeper + 4 enroll permits) — "
+               "an enroll burst can starve edge writes, or the lanes the sweeper")
         failed += 1
     elif writer > 0:
-        zb.ok(f"writer budget fits its consumers: {writer} ≥ 2 + 4 enroll permits")
+        zb.ok(f"writer budget fits its consumers: {writer} ≥ {needs} ({lanes} ingress lane(s) + sweeper + 4 enroll permits)")
 
     # ── 2. the writer ceiling BITES ───────────────────────────────────────────
     # DATABASE_WRITER_URL is what .env.bridge carries; a run without it cannot prove

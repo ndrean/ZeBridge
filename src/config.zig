@@ -29,6 +29,10 @@ pub const Postgres = struct {
 
 /// NATS JetStream configuration
 pub const Nats = struct {
+    /// §10cs: the most mutation listener lanes ZB_INGRESS_LANES may ask for. The init
+    /// template's writer CONNECTION LIMIT (20) is sized for this many, plus the sweeper,
+    /// the enrollment permits and a margin.
+    pub const max_ingress_lanes: u32 = 8;
     pub const default_host = "127.0.0.1";
     pub const default_port = 4222;
 
@@ -304,10 +308,11 @@ pub const Http = struct {
     /// sweeper — preflight's budget introspection warns when it does not.
     pub const max_concurrent_enrolls: u32 = 4;
 
-    /// The writer role's slots that are NOT enrollment's to spend: the mutation
-    /// listener's persistent connection plus the sweeper's reserved one (an
-    /// external cron job — transient, but its slot must exist when it fires).
-    pub const pg_writer_reserved_connections: u32 = 2;
+    /// The writer role's slots that are neither enrollment's nor the ingress lanes' to
+    /// spend: the sweeper's reserved one (an external cron job — transient, but its slot
+    /// must exist when it fires). Each mutation listener lane holds one more, counted
+    /// from ZB_INGRESS_LANES by preflight's budget check.
+    pub const pg_writer_reserved_connections: u32 = 1;
 
     /// Invite-code length bounds accepted by /enroll. Codes are operator-minted
     /// hex (32 chars today); the range refuses garbage before any PG work.
@@ -762,6 +767,10 @@ pub const RuntimeConfig = struct {
     /// client may send at once after a quiet spell; 0 means one second's worth.
     mutation_rate_per_principal: u32 = 0,
     mutation_rate_burst: u32 = 0,
+    /// §10cs: ZB_INGRESS_LANES, parallel mutation listeners on the one durable (1 to
+    /// Nats.max_ingress_lanes). Each holds one PostgreSQL writer connection and one NATS
+    /// connection; the writer role's CONNECTION LIMIT must fit them (preflight warns).
+    ingress_lanes: u32 = 1,
     /// CDC stream retention (StreamLimits, §10eg); the age defaults to three cadences.
     cdc_max_age_seconds: u64 = Nats.default_cdc_max_age_cadences * Generations.default_cadence_seconds,
     cdc_max_bytes: i64 = @intCast(Nats.default_cdc_max_bytes),

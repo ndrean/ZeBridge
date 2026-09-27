@@ -16978,3 +16978,29 @@ burst at a few thousand events/s on an iPhone 12.
   was too slow in JS on this phone to wait for, so no TS kill test here. On a budget
   Android phone the heavy path belongs to libzb.
 
+
+## §10jd — sensor events on a DuckDB replica, the ingress ramp, and a writer budget that follows the lanes (2026-09-27)
+
+`examples/09-event`: simulated sensors publish a reading every 20 ms as edge writes,
+keyed by a UUIDv7 that is also the reading's time; the bridge writes PostgreSQL, CDC feeds
+a libzb DuckDB replica, and a Python service answers named time-series queries over NATS
+from the same file. The newest reading was 9–11 ms old when answered at 1,000 and 5,000
+readings/s, everything on one Mac. Time filters compare the key with a boundary built in
+Python (`zb_client_query` refuses CREATE MACRO): a 20M-row filter 19.3 → 1.3 ms.
+
+**The ramp** (`ramp.sh`, ReleaseFast): the §10cs batching (64 writes per pipelined
+transaction) plus `ZB_INGRESS_LANES` gave one lane ~8,500 writes/s, two ~14,000, four
+~19,500 — 20,000/s absorbed with a 11 ms median verdict — and eight 22,700 with the CPU at
+0% idle. Past a ceiling the per-subject MUTATIONS cap (5,000) refuses with 503 and every
+write waits behind a full queue. The replica kept up (22,900 changes/s) and ended exact at
+3,515,172 rows. The time spent on the mutation path in §10cr–§10cs paid here directly.
+
+**The writer budget did not know about lanes.** Each lane holds a writer connection, but
+the role limit was 8 (listener 1 + sweeper 1 + enrollments 4 + margin) and preflight's 🔌
+line counted one listener whatever the setting: at 8 lanes the lanes alone filled the role
+while the boot line said "headroom 82". Now the limit is 20 in `init.write.template.sql`
+(8 lanes + sweeper + 4 enrollments + margin; reader 10 + writer 20 stays under a third of
+the default 100), `ZB_INGRESS_LANES` is read once into the runtime config, and preflight
+checks `limit ≥ lanes + 1 + 4`, warning with the `ALTER ROLE` to run — proven by booting 8
+lanes against the old 8 ("needs 13"). `connbudget.py` does the same arithmetic from the
+environment; PASS at 20, the bite test refusing 3 of 22.

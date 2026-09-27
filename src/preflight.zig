@@ -928,6 +928,8 @@ pub fn run(
     /// Role the write grants were made to, from `DATABASE_WRITER_URL`. Null when ingress
     /// is not configured, in which case no table is expected to be writable.
     writer_role: ?[]const u8,
+    /// ZB_INGRESS_LANES: each lane holds one writer connection, which the budget counts.
+    ingress_lanes: u32,
     /// `TENANT_RULES`: which column carries the tenant, per table. Empty when reads are
     /// unscoped, which is the default and is reported as such.
     tenant_rules: *const Config.EventClassification.TransitionRules,
@@ -1091,7 +1093,7 @@ pub fn run(
         log.warn("⚠️  Tenant-column report failed: {}", .{err});
     };
 
-    reportConnectionBudget(conn, writer_role) catch |err| {
+    reportConnectionBudget(conn, writer_role, ingress_lanes) catch |err| {
         log.warn("⚠️  Connection-budget report failed: {}", .{err});
     };
 
@@ -1260,11 +1262,16 @@ fn preflightRole(url: []const u8) ?[]const u8 {
 /// role limits and the cluster ceiling, then checks the three ways the budget
 /// drifts: a limit quietly raised to unlimited, a budget grown past the
 /// cluster's headroom, and — the one only the bridge can see — a writer limit
-/// LOWERED below what its own consumers need (mutation listener + sweeper +
-/// enroll permits), which would let an enrollment burst starve edge writes.
+/// below what its own consumers need (one connection per ingress lane + the sweeper +
+/// the enroll permits), which would let an enrollment burst starve edge writes, or
+/// lanes starve the sweeper and enrollment.
 /// Warnings, not refusals: none of these is a guaranteed runtime failure.
-fn reportConnectionBudget(conn: *c.PGconn, writer_role: ?[]const u8) !void {
+fn reportConnectionBudget(conn: *c.PGconn, writer_role: ?[]const u8, ingress_lanes: u32) !void {
     const enrolls: i64 = Config.Http.max_concurrent_enrolls;
+    const lanes: i64 = ingress_lanes;
+    // What the writer role must fit: every lane's connection, the sweeper's slot, and
+    // the enrollment permits. Without ingress (no writer role) nothing is needed.
+    const writer_needs: i64 = lanes + Config.Http.pg_writer_reserved_connections + enrolls;
 
     var wr_buf: [128]u8 = undefined;
     const wr = writer_role orelse "";
@@ -1280,18 +1287,17 @@ fn reportConnectionBudget(conn: *c.PGconn, writer_role: ?[]const u8) !void {
     const reader_lim = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 1)), 10) catch return;
     const writer_lim = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 2)), 10) catch return;
 
-    log.info("🔌 connection budget: reader limit {d}, writer limit {d}, cluster max {d} — bridge worst case {d} (headroom {d})", .{
-        reader_lim,                                                             writer_lim,                                                                        max_conn,
+    log.info("🔌 connection budget: reader limit {d}, writer limit {d} (needs {d}: {d} ingress lane(s) + sweeper + {d} enrollments), cluster max {d} — bridge worst case {d} (headroom {d})", .{
+        reader_lim,                                                             writer_lim,                                                                        writer_needs, lanes, enrolls, max_conn,
         if (reader_lim > 0 and writer_lim > 0) reader_lim + writer_lim else -1, if (reader_lim > 0 and writer_lim > 0) max_conn - reader_lim - writer_lim else -1,
     });
 
     if (reader_lim < 0)
         log.warn("⚠️  the reader role has NO connection limit — a bridge bug can eat the cluster's {d}. ALTER ROLE <reader> CONNECTION LIMIT 10;", .{max_conn});
     if (writer_role != null and writer_lim < 0)
-        log.warn("⚠️  the writer role has NO connection limit — same exposure. ALTER ROLE {s} CONNECTION LIMIT 8;", .{wr});
+        log.warn("⚠️  the writer role has NO connection limit — same exposure. ALTER ROLE {s} CONNECTION LIMIT 20;", .{wr});
     if (reader_lim > 0 and writer_lim > 0 and reader_lim + writer_lim > @divTrunc(max_conn, 2))
         log.warn("⚠️  bridge budget {d}+{d} exceeds half of max_connections={d} — the headroom accounting is gone", .{ reader_lim, writer_lim, max_conn });
-    const reserved: i64 = Config.Http.pg_writer_reserved_connections;
-    if (writer_role != null and writer_lim > 0 and writer_lim < reserved + enrolls)
-        log.warn("⚠️  writer limit {d} < {d} enroll permits + reserved slots: an enrollment burst can starve the mutation listener/sweeper. Raise the role limit or lower Config.Http.max_concurrent_enrolls.", .{ writer_lim, reserved + enrolls });
+    if (writer_role != null and writer_lim > 0 and writer_lim < writer_needs)
+        log.warn("⚠️  writer limit {d} < {d} needed ({d} ingress lane(s) + sweeper + {d} enrollments): an enrollment burst can starve edge writes, or the lanes the sweeper. ALTER ROLE {s} CONNECTION LIMIT {d}; or lower ZB_INGRESS_LANES.", .{ writer_lim, writer_needs, lanes, enrolls, wr, writer_needs });
 }

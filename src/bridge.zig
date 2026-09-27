@@ -363,6 +363,7 @@ fn runDiagnose(
     default_version_column: []const u8,
     refused: *refused_tables.Registry,
     writer_role: ?[]const u8,
+    ingress_lanes: u32,
     tenant_rules: *const Config.EventClassification.TransitionRules,
     writable: *writable_tables.Registry,
     topo: *const topology_mod.Topology,
@@ -446,6 +447,7 @@ fn runDiagnose(
         false, // never strict here: report everything, refuse nothing
         refused,
         writer_role,
+        ingress_lanes,
         tenant_rules,
         event_buf,
         writable,
@@ -975,6 +977,7 @@ pub fn main(init: std.process.Init) !void {
             default_version_column,
             &d_refused,
             d_writer_role,
+            runtime_config.ingress_lanes,
             &tenant_rules,
             &d_writable,
             &runtime_config.topology,
@@ -1124,6 +1127,7 @@ pub fn main(init: std.process.Init) !void {
         runtime_config.strict_tables,
         &refused,
         writer_role,
+        runtime_config.ingress_lanes,
         &tenant_rules,
         @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2),
         &writable,
@@ -1576,11 +1580,7 @@ pub fn main(init: std.process.Init) !void {
     defer rate_limiter.deinit();
     if (rate_limiter.enabled()) log.info("🚦 ingress rate limit: {d} write(s)/s per principal and per tenant, burst {d}", .{ runtime_config.mutation_rate_per_principal, @as(u32, @intFromFloat(rate_limiter.burst)) });
     http_srv.limiter = &rate_limiter;
-    const ingress_lanes: usize = blk: {
-        const raw = init.minimal.environ.getPosix("ZB_INGRESS_LANES") orelse break :blk 1;
-        const n = std.fmt.parseInt(usize, raw, 10) catch break :blk 1;
-        break :blk @min(@max(n, 1), 8);
-    };
+    const ingress_lanes: usize = runtime_config.ingress_lanes;
     var mut_listeners: std.ArrayListUnmanaged(*mutation_listener.MutationListener) = .empty;
     defer mut_listeners.deinit(allocator);
     if (writer_config) |*wc| {

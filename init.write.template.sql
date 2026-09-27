@@ -55,11 +55,13 @@ BEGIN
             NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
     END IF;
     -- The writer's connection BUDGET, DB-enforced (outside the IF: applies on
-    -- re-apply to existing roles). Inventory: mutation listener 1 + sweeper 1 +
-    -- enrollment permits ≤4 (http_server caps them, connect_timeout=3 bounds a
-    -- hang) + margin. 8 total: the bridge cannot starve the cluster's default
-    -- 100 even through a bug — the budget is a rule in PG, not prose.
-    ALTER ROLE ${POSTGRES_WRITER_USER} CONNECTION LIMIT 8;
+    -- re-apply to existing roles). Inventory: one per mutation listener lane
+    -- (ZB_INGRESS_LANES, at most 8) + sweeper 1 + enrollment permits ≤4
+    -- (http_server caps them, connect_timeout=3 bounds a hang) + margin. 20 total,
+    -- with the reader's 10 still under a third of the cluster's default 100: the
+    -- bridge cannot starve it even through a bug — the budget is a rule in PG, not
+    -- prose. The bridge checks the arithmetic at every boot (preflight's 🔌 line).
+    ALTER ROLE ${POSTGRES_WRITER_USER} CONNECTION LIMIT 20;
 END;
 $$;
 
