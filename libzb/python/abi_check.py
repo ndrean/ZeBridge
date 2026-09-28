@@ -26,7 +26,7 @@ if keys != abi["connectOptions"]:
     problems.append(f"connect options changed: +{sorted(set(keys) - set(abi['connectOptions']))} -{sorted(set(abi['connectOptions']) - set(keys))}")
 if code_version != abi["version"]:
     problems.append(f"capi.zig abi_version is {code_version}, abi.json says {abi['version']}")
-for pin in (REPO / "zb-react-native" / "src" / "abi.ts", REPO / "zb-android" / "src" / "main" / "kotlin" / "dev" / "zebridge" / "ZeBridge.kt"):
+for pin in (REPO / "zb-react-native" / "src" / "abi.ts", REPO / "zb-android" / "src" / "main" / "kotlin" / "dev" / "zebridge" / "ZeBridge.kt", REPO / "zb-python" / "src" / "zebridge" / "__init__.py"):
     if pin.exists():
         pm = re.search(r"ZB_ABI = (\d+)", pin.read_text())
         if not pm or int(pm.group(1)) != abi["version"]:

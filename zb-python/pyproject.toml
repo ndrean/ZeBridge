@@ -1,0 +1,19 @@
+[project]
+name = "zebridge"
+version = "0.1.0"
+description = "ZeBridge client: a local replica of PostgreSQL through NATS, over libzb's C ABI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# A platform wheel carries libzb here (zebridge/lib/libzbcore.*); a source checkout
+# finds the repository's build instead, or ZB_LIB.
+zebridge = ["lib/*"]

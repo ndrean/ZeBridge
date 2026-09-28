@@ -17638,3 +17638,21 @@ PostgreSQL; Node — enrolled, renewed twice, the 70 s row seen, 22 rows = Postg
 Left: the cut-off at the old JWT's expiry is visible in nats.zig's log; reconnecting right
 after a renewal would retire the old JWT early and silence it — not built. iOS https
 renewal from libzb inherits §10jq's trust-store limit.
+
+## §10ju — the Python package: `ZeBridge(opts)` over libzb (2026-09-28)
+
+`zb-python/` (package `zebridge`): the C ABI declared once (`_native.py`: every function's
+argtypes, `take` = read JSON + zb_free, NULL → zb_last_error), and one class shaped like
+the Kotlin one and zb-client-ts: `ZeBridge(options, on_change=, on_error=, poll_ms=,
+**kw)`. Constructing connects: the worker thread opens the handle and syncs (so
+zb_last_error is read on the thread that failed), then polls between queued calls — any
+thread may call, a call waits at most one poll, an on_change callback calling back in runs
+in place. Keys are the shared camelCase ones, snake_case accepted (`bridge_url` →
+`bridgeUrl`). `ZB_ABI = 3`, pinned in abi_check.py with zb-react-native and zb-android.
+
+Live: an invite alone → enrolled as py_user (kilo), 22 rows = PostgreSQL, "écrit en Python
+🐍" round-trips through `query` and back from PostgreSQL after a `mutate` (lowercase
+"insert"/"delete", §10jm), both verdicts at `on_change`, a write through `query` refused
+(ReadOnlyQuery); a second run from the identity alone. The examples and scenarios still
+carry their own ctypes classes (09-event's `Card` is ~45 lines the package replaces) —
+migrating them is the next step, one re-run each.
