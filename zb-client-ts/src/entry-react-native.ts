@@ -8,6 +8,7 @@
 import 'react-native-get-random-values'; // crypto.getRandomValues, which `uuid` needs
 import { sha256 } from 'js-sha256';
 import { decompress } from 'fzstd';
+import * as SQLite from 'expo-sqlite';
 import { registerPlatform } from './platform.ts';
 import { expoStorage } from './expo-storage.ts';
 import { fzstdStream } from './fzstd-stream.ts';
@@ -82,7 +83,32 @@ registerPlatform({
   zstdDecompress: (b) => { const z = native(); return z ? nativeOnce(z, b) : decompress(b); },
   zstdDecompressStream: (chunks) => { const z = native(); return z ? nativeStream(z, chunks) : fzstdStream(chunks); },
   zstdName: () => (native() ? 'libzb (native)' : 'fzstd (JS)'),
+  // §10jq: the identity in a small expo-sqlite database of its own (expo-sqlite is
+  // already this platform's storage). The Keychain (expo-secure-store) would suit the
+  // seed better; it is one more native module, not taken yet.
+  identity: {
+    load: async (key) => {
+      const db = await identityDb();
+      const rows = await db.getAllAsync(`SELECT text FROM identity WHERE key = '${key.replace(/'/g, "''")}'`) as { text: string }[];
+      return rows[0]?.text ?? null;
+    },
+    save: async (key, text) => {
+      const db = await identityDb();
+      const q = (v: string) => `'${v.replace(/'/g, "''")}'`; // this expo-sqlite's execAsync takes no parameters
+      await db.execAsync(`INSERT OR REPLACE INTO identity (key, text) VALUES (${q(key)}, ${q(text)})`);
+    },
+  },
+  natsOverWebSocket: true,
 });
+
+let identityDbP: Promise<SQLite.SQLiteDatabase> | null = null;
+function identityDb(): Promise<SQLite.SQLiteDatabase> {
+  identityDbP ??= SQLite.openDatabaseAsync('zebridge-identity.db').then(async (db) => {
+    await db.execAsync('CREATE TABLE IF NOT EXISTS identity (key TEXT PRIMARY KEY, text TEXT NOT NULL)');
+    return db;
+  });
+  return identityDbP;
+}
 
 export * from './index.ts';
 export { expoStorage } from './expo-storage.ts';

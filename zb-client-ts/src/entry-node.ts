@@ -4,6 +4,7 @@
 /// 'zb-client-ts/node'. better-sqlite3 and @nats-io/transport-node are the host's to
 /// install (optional peers).
 import { readFileSync } from 'node:fs';
+import { readFile, rename, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { createZstdDecompress, zstdCompressSync, zstdDecompressSync } from 'node:zlib';
@@ -35,6 +36,15 @@ registerPlatform({
     return { update: (c) => { h.update(c); }, base64: () => h.digest('base64') };
   },
   readText: (path) => readFileSync(path, 'utf8'),
+  identity: {
+    load: async (key) => readFile(key, 'utf8').catch((e) => (e?.code === 'ENOENT' ? null : Promise.reject(e))),
+    // A temporary name renamed into place, mode 600: never half an identity, never
+    // readable by another user (the seed is in it).
+    save: async (key, text) => {
+      await writeFile(`${key}.tmp`, text, { mode: 0o600 });
+      await rename(`${key}.tmp`, key);
+    },
+  },
   zstdName: () => 'node:zlib',
 });
 

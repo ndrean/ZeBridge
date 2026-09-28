@@ -17512,3 +17512,19 @@ unreachable (ConnectionRefused)".
 /system/etc/security/cacerts included — BSDs, Windows only), so an https:// enrollment
 from libzb on an iPhone is refused up front with a message saying so; the host enrolls
 itself and passes `creds`. The fix is Security.framework trust evaluation, not built.
+
+**zb-client-ts.** `new ZeBridge({ bridgeUrl, invite, tables })` and `connect()`:
+`resolveIdentity()` runs first — explicit `creds` win, else the stored identity, else
+`enrollAt` (exported for apps that manage identities themselves) generates the pair
+through the transport seam, redeems the invite and stores the SAME JSON libzb writes.
+`natsUrl` and `principal` are optional now; the default `dbName` waits for the
+principal. The store is on the platform seam: a mode-600 file on Node (temp + rename),
+localStorage in the browser, a small expo-sqlite database on React Native (the Keychain
+via expo-secure-store would suit the seed better; one more native module, not taken).
+Browsers and React Native cannot dial TCP, so the bridge also hands out `nats_ws_url`
+(ENROLL_NATS_WS_URL) and each platform picks the URL it can use.
+
+Live on Node: an invite alone → enrolled as enroll_node, the TCP URL taken, 20 rows;
+the identity alone → the same principal; and libzb, pointed at the identity file Node
+wrote, connected with it — one identity, two libraries. Browser and React Native:
+typecheck only, not run yet.

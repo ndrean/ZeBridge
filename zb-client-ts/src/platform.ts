@@ -25,6 +25,14 @@ export interface Platform {
   sha256Stream?(): { update(c: Uint8Array): void; base64(): string };
   /// `credsPath`: only where there is a filesystem to read it from.
   readText?(path: string): string;
+  /// §10jq: where the identity `/enroll` produced is kept between runs, by key (the
+  /// `identityPath`): a mode-600 file on Node — the same JSON libzb writes, so both
+  /// clients read one identity — localStorage in the browser, an expo-sqlite row on
+  /// React Native. Absent: an enrollment still works, but is not remembered.
+  identity?: { load(key: string): Promise<string | null>; save(key: string, text: string): Promise<void> };
+  /// Whether this platform dials NATS over TCP (Node) or only over WebSocket (the
+  /// browser, React Native): picks `nats_url` or `nats_ws_url` from the identity.
+  natsOverWebSocket?: boolean;
   /// Which zstd decoder runs — `zb.platformInfo`, for a log line.
   zstdName(): string;
 }

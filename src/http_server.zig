@@ -96,6 +96,9 @@ pub const Server = struct {
         /// so a client bootstraps from the bridge's URL and an invite alone (§10jq).
         /// Absent: the client must be told where NATS is.
         nats_url: ?[]const u8 = null,
+        /// The WebSocket URL (ENROLL_NATS_WS_URL) for clients that cannot open TCP — a
+        /// browser, React Native — handed out as `nats_ws_url`.
+        nats_ws_url: ?[]const u8 = null,
     };
 
     pub fn init(
@@ -494,7 +497,9 @@ pub const Server = struct {
         defer if (ctx.js_domain != null) self.allocator.free(dom_part);
         const url_part = if (ctx.nats_url) |u| try std.fmt.allocPrint(self.allocator, ",\"nats_url\":\"{s}\"", .{u}) else "";
         defer if (ctx.nats_url != null) self.allocator.free(url_part);
-        const body = try std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\",\"grammar_hash\":\"{x}\"{s}{s},\"grammar\":{s}}}\n", .{ jwt, principal, &ghash, dom_part, url_part, topology_mod.embedded_json });
+        const ws_part = if (ctx.nats_ws_url) |u| try std.fmt.allocPrint(self.allocator, ",\"nats_ws_url\":\"{s}\"", .{u}) else "";
+        defer if (ctx.nats_ws_url != null) self.allocator.free(ws_part);
+        const body = try std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\",\"grammar_hash\":\"{x}\"{s}{s}{s},\"grammar\":{s}}}\n", .{ jwt, principal, &ghash, dom_part, url_part, ws_part, topology_mod.embedded_json });
         defer self.allocator.free(body);
         log.info("🎟️ enrolled '{s}' (tenant '{s}', {d} membership(s) tagged) — JWT minted, mapping registered", .{ principal, tenant, tenants.len });
         try req.respond(body, .{ .status = .ok, .extra_headers = cors });

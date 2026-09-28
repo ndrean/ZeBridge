@@ -14,6 +14,12 @@ registerPlatform({
   zstdDecompress: (b) => decompress(b),
   zstdDecompressStream: fzstdStream,
   zstdName: () => 'fzstd (JS)',
+  // §10jq: the identity per origin, like the OPFS replica beside it.
+  identity: {
+    load: async (key) => { try { return localStorage.getItem(`zebridge.identity:${key}`); } catch { return null; } },
+    save: async (key, text) => { localStorage.setItem(`zebridge.identity:${key}`, text); },
+  },
+  natsOverWebSocket: true,
 });
 
 export * from './index.ts';

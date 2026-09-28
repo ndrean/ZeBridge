@@ -77,9 +77,20 @@ export interface ZeBridgeConfig {
   /// Replace the whole wire layer (NATS factories, headers, wire constants) —
   /// the transport seam (transport.ts). Default: the @nats-io libraries.
   transport?: Transport;
-  natsUrl: string;
-  principal: string;
+  /// Where NATS is. Optional since §10jq: an enrolled client takes it from its identity
+  /// (`nats_url`, or `nats_ws_url` in the browser and on React Native).
+  natsUrl?: string;
+  /// Optional since §10jq: the creds (or the identity) name the principal.
+  principal?: string;
   password?: string;
+  /// §10jq: a one-time invite code. With `bridgeUrl` and no stored identity, `connect()`
+  /// generates this device's key pair, redeems the code at `<bridgeUrl>/enroll`, and
+  /// keeps the result (`identityPath`) — every later run needs neither. libzb: same.
+  invite?: string;
+  /// §10jq: where the identity is kept: a file on Node, a key in the browser's
+  /// localStorage or React Native's store. Default `<dbPath>.identity`, else
+  /// `zebridge.identity`. libzb: same name, same default, same JSON.
+  identityPath?: string;
   /// Override the platform's zstd (platform.ts). An app never needs to: Node inflates
   /// with node:zlib, the browser with fzstd, React Native with libzb's native decoder
   /// when the app has it, else fzstd.
@@ -312,6 +323,45 @@ export function createUser(transport: Transport = natsTransport): UserKeyPair {
   return transport.createUser();
 }
 
+/// §10jq: what an enrollment leaves behind — the same JSON libzb writes, so a Node
+/// client and a libzb client can share one identity file.
+export interface EnrolledIdentity {
+  version: 1;
+  bridge_url: string;
+  principal: string;
+  creds: string;
+  nats_url?: string;
+  nats_ws_url?: string;
+  grammar_hash?: string;
+  js_domain?: string;
+}
+
+/// Redeem an invite: this device's own key pair (the seed never leaves it), `GET
+/// <bridgeUrl>/enroll`, and the identity built from the answer. `connect()` calls it
+/// with an `invite`; an app that manages identities itself can call it directly.
+export async function enrollAt(bridgeUrl: string, code: string, transport: Transport = natsTransport): Promise<EnrolledIdentity> {
+  const base = bridgeUrl.replace(/\/+$/, '');
+  const kp = transport.createUser();
+  let res: Response;
+  try {
+    res = await fetch(`${base}/enroll?code=${encodeURIComponent(code.trim())}&user_pubkey=${kp.publicKey}`);
+  } catch (e) {
+    throw new Error(`enroll: ${base} unreachable (${(e as Error).message})`);
+  }
+  if (res.status === 404) throw new Error(`enroll: ${base} has enrollment off (404) — the bridge needs ZB_SIGNING_SEED and ZB_ACCOUNT_PUB`);
+  if (res.status === 401 || res.status === 403) throw new Error(`enroll: refused (${res.status}): the code is invalid, used or expired, or the principal was revoked`);
+  if (!res.ok) throw new Error(`enroll: ${base} answered ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const p = await res.json() as Record<string, string | undefined>;
+  if (!p.jwt || !p.principal) throw new Error('enroll: the bridge\'s answer has no jwt or principal');
+  return {
+    version: 1, bridge_url: base, principal: p.principal, creds: credsFileText(p.jwt, kp.seed),
+    ...(p.nats_url ? { nats_url: p.nats_url } : {}),
+    ...(p.nats_ws_url ? { nats_ws_url: p.nats_ws_url } : {}),
+    ...(p.grammar_hash ? { grammar_hash: p.grammar_hash } : {}),
+    ...(p.js_domain ? { js_domain: p.js_domain } : {}),
+  };
+}
+
 export function credsFileText(jwt: string, seed: string): string {
   // The layout `nsc` writes and `bridge --init-nats` emits, byte for byte — libzb's
   // `zb_creds_file_text` produces the same. The warning block is not decoration: this
@@ -359,7 +409,9 @@ function outboxVersionOf(row: { payload?: string }): string | null {
 const OBJECT_PULL_CHUNKS = 16;
 
 export class ZeBridge {
-  public readonly dbName: string;
+  /// The replica's name. With an invite and nothing given, known only once `connect()`
+  /// has enrolled (the default is per principal).
+  public dbName: string;
   public sql: StorageExec = async () => { throw new Error('Not connected'); };
   public transaction: Storage['transaction'] = async () => { throw new Error('Not connected'); };
   public deleteDatabaseFile: Storage['deleteDatabaseFile'] = async () => { throw new Error('Not connected'); };
@@ -472,15 +524,52 @@ export class ZeBridge {
       if (fromJwt && fromJwt !== config.principal) config.principal = fromJwt;
     }
     if (config.clientId) this.clientIdValue = config.clientId;
-    // The same default as libzb: one replica per principal, kept across runs.
-    this.dbName = config.dbPath ?? `zebridge_${config.principal}.sqlite3`;
+    // The same default as libzb: one replica per principal, kept across runs. Without a
+    // principal yet (an invite, §10jq) the name is settled by connect().
+    this.dbName = config.dbPath ?? (config.principal ? `zebridge_${config.principal}.sqlite3` : '');
     
     this.transport = config.transport ?? natsTransport;
     this.outboxInitPromise = new Promise((resolve) => { this.resolveOutboxInit = resolve; });
   }
 
+  /// §10jq: who this client is, before anything opens. Explicit `creds` win; else the
+  /// stored identity; else `bridgeUrl` + `invite` enroll and store one. What the identity
+  /// knows fills every option the app left out — the same rule as libzb's.
+  private identityResolved = false;
+  private async resolveIdentity(): Promise<void> {
+    if (this.identityResolved) return;
+    const c = this.config;
+    if (!c.creds) {
+      const key = c.identityPath ?? (c.dbPath ? `${c.dbPath}.identity` : 'zebridge.identity');
+      const store = this.platform.identity;
+      let text = store ? await store.load(key) : null;
+      if (!text && c.invite) {
+        if (!c.bridgeUrl) throw new Error('zb-client-ts: an invite needs `bridgeUrl`: the bridge that redeems it');
+        const id = await enrollAt(c.bridgeUrl, c.invite, this.transport);
+        text = JSON.stringify(id);
+        if (store) await store.save(key, text);
+        else this.appendLog('SYS', `enrolled as '${id.principal}', but ${this.platform.name} has no identity store: the next run needs creds`, 'WARN');
+        this.appendLog('SYS', `Enrolled as '${id.principal}' at ${id.bridge_url}`, 'INFO');
+      }
+      if (text) {
+        const id = JSON.parse(text) as EnrolledIdentity;
+        c.creds = id.creds;
+        c.principal = principalFromCreds(id.creds) ?? id.principal;
+        c.natsUrl ??= (this.platform.natsOverWebSocket ? id.nats_ws_url : id.nats_url) ?? undefined;
+        c.grammarHash ??= id.grammar_hash ?? undefined;
+        c.jsDomain ??= id.js_domain ?? undefined;
+        c.bridgeUrl ??= id.bridge_url;
+      }
+    }
+    if (!c.natsUrl) throw new Error('zb-client-ts: no `natsUrl`, and no identity that names one (the bridge sets ENROLL_NATS_URL / ENROLL_NATS_WS_URL)');
+    if (!c.principal) throw new Error('zb-client-ts: no principal: pass `creds`, an `invite` with `bridgeUrl`, or `principal` + `password`');
+    if (!this.dbName) (this as { dbName: string }).dbName = `zebridge_${c.principal}.sqlite3`;
+    this.identityResolved = true;
+  }
+
   private async initializeStorage() {
     if (this.storage) return; // already initialized
+    if (!this.dbName) throw new Error('zb-client-ts: the replica is named after the principal, which enrollment gives — call connect() first');
     
     const factory = this.config.storage ?? await this.platform.storage({ dbPath: this.dbName, engine: this.config.engine });
 
@@ -808,6 +897,7 @@ export class ZeBridge {
   // ─── lifecycle ────────────────────────────────────────────────────────────
 
   public async connect(): Promise<void> {
+    await this.resolveIdentity();
     await this.initializeStorage();
     if (!this.config.grammarHash && this.config.bridgeUrl) {
       try {
@@ -3722,7 +3812,7 @@ export class ZeBridge {
     // Subject and idempotency id come from core (§10s 2c): the version stays
     // IN the id — a second edit to the same row is a different write; a retry
     // of the same edit is not.
-    const subject = mutationSubject(this.config.principal, table, op, this.config.grammar.subjects?.mutations_prefix);
+    const subject = mutationSubject(this.config.principal!, table, op, this.config.grammar.subjects?.mutations_prefix);
     const msgId = mutationMsgId(this.clientIdValue, table, id, version);
     const h = this.transport.headers();
     h.set('Nats-Msg-Id', msgId);
@@ -3887,7 +3977,7 @@ export class ZeBridge {
     const bucket = this.config.grammar?.kv?.live ?? 'live';
     const subject = `$KV.${bucket}.${tenant}.${this.config.principal}`;
     try {
-      const payload = heartbeatPayload(this.config.principal, tenant, Date.now(), this.globalSyncState.seq);
+      const payload = heartbeatPayload(this.config.principal!, tenant, Date.now(), this.globalSyncState.seq);
       await this.transport.jetstream(this.nc, this.jsOpts()).publish(subject, new TextEncoder().encode(payload));
     } catch (err) {
       this.appendLog('SYS', `heartbeat not accepted (${subject}): ${err}`, 'WARNING');
