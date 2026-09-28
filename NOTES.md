@@ -17450,3 +17450,30 @@ and drops them. Correct, since attribution is by reply subject, and cheap — bu
 §10jb's "inbox held" diagnostic at a constant 4 instead of 0, which is noise exactly
 where a real backlog would show. A fix for nats.zig: ask the server to expire slightly
 before the client's own deadline, so the 408s end the fetch inside its wait.
+
+## §10jp — reprovision.py had become destructive; it now keeps what it does not know (2026-09-28)
+
+`scripts/reprovision.py` (§10cv, 2026-09-05) defined residue as "every public table that
+is not a base fixture". A `--list` on today's stack showed what that had grown into: it
+would have dropped PostGIS's own `spatial_ref_sys`, every example table (05's app_*,
+06's fire_types, 08's pois, routes, fuel_* and charge_points), the LIVE bridge's
+`my_slot`, and deleted the events/mqttgw mappings — a revocation with a ban (§10dm).
+Its tenant check also read memberships into a dict, one tenant per principal, a
+leftover of before §10fn made them sets.
+
+Now:
+
+* **Tables:** dropped only when recognised as a scenario probe (zb_*, *_t type fixtures,
+  mig_*, crazy_N, tzguard_*, ro_*/rw_*, sw_*, test_types_vN and a few one-offs, from
+  scripts/scenarios); anything else is printed as kept, and `--drop-unknown` opts in.
+  A table an extension owns (pg_depend 'e') is never a candidate.
+* **Slots:** an active slot is never dropped; the bridge's own ($BRIDGE_CDC_SLOT, default
+  my_slot) only with `--drop-bridge-slot`. (psql prints a boolean as `t`, but cast to
+  text it is `true` — the first check never matched; it says `active`/`idle` now.)
+* **Mappings:** only the fixture principals (alice, bob, mary, nina, omar), compared as
+  sets; the canonical mapping is inserted before an extra one is deleted, so none passes
+  through zero memberships. Other principals are the examples' and are left alone.
+* **Publication:** $BRIDGE_CDC_PUBLICATION, else the database's only publication.
+
+Dry run on the same stack: 4 probe tables (crazy_1–4), the fixtures truncated and
+re-enabled; 9 example tables kept, my_slot kept (active), spatial_ref_sys not listed.
