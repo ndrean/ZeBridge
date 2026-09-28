@@ -17417,3 +17417,36 @@ lost measurably. Pure INSERT segments are unchanged (1.38 ms at 5,000/s). What a
 load really pays is the upsert's fixed ~1.4 ms (temp table, statement, drop) for a
 handful of rows; a per-row prepared upsert for a small remainder is the next lever, not
 built.
+
+## §10jo — the pruned range, live: a follower re-seeds instead of jumping (2026-09-28)
+
+§10jh's fix (a tail never jumps over a range the stream dropped; libzb's `.pruned` →
+gapAndSeed) had only fixtures behind it — and until §10jm the libzb runner never even fed
+the case its `firstSeq`. Now live, on the dev stack, with a libzb follower (omar,
+`test_types`, tenant kilo, a SQLite file kept between runs):
+
+1. Caught up at CDC_kilo 25962, the stream's end (max-age had emptied it); stopped.
+2. Five rows written in PostgreSQL (seq 25963–25967), then `nats stream purge CDC_kilo
+   --seq=25968` — what max-age or max-bytes does while a client is away — then three more
+   rows (25968–25970).
+3. Restarted. libzb said: chain g33 predates the stream (cutoff 25962 < first 25968),
+   waiting for the next generation; the drain saw "5 message(s) pruned under the drain
+   (position 25962, delivered 25968)" and did not move; it re-seeded from g34 (cutoff
+   25970, 8 rows), "gap healed", resumed at 25968 and tailed on.
+
+End state equal to PostgreSQL: 20 live kilo rows, the same sha256 over the sorted uids
+(484cb40e11a6), position 25970 = the stream's last sequence.
+
+**The 4 messages waiting in the inbox before every idle pull**, traced (a temporary print
+of every status frame `PullInbox.fetch` receives): not leftovers of the recovery, the
+steady state of ANY idle tail. The tails use `pull_depth = 2`, and omar follows two
+streams (CDC_PUBLIC, CDC_kilo): 4 requests per poll, each asking the server to expire it
+after the poll's `wait_ms`. The client's own deadline is the same 500 ms, but it starts
+before the request reaches the server, so the client always gives up first (polls
+returned after 503–518 ms), and the four `408 Request Timeout` frames land just after.
+The next fetch finds them at the front of the queue, sees reply subjects of the
+previous fetch (`<prefix>1x0y0` = fetch 1, consumer 0, request 0) with no open request,
+and drops them. Correct, since attribution is by reply subject, and cheap — but it keeps
+§10jb's "inbox held" diagnostic at a constant 4 instead of 0, which is noise exactly
+where a real backlog would show. A fix for nats.zig: ask the server to expire slightly
+before the client's own deadline, so the 408s end the fetch inside its wait.
