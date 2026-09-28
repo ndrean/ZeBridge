@@ -17304,3 +17304,23 @@ test writes to stderr, and these tests print expected refusals.
 
 Windows: `std.DynLib` does not cover it, so there the two optional engines report
 themselves unavailable; SQLite is unaffected.
+
+## §10jm — the mutation op in any case; the Zig runner's missing firstSeq (2026-09-28)
+
+§10jl found that libzb's core compared the op to `"DELETE"` as given, so a host's
+lowercase `"delete"` built an envelope with data, an optimistic event whose operation no
+apply recognised, and only the subject (lowercased anyway) said delete. Both cores now
+have `normalizeOp`: any case in, `INSERT`/`UPDATE`/`DELETE` out, anything else refused as
+`UnknownOperation` before an outbox row exists. `buildMutation` uses it, and so do both
+clients at their `mutate` entry (libzb's `mutateAt`, zb-client-ts's `mutate`), because
+the shells compare the op again after the core. The Kotlin class no longer capitalises.
+Three `envelope` fixtures pin it: "delete" equals the DELETE case, "Update" equals the
+UPDATE case, "UPSERT" throws.
+
+Running them through libzb (python/runner.py) turned up an older fault: the runner built
+`caughtUp`'s arguments from a fixed key list that e838145 never extended, so libzb got
+`firstSeq = 0` and the §10jh pruned-range case failed there while passing in TS. The Zig
+function was right; the runner passes `firstSeq` now. 232/232 through libzb, 244/244 in
+TS.
+On the moto e20, the AAR rebuilt without the Kotlin capitalising: 3/3, the DELETE sent as
+`"delete"` settled and PostgreSQL holds the row tombstoned.

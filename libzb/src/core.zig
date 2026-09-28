@@ -869,12 +869,22 @@ pub fn chainRowParams(a: std.mem.Allocator, row: std.json.Array) !Value {
 
 // ─── the mutate() envelope ──────────────────────────────────────────────────
 
+/// core.ts normalizeOp (§10jm): the op a host passes, in any case, as the wire spells
+/// it. Every comparison after this one reads the result, never the host's text — a
+/// lowercase "delete" once built a non-delete envelope. null: not an operation.
+pub fn normalizeOp(op: []const u8) ?[]const u8 {
+    for ([_][]const u8{ "INSERT", "UPDATE", "DELETE" }) |known| {
+        if (std.ascii.eqlIgnoreCase(op, known)) return known;
+    }
+    return null;
+}
+
 /// core.ts buildMutation: the whole envelope in one call.
 pub fn buildMutation(a: std.mem.Allocator, args: Value) !Value {
     const principal = getStr(args, "principal") orelse "";
     const client_id = getStr(args, "clientId") orelse "";
     const table = getStr(args, "table") orelse "";
-    const op = getStr(args, "op") orelse "";
+    const op = normalizeOp(getStr(args, "op") orelse "") orelse return error.UnknownOperation;
     const version = getStr(args, "version") orelse "";
     const key = if (args == .object) args.object.get("key") orelse .null else Value.null;
     const values = if (args == .object) args.object.get("values") else null;

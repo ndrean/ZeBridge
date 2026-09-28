@@ -35,7 +35,7 @@ import { heartbeatPayload,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgEngineValues, chainUpsertSql, chainRowParams,
   type SqlStep,
   fkClausesFor, createTableSteps, rebuildSteps, diffColumns, keyShape, typeShape, retypedColumns, isReadOnlySql,
-  mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent,
+  mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent, normalizeOp,
   normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate,
   isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, parseChainHead, msgpackScan, msgpackDecodeScanned, chainStageSql, vecColsOf, pgVectorValues, vecLiteral, strictMissing,
@@ -515,11 +515,12 @@ export class ZeBridge {
   /// version stamped on the write so callers can mirror it into value columns.
   public async mutate(
     table: string,
-    op: 'INSERT' | 'UPDATE' | 'DELETE',
+    opIn: string,
     key: Record<string, unknown>,
     values?: Record<string, unknown>,
     opts?: { version?: string },
   ): Promise<{ version: string }> {
+    const op = normalizeOp(opIn); // §10jm: any case in, capitals from here on
     await this.initializeStorage();
     const state = this.syncedTables.get(table);
     if (!state || !state.pkCols.length) throw new Error(`table ${table} is not synced or has no primary key`);

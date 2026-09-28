@@ -4034,7 +4034,9 @@ pub const SyncClient = struct {
     /// `mutate` with the caller's own stamp (the TypeScript client's `opts.version`):
     /// a host that keeps its own clock, or a test modelling a slow one. The HLC only
     /// advances: a stamp above it is followed, one below it is sent and forgotten.
-    pub fn mutateAt(self: *SyncClient, result_a: std.mem.Allocator, table: []const u8, op: []const u8, key: Value, values: ?Value, stamp: ?[]const u8) ![]const u8 {
+    pub fn mutateAt(self: *SyncClient, result_a: std.mem.Allocator, table: []const u8, op_in: []const u8, key: Value, values: ?Value, stamp: ?[]const u8) ![]const u8 {
+        // §10jm: any case in, capitals from here on — the `"DELETE"` checks below read this.
+        const op = core.normalizeOp(op_in) orelse return error.UnknownOperation;
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const a = ca.allocator();

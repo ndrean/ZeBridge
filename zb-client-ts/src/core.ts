@@ -1203,22 +1203,34 @@ export function optimisticEvent(table: string, op: string, payload: Record<strin
   };
 }
 
+export type MutationOp = 'INSERT' | 'UPDATE' | 'DELETE';
+
+/// §10jm: the op a host passes, in any case — the wire's spelling is capitals. Every
+/// comparison after this one (`=== 'DELETE'`) reads the result, never the host's text:
+/// a lowercase "delete" once built a non-delete envelope. Anything else is refused.
+export function normalizeOp(op: string): MutationOp {
+  const up = String(op).toUpperCase();
+  if (up === 'INSERT' || up === 'UPDATE' || up === 'DELETE') return up;
+  throw new Error(`UnknownOperation: ${op}`);
+}
+
 /// The whole envelope in one call — what a port implements first.
 export function buildMutation(args: {
   principal: string; clientId: string; table: string;
-  op: 'INSERT' | 'UPDATE' | 'DELETE';
+  op: string;
   key: Record<string, unknown>; values?: Record<string, unknown>;
   pkCols: string[]; version: string;
   mutationsPrefix?: string;
 }): { subject: string; msgId: string; id: string; payload: Record<string, unknown>; optimistic: Record<string, unknown> } {
+  const op = normalizeOp(args.op);
   const id = mutationKeyId(args.pkCols, args.key);
-  const payload = mutationPayload(args.op, args.key, args.values, args.version, args.clientId);
+  const payload = mutationPayload(op, args.key, args.values, args.version, args.clientId);
   return {
-    subject: mutationSubject(args.principal, args.table, args.op, args.mutationsPrefix),
+    subject: mutationSubject(args.principal, args.table, op, args.mutationsPrefix),
     msgId: mutationMsgId(args.clientId, args.table, id, args.version),
     id,
     payload,
-    optimistic: optimisticEvent(args.table, args.op, payload),
+    optimistic: optimisticEvent(args.table, op, payload),
   };
 }
 
