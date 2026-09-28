@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
-import '../data/zebridge_worker.dart';
+import 'package:zebridge/zebridge.dart';
 
 class ZeBridgeApp extends StatelessWidget {
   const ZeBridgeApp({super.key});

@@ -17,8 +17,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
 
-import 'src/data/zebridge.dart' show PollReport;
-import 'src/data/zebridge_worker.dart';
+import 'package:zebridge/zebridge.dart';
 
 /// The simulator shares the Mac's network; a real phone needs the Mac's LAN address:
 ///   flutter run -d `<device>` --dart-define=ZB_NATS_URL=nats://192.168.1.11:4222

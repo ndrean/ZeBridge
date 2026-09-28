@@ -36,8 +36,7 @@ import 'package:vector_map_tiles_pmtiles/vector_map_tiles_pmtiles.dart';
 import 'package:vector_tile_renderer/vector_tile_renderer.dart'
     show ProvidedThemes;
 
-import 'zebridge.dart' show PollReport;
-import 'zebridge_worker.dart';
+import 'package:zebridge/zebridge.dart';
 
 // Dev copy: the repository paths, like 05-tables. A shipped app bundles the creds it
 // enrolled.

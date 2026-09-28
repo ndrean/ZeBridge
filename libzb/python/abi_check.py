@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """libzb/abi.json against the code: the exported `zb_*` functions, the option keys
 `openBox` reads from `zb_client_connect`'s JSON, and the version — capi.zig's
-`abi_version` and every host that pins it (zb-react-native, zb-android). Any difference fails and
+`abi_version` and every host that pins it (zb-react-native, zb-android, zb-python, zb-dart). Any difference fails and
 says what to do: a host embedding a COPY of libzb (an xcframework, an .so) finds out it
 is stale by comparing versions, so a change that is not a bump is a stale copy nobody
 can detect (NOTES §10ja: an app's libzb, built before `creds`, sat in connect)."""
@@ -26,9 +26,9 @@ if keys != abi["connectOptions"]:
     problems.append(f"connect options changed: +{sorted(set(keys) - set(abi['connectOptions']))} -{sorted(set(abi['connectOptions']) - set(keys))}")
 if code_version != abi["version"]:
     problems.append(f"capi.zig abi_version is {code_version}, abi.json says {abi['version']}")
-for pin in (REPO / "zb-react-native" / "src" / "abi.ts", REPO / "zb-android" / "src" / "main" / "kotlin" / "dev" / "zebridge" / "ZeBridge.kt", REPO / "zb-python" / "src" / "zebridge" / "__init__.py"):
+for pin in (REPO / "zb-react-native" / "src" / "abi.ts", REPO / "zb-android" / "src" / "main" / "kotlin" / "dev" / "zebridge" / "ZeBridge.kt", REPO / "zb-python" / "src" / "zebridge" / "__init__.py", REPO / "zb-dart" / "lib" / "src" / "native.dart"):
     if pin.exists():
-        pm = re.search(r"ZB_ABI = (\d+)", pin.read_text())
+        pm = re.search(r"(?:ZB_ABI|zbAbi) = (\d+)", pin.read_text())
         if not pm or int(pm.group(1)) != abi["version"]:
             problems.append(f"{pin.relative_to(REPO)} pins {pm.group(1) if pm else '?'}, abi.json says {abi['version']}")
 

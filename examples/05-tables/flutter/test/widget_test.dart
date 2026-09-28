@@ -2,7 +2,7 @@
 // library"): what changed, what was seeded, what settled, and — from the worker —
 // why a poll failed. Parsed from the C card's JSON exactly as it comes.
 import 'package:flutter_test/flutter_test.dart';
-import 'package:zebridge_flutter/src/data/zebridge.dart';
+import 'package:zebridge/zebridge.dart';
 
 void main() {
   test('a poll report carries the changed and seeded tables', () {

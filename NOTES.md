@@ -17671,3 +17671,25 @@ bridge's port and creates an invite per run: 4/4 — the three earlier tests and
 `enrollFromInvite`: an invite alone → enrolled (tenant kilo), the identity kept beside the
 replica, and a second construction from the identity alone. Over http through adb
 reverse; https from the phone (the NDK's CA directory, §10jq) not yet exercised.
+
+## §10jw — the Dart package: one ZeBridgeWorker instead of three drifting copies (2026-09-28)
+
+Each Flutter example carried its own `zebridge.dart` + `zebridge_worker.dart`, and they had
+drifted: 05 and 06 reported `unseeded`, 08 had `tenants`, `join`/`leave`, `request`,
+`ingest` and `call`; 05 and 08 opened libzb from a hardcoded `/Users/nevendrean/...` path.
+
+`zb-dart/` (package `zebridge`): the FFI layer rewritten once (`_take` reads the JSON and
+frees it, `{"error"}` and NULL raise `ZeBridgeException` with libzb's words, connect
+failures read zb_last_error), the ABI pinned (`zbAbi = 3`, now in abi_check.py with the
+other bindings), libzb found with no path in the code (iOS: the process, Android:
+`libzbcore.so`, desktop: `ZB_LIB` or the repository build found from the working
+directory), and 08's isolate worker with 06's `unseeded`. The options go to libzb as they
+are, so `bridgeUrl` + `invite` need nothing Dart-specific.
+
+The three apps depend on it (`path: ../../../zb-dart`) and their copies are deleted:
+`flutter analyze` clean for 05 and 06, 08 unchanged (the same six `print` notes in its
+`tool/` scripts). Live on macOS with plain Dart (`example/enroll.dart`): an invite alone →
+enrolled as dart_user, UTF-8 round trip, a write settled through the report stream; then
+the identity alone. The phone libraries are rebuilt for ABI 3 (06's xcframework and
+jniLibs, zb-react-native's ZbCore) and the 06 app builds for Android (debug APK) and iOS
+(no codesign). Not yet run on a phone.

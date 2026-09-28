@@ -208,6 +208,13 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "15.3.0"
+  zebridge:
+    dependency: "direct main"
+    description:
+      path: "../../../zb-dart"
+      relative: true
+    source: path
+    version: "0.1.0"
 sdks:
   dart: ">=3.11.0-0 <4.0.0"
   flutter: ">=3.18.0-18.0.pre.54"

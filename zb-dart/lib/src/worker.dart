@@ -14,6 +14,10 @@
 /// broker, then yields to the command port, so a click reaches the handle within that
 /// bound (100 ms by default — the trade between broker round trips and UI latency).
 ///
+/// The options are passed to libzb as they are (CLIENTS.md): the first run needs only
+/// `bridgeUrl` and `invite` — libzb enrolls, keeps the identity beside the replica, and
+/// renews the JWT from `poll` (§10jq, §10jt).
+///
 /// App lifecycle: `pause()` stops polling (the loop idles without touching the broker)
 /// and `resume()` restarts it — `poll` then catches up on everything missed and
 /// `flush` sends what was written meanwhile. The outbox is what makes the pause
@@ -24,17 +28,23 @@ library;
 import 'dart:async';
 import 'dart:isolate';
 
-import 'zebridge.dart';
+import 'native.dart';
 
 class ZeBridgeWorker {
-  ZeBridgeWorker._(this._toWorker, this._fromWorker, this.tenant, this.unseeded);
+  ZeBridgeWorker._(this._toWorker, this._fromWorker, this.tenant, this.tenants, this.unseeded);
 
   final SendPort _toWorker;
   final ReceivePort _fromWorker;
+
+  /// The first membership (sorted), or the open tenant.
   final String tenant;
-  /// §10iz: what the first sync could not seed — `[{table, reason}]`, libzb's own
-  /// words. Empty means every followed table is in the replica. A host that shows
-  /// "usable" without reading this showed "usable in 15.8 s" over 0 rows once.
+
+  /// Every membership resolved at connect (§10fn); `join`/`leave` move it from here on.
+  final List<String> tenants;
+
+  /// §10iz: what the first sync could not seed — `[{table, reason}]`, libzb's own words.
+  /// Empty means every followed table is in the replica. A host that shows "usable"
+  /// without reading this showed "usable in 15.8 s" over 0 rows once.
   final List<Map<String, dynamic>> unseeded;
 
   final _reports = StreamController<PollReport>.broadcast();
@@ -65,7 +75,7 @@ class ZeBridgeWorker {
           ready.complete(m);
           break;
         case 'fatal':
-          if (!ready.isCompleted) ready.completeError(Exception(m['error']));
+          if (!ready.isCompleted) ready.completeError(ZeBridgeException(m['error'] as String));
           break;
         case 'report':
           worker._reports
@@ -75,7 +85,7 @@ class ZeBridgeWorker {
           final c = worker._pending.remove(m['id'] as int);
           if (c == null) break;
           if (m.containsKey('error')) {
-            c.completeError(Exception(m['error']));
+            c.completeError(ZeBridgeException(m['error'] as String));
           } else {
             c.complete(m['result']);
           }
@@ -90,9 +100,8 @@ class ZeBridgeWorker {
         toWorker!,
         fromWorker,
         (info['tenant'] as String?) ?? '—',
-        ((info['unseeded'] as List?) ?? const [])
-            .map((e) => Map<String, dynamic>.from(e as Map))
-            .toList());
+        List<String>.from((info['tenants'] as List?) ?? const []),
+        ((info['unseeded'] as List?) ?? const []).map((e) => Map<String, dynamic>.from(e as Map)).toList());
     // keep the subscription alive with the worker
     worker._sub = sub;
     return worker;
@@ -129,6 +138,37 @@ class ZeBridgeWorker {
   Future<Map<String, dynamic>> flush(int waitMs) async =>
       Map<String, dynamic>.from(
           await _call<dynamic>('flush', {'waitMs': waitMs}) as Map);
+
+  /// §10fn: follow one more tenant / drop one. Served between polls like the rest;
+  /// a join seeds the tenant's chains before it answers, so it takes a moment.
+  Future<List<String>> join(String tenant) async => List<String>.from(
+      await _call<dynamic>('join', {'tenant': tenant}) as List);
+  Future<List<String>> leave(String tenant) async => List<String>.from(
+      await _call<dynamic>('leave', {'tenant': tenant}) as List);
+
+  /// §10hj: ask a service (request/reply on the card's connection) — served between polls.
+  Future<Map<String, dynamic>> request(
+          String subject, Map<String, dynamic> payload,
+          {int timeoutMs = 5000}) async =>
+      Map<String, dynamic>.from(await _call<dynamic>('request', {
+        'subject': subject,
+        'payload': payload,
+        'timeoutMs': timeoutMs
+      }) as Map);
+
+  /// §10hj: keep an answer in an on-demand table; returns the rows applied.
+  /// §10ho: a core function of the library, by name — `mergeRegisters` for the route.
+  Future<Map<String, dynamic>> call(
+          String fn, Map<String, dynamic> args) async =>
+      Map<String, dynamic>.from(
+          await _call<dynamic>('call', {'fn': fn, 'args': args}) as Map);
+
+  Future<int> ingest(String table, Map<String, dynamic> answer,
+          [Map<String, dynamic>? scope]) async =>
+      (await _call<dynamic>(
+                  'ingest', {'table': table, 'answer': answer, 'scope': scope})
+              as num)
+          .toInt();
 
   /// Stop polling while the app is in the background; nothing touches the broker.
   void pause() => _toWorker.send({'op': 'pause'});
@@ -167,7 +207,12 @@ Future<void> _workerMain(_Boot boot) async {
     ZeBridge.init();
     zb = ZeBridge(boot.options);
     final info = zb.sync();
-    toUi.send({'type': 'ready', 'tenant': info['tenant'], 'unseeded': info['unseeded']});
+    toUi.send({
+      'type': 'ready',
+      'tenant': info['tenant'],
+      'tenants': info['tenants'],
+      'unseeded': info['unseeded'],
+    });
   } catch (e) {
     toUi.send({'type': 'fatal', 'error': e.toString()});
     commands.close();
@@ -213,6 +258,30 @@ Future<void> _workerMain(_Boot boot) async {
         case 'flush':
           reply(zb.flush(m['waitMs'] as int));
           break;
+        case 'request':
+          reply(zb.request(
+              m['subject'] as String,
+              Map<String, dynamic>.from(m['payload'] as Map),
+              m['timeoutMs'] as int));
+          break;
+        case 'call':
+          reply(ZeBridge.call(
+              m['fn'] as String, Map<String, dynamic>.from(m['args'] as Map)));
+          break;
+        case 'ingest':
+          reply(zb.ingest(
+              m['table'] as String,
+              Map<String, dynamic>.from(m['answer'] as Map),
+              m['scope'] == null
+                  ? null
+                  : Map<String, dynamic>.from(m['scope'] as Map)));
+          break;
+        case 'join':
+          reply(zb.join(m['tenant'] as String));
+          break;
+        case 'leave':
+          reply(zb.leave(m['tenant'] as String));
+          break;
         case 'pause':
           paused = true;
           break;
@@ -238,7 +307,9 @@ Future<void> _workerMain(_Boot boot) async {
     }
     try {
       final report = zb.poll(boot.pollWaitMs);
-      if (report.changedTables.isNotEmpty || report.seeded.isNotEmpty) {
+      if (report.changedTables.isNotEmpty ||
+          report.seeded.isNotEmpty ||
+          report.unreadable.isNotEmpty) {
         toUi.send({
           'type': 'report',
           'report': {
@@ -246,6 +317,7 @@ Future<void> _workerMain(_Boot boot) async {
             'settled': report.settled,
             'changed_tables': report.changedTables,
             'seeded': report.seeded,
+            'unreadable': report.unreadable,
           },
         });
       }
