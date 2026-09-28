@@ -43,7 +43,7 @@ class ZeBridgeDeviceTest {
     fun seedQueryWriteEchoDelete() {
         val settled = CountDownLatch(2) // the INSERT's verdict, then the DELETE's
         ctx.deleteDatabase("zebridge.sqlite3")
-        val zb = ZeBridge.connect(options(), ctx, listener = { r -> repeat(r.optInt("settled")) { settled.countDown() } })
+        val zb = ZeBridge(options(), ctx, listener = { r -> repeat(r.optInt("settled")) { settled.countDown() } })
         try {
             assertEquals(listOf("kilo"), zb.tenants)
             val live = zb.query("SELECT count(*) AS n FROM test_types WHERE deleted_at IS NULL")[0]["n"] as Number
@@ -91,10 +91,28 @@ class ZeBridgeDeviceTest {
         }
     }
 
+    /** §10jq: the whole onboarding from an invite — no creds, no NATS URL, no principal. */
+    @Test
+    fun enrollFromInvite() {
+        val invite = args.getString("invite") ?: return // the script creates one per run
+        val db = ctx.getDatabasePath("zb-enroll.sqlite3")
+        ctx.deleteDatabase("zb-enroll.sqlite3")
+        java.io.File("${db.path}.identity").delete()
+        val base = mapOf("bridgeUrl" to "http://127.0.0.1:27434", "dbPath" to db.path, "tables" to listOf("test_types"), "heartbeatMs" to 0)
+        ZeBridge(base + ("invite" to invite), ctx).use { zb ->
+            assertEquals(listOf("kilo"), zb.tenants)
+            zb.query("SELECT count(*) AS n FROM test_types")
+        }
+        val identity = java.io.File("${db.path}.identity")
+        assertTrue("the identity is kept beside the replica", identity.exists())
+        // A later start: the invite is spent, the identity is enough.
+        ZeBridge(base, ctx).use { zb -> assertEquals(listOf("kilo"), zb.tenants) }
+    }
+
     @Test
     fun missingEngineSaysWhy() {
         try {
-            ZeBridge.connect(options(mapOf("engine" to "duckdb", "dbPath" to ctx.getDatabasePath("zb-test.duckdb").path)))
+            ZeBridge(options(mapOf("engine" to "duckdb", "dbPath" to ctx.getDatabasePath("zb-test.duckdb").path)))
             fail("a phone has no libduckdb")
         } catch (e: ZeBridgeException) {
             assertTrue(e.message, e.message!!.contains("engine 'duckdb'"))

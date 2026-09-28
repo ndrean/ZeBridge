@@ -19,9 +19,9 @@ class ZeBridgeException(message: String) : RuntimeException(message)
  * writes back through it.
  *
  * ```kotlin
- * val zb = ZeBridge.connect(mapOf(
- *     "natsUrl" to "tls://example.com:4222",
- *     "creds" to credsText,               // what /enroll handed this device
+ * val zb = ZeBridge(mapOf(
+ *     "bridgeUrl" to "https://zb.example.com",
+ *     "invite" to code,                    // first run only: what your backend handed the device
  *     "tables" to listOf("orders"),
  * ), context) { result -> /* rows changed: re-query, on your UI thread */ }
  * val rows = zb.query("SELECT * FROM orders WHERE status = ?", "open")
@@ -29,19 +29,23 @@ class ZeBridgeException(message: String) : RuntimeException(message)
  * zb.close()
  * ```
  *
- * The same names and options as zb-client-ts and libzb (CLIENTS.md). libzb drives one
- * client from one thread; this class owns that thread. Every method may be called from
- * any thread and blocks until the worker has run it — so not from the main thread: a
- * call waits behind the poll in progress, up to [pollMs]. Between calls the worker
- * polls on its own, and [Listener.onPoll] hears about every change.
+ * The same names and options as zb-client-ts, libzb and the Python package (CLIENTS.md).
+ * Constructing connects: the first run enrolls with `invite` and keeps the identity
+ * next to the replica, later runs need only `bridgeUrl` (or nothing), and the JWT renews
+ * itself. With a [context] and neither `dbPath` nor `dbUrl`, the replica is
+ * `zebridge.sqlite3` in the app's private database directory, and the identity beside it.
+ * Throws [ZeBridgeException] with libzb's reason when it cannot connect.
+ *
+ * libzb drives one client from one thread; this class owns that thread. Every method may
+ * be called from any thread and blocks until the worker has run it — so not from the
+ * main thread: a call waits behind the poll in progress, up to [pollMs]. Between calls
+ * the worker polls on its own, and [Listener.onPoll] hears about every change.
  */
-class ZeBridge private constructor(
-    private val handle: Long,
-    /** The tenants this principal follows, from the first `sync` (`$KV.tenants.<principal>`). */
-    val tenants: List<String>,
-    private val worker: ScheduledExecutorService,
-    private val listener: Listener?,
-    private val pollMs: Long,
+class ZeBridge @JvmOverloads constructor(
+    options: Map<String, Any?>,
+    context: Context? = null,
+    private val pollMs: Long = 250,
+    private val listener: Listener? = null,
 ) : AutoCloseable {
 
     /** Called on the client's worker thread; hop to your UI thread to update views. */
@@ -53,56 +57,49 @@ class ZeBridge private constructor(
         fun onError(error: ZeBridgeException) {}
     }
 
+    private val handle: Long
+    /** The tenants this principal follows, from the first `sync` (`$KV.tenants.<principal>`). */
+    val tenants: List<String>
+    private val worker: ScheduledExecutorService
+
     @Volatile private var workerThread: Thread? = null
     @Volatile private var running = true
 
-    companion object {
-        /**
-         * Open the replica, seed and catch up (`sync`), then start the loop. Throws
-         * [ZeBridgeException] with libzb's reason when it cannot connect.
-         *
-         * With a [context] and neither `dbPath` nor `dbUrl`, the replica is
-         * `zebridge.sqlite3` in the app's database directory.
-         */
-        @JvmStatic
-        @JvmOverloads
-        fun connect(options: Map<String, Any?>, context: Context? = null, pollMs: Long = 250, listener: Listener? = null): ZeBridge =
-            connect(JSONObject(options), context, pollMs, listener)
-
-        @JvmStatic
-        @JvmOverloads
-        fun connect(options: JSONObject, context: Context? = null, pollMs: Long = 250, listener: Listener? = null): ZeBridge {
-            val abi = Native.abiVersion()
-            if (abi != ZB_ABI) throw ZeBridgeException("libzb ABI $abi, this binding speaks $ZB_ABI: rebuild the AAR")
-            val opts = JSONObject(options.toString())
-            if (context != null && !opts.has("dbPath") && !opts.has("dbUrl")) {
-                opts.put("dbPath", context.getDatabasePath("zebridge.sqlite3").also { it.parentFile?.mkdirs() }.path)
-            }
-            val worker = Executors.newSingleThreadScheduledExecutor { r ->
-                Thread(r, "zebridge-${opts.optString("clientId", "client")}").apply { isDaemon = true }
-            }
-            // Connect AND sync on the worker: the handle belongs to that thread from the start,
-            // and zb_last_error, being per thread, is read where the failure happened.
-            val (handle, synced) = try {
-                worker.submit<Pair<Long, JSONObject>> {
-                    val h = Native.connect(opts.toString().toByteArray(Charsets.UTF_8))
-                    if (h == 0L) throw ZeBridgeException(lastErrorText() ?: "zb_client_connect failed")
-                    val synced = try {
-                        result(Native.sync(h))
-                    } catch (e: ZeBridgeException) {
-                        Native.close(h)
-                        throw e
-                    }
-                    h to synced
-                }.get()
-            } catch (e: ExecutionException) {
-                worker.shutdownNow()
-                throw (e.cause as? ZeBridgeException) ?: ZeBridgeException(e.cause?.toString() ?: e.toString())
-            }
-            val tenants = synced.optJSONArray("tenants")?.let { a -> List(a.length()) { a.getString(it) } } ?: emptyList()
-            return ZeBridge(handle, tenants, worker, listener, pollMs).also { it.startLoop() }
+    init {
+        val abi = Native.abiVersion()
+        if (abi != ZB_ABI) throw ZeBridgeException("libzb ABI $abi, this binding speaks $ZB_ABI: rebuild the AAR")
+        val opts = JSONObject(options)
+        if (context != null && !opts.has("dbPath") && !opts.has("dbUrl")) {
+            opts.put("dbPath", context.getDatabasePath("zebridge.sqlite3").also { it.parentFile?.mkdirs() }.path)
         }
+        worker = Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "zebridge-${opts.optString("clientId", "client")}").apply { isDaemon = true }
+        }
+        // Connect AND sync on the worker: the handle belongs to that thread from the start,
+        // and zb_last_error, being per thread, is read where the failure happened (an
+        // enrollment refused, a bridge unreachable — libzb's words either way).
+        val (h, synced) = try {
+            worker.submit<Pair<Long, JSONObject>> {
+                val h = Native.connect(opts.toString().toByteArray(Charsets.UTF_8))
+                if (h == 0L) throw ZeBridgeException(lastErrorText() ?: "zb_client_connect failed")
+                val synced = try {
+                    result(Native.sync(h))
+                } catch (e: ZeBridgeException) {
+                    Native.close(h)
+                    throw e
+                }
+                h to synced
+            }.get()
+        } catch (e: ExecutionException) {
+            worker.shutdownNow()
+            throw (e.cause as? ZeBridgeException) ?: ZeBridgeException(e.cause?.toString() ?: e.toString())
+        }
+        handle = h
+        tenants = synced.optJSONArray("tenants")?.let { a -> List(a.length()) { a.getString(it) } } ?: emptyList()
+        startLoop()
+    }
 
+    companion object {
         /** The grammar this library was built for; compare with the bridge's `X-Grammar-Hash`. */
         @JvmStatic
         fun grammarHash(): String = text(Native.grammarHash()) ?: ""

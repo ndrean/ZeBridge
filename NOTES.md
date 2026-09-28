@@ -17656,3 +17656,18 @@ Live: an invite alone → enrolled as py_user (kilo), 22 rows = PostgreSQL, "éc
 (ReadOnlyQuery); a second run from the identity alone. The examples and scenarios still
 carry their own ctypes classes (09-event's `Card` is ~45 lines the package replaces) —
 migrating them is the next step, one re-run each.
+
+## §10jv — Kotlin: `ZeBridge(options, context)`, and enrollment on a phone (2026-09-28)
+
+The static `ZeBridge.connect(...)` is gone (no alias): constructing connects, as in the
+Python package and zb-client-ts's `new ZeBridge(opts)`. With a Context and no dbPath the
+replica is `zebridge.sqlite3` in the app's private database directory, and libzb keeps the
+identity beside it (`<dbPath>.identity`, 0600) — `bridgeUrl` and `invite` are plain
+options, nothing Kotlin-specific. The AAR is rebuilt for ABI 3 (each .so ~300 KB larger:
+libzb's HTTP client and TLS, for /enroll and /renew).
+
+On the moto e20 (Android 11, armeabi-v7a), `scripts/device-test.sh` now also reverses the
+bridge's port and creates an invite per run: 4/4 — the three earlier tests and
+`enrollFromInvite`: an invite alone → enrolled (tenant kilo), the identity kept beside the
+replica, and a second construction from the identity alone. Over http through adb
+reverse; https from the phone (the NDK's CA directory, §10jq) not yet exercised.

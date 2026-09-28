@@ -8,13 +8,13 @@ arm64-v8a, armeabi-v7a and x86_64 (the emulator), the JNI layer, and one class,
 ## Use
 
 ```kotlin
-val zb = ZeBridge.connect(
+val zb = ZeBridge(
     mapOf(
-        "natsUrl" to "tls://example.com:4222",
-        "creds" to credsText,            // what /enroll gave this device
+        "bridgeUrl" to "https://zb.example.com",
+        "invite" to code,                // first run only: what your backend handed the device
         "tables" to listOf("orders"),
     ),
-    context,                             // the replica goes in the app's database directory
+    context,                             // the replica and its identity go in the app's private storage
 ) { result -> /* rows changed or writes settled: re-query, then update the UI on its thread */ }
 
 val open = zb.query("SELECT * FROM orders WHERE status = ?", "open")   // List<Map<String, Any?>>
@@ -35,9 +35,10 @@ the library's job:
 - **Revocation.** After the operator revokes the principal, `revoked` is true and the
   loop stops. The rows stay; `wipe()` removes them.
 
-Enrollment: `ZeBridge.createUser()` makes the key pair, `GET /enroll?code=…&user_pubkey=…`
-returns the JWT, and `ZeBridge.credsFileText(jwt, seed)` makes the `creds` text. Keep the
-seed in the Android Keystore.
+Enrollment is the library's: the first construction redeems `invite` at `bridgeUrl` and
+keeps the identity beside the replica (mode 0600, app-private); later ones need neither,
+and the JWT renews itself before it expires. `ZeBridge.createUser()` and
+`ZeBridge.credsFileText(jwt, seed)` remain for an app that manages identities itself.
 
 ## Build
 
