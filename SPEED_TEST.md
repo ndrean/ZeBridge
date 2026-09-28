@@ -423,6 +423,7 @@ deltas, which are still built in memory, or allocator retention) is not measured
 ## 100,000 events a second, and PostgreSQL's own settings (2026-09-15)
 
 ```sh
+scripts/native/down.sh && ZB_PG_BENCH=1 scripts/native/up.sh   # the sizing below; up.sh defaults to 512MB / 2GB
 RING_BUFFER_COUNT=132000 python scripts/scenarios/firehose_tls.py --seconds 300 --rate 50000 --cap-mib 128 --preload 2000000 --runs tls:on:defer:async
 ```
 

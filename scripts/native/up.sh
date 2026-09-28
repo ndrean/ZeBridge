@@ -38,15 +38,20 @@ PG_FLAGS=(
   -c wal_buffers=64MB
   -c commit_delay=1000
   -c commit_siblings=5
-  # NOTES §10gk: initdb's defaults (128MB buffers, 1GB of WAL between checkpoints) made
-  # the 100k firehose a disk benchmark — the client backend wrote its own evicted pages,
-  # 687 checkpoints were forced by WAL volume, and full-page writes doubled the WAL.
-  # Sized for a 16 GB Mac.
-  -c shared_buffers=4GB
-  -c max_wal_size=16GB
   -c checkpoint_timeout=15min
   -c wal_compression=zstd
 )
+# NOTES §10gk: initdb's defaults (128MB buffers, 1GB of WAL between checkpoints) made
+# the 100k firehose a disk benchmark — the client backend wrote its own evicted pages,
+# 687 checkpoints were forced by WAL volume, and full-page writes doubled the WAL.
+# ZB_PG_BENCH=1 sizes the cluster for that benchmark (16 GB Mac). Not the default:
+# shared_buffers is never given back while the server runs, so after a few big runs
+# PostgreSQL held 3.7 GB of RAM, and max_wal_size kept 3.6 GB of recycled WAL on disk.
+if [ "${ZB_PG_BENCH:-0}" = "1" ]; then
+  PG_FLAGS+=(-c shared_buffers=4GB -c max_wal_size=16GB)
+else
+  PG_FLAGS+=(-c shared_buffers=512MB -c max_wal_size=2GB)
+fi
 
 FRESH_PG=0
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
