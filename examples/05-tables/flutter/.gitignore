@@ -46,3 +46,7 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# libzb, built by ../../06-large-table/flutter/tool/build-libzb-*.sh and copied here
+ios/libzb/*.xcframework
+android/app/src/main/jniLibs/

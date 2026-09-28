@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:zebridge/zebridge.dart';
 
 class ZeBridgeApp extends StatelessWidget {
@@ -36,6 +37,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// path and the label on screen all derive from it, so they cannot drift apart
   /// the way they did (the screen read "alice" while the client was bob).
   static const String principal = 'bob';
+
+  /// §10jq: on a phone, the app enrolls: `--dart-define=ZB_BRIDGE_URL=http://<mac>:27434`
+  /// and, the first time, `--dart-define=ZB_INVITE=<code>`. The identity lands next to
+  /// the replica in the app's support directory; later runs need only the bridge URL.
+  /// Without ZB_BRIDGE_URL the desktop dev path below runs as before (bob's creds file).
+  static const String bridgeUrl = String.fromEnvironment('ZB_BRIDGE_URL');
+  static const String invite = String.fromEnvironment('ZB_INVITE');
+  String shownPrincipal = principal;
 
   ZeBridgeWorker? zb;
   StreamSubscription? reportsSub;
@@ -90,12 +99,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // libzb speaks plain NATS over TCP (no websocket — that is the browser's
       // transport), and the operator-mode broker takes a creds file, nothing else.
       // Dev copy: the file straight from the repository, like the library path.
+      final enrolled = bridgeUrl.isNotEmpty;
+      final dir = enrolled ? (await getApplicationSupportDirectory()).path : Directory.systemTemp.path;
       final worker = await ZeBridgeWorker.spawn({
-        "natsUrl": "nats://127.0.0.1:4222",
-        "credsPath":
-            "/Users/nevendrean/code/zig/ZeBridge/scripts/native/creds/$principal.creds",
-        "dbPath": "${Directory.systemTemp.path}/zb-flutter-$principal.sqlite3",
-        "principal": principal,
+        if (enrolled) ...{
+          "bridgeUrl": bridgeUrl,
+          if (invite.isNotEmpty) "invite": invite,
+          "dbPath": "$dir/zb-05-tables.sqlite3",
+        } else ...{
+          "natsUrl": "nats://127.0.0.1:4222",
+          "credsPath": "/Users/nevendrean/code/zig/ZeBridge/scripts/native/creds/$principal.creds",
+          "dbPath": "$dir/zb-flutter-$principal.sqlite3",
+          "principal": principal,
+        },
         // Parents before children (app_users before app_orders): the seed applies
         // them in order. NOT test_types — not because the chain cannot carry it
         // (measured: 3,055,002 rows seed in 67.6 s, 317 MB peak RSS, a 1.04 GB
@@ -112,6 +128,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       zb = worker;
       setState(() {
         tenant = worker.tenant;
+        if (enrolled) shownPrincipal = 'enrolled';
         isConnected = true;
       });
       await _refreshAll();
@@ -311,7 +328,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Principal: $principal · Tenant: $tenant',
+            Text('Principal: $shownPrincipal · Tenant: $tenant',
                 style: const TextStyle(fontWeight: FontWeight.bold)),
             if (lastError != null)
               Text(lastError!, style: const TextStyle(color: Colors.red)),

@@ -17693,3 +17693,23 @@ enrolled as dart_user, UTF-8 round trip, a write settled through the report stre
 the identity alone. The phone libraries are rebuilt for ABI 3 (06's xcframework and
 jniLibs, zb-react-native's ZbCore) and the 06 app builds for Android (debug APK) and iOS
 (no codesign). Not yet run on a phone.
+
+## §10jx — 05-tables on the iPhone, the moto e20 and a browser, enrolled from invites (2026-09-28)
+
+05's Flutter app was desktop-only (bob's creds from a Mac path, no phone libraries). With
+zb-dart and enrollment it runs on phones from two dart-defines: `ZB_BRIDGE_URL` and, the
+first time, `ZB_INVITE`; the replica and the identity go in the app support directory
+(path_provider). The macOS dev path is unchanged. It took 06's iOS xcconfig (force_load of
+the xcframework, the release export list, the team), a Local Network usage text, and
+INTERNET in the main Android manifest; the copied libzb binaries are gitignored.
+
+Run: the bridge on the LAN (`BRIDGE_BIND=0.0.0.0`, `ENROLL_NATS_URL=nats://192.168.1.11:4222`,
+`ENROLL_NATS_WS_URL=ws://192.168.1.11:8080` — dev only: its HTTP endpoints have no auth),
+one invite per phone in globex, the web consumer as bob (globex) in Chrome incognito.
+The moto enrolled as moto_05 and showed globex's counters and orders; the browser
+followed; the iPhone first needed the developer profile trusted (a new bundle id), then
+failed with "enroll: http://192.168.1.11:27434 unreachable" — and was not listed under
+Local Network. The simulator, on the same code and address, enrolled at once (sim_05): the
+code was fine. The phone's Wi-Fi was off; iOS lists an app under Local Network only once
+it reaches an address on the network the phone is on, so no prompt, no entry. Wi-Fi on,
+relaunch: enrolled as iphone_05. Three devices, three runtimes, one tenant, live.
