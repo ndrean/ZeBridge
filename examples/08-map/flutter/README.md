@@ -26,7 +26,7 @@ replica drops the row. A new point carries its PostGIS bytes (`ewkbPoint` in mai
 Needs, besides the dev stack: `charge_points` loaded (`load_chargers.py --create`, which
 publishes it public and writable), the map service
 running (`scripts/scenarios/.venv/bin/python3 examples/08-map/poi_service.py`), libzb
-built with `-Dduckdb=true` for the service (the app itself needs only SQLite), and the
+and libduckdb installed for the service (the app itself needs only SQLite), and the
 `omar` creds of the dev stack. The `mapper` principal of the earlier cell design was
 revoked with its grid, and a revoked principal stays revoked.
 
@@ -53,7 +53,7 @@ same war between two libzb clients, asserted.
 
 ## Run
 
-The dev stack (PostgreSQL, nats-server, the bridge on `my_pub`/`my_slot`), the library built with `zig build -Doptimize=ReleaseFast -Dduckdb=true` in `libzb/` (the map service needs the DuckDB engine; the plain build silently omits it), the creds path at the top of `lib/main.dart`, then `flutter run -d macos`.
+The dev stack (PostgreSQL, nats-server, the bridge on `my_pub`/`my_slot`), the library built with `zig build -Doptimize=ReleaseFast` in `libzb/` (the map service's DuckDB engine opens libduckdb at run time, so DuckDB must be installed), the creds path at the top of `lib/main.dart`, then `flutter run -d macos`.
 
 The vector tiles come from `france.pmtiles` on R2, through the Worker in `../worker`, read by HTTP range request so only the tiles in view travel. That is the ONE source. A local `test_region.pmtiles` used to stand behind it as a fallback and has been removed: a second archive that nobody refreshes draws a different map and says nothing about it. When the archive is unreachable the map shows plain OSM raster tiles and the status line says why.
 

@@ -17267,3 +17267,40 @@ Checked live on the dev stack: grant → revoke → `mutation_ack.zbtest.revoked
 re-grant → gone, with "the ban … is lifted" in the log; revoke, bridge down, re-grant,
 boot → "1 ban(s) lifted". offline.py as bob passes (8/8), its verdict landed in VERDICTS;
 bob reads his own verdict by direct get and is refused alice's (Permissions Violation).
+
+## §10jk — DISTRIBUTION.md, and the optional engines open at run time (2026-09-28)
+
+`-Dduckdb` (off by default) dropped the DuckDB engine from every plain `zig build`: the
+trap of §10hw and §10iq, hit a third time when the phones were rebuilt for §10jj and the
+host dylib lost the engine 09-event's service opens. `-Dlibpq` was the same switch the
+other way round, turned off for phones only because libpq-fe.h was not in their SDKs.
+
+Both flags are gone. `libzb/include-engines/` holds duckdb.h (1.5.5), libpq-fe.h and
+postgres_ext.h (18.6), with their licences, so every build — phones included — compiles
+all three engines. Neither library is linked: `src/engines.zig` opens libduckdb or libpq
+the first time a Storage of that engine opens (`ZB_DUCKDB_LIB` / `ZB_LIBPQ_LIB`, then
+the bare name, then the usual install places) and looks up the 57 DuckDB and 23 libpq
+functions libzb calls into a struct built with `@Struct` from the translated headers'
+own types. Call sites read `D().duckdb_open(...)` and `P().PQexec(...)`. A missing
+library or function becomes the `zb_last_error` text, not only a stderr line.
+
+Phone cross builds then failed on `'stdio.h' not found` in libpq-fe.h: translate-c, like
+the vendored C sources (§10iq), does not see the sysroot, so both translate-c steps get
+`<sysroot>/usr/include` (and Android's per-architecture directory, §10ir).
+
+Measured: the vendored macOS dylib with all three engines is 4,213,792 bytes and
+depends on libSystem only (4,062,960 before, SQLite alone). The DuckDB unit test, which
+the default build used to skip, now runs and passes wherever libduckdb is installed.
+Live, one library, omar: DuckDB, PostgreSQL (a scratch database) and SQLite replicas
+each seeded test_types' 483 rows; `ZB_DUCKDB_LIB=/nope` answers "engine 'duckdb':
+ZB_DUCKDB_LIB=/nope/libduckdb.dylib does not open"; libduckdb given as libpq answers
+"lacks PQclear: not this engine's library, or too old". iOS (device, simulator) and
+Android (arm64-v8a, armeabi-v7a) rebuilt; the Android .so already lists libdl.so, so
+dlopen resolves on the device.
+
+A correction: the libzb `zig build test` "failed command" line seen during §10jj is not
+a failure. The summary says "6/6 steps succeeded"; Zig prints the command whenever a
+test writes to stderr, and these tests print expected refusals.
+
+Windows: `std.DynLib` does not cover it, so there the two optional engines report
+themselves unavailable; SQLite is unaffected.

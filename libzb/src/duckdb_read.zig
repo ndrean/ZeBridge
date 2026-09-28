@@ -12,29 +12,33 @@
 const std = @import("std");
 const dk = @import("duckdb");
 const storage = @import("storage.zig");
+const engines = @import("engines.zig");
+inline fn D() *const engines.DuckDB {
+    return engines.duckdb.get();
+}
 const Value = storage.Value;
 const Row = storage.Row;
 
 pub fn readResult(a: std.mem.Allocator, res: *dk.duckdb_result, want_names: bool) storage.Error!storage.Storage.Named {
-    const ncol: usize = @intCast(dk.duckdb_column_count(res));
+    const ncol: usize = @intCast(D().duckdb_column_count(res));
     const cols = try a.alloc([]const u8, if (want_names) ncol else 0);
     if (want_names) for (cols, 0..) |*nm, i| {
-        nm.* = try a.dupe(u8, std.mem.span(dk.duckdb_column_name(res, @intCast(i))));
+        nm.* = try a.dupe(u8, std.mem.span(D().duckdb_column_name(res, @intCast(i))));
     };
     var rows: std.ArrayListUnmanaged(Row) = .empty;
-    const nchunks: usize = @intCast(dk.duckdb_result_chunk_count(res.*));
+    const nchunks: usize = @intCast(D().duckdb_result_chunk_count(res.*));
     for (0..nchunks) |ci| {
-        var chunk = dk.duckdb_result_get_chunk(res.*, @intCast(ci));
+        var chunk = D().duckdb_result_get_chunk(res.*, @intCast(ci));
         if (chunk == null) continue;
-        defer dk.duckdb_destroy_data_chunk(&chunk);
-        const size: usize = @intCast(dk.duckdb_data_chunk_get_size(chunk));
+        defer D().duckdb_destroy_data_chunk(&chunk);
+        const size: usize = @intCast(D().duckdb_data_chunk_get_size(chunk));
         const first = rows.items.len;
         try rows.ensureUnusedCapacity(a, size);
         for (0..size) |_| rows.appendAssumeCapacity(try a.alloc(Value, ncol));
         for (0..ncol) |col| {
-            const vec = dk.duckdb_data_chunk_get_vector(chunk, @intCast(col));
-            var lt = dk.duckdb_vector_get_column_type(vec);
-            defer dk.duckdb_destroy_logical_type(&lt);
+            const vec = D().duckdb_data_chunk_get_vector(chunk, @intCast(col));
+            var lt = D().duckdb_vector_get_column_type(vec);
+            defer D().duckdb_destroy_logical_type(&lt);
             for (0..size) |r| rows.items[first + r][col] = try readCell(a, vec, lt, r);
         }
     }
@@ -42,13 +46,13 @@ pub fn readResult(a: std.mem.Allocator, res: *dk.duckdb_result, want_names: bool
 }
 
 fn readCell(a: std.mem.Allocator, vec: dk.duckdb_vector, lt: dk.duckdb_logical_type, row: usize) storage.Error!Value {
-    const validity = dk.duckdb_vector_get_validity(vec);
-    if (validity != null and !dk.duckdb_validity_row_is_valid(validity, @intCast(row))) return .null;
-    const tid = dk.duckdb_get_type_id(lt);
+    const validity = D().duckdb_vector_get_validity(vec);
+    if (validity != null and !D().duckdb_validity_row_is_valid(validity, @intCast(row))) return .null;
+    const tid = D().duckdb_get_type_id(lt);
     // An ARRAY or STRUCT vector has no data of its own (it lives in the children):
     // only the scalar and LIST branches read `data`, and a missing buffer there is
     // an empty cell rather than a read past nothing.
-    const data = dk.duckdb_vector_get_data(vec) orelse switch (tid) {
+    const data = D().duckdb_vector_get_data(vec) orelse switch (tid) {
         dk.DUCKDB_TYPE_ARRAY, dk.DUCKDB_TYPE_STRUCT => @as(*anyopaque, @ptrFromInt(8)),
         else => return .null,
     };
@@ -74,7 +78,7 @@ fn readCell(a: std.mem.Allocator, vec: dk.duckdb_vector, lt: dk.duckdb_logical_t
         dk.DUCKDB_TYPE_TIMESTAMP_MS => return .{ .text = try timestampText(a, @as([*]const i64, @ptrCast(@alignCast(data)))[row] * 1_000) },
         dk.DUCKDB_TYPE_TIMESTAMP_NS => return .{ .text = try timestampText(a, @divTrunc(@as([*]const i64, @ptrCast(@alignCast(data)))[row], 1_000)) },
         dk.DUCKDB_TYPE_DATE => {
-            const d = dk.duckdb_from_date(.{ .days = @as([*]const i32, @ptrCast(@alignCast(data)))[row] });
+            const d = D().duckdb_from_date(.{ .days = @as([*]const i32, @ptrCast(@alignCast(data)))[row] });
             return .{ .text = try std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u32, @intCast(d.year)), @as(u8, @intCast(d.month)), @as(u8, @intCast(d.day)) }) };
         },
         dk.DUCKDB_TYPE_TIME => {
@@ -99,8 +103,8 @@ fn readCell(a: std.mem.Allocator, vec: dk.duckdb_vector, lt: dk.duckdb_logical_t
             return .{ .text = try std.fmt.allocPrint(a, "{d}", .{v}) };
         },
         dk.DUCKDB_TYPE_DECIMAL => {
-            const scale: u8 = dk.duckdb_decimal_scale(lt);
-            const raw: i128 = switch (dk.duckdb_decimal_internal_type(lt)) {
+            const scale: u8 = D().duckdb_decimal_scale(lt);
+            const raw: i128 = switch (D().duckdb_decimal_internal_type(lt)) {
                 dk.DUCKDB_TYPE_SMALLINT => @as([*]const i16, @ptrCast(@alignCast(data)))[row],
                 dk.DUCKDB_TYPE_INTEGER => @as([*]const i32, @ptrCast(@alignCast(data)))[row],
                 dk.DUCKDB_TYPE_BIGINT => @as([*]const i64, @ptrCast(@alignCast(data)))[row],
@@ -109,13 +113,13 @@ fn readCell(a: std.mem.Allocator, vec: dk.duckdb_vector, lt: dk.duckdb_logical_t
             return .{ .text = try decimalText(a, raw, scale) };
         },
         dk.DUCKDB_TYPE_ENUM => {
-            const idx: usize = switch (dk.duckdb_enum_internal_type(lt)) {
+            const idx: usize = switch (D().duckdb_enum_internal_type(lt)) {
                 dk.DUCKDB_TYPE_UTINYINT => @as([*]const u8, @ptrCast(data))[row],
                 dk.DUCKDB_TYPE_USMALLINT => @as([*]const u16, @ptrCast(@alignCast(data)))[row],
                 else => @as([*]const u32, @ptrCast(@alignCast(data)))[row],
             };
-            const s = dk.duckdb_enum_dictionary_value(lt, @intCast(idx));
-            defer dk.duckdb_free(s);
+            const s = D().duckdb_enum_dictionary_value(lt, @intCast(idx));
+            defer D().duckdb_free(s);
             return .{ .text = try a.dupe(u8, if (s != null) std.mem.span(s) else "") };
         },
         dk.DUCKDB_TYPE_INTERVAL => {
@@ -138,9 +142,9 @@ fn readCell(a: std.mem.Allocator, vec: dk.duckdb_vector, lt: dk.duckdb_logical_t
         },
         dk.DUCKDB_TYPE_LIST => {
             const entries = @as([*]const dk.duckdb_list_entry, @ptrCast(@alignCast(data)))[row];
-            const child = dk.duckdb_list_vector_get_child(vec);
-            var clt = dk.duckdb_vector_get_column_type(child);
-            defer dk.duckdb_destroy_logical_type(&clt);
+            const child = D().duckdb_list_vector_get_child(vec);
+            var clt = D().duckdb_vector_get_column_type(child);
+            defer D().duckdb_destroy_logical_type(&clt);
             var out: std.ArrayListUnmanaged(u8) = .empty;
             try out.append(a, '[');
             for (0..@intCast(entries.length)) |k| {
@@ -151,10 +155,10 @@ fn readCell(a: std.mem.Allocator, vec: dk.duckdb_vector, lt: dk.duckdb_logical_t
             return .{ .text = out.items };
         },
         dk.DUCKDB_TYPE_ARRAY => {
-            const n: usize = @intCast(dk.duckdb_array_type_array_size(lt));
-            const child = dk.duckdb_array_vector_get_child(vec);
-            var clt = dk.duckdb_vector_get_column_type(child);
-            defer dk.duckdb_destroy_logical_type(&clt);
+            const n: usize = @intCast(D().duckdb_array_type_array_size(lt));
+            const child = D().duckdb_array_vector_get_child(vec);
+            var clt = D().duckdb_vector_get_column_type(child);
+            defer D().duckdb_destroy_logical_type(&clt);
             var out: std.ArrayListUnmanaged(u8) = .empty;
             try out.append(a, '[');
             for (0..n) |k| {
@@ -165,18 +169,18 @@ fn readCell(a: std.mem.Allocator, vec: dk.duckdb_vector, lt: dk.duckdb_logical_t
             return .{ .text = out.items };
         },
         dk.DUCKDB_TYPE_STRUCT => {
-            const n: usize = @intCast(dk.duckdb_struct_type_child_count(lt));
+            const n: usize = @intCast(D().duckdb_struct_type_child_count(lt));
             var out: std.ArrayListUnmanaged(u8) = .empty;
             try out.append(a, '{');
             for (0..n) |k| {
                 if (k > 0) try out.append(a, ',');
-                const nm = dk.duckdb_struct_type_child_name(lt, @intCast(k));
-                defer dk.duckdb_free(nm);
+                const nm = D().duckdb_struct_type_child_name(lt, @intCast(k));
+                defer D().duckdb_free(nm);
                 try jsonString(a, &out, if (nm != null) std.mem.span(nm) else "");
                 try out.append(a, ':');
-                const child = dk.duckdb_struct_vector_get_child(vec, @intCast(k));
-                var clt = dk.duckdb_vector_get_column_type(child);
-                defer dk.duckdb_destroy_logical_type(&clt);
+                const child = D().duckdb_struct_vector_get_child(vec, @intCast(k));
+                var clt = D().duckdb_vector_get_column_type(child);
+                defer D().duckdb_destroy_logical_type(&clt);
                 try jsonValue(a, &out, try readCell(a, child, clt, row));
             }
             try out.append(a, '}');
@@ -190,8 +194,8 @@ fn readCell(a: std.mem.Allocator, vec: dk.duckdb_vector, lt: dk.duckdb_logical_t
 fn stringAt(data: *anyopaque, row: usize) []const u8 {
     const arr: [*]dk.duckdb_string_t = @ptrCast(@alignCast(data));
     const s = &arr[row];
-    const len: usize = dk.duckdb_string_t_length(s.*);
-    const p = dk.duckdb_string_t_data(s);
+    const len: usize = D().duckdb_string_t_length(s.*);
+    const p = D().duckdb_string_t_data(s);
     return if (p != null) p[0..len] else "";
 }
 
@@ -201,7 +205,7 @@ fn hugeToI128(h: dk.duckdb_hugeint) i128 {
 
 /// Micros since the epoch (UTC) in PostgreSQL's own text shape, `+00` included.
 fn timestampText(a: std.mem.Allocator, micros: i64) ![]const u8 {
-    const t = dk.duckdb_from_timestamp(.{ .micros = micros });
+    const t = D().duckdb_from_timestamp(.{ .micros = micros });
     return std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}+00", .{
         @as(u32, @intCast(t.date.year)), @as(u8, @intCast(t.date.month)), @as(u8, @intCast(t.date.day)),
         @as(u8, @intCast(t.time.hour)), @as(u8, @intCast(t.time.min)), @as(u8, @intCast(t.time.sec)), @as(u32, @intCast(t.time.micros)),

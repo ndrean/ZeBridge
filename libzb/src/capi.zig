@@ -64,6 +64,7 @@ const C = @import("c");
 const core = @import("core.zig");
 const client = @import("client.zig");
 const handles = @import("handles.zig");
+const engines = @import("engines.zig");
 const Value = std.json.Value;
 
 /// ⚠️ The host never receives a pointer — only a generation-tagged u64 (handles.zig).
@@ -477,7 +478,13 @@ export fn zb_client_connect(opts_json: ?[*:0]const u8) u64 {
     // with no line is the worst failure this ABI can produce, because the host has
     // nothing at all to search for. §10iz: and a line on stderr is not enough either —
     // a phone has no stderr anyone reads — so the words are kept for `zb_last_error`.
+    engines.last_failure = null;
     const box = openBox(std.heap.c_allocator, text) catch |err| {
+        // §10jk: an engine whose library did not open says which, and what to do.
+        if (engines.last_failure) |why| {
+            setLastError("zb_client_connect failed: {s}", .{why});
+            return 0;
+        }
         std.debug.print("zb_client_connect failed: {s}\n", .{@errorName(err)});
         setLastError("zb_client_connect failed: {s}", .{@errorName(err)});
         return 0;

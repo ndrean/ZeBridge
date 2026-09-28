@@ -37,13 +37,14 @@ pub const Row = []Value;
 
 /// Minimal serializer for the transaction contract. The orchestration layer
 /// will bring std.Io and can swap this for std.Io.Mutex; a storage shell must
-/// not force an Io on every caller just to lock.
-const SpinLock = struct {
+/// not force an Io on every caller just to lock. Also guards engines.zig's one-time
+/// library open (§10jk).
+pub const SpinLock = struct {
     v: std.atomic.Value(bool) = .init(false),
-    fn lock(self: *SpinLock) void {
+    pub fn lock(self: *SpinLock) void {
         while (self.v.swap(true, .acquire)) std.atomic.spinLoopHint();
     }
-    fn unlock(self: *SpinLock) void {
+    pub fn unlock(self: *SpinLock) void {
         self.v.store(false, .release);
     }
 };
@@ -55,12 +56,20 @@ fn quietNotice(_: ?*anyopaque, _: [*c]const u8) callconv(.c) void {}
 /// reads). One `Storage`, the client speaks one SQL to it, and the differences
 /// live here: placeholders, PRAGMAs, the catalogue questions, typed results.
 /// §10fl: `duckdb` is the third engine — an analytical replica in a `.duckdb` file
-/// (the micro-VM worker's), built in with `-Dduckdb=true`. Every DuckDB path is
-/// behind `build_options.duckdb`, so the default build never references libduckdb.
+/// (the micro-VM worker's). DuckDB and PostgreSQL are compiled into every build and
+/// their libraries opened at run time, on the first open of that engine (§10jk,
+/// engines.zig): `D()` and `P()` are the looked-up functions, valid once a Storage of
+/// that engine exists.
 pub const Engine = enum { sqlite, postgres, duckdb };
-const build_options = @import("build_options");
 const dk = @import("duckdb");
 const duckdb_read = @import("duckdb_read.zig");
+const engines = @import("engines.zig");
+inline fn D() *const engines.DuckDB {
+    return engines.duckdb.get();
+}
+inline fn P() *const engines.Libpq {
+    return engines.libpq.get();
+}
 
 pub const Storage = struct {
     engine: Engine = .sqlite,
@@ -69,10 +78,7 @@ pub const Storage = struct {
     db: *c.sqlite3 = undefined,
     mutex: SpinLock = .{},
     // ── PostgreSQL ──
-    // §10ig: a struct FIELD cannot sit behind an `if` the way a statement can, so the
-    // TYPE carries the switch. Without libpq there is no `c.PGconn` to name, and every
-    // path that would dereference this one is gated, so the placeholder is never read.
-    pg: if (build_options.libpq) ?*c.PGconn else ?*anyopaque = null,
+    pg: ?*c.PGconn = null,
     /// translated SQL → the server-side prepared statement's name.
     pg_stmts: std.StringHashMapUnmanaged([:0]const u8) = .empty,
     pg_next: usize = 0,
@@ -145,23 +151,18 @@ pub const Storage = struct {
     /// second connection the C card's `query` uses — enforced by the server, as the
     /// SQLite one is by the open flag.
     pub fn openPostgres(url: [*:0]const u8, read_only: bool) Error!Storage {
-        if (!build_options.libpq) {
-            // §10ig: this build has no PostgreSQL engine. Say which flag brings it
-            // back, the way the DuckDB guard does — a bare OpenFailed is the same
-            // error a corrupt file gives.
-            std.debug.print("engine 'postgres' asked for, but this libzb was built without it — rebuild with `-Dlibpq=true`\n", .{});
-            return Error.OpenFailed;
-        }
-        const conn = c.PQconnectdb(url) orelse return Error.OpenFailed;
-        if (c.PQstatus(conn) != c.CONNECTION_OK) {
-            c.PQfinish(conn);
+        // §10jk: libpq opens here, once per process; `load` says why when it cannot.
+        if (!engines.libpq.load()) return Error.OpenFailed;
+        const conn = P().PQconnectdb(url) orelse return Error.OpenFailed;
+        if (P().PQstatus(conn) != c.CONNECTION_OK) {
+            P().PQfinish(conn);
             return Error.OpenFailed;
         }
         var self = Storage{ .engine = .postgres, .pg = conn };
-        errdefer c.PQfinish(conn);
+        errdefer P().PQfinish(conn);
         // Server notices ("relation already exists, skipping" on every IF NOT EXISTS)
         // would land on the host's stderr; the client says what matters itself.
-        _ = c.PQsetNoticeProcessor(conn, quietNotice, null);
+        _ = P().PQsetNoticeProcessor(conn, quietNotice, null);
         try self.execSimple("SET timezone TO 'UTC'");
         if (read_only) try self.execSimple("SET default_transaction_read_only = on");
         return self;
@@ -171,19 +172,13 @@ pub const Storage = struct {
     /// test). One connection; the card's read-only handle comes from
     /// `openDuckdbShared` on the same database.
     pub fn openDuckdb(path: [*:0]const u8) Error!Storage {
-        if (!build_options.duckdb) {
-            // §10hw: this build has no DuckDB. Saying so is the difference between a
-            // five-minute fix and an afternoon: the default is `-Dduckdb=false`, so a
-            // plain `zig build` silently produces a library that cannot open the
-            // engine a host asks for by name.
-            std.debug.print("engine 'duckdb' asked for, but this libzb was built without it — rebuild with `-Dduckdb=true`\n", .{});
-            return Error.OpenFailed;
-        }
+        // §10jk: libduckdb opens here, once per process; `load` says why when it cannot.
+        if (!engines.duckdb.load()) return Error.OpenFailed;
         var db: dk.duckdb_database = null;
-        if (dk.duckdb_open(path, &db) != dk.DuckDBSuccess) return Error.OpenFailed;
+        if (D().duckdb_open(path, &db) != dk.DuckDBSuccess) return Error.OpenFailed;
         var con: dk.duckdb_connection = null;
-        if (dk.duckdb_connect(db, &con) != dk.DuckDBSuccess) {
-            dk.duckdb_close(&db);
+        if (D().duckdb_connect(db, &con) != dk.DuckDBSuccess) {
+            D().duckdb_close(&db);
             return Error.OpenFailed;
         }
         var self = Storage{ .engine = .duckdb, .dk_db = @ptrCast(db), .dk_con = @ptrCast(con) };
@@ -197,17 +192,9 @@ pub const Storage = struct {
 
     /// A second connection on `primary`'s database (the card's query handle).
     pub fn openDuckdbShared(primary: *Storage) Error!Storage {
-        if (!build_options.duckdb) {
-            // §10hw: this build has no DuckDB. Saying so is the difference between a
-            // five-minute fix and an afternoon: the default is `-Dduckdb=false`, so a
-            // plain `zig build` silently produces a library that cannot open the
-            // engine a host asks for by name.
-            std.debug.print("engine 'duckdb' asked for, but this libzb was built without it — rebuild with `-Dduckdb=true`\n", .{});
-            return Error.OpenFailed;
-        }
         const db: dk.duckdb_database = @ptrCast(@alignCast(primary.dk_db orelse return Error.OpenFailed));
         var con: dk.duckdb_connection = null;
-        if (dk.duckdb_connect(db, &con) != dk.DuckDBSuccess) return Error.OpenFailed;
+        if (D().duckdb_connect(db, &con) != dk.DuckDBSuccess) return Error.OpenFailed;
         return Storage{ .engine = .duckdb, .dk_db = @ptrCast(db), .dk_con = @ptrCast(con), .dk_owns_db = false };
     }
 
@@ -215,17 +202,17 @@ pub const Storage = struct {
         self.clearStmtCache();
         switch (self.engine) {
             .sqlite => _ = c.sqlite3_close(self.db),
-            .postgres => if (build_options.libpq) {
-                if (self.pg) |conn| c.PQfinish(conn);
+            .postgres => {
+                if (self.pg) |conn| P().PQfinish(conn);
             },
-            .duckdb => if (build_options.duckdb) {
+            .duckdb => {
                 if (self.dk_con) |cp| {
                     var con: dk.duckdb_connection = @ptrCast(@alignCast(cp));
-                    dk.duckdb_disconnect(&con);
+                    D().duckdb_disconnect(&con);
                 }
                 if (self.dk_owns_db) if (self.dk_db) |dp| {
                     var db: dk.duckdb_database = @ptrCast(@alignCast(dp));
-                    dk.duckdb_close(&db);
+                    D().duckdb_close(&db);
                 };
             },
         }
@@ -237,7 +224,7 @@ pub const Storage = struct {
     /// statement fails forever after — clearing is cheap certainty. On PostgreSQL
     /// the server-side statements are deallocated the same way.
     pub fn clearStmtCache(self: *Storage) void {
-        if (build_options.libpq and self.engine == .postgres) {
+        if (self.engine == .postgres) {
             var pit = self.pg_stmts.iterator();
             while (pit.next()) |e| {
                 std.heap.c_allocator.free(e.key_ptr.*);
@@ -246,22 +233,20 @@ pub const Storage = struct {
             self.pg_stmts.deinit(std.heap.c_allocator);
             self.pg_stmts = .empty;
             if (self.pg) |conn| {
-                const r = c.PQexec(conn, "DEALLOCATE ALL");
-                c.PQclear(r);
+                const r = P().PQexec(conn, "DEALLOCATE ALL");
+                P().PQclear(r);
             }
             return;
         }
         if (self.engine == .duckdb) {
-            if (build_options.duckdb) {
-                var dit = self.dk_stmts.iterator();
-                while (dit.next()) |e| {
-                    var st: dk.duckdb_prepared_statement = @ptrCast(@alignCast(e.value_ptr.*));
-                    dk.duckdb_destroy_prepare(&st);
-                    std.heap.c_allocator.free(e.key_ptr.*);
-                }
-                self.dk_stmts.deinit(std.heap.c_allocator);
-                self.dk_stmts = .empty;
+            var dit = self.dk_stmts.iterator();
+            while (dit.next()) |e| {
+                var st: dk.duckdb_prepared_statement = @ptrCast(@alignCast(e.value_ptr.*));
+                D().duckdb_destroy_prepare(&st);
+                std.heap.c_allocator.free(e.key_ptr.*);
             }
+            self.dk_stmts.deinit(std.heap.c_allocator);
+            self.dk_stmts = .empty;
             return;
         }
         var it = self.stmt_cache.iterator();
@@ -453,8 +438,6 @@ pub const Storage = struct {
     /// the integers, the floats, bytea; everything else — numeric included, by the
     /// contract — as text. A PRAGMA is SQLite's business and answers nothing here.
     fn pgExec(self: *Storage, a: std.mem.Allocator, sql: []const u8, params: []const Value, want_names: bool) Error!Named {
-        // Unreachable without the engine: nothing can have opened a postgres Storage.
-        if (!build_options.libpq) return Error.OpenFailed;
         const conn = self.pg orelse return Error.ExecFailed;
         const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
         if (std.ascii.startsWithIgnoreCase(trimmed, "PRAGMA")) return .{ .columns = &.{}, .rows = try a.alloc(Row, 0) };
@@ -483,15 +466,15 @@ pub const Storage = struct {
             const name: [:0]const u8 = self.pg_stmts.get(zsql) orelse blk: {
                 const nm = try std.fmt.allocPrintSentinel(std.heap.c_allocator, "zb_{d}", .{self.pg_next}, 0);
                 self.pg_next += 1;
-                const pr = c.PQprepare(conn, nm.ptr, zsql.ptr, @intCast(params.len), null);
-                const pst = c.PQresultStatus(pr);
+                const pr = P().PQprepare(conn, nm.ptr, zsql.ptr, @intCast(params.len), null);
+                const pst = P().PQresultStatus(pr);
                 if (pst != c.PGRES_COMMAND_OK) {
-                    self.pgRecordError(std.mem.span(c.PQresultErrorMessage(pr)));
-                    c.PQclear(pr);
+                    self.pgRecordError(std.mem.span(P().PQresultErrorMessage(pr)));
+                    P().PQclear(pr);
                     std.heap.c_allocator.free(nm);
                     return Error.PrepareFailed;
                 }
-                c.PQclear(pr);
+                P().PQclear(pr);
                 const key = std.heap.c_allocator.dupe(u8, zsql) catch {
                     std.heap.c_allocator.free(nm);
                     return Error.OutOfMemory;
@@ -503,19 +486,19 @@ pub const Storage = struct {
                 };
                 break :blk nm;
             };
-            const res = c.PQexecPrepared(conn, name.ptr, @intCast(params.len), vals.ptr, lens.ptr, fmts.ptr, 0);
-            defer c.PQclear(res);
-            const st = c.PQresultStatus(res);
+            const res = P().PQexecPrepared(conn, name.ptr, @intCast(params.len), vals.ptr, lens.ptr, fmts.ptr, 0);
+            defer P().PQclear(res);
+            const st = P().PQresultStatus(res);
             if (st != c.PGRES_TUPLES_OK and st != c.PGRES_COMMAND_OK) {
-                const msg = std.mem.span(c.PQresultErrorMessage(res));
+                const msg = std.mem.span(P().PQresultErrorMessage(res));
                 self.pgRecordError(msg);
                 // A plan cached before a DDL on its table: forget it and go once more.
                 if (attempt == 0 and std.mem.indexOf(u8, msg, "cached plan") != null) {
                     if (self.pg_stmts.fetchRemove(zsql)) |kv| {
                         const dl = std.fmt.allocPrintSentinel(a, "DEALLOCATE {s}", .{kv.value}, 0) catch "";
                         if (dl.len > 0) {
-                            const dr = c.PQexec(conn, dl.ptr);
-                            c.PQclear(dr);
+                            const dr = P().PQexec(conn, dl.ptr);
+                            P().PQclear(dr);
                         }
                         std.heap.c_allocator.free(kv.key);
                         std.heap.c_allocator.free(kv.value);
@@ -524,11 +507,11 @@ pub const Storage = struct {
                 }
                 return Error.StepFailed;
             }
-            const ntup: usize = @intCast(c.PQntuples(res));
-            const ncol: usize = @intCast(c.PQnfields(res));
+            const ntup: usize = @intCast(P().PQntuples(res));
+            const ncol: usize = @intCast(P().PQnfields(res));
             const cols = try a.alloc([]const u8, if (want_names) ncol else 0);
             if (want_names) for (cols, 0..) |*nm, i| {
-                nm.* = try a.dupe(u8, std.mem.span(c.PQfname(res, @intCast(i))));
+                nm.* = try a.dupe(u8, std.mem.span(P().PQfname(res, @intCast(i))));
             };
             const rows = try a.alloc(Row, ntup);
             for (rows, 0..) |*row, r| {
@@ -536,19 +519,19 @@ pub const Storage = struct {
                 for (row.*, 0..) |*cell, col| {
                     const ri: c_int = @intCast(r);
                     const ci: c_int = @intCast(col);
-                    if (c.PQgetisnull(res, ri, ci) == 1) {
+                    if (P().PQgetisnull(res, ri, ci) == 1) {
                         cell.* = .null;
                         continue;
                     }
-                    const txt = std.mem.span(c.PQgetvalue(res, ri, ci));
-                    cell.* = switch (c.PQftype(res, ci)) {
+                    const txt = std.mem.span(P().PQgetvalue(res, ri, ci));
+                    cell.* = switch (P().PQftype(res, ci)) {
                         16 => .{ .boolean = txt.len > 0 and txt[0] == 't' },
                         20, 21, 23 => .{ .integer = std.fmt.parseInt(i64, txt, 10) catch 0 },
                         700, 701 => .{ .real = std.fmt.parseFloat(f64, txt) catch 0 },
                         17 => blk: {
                             var n: usize = 0;
-                            const raw = c.PQunescapeBytea(c.PQgetvalue(res, ri, ci), &n);
-                            defer c.PQfreemem(raw);
+                            const raw = P().PQunescapeBytea(P().PQgetvalue(res, ri, ci), &n);
+                            defer P().PQfreemem(raw);
                             break :blk .{ .blob = try a.dupe(u8, @as([*]const u8, @ptrCast(raw))[0..n]) };
                         },
                         else => .{ .text = try a.dupe(u8, txt) },
@@ -572,7 +555,6 @@ pub const Storage = struct {
     /// PRAGMAs answer nothing, and `BEGIN IMMEDIATE` is `BEGIN TRANSACTION`. `?` is a
     /// DuckDB placeholder as it is; a prepared statement is cached by text.
     fn dkExec(self: *Storage, a: std.mem.Allocator, sql: []const u8, params: []const Value, want_names: bool) Error!Named {
-        if (!build_options.duckdb) return Error.ExecFailed;
         const con: dk.duckdb_connection = @ptrCast(@alignCast(self.dk_con orelse return Error.ExecFailed));
         const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
         if (std.ascii.startsWithIgnoreCase(trimmed, "PRAGMA")) return .{ .columns = &.{}, .rows = try a.alloc(Row, 0) };
@@ -585,22 +567,22 @@ pub const Storage = struct {
         // one-off DDL text has no business in the statement cache anyway.
         if (params.len == 0) {
             var qres: dk.duckdb_result = undefined;
-            if (dk.duckdb_query(con, zsql.ptr, &qres) != dk.DuckDBSuccess) {
-                const msg = dk.duckdb_result_error(&qres);
+            if (D().duckdb_query(con, zsql.ptr, &qres) != dk.DuckDBSuccess) {
+                const msg = D().duckdb_result_error(&qres);
                 self.dkRecordError(if (msg != null) std.mem.span(msg) else "query failed");
-                dk.duckdb_destroy_result(&qres);
+                D().duckdb_destroy_result(&qres);
                 return Error.StepFailed;
             }
-            defer dk.duckdb_destroy_result(&qres);
+            defer D().duckdb_destroy_result(&qres);
             return duckdb_read.readResult(a, &qres, want_names);
         }
         const stmt: dk.duckdb_prepared_statement = blk: {
             if (self.dk_stmts.get(zsql)) |hit| break :blk @ptrCast(@alignCast(hit));
             var st: dk.duckdb_prepared_statement = null;
-            if (dk.duckdb_prepare(con, zsql.ptr, &st) != dk.DuckDBSuccess) {
-                const msg = dk.duckdb_prepare_error(st);
+            if (D().duckdb_prepare(con, zsql.ptr, &st) != dk.DuckDBSuccess) {
+                const msg = D().duckdb_prepare_error(st);
                 self.dkRecordError(if (msg != null) std.mem.span(msg) else "prepare failed");
-                dk.duckdb_destroy_prepare(&st);
+                D().duckdb_destroy_prepare(&st);
                 return Error.PrepareFailed;
             }
             if (self.dk_stmts.count() < 256) cache: {
@@ -615,12 +597,12 @@ pub const Storage = struct {
         for (params, 0..) |p, i| {
             const idx: dk.idx_t = @intCast(i + 1);
             const ok = switch (p) {
-                .null => dk.duckdb_bind_null(stmt, idx),
-                .integer => |v| dk.duckdb_bind_int64(stmt, idx, v),
-                .real => |v| dk.duckdb_bind_double(stmt, idx, v),
-                .boolean => |v| dk.duckdb_bind_boolean(stmt, idx, v),
-                .text => |v| dk.duckdb_bind_varchar_length(stmt, idx, v.ptr, v.len),
-                .blob => |v| dk.duckdb_bind_blob(stmt, idx, v.ptr, v.len),
+                .null => D().duckdb_bind_null(stmt, idx),
+                .integer => |v| D().duckdb_bind_int64(stmt, idx, v),
+                .real => |v| D().duckdb_bind_double(stmt, idx, v),
+                .boolean => |v| D().duckdb_bind_boolean(stmt, idx, v),
+                .text => |v| D().duckdb_bind_varchar_length(stmt, idx, v.ptr, v.len),
+                .blob => |v| D().duckdb_bind_blob(stmt, idx, v.ptr, v.len),
             };
             if (ok != dk.DuckDBSuccess) {
                 self.dkRecordError("bind failed");
@@ -628,13 +610,13 @@ pub const Storage = struct {
             }
         }
         var res: dk.duckdb_result = undefined;
-        if (dk.duckdb_execute_prepared(stmt, &res) != dk.DuckDBSuccess) {
-            const msg = dk.duckdb_result_error(&res);
+        if (D().duckdb_execute_prepared(stmt, &res) != dk.DuckDBSuccess) {
+            const msg = D().duckdb_result_error(&res);
             self.dkRecordError(if (msg != null) std.mem.span(msg) else "execute failed");
-            dk.duckdb_destroy_result(&res);
+            D().duckdb_destroy_result(&res);
             return Error.StepFailed;
         }
-        defer dk.duckdb_destroy_result(&res);
+        defer D().duckdb_destroy_result(&res);
         // The supported reader: chunks and vectors (duckdb_read.zig) — the legacy
         // `duckdb_value_*` family is marked for removal and was not safe here.
         return duckdb_read.readResult(a, &res, want_names);
@@ -644,40 +626,39 @@ pub const Storage = struct {
     /// TABLE column order (the caller maps the chain's columns to it, NULL for one
     /// the chain lacks); every value type the shell has binds directly.
     pub fn dkAppend(self: *Storage, table: [:0]const u8, rows: []const []const Value) Error!void {
-        if (!build_options.duckdb) return Error.ExecFailed;
         const con: dk.duckdb_connection = @ptrCast(@alignCast(self.dk_con orelse return Error.ExecFailed));
         var app: dk.duckdb_appender = null;
-        if (dk.duckdb_appender_create(con, null, table.ptr, &app) != dk.DuckDBSuccess) {
-            const msg = dk.duckdb_appender_error(app);
+        if (D().duckdb_appender_create(con, null, table.ptr, &app) != dk.DuckDBSuccess) {
+            const msg = D().duckdb_appender_error(app);
             self.dkRecordError(if (msg != null) std.mem.span(msg) else "appender failed");
-            _ = dk.duckdb_appender_destroy(&app);
+            _ = D().duckdb_appender_destroy(&app);
             return Error.ExecFailed;
         }
-        defer _ = dk.duckdb_appender_destroy(&app);
+        defer _ = D().duckdb_appender_destroy(&app);
         for (rows) |row| {
             for (row) |v| {
                 const ok = switch (v) {
-                    .null => dk.duckdb_append_null(app),
-                    .integer => |x| dk.duckdb_append_int64(app, x),
-                    .real => |x| dk.duckdb_append_double(app, x),
-                    .boolean => |x| dk.duckdb_append_bool(app, x),
-                    .text => |x| dk.duckdb_append_varchar_length(app, x.ptr, x.len),
-                    .blob => |x| dk.duckdb_append_blob(app, x.ptr, x.len),
+                    .null => D().duckdb_append_null(app),
+                    .integer => |x| D().duckdb_append_int64(app, x),
+                    .real => |x| D().duckdb_append_double(app, x),
+                    .boolean => |x| D().duckdb_append_bool(app, x),
+                    .text => |x| D().duckdb_append_varchar_length(app, x.ptr, x.len),
+                    .blob => |x| D().duckdb_append_blob(app, x.ptr, x.len),
                 };
                 if (ok != dk.DuckDBSuccess) {
-                    const msg = dk.duckdb_appender_error(app);
+                    const msg = D().duckdb_appender_error(app);
                     self.dkRecordError(if (msg != null) std.mem.span(msg) else "append failed");
                     return Error.StepFailed;
                 }
             }
-            if (dk.duckdb_appender_end_row(app) != dk.DuckDBSuccess) {
-                const msg = dk.duckdb_appender_error(app);
+            if (D().duckdb_appender_end_row(app) != dk.DuckDBSuccess) {
+                const msg = D().duckdb_appender_error(app);
                 self.dkRecordError(if (msg != null) std.mem.span(msg) else "append failed");
                 return Error.StepFailed;
             }
         }
-        if (dk.duckdb_appender_close(app) != dk.DuckDBSuccess) {
-            const msg = dk.duckdb_appender_error(app);
+        if (D().duckdb_appender_close(app) != dk.DuckDBSuccess) {
+            const msg = D().duckdb_appender_error(app);
             self.dkRecordError(if (msg != null) std.mem.span(msg) else "appender close failed");
             return Error.StepFailed;
         }
@@ -685,34 +666,33 @@ pub const Storage = struct {
 
     /// §10fe: COPY FROM STDIN — the statement, then the rows as one text buffer.
     pub fn pgCopy(self: *Storage, copy_sql: [:0]const u8, data: []const u8) Error!void {
-        if (!build_options.libpq) return Error.OpenFailed;
         const conn = self.pg orelse return Error.ExecFailed;
-        const start = c.PQexec(conn, copy_sql.ptr);
-        const st0 = c.PQresultStatus(start);
+        const start = P().PQexec(conn, copy_sql.ptr);
+        const st0 = P().PQresultStatus(start);
         if (st0 != c.PGRES_COPY_IN) {
-            self.pgRecordError(std.mem.span(c.PQresultErrorMessage(start)));
-            c.PQclear(start);
+            self.pgRecordError(std.mem.span(P().PQresultErrorMessage(start)));
+            P().PQclear(start);
             return Error.ExecFailed;
         }
-        c.PQclear(start);
-        if (c.PQputCopyData(conn, data.ptr, @intCast(data.len)) != 1) {
-            self.pgRecordError(std.mem.span(c.PQerrorMessage(conn)));
-            _ = c.PQputCopyEnd(conn, "aborted");
+        P().PQclear(start);
+        if (P().PQputCopyData(conn, data.ptr, @intCast(data.len)) != 1) {
+            self.pgRecordError(std.mem.span(P().PQerrorMessage(conn)));
+            _ = P().PQputCopyEnd(conn, "aborted");
             return Error.ExecFailed;
         }
-        if (c.PQputCopyEnd(conn, null) != 1) {
-            self.pgRecordError(std.mem.span(c.PQerrorMessage(conn)));
+        if (P().PQputCopyEnd(conn, null) != 1) {
+            self.pgRecordError(std.mem.span(P().PQerrorMessage(conn)));
             return Error.ExecFailed;
         }
-        const done = c.PQgetResult(conn);
-        defer c.PQclear(done);
-        if (c.PQresultStatus(done) != c.PGRES_COMMAND_OK) {
-            self.pgRecordError(std.mem.span(c.PQresultErrorMessage(done)));
+        const done = P().PQgetResult(conn);
+        defer P().PQclear(done);
+        if (P().PQresultStatus(done) != c.PGRES_COMMAND_OK) {
+            self.pgRecordError(std.mem.span(P().PQresultErrorMessage(done)));
             // Drain whatever else the server answers, or the connection stays busy.
-            while (c.PQgetResult(conn)) |r| c.PQclear(r);
+            while (P().PQgetResult(conn)) |r| P().PQclear(r);
             return Error.ExecFailed;
         }
-        while (c.PQgetResult(conn)) |r| c.PQclear(r);
+        while (P().PQgetResult(conn)) |r| P().PQclear(r);
     }
 
     // ── the catalogue questions, answered per engine ──────────────────────────
@@ -794,7 +774,7 @@ pub const Storage = struct {
 // ─── tests (offline; :memory:) ──────────────────────────────────────────────
 
 test "DuckDB engine: typed cells, bytes, lists from JSON text, the appender, BEGIN IMMEDIATE, a PRAGMA answers nothing (§10fl)" {
-    if (!build_options.duckdb) return error.SkipZigTest;
+    if (!engines.duckdb.load()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

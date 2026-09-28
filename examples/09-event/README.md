@@ -30,7 +30,7 @@ The data model follows TimescaleDB's [events-uuidv7](https://github.com/timescal
 You need the dev stack running (PostgreSQL, nats-server, the bridge) and libzb built with DuckDB. The `events` credential comes from `scripts/native/jwt-bootstrap.sh`.
 
 ```sh
-cd libzb && zig build -Doptimize=ReleaseFast -Dduckdb=true && cd ..
+cd libzb && zig build -Doptimize=ReleaseFast && cd ..   # the DuckDB engine needs DuckDB installed
 set -a && . ./.env.admin && set +a
 PY=scripts/scenarios/.venv/bin/python
 

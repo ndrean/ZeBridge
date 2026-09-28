@@ -355,8 +355,8 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
             raise RuntimeError(r["error"])
         return {int(b): (int(n), int(sa)) for b, n, sa in r["rows"]}
 
-    # §10hf: ZB_CLIENT_ENGINE=duckdb opens the same client on libzb's DuckDB engine (a build
-    # with -Dduckdb=true); the replica is then a .duckdb file, sampled with the duckdb module.
+    # §10hf: ZB_CLIENT_ENGINE=duckdb opens the same client on libzb's DuckDB engine (libduckdb
+    # installed); the replica is then a .duckdb file, sampled with the duckdb module.
     engine = os.environ.get("ZB_CLIENT_ENGINE", "sqlite")
     db = run_dir / ("client.duckdb" if engine == "duckdb" else "client.sqlite3")
     # §10gu: the replica is sampled from OUTSIDE, on its own read-only connection. The C

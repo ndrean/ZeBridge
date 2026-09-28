@@ -55,7 +55,7 @@ pub const Options = struct {
     db_url: ?[*:0]const u8 = null,
     /// §10fl: the storage engine. `sqlite` (the default) and `duckdb` take
     /// `db_path`; `postgres` is implied by `db_url`. DuckDB is the analytical
-    /// replica of the micro-VM worker, built in with `-Dduckdb=true`.
+    /// replica of the micro-VM worker; libduckdb opens at run time (engines.zig).
     engine: storage.Engine = .sqlite,
     principal: []const u8,
     /// Parents FIRST is still the recommended order — but since §10cp the seed

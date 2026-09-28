@@ -95,8 +95,8 @@ class ZeBridge {
     if (Platform.isIOS) {
       // libzbcore.a is linked INTO the Runner (ios/Flutter/*.xcconfig: `-force_load`
       // on the slice in ios/libzb/libzb.xcframework), so its symbols are the
-      // process's own. Built with `zig build lib -Dtarget=aarch64-ios -Dvendor=true
-      // -Dlibpq=false` — sqlite and zstd vendored, no libpq (NOTES §10iq/§10iy).
+      // process's own. Built with `zig build lib -Dtarget=aarch64-ios -Dvendor=true`
+      // — sqlite and zstd vendored (NOTES §10iq/§10iy, DISTRIBUTION.md).
       _lib = ffi.DynamicLibrary.process();
     } else if (Platform.isAndroid) {
       // android/app/src/main/jniLibs/arm64-v8a/libzbcore.so: libzb's static archive

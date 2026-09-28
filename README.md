@@ -1397,7 +1397,7 @@ final zb = await ZeBridgeWorker.spawn({
   "seedStreaming": false,               // true on a phone: the chain object is never held inflated (3 M rows: 329 MB peak instead of 1.1 GB, 23 s instead of 11)
   "seedStreamingAboveBytes": 8388608,   // with seedStreaming: a step whose compressed object is smaller takes the faster whole-object path (deltas always do)
   // "dbUrl": "postgres://user@host/db", // instead of dbPath: the replica on a PostgreSQL server (a libpq URL) — the micro-VM case
-  // "engine": "duckdb",                 // dbPath is a .duckdb file: the analytical replica (libzb built with -Dduckdb=true; DuckDB opens the file once the client closes it)
+  // "engine": "duckdb",                 // dbPath is a .duckdb file: the analytical replica (needs DuckDB installed; DuckDB opens the file once the client closes it)
 });
 print(zb.tenant);                       // resolved by the worker's first sync
 

@@ -11,7 +11,7 @@ api=29
 # Both ABIs: a 2 GB Android Go phone (the moto e20 at hand) may run a 32-bit userspace,
 # and Android then loads the armeabi-v7a Flutter engine — and finds no library.
 build() { # <zig target> <clang target> <jniLibs abi> [zig cpu]
-  (cd "$libzb" && zig build lib -Dtarget="$1" ${4:+-Dcpu=$4} -Dvendor=true -Dlibpq=false -Dandroid-api=$api \
+  (cd "$libzb" && zig build lib -Dtarget="$1" ${4:+-Dcpu=$4} -Dvendor=true -Dandroid-api=$api \
       --sysroot "$tc/sysroot" -Doptimize=ReleaseFast -p "zig-out/android-$3")
   mkdir -p "$libzb/zig-out/android-$3/shared" "$here/android/app/src/main/jniLibs/$3"
   "$tc/bin/clang" --target="$2" -shared -o "$libzb/zig-out/android-$3/shared/libzbcore.so" \

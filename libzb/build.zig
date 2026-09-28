@@ -27,15 +27,8 @@ pub fn build(b: *std.Build) void {
     // Opt-in for now, so nothing that works today changes: `-Dvendor=true`.
     const vendor = b.option(bool, "vendor", "Compile sqlite and zstd from pinned sources instead of linking the host's") orelse false;
 
-    // §10ig: the PostgreSQL replica engine (§10fd) as a build-time switch, like
-    // DuckDB's but ON by default — every desktop build has had it and nothing should
-    // change for them. It exists for the phone: libpq-fe.h is not in the iOS SDK and
-    // drags a hosted libc through translate-c, so a build that can never open a
-    // PostgreSQL replica still had to find a PostgreSQL client library to compile.
-    const with_libpq = b.option(bool, "libpq", "Build the PostgreSQL storage engine (needs libpq)") orelse true;
-
     const translate_c = b.addTranslateC(.{
-        .root_source_file = b.path(if (with_libpq) "src/sqlite_includes.h" else "src/sqlite_includes_nopq.h"),
+        .root_source_file = b.path("src/sqlite_includes.h"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -58,34 +51,37 @@ pub fn build(b: *std.Build) void {
     // libpq for the PostgreSQL replica engine (§10fd): a client's storage may be a
     // PostgreSQL server instead of a SQLite file — the micro-VM case.
     //
-    const pq_prefix: []const u8 = b.option([]const u8, "libpq-prefix", "System libpq prefix") orelse
-        (if (builtin.os.tag == .macos) "/opt/homebrew/opt/libpq" else "/usr");
-    if (with_libpq) {
-        translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "include" }) });
-        translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "include", "postgresql" }) });
-    }
+    // §10jk: the engines' headers are vendored (include-engines/), so every build —
+    // phones included — compiles the DuckDB and PostgreSQL engines without either
+    // library installed. Neither is LINKED: engines.zig opens them at run time.
+    translate_c.addIncludePath(b.path("include-engines"));
+    // §10jk: and a CROSS target's libc headers: libpq-fe.h includes stdio.h, which the
+    // phone SDKs hold under the sysroot — the same reach `addVendored` gives the C
+    // sources (§10iq), Android's per-architecture directory included (§10ir).
+    const sysroot_includes: []const []const u8 = if (b.sysroot) |sr| blk: {
+        const base = b.pathJoin(&.{ sr, "usr", "include" });
+        if (target.result.abi == .android or target.result.abi == .androideabi) {
+            const triple = target.result.linuxTriple(b.allocator) catch break :blk &.{base};
+            break :blk b.allocator.dupe([]const u8, &.{ base, b.pathJoin(&.{ base, triple }) }) catch &.{base};
+        }
+        break :blk b.allocator.dupe([]const u8, &.{base}) catch &.{};
+    } else &.{};
+    for (sysroot_includes) |p| translate_c.addSystemIncludePath(.{ .cwd_relative = p });
     const c_mod = translate_c.createModule();
 
-    // §10fl: the DuckDB engine, a build-time switch. Off by default and always off
-    // on a phone: libduckdb is a 50 MB analytics library the micro-VM worker links
-    // (Homebrew keg on macOS, the release zip unpacked under a prefix on Linux) and
-    // nothing else needs. On, `duckdb.h` is translated as its own module.
-    const with_duckdb = b.option(bool, "duckdb", "Build the DuckDB storage engine (needs libduckdb)") orelse false;
-    const duckdb_prefix: []const u8 = b.option([]const u8, "duckdb-prefix", "System DuckDB prefix") orelse
-        (if (builtin.os.tag == .macos) "/opt/homebrew/opt/duckdb" else "/usr/local");
-    const build_opts = b.addOptions();
-    build_opts.addOption(bool, "duckdb", with_duckdb);
-    build_opts.addOption(bool, "libpq", with_libpq);
-    const duckdb_mod: *std.Build.Module = if (with_duckdb) blk: {
+    // §10fl: DuckDB's header as its own module (`@import("duckdb")`), from the vendored
+    // copy. The library itself is opened at run time (§10jk, engines.zig).
+    const duckdb_mod: *std.Build.Module = blk: {
         const tc = b.addTranslateC(.{
             .root_source_file = b.path("src/duckdb_includes.h"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
-        tc.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ duckdb_prefix, "include" }) });
+        tc.addIncludePath(b.path("include-engines"));
+        for (sysroot_includes) |p| tc.addSystemIncludePath(.{ .cwd_relative = p });
         break :blk tc.createModule();
-    } else b.createModule(.{ .root_source_file = b.path("src/duckdb_stub.zig"), .target = target, .optimize = optimize });
+    };
 
     // §10iq: the vendored C, added to whichever module links it. One function so the
     // four modules cannot drift — that drift is exactly what let a plain `zig build`
@@ -225,17 +221,8 @@ pub fn build(b: *std.Build) void {
         mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
         mod.linkSystemLibrary("zstd", .{});
     }
-    if (with_libpq) {
-        mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
-        mod.linkSystemLibrary("pq", .{});
-    }
     mod.link_libc = true;
     mod.addImport("duckdb", duckdb_mod);
-    mod.addOptions("build_options", build_opts);
-    if (with_duckdb) {
-        mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ duckdb_prefix, "lib" }) });
-        mod.linkSystemLibrary("duckdb", .{});
-    }
 
     // The C-ABI shared library: one JSON dispatch entrypoint (zb_call) +
     // zb_free. Hosts: Python (ctypes), and later Dart/Swift/Kotlin/.NET FFI.
@@ -306,17 +293,8 @@ pub fn build(b: *std.Build) void {
         demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
         demo_mod.linkSystemLibrary("zstd", .{});
     }
-    if (with_libpq) {
-        demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
-        demo_mod.linkSystemLibrary("pq", .{});
-    }
     demo_mod.link_libc = true;
     demo_mod.addImport("duckdb", duckdb_mod);
-    demo_mod.addOptions("build_options", build_opts);
-    if (with_duckdb) {
-        demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ duckdb_prefix, "lib" }) });
-        demo_mod.linkSystemLibrary("duckdb", .{});
-    }
     const demo = b.addExecutable(.{ .name = "zb-demo", .root_module = demo_mod });
     b.installArtifact(demo);
 
@@ -341,17 +319,8 @@ pub fn build(b: *std.Build) void {
         soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
         soak_mod.linkSystemLibrary("zstd", .{});
     }
-    if (with_libpq) {
-        soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
-        soak_mod.linkSystemLibrary("pq", .{});
-    }
     soak_mod.link_libc = true;
     soak_mod.addImport("duckdb", duckdb_mod);
-    soak_mod.addOptions("build_options", build_opts);
-    if (with_duckdb) {
-        soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ duckdb_prefix, "lib" }) });
-        soak_mod.linkSystemLibrary("duckdb", .{});
-    }
     b.installArtifact(b.addExecutable(.{ .name = "zb-soak", .root_module = soak_mod }));
 
     // `zb sync` (§10fl): the replica as a command — the micro-VM worker's boot.
@@ -373,17 +342,8 @@ pub fn build(b: *std.Build) void {
         zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
         zb_mod.linkSystemLibrary("zstd", .{});
     }
-    if (with_libpq) {
-        zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
-        zb_mod.linkSystemLibrary("pq", .{});
-    }
     zb_mod.link_libc = true;
     zb_mod.addImport("duckdb", duckdb_mod);
-    zb_mod.addOptions("build_options", build_opts);
-    if (with_duckdb) {
-        zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ duckdb_prefix, "lib" }) });
-        zb_mod.linkSystemLibrary("duckdb", .{});
-    }
     b.installArtifact(b.addExecutable(.{ .name = "zb", .root_module = zb_mod }));
 
     const tests = b.addTest(.{ .root_module = mod });

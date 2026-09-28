@@ -4,8 +4,8 @@
   set -a && . ./.env.bridge && set +a
   scripts/scenarios/.venv/bin/python scripts/scenarios/duckdb_replica.py
 
-Needs a running bridge, PostGIS and pgvector on the master, libzb built with the
-engine (`cd libzb && zig build -Doptimize=ReleaseFast -Dduckdb=true`) and the
+Needs a running bridge, PostGIS and pgvector on the master, libzb built (`cd libzb
+&& zig build -Doptimize=ReleaseFast`), DuckDB installed for the engine, and the
 `duckdb` Python package in the venv. A master table with every shape the wire
 carries — integers, numeric, boolean, text[] and int[][], jsonb, bytea, a PostGIS
 point, a vector(3), timestamptz — is created and enabled here and dropped at the end.

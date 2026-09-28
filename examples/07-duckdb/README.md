@@ -27,9 +27,9 @@ fired on demand, PostgreSQL untouched.
 ## The native route: libzb's DuckDB engine
 
 Since §10fl libzb can write the replica straight into a `.duckdb` file — no SQLite
-in the middle — when built with the engine (`cd libzb && zig build
--Doptimize=ReleaseFast -Dduckdb=true`; `duckdb.h` and `libduckdb` from the host, the
-Homebrew keg or the release zip). The worker is then one command:
+in the middle. libzb opens libduckdb when a client asks for the engine, so the host
+needs DuckDB installed (the Homebrew keg or the release zip; `ZB_DUCKDB_LIB` names the
+file if it is elsewhere). The worker is then one command:
 
 ```sh
 libzb/zig-out/bin/zb sync --creds scripts/native/creds/bob.creds --principal bob \

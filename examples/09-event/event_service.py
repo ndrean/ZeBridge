@@ -78,7 +78,8 @@ class Card:
         self.lib = lib
         self.h = lib.zb_client_connect(json.dumps(opts).encode())
         if not self.h:
-            sys.exit("libzb: open failed (is libzb built with -Dduckdb=true?)")
+            lib.zb_last_error.restype = ctypes.c_char_p
+            sys.exit(f"libzb: open failed: {(lib.zb_last_error() or b'').decode()}")
 
     def take(self, ptr):
         try:
