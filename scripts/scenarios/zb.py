@@ -502,3 +502,12 @@ def parse_tenants(value: str) -> list[str]:
 def kv_tenants(principal: str) -> list[str]:
     """The principal's memberships as the bucket states them."""
     return parse_tenants(kv_get("tenants", principal))
+
+
+def kv_bind(js, bucket: str):
+    """A KV bucket BOUND without STREAM.INFO (§10jr) — nats-py's `key_value()` asks the
+    server first, and client credentials no longer hold STREAM.INFO on the key-scoped
+    buckets (tenants, generations): its `subjects_filter` lists every key. Reads go by
+    direct get, as the libraries do (nats.zig kvBind, nats.js Kvm.open)."""
+    from nats.js.kv import KeyValue
+    return KeyValue(name=bucket, stream=f"KV_{bucket}", pre=f"$KV.{bucket}.", js=js, direct=True)

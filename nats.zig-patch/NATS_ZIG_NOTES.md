@@ -1008,3 +1008,23 @@ request a message answers is the server's business; the bounded count needs no g
 batches exact (1,282,000 rows), 104 deliveries lost and recovered, four kills, no
 `ConsumerSequenceMismatch` (before: the follower exited twice per run and the run never
 converged).
+
+## 27. A KV bucket can be bound without STREAM.INFO (2026-09-28)
+
+**Problem.** `KVManager.openBucket` (and `JetStream.kvBucket`) call `getStreamInfo` to check
+the bucket exists before returning it. A credential granted only exact keys of a bucket
+(ZeBridge's clients: `$KV.tenants.<self>`, `$KV.generations.<tenant>.*`, by direct get) must
+then also hold `$JS.API.STREAM.INFO.KV_<bucket>` — and STREAM.INFO takes a
+`subjects_filter` in its request BODY, which no subject grant can scope: the holder lists
+every key of the bucket (measured in ZeBridge: 164 principal names, every tenant's
+manifest keys — NOTES §10jr).
+
+**Change** (`27-nats.zig-kv-bind.patch`)
+
+`src/jetstream_kv.zig`: `KVManager.bindBucket` returns `KV.init` without the lookup — what
+nats.js's `Kvm.open` does (bindOnly). `src/jetstream.zig`: `JetStream.kvBind`, the
+`kvBucket` counterpart. A missing bucket shows at the first read instead of at open.
+
+**Verified**: `zig build test` in libzb; live, with STREAM.INFO removed from the client
+templates: libzb seeds a fresh replica from the chain, reads its tenants key, and the
+bucket it can no longer describe answers its exact keys.

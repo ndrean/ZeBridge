@@ -479,13 +479,15 @@ tenant-keyed generation names (`$KV.generations.<tenant>.<table>`, `gen-<tenant>
 `$KV.tenants.<principal>` alike — one invariant, applied everywhere a name carries an
 identity to grant against.
 
-⚠️ **A key-scoped grant holds only if no consumer is granted on the same stream.** A
+⚠️ **A key-scoped grant holds only if neither a consumer nor STREAM.INFO is granted on the same stream.** A
 consumer reads its whole stream, whatever the keys: with `CONSUMER.CREATE.KV_generations.>`
 granted beside the tenant-scoped direct gets, any client listed and watched every
 tenant's generation manifests (NOTES §10jr — tenant names, table names, when each last
 wrote). Manifests, the tenants key and stored verdicts are therefore read by DIRECT GET
-of an exact key only, and no client template grants a consumer on `KV_generations`,
-`KV_tenants` or `VERDICTS`.
+of an exact key only, and no client template grants a consumer — or STREAM.INFO, whose
+`subjects_filter` sits in the request body where no grant reaches and lists every key
+(164 principal names, measured) — on `KV_generations`, `KV_tenants` or `VERDICTS`. The
+clients bind those buckets without asking (nats.js `Kvm.open`, nats.zig `kvBind`).
 
 ⚠️ **Values interpolated into subjects are validated** (`utils.isSubjectToken`). A tenant
 value is row data and can contain anything: a dot splits the token and the row vanishes

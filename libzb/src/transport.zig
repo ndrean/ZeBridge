@@ -265,8 +265,12 @@ pub const Transport = struct {
     /// must use the PER-KEY subject form, because the JWT grants deliberately
     /// exclude the bucket-level API — per-key scoping is what makes
     /// tenant-scoped KV grants possible.
+    /// One key, by direct get. §10jr: BOUND, not opened — `kvBucket` asks STREAM.INFO first,
+    /// and that grant lists every key of the bucket through its `subjects_filter`, so the
+    /// client templates no longer carry it for the key-scoped buckets (tenants,
+    /// generations). A missing bucket now reads as a missing key.
     pub fn kvGet(self: *Transport, a: std.mem.Allocator, bucket: []const u8, key: []const u8) !?[]u8 {
-        var kv = try self.js.kvBucket(bucket);
+        var kv = try self.js.kvBind(bucket);
         defer kv.deinit();
         var entry = kv.get(key) catch return null;
         defer entry.deinit();

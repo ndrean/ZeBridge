@@ -180,8 +180,10 @@ fn roleAllows(
     try P.add(&pubs, a, "{s}STREAM.INFO.{s}{{{{tag(tenant)}}}}", .{ js_api, cdc_pre });
     try P.add(&pubs, a, "{s}STREAM.INFO.{s}", .{ js_api, cdc_pub });
     try P.add(&pubs, a, "{s}STREAM.INFO.KV_{s}", .{ js_api, kv_schemas });
-    try P.add(&pubs, a, "{s}STREAM.INFO.KV_{s}", .{ js_api, kv_gens });
-    try P.add(&pubs, a, "{s}STREAM.INFO.KV_{s}", .{ js_api, kv_tenants });
+    // §10jr: NOT KV_generations / KV_tenants — STREAM.INFO's `subjects_filter` (in the
+    // body, where no grant reaches) lists every key: every tenant's manifests, every
+    // principal. Clients bind those buckets without asking (nats.zig kvBind, nats.js
+    // Kvm.open) and read their exact keys by direct get.
     try P.add(&pubs, a, "{s}STREAM.INFO.OBJ_{s}{{{{tag(tenant)}}}}", .{ js_api, obj_pre });
     try P.add(&pubs, a, "{s}STREAM.INFO.OBJ_{s}{s}", .{ js_api, obj_pre, open });
     try P.add(&pubs, a, "{s}STREAM.MSG.GET.KV_{s}", .{ js_api, kv_schemas });

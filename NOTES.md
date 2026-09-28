@@ -17553,6 +17553,21 @@ Node client each seeded a fresh replica from the chain (20 live kilo rows = Post
 The rule is in SECURITY.md: a key-scoped grant holds only if no consumer is granted on
 the same stream (the §10dm reasoning for verdicts, one stream further).
 
+**And STREAM.INFO leaked the same names.** Removing the consumers left
+`STREAM.INFO.KV_generations` and `STREAM.INFO.KV_tenants`, granted so a client could open
+the bucket. Its request body takes a `subjects_filter` — the very call the bridge uses to
+list stored bans — and no subject grant reaches a body: as omar it returned 90 generation
+keys and **164 principal names** (every user of the deployment). The clients never needed
+the answer: nats.js's `Kvm.open` already binds without it (bindOnly), and nats.zig gained
+`kvBind` (patch 27, a `KV.init` without the lookup), which libzb's `kvGet` now uses. Both
+grants are gone from every template, the live keys and the password-mode conf; the
+scenarios read the tenants bucket through `zb.kv_bind` (nats-py's `key_value()` asks
+STREAM.INFO too). After: omar's STREAM.INFO on both is a Permissions Violation; libzb
+(494 chain rows → 20 live) and Node seed fresh replicas; tenant_kv.py passes, each
+principal reading its own key and denied the others'. The security is the server's grants
+alone — anyone holding a device's creds uses any NATS client, not ours; the library
+changes only keep honest clients inside the tighter grants.
+
 Asked on the way (answered, not built): a tenant needing other permissions is a ROLE —
 its own signing key and template, loaded into the server (memory resolver: conf splice
 + SIGHUP; full resolver: nsc push) — and `zebridge_invites.role` already exists for it,

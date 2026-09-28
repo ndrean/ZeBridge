@@ -62,8 +62,6 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_CLIENT" --role client \
     --allow-pub "\$JS.API.STREAM.INFO.CDC_{{tag(tenant)}}" \
     --allow-pub "\$JS.API.STREAM.INFO.CDC_PUBLIC" \
     --allow-pub "\$JS.API.STREAM.INFO.KV_schemas" \
-    --allow-pub "\$JS.API.STREAM.INFO.KV_generations" \
-    --allow-pub "\$JS.API.STREAM.INFO.KV_tenants" \
     --allow-pub "\$JS.API.STREAM.MSG.GET.KV_schemas" \
     --allow-pub "\$JS.API.DIRECT.GET.KV_schemas.>" \
     --allow-pub "\$JS.API.DIRECT.GET.KV_generations.\$KV.generations.{{tag(tenant)}}.>" \
@@ -132,8 +130,6 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_RESPONDER" --role responder \
     --allow-pub "\$JS.API.STREAM.INFO.CDC_{{tag(tenant)}}" \
     --allow-pub "\$JS.API.STREAM.INFO.CDC_PUBLIC" \
     --allow-pub "\$JS.API.STREAM.INFO.KV_schemas" \
-    --allow-pub "\$JS.API.STREAM.INFO.KV_generations" \
-    --allow-pub "\$JS.API.STREAM.INFO.KV_tenants" \
     --allow-pub "\$JS.API.STREAM.MSG.GET.KV_schemas" \
     --allow-pub "\$JS.API.DIRECT.GET.KV_schemas.>" \
     --allow-pub "\$JS.API.DIRECT.GET.KV_generations.\$KV.generations.{{tag(tenant)}}.>" \

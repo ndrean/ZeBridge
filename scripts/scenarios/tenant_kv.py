@@ -98,7 +98,7 @@ async def connect_as(principal: str) -> nats.NATS:
 async def own_key(nc: nats.NATS, key: str):
     """Direct Get on `key`. Returns (value_or_None, 'not_found' | error class name | None)."""
     js = nc.jetstream()
-    kv = await js.key_value(BUCKET)
+    kv = zb.kv_bind(js, BUCKET)
     try:
         entry = await kv.get(key)
         return entry.value.decode(), None
@@ -148,7 +148,7 @@ async def main():
         nc = await connect_as(principal)
         try:
             js = nc.jetstream()
-            kv = await js.key_value(BUCKET)
+            kv = zb.kv_bind(js, BUCKET)
             await asyncio.wait_for(kv.get(victim), timeout=3)
             check(
                 f"{principal} denied on {victim}'s key",
