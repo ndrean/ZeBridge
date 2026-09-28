@@ -79,15 +79,21 @@ Trust is earned. Test first. See [SPEED_TEST.md](#speed_test.md)
 Although they might seem rigorous, these rules are mostly standard and well known, almost mechanical, schemas.
 See [The daemon](#the-daemon) for more details.
 
-**Configuration**: Because the engine uses a pre-allocated ring buffer with zero allocation on the hot path, the primary runtime configuration of the engine is the **fixed-size buffer**. After this, the daemon takes a publication and a slot, and uses its default port. The rest are env variables:
+**Configuration**: ZeBridge operates with a **fixed-size buffer** for the CDCs/changes (PG-WAL/CDC →  bridge → NATS), and can parallelize the mutations ingestion (client → NATS → bridge → PG).
+
+For the changes (CDC) propagation from Postgres into NATS, because the engine uses a pre-allocated ring buffer with zero allocation on the hot path, the primary runtime configuration uses `BASE_BUF` (an integer between 10 and 20) and `RING_BUFFER_COUNT` (an integer between 1024 and 1M+). There is also `MAX_COLUMNS` (an integer which defaults to 128).
+Defaults are `BASE_BUF=12` (4 KB/row), `RING_BUFFER_COUNT=32768`and `MAX_COLUMNS=128`, consuming around 150MB.
+
+Depending on the change volume, the schema sizes of your published tables, and if you have lengthy cascading transactions, the total buffer allocation can be configured anywhere from 16 MB to 6+ GB.
 
 ❗️ Read [Sizing the ring](#️--sizing-the-ring).
 
-Depending on the write volume, the schema sizes of your published tables, and if you have lengthy cascading transactions, the total buffer allocation can be configured anywhere from 16 MB to 6+ GB.
-
 Any change in the buffer, for special live migrations that could enable larger tables than the current setting, or for tables with numerous columns exceeding the max column expected to be larger than the current setting, needs a daemon restart: see [Restart Rules](#restart-rules).
 
-Defaults are `BASE_BUF=12` (4 KB/row), `RING_BUFFER_COUNT=32768`and `MAX_COLUMNS=128`, consuming around 150MB.
+On the other side, for inserting client mutations into Postgres via NATS, you may need to tweak the `ZB_INGRESS_LANES` (an integer betwween default=1 and 8) depending upon the mutation rate. For example, if messages arrive in less than 200µs, you may want to add another lane with `ZB_INGRES_LANES=2` to run more parallele mutation lanes.
+Postgres `max_connections` setting is checked against this number when the bridge is started.
+
+After this, the daemon takes a publication and a slot, and uses its default port.
 
 **Observability**: production-ready out of the box. It exposes standard Prometheus metrics for performance tracking and structured logs optimized for Loki and Grafana dashboards. The metrics are all owned by the daemon, meaning metrics from its Postgres catalogue and self reflecting metrics.
 
