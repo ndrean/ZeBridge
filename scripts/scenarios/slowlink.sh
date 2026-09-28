@@ -32,9 +32,13 @@ start)
   BW=${2:-20}; DELAY=${3:-30}; LOSS=${4:-0.005}
   dnctl pipe $DOWN config bw "${BW}Mbit/s" delay "$DELAY" plr "$LOSS"   # NATS → client
   dnctl pipe $UP config bw "${BW}Mbit/s" delay "$DELAY"                  # client → NATS
+  # No `on lo0`: macOS does not present traffic to the Mac's own LAN address as lo0 inbound
+  # (measured: 16,053 lo0 evaluations, all 127.0.0.1, 0 matches), so the rule names no
+  # interface. The addresses and the port alone pick exactly the LAN-address connections;
+  # 127.0.0.1 — the bridge, the services — never matches.
   printf '%s\n' \
-    "dummynet in quick on lo0 proto tcp from $LAN port 4222 to $LAN pipe $DOWN" \
-    "dummynet in quick on lo0 proto tcp from $LAN to $LAN port 4222 pipe $UP" |
+    "dummynet in quick proto tcp from $LAN port 4222 to $LAN pipe $DOWN" \
+    "dummynet in quick proto tcp from $LAN to $LAN port 4222 pipe $UP" |
     pfctl -q -a "$ANCHOR" -f -
   if [ ! -s "$TOKEN_FILE" ]; then
     pfctl -E 2>&1 | sed -n 's/.*[Tt]oken *: *\([0-9][0-9]*\).*/\1/p' > "$TOKEN_FILE"
