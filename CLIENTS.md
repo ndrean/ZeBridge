@@ -6,7 +6,7 @@ lifecycle lesson learned in one is not silently missing from the other.
 | | libzb | zb-client-ts |
 | --- | --- | --- |
 | language | Zig core + shell, C ABI | TypeScript core + shell |
-| hosts | Python, Node (ctypes/FFI), Flutter (Dart FFI) | browser, Node |
+| hosts | through its bindings: Python (`zb-python`), Kotlin/Java (`zb-android`), Dart/Flutter (`zb-dart`); any other language through the C ABI directly | browser, Node, React Native |
 | local engine | SQLite (a file), PostgreSQL (`dbUrl`, §10fd; seeds through COPY, §10fe), or DuckDB (`engine: "duckdb"`, §10fl; libduckdb opened at run time; seeds through the appender; the micro-VM worker's analytical replica, a file DuckDB itself opens once libzb closes it) | SQLite (sqlocal, better-sqlite3), PGlite |
 | large answers | §10hq: `reply` puts an answer past `results.inline_max_bytes` in `res-<tenant>` and sends an envelope; `request` resolves it | the same, in `serve`'s reply and in `request` |
 | being a service | `zb_client_serve` + the `requests` in `poll` + `zb_client_reply` (§10hp): the host's loop answers | `serve({tenants, handlers, queue})`: async handlers, the library subscribes and replies |
@@ -16,6 +16,86 @@ lifecycle lesson learned in one is not silently missing from the other.
 | loop | host-driven: `sync`, `poll`, `flush` | self-driven: `connect()` runs it |
 | tables followed | **one rule, both clients (§10hn, `core.tableSet`, fixtures `tableSet`)**: `tables` is a list, or `"*"` for every published table; `ondemandTables` are held for their schema only, never seeded or tailed (§10hj), rows through `ingest`; a name in both is on-demand; absent both, nothing is followed — and the TS client says so in its log | the same |
 | tenants followed | every membership in `$KV.tenants.<principal>` (a set, §10fn): one chain per tenant into one table, one CDC stream per tenant, watermarks per (table, tenant); `zb_client_join`/`zb_client_leave` at runtime; a join the credentials cannot read is refused, and a stream that becomes unreadable is set aside alone and named in the poll report (`unreadable`, §10fq) | the FIRST membership only, with a warning when there are more (parity queued) |
+
+## The first ten lines
+
+The same shape in every language: one options object, the same keys, passed to a
+constructor. The first run on a device needs only the bridge's URL and the invite your
+backend handed it; later runs need nothing but the tables. Enrollment, the identity file,
+the NATS URL and JWT renewal are the library's.
+
+TypeScript (browser, Node, React Native):
+
+```ts
+import { ZeBridge } from 'zb-client-ts';
+const zb = new ZeBridge({ bridgeUrl: 'https://zb.example.com', invite: code, tables: ['orders'] });
+await zb.connect();
+zb.onChange('orders', refresh);
+const open = await zb.query('SELECT * FROM orders WHERE status = ?', 'open');
+await zb.mutate('orders', 'UPDATE', { id: 7 }, { status: 'done' });
+```
+
+Python:
+
+```python
+from zebridge import ZeBridge
+with ZeBridge(bridge_url="https://zb.example.com", invite=code, tables=["orders"], on_change=refresh) as zb:
+    open_ = zb.query("SELECT * FROM orders WHERE status = ?", "open")
+    zb.mutate("orders", "UPDATE", {"id": 7}, {"status": "done"})
+```
+
+Kotlin (Android):
+
+```kotlin
+val zb = ZeBridge(mapOf("bridgeUrl" to "https://zb.example.com", "invite" to code, "tables" to listOf("orders")), context) { refresh() }
+val open = zb.query("SELECT * FROM orders WHERE status = ?", "open")
+zb.mutate("orders", "UPDATE", mapOf("id" to 7), mapOf("status" to "done"))
+```
+
+Dart (Flutter):
+
+```dart
+final zb = await ZeBridgeWorker.spawn({'bridgeUrl': 'https://zb.example.com', 'invite': code, 'tables': ['orders']});
+zb.reports.listen((r) => refresh());
+final open = await zb.query('SELECT * FROM orders WHERE status = ?', ['open']);
+await zb.mutate('orders', 'UPDATE', {'id': 7}, {'status': 'done'});
+```
+
+Any other language, through the C ABI — five calls, JSON in and out:
+
+```c
+uint64_t h = zb_client_connect("{\"bridgeUrl\":\"https://zb.example.com\",\"invite\":\"…\",\"tables\":[\"orders\"]}");
+zb_free(zb_client_sync(h));                 // seed and catch up
+for (;;) zb_free(zb_client_poll(h, 1000));  // the loop: tail, verdicts, JWT renewal
+char *rows = zb_client_query(h, "SELECT * FROM orders", "[]");  /* … */ zb_free(rows);
+zb_client_close(h);
+```
+
+The two table lists: `tables` are seeded and followed live; `ondemandTables` get their
+schema only, and rows arrive when this client asks a service (`request`) and keeps the
+answer (`ingest`).
+
+## Bindings: the rule
+
+A binding is the thin layer that gives one language libzb's C ABI. It may contain **only**:
+
+1. **the declarations** of the C functions (types, freeing the returned strings);
+2. **its language's thread model** — libzb drives a client from one thread: a worker thread
+   (Python, Kotlin), an isolate (Dart), a loop the host already has;
+3. **error mapping** — libzb's words (`{"error"}`, `zb_last_error`) into the language's
+   exception;
+4. **a default storage location** — the app-private directory where the platform has one.
+
+**Behavior never goes in a binding.** A retry, a default value, a parsing rule, a renewal
+policy: libzb, where every binding gets it at once. Enrollment and renewal were built that
+way, and they cost the Kotlin and Dart bindings almost nothing. A binding with logic is a
+second implementation, and a second implementation drifts — the three Flutter examples'
+copies had, before `zb-dart` replaced them.
+
+Each binding pins the ABI version it was written for (`ZB_ABI` / `zbAbi`), and
+`libzb/python/abi_check.py` fails when any pin disagrees with libzb. The bindings today:
+`zb-python` (~300 lines), `zb-dart` (~590, the isolate worker included), `zb-android`
+(~430, JNI included). A new one — Swift, Go, Rust, Ruby — starts from the closest of them.
 
 ## The configuration keys, side by side
 

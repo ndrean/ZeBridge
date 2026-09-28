@@ -1212,6 +1212,10 @@ The client libray comes in two flavours: TypeScript (for any JavaScript engine) 
 
 💡 One big difference: The TypeScript client drives itself, the C ABI library is driven by its host.
 
+**Start with [the first ten lines](CLIENTS.md#the-first-ten-lines)** — the same few calls
+in TypeScript, Python, Kotlin, Dart, and C for any other language. Every binding follows
+[one rule](CLIENTS.md#bindings-the-rule): it holds no behavior of its own.
+
 ### The TypeScript API
 
 The consumer app uses one websocket connection to NATS, one storage (persisted or in-memory, storage defaults to SQLite, or declared PGlite)

@@ -35,6 +35,10 @@ library.
 | **libzb-android** | arm64-v8a, armeabi-v7a, x86_64 | compiled in | – | – | AAR (`zb-android`), or a `.so` per CPU | Kotlin/Java (`dev.zebridge.ZeBridge`), Flutter (dart:ffi) |
 | **libzb-desktop** | macOS, Linux, Windows | compiled in | if libpq is installed | if libduckdb is installed | shared library | apps and services: Python (ctypes), Node, Dart, JVM (JNA, FFM), .NET (P/Invoke) |
 
+On top of these, one package per language gives libzb its idioms — `zb-python`,
+`zb-android` (the AAR), `zb-dart` — each a thin binding with no behavior of its own
+([CLIENTS.md](CLIENTS.md#bindings-the-rule)); zb-client-ts covers JavaScript without libzb.
+
 A phone never has libpq or libduckdb, so on a phone those two engines answer with the
 message above. The desktop library is the same file for an app and for a service; what
 differs is what is installed next to it.
