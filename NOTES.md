@@ -17361,3 +17361,59 @@ function was right; the runner passes `firstSeq` now. 232/232 through libzb, 244
 TS.
 On the moto e20, the AAR rebuilt without the Kotlin capitalising: 3/3, the DELETE sent as
 `"delete"` settled and PostgreSQL holds the row tombstoned.
+
+## §10jn — live apply into DuckDB, measured: the cost is per batch, and INSERTs skip it (2026-09-28)
+
+The question was a double buffer (NATS → buffer A while buffer B flushes to DuckDB),
+possibly in memory the host allocates. Measured first: `ZB_APPLY_STATS=1` makes libzb
+print, every 5 s, where applyBatch's time goes (decode, plan, shape, append, upsert,
+single, commit/rest, acks), from the monotonic clock. 09-event, one DuckDB service,
+sensors at three rates, one ingress lane:
+
+| load | batches/s | events/batch avg / max | ms/batch | decode | upsert | commit/rest | busy |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1,000/s | 160 | 6 / 46 | 2.49 | 0.01 | 1.12 | 0.99 | ~40% |
+| 5,000/s | 152 | 33 / 446 | 2.87 | 0.04 | 1.33 | 1.07 | ~44% |
+| 8,000/s | 142 | 56 / 576 | 3.20 | 0.07 | 1.45 | 1.17 | ~45% |
+
+* Batches already size themselves: each poll takes what has arrived, so 8× the load gave
+  9× the batch at the same batch rate — group commit, latency about one batch (~3 ms),
+  never N ÷ rate. No batch waits to fill.
+* The cost is fixed per batch: the temp table, the set-based upsert, the drop and the
+  commit; a row adds ~0.013 ms. Decoding is 0.01–0.07 ms, ~2%: overlapping it with the
+  write (the double buffer) could save that 2%, and the stream is already the buffer
+  that waits (JetStream holds the backlog; a pull is the swap). Host-provided memory
+  would not help either: the appender copies every value into DuckDB's own storage.
+
+So the fix removes the fixed work. A bulk segment of INSERTs only, whose columns are
+exactly the table's, is appended straight into the table in DuckDB's own column order
+(information_schema, asked once per TableState; the schema message's order is not
+trusted). Only on applyBatch's first pass: an INSERT meeting a key already there — a
+batch redelivered between commit and ack — makes the appender refuse ("Duplicate key …
+violates primary key constraint"), DuckDB aborts the transaction, and the second pass
+takes the temp-table upsert as before.
+
+| load | ms/batch before → after | busy before → after |
+| --- | --- | --- |
+| 1,000/s | 2.49 → 1.21 | ~40% → ~24% |
+| 5,000/s | 2.87 → 1.38 | ~44% → ~27% |
+| 8,000/s | 3.20 → 1.53 | ~45% → ~25% |
+
+What remains is the commit and the position write (~1 ms). Fallback proved by moving the
+stored CDC_globex position back 3,000 messages and restarting: each redelivered batch
+failed its fast pass, upserted on the second, and the replica ended at 1,119,991 rows,
+1,119,991 distinct keys, equal to PostgreSQL. The retry line on DuckDB now says so and
+carries DuckDB's message (it read the empty commit text before).
+
+**Mixed segments, per key.** The first version sent a whole segment to the upsert when a
+single event in it was not an INSERT. Now each key is judged by its first event in the
+segment: keys born there are appended, the rest upserted — one statement of each only
+when both kinds are present. Measured with 5,000 INSERTs/s and 500 UPDATEs/s of existing
+readings (each UPDATE its own message, so nearly every batch carried one): 3.27–3.57 ms
+per batch with the split, 3.30–3.37 ms with it switched off for an A/B — equal. At ~35
+born rows and a few updates per batch, the split saves on the upsert about what the extra
+append costs; it should pay off on large mixed batches (a backlog catch-up), and never
+lost measurably. Pure INSERT segments are unchanged (1.38 ms at 5,000/s). What a mixed
+load really pays is the upsert's fixed ~1.4 ms (temp table, statement, drop) for a
+handful of rows; a per-row prepared upsert for a small remainder is the next lever, not
+built.

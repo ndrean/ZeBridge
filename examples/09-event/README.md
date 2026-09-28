@@ -336,6 +336,12 @@ In the other test, we ramp up and use the parallelised threads.
 
 After both runs PostgreSQL and the DuckDB copy agreed exactly: 359,996 rows, the same `sum(value)`. One sensor's 1 s average swung by about a degree each second, as the 2 s wave predicts, while its moving average stayed within 0.3 of the base. That average held 11 buckets at the time, the off-by-one since fixed; 10 buckets hold exactly five waves, so the wave cancels fully.
 
+### How the DuckDB copy keeps up
+
+Each `poll` takes whatever has arrived since the last one and writes it in one transaction. Nothing waits for a batch to fill: at 1,000 readings/s a batch holds about 5 rows, at 8,000/s about 50, and the delay stays around one batch's write, a millisecond or two. Most of a batch's cost is fixed (the commit and the stream position), so bigger batches make each row cheaper.
+
+New readings are appended straight into the table. At 8,000 readings/s this costs the service about a quarter of one CPU core, the same loop that answers the questions. `ZB_APPLY_STATS=1` makes libzb print where the time goes, every 5 seconds (NOTES §10jn).
+
 ## The ramp: how far one Mac goes
 
 Restart the bridge with  `ZB_INGRESS_LANES=1..8`.

@@ -158,6 +158,10 @@ const TableState = struct {
     /// §10fe: the PostGIS columns (`pg` block, type geometry/geography): bytes into
     /// them are bare EWKB hex in COPY text, where a bytea takes `\\x` hex.
     geom_cols: []const []const u8 = &.{},
+    /// §10jn: the DuckDB table's own column order, asked once (information_schema), for
+    /// the insert-only fast path that appends straight into the table. A schema change
+    /// builds a fresh TableState, so a moved column is asked again.
+    dk_order: ?[]const []const u8 = null,
     /// §10fg: the pgvector and bit(n) columns (`pg` block): a PostgreSQL replica
     /// binds pgvector's text form of the wire BLOB (core.vecLiteral); SQLite keeps
     /// the BLOB.
@@ -184,6 +188,62 @@ const TableState = struct {
 };
 
 var trace_enabled: bool = false;
+/// ZB_APPLY_STATS=1: where live apply time goes, summed and printed every 5 s (§10jn).
+var apply_stats_enabled: bool = false;
+
+/// Microseconds on the monotonic clock: phase timings, never compared with wall time.
+fn usMono() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1_000_000 + @divTrunc(@as(i64, ts.nsec), 1000);
+}
+
+/// §10jn: live-apply phases, summed over a 5 s window. `decode` is msgpack to events,
+/// `plan` core.planCdcBulk, `shape` the rows cut and de-duplicated, `append` the temp
+/// table and the appender, `upsert` the set-based upsert and the drop, `single` the
+/// per-event path; `batch` is applyBatch end to end, so batch minus the rest is the
+/// transaction's begin/commit and the position write. `ack` follows the commit.
+const ApplyStats = struct {
+    window_us: i64 = 0,
+    batches: u64 = 0,
+    msgs: u64 = 0,
+    events: u64 = 0,
+    max_events: u64 = 0,
+    decode: i64 = 0,
+    plan: i64 = 0,
+    shape: i64 = 0,
+    append: i64 = 0,
+    upsert: i64 = 0,
+    direct: u64 = 0,
+    split: u64 = 0,
+    fallbacks: u64 = 0,
+    single: i64 = 0,
+    batch: i64 = 0,
+    ack: i64 = 0,
+
+    fn endBatch(self: *ApplyStats, msgs: usize, events: usize, batch_us: i64, ack_us: i64) void {
+        const now = usMono();
+        if (self.window_us == 0) self.window_us = now;
+        self.batches += 1;
+        self.msgs += msgs;
+        self.events += events;
+        self.max_events = @max(self.max_events, events);
+        self.batch += batch_us;
+        self.ack += ack_us;
+        if (now - self.window_us < 5_000_000) return;
+        const b: i64 = @intCast(@max(self.batches, 1));
+        const inside = self.decode + self.plan + self.shape + self.append + self.upsert + self.single;
+        std.debug.print("apply stats: {d} batches, {d} msgs, {d} events ({d}/s), {d} avg / {d} max events per batch — per batch, ms: total {d:.2} = decode {d:.2} + plan {d:.2} + shape {d:.2} + append {d:.2} + upsert {d:.2} + single {d:.2} + commit/rest {d:.2}; acks {d:.2}; {d} segment(s) appended direct ({d} split with an upsert), {d} batch(es) fell back\n", .{
+            self.batches, self.msgs, self.events, @divTrunc(self.events * 1_000_000, @as(u64, @intCast(now - self.window_us))), self.events / @as(u64, @intCast(b)), self.max_events,
+            ms(self.batch, b), ms(self.decode, b), ms(self.plan, b), ms(self.shape, b), ms(self.append, b), ms(self.upsert, b), ms(self.single, b), ms(self.batch - inside, b), ms(self.ack, b), self.direct, self.split, self.fallbacks,
+        });
+        self.* = .{ .window_us = now };
+    }
+
+    fn ms(total_us: i64, n: i64) f64 {
+        return @as(f64, @floatFromInt(total_us)) / @as(f64, @floatFromInt(n)) / 1000.0;
+    }
+};
 /// §10jc test hook: every Nth delivery is discarded on arrival — not applied, not acked,
 /// its consumer sequence never seen — exactly what a delivery lost in transit looks like
 /// from here. The server re-sends it after ack_wait, out of order. 0: off.
@@ -309,6 +369,7 @@ pub const SyncClient = struct {
     seen_floor_buf: [64]u8 = undefined,
     /// §10hg: what the planned batch path did — events bulked, statements, events through applyEvent.
     bulk_stats: BulkStats = .{},
+    apply_stats: ApplyStats = .{},
     /// Live schema (CLIENTS.md divergence 2, ported from the TS `watchSchemas`): a KV
     /// watch on the schemas bucket, drained at the top of every poll, so a host that
     /// only polls still follows a migration. Opened lazily on the first poll.
@@ -394,6 +455,7 @@ pub const SyncClient = struct {
         // per stream, what applying did to the position, how many events the seed gate
         // dropped, what the server said in the idle check (§10ja, the deaf tail hunt).
         trace_enabled = std.c.getenv("ZB_TAIL_TRACE") != null;
+        apply_stats_enabled = std.c.getenv("ZB_APPLY_STATS") != null;
         test_drop_every = if (std.c.getenv("ZB_TEST_DROP_DELIVERY")) |v| (std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0) else 0;
 
         self.* = .{
@@ -2856,6 +2918,7 @@ pub const SyncClient = struct {
         var ba = std.heap.ArenaAllocator.init(self.a);
         defer ba.deinit();
         const t_batch = msNow();
+        const us_batch = usMono();
         if (trace_enabled) _ = self.st.cacheStats(); // reset: the counters below are this batch's
 
         // ONE transaction for the whole batch — the same lesson the TS client has
@@ -2951,7 +3014,12 @@ pub const SyncClient = struct {
             .deferred = true,
         };
         self.st.transaction(ctx, Ctx.apply) catch |err| {
-            std.debug.print("{s}: batch of {d} message(s) refused as a unit ({s}: {s}) — replaying event by event, holding what cannot land\n", .{ stream, messages.len, @errorName(err), self.st.commitErr() });
+            if (apply_stats_enabled) self.apply_stats.fallbacks += 1;
+            if (self.st.engine == .duckdb) {
+                // §10jn: usually the insert-only fast path meeting a key already there (a
+                // batch redelivered between commit and ack); the second pass upserts.
+                std.debug.print("{s}: batch of {d} message(s) refused as a unit ({s}: {s}) — applying it again through the upsert\n", .{ stream, messages.len, @errorName(err), self.st.errMsg() });
+            } else std.debug.print("{s}: batch of {d} message(s) refused as a unit ({s}: {s}) — replaying event by event, holding what cannot land\n", .{ stream, messages.len, @errorName(err), self.st.commitErr() });
             offered = 0;
             max_seq.* = last;
             ctx.deferred = false;
@@ -2965,7 +3033,9 @@ pub const SyncClient = struct {
                 try self.applyBatchIsolated(report_a, stream, messages, max_seq, changed_map, &offered);
             };
         };
+        const us_acks = usMono();
         for (messages) |m| m.ack() catch {};
+        if (apply_stats_enabled) self.apply_stats.endBatch(messages.len, offered, us_acks - us_batch, usMono() - us_acks);
         if (trace_enabled) {
             const cs = self.st.cacheStats();
             tr("{s}: batch of {d} message(s) [{d}..{d}], {d} event(s) applied in {d} ms — page cache: {d} hit, {d} miss, {d} written; peak RSS {d} MB", .{ stream, messages.len, if (messages.len > 0) messages[0].metadata.sequence.stream else 0, if (messages.len > 0) messages[messages.len - 1].metadata.sequence.stream else 0, offered, msNow() - t_batch, cs.hit, cs.miss, cs.write, maxRssMb() });
@@ -3686,8 +3756,33 @@ pub const SyncClient = struct {
     /// guard (the stream's order is the truth; a key repeated in the segment keeps its LAST
     /// row, since DuckDB refuses to update one row twice in a statement). `single`s take
     /// `applyEvent`; a refused one aborts the batch for the isolated replay.
+    /// §10jn: a CDC event that is an INSERT (the wire's capitals).
+    fn isInsert(ev: Value) bool {
+        const op = ev.object.get("operation") orelse return false;
+        return op == .string and std.mem.eql(u8, op.string, "INSERT");
+    }
+
+    /// §10jn: for each column of the DuckDB table in its own order, the index of that
+    /// column in the segment's `cols` — or null when the two are not the same set (the
+    /// appender fills every column, so a missing one would be written NULL, not its default).
+    fn appendOrder(self: *SyncClient, a: std.mem.Allocator, st_: *storage.Storage, table: []const u8, cols: []const []const u8) !?[]const usize {
+        const stp = self.states.getPtr(table) orelse return null;
+        if (stp.dk_order == null) stp.dk_order = try dupeStrings(self.aa(), try st_.tableColumns(a, table));
+        const order = stp.dk_order.?;
+        if (order.len != cols.len) return null;
+        const map = try a.alloc(usize, order.len);
+        for (order, 0..) |name, oi| {
+            map[oi] = for (cols, 0..) |cn, ci| {
+                if (std.mem.eql(u8, cn, name)) break ci;
+            } else return null;
+        }
+        return map;
+    }
+
     fn applyBatchPlanned(self: *SyncClient, cx: anytype, st_: *storage.Storage) !void {
         const a = cx.a;
+        const ps = &self.apply_stats;
+        var t_ph = usMono();
         const Ev = struct { table: []const u8, ev: Value, seq: u64, stream: []const u8 };
         var evs: std.ArrayListUnmanaged(Ev) = .empty;
         var tables_v: std.json.ObjectMap = .empty;
@@ -3744,7 +3839,10 @@ pub const SyncClient = struct {
             }
             if (seq > cx.max_seq.*) cx.max_seq.* = seq;
         }
+        ps.decode += usMono() - t_ph;
+        t_ph = usMono();
         const segments = try core.planCdcBulk(a, "duckdb", .{ .object = tables_v }, .{ .array = events_v });
+        ps.plan += usMono() - t_ph;
         var bulked: usize = 0;
         var statements: usize = 0;
         var singles: usize = 0;
@@ -3755,6 +3853,8 @@ pub const SyncClient = struct {
                 continue;
             }
             if (std.mem.eql(u8, kind, "single")) {
+                const t_single = usMono();
+                defer ps.single += usMono() - t_single;
                 const i: usize = @intCast(seg.object.get("event").?.integer);
                 const e = evs.items[i];
                 cx.offered.* += 1;
@@ -3780,6 +3880,7 @@ pub const SyncClient = struct {
                 continue;
             }
             // bulk
+            t_ph = usMono();
             const table = seg.object.get("table").?.string;
             const st = self.states.get(table).?;
             const cols = try core.strArrPub(a, seg.object.get("cols").?.array);
@@ -3794,7 +3895,10 @@ pub const SyncClient = struct {
             }
             var slot: std.StringArrayHashMapUnmanaged(usize) = .empty;
             var rows: std.ArrayListUnmanaged([]const storage.Value) = .empty;
-            for (rows_v) |rv| {
+            // §10jn: per key, whether its FIRST event in this segment is an INSERT — a key
+            // born here, whose final row can be appended straight into the table.
+            var born: std.ArrayListUnmanaged(bool) = .empty;
+            for (rows_v, 0..) |rv, ri_v| {
                 const cells = rv.array.items;
                 var key: std.ArrayListUnmanaged(u8) = .empty;
                 for (pk_idx) |ci| {
@@ -3808,13 +3912,51 @@ pub const SyncClient = struct {
                 } else {
                     try slot.put(a, key.items, rows.items.len);
                     try rows.append(a, params);
+                    try born.append(a, isInsert(evs.items[@intCast(ev_idx[ri_v].integer)].ev));
                 }
             }
             const col_list = try core.quotedJoin(a, cols);
-            try st_.execSimple(try std.fmt.allocPrint(a, "CREATE OR REPLACE TEMP TABLE _zbz_copy AS SELECT {s} FROM {s} LIMIT 0", .{ col_list, table }));
-            try st_.dkAppend("_zbz_copy", rows.items);
-            try st_.execSimple(try core.pgUpsertFromCopySql(a, table, cols, st.pk, null));
-            try st_.execSimple("DROP TABLE _zbz_copy");
+            // §10jn: the keys BORN in this segment (first event an INSERT) are appended
+            // straight into the table — no temp table, no upsert, no drop — and only the
+            // rest take the upsert, so a mixed segment costs one of each and a pure one
+            // costs one. Safe per key: a segment holds INSERTs and full UPDATEs only (a
+            // DELETE, a tombstone or a partial UPDATE cuts it), reduced to one final row
+            // per key. Only on the first pass (`deferred`), and only when the rows cover
+            // exactly the table's columns: a born key that is in fact already there (a
+            // batch redelivered between commit and ack) makes the appender refuse, DuckDB
+            // aborts the transaction, and applyBatch's second pass upserts every row.
+            const direct_order: ?[]const usize = if (cx.deferred and std.mem.indexOfScalar(bool, born.items, true) != null) try self.appendOrder(a, st_, table, cols) else null;
+            var upsert_rows = rows.items;
+            ps.shape += usMono() - t_ph;
+            t_ph = usMono();
+            if (direct_order) |order| {
+                var appended: std.ArrayListUnmanaged([]const storage.Value) = .empty;
+                var rest: std.ArrayListUnmanaged([]const storage.Value) = .empty;
+                for (rows.items, born.items) |r, is_born| {
+                    if (!is_born) {
+                        try rest.append(a, r);
+                        continue;
+                    }
+                    const out = try a.alloc(storage.Value, order.len);
+                    for (order, 0..) |ci, oi| out[oi] = r[ci];
+                    try appended.append(a, out);
+                }
+                try st_.dkAppend(try a.dupeZ(u8, table), appended.items);
+                ps.append += usMono() - t_ph;
+                ps.direct += 1;
+                if (rest.items.len > 0) ps.split += 1;
+                upsert_rows = rest.items;
+                t_ph = usMono();
+            }
+            if (upsert_rows.len > 0) {
+                try st_.execSimple(try std.fmt.allocPrint(a, "CREATE OR REPLACE TEMP TABLE _zbz_copy AS SELECT {s} FROM {s} LIMIT 0", .{ col_list, table }));
+                try st_.dkAppend("_zbz_copy", upsert_rows);
+                ps.append += usMono() - t_ph;
+                t_ph = usMono();
+                try st_.execSimple(try core.pgUpsertFromCopySql(a, table, cols, st.pk, null));
+                try st_.execSimple("DROP TABLE _zbz_copy");
+                ps.upsert += usMono() - t_ph;
+            }
             statements += 1;
             bulked += ev_idx.len;
             for (ev_idx) |iv| {
