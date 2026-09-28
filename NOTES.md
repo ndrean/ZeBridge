@@ -17477,3 +17477,38 @@ Now:
 
 Dry run on the same stack: 4 probe tables (crazy_1–4), the fixtures truncated and
 re-enabled; 9 example tables kept, my_slot kept (active), spatial_ref_sys not listed.
+
+## §10jq — one call: enrollment inside the libraries (2026-09-28, in progress)
+
+The client-simplification goal: every language gets the same shape — ONE options object
+with the same keys, passed to a constructor (`new ZeBridge(opts)` in TS,
+`ZeBridgeWorker.spawn(opts)` in Dart, `ZeBridge(opts)` in the Python package to come) —
+and the first run on a device needs only the bridge's URL and an invite. The C ABI stays
+the one real API (JSON options in, JSON out), so Python, Go, Ruby, Elixir, Java/Kotlin,
+Dart, Swift and Rust each get a thin owner class over it, and enrollment written once in
+libzb serves them all.
+
+**Bridge.** `/enroll` also returns `nats_url` when `ENROLL_NATS_URL` is set: where
+clients dial. With the JWT's principal, `grammar_hash` and `js_domain`, the payload now
+carries every fact a client used to be configured with. Two optional fields are built
+as fragments instead of four format strings.
+
+**libzb** (src/enroll.zig, ABI 3: `bridgeUrl`, `invite`, `identityPath`). Explicit
+`creds`/`credsPath` win; otherwise the identity file (`identityPath`, default
+`<dbPath>.identity`, else `zebridge.identity`); otherwise `bridgeUrl` + `invite` enroll —
+key pair generated in libzb, GET /enroll over std.http.Client, the `.creds` text built,
+the identity saved as JSON, mode 0600, through a temporary name and a rename — and the
+identity fills every option the app left out (natsUrl, grammarHash, jsDomain,
+principal). Failures are the zb_last_error text. `zb_create_user` and
+`zb_creds_file_text` now share enroll.zig's key and creds code.
+
+Live, through the C ABI: invite only → enrolled as enroll_live, NATS URL from the bridge,
+identity 0600, seeded, 20 live rows = PostgreSQL; identity only → the same principal, no
+invite; the used invite again → "enroll: refused (403): the code is invalid, used or
+expired, or the principal was revoked"; a dead bridge → "enroll: http://127.0.0.1:1
+unreachable (ConnectionRefused)".
+
+⚠️ iOS: std's CA-bundle rescan has no iOS branch (macOS, Linux — Android's
+/system/etc/security/cacerts included — BSDs, Windows only), so an https:// enrollment
+from libzb on an iPhone is refused up front with a message saying so; the host enrolls
+itself and passes `creds`. The fix is Security.framework trust evaluation, not built.

@@ -65,6 +65,7 @@ const core = @import("core.zig");
 const client = @import("client.zig");
 const handles = @import("handles.zig");
 const engines = @import("engines.zig");
+const enroll = @import("enroll.zig");
 const Value = std.json.Value;
 
 /// ⚠️ The host never receives a pointer — only a generation-tagged u64 (handles.zig).
@@ -80,7 +81,7 @@ var clients: handles.Table(ClientBox, 64) = .{};
 
 /// The ABI version — libzb/abi.json's `version`, which python/abi_check.py keeps in
 /// step with what this file exports and what `openBox` reads.
-pub const abi_version: c_int = 2;
+pub const abi_version: c_int = 3;
 
 export fn zb_abi_version() c_int {
     return abi_version;
@@ -479,9 +480,11 @@ export fn zb_client_connect(opts_json: ?[*:0]const u8) u64 {
     // nothing at all to search for. §10iz: and a line on stderr is not enough either —
     // a phone has no stderr anyone reads — so the words are kept for `zb_last_error`.
     engines.last_failure = null;
+    enroll.last_failure = null;
     const box = openBox(std.heap.c_allocator, text) catch |err| {
         // §10jk: an engine whose library did not open says which, and what to do.
-        if (engines.last_failure) |why| {
+        // §10jq: an enrollment or identity step that failed says why, the same way.
+        if (engines.last_failure orelse enroll.last_failure) |why| {
             setLastError("zb_client_connect failed: {s}", .{why});
             return 0;
         }
@@ -545,24 +548,55 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         }
     };
 
+    // §10jq: the identity. Explicit credentials (`creds`, `credsPath`) win; without them
+    // the identity file (`identityPath`, default `<dbPath>.identity`, else
+    // `zebridge.identity`), and without that `bridgeUrl` + `invite` enroll here and write
+    // it. What the identity knows fills every option the app left out.
+    var ident: ?enroll.Identity = null;
+    defer if (ident) |*i| i.deinit(a);
+    if (str.get(o, "creds", "").len == 0 and str.get(o, "credsPath", "").len == 0) {
+        const db_given = str.get(o, "dbPath", "");
+        const id_path_opt = str.get(o, "identityPath", "");
+        const id_path = if (id_path_opt.len > 0) try a.dupe(u8, id_path_opt) else if (db_given.len > 0) try std.fmt.allocPrint(a, "{s}.identity", .{db_given}) else try a.dupe(u8, "zebridge.identity");
+        defer a.free(id_path);
+        ident = try enroll.load(a, id_path);
+        if (ident == null) {
+            const bridge = str.get(o, "bridgeUrl", "");
+            const invite = str.get(o, "invite", "");
+            if (bridge.len > 0 and invite.len > 0) {
+                ident = try enroll.enroll(a, bridge, invite);
+                try enroll.save(a, id_path, ident.?);
+            } else if (invite.len > 0) {
+                enroll.last_failure = "an invite needs `bridgeUrl`: the bridge that redeems it";
+                return error.EnrollFailed;
+            }
+        }
+    }
+    const idv = struct {
+        fn or_(opt: []const u8, from_id: ?[]const u8) []const u8 {
+            return if (opt.len > 0) opt else from_id orelse "";
+        }
+    };
+
     // One acquire per statement, its errdefer on the next line — and here they FIRE,
     // because this function returns an error union.
-    // §10hn: `natsUrl`, the one name both clients share.
-    const url = try a.dupeZ(u8, str.get(o, "natsUrl", "nats://127.0.0.1:4222"));
+    // §10hn: `natsUrl`, the one name both clients share; else where /enroll said to dial.
+    const url_s = idv.or_(str.get(o, "natsUrl", ""), if (ident) |i| i.nats_url else null);
+    const url = try a.dupeZ(u8, if (url_s.len > 0) url_s else "nats://127.0.0.1:4222");
     errdefer a.free(url);
     const creds = try a.dupeZ(u8, str.get(o, "credsPath", ""));
     errdefer a.free(creds);
     // "creds": the credentials as text (what /enroll hands an app) — the same option as
     // zb-client-ts's. Kept for the connection's life: every reconnect reads it.
-    const creds_text = try a.dupe(u8, str.get(o, "creds", ""));
+    const creds_text = try a.dupe(u8, idv.or_(str.get(o, "creds", ""), if (ident) |i| i.creds else null));
     errdefer a.free(creds_text);
     // "grammarHash": what the host received beside its creds (§10dq). Empty = unchecked.
-    const gh_raw = str.get(o, "grammarHash", "");
+    const gh_raw = idv.or_(str.get(o, "grammarHash", ""), if (ident) |i| i.grammar_hash else null);
     const grammar_hash: ?[]u8 = if (gh_raw.len > 0) try a.dupe(u8, gh_raw) else null;
     errdefer if (grammar_hash) |g| a.free(g);
     // "jsDomain": the /enroll payload's `js_domain`, when the deployment reaches
     // JetStream across a leaf link. Empty = the server's own JetStream.
-    const jd_raw = str.get(o, "jsDomain", "");
+    const jd_raw = idv.or_(str.get(o, "jsDomain", ""), if (ident) |i| i.js_domain else null);
     const js_domain: ?[]u8 = if (jd_raw.len > 0) try a.dupe(u8, jd_raw) else null;
     errdefer if (js_domain) |d| a.free(d);
     // dbUrl (§10fd): a PostgreSQL replica instead of the SQLite file.
@@ -572,7 +606,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     // engine (§10fl): "sqlite" (default) or "duckdb", both on dbPath; dbUrl implies postgres.
     const engine_s = str.get(o, "engine", "sqlite");
     const engine: client.storage.Engine = if (std.mem.eql(u8, engine_s, "duckdb")) .duckdb else .sqlite;
-    const principal = try a.dupeZ(u8, str.get(o, "principal", ""));
+    const principal = try a.dupeZ(u8, idv.or_(str.get(o, "principal", ""), if (ident) |i| i.principal else null));
     errdefer a.free(principal);
     // The same defaults as zb-client-ts: one replica per principal, kept across runs;
     // a random client id per instance (it prefixes every mutation's msg_id — a fixed
@@ -743,22 +777,7 @@ export fn zb_creds_file_text(jwt: ?[*:0]const u8, seed: ?[*:0]const u8) ?[*:0]u8
     if (j.len == 0) return errJson("NoJwt");
     if (sd.len == 0 or sd[0] != 'S') return errJson("NotASeed");
     const a = std.heap.c_allocator;
-    const text = std.fmt.allocPrint(a,
-        \\-----BEGIN NATS USER JWT-----
-        \\{s}
-        \\------END NATS USER JWT------
-        \\
-        \\************************* IMPORTANT *************************
-        \\NKEY Seed printed below can be used to sign and prove identity.
-        \\NKEYs are sensitive and should be treated as secrets.
-        \\
-        \\-----BEGIN USER NKEY SEED-----
-        \\{s}
-        \\------END USER NKEY SEED------
-        \\
-        \\*************************************************************
-        \\
-    , .{ j, sd }) catch return errJson("OutOfMemory");
+    const text = enroll.credsText(a, j, sd) catch return errJson("OutOfMemory");
     defer a.free(text);
     return dupeZ(text);
 }
@@ -791,19 +810,13 @@ export fn zb_client_live() c_int {
 ///
 /// Free the result with `zb_free`.
 export fn zb_create_user() ?[*:0]u8 {
-    // Its own Io: key generation is a leaf call with no client attached, so there is
-    // no transport whose event loop it could borrow.
-    var threaded: std.Io.Threaded = .init(std.heap.c_allocator, .{});
-    defer threaded.deinit();
-    const kp = std.crypto.sign.Ed25519.KeyPair.generate(threaded.io());
-    var seed_buf: [nats.nkeys.seed_text_len]u8 = undefined;
-    const seed = nats.nkeys.encodeSeed(.user, &kp.secret_key.seed(), &seed_buf);
-    // Round-tripped like `bridge --gen-nkey`: derive the public text from the seed
-    // TEXT about to be returned, so a seed that cannot be read back never escapes.
-    var skp = nats.nkeys.SeedKeyPair.fromSeed(seed) catch return errJson("KeyEncodeFailed");
-    defer skp.wipe();
-    var pub_buf: [nats.nkeys.public_key_text_len]u8 = undefined;
-    const public = skp.publicKeyText(&pub_buf);
+    // Its own Io (inside newUserKeys): key generation is a leaf call with no client
+    // attached. The same pair enrollment makes (§10jq), public text derived from the seed.
+    var keys: enroll.UserKeys = .{};
+    defer keys.wipe();
+    enroll.newUserKeys(&keys) catch return errJson("KeyEncodeFailed");
+    const public = keys.public;
+    const seed = keys.seed;
     var out: [256]u8 = undefined;
     const j = std.fmt.bufPrint(&out, "{{\"publicKey\":\"{s}\",\"seed\":\"{s}\"}}", .{ public, seed }) catch return errJson("KeyEncodeFailed");
     return dupeZ(j);

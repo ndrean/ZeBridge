@@ -92,6 +92,10 @@ pub const Server = struct {
         /// the client in the payload as `js_domain`, so it addresses the same API the
         /// grants name; absent when the deployment has none.
         js_domain: ?[]const u8 = null,
+        /// The NATS URL clients should dial (ENROLL_NATS_URL), handed out as `nats_url`
+        /// so a client bootstraps from the bridge's URL and an invite alone (§10jq).
+        /// Absent: the client must be told where NATS is.
+        nats_url: ?[]const u8 = null,
     };
 
     pub fn init(
@@ -484,10 +488,13 @@ pub const Server = struct {
         // bootstraps from nothing but a URL and an invite code, no file to copy.
         var ghash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(topology_mod.embedded_json, &ghash, .{});
-        const body = if (ctx.js_domain) |d|
-            try std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\",\"grammar_hash\":\"{x}\",\"js_domain\":\"{s}\",\"grammar\":{s}}}\n", .{ jwt, principal, &ghash, d, topology_mod.embedded_json })
-        else
-            try std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\",\"grammar_hash\":\"{x}\",\"grammar\":{s}}}\n", .{ jwt, principal, &ghash, topology_mod.embedded_json });
+        // The optional facts as fragments: `js_domain` (a leaf deployment) and `nats_url`
+        // (§10jq: where the client dials, so the bridge is the only address it needs).
+        const dom_part = if (ctx.js_domain) |d| try std.fmt.allocPrint(self.allocator, ",\"js_domain\":\"{s}\"", .{d}) else "";
+        defer if (ctx.js_domain != null) self.allocator.free(dom_part);
+        const url_part = if (ctx.nats_url) |u| try std.fmt.allocPrint(self.allocator, ",\"nats_url\":\"{s}\"", .{u}) else "";
+        defer if (ctx.nats_url != null) self.allocator.free(url_part);
+        const body = try std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\",\"grammar_hash\":\"{x}\"{s}{s},\"grammar\":{s}}}\n", .{ jwt, principal, &ghash, dom_part, url_part, topology_mod.embedded_json });
         defer self.allocator.free(body);
         log.info("🎟️ enrolled '{s}' (tenant '{s}', {d} membership(s) tagged) — JWT minted, mapping registered", .{ principal, tenant, tenants.len });
         try req.respond(body, .{ .status = .ok, .extra_headers = cors });

@@ -843,6 +843,7 @@ pub fn main(init: std.process.Init) !void {
                     else
                         Config.Http.enroll_jwt_ttl_seconds,
                     .js_domain = runtime_config.nats_js_domain,
+                    .nats_url = init.minimal.environ.getPosix("ENROLL_NATS_URL"),
                 };
                 log.info("🎟️ enrollment endpoint armed: GET /enroll (signer: scoped client key)", .{});
             } else {
