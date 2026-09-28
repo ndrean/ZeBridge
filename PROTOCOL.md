@@ -1382,7 +1382,7 @@ But that is only true for consumers that *write*. The read path needs no identit
 
 | | subscribe | publish | needs an account |
 | --- | --- | --- | --- |
-| **read-only consumer** | `cdc.>`, `$KV.schemas.>`, `$KV.generations.>`, the `gen-<tenant>` objects | — | **no** |
+| **read-only consumer** | `cdc.>`, `$KV.schemas.>`, its tenants' manifests by direct get (`$KV.generations.<tenant>.<table>`), the `gen-<tenant>` objects | — | **no** |
 | **read-write consumer** | the same | + `mutation.<principal>.>` | yes |
 
 So a deployment can offer local-first *reading* — schemas, chain seeds, live CDC into a

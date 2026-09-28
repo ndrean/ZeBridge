@@ -53,16 +53,12 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_CLIENT" --role client \
     --allow-pub "\$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>" \
     --allow-pub "\$JS.API.CONSUMER.CREATE.KV_schemas" \
     --allow-pub "\$JS.API.CONSUMER.CREATE.KV_schemas.>" \
-    --allow-pub "\$JS.API.CONSUMER.CREATE.KV_generations" \
-    --allow-pub "\$JS.API.CONSUMER.CREATE.KV_generations.>" \
     --allow-pub "\$JS.API.CONSUMER.INFO.CDC_{{tag(tenant)}}.>" \
     --allow-pub "\$JS.API.CONSUMER.INFO.CDC_PUBLIC.>" \
     --allow-pub "\$JS.API.CONSUMER.INFO.KV_schemas.>" \
-    --allow-pub "\$JS.API.CONSUMER.INFO.KV_generations.>" \
     --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.CDC_{{tag(tenant)}}.>" \
     --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>" \
     --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>" \
-    --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.KV_generations.>" \
     --allow-pub "\$JS.API.STREAM.INFO.CDC_{{tag(tenant)}}" \
     --allow-pub "\$JS.API.STREAM.INFO.CDC_PUBLIC" \
     --allow-pub "\$JS.API.STREAM.INFO.KV_schemas" \
@@ -110,7 +106,6 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_CLIENT" --role client \
     --allow-sub "cdc.{{tag(tenant)}}.>" \
     --allow-sub "cdc._default.>" \
     --allow-sub "\$KV.schemas.>" \
-    --allow-sub "\$KV.generations.>" \
     --allow-sub "_INBOX.{{name()}}.>" >/dev/null
 echo "client signing key:  $SK_CLIENT"
 
@@ -128,16 +123,12 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_RESPONDER" --role responder \
     --allow-pub "\$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>" \
     --allow-pub "\$JS.API.CONSUMER.CREATE.KV_schemas" \
     --allow-pub "\$JS.API.CONSUMER.CREATE.KV_schemas.>" \
-    --allow-pub "\$JS.API.CONSUMER.CREATE.KV_generations" \
-    --allow-pub "\$JS.API.CONSUMER.CREATE.KV_generations.>" \
     --allow-pub "\$JS.API.CONSUMER.INFO.CDC_{{tag(tenant)}}.>" \
     --allow-pub "\$JS.API.CONSUMER.INFO.CDC_PUBLIC.>" \
     --allow-pub "\$JS.API.CONSUMER.INFO.KV_schemas.>" \
-    --allow-pub "\$JS.API.CONSUMER.INFO.KV_generations.>" \
     --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.CDC_{{tag(tenant)}}.>" \
     --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>" \
     --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>" \
-    --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.KV_generations.>" \
     --allow-pub "\$JS.API.STREAM.INFO.CDC_{{tag(tenant)}}" \
     --allow-pub "\$JS.API.STREAM.INFO.CDC_PUBLIC" \
     --allow-pub "\$JS.API.STREAM.INFO.KV_schemas" \
@@ -190,7 +181,6 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_RESPONDER" --role responder \
     --allow-sub "cdc.{{tag(tenant)}}.>" \
     --allow-sub "cdc._default.>" \
     --allow-sub "\$KV.schemas.>" \
-    --allow-sub "\$KV.generations.>" \
     --allow-sub "_INBOX.{{name()}}.>" >/dev/null
 echo "responder signing key: $SK_RESPONDER"
 

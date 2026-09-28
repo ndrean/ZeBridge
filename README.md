@@ -2170,7 +2170,7 @@ The principal is authenticated by the consumer app, and carried through NATS's J
 
 |  |  subscribe  |   publish  | needs an account |
 |--|--|--|--|
-| read-only consumer  | cdc.>, KV.schemas.>, KV.generations.>, the gen-`<tenant>` objects | —       | no |
+| read-only consumer  | cdc.>, KV.schemas.>, its tenants' manifests by direct get (KV.generations.`<tenant>`.`<table>`), the gen-`<tenant>` objects | —       | no |
 | read-write consumer | the same | + mutation.`<principal>`.> | yes |
 
 ```txt

@@ -17528,3 +17528,35 @@ Live on Node: an invite alone → enrolled as enroll_node, the TCP URL taken, 20
 the identity alone → the same principal; and libzb, pointed at the identity file Node
 wrote, connected with it — one identity, two libraries. Browser and React Native:
 typecheck only, not run yet.
+
+## §10jr — any client could list and watch every tenant's generation manifests (2026-09-28)
+
+Found reviewing the tenant flow: the client and responder templates granted
+`CONSUMER.CREATE/INFO/MSG.NEXT` on `KV_generations` and subscribe on `$KV.generations.>`
+beside the tenant-scoped direct gets. A consumer reads the whole stream, so the key
+scoping meant nothing. Measured as omar (tenant kilo): `nats kv ls generations` listed
+every tenant's keys (the 08-map tenants, `_default` …), and `nats kv watch generations
+globex.test_types` returned globex's live manifest — its tables, object names, stream,
+and when it last wrote (`cutoff_version`). Row data stayed out of reach (globex's
+objects and stream are not granted), but tenant names and activity leaked.
+
+Neither client needs a consumer there: libzb and zb-client-ts both read a manifest by
+DIRECT GET of `$KV.generations.<tenant>.<table>`. So the grants are gone, not narrowed —
+from nats_init.zig (the generated templates), jwt-bootstrap.sh, the password-mode
+nats-server.conf (the client read lists), and the live signing keys (edited in place;
+issued creds unchanged; the account JWT spliced and the server reloaded). Kept:
+`STREAM.INFO.KV_generations` (opening the bucket) and the two scoped direct gets.
+
+After: omar's `kv ls` and `kv watch` answer "Permissions Violation for Publish to
+$JS.API.CONSUMER.CREATE.KV_generations…"; his own manifest still reads; libzb and the
+Node client each seeded a fresh replica from the chain (20 live kilo rows = PostgreSQL).
+The rule is in SECURITY.md: a key-scoped grant holds only if no consumer is granted on
+the same stream (the §10dm reasoning for verdicts, one stream further).
+
+Asked on the way (answered, not built): a tenant needing other permissions is a ROLE —
+its own signing key and template, loaded into the server (memory resolver: conf splice
++ SIGHUP; full resolver: nsc push) — and `zebridge_invites.role` already exists for it,
+though the mint signs everything with the one client key today. And encryption at rest
+is a separate question: grants stop a connected client, JetStream's `cipher` stops
+someone holding the disk or a backup; the CDC streams, the gen-<tenant> objects,
+MUTATIONS and VERDICTS are what it would protect.

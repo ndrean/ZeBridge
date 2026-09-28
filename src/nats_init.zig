@@ -160,19 +160,20 @@ fn roleAllows(
     try P.add(&pubs, a, "{s}INFO", .{js_api});
 
     inline for (.{ "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT" }) |op| {
-        // tenant stream, public stream, the two KV backers — CREATE also bare (no filter)
+        // tenant stream, public stream, the schemas KV — CREATE also bare (no filter).
+        // NOT the generations KV (§10jr): a consumer reads the whole stream, so it let a
+        // client list and watch every tenant's manifests; clients read theirs by DIRECT
+        // GET of an exact, tenant-scoped key, which is all they need.
         if (std.mem.eql(u8, op, "CONSUMER.CREATE")) {
             try P.add(&pubs, a, "{s}{s}.{s}{{{{tag(tenant)}}}}", .{ js_api, op, cdc_pre });
             try P.add(&pubs, a, "{s}{s}.{s}", .{ js_api, op, cdc_pub });
             try P.add(&pubs, a, "{s}{s}.KV_{s}", .{ js_api, op, kv_schemas });
-            try P.add(&pubs, a, "{s}{s}.KV_{s}", .{ js_api, op, kv_gens });
             try P.add(&pubs, a, "{s}{s}.OBJ_{s}{{{{tag(tenant)}}}}", .{ js_api, op, obj_pre });
             try P.add(&pubs, a, "{s}{s}.OBJ_{s}{s}", .{ js_api, op, obj_pre, open });
         }
         try P.add(&pubs, a, "{s}{s}.{s}{{{{tag(tenant)}}}}.>", .{ js_api, op, cdc_pre });
         try P.add(&pubs, a, "{s}{s}.{s}.>", .{ js_api, op, cdc_pub });
         try P.add(&pubs, a, "{s}{s}.KV_{s}.>", .{ js_api, op, kv_schemas });
-        try P.add(&pubs, a, "{s}{s}.KV_{s}.>", .{ js_api, op, kv_gens });
         try P.add(&pubs, a, "{s}{s}.OBJ_{s}{{{{tag(tenant)}}}}.>", .{ js_api, op, obj_pre });
         try P.add(&pubs, a, "{s}{s}.OBJ_{s}{s}.>", .{ js_api, op, obj_pre, open });
     }
@@ -236,7 +237,6 @@ fn roleAllows(
     try P.add(&subs, a, "{s}.{{{{tag(tenant)}}}}.>", .{subj_cdc});
     try P.add(&subs, a, "{s}.{s}.>", .{ subj_cdc, open });
     try P.add(&subs, a, "$KV.{s}.>", .{kv_schemas});
-    try P.add(&subs, a, "$KV.{s}.>", .{kv_gens});
     // §10hm: its OWN inbox, not the shared one. JetStream delivers pulled messages,
     // KV answers and object chunks to the reader's inbox, so `_INBOX.>` let any
     // principal read what every other one received (measured, §10fs). Every client
