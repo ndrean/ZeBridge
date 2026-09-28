@@ -77,6 +77,23 @@ of embedding it. Three things a service must know:
    holds it while running. Read through libzb's `query` (09-event does), or open the
    file yourself after libzb closes it.
 
+**A Python service that also uses the `duckdb` package** can make libzb use the
+package's own DuckDB, so both sides read and write the same file version. The wheel's
+native module exports DuckDB's C functions; point `ZB_DUCKDB_LIB` at it before the first
+DuckDB client opens:
+
+```python
+import glob, os, duckdb
+
+site = os.path.dirname(os.path.dirname(duckdb.__file__))
+os.environ["ZB_DUCKDB_LIB"] = glob.glob(os.path.join(site, "_duckdb*.so"))[0]
+# … zb_client_connect({"engine": "duckdb", "dbPath": "replica.duckdb", …}) …
+```
+
+Checked with duckdb 1.5.5 on macOS: libzb seeded a replica through the wheel's copy,
+and `duckdb.connect(path, read_only=True)` read it after libzb closed it. Point 3 still
+holds: while libzb has the file open, read through `zb_client_query`.
+
 Compiling DuckDB in is possible (`libduckdb_static.a` ships with it): one
 self-contained file of about 50 MB with the DuckDB version pinned. That suits a sealed
 appliance; it is not the default.
