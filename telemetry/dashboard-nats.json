@@ -1,0 +1,972 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "title": "Server",
+      "type": "row",
+      "panels": []
+    },
+    {
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 1
+      },
+      "id": 2,
+      "title": "At a glance",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "gnatsd_varz_connections",
+          "legendFormat": "connections",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "gnatsd_varz_slow_consumers",
+          "legendFormat": "slow consumers (since start)",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "gnatsd_varz_subscriptions",
+          "legendFormat": "subscriptions",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "jetstream_server_total_streams",
+          "legendFormat": "streams",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "jetstream_server_total_consumers",
+          "legendFormat": "consumers",
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "gnatsd_varz_leafnodes",
+          "legendFormat": "leaf nodes",
+          "refId": "F"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "id": 3,
+      "title": "Slow consumers (new, per 5 min)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "delta(gnatsd_varz_slow_consumers[5m])",
+          "legendFormat": "all",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "delta(gnatsd_varz_slow_consumer_stats_clients[5m])",
+          "legendFormat": "clients",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "delta(gnatsd_varz_slow_consumer_stats_leafs[5m])",
+          "legendFormat": "leaf nodes",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "delta(gnatsd_varz_slow_consumer_stats_routes[5m])",
+          "legendFormat": "routes",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "A slow consumer is a connection the server cut because it did not read fast enough (its pending bytes passed max_pending, or a write missed write_deadline). Every disconnect loses the deliveries in flight: on phones over Wi-Fi this was the first sign of a link that could not keep up (NOTES §10jc). The server's log names the connection."
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "id": 4,
+      "title": "Connections vs max",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "gnatsd_varz_connections",
+          "legendFormat": "connections",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "gnatsd_varz_max_connections",
+          "legendFormat": "max_connections",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 13
+      },
+      "id": 5,
+      "title": "Server memory",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "gnatsd_varz_mem",
+          "legendFormat": "resident memory",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0,
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "description": "nats-server's RSS. JetStream keeps recent blocks of every stream in memory, so this grows with the streams' activity, not only with connections."
+    },
+    {
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 13
+      },
+      "id": 6,
+      "title": "Server CPU (%)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "gnatsd_varz_cpu",
+          "legendFormat": "cpu",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0,
+          "unit": "percent"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 13
+      },
+      "id": 7,
+      "title": "Messages per second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(gnatsd_varz_in_msgs[1m])",
+          "legendFormat": "in",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(gnatsd_varz_out_msgs[1m])",
+          "legendFormat": "out",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "id": 8,
+      "title": "Bytes per second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(gnatsd_varz_in_bytes[1m])",
+          "legendFormat": "in",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(gnatsd_varz_out_bytes[1m])",
+          "legendFormat": "out",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0,
+          "unit": "Bps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "id": 9,
+      "title": "Stale connections (per 5 min)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "delta(gnatsd_varz_stale_connections[5m])",
+          "legendFormat": "stale",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "Connections closed for missing pings: a client that went away without saying so — a phone locked or out of coverage."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      },
+      "id": 10,
+      "title": "JetStream",
+      "type": "row",
+      "panels": []
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 28
+      },
+      "id": 11,
+      "title": "Storage used vs limit",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "jetstream_server_total_message_bytes",
+          "legendFormat": "used",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "jetstream_server_max_storage",
+          "legendFormat": "limit",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0,
+          "unit": "bytes"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "id": 12,
+      "title": "Largest streams (top 10)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "topk(10, jetstream_stream_total_bytes)",
+          "legendFormat": "{{stream_name}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0,
+          "unit": "bytes"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 36
+      },
+      "id": 13,
+      "title": "MUTATIONS: bytes vs its cap",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "jetstream_stream_total_bytes{stream_name=\"MUTATIONS\"}",
+          "legendFormat": "stored",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "jetstream_stream_limit_bytes{stream_name=\"MUTATIONS\"}",
+          "legendFormat": "max_bytes",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0,
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "description": "Incoming writes AND the verdicts share this stream; verdicts stay for its max-age (2 h) so an offline client can collect them. With discard=new, a full stream refuses new writes: sustained ~20k writes/s fills 1 GiB in about 5 minutes (NOTES §10jd). Watch the stored line approach the cap."
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 36
+      },
+      "id": 14,
+      "title": "MUTATIONS: messages",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "jetstream_stream_total_messages{stream_name=\"MUTATIONS\"}",
+          "legendFormat": "messages (waiting writes + retained verdicts)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 44
+      },
+      "id": 15,
+      "title": "CDC streams: bytes vs cap",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "jetstream_stream_total_bytes{stream_name=~\"CDC_.*\"}",
+          "legendFormat": "{{stream_name}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max(jetstream_stream_limit_bytes{stream_name=~\"CDC_.*\"})",
+          "legendFormat": "cap (CDC_MAX_BYTES)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0,
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "description": "The change feed per tenant. A stream at its byte cap prunes by size before its age: clients away longer than its window re-seed from the chain."
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 44
+      },
+      "id": 16,
+      "title": "Chain object stores (bytes)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "jetstream_stream_total_bytes{stream_name=~\"OBJ_gen-.*\"}",
+          "legendFormat": "{{stream_name}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0,
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "description": "The generation chains the bridge writes, one object store per tenant: seeds and catch-ups read from here."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 52
+      },
+      "id": 17,
+      "title": "Consumers",
+      "type": "row",
+      "panels": []
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 53
+      },
+      "id": 18,
+      "title": "Pending messages (top 10 consumers)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "topk(10, jetstream_consumer_num_pending)",
+          "legendFormat": "{{stream_name}} / {{consumer_name}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "Messages a consumer has not been handed yet: a client or the bridge falling behind."
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 53
+      },
+      "id": 19,
+      "title": "Ack pending and redelivered (top 10)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "topk(10, jetstream_consumer_num_ack_pending)",
+          "legendFormat": "ack pending {{stream_name}}/{{consumer_name}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "topk(10, jetstream_consumer_num_redelivered)",
+          "legendFormat": "redelivered {{stream_name}}/{{consumer_name}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "Handed over but not acknowledged, and delivered more than once. Redeliveries climbing on a client's consumer mean deliveries lost in transit — the libzb/zb-client-ts strict-order rule recovers them (NOTES §10jc)."
+    },
+    {
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 61
+      },
+      "id": 20,
+      "title": "The bridge's write intake (bridge_mutations_worker)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "jetstream_consumer_num_pending{consumer_name=\"bridge_mutations_worker\"}",
+          "legendFormat": "waiting writes",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "jetstream_consumer_num_ack_pending{consumer_name=\"bridge_mutations_worker\"}",
+          "legendFormat": "being applied",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "Edge writes queued for the bridge's ingress lanes. A steady queue means the lanes are at their ceiling: raise ZB_INGRESS_LANES (and the writer role's CONNECTION LIMIT with it)."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 68
+      },
+      "id": 21,
+      "title": "Leaf nodes",
+      "type": "row",
+      "panels": []
+    },
+    {
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 69
+      },
+      "id": 22,
+      "title": "Leaf connections",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "gnatsd_varz_leafnodes",
+          "legendFormat": "leaf connections",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "gnatsd_leafz_conn_nodes_total",
+          "legendFormat": "leafz nodes",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "Regional leaf nodes linked to this hub. Needs the exporter's -leafz flag."
+    },
+    {
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 69
+      },
+      "id": 23,
+      "title": "Slow leaf links (per 5 min)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "delta(gnatsd_varz_slow_consumer_stats_leafs[5m])",
+          "legendFormat": "slow leafs",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": [
+    "zebridge",
+    "nats"
+  ],
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "ZeBridge — NATS server",
+  "uid": "zebridge-nats",
+  "version": 1,
+  "description": "The NATS server itself, from prometheus-nats-exporter (-varz -jsz all -leafz). The bridge dashboard needs none of this; this one shows what only the server knows: slow consumers, its memory, every stream and consumer."
+}

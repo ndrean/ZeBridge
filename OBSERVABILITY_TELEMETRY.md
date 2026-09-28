@@ -191,7 +191,27 @@ The same figure appears _in the log_ as `cpu=31%` on each `LOOP` line, which bea
 
 ### Dashboard
 
-`telemetry/dashboard.json` (Grafana) reads only the bridge's `/metrics`, so it works on the native stack without the NATS exporter. Its rows: the bridge and the WAL (status, lags, throughput, queue, CPU, memory, suspended tables); the CDC streams (bytes and messages per stream, the window each holds); the clients (live per tenant, lag per client and stream, last seen); the write path (verdicts per second by status, rate-limit refusals); the chain (age of the last cut and live generations per table); PostgreSQL (connections per bridge role against its limit, the oldest open transaction, server connections against `max_connections`, the ten largest published tables and their dead rows, and a line of counts: tables, principals, tenants, pending invites).
+`telemetry/dashboard.json` (Grafana) reads only the bridge's `/metrics`, so it works on the native stack without the NATS exporter. Its rows:
+
+- the bridge and the WAL (status, lags, throughput, queue, CPU, memory, suspended tables);
+- the CDC streams (bytes and messages per stream, the window each holds);
+- the clients (live per tenant, lag per client and stream, last seen);
+- the write path (verdicts per second by status, rate-limit refusals);
+- the chain (age of the last cut and live generations per table);
+- PostgreSQL (connections per bridge role against its limit, the oldest open transaction, server connections against `max_connections`, the ten largest published tables and their dead rows, and a line of counts: tables, principals, tenants, pending invites).
+
+### The NATS dashboard
+
+`telemetry/dashboard-nats.json` ("ZeBridge — NATS server") shows what only the server knows, from [prometheus-nats-exporter](https://github.com/nats-io/prometheus-nats-exporter) scraping nats-server's monitoring port (`-varz -jsz all -leafz`; the `nats-exporter` service in `docker-compose.full.yml`, the `nats` job in `telemetry/prometheus.yml`). The bridge dashboard does not need it; this one is for operating the broker.
+
+| row | panels | read it for |
+| --- | --- | --- |
+| Server | connections against `max_connections`; **slow consumers** per 5 min, split clients / leaf nodes / routes; memory, CPU, messages and bytes per second; stale connections | a slow consumer is a connection the server cut for reading too slowly, and every cut loses the deliveries in flight — the first sign of a client whose link cannot keep up (NOTES §10jc). The server's log names the connection |
+| JetStream | storage against its limit; the ten largest streams; `MUTATIONS` against its byte cap; the CDC streams against theirs; the chain object stores | `MUTATIONS` holds waiting writes AND verdicts kept 2 h for offline clients, and refuses new writes once full: sustained heavy ingest fills it (NOTES §10jd). A CDC stream at its cap prunes by size, and clients away longer re-seed from the chain |
+| Consumers | pending messages and ack-pending / redelivered, top 10; the bridge's own intake, `bridge_mutations_worker` | redeliveries climbing on a client's consumer are deliveries lost in transit (recovered by the clients' strict-order rule); a steady queue on the bridge's intake means its lanes are at their ceiling — raise `ZB_INGRESS_LANES`, and the writer role's connection limit with it |
+| Leaf nodes | leaf connections; slow leaf links | the regional links, once leaf nodes are deployed |
+
+Every metric it queries was checked against a running exporter (`prometheus-nats-exporter`, nats-server 2.15.0).
 
 **Configure Prometheus to scrape this endpoint**:
 

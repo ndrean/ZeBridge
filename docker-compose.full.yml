@@ -572,6 +572,7 @@ services:
       - ./telemetry/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./telemetry/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
       - ./telemetry/dashboard.json:/var/lib/grafana/dashboards/dashboard.json:ro
+      - ./telemetry/dashboard-nats.json:/var/lib/grafana/dashboards/dashboard-nats.json:ro
     depends_on:
       - prometheus
     networks:
@@ -580,7 +581,7 @@ services:
   nats-exporter:
     image: natsio/prometheus-nats-exporter:latest
     container_name: zebridge_nats_exporter
-    command: [ "-jsz", "all", "-varz", "http://nats-server:8222" ]
+    command: [ "-jsz", "all", "-varz", "-leafz", "http://nats-server:8222" ]
     ports:
       # Loopback, same reasoning. Prometheus scrapes this over the compose network at
       # `nats-exporter:7777`, so publishing it at all is only for a human with curl.
