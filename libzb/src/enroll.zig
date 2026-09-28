@@ -143,6 +143,100 @@ pub fn enroll(a: std.mem.Allocator, bridge_url: []const u8, code: []const u8) !I
     return id;
 }
 
+/// §10jt: the JWT's issue and expiry times (unix seconds), read from its payload —
+/// no signature check, the server does that; this only decides WHEN to renew.
+pub const JwtTimes = struct { iat: i64, exp: i64 };
+
+pub fn jwtTimes(creds: []const u8) ?JwtTimes {
+    const jwt = section(creds, "-----BEGIN NATS USER JWT-----", "------END NATS USER JWT------") orelse return null;
+    var parts = std.mem.splitScalar(u8, jwt, '.');
+    _ = parts.next() orelse return null;
+    const payload = parts.next() orelse return null;
+    var buf: [4096]u8 = undefined;
+    const dec = std.base64.url_safe_no_pad.Decoder;
+    const n = dec.calcSizeForSlice(payload) catch return null;
+    if (n > buf.len) return null;
+    dec.decode(buf[0..n], payload) catch return null;
+    var fba = std.heap.FixedBufferAllocator.init(buf[n..]);
+    const parsed = std.json.parseFromSliceLeaky(Value, fba.allocator(), buf[0..n], .{}) catch return null;
+    if (parsed != .object) return null;
+    const iat = parsed.object.get("iat") orelse return null;
+    const exp = parsed.object.get("exp") orelse return null;
+    if (iat != .integer or exp != .integer) return null;
+    return .{ .iat = iat.integer, .exp = exp.integer };
+}
+
+/// Renew when less than a quarter of the JWT's life is left (or it is gone).
+pub fn renewDue(creds: []const u8, now: i64) bool {
+    const t = jwtTimes(creds) orelse return false;
+    const life = t.exp - t.iat;
+    return life > 0 and (t.exp - now) * 4 < life;
+}
+
+fn section(text: []const u8, begin: []const u8, end: []const u8) ?[]const u8 {
+    const b = std.mem.indexOf(u8, text, begin) orelse return null;
+    const from = b + begin.len;
+    const e = std.mem.indexOfPos(u8, text, from, end) orelse return null;
+    return std.mem.trim(u8, text[from..e], " \r\n\t");
+}
+
+/// §10jt: a new JWT for the SAME key, no invite: sign `zebridge-renew:<pub>:<ts>` with
+/// the identity's seed, `GET <bridge>/renew`, and rebuild the identity from the answer
+/// (the NATS URLs, grammar hash and memberships come back current).
+pub fn renew(a: std.mem.Allocator, id: Identity) !Identity {
+    if (id.bridge_url.len == 0) return fail("renew: the identity names no bridge", .{});
+    if (builtin.os.tag == .ios and std.ascii.startsWithIgnoreCase(id.bridge_url, "https://"))
+        return fail("renew: https on iOS needs the system trust store, which libzb cannot read", .{});
+    const seed = section(id.creds, "-----BEGIN USER NKEY SEED-----", "------END USER NKEY SEED------") orelse
+        return fail("renew: the identity's creds hold no seed", .{});
+    var skp = nats.nkeys.SeedKeyPair.fromSeed(seed) catch return fail("renew: the identity's seed does not decode", .{});
+    defer skp.wipe();
+    var pub_buf: [nats.nkeys.public_key_text_len]u8 = undefined;
+    const public = skp.publicKeyText(&pub_buf);
+    var ts_c: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts_c);
+    const ts: i64 = @intCast(ts_c.sec);
+    var msg_buf: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "zebridge-renew:{s}:{d}", .{ public, ts }) catch unreachable;
+    const sig = skp.sign(msg) catch return fail("renew: signing failed", .{});
+    var sig_buf: [88]u8 = undefined;
+    const sig_s = std.base64.url_safe_no_pad.Encoder.encode(&sig_buf, &sig);
+
+    const url = try std.fmt.allocPrint(a, "{s}/renew?user_pubkey={s}&ts={d}&sig={s}", .{ id.bridge_url, public, ts, sig_s });
+    defer a.free(url);
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    var client: std.http.Client = .{ .allocator = a, .io = threaded.io() };
+    defer client.deinit();
+    var body: std.Io.Writer.Allocating = .init(a);
+    defer body.deinit();
+    const res = client.fetch(.{ .location = .{ .url = url }, .response_writer = &body.writer }) catch |err|
+        return fail("renew: {s} unreachable ({s})", .{ id.bridge_url, @errorName(err) });
+    const text = body.written();
+    if (res.status != .ok) {
+        const why = std.mem.trim(u8, text, " \r\n");
+        return switch (res.status) {
+            .forbidden => fail("renew: refused — the key is revoked or no membership is left: a new invite is needed", .{}),
+            .unauthorized => fail("renew: refused ({s})", .{why[0..@min(why.len, 160)]}),
+            else => fail("renew: {s} answered {d}: {s}", .{ id.bridge_url, @intFromEnum(res.status), why[0..@min(why.len, 160)] }),
+        };
+    }
+    const parsed = std.json.parseFromSlice(Value, a, text, .{}) catch return fail("renew: the bridge's answer is not JSON", .{});
+    defer parsed.deinit();
+    const o = parsed.value;
+    const jwt = str(o, "jwt") orelse return fail("renew: the bridge's answer has no jwt", .{});
+    var out: Identity = .{
+        .bridge_url = try a.dupe(u8, id.bridge_url),
+        .principal = try a.dupe(u8, str(o, "principal") orelse id.principal),
+        .creds = try credsText(a, jwt, seed),
+    };
+    errdefer out.deinit(a);
+    if (str(o, "nats_url")) |v| out.nats_url = try a.dupe(u8, v);
+    if (str(o, "grammar_hash")) |v| out.grammar_hash = try a.dupe(u8, v);
+    if (str(o, "js_domain")) |v| out.js_domain = try a.dupe(u8, v);
+    return out;
+}
+
 fn str(o: Value, k: []const u8) ?[]const u8 {
     if (o != .object) return null;
     const v = o.object.get(k) orelse return null;
@@ -251,4 +345,15 @@ test "an identity survives save and load, and the file is private" {
 test "a code outside the safe alphabet is refused before any request" {
     try std.testing.expectError(error.EnrollFailed, enroll(std.testing.allocator, "http://127.0.0.1:1", "bad code&x=1"));
     try std.testing.expect(std.mem.indexOf(u8, last_failure.?, "invite code") != null);
+}
+
+test "renewDue: a quarter of the life left is the line" {
+    // header.payload.sig with payload {"iat":1000,"exp":2000}
+    const payload = "eyJpYXQiOjEwMDAsImV4cCI6MjAwMH0";
+    const creds = "-----BEGIN NATS USER JWT-----\nxx." ++ payload ++ ".yy\n------END NATS USER JWT------\n";
+    try std.testing.expectEqual(@as(i64, 2000), jwtTimes(creds).?.exp);
+    try std.testing.expect(!renewDue(creds, 1500));
+    try std.testing.expect(!renewDue(creds, 1750));
+    try std.testing.expect(renewDue(creds, 1751));
+    try std.testing.expect(renewDue(creds, 2500));
 }

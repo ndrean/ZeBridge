@@ -1,0 +1,23 @@
+diff --git a/src/connection.zig b/src/connection.zig
+index 5736663..602d1c9 100644
+--- a/src/connection.zig
++++ b/src/connection.zig
+@@ -912,6 +912,18 @@ pub const Connection = struct {
+     /// - Rebalancing client connections
+     /// - Testing reconnection behavior
+     /// Returns error if reconnection cannot be initiated
++    /// Replace the in-memory credentials (`user_creds_content`) the NEXT handshake
++    /// reads — a renewed JWT, same seed. Under the connection mutex, which every
++    /// handshake holds, so a reconnect in flight sees the old bytes or the new ones,
++    /// never half of each. The caller owns `content` and keeps it alive; the previous
++    /// bytes may be freed once this returns. The current connection is not touched:
++    /// the server ends it when its JWT expires, and the reconnect presents the new one.
++    pub fn setCredsContent(self: *Self, content: []const u8) !void {
++        try self.mutex.lock(self.io);
++        defer self.mutex.unlock(self.io);
++        self.options.user_creds_content = content;
++    }
++
+     pub fn reconnect(self: *Self) !void {
+         try self.mutex.lock(self.io);
+         defer self.mutex.unlock(self.io);

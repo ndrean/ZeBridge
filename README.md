@@ -1342,15 +1342,23 @@ That is the whole contract for an app author. A callback to implement by table, 
 | `zb_client_mutate(h, table, op, key_json, values_json)` | one write: optimistic locally, sent at once | `{"msgId": …}` |
 | `zb_client_close(h)` | closes the socket and the replica | `0` |
 
-**Enrolling, in any language.** Three steps, the same three everywhere — the HTTP call
-stays with the host, which has its own stack and receives the invite through its own
-channel:
+**Enrolling, in any language: one option.** Pass the bridge's URL and the invite your
+backend handed the device; the library does the rest, in both libraries:
 
-1. `createUser()` / `zb_create_user()` → `{publicKey, seed}`. The seed is private and
-   never leaves the device.
-2. `GET /enroll?code=<invite>&user_pubkey=<publicKey>` → a signed JWT.
-3. `credsFileText(jwt, seed)` / `zb_creds_file_text(jwt, seed)` → the `.creds` text.
-   Store it where the platform keeps secrets, and hand it to `connect`.
+```ts
+const zb = new ZeBridge({ bridgeUrl: 'https://zb.example.com', invite: code, tables: ['orders'] });
+await zb.connect();   // libzb: {"bridgeUrl": …, "invite": …, "tables": […]} to zb_client_connect
+```
+
+The first connect generates the device's key pair (the seed never leaves it), redeems
+the invite at `GET /enroll`, and stores the identity (`identityPath`: a 0600 file, the
+browser's localStorage, React Native's store — the same JSON in both libraries). Every
+later connect needs neither the invite nor `natsUrl`: the identity names the principal,
+the NATS URL the bridge handed out, the grammar hash and the JetStream domain. The JWT
+**renews itself** before it expires (`GET /renew`, signed with the device's key — no
+invite, no backend call), so a device enrolls once and stays enrolled until it is
+revoked. The low-level steps remain for a host that manages identities itself:
+`createUser()`/`zb_create_user()`, `enrollAt`, `credsFileText`/`zb_creds_file_text`.
 
 **One vocabulary, two libraries.** The names are zb-client-ts's, so an app author — or a
 model reading the code — learns one API and can write either. Where they differ, the
@@ -1743,7 +1751,7 @@ A client never gets a password to connect to NATS. It gets a **`.creds` file** (
    * ZeBridge then acts as a **Delegated Signer**. Because you provided it with a NATS Scoped Signing Key via the `ZB_SIGNING_SEED` environment variable, it mints a NATS 2.0 JWT embedding the client's public key, restricts their subjects to their specific `tenant_id`, signs it, and returns `{"jwt":"..."}` to the client.
 6. **The Credential Assembly (Edge Client):** The client app takes the JWT it received from the bridge and combines it with the private seed it already generated in step 3 to create the standard `.creds` file format. (Browser: memory/sessionStorage. Mobile: secure keychain).
 7. **Connection to NATS:** The client connects to NATS presenting this `.creds` format. The NATS server sends a cryptographic challenge (a nonce). The client signs the nonce with its private seed. The NATS server verifies the signature, verifies the JWT was officially signed by the `ZB_SIGNING_SEED`, and grants access. **No secret ever crosses the wire.**
-8. **Expiration:** Minted JWTs live 24 h (`enroll_jwt_ttl_seconds`). After that, the client quietly asks your backend for a new invite code and enrolls again.
+8. **Renewal:** Minted JWTs live 24 h (`ENROLL_JWT_TTL_SECONDS`). With a quarter of that left, the client renews by itself: it signs `zebridge-renew:<its public key>:<now>` with its seed and calls `GET /renew`; the bridge verifies the signature, checks the key is on record and not revoked and the principal still has a membership, and mints a new JWT for the same key with the current memberships. No invite, no backend. A revoked key, or a principal with no membership left, is refused — the one moment the app needs a new invite.
 
 The consumer boundary is one model for **every** consumer type — webapp, mobile, or microservice. The JWT and its verification are identical everywhere; only the transport (WebSocket for the browser, TLS-TCP for native) and the credential storage differ.
 

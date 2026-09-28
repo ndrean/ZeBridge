@@ -362,6 +362,56 @@ export async function enrollAt(bridgeUrl: string, code: string, transport: Trans
   };
 }
 
+/// §10jt: the JWT's issue and expiry (unix seconds), read from its payload — to decide
+/// WHEN to renew; the server checks the signature.
+export function jwtTimes(creds: string): { iat: number; exp: number } | null {
+  const m = /-----BEGIN NATS USER JWT-----\s*([^\s]+)\s*------END NATS USER JWT------/.exec(creds);
+  const part = m?.[1].split('.')[1];
+  if (!part) return null;
+  try {
+    const p = JSON.parse(atob(part.replace(/-/g, '+').replace(/_/g, '/')));
+    return typeof p.iat === 'number' && typeof p.exp === 'number' ? { iat: p.iat, exp: p.exp } : null;
+  } catch { return null; }
+}
+
+/// Renew when less than a quarter of the JWT's life is left (or it is gone). libzb: same line.
+export function renewDue(creds: string, now = Math.floor(Date.now() / 1000)): boolean {
+  const t = jwtTimes(creds);
+  return !!t && t.exp > t.iat && (t.exp - now) * 4 < t.exp - t.iat;
+}
+
+/// §10jt: a new JWT for the SAME key, no invite — sign `zebridge-renew:<pub>:<ts>` with the
+/// identity's seed, `GET <bridge>/renew`, and rebuild the identity (NATS URLs, grammar
+/// hash and memberships come back current). libzb's `renew`, the same wire.
+export async function renewAt(id: EnrolledIdentity, transport: Transport = natsTransport): Promise<EnrolledIdentity> {
+  const seed = /-----BEGIN USER NKEY SEED-----\s*([^\s]+)\s*------END USER NKEY SEED------/.exec(id.creds)?.[1];
+  if (!seed) throw new Error('renew: the identity\'s creds hold no seed');
+  const ts = Math.floor(Date.now() / 1000);
+  const { publicKey, signature } = transport.nkeySign(seed, new TextEncoder().encode(`zebridge-renew:${publicKeyOf(seed, transport)}:${ts}`));
+  const sig = btoa(String.fromCharCode(...signature)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  let res: Response;
+  try {
+    res = await fetch(`${id.bridge_url}/renew?user_pubkey=${publicKey}&ts=${ts}&sig=${sig}`);
+  } catch (e) {
+    throw new Error(`renew: ${id.bridge_url} unreachable (${(e as Error).message})`);
+  }
+  if (res.status === 403) throw new Error('renew: refused — the key is revoked or no membership is left: a new invite is needed');
+  if (!res.ok) throw new Error(`renew: ${id.bridge_url} answered ${res.status}: ${(await res.text()).slice(0, 160)}`);
+  const p = await res.json() as Record<string, string | undefined>;
+  if (!p.jwt) throw new Error('renew: the bridge\'s answer has no jwt');
+  return {
+    version: 1, bridge_url: id.bridge_url, principal: p.principal ?? id.principal, creds: credsFileText(p.jwt, seed),
+    ...(p.nats_url ? { nats_url: p.nats_url } : {}),
+    ...(p.nats_ws_url ? { nats_ws_url: p.nats_ws_url } : {}),
+    ...(p.grammar_hash ? { grammar_hash: p.grammar_hash } : {}),
+    ...(p.js_domain ? { js_domain: p.js_domain } : {}),
+  };
+}
+
+function publicKeyOf(seed: string, transport: Transport): string {
+  return transport.nkeySign(seed, new Uint8Array(0)).publicKey;
+}
+
 export function credsFileText(jwt: string, seed: string): string {
   // The layout `nsc` writes and `bridge --init-nats` emits, byte for byte — libzb's
   // `zb_creds_file_text` produces the same. The warning block is not decoration: this
@@ -536,6 +586,35 @@ export class ZeBridge {
   /// stored identity; else `bridgeUrl` + `invite` enroll and store one. What the identity
   /// knows fills every option the app left out — the same rule as libzb's.
   private identityResolved = false;
+  /// §10jt: the stored identity this client runs on (null: explicit creds) and its key,
+  /// for the renewal timer.
+  private identityKey: string | null = null;
+  private identityNow: EnrolledIdentity | null = null;
+  private renewTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /// §10jt: every eighth of the JWT's life (at most a minute), renew when due; the new
+  /// creds reach the NEXT handshake through the authenticator's function, so the
+  /// connection is not rebuilt — the server ends it at the old JWT's expiry.
+  private scheduleRenew(): void {
+    if (!this.identityNow) return;
+    const t = jwtTimes(this.identityNow.creds);
+    const every = Math.min(60, Math.max(1, Math.floor(((t?.exp ?? 480) - (t?.iat ?? 0)) / 8)));
+    this.renewTimer = setTimeout(async () => {
+      const id = this.identityNow;
+      if (id && renewDue(id.creds)) {
+        try {
+          const fresh = await renewAt(id, this.transport);
+          this.identityNow = fresh;
+          this.config.creds = fresh.creds;
+          if (this.identityKey) await this.platform.identity?.save(this.identityKey, JSON.stringify(fresh));
+          this.appendLog('SYS', `Renewed '${fresh.principal}' — the next reconnect presents the new JWT`, 'INFO');
+        } catch (e) {
+          this.appendLog('SYS', `${(e as Error).message} — retried shortly`, 'WARN');
+        }
+      }
+      this.scheduleRenew();
+    }, every * 1000);
+  }
   private async resolveIdentity(): Promise<void> {
     if (this.identityResolved) return;
     const c = this.config;
@@ -552,7 +631,22 @@ export class ZeBridge {
         this.appendLog('SYS', `Enrolled as '${id.principal}' at ${id.bridge_url}`, 'INFO');
       }
       if (text) {
-        const id = JSON.parse(text) as EnrolledIdentity;
+        let id = JSON.parse(text) as EnrolledIdentity;
+        // §10jt: close to (or past) expiry → renew now, with the key. Before expiry a
+        // failure is a warning (the JWT still works); after it, it is the connect's error.
+        if (renewDue(id.creds)) {
+          try {
+            id = await renewAt(id, this.transport);
+            if (store) await store.save(key, JSON.stringify(id));
+            this.appendLog('SYS', `Renewed '${id.principal}' at ${id.bridge_url}`, 'INFO');
+          } catch (e) {
+            const t = jwtTimes(id.creds);
+            if (!t || t.exp <= Date.now() / 1000) throw e;
+            this.appendLog('SYS', `${(e as Error).message} — carrying on with the current JWT`, 'WARN');
+          }
+        }
+        this.identityKey = key;
+        this.identityNow = id;
         c.creds = id.creds;
         c.principal = principalFromCreds(id.creds) ?? id.principal;
         c.natsUrl ??= (this.platform.natsOverWebSocket ? id.nats_ws_url : id.nats_url) ?? undefined;
@@ -921,7 +1015,7 @@ export class ZeBridge {
       this.nc = await dial({
         servers: this.config.natsUrl,
         ...(this.config.creds
-          ? { authenticator: this.transport.credsAuthenticator(new TextEncoder().encode(this.config.creds)) }
+          ? { authenticator: this.transport.credsAuthenticator(() => new TextEncoder().encode(this.config.creds!)) }
           : { user: this.config.principal, pass: this.config.password }),
         reconnect: true,
         maxReconnectAttempts: -1,
@@ -938,6 +1032,8 @@ export class ZeBridge {
       this.emitStatus('connected');
       this.reach('connected');
       this.appendLog('SYS', `Connected to NATS as '${this.config.principal}'`);
+      if (this.renewTimer) clearTimeout(this.renewTimer);
+      this.scheduleRenew();
       await this.loadHeldEvents();
       // The tenant FIRST (§10dr): the schema watch replays every descriptor at once,
       // and a tenant-scoped table that arrives before the tenant is known is skipped
@@ -1048,6 +1144,7 @@ export class ZeBridge {
   }
 
   public async close(): Promise<void> {
+    if (this.renewTimer) { clearTimeout(this.renewTimer); this.renewTimer = null; }
     clearInterval(this.sweepId);
     clearInterval(this.rttIntervalId);
     clearInterval(this.hbIntervalId);

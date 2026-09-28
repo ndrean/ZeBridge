@@ -444,9 +444,14 @@ const ClientBox = struct {
     tables: []const []const u8,
     ondemand: []const []const u8,
     all_tables: []const []const u8,
+    /// §10jt: the identity file this client came from (null: explicit creds), and when
+    /// `poll` last asked whether its JWT is due for renewal.
+    id_path: ?[]u8 = null,
+    next_renew_check: i64 = 0,
 
     fn destroy(self: *ClientBox, a: std.mem.Allocator) void {
         self.c.deinit();
+        if (self.id_path) |p| a.free(p);
         a.free(self.url);
         a.free(self.creds);
         std.crypto.secureZero(u8, self.creds_text); // a secret: not left in freed memory
@@ -554,18 +559,37 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     // it. What the identity knows fills every option the app left out.
     var ident: ?enroll.Identity = null;
     defer if (ident) |*i| i.deinit(a);
+    var kept_id_path: ?[]u8 = null;
+    errdefer if (kept_id_path) |p| a.free(p);
     if (str.get(o, "creds", "").len == 0 and str.get(o, "credsPath", "").len == 0) {
         const db_given = str.get(o, "dbPath", "");
         const id_path_opt = str.get(o, "identityPath", "");
         const id_path = if (id_path_opt.len > 0) try a.dupe(u8, id_path_opt) else if (db_given.len > 0) try std.fmt.allocPrint(a, "{s}.identity", .{db_given}) else try a.dupe(u8, "zebridge.identity");
         defer a.free(id_path);
         ident = try enroll.load(a, id_path);
+        // §10jt: a stored identity close to (or past) its JWT's expiry renews here,
+        // with its key — no invite. Before expiry a failed renewal is only a warning
+        // (the JWT still works); after it, the reason is the connect's error.
+        if (ident) |*cur| if (enroll.renewDue(cur.creds, nowSeconds())) {
+            if (enroll.renew(a, cur.*)) |fresh| {
+                cur.deinit(a);
+                cur.* = fresh;
+                try enroll.save(a, id_path, cur.*);
+            } else |_| {
+                const expired = if (enroll.jwtTimes(cur.creds)) |t| t.exp <= nowSeconds() else false;
+                if (expired) return error.EnrollFailed;
+                std.debug.print("zebridge: {s} — carrying on with the current JWT\n", .{enroll.last_failure orelse "renew failed"});
+                enroll.last_failure = null;
+            }
+        };
+        if (ident != null) kept_id_path = try a.dupe(u8, id_path);
         if (ident == null) {
             const bridge = str.get(o, "bridgeUrl", "");
             const invite = str.get(o, "invite", "");
             if (bridge.len > 0 and invite.len > 0) {
                 ident = try enroll.enroll(a, bridge, invite);
                 try enroll.save(a, id_path, ident.?);
+                kept_id_path = try a.dupe(u8, id_path);
             } else if (invite.len > 0) {
                 enroll.last_failure = "an invite needs `bridgeUrl`: the bridge that redeems it";
                 return error.EnrollFailed;
@@ -715,6 +739,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         .tables = tables,
         .ondemand = ondemand,
         .all_tables = all_tables,
+        .id_path = kept_id_path,
     };
     return box;
 }
@@ -1083,8 +1108,54 @@ export fn zb_client_reply(handle: u64, id: u64, answer_json: ?[*:0]const u8) ?[*
 /// The host's loop body: `while (running) poll(h, 1000)`. Returns as soon as a CDC
 /// batch was applied, or after `wait_ms` with nothing — never earlier on idle, so the
 /// host's loop does not spin. Requires a prior `zb_client_sync` (schemas, positions).
+fn nowSeconds() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    return @intCast(ts.sec);
+}
+
+/// §10jt: every eighth of the JWT's life (at most a minute), from the host's poll thread: a JWT with less than
+/// a quarter of its life left is renewed with the identity's key, the identity file is
+/// rewritten, and the new creds go to the connection for its NEXT handshake (nats.zig
+/// patch 29, under the connection's mutex). The current socket is left alone: the
+/// server ends it at the old JWT's expiry and the reconnect presents the new one.
+fn maybeRenew(b: *ClientBox) void {
+    const path = b.id_path orelse return;
+    const now = nowSeconds();
+    if (now < b.next_renew_check) return;
+    // An eighth of the JWT's life between checks, at most a minute: several chances
+    // inside the last quarter, whatever the lifetime (24 h in production, seconds in
+    // a test).
+    const life: i64 = if (enroll.jwtTimes(b.creds_text)) |t| t.exp - t.iat else 480;
+    b.next_renew_check = now + std.math.clamp(@divTrunc(life, 8), 1, 60);
+    if (!enroll.renewDue(b.creds_text, now)) return;
+    const a = std.heap.c_allocator;
+    var id = (enroll.load(a, path) catch null) orelse return;
+    defer id.deinit(a);
+    // Another process sharing the identity may have renewed it already.
+    var fresh = if (enroll.renewDue(id.creds, now)) (enroll.renew(a, id) catch {
+        std.debug.print("zebridge: {s} — retried in a minute\n", .{enroll.last_failure orelse "renew failed"});
+        return;
+    }) else (enroll.load(a, path) catch null) orelse return;
+    defer fresh.deinit(a);
+    enroll.save(a, path, fresh) catch return;
+    const text = a.dupe(u8, fresh.creds) catch return;
+    b.c.t.js.nc.setCredsContent(text) catch {
+        std.crypto.secureZero(u8, text);
+        a.free(text);
+        return;
+    };
+    const old = b.creds_text;
+    b.creds_text = text;
+    b.c.opts.creds = text;
+    std.crypto.secureZero(u8, old);
+    a.free(old);
+    std.debug.print("zebridge: renewed '{s}' — the next reconnect presents the new JWT\n", .{fresh.principal});
+}
+
 export fn zb_client_poll(handle: u64, wait_ms: u64) ?[*:0]u8 {
     const b = lookup(handle) orelse return errJson("UnknownHandle");
+    maybeRenew(b);
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
     const out = pollJson(arena.allocator(), b, wait_ms) catch |err| {

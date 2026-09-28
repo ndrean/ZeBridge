@@ -1028,3 +1028,30 @@ nats.js's `Kvm.open` does (bindOnly). `src/jetstream.zig`: `JetStream.kvBind`, t
 **Verified**: `zig build test` in libzb; live, with STREAM.INFO removed from the client
 templates: libzb seeds a fresh replica from the chain, reads its tenants key, and the
 bucket it can no longer describe answers its exact keys.
+
+## 28. An nkey signature can be verified (2026-09-28)
+
+**Problem.** `nkeys.zig` could sign (`SeedKeyPair.sign`) but not verify: decoding a public
+key text needs the private `base32Decode` and `verifyChecksum`. ZeBridge's `/renew` must
+check that a request was signed by the key a device enrolled with.
+
+**Change** (`28-nats.zig-nkeys-verify.patch`): `pub fn verify(expected: KeyType,
+public_text, msg, signature: [64]u8) Error!bool` — decode, checksum, prefix, Ed25519 verify;
+false for a bad signature, an error for a key that does not decode. Tested: a seed's
+signature verifies against its key, not against another key, not over another message,
+and an account-type expectation refuses a user key.
+
+## 29. In-memory creds can be replaced for the next handshake (2026-09-28)
+
+**Problem.** `user_creds_content` is set once in the options, and every handshake parses
+it. A renewed JWT (same seed) must reach the NEXT reconnect without rebuilding the
+connection, and the reconnect may run while the host swaps the bytes.
+
+**Change** (`29-nats.zig-creds-swap.patch`): `Connection.setCredsContent(content)` replaces
+the slice under the connection mutex, which the handshake holds — a reconnect sees the old
+bytes or the new ones. The live socket is untouched; the server ends it at the old JWT's
+expiry ("User Authentication Expired") and the reconnect presents the new one.
+
+**Verified** (with 28): libzb polled for 100 s across 40 s JWTs — two renewals, two
+server cut-offs each followed by a reconnect with the new JWT, no poll error, and a row
+written after the first expiry arrived.

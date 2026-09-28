@@ -351,6 +351,8 @@ pub const Server = struct {
             try self.handleMetrics(req);
         } else if (method == .GET and std.mem.eql(u8, target, "/grammar")) {
             try handleGrammar(req);
+        } else if (method == .GET and std.mem.startsWith(u8, target, "/renew?")) {
+            try self.handleRenew(req);
         } else if (method == .GET and std.mem.startsWith(u8, target, "/enroll?")) {
             try self.handleEnroll(req);
         } else {
@@ -486,22 +488,109 @@ pub const Server = struct {
         };
         defer self.allocator.free(jwt);
 
-        // The grammar rides along (§10ci): identity and wire contract are one artifact
-        // — the grants inside the JWT were minted from these very names — so a client
-        // bootstraps from nothing but a URL and an invite code, no file to copy.
+        const body = try self.identityPayload(ctx, jwt, principal);
+        defer self.allocator.free(body);
+        log.info("🎟️ enrolled '{s}' (tenant '{s}', {d} membership(s) tagged) — JWT minted, mapping registered", .{ principal, tenant, tenants.len });
+        try req.respond(body, .{ .status = .ok, .extra_headers = cors });
+    }
+
+    /// What /enroll and /renew answer (§10ci, §10jq, §10jt): the JWT and every fact a
+    /// client is configured with — the principal, the grammar's hash (and the grammar:
+    /// identity and wire contract are one artifact — the grants inside the JWT were
+    /// minted from these very names), and, when set, the JetStream domain and the NATS
+    /// URLs. A renewal hands out the CURRENT values, so a moved NATS reaches devices.
+    fn identityPayload(self: *Server, ctx: EnrollCtx, jwt: []const u8, principal: []const u8) ![]u8 {
         var ghash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(topology_mod.embedded_json, &ghash, .{});
-        // The optional facts as fragments: `js_domain` (a leaf deployment) and `nats_url`
-        // (§10jq: where the client dials, so the bridge is the only address it needs).
         const dom_part = if (ctx.js_domain) |d| try std.fmt.allocPrint(self.allocator, ",\"js_domain\":\"{s}\"", .{d}) else "";
         defer if (ctx.js_domain != null) self.allocator.free(dom_part);
         const url_part = if (ctx.nats_url) |u| try std.fmt.allocPrint(self.allocator, ",\"nats_url\":\"{s}\"", .{u}) else "";
         defer if (ctx.nats_url != null) self.allocator.free(url_part);
         const ws_part = if (ctx.nats_ws_url) |u| try std.fmt.allocPrint(self.allocator, ",\"nats_ws_url\":\"{s}\"", .{u}) else "";
         defer if (ctx.nats_ws_url != null) self.allocator.free(ws_part);
-        const body = try std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\",\"grammar_hash\":\"{x}\"{s}{s}{s},\"grammar\":{s}}}\n", .{ jwt, principal, &ghash, dom_part, url_part, ws_part, topology_mod.embedded_json });
+        return std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\",\"grammar_hash\":\"{x}\"{s}{s}{s},\"grammar\":{s}}}\n", .{ jwt, principal, &ghash, dom_part, url_part, ws_part, topology_mod.embedded_json });
+    }
+
+    /// GET /renew?user_pubkey=<U...>&ts=<unix seconds>&sig=<base64url> → the /enroll payload
+    ///
+    /// §10jt: a device keeps itself enrolled without an invite. `sig` is Ed25519 over
+    /// `zebridge-renew:<user_pubkey>:<ts>`, made with the device's own seed — the key
+    /// it enrolled with, which never leaves it. Accepted only when the signature
+    /// verifies against that key, `ts` is within `renew_clock_skew_seconds`, the key is
+    /// on record and not revoked, and its principal still holds a membership. The JWT
+    /// is minted for the SAME key with the CURRENT memberships (a join or a leave
+    /// reaches the device here). Nothing is written: a renewal changes no state.
+    fn handleRenew(self: *Server, req: *std.http.Server.Request) !void {
+        const cors: []const std.http.Header = &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "access-control-allow-origin", .value = "*" },
+        };
+        const ctx = self.enroll orelse {
+            try req.respond("{\"error\":\"enrollment not configured\"}\n", .{ .status = .not_found, .extra_headers = cors });
+            return;
+        };
+        if (self.enroll_in_flight.fetchAdd(1, .monotonic) >= max_concurrent_enrolls) {
+            _ = self.enroll_in_flight.fetchSub(1, .monotonic);
+            try req.respond("{\"error\":\"busy — retry shortly\"}\n", .{ .status = .service_unavailable, .extra_headers = cors });
+            return;
+        }
+        defer _ = self.enroll_in_flight.fetchSub(1, .monotonic);
+
+        const target = req.head.target;
+        const user_pub = queryParam(target, "user_pubkey") orelse "";
+        const ts_s = queryParam(target, "ts") orelse "";
+        const sig_s = queryParam(target, "sig") orelse "";
+        const bad = struct {
+            fn respond(r: *std.http.Server.Request, h: []const std.http.Header, status: std.http.Status, msg: []const u8) !void {
+                try r.respond(msg, .{ .status = status, .extra_headers = h });
+            }
+        };
+        if (user_pub.len != nats.nkeys.public_key_text_len or user_pub[0] != 'U') return bad.respond(req, cors, .bad_request, "{\"error\":\"bad request\"}\n");
+        const ts = std.fmt.parseInt(i64, ts_s, 10) catch return bad.respond(req, cors, .bad_request, "{\"error\":\"bad request\"}\n");
+        var sig: [64]u8 = undefined;
+        const dec = std.base64.url_safe_no_pad.Decoder;
+        if ((dec.calcSizeForSlice(sig_s) catch 0) != 64) return bad.respond(req, cors, .bad_request, "{\"error\":\"bad request\"}\n");
+        dec.decode(&sig, sig_s) catch return bad.respond(req, cors, .bad_request, "{\"error\":\"bad request\"}\n");
+
+        const now = @as(i64, @intCast(c.time(null)));
+        if (@abs(now - ts) > Config.Http.renew_clock_skew_seconds) {
+            log.warn("🔁 renewal refused: timestamp {d} s off the bridge's clock", .{now - ts});
+            return bad.respond(req, cors, .unauthorized, "{\"error\":\"stale or future timestamp — check the device clock\"}\n");
+        }
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "zebridge-renew:{s}:{d}", .{ user_pub, ts }) catch unreachable;
+        const ok = nats.nkeys.verify(.user, user_pub, msg, sig) catch false;
+        if (!ok) {
+            log.warn("🔁 renewal refused: bad signature", .{});
+            return bad.respond(req, cors, .unauthorized, "{\"error\":\"bad signature\"}\n");
+        }
+
+        const conn = c.PQconnectdb(ctx.writer_conninfo.ptr) orelse return bad.respond(req, cors, .service_unavailable, "{\"error\":\"backend unavailable\"}\n");
+        defer c.PQfinish(conn);
+        if (c.PQstatus(conn) != c.CONNECTION_OK) return bad.respond(req, cors, .service_unavailable, "{\"error\":\"backend unavailable\"}\n");
+        var pub_buf: [nats.nkeys.public_key_text_len + 1]u8 = undefined;
+        const pub_z = std.fmt.bufPrintZ(&pub_buf, "{s}", .{user_pub}) catch unreachable;
+        const params = [_]?[*:0]const u8{pub_z.ptr};
+        const res = c.PQexecParams(conn, "SELECT principal FROM public.zebridge_principal_keys WHERE user_pubkey = $1 AND revoked_at IS NULL", 1, null, &params[0], null, null, 0);
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) {
+            log.warn("🔁 renewal refused: key unknown or revoked", .{});
+            return bad.respond(req, cors, .forbidden, "{\"error\":\"key unknown or revoked — a new invite is needed\"}\n");
+        }
+        const principal = std.mem.span(c.PQgetvalue(res, 0, 0));
+        var tenants_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer tenants_arena.deinit();
+        const tenants = rosterTenants(tenants_arena.allocator(), conn, principal) catch &.{};
+        if (tenants.len == 0) {
+            log.warn("🔁 renewal refused for '{s}': no membership left", .{principal});
+            return bad.respond(req, cors, .forbidden, "{\"error\":\"no tenant membership left — a new invite is needed\"}\n");
+        }
+        const jwt = jwt_mint.mint(self.allocator, ctx.signing_seed, ctx.account_pub, principal, tenants, user_pub, ctx.ttl_seconds, now) catch
+            return bad.respond(req, cors, .internal_server_error, "{\"error\":\"mint failed\"}\n");
+        defer self.allocator.free(jwt);
+        const body = try self.identityPayload(ctx, jwt, principal);
         defer self.allocator.free(body);
-        log.info("🎟️ enrolled '{s}' (tenant '{s}', {d} membership(s) tagged) — JWT minted, mapping registered", .{ principal, tenant, tenants.len });
+        log.info("🔁 renewed '{s}' ({d} membership(s)) — JWT minted for the same key", .{ principal, tenants.len });
         try req.respond(body, .{ .status = .ok, .extra_headers = cors });
     }
 

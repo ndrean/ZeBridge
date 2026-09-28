@@ -17604,3 +17604,37 @@ line, not built.
 
 The README's "new tenant" row said to create streams and SIGHUP the server: neither is
 true any more — a tenant is data, and the role's template carries its grants.
+
+## §10jt — /renew: a device stays enrolled with its own key (2026-09-28)
+
+A 24 h JWT and "ask your backend for a new invite" at expiry meant every device needed a
+human-free onboarding path every day. The device already holds a long-lived secret that
+never leaves it — its nkey seed — so the seed is the refresh credential; no second token.
+
+**Bridge.** `GET /renew?user_pubkey=U…&ts=<unix s>&sig=<base64url>`: Ed25519 over
+`zebridge-renew:<user_pubkey>:<ts>` (nats.zig patch 28 adds `nkeys.verify`). Accepted when
+the signature verifies, `ts` is within 60 s, the key is in zebridge_principal_keys and not
+revoked, and the principal still has a membership; then a JWT for the SAME key with the
+CURRENT memberships (a join or leave reaches the device here). Nothing is written. Same
+payload as /enroll (`identityPayload`, shared), so NATS URLs and the grammar hash
+refresh too. Refusals: 401 bad signature or clock, 403 key unknown/revoked or no
+membership — the only moment a device needs a new invite.
+
+**Clients.** libzb (enroll.zig `jwtTimes`, `renewDue`, `renew`) and zb-client-ts
+(`jwtTimes`, `renewDue`, `renewAt`) renew when under a quarter of the JWT's life is left:
+at connect (a failure before expiry is a warning, after it the connect's error), and
+while running — libzb from `zb_client_poll`, zb-client-ts on a timer — checking every
+eighth of the lifetime (at most a minute). The identity is rewritten; the new creds reach
+the next handshake without rebuilding the connection: nats.zig patch 29
+(`setCredsContent`, under the connection mutex the handshake holds), nats.js's
+`credsAuthenticator(() => creds)`. The server ends the old socket at its JWT's expiry and
+the reconnect presents the new one.
+
+Live, bridge at `ENROLL_JWT_TTL_SECONDS=40`, 100 s runs (2.5 lifetimes), a kilo row written
+at 70 s (after the first expiry): libzb — two renewals, two "User Authentication Expired"
+cut-offs each followed by a reconnect, **no poll error**, the 70 s row applied, 21 rows =
+PostgreSQL; Node — enrolled, renewed twice, the 70 s row seen, 22 rows = PostgreSQL.
+
+Left: the cut-off at the old JWT's expiry is visible in nats.zig's log; reconnecting right
+after a renewal would retire the old JWT early and silence it — not built. iOS https
+renewal from libzb inherits §10jq's trust-store limit.

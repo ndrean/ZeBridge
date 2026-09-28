@@ -322,6 +322,11 @@ pub const Http = struct {
     /// Lifetime of a minted user JWT. Expiry IS the revocation story: a deleted
     /// mapping stops mattering at most this long after the deletion.
     pub const enroll_jwt_ttl_seconds: i64 = 60 * 60 * 24;
+    /// §10jt: how far a /renew request's signed timestamp may be from the bridge's
+    /// clock. The signature proves the key; the window keeps a captured request from
+    /// being replayed later (a replay only re-mints a JWT the replayer cannot use
+    /// without the seed — the window bounds even that).
+    pub const renew_clock_skew_seconds: i64 = 60;
 
     /// connect_timeout for the enroll handler's PG dial: a hung Postgres must
     /// cost an enroll permit for seconds, not forever — the permits are the
