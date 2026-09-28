@@ -2057,6 +2057,9 @@ pub fn main(init: std.process.Init) !void {
                                             tx_slots_count += 1;
                                             cdc_events += 1;
                                         }
+                                        // §10js: a tenant born with this row — its stream is
+                                        // reconciled by the reload at commit, as for a new table.
+                                        if (event_proc.takeNewTenant()) catalogue_moved = true;
                                     } else if (event_proc.refused.verdictFor(rel.name) != .drop) {
                                         // Refused structurally: no schema was published for this
                                         // table, so a client receiving the row would have nowhere
@@ -2114,6 +2117,7 @@ pub fn main(init: std.process.Init) !void {
                                             tx_slots_count += 1;
                                             cdc_events += 1;
                                         }
+                                        if (event_proc.takeNewTenant()) catalogue_moved = true;
                                         break :blk_upd;
                                     }
                                     if (event_proc.refused.verdictFor(rel.name) == .drop) break :blk_upd;

@@ -1135,7 +1135,7 @@ One rule covers almost everything:
 | --- | --- |
 | ✚ new table <br> (public or tenant-scoped) | ❗️ `zebridge_enable(...)` migration, <br> **no restart** — the bridge sees the catalogue row in the WAL, reloads its rules, reconciles CDC_PUBLIC's subjects, lifts the table's refusal and publishes its schema. No env edit, no stream edit by hand. |
 | changed _rule_ on an existing table (version / tombstone / tiebreak / tenant column) | ❗️re-run `zebridge_enable`, <br> **no restart** — same path (the write path re-reads the catalogue on the same signal; the sweeper still re-reads on its own restart) |
-| ✚ new tenant | INSERT INTO `zebridge_user_tenants` row; <br> **no restart** — create its streams,  the INSERT propagates live to `$KV.tenants`,NATS grants need a SIGHUP (reload, not restart) until the JWT signing key covers them |
+| ✚ new tenant | **nothing** — a tenant is born with its first mapping (an invite redeemed, or an INSERT into `zebridge_user_tenants`): the bridge creates `CDC_<tenant>` on the spot, the producer its `gen-<tenant>` store on the first row, and the JWT's `tenant` tag carries the grants (the role's template, no server change) |
 | ✚ new user on an existing tenant | conf grant + SIGHUP only — with the JWT operator model, not even that |
 | generations on/off, tenant growth, invites, enrollment | **nothing** — the producer and the mint read the database per tick/request |
 | `DROP TABLE` | nothing for the bridge — the DDL trigger tombstones the schema and reaps the guard |

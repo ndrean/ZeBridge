@@ -17575,3 +17575,32 @@ though the mint signs everything with the one client key today. And encryption a
 is a separate question: grants stop a connected client, JetStream's `cipher` stops
 someone holding the disk or a backup; the CDC streams, the gen-<tenant> objects,
 MUTATIONS and VERDICTS are what it would protect.
+
+## §10js — a tenant is born with its first mapping: its stream is created on the spot (2026-09-28)
+
+Found reviewing the onboarding flow: the bridge created `CDC_<tenant>` only at boot or when
+the catalogue changed. A mapping INSERT for a new tenant updated `$KV.tenants` but never
+reached the stream reconciliation (`zebridge_user_tenants` rows did not set
+`catalogue_moved`), so the first client of a brand-new tenant found no stream until the
+next bridge restart — NOTES called it "a boot-time reconciliation".
+
+Now `packTenantToKvSlot` notes a row whose tenant the topology does not list
+(`new_tenant_seen`, read by `takeNewTenant`), and both mapping branches (INSERT, and an
+UPDATE that moves a principal) turn it into `catalogue_moved`: the reload at commit
+re-reads the tenants from the data and reconciles the streams — the path a new table
+already took. The open tenant is excluded (its rows ride CDC_PUBLIC).
+
+Live, bridge running: an invite for principal newco_user in tenant `newco` (no such
+tenant before; no CDC_newco) redeemed through libzb → "tenant 'newco' is new — reconciling
+its stream", "created stream CDC_newco (cdc.newco.>)"; a newco row written in PostgreSQL
+reached CDC_newco and the client (1 row). No restart, no manual step. (The sweeper's
+mapping, added by its trigger in the same transaction, was the first the bridge saw.)
+
+A benign race remains: the client connected milliseconds after its enrollment, before
+the commit-time reload, and logged "CDC_newco: unreadable (StreamNotFound) — set aside …
+retried with backoff" — then read it within the same sync. The dark-stream handling
+(§10fq) covers it; answering /enroll only once the stream exists would remove even the
+line, not built.
+
+The README's "new tenant" row said to create streams and SIGHUP the server: neither is
+true any more — a tenant is data, and the role's template carries its grants.

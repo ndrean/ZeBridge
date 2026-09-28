@@ -154,6 +154,9 @@ pub const EventProcessor = struct {
     /// of the set: filled at boot from the table, then kept by every INSERT/UPDATE/
     /// DELETE the slot sees. Strings live for the process (the roster is small).
     roster: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
+    /// §10js: set when a mapping names a tenant the topology does not list; read and
+    /// cleared by the replication loop (`takeNewTenant`), which reloads the catalogue.
+    new_tenant_seen: bool = false,
     batch_publisher: *batch_publisher.BatchPublisher,
     /// The shared NATS publisher, for the DROP-prune below. Optional and assigned
     /// after construction (bridge.zig), because the publisher outlives this struct
@@ -1979,6 +1982,13 @@ pub const EventProcessor = struct {
     /// bucket is a lookup, not a subject a row is published on), but still worth
     /// guarding if this table ever gets a DBA-facing insert path less careful than a
     /// manual `INSERT`.
+    /// §10js: whether a mapping since the last call named a tenant the topology did not
+    /// list — its stream must be reconciled.
+    pub fn takeNewTenant(self: *EventProcessor) bool {
+        defer self.new_tenant_seen = false;
+        return self.new_tenant_seen;
+    }
+
     pub fn packTenantToKvSlot(
         self: *EventProcessor,
         arena: std.mem.Allocator,
@@ -1987,6 +1997,20 @@ pub const EventProcessor = struct {
         wal_end: u64,
     ) !?u32 {
         const row = try rosterRow(arena, rel, tuple_data, self.types) orelse return null;
+        // §10js: a tenant the topology does not list yet is born with this row — its
+        // CDC_<tenant> stream does not exist. The caller turns this into a catalogue
+        // reload, which re-reads the tenants from the data and reconciles the streams.
+        if (!std.mem.eql(u8, row.tenant, self.topology.open_tenant)) {
+            var known = false;
+            for (self.topology.tenants) |t| if (std.mem.eql(u8, t, row.tenant)) {
+                known = true;
+                break;
+            };
+            if (!known) {
+                self.new_tenant_seen = true;
+                log.info("🆕 tenant '{s}' is new (first mapping: '{s}') — reconciling its stream", .{ row.tenant, row.principal });
+            }
+        }
         const first = self.rosterLen(row.principal) == 0;
         try self.rosterAdd(row.principal, row.tenant);
         // §10jj: none → one is a re-grant when the principal was revoked; lift its ban.
