@@ -195,7 +195,7 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
                 return if (v == .integer) @intCast(v.integer) else 0;
             }
         };
-        return try std.fmt.allocPrint(a, "{d}", .{core.caughtUpPosition(g.u(args, "pos"), g.u(args, "lastSeq"), g.u(args, "numPending"), g.u(args, "numAckPending"), g.u(args, "deliveredCount"), g.u(args, "delivered"))});
+        return try std.fmt.allocPrint(a, "{d}", .{core.caughtUpPosition(g.u(args, "pos"), g.u(args, "firstSeq"), g.u(args, "lastSeq"), g.u(args, "numPending"), g.u(args, "numAckPending"), g.u(args, "deliveredCount"), g.u(args, "delivered"))});
     }
     if (eq(u8, name, "fkKind")) {
         const msg = args.object.get("message").?.string;

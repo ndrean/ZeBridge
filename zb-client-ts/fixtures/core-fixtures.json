@@ -1187,6 +1187,39 @@
       "deliveredCount": 9,
       "delivered": 9800,
       "next": 9800
+    },
+    {
+      "name": "§10jh: the stream pruned past the position and nothing is pending: stay — never jump over what was dropped",
+      "pos": 1727826,
+      "firstSeq": 1728850,
+      "lastSeq": 1729418,
+      "numPending": 0,
+      "numAckPending": 0,
+      "deliveredCount": 0,
+      "delivered": 0,
+      "next": 1727826
+    },
+    {
+      "name": "§10jh: the stream starts right after the position: nothing dropped, take the end",
+      "pos": 100,
+      "firstSeq": 101,
+      "lastSeq": 200,
+      "numPending": 0,
+      "numAckPending": 0,
+      "deliveredCount": 0,
+      "delivered": 0,
+      "next": 200
+    },
+    {
+      "name": "§10jh: the stream starts at or before the position: take the end",
+      "pos": 100,
+      "firstSeq": 50,
+      "lastSeq": 200,
+      "numPending": 0,
+      "numAckPending": 0,
+      "deliveredCount": 0,
+      "delivered": 0,
+      "next": 200
     }
   ],
   "fkKind": [

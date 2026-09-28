@@ -17173,3 +17173,28 @@ stream now began at 1728850. The harness waited its 900 s and failed the compari
 no longer holds what follows the position, and a chain re-seed. OPEN: reproduce without the
 link — recreate a consumer at a position the stream has already dropped — and find where it
 waits. The follower's log is kept in the session scratchpad (slowlink-follower.log).
+
+**The stop, diagnosed and fixed (same day).** The follower did NOT stop because the stream
+passed it; that was a consequence. Per process, it had recreated its drain consumer exactly
+50 times: one delivery in 41 is lost (the test hook), each loss costs one recreation, and
+the drain allowed 50 per drain. The 51st loss found the cap, the consumer stayed gapped,
+every later delivery was refused as out of order, and the drain sat silent — 15 minutes
+later the stream had aged past it. Fixed in libzb's drain: only recreations WITHOUT
+PROGRESS count (the counter resets whenever the position moved since the last one); fifty
+in a row with nothing applied ends the drain loudly and hands over to the tail, which
+reopens without a cap. zb-client-ts backs off instead of counting and has no such cap.
+
+**The pruned range, fixed too, in both clients.** Hunting the stop found a real second hole:
+an idle, caught-up tail moved its position to the stream's last sequence
+(`caughtUpPosition`) even when the stream no longer held what followed the position — a
+filtered consumer created in a pruned range has nothing pending and looks caught up, so the
+jump erased the hole for good (a quiet table stayed incomplete until its next write).
+`caughtUpPosition` now takes the stream's first sequence and never jumps a pruned range
+(three new shared cases in core-fixtures.json; both cores 9/9); libzb's `tailHealth`
+returns `.pruned` and the tail runs `gapAndSeed`, and zb-client-ts's idle check takes the
+live hole path — the chain heals it: deltas if the table changed, nothing if it did not.
+
+**After**: delivery_loss.sh through slowproxy.py (20 Mbit/s, 30 ms, stalls) — PASS, 62/62
+batches, 1,381,000 rows exact, 110 lost deliveries and 107 recreations in one process
+(past the old 50), lag 39 s p50 during the load then converged. That run never fell
+behind the window, so the pruned-range fix is proven by the fixtures, not yet end to end.

@@ -295,8 +295,14 @@ pub fn advancePosition(stored: i64, batch: std.json.Array) i64 {
 /// stream's `last_seq`, read before the consumer's info, when nothing is pending,
 /// nothing is unacked and nothing handed over is past `pos` (`delivered_count` 0: a
 /// fresh consumer's `delivered` is its start - 1, no message). Otherwise `pos`.
-pub fn caughtUpPosition(pos: u64, last_seq: u64, num_pending: u64, num_ack_pending: u64, delivered_count: u64, delivered: u64) u64 {
+/// §10jh: and never over a PRUNED range. `first_seq` past `pos + 1` means the stream
+/// dropped messages after the position before this client saw them; a filtered consumer
+/// then has nothing pending and looks caught up, and jumping to `last_seq` erased the
+/// hole (a follower behind a slow link: 330,000 rows missing, the tail idle and "fine").
+/// Stay, and let the gap rule heal it from the chain. `first_seq` 0: unknown, the old rule.
+pub fn caughtUpPosition(pos: u64, first_seq: u64, last_seq: u64, num_pending: u64, num_ack_pending: u64, delivered_count: u64, delivered: u64) u64 {
     if (last_seq <= pos) return pos;
+    if (first_seq > pos + 1) return pos;
     if (num_pending != 0 or num_ack_pending != 0 or (delivered_count > 0 and delivered > pos)) return pos;
     return last_seq;
 }

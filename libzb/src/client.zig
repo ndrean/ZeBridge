@@ -2737,9 +2737,15 @@ pub const SyncClient = struct {
         var sub = try self.openConsumer(stream, 30 * std.time.ns_per_s, null);
         defer sub.deinit(); // the server reaps the consumer itself — see openConsumer
 
-        // §10jc: recreations of the consumer after a lost delivery (bounded: a link losing
-        // deliveries on every batch would otherwise drain for ever).
+        // §10jc: recreations of the consumer after a lost delivery, bounded — but only
+        // those WITHOUT PROGRESS count (§10jh). A plain count of 50 per drain stopped a
+        // follower behind a slow, lossy link: one delivery in 41 lost, the 51st loss found
+        // the cap, the consumer stayed gapped, every later delivery was refused as out of
+        // order, and the drain sat silent with 330,000 rows missing. A recreation after
+        // which the position moved is progress, however slow; 50 in a row without it is
+        // a link that loses everything, and the drain hands over to the tail (below).
         var gap_reopens: u32 = 0;
+        var reopen_pos: u64 = last;
         // ONE reopen if the consumer dies under us mid-drain (a 409 under 12
         // concurrent seeding clients, §10cq): the position is the client's, so a
         // fresh consumer resumes exactly where the last batch left off. A second
@@ -2762,6 +2768,11 @@ pub const SyncClient = struct {
                     // The expiry: caught up to the tail — unless the server still counts
                     // deliveries this client never received (§10jc: all it received is
                     // acked). Those are lost in transit: recreate from the position.
+                    const idle_pos = try self.storedSeq(stream);
+                    if (idle_pos > reopen_pos) {
+                        gap_reopens = 0;
+                        reopen_pos = idle_pos;
+                    }
                     if (gap_reopens < 50 and self.unackedOn(stream, sub.consumer_name) > 0) {
                         std.debug.print("{s}: drain idle with deliveries unacknowledged on {s} — lost in transit; recreating the consumer from position {d}\n", .{ stream, sub.consumer_name, try self.storedSeq(stream) });
                         gap_reopens += 1;
@@ -2806,7 +2817,21 @@ pub const SyncClient = struct {
             }
             var ms = pos;
             if (keep.len > 0) _ = try self.applyBatch(null, stream, keep, pos, &ms, null);
-            if ((try self.flowFor(stream)).gap and gap_reopens < 50) {
+            const now_pos = try self.storedSeq(stream);
+            if (now_pos > reopen_pos) {
+                gap_reopens = 0;
+                reopen_pos = now_pos;
+            }
+            if ((try self.flowFor(stream)).gap and gap_reopens >= 50) {
+                // Fifty recreations without a single message applied: stop draining,
+                // loudly, and leave the flow clean — the live tail reopens from the
+                // position with no cap, rather than this consumer refusing every
+                // delivery for ever.
+                std.debug.print("{s}: 50 consumer recreations without progress (position {d}) — ending the drain; the tail takes over\n", .{ stream, now_pos });
+                self.resetFlow(stream);
+                break;
+            }
+            if ((try self.flowFor(stream)).gap) {
                 std.debug.print("{s}: recreating the drain's consumer from position {d} after a lost delivery\n", .{ stream, try self.storedSeq(stream) });
                 gap_reopens += 1;
                 self.resetFlow(stream);
@@ -2819,7 +2844,6 @@ pub const SyncClient = struct {
         const to = self.caughtUpTo(stream, sub.consumer_name, at);
         if (to > at) try self.persistSeq(stream, to);
         std.debug.print("{s}: drained to seq {d}\n", .{ stream, @max(to, at) });
-        _ = last;
         return false;
     }
 
@@ -3155,6 +3179,10 @@ pub const SyncClient = struct {
         deaf: u64,
         /// The server no longer knows the consumer (reaped, or the stream went).
         gone,
+        /// §10jh: nothing pending, but the stream no longer holds what follows the
+        /// position (its first sequence, given): messages were dropped before this
+        /// client saw them. The position stays; the gap rule heals it from the chain.
+        pruned: u64,
     };
 
     fn tailHealth(self: *SyncClient, stream: []const u8, consumer: []const u8, pos: u64, idle_ms: i64) TailHealth {
@@ -3176,7 +3204,11 @@ pub const SyncClient = struct {
         // server re-sends them only after ack_wait, out of order. Reopen from the position.
         if (c.num_ack_pending > 0 and idle_ms >= tail_watch_ms) return .{ .deaf = c.num_ack_pending };
         if (last <= pos) return .{ .fine = pos };
-        return .{ .fine = core.caughtUpPosition(pos, last, c.num_pending, c.num_ack_pending, c.delivered.consumer_seq, c.delivered.stream_seq) };
+        // §10jh: the stream dropped what follows the position before it was delivered —
+        // a filtered consumer created there has nothing pending and would look caught up.
+        if (c.num_pending == 0 and c.num_ack_pending == 0 and si.value.state.first_seq > pos + 1)
+            return .{ .pruned = si.value.state.first_seq };
+        return .{ .fine = core.caughtUpPosition(pos, si.value.state.first_seq, last, c.num_pending, c.num_ack_pending, c.delivered.consumer_seq, c.delivered.stream_seq) };
     }
 
     /// A request taken off a queue subscription and handed to the host: the id the host
@@ -3444,6 +3476,16 @@ pub const SyncClient = struct {
                     .gone => {
                         std.debug.print("{s}: tail consumer {s} gone from the server (position {d}) — reopening\n", .{ stream, tl.sub.consumer_name, pos });
                         self.reopenTail(tl) catch |e| self.markDark(stream, e);
+                    },
+                    .pruned => |first| {
+                        // §10jh: the gap no delivery will ever show. gapAndSeed sees it
+                        // (the position is below first - 1) and brings every table on
+                        // the stream to a chain cutoff at or past it — the deltas if the
+                        // table changed, nothing if it did not — then resumes there.
+                        std.debug.print("{s}: the stream dropped {d} message(s) after position {d} before they were delivered — healing from the chain\n", .{ stream, first - pos - 1, pos });
+                        self.reseed_pending = false;
+                        self.gapAndSeed(report_a, &seeded_map) catch |err| std.debug.print("{s}: re-seed after the prune failed: {s}\n", .{ stream, @errorName(err) });
+                        if (self.reseed_pending) std.debug.print("{s}: the gap stays open — waiting for the producer's next generation\n", .{stream});
                     },
                 }
                 continue;

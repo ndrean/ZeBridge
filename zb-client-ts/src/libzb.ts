@@ -3378,7 +3378,12 @@ export class ZeBridge {
                 const stored = this.globalSyncState.seq[streamName] ?? 0;
                 // The stream's end FIRST, then the consumer: see caughtUpPosition.
                 let lastSeq = 0;
-                try { lastSeq = (await jsm.streams.info(streamName))?.state?.last_seq ?? 0; } catch { /* keep 0: no move */ }
+                let firstSeq = 0;
+                try {
+                  const st = (await jsm.streams.info(streamName))?.state;
+                  lastSeq = st?.last_seq ?? 0;
+                  firstSeq = st?.first_seq ?? 0;
+                } catch { /* keep 0: no move */ }
                 let pending = -1;
                 let ci: any = null;
                 try { ci = await jsm.consumers.info(streamName, curName); pending = ci?.num_pending ?? 0; } catch { /* gone */ }
@@ -3394,10 +3399,22 @@ export class ZeBridge {
                   try { itRef.stop(); } catch { /* already ended */ }
                   return;
                 }
+                // §10jh: nothing pending, yet the stream no longer holds what follows the
+                // position — dropped before it was delivered (a follower behind a slow
+                // link past the stream's window). No delivery will ever show this hole:
+                // take the gap as a live hole is taken, and let the resync heal it from
+                // the chain.
+                if (stored > 0 && firstSeq > stored + 1 && (ci?.num_ack_pending ?? 0) === 0) {
+                  this.appendLog('SYS', `${streamName}: the stream dropped ${firstSeq - stored - 1} message(s) after position ${stored} before they were delivered — healing from the chain`, 'WARNING');
+                  holeFound = true;
+                  try { itRef.stop(); } catch { /* already ended */ }
+                  return;
+                }
                 // §10ja: idle and caught up — the position is the stream's end, or a
                 // consumer filtered to other tables' silence stays at 0 and the next
                 // launch reads that as a gap.
                 const to = caughtUpPosition(stored, lastSeq, {
+                  firstSeq,
                   numPending: pending, numAckPending: ci?.num_ack_pending ?? 1,
                   deliveredCount: ci?.delivered?.consumer_seq ?? 1, delivered: ci?.delivered?.stream_seq ?? Number.MAX_SAFE_INTEGER,
                 });

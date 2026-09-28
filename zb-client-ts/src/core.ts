@@ -236,8 +236,13 @@ export function advancePosition(stored: number, batchSeqs: number[]): number {
 /// applied. `deliveredCount` is the consumer's own sequence: a consumer that delivered
 /// nothing still reports `delivered` = its start - 1 (measured: 9631 on a fresh one,
 /// position 0), which is no message in flight. Any doubt keeps `pos`; never backwards.
-export function caughtUpPosition(pos: number, lastSeq: number, c: { numPending: number; numAckPending: number; deliveredCount: number; delivered: number }): number {
+/// §10jh: never over a PRUNED range — `firstSeq` past `pos + 1` means the stream dropped
+/// messages after the position before this client saw them, and a filtered consumer then
+/// looks caught up. Stay; the gap rule heals it from the chain. `firstSeq` absent or 0:
+/// unknown, the old rule (libzb core.caughtUpPosition, the same fixtures).
+export function caughtUpPosition(pos: number, lastSeq: number, c: { numPending: number; numAckPending: number; deliveredCount: number; delivered: number; firstSeq?: number }): number {
   if (lastSeq <= pos) return pos;
+  if ((c.firstSeq ?? 0) > pos + 1) return pos;
   if (c.numPending !== 0 || c.numAckPending !== 0 || (c.deliveredCount > 0 && c.delivered > pos)) return pos;
   return lastSeq;
 }
