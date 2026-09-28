@@ -240,7 +240,7 @@ pub const SyncClient = struct {
     /// the application's explicit act (`zb_client_wipe`).
     revoked: bool = false,
     hung_up: bool = false,
-    stream_mutations: []const u8 = undefined, // streams.mutations
+    stream_verdicts: []const u8 = undefined, // streams.verdicts: stored verdicts and the ban
     subject_mutations_prefix: []const u8 = undefined, // subjects.mutations_prefix
     subject_mutation_ack_prefix: []const u8 = undefined, // subjects.mutation_ack_prefix
 
@@ -560,7 +560,7 @@ pub const SyncClient = struct {
         self.gen_bucket_prefix = try grammarString(root, &.{ "generations", "bucket_prefix" });
         self.open_tenant = try grammarString(root, &.{"open_tenant"});
         self.open_tenants = try self.aa().dupe([]const u8, &.{self.open_tenant});
-        self.stream_mutations = try grammarString(root, &.{ "streams", "mutations" });
+        self.stream_verdicts = try grammarString(root, &.{ "streams", "verdicts" });
         self.subject_mutations_prefix = try grammarString(root, &.{ "subjects", "mutations_prefix" });
         self.subject_mutation_ack_prefix = try grammarString(root, &.{ "subjects", "mutation_ack_prefix" });
     }
@@ -4178,7 +4178,7 @@ pub const SyncClient = struct {
             // a `stale` for a write that had been accepted.
             if (!refused.contains(msg_id)) {
                 const ack_subject = try std.fmt.allocPrint(a, "{s}.{s}.{s}", .{ self.subject_mutation_ack_prefix, self.opts.principal, msg_id });
-                if (self.t.lastBySubject(self.stream_mutations, ack_subject) catch null) |vm| {
+                if (self.t.lastBySubject(self.stream_verdicts, ack_subject) catch null) |vm| {
                     defer vm.deinit();
                     if (try self.settleVerdict(a, msg_id, vm.data)) {
                         collected += 1;
@@ -4470,7 +4470,7 @@ pub const SyncClient = struct {
     fn probeRevoked(self: *SyncClient) !void {
         var buf: [256]u8 = undefined;
         const subject = try std.fmt.bufPrint(&buf, "{s}.{s}.revoked", .{ self.subject_mutation_ack_prefix, self.opts.principal });
-        if (self.t.lastBySubject(self.stream_mutations, subject) catch null) |m| {
+        if (self.t.lastBySubject(self.stream_verdicts, subject) catch null) |m| {
             m.deinit();
             return self.hangUpRevoked();
         }

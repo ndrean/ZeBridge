@@ -865,7 +865,7 @@ pub const MutationListener = struct {
     ///    stream sequence, but it is ephemeral, lives in a system subject space no client
     ///    should be granted, and says only "five attempts", never why.
     ///
-    /// So the verdict is an ordinary message on an ordinary subject: durable in MUTATIONS
+    /// So the verdict is an ordinary message on an ordinary subject: durable in VERDICTS
     /// for as long as the stream keeps it, which is what lets a client that was offline
     /// collect the verdicts it missed — the one thing none of the three above can do.
     ///

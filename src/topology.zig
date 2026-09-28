@@ -62,6 +62,9 @@ pub const Topology = struct {
     // ─── streams ────────────────────────────────────────────────────────────────
     stream_cdc: []const u8,
     stream_mutations: []const u8,
+    /// Write verdicts (`mutation_ack.>`) and the revocation ban: kept apart from the
+    /// writes so a burst of verdicts can never fill the stream incoming writes need.
+    stream_verdicts: []const u8,
 
     // ─── per-tenant CDC streams (empty when the deployment is not tenant-routed) ──
     //
@@ -182,6 +185,7 @@ pub const Topology = struct {
     pub const for_tests = Topology{
         .stream_cdc = "CDC",
         .stream_mutations = "MUTATIONS",
+        .stream_verdicts = "VERDICTS",
         .tenants = &.{},
         .public_tables = &.{},
         .cdc_stream_prefix = "CDC_",
@@ -263,6 +267,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
 
     t.stream_cdc = try str(a, streams, "streams", "cdc", diag);
     t.stream_mutations = try str(a, streams, "streams", "mutations", diag);
+    t.stream_verdicts = try str(a, streams, "streams", "verdicts", diag);
 
     // Optional: a deployment with no `tenants` is not tenant-routed, and that is a valid
     // shape (the single wide CDC stream). Absent means an empty list, never an error.
@@ -587,7 +592,7 @@ test "render: malformed patterns are rejected rather than half-substituted" {
 test "parse: reads every name and derives the composites" {
     const json =
         \\{
-        \\  "streams": {"cdc":"C","mutations":"M"},
+        \\  "streams": {"cdc":"C","mutations":"M","verdicts":"V"},
         \\  "subjects": {
         \\    "cdc_prefix":"cdc","mutations_prefix":"mut",
         \\    "mutation_pattern":"mut.{[principal]s}.{[table]s}.{[operation]s}",
@@ -625,7 +630,7 @@ test "parse: a missing section fails at load" {
 
 test "parse: a non-string name is rejected" {
     const json =
-        \\{"streams": {"cdc":42,"mutations":"M"},
+        \\{"streams": {"cdc":42,"mutations":"M","verdicts":"V"},
         \\ "subjects": {}, "kv": {}}
     ;
     try testing.expectError(Error.NotAString, parse(testing.allocator, json, null));

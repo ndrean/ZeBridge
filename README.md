@@ -2115,7 +2115,8 @@ A ZeBridge instance is started with one config. The DBA starts the NATS server w
 | Stream | Purpose | Retention (default) | Consumer Pattern | Role |
 | -------- | ------------------- | ------------- | ----------------------- | -- |
 | **CDC** | Real-time egress changes | `CDC_MAX_AGE_SECONDS`, 3 × the generation cadence; `CDC_MAX_BYTES` 1 GiB and `CDC_MAX_MSGS` 10 M as disk valves | Continuous subscription | READ |
-| **MUTATIONS** | Real-time ingress changes | 2 h, 1 GB (`scripts/native/up.sh`): the window a missed verdict can be recovered in | Continuous subscription | WRITE |
+| **MUTATIONS** | Real-time ingress changes | 2 h, 1 GB, discard new (`scripts/native/up.sh`): a full stream refuses writes | Continuous subscription | WRITE |
+| **VERDICTS** | Write verdicts and the revocation ban | 2 h, 1 GB, discard old: the window a missed verdict can be recovered in | Direct get by key | WRITE |
 
 Besides the streams, the bridge maintains the seeding buckets: the **`generations` KV** holds one chain manifest per `<tenant>.<table>`, and a per-tenant **`gen-<tenant>` object store** holds the full and delta objects the manifest points to. The producer provisions the object stores at runtime, the same way the bridge provisions per-tenant CDC streams.
 

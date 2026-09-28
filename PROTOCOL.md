@@ -145,7 +145,7 @@ REQUESTS streams carried nothing else.
 
 | key | read by |
 | --- | --- |
-| `streams.*` | `nats-init` creates `MUTATIONS`; the bridge names it for its ingress consumer, and clients name it to collect stored verdicts (§7.4b). `streams.cdc` is the pre-tenant name of the single CDC stream: the bridge echoes it at boot, and a client falls back to it only when `cdc_streams` is absent |
+| `streams.*` | `nats-init` creates `MUTATIONS` and `VERDICTS`; the bridge names `MUTATIONS` for its ingress consumer, and clients name `VERDICTS` to collect stored verdicts and the ban (§7.4b). `streams.cdc` is the pre-tenant name of the single CDC stream: the bridge echoes it at boot, and a client falls back to it only when `cdc_streams` is absent |
 | `open_tenant` | bridge (routing for tenant-agnostic tables), clients (the shared subject/KV token) |
 | `cdc_streams.*` | bridge — at boot it creates any missing `CDC_<TENANT>` stream and sets `CDC_PUBLIC`'s subjects from the catalogue |
 | `subjects.cdc_prefix` | bridge (CDC subject), clients (subscription) |
@@ -172,9 +172,10 @@ flowchart TD
   TEN --> C
   CDC --> C
   GEN --> C
-  C -->|"mutation.&lt;principal&gt;.&lt;table&gt;.&lt;op&gt;"| MUT[["Stream: MUTATIONS<br/>writes + verdicts"]]
+  C -->|"mutation.&lt;principal&gt;.&lt;table&gt;.&lt;op&gt;"| MUT[["Stream: MUTATIONS<br/>writes"]]
   MUT --> B
-  MUT -->|"mutation_ack.&lt;principal&gt;.&lt;msg_id&gt;"| C
+  B -->|"mutation_ack.&lt;principal&gt;.&lt;msg_id&gt;"| VER[["Stream: VERDICTS"]]
+  VER --> C
   C --> L[(Local store<br/>SQLite / PG / …)]
 ```
 
@@ -184,7 +185,8 @@ flowchart TD
 | `tenants` | **KV bucket** | bridge → client | `$KV.tenants.<principal>` → the principal's memberships, a JSON array, kept current from `zebridge_user_tenants` (§6, Step 0). One key per principal, granted per principal. |
 | `CDC_PUBLIC`, `CDC_<tenant>` | **streams** | bridge → client | Ordered, replayable, time-bounded. Changes are *events*: public tables on `CDC_PUBLIC`, a tenant's tables on its own stream (§4). |
 | `generations` + `gen-<tenant>` | **KV + object store** | bridge → client | The seed source (§6): one chain manifest per `<tenant>.<table>`, objects chunked by the store itself — a seed is *state*, built on a cadence, never served per request. |
-| `MUTATIONS` | **stream** | client → bridge → client | Edge writes (§7), the verdicts answering them (`mutation_ack.>`), and the dead-letter copies of refused writes (`mutation_error.<table>`) for the operator. |
+| `MUTATIONS` | **stream** | client → bridge | Edge writes (§7), and the dead-letter copies of refused writes (`mutation_error.<table>`) for the operator. Discard new: when full, a write is refused at the door. |
+| `VERDICTS` | **stream** | bridge → client | The verdicts answering writes (`mutation_ack.<principal>.<msg_id>`) and the ban (`mutation_ack.<principal>.revoked`), kept 2 h for a client that was offline. One message per subject, discard old: verdicts never take the space writes need, and a verdict pushed out early costs one idempotent replay. |
 
 ### `query.<tenant>.<name>` is request/reply, not a stream
 
@@ -1146,7 +1148,9 @@ to one or more tenants; the bridge mirrors `zebridge_user_tenants` and writes th
 change. An INSERT adds a membership, a DELETE removes one and republishes the smaller
 set; the LAST membership deleted purges the key and publishes the ban
 (`mutation_ack.<principal>.revoked`), so a revoked principal resolves to no mapping —
-the open tenant — on its next connect.
+the open tenant — on its next connect. The first membership given back lifts the ban
+(the bridge purges that subject from `VERDICTS`, at boot too for a re-grant made while
+it was down); a revoked KEY stays revoked in the account JWT.
 **Resolved fresh on every connect, never cached client-side across sessions**: the
 bucket is what lets a membership change take effect without restarting anything.
 
@@ -1446,7 +1450,7 @@ Two things follow, and they are the whole reason this section is long:
    | `accepted` | pop |
    | `stale` | pop — do **not** hand-revert; the winning row arrives via CDC. An UPDATE is kept aside until that row is here (its version is above the refused stamp): resubmitted with a fresh stamp when the winner changed none of its columns, dropped and surfaced when they overlap (§7.6) |
    | `row_deleted` | pop, revert the local row to "deleted," and surface it to the user |
-   | `revoked` | not a reply to a write: the ban (§10dm). Published as `mutation_ack.<principal>.revoked` when the principal's mapping is deleted, retained by the stream. Close the connection now, stay closed on reconnect (probe it by direct get before reading anything), answer `Revoked` to every call; leave the rows — the wipe is the application's explicit act |
+   | `revoked` | not a reply to a write: the ban (§10dm). Published as `mutation_ack.<principal>.revoked` when the principal's last mapping is deleted, retained by `VERDICTS` until a mapping is given back or 2 h pass. Close the connection now, stay closed on reconnect (probe it by direct get before reading anything), answer `Revoked` to every call; leave the rows — the wipe is the application's explicit act |
    | `rejected` | pop, revert the local row to its pre-write state |
    | timeout / error | keep, retry (idempotent via `msg_id` for 2 minutes — §2) |
 
@@ -2089,13 +2093,13 @@ reply published under it would be read back by the bridge as if it were a write.
 them are *zero rows affected*. The bridge tells them apart by reading the row's state in
 the same transaction as the write; a client cannot derive them and must not try.
 
-**Collecting a verdict you were not there for.** The reply is retained in `MUTATIONS`,
-so a client that reconnects asks for it by key — `$JS.API.DIRECT.GET.MUTATIONS.
+**Collecting a verdict you were not there for.** The reply is retained in `VERDICTS`,
+so a client that reconnects asks for it by key — `$JS.API.DIRECT.GET.VERDICTS.
 mutation_ack.<principal>.<msg_id>` (the same exact-key direct-get form as `$KV.tenants`)
 — for every entry still in its outbox, and settles each answer through the same handler
 as a live verdict; a 404 means not judged yet, or judged longer ago than the stream keeps,
-and the entry is replayed. The grant is `DIRECT.GET.MUTATIONS.mutation_ack.<principal>.>`,
-scoped to the principal's own replies. ⚠️ Not a JetStream consumer on `MUTATIONS`: a
+and the entry is replayed. The grant is `DIRECT.GET.VERDICTS.mutation_ack.<principal>.>`,
+scoped to the principal's own replies. ⚠️ Not a JetStream consumer on `VERDICTS`: a
 consumer's `MSG.NEXT` cannot be scoped below the stream, so one principal could pull
 another's verdicts by guessing a consumer name.
 

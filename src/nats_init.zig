@@ -135,6 +135,7 @@ fn roleAllows(
     const subj_cdc = topo.subject_cdc_prefix; // "cdc"
     const subj_mut = topo.subject_mutations_prefix; // "mutation"
     const subj_ack = topo.mutation_ack_prefix; // "mutation_ack"
+    const verdicts = topo.stream_verdicts; // "VERDICTS"
     const subj_query = topo.query_prefix; // "query" (§10hj: a service answers, a client asks)
     const res_pre = topo.results_bucket_prefix; // "res-" (§10hq: answers too large for one message)
 
@@ -204,7 +205,7 @@ fn roleAllows(
     try P.add(&pubs, a, "$JS.ACK.>", .{});
     // Its own verdict marker, both roles: the revocation check at connect reads
     // `mutation_ack.<name>.revoked` (§10hl) — a responder is a principal too.
-    try P.add(&pubs, a, "{s}DIRECT.GET.MUTATIONS.{s}.{{{{name()}}}}.>", .{ js_api, subj_ack });
+    try P.add(&pubs, a, "{s}DIRECT.GET.{s}.{s}.{{{{name()}}}}.>", .{ js_api, verdicts, subj_ack });
     switch (role) {
         .client => {
             // §10dc: the fleet heartbeat — a client may write ONLY its own key.

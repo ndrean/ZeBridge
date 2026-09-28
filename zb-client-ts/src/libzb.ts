@@ -3558,11 +3558,11 @@ export class ZeBridge {
   /// came from the REPLAY earning a fresh one, which costs a second PostgreSQL write
   /// attempt per entry and, past the duplicate window, a `stale` for a write that had
   /// in fact been accepted. The grant is per key —
-  /// `$JS.API.DIRECT.GET.MUTATIONS.mutation_ack.<principal>.>` — scoped like `$KV.tenants`.
+  /// `$JS.API.DIRECT.GET.VERDICTS.mutation_ack.<principal>.>` — scoped like `$KV.tenants`.
   private async collectMissedVerdicts(rows: any[]): Promise<Set<string>> {
     const settled = new Set<string>();
     if (!this.nc || !rows.length) return settled;
-    const stream = this.config.grammar.streams?.mutations ?? 'MUTATIONS';
+    const stream = this.config.grammar.streams?.verdicts ?? 'VERDICTS';
     let jsm: any;
     try { jsm = await this.transport.jetstreamManager(this.nc, this.jsOpts()); } catch { return settled; }
     // ⚠️ The DIRECT form only. `jsm.streams.getMessage` is the legacy

@@ -7,7 +7,7 @@ The SPEED_TEST.md load — 2,000 transactions of 1,000 small rows each — again
 that is identical in both runs except its NATS URL: `nats://` to a plain nats-server, or
 `tls://` to a TLS-only one (the nats.zig submodule's test certificates, verified). All of
 it isolated: a scratch database rendered from the templates, its own publication and slot,
-two scratch nats-servers with the KV buckets and MUTATIONS stream up.sh would create, a
+two scratch nats-servers with the KV buckets and MUTATIONS/VERDICTS streams up.sh would create, a
 bridge on its own HTTP port. Nothing of the dev stack is written to.
 
 Per run:
@@ -175,8 +175,11 @@ def start_nats(tmp: pathlib.Path, tls: bool, allow_non_tls: bool = False) -> tup
     cli = ["nats", "--server", url] + (["--tlsca", str(CERTS / "ca.pem")] if secure else [])
     for args in (["kv", "add", "schemas", "--history=10", "--replicas=1"], ["kv", "add", "tenants", "--history=1", "--replicas=1"],
                  ["kv", "add", "generations", "--history=1", "--replicas=1"], ["kv", "add", "live", "--history=1", "--ttl=90s", "--replicas=1"],
-                 ["stream", "add", "MUTATIONS", "--subjects=mutation.>,mutation_error.>,mutation_ack.>", "--storage=file",
-                  "--retention=work", "--max-age=2h", "--max-bytes=1G", "--replicas=1", "--discard=new", "--defaults"]):
+                 ["stream", "add", "MUTATIONS", "--subjects=mutation.>,mutation_error.>", "--storage=file",
+                  "--retention=work", "--max-age=2h", "--max-bytes=1G", "--replicas=1", "--discard=new", "--defaults"],
+                 ["stream", "add", "VERDICTS", "--subjects=mutation_ack.>", "--storage=file", "--retention=limits",
+                  "--max-age=2h", "--max-bytes=1G", "--replicas=1", "--discard=old", "--max-msgs-per-subject=1",
+                  "--allow-direct", "--defaults"]):
         r = subprocess.run(cli + args, capture_output=True, text=True)
         if r.returncode != 0:
             sys.exit(f"{name}: {' '.join(args[:3])}: {r.stderr.strip()}")

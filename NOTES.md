@@ -17043,6 +17043,7 @@ hung up (`sync: Revoked`). Worked around by purging that one subject; the exampl
 teardown now keeps its principals' mappings. Open: re-granting a revoked principal should
 lift the ban (the bridge purging `mutation_ack.<p>.revoked` when the first mapping comes
 back), or `--unrevoke` should exist; today a re-grant is a silent lockout for up to 2 h.
+CLOSED in §10jj: the first mapping given back lifts the ban, live and at boot.
 
 ## §10jg — TODO: telemetry should not live in PostgreSQL (2026-09-27, design, not built)
 
@@ -17227,3 +17228,42 @@ metrics the native stack does not run, one querying a `CDC` stream renamed long 
 
 Checked live: 2,500 sensor writes → `accepted 2500`; 31 catalogue tables, 8 principals, 4
 tenants, 63 chain series; writer 1 of 20 connections, reader 2 of 10.
+
+## §10jj — verdicts get their own stream, and a re-grant lifts the ban (2026-09-28)
+
+Two open items from §10jd and §10jf, one cause: verdicts lived in `MUTATIONS`.
+
+**Capacity.** `MUTATIONS` is 1 GiB, discard new, 2 h: the right policy for writes (a full
+stream refuses at the door, nothing honest is evicted). Verdicts (`mutation_ack.>`) shared
+it and have no consumer, so they stayed the full 2 h. At ~193 B each, 20k writes/s filled
+the stream in ~4.6 min; from then on every write was refused until verdicts aged out.
+
+Fix: a `VERDICTS` stream owns `mutation_ack.>` — limits retention, 2 h, 1 GiB, **discard
+old**, one message per subject, direct get on. A verdict pushed out early costs a client
+that was offline that long one replay, which the ingress judges idempotently (§10dy);
+writes never compete with verdicts for space. `grammar.json` gains `streams.verdicts`
+(bridge, libzb and zb-client-ts read the name from there; the grammar hash changes, so a
+client pinned to the old hash must be rebuilt). The client and responder signing-key
+templates grant `DIRECT.GET.VERDICTS.mutation_ack.{{name()}}.>` instead of the MUTATIONS
+form. up.sh, nats-init (compose) and burst_tls.py create it; zbdoctor gate C reports a
+missing VERDICTS and a MUTATIONS still listing `mutation_ack.>`.
+
+Upgrading a running stack: stop the bridge, `nats stream edit MUTATIONS
+--subjects="mutation.>,mutation_error.>"` (the stored verdicts stay until they age out),
+`nats stream add VERDICTS …` as in up.sh, `nsc edit signing-key --rm … --allow-pub …` on
+the client and responder keys, splice the account JWT into nats-server-jwt.conf, `kill
+-HUP`, start the bridge. Issued creds stay valid: the grant comes from the template.
+
+**The ban outlived a re-grant.** `packTenantToKvSlot` now notices a principal's first
+membership after none and purges `mutation_ack.<p>.revoked` from VERDICTS
+(`liftRevoked`). A re-grant made while the bridge was down is caught at boot: one
+`STREAM.INFO` with `subjects_filter: mutation_ack.*.revoked` lists the stored bans, and
+each principal holding a membership now is lifted (`liftStaleBans`). The ban itself is
+now a JetStream publish: the PubAck proves it is stored (a core publish into a full or
+missing stream was dropped silently), and a re-grant right behind it cannot purge before
+it lands. A revoked KEY (`--revoke --conf`) is untouched: this undoes only the mapping ban.
+
+Checked live on the dev stack: grant → revoke → `mutation_ack.zbtest.revoked` stored →
+re-grant → gone, with "the ban … is lifted" in the log; revoke, bridge down, re-grant,
+boot → "1 ban(s) lifted". offline.py as bob passes (8/8), its verdict landed in VERDICTS;
+bob reads his own verdict by direct get and is refused alice's (Permissions Violation).

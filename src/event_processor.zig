@@ -1092,21 +1092,76 @@ pub const EventProcessor = struct {
 
     /// §10dm: the ban. A revoked mapping is announced on the principal's OWN verdict
     /// channel — `mutation_ack.<principal>.revoked`, a subject every client already
-    /// subscribes to and the MUTATIONS stream retains — so a live client hangs up NOW
+    /// subscribes to and the VERDICTS stream retains — so a live client hangs up NOW
     /// and a reconnecting one finds the verdict again. Cooperative by nature: it is
     /// the immediate rung for clients built on the libraries; the account JWT's
     /// revocation (`--revoke --conf`) stays the enforcement, expiry the backstop.
+    ///
+    /// A JetStream publish, not a core one: the PubAck says the ban is STORED (a
+    /// missing VERDICTS stream is an error here, not a silent drop), and a re-grant
+    /// right behind it cannot purge before the ban lands (`liftRevoked`).
     pub fn publishRevoked(self: *EventProcessor, principal: []const u8) void {
         const publ = self.publisher orelse return;
         const js = if (publ.js) |*j| j else return;
         var buf: [256]u8 = undefined;
         const subject = std.fmt.bufPrint(&buf, "{s}.{s}.revoked", .{ self.topology.mutation_ack_prefix, principal }) catch return;
         const body = "{\"status\":\"revoked\",\"reason\":\"mapping removed by the operator\"}";
-        js.nc.publish(subject, body) catch |err| {
-            log.warn("⛔ '{s}': the ban could not be published on {s} ({s}) — its live clients read until expiry or the JWT revocation", .{ principal, subject, @errorName(err) });
+        var res = js.publish(subject, body, .{}) catch |err| {
+            log.warn("⛔ '{s}': the ban could not be stored on {s} ({s}) — its live clients read until expiry or the JWT revocation", .{ principal, subject, @errorName(err) });
             return;
         };
+        res.deinit();
         log.info("⛔ '{s}' revoked — the ban is on {s}: its live clients hang up, a reconnecting one finds it retained", .{ principal, subject });
+    }
+
+    /// §10jj: the ban's undo. A principal that gets a mapping back (its first membership
+    /// after none) must not keep finding `mutation_ack.<principal>.revoked` for the rest
+    /// of the stream's max-age: its clients would refuse to connect for two hours. The
+    /// ban's retention is the ONLY state a re-grant has to undo — the KV key is written
+    /// by the same INSERT. Advisory like the ban itself: a failure logs, and the ban
+    /// ages out on its own. The JWT revocation (`--revoke --conf`) is untouched: a
+    /// revoked KEY stays revoked; this lifts only the cooperative mapping ban.
+    pub fn liftRevoked(self: *EventProcessor, principal: []const u8) void {
+        const publ = self.publisher orelse return;
+        const js = if (publ.js) |*j| j else return;
+        var buf: [256]u8 = undefined;
+        const subject = std.fmt.bufPrint(&buf, "{s}.{s}.revoked", .{ self.topology.mutation_ack_prefix, principal }) catch return;
+        if (js.purgeStream(self.topology.stream_verdicts, .{ .filter = subject })) |res| {
+            var r = res;
+            defer r.deinit();
+            if (r.value.purged > 0) log.info("✅ '{s}' mapped again — the ban on {s} is lifted", .{ principal, subject });
+        } else |err| log.warn("⛔ '{s}' mapped again, but the ban on {s} could not be lifted ({s}) — its clients refuse to connect until it ages out", .{ principal, subject, @errorName(err) });
+    }
+
+    /// §10jj, the boot side of `liftRevoked`: a principal re-mapped while this bridge was
+    /// down has its INSERT in WAL the bridge may never replay as a first membership (the
+    /// boot backfill loads the roster first). One STREAM.INFO lists every stored ban;
+    /// each one whose principal holds a membership now is lifted. Bans are few — one per
+    /// revoked principal inside the max-age — so this is one request plus a purge each.
+    fn liftStaleBans(self: *EventProcessor, arena: std.mem.Allocator) usize {
+        const publ = self.publisher orelse return 0;
+        const js = if (publ.js) |*j| j else return 0;
+        const api = js.apiSubject(arena, "STREAM.INFO.{s}", .{self.topology.stream_verdicts}) catch return 0;
+        const body = std.fmt.allocPrint(arena, "{{\"subjects_filter\":\"{s}.*.revoked\"}}", .{self.topology.mutation_ack_prefix}) catch return 0;
+        const reply = js.nc.request(api, body, js.opts.request_timeout) catch |err| {
+            log.warn("⛔ could not list stored bans on {s} ({s}) — a principal re-mapped while this bridge was down stays banned until the ban ages out", .{ self.topology.stream_verdicts, @errorName(err) });
+            return 0;
+        };
+        defer reply.deinit();
+        const Info = struct { state: ?struct { subjects: ?std.json.ArrayHashMap(u64) = null } = null };
+        const info = std.json.parseFromSliceLeaky(Info, arena, reply.data, .{ .ignore_unknown_fields = true }) catch return 0;
+        const subjects = (info.state orelse return 0).subjects orelse return 0;
+        var lifted: usize = 0;
+        const prefix_len = self.topology.mutation_ack_prefix.len + 1;
+        for (subjects.map.keys()) |subj| {
+            if (subj.len <= prefix_len + ".revoked".len) continue;
+            const principal = subj[prefix_len .. subj.len - ".revoked".len];
+            const held = self.roster.get(principal) orelse continue;
+            if (held.items.len == 0) continue;
+            self.liftRevoked(principal);
+            lifted += 1;
+        }
+        return lifted;
     }
 
     fn pruneDroppedTable(self: *EventProcessor, arena: std.mem.Allocator, table: []const u8) void {
@@ -1932,7 +1987,10 @@ pub const EventProcessor = struct {
         wal_end: u64,
     ) !?u32 {
         const row = try rosterRow(arena, rel, tuple_data, self.types) orelse return null;
+        const first = self.rosterLen(row.principal) == 0;
         try self.rosterAdd(row.principal, row.tenant);
+        // §10jj: none → one is a re-grant when the principal was revoked; lift its ban.
+        if (first) self.liftRevoked(row.principal);
         const slot_idx = try self.packRosterSet(arena, row.principal, rel.relation_id, wal_end);
         log.info("✅ tenant mapping published to KV: '{s}' ∋ '{s}' ({d} membership(s))", .{ row.principal, row.tenant, self.rosterLen(row.principal) });
         return slot_idx;
@@ -2127,7 +2185,8 @@ pub const EventProcessor = struct {
             } else |err| log.warn("🧹 tenants bucket unreachable at boot ({s}) — deletions not reconciled", .{@errorName(err)});
         };
 
-        log.info("✅ Boot tenant backfill published to KV for {d} principal(s) ({d} membership row(s)), {d} stale key(s) purged", .{ published, num_rows, stale });
+        const lifted = self.liftStaleBans(arena);
+        log.info("✅ Boot tenant backfill published to KV for {d} principal(s) ({d} membership row(s)), {d} stale key(s) purged, {d} ban(s) lifted", .{ published, num_rows, stale, lifted });
     }
 
     /// §10gz: the DELETING direction of the `$KV.schemas` mirror, which boot never had.

@@ -1,7 +1,8 @@
 {
   "streams": {
     "cdc": "CDC",
-    "mutations": "MUTATIONS"
+    "mutations": "MUTATIONS",
+    "verdicts": "VERDICTS"
   },
   "open_tenant": "_default",
   "cdc_streams": {

@@ -133,6 +133,7 @@ if [ "$FRESH_NATS" = "1" ]; then
 
   CDC_PREFIX=$(jq -r '.subjects.cdc_prefix' "$ROOT/src/grammar.json")
   MUTATIONS_STREAM=$(jq -r '.streams.mutations' "$ROOT/src/grammar.json")
+  VERDICTS_STREAM=$(jq -r '.streams.verdicts' "$ROOT/src/grammar.json")
   MUTATIONS_PREFIX=$(jq -r '.subjects.mutations_prefix' "$ROOT/src/grammar.json")
   MUTATION_ERROR_PREFIX=$(jq -r '.subjects.mutation_error_prefix' "$ROOT/src/grammar.json")
   MUTATION_ACK_PREFIX=$(jq -r '.subjects.mutation_ack_prefix' "$ROOT/src/grammar.json")
@@ -152,14 +153,25 @@ if [ "$FRESH_NATS" = "1" ]; then
   # policy a flood evicted the oldest: honest queued writes, stored verdicts, dead
   # letters. Workqueue retention deletes a mutation once the bridge acks it, so the
   # cap counts what is QUEUED; with `limits` it would count every write of the last
-  # max-age, a quota per two hours. Verdicts and dead letters have no consumer and
-  # stay until max-age, as before. The bridge declares its rate on /status; zbdoctor
-  # checks the two against each other.
+  # max-age, a quota per two hours. Dead letters have no consumer and stay until
+  # max-age. The bridge declares its rate on /status; zbdoctor checks the two against
+  # each other.
   MUTATION_BACKLOG_PER_PRINCIPAL="${MUTATION_BACKLOG_PER_PRINCIPAL:-5000}"
   nats --server "$NATS_URL" --nkey "$SEED" stream add "$MUTATIONS_STREAM" \
-    --subjects="$MUTATIONS_PREFIX.>,$MUTATION_ERROR_PREFIX.>,$MUTATION_ACK_PREFIX.>" \
+    --subjects="$MUTATIONS_PREFIX.>,$MUTATION_ERROR_PREFIX.>" \
     --storage=file --retention=work --max-age=2h --max-bytes=1G --replicas=1 \
     --discard=new --max-msgs-per-subject="$MUTATION_BACKLOG_PER_PRINCIPAL" --discard-per-subject --defaults >/dev/null
+  # Verdicts (mutation_ack.<principal>.<msg_id>, and the ban mutation_ack.<p>.revoked)
+  # live in their OWN stream. In MUTATIONS they filled the 1 GiB that incoming writes
+  # need: ~193 B each, so ~4.6 min of 20k writes/s, and then `discard new` refused
+  # every write until verdicts aged out (NOTES §10jj). Here `discard old` is right: a
+  # verdict pushed out early costs a client that was offline that long one replay,
+  # which the ingress judges idempotently. One message per subject: a msg_id is judged
+  # once, and a new ban replaces the old one.
+  nats --server "$NATS_URL" --nkey "$SEED" stream add "$VERDICTS_STREAM" \
+    --subjects="$MUTATION_ACK_PREFIX.>" \
+    --storage=file --retention=limits --max-age=2h --max-bytes=1G --replicas=1 \
+    --discard=old --max-msgs-per-subject=1 --allow-direct --defaults >/dev/null
   # 2h, not days: a mutation is consumed within seconds, and its verdict is kept only for
   # a client that went offline between the send and the reply — on reconnect it collects
   # the verdict, or, past this window, REPLAYS the write, which the ingress judges

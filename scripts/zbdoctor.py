@@ -72,6 +72,8 @@ KV_SCHEMAS = GRAMMAR.get("kv", {}).get("schemas", "schemas")
 KV_TENANTS = GRAMMAR.get("kv", {}).get("tenants", "tenants")
 KV_GENERATIONS = GRAMMAR.get("generations", {}).get("kv", "generations")
 MUTATIONS = GRAMMAR.get("streams", {}).get("mutations", "MUTATIONS")
+VERDICTS = GRAMMAR.get("streams", {}).get("verdicts", "VERDICTS")
+ACK_PREFIX = GRAMMAR.get("subjects", {}).get("mutation_ack_prefix", "mutation_ack")
 GEN_PREFIX = GRAMMAR.get("generations", {}).get("bucket_prefix", "gen-")
 
 BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://127.0.0.1:9090").rstrip("/")
@@ -451,7 +453,7 @@ def gate_nats(tenants: list[str]) -> set[str]:
             cap = int(cfg.get("max_msgs_per_subject") or -1)
             per_subject = bool(cfg.get("discard_new_per_subject"))
             if cfg.get("discard") != "new":
-                red("C", f"{MUTATIONS} discards OLD messages when full: a flood evicts honest queued writes, stored verdicts and dead letters",
+                red("C", f"{MUTATIONS} discards OLD messages when full: a flood evicts honest queued writes and dead letters",
                     "scripts/native/up.sh creates it with --discard=new; `nats stream edit` an existing one")
             if cap <= 0 or not per_subject:
                 red("C", f"{MUTATIONS} has no per-principal backlog cap (max_msgs_per_subject {cap}, discard-per-subject {per_subject})",
@@ -467,6 +469,25 @@ def gate_nats(tenants: list[str]) -> set[str]:
                     pass
                 worst = f", a full backlog drains in {cap // rate} s at the bridge's {rate}/s" if rate else " (the bridge declares no rate limit: MUTATION_RATE_PER_PRINCIPAL is off)"
                 ok(f"{MUTATIONS}: discard new, {cap} queued write(s) per principal and verb{worst}")
+            if f"{ACK_PREFIX}.>" in (cfg.get("subjects") or []):
+                red("C", f"{MUTATIONS} still stores verdicts ({ACK_PREFIX}.>): they fill the space writes need, and `discard new` then refuses every write",
+                    f"NOTES §10jj: `nats stream edit {MUTATIONS} --subjects=...` without {ACK_PREFIX}.>, then create {VERDICTS} (scripts/native/up.sh)")
+
+    # §10jj: verdicts and the revocation ban in their own stream, discard OLD.
+    if VERDICTS not in streams:
+        red("C", f"{VERDICTS} stream is missing: stored verdicts and the ban are not kept",
+            "scripts/native/up.sh / nats-init create it; a client offline at its verdict replays instead, and a revoked principal is not told on reconnect")
+    else:
+        r = nats("stream", "info", VERDICTS, "--json")
+        try:
+            vcfg = json.loads(r.stdout)["config"] if r.returncode == 0 else {}
+        except Exception:  # noqa: BLE001
+            vcfg = {}
+        if vcfg and vcfg.get("discard") != "old":
+            amber("C", f"{VERDICTS} discards NEW when full: a burst of verdicts then drops the newest, and the ban with them",
+                  f"`nats stream edit {VERDICTS} --discard=old`")
+        elif vcfg:
+            ok(f"{VERDICTS}: discard old, {int(vcfg.get('max_bytes') or -1) // (1 << 20)} MiB, {int(vcfg.get('max_age', 0)) // 60_000_000_000} min")
 
     # Retired by §10p — present means an old deployment was upgraded in place.
     retired = sorted(s for s in streams if s.startswith("INIT_") or s in ("INIT", "REQUESTS", "KV_snapshots"))

@@ -34,12 +34,12 @@ echo "service signing key: $SK_SERVICE"
 
 # ── the CLIENT signing key: the WHOLE per-principal grant block, ONCE ────────
 #
-# `DIRECT.GET.MUTATIONS.mutation_ack.{{name()}}.>` is what lets a client collect the
+# `DIRECT.GET.VERDICTS.mutation_ack.{{name()}}.>` is what lets a client collect the
 # verdicts it MISSED while offline (PROTOCOL §7.4b): the outbox knows every msg_id it
 # awaits and a verdict is one message on `mutation_ack.<principal>.<msg_id>`, so a
 # per-key direct get answers "was this judged?" — scoped to the principal's own
 # replies, no consumer state, the same exact-key form as `$KV.tenants`. A consumer
-# on MUTATIONS is NOT granted: MSG.NEXT cannot be scoped below the stream, so one
+# on VERDICTS is NOT granted: MSG.NEXT cannot be scoped below the stream, so one
 # principal could pull another's verdicts by guessing a consumer name.
 SK_CLIENT=$(nsc edit account ZEBRIDGE --sk generate 2>&1 | grep -o 'A[A-Z0-9]\{55\}' | tail -1)
 nsc edit signing-key --account ZEBRIDGE --sk "$SK_CLIENT" --role client \
@@ -103,7 +103,7 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_CLIENT" --role client \
     --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.OBJ_res-{{tag(tenant)}}.>" \
     --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.OBJ_res-_default.>" \
     --allow-pub "\$JS.ACK.>" \
-    --allow-pub "\$JS.API.DIRECT.GET.MUTATIONS.mutation_ack.{{name()}}.>" \
+    --allow-pub "\$JS.API.DIRECT.GET.VERDICTS.mutation_ack.{{name()}}.>" \
     --allow-pub "query.{{tag(tenant)}}.>" \
     --allow-pub "query._default.>" \
     --allow-sub "mutation_ack.{{name()}}.>" \
@@ -182,7 +182,7 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_RESPONDER" --role responder \
     --allow-pub "\$O.res-{{tag(tenant)}}.>" \
     --allow-pub "\$O.res-_default.>" \
     --allow-pub "\$JS.ACK.>" \
-    --allow-pub "\$JS.API.DIRECT.GET.MUTATIONS.mutation_ack.{{name()}}.>" \
+    --allow-pub "\$JS.API.DIRECT.GET.VERDICTS.mutation_ack.{{name()}}.>" \
     --allow-pub "_INBOX.>" \
     --allow-sub "query.{{tag(tenant)}}.>" \
     --allow-sub "query._default.>" \
