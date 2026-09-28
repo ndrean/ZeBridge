@@ -8,6 +8,7 @@ const utils = @import("utils.zig");
 const pg_conn = @import("pg_conn.zig");
 const metrics_mod = @import("metrics.zig");
 const Conf = @import("config.zig");
+const pg_health = @import("pg_health.zig");
 
 pub const log = std.log.scoped(.wal_monitor);
 
@@ -20,6 +21,12 @@ pub const WalConfig = struct {
     /// WAL, on a cadence of minutes. `slots` null = the inventory is off.
     slot_inventory_seconds: u32 = @intCast(Conf.WalMonitor.default_slot_inventory_seconds),
     slots: ?*SlotRegistry = null,
+    /// §10ji: PostgreSQL as the bridge sees it (its chain, catalogue, tenants, invites; the
+    /// server's connections, oldest transaction, published tables), every `health_seconds`.
+    health: ?*pg_health.HealthRegistry = null,
+    health_seconds: u32 = 60,
+    writer_role: ?[]const u8 = null,
+    publication: []const u8 = "",
 };
 
 /// Every replication slot the reader's server holds, as of the last inventory (§10db).
@@ -158,6 +165,8 @@ pub const WalMonitor = struct {
         // this loop starts before the WAL stream has attached, and an inventory taken
         // then would show our own slot inactive for a whole interval.
         var since_inventory: u32 = 0;
+        // §10ji: the health pass on its own clock too; its first one after a minute.
+        var since_health: u32 = 0;
         while (!self.should_stop.load(.seq_cst)) {
             // Check WAL lag
             checkWalLag(
@@ -177,6 +186,13 @@ pub const WalMonitor = struct {
                 utils.sleep(1 * std.time.ns_per_s);
                 remaining_seconds -= 1;
                 since_inventory += 1;
+                since_health += 1;
+                if (self.config.health) |h| if (since_health >= self.config.health_seconds) {
+                    since_health = 0;
+                    pg_health.poll(h, self.config.pg_config, self.allocator, self.config.writer_role, self.config.publication) catch |err| {
+                        log.warn("⚠️ PostgreSQL health pass failed: {} — the previous snapshot stands", .{err});
+                    };
+                };
                 if (self.config.slots != null and since_inventory >= self.config.slot_inventory_seconds) {
                     since_inventory = 0;
                     checkSlotInventory(self.config, self.allocator) catch |err| {

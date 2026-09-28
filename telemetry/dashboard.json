@@ -229,9 +229,8 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "jetstream_stream_total_bytes{stream=\"CDC\"} / 1024 / 1024 or vector(0)",
-          "legendFormat": "CDC Stream MB",
-          "range": false,
+          "expr": "bridge_cdc_stream_bytes / 1024 / 1024",
+          "legendFormat": "{{stream}}",
           "refId": "A"
         }
       ],
@@ -260,7 +259,8 @@
           }
         },
         "overrides": []
-      }
+      },
+      "description": "From the bridge's own /metrics (the stream sizes it reads for the CDC window, and the fleet's heartbeats) — no NATS exporter needed."
     },
     {
       "collapsed": false,
@@ -342,19 +342,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "jetstream_stream_total_bytes{stream=\"CDC\"}",
-          "legendFormat": "NATS CDC Stream Bytes",
+          "expr": "sum(bridge_cdc_stream_bytes)",
+          "legendFormat": "CDC streams in NATS (all tenants)",
           "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "jetstream_stream_total_bytes{stream=\"INIT\"}",
-          "legendFormat": "NATS INIT Stream Bytes",
-          "refId": "C"
         }
       ],
       "fieldConfig": {
@@ -367,7 +357,8 @@
           "unit": "decbytes"
         },
         "overrides": []
-      }
+      },
+      "description": "PostgreSQL's retained WAL for the slot against what the CDC streams hold in NATS — both from the bridge's own /metrics."
     },
     {
       "collapsed": false,
@@ -378,7 +369,7 @@
         "y": 12
       },
       "id": 7,
-      "title": "NATS Consumer Lag / Pending Messages",
+      "title": "Clients' lag per CDC stream (events)",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -391,8 +382,8 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "jetstream_consumer_num_pending",
-          "legendFormat": "Consumer {{consumer}} (Stream {{stream}})",
+          "expr": "sum by (stream) (bridge_fleet_client_lag_events)",
+          "legendFormat": "{{stream}}",
           "refId": "A"
         }
       ],
@@ -406,7 +397,8 @@
           "unit": "short"
         },
         "overrides": []
-      }
+      },
+      "description": "From the bridge's own /metrics (the stream sizes it reads for the CDC window, and the fleet's heartbeats) — no NATS exporter needed."
     },
     {
       "collapsed": false,
@@ -517,8 +509,8 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "jetstream_stream_total_messages",
-          "legendFormat": "Stream {{stream}} Messages",
+          "expr": "bridge_cdc_stream_messages",
+          "legendFormat": "{{stream}}",
           "refId": "A"
         }
       ],
@@ -531,7 +523,8 @@
           "unit": "short"
         },
         "overrides": []
-      }
+      },
+      "description": "From the bridge's own /metrics (the stream sizes it reads for the CDC window, and the fleet's heartbeats) — no NATS exporter needed."
     },
     {
       "collapsed": false,
@@ -548,7 +541,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Process CPU across all threads. 1.0 = one core saturated. The WAL reader is single-threaded, so sustained 1.0 means it IS the bottleneck \u2014 that is what a quadratic PQconsumeInput looked like.",
+      "description": "Process CPU across all threads. 1.0 = one core saturated. The WAL reader is single-threaded, so sustained 1.0 means it IS the bottleneck — that is what a quadratic PQconsumeInput looked like.",
       "targets": [
         {
           "datasource": {
@@ -606,7 +599,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Two different questions. UNCONFIRMED (from confirmed_flush_lsn) is the bridge's backlog and moves on every ACK \u2014 alert on this one for 'the bridge is stuck'. RETAINED (from restart_lsn) is what PostgreSQL keeps on disk and only advances at checkpoints, so it plateaus even when the bridge is fully caught up.",
+      "description": "Two different questions. UNCONFIRMED (from confirmed_flush_lsn) is the bridge's backlog and moves on every ACK — alert on this one for 'the bridge is stuck'. RETAINED (from restart_lsn) is what PostgreSQL keeps on disk and only advances at checkpoints, so it plateaus even when the bridge is fully caught up.",
       "targets": [
         {
           "datasource": {
@@ -743,6 +736,675 @@
         },
         "overrides": []
       }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 36
+      },
+      "id": 15,
+      "title": "Clients",
+      "type": "row",
+      "panels": []
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 37
+      },
+      "id": 16,
+      "title": "Live clients per tenant",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_fleet_clients_live",
+          "legendFormat": "{{tenant}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "Clients whose heartbeat is inside the live bucket's TTL."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 37
+      },
+      "id": 17,
+      "title": "Client lag (events behind, per client and stream)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_fleet_client_lag_events",
+          "legendFormat": "{{tenant}}/{{principal}} {{stream}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 44
+      },
+      "id": 18,
+      "title": "Client last seen (seconds ago)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_fleet_client_last_seen_seconds",
+          "legendFormat": "{{tenant}}/{{principal}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 44
+      },
+      "id": 19,
+      "title": "CDC stream window (seconds of history kept)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_cdc_window_seconds",
+          "legendFormat": "{{stream}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_cdc_window_short",
+          "legendFormat": "{{stream}} too short",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "description": "How far back each CDC stream reaches. -1: the stream is empty. 'too short' = 1 when the window is under two generation cadences: a client away that long re-seeds from the chain."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 51
+      },
+      "id": 20,
+      "title": "Write path",
+      "type": "row",
+      "panels": []
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 52
+      },
+      "id": 21,
+      "title": "Write verdicts per second, by status",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (status) (rate(bridge_mutation_verdicts_total[1m]))",
+          "legendFormat": "{{status}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "Every verdict the bridge publishes on mutation_ack.<principal>.<msg_id>. accepted = written; stale = an older version lost; row_deleted = updated a deleted row; rejected = refused for good; failed = could not be applied (includes the rate limit)."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 52
+      },
+      "id": 22,
+      "title": "Writes refused by the rate limit (per second)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(bridge_mutation_rate_limited_total[1m])",
+          "legendFormat": "refused",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "MUTATION_RATE_PER_PRINCIPAL at work; 0 when the limit is off."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 59
+      },
+      "id": 23,
+      "title": "Chain",
+      "type": "row",
+      "panels": []
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 60
+      },
+      "id": 24,
+      "title": "Chain: age of the last cut, per table",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "time() - bridge_chain_last_cut_timestamp_seconds",
+          "legendFormat": "{{tenant}}/{{table}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "Seconds since each table's latest live generation was built. It grows only when the table is quiet; a busy table whose age keeps growing means the producer is stuck."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 60
+      },
+      "id": 25,
+      "title": "Chain: live generations per table",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_chain_live_generations",
+          "legendFormat": "{{tenant}}/{{table}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "Generations not yet retired: what a returning client can walk instead of re-seeding."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 67
+      },
+      "id": 26,
+      "title": "PostgreSQL",
+      "type": "row",
+      "panels": []
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 68
+      },
+      "id": 27,
+      "title": "Connections per bridge role vs its limit",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_pg_role_connections",
+          "legendFormat": "{{role}} open",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_pg_role_connection_limit",
+          "legendFormat": "{{role}} limit",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "The writer role needs ZB_INGRESS_LANES + 1 (sweeper) + 4 (enrollments) under its CONNECTION LIMIT."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 68
+      },
+      "id": 28,
+      "title": "Oldest open transaction (seconds)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_pg_oldest_xact_age_seconds",
+          "legendFormat": "oldest",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "A long-open transaction elsewhere holds back the replication slot's progress and vacuum. 0 = none."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 68
+      },
+      "id": 29,
+      "title": "Server connections vs max_connections",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_pg_client_connections",
+          "legendFormat": "client sessions",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_pg_max_connections",
+          "legendFormat": "max_connections",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 75
+      },
+      "id": 30,
+      "title": "Published tables: size (top 10)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "topk(10, bridge_pg_table_bytes)",
+          "legendFormat": "{{table}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 75
+      },
+      "id": 31,
+      "title": "Published tables: dead rows (top 10)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "topk(10, bridge_pg_table_dead_rows)",
+          "legendFormat": "{{table}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "Rows awaiting vacuum: tombstoned rows the sweeper has reaped land here until autovacuum passes."
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 82
+      },
+      "id": 32,
+      "title": "Catalogue, principals and invites",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_catalogue_tables{kind=\"all\"}",
+          "legendFormat": "published tables",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_catalogue_tables{kind=\"tenant_scoped\"}",
+          "legendFormat": "tenant-scoped",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_principals",
+          "legendFormat": "principals",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_tenants",
+          "legendFormat": "tenants",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "bridge_invites{state=\"pending\"}",
+          "legendFormat": "pending invites",
+          "refId": "E"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      }
     }
   ],
   "refresh": "5s",
@@ -763,5 +1425,5 @@
   "timezone": "browser",
   "title": "ZeBridge - Postgres CDC to NATS",
   "uid": "zebridge-overview",
-  "version": 3
+  "version": 4
 }

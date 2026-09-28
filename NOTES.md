@@ -17198,3 +17198,32 @@ live hole path — the chain heals it: deltas if the table changed, nothing if i
 batches, 1,381,000 rows exact, 110 lost deliveries and 107 recreations in one process
 (past the old 50), lag 39 s p50 during the load then converged. That run never fell
 behind the window, so the pruned-range fix is proven by the fixtures, not yet end to end.
+
+## §10ji — telemetry from what the bridge owns: the chain, verdicts, PostgreSQL's health (2026-09-28)
+
+/metrics exported the bridge's own activity, the slots and the fleet, but nothing from the
+PostgreSQL data the bridge owns, no health of PostgreSQL itself, and the dashboard had fallen
+behind (no panel for the fleet, slots, CDC window, ingress; three NATS panels on exporter
+metrics the native stack does not run, one querying a `CDC` stream renamed long ago).
+
+* `src/pg_health.zig`: one pass every 60 s on the reader connection, seven independent
+  queries, snapshot-swapped like the slot inventory; a query the reader cannot run leaves
+  its section out. The chain per tenant and table (latest live generation, when it was
+  built, live generations, rows), the catalogue (tables, tenant-scoped, public, with
+  generations), principals and tenants, invites by state, connections per bridge role
+  against its CONNECTION LIMIT, server sessions against max_connections, the oldest open
+  transaction (`zebridge_oldest_open_xact()`, which existed and was never exported), and
+  each published table's size, live and dead rows. All as the reader: no new grant.
+* `src/verdict_stats.zig`: `bridge_mutation_verdicts_total{status}` and
+  `bridge_mutation_rate_limited_total`, counted where every verdict passes
+  (`publishVerdictExtra`); process-wide atomics, nothing threaded through the listener.
+* One catch, fixed: `pg_stat_activity` hides other roles' `backend_type` from the reader,
+  so the first count of client sessions read 1 with three bridge connections open; it now
+  counts sessions with a user whose type is `client backend` or hidden (3, close estimate).
+* telemetry/dashboard.json: the NATS panels read the bridge's own `bridge_cdc_stream_*`
+  and fleet lag (no exporter), plus four rows — clients, write path, chain, PostgreSQL —
+  32 panels. OBSERVABILITY_TELEMETRY.md: the two new families, four alert rows, a
+  Dashboard section.
+
+Checked live: 2,500 sensor writes → `accepted 2500`; 31 catalogue tables, 8 principals, 4
+tenants, 63 chain series; writer 1 of 20 connections, reader 2 of 10.

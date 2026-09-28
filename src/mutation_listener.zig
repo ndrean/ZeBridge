@@ -3,6 +3,7 @@ const nats = @import("nats");
 const nats_endpoint = @import("nats_endpoint.zig");
 const Topology = @import("topology.zig");
 const CatalogEpoch = @import("catalog_epoch.zig").CatalogEpoch;
+const verdict_stats = @import("verdict_stats.zig");
 const log = std.log.scoped(.mutation_listener);
 const config = @import("config.zig");
 const pg_conn = @import("pg_conn.zig");
@@ -894,6 +895,8 @@ pub const MutationListener = struct {
         reason: []const u8,
         extra: []const u8,
     ) void {
+        // Counted first: a verdict nobody can address still happened (§10ji).
+        verdict_stats.record(status, reason);
         const msg_id = msgIdOf(msg) orelse {
             log.debug("no Nats-Msg-Id on this mutation; no verdict addressable", .{});
             return;

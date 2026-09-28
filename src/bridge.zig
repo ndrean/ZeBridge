@@ -12,6 +12,7 @@ const replication_setup = @import("replication_setup.zig");
 const msgpack = @import("msgpack");
 const http_server = @import("http_server.zig");
 const metrics_mod = @import("metrics.zig");
+const pg_health = @import("pg_health.zig");
 const wal_monitor = @import("wal_monitor.zig");
 const fleet_monitor = @import("fleet_monitor.zig");
 const pg_conn = @import("pg_conn.zig");
@@ -1165,6 +1166,13 @@ pub fn main(init: std.process.Init) !void {
     wal_mon.config.slots = &slot_registry;
     wal_mon.config.slot_inventory_seconds = @intCast(runtime_config.slot_inventory_seconds);
     http_srv.slots = &slot_registry;
+    // §10ji: PostgreSQL health and the data the bridge owns (chain, catalogue, tenants).
+    var health_registry = pg_health.HealthRegistry.init(allocator);
+    defer health_registry.deinit();
+    wal_mon.config.health = &health_registry;
+    wal_mon.config.writer_role = writer_role;
+    wal_mon.config.publication = parsed_args.publication_name;
+    http_srv.health = &health_registry;
     wal_mon.pg_shutting_down = &pg_shutting_down;
     try wal_mon.start();
     defer wal_mon.join();

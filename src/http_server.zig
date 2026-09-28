@@ -6,6 +6,8 @@ const c = @import("c_imports.zig").c;
 const nats = @import("nats");
 const refused_tables = @import("refused_tables.zig");
 const rate_limit = @import("rate_limit.zig");
+const pg_health = @import("pg_health.zig");
+const verdict_stats = @import("verdict_stats.zig");
 const wal_monitor = @import("wal_monitor.zig");
 const fleet_monitor = @import("fleet_monitor.zig");
 const utils = @import("utils.zig");
@@ -54,6 +56,8 @@ pub const Server = struct {
     limiter: ?*const rate_limit.Limiter = null,
     /// §10db / §10dc: snapshot registries other threads swap whole; rendered as-is.
     slots: ?*wal_monitor.SlotRegistry = null,
+    /// §10ji: PostgreSQL health and the bridge-owned data, for /metrics.
+    health: ?*pg_health.HealthRegistry = null,
     fleet: ?*fleet_monitor.Registry = null,
     /// Enrollment/mint context (NOTES: the JWT mint flow). Set after construction
     /// like nats_publisher; null leaves /enroll answering 404 — the bridge is only
@@ -738,6 +742,8 @@ pub const Server = struct {
             if (self.slots) |s| try s.writePrometheus(&w);
             if (self.fleet) |f| try f.writePrometheus(&w);
             if (self.limiter) |l| try writeIngressPrometheus(&w, l);
+            if (self.health) |h| try h.writePrometheus(&w);
+            try verdict_stats.writePrometheus(&w);
 
             try respond(req, .ok, "text/plain", buf[0 .. body.len + w.buffered().len]);
         } else {

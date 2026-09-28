@@ -6,7 +6,7 @@ The bridge provides telemetry through multiple channels:
 flowchart LR
     PG[PG]
     B[ZB] -->|GET /metrics<br/>Prometheus format| Prometheus
-    PG-->|public.zebridge <br>catalgoue|B
+    PG-->|zebridge_* tables<br>health, every 60 s|B
     B -->|stderr<br/>Structured logfmt| Alloy/Loki
     B -->|GET <br>/health <br>/status| client
 ```
@@ -53,12 +53,11 @@ Both are served by a thread that keeps answering through every outage below — 
 
 _Prometheus physically cannot hold the table name or the fix. Loki can, but is poor at counting and alerting on rates_.
 
-Data emitted by ZeBridge are self-reflection, or owned by ZeBridge (public.zebridge_catalogue in Postgres).
+Data emitted by ZeBridge are self-reflection, or read from what ZeBridge owns and depends on:
 
-Two exceptions:
-
-- the consumer fleet count signaling themselves via NATS, a small complement to the NATS-exporter data connected to the NATS server, scraped by Prometheus,
-- the number of slots on the owned publication (for left-overs: Postgres will keep retaining all the WAL data generated beyond the possibly abandoned slot point). The same inventory from a shell: `bridge --view-slots`; the cure: `bridge --drop-slot <slot>` (README, [CLI](README.md#cli)).
+- its own tables in PostgreSQL — the chain (`zebridge_generations`), the catalogue, the tenant mappings, the invites — and the server's health as it bears on the bridge: connections per bridge role against their limits, the oldest open transaction, the size and dead rows of every published table. One pass every 60 s on the reader connection,
+- the consumer fleet signaling itself via NATS heartbeats, and the CDC streams' state, read by the fleet poll — so the dashboard needs no NATS exporter,
+- every replication slot on the server (for left-overs: Postgres will keep retaining all the WAL data generated beyond the possibly abandoned slot point). The same inventory from a shell: `bridge --view-slots`; the cure: `bridge --drop-slot <slot>` (README, [CLI](README.md#cli)).
 
 ---
 
@@ -114,12 +113,35 @@ bridge_cdc_window_short{stream="CDC_PUBLIC"} 0
 bridge_cdc_window_short{stream="CDC_kilo"} 1
 bridge_cdc_stream_bytes{stream="CDC_kilo"} 806320080
 bridge_cdc_stream_messages{stream="CDC_kilo"} 1236512
+bridge_mutation_verdicts_total{status="accepted"} 2500
+bridge_mutation_verdicts_total{status="stale"} 0
+bridge_mutation_verdicts_total{status="rejected"} 0
+bridge_mutation_verdicts_total{status="failed"} 0
+bridge_mutation_rate_limited_total 0
+bridge_pg_health_timestamp_seconds 1790587746
+bridge_chain_generation{tenant="globex",table="sensor_events"} 2
+bridge_chain_last_cut_timestamp_seconds{tenant="globex",table="sensor_events"} 1790587996
+bridge_chain_live_generations{tenant="globex",table="sensor_events"} 2
+bridge_chain_rows{tenant="globex",table="sensor_events"} 2500
+bridge_catalogue_tables{kind="all"} 31
+bridge_catalogue_tables{kind="tenant_scoped"} 21
+bridge_principals 8
+bridge_tenants 4
+bridge_tenant_principals{tenant="globex"} 4
+bridge_invites{state="pending"} 0
+bridge_pg_role_connections{role="bridge_writer"} 1
+bridge_pg_role_connection_limit{role="bridge_writer"} 20
+bridge_pg_client_connections 3
+bridge_pg_max_connections 100
+bridge_pg_oldest_xact_age_seconds 0
+bridge_pg_table_bytes{table="sensor_events"} 1622016
+bridge_pg_table_dead_rows{table="sensor_events"} 0
 ```
 
 </details>
 <br>
 
-Four families come from the bridge's own schedules or from events it intercepts, not from the WAL loop (NOTES §10dc, §10eg):
+Six families come from the bridge's own schedules or from events it intercepts, not from the WAL loop (NOTES §10dc, §10eg, §10ji):
 
 | family | source | cadence | what to read |
 | --- | --- | --- | --- |
@@ -127,6 +149,8 @@ Four families come from the bridge's own schedules or from events it intercepts,
 | `bridge_replication_slot_*` | `pg_replication_slots` on the reader's server — every slot, this bridge's marked `self="true"` | every `SLOT_INVENTORY_SECONDS` (300); the first pass lands one interval after boot | an inactive slot whose retained WAL climbs is an abandoned instance holding the disk; `bridge_replication_slots` is the count |
 | `bridge_cdc_window_*`, `bridge_cdc_stream_*` | each CDC stream's state, read by the same fleet poll | every `FLEET_POLL_SECONDS` | the window a stream really holds (now minus its oldest event, `-1` when empty) against the two-cadence floor the chain needs; `short = 1` means the stream is pruning under that floor, so a size or message valve, not the age, is ending the window — see README, [Catching up](README.md#catching-up-the-chain-and-the-stream) |
 | `bridge_gc_*` | the sweeper's `zebridge_gc_watermark` writes, seen on the WAL | at every sweep | rows reaped and when, counted since this bridge started (`0` until the first sweep it sees) |
+| `bridge_chain_*`, `bridge_catalogue_tables`, `bridge_principals`, `bridge_tenants`, `bridge_invites`, `bridge_pg_*` | the bridge's own tables and the server's catalog views, read as the reader role: `zebridge_generations` (live generations per tenant and table), `zebridge_catalogue`, `zebridge_user_tenants`, `zebridge_invites`, `pg_stat_activity` with `pg_roles`, `zebridge_oldest_open_xact()`, `pg_publication_tables` with `pg_stat_user_tables` | every 60 s, one connection per pass; a query the reader may not run leaves its section out and the rest stand | the chain's age per table (`time() - bridge_chain_last_cut_timestamp_seconds`); the bridge roles' connections against their limits; the oldest open transaction; each published table's size and dead rows. `bridge_pg_client_connections` is a close estimate: other roles' session types are hidden from the reader |
+| `bridge_mutation_verdicts_total{status}`, `bridge_mutation_rate_limited_total` | every verdict the mutation listener publishes, counted in process | at each verdict | `accepted`, `stale`, `row_deleted`, `rejected`, `failed` since this bridge started; the rate-limit refusals, also counted in `failed`, on their own |
 
 The four worth alerting on:
 
@@ -143,6 +167,10 @@ The four worth alerting on:
 | `bridge_ingress_rate_limited_total` | `increase()` for minutes | a principal is living at its write ceiling (`MUTATION_RATE_PER_PRINCIPAL`, §10fk); its writes are still served, at the rate, and the log line names it. Minutes of it from one principal is the evidence a revocation is made on. `bridge_ingress_rate_per_principal` and `_burst` are the knobs as the bridge runs them, 0 when the limit is off |
 | `bridge_wal_lag_bytes` | large and growing across checkpoints | WAL PostgreSQL is _retaining_ on disk for the slot, until `max_slot_wal_keep_size` |
 | `bridge_connected` | `== 0` | the replication stream is down |
+| `bridge_mutation_verdicts_total{status="rejected"}` or `{status="failed"}` | `rate() > 0` for minutes | edge writes are being refused or failing; the bridge's log names the table and the reason. `stale` is normal under concurrent writers |
+| `bridge_pg_role_connections{role}` against `bridge_pg_role_connection_limit{role}` | within 2 of the limit | the writer role must hold `ZB_INGRESS_LANES` + 1 (sweeper) + 4 (enrollments): a role at its limit refuses the next enrollment or lane |
+| `bridge_pg_oldest_xact_age_seconds` | `> 600` | a transaction open for minutes elsewhere holds back vacuum and the slot's progress; find it in `pg_stat_activity` |
+| `time() - bridge_chain_last_cut_timestamp_seconds{tenant,table}` | growing for a table that is being written | the generation producer is not cutting that table: a returning client will not find a recent chain. A QUIET table's age growing is normal |
 
 💡 **How do you read the lag**? The two lag metrics are not the same.
 
@@ -160,6 +188,10 @@ The four worth alerting on:
 The same figure appears _in the log_ as `cpu=31%` on each `LOOP` line, which beats trying to isolate one process in `htop`.
 - `rate(bridge_nats_publish_ack_seconds_total[1m]) / rate(bridge_nats_publishes_total[1m])` is the mean time a JetStream publish waits for its PubAck — the NATS side of "who is slow" when `bridge_queue_usage_percent` climbs.
 - `bridge_max_rss_bytes` is peak RSS: expect it to sit near `2^BASE_BUF × RING_BUFFER_COUNT` plus metadata, since the slab is pre-allocated at startup.
+
+### Dashboard
+
+`telemetry/dashboard.json` (Grafana) reads only the bridge's `/metrics`, so it works on the native stack without the NATS exporter. Its rows: the bridge and the WAL (status, lags, throughput, queue, CPU, memory, suspended tables); the CDC streams (bytes and messages per stream, the window each holds); the clients (live per tenant, lag per client and stream, last seen); the write path (verdicts per second by status, rate-limit refusals); the chain (age of the last cut and live generations per table); PostgreSQL (connections per bridge role against its limit, the oldest open transaction, server connections against `max_connections`, the ten largest published tables and their dead rows, and a line of counts: tables, principals, tenants, pending invites).
 
 **Configure Prometheus to scrape this endpoint**:
 
