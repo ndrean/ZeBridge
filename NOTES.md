@@ -17151,3 +17151,25 @@ never sees a half-uploaded compacted file, and the registry moves after Complete
 URLs still apply, one per part number. The ~10 s rolling files (hundreds of KB at
 1,000 readings/s) stay single PUTs: below the 5 MiB minimum part. (Limits from the S3 API
 as known, not re-checked against current R2 docs.)
+
+## §10jh — the slow link: pf cannot shape it on a Mac, a proxy can, and a follower that stops (2026-09-28)
+
+**pf/dummynet does not see a Mac's traffic to its own LAN address.** slowlink.sh loaded its
+rules (confirmed by `status`: both rules, both pipes, pf enabled) yet the pipes showed
+"0 queues": `-vvs` counted 16,053 evaluations of the `on lo0` rule — the 127.0.0.1 traffic —
+and 0 matches; the rule rewritten without `on lo0` and re-applied by the owner still left
+the LAN round trip at 95 µs. So: `scripts/scenarios/slowproxy.py`, a TCP proxy for ONE
+client (`:14222 → :4222`), per-direction delay and bandwidth, and random stalls standing in
+for a lossy link's retransmission timeouts. No root. Measured: 63 ms round trip through it,
+0.4 ms direct. slowlink.sh stays for a real second machine, where pf applies.
+
+**The run: delivery_loss.sh with the follower behind the proxy** (20 Mbit/s, 30 ms each
+way, a 300 ms stall every ~10 s; the load's 20k events/s exceed the link, on purpose).
+The follower lagged 39 s at p50 during the load, fell behind the CDC stream's 15-minute
+window, and then STOPPED: after a routine recreation ("recreating the drain's consumer from
+position 1727826 after a lost delivery") it logged nothing more, alive and idle, while the
+stream now began at 1728850. The harness waited its 900 s and failed the comparison
+(941,000 of 1,271,000 rows). Expected instead: the gap rule (§10ei) seeing that the stream
+no longer holds what follows the position, and a chain re-seed. OPEN: reproduce without the
+link — recreate a consumer at a position the stream has already dropped — and find where it
+waits. The follower's log is kept in the session scratchpad (slowlink-follower.log).
