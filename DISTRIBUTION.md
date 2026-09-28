@@ -32,15 +32,15 @@ library.
 | artifact | targets | SQLite / zstd | PostgreSQL | DuckDB | form | used from |
 | --- | --- | --- | --- | --- | --- | --- |
 | **libzb-ios** | iPhone arm64, simulator arm64 | compiled in | – | – | xcframework (static) | Swift, Flutter (dart:ffi), React Native (Expo module) |
-| **libzb-android** | arm64-v8a, armeabi-v7a, x86_64 | compiled in | – | – | `.so` per CPU | Flutter (dart:ffi); Kotlin/Java through JNI |
+| **libzb-android** | arm64-v8a, armeabi-v7a, x86_64 | compiled in | – | – | AAR (`zb-android`), or a `.so` per CPU | Kotlin/Java (`dev.zebridge.ZeBridge`), Flutter (dart:ffi) |
 | **libzb-desktop** | macOS, Linux, Windows | compiled in | if libpq is installed | if libduckdb is installed | shared library | apps and services: Python (ctypes), Node, Dart, JVM (JNA, FFM), .NET (P/Invoke) |
 
 A phone never has libpq or libduckdb, so on a phone those two engines answer with the
 message above. The desktop library is the same file for an app and for a service; what
 differs is what is installed next to it.
 
-Built today: iOS (both slices), Android arm64-v8a and armeabi-v7a, macOS. Not yet: the
-Android x86_64 emulator slice, Linux and Windows release builds (on Windows the two
+Built today: iOS (both slices), the Android AAR (all three CPUs), macOS. Not yet: Linux
+and Windows release builds (on Windows the two
 optional engines do not load yet), and packaging (see
 [What is missing](#what-is-missing)).
 
@@ -51,10 +51,10 @@ iOS apps link code in, they do not load it at run time. React Native wraps it in
 Expo module (`zb-react-native/scripts/build-ios.sh`); Flutter looks the functions up in
 its own process (`examples/06-large-table/flutter/tool/build-libzb-ios.sh`).
 
-**Android.** One `.so` per CPU in the app's `jniLibs/`. Flutter loads it with dart:ffi
-(`build-libzb-android.sh`). SQLite must be compiled in: Android's own SQLite is not
-reachable from native code (the NDK does not expose it). A Kotlin or Java app needs a
-JNI layer between the JVM and the C functions; see [What is missing](#what-is-missing).
+**Android.** A Kotlin or Java app adds the AAR ([zb-android](zb-android/README.md)): the
+JNI layer, a `ZeBridge` class that owns the client's thread, and `libzb.so` per CPU. Flutter
+loads its own `.so` with dart:ffi (`build-libzb-android.sh`). SQLite is compiled in either
+way: Android's own SQLite is not reachable from native code (the NDK does not expose it).
 
 **Desktop.** A shared library that the host loads at run time. Python uses ctypes,
 Dart uses dart:ffi, a desktop JVM can use JNA or Java 22's FFM (no glue code needed),
@@ -122,6 +122,7 @@ machine that runs the service.
     zb-react-native/scripts/build-ios.sh
     examples/06-large-table/flutter/tool/build-libzb-ios.sh
     examples/06-large-table/flutter/tool/build-libzb-android.sh
+    zb-android/scripts/build.sh        # the AAR
 
 The engines' headers are in `libzb/include-engines/`, so building needs neither DuckDB
 nor PostgreSQL installed.
@@ -133,11 +134,7 @@ connect: rebuild every native client when `grammar.json` changes.
 ## What is missing
 
 - **Windows loading** for the two optional engines (`LoadLibrary`); SQLite works there.
-- **An Android AAR for Kotlin and Java.** The `.so` files, the JNI layer and a small
-  Kotlin class with the same names as zb-client-ts (`connect`, `poll`, `query`,
-  `mutate`, `close`). Today a Kotlin app would write that layer itself, and the library
-  should own it.
-- **The Android x86_64 slice**, for the emulator.
+- **Publishing the AAR** to a Maven repository; today it is built from source.
 - **A C header, `zb.h`.** The functions are listed in `libzb/abi.json` (checked against
   the code by `libzb/python/abi_check.py`), but a C, Swift or C++ host still writes its
   own declarations. The header should be generated from that file.

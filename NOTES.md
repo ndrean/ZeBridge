@@ -17305,6 +17305,43 @@ test writes to stderr, and these tests print expected refusals.
 Windows: `std.DynLib` does not cover it, so there the two optional engines report
 themselves unavailable; SQLite is unaffected.
 
+## §10jl — the Android AAR: Kotlin and Java get libzb (2026-09-28)
+
+`zb-android/` builds an AAR for Kotlin and Java apps, the gap DISTRIBUTION.md named:
+
+* **One `libzb.so` per CPU** (arm64-v8a, armeabi-v7a, x86_64 for the emulator): libzb's
+  static archive and `src/main/cpp/zb_jni.c`, linked by the NDK's clang with
+  `--exclude-libs,ALL --gc-sections -s` and 16 KB pages. It exports only the 20 JNI
+  functions: 3.8 MB on arm64, against 25.8 MB for Flutter's unstripped whole-archive `.so`.
+* **Strings cross as UTF-8 byte arrays, never `jstring`.** JNI's string functions speak
+  modified UTF-8, which turns an emoji (outside the BMP) into two surrogates; libzb speaks
+  standard UTF-8. Kotlin encodes and decodes with `Charsets.UTF_8`.
+* **`dev.zebridge.ZeBridge` owns the thread.** libzb drives a handle from one thread and
+  keeps `zb_last_error` per thread, so the class runs connect, sync, every call and the
+  poll loop on one single-thread executor. A call from any thread is queued behind the
+  poll in progress (250 ms by default); the next poll is queued behind it. A listener
+  hears polls that applied, settled or brought requests; a Listener calling back in runs
+  in place. Revocation stops the loop. `tenants` comes from the first sync. The same
+  option names as the other clients; with a `Context`, the replica defaults to the app's
+  database directory.
+* **Gradle only packages.** No CMake: `scripts/build.sh` prebuilds the `.so` files into
+  `src/main/jniLibs/` and runs `assembleRelease` (AGP 9.1, built-in Kotlin, the JDK from
+  Android Studio). `ZB_ABI = 2` in ZeBridge.kt is checked by libzb/python/abi_check.py.
+
+Checked on the moto e20 (Android 11, armeabi-v7a only) through `adb reverse tcp:4222`,
+`scripts/device-test.sh`, 3 of 3: the ABI and the bridge's grammar hash; a seed whose
+live rows equal PostgreSQL's (12); `SELECT ?` returns "écrit sur Android 🌍 — ok" intact;
+a write through `query` is refused; an INSERT echoed back from PostgreSQL with
+`last_writer = android-device-test`, then a DELETE, both verdicts at the listener; and
+`engine: "duckdb"` answering "engine 'duckdb' …" (a phone has no libduckdb, §10jk).
+PostgreSQL holds the row's text byte for byte.
+
+Found while writing the README: libzb's core takes the op in capitals (`is_delete = op ==
+"DELETE"` in core.zig; zb-client-ts types it `'INSERT' | 'UPDATE' | 'DELETE'`), so a
+lowercase `"delete"` passed straight through would not be treated as a delete. The Kotlin
+`mutate` capitalises it; the device test now deletes with `"delete"` and still passes. The
+C ABI itself stays case-sensitive — worth normalising in core.zig for every host.
+
 ## §10jm — the mutation op in any case; the Zig runner's missing firstSeq (2026-09-28)
 
 §10jl found that libzb's core compared the op to `"DELETE"` as given, so a host's
