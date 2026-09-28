@@ -837,6 +837,8 @@ CHECKPOINT;
 
   --init-nats [dev|operator]  Generate the whole NATS stack, no nsc (--force overwrites)
       [--js-domain NAME]      …for a JetStream reached across a leaf link (conf, grants, env)
+  --init-nats --update        Re-sign the account after a grammar change, same keys
+      [--store PATH]          …the offline seeds (default zb-nats/operator.store)
   
   --revoke <principal>  Revoke: mapping + unused invites, three-clock narration.
                   Needs ADMIN_DATABASE_URL for the invocation (never stored in env)
@@ -1511,7 +1513,116 @@ It watches the schema, seeds the local database (from the generation chain), fol
 
 It owns the local SQLite, so a write can only go through the library.
 
-**Getting a consumer connected** is enrollment: the app authenticates to your backend (or the bridge's mint endpoint), receives a JWT credential, and connects. The principal comes back _inside_ the credential — the consumer never types it. The same model works for every consumer type.
+**Setting up the operator** happens once per deployment, before any client exists. NATS's operator mode is a chain of signatures: the **operator** signs the **account**, the account lists **scoped signing keys**, and each signing key signs **users**. A signing key carries a *role template*: the permissions every user it signs gets, with `{{name()}}` (the principal) and `{{tag(tenant)}}` (each tenant) filled in at connect. `bridge --init-nats operator` generates the whole chain, with no `nsc`:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Op as Operator (you)
+    participant CLI as bridge --init-nats
+    participant F as Files
+    participant N as nats-server
+    participant B as Bridge
+
+    Op->>CLI: bridge --init-nats operator
+    CLI->>CLI: generate keys: operator, SYS account, ZEBRIDGE account,<br/>3 signing keys (client, responder, service), the bridge's user
+    CLI->>CLI: operator JWT (self-signed, names SYS)
+    CLI->>CLI: ZEBRIDGE account JWT: JetStream limits +<br/>the 3 signing keys, each with its role template
+    Note over CLI: the client template is derived from grammar.json:<br/>cdc.{{tag(tenant)}}.>, mutation.{{name()}}.>, …
+    CLI->>F: nats-server.conf: operator JWT + account JWTs (resolver preload)
+    CLI->>F: creds/bridge.creds: a user signed by the SERVICE key
+    CLI->>F: .env.bridge: NATS_CREDS, ZB_SIGNING_SEED (the CLIENT key), ZB_ACCOUNT_PUB
+    CLI->>F: operator.store: every seed (mode 0600)
+    Note over Op,F: move operator.store off the host — nothing running reads it
+
+    Op->>N: start with nats-server.conf
+    N->>N: trust the operator → the accounts → their signing keys
+    Op->>B: start with .env.bridge
+    B->>N: connect as the bridge user (service role: streams, KV, CDC)
+    B->>B: /enroll, /renew armed: signs CLIENT users only
+
+    opt the grammar changed (a new bridge version)
+        Op->>CLI: bridge --init-nats --update --store operator.store
+        CLI->>CLI: the same keys, templates re-derived, revocations kept
+        CLI->>F: nats-server.conf: only the account's line changes
+        Op->>N: reload (SIGHUP): issued creds and device JWTs stay valid
+    end
+```
+
+Who ends up holding what:
+
+| | holds | can |
+| --- | --- | --- |
+| you, offline | `operator.store`: every seed | re-sign the account: `bridge --init-nats --update` |
+| nats-server | the operator JWT and the account JWTs | check every user's chain of signatures, apply its role's template |
+| the bridge | its own service creds + the **client** signing seed | run the pipeline; mint client users only, never an admin |
+| a device | its own seed + its JWT | be itself, in its tenants |
+
+A new tenant needs none of this again: its grants are the template, filled with the tenant tag the JWT carries. A new *role* (other permissions) is a new signing key in the account JWT, reloaded into the server.
+
+**Onboarding** happens once per device. Your backend decides *who* (the principal), *where* (the tenant) and *how* (the role), and writes it as a one-time invite; today a DBA writes it by hand. The app passes the invite to the library, and the library does the rest: it makes the device's key pair (the private seed never leaves the device), redeems the invite at the bridge, and keeps the identity next to the replica.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant A as App + ZeBridge library
+    participant BE as Your backend
+    participant B as Bridge
+    participant PG@{ "type" : "database" }
+    participant N as NATS
+
+    U->>BE: log in (OAuth, password…)
+    BE->>BE: decide principal, tenant, role
+    BE->>PG: INSERT INTO zebridge_invites (code, principal, tenant, role)
+    Note over BE,PG: today: a DBA does this by hand
+    BE-->>A: the one-time code (in the login response)
+
+    A->>A: new ZeBridge({ bridgeUrl, invite, tables })
+    A->>A: generate the device key pair (seed stays here)
+    A->>B: GET /enroll?code=…&user_pubkey=U…
+    B->>PG: one transaction: mark the invite used,<br/>add the mapping principal ∈ tenant,<br/>record the device key
+    B->>B: mint a JWT for this key (tagged with the tenant)
+    B-->>A: JWT + principal + NATS URLs + grammar hash
+    A->>A: store the identity (0600 file, localStorage, app storage)
+
+    PG--)B: WAL: the new mapping
+    B->>N: $KV.tenants.principal = [tenant]
+    Note over B,N: a new tenant also gets its CDC stream here
+```
+
+The client never sends its principal or its tenant: `/enroll` reads them from the invite row. The same code for a principal that already exists adds a device, or joins another tenant.
+
+**Connecting** is the same on every start, with nothing to configure but the bridge URL. The library renews the JWT itself when a quarter of its life is left, by proving it holds the device's key: no invite, no backend. Only a revoked key, or a principal with no tenant left, needs a new invite.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as App + ZeBridge library
+    participant B as Bridge
+    participant PG@{ "type" : "database" }
+    participant N as NATS
+
+    A->>A: load the identity (JWT, seed, NATS URL, grammar hash)
+    opt the JWT has less than a quarter of its life left, or has expired
+        A->>B: GET /renew?user_pubkey=U…&ts=now&sig=Ed25519(seed)
+        B->>PG: key on record, not revoked? a tenant left?
+        B-->>A: a new JWT for the same key, current tenants
+        A->>A: rewrite the identity
+    end
+    A->>N: connect: JWT, and the server's nonce signed with the seed
+    N->>N: grants = the role's template × the JWT's tenant tags
+    A->>N: direct get $KV.tenants.principal → the tenants
+    A->>N: schemas, then each table's chain (generations KV, gen-tenant objects)
+    A->>A: seed the local database
+    loop while running
+        N--)A: CDC_tenant: live changes, applied last-writer-wins
+        A->>N: mutate → MUTATIONS, its verdict comes back on VERDICTS
+        A->>B: GET /renew when due (the next reconnect uses the new JWT)
+    end
+```
+
+The library needs only the bridge's location; every other fact comes from the bridge, inside the identity. The same flow runs in every language ([the first ten lines](CLIENTS.md#the-first-ten-lines)).
 
 See [Credentials & trust boundaries](#credentials--trust-boundaries).
 

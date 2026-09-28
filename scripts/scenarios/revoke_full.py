@@ -45,7 +45,8 @@ def main() -> int:
                             .replace("port: 8222", "port: 18223").replace("port: 8080", "port: 18081")
         conf.write_text(c)
         env_text = (tmp / "zb-nats" / ".env.bridge").read_text()
-        op_seed = re.search(r"ZB_OPERATOR_SEED=(SO[A-Z0-9]+)", env_text).group(1)
+        store = tmp / "zb-nats" / "operator.store"  # the offline seeds, never in .env.bridge
+        op_seed = re.search(r"^OPERATOR_SEED=(SO[A-Z0-9]+)", store.read_text(), re.M).group(1)
         acct = re.search(r"^ZB_ACCOUNT_PUB=(A[A-Z0-9]+)", env_text, re.M).group(1)
         creds = tmp / "zb-nats" / "creds" / "bridge.creds"
         jwt = re.search(r"JWT-----\n(ey[^\n]+)", creds.read_text()).group(1)
@@ -112,6 +113,23 @@ def main() -> int:
             zb.ok("and the dead token cannot come back: reconnect → Authorization Violation")
         else:
             zb.bad(f"the revoked token reconnected (rc={bare.returncode})"); failed += 1
+
+        # An update re-signs the account: it must carry the revocations over. A domain
+        # set in the store changes the grants, so the account really is re-signed.
+        store.write_text(store.read_text().replace("JS_DOMAIN=\n", "JS_DOMAIN=zbtest\n"))
+        r = subprocess.run([str(BRIDGE), "--init-nats", "--update"], cwd=tmp, capture_output=True, text=True)
+        outp = r.stdout + r.stderr
+        if r.returncode == 0 and "re-signed" in outp and "revocations carried over: yes" in outp:
+            ns.send_signal(1)
+            time.sleep(1.5)
+            again = subprocess.run(["nats", "--server", f"nats://127.0.0.1:{PORT}", "--creds", str(creds),
+                                    "pub", "x", "y"], capture_output=True, text=True, timeout=10)
+            if again.returncode != 0 and "Authorization" in again.stderr + again.stdout:
+                zb.ok("--update re-signed the account and the revoked key stays refused after reload")
+            else:
+                zb.bad(f"--update un-revoked the key (rc={again.returncode})"); failed += 1
+        else:
+            zb.bad(f"--update failed: {outp[-200:]}"); failed += 1
     finally:
         for pr in (sub, ns):
             if pr and pr.poll() is None:

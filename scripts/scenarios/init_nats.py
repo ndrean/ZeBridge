@@ -103,6 +103,14 @@ def main() -> int:
             zb.ok("enrollment wired: ZB_SIGNING_SEED (scoped client key) + ZB_ACCOUNT_PUB in .env.bridge")
         else:
             zb.bad("the enrollment seed/account are missing from the generated env"); failed += 1
+
+        store = tmp / "zb-nats" / "operator.store"
+        mode = store.stat().st_mode & 0o777 if store.exists() else None
+        if mode == 0o600 and "OPERATOR_SEED=SO" in store.read_text() and "OPERATOR_SEED" not in env2 \
+                and "ACCOUNT_SEED" not in env2:
+            zb.ok("the operator and account seeds live in operator.store (0600), not in .env.bridge")
+        else:
+            zb.bad(f"offline seeds misplaced (store mode={mode and oct(mode)})"); failed += 1
     finally:
         if ns and ns.poll() is None:
             ns.terminate()

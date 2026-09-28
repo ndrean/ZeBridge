@@ -45,8 +45,10 @@ comptime {
     _ = @import("batch_publisher.zig");
     _ = @import("config.zig");
     _ = @import("encoder.zig");
+    _ = @import("event_processor.zig");
     _ = @import("numeric.zig");
     _ = @import("mutation_listener.zig");
+    _ = @import("nats_init.zig");
     _ = @import("rate_limit.zig");
     _ = @import("pg_conn.zig");
     _ = @import("pgoutput.zig");
@@ -2841,9 +2843,11 @@ test {
     _ = @import("catalog_epoch.zig");
     _ = @import("config.zig");
     _ = @import("encoder.zig");
+    _ = @import("event_processor.zig");
     _ = @import("fleet_monitor.zig");
     _ = @import("generation_producer.zig");
     _ = @import("mutation_listener.zig");
+    _ = @import("nats_init.zig");
     _ = @import("numeric.zig");
     _ = @import("pg_conn.zig");
     _ = @import("pgoutput.zig");

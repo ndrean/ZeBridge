@@ -8,17 +8,22 @@
 //! That was `nsc add operator` / `nsc add account` / a 90-line bootstrap script — a
 //! wall for anyone who just wants to try the bridge.
 //!
-//! Two modes:
-//!   --mode dev       10 seconds flat: an OPEN server conf (JetStream on, no auth at
+//! Two modes, and an update:
+//!   dev              10 seconds flat: an OPEN server conf (JetStream on, no auth at
 //!                    all) plus a matching .env.bridge. No JWT in sight. Enrollment
 //!                    stays off (no ZB_SIGNING_SEED) — the bridge already treats that
 //!                    as "endpoint dark". Loudly marked dev-only.
-//!   --mode operator  the full stack, self-contained: every key generated here, the
+//!   operator         the full stack, self-contained: every key generated here, the
 //!                    operator and account JWTs minted by `jwt_mint.signClaims`, the
 //!                    client template's subject list derived FROM THE TOPOLOGY —
 //!                    grammar renames propagate instead of drifting from a shell
 //!                    script — and .env.bridge ready for enrollment (`ZB_SIGNING_SEED`
 //!                    is the scoped client key, exactly what /enroll mints with).
+//!                    Every seed also goes to operator.store (0600), which the bridge
+//!                    never reads: the operator and account seeds live ONLY there.
+//!   --update         after a grammar change: re-sign the account from operator.store
+//!                    with the same keys, templates re-derived, revocations kept. Only
+//!                    the account's preload line changes; issued creds stay valid.
 //!
 //! ⚠️ Never overwrites: an existing target file aborts the run (--force to override).
 //! Seeds are credentials; clobbering them silently would orphan a running system.
@@ -61,7 +66,28 @@ fn genKey(io: std.Io, key_type: nats.nkeys.KeyType) !KeyPair {
     return kp;
 }
 
+/// A key pair from its seed text — how `--update` gets back the keys `--init-nats` made.
+fn keyFromSeed(seed_text: []const u8) !KeyPair {
+    var kp = KeyPair{};
+    if (seed_text.len > kp.seed_buf.len) return error.BadSeed;
+    @memcpy(kp.seed_buf[0..seed_text.len], seed_text);
+    kp.seed_len = seed_text.len;
+    var skp = try nats.nkeys.SeedKeyPair.fromSeed(kp.seed());
+    defer skp.wipe();
+    kp.pub_len = skp.publicKeyText(&kp.pub_buf).len;
+    return kp;
+}
+
+/// A file holding a seed: mode 0600, so another user on the host cannot read it.
+fn writeSecret(io: std.Io, path: []const u8, bytes: []const u8, force: bool) !void {
+    return writeFileMode(io, path, bytes, force, @enumFromInt(0o600));
+}
+
 fn writeFile(io: std.Io, path: []const u8, bytes: []const u8, force: bool) !void {
+    return writeFileMode(io, path, bytes, force, .default_file);
+}
+
+fn writeFileMode(io: std.Io, path: []const u8, bytes: []const u8, force: bool, permissions: std.Io.File.Permissions) !void {
     if (!force) {
         if (std.Io.Dir.cwd().openFile(io, path, .{})) |f| {
             var fv = f;
@@ -70,7 +96,7 @@ fn writeFile(io: std.Io, path: []const u8, bytes: []const u8, force: bool) !void
             return error.WouldOverwrite;
         } else |_| {}
     }
-    var f = try std.Io.Dir.cwd().createFile(io, path, .{});
+    var f = try std.Io.Dir.cwd().createFile(io, path, .{ .permissions = permissions });
     defer f.close(io);
     try f.writeStreamingAll(io, bytes);
 }
@@ -310,6 +336,9 @@ pub fn run(
     // server conf declares the domain, the grants name `$JS.<NAME>.API.`, and
     // .env.bridge carries NATS_JS_DOMAIN so the bridge and /enroll say the same.
     var js_domain: ?[]const u8 = null;
+    // `--update [--store PATH]`: re-sign the account from the offline store (runUpdate).
+    var update = false;
+    var store_path: ?[]const u8 = null;
     {
         var it = init.minimal.args.iterate();
         _ = it.next();
@@ -317,6 +346,10 @@ pub fn run(
             if (std.mem.eql(u8, arg, "--init-nats")) continue;
             if (std.mem.eql(u8, arg, "--force")) {
                 force = true;
+            } else if (std.mem.eql(u8, arg, "--update")) {
+                update = true;
+            } else if (std.mem.eql(u8, arg, "--store")) {
+                store_path = it.next() orelse return usageErr("--store needs a path");
             } else if (std.mem.eql(u8, arg, "--js-domain")) {
                 const v = it.next() orelse return usageErr("--js-domain needs a name");
                 for (v) |ch| if (ch == '.' or ch == ' ' or ch == '*' or ch == '>') return usageErr("--js-domain must be one subject token (no '.', ' ', '*', '>')");
@@ -328,6 +361,13 @@ pub fn run(
         }
     }
     const dir: []const u8 = "zb-nats";
+    if (update) {
+        // The domain is part of the conf and the env as well as the grants: changing it
+        // is a new stack, not an update.
+        if (js_domain != null) return usageErr("--update keeps the store's JS domain; --js-domain is for a new stack");
+        return runUpdate(io, dir, store_path);
+    }
+    if (store_path != null) return usageErr("--store goes with --update");
     const nats_port: u32 = 4222;
     const ws_port: u32 = 8080;
     const http_port: u32 = 8222;
@@ -369,7 +409,7 @@ pub fn run(
 }
 
 fn usageErr(msg: []const u8) u8 {
-    out("🔴 {s}\n  bridge --init-nats [dev|operator] [--force]\n", .{msg});
+    out("🔴 {s}\n  bridge --init-nats [dev|operator] [--js-domain NAME] [--force]\n  bridge --init-nats --update [--store PATH]\n", .{msg});
     return 1;
 }
 
@@ -413,7 +453,7 @@ fn runDev(
 
     const conf = std.fmt.allocPrint(
         a,
-        \\# Generated by `bridge --init-nats --mode dev` — DEV ONLY.
+        \\# Generated by `bridge --init-nats dev` — DEV ONLY.
         \\#
         \\# ⚠️ This server is OPEN: no authorization block, anyone who can reach the port
         \\# owns every stream. That is the point — the whole stack in ten seconds, not a
@@ -435,7 +475,7 @@ fn runDev(
 
     const env = std.fmt.allocPrint(
         a,
-        \\# Generated by `bridge --init-nats --mode dev` — DEV ONLY (open NATS, no JWT).
+        \\# Generated by `bridge --init-nats dev` — DEV ONLY (open NATS, no JWT).
         \\DATABASE_READER_URL=postgres://bridge_reader:reader_password_changeme@127.0.0.1:5432/postgres
         \\DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:5432/postgres
         \\NATS_URL=nats://127.0.0.1:{d}
@@ -473,6 +513,45 @@ fn runDev(
         .{ dir, dir, dir, dir },
     );
     return 0;
+}
+
+/// The ZEBRIDGE account JWT: JetStream unlimited, and the three SCOPED signing keys, each
+/// with its role template — the client and responder ones DERIVED from the topology
+/// (grammar.json), so a grammar change is a `--update`, never a hand-edited list. Shared
+/// by `operator` (new keys) and `--update` (the same keys, from the store).
+fn accountJwt(
+    a: std.mem.Allocator,
+    topo: *const topology_mod.Topology,
+    js_domain: ?[]const u8,
+    now: i64,
+    op_seed_kp: *nats.nkeys.SeedKeyPair,
+    op_pub: []const u8,
+    acct_pub: []const u8,
+    sk_client_pub: []const u8,
+    sk_responder_pub: []const u8,
+    sk_service_pub: []const u8,
+    revocations: []const u8,
+) ![]const u8 {
+    const js_api = try jsApiPrefix(a, js_domain);
+    const allows = try roleAllows(a, topo, .client, js_api);
+    const answers = try roleAllows(a, topo, .responder, js_api);
+    const acct_claims = try std.fmt.allocPrint(
+        a,
+        "{{\"jti\":\"__JTI__\",\"iat\":{d},\"iss\":\"{s}\",\"name\":\"ZEBRIDGE\",\"sub\":\"{s}\",\"nats\":{{" ++
+            "\"limits\":{{\"subs\":-1,\"data\":-1,\"payload\":-1,\"imports\":-1,\"exports\":-1,\"wildcards\":true," ++
+            "\"conn\":-1,\"leaf\":-1,\"mem_storage\":-1,\"disk_storage\":-1,\"streams\":-1,\"consumer\":-1," ++
+            "\"max_ack_pending\":-1,\"mem_max_stream_bytes\":-1,\"disk_max_stream_bytes\":-1}}," ++
+            "\"signing_keys\":[" ++
+            "{{\"kind\":\"user_scope\",\"key\":\"{s}\",\"role\":\"client\",\"template\":{{" ++
+            "\"pub\":{{\"allow\":[{s}]}},\"sub\":{{\"allow\":[{s}]}},\"subs\":-1,\"data\":-1,\"payload\":-1}},\"description\":\"\"}}," ++
+            "{{\"kind\":\"user_scope\",\"key\":\"{s}\",\"role\":\"responder\",\"template\":{{" ++
+            "\"pub\":{{\"allow\":[{s}]}},\"sub\":{{\"allow\":[{s}]}},\"subs\":-1,\"data\":-1,\"payload\":-1}},\"description\":\"\"}}," ++
+            "{{\"kind\":\"user_scope\",\"key\":\"{s}\",\"role\":\"service\",\"template\":{{" ++
+            "\"pub\":{{\"allow\":[\"\\u003e\"]}},\"sub\":{{\"allow\":[\"\\u003e\"]}},\"subs\":-1,\"data\":-1,\"payload\":-1}},\"description\":\"\"}}]," ++
+            "\"default_permissions\":{{\"pub\":{{}},\"sub\":{{}}}},\"authorization\":{{}},{s}\"type\":\"account\",\"version\":2}}}}",
+        .{ now, op_pub, acct_pub, sk_client_pub, allows.pub_json, allows.sub_json, sk_responder_pub, answers.pub_json, answers.sub_json, sk_service_pub, revocations },
+    );
+    return jwt_mint.signClaims(a, op_seed_kp, acct_claims, "__JTI__");
 }
 
 fn runOperator(
@@ -542,42 +621,7 @@ fn runOperator(
     const sys_jwt = jwt_mint.signClaims(a, &op_seed_kp, sys_claims, "__JTI__") catch return 1;
 
     // ── account JWT: JetStream unlimited + the three SCOPED signing keys ────────
-    const js_api = jsApiPrefix(a, js_domain) catch return 1;
-    const allows = roleAllows(a, &topo, .client, js_api) catch return 1;
-    const answers = roleAllows(a, &topo, .responder, js_api) catch return 1;
-    const acct_claims = std.fmt.allocPrint(
-        a,
-        "{{\"jti\":\"__JTI__\",\"iat\":{d},\"iss\":\"{s}\",\"name\":\"ZEBRIDGE\",\"sub\":\"{s}\",\"nats\":{{" ++
-            "\"limits\":{{\"subs\":-1,\"data\":-1,\"payload\":-1,\"imports\":-1,\"exports\":-1,\"wildcards\":true," ++
-            "\"conn\":-1,\"leaf\":-1,\"mem_storage\":-1,\"disk_storage\":-1,\"streams\":-1,\"consumer\":-1," ++
-            "\"max_ack_pending\":-1,\"mem_max_stream_bytes\":-1,\"disk_max_stream_bytes\":-1}}," ++
-            "\"signing_keys\":[" ++
-            "{{\"kind\":\"user_scope\",\"key\":\"{s}\",\"role\":\"client\",\"template\":{{" ++
-            "\"pub\":{{\"allow\":[{s}]}},\"sub\":{{\"allow\":[{s}]}},\"subs\":-1,\"data\":-1,\"payload\":-1}},\"description\":\"\"}}," ++
-            "{{\"kind\":\"user_scope\",\"key\":\"{s}\",\"role\":\"responder\",\"template\":{{" ++
-            "\"pub\":{{\"allow\":[{s}]}},\"sub\":{{\"allow\":[{s}]}},\"subs\":-1,\"data\":-1,\"payload\":-1}},\"description\":\"\"}}," ++
-            "{{\"kind\":\"user_scope\",\"key\":\"{s}\",\"role\":\"service\",\"template\":{{" ++
-            "\"pub\":{{\"allow\":[\"\\u003e\"]}},\"sub\":{{\"allow\":[\"\\u003e\"]}},\"subs\":-1,\"data\":-1,\"payload\":-1}},\"description\":\"\"}}]," ++
-            "\"default_permissions\":{{\"pub\":{{}},\"sub\":{{}}}},\"authorization\":{{}},\"type\":\"account\",\"version\":2}}}}",
-        .{
-            now,
-            op_kp.public(),
-            acct_kp.public(),
-            sk_client.public(),
-            allows.pub_json,
-            allows.sub_json,
-            sk_responder.public(),
-            answers.pub_json,
-            answers.sub_json,
-            sk_service.public(),
-        },
-    ) catch return 1;
-    const acct_jwt = jwt_mint.signClaims(
-        a,
-        &op_seed_kp,
-        acct_claims,
-        "__JTI__",
-    ) catch return 1;
+    const acct_jwt = accountJwt(a, &topo, js_domain, now, &op_seed_kp, op_kp.public(), acct_kp.public(), sk_client.public(), sk_responder.public(), sk_service.public(), "") catch return 1;
 
     // ── the bridge user: a scoped user under the SERVICE key ────────────────────
     // Ten years: the bridge's own credential rotates with a redeploy, not a TTL.
@@ -603,7 +647,7 @@ fn runOperator(
     // ── files ───────────────────────────────────────────────────────────────────
     const conf = std.fmt.allocPrint(
         a,
-        \\# Generated by `bridge --init-nats --mode operator` — self-contained, no nsc.
+        \\# Generated by `bridge --init-nats operator` — self-contained, no nsc.
         \\# Operator "ZeBridgeOp"
         \\operator: {s}
         \\
@@ -646,7 +690,7 @@ fn runOperator(
 
     const env = std.fmt.allocPrint(
         a,
-        \\# Generated by `bridge --init-nats --mode operator` — the full JWT stack.
+        \\# Generated by `bridge --init-nats operator` — the full JWT stack.
         \\DATABASE_READER_URL=postgres://bridge_reader:reader_password_changeme@127.0.0.1:5432/postgres
         \\DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:5432/postgres
         \\NATS_URL=nats://127.0.0.1:{d}
@@ -671,10 +715,8 @@ fn runOperator(
         \\#     --name pois --tenant kilo > pois.creds
         \\ZB_RESPONDER_SEED={s}
         \\
-        \\# Operator seed — NOT read by the bridge. Keep it offline; it signs accounts.
-        \\# ZB_OPERATOR_SEED={s}
-        \\# Account identity seed — same: offline. Signs nothing day-to-day.
-        \\# ZB_ACCOUNT_SEED={s}
+        \\# The operator and account seeds are NOT here: they live in operator.store, which
+        \\# the bridge never reads. Move it off this host; bring it back for `--update`.
         \\
     ,
         .{
@@ -684,8 +726,6 @@ fn runOperator(
             sk_client.seed(),
             acct_kp.public(),
             sk_responder.seed(),
-            op_kp.seed(),
-            acct_kp.seed(),
         },
     ) catch return 1;
 
@@ -694,21 +734,201 @@ fn runOperator(
     const conf_path = std.fs.path.join(a, &.{ dir, "nats-server.conf" }) catch return 1;
     const env_path = std.fs.path.join(a, &.{ dir, ".env.bridge" }) catch return 1;
     const creds_path = std.fs.path.join(a, &.{ dir, "creds", "bridge.creds" }) catch return 1;
+    // The store first: if it cannot be written, no conf may exist signed by keys
+    // that nobody kept.
+    const store = std.fmt.allocPrint(
+        a,
+        \\# Generated by `bridge --init-nats operator`. OFFLINE: every seed of the NATS
+        \\# identity stack. The bridge never reads this file. `bridge --init-nats --update`
+        \\# does: it re-signs the account with these same keys, so nothing issued breaks.
+        \\OPERATOR_SEED={s}
+        \\SYS_SEED={s}
+        \\ACCOUNT_SEED={s}
+        \\SK_CLIENT_SEED={s}
+        \\SK_RESPONDER_SEED={s}
+        \\SK_SERVICE_SEED={s}
+        \\JS_DOMAIN={s}
+        \\
+    ,
+        .{ op_kp.seed(), sys_kp.seed(), acct_kp.seed(), sk_client.seed(), sk_responder.seed(), sk_service.seed(), js_domain orelse "" },
+    ) catch return 1;
+    const store_path = std.fs.path.join(a, &.{ dir, "operator.store" }) catch return 1;
+    writeSecret(io, store_path, store, force) catch return 1;
     writeFile(io, conf_path, conf, force) catch return 1;
-    writeFile(io, env_path, env, force) catch return 1;
-    writeFile(io, creds_path, bridge_creds, force) catch return 1;
+    writeSecret(io, env_path, env, force) catch return 1;
+    writeSecret(io, creds_path, bridge_creds, force) catch return 1;
+
 
     out(
         \\✅ operator stack generated — no nsc involved:
         \\   {s}/nats-server.conf   operator + ZEBRIDGE account (3 scoped signing keys: client, responder, service), resolver preload
         \\   {s}/creds/bridge.creds the bridge's identity (service scope)
         \\   {s}/.env.bridge        NATS_CREDS + ZB_SIGNING_SEED wired for /enroll, ZB_RESPONDER_SEED for services
+        \\   {s}/operator.store     every seed, 0600 — the bridge never reads it: move it OFF this host
         \\   Client onboarding is now ONLY the enrollment flow: invite row → GET /enroll →
         \\   creds. Nobody needs to understand accounts or claims.
         \\   Start:  nats-server -c {s}/nats-server.conf
         \\
     ,
-        .{ dir, dir, dir, dir },
+        .{ dir, dir, dir, dir, dir },
     );
     return 0;
+}
+
+/// `bridge --init-nats --update`: the grammar changed (a table, a subject), so the role
+/// templates must follow. It reads the offline store, re-derives the templates, and
+/// re-signs the ZEBRIDGE account with the SAME keys — the operator, the account and the
+/// three signing keys keep their public keys, so every creds file and device JWT already
+/// issued stays valid. Only the account's line in the conf's resolver_preload changes;
+/// hand edits elsewhere in the conf survive. The revocations `bridge --revoke --full`
+/// wrote into the account are carried over: an update never un-revokes a key.
+fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8) u8 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const store_path = store_arg orelse (std.fs.path.join(a, &.{ dir, "operator.store" }) catch return 1);
+    const conf_path = std.fs.path.join(a, &.{ dir, "nats-server.conf" }) catch return 1;
+    const store = std.Io.Dir.cwd().readFileAlloc(io, store_path, a, .limited(1 << 16)) catch {
+        out("🔴 cannot read the store {s} (--store PATH if it lives elsewhere)\n", .{store_path});
+        return 1;
+    };
+    const conf = std.Io.Dir.cwd().readFileAlloc(io, conf_path, a, .limited(1 << 20)) catch {
+        out("🔴 cannot read {s}\n", .{conf_path});
+        return 1;
+    };
+
+    const want = [_][]const u8{ "OPERATOR_SEED", "ACCOUNT_SEED", "SK_CLIENT_SEED", "SK_RESPONDER_SEED", "SK_SERVICE_SEED" };
+    var keys: [want.len]KeyPair = undefined;
+    for (want, 0..) |name, i| {
+        const v = storeValue(store, name) orelse {
+            out("🔴 {s} has no {s}\n", .{ store_path, name });
+            return 1;
+        };
+        keys[i] = keyFromSeed(v) catch {
+            out("🔴 {s} in {s} is not a valid seed\n", .{ name, store_path });
+            return 1;
+        };
+    }
+    const op_kp, const acct_kp, const sk_client, const sk_responder, const sk_service = keys;
+    const domain = storeValue(store, "JS_DOMAIN") orelse "";
+    const js_domain: ?[]const u8 = if (domain.len == 0) null else domain;
+
+    // ── the account's current JWT in the conf, and a check it is OURS ───────────
+    const needle = std.fmt.allocPrint(a, "{s}: ey", .{acct_kp.public()}) catch return 1;
+    const at = std.mem.indexOf(u8, conf, needle) orelse {
+        out("🔴 the store's account {s} is not in {s} — wrong store for this conf?\n", .{ acct_kp.public(), conf_path });
+        return 1;
+    };
+    const jwt_start = at + needle.len - 2;
+    var jwt_end = jwt_start;
+    while (jwt_end < conf.len and (std.ascii.isAlphanumeric(conf[jwt_end]) or conf[jwt_end] == '.' or conf[jwt_end] == '_' or conf[jwt_end] == '-')) jwt_end += 1;
+    const old_claims = jwtClaims(a, conf[jwt_start..jwt_end]) orelse {
+        out("🔴 the account JWT in {s} does not decode\n", .{conf_path});
+        return 1;
+    };
+    const iss = std.fmt.allocPrint(a, "\"iss\":\"{s}\"", .{op_kp.public()}) catch return 1;
+    if (std.mem.indexOf(u8, old_claims, iss) == null) {
+        out("🔴 the account JWT in {s} was not signed by the store's operator\n", .{conf_path});
+        return 1;
+    }
+    const revocations = revocationsOf(old_claims);
+
+    // ── re-derive and re-sign ────────────────────────────────────────────────────
+    const owned = topology_mod.loadEmbedded(a) catch return 1;
+    const topo: topology_mod.Topology = owned.topology;
+    var op_seed_kp = nats.nkeys.SeedKeyPair.fromSeed(op_kp.seed()) catch return 1;
+    defer op_seed_kp.wipe();
+    const now: i64 = @intCast(c.time(null));
+    const new_jwt = accountJwt(a, &topo, js_domain, now, &op_seed_kp, op_kp.public(), acct_kp.public(), sk_client.public(), sk_responder.public(), sk_service.public(), revocations) catch return 1;
+
+    const new_claims = jwtClaims(a, new_jwt) orelse return 1;
+    if (std.mem.eql(u8, grantsOf(old_claims), grantsOf(new_claims))) {
+        out("✅ {s} already matches the grammar — nothing to update\n", .{conf_path});
+        return 0;
+    }
+
+    const new_conf = std.mem.concat(a, u8, &.{ conf[0..jwt_start], new_jwt, conf[jwt_end..] }) catch return 1;
+    writeFile(io, conf_path, new_conf, true) catch return 1;
+    out(
+        \\✅ ZEBRIDGE account re-signed with the same keys ({s})
+        \\   templates re-derived from the grammar; revocations carried over: {s}
+        \\   Issued creds and device JWTs stay valid. Now reload the server:
+        \\     kill -HUP $(pgrep -x nats-server)
+        \\
+    , .{ conf_path, if (revocations.len == 0) "none" else "yes" });
+    return 0;
+}
+
+/// `NAME=value` from the store; comments and blank lines skipped.
+fn storeValue(store: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, store, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (std.mem.eql(u8, line[0..eq], name)) return line[eq + 1 ..];
+    }
+    return null;
+}
+
+/// A JWT's claims segment, decoded.
+fn jwtClaims(a: std.mem.Allocator, jwt: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, jwt, '.');
+    _ = it.next();
+    const b64 = it.next() orelse return null;
+    const dec = std.base64.url_safe_no_pad.Decoder;
+    const n = dec.calcSizeForSlice(b64) catch return null;
+    const buf = a.alloc(u8, n) catch return null;
+    dec.decode(buf, b64) catch return null;
+    return buf;
+}
+
+/// `"revocations":{…},` as it stands in the claims — the map holds only
+/// `"U…":seconds` pairs, so the first `}` closes it — or "" when there is none.
+fn revocationsOf(claims: []const u8) []const u8 {
+    const start = std.mem.indexOf(u8, claims, "\"revocations\":{") orelse return "";
+    const close = std.mem.indexOfScalarPos(u8, claims, start, '}') orelse return "";
+    var end = close + 1;
+    if (end < claims.len and claims[end] == ',') end += 1;
+    return claims[start..end];
+}
+
+/// What an update can change: the signing keys and their templates, up to the end of
+/// the claims. jti and iat differ on every signing and are left out.
+fn grantsOf(claims: []const u8) []const u8 {
+    const start = std.mem.indexOf(u8, claims, "\"signing_keys\"") orelse return claims;
+    return claims[start..];
+}
+
+test "an update keeps the store's keys and carries the revocations over" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const owned = try topology_mod.loadEmbedded(aa);
+    const io = std.testing.io;
+    const op = try genKey(io, .operator);
+    const acct = try genKey(io, .account);
+    const sk = try genKey(io, .account);
+    // The store round trip: a key rebuilt from its seed has the same public key.
+    const store = try std.fmt.allocPrint(aa, "# offline\nOPERATOR_SEED={s}\nJS_DOMAIN=\n", .{op.seed()});
+    const back = try keyFromSeed(storeValue(store, "OPERATOR_SEED").?);
+    try std.testing.expectEqualStrings(op.public(), back.public());
+    try std.testing.expectEqualStrings("", storeValue(store, "JS_DOMAIN").?);
+
+    var op_skp = try nats.nkeys.SeedKeyPair.fromSeed(op.seed());
+    defer op_skp.wipe();
+    const revoked = "\"revocations\":{\"UABC\":1700000000,\"UDEF\":1700000001},";
+    const first = try accountJwt(aa, &owned.topology, null, 1, &op_skp, op.public(), acct.public(), sk.public(), sk.public(), sk.public(), revoked);
+    const first_claims = jwtClaims(aa, first).?;
+    try std.testing.expectEqualStrings(revoked, revocationsOf(first_claims));
+
+    // Re-signed later with what it carried: the same grants, the same revocations.
+    const again = try accountJwt(aa, &owned.topology, null, 2, &op_skp, op.public(), acct.public(), sk.public(), sk.public(), sk.public(), revocationsOf(first_claims));
+    const again_claims = jwtClaims(aa, again).?;
+    try std.testing.expectEqualStrings(grantsOf(first_claims), grantsOf(again_claims));
+    // A domain change is a grants change.
+    const hub = try accountJwt(aa, &owned.topology, "hub", 3, &op_skp, op.public(), acct.public(), sk.public(), sk.public(), sk.public(), "");
+    try std.testing.expect(!std.mem.eql(u8, grantsOf(first_claims), grantsOf(jwtClaims(aa, hub).?)));
+    try std.testing.expectEqualStrings("", revocationsOf(jwtClaims(aa, hub).?));
 }

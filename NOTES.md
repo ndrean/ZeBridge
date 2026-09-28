@@ -17713,3 +17713,29 @@ Local Network. The simulator, on the same code and address, enrolled at once (si
 code was fine. The phone's Wi-Fi was off; iOS lists an app under Local Network only once
 it reaches an address on the network the phone is on, so no prompt, no entry. Wi-Fi on,
 relaunch: enrolled as iphone_05. Three devices, three runtimes, one tenant, live.
+
+## §10jy — `--init-nats --update`, and the seeds in an offline store (2026-09-28)
+
+`--init-nats operator` wrote the operator and account seeds, commented, into .env.bridge —
+the file the bridge host reads. They now go, with every other seed and the JS domain, to
+`zb-nats/operator.store` (0600), which nothing running reads; .env.bridge (0600 too: it
+holds the client signing seed) points to it. The store is written first, so no conf can
+exist whose keys nobody kept.
+
+`--init-nats --update [--store PATH]` replaces the `nsc edit signing-key` work after a
+grammar change: it rebuilds the keys from the store, re-derives the client and responder
+templates from the built-in grammar (the same `roleAllows`, now in a shared `accountJwt`),
+re-signs the account with the same keys, and splices only the account's preload line.
+Hand edits elsewhere in the conf survive; issued creds and device JWTs stay valid. It
+refuses a store whose account is not in the conf, or whose operator did not sign it, and
+does nothing when the grants already match. There is no policy language: the templates
+come from the grammar, as before.
+
+The catch found while writing it: `--revoke --full` writes a `revocations` map into the
+account JWT. A re-mint from scratch would drop it and un-revoke every key, so the update
+copies the map over. revoke_full.py proves it live: hard revoke, `--update` (a domain set
+in the store forces a real re-sign), reload, the revoked creds still refused. A unit test
+covers the store round trip and the carried map.
+
+Also found: `nats_init.zig` and `event_processor.zig` were missing from bridge.zig's
+test-import block, so their tests never ran. Wired; 162 pass.
