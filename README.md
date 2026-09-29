@@ -1,6 +1,7 @@
+
 # Sync PostgreSQL locally
 
-<p align="center"><img width="400" height="218" alt="Gemini_Generated_Image_28pnm328pnm328pn" src="https://github.com/user-attachments/assets/1db3d845-08be-4651-921d-9f90beb3de54" /></p>
+<p align="center"><img width="400" height="400" alt="zebridge2" src="https://github.com/user-attachments/assets/137010f2-6274-4916-ad9e-b160fc83d66c" /></p>
 
 ![Zig support](https://img.shields.io/badge/Zig-0.16.0-color?logo=zig&color=%23f3ab20)
 
