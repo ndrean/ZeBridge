@@ -13,12 +13,11 @@
 --     SELECT zebridge_grant_edge_writes('public.orders');
 --     SELECT zebridge_install_write_guards('public.orders', 'updated_at', 'deleted_at');
 --
--- Multi-tenant is not a build flag, it is two more calls plus one bridge setting:
+-- Multi-tenant is not a build flag, it is two more calls, both live without a restart:
 --
 --     INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('alice', 'acme');
---     SELECT zebridge_scope_writes_by_tenant('public.orders', 'tenant_id');
---     -- and in the bridge's environment, which is what routes the *subject*:
---     TENANT_RULES=orders:tenant_id        ← needs a bridge restart; the two above do not
+--     SELECT zebridge_enable('public.orders', tenant_col => 'tenant_id', dry_run => false);
+--     -- the catalogue row it writes is what routes the *subject*
 --
 -- ⚠️ `zebridge_scope_publication_to_one_tenant()` is a different shape entirely — it pins
 -- a publication to ONE tenant value, for one-bridge-per-tenant deployments. It is not the
@@ -217,8 +216,8 @@ $$ LANGUAGE plpgsql;
 
 -- Attach both to one table — see PROTOCOL.md §7.3
 --
--- The column names must match this table's SYNC_RULES entry in the bridge's environment.
--- They are the same contract stated in two places and nothing cross-checks them: name a
+-- The column names must match this table's zebridge_catalogue row. zebridge_enable writes
+-- both in one transaction; called by hand, nothing cross-checks them: name a
 -- different column here and the bridge and the database disagree about what "version"
 -- means, with no error. `zebridge_audit_write_guards()` reports what is actually attached
 -- so the two can be compared.
@@ -450,7 +449,7 @@ $$ LANGUAGE plpgsql;
 -- point. That one adds a publication row filter (`WHERE tenant = 'acme'`), which pins the
 -- publication — and therefore the bridge — to **one** tenant. This one does not touch the
 -- publication at all, so a single bridge can carry many tenants and route them by subject
--- (`TENANT_RULES` → `cdc.<tenant>.<table>.<op>`).
+-- (the catalogue's `tenant_col` → `cdc.<tenant>.<table>.<op>`).
 --
 -- ⚠️ **RLS does not bound reads.** It bounds what the writer role may write and what a
 -- snapshot may select. What stops one tenant *reading* another's rows is the CDC subject
@@ -509,7 +508,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Answers "which tables are guarded, and on which columns?" — compare against SYNC_RULES
+-- Answers "which tables are guarded, and on which columns?" — compare against the catalogue
 CREATE OR REPLACE FUNCTION public.zebridge_audit_write_guards()
 RETURNS TABLE (tbl text, version_guard boolean, delete_guard boolean, detail text) AS $$
     SELECT c.relname::text,

@@ -17739,3 +17739,34 @@ covers the store round trip and the carried map.
 
 Also found: `nats_init.zig` and `event_processor.zig` were missing from bridge.zig's
 test-import block, so their tests never ran. Wired; 162 pass.
+
+## §10jz — the catalogue is the only rule source: SYNC_RULES, TENANT_RULES, SYNC_VERSION_COLUMN removed (2026-09-29)
+
+Since the catalogue era the env overrides were "for emergencies only", and every live
+env had them commented out. They were worse than unused. `zebridge_enable` builds the
+PostgreSQL guards (version trigger, tombstone and tenant guards) from the catalogue row
+in the same transaction, so an env override could only change the bridge's side:
+`SYNC_RULES=orders:modified_at` made the bridge judge LWW on one column while the trigger
+stamped another. And `TENANT_RULES` let a table without any catalogue row pass
+preflight as tenant-scoped — replicated with no guard at all, around the one function
+meant to be the door. `SYNC_VERSION_COLUMN` was the fallback for a table with no rule,
+which preflight already refuses.
+
+Removed from the bridge (args, the env key snapshot in bridge.zig, `catalogue.Env`, the
+listener's env map — it reads the catalogue row directly now), from `bridge_sweeper`
+(the sweep set is `zebridge_catalogue.tombstone_col` only), and from the scenario
+helpers (`zb.rules`, check.py). `default_version_column` is no longer a parameter: the
+constant `Config.Sync.default_version_column` matches the catalogue's own column
+default. A database without the catalogue now logs "apply init.core.template.sql" and
+every table stays refused, instead of running on env rules. Operator messages that
+said "set SYNC_RULES=…" now name `zebridge_enable(version_col => …)`.
+
+Kept: TRANSITION_RULES (event classification, not in the catalogue) and
+GENERATION_RULES (a probe restriction that can only narrow the derived set).
+
+Checked: unit tests 162 pass; the live bridge restarted on the new binary (31 catalogue
+rows, same preflight findings as before); offline group 9/9 (pubname needs
+BRIDGE_CDC_PUBLICATION, commented out in .env.bridge); live check, diagnose, writable,
+mutate, tiebreak, clamp, intclamp, reaps, dyntenant, invalidate, keys, sweeper pass.
+check.py's one finding (fire_types, a read-only tenant table, "not fully wired") is
+the same on HEAD's check.py: its heuristic predates §10fx's read-only tenant tables.

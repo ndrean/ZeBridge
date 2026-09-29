@@ -185,23 +185,19 @@ def main():
                 "Every consumer may read it while its rows belong to individual tenants.\n"
                 "Either delete the catalogue row or drop the tenant column.")
 
-    # ── 6. tenant columns (catalogue + env overrides) vs the schema ───────────
+    # ── 6. tenant columns (the catalogue) vs the schema ───────────────────────
     tenant_rules = {}
-    for entry in os.environ.get("TENANT_RULES", "").split(";"):
-        if ":" in entry:
-            t, c = entry.split(":", 1)
-            tenant_rules[t.strip()] = c.strip()
     for r in zb.psql(
             "SELECT tbl||':'||tenant_col FROM zebridge_catalogue "
             "WHERE tenant_col IS NOT NULL").splitlines():
         if ":" in r:
             t, c = r.split(":", 1)
-            tenant_rules.setdefault(t.strip(), c.strip())
+            tenant_rules[t.strip()] = c.strip()
 
     for tbl, col in tenant_rules.items():
         # ⚠️ A rule for a table that does not exist and a rule naming a column that does
         # not exist are NOT the same finding, and conflating them made this check
-        # permanently red: TENANT_RULES pre-declares the scratch tables the manual
+        # permanently red: the catalogue keeps rows for the scratch tables the manual
         # scenarios create and drop (vec_t, blob_t, rl_t …), and a rule for an absent
         # table is INERT — nothing routes through it until the table is there. A rule
         # naming a missing COLUMN on a table that IS there is the drift worth failing on:
@@ -242,21 +238,17 @@ def main():
 
     # ── 7. the LWW columns every table is configured with exist ───────────────
     #
-    # Catalogue-driven: zb.rules() gives the EFFECTIVE columns (zebridge_catalogue,
-    # with a legacy SYNC_RULES/TENANT_RULES entry overriding per table exactly as the
-    # bridge honours it). enable() validated them at write time, but a later DROP
-    # COLUMN invalidates the row silently, and an env override was never validated.
+    # Catalogue-driven: zb.rules() gives the columns from zebridge_catalogue.
+    # enable() validated them at write time, but a later DROP COLUMN invalidates the
+    # row silently.
     # (The old loop here had a for/else: `else` ran after a complete loop, i.e. also
     # after a missing column, and reported success on a failure.)
     configured = {r for r in zb.psql("SELECT tbl FROM zebridge_catalogue", quiet=True).splitlines() if r}
-    for entry in os.environ.get("SYNC_RULES", "").split(";") + os.environ.get("TENANT_RULES", "").split(";"):
-        if ":" in entry:
-            configured.add(entry.split(":", 1)[0].strip())
     for tbl in sorted(configured):
         exists = zb.psql(
             f"SELECT 1 FROM pg_class WHERE relname='{tbl}' AND relkind='r'", quiet=True).strip()
         if not exists:
-            print(f"  ⓘ  rules for '{tbl}' but no such table (dropped? delete the catalogue row / env entry)")
+            print(f"  ⓘ  rules for '{tbl}' but no such table (dropped? delete the catalogue row)")
             continue
         r = zb.rules(tbl)
         missing = []
@@ -378,7 +370,7 @@ def main():
     # route by tenant has the machinery to do it correctly. A tenant-capable table with a
     # broken chain silently exposes or fails to route whatever tenant data it does hold.
     #
-    # The signal is the column, independent of TENANT_RULES (which is what we are checking
+    # The signal is the column, independent of the catalogue row (which is what we are checking
     # got set). ⚠️ Heuristic: a column named tenant_id for an unrelated reason is swept in;
     # in this schema that does not happen.
     sensitive = [r for r in zb.psql(

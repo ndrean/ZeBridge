@@ -160,7 +160,7 @@ pub const Topology = struct {
     ///
     /// Tenant-scoped tables are always covered: `CDC_<TENANT>` exists for every declared
     /// tenant (preflight's own boot check enforces that), and `CDC_PUBLIC` additionally
-    /// covers the open-tenant case — so `TENANT_RULES` membership alone is sufficient,
+    /// covers the open-tenant case — so tenant-rule membership alone is sufficient,
     /// with no need to special-case which tenant a row carries. `is_tenant_scoped` is the
     /// caller's own `tenant_rules.contains(table)`, not re-derived here, because
     /// `TransitionRules` lives in `config.zig`, which already imports this module —

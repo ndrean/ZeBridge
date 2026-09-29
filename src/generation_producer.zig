@@ -74,9 +74,9 @@ pub const GenerationProducer = struct {
     /// GENERATION_RULES — a RESTRICTION intersected with the derived set (probes,
     /// dev subsets). Empty means: everything the publication carries.
     rules: *const config.EventClassification.TransitionRules,
-    /// table → [version_col, …] (SYNC_RULES); absent falls back to the default column
+    /// table → [version_col, …] (the catalogue); absent falls back to the default column
     sync_rules: *const config.EventClassification.TransitionRules,
-    /// table → [tenant_col] (TENANT_RULES) — which tables are tenant-scoped, and by
+    /// table → [tenant_col] (the catalogue) — which tables are tenant-scoped, and by
     /// which column; the tenant SET itself comes from the data (zebridge_tenants_of).
     tenant_rules: *const config.EventClassification.TransitionRules,
     /// For isCdcRoutable (skip tables no client can follow) and the open tenant.

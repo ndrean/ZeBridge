@@ -284,9 +284,9 @@ $$ LANGUAGE plpgsql STABLE;
 -- THE CATALOGUE — one row per replicated table, the disjoint union of public and
 -- tenant-scoped as one nullable column (NOTES.md, the static-residue endgame).
 -- Written by `zebridge_enable` in the SAME transaction as the guards it installs
--- with these very columns, so nothing can disagree: TENANT_RULES and SYNC_RULES
--- become boot-time reads of this table (env demotes to override), the generation
--- producer reads it per tick, and the T3 "transcribe into .env.bridge" era ends.
+-- with these very columns, so nothing can disagree: the bridge and the sweeper read
+-- their per-table rules only from here (no env override), and the generation
+-- producer reads it per tick.
 -- The CHECK absorbs the publication guard's core law into the schema itself: a
 -- row is tenant-scoped or publicly justified — never silently neither.
 CREATE TABLE IF NOT EXISTS public.zebridge_catalogue (
@@ -459,8 +459,7 @@ BEGIN
         -- Either model counts as scoped:
         --   A  a publication row filter  → PostgreSQL bounds CDC itself
         --   B  RLS enabled               → RLS bounds writes and snapshots, and the
-        --                                  bridge bounds CDC via TENANT_RULES, which is
-        --                                  not visible from here
+        --                                  bridge bounds CDC via the catalogue's tenant_col
         -- Requiring both would refuse every model-B table; requiring neither would let an
         -- unscoped table through. So: at least one deliberate act of scoping.
         CONTINUE WHEN scoped OR rls;
@@ -2266,9 +2265,7 @@ $$ LANGUAGE plpgsql;
 -- before a migration: which column is the version, the tombstone, the tiebreak, the
 -- tenant. Name them and the check compares your naming with the schema AND with the
 -- catalogue (a disagreement is a finding); leave them NULL and the catalogue's row is
--- taken at its word (`updated_at` when there is no row yet). The one thing it cannot
--- see is a SYNC_RULES/TENANT_RULES override in the bridge's environment — those are
--- legacy per-table overrides, and a table that needs one is a table to migrate.
+-- taken at its word (`updated_at` when there is no row yet).
 CREATE OR REPLACE FUNCTION public.zebridge_check(
     tbl           regclass,
     intent        text DEFAULT NULL,   -- 'read_only' | 'writable' | NULL = whatever the grants say

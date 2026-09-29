@@ -127,7 +127,9 @@ export interface ZeBridgeConfig {
   /// hub's. The wrong value is not detectable at connect: every API call simply gets
   /// no responder, so it fails at the first request.
   jsDomain?: string;
-  /// The bridge's HTTP url to fetch the grammar hash automatically.
+  /// The bridge's HTTP url: where `invite` is redeemed (`/enroll`) and the JWT renewed
+  /// (`/renew`), kept in the identity; and where the grammar hash is fetched when
+  /// `grammarHash` is unset. libzb: same name.
   bridgeUrl?: string;
   /** @internal The compiled-in grammar (§10dq). Not a consumer input: any value passed here is replaced. */
   grammar?: any;

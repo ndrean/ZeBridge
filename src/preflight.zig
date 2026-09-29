@@ -283,7 +283,7 @@ pub fn reportTenantColumns(
             (ri.len > 0 and ri[0] == 'f');
 
         if (!exists) {
-            log.err("🔴 REFUSING '{s}': TENANT_RULES names column '{s}', which the table does not have.", .{ table, tenant_col });
+            log.err("🔴 REFUSING '{s}': its catalogue row names tenant column '{s}', which the table does not have.", .{ table, tenant_col });
             refused.refuse(table, .no_tenant_column) catch {};
             continue;
         }
@@ -307,7 +307,7 @@ pub fn reportTenantColumns(
 /// The role name out of a PostgreSQL connection URL.
 ///
 /// The writer's *grants* are the only authoritative statement of which tables are meant
-/// to accept edge writes — `SYNC_RULES` says how to write a table, never whether it may
+/// to accept edge writes — the catalogue says how to write a table, never whether it may
 /// be written — so the report needs the role those grants were made to. It is already in
 /// `DATABASE_WRITER_URL`; nothing else has to be configured.
 ///
@@ -373,7 +373,6 @@ pub fn reportVersionColumns(
     conn: *c.PGconn,
     publication_name: []const u8,
     sync_rules: *const Config.EventClassification.TransitionRules,
-    default_version_column: []const u8,
     writer_role: ?[]const u8,
     /// Records the combined verdict (§1.11) so `appendWriteContract` can publish it
     /// instead of a client discovering "outbound-only" only after a rejected write.
@@ -430,9 +429,9 @@ pub fn reportVersionColumns(
 
         // The configured name for this table, or the global default.
         const wanted: []const u8 = if (sync_rules.get(table)) |cols|
-            (if (cols.len > 0 and cols[0].len > 0) cols[0] else default_version_column)
+            (if (cols.len > 0 and cols[0].len > 0) cols[0] else Config.Sync.default_version_column)
         else
-            default_version_column;
+            Config.Sync.default_version_column;
 
         // One pass over this table's rows: find the wanted column, remember the rest.
         var verdict: VersionVerdict = .absent;
@@ -462,11 +461,9 @@ pub fn reportVersionColumns(
 
         const usable = logVerdict(table, wanted, verdict, candidates.items, granted);
         if (usable) writable_count += 1 else outbound_only += 1;
-        // "Named in SYNC_RULES" meant WRITE INTENT while the env named only edge
-        // tables. The catalogue fills the map for EVERY replicated table now, so a
-        // bare version column is universal bookkeeping, not intent — only an entry
-        // that also carries a tombstone or tiebreak still signals "someone expects
-        // edge writes here" (outbound-only tables warned spuriously otherwise).
+        // The catalogue fills the map for EVERY replicated table, so a bare version
+        // column is universal bookkeeping, not intent — only a row that also carries
+        // a tombstone or tiebreak signals "someone expects edge writes here".
         const write_intent = blk: {
             const cols = sync_rules.get(table) orelse break :blk false;
             if (cols.len > 1 and cols[1].len > 0) break :blk true;
@@ -500,7 +497,7 @@ pub fn reportVersionColumns(
 
 /// Cross-check **intent** against **capability**, and report where they disagree.
 ///
-/// `SYNC_RULES` teaches the bridge *how* to write a table; nothing in it says a table
+/// The catalogue teaches the bridge *how* to write a table; nothing in it says a table
 /// *may* be written, so nothing validates it against the schema. The missing declaration
 /// was already there and unread: `GRANT INSERT ... TO bridge_writer` is explicit,
 /// per-table, made deliberately by a DBA, and — unlike any config file — cannot drift
@@ -546,7 +543,7 @@ fn reportWriteIntent(
     // but configuring one for writes it can never perform is worth saying out loud.
     if (named_in_sync_rules) {
         log.warn(
-            "⚠️  '{s}': SYNC_RULES configures it for edge writes, but the writer has no INSERT privilege. Mutations will be retried to max_deliver and dead-lettered, with nothing explaining why. Either GRANT it or drop the rule.",
+            "⚠️  '{s}': its catalogue row configures it for edge writes (a tombstone or tiebreak column), but the writer has no INSERT privilege. Mutations will be retried to max_deliver and dead-lettered, with nothing explaining why. Either GRANT it (zebridge_enable(writable => true)) or drop those columns from its row.",
             .{table},
         );
         return true;
@@ -618,7 +615,7 @@ fn logVerdict(
                 for (candidates) |cand| {
                     log.info("      candidate: {s}", .{cand});
                 }
-                log.info("      make it edge-writable with: SYNC_RULES={s}:<column>", .{table});
+                log.info("      make it edge-writable with: SELECT zebridge_enable('{s}', version_col => '<column>', writable => true, dry_run => false)", .{table});
             }
             return false;
         },
@@ -635,7 +632,6 @@ pub fn reportTable(
     conn: *c.PGconn,
     table: []const u8,
     sync_rules: *const Config.EventClassification.TransitionRules,
-    default_version_column: []const u8,
     /// Same role `run()` checks grants against. Null when ingress is unconfigured, in
     /// which case the query's own `pg_roles` guard makes every grant check a correct
     /// `false` — mirrors `reportVersionColumns`.
@@ -686,9 +682,9 @@ pub fn reportTable(
     }
 
     const wanted: []const u8 = if (sync_rules.get(table)) |cols|
-        (if (cols.len > 0 and cols[0].len > 0) cols[0] else default_version_column)
+        (if (cols.len > 0 and cols[0].len > 0) cols[0] else Config.Sync.default_version_column)
     else
-        default_version_column;
+        Config.Sync.default_version_column;
 
     var verdict: VersionVerdict = .absent;
     var granted = false;
@@ -922,7 +918,6 @@ pub fn run(
     publication_name: []const u8,
     transition_rules: *const Config.EventClassification.TransitionRules,
     sync_rules: *const Config.EventClassification.TransitionRules,
-    default_version_column: []const u8,
     strict: bool,
     refused: *RefusedTables.Registry,
     /// Role the write grants were made to, from `DATABASE_WRITER_URL`. Null when ingress
@@ -930,7 +925,7 @@ pub fn run(
     writer_role: ?[]const u8,
     /// ZB_INGRESS_LANES: each lane holds one writer connection, which the budget counts.
     ingress_lanes: u32,
-    /// `TENANT_RULES`: which column carries the tenant, per table. Empty when reads are
+    /// The catalogue's `tenant_col`, per table. Empty when reads are
     /// unscoped, which is the default and is reported as such.
     tenant_rules: *const Config.EventClassification.TransitionRules,
     /// The CDC per-event buffer, `2^BASE_BUF`. Compared against the widest row already
@@ -1081,7 +1076,7 @@ pub fn run(
 
     // Reported after the table shapes, because "can this table be edited from the edge"
     // only matters for tables that replicate at all.
-    reportVersionColumns(allocator, conn, publication_name, sync_rules, default_version_column, writer_role, writable) catch |err| {
+    reportVersionColumns(allocator, conn, publication_name, sync_rules, writer_role, writable) catch |err| {
         log.warn("⚠️  Version-column report failed: {}", .{err});
     };
     reportTombstoneColumns(allocator, conn, publication_name);

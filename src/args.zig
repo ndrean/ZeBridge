@@ -14,19 +14,30 @@ const usage =
     \\  --pub <NAME>    PostgreSQL PUBLICATION to stream. REQUIRED here or as
     \\                  BRIDGE_CDC_PUBLICATION — there is no default.
     \\  --port <PORT>   HTTP telemetry port
+    \\
     \\  --gen-nkey      Mint the bridge<->NATS nkey pair (seed to stdout, once)
+    \\
     \\  --diagnose      Pre-run doctor: report everything boot would decide, write nothing
+    \\
     \\  --init-nats [dev|operator]  Generate the whole NATS stack, no nsc (--force overwrites)
     \\      [--js-domain NAME]      …for a JetStream reached across a leaf link (conf, grants, env)
+    \\
+    \\  --init-nats --update        Re-sign the account after a grammar change, same keys
+    \\      [--store PATH]          …the offline seeds (default zb-nats/operator.store)
+    \\
     \\  --revoke <principal>  Revoke: mapping + unused invites, three-clock narration.
+    \\                  Needs ADMIN_DATABASE_URL for the invocation (never stored in env)
+    \\      [--conf PATH]           …and close the token now: with OPERATOR_SEED and
+    \\                              ZB_ACCOUNT_PUB, re-sign the account's revocations
+    \\                              into this nats-server.conf (then reload the server)
+    \\
     \\  --view-slots    Every replication slot on the server: active, pid, LSNs, retained WAL
     \\  --view-slot <slot>  The same for one slot
     \\  --drop-slot <slot>  Drop an INACTIVE slot (frees its retained WAL). Needs
     \\                  ADMIN_DATABASE_URL for the invocation, never stored in env
-    \\                  Needs ADMIN_DATABASE_URL for the invocation (never stored in env)
     \\
     \\Environment:
-    \\  DATABASE_READER_URL          REQUIRED. Read path, credentials included:
+    \\  DATABASE_READER_URL   REQUIRED. Read path, credentials included:
     \\                        postgres://<role>:<pass>@<host>:<port>/<db>[?sslmode=…]
     \\                        May be a hot standby (PG ≥ 16): detected at boot; the CDC
     \\                        slot and every read stay there, and DATABASE_WRITER_URL
@@ -48,6 +59,21 @@ const usage =
     \\                        it differs from the dialed host (a public name, dialed on 127.0.0.1)
     \\  NATS_JS_DOMAIN        the JetStream domain to address, when JetStream is reached across
     \\                        a leaf link (API subjects, grants and /enroll all carry it)
+    \\  ZB_FEED_RESTART       1: this new slot replaces a lost one — restart the feed
+    \\                        once, so clients re-seed instead of resuming past the hole
+    \\  ZB_INGRESS_LANES      parallel mutation listeners, each with its own PG writer and
+    \\                        NATS connection (default: 1, max 8)
+    \\
+    \\  Enrollment (GET /enroll, GET /renew) — on only when these two and DATABASE_WRITER_URL
+    \\                        are set; `--init-nats operator` writes them:
+    \\  ZB_SIGNING_SEED       the account's scoped CLIENT signing seed: mints client users only
+    \\  ZB_ACCOUNT_PUB        the account's public key, named in every JWT minted
+    \\  ENROLL_JWT_TTL_SECONDS  life of a minted JWT (default: 86400). Clients renew by
+    \\                        themselves with a quarter of it left
+    \\  ENROLL_NATS_URL       the NATS URL handed to clients over TCP (native, Node)
+    \\                        (e.g. tls://nats.example.com:4222)
+    \\  ENROLL_NATS_WS_URL    the same for browsers (e.g. wss://nats.example.com)
+    \\
     \\  BASE_BUF              log2 of per-event data buffer (10-20 by default)
     \\  BASE_BUF_MAX          Raise BASE_BUF's ceiling past 20 (to at most 24), for a
     \\                        deployment that has also raised NATS's own max_payload.
@@ -56,17 +82,11 @@ const usage =
     \\  MAX_COLUMNS           Columns one CDC event can carry (8-1600). Unset (default):
     \\                        auto-detected at boot from the widest monitored table,
     \\                        rounded up for migration headroom. Set only to override.
+    \\
     \\  PUBLISH_MAX_RETRIES   Publish retries before fatal (default: 5)
     \\  PUBLISH_BACKOFF_MS    First publish backoff (default: 100)
     \\  PUBLISH_MAX_BACKOFF_MS  Publish backoff ceiling (default: 5000)
     \\  TRANSITION_RULES      e.g. users:status,kyc_level;orders:state
-    \\  SYNC_VERSION_COLUMN   default version column (default: updated_at)
-    \\  SYNC_RULES            per-table override, same grammar:
-    \\                        users:updated_at,deleted_at;orders:modified_at
-    \\  TENANT_RULES          which column carries the tenant, per table:
-    \\                        orders:tenant_id;invoices:tenant_id
-    \\                        A listed table gets its tenant appended to every CDC
-    \\                        subject, so reads can be scoped per principal.
     \\  GENERATIONS_ENABLED   1/true: the generation producer derives its table set
     \\                        from the publication (minus internals, no-PK,
     \\                        non-routable, opted-out via zebridge_enable) and its
@@ -84,10 +104,17 @@ const usage =
     \\                        parameter: depth × cadence must stay under the
     \\                        sweeper's tombstone retention.
     \\  GENERATION_CHAIN_DEPTH  generations kept per pair (default: 6)
-    \\  GENERATION_ASYNC_FULLS  build the depth rotation's full in the background while deltas keep cutting (default: true)
-    \\  GENERATION_RETIRE_GRACE_SECONDS  how long a retired generation's objects stay readable for a client mid-seed (default: 600)
-    \\  GENERATION_CHECKPOINT_SECONDS  how often the background lane cuts a checkpoint — rows moved since the last one, tombstones included (default: 1800; 0 = off)
-    \\  GENERATION_DEFER_FULLS  wait with the depth rotation's full while the stream is short of time (default: true)
+    \\  GENERATION_ASYNC_FULLS  build the depth rotation's full in the background while deltas 
+    \\                        keep cutting (default: true)
+    \\  GENERATION_BASE_REBUILD_PERCENT  rebuild the base once the checkpoints above it
+    \\                        weigh this percentage of it (default: 100)
+    \\  GENERATION_RETIRE_WINDOWS  retirements the grace may hold at once (default: 4)
+    \\  GENERATION_RETIRE_GRACE_SECONDS  how long a retired generation's objects stay readable
+    \\                        for a client mid-seed (default: 600)
+    \\  GENERATION_CHECKPOINT_SECONDS  how often the background lane cuts a checkpoint — rows moved
+    \\                        since the last one, tombstones included (default: 1800; 0 = off)
+    \\  GENERATION_DEFER_FULLS  wait with the depth rotation's full while the stream is short 
+    \\                        of time (default: true)
     \\  GENERATION_WORKERS    builders for the early cuts of bursting streams
     \\                        (default: 1). More re-cut those pairs in parallel,
     \\                        each on its own connections; the cadence tick builds
@@ -110,9 +137,9 @@ const usage =
     \\                        Log lines print "warning"/"error"; both
     \\                        spellings are accepted here.
     \\
-    \\Admin credentials (PG_HOST/PG_USER/PG_PASSWORD, POSTGRES_READER_*,
-    \\POSTGRES_WRITER_*) are NOT read by the bridge — they belong to init.sql and the
-    \\bridge-init container. Keep them in .env.admin. Defaults live in src/config.zig.
+    \\Admin credentials (PG_HOST/PG_USER/PG_PASSWORD, POSTGRES_READER_*, POSTGRES_WRITER_*) 
+    \\are NOT read by the bridge — they belong to init.sql and the bridge-init container.
+    \\Keep them in .env.admin. Defaults live in src/config.zig.
     \\
 ;
 
@@ -636,33 +663,6 @@ pub const Args = struct {
     /// Example: "users:status,kyc_level;orders:state,payment_status"
     pub fn parseTransitionRules(allocator: std.mem.Allocator, init: *const std.process.Init) !config.EventClassification.TransitionRules {
         return parseTableRules(allocator, init, "TRANSITION_RULES");
-    }
-
-    /// `SYNC_RULES=users:updated_at,deleted_at;orders:modified_at`
-    ///
-    /// Same grammar as TRANSITION_RULES on purpose — operators learn one format, and the
-    /// parser is literally the same code. First column is the version, optional second
-    /// is the tombstone.
-    pub fn parseSyncRules(allocator: std.mem.Allocator, init: *const std.process.Init) !config.EventClassification.TransitionRules {
-        return parseTableRules(allocator, init, "SYNC_RULES");
-    }
-
-    /// `TENANT_RULES=orders:tenant_id;invoices:tenant_id`
-    ///
-    /// Which column carries the tenant, per table. A table listed here has its tenant
-    /// appended to every CDC subject (`cdc.<table>.<op>.<tenant>`), so NATS subject
-    /// permissions can scope reads the way they already scope writes.
-    ///
-    /// Deliberately a **separate variable** from SYNC_RULES rather than a third positional
-    /// field. SYNC_RULES is `table:version[,tombstone]` with an optional second column, so
-    /// a third could not be told apart from a tombstone by position — and confusing a
-    /// tombstone column with a tenant column would route every row of the table to a
-    /// subject named after a timestamp.
-    ///
-    /// The same list-of-columns type as the other two, so the parser is shared; only the
-    /// first column is read.
-    pub fn parseTenantRules(allocator: std.mem.Allocator, init: *const std.process.Init) !config.EventClassification.TransitionRules {
-        return parseTableRules(allocator, init, "TENANT_RULES");
     }
 
     /// `GENERATION_RULES=users:_default;test_types:acme,globex`

@@ -137,7 +137,7 @@ services:
   # ⚠️ **Nothing may `depends_on` this service.** It exits non-zero on drift so the verdict
   # travels (visible as `exited (1)` in `docker compose ps`, and adoptable by CI later), but
   # blocking a deploy on it would be wrong today: the declaration is often legitimately ahead
-  # of reality — add a table, migrate, set TENANT_RULES, reload NATS — and findings inside
+  # of reality — add a table, migrate, zebridge_enable it, reload NATS — and findings inside
   # that window are correct without being bugs. Promote individual checks to gating by adding
   # a `depends_on` here, not by editing the script.
   #

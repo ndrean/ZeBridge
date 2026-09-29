@@ -81,9 +81,8 @@ SELECT * FROM zebridge_enable(
 
 The call also writes the table's `zebridge_catalogue` row (`version_col`,
 `tombstone_col`, `tiebreak_col`) in the same transaction; the bridge reads the catalogue
-at boot, so a restart makes it pick the table up. (`SYNC_RULES` in the bridge's
-environment is an optional per-table override for emergencies; production leaves it
-unset.)
+at boot and again on every catalogue row the WAL carries, so a running bridge picks
+the table up at COMMIT. The catalogue is the bridge's only source of per-table rules.
 
 This grants the table (`SELECT, INSERT, UPDATE, DELETE`, and refuses `zebridge_ddl_events`
 by name — see §1.7) and attaches the triggers that make the columns named in the catalogue
@@ -120,9 +119,8 @@ SELECT * FROM zebridge_enable(
 ```
 
 The catalogue row (`tenant_col`, `version_col`, `tombstone_col`) lands in the same
-transaction; the bridge reads the catalogue at boot, so a restart makes it pick the table
-up. (`TENANT_RULES`/`SYNC_RULES` in the bridge's environment are optional per-table
-overrides for emergencies; production leaves them unset.)
+transaction; the bridge reads the catalogue at boot and on every catalogue row the WAL
+carries, so a running bridge picks the table up at COMMIT.
 
 `zebridge_audit_write_guards()` reports what triggers/policies/RLS state are actually
 attached to a table, to compare against what the catalogue claims. Reads
@@ -273,9 +271,8 @@ ALTER EVENT TRIGGER zebridge_timestamp_guard_t DISABLE;  -- migrate, then ENABLE
    version/tombstone/tiebreak columns), and `zebridge_catalogue` rides the publication —
    so a running bridge sees that row arrive and reloads the catalogue at the
    transaction's COMMIT. ✅ Measured: a table enabled against a bridge that was never
-   restarted went from unbound to routed in one transaction.
-   (`SYNC_RULES`/`TENANT_RULES` remain as optional per-table env overrides for
-   emergencies; production leaves them unset.)
+   restarted went from unbound to routed in one transaction. There is no env override:
+   the guards are built from the same row, so the bridge cannot disagree with them.
 6. **NATS: nothing by hand.** A tenant-scoped table is already covered by the tenant's
    existing `cdc.<tenant>.>` grant. A public table gets its own named subject
    (`cdc.<table>.>`), not a wildcard — and the catalogue reload of step 5 is what binds
@@ -371,7 +368,7 @@ A clock running slow only delays the sweep, which costs disk and nothing else.
 
 ✅ The sweep set is derived from `zebridge_catalogue.tombstone_col`, read on the sweeper's
 own writer connection — the same table the bridge reads — so the two cannot disagree about
-which column is the tombstone (`SYNC_RULES` is an optional override). A table with no
+which column is the tombstone. A table with no
 tombstone is not swept: its deletes are physical and there is nothing to reap.
 
 ```

@@ -115,7 +115,6 @@ async def run():
     print(f"seeded {len(seeds)} rows in '{FIX}' (threshold {THRESHOLD_MS // 60000} min)\n")
 
     env = dict(os.environ)
-    env.pop("SYNC_RULES", None)  # the catalogue is the source under test
     env["SWEEP_ONLY_TABLES"] = FIX  # ⚠️ the scope: nothing else is swept
     env["GC_THRESHOLD_MS"] = str(THRESHOLD_MS)
     env["GC_INTERVAL_MS"] = "999999999"  # one pass, then it sleeps

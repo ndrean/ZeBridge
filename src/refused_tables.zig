@@ -58,7 +58,7 @@ pub const Reason = enum {
     /// is a sizing verdict rather than a schema one, and it lifts on restart rather
     /// than on a migration.
     row_too_large,
-    /// `TENANT_RULES` names a column the table does not have. Routing every row to a
+    /// The catalogue's `tenant_col` names a column the table does not have. Routing every row to a
     /// subject derived from a column that is not there would send them all to the same
     /// place — which is the opposite of scoping.
     no_tenant_column,
@@ -113,7 +113,7 @@ pub const Reason = enum {
             // wide row cannot be the operator's fresh mistake (the width guard refuses
             // those at write time) — say what is being waited for, not what to fear.
             .row_too_large => "waiting for a write that fits — it lifts itself then (30 s cooldown), no restart; the row predates the guard, a triggers-off load, or a BASE_BUF shrink. See the SUSPENDING block above, or SELECT public.zebridge_widest_row('<table>')",
-            .no_tenant_column => "add the column the catalogue/TENANT_RULES names, or correct the rule",
+            .no_tenant_column => "add the column the catalogue names, or correct it with zebridge_enable",
             .tenant_not_in_replica_identity => "CREATE UNIQUE INDEX <t>_zb_ri ON <t> (<tenant>, <pk>); ALTER TABLE <t> REPLICA IDENTITY USING INDEX <t>_zb_ri",
             .too_many_columns => "restart the bridge — MAX_COLUMNS re-detects from the widest table (doubled) — or set MAX_COLUMNS higher; dropping columns lifts it live",
             .no_cdc_subject => "declare the table in zebridge_catalogue (zebridge_enable with public_reason or tenant_col) — the bridge reloads on the catalogue row and lifts this itself, no restart",

@@ -363,7 +363,6 @@ fn runDiagnose(
     event_buf: usize,
     transition_rules: *const Config.EventClassification.TransitionRules,
     sync_rules: *const Config.EventClassification.TransitionRules,
-    default_version_column: []const u8,
     refused: *refused_tables.Registry,
     writer_role: ?[]const u8,
     ingress_lanes: u32,
@@ -446,7 +445,6 @@ fn runDiagnose(
         pub_name,
         transition_rules,
         sync_rules,
-        default_version_column,
         false, // never strict here: report everything, refuse nothing
         refused,
         writer_role,
@@ -902,43 +900,16 @@ pub fn main(init: std.process.Init) !void {
     var transition_rules = try args.Args.parseTransitionRules(allocator, &init);
     defer args.Args.deinitTransitionRules(&transition_rules, allocator);
 
-    // Which column carries the version, per table. Same grammar as TRANSITION_RULES.
-    var sync_rules = try args.Args.parseSyncRules(allocator, &init);
+    // THE CATALOGUE (NOTES.md, static-residue endgame; §10jz): `zebridge_catalogue` is
+    // the one per-table rule source, written by zebridge_enable atomically with the
+    // guards. These maps are its in-memory form: which column carries the version (and
+    // tombstone, tiebreak), and which carries the tenant. No env override — the guards
+    // in PostgreSQL are built from the same row, so the bridge can never disagree.
+    var sync_rules: Config.EventClassification.TransitionRules = .init(allocator);
     defer args.Args.deinitTransitionRules(&sync_rules, allocator);
-
-    // Which column carries the tenant, per table. Empty by default: reads are unscoped
-    // unless an operator says otherwise, and preflight reports that plainly rather than
-    // letting it be assumed.
-    var tenant_rules = try args.Args.parseTenantRules(allocator, &init);
+    var tenant_rules: Config.EventClassification.TransitionRules = .init(allocator);
     defer args.Args.deinitTransitionRules(&tenant_rules, allocator);
-
-    // THE CATALOGUE (NOTES.md, static-residue endgame): `zebridge_catalogue` is the
-    // authoritative per-table rule source, written by zebridge_enable atomically
-    // with the guards. Env rules above become per-table OVERRIDES; the catalogue
-    // fills everything else, and a pre-catalogue database loads zero rows.
-    // What the ENV named, snapshotted before the catalogue touches the maps: these
-    // tables stay the env's on every reload (§10bj). `env_sync_rules` is the listener's
-    // copy — immutable for the life of the process, so the write path never reads a
-    // map the replication thread rewrites.
-    var env_tenant_keys: catalogue.KeySet = .init(allocator);
-    defer env_tenant_keys.deinit();
-    var env_sync_keys: catalogue.KeySet = .init(allocator);
-    defer env_sync_keys.deinit();
-    var env_sync_rules: Config.EventClassification.TransitionRules = .init(allocator);
-    defer args.Args.deinitTransitionRules(&env_sync_rules, allocator);
-    {
-        var it = tenant_rules.keyIterator();
-        while (it.next()) |k| try env_tenant_keys.put(k.*, {});
-        var it2 = sync_rules.iterator();
-        while (it2.next()) |e| {
-            try env_sync_keys.put(e.key_ptr.*, {});
-            const cols = try allocator.alloc([]const u8, e.value_ptr.*.len);
-            for (e.value_ptr.*, 0..) |cname, i| cols[i] = try allocator.dupe(u8, cname);
-            try env_sync_rules.put(try allocator.dupe(u8, e.key_ptr.*), cols);
-        }
-    }
-    const catalogue_env: catalogue.Env = .{ .tenant_keys = &env_tenant_keys, .sync_keys = &env_sync_keys };
-    var cat = catalogue.loadRules(allocator, &pg_config, &tenant_rules, &sync_rules, catalogue_env);
+    var cat = catalogue.loadRules(allocator, &pg_config, &tenant_rules, &sync_rules);
     // Freed on the way out of main — topology.public_tables/tenants alias these
     // slices, and LIFO defers put this AFTER every thread join that reads them.
     defer cat.deinit(allocator);
@@ -949,8 +920,6 @@ pub fn main(init: std.process.Init) !void {
         runtime_config.topology.public_tables = cat.publics;
         if (cat.tenants.len > 0) runtime_config.topology.tenants = cat.tenants;
     }
-    const default_version_column = init.minimal.environ.getPosix("SYNC_VERSION_COLUMN") orelse
-        Config.Sync.default_version_column;
 
     // ── --diagnose: the pre-run doctor ──────────────────────────────────────────
     // Everything the boot would DECIDE, said before anything is DONE. By this point the
@@ -979,7 +948,6 @@ pub fn main(init: std.process.Init) !void {
             own_event_buf,
             &transition_rules,
             &sync_rules,
-            default_version_column,
             &d_refused,
             d_writer_role,
             runtime_config.ingress_lanes,
@@ -1098,7 +1066,6 @@ pub fn main(init: std.process.Init) !void {
         .pg_config = &pg_config,
         .tenant_rules = &tenant_rules,
         .sync_rules = &sync_rules,
-        .env = catalogue_env,
         .cat = &cat,
         .topo = &runtime_config.topology,
         .refused = &refused,
@@ -1128,7 +1095,6 @@ pub fn main(init: std.process.Init) !void {
         parsed_args.publication_name,
         &transition_rules,
         &sync_rules,
-        default_version_column,
         runtime_config.strict_tables,
         &refused,
         writer_role,
@@ -1515,7 +1481,6 @@ pub fn main(init: std.process.Init) !void {
         &type_registry_inst,
         &runtime_config.topology,
         &sync_rules,
-        default_version_column,
         &tenant_rules,
         @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2),
         &writable,
@@ -1604,8 +1569,6 @@ pub fn main(init: std.process.Init) !void {
                 wc,
                 nats_endpoint,
                 &runtime_config.topology,
-                &env_sync_rules,
-                default_version_column,
                 io,
                 &should_stop,
                 &catalog_epoch,
@@ -2508,7 +2471,6 @@ const LiveCatalogue = struct {
     pg_config: *const pg_conn.PgConf,
     tenant_rules: *Config.EventClassification.TransitionRules,
     sync_rules: *Config.EventClassification.TransitionRules,
-    env: catalogue.Env,
     cat: *catalogue.Load,
     topo: *topology_mod.Topology,
     refused: *refused_tables.Registry,
@@ -2516,7 +2478,7 @@ const LiveCatalogue = struct {
     stream_limits: Config.StreamLimits,
 
     fn reload(self: *LiveCatalogue, publisher: anytype, event_proc: anytype) void {
-        var fresh = catalogue.loadRules(self.allocator, self.pg_config, self.tenant_rules, self.sync_rules, self.env);
+        var fresh = catalogue.loadRules(self.allocator, self.pg_config, self.tenant_rules, self.sync_rules);
         if (!fresh.available) {
             log.warn("🗂️ catalogue moved but could not be re-read — routing unchanged until the next row", .{});
             fresh.deinit(self.allocator);

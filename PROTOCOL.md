@@ -1942,8 +1942,7 @@ allocates instead (§7.2).
 
 One recurring confusion, worth stating once: the catalogue (`zebridge_catalogue`) maps
 protocol concepts onto *your* schema. Every column name in it is yours to choose. Every
-payload field name is fixed by this protocol. (The `SYNC_RULES`/`TENANT_RULES` environment
-variables are optional per-table overrides for emergencies; production leaves them unset.)
+payload field name is fixed by this protocol.
 
 ```txt
 version_col   = 'updated_at'    -- version   — your column names

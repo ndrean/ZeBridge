@@ -2,7 +2,7 @@
 //! `event_processor.zig` when it builds a table's write contract (NOTES.md §1.11).
 //!
 //! Preflight already concludes the right answer — a usable version column
-//! (`SYNC_RULES`), the writer's actual `INSERT` grant, and whether the primary key is
+//! (from the catalogue), the writer's actual `INSERT` grant, and whether the primary key is
 //! database-allocated (which refuses edge writes outright, independent of the grant) —
 //! but until this registry existed the verdict was print-only: a boot-time log line and
 //! nothing else. This is where it is kept instead, so `appendWriteContract` can publish

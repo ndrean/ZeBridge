@@ -428,7 +428,7 @@ pub const Bridge = struct {
 /// Edge-write (ingress) configuration.
 pub const Sync = struct {
     /// The column compared for last-write-wins, when a table does not name its own in
-    /// SYNC_RULES. `updated_at` because that is what Ecto's `timestamps()` and Rails'
+    /// its catalogue row. `updated_at` because that is what Ecto's `timestamps()` and Rails'
     /// `t.timestamps` produce; Django and TypeORM differ, which is exactly why it is a
     /// default rather than a rule.
     pub const default_version_column = "updated_at";

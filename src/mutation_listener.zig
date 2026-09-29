@@ -354,7 +354,7 @@ const TableMeta = struct {
     col_kinds: []ColKind,
     /// The column compared for last-write-wins.
     version_col: []const u8,
-    /// Optional third `SYNC_RULES` column: where the winning writer's id is stored, so
+    /// Optional catalogue `tiebreak_col`: where the winning writer's id is stored, so
     /// equal versions can be broken instead of rejected. Null means no tiebreak — a tie
     /// is refused, which is the safe default and the behaviour before this existed.
     client_col: ?[]const u8 = null,
@@ -445,11 +445,6 @@ pub const MutationListener = struct {
     endpoint: config.Nats.Endpoint,
     io: std.Io,
     should_stop: *std.atomic.Value(bool),
-    /// Per-table version/tombstone column overrides, `SYNC_RULES`.
-    /// The ENV's SYNC_RULES only — an immutable copy made at boot. The catalogue's
-    /// rules are read from the catalogue itself in `tableMeta` (§10bj).
-    sync_rules: *const config.EventClassification.TransitionRules,
-    default_version_column: []const u8,
     /// table -> catalog facts, resolved on first use. See `TableMeta`.
     meta_cache: std.StringHashMap(TableMeta),
     /// Bumped by the replication thread on every DDL event, so a cached `TableMeta` can
@@ -496,9 +491,7 @@ pub const MutationListener = struct {
         pg_config: *const pg_conn.PgConf,
         endpoint: config.Nats.Endpoint,
         topology: *const Topology.Topology,
-        sync_rules: *const config.EventClassification.TransitionRules,
-        default_version_column: []const u8,
-        io: std.Io,
+            io: std.Io,
         should_stop: *std.atomic.Value(bool),
         catalog_epoch: *const CatalogEpoch,
         event_buf_bytes: usize,
@@ -513,8 +506,6 @@ pub const MutationListener = struct {
             .endpoint_topology = topology,
             .io = io,
             .should_stop = should_stop,
-            .sync_rules = sync_rules,
-            .default_version_column = default_version_column,
             .meta_cache = std.StringHashMap(TableMeta).init(allocator),
             .catalog_epoch = catalog_epoch,
             .event_buf_bytes = event_buf_bytes,
@@ -1072,10 +1063,10 @@ pub const MutationListener = struct {
                 if (isOperatorFault(err)) {
                     // One line for every operator fault: the specific reason was
                     // already logged where it was detected (`tableMeta`), and
-                    // `DbAllocatedKey` is not a SYNC_RULES disagreement — it is
+                    // `DbAllocatedKey` is not a catalogue disagreement — it is
                     // the table's key shape — so this stays generic.
                     log.err(
-                        "🔴 '{s}' cannot accept writes ({}): only a migration or a SYNC_RULES change can fix this. Preflight reports it at boot; see the line above for the reason.",
+                        "🔴 '{s}' cannot accept writes ({}): only a migration or a zebridge_enable change can fix this. Preflight reports it at boot; see the line above for the reason.",
                         .{ mutation.table, err },
                     );
                 } else {
@@ -1115,7 +1106,7 @@ pub const MutationListener = struct {
                     // which is the boundary doing its job. Nothing here is the
                     // operator's to fix — if the *grant* were the mistake,
                     // preflight would already have said so at boot, because
-                    // SYNC_RULES naming an ungrantable table is checked there.
+                    // a catalogue row on an ungrantable table is checked there.
                     log.info(
                         "⛔ Mutation refused [{s}] on '{s}': SQLSTATE {s} (not retrying)",
                         .{ mutation.principal, mutation.table, self.lastSqlstate() },
@@ -1609,7 +1600,7 @@ pub const MutationListener = struct {
     ///
     /// What *is* theirs:
     ///
-    ///   `NoVersionColumn` / `NoTombstoneColumn`         `SYNC_RULES` names a column the
+    ///   `NoVersionColumn` / `NoTombstoneColumn`         the catalogue names a column the
     ///                                                   schema does not have. Preflight
     ///                                                   says so at boot; if it reaches
     ///                                                   here, that warning was missed.
@@ -1621,7 +1612,7 @@ pub const MutationListener = struct {
     /// channel — no verdict reaches anyone who can act on it.
     fn isOperatorFault(err: anyerror) bool {
         return switch (err) {
-            // The schema and SYNC_RULES disagree. Preflight reports this at boot; seeing
+            // The schema and the catalogue disagree. Preflight reports this at boot; seeing
             // it at runtime means a table appeared later, or the warning went unread.
             error.NoVersionColumn,
             error.NoTombstoneColumn,
@@ -1895,7 +1886,7 @@ pub const MutationListener = struct {
         // index, but the cursor and every error message read better in key order.
         var ordered: [64]?[]const u8 = @splat(null);
         // Collected in the same pass so the version column's type is known without a
-        // second query; matched by name below, once SYNC_RULES has said which it is.
+        // second query; matched by name below, once the catalogue has said which it is.
         var type_oids: std.ArrayList(u32) = .empty;
         defer type_oids.deinit(alloc);
         var kinds: std.ArrayList(ColKind) = .empty;
@@ -1946,29 +1937,19 @@ pub const MutationListener = struct {
         }
         if (pk.items.len == 0) return error.NoPrimaryKey;
 
-        // SYNC_RULES wins over the global default; the tombstone is its optional second
-        // column. Absent means deletes are physical for this table.
-        var version_name: []const u8 = self.default_version_column;
+        // The CATALOGUE is the rule source (§10jz), read here — not from the bridge's
+        // rule map, which the replication thread rewrites on a live enable (§10bj).
+        // This struct is re-read on every catalog epoch, and a catalogue row bumps it,
+        // so a changed rule reaches the write path without a restart. The tombstone is
+        // optional (absent: deletes are physical); so is the tiebreak column, where
+        // the winner's client_id is kept on equal versions.
+        var version_name: []const u8 = config.Sync.default_version_column;
         var tombstone_name: ?[]const u8 = null;
         var client_name: ?[]const u8 = null;
         // Kept until the names are duped into `meta` below — the values point into it.
         var cat_res: ?*c.PGresult = null;
         defer if (cat_res) |res_| c.PQclear(res_);
-        if (self.sync_rules.get(table)) |cols| {
-            // Positional, and an empty entry means "not configured" — `updated_at,,x`
-            // is version + tiebreak with NO tombstone (see parseTableRules).
-            if (cols.len > 0 and cols[0].len > 0) version_name = cols[0];
-            if (cols.len > 1 and cols[1].len > 0) tombstone_name = cols[1];
-            // `table:updated_at,deleted_at,last_writer` — the third column is where the
-            // winner's client_id is kept. Opt-in per table because it costs a column, and
-            // a table that never sees concurrent equal versions does not need one.
-            if (cols.len > 2 and cols[2].len > 0) client_name = cols[2];
-        } else if (conn) |cn| {
-            // Not named by the env: the CATALOGUE is the rule source, and it is read
-            // here — not from the bridge's rule map, which the replication thread
-            // rewrites on a live enable (§10bj). This struct is already re-read on
-            // every catalog epoch, and a catalogue row bumps it, so a changed rule
-            // reaches the write path without a restart.
+        if (conn) |cn| {
             const tbl_z = try alloc.dupeZ(u8, table);
             defer alloc.free(tbl_z);
             const cat_params = [_]?[*:0]const u8{tbl_z.ptr};
@@ -2031,7 +2012,7 @@ pub const MutationListener = struct {
 
         if (!meta.hasColumn(meta.version_col)) {
             log.err(
-                "🔴 '{s}' has no version column '{s}': it is outbound-only. Preflight lists the candidates and the SYNC_RULES line to set.",
+                "🔴 '{s}' has no version column '{s}': it is outbound-only. Preflight lists the candidates; name one with zebridge_enable(version_col => …).",
                 .{ table, meta.version_col },
             );
             return error.NoVersionColumn;
@@ -2493,8 +2474,8 @@ pub const MutationListener = struct {
         // given the same pair of writes reach the same row, which a rejection does not
         // guarantee and a coin flip actively breaks.
         //
-        // ⚠️ Only when the table declares a column to store the winner's id (the third
-        // `SYNC_RULES` field). Without one there is nothing to compare against — the
+        // ⚠️ Only when the table declares a column to store the winner's id (the
+        // catalogue's `tiebreak_col`). Without one there is nothing to compare against — the
         // stored id has to be *on the row* — so a tie is refused exactly as before, which
         // is the safe default rather than a silent coin flip.
         if (meta.client_col) |client_col| {

@@ -110,10 +110,7 @@ def tenant_of(who: str) -> str:
 
 def rules(table: str) -> dict:
     """The LWW columns for a table: version, tombstone, tiebreak, tenant — from
-    `zebridge_catalogue`, with a `SYNC_RULES`/`TENANT_RULES` env entry overriding per
-    table exactly as the bridge honours it. Absent keys are None. Scenarios used to
-    read the env alone and `sys.exit` when it was empty, which on a catalogue-configured
-    stack is always."""
+    `zebridge_catalogue`, the bridge's only rule source. Absent keys are None."""
     r = {"version": None, "tombstone": None, "tiebreak": None, "tenant": None}
     out = psql(
         "SELECT version_col::text, COALESCE(tombstone_col::text, ''), COALESCE(tiebreak_col::text, ''), "
@@ -121,13 +118,6 @@ def rules(table: str) -> dict:
     if out:
         v, t, k, tc = (out.splitlines()[0].split("|") + ["", "", "", ""])[:4]
         r.update(version=v or None, tombstone=t or None, tiebreak=k or None, tenant=tc or None)
-    for entry in os.environ.get("SYNC_RULES", "").split(";"):
-        if entry.strip().startswith(table + ":"):
-            cols = (entry.split(":", 1)[1].split(",") + ["", "", ""])[:3]
-            r.update(version=cols[0] or r["version"], tombstone=cols[1] or None, tiebreak=cols[2] or None)
-    for entry in os.environ.get("TENANT_RULES", "").split(";"):
-        if entry.strip().startswith(table + ":"):
-            r["tenant"] = entry.split(":", 1)[1].split(",")[0] or r["tenant"]
     return r
 
 

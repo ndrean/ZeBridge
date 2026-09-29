@@ -49,8 +49,7 @@ async def main():
         f"AND tgrelid = 'public.{TABLE}'::regclass").strip() not in ("", "0")
 
     failed = 0
-    # From zebridge_catalogue (SYNC_RULES is only an override), exactly as the bridge
-    # resolves them — reading the env alone exits on every catalogue-configured stack.
+    # From zebridge_catalogue, exactly as the bridge resolves them.
     cols = zb.require_rules(TABLE, "version", "tombstone")
     version_col, tombstone_col = cols["version"], cols["tombstone"]
     print(f"version={version_col}  tombstone={tombstone_col}\n")

@@ -184,8 +184,7 @@ pub const EventProcessor = struct {
     /// Per-table version-column overrides and the global default, for the edge-writability
     /// report a table gets when it appears after boot. Same two values preflight uses.
     sync_rules: *const Config.EventClassification.TransitionRules,
-    default_version_column: []const u8,
-    /// `TENANT_RULES`: which column carries the tenant, per table. Empty means reads are
+    /// The catalogue's `tenant_col`, per table. Empty means reads are
     /// unscoped — every subscriber of `cdc.>` receives every row, which is the default and
     /// is reported as such at boot.
     tenant_rules: *const Config.EventClassification.TransitionRules,
@@ -212,7 +211,6 @@ pub const EventProcessor = struct {
         types: *TypeRegistry.Registry,
         topology: *const Topology.Topology,
         sync_rules: *const Config.EventClassification.TransitionRules,
-        default_version_column: []const u8,
         tenant_rules: *const Config.EventClassification.TransitionRules,
         /// `2^BASE_BUF`. Published so a client can size a write before sending it.
         event_buf_bytes: usize,
@@ -229,7 +227,6 @@ pub const EventProcessor = struct {
             .types = types,
             .topology = topology,
             .sync_rules = sync_rules,
-            .default_version_column = default_version_column,
             .tenant_rules = tenant_rules,
             .event_buf_bytes = event_buf_bytes,
             .writable = writable,
@@ -258,7 +255,6 @@ pub const EventProcessor = struct {
             conn.?,
             table,
             self.sync_rules,
-            self.default_version_column,
             self.writer_role,
             self.writable,
         ) catch |err| {
@@ -620,7 +616,7 @@ pub const EventProcessor = struct {
         // bug require misreading a value that is right there in the decoded tuple, rather
         // than a mismatched file.
         //
-        // ⚠️ A table listed in TENANT_RULES whose tenant value is missing here is dropped,
+        // ⚠️ A tenant-scoped table whose tenant value is missing here is dropped,
         // not published unscoped. Preflight already refuses tables whose tenant is outside
         // the replica identity — the case that would make DELETEs arrive bare — so
         // reaching this branch means something changed underneath a running bridge. The
@@ -670,7 +666,7 @@ pub const EventProcessor = struct {
             else
                 "?";
             log.err(
-                "🔴 Quarantining {s} on '{s}' to '.unrouted': TENANT_RULES names '{s}' but this event carries no value for it. Check that the replica identity still covers it.",
+                "🔴 Quarantining {s} on '{s}' to '.unrouted': the catalogue names tenant column '{s}' but this event carries no value for it. Check that the replica identity still covers it.",
                 .{ operation_lower, rel.name, named },
             );
             // ⚠️ Not published, even quarantined: no stream binds an `unrouted` subject, so
@@ -1047,7 +1043,7 @@ pub const EventProcessor = struct {
     /// and pack it into the ring buffer directly to the KV schemas subject.
     /// Does this table declare a tombstone column?
     ///
-    /// Read from `SYNC_RULES`, the same source `mutation_listener` uses to decide whether a
+    /// Read from the catalogue, the same source `mutation_listener` uses to decide whether a
     /// client's delete becomes an UPDATE — so the two cannot disagree about whether a
     /// table soft-deletes.
     ///
@@ -1291,7 +1287,7 @@ pub const EventProcessor = struct {
 
     /// Append `"version_column"` and `"tombstone_column"` to a schema descriptor.
     ///
-    /// The bridge resolves both from `SYNC_RULES` (falling back to the global default
+    /// The bridge resolves both from the catalogue (falling back to the global default
     /// version column), and until now kept the answer to itself — a descriptor carried
     /// `pk_columns` but never said *which* column a client must send as `version`, nor
     /// whether deletes on this table are soft. Both are required to write to the table
@@ -1314,7 +1310,7 @@ pub const EventProcessor = struct {
         const epoch: i64 = if (self.cat) |cat| (cat.epochs.get(table) orelse 0) else 0;
         try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"seed_epoch\":{d}", .{epoch}));
 
-        var version_name: []const u8 = self.default_version_column;
+        var version_name: []const u8 = Config.Sync.default_version_column;
         var tombstone_name: ?[]const u8 = null;
         if (self.sync_rules.get(table)) |cols| {
             if (cols.len > 0 and cols[0].len > 0) version_name = cols[0];
@@ -1390,7 +1386,7 @@ pub const EventProcessor = struct {
             try json_str.appendSlice(arena, ",\"tombstone_column\":null");
         }
 
-        // `TENANT_RULES`: which column scopes this table's rows by tenant, or `null` for
+        // The catalogue's `tenant_col`: which column scopes this table's rows by tenant, or `null` for
         // a table every principal reads and writes the same content of (system tables,
         // genuinely public business tables alike). Published so a client can tell the two
         // apart per table instead of assuming its own tenant everywhere — before this, a

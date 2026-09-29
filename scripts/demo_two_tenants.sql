@@ -9,7 +9,7 @@
 --
 -- Model B keeps one publication carrying every tenant and splits them on the **subject**:
 --   * RLS bounds what each principal may WRITE          (this file)
---   * TENANT_RULES routes CDC to cdc.<tenant>.<table>.<op>   (.env.bridge)
+--   * the catalogue's tenant_col routes CDC to cdc.<tenant>.<table>.<op>   (zebridge_enable)
 --   * NATS permissions bound what each client may READ  (nats-server.conf.template)
 --
 -- ⚠️ All three are required. RLS alone gives airtight writes and **no read isolation**:

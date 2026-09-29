@@ -59,8 +59,7 @@ exists to keep true.
 Subject, stream and KV names come from `grammar.json` (via `zb.py`), never hardcoded:
 one rename must move the bridge, `nats-init` and this harness together. Configuration
 comes from `zebridge_catalogue` (written by `zebridge_enable`): `zb.rules(table)` reads a
-table's LWW/tenant columns from it (a `SYNC_RULES`/`TENANT_RULES` env entry still
-overrides per table, as the bridge honours it), and `zb.tenants()` reads the live tenant
+table's LWW/tenant columns from it, as the bridge does, and `zb.tenants()` reads the live tenant
 list from `zebridge_user_tenants` — tenants are data, not config.
 
 ## Groups

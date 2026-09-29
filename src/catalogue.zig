@@ -2,11 +2,10 @@
 //!
 //! One row per replicated table, written by `zebridge_enable` atomically with the
 //! guards (the static-residue endgame): `tenant_col NULL` = public, NOT NULL =
-//! tenant-scoped; version/tombstone/tiebreak are the LWW columns. Loading it here
-//! ends the T3 transcription era — SYNC_RULES/TENANT_RULES env become OVERRIDES
-//! (an env entry for a table wins; the catalogue fills every table the env does
-//! not name). A database predating the catalogue loads zero rows and the bridge
-//! behaves exactly as before — graceful by construction, not by flag.
+//! tenant-scoped; version/tombstone/tiebreak are the LWW columns. It is the ONLY
+//! source of per-table rules (§10jz): the env overrides SYNC_RULES / TENANT_RULES are
+//! gone, because PostgreSQL's guards are built from this row and an override could
+//! only make the bridge disagree with them.
 //!
 //! Beyond the rule maps, the same read yields the two boot-scope lists the grammar
 //! file used to carry:
@@ -27,14 +26,7 @@ const c = c_imports.c;
 
 const log = std.log.scoped(.catalogue);
 
-/// The tables the ENV named (SYNC_RULES / TENANT_RULES) — snapshotted before the
-/// first catalogue read. An env entry overrides the catalogue for its table, at boot
-/// and on every reload; the catalogue owns every other table's entry outright.
-pub const KeySet = std.StringHashMap(void);
-pub const Env = struct {
-    tenant_keys: *const KeySet,
-    sync_keys: *const KeySet,
-};
+const KeySet = std.StringHashMap(void);
 
 /// What one read of the catalogue produced. The slices are allocated from the
 /// caller's allocator; the caller owns them until the next read replaces them (the
@@ -44,12 +36,11 @@ pub const Env = struct {
 /// MAPS are owned by the maps and freed by their own deinits, not here.
 pub const Load = struct {
     /// Whether the catalogue was reachable at all. False = pre-catalogue database or
-    /// connect failure; the caller keeps whatever the grammar file / env provided.
+    /// connect failure; the rule maps stay as they were (empty at boot).
     available: bool = false,
     /// Rows in the catalogue.
     rows: usize = 0,
-    /// Tables that gained rules here (env entries override, so an env-named table
-    /// counts only if the catalogue added something the env did not).
+    /// Tables that gained or changed rules here.
     merged: usize = 0,
     /// Tables with `tenant_col IS NULL` — what CDC_PUBLIC must route.
     publics: []const []const u8 = &.{},
@@ -81,20 +72,15 @@ fn freeCols(allocator: std.mem.Allocator, cols: []const []const u8) void {
     allocator.free(cols);
 }
 
-/// Put `cols` under `tbl` unless the env owns that table. Returns true when the map
+/// Put `cols` under `tbl`. Returns true when the map
 /// changed (added, or replaced with a different value). A replaced value is freed
 /// here; the key is the map's and stays.
 fn upsertRule(
     allocator: std.mem.Allocator,
     map: *config.EventClassification.TransitionRules,
-    env_keys: *const KeySet,
     tbl: []const u8,
     cols: []const []const u8,
 ) bool {
-    if (env_keys.contains(tbl)) {
-        freeCols(allocator, cols);
-        return false;
-    }
     if (map.getPtr(tbl)) |vp| {
         var same = vp.*.len == cols.len;
         if (same) for (vp.*, cols) |x, y| {
@@ -120,11 +106,10 @@ fn upsertRule(
     return true;
 }
 
-/// Drop every catalogue-owned entry whose table the catalogue no longer lists.
+/// Drop every entry whose table the catalogue no longer lists.
 fn pruneRules(
     allocator: std.mem.Allocator,
     map: *config.EventClassification.TransitionRules,
-    env_keys: *const KeySet,
     seen: *const KeySet,
     changed: *std.ArrayList([]const u8),
 ) void {
@@ -132,7 +117,7 @@ fn pruneRules(
     defer gone.deinit(allocator);
     var it = map.iterator();
     while (it.next()) |e| {
-        if (env_keys.contains(e.key_ptr.*) or seen.contains(e.key_ptr.*)) continue;
+        if (seen.contains(e.key_ptr.*)) continue;
         gone.append(allocator, e.key_ptr.*) catch continue;
     }
     for (gone.items) |k| {
@@ -155,18 +140,17 @@ fn pruneRules(
     }
 }
 
-/// Read the catalogue into the rule maps (env wins per table; the catalogue ADDS,
-/// REPLACES and REMOVES everything else) and collect the scope lists. Never fails:
+/// Read the catalogue into the rule maps (it ADDS, REPLACES and REMOVES entries) and
+/// collect the scope lists. Never fails:
 /// every degraded shape logs and returns what it could get. Called at boot and again
 /// on every `zebridge_catalogue` row the WAL delivers (§10bj), from the same thread
-/// that reads the maps for CDC — the mutation listener never reads them (it has the
-/// env map and the catalogue itself).
+/// that reads the maps for CDC — the mutation listener never reads them (it reads the
+/// catalogue itself).
 pub fn loadRules(
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
     tenant_rules: *config.EventClassification.TransitionRules,
     sync_rules: *config.EventClassification.TransitionRules,
-    env: Env,
 ) Load {
     var out: Load = .{};
     var changed: std.ArrayList([]const u8) = .empty;
@@ -178,7 +162,7 @@ pub fn loadRules(
     const conn = c.PQconnectdb(conninfo.ptr) orelse return out;
     defer c.PQfinish(conn);
     if (c.PQstatus(conn) != c.CONNECTION_OK) {
-        log.warn("🗂️ catalogue: PG connect failed at boot ({s}) — env rules only", .{c.PQerrorMessage(conn)});
+        log.warn("🗂️ catalogue: PG connect failed at boot ({s}) — no table rules until the next reload", .{c.PQerrorMessage(conn)});
         return out;
     }
 
@@ -188,8 +172,9 @@ pub fn loadRules(
             "FROM public.zebridge_catalogue ORDER BY tbl");
     defer c.PQclear(res);
     if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
-        // Missing table = a pre-catalogue database. Not an error; say so once.
-        log.info("🗂️ no zebridge_catalogue (pre-catalogue database?) — env rules only", .{});
+        // Missing table = init.core.template.sql was never applied. Preflight then
+        // refuses every table, with the reason; say it once here too.
+        log.warn("🗂️ no zebridge_catalogue — apply init.core.template.sql; every table stays refused", .{});
         return out;
     }
     out.available = true;
@@ -224,8 +209,8 @@ pub fn loadRules(
                 allocator.free(cols);
                 continue;
             };
-            if (upsertRule(allocator, tenant_rules, env.tenant_keys, tbl, cols)) grew = true;
-        } else if (!env.tenant_keys.contains(tbl)) {
+            if (upsertRule(allocator, tenant_rules, tbl, cols)) grew = true;
+        } else {
             // Public now: a tenant rule the catalogue used to carry goes.
             if (tenant_rules.fetchRemove(tbl)) |kv| {
                 allocator.free(kv.key);
@@ -234,7 +219,7 @@ pub fn loadRules(
             }
         }
         {
-            // POSITIONAL grammar mirrored from parseTableRules: version, tombstone,
+            // POSITIONAL: version, tombstone,
             // tiebreak — and position IS the meaning, so a tiebreak with no tombstone
             // keeps an empty placeholder in slot 1. Sliding it forward made the
             // tiebreak the tombstone (found live on counter_public: last_writer as
@@ -246,7 +231,7 @@ pub fn loadRules(
             if (tiebreak_col.len > 0)
                 list.append(allocator, allocator.dupe(u8, tiebreak_col) catch continue) catch continue;
             const cols = list.toOwnedSlice(allocator) catch continue;
-            if (upsertRule(allocator, sync_rules, env.sync_keys, tbl, cols)) grew = true;
+            if (upsertRule(allocator, sync_rules, tbl, cols)) grew = true;
         }
         if (grew) {
             out.merged += 1;
@@ -254,9 +239,9 @@ pub fn loadRules(
         }
     }
     out.publics = publics.toOwnedSlice(allocator) catch &.{};
-    // Tables gone from the catalogue: their catalogue-owned rules go with them.
-    pruneRules(allocator, tenant_rules, env.tenant_keys, &seen, &changed);
-    pruneRules(allocator, sync_rules, env.sync_keys, &seen, &changed);
+    // Tables gone from the catalogue: their rules go with them.
+    pruneRules(allocator, tenant_rules, &seen, &changed);
+    pruneRules(allocator, sync_rules, &seen, &changed);
     out.changed = changed.toOwnedSlice(allocator) catch &.{};
 
     // Tenants are data, not config: whoever is mapped today is whose streams boot
@@ -279,7 +264,7 @@ pub fn loadRules(
     }
     out.tenants = tenants.toOwnedSlice(allocator) catch &.{};
 
-    log.info("🗂️ catalogue: {d} row(s), {d} table(s) gained or changed rules (env entries override), {d} public, {d} tenant(s), {d} changed", .{
+    log.info("🗂️ catalogue: {d} row(s), {d} table(s) gained or changed rules, {d} public, {d} tenant(s), {d} changed", .{
         out.rows, out.merged, out.publics.len, out.tenants.len, out.changed.len,
     });
     return out;

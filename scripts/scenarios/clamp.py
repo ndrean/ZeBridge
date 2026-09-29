@@ -61,7 +61,7 @@ async def main():
     failed = 0
     who = zb.require_principal()
 
-    # the version column is what zebridge_catalogue declares (SYNC_RULES only overrides)
+    # the version column is what zebridge_catalogue declares (its only source)
     version_col = zb.require_rules(TABLE, "version")["version"]
 
     coltype = zb.psql(

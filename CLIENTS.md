@@ -30,7 +30,7 @@ TypeScript (browser, Node, React Native):
 import { ZeBridge } from 'zb-client-ts';
 const zb = new ZeBridge({ bridgeUrl: 'https://zb.example.com', invite: code, tables: ['orders'] });
 await zb.connect();
-zb.onChange('orders', refresh);
+zb.onChange('orders', refresh_ui_callback);
 const open = await zb.query('SELECT * FROM orders WHERE status = ?', 'open');
 await zb.mutate('orders', 'UPDATE', { id: 7 }, { status: 'done' });
 ```
@@ -47,7 +47,7 @@ with ZeBridge(bridge_url="https://zb.example.com", invite=code, tables=["orders"
 Kotlin (Android):
 
 ```kotlin
-val zb = ZeBridge(mapOf("bridgeUrl" to "https://zb.example.com", "invite" to code, "tables" to listOf("orders")), context) { refresh() }
+val zb = ZeBridge(mapOf("bridgeUrl" to "https://zb.example.com", "invite" to code, "tables" to listOf("orders")), context) { refresh_ui_callback() }
 val open = zb.query("SELECT * FROM orders WHERE status = ?", "open")
 zb.mutate("orders", "UPDATE", mapOf("id" to 7), mapOf("status" to "done"))
 ```
@@ -56,7 +56,7 @@ Dart (Flutter):
 
 ```dart
 final zb = await ZeBridgeWorker.spawn({'bridgeUrl': 'https://zb.example.com', 'invite': code, 'tables': ['orders']});
-zb.reports.listen((r) => refresh());
+zb.reports.listen((r) => refresh_ui_callback());
 final open = await zb.query('SELECT * FROM orders WHERE status = ?', ['open']);
 await zb.mutate('orders', 'UPDATE', {'id': 7}, {'status': 'done'});
 ```
@@ -67,53 +67,79 @@ Any other language, through the C ABI — five calls, JSON in and out:
 uint64_t h = zb_client_connect("{\"bridgeUrl\":\"https://zb.example.com\",\"invite\":\"…\",\"tables\":[\"orders\"]}");
 zb_free(zb_client_sync(h));                 // seed and catch up
 for (;;) zb_free(zb_client_poll(h, 1000));  // the loop: tail, verdicts, JWT renewal
-char *rows = zb_client_query(h, "SELECT * FROM orders", "[]");  /* … */ zb_free(rows);
+char *rows = zb_client_query(h, "SELECT * FROM orders", "[]");  /* … */ 
+zb_free(rows);
 zb_client_close(h);
 ```
 
-The two table lists: `tables` are seeded and followed live; `ondemandTables` get their
-schema only, and rows arrive when this client asks a service (`request`) and keeps the
-answer (`ingest`).
+**The two table lists**:
+
+- `tables` are seeded and followed live;
+- `ondemandTables` get their schema only, and rows arrive when this client asks a service (`request`) and keeps the answer (`ingest`).
+
+## Writes: what the library does for you
+
+An app calls `mutate` and reads rows back with `query`. Everything between is the
+library's, in both clients, and it is what PROTOCOL §7 requires of any client:
+
+1. **Optimistic apply and outbox, in one transaction.** The row changes locally at once,
+   and the write is queued in `_zebridge_outbox` in the same transaction, with the row's
+   state before it. A crash cannot keep one without the other.
+2. **Sent in the order it was written**, with a version stamp and a `msg_id`, so a retry
+   is the same write, not a second one. Before sending, the queue is checked against the
+   GC watermark: a write older than it is refused locally and its row restored.
+3. **A verdict per write** (`mutation_ack.<principal>.<msg_id>`), and the library acts on it:
+
+   | verdict | the library |
+   | --- | --- |
+   | `accepted` | drops the entry; the CDC echo confirms the row |
+   | `stale` | drops the entry; rebases the write onto the winning row when their columns do not overlap, else surfaces it |
+   | `row_deleted` | drops the entry and the local row |
+   | `rejected` | drops the entry and restores the row's state before the write |
+   | `failed` (`rate_limited`) | keeps the entry, holds the queue for `retry_after_ms` |
+   | no verdict yet | keeps the entry and sends it again on the next flush; missed verdicts are read back from the `VERDICTS` stream |
+
+4. **State only arrives through CDC.** A verdict is never data: the row the app sees is
+   what PostgreSQL emitted, apart from the optimistic row still waiting for its echo.
+
+Last-write-wins is decided by PostgreSQL on the table's version column (and its tiebreak
+column, on equal versions). The version, tombstone and tiebreak columns are the table's
+`zebridge_catalogue` row, and every client learns them from the schema it receives.
+
+⚠️ A client written from scratch, not on libzb or zb-client-ts, must do all four. Without
+them it does not get a weaker guarantee, it loses writes: a write sent while offline and
+not queued is gone, and one with no verdict looks the same whether it was applied or
+refused.
 
 ## Bindings: the rule
 
 A binding is the thin layer that gives one language libzb's C ABI. It may contain **only**:
 
 1. **the declarations** of the C functions (types, freeing the returned strings);
-2. **its language's thread model** — libzb drives a client from one thread: a worker thread
-   (Python, Kotlin), an isolate (Dart), a loop the host already has;
-3. **error mapping** — libzb's words (`{"error"}`, `zb_last_error`) into the language's
-   exception;
+2. **its language's thread model** — libzb drives a client from one thread: a worker thread (Python, Kotlin), an isolate (Dart), a loop the host already has;
+3. **error mapping** — libzb's words (`{"error"}`, `zb_last_error`) into the language's exception;
 4. **a default storage location** — the app-private directory where the platform has one.
 
-**Behavior never goes in a binding.** A retry, a default value, a parsing rule, a renewal
-policy: libzb, where every binding gets it at once. Enrollment and renewal were built that
-way, and they cost the Kotlin and Dart bindings almost nothing. A binding with logic is a
-second implementation, and a second implementation drifts — the three Flutter examples'
-copies had, before `zb-dart` replaced them.
+**Behavior never goes in a binding.** A retry, a default value, a parsing rule, a renewal policy: libzb, where every binding gets it at once. Enrollment and renewal were built that way, and they cost the Kotlin and Dart bindings almost nothing. A binding with logic is a second implementation, and a second implementation drifts — the three Flutter examples' copies had, before `zb-dart` replaced them.
 
-Each binding pins the ABI version it was written for (`ZB_ABI` / `zbAbi`), and
-`libzb/python/abi_check.py` fails when any pin disagrees with libzb. The bindings today:
-`zb-python` (~300 lines), `zb-dart` (~590, the isolate worker included), `zb-android`
-(~430, JNI included). A new one — Swift, Go, Rust, Ruby — starts from the closest of them.
+Each binding pins the ABI version it was written for (`ZB_ABI` / `zbAbi`), and `libzb/python/abi_check.py` fails when any pin disagrees with libzb.
+The bindings today: `zb-python` (~300 lines), `zb-dart` (~600, the isolate worker included), `zb-android` (~430, JNI included). A new one — Swift, Go, Rust, Ruby — starts from the closest of them.
 
 ## The configuration keys, side by side
 
-One vocabulary: the same key means the same thing in libzb's `opts_json` and in
-zb-client-ts's `new ZeBridge(opts)`, with the same default. An app passes what is about
-the app; what differs between platforms (storage, zstd, the NATS dial, crypto) the
-library decides — libzb by being native, zb-client-ts by its platform entry, which the
-bundler picks from package.json `exports` (`node`, `browser`, `react-native`).
+One vocabulary: the same key means the same thing in libzb's `opts_json` and in zb-client-ts's `new ZeBridge(opts)`, with the same default. An app passes what is about the app; what differs between platforms (storage, zstd, the NATS dial, crypto) the library decides — libzb by being native, zb-client-ts by its platform entry, which the bundler picks from package.json `exports` (`node`, `browser`, `react-native`).
 
 | key | libzb (`opts_json`) | zb-client-ts (`ZeBridgeConfig`) |
 | --- | --- | --- |
-| `natsUrl` | ✅ | ✅ |
-| `creds` | ✅ the .creds TEXT (nats.zig patch 19) | ✅ |
+| `bridgeUrl` | ✅ where `invite` is redeemed (`/enroll`) and the JWT renewed (`/renew`); kept in the identity | ✅ the same, and where the grammar hash is fetched when `grammarHash` is unset |
+| `invite` | ✅ first run only: with `bridgeUrl` and no stored identity, enrolls this device (§10jq) | ✅ the same |
+| `identityPath` | ✅ where the identity is kept (JSON, mode 0600); default `<dbPath>.identity`, else `zebridge.identity` | ✅ the same file on Node; a localStorage key in the browser; the app's SQLite store on React Native |
+| `natsUrl` | ✅ optional once enrolled: the identity carries it | ✅ the same (the identity's `nats_ws_url` in the browser and on React Native) |
+| `creds` | ✅ the .creds TEXT (nats.zig patch 19); wins over the identity | ✅ |
 | `credsPath` | ✅ a .creds file | ✅ where there is a filesystem (Node) |
-| `principal` | ✅ | ✅ (also the inbox prefix on both, §10hm) |
+| `principal` | ✅ optional: the creds or the identity name it | ✅ the same (also the inbox prefix on both, §10hm) |
 | `password` | — (creds only) | ✅ dev shape, user/password |
 | `grammarHash` | ✅ refuses to open on a mismatch | ✅ |
-| `bridgeUrl` | — (the grammar is compiled in) | ✅ where to fetch the grammar hash |
 | `tables`, `ondemandTables` | ✅ list or `"*"` | ✅ the same rule (§10hn) |
 | `dbPath` | ✅ SQLite or DuckDB file | ✅ a file (Node, React Native) or an OPFS name (browser) |
 | — default | `zebridge_<principal>.sqlite3`, kept across runs | the same |
@@ -130,27 +156,23 @@ bundler picks from package.json `exports` (`node`, `browser`, `react-native`).
 
 ## Pinned by fixtures — identical by construction
 
-One conformance suite, `zb-client-ts/fixtures/core-fixtures.json`, drives both cores
-(`core.ts` through `core.test.ts`, `core.zig` through `libzb/python/runner.py`). A
-rule in a fixture group cannot diverge without a test failing on one side. The groups,
-34 today: seedGate, tombstoned, chainPlan, outboxWatermark, fullPredates, scope,
-position, fkKind, pgTsToWire, lsnToNumber, normalizeVersion, nextVersion, hlcVersion,
-subjectSafe, envelope, keyChange, upsert, pgArrayLiteral, update, exists, delete,
-chainUpsert, chainRowParams, columnDdl, fkClauses, createTable, rebuildSteps,
-diffColumns, fkDiffer, viewSteps, indexPlan, heartbeat.
+One conformance suite, `zb-client-ts/fixtures/core-fixtures.json`, drives both cores (`core.ts` through `core.test.ts`, `core.zig` through `libzb/python/runner.py`). A rule in a fixture group cannot diverge without a test failing on one side.
+The groups, 39 today: seedGate, chainPlan, fullPredates, scope, position, caughtUp, fkKind, pgTsToWire, lsnToNumber, keyChange, upsert, delete, chainUpsert, chainRowParams, cdcBulk, columnDdl, fkClauses, createTable, rebuildSteps, diffColumns, fkDiffer, viewSteps, indexPlan, nextVersion, subjectSafe, envelope, normalizeVersion, hlcVersion, outboxWatermark, tombstoned, update, exists, pgArrayLiteral, heartbeat, shape, retyped, readOnlySql, tableSet, mergeRegisters.
 
-Everything below the core — the shells — is where parity is by hand, and where this
-document earns its place.
+Everything below the core — the shells — is where parity is by hand, and where this document earns its place.
 
 ## Parity matrix
 
-✓ same behaviour · ≠ different · — not applicable. The NOTES section that made each
-row a rule is named.
+✓ same behaviour · ≠ different · — not applicable. The NOTES section that made each row a rule is named.
 
 | contract | libzb | zb-client-ts | source |
 | --- | --- | --- | --- |
+| enrollment from an invite: the key pair made on the device, the seed never sent, `/enroll` redeemed, the identity stored | ✓ | ✓ | §10jq |
+| one identity format: a file libzb writes, zb-client-ts on Node reads, and back | ✓ | ✓ | §10jq |
+| https enrollment and renewal | ✓, except iOS: Zig cannot read the system trust store, so the app enrolls itself and passes `creds` | ✓ | §10jq |
+| JWT renewal: checked every eighth of the JWT's life (at most every 60 s), renewed with a quarter left, by signing with the device's key (`/renew`); the next reconnect uses the new JWT | ✓ in `poll` | ✓ on a timer | §10jt |
 | seed gate by stream seq, never by LSN | ✓ | ✓ | §10i, fixture |
-| on-demand tables: schema followed, nothing seeded or tailed, rows from `request` + `ingest` | ✓ | — not built | §10hj |
+| on-demand tables: schema followed, nothing seeded or tailed, rows from `request` + `ingest` | ✓ | ✓ | §10hj, §10hn |
 | seeding scoped to gapped streams, shared route included | ✓ | ✓ | §10n, §10bq, fixture |
 | a chain older than the replica's position is refused | ✓ | ✓ | §10n, fixture |
 | seed with foreign keys off, on again after | ✓ | ✓ | §10cp |
@@ -222,23 +244,28 @@ row a rule is named.
 2. ~~Migrations reach libzb late~~ — closed 2026-09-06: libzb drains a watch on the
    schemas bucket at the top of every poll (§10de); both clients now walk every
    migration shape of `MIGRATIONS.md` side by side (`scripts/scenarios/migrate_both.py`).
-3. **The TypeScript client follows every schema key.** No table list, so a ghost key
-   — a probe table dropped while no bridge watched, hence no tombstone — costs every
-   fresh client a 90 s wait and a permanent exclusion (item 3 of §10cq). libzb's
-   explicit list is immune. Two fixes, not exclusive: a `tables` option, and the
-   bridge purging keys for tables no longer in the publication at boot.
+3. ~~The TypeScript client follows every schema key~~ — closed by §10hn: both clients
+   follow `tables` (a list, or `"*"`) and nothing else.
 4. ~~Missing chain: retry or exclude~~ — closed 2026-09-11 (§10et): the TypeScript client
    keeps the table, holds its events (bounded) and asks for the chain without a deadline;
    the late seed replays what was held. Measured live on a table enabled between two ticks.
 5. **Chain-orphan check** is built in neither. Retention ≥ cadence keeps it rare, not
    impossible.
+6. **The TypeScript client follows one tenant.** A principal in several tenants gets the
+   first one only, with a warning in the log; libzb follows every membership and can
+   join or leave at runtime.
+7. **libzb cannot enroll over https on iOS.** Everywhere else the first ten lines are the
+   whole setup; on iOS with an https bridge, the app redeems the invite itself and passes
+   `creds`.
 
 ## What is tested, per client
 
 Both clients walk every migration shape together in `migrate_both` (owns).
 libzb carries the chaos program: `matrix`, `churn`, `cascade`, `client_gap`,
 `shared_gap`, `client_kill`, `chain_kill`, `jwt_expiry`, `clockskew`, `fleet`,
-`grammar_served`, `leaksoak`, and the swarm's Python workers. The TypeScript client
+`grammar_served`, `leaksoak`, and the swarm's Python workers. Enrollment is in the
+battery through `jwt_expiry` (an invite redeemed with a tiny TTL); renewal was proven by
+hand on both clients (a 40 s TTL held across 100 s) and is not in the battery yet. The TypeScript client
 is exercised by `objstore_race`, the swarm's Node/PGlite workers (§10cp, §10cq), the
 Node consumer example, and the browser by hand. Nothing kills a TypeScript host
 mid-seed, nothing migrates a table under a TypeScript client in the battery, and the
