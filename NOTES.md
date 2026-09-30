@@ -17883,3 +17883,25 @@ another holding `@` (both log in), 4 event triggers, the publication; read-only 
 writer URL (no write-side tables). Unit tests for the URL split, the quoting, the comment
 rule, and that both embedded templates use only the six known variables. zb-derive-env.py
 stays for the scenarios.
+
+## §10kf — fleet heartbeats: the live bucket's TTL is reconciled, and `inactive` is not a pause (2026-09-30)
+
+Found on the first Grafana Cloud dashboards: with two clients running (mary in a browser,
+bob in the 05 Flutter app on macOS), the fleet panels showed only one, and not always the
+same.
+
+**The bucket.** `$KV.live` had a 10 s TTL: `fleet.py` recreates it that way for its own
+speed, and the bridge only created the bucket when missing — an existing one kept its TTL.
+Heartbeats come every 30 s, so each client was in the bucket 10 s out of 30, and the
+bridge's 60 s poll saw whoever happened to fall inside the window. The fleet monitor now
+compares the bucket's stream (`KV_live`) max_age with FLEET_TTL_SECONDS on every poll and
+updates it when it differs (the stored config back whole; the duplicate window lowered
+with the age, which JetStream requires), logging `$KV.live TTL 10s → 90s`. Checked live:
+bucket set to 10 s, bridge restarted, corrected at the first poll.
+
+**The Flutter apps.** 05-tables and 08-map paused their worker on
+`AppLifecycleState.inactive`. On macOS that is "another window has focus": the app is on
+screen, stops polling, and its heartbeat stops with it (bob beat once, when clicked).
+On a phone `inactive` is brief (a call, the control centre). Both apps now pause only on
+`paused`, `hidden`, `detached`. libzb itself was fine: an idle client through zb-python
+beat every 30 s exactly.

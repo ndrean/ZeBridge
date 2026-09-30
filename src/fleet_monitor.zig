@@ -329,9 +329,11 @@ pub const FleetMonitor = struct {
         return h;
     }
 
-    /// Bind to the bucket; create it with the configured TTL only when it is missing.
-    /// A bucket that already exists keeps ITS TTL — the setting is applied at creation.
-    /// Open FIRST: creating over an existing bucket is refused by the server (10058,
+    /// Bind to the bucket; create it with the configured TTL when it is missing, and
+    /// bring an existing bucket's TTL to FLEET_TTL_SECONDS when it differs (§10kf): a
+    /// bucket left by a test (fleet.py makes one with a 10 s TTL) or by an older
+    /// setting kept ITS TTL, and heartbeats sent every 30 s then lived 10 s — clients
+    /// flickered on and off the fleet metrics. Open FIRST: creating over an existing bucket is refused by the server (10058,
     /// "already in use with a different configuration") and the library logs that
     /// refusal at error level, so create-then-open printed a misleading boot error
     /// on every start (§10dr).
@@ -347,14 +349,34 @@ pub const FleetMonitor = struct {
         // connection and retries until the batch publisher gives up and stops the
         // bridge. Measured 2026-09-17: the bucket was gone, `fleet` failed, and
         // `genproducer` died mid-run with `NoStreamResponse`.
-        return km.openBucket(self.topo.kv_live) catch |err| switch (err) {
-            error.BucketNotFound, error.StreamNotFound => km.createBucket(.{
+        const kv = km.openBucket(self.topo.kv_live) catch |err| switch (err) {
+            error.BucketNotFound, error.StreamNotFound => return km.createBucket(.{
                 .bucket = self.topo.kv_live,
                 .history = 1,
                 .ttl = .fromNanoseconds(@intCast(self.ttl_seconds * std.time.ns_per_s)),
             }),
-            else => err,
+            else => return err,
         };
+        self.reconcileTtl(js) catch |err| log.warn("👁️  $KV.{s}: could not check its TTL ({s}) — it stays as it is", .{ self.topo.kv_live, @errorName(err) });
+        return kv;
+    }
+
+    /// The bucket's stream is `KV_<bucket>`; its max_age IS the key TTL. The stored config
+    /// goes back whole with only the age (and the duplicate window, which JetStream
+    /// refuses longer than the age) replaced — a partial config would reset the rest.
+    fn reconcileTtl(self: *FleetMonitor, js: nats.JetStream) !void {
+        var buf: [128]u8 = undefined;
+        const stream = try std.fmt.bufPrint(&buf, "KV_{s}", .{self.topo.kv_live});
+        var info = try js.getStreamInfo(stream);
+        defer info.deinit();
+        var cfg = info.value.config;
+        const want: u64 = self.ttl_seconds * std.time.ns_per_s;
+        if (cfg.max_age == want) return;
+        log.info("👁️  $KV.{s} TTL {d}s → {d}s (FLEET_TTL_SECONDS)", .{ self.topo.kv_live, cfg.max_age / std.time.ns_per_s, self.ttl_seconds });
+        cfg.max_age = want;
+        if (cfg.duplicate_window == 0 or cfg.duplicate_window > want) cfg.duplicate_window = want;
+        var res = try js.updateStream(cfg);
+        res.deinit();
     }
 };
 

@@ -85,8 +85,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       case AppLifecycleState.resumed:
         zb!.resume();
         break;
-      case AppLifecycleState.paused:
+      // `inactive` is not a pause: on a desktop it means another window has focus (the
+      // app is on screen and must keep syncing); on a phone it is brief (a call, the
+      // control centre). Pausing there stopped sync, and the fleet heartbeat with it.
       case AppLifecycleState.inactive:
+        break;
+      case AppLifecycleState.paused:
       case AppLifecycleState.hidden:
       case AppLifecycleState.detached:
         zb!.pause();

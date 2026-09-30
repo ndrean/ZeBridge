@@ -162,10 +162,17 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final w = zb;
     if (w == null) return;
-    if (state == AppLifecycleState.resumed) {
-      w.resume();
-    } else {
-      w.pause();
+    switch (state) {
+      case AppLifecycleState.resumed:
+        w.resume();
+      // `inactive` is not a pause: on a desktop another window has focus (the app is on
+      // screen and must keep syncing); on a phone it is brief (a call, the control centre).
+      case AppLifecycleState.inactive:
+        break;
+      case AppLifecycleState.paused:
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.detached:
+        w.pause();
     }
   }
 
