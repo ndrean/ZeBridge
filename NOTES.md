@@ -17933,3 +17933,8 @@ Also seen in the same ramp, not fixed: the Python binding's writer reached 707 w
 three minutes instead of ~9,600. zb-python serves calls between polls (`poll_ms`, 250 ms
 by default), so a loop of `mutate` calls is capped near 4/s. Fine for an app, a limit for
 a writer; lowering `poll_ms` or batching would lift it.
+
+Follow-up, same day: the `mutate` scenario now publishes a sparse INSERT (the key only in
+`key`) and one whose data names another key, and checks the row lands under the client's
+key and the mismatch stores nothing. PROTOCOL §7.2 (`key` is the only source of the key;
+`data` may leave key columns out) and §7.7 (the rule holds for INSERT) say the same.

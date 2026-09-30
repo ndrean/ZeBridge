@@ -1566,8 +1566,8 @@ MessagePack, as everywhere else on the wire (§4).
 
 | field | required | what it is |
 | --- | --- | --- |
-| `key` | always | Every primary key column, by name. A **partial** key is refused rather than guessed: `ON CONFLICT` would otherwise match a different row than the client meant, and a DELETE would remove more rows than it asked for |
-| `data` | insert, update | The full row. Column names are checked against the catalog, which is the allowlist — an unknown name is refused and never reaches SQL. Ignored for `delete` |
+| `key` | always | Every primary key column, by name. It is the only source of the row's key: an INSERT stores the row under it, an UPDATE and a DELETE address the row by it. A **partial** key is refused rather than guessed: `ON CONFLICT` would otherwise match a different row than the client meant, and a DELETE would remove more rows than it asked for |
+| `data` | insert, update | The row's other columns: all of them for an insert, the changed ones for an update. The key columns may be left out; a key column that is present must equal `key`, or the write is refused (`KeyChange`). Column names are checked against the catalog, which is the allowlist — an unknown name is refused and never reaches SQL. Ignored for `delete` |
 | `version` | always | The value of *this table's* version column, as text, rendered exactly as CDC renders it (§7.3). Not a timestamp of your choosing, and not a field name you pick |
 | `client_id` | should | Tiebreaker for equal versions (§7.3): on a table with a `tiebreak_col` the higher `client_id` wins and is stored in that column (§7.4, 2b). Must be **stable across restarts** — a value regenerated per page load also changes `Nats-Msg-Id`, so a mutation retried after a crash is deduplicated against nothing and applies twice |
 
@@ -2214,10 +2214,10 @@ write in every respect: outbox row, optimistic apply, watermark gate, verdict.
 
 ### 7.7 Key columns are immutable
 
-An UPDATE addresses a row by its key and may not move it: a key column present in
-`data` must carry the key's own value. A different value is refused by the ingress as
-`rejected` / `KeyChange`, and both client libraries refuse it before an outbox row
-exists. A rename is a DELETE of the old key and an INSERT under the new one, and the
+A write addresses its row by `key`, and an INSERT stores the row under it: a key column
+present in `data` must carry the key's own value, for an INSERT as for an UPDATE. A
+different value is refused by the ingress as `rejected` / `KeyChange`, and both client
+libraries refuse it before an outbox row exists. A rename is a DELETE of the old key and an INSERT under the new one, and the
 old key's tombstone keeps it occupied until the sweeper reaps it (§7.5).
 
 ## 8. Ordering guarantees

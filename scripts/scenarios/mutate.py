@@ -165,6 +165,7 @@ async def main():
             zb.bad(f"{label}: {detail}")
             failed += 1
 
+    extra_keys: list = []
     nc = await zb.connect_as(PRINCIPAL)
     js = nc.jetstream()
     base = zb.subject(zb.TOPOLOGY["subjects"]["mutations_prefix"], PRINCIPAL, table)
@@ -221,9 +222,42 @@ async def main():
         else:
             check("delete", text is None,
                   "row physically deleted" if text is None else "row still present after the delete")
+
+        # ── §10kg: the INSERT's key comes from `key` ──────────────────────────────
+        # Clients send `data` sparse (libzb and zb-client-ts put the key only in `key`).
+        # The row must land under THAT key — a key left to the column DEFAULT is one
+        # the client never learns, and its next UPDATE answers row_deleted.
+        def new_key():
+            return str(uuid.uuid4()) if pk_type == "uuid" else 2_000_000_000 + uuid.uuid4().int % 100_000_000
+
+        def exists(k) -> bool:
+            return zb.psql(f"SELECT count(*) FROM public.{table} WHERE \"{pk_col}\" = '{k}'").strip() == "1"
+
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+        sparse_key, key_k, key_j = new_key(), new_key(), new_key()
+        extra_keys.extend([sparse_key, key_k, key_j])
+
+        sparse = full_row(columns, sparse_key, "sparse insert", now)
+        sparse.pop(pk_col, None)
+        await js.publish(f"{base}.insert", msgpack.packb(
+            {"key": {pk_col: sparse_key}, "data": sparse, "version": now, "client_id": "c1"}))
+        # key K, data naming J: one row stored under J while the verdict names K.
+        await js.publish(f"{base}.insert", msgpack.packb(
+            {"key": {pk_col: key_k}, "data": full_row(columns, key_j, "mismatched key", now),
+             "version": now, "client_id": "c1"}))
+        print("\n  insert with the key only in `key` — expect the row under that key")
+        print("  insert whose data names another key — expect KeyChange, no row")
+        await asyncio.sleep(2)
+        check("sparse insert", exists(sparse_key),
+              "stored under the client's key" if exists(sparse_key) else "NO ROW under the client's key — the key was not taken from `key`")
+        leaked = exists(key_k) or exists(key_j)
+        check("mismatched key", not leaked,
+              "refused, nothing stored" if not leaked else "a row was stored for an INSERT whose data named another key")
     finally:
         await nc.close()
         zb.psql(f"DELETE FROM public.{table} {where}", quiet=True)
+        for k in extra_keys:
+            zb.psql(f"DELETE FROM public.{table} WHERE \"{pk_col}\" = '{k}'", quiet=True)
 
     return 1 if failed else 0
 
