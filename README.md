@@ -1,7 +1,9 @@
 
 # Sync PostgreSQL locally
 
-<p align="center"><img width="400" height="400" alt="zebridge2" src="https://github.com/user-attachments/assets/137010f2-6274-4916-ad9e-b160fc83d66c" /></p>
+<p align="center">
+<img width="400" height="400" alt="zebridge-logo" src="https://github.com/user-attachments/assets/3b0b7c42-a94b-45ff-a9d7-274fdf26132c" />
+</p>
 
 ![Zig support](https://img.shields.io/badge/Zig-0.16.0-color?logo=zig&color=%23f3ab20)
 
