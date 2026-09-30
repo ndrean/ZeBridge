@@ -102,6 +102,11 @@ pub fn build(b: *std.Build) void {
     mod.addImport("msgpack", msgpack.module("msgpack"));
     mod.addImport("nats", nats_mod);
     mod.addImport("c", c_mod);
+    // §10ke: `bridge --init-sql` prints the init SQL, so the templates travel inside
+    // the binary. They live at the repository root, outside src/, where @embedFile
+    // cannot reach: named imports can.
+    mod.addAnonymousImport("init_core_sql", .{ .root_source_file = b.path("init.core.template.sql") });
+    mod.addAnonymousImport("init_write_sql", .{ .root_source_file = b.path("init.write.template.sql") });
 
     const exe = b.addExecutable(.{
         .name = "bridge",
@@ -120,6 +125,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    exe.root_module.addAnonymousImport("init_core_sql", .{ .root_source_file = b.path("init.core.template.sql") });
+    exe.root_module.addAnonymousImport("init_write_sql", .{ .root_source_file = b.path("init.write.template.sql") });
     exe.root_module.link_libc = true;
     linkLibpq(exe, b, prefix);
     linkZstd(exe, b, zstd_prefix);

@@ -407,7 +407,7 @@ tags, and publishes to inboxes. The write side is absent from its template, so a
 compromised service cannot reach PostgreSQL through the bridge, and a client credential
 is refused a `query.>` subscription, so nobody can pose as a service. Both are measured
 (NOTES §10hk). Minted by `scripts/native/jwt-bootstrap.sh` (nsc) or, in the stack the
-bridge generated, by `scripts/native/mint_responder.py --store operator.store`, offline: the
+bridge generated, by `bridge --mint-responder --store operator.store`, offline: the
 responder signing seed is never on the bridge host.
 
 **The reply inbox is a read boundary.** JetStream does not deliver a pulled message, a

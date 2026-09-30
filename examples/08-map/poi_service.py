@@ -514,7 +514,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default=os.environ.get("NATS_URL", "nats://127.0.0.1:4222"))
     # §10hk: a responder principal — reads like a client, answers, cannot write. Minted by
-    # jwt-bootstrap.sh (nsc) or scripts/native/mint_responder.py; tagged with the tenants it serves.
+    # jwt-bootstrap.sh (nsc) or `bridge --mint-responder`; tagged with the tenants it serves.
     ap.add_argument("--creds", default=str(ROOT / "scripts" / "native" / "creds" / "pois.creds"))
     ap.add_argument("--principal", default="pois")
     ap.add_argument("--db", default=os.environ.get("ZB_DB", "/tmp/pois-service.duckdb"))

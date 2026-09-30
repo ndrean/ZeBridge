@@ -339,6 +339,10 @@ pub fn run(
     // `--update [--store PATH]`: re-sign the account from the offline store (runUpdate).
     var update = false;
     var store_path: ?[]const u8 = null;
+    // `--dir DIR` (§10kd): where the files live on THEIR host — written there, and the
+    // absolute paths inside them (JetStream's store_dir, NATS_CREDS) point there. Run
+    // it on the host that will use the files: `--dir /etc/zebridge`.
+    var dir: []const u8 = "zb-nats";
     {
         var it = init.minimal.args.iterate();
         _ = it.next();
@@ -350,6 +354,9 @@ pub fn run(
                 update = true;
             } else if (std.mem.eql(u8, arg, "--store")) {
                 store_path = it.next() orelse return usageErr("--store needs a path");
+            } else if (std.mem.eql(u8, arg, "--dir")) {
+                dir = it.next() orelse return usageErr("--dir needs a path");
+                if (dir.len == 0) return usageErr("--dir needs a path");
             } else if (std.mem.eql(u8, arg, "--js-domain")) {
                 const v = it.next() orelse return usageErr("--js-domain needs a name");
                 for (v) |ch| if (ch == '.' or ch == ' ' or ch == '*' or ch == '>') return usageErr("--js-domain must be one subject token (no '.', ' ', '*', '>')");
@@ -360,7 +367,6 @@ pub fn run(
             } else return usageErr("unknown argument");
         }
     }
-    const dir: []const u8 = "zb-nats";
     if (update) {
         // The domain is part of the conf and the env as well as the grants: changing it
         // is a new stack, not an update.
@@ -409,7 +415,7 @@ pub fn run(
 }
 
 fn usageErr(msg: []const u8) u8 {
-    out("🔴 {s}\n  bridge --init-nats [dev|operator] [--js-domain NAME] [--force]\n  bridge --init-nats --update [--store PATH]\n", .{msg});
+    out("🔴 {s}\n  bridge --init-nats [dev|operator] [--dir DIR] [--js-domain NAME] [--force]\n  bridge --init-nats --update [--dir DIR] [--store PATH]\n", .{msg});
     return 1;
 }
 
@@ -711,7 +717,7 @@ fn runOperator(
         \\# Responders (§10hk): services that answer `query.<tenant>.<name>` from a replica.
         \\# Their signing seed is not here — the bridge never uses it. Mint one offline,
         \\# from the store:
-        \\#   scripts/native/mint_responder.py --store operator.store --name pois --tenant kilo > pois.creds
+        \\#   bridge --mint-responder --store operator.store --name pois --tenant kilo > pois.creds
         \\
         \\# The operator and account seeds are NOT here: they live in operator.store, which
         \\# the bridge never reads. Move it off this host; bring it back for `--update`.
@@ -928,4 +934,83 @@ test "an update keeps the store's keys and carries the revocations over" {
     const hub = try accountJwt(aa, &owned.topology, "hub", 3, &op_skp, op.public(), acct.public(), sk.public(), sk.public(), sk.public(), "");
     try std.testing.expect(!std.mem.eql(u8, grantsOf(first_claims), grantsOf(jwtClaims(aa, hub).?)));
     try std.testing.expectEqualStrings("", revocationsOf(jwtClaims(aa, hub).?));
+}
+
+/// `bridge --mint-responder --name N [--tenant T]… [--store PATH] [--ttl-days D]`
+/// (§10kc): a responder's creds, printed on stdout. A responder is a service that
+/// answers `query.<tenant>.<name>` from its replica; it reads like a client and never
+/// writes. Its permissions are the responder signing key's TEMPLATE in the account
+/// JWT — this names the user and tags its tenants, it cannot widen what the user may
+/// do. The signing seed comes from the offline store, so this runs where the store
+/// lives, never on the bridge host. One JWT implementation (`jwt_mint.mint`), and no
+/// Python package to install (it replaced scripts/native/mint_responder.py).
+pub fn mintResponder(io: std.Io, init: *const std.process.Init) u8 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var store_path: []const u8 = "zb-nats/operator.store";
+    var name: ?[]const u8 = null;
+    var tenants: std.ArrayList([]const u8) = .empty;
+    var ttl_days: i64 = 3650; // a service rotates with a redeploy, not a TTL
+    {
+        var it = init.minimal.args.iterate();
+        _ = it.next();
+        while (it.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--mint-responder")) continue;
+            if (std.mem.eql(u8, arg, "--store")) {
+                store_path = it.next() orelse return mintUsage("--store needs a path");
+            } else if (std.mem.eql(u8, arg, "--name")) {
+                name = it.next() orelse return mintUsage("--name needs a value");
+            } else if (std.mem.eql(u8, arg, "--tenant")) {
+                const t = it.next() orelse return mintUsage("--tenant needs a value");
+                if (t.len == 0 or std.mem.indexOfAny(u8, t, ".*> ") != null) return mintUsage("a tenant is one subject token (no '.', '*', '>', ' ')");
+                tenants.append(a, t) catch return 1;
+            } else if (std.mem.eql(u8, arg, "--ttl-days")) {
+                const v = it.next() orelse return mintUsage("--ttl-days needs a number");
+                ttl_days = std.fmt.parseInt(i64, v, 10) catch return mintUsage("--ttl-days needs a number");
+                if (ttl_days < 1) return mintUsage("--ttl-days must be at least 1");
+            } else return mintUsage("unknown argument");
+        }
+    }
+    const who = name orelse return mintUsage("--name is required");
+    // The principal alphabet invites use: a NATS subject token, a KV key and a
+    // template expansion all accept it.
+    for (who) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-')) return mintUsage("--name: letters, digits, '_' and '-' only");
+
+    const store = std.Io.Dir.cwd().readFileAlloc(io, store_path, a, .limited(1 << 16)) catch {
+        out("🔴 cannot read the store {s} (--store PATH)\n", .{store_path});
+        return 1;
+    };
+    const sk_text = storeValue(store, "SK_RESPONDER_SEED") orelse {
+        out("🔴 {s} has no SK_RESPONDER_SEED — is it an operator.store?\n", .{store_path});
+        return 1;
+    };
+    const acct_text = storeValue(store, "ACCOUNT_SEED") orelse {
+        out("🔴 {s} has no ACCOUNT_SEED — is it an operator.store?\n", .{store_path});
+        return 1;
+    };
+    const sk = keyFromSeed(sk_text) catch {
+        out("🔴 SK_RESPONDER_SEED in {s} is not a valid seed\n", .{store_path});
+        return 1;
+    };
+    const acct = keyFromSeed(acct_text) catch {
+        out("🔴 ACCOUNT_SEED in {s} is not a valid seed\n", .{store_path});
+        return 1;
+    };
+    const user = genKey(io, .user) catch return 1;
+    const now: i64 = @intCast(c.time(null));
+    const jwt = jwt_mint.mint(a, sk.seed(), acct.public(), who, tenants.items, user.public(), ttl_days * 24 * 3600, now) catch |err| {
+        out("🔴 mint failed: {}\n", .{err});
+        return 1;
+    };
+    const creds = credsFile(a, jwt, user.seed()) catch return 1;
+    std.Io.File.stdout().writeStreamingAll(io, creds) catch return 1;
+    out("✅ responder '{s}' minted ({d} tenant tag(s), {d} days) — keep the creds file like any secret\n", .{ who, tenants.items.len, ttl_days });
+    return 0;
+}
+
+fn mintUsage(msg: []const u8) u8 {
+    out("🔴 {s}\n  bridge --mint-responder --name NAME [--tenant T]... [--store PATH] [--ttl-days D] > NAME.creds\n", .{msg});
+    return 1;
 }

@@ -20,11 +20,18 @@ const usage =
     \\  --diagnose      Pre-run doctor: report everything boot would decide, write nothing
     \\
     \\  --init-nats [dev|operator]  Generate the whole NATS stack, no nsc (--force overwrites)
+    \\      [--dir DIR]             …where the files live on their host (default ./zb-nats)
     \\      [--js-domain NAME]      …for a JetStream reached across a leaf link (conf, grants, env)
     \\
     \\  --init-nats --update        Re-sign the account after a grammar change, same keys
-    \\      [--store PATH]          …the offline seeds (default zb-nats/operator.store)
+    \\      [--dir DIR]             …the directory holding nats-server.conf (default ./zb-nats)
+    \\      [--store PATH]          …the offline seeds (default DIR/operator.store)
     \\
+    \\  --init-sql      The init SQL for this database, on stdout (pipe it to psql). Reads
+    \\                  DATABASE_READER_URL, DATABASE_WRITER_URL, BRIDGE_CDC_PUBLICATION
+    \\
+    \\  --mint-responder --name NAME [--tenant T]... [--store PATH]
+    \\                  Creds for a responder service, on stdout, signed from operator.store
     \\  --revoke <principal>  Revoke: mapping + unused invites, three-clock narration.
     \\                  Needs ADMIN_DATABASE_URL for the invocation (never stored in env)
     \\      [--conf PATH]           …and close the token now: with OPERATOR_SEED and
@@ -150,7 +157,7 @@ pub const gen_nkey_flag = "--gen-nkey";
 
 /// Flags that REPLACE the program instead of configuring it: they read no environment,
 /// open nothing, and their whole output IS the answer.
-pub const EarlyExit = enum { help, gen_nkey, init_nats, revoke, view_slots, view_slot, drop_slot };
+pub const EarlyExit = enum { help, gen_nkey, init_nats, init_sql, mint_responder, revoke, view_slots, view_slot, drop_slot };
 
 /// Answered from argv by `main` BEFORE the log level is resolved and before anything
 /// else prints — boot noise on stderr is noise in a command meant to be piped
@@ -168,6 +175,8 @@ pub fn earlyExit(init: *const std.process.Init) ?EarlyExit {
         }
         if (std.mem.eql(u8, arg, gen_nkey_flag)) return .gen_nkey;
         if (std.mem.eql(u8, arg, "--init-nats")) return .init_nats;
+        if (std.mem.eql(u8, arg, "--mint-responder")) return .mint_responder;
+        if (std.mem.eql(u8, arg, "--init-sql")) return .init_sql;
         if (std.mem.eql(u8, arg, "--revoke")) return .revoke;
         if (std.mem.eql(u8, arg, "--view-slots")) return .view_slots;
         if (std.mem.eql(u8, arg, "--view-slot")) return .view_slot;

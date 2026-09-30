@@ -19,6 +19,7 @@ const pg_conn = @import("pg_conn.zig");
 const args = @import("args.zig");
 const nkey_gen = @import("nkey_gen.zig");
 const nats_init = @import("nats_init.zig");
+const init_sql = @import("init_sql.zig");
 const admin_revoke = @import("admin_revoke.zig");
 const admin_slots = @import("admin_slots.zig");
 const hot_streams = @import("hot_streams.zig");
@@ -725,6 +726,8 @@ pub fn main(init: std.process.Init) !void {
         .help => return args.printUsage(init.io),
         .gen_nkey => return nkey_gen.genNkey(init.io),
         .init_nats => return std.process.exit(nats_init.run(init.io, &init)),
+        .mint_responder => return std.process.exit(nats_init.mintResponder(init.io, &init)),
+        .init_sql => return std.process.exit(init_sql.run(init.io, &init)),
         .revoke => return std.process.exit(admin_revoke.run(&init)),
         .view_slots => return std.process.exit(admin_slots.run(&init, .view_all)),
         .view_slot => return std.process.exit(admin_slots.run(&init, .view_one)),
@@ -2808,6 +2811,7 @@ test {
     _ = @import("event_processor.zig");
     _ = @import("fleet_monitor.zig");
     _ = @import("generation_producer.zig");
+    _ = @import("init_sql.zig");
     _ = @import("mutation_listener.zig");
     _ = @import("nats_init.zig");
     _ = @import("numeric.zig");

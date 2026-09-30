@@ -17816,3 +17816,70 @@ onto a revoked name, and let a live principal through. No principal in the dev d
 had a revoked key, so nothing existing was affected. Scenarios render, tenant_writes,
 guards, enable_scoping, revoke and revoke_full pass; revoke_midseed (owns) not run next
 to the live bridge, and it never re-maps a revoked principal.
+
+## §10kc — `bridge --mint-responder`: responder creds without Python (2026-09-30)
+
+A responder's creds came from `scripts/native/mint_responder.py`, which needs the
+third-party `nkeys` package: the one operator task that required installing Python
+packages. The bridge already had both halves, `jwt_mint.mint` (its own `bridge.creds`)
+and the store reader of `--init-nats --update`, so the command moved into the binary:
+
+    bridge --mint-responder --store operator.store --name pois --tenant kilo > pois.creds
+
+The creds go to stdout, messages to stderr. It rebuilds the responder signing key and the
+account from the store, makes a fresh user key, and signs with the tenant tags. `--name`
+takes the invite alphabet (`[A-Za-z0-9_-]`), a tenant must be one subject token,
+`--ttl-days` defaults to 3650. The script is deleted (clean break); one JWT implementation
+remains. `--init-nats` stopped writing `ZB_RESPONDER_SEED` into `.env.bridge` the same day:
+the responder seed is only in the offline store.
+
+Checked on a generated stack: two tenant tags, the account matching ZB_ACCOUNT_PUB, the
+creds subscribe to `query.acme.pois` and are refused `mutation.x.y`; the four argument
+errors answer clearly.
+
+## §10kd — `--init-nats --dir`: the files are written for the host that reads them (2026-09-30)
+
+`--init-nats` always wrote `./zb-nats/`, and two paths inside the files are absolute:
+JetStream's `store_dir` in `nats-server.conf` and `NATS_CREDS` in `.env.bridge` (both must
+be: a relative store_dir resolves against nats-server's working directory, §10ch). So
+files generated on one machine pointed into that machine. `--dir DIR` names where the
+files live: they are written there and the paths point there (`--dir /etc/zebridge`,
+run on the server). `--update --dir DIR` edits `DIR/nats-server.conf`, and the store
+defaults to `DIR/operator.store`. Default unchanged: `zb-nats`.
+
+README: the setup commands use `--dir /etc/zebridge`, say to run on the server that uses
+the files (or edit `store_dir` when NATS is elsewhere), and that a service manager loads
+`.env.bridge` in production. The responder paragraph says where `--mint-responder` runs:
+on the machine holding `operator.store`; the command connects to nothing, and a copy of
+the binary needs only libpq and zstd installed.
+
+## §10ke — `bridge --init-sql`: the init SQL travels in the binary (2026-09-30)
+
+The DBA's step needed a checkout of the repository: the two templates,
+`scripts/zb-derive-env.py` (which reads `src/grammar.json` next to itself for the open
+tenant) and `envsubst`. The bridge already held the grammar; `build.zig` now also embeds
+`init.core.template.sql` and `init.write.template.sql` (named imports: they sit outside
+`src/`, where `@embedFile` cannot reach), and
+
+    set -a; . .env.bridge; set +a
+    bridge --init-sql | psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1
+
+prints the rendered SQL: role names and passwords from DATABASE_READER_URL /
+DATABASE_WRITER_URL (percent-decoded, split like libpq), TARGET_DB from the reader URL's
+database (TARGET_DB overrides), OPEN_TENANT from the embedded grammar, and
+`zebridge_create_publication('<BRIDGE_CDC_PUBLICATION>')` appended when it is set. No
+writer URL = the read-only profile (init.core only), as the bridge runs without ingress.
+
+Stricter than envsubst: role, database and publication names must be plain identifiers
+(they are written bare), passwords have their quotes doubled (written inside '…'), an
+unknown `${…}` is an error and so is an empty value in SQL (an empty one in a `--`
+comment is kept as written: init.core's own comment names ${POSTGRES_WRITER_USER}).
+Compared with the envsubst route on the dev env: identical except 12 spots where envsubst
+had eaten `$KV` (it replaces bare `$word` too): 11 comments and one message string, now
+as the template says.
+
+Checked on scratch databases: read/write with new roles and a password holding `'` and
+another holding `@` (both log in), 4 event triggers, the publication; read-only without a
+writer URL (no write-side tables). Unit tests for the URL split, the quoting, the comment
+rule, and that both embedded templates use only the six known variables. zb-derive-env.py
+stays for the scenarios.
