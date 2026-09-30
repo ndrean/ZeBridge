@@ -94,6 +94,10 @@ pub const GenerationProducer = struct {
     /// owned by `allocator` and live until deinit, so a copy of a Cut stays valid.
     cuts: std.StringArrayHashMapUnmanaged(Cut) = .empty,
     cuts_lock: utils.SpinLock = .{},
+    /// §10ki: tenants that have rows but no CDC stream — nobody is mapped to them, so no
+    /// client can follow a chain; their pairs are skipped. Said once per tenant, and once
+    /// again when the stream appears. Guarded by `cuts_lock`, keys owned by `allocator`.
+    streamless: std.StringHashMapUnmanaged(void) = .empty,
     /// §10ev: builders per tick (GENERATION_WORKERS). One builds on the tick's own
     /// thread and connections; more spawn that many threads, each with its own
     /// connections, taking pairs off a shared counter.
@@ -405,9 +409,13 @@ pub const GenerationProducer = struct {
                     "the fill is past 80% and the cut sits in the oldest half"
                 else
                     "the cut is within a tenth of the span";
-                log.warn("🧬 '{s}'/'{s}': cutting early — {s} holds {d} message(s), {d:.0}% of a cap, {d:.1} s to the byte cap, pruning {d:.0} msg/s; this pair's cut is {d} message(s) from the oldest and {d:.0} s old ({s})", .{
-                    cut.tenant, cut.table, cut.stream, span, r.fill * 100, r.to_cap_s, r.rate, @max(margin_msgs, 0), age_s, why,
-                });
+                // §10ki: AGE alone is routine — every quiet pair on a live stream comes here
+                // once per max_age — so it is info. The others say the stream is under
+                // pressure or a cut already fell off it: someone may need to act.
+                const routine = by_age and !(by_rate or by_fill or by_floor or by_gone);
+                const fmt = "🧬 '{s}'/'{s}': cutting early — {s} holds {d} message(s), {d:.0}% of a cap, {d:.1} s to the byte cap, pruning {d:.0} msg/s; this pair's cut is {d} message(s) from the oldest and {d:.0} s old ({s})";
+                const args = .{ cut.tenant, cut.table, cut.stream, span, r.fill * 100, r.to_cap_s, r.rate, @max(margin_msgs, 0), age_s, why };
+                if (routine) log.info(fmt, args) else log.warn(fmt, args);
                 try urgent.append(alloc, cut);
             }
         }
@@ -964,6 +972,29 @@ pub const GenerationProducer = struct {
         log.debug("🧬 '{s}'/'{s}': {d} object(s), manifest and bookkeeping swept", .{ tenant, table, deleted });
     }
 
+    /// §10ki: once per tenant, the first time its stream is missing.
+    fn streamGone(self: *GenerationProducer, tenant: []const u8, stream: []const u8) void {
+        self.cuts_lock.lock();
+        defer self.cuts_lock.unlock();
+        if (self.streamless.contains(tenant)) return;
+        const key = self.allocator.dupe(u8, tenant) catch return;
+        self.streamless.put(self.allocator, key, {}) catch {
+            self.allocator.free(key);
+            return;
+        };
+        log.info("🧬 tenant '{s}' has rows but no stream ({s}): nobody is mapped to it, so no client can follow its chains — skipped until one is", .{ tenant, stream });
+    }
+
+    /// §10ki: the tenant's stream exists again (a principal was mapped): say it once.
+    fn streamBack(self: *GenerationProducer, tenant: []const u8) void {
+        self.cuts_lock.lock();
+        defer self.cuts_lock.unlock();
+        if (self.streamless.fetchRemove(tenant)) |kv| {
+            log.info("🧬 tenant '{s}' has a stream again: its chains resume", .{tenant});
+            self.allocator.free(kv.key);
+        }
+    }
+
     fn buildOne(
         self: *GenerationProducer,
         alloc: std.mem.Allocator,
@@ -1279,8 +1310,16 @@ pub const GenerationProducer = struct {
             if (js.getStreamInfo(name)) |info_const| {
                 var info = info_const;
                 defer info.deinit();
+                self.streamBack(tenant);
                 break :blk .{ info.value.state.last_seq, try alloc.dupe(u8, name), info.value.state.first_seq, try alloc.dupe(u8, info.value.created) };
             } else |err| {
+                // §10ki: a tenant's stream exists once a principal is mapped to it
+                // (§10js). Without one nobody can follow this chain: skip the pair —
+                // before the snapshot's transaction, so nothing is left open.
+                if (err == error.StreamNotFound and !std.mem.eql(u8, tenant, self.topo.open_tenant)) {
+                    self.streamGone(tenant, name);
+                    return;
+                }
                 log.warn("🧬 '{s}'/'{s}': stream info for {s} failed ({}) — manifest ships without cutoff_seq, clients use the legacy lsn gate", .{ tenant, table, name, err });
                 break :blk .{ 0, name, 0, "" };
             }

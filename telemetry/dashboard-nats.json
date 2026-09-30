@@ -580,7 +580,7 @@
         },
         "overrides": []
       },
-      "description": "Incoming writes AND the verdicts share this stream; verdicts stay for its max-age (2 h) so an offline client can collect them. With discard=new, a full stream refuses new writes: sustained ~20k writes/s fills 1 GiB in about 5 minutes (NOTES §10jd). Watch the stored line approach the cap."
+      "description": "Client writes waiting for the bridge's ingress lanes. A write leaves the stream once applied (work-queue retention). With discard=new, a full stream refuses new writes at the door: the client's publish gets the error and keeps the write in its outbox. Verdicts are not here: they have their own stream, VERDICTS (NOTES §10jj)."
     },
     {
       "gridPos": {
@@ -590,7 +590,7 @@
         "y": 36
       },
       "id": 14,
-      "title": "MUTATIONS: messages",
+      "title": "Writes waiting and verdicts kept",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -604,8 +604,18 @@
           },
           "editorMode": "code",
           "expr": "jetstream_stream_total_messages{stream_name=\"MUTATIONS\"}",
-          "legendFormat": "messages (waiting writes + retained verdicts)",
+          "legendFormat": "writes waiting (MUTATIONS)",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "jetstream_stream_total_messages{stream_name=\"VERDICTS\"}",
+          "legendFormat": "verdicts kept (VERDICTS)",
+          "refId": "B"
         }
       ],
       "fieldConfig": {
@@ -617,7 +627,8 @@
           "min": 0
         },
         "overrides": []
-      }
+      },
+      "description": "MUTATIONS holds the writes the bridge has not applied yet; a steady rise means the lanes are at their ceiling. VERDICTS keeps the last verdict per write for 2 h so a client that was offline can collect it; when full it drops the oldest (discard=old), which costs that client one replay, never a write."
     },
     {
       "gridPos": {

@@ -21,9 +21,11 @@ with ZeBridge(bridge_url="https://zb.example.com", invite=code, tables=["orders"
   to the replica (`identity_path`, default `<db_path>.identity`, mode 0600). Later runs need
   neither the invite nor a NATS URL, and the JWT renews itself before it expires.
 - **The thread.** libzb drives a client from one thread; `ZeBridge` owns it. Any thread may
-  call it; a call waits at most one poll (`poll_ms`, 250 ms). Between calls the worker
-  polls, and `on_change` hears every poll that applied rows, settled writes or brought
-  requests — on the worker thread (calling back into `zb` from it is fine).
+  call it. An idle client polls every `poll_ms` (250 ms); while calls keep coming, the
+  thread serves each one at once and still polls every `poll_ms`, so a writer in a loop runs
+  at its own pace (measured: 1,700 writes/s, all settled). `on_change` hears every poll
+  that applied rows, settled writes or brought requests — on the worker thread (calling
+  back into `zb` from it is fine).
 - **Errors** raise `ZeBridgeError` with libzb's words. `on_error` hears the loop's.
 - **Revocation.** Once revoked, `zb.revoked` is true and the loop stops; `wipe()` removes the
   rows.

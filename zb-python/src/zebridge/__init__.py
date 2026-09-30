@@ -108,21 +108,43 @@ class ZeBridge:
             return
         self._handle = h
         ready.set_result(synced)
+        # Two paces. Idle: one poll of `poll_ms` at a time, as cheap as it gets (each poll
+        # is a pull request per stream). Busy — a call served in the last BUSY_S: the
+        # thread waits on the call queue instead, so a caller in a loop is served at once
+        # rather than after the poll in flight (a writer was capped near 4 calls/s at
+        # 250 ms); it still polls every `poll_ms`, briefly, so CDC and verdicts flow.
+        import time
+        busy_s, busy_poll_ms = 0.05, 5
+        last_call = last_poll = 0.0
+        pending: list = []
         while self._running:
-            # Calls first — each waits at most one poll — then the next poll.
             while True:
-                try:
-                    fn, fut = self._tasks.get_nowait()
-                except queue.Empty:
-                    break
+                if pending:
+                    fn, fut = pending.pop()
+                else:
+                    try:
+                        fn, fut = self._tasks.get_nowait()
+                    except queue.Empty:
+                        break
+                last_call = time.monotonic()
                 try:
                     fut.set_result(fn())
                 except BaseException as e:  # handed to the caller's thread
                     fut.set_exception(e)
             if not self._running:
                 break
+            now = time.monotonic()
+            busy = now - last_call < busy_s
+            poll_due = now - last_poll >= self._poll_ms / 1000
+            if busy and not poll_due:
+                try:
+                    pending.append(self._tasks.get(timeout=min(busy_s, self._poll_ms / 1000 - (now - last_poll))))
+                except queue.Empty:
+                    pass
+                continue
             try:
-                r = _check(n.take(n.lib.zb_client_poll(h, self._poll_ms)))
+                last_poll = time.monotonic()
+                r = _check(n.take(n.lib.zb_client_poll(h, busy_poll_ms if busy else self._poll_ms)))
                 if (r.get("applied") or r.get("settled") or r.get("requests")) and self._on_change:
                     self._on_change(r)
             except ZeBridgeError as e:

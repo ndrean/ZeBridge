@@ -17938,3 +17938,65 @@ Follow-up, same day: the `mutate` scenario now publishes a sparse INSERT (the ke
 `key`) and one whose data names another key, and checks the row lands under the client's
 key and the mismatch stores nothing. PROTOCOL §7.2 (`key` is the only source of the key;
 `data` may leave key columns out) and §7.7 (the rule holds for INSERT) say the same.
+
+## §10kh — zb-python serves calls at once while they keep coming (2026-09-30)
+
+The load ramp's writer reached 707 writes in three minutes. zb-python's worker served
+calls between polls, and a poll blocks `poll_ms` (250 ms): a caller in a loop waited for
+the poll in flight, so ~4 calls/s. Shorter polls would have fixed it at a cost — each poll
+is a pull request per stream — so the worker now has two paces: idle, one poll of
+`poll_ms` at a time as before; busy (a call served in the last 50 ms), it waits on the
+call queue instead and still polls every `poll_ms` with a 5 ms wait, so CDC and verdicts
+flow. Measured: 16,795 UPDATEs in 10 s (1,679/s) as nina, all 16,795 settled, the last
+value stored. zb-dart (`pollWaitMs` 100) and zb-android (250) have the same shape and the
+same cap; not changed yet.
+
+Dashboard: the NATS dashboard's MUTATIONS panels described the pre-§10jj stream (writes
+and verdicts together). MUTATIONS now reads as the writes waiting; the second panel shows
+it next to VERDICTS (verdicts kept 2 h, discard old). Patched in Grafana Cloud too.
+
+Correction to §10kg's reading of the ramp: the 05 page does not re-run a query per counter
+change (it sets the counter from the event). Why the browser client lagged at 200
+one-row transactions/s is not established; the next step is the same ramp against a
+zb-client-ts client in Node beside the browser, to separate the library from the page and
+its OPFS SQLite.
+
+## §10ki — the producer's log: routine re-cuts at info, streamless tenants skipped (2026-09-30)
+
+Read in Grafana Cloud's Loki, the bridge's warnings were mostly two things.
+
+**Early cuts by age.** Every quiet pair on a live stream is re-cut once per
+`CDC_MAX_AGE` (§10ev reason 5: an empty delta that keeps the pair's resume point inside
+the stream's window), and each one logged `cutting early` as a warning — about two lines
+a minute on the dev stack, 743 in bridge.log, beside 1,006 rate, 612 gone and 479 fill
+cases from bursts. The age case alone is now info; rate, fill, floor and gone stay
+warnings (stream pressure, or a cut already lost).
+
+**Tenants with rows and no stream.** The producer takes its tenants from the data
+(`zebridge_tenants_of`), streams exist for mapped tenants (§10js). Test leftovers
+(`dynten` in test_types, the 08-map grid's `c_gbq*` in pois) had rows and no mapping:
+every tick built their chains and warned `stream info for CDC_<t> failed
+(StreamNotFound)` — 1,032 times for dynten. The same happens in production when a
+tenant's last principal goes and its rows stay. `buildOne` now skips a pair whose
+tenant stream does not exist (before the snapshot's transaction), says so once per
+tenant at info, and once more when the stream appears (a principal mapped).
+
+**Scaling note, not built.** The age re-cut writes a real generation (a scan of the
+version index, an object, a manifest) per quiet pair per `CDC_MAX_AGE`: nothing at 30
+pairs, 50,000 per 15 minutes at 100 tables x 500 tenants. When a pair's version has not
+moved since its cut, moving the manifest's resume point forward (no object) would keep
+the guarantee for the price of a KV write.
+
+**The browser's lag was the metric's.** Same 200 updates/s ramp on globex's counter,
+applied by the browser (mary, zb-client-ts, OPFS SQLite) and by a Node zb-client-ts probe
+(mary's creds, heartbeat off): Node applied every update (~176/s, the loop's real rate)
+at 1 ms p50, 19 ms max from commit to apply. The browser's "lag" read 2,390 events with a
+heartbeat 13 s old, and 0 on the next heartbeat after the ramp. `bridge_fleet_client_lag_events`
+is (stream head at the bridge's poll) minus (applied seq in the client's last heartbeat,
+up to 30 s older): under load it over-reports by rate x heartbeat age — ~5,000 events at
+176/s at worst — which is exactly the number one would alert on. Not fixed: the heartbeat
+could carry each stream's `num_pending` (JetStream reports it on every delivery), and the
+bridge report that. The §10kh suspicion of the page or OPFS is withdrawn.
+
+The dynten resume, checked live: a principal mapped to dynten → the bridge created
+CDC_dynten, the producer logged "has a stream again" and built the chain (11 ms).
