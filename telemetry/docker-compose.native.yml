@@ -24,6 +24,18 @@ services:
     ports:
       - "127.0.0.1:9091:9090"
 
+  # Logs: tails the native bridge and nats-server log files, pushes to Grafana Cloud Loki.
+  alloy:
+    image: grafana/alloy:latest
+    container_name: zb_native_alloy
+    env_file: ../.env.grafana
+    command: ["run", "/etc/alloy/config.alloy", "--storage.path=/var/lib/alloy/data"]
+    volumes:
+      - ./alloy.native.alloy:/etc/alloy/config.alloy:ro
+      # the two log files only: scripts/native also holds creds and the nsc store
+      - ../scripts/native/bridge.log:/logs/bridge.log:ro
+      - ../scripts/native/nats-server-jwt.log:/logs/nats-server-jwt.log:ro
+
   nats-exporter:
     image: natsio/prometheus-nats-exporter:latest
     container_name: zb_native_nats_exporter

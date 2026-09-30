@@ -2367,11 +2367,35 @@ pub const MutationListener = struct {
             if (meta.client_col) |cc| {
                 if (std.mem.eql(u8, name, cc)) continue;
             }
+            // §10kg: the key comes from `key`, below. Repeated here unchanged it is
+            // skipped; a DIFFERENT value would insert one row while the verdict and the
+            // client's copy name another — refused, as the UPDATE path refuses it.
+            if (meta.isPk(name)) {
+                const sent = try self.payloadToStringTyped(alloc, entry.value_ptr.*, meta.kindOf(name));
+                for (meta.pk_cols, key_values) |pk, kv| {
+                    if (!std.mem.eql(u8, pk, name)) continue;
+                    const same = if (sent) |sv| (if (kv) |k| std.mem.eql(u8, std.mem.span(sv), std.mem.span(k)) else false) else (kv == null);
+                    if (!same) {
+                        log.info("⛔ '{s}': INSERT from '{s}' names key column '{s}' with a value other than its key", .{ mutation.table, mutation.principal, name });
+                        return error.KeyChange;
+                    }
+                }
+                continue;
+            }
             try cols.append(alloc, name);
             // Typed: the column decides the text form (ColKind). Only the DATA binds
             // go through this — the version and the primary key are scalars by
             // definition, and routing them here would only add a lookup.
             try vals.append(alloc, try self.payloadToStringTyped(alloc, entry.value_ptr.*, meta.kindOf(name)));
+        }
+
+        // §10kg: the key columns, from `key` — always. `data` may leave them out (libzb
+        // and zb-client-ts send it sparse), and a key left out was filled by the column's
+        // DEFAULT: `gen_random_uuid()` gave the row a key the client never knew, so its
+        // next UPDATE found nothing (`row_deleted`) and its local copy diverged.
+        for (meta.pk_cols, key_values) |pk, kv| {
+            try cols.append(alloc, pk);
+            try vals.append(alloc, kv);
         }
 
         // The version is the bridge's to write, from the message's `version` field —

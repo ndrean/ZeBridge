@@ -1,0 +1,51 @@
+// Grafana Alloy for the NATIVE dev stack: tails the bridge's and nats-server's log
+// files and pushes them to Grafana Cloud Loki. Run by telemetry/docker-compose.native.yml.
+// The key comes from the environment (GRAFANA_PASSWORD), never from this file.
+
+local.file_match "zebridge" {
+  path_targets = [
+    {__path__ = "/logs/bridge.log", service = "cdc-bridge", environment = "dev"},
+    {__path__ = "/logs/nats-server-jwt.log", service = "nats-server", environment = "dev"},
+  ]
+}
+
+loki.source.file "zebridge" {
+  targets       = local.file_match.zebridge.targets
+  // bridge.log holds days of history: start at the end, ship what happens from now on.
+  tail_from_end = true
+  forward_to    = [loki.process.zebridge.receiver]
+}
+
+loki.process "zebridge" {
+  // The bridge logs `info(fleet): …`, `warning(preflight): …`: level and scope.
+  stage.match {
+    selector = "{service=\"cdc-bridge\"}"
+    stage.regex {
+      expression = "^(?P<level>debug|info|warning|error)\\((?P<scope>[a-z_]+)\\):"
+    }
+    stage.labels {
+      values = {level = "", scope = ""}
+    }
+  }
+  // nats-server logs `[pid] date time [INF] …`.
+  stage.match {
+    selector = "{service=\"nats-server\"}"
+    stage.regex {
+      expression = "\\[(?P<level>INF|WRN|ERR|DBG|FTL|TRC)\\]"
+    }
+    stage.labels {
+      values = {level = ""}
+    }
+  }
+  forward_to = [loki.write.grafana_cloud.receiver]
+}
+
+loki.write "grafana_cloud" {
+  endpoint {
+    url = "https://logs-prod-035.grafana.net/loki/api/v1/push"
+    basic_auth {
+      username = "1246111"                        // the Loki user (the logs datasource's basicAuthUser)
+      password = sys.env("GRAFANA_PASSWORD")
+    }
+  }
+}

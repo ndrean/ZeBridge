@@ -17905,3 +17905,31 @@ screen, stops polling, and its heartbeat stops with it (bob beat once, when clic
 On a phone `inactive` is brief (a call, the control centre). Both apps now pause only on
 `paused`, `hidden`, `detached`. libzb itself was fine: an idle client through zb-python
 beat every 30 s exactly.
+
+## §10kg — an INSERT takes its key from `key`, not only from `data` (2026-09-30)
+
+Found by the first load ramp against the Grafana dashboards. A libzb client INSERTed a
+row with `key = {uid: K}` and `data` without `uid` (libzb and zb-client-ts send `data`
+sparse; they merge the key only into their own optimistic copy). The ingress built its
+INSERT from `data` alone, so `uid` was absent and PostgreSQL's `DEFAULT
+gen_random_uuid()` gave the row a key nobody knew. Every UPDATE on K then answered
+`row_deleted`, and the client's local row never matched the server's. PROTOCOL §7.2 says
+`data` is "the full row", so the client broke the contract, but the bridge accepted the
+break silently, with a key of its own.
+
+Now `applyUpsert` always adds the primary-key columns from `key` (already required, all
+columns, `MissingPrimaryKey` otherwise). A key column repeated in `data` with the same
+value is skipped; a different value is refused as `KeyChange`, like the UPDATE path
+(§10dv) — otherwise the row would be stored under one key while the verdict and the
+client's copy name another. The `ON CONFLICT … DO UPDATE SET` list already skipped key
+columns.
+
+Checked live: a sparse INSERT (nina, tango's counter) stored under the client's key, and
+its UPDATE accepted; a forged envelope (key K, data uid J) published with the nats CLI
+as nina was refused, nothing stored. Scenarios writable, mutate, replies, offline,
+tiebreak, clamp, intclamp, keys pass.
+
+Also seen in the same ramp, not fixed: the Python binding's writer reached 707 writes in
+three minutes instead of ~9,600. zb-python serves calls between polls (`poll_ms`, 250 ms
+by default), so a loop of `mutate` calls is capped near 4/s. Fine for an app, a limit for
+a writer; lowering `poll_ms` or batching would lift it.
