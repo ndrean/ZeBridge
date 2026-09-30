@@ -19,7 +19,7 @@ cp "$root/scripts/native/creds/omar.creds" "$here/build/zbtest-assets/omar.creds
 set -a; . "$root/.env.admin"; set +a
 live=$(psql "$ADMIN_DATABASE_URL" -XAtc "SELECT count(*) FROM test_types WHERE tenant_id = 'kilo' AND deleted_at IS NULL")
 port=$(ps -axo command | sed -n 's/.*zig-out\/bin\/bridge .*--port \([0-9]*\).*/\1/p' | head -1)
-hash=$(curl -s -D - -o /dev/null "http://127.0.0.1:${port:-9090}/grammar" | tr -d '\r' | sed -n 's/^x-grammar-hash: //Ip')
+hash=$(curl -s -D - -o /dev/null "http://127.0.0.1:${port:-27434}/grammar" | tr -d '\r' | sed -n 's/^x-grammar-hash: //Ip')
 # §10jq: a fresh invite per run for the enrollment test (the bridge must have /enroll armed).
 invite="android-$(openssl rand -hex 12)"
 psql "$ADMIN_DATABASE_URL" -XAtqc "INSERT INTO zebridge_invites (code, principal, tenant_id) VALUES ('$invite', 'android_user_$(openssl rand -hex 3)', 'kilo')"

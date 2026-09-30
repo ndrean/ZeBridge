@@ -65,7 +65,7 @@ Data emitted by ZeBridge are self-reflection, or read from what ZeBridge owns an
 
 ### Prometheus /metrics Endpoint
 
-**HTTP GET** `http://localhost:9090/metrics`, Prometheus text format, each metric with its own `# HELP`/`# TYPE` line.
+**HTTP GET** `http://localhost:27434/metrics`, Prometheus text format, each metric with its own `# HELP`/`# TYPE` line.
 
 <details>
 <summary>Example output</summary>
@@ -219,12 +219,12 @@ Every metric it queries was checked against a running exporter (`prometheus-nats
 scrape_configs:
   - job_name: 'cdc_bridge'
     static_configs:
-      - targets: ['localhost:9090']
+      - targets: ['localhost:27434']
 ```
 
 ### JSON /status Endpoint
 
-**HTTP GET** `http://localhost:9090/status` — the same data as `/metrics` above but shaped as JSON for a human or a shell script rather than a scraper.
+**HTTP GET** `http://localhost:27434/status` — the same data as `/metrics` above but shaped as JSON for a human or a shell script rather than a scraper.
 
 <details>
 <summary>Example output</summary>
@@ -372,7 +372,7 @@ The queries that matter are `{job="zebridge", level="error"}` and `{job="zebridg
 
 ## Health Check Endpoint
 
-**HTTP GET** `http://localhost:9090/health`
+**HTTP GET** `http://localhost:27434/health`
 Use for Docker health checks, Kubernetes probes, or load balancers.
 
 Returns:

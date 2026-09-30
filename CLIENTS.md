@@ -1,7 +1,6 @@
 # The two clients — what each does, and where they differ
 
-Two client libraries speak the protocol. This is their parity, as it stands, so a
-lifecycle lesson learned in one is not silently missing from the other.
+Two client libraries speak the protocol.
 
 | | libzb | zb-client-ts |
 | --- | --- | --- |

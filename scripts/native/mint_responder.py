@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Mint a RESPONDER credential without nsc (§10hk).
 
-    scripts/native/mint_responder.py --seed "$ZB_RESPONDER_SEED" --account "$ZB_ACCOUNT_PUB" \\
+    scripts/native/mint_responder.py --store operator.store \\
         --name pois --tenant kilo [--tenant acme] [--ttl-days 3650] > pois.creds
+
+    # or, with the two values in hand (the dev stack's nsc store):
+    scripts/native/mint_responder.py --seed SA… --account A… --name pois --tenant kilo > pois.creds
 
 A responder is a service that answers `query.<tenant>.<name>` from a replica: it reads
 like a client and answers, never writes. Its permissions are the account's responder
-signing-key TEMPLATE (`bridge --init-nats --mode operator` renders it; so does
+signing-key TEMPLATE (`bridge --init-nats operator` renders it; so does
 scripts/native/jwt-bootstrap.sh) — this script only names the user and tags its
 tenants; it cannot widen what the user may do. The JWT is the same document
 src/jwt_mint.zig mints: jti = base32(sha256) of the claims, ed25519-nkey signature over
@@ -75,12 +78,28 @@ def creds_file(jwt: str, seed: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--seed", required=True, help="the account's RESPONDER signing-key seed (SA…), or a path to a .nk file holding it")
-    ap.add_argument("--account", required=True, help="the account's public key (A…), ZB_ACCOUNT_PUB")
+    ap.add_argument("--store", help="operator.store from `bridge --init-nats operator`: the responder seed and the account come from it")
+    ap.add_argument("--seed", help="the account's RESPONDER signing-key seed (SA…), or a path to a .nk file holding it")
+    ap.add_argument("--account", help="the account's public key (A…), ZB_ACCOUNT_PUB")
     ap.add_argument("--name", required=True, help="the principal — the JWT's user name")
     ap.add_argument("--tenant", action="append", default=[], help="a tenant the responder answers for (repeatable); the open tenant is always granted")
     ap.add_argument("--ttl-days", type=int, default=3650, help="a service rotates with a redeploy, not a TTL")
     a = ap.parse_args()
+    if a.store:
+        # The store is offline by design (§10jy): this runs where it lives, never on the
+        # bridge host. Same `NAME=value` lines the bridge's --update reads.
+        vals = {}
+        for line in open(a.store).read().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                vals[k] = v
+        if "SK_RESPONDER_SEED" not in vals or "ACCOUNT_SEED" not in vals:
+            sys.exit(f"{a.store} has no SK_RESPONDER_SEED / ACCOUNT_SEED — is it an operator.store?")
+        a.seed = a.seed or vals["SK_RESPONDER_SEED"]
+        a.account = a.account or nkeys.from_seed(vals["ACCOUNT_SEED"].encode()).public_key.decode()
+    if not a.seed or not a.account:
+        sys.exit("give --store operator.store, or both --seed and --account")
     seed = a.seed.strip()
     if os.path.exists(seed):
         seed = open(seed).read().strip()

@@ -24,7 +24,7 @@ set -a && . ./.env.bridge && set +a          # DATABASE_READER_URL, DATABASE_WRI
 export BRIDGE_CDC_PUBLICATION=my_pub         # named, never guessed (NOTES §10ad)
 
 scripts/scenarios/run.py offline             # no stack needed
-scripts/scenarios/run.py live                # against the running stack + bridge on :9090
+scripts/scenarios/run.py live                # against the running stack + bridge on :27434
 scripts/scenarios/run.py owns                # each starts its OWN bridge: stop yours first
 scripts/scenarios/run.py all                 # offline, then live, then owns
 scripts/scenarios/run.py live -k mutate      # a subset by name
@@ -53,8 +53,8 @@ exists to keep true.
 | `BRIDGE_CDC_PUBLICATION` | **required** — the publication under test, passed to probe bridges as `--pub` |
 | `DATABASE_READER_URL` | **required by the bridge-spawning probes** — they start a real bridge, and it has no PG_HOST/PG_USER fallback |
 | `DATABASE_WRITER_URL` | required by `sweeper.py` (the sidecar's own connection) |
-| `ZB_BRIDGE_ARGS` | `--slot zb_probe --port 9096` — the probes get their own slot and port so they never disturb the bridge on :9090 |
-| `BRIDGE_PORT` | `9090`, the long-running bridge `telemetry.py` and the `live` group talk to |
+| `ZB_BRIDGE_ARGS` | `--slot zb_probe --port 9096` — the probes get their own slot and port so they never disturb the bridge on :27434 |
+| `BRIDGE_PORT` | `27434`, the long-running bridge `telemetry.py` and the `live` group talk to |
 
 Subject, stream and KV names come from `grammar.json` (via `zb.py`), never hardcoded:
 one rename must move the bridge, `nats-init` and this harness together. Configuration
@@ -65,7 +65,7 @@ list from `zebridge_user_tenants` — tenants are data, not config.
 ## Groups
 
 `offline` needs no bridge and no NATS — pure SQL and files, seconds each. `live` needs
-the long-running bridge on :9090 and the stack. `owns` scenarios start a probe bridge of
+the long-running bridge on :27434 and the stack. `owns` scenarios start a probe bridge of
 their own (`--slot zb_probe --port 9096`) and refuse to run beside another bridge —
 `run.py` serializes them, never in a parallel lane. `manual` scenarios are listed but
 never run by the battery.

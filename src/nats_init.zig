@@ -482,7 +482,7 @@ fn runDev(
         \\{s}
         \\BRIDGE_CDC_SLOT=zb_slot
         \\BRIDGE_CDC_PUBLICATION=zb_pub
-        \\BRIDGE_PORT=9090
+        \\BRIDGE_PORT=27434
         \\LOG_LEVEL=info
         \\
         \\# The bridge's nkey identity — unused by the OPEN dev server, but generated now
@@ -698,7 +698,7 @@ fn runOperator(
         \\{s}
         \\BRIDGE_CDC_SLOT=zb_slot
         \\BRIDGE_CDC_PUBLICATION=zb_pub
-        \\BRIDGE_PORT=9090
+        \\BRIDGE_PORT=27434
         \\LOG_LEVEL=info
         \\
         \\# Enrollment: the bridge as online signer (GET /enroll). The seed below is the
@@ -709,11 +709,9 @@ fn runOperator(
         \\ENROLL_JWT_TTL_SECONDS=86400
         \\
         \\# Responders (§10hk): services that answer `query.<tenant>.<name>` from a replica.
-        \\# This seed is the account's SCOPED responder signing key — a user it mints reads
-        \\# like a client and answers, never writes. Not read by the bridge; mint with
-        \\#   scripts/native/mint_responder.py --seed "$ZB_RESPONDER_SEED" --account "$ZB_ACCOUNT_PUB" \\
-        \\#     --name pois --tenant kilo > pois.creds
-        \\ZB_RESPONDER_SEED={s}
+        \\# Their signing seed is not here — the bridge never uses it. Mint one offline,
+        \\# from the store:
+        \\#   scripts/native/mint_responder.py --store operator.store --name pois --tenant kilo > pois.creds
         \\
         \\# The operator and account seeds are NOT here: they live in operator.store, which
         \\# the bridge never reads. Move it off this host; bring it back for `--update`.
@@ -725,7 +723,6 @@ fn runOperator(
             env_line,
             sk_client.seed(),
             acct_kp.public(),
-            sk_responder.seed(),
         },
     ) catch return 1;
 
@@ -763,7 +760,7 @@ fn runOperator(
         \\✅ operator stack generated — no nsc involved:
         \\   {s}/nats-server.conf   operator + ZEBRIDGE account (3 scoped signing keys: client, responder, service), resolver preload
         \\   {s}/creds/bridge.creds the bridge's identity (service scope)
-        \\   {s}/.env.bridge        NATS_CREDS + ZB_SIGNING_SEED wired for /enroll, ZB_RESPONDER_SEED for services
+        \\   {s}/.env.bridge        NATS_CREDS + ZB_SIGNING_SEED wired for /enroll
         \\   {s}/operator.store     every seed, 0600 — the bridge never reads it: move it OFF this host
         \\   Client onboarding is now ONLY the enrollment flow: invite row → GET /enroll →
         \\   creds. Nobody needs to understand accounts or claims.
@@ -854,7 +851,7 @@ fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8) u8 {
         \\✅ ZEBRIDGE account re-signed with the same keys ({s})
         \\   templates re-derived from the grammar; revocations carried over: {s}
         \\   Issued creds and device JWTs stay valid. Now reload the server:
-        \\     kill -HUP $(pgrep -x nats-server)
+        \\     nats-server --signal reload
         \\
     , .{ conf_path, if (revocations.len == 0) "none" else "yes" });
     return 0;

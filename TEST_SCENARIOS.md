@@ -9,7 +9,7 @@ The native stack (`scripts/native/up.sh`):
 
 * PostgreSQL 18 on 127.0.0.1:5432,
 * nats-server on 127.0.0.1:4222 in JWT/operator mode,
-* the bridge on :9090.
+* the bridge on :27434.
 
 Credentials are files: `scripts/native/creds/<principal>.creds` (`bridge`, `zbdoctor`, and the client principals `alice bob mary nina omar`, each mapped to a tenant in `zebridge_user_tenants`).
 Configuration is the catalogue: `zebridge_enable(...)` writes `zebridge_catalogue`, and a running bridge reloads it live (NOTES §10bj).

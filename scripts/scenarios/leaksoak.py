@@ -21,7 +21,7 @@ Needs the fixture tables `memo`, `note_t` and `counter_public` (init.core seeds 
 (`leaks`); run by hand, never by the battery.
 
 Env: SOAK_SECONDS (default 60), ZB_RSS_DRIFT_MB (default 64).
-Usage:  python scripts/scenarios/leaksoak.py   (admin ZB_PSQL; bridge on :9090; NATS_CREDS)
+Usage:  python scripts/scenarios/leaksoak.py   (admin ZB_PSQL; bridge on :27434; NATS_CREDS)
 """
 
 import datetime

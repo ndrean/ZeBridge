@@ -48,7 +48,7 @@ It is read-only by construction (NOTES §10y): stream names/info, per-key
 DIRECT.GET, its own inbox — and no CONSUMER.CREATE, so it cannot read a
 stream's data even though it can see that the stream exists. Postgres needs
 no more than the read role either: `bridge_reader` runs every gate.
-    BRIDGE_URL               the bridge's HTTP      (default: http://127.0.0.1:9090)
+    BRIDGE_URL               the bridge's HTTP      (default: http://127.0.0.1:27434)
 """
 
 import json
@@ -76,7 +76,7 @@ VERDICTS = GRAMMAR.get("streams", {}).get("verdicts", "VERDICTS")
 ACK_PREFIX = GRAMMAR.get("subjects", {}).get("mutation_ack_prefix", "mutation_ack")
 GEN_PREFIX = GRAMMAR.get("generations", {}).get("bucket_prefix", "gen-")
 
-BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://127.0.0.1:9090").rstrip("/")
+BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://127.0.0.1:27434").rstrip("/")
 NATS_URL = os.environ.get("NATS_URL", "nats://127.0.0.1:4222")
 NATS_CREDS = os.environ.get("NATS_CREDS")
 

@@ -51,7 +51,7 @@ moment the batch publisher acks:
 # in another shell, before starting the load
 while :; do
   printf '%s %s\n' "$(date +%s.%N)" \
-    "$(curl -s localhost:9090/metrics | awk '/^bridge_cdc_events_published_total /{print $2}')"
+    "$(curl -s localhost:27434/metrics | awk '/^bridge_cdc_events_published_total /{print $2}')"
   sleep 0.5
 done | tee drain.log
 ```

@@ -6,7 +6,7 @@ interface ImportMetaEnv {
   readonly VITE_PRINCIPAL?: string;
   readonly VITE_PASSWORD?: string;
   /// Where NATS's websocket and the bridge's HTTP actually are. Unset means the
-  /// native dev loop's ports (8080 / 9090); the compose stack puts both behind one
+  /// native dev loop's ports (8080 / 27434); the compose stack puts both behind one
   /// nginx origin, so there they are `ws://localhost:8090/nats` and
   /// `http://localhost:8090`.
   /// 'creds' (default, operator/JWT) or 'password' (the pre-operator broker, which

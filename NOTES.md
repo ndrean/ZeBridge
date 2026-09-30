@@ -17770,3 +17770,49 @@ BRIDGE_CDC_PUBLICATION, commented out in .env.bridge); live check, diagnose, wri
 mutate, tiebreak, clamp, intclamp, reaps, dyntenant, invalidate, keys, sweeper pass.
 check.py's one finding (fire_types, a read-only tenant table, "not fully wired") is
 the same on HEAD's check.py: its heuristic predates §10fx's read-only tenant tables.
+
+## §10ka — the bridge's HTTP port defaults to 27434, not 9090 (2026-09-29)
+
+`Config.Http.default_port` was 9090 from the first commit, with no reason recorded. 9090
+is Prometheus's own default, and on the VPS Prometheus runs beside the bridge
+(`debian/install.txt` leaves its listen address alone), so a bridge started without
+`BRIDGE_PORT` would have lost the port to it. Every deployment config already named
+27434: HAProxy's `/enroll` and `/renew` backend, both Prometheus scrape configs, the dev
+`.env.bridge`, the Vite proxy. Only the code disagreed.
+
+Changed: the compiled default; `--init-nats`'s generated `BRIDGE_PORT`; zbdoctor's
+`BRIDGE_URL`; the scenario harness's `BRIDGE_PORT` fallback; `device-test.sh`; the
+README, SECURITY (which also still said the server binds `0.0.0.0`; the default has been
+`127.0.0.1`), OBSERVABILITY_TELEMETRY, SPEED_TEST, TEST_SCENARIOS and compose comments.
+Prometheus's own 9090 stays where it is.
+
+## §10kb — a revoked principal cannot be mapped again (2026-09-29)
+
+§10jj made a re-grant lift the mapping ban: the bridge purges
+`mutation_ack.<p>.revoked` from VERDICTS when a principal's first membership comes
+back, live and at boot. It never asked why the mapping had gone. `bridge --revoke`
+deletes the mappings AND stamps the principal's keys; `/enroll` and `/renew` then refuse
+the name for good. But an `INSERT INTO zebridge_user_tenants` by hand still passed: the
+write guards accepted the principal again, `$KV.tenants` came back, the ban was lifted,
+and the revoked device's unexpired JWT (24 h) worked until it expired. Without the lift,
+the ban (2 h) would only have shortened that window.
+
+Two layers now:
+- **The door.** `zebridge_refuse_revoked_mapping_t`, BEFORE INSERT OR UPDATE OF principal
+  on `zebridge_user_tenants`: a principal with a revoked key cannot be mapped, with the
+  hint "invite the person under a new principal". The same test `/enroll` applies to an
+  invite. SECURITY DEFINER, so the writer role's enroll path is covered too.
+- **The lift.** `liftRevoked` (and so `liftStaleBans` at boot) skips a principal with a
+  revoked key and says so. It answers "revoked" when PostgreSQL cannot be asked: a ban
+  kept too long costs a wait, a ban lifted wrongly reopens a revoked device.
+
+A mapping removed by hand (no `--revoke`) is unchanged: its keys are fine, the INSERT
+passes, the ban lifts.
+
+Checked live on the dev stack: case 1 (mapping removed and restored) lifted live and at
+boot ("1 ban(s) lifted"); case 2 (key revoked) kept the ban with the log line; the
+trigger refused the INSERT as postgres and as the writer role, refused an UPDATE renaming
+onto a revoked name, and let a live principal through. No principal in the dev database
+had a revoked key, so nothing existing was affected. Scenarios render, tenant_writes,
+guards, enable_scoping, revoke and revoke_full pass; revoke_midseed (owns) not run next
+to the live bridge, and it never re-maps a revoked principal.

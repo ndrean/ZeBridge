@@ -1120,16 +1120,44 @@ pub const EventProcessor = struct {
     /// by the same INSERT. Advisory like the ban itself: a failure logs, and the ban
     /// ages out on its own. The JWT revocation (`--revoke --conf`) is untouched: a
     /// revoked KEY stays revoked; this lifts only the cooperative mapping ban.
-    pub fn liftRevoked(self: *EventProcessor, principal: []const u8) void {
-        const publ = self.publisher orelse return;
-        const js = if (publ.js) |*j| j else return;
+    ///
+    /// §10kb: never for a principal with a revoked key. `bridge --revoke` stamps the keys,
+    /// and such a name is dead for good — `/enroll` and `/renew` refuse it — so a mapping
+    /// put back by hand must not reopen the door for the revoked device's unexpired JWT.
+    /// Returns whether a ban was lifted.
+    pub fn liftRevoked(self: *EventProcessor, arena: std.mem.Allocator, principal: []const u8) bool {
+        if (self.hasRevokedKey(arena, principal)) {
+            log.warn("⛔ '{s}' mapped again, but it has a revoked key — the ban stays (a revoked name is dead for good; give the person a new principal)", .{principal});
+            return false;
+        }
+        const publ = self.publisher orelse return false;
+        const js = if (publ.js) |*j| j else return false;
         var buf: [256]u8 = undefined;
-        const subject = std.fmt.bufPrint(&buf, "{s}.{s}.revoked", .{ self.topology.mutation_ack_prefix, principal }) catch return;
+        const subject = std.fmt.bufPrint(&buf, "{s}.{s}.revoked", .{ self.topology.mutation_ack_prefix, principal }) catch return false;
         if (js.purgeStream(self.topology.stream_verdicts, .{ .filter = subject })) |res| {
             var r = res;
             defer r.deinit();
             if (r.value.purged > 0) log.info("✅ '{s}' mapped again — the ban on {s} is lifted", .{ principal, subject });
+            return r.value.purged > 0;
         } else |err| log.warn("⛔ '{s}' mapped again, but the ban on {s} could not be lifted ({s}) — its clients refuse to connect until it ages out", .{ principal, subject, @errorName(err) });
+        return false;
+    }
+
+    /// §10kb: whether any key of `principal` is revoked — the same test `/enroll` applies
+    /// to an invite. True when the question cannot be asked: keeping a ban that should
+    /// have gone costs a wait until it ages out; lifting one that should stay reopens a
+    /// revoked device.
+    fn hasRevokedKey(self: *EventProcessor, arena: std.mem.Allocator, principal: []const u8) bool {
+        var standard_pg_config = self.pg_config.*;
+        standard_pg_config.replication = false;
+        const conn = pg_conn.connect(arena, standard_pg_config) catch return true;
+        defer c.PQfinish(conn);
+        const p_z = arena.dupeZ(u8, principal) catch return true;
+        const params = [_]?[*:0]const u8{p_z.ptr};
+        const res = c.PQexecParams(conn, "SELECT EXISTS (SELECT 1 FROM public.zebridge_principal_keys WHERE principal = $1 AND revoked_at IS NOT NULL)::text", 1, null, &params, null, null, 0);
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) return true;
+        return std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, 0, 0)), "true");
     }
 
     /// §10jj, the boot side of `liftRevoked`: a principal re-mapped while this bridge was
@@ -1157,8 +1185,7 @@ pub const EventProcessor = struct {
             const principal = subj[prefix_len .. subj.len - ".revoked".len];
             const held = self.roster.get(principal) orelse continue;
             if (held.items.len == 0) continue;
-            self.liftRevoked(principal);
-            lifted += 1;
+            if (self.liftRevoked(arena, principal)) lifted += 1;
         }
         return lifted;
     }
@@ -2010,7 +2037,7 @@ pub const EventProcessor = struct {
         const first = self.rosterLen(row.principal) == 0;
         try self.rosterAdd(row.principal, row.tenant);
         // §10jj: none → one is a re-grant when the principal was revoked; lift its ban.
-        if (first) self.liftRevoked(row.principal);
+        if (first) _ = self.liftRevoked(arena, row.principal);
         const slot_idx = try self.packRosterSet(arena, row.principal, rel.relation_id, wal_end);
         log.info("✅ tenant mapping published to KV: '{s}' ∋ '{s}' ({d} membership(s))", .{ row.principal, row.tenant, self.rosterLen(row.principal) });
         return slot_idx;

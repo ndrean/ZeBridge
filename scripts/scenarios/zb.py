@@ -246,14 +246,14 @@ if "--pub" not in BRIDGE_ARGS:
 
 def bridge_port() -> int:
     """The HTTP port of the bridge a scenario drives: `--port` in ZB_BRIDGE_ARGS for a
-    probe, else `BRIDGE_PORT`, else the long-running bridge's 9090."""
+    probe, else `BRIDGE_PORT`, else the long-running bridge's 27434."""
     if "--port" in BRIDGE_ARGS:
         return int(BRIDGE_ARGS[BRIDGE_ARGS.index("--port") + 1])
-    return int(os.environ.get("BRIDGE_PORT", "9090"))
+    return int(os.environ.get("BRIDGE_PORT", "27434"))
 
 
 def http_base(probe: bool = False) -> str:
-    port = bridge_port() if probe else int(os.environ.get("BRIDGE_PORT", "9090"))
+    port = bridge_port() if probe else int(os.environ.get("BRIDGE_PORT", "27434"))
     return f"http://127.0.0.1:{port}"
 
 

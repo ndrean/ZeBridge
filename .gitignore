@@ -102,3 +102,6 @@ __pycache__/
 pnpm-lock.yaml
 examples/08-map/prix-des-carburants-en-france-flux-instantane-v2.csv
 zb.sqlite*
+
+# `bridge --init-nats` output: seeds, creds and .env.bridge (mode 0600). Never committed.
+/zb-nats/

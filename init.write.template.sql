@@ -613,6 +613,29 @@ GRANT SELECT ON public.zebridge_principal_keys TO ${POSTGRES_READER_USER}, ${POS
 -- its ownership row). Never DELETE: the rows outlive revocation on purpose.
 GRANT INSERT, UPDATE ON public.zebridge_principal_keys TO ${POSTGRES_WRITER_USER};
 
+-- A revoked principal is dead for good (§10dm, §10kb). `bridge --revoke` deletes its
+-- mappings and stamps its keys; /enroll then refuses any invite for the name and /renew
+-- refuses its keys. A mapping put back by hand would still reopen the door: writes pass
+-- the tenant guard again, and once the 2 h ban on VERDICTS ages out, the revoked
+-- device's unexpired JWT works until it expires. So the door itself refuses: no mapping
+-- for a principal with a revoked key. The fix is a new principal name.
+CREATE OR REPLACE FUNCTION public.zebridge_refuse_revoked_mapping()
+RETURNS trigger AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM public.zebridge_principal_keys
+               WHERE principal = NEW.principal AND revoked_at IS NOT NULL) THEN
+        RAISE EXCEPTION 'principal % was revoked and cannot be mapped again', NEW.principal
+            USING HINT = 'A revoked name is dead for good: invite the person under a new principal.';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_catalog;
+
+DROP TRIGGER IF EXISTS zebridge_refuse_revoked_mapping_t ON public.zebridge_user_tenants;
+CREATE TRIGGER zebridge_refuse_revoked_mapping_t
+    BEFORE INSERT OR UPDATE OF principal ON public.zebridge_user_tenants
+    FOR EACH ROW EXECUTE FUNCTION public.zebridge_refuse_revoked_mapping();
+
 -- Enrollment invites — the pump-starter (NOTES: the JWT mint flow). One row per
 -- invitation: a high-entropy single-use code the operator hands out out-of-band;
 -- presenting it to the bridge's /enroll endpoint IS the authentication (a one-time

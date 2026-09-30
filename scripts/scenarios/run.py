@@ -11,7 +11,7 @@
 Groups, because the scenarios differ in what they need and what they break:
 
   offline   pure SQL / files / a scratch package — no bridge, no NATS, seconds each.
-  live      need the long-running bridge (:9090) and act as a client principal
+  live      need the long-running bridge (:27434) and act as a client principal
             (`NATS_CREDS`, default omar) or as the bridge (`bridge.creds`).
   owns      start a probe bridge (`--slot zb_probe --port 9096`) and refuse to run
             beside another — serialized here, never in a parallel lane.

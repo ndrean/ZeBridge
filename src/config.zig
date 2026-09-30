@@ -279,8 +279,10 @@ pub const Nats = struct {
 
 /// HTTP metrics server configuration
 pub const Http = struct {
-    /// Default HTTP port for metrics endpoint
-    pub const default_port = 9090;
+    /// Default HTTP port (metrics, status, /enroll, /renew). Not 9090: that is
+    /// Prometheus's own default, and Prometheus runs beside the bridge on the VPS.
+    /// 27434 is what every deployment config (HAProxy, Prometheus scrape) names.
+    pub const default_port = 27434;
 
     /// How long a connection may take to send its request line and headers.
     ///

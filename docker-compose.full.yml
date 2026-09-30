@@ -148,7 +148,7 @@ services:
       dockerfile: Dockerfile.sweeper
     container_name: zb_sweeper
     # ports:
-    # Published on its own knob: the host dev loop usually holds 9090 already.
+    # Published on its own knob: the host dev loop usually holds 27434 already.
     # - "${BRIDGE_PUBLISH_PORT}:${BRIDGE_PORT}" #<--
     depends_on:
       bridge:
@@ -557,7 +557,7 @@ services:
       # topology. None of them is a service; all three are a developer's own window
       # onto the stack, so loopback is the correct audience.
       #
-      # Scraping is unaffected: Prometheus reaches `bridge:9090` and
+      # Scraping is unaffected: Prometheus reaches `bridge:27434` and
       # `nats-exporter:7777` over the compose network, not through a published port.
       # - "127.0.0.1:9091:9090"
     extra_hosts:

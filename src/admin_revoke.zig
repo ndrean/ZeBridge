@@ -228,7 +228,7 @@ fn fullRevoke(conn: ?*c.PGconn, init: *const std.process.Init, op_seed: []const 
         \\✅ FULL revocation written: {d} revoked key(s) in the account JWT ({s})
         \\   {s} amended in place. Now reload the server and the live session is kicked
         \\   with "Authentication Revoked":
-        \\     kill -HUP $(pgrep -x nats-server)
+        \\     nats-server --signal reload
         \\
     , .{ @as(usize, @intCast(c.PQntuples(rres))), account_pub, conf_path });
     return 0;

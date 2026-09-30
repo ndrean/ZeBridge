@@ -407,7 +407,8 @@ tags, and publishes to inboxes. The write side is absent from its template, so a
 compromised service cannot reach PostgreSQL through the bridge, and a client credential
 is refused a `query.>` subscription, so nobody can pose as a service. Both are measured
 (NOTES §10hk). Minted by `scripts/native/jwt-bootstrap.sh` (nsc) or, in the stack the
-bridge generated, by `scripts/native/mint_responder.py` from `ZB_RESPONDER_SEED`.
+bridge generated, by `scripts/native/mint_responder.py --store operator.store`, offline: the
+responder signing seed is never on the bridge host.
 
 **The reply inbox is a read boundary.** JetStream does not deliver a pulled message, a
 KV answer or an object chunk on the subject the reader filtered on: it delivers to the
@@ -703,7 +704,7 @@ A publication and slot per tenant moves that guarantee back into PostgreSQL.
   The NKEY seed already gets this treatment — deliberately in no env file, passed on the
   command line. The database credentials should get the same.
 
-* **The HTTP telemetry server** ⚠️ — it binds `0.0.0.0:9090` (`INADDR_ANY`) with no authentication on any endpoint. Verified reachable: `/metrics` and `/streams/info?stream=CDC` both answer `200` to an unauthenticated caller.
+* **The HTTP telemetry server** ⚠️ — it binds `127.0.0.1:27434` by default (`BRIDGE_BIND`, `BRIDGE_PORT`), with no authentication on any endpoint; `BRIDGE_BIND=0.0.0.0` exposes it to the network. Verified reachable: `/metrics` and `/streams/info?stream=CDC` both answer `200` to an unauthenticated caller.
 
   | endpoint | exposure |
   | --- | --- |

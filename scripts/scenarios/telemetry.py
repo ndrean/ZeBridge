@@ -20,8 +20,8 @@ Four things, in order of what they would cost if wrong:
 
 Usage:  python scripts/scenarios/telemetry.py [base_url]
 
-  telemetry.py                        # the long-running bridge (zb.http_base(): BRIDGE_PORT, default 9090)
-  telemetry.py http://otherhost:9090
+  telemetry.py                        # the long-running bridge (zb.http_base(): BRIDGE_PORT, default 27434)
+  telemetry.py http://otherhost:27434
 """
 
 import json

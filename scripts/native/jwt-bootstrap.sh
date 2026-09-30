@@ -252,7 +252,7 @@ nsc generate config --mem-resolver --config-file "$ROOT/scripts/native/resolver.
 # key regenerates the ACCOUNT JWT, so that block must be refreshed too, or a reload
 # reports "Reloaded: accounts" while enforcing the old template (measured 2026-08-29:
 # a new DIRECT.GET grant was refused for 20 minutes after a successful reload).
-# Splice the fresh ZEBRIDGE JWT in when the file exists, then `kill -HUP` the server.
+# Splice the fresh ZEBRIDGE JWT in when the file exists, then reload the server (`nats-server --signal reload`).
 JWTCONF="$ROOT/scripts/native/nats-server-jwt.conf"
 if [ -f "$JWTCONF" ]; then
   python3 - "$ROOT/scripts/native/resolver.conf" "$JWTCONF" <<'PY'
@@ -261,7 +261,7 @@ res, conf = open(sys.argv[1]).read(), open(sys.argv[2]).read()
 for acc, jwt in re.findall(r'([A-Z2-7]{56}):\s*(ey[A-Za-z0-9_.\-]+)', res):
     conf = re.sub(acc + r':\s*ey[A-Za-z0-9_.\-]+', acc + ': ' + jwt, conf)
 open(sys.argv[2], 'w').write(conf)
-print('nats-server-jwt.conf: account JWTs refreshed — reload the server (kill -HUP)')
+print('nats-server-jwt.conf: account JWTs refreshed — reload the server (nats-server --signal reload)')
 PY
 fi
 echo; echo "── store ──"; nsc describe account ZEBRIDGE | head -30
