@@ -272,6 +272,7 @@
       },
       "id": 5,
       "title": "Event Throughput (msg/sec)",
+      "description": "WAL messages count everything logical replication sends: BEGIN, COMMIT, RELATION and keepalives as well as row changes, so they run several times the events. NATS Events Out is the row changes the bridge published.",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -285,7 +286,7 @@
           },
           "editorMode": "code",
           "expr": "rate(bridge_wal_messages_received_total[1m])",
-          "legendFormat": "WAL Messages In",
+          "legendFormat": "WAL messages in (incl. BEGIN/COMMIT)",
           "refId": "A"
         },
         {
