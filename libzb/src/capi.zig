@@ -264,7 +264,15 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
             }
         }
         const ts: i64 = if (args.object.get("ts")) |v| (if (v == .integer) v.integer else 0) else 0;
-        try core.writeJsonString(a, &out, try core.heartbeatPayload(a, args.object.get("principal").?.string, args.object.get("tenant").?.string, ts, names, seqs));
+        const pend_v = args.object.get("pending") orelse .null;
+        const pending = try a.alloc(?u64, n);
+        for (names, 0..) |nm, i| {
+            pending[i] = null;
+            if (pend_v == .object) if (pend_v.object.get(nm)) |pv| {
+                if (pv == .integer and pv.integer >= 0) pending[i] = @intCast(pv.integer);
+            };
+        }
+        try core.writeJsonString(a, &out, try core.heartbeatPayload(a, args.object.get("principal").?.string, args.object.get("tenant").?.string, ts, names, seqs, pending));
         return out.items;
     }
     if (eq(u8, name, "update")) {

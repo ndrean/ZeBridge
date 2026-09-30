@@ -4357,6 +4357,35 @@
         "CDC_acme": 0
       },
       "out": "{\"principal\":\"nina\",\"tenant\":\"acme\",\"ts\":42,\"streams\":{\"CDC_acme\":0}}"
+    },
+    {
+      "name": "pending known for one stream only: the object lists that one, sorted like streams",
+      "principal": "omar",
+      "tenant": "kilo",
+      "ts": 1757150000123,
+      "seqs": {
+        "CDC_kilo": 223,
+        "CDC_PUBLIC": 3190
+      },
+      "pending": {
+        "CDC_kilo": 12
+      },
+      "out": "{\"principal\":\"omar\",\"tenant\":\"kilo\",\"ts\":1757150000123,\"streams\":{\"CDC_PUBLIC\":3190,\"CDC_kilo\":223},\"pending\":{\"CDC_kilo\":12}}"
+    },
+    {
+      "name": "pending known for both, zero included",
+      "principal": "nina",
+      "tenant": "acme",
+      "ts": 42,
+      "seqs": {
+        "CDC_acme": 7,
+        "CDC_PUBLIC": 3
+      },
+      "pending": {
+        "CDC_acme": 0,
+        "CDC_PUBLIC": 5
+      },
+      "out": "{\"principal\":\"nina\",\"tenant\":\"acme\",\"ts\":42,\"streams\":{\"CDC_PUBLIC\":3,\"CDC_acme\":7},\"pending\":{\"CDC_PUBLIC\":5,\"CDC_acme\":0}}"
     }
   ],
   "shape": [

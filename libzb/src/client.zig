@@ -286,6 +286,9 @@ pub const SyncClient = struct {
     kv_tenants: []const u8 = undefined, // kv.tenants
     kv_live: []const u8 = "live", // kv.live — optional in the grammar (a bridge older than §10dc has no key)
     last_heartbeat_ms: i64 = 0,
+    /// §10kj: per CDC stream, `num_pending` of the last message applied — what JetStream
+    /// says is still behind it. Memory only: a restart reports none until a delivery.
+    last_pending: std.StringHashMapUnmanaged(u64) = .empty,
     kv_generations: []const u8 = undefined, // generations.kv
     gen_bucket_prefix: []const u8 = undefined, // generations.bucket_prefix
     open_tenant: []const u8 = undefined, // open_tenant
@@ -523,6 +526,9 @@ pub const SyncClient = struct {
         var sit = self.sent_at.iterator();
         while (sit.next()) |e| self.a.free(e.key_ptr.*);
         self.sent_at.deinit(self.a);
+        var pit = self.last_pending.iterator();
+        while (pit.next()) |e| self.a.free(e.key_ptr.*);
+        self.last_pending.deinit(self.a);
         self.flows.deinit(self.a);
         self.ro.close();
         self.st.close();
@@ -3035,6 +3041,9 @@ pub const SyncClient = struct {
         };
         const us_acks = usMono();
         for (messages) |m| m.ack() catch {};
+        // §10kj: the server's own count of what is left behind the last message of the
+        // batch — the heartbeat reports it as this stream's backlog.
+        if (messages.len > 0) self.notePending(stream, messages[messages.len - 1].metadata.num_pending);
         if (apply_stats_enabled) self.apply_stats.endBatch(messages.len, offered, us_acks - us_batch, usMono() - us_acks);
         if (trace_enabled) {
             const cs = self.st.cacheStats();
@@ -4706,6 +4715,15 @@ pub const SyncClient = struct {
     /// per key, TTL on the bucket, so a client that stops beating simply goes stale. The
     /// bridge reads the bucket on its own cadence and turns head − applied into lag.
     /// Cooperative: a failed beat is printed and retried on the next turn, never fatal.
+    fn notePending(self: *SyncClient, stream: []const u8, n: u64) void {
+        if (self.last_pending.getPtr(stream)) |p| {
+            p.* = n;
+            return;
+        }
+        const key = self.a.dupe(u8, stream) catch return;
+        self.last_pending.put(self.a, key, n) catch self.a.free(key);
+    }
+
     fn heartbeatIfDue(self: *SyncClient) !void {
         if (self.opts.heartbeat_ms == 0 or self.tenant.len == 0) return;
         const now = nowMillis();
@@ -4716,11 +4734,13 @@ pub const SyncClient = struct {
         const streams = try self.cdcStreams(a);
         const seqs = try a.alloc(u64, streams.len);
         for (streams, 0..) |s, i| seqs[i] = try self.storedSeq(s);
+        const pending = try a.alloc(?u64, streams.len);
+        for (streams, 0..) |s, i| pending[i] = self.last_pending.get(s);
         // §10fn: one beat per membership — the grant is `$KV.live.<tenant>.<principal>`
         // per tag, and each tenant's fleet view lists this client under its own key.
         const beats: []const []const u8 = if (self.tenants.len > 0) self.tenants else self.open_tenants;
         for (beats) |tenant| {
-            const payload = try core.heartbeatPayload(a, self.opts.principal, tenant, now, streams, seqs);
+            const payload = try core.heartbeatPayload(a, self.opts.principal, tenant, now, streams, seqs, pending);
             const subject = try std.fmt.allocPrint(a, "$KV.{s}.{s}.{s}", .{ self.kv_live, tenant, self.opts.principal });
             try self.t.publish(subject, payload, null);
         }

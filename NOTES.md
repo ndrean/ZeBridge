@@ -18000,3 +18000,29 @@ bridge report that. The §10kh suspicion of the page or OPFS is withdrawn.
 
 The dynten resume, checked live: a principal mapped to dynten → the bridge created
 CDC_dynten, the producer logged "has a stream again" and built the chain (11 ms).
+
+## §10kj — client lag from JetStream's pending count (2026-09-30)
+
+§10ki showed `bridge_fleet_client_lag_events` over-reporting under load by rate × heartbeat
+age (a head read now minus a position up to 30 s old). Now each client's heartbeat carries
+`pending`: per stream, the `num_pending` JetStream gave with the last message applied
+(libzb: `metadata.num_pending` after each acked batch; zb-client-ts: `msg.info.pending`
+after the batch's ack), in memory only. Added only when known, so an older beat is
+byte-identical; the heartbeat fixture gained two cases, both cores pass (234/234).
+
+The bridge's lag is `pending`, unless the client stalled — its applied seq did not move
+since the previous poll while head > applied + pending — when head − applied is right
+again; a client without `pending` keeps the old reading. The previous poll's positions
+live in a map rebuilt every poll (only present clients). `lagOf` unit-tested (5 cases).
+
+Checked live: nina (libzb) under a 200 updates/s ramp on tango — heartbeats 11, 6, 2 s old
+with `pending` 0 each time, the bridge reporting 0, where head − applied would have read
+1,920, 1,092, 277. The browser and Flutter clients report `pending` once reloaded/rebuilt.
+PROTOCOL §9 documents the field and the rule.
+
+Follow-up: the browser client (mary) showed one 2,456 point on CDC_globex right after a
+page reload. Her beat had `pending` for CDC_PUBLIC but not yet for CDC_globex (nothing
+delivered there since the load), so the old head − applied reading applied, with the
+position she persisted before the reload. Now a client that reports `pending` at all gets
+0 for a stream it has not reported yet; the stall test still catches one that never
+moves (7 cases).

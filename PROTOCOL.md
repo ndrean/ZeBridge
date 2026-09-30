@@ -2450,7 +2450,8 @@ reading and how far behind. Clients say so themselves, cooperatively.
 
     subject  $KV.<kv.live>.<tenant>.<principal>          (kv.live is "live" in grammar.json)
     payload  {"principal":"omar","tenant":"acme","ts":1757150000123,
-              "streams":{"CDC_acme":1234,"CDC_PUBLIC":56}}
+              "streams":{"CDC_acme":1234,"CDC_PUBLIC":56},
+              "pending":{"CDC_acme":0,"CDC_PUBLIC":3}}
 
 - `<tenant>` is the tenant the client resolved (§6 "The Connection Flow"), `_default`
   for an unmapped principal; `<principal>` is its NATS user name. The per-principal
@@ -2458,6 +2459,10 @@ reading and how far behind. Clients say so themselves, cooperatively.
 - `ts` is the client's clock, unix milliseconds. `streams` maps each CDC stream the
   client tails to the **last sequence it has applied** — the same number it persists
   as its position (§5 "Two positions").
+- `pending` maps each stream to the `num_pending` JetStream reported with the last
+  message the client applied on it: what the server still holds behind that message.
+  A stream with no message applied yet since the client started is left out, and so is
+  the whole field when no stream has one. Keys are sorted like `streams`.
 - Cadence: libzb beats once per `heartbeatMs` (default 30 000; 0 disables) from
   inside `poll`, so a host that polls is a host that beats. The bucket keeps ONE value
   per key and carries a TTL (bridge `FLEET_TTL_SECONDS`, default 90): a client that
@@ -2466,13 +2471,16 @@ reading and how far behind. Clients say so themselves, cooperatively.
   turn. The beat is a report, never a request.
 
 **The bridge reads the whole bucket** on its own cadence (`FLEET_POLL_SECONDS`,
-default 60), asks JetStream for each named stream's head, and exposes on `/metrics`:
+default 60), asks JetStream for each named stream's head, and exposes on `/metrics`.
+Head − applied alone would compare a head read now with a position up to one beat old:
+under load it reads rate × beat age of lag for a client that is keeping up. `pending` is
+counted by the server at the delivery, so it needs no clock and no timing.
 
 | series | meaning |
 | --- | --- |
 | `bridge_fleet_clients_live{tenant}` | clients whose beat is inside the TTL, per tenant (`_total` across tenants) |
 | `bridge_fleet_client_last_seen_seconds{tenant,principal}` | seconds since that client's `ts`, at the last poll |
-| `bridge_fleet_client_lag_events{tenant,principal,stream}` | stream head − applied, in stream **messages** (a published batch is one) |
+| `bridge_fleet_client_lag_events{tenant,principal,stream}` | messages the client has still to apply (a published batch is one): its `pending`; 0 for a stream the client has not applied on since it started, when it reports `pending` for others; stream head − applied when the client reports no `pending` at all, or when its position has not moved since the previous poll while the stream holds more than it took (a stalled client) |
 | `bridge_fleet_poll_timestamp_seconds` | when the bucket was last read |
 
 The bridge never writes the bucket. It creates it if missing (with the TTL) and

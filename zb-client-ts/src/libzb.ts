@@ -483,6 +483,8 @@ export class ZeBridge {
   /// §10hn: the on-demand tables (deduplicated); cdcFilters, the seed planner and the
   /// epoch re-seed all skip these.
   private ondemandSet = new Set<string>();
+  /// §10kj: per CDC stream, `num_pending` of the last message applied (memory only).
+  private lastPending: Record<string, number> = {};
   private warnedNoTables = false;
   /// §10go: how long to wait before re-opening a tail on a stream whose gap could not be
   /// healed (no chain past the hole yet). Doubles while it stays blocked, cleared once healed.
@@ -3524,6 +3526,10 @@ export class ZeBridge {
             // here is correct — what must never happen again is acking events that
             // were neither applied nor held.
             for (const m of toAck) m.ack();
+            // §10kj: the server's count of what is behind the batch's last message —
+            // the heartbeat reports it as this stream's backlog.
+            const lastMsg = toAck[toAck.length - 1];
+            if (lastMsg && typeof lastMsg.info?.pending === 'number') this.lastPending[streamName] = lastMsg.info.pending;
 
             // ── ADVANCE THE STREAM POSITION FOR EVERY DELIVERED MESSAGE ──
             // It used to advance only inside applyEvent, whose early returns (the
@@ -4076,7 +4082,7 @@ export class ZeBridge {
     const bucket = this.config.grammar?.kv?.live ?? 'live';
     const subject = `$KV.${bucket}.${tenant}.${this.config.principal}`;
     try {
-      const payload = heartbeatPayload(this.config.principal!, tenant, Date.now(), this.globalSyncState.seq);
+      const payload = heartbeatPayload(this.config.principal!, tenant, Date.now(), this.globalSyncState.seq, this.lastPending);
       await this.transport.jetstream(this.nc, this.jsOpts()).publish(subject, new TextEncoder().encode(payload));
     } catch (err) {
       this.appendLog('SYS', `heartbeat not accepted (${subject}): ${err}`, 'WARNING');

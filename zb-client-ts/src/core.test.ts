@@ -86,7 +86,7 @@ test('grammar: the packaged copy is byte-identical to src/grammar.json', () => {
 });
 
 for (const c of fx.heartbeat) {
-  test(`heartbeat: ${c.name}`, () => assert.equal(heartbeatPayload(c.principal, c.tenant, c.ts, c.seqs), c.out));
+  test(`heartbeat: ${c.name}`, () => assert.equal(heartbeatPayload(c.principal, c.tenant, c.ts, c.seqs, c.pending ?? {}), c.out));
 }
 for (const c of fx.seedGate) {
   test(`seedGate: ${c.name}`, () => assert.equal(seedGateDrops(c.ev, c.anchor), c.drops));

@@ -1135,10 +1135,17 @@ export const subjectSafeToken = (v: string): string => v.replace(/[.*>\s]/g, '-'
 /// PROTOCOL §9: the fleet heartbeat a client writes to `$KV.live.<tenant>.<principal>`.
 /// Byte-identical across cores: stream keys sorted bytewise (JS default sort on ASCII
 /// names is bytewise), fixed key order, integers verbatim. Pinned in fixtures/heartbeat.
-export function heartbeatPayload(principal: string, tenant: string, ts: number, seqs: Record<string, number>): string {
+/// §10kj: `pending` — per stream, JetStream's `num_pending` on the last message applied
+/// (the backlog as the server counts it). Present only when one is known, so a beat
+/// without it is byte-identical to the older form. libzb: core.heartbeatPayload.
+export function heartbeatPayload(principal: string, tenant: string, ts: number, seqs: Record<string, number>, pending: Record<string, number> = {}): string {
   const streams: Record<string, number> = {};
   for (const k of Object.keys(seqs).sort()) streams[k] = seqs[k];
-  return JSON.stringify({ principal, tenant, ts, streams });
+  const known = Object.keys(seqs).sort().filter((k) => typeof pending[k] === 'number');
+  if (known.length === 0) return JSON.stringify({ principal, tenant, ts, streams });
+  const p: Record<string, number> = {};
+  for (const k of known) p[k] = pending[k];
+  return JSON.stringify({ principal, tenant, ts, streams, pending: p });
 }
 
 export function mutationSubject(principal: string, table: string, op: string, prefix = 'mutation'): string {

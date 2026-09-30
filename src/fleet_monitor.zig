@@ -3,10 +3,17 @@
 //!
 //!     key    <tenant>.<principal>
 //!     value  {"principal":"omar","tenant":"acme","ts":<unix ms>,
-//!             "streams":{"CDC_acme":1234,"CDC_PUBLIC":56}}      (applied seq per stream)
+//!             "streams":{"CDC_acme":1234,"CDC_PUBLIC":56},      (applied seq per stream)
+//!             "pending":{"CDC_acme":0,"CDC_PUBLIC":3}}           (§10kj, optional)
 //!
-//! and this thread reads the WHOLE bucket on its own slow cadence, asks JetStream for
-//! each stream's head, and renders `head − applied` per client per stream: the metric
+//! and this thread reads the WHOLE bucket on its own slow cadence and renders each
+//! client's lag per stream. §10kj: `head − applied` compared a head read NOW with a
+//! position up to a heartbeat old — under load it invented rate × age of lag (the
+//! browser "behind by 2,390" while it kept up). A client now reports `pending`, the
+//! `num_pending` JetStream gave with the last message it applied: the lag is that,
+//! unless the client STALLED (its position did not move since the previous poll while
+//! the stream holds more than it took), when `head − applied` is right again. A client
+//! without `pending` (an older library) keeps the old reading. The metric
 //! an operator wants ("who is falling behind"), next to plain liveness. Cooperative by
 //! design — a dead client just stops beating and the TTL drops it, which is precisely
 //! what is being detected. Bounded — last value per key, one entry per live client.
@@ -133,7 +140,7 @@ pub const Registry = struct {
         for (self.clients) |cl| {
             try w.print("bridge_fleet_client_last_seen_seconds{{tenant=\"{s}\",principal=\"{s}\"}} {d}\n", .{ cl.tenant, cl.principal, cl.age_seconds });
         }
-        try w.print("# HELP bridge_fleet_client_lag_events Stream head minus the client's applied sequence, in stream MESSAGES (a published batch counts one) — how far behind the client is, per CDC stream\n", .{});
+        try w.print("# HELP bridge_fleet_client_lag_events Messages the client has still to apply, per CDC stream (a published batch counts one): JetStream's pending count at the client's last delivery; stream head minus applied when the client stalled or does not report it\n", .{});
         try w.print("# TYPE bridge_fleet_client_lag_events gauge\n", .{});
         for (self.clients) |cl| {
             for (cl.streams) |sl| {
@@ -156,6 +163,9 @@ pub const FleetMonitor = struct {
     registry: Registry,
     /// Each stream's `first_seq` at the previous poll: pruning is the sequence moving.
     last_first: std.StringHashMapUnmanaged(u64) = .empty,
+    /// §10kj: each `<tenant>.<principal>/<stream>` applied seq at the previous poll —
+    /// the stall test. Rebuilt every poll (only the clients seen now), keys owned here.
+    last_applied: std.StringHashMapUnmanaged(u64) = .empty,
     thread: ?std.Thread = null,
 
     pub fn init(
@@ -194,6 +204,9 @@ pub const FleetMonitor = struct {
 
     pub fn deinit(self: *FleetMonitor) void {
         self.registry.deinit();
+        var lit = self.last_applied.iterator();
+        while (lit.next()) |e| self.allocator.free(e.key_ptr.*);
+        self.last_applied.deinit(self.allocator);
         var it = self.last_first.iterator();
         while (it.next()) |e| self.allocator.free(e.key_ptr.*);
         self.last_first.deinit(self.allocator);
@@ -260,6 +273,7 @@ pub const FleetMonitor = struct {
             try self.windowOf(js, &heads, &windows, a, name, now_ms);
         }
 
+        var seen: std.StringHashMapUnmanaged(u64) = .empty;
         if (keys) |k| for (k.value) |key| {
             var entry = kv.get(key) catch continue;
             defer entry.deinit();
@@ -275,17 +289,23 @@ pub const FleetMonitor = struct {
             const ts: i64 = if (o.get("ts")) |v| (if (v == .integer) v.integer else 0) else 0;
             const age: i64 = if (ts > 0) @divFloor(now_ms - ts, 1000) else -1;
             var lags: std.ArrayList(StreamLag) = .empty;
+            const pend: ?std.json.ObjectMap = if (o.get("pending")) |pv| (if (pv == .object) pv.object else null) else null;
             if (o.get("streams")) |sv| if (sv == .object) {
                 var it = sv.object.iterator();
                 while (it.next()) |e| {
                     const applied: u64 = if (e.value_ptr.* == .integer and e.value_ptr.integer >= 0) @intCast(e.value_ptr.integer) else 0;
                     const head = try self.headOf(js, &heads, a, e.key_ptr.*);
-                    try lags.append(a, .{ .stream = try a.dupe(u8, e.key_ptr.*), .applied = applied, .head = head, .lag = head -| applied });
+                    const pending: ?u64 = if (pend) |pm| (if (pm.get(e.key_ptr.*)) |x| (if (x == .integer and x.integer >= 0) @as(u64, @intCast(x.integer)) else null) else null) else null;
+                    const slot_key = try std.fmt.allocPrint(a, "{s}/{s}", .{ key, e.key_ptr.* });
+                    const prev = self.last_applied.get(slot_key);
+                    try seen.put(a, slot_key, applied);
+                    try lags.append(a, .{ .stream = try a.dupe(u8, e.key_ptr.*), .applied = applied, .head = head, .lag = lagOf(head, applied, pending, prev, pend != null) });
                 }
             };
             try clients.append(a, .{ .tenant = tenant, .principal = principal, .age_seconds = age, .streams = lags.items });
         };
 
+        self.rememberApplied(&seen);
         self.registry.swap(arena, clients.items, windows.items, @divFloor(now_ms, 1000));
         log.debug("fleet poll: {d} live client(s), {d} stream window(s)", .{ clients.items.len, windows.items.len });
     }
@@ -327,6 +347,19 @@ pub const FleetMonitor = struct {
         const h: u64 = info.value.state.last_seq;
         try heads.put(a, try a.dupe(u8, stream), h);
         return h;
+    }
+
+    /// §10kj: this poll's positions replace the previous poll's — clients gone since
+    /// drop out, so the map is as big as the fleet, never the fleet's history.
+    fn rememberApplied(self: *FleetMonitor, seen: *const std.StringHashMapUnmanaged(u64)) void {
+        var old = self.last_applied.iterator();
+        while (old.next()) |e| self.allocator.free(e.key_ptr.*);
+        self.last_applied.clearRetainingCapacity();
+        var it = seen.iterator();
+        while (it.next()) |e| {
+            const k = self.allocator.dupe(u8, e.key_ptr.*) catch continue;
+            self.last_applied.put(self.allocator, k, e.value_ptr.*) catch self.allocator.free(k);
+        }
     }
 
     /// Bind to the bucket; create it with the configured TTL when it is missing, and
@@ -407,4 +440,35 @@ test "unixSecondsOf reads JetStream timestamps" {
     try std.testing.expectEqual(@as(?i64, 951868800), unixSecondsOf("2000-03-01T00:00:00Z"));
     try std.testing.expectEqual(@as(?i64, 1789027392), unixSecondsOf("2026-09-10T08:03:12.608794123Z"));
     try std.testing.expectEqual(@as(?i64, null), unixSecondsOf("0001-01-01"));
+}
+
+/// §10kj: a client's lag on one stream. `pending` is JetStream's count behind the last
+/// message the client applied; `prev` its applied seq at the previous poll; `reports`
+/// whether the client sends `pending` at all. A client that does but not for this stream
+/// has applied nothing on it since it started (a page just reloaded) and is pulling it:
+/// counted as caught up, unless the stall test below says otherwise — the old reading
+/// there showed a one-poll spike of rate × beat age at every client start.
+fn lagOf(head: u64, applied: u64, pending: ?u64, prev: ?u64, reports: bool) u64 {
+    const p = pending orelse if (reports) 0 else return head -| applied; // an older client: the old reading
+    // Stalled: the position did not move since the previous poll while the stream holds
+    // more than it took — its `pending` is from a delivery long past, the head is right.
+    if (prev) |pv| if (pv == applied and head > applied + p) return head - applied;
+    return p;
+}
+
+test "lagOf: pending when progressing, head − applied when stalled or unknown" {
+    // An older client: the old reading.
+    try std.testing.expectEqual(@as(u64, 500), lagOf(1500, 1000, null, null, false));
+    // Keeping up under load: the heartbeat is old, the head moved on — pending says 0.
+    try std.testing.expectEqual(@as(u64, 0), lagOf(3390, 1000, 0, 400, true));
+    // Behind for real, and progressing: pending is the backlog.
+    try std.testing.expectEqual(@as(u64, 120), lagOf(3390, 1000, 120, 900, true));
+    // Stalled: same position as last poll, the stream holds more — head − applied.
+    try std.testing.expectEqual(@as(u64, 2390), lagOf(3390, 1000, 0, 1000, true));
+    // Same position but nothing new: caught up and idle, not stalled.
+    try std.testing.expectEqual(@as(u64, 0), lagOf(1000, 1000, 0, 1000, true));
+    // A client that reports pending, not yet for this stream (just started): caught up…
+    try std.testing.expectEqual(@as(u64, 0), lagOf(3456, 1000, null, null, true));
+    // …unless its position stays frozen across polls while the stream grows.
+    try std.testing.expectEqual(@as(u64, 2456), lagOf(3456, 1000, null, 1000, true));
 }

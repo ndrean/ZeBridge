@@ -425,7 +425,11 @@ pub fn planUpsert(a: std.mem.Allocator, table: []const u8, pk: []const []const u
 /// core.ts heartbeatPayload (PROTOCOL §9): the fleet heartbeat, byte-identical across
 /// cores — stream keys sorted bytewise, fixed key order, integers verbatim. Pinned in
 /// fixtures/heartbeat. `names`/`seqs` are parallel; sorted here, not by the caller.
-pub fn heartbeatPayload(a: std.mem.Allocator, principal: []const u8, tenant: []const u8, ts: i64, names: []const []const u8, seqs: []const u64) ![]const u8 {
+/// §10kj: `pending[i]` is the `num_pending` JetStream reported with the last message
+/// applied on `names[i]` — the backlog as the server counts it, at that moment. Null when
+/// no message was applied yet on that stream; the `pending` object appears only when at
+/// least one is known, so a beat without it is byte-identical to the older form.
+pub fn heartbeatPayload(a: std.mem.Allocator, principal: []const u8, tenant: []const u8, ts: i64, names: []const []const u8, seqs: []const u64, pending: []const ?u64) ![]const u8 {
     const idx = try a.alloc(usize, names.len);
     for (idx, 0..) |*x, i| x.* = i;
     std.mem.sort(usize, idx, names, struct {
@@ -444,7 +448,24 @@ pub fn heartbeatPayload(a: std.mem.Allocator, principal: []const u8, tenant: []c
         try writeJsonString(a, &out, names[i]);
         try out.appendSlice(a, try std.fmt.allocPrint(a, ":{d}", .{seqs[i]}));
     }
-    try out.appendSlice(a, "}}");
+    try out.append(a, '}');
+    var known = false;
+    for (pending) |p| if (p != null) {
+        known = true;
+    };
+    if (known) {
+        try out.appendSlice(a, ",\"pending\":{");
+        var first = true;
+        for (idx) |i| {
+            const p = pending[i] orelse continue;
+            if (!first) try out.append(a, ',');
+            first = false;
+            try writeJsonString(a, &out, names[i]);
+            try out.appendSlice(a, try std.fmt.allocPrint(a, ":{d}", .{p}));
+        }
+        try out.append(a, '}');
+    }
+    try out.append(a, '}');
     return out.items;
 }
 
