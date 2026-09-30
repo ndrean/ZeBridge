@@ -1,0 +1,30 @@
+# Prometheus for the NATIVE dev stack (bridge, nats-server, PostgreSQL on the host),
+# run by telemetry/docker-compose.native.yml. Scrapes through host.docker.internal and
+# pushes to Grafana Cloud. The password is never in this file: the container writes it
+# to /prometheus/grafana.key at start (see the compose file).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "zebridge"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["host.docker.internal:27434"]
+        labels:
+          environment: "dev"
+          service: "cdc-bridge"
+
+  - job_name: "nats"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["nats-exporter:7777"]
+        labels:
+          environment: "dev"
+          service: "nats-server"
+
+remote_write:
+  - url: https://prometheus-prod-55-prod-gb-south-1.grafana.net/api/prom/push
+    basic_auth:
+      username: "2500869"          # the Prometheus instance ID (the datasource's basicAuthUser)
+      password_file: /prometheus/grafana.key

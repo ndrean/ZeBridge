@@ -1,0 +1,32 @@
+# Telemetry for the NATIVE dev stack: Prometheus + the NATS exporter in containers,
+# everything else on the host. Metrics go to Grafana Cloud.
+#
+#   docker --context orbstack compose -f telemetry/docker-compose.native.yml up -d
+#
+# Needs the Grafana Cloud key in .env.grafana at the repository root (gitignored), and
+# nats-server's monitoring on the host's 8222.
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: zb_native_prometheus
+    env_file: ../.env.grafana
+    # The key goes to a 0600 file inside the container, never into the config.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        umask 077 && printf %s "$$GRAFANA_PASSWORD" > /prometheus/grafana.key &&
+        exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml
+        --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=1d
+    volumes:
+      - ./prometheus.native.yml:/etc/prometheus/prometheus.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:9091:9090"
+
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:latest
+    container_name: zb_native_nats_exporter
+    command: ["-jsz", "all", "-varz", "-connz", "-leafz", "http://host.docker.internal:8222"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

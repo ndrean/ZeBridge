@@ -1,5 +1,5 @@
 global:
-  scrape_interval: 60s     # Scrape metrics every 5 seconds for responsive CDC dashboards
+  scrape_interval: 60s
   evaluation_interval: 5s
 
 scrape_configs:
@@ -24,4 +24,6 @@ remote_write:
   - url: https://prometheus-prod-55-prod-gb-south-1.grafana.net/api/prom/push
     basic_auth:
       username: "2500869"
-      password: ${GRAFANA_PASSWORD}
+      # Prometheus does not expand variables in its config: the key lives in a file
+      # (the key alone, mode 0600, owned by the prometheus user).
+      password_file: /usr/local/etc/prometheus/grafana.key
