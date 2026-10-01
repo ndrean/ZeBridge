@@ -173,7 +173,7 @@ Each claim of the README's feature list, the tests behind it, and how far they g
 | data travels three ways (changes, snapshots, writes) | `stamp`, `churn`; `speed`, `burst` by hand | the rates are measurements, read by a person; `stamp` and `churn` judge that they hold steady |
 | standby read replica | `standby` | the whole path: slot on the standby, seed, live change, write to the primary |
 | `--revoke --purge` deletes the local replica | `revoke_purge` | both libraries, connected and on return, at reconnection and at renewal |
-| multiple instances | `multi_bridge` | two bridges, one database, one NATS |
+| multiple instances (possible, not recommended yet) | `multi_bridge` | two bridges, one database, one NATS |
 | the JWT renews itself | `jwt_renew`, `revoke_purge` (F), `jwt_expiry`; real iPhone JWT renewal testing in `scripts/phone/renew` | both libraries keep working past two JWT lifetimes, and through a device clock 2 h off either way; a revoked device's renewal gets the purge answer; on an iPhone 12, libzb renews on the bridge's schedule with the clock moved by hand, open or closed |
 | TLS in transit | `tls`, `burst_tls` | the certificate is checked; the cost is measured |
 | schema changes reach every replica live | `migrate_both`, `invalidate`, `offline_migrate` | online and offline, both libraries |
