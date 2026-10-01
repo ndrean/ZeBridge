@@ -39,7 +39,7 @@ Two migration shapes need care:
 ## Per-principal write rate-limiting does not exist yet
 
 HAProxy rate-limits `/enroll` and edge connections, but mutations flow down the
-NATS WebSocket, which the proxy treats as one opaque long-lived tunnel — it never sees the individual writes inside it. Nor does NATS throttle per user: a user JWT's `payload`/`subs`/`data` limits are caps (message size, subscription count, a byte budget), not rates, and JetStream's ingest limit is server-wide — a flooding principal degrades its neighbours before it is stopped. So today one authenticated client can flood a tenant's writes. The fix belongs in the bridge's mutation listener: a token bucket per principal at classify time, refusing over-budget writes with a `rate_limited` verdict (NOTES §10dd, shelved). Set the JWT caps at enrollment anyway — cheap hygiene, not the answer.
+NATS WebSocket, which the proxy treats as one opaque long-lived tunnel — it never sees the individual writes inside it. Nor does NATS throttle per user: a user JWT's `payload`/`subs`/`data` limits are caps (message size, subscription count, a byte budget), not rates, and JetStream's ingest limit is server-wide — a flooding principal degrades its neighbours before it is stopped. So today one authenticated client can flood a tenant's writes. The fix belongs in the bridge's mutation listener: a token bucket per principal at classify time, refusing over-budget writes with a `rate_limited` verdict (shelved). Set the JWT caps at enrollment anyway — cheap hygiene, not the answer.
 
 ## Not yet battle-tested at scale
 

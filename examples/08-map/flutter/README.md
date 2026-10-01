@@ -1,10 +1,9 @@
 # ZeMap — the phone holds what it asked for
 
 A Flutter map of France: the vector tiles from an R2 bucket, the OpenStreetMap points
-of interest around the viewport as markers, editable. NOTES §10hj, design B.
+of interest around the viewport as markers, editable.
 
-`charge_points` (16,173 OpenChargeMap points of France, `examples/08-map/load_chargers.py`
-— §10hr) is an **on-demand** table on the phone: libzb creates it from the descriptor,
+`charge_points` (16,173 OpenChargeMap points of France, `examples/08-map/load_chargers.py`) is an **on-demand** table on the phone: libzb creates it from the descriptor,
 nothing seeds it and nothing is tailed. On every move the map asks the map service —
 `examples/08-map/poi_service.py`, a DuckDB replica of all of France answering
 `query._default.chargers_near` from its own copy, PostgreSQL never asked — for the points
@@ -30,7 +29,7 @@ and libduckdb installed for the service (the app itself needs only SQLite), and 
 `omar` creds of the dev stack. The `mapper` principal of the earlier cell design was
 revoked with its grid, and a revoked principal stays revoked.
 
-**One route, two editors** (NOTES §10ho). The directions button enters route mode; a tap
+**One route, two editors** ([COOPERATIVE_EDITING.md](../../../COOPERATIVE_EDITING.md)). The directions button enters route mode; a tap
 sets the start, the next the end, and both pins are drawn from the row `routes.doc` as CDC
 delivers it, not from the tap. That row is a jsonb map of registers — `start` and `end`,
 each with its writer's stamp and name — over a plain LWW row: the phone writes its own

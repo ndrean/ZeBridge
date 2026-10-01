@@ -20,27 +20,27 @@ Both are served by a thread that keeps answering through every outage below — 
 | --- | --- | --- | --- |
 | `bridge_connected` | the WAL stream is attached | any PostgreSQL outage (0 while down, 1 after self-reconnect) | `pg_restart.py` |
 | `bridge_pg_reconnects_total` | PostgreSQL sessions re-established | backend kills, cluster restarts | `pg_restart.py`, `chaos.py` |
-| `bridge_nats_reconnects_total` | broker SESSIONS re-established, at the transport — nats.zig's `reconnected_cb` counts the library's silent self-heals, the publisher's fresh-connection fallback adds its disjoint share (§10cn). NOT a broker-restart count: adjacent bounces merge into one down period, honestly | broker kill + return, even idle bounces | `churn.py` (metric == log ground truth), `nats_outage.py` |
-| `bridge_queue_usage_percent` | events held in the ring, right now | broker gone under load: climbs as the ring fills, 0 again after the drain. Three writers: post-flush, the halt loop, the periodic tick (§10cd) | `cascade.py` |
+| `bridge_nats_reconnects_total` | broker SESSIONS re-established, at the transport — nats.zig's `reconnected_cb` counts the library's silent self-heals, the publisher's fresh-connection fallback adds its disjoint share. NOT a broker-restart count: adjacent bounces merge into one down period, honestly | broker kill + return, even idle bounces | `churn.py` (metric == log ground truth), `nats_outage.py` |
+| `bridge_queue_usage_percent` | events held in the ring, right now | broker gone under load: climbs as the ring fills, 0 again after the drain. Three writers: post-flush, the halt loop, the periodic tick | `cascade.py` |
 | `bridge_wal_confirmed_lag_bytes` | WAL PostgreSQL retains that this bridge has not confirmed — THE backlog number | any outage that stops acking; collapses on recovery. Samples on the monitor's 30 s cadence | `cascade.py` |
 | `bridge_wal_lag_bytes` | WAL retained from `restart_lsn` — a disk-pressure number that only moves at checkpoints. NOT a backlog gauge; a healthy bridge plateaus at a few MB | slot pressure | (definitional; see the field's comment) |
 | `bridge_slot_active` | PostgreSQL shows our slot streaming | bridge down or stepped aside → 0 | `downtime.py` |
 | `bridge_cdc_events_published_total` | ROW events acked by JetStream — trusted arithmetic, equals rows delivered | any write reaching CDC | `slot_contest.py` (flow-through), README burst method |
 | `bridge_schema_events_published_total` | KV/schema traffic, kept OUT of the row counter | DDL, suspensions, drops | `livebirth.py`, `legacybait.py` |
 | `bridge_refused_tables` | tables currently suspended or refused — the COUNT | `row_too_large` and structural refusals; falls on the live lift | `suspension_lift.py`, `legacybait.py` |
-| `bridge_refused_table{table,reason}` | the NAMED refusal series (§10cg): 1 while refused, an explicit 0 after a lift in this process; the family vanishes on restart — which also cleared every ban, so absence and truth agree. psql twin: `SELECT tbl, suspended_reason FROM zebridge_catalogue WHERE suspended;` (§10cf — a bridge dump, live while the bridge lives, pruned at boot) | every refusal transition | `suspension_lift.py` |
+| `bridge_refused_table{table,reason}` | the NAMED refusal series: 1 while refused, an explicit 0 after a lift in this process; the family vanishes on restart — which also cleared every ban, so absence and truth agree. psql twin: `SELECT tbl, suspended_reason FROM zebridge_catalogue WHERE suspended;` (a bridge dump, live while the bridge lives, pruned at boot) | every refusal transition | `suspension_lift.py` |
 | `bridge_refused_events_dropped_total` | events dropped for refused tables | writes hitting a suspended table | `suspension_lift.py` |
-| `bridge_nats_publish_ack_seconds_total` / `bridge_nats_publishes_total` | summed publish→PubAck wall time / count (mean = quotient) | load; the ack changes of §10cb ride on these being honest | README burst method |
+| `bridge_nats_publish_ack_seconds_total` / `bridge_nats_publishes_total` | summed publish→PubAck wall time / count (mean = quotient) | load; the drained fast-ack rides on these being honest | README burst method |
 | `bridge_gc_total_reaped_total` / `bridge_gc_last_sweep_timestamp_seconds` | sweeper activity, read off the watermark row's own CDC event — the sweeper stays a pure PG client | sweeper passes; survives a PostgreSQL restart under the daemon | `sweeper_restart.py`, `reaps.py` |
-| `bridge_last_ack_lsn` | the position THIS bridge confirmed — never the server's WAL head (the conflation that once silently skipped a downtime's changes) | every ack; jumps with the §10cb drained fast-ack | `txn_kill.py`, `pg_restart.py` |
+| `bridge_last_ack_lsn` | the position THIS bridge confirmed — never the server's WAL head (the conflation that once silently skipped a downtime's changes) | every ack; jumps with the drained fast-ack | `txn_kill.py`, `pg_restart.py` |
 | `bridge_uptime_seconds`, `bridge_cpu_seconds_total`, `bridge_max_rss_bytes` | process vitals | always | (trivially live) |
-| `/health` → 200 | the PROCESS is up **and will exit when replication dies** — a FATAL sets the global stop since §10bu, so a lying 200 cannot outlive the failure | fatal paths | `stream_full.py` |
+| `/health` → 200 | the PROCESS is up **and will exit when replication dies** — a FATAL sets the global stop, so a lying 200 cannot outlive the failure | fatal paths | `stream_full.py` |
 
 > **Alert on `bridge_connected == 0` and on `bridge_wal_confirmed_lag_bytes` growth**, not on `/health` alone — health says "process alive", and a process can be alive and parked (that is its correct behaviour during a broker outage).
 
 > `bridge_queue_usage_percent` and `bridge_wal_confirmed_lag_bytes` tick on their own cadences (periodic tick; 30 s WAL monitor). A panel averaging over <1 min windows will alias; 1–2 min windows read true.
 
-> The pair to watch during a broker outage is queue% (the dam filling) THEN confirmed lag (PostgreSQL taking the overflow): §10cd's cascade in two panels.
+> The pair to watch during a broker outage is queue% (the dam filling) THEN confirmed lag (PostgreSQL taking the overflow): the cascade, in two panels.
 
 **Metrics and logs**: Alert on the metric, read the log for the detail.
 
@@ -141,11 +141,11 @@ bridge_pg_table_dead_rows{table="sensor_events"} 0
 </details>
 <br>
 
-Six families come from the bridge's own schedules or from events it intercepts, not from the WAL loop (NOTES §10dc, §10eg, §10ji):
+Six families come from the bridge's own schedules or from events it intercepts, not from the WAL loop:
 
 | family | source | cadence | what to read |
 | --- | --- | --- | --- |
-| `bridge_fleet_*` | the clients' heartbeats in the `live` KV bucket (PROTOCOL §9): each client writes `{principal, tenant, ts, streams: {stream: applied seq}}` every `heartbeatMs` | read every `FLEET_POLL_SECONDS` (60); a client silent for `FLEET_TTL_SECONDS` (90) drops out of the bucket by itself | `clients_live` per tenant, `last_seen_seconds` per client, `lag_events` per client and stream: stream head minus the sequence the client applied, in **messages** (a published batch counts one, not one per row) |
+| `bridge_fleet_*` | the clients' heartbeats in the `live` KV bucket (PROTOCOL §11): each client writes `{principal, tenant, ts, streams: {stream: applied seq}}` every `heartbeatMs` | read every `FLEET_POLL_SECONDS` (60); a client silent for `FLEET_TTL_SECONDS` (90) drops out of the bucket by itself | `clients_live` per tenant, `last_seen_seconds` per client, `lag_events` per client and stream: stream head minus the sequence the client applied, in **messages** (a published batch counts one, not one per row) |
 | `bridge_replication_slot_*` | `pg_replication_slots` on the reader's server — every slot, this bridge's marked `self="true"` | every `SLOT_INVENTORY_SECONDS` (300); the first pass lands one interval after boot | an inactive slot whose retained WAL climbs is an abandoned instance holding the disk; `bridge_replication_slots` is the count |
 | `bridge_cdc_window_*`, `bridge_cdc_stream_*` | each CDC stream's state, read by the same fleet poll | every `FLEET_POLL_SECONDS` | the window a stream really holds (now minus its oldest event, `-1` when empty) against the two-cadence floor the chain needs; `short = 1` means the stream is pruning under that floor, so a size or message valve, not the age, is ending the window — see README, [Catching up](README.md#catching-up-the-chain-and-the-stream) |
 | `bridge_gc_*` | the sweeper's `zebridge_gc_watermark` writes, seen on the WAL | at every sweep | rows reaped and when, counted since this bridge started (`0` until the first sweep it sees) |
@@ -158,13 +158,13 @@ The four worth alerting on:
 | --- | --- | --- |
 | `bridge_refused_tables` | `> 0` | a table is **suspended** — no primary key, an undecodable column type, or a row larger than the event buffer. The log line names which and why. |
 | `bridge_refused_events_dropped_total` | `increase() > 0` | rows are being discarded right now for a suspended table |
-| `bridge_fleet_clients_live{tenant}` | drops | clients heartbeating inside the live bucket's TTL (PROTOCOL §9); a fleet going quiet is visible here before anyone complains |
+| `bridge_fleet_clients_live{tenant}` | drops | clients heartbeating inside the live bucket's TTL (PROTOCOL §11); a fleet going quiet is visible here before anyone complains |
 | `bridge_fleet_client_lag_events{tenant,principal,stream}` | `> N` for minutes | that client is falling behind on that stream — stream head minus what it applied, in messages |
-| `bridge_replication_slot_active{slot,type,self}` | `== 0` with retained WAL climbing | a slot nobody reads — an abandoned instance (NOTES §10da): `bridge --view-slots` to see it from a shell, `ADMIN_DATABASE_URL=… bridge --drop-slot <slot>` once you are sure (it refuses an active slot); PostgreSQL frees the WAL at its next `CHECKPOINT` |
+| `bridge_replication_slot_active{slot,type,self}` | `== 0` with retained WAL climbing | a slot nobody reads — an abandoned instance: `bridge --view-slots` to see it from a shell, `ADMIN_DATABASE_URL=… bridge --drop-slot <slot>` once you are sure (it refuses an active slot); PostgreSQL frees the WAL at its next `CHECKPOINT` |
 | `bridge_replication_slot_retained_wal_bytes{slot,type,self}` | growing for an inactive slot | WAL PostgreSQL keeps for that slot; every slot on the server, not only this bridge's |
 | `bridge_cdc_window_short{stream}` | `== 1` | that stream holds less than two generation cadences and is pruning: a client that falls off it can find a chain that predates it and waits. Raise `CDC_MAX_BYTES` / `CDC_MAX_MSGS` if `bridge_cdc_stream_bytes` or `_messages` sits at a cap, `CDC_MAX_AGE_SECONDS` otherwise |
 | `bridge_wal_confirmed_lag_bytes` | rising steadily | **the bridge is behind**: WAL it has not confirmed yet. This is the backlog number. |
-| `bridge_ingress_rate_limited_total` | `increase()` for minutes | a principal is living at its write ceiling (`MUTATION_RATE_PER_PRINCIPAL`, §10fk); its writes are still served, at the rate, and the log line names it. Minutes of it from one principal is the evidence a revocation is made on. `bridge_ingress_rate_per_principal` and `_burst` are the knobs as the bridge runs them, 0 when the limit is off |
+| `bridge_ingress_rate_limited_total` | `increase()` for minutes | a principal is living at its write ceiling (`MUTATION_RATE_PER_PRINCIPAL`); its writes are still served, at the rate, and the log line names it. Minutes of it from one principal is the evidence a revocation is made on. `bridge_ingress_rate_per_principal` and `_burst` are the knobs as the bridge runs them, 0 when the limit is off |
 | `bridge_wal_lag_bytes` | large and growing across checkpoints | WAL PostgreSQL is _retaining_ on disk for the slot, until `max_slot_wal_keep_size` |
 | `bridge_connected` | `== 0` | the replication stream is down |
 | `bridge_mutation_verdicts_total{status="rejected"}` or `{status="failed"}` | `rate() > 0` for minutes | edge writes are being refused or failing; the bridge's log names the table and the reason. `stale` is normal under concurrent writers |
@@ -206,8 +206,8 @@ The same figure appears _in the log_ as `cpu=31%` on each `LOOP` line, which bea
 
 | row | panels | read it for |
 | --- | --- | --- |
-| Server | connections against `max_connections`; **slow consumers** per 5 min, split clients / leaf nodes / routes; memory, CPU, messages and bytes per second; stale connections | a slow consumer is a connection the server cut for reading too slowly, and every cut loses the deliveries in flight — the first sign of a client whose link cannot keep up (NOTES §10jc). The server's log names the connection |
-| JetStream | storage against its limit; the ten largest streams; `MUTATIONS` against its byte cap; the CDC streams against theirs; the chain object stores | `MUTATIONS` holds waiting writes and refuses new ones once full; verdicts live apart in `VERDICTS`, which drops its oldest instead (NOTES §10jj). A CDC stream at its cap prunes by size, and clients away longer re-seed from the chain |
+| Server | connections against `max_connections`; **slow consumers** per 5 min, split clients / leaf nodes / routes; memory, CPU, messages and bytes per second; stale connections | a slow consumer is a connection the server cut for reading too slowly, and every cut loses the deliveries in flight — the first sign of a client whose link cannot keep up. The server's log names the connection |
+| JetStream | storage against its limit; the ten largest streams; `MUTATIONS` against its byte cap; the CDC streams against theirs; the chain object stores | `MUTATIONS` holds waiting writes and refuses new ones once full; verdicts live apart in `VERDICTS`, which drops its oldest instead. A CDC stream at its cap prunes by size, and clients away longer re-seed from the chain |
 | Consumers | pending messages and ack-pending / redelivered, top 10; the bridge's own intake, `bridge_mutations_worker` | redeliveries climbing on a client's consumer are deliveries lost in transit (recovered by the clients' strict-order rule); a steady queue on the bridge's intake means its lanes are at their ceiling — raise `ZB_INGRESS_LANES`, and the writer role's connection limit with it |
 | Leaf nodes | leaf connections; slow leaf links | the regional links, once leaf nodes are deployed |
 

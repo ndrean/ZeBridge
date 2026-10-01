@@ -87,7 +87,7 @@ All three exact: 3,055,002 / 3,055,002 / 138,916,285. RN with libzb matches Flut
 with libzb, so the host framework costs nothing; the 15× gap is per-row JavaScript on
 Hermes (no JIT): fzstd, msgpack, parameter arrays. The TS rate also fell as it went
 (7.1k → 5.4k rows/s per 500k): the phone heating up. A trace shows the same work per row
-throughout and JS faster after a two-minute pause than at the start (NOTES §10ja).
+throughout and JS faster after a two-minute pause than at the start.
 
 `EXPO_PUBLIC_ZB_TRACE=1` writes where the zb-client-ts seed spends its time — SQLite vs
 JS, Hermes GC and heap, WAL size, every 100k rows — to the app's Documents:
@@ -119,7 +119,7 @@ each stage insert) runs about 4× slower than Chrome's 156 s for the same table 
 iOS simulator (which runs on the Mac's own CPU), and slower again in the Android
 emulator, a full VM; the staged path itself behaves as on Node. A real device is the
 next measurement. The first run on this host is what removed the chain's zstd
-dictionary — NOTES §10iy.
+dictionary.
 
 ⚠️ Android would not resolve the library's `import('js-sha256')` (the streaming digest):
 Metro found it in zb-client-ts's own node_modules, outside the project root, and turned

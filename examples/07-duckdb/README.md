@@ -26,7 +26,7 @@ fired on demand, PostgreSQL untouched.
 
 ## The native route: libzb's DuckDB engine
 
-Since §10fl libzb can write the replica straight into a `.duckdb` file — no SQLite
+libzb can write the replica straight into a `.duckdb` file — no SQLite
 in the middle. libzb opens libduckdb when a client asks for the engine, so the host
 needs DuckDB installed (the Homebrew keg or the release zip; `ZB_DUCKDB_LIB` names the
 file if it is elsewhere). The worker is then one command:

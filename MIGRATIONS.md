@@ -100,7 +100,7 @@ Retiring a replicated table and putting another in its place is the largest shap
 there is, and the protocol has an answer for it that needs no downtime and no
 coordination: the new table is enabled, the old one is dropped, and each client learns
 both facts from the same schema bucket it already watches. This is that move as it was
-actually made (NOTES §10hr: `osm_pois`, 2.1M OpenStreetMap points, replaced by
+actually made (`osm_pois`, 2.1M OpenStreetMap points, replaced by
 `charge_points`, 16,173 OpenChargeMap points), the checks that prove each half, and what
 it does to a client that already pulled the old schema.
 
@@ -254,7 +254,7 @@ local tables: ['charge_points', 'sqlite_sequence']
 discarded the outbox on a drop, a re-key and an emptied rebuild; libzb discarded only
 the held events and left the outbox to retry forever against a table that no longer
 exists. Writing this playbook is what found it. libzb now has the same `discardOutbox`
-at the same sites (NOTES §10hs), so the row above describes both clients.
+at the same sites, so the row above describes both clients.
 
 One consequence that is easy to miss: **the old table's rows are gone from every replica,
 including the edits a phone made to it.** A drop is not a migration — nothing is carried

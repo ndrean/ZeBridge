@@ -16,7 +16,7 @@ guessable** — the reference web client got one of them wrong and silently drop
 row. They are marked ⚠️.
 
 > **Status.** Everything marked ✅ is implemented and verified against a running
-> stack. See `NOTES.md` for the history and the open questions behind each section.
+> stack.
 
 ---
 
@@ -500,10 +500,8 @@ const events = Array.isArray(decoded) ? decoded : [decoded];
 
 ⚠️ **Every event in a batch shares that batch's subject** — the bridge groups by
 subject before publishing, so a `cdc.users.insert.batch` message contains only
-`users` INSERTs. This was not always true; a batch used to be published under
-whatever its first event happened to be, mixing tables and operations under one
-subject (`NOTES.md` §2.1). Do not rely on the payload's `subject` field disagreeing
-with the message subject — they now agree, and that is the contract.
+`users` INSERTs. The payload's `subject` field always equals the message subject;
+that is the contract.
 
 ### Ordering — what is guaranteed, and the foreign-key rule
 
@@ -606,13 +604,11 @@ a DELETE carries the key (plus nulls under DEFAULT identity, as above).
 
 ### Value encoding
 
-⚠️ **Always MessagePack, unconditionally — never JSON.** There used to be a `--json` flag
-making this a runtime choice; it is gone, along with the whole `Format`-as-CLI-choice axis
-(`args.zig`, `batch_publisher.zig`). Every CDC event and every chain payload (§6) is
-MessagePack, full stop — the mirror image of schema's "always JSON" (§3). A client written
-against the old "MessagePack by default" wording should stop carrying a JSON fallback for
-this payload; the bridge can no longer produce one, and a stray fallback here is dead code
-that only obscures a genuine decode failure (`NOTES.md` §2.16).
+⚠️ **Always MessagePack, unconditionally — never JSON.** No flag or setting changes this.
+Every CDC event and every chain payload (§6) is MessagePack, full stop — the mirror image
+of schema's "always JSON" (§3). A client carries no JSON fallback for this payload: the
+bridge cannot produce one, and a fallback here is dead code that only obscures a genuine
+decode failure.
 
 * `numeric` arrives as a **string** (`"123.45000000"`) to preserve precision.
 * a column PostgreSQL sent in **text format** (it does this per column, even under
@@ -790,13 +786,13 @@ below the cutoff.
 ⚠️ **Do not gate data on `lsn` when `cutoff_seq` is available.** LSNs are not monotonic
 in delivery order — a transaction that begins before the chain build and commits after it
 delivers late carrying a *lower* lsn, and an lsn gate silently drops it even though the
-chain never contained it (measured; `cutoff_seq` is the fix, NOTES §10i). For a legacy
+chain never contained it (measured; `cutoff_seq` is the fix). For a legacy
 manifest without `cutoff_seq`, gate with **strictly less-than** on `cutoff_lsn` — `<=`
 loses exactly one row per seed, because the watermark is taken at the build's BEGIN and
 the next commit is stamped with *that same LSN* (measured: watermark `25472600`, first
 post-seed event `25472600`). And anchor that lsn ONLY to a value a seed set — never to a
 schema event's lsn, which a bridge restart advances to the WAL head and which would then
-eat every event the new bridge replays (measured, NOTES §10p).
+eat every event the new bridge replays (measured).
 
 The boundary tie breaks by cost either way: re-applying a seeded row is a free idempotent
 upsert; dropping an unseeded one is permanent.
@@ -1256,7 +1252,7 @@ Two consequences worth knowing:
 
 * `NUMERIC` is rendered to its **stored scale** (`dscale`), the digits PostgreSQL itself prints, so `numeric(20,8)` holding `0.1`
   arrives as `0.10000000` and `1.5` stored with scale 1 arrives as `1.5`. This matters because
-  NUMERIC maps to SQLite **TEXT** (§3), and in TEXT `'0.1000' = '0.10000000'` is false. (The decoder ignored the scale until 2026-09-11 and rendered the digit groups' padding, `0.1000`; fixed, NOTES §10ep.)
+  NUMERIC maps to SQLite **TEXT** (§3), and in TEXT `'0.1000' = '0.10000000'` is false.
 * Arrays keep the Postgres literal form (`{x,"y,z"}`), not JSON. ⚠️ The bridge quotes
   elements slightly more eagerly than Postgres does — `{"x","y,z"}` where Postgres
   writes `{x,"y,z"}`. Both parse identically as array literals; they are not byte-equal.
@@ -1450,7 +1446,7 @@ Two things follow, and they are the whole reason this section is long:
    | `accepted` | pop |
    | `stale` | pop — do **not** hand-revert; the winning row arrives via CDC. An UPDATE is kept aside until that row is here (its version is above the refused stamp): resubmitted with a fresh stamp when the winner changed none of its columns, dropped and surfaced when they overlap (§7.6) |
    | `row_deleted` | pop, revert the local row to "deleted," and surface it to the user |
-   | `revoked` | not a reply to a write: the ban (§10dm). Published as `mutation_ack.<principal>.revoked` when the principal's last mapping is deleted, retained by `VERDICTS` until a mapping is given back or 2 h pass. Close the connection now, stay closed on reconnect (probe it by direct get before reading anything), answer `Revoked` to every call; leave the rows — the wipe is the application's explicit act |
+   | `revoked` | not a reply to a write: the ban. Published as `mutation_ack.<principal>.revoked` when the principal's last mapping is deleted, retained by `VERDICTS` until a mapping is given back or 2 h pass. Close the connection now, stay closed on reconnect (probe it by direct get before reading anything), answer `Revoked` to every call; leave the rows — the wipe is the application's explicit act |
    | `rejected` | pop, revert the local row to its pre-write state |
    | timeout / error | keep, retry (idempotent via `msg_id` for 2 minutes — §2) |
 
@@ -2226,7 +2222,7 @@ What the bridge promises:
 
 1. **WAL order is preserved** into NATS. PostgreSQL serialises DDL against DML via
    ACCESS EXCLUSIVE locks, so an "old-shape row after a schema change" cannot exist —
-   verified (`NOTES.md` §3.1).
+   verified.
 2. **Schema before dependent row.** When a schema event and CDC events land in the
    same flush, the schema is published first.
 3. **Per-subject order.** Events on the same subject reach the stream in WAL order.
@@ -2441,7 +2437,7 @@ SQLite, `idb://` for PGlite), by default the stable per-principal
 Restart and replay are exercised by the Node consumer's persisted replica (a second run
 resumes from its stored positions with nothing re-seeded) and by libzb's soak.
 
-## 9. Liveness — KV bucket `live` ✅
+## 11. Liveness — KV bucket `live` ✅
 
 The bridge cannot see its clients: it holds a slot and a lag, nothing about who is
 reading and how far behind. Clients say so themselves, cooperatively.

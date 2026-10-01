@@ -1,7 +1,6 @@
 # Test scenarios
 
-What is tested, by which command, and what a pass proves. Current state only — the
-history of how each scenario was found is in NOTES.md.
+What is tested, by which command, and what a pass proves. Current state only.
 
 ## The stack under test
 
@@ -12,7 +11,7 @@ The native stack (`scripts/native/up.sh`):
 * the bridge on :27434.
 
 Credentials are files: `scripts/native/creds/<principal>.creds` (`bridge`, `zbdoctor`, and the client principals `alice bob mary nina omar`, each mapped to a tenant in `zebridge_user_tenants`).
-Configuration is the catalogue: `zebridge_enable(...)` writes `zebridge_catalogue`, and a running bridge reloads it live (NOTES §10bj).
+Configuration is the catalogue: `zebridge_enable(...)` writes `zebridge_catalogue`, and a running bridge reloads it live.
 Seeding is generation chains (msgpack under zstd, OBJ `gen-<tenant>`, KV `generations`).
 
 Three clients exist, and the same protocol is asserted through each:
@@ -78,8 +77,8 @@ listed and never run by it — those report, they do not assert.
 | a full is forced when rows were deleted since the cutoff (no resurrection) | `genproducer.py`, bridge unit tests |
 | writes committed while the bridge was down — and after a `kill -9` — replay from the slot | `downtime.py` |
 | a bridge `kill -9`'d MID-delivery of one large transaction: the unacked transaction replays whole, no row lost, the replayed half deduped at the broker | `txn_kill.py` |
-| a stream at `max_bytes` refusing publishes: retry budget burns, the bridge stops itself (really — the zombie it used to leave is §10bu), the slot retains, a restart after repair loses nothing | `stream_full.py` |
-| BASE_BUF lowered under stored data: the shrink-gated scan (§10bx) warns at boot, names the table, and stays silent on every non-shrinking boot | `shrink.py` |
+| a stream at `max_bytes` refusing publishes: retry budget burns, the bridge stops itself, the slot retains, a restart after repair loses nothing | `stream_full.py` |
+| BASE_BUF lowered under stored data: the shrink-gated scan warns at boot, names the table, and stays silent on every non-shrinking boot | `shrink.py` |
 | `bridge --diagnose` says everything the boot would decide and changes nothing: exit 0/1, init presence the headline, minimum BASE_BUF computed, shrink a finding | `diagnose.py` |
 | two bridges on one slot: the loser refuses in its own words within seconds, no fight, no half-start — and `leaks` reads 0 bytes on the refusal path | `slot_contest.py` |
 | a CDC stream deleted wholesale under a live client: deliberate stop, boot recreates, slot replays, client resets to the fresh numbering and converges | `stream_wipe.py` |
@@ -90,16 +89,16 @@ listed and never run by it — those report, they do not assert.
 | the CLIENT's host SIGKILLed mid-seed, twice: the torn SQLite file reopens, the seed re-applies idempotently — 120k rows, all distinct, equal to PostgreSQL | `client_kill.py` |
 | `bridge --revoke` (ADMIN_DATABASE_URL, non-ambient): mapping + unused invites in one command, the three clocks narrated, KV purged by the live bridge, double-revoke distinguishable | `revoke.py` |
 | `bridge --init-nats` generates the whole NATS stack (dev: open, 10 s; operator: full JWT, no nsc) — proven by BOOTING the generated conf and round-tripping JetStream on the generated creds | `init_nats.py` |
-| the grammar is built in and served (§10ci): /grammar byte-identical to src/grammar.json with its sha256 header, and a libzb client syncs from `grammarJson` alone — no file copied anywhere | `grammar_served.py` |
-| a JWT with a tiny TTL: full invite-code bootstrap (jwt + grammar in one GET), an ordinary client inside the window, then the read door closes AUDIBLY as a named auth error — not a silent forever-retry (§10cj) | `jwt_expiry.py` |
-| the HARD kill (§10cm): `--revoke --conf` + OPERATOR_SEED rebuilds the revocations map from PG, re-signs the account JWT, splices the conf — on reload the live session is kicked and the dead token refused, in seconds | `revoke_full.py` |
-| reconnect churn (§10cn): 50 shuffled NATS bounces + 15 PG fast stop/starts with wasp-swarm writes — RSS/fd/threads flat against a warmup baseline, no sting lost or doubled, one client converges, and `bridge_nats_reconnects_total` equals the log's ground truth (library self-heals + fallback connections — sessions, not bounces; adjacent bounces merge honestly) | `churn.py` |
-| clock skew under LWW (§10co): a 4 s-fast clock steals the row — audibly (`stale`) and only until the wall clock catches up; a 30 s-slow clock is starved writing from its wrist but writes through with §7.3's rule (libzb's `hlcVersion`); the feed's last word equals PostgreSQL's and no stale write leaves a trace | `clockskew.py` |
-| the CRDT ladder's top rung (§10cr): a jsonb map-of-LWW-registers — blind replace demonstrably loses an accepted intent; state-based merge with reconcile-to-fixed-point loses none of 18 concurrent keys, settles the contested one by its register tiebreak, and terminates | `crdt.py` |
-| the capacity stamp (§10ct): saturated and fault-free for 3 minutes — 4M mutations at a flat 21.5k/s (2 lanes), one consumer sustaining 10.4k rows/s downstream beside it; FAILs on a sagging bucket | `stamp.py` |
+| the grammar is built in and served: /grammar byte-identical to src/grammar.json with its sha256 header, and a libzb client syncs from `grammarJson` alone — no file copied anywhere | `grammar_served.py` |
+| a JWT with a tiny TTL: full invite-code bootstrap (jwt + grammar in one GET), an ordinary client inside the window, then the read door closes AUDIBLY as a named auth error — not a silent forever-retry | `jwt_expiry.py` |
+| the HARD kill: `--revoke --conf` + OPERATOR_SEED rebuilds the revocations map from PG, re-signs the account JWT, splices the conf — on reload the live session is kicked and the dead token refused, in seconds | `revoke_full.py` |
+| reconnect churn: 50 shuffled NATS bounces + 15 PG fast stop/starts with wasp-swarm writes — RSS/fd/threads flat against a warmup baseline, no sting lost or doubled, one client converges, and `bridge_nats_reconnects_total` equals the log's ground truth (library self-heals + fallback connections — sessions, not bounces; adjacent bounces merge honestly) | `churn.py` |
+| clock skew under LWW: a 4 s-fast clock steals the row — audibly (`stale`) and only until the wall clock catches up; a 30 s-slow clock is starved writing from its wrist but writes through with §7.3's rule (libzb's `hlcVersion`); the feed's last word equals PostgreSQL's and no stale write leaves a trace | `clockskew.py` |
+| the CRDT ladder's top rung: a jsonb map-of-LWW-registers — blind replace demonstrably loses an accepted intent; state-based merge with reconcile-to-fixed-point loses none of 18 concurrent keys, settles the contested one by its register tiebreak, and terminates | `crdt.py` |
+| the capacity stamp: saturated and fault-free for 3 minutes — 4M mutations at a flat 21.5k/s (2 lanes), one consumer sustaining 10.4k rows/s downstream beside it; FAILs on a sagging bucket | `stamp.py` |
 | a row written outside the client is in its replica in single-digit ms; a 300-row transaction lands in one poll | `libzb/python/tail.py`, `bench_poll.py` (benchmark) |
 | a pre-guard oversized row quarantines the table, boot re-derives it, removing the row lifts it | `legacybait.py` |
-| a `row_too_large` suspension lifts LIVE once the table can be carried again — after a 30 s anti-flap cooldown — and the descriptor is republished; `zebridge_catalogue.suspended`/`suspended_reason` mirror both transitions for psql (§10cf) | `suspension_lift.py` |
+| a `row_too_large` suspension lifts LIVE once the table can be carried again — after a 30 s anti-flap cooldown — and the descriptor is republished; `zebridge_catalogue.suspended`/`suspended_reason` mirror both transitions for psql | `suspension_lift.py` |
 | the broker gone for minutes: the bridge waits, ACKs nothing (`confirmed_flush_lsn` holds), the same process resumes, every row lands | `nats_outage.py` |
 | the slot invalidated: boot refuses with the recovery; `ZB_FEED_RESTART=1` restarts the feed (streams, chains, manifests); a client's position beyond `last_seq` is a gap and it re-seeds from a fresh full | `slot_loss.py` |
 | the client away past retention: the tail it needs is gone → gap → re-seed from the chain → converge | `client_gap.py` |

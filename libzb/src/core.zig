@@ -422,7 +422,7 @@ pub fn planUpsert(a: std.mem.Allocator, table: []const u8, pk: []const []const u
     return .{ .object = obj };
 }
 
-/// core.ts heartbeatPayload (PROTOCOL §9): the fleet heartbeat, byte-identical across
+/// core.ts heartbeatPayload (PROTOCOL §11): the fleet heartbeat, byte-identical across
 /// cores — stream keys sorted bytewise, fixed key order, integers verbatim. Pinned in
 /// fixtures/heartbeat. `names`/`seqs` are parallel; sorted here, not by the caller.
 /// §10kj: `pending[i]` is the `num_pending` JetStream reported with the last message

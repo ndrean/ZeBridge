@@ -1,15 +1,15 @@
 # 06-large-table — one big table, every host
 
 The other examples follow a handful of small tables. This one follows exactly one,
-`test_types` — 3,055,002 rows on tenant globex, the firehose fixture of NOTES §10iw —
+`test_types` — 3,055,002 rows on tenant globex, the firehose fixture —
 and does nothing but seed it: a progress bar, a clock, and at the end the three facts
 that are checked against PostgreSQL. Each host is a measurement of the same seed.
 
 | host | client | path | status |
 | --- | --- | --- | --- |
-| `web/` | zb-client-ts, OPFS-SQLite in Chrome | staged (TEMP on OPFS) | 156 s, 988 MB — NOTES §10ix "in Chrome" |
-| `react-native/` | zb-client-ts, expo-sqlite | staged | iOS simulator 364 s, Android emulator 475 s, **iPhone 12: 725 s** — NOTES §10iy |
-| `flutter/` | libzb (C ABI), dart:ffi | streamed, sorted per window in Zig | **iPhone 12: 70.8 s**, simulator 30.2 s — NOTES §10iy |
+| `web/` | zb-client-ts, OPFS-SQLite in Chrome | staged (TEMP on OPFS) | 156 s, 988 MB |
+| `react-native/` | zb-client-ts, expo-sqlite | staged | iOS simulator 364 s, Android emulator 475 s, **iPhone 12: 725 s** |
+| `flutter/` | libzb (C ABI), dart:ffi | streamed, sorted per window in Zig | **iPhone 12: 70.8 s**, simulator 30.2 s |
 | `python/` | libzb (C ABI) | streamed | planned |
 
 The two TypeScript hosts share the streaming pipeline (`seedStreaming`, fzstd as the

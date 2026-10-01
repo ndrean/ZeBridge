@@ -60,7 +60,7 @@ SELECT * FROM zebridge_enable(
 
 ⚠️ **The reason is mandatory.** A public table is a `zebridge_catalogue` row with `tenant_col IS NULL`, and the table's CHECK forces a recorded `public_reason` — who decided this table is public, and why. The event trigger refuses a bare `ALTER PUBLICATION ... ADD TABLE` for a table that is neither tenant-scoped nor in the catalogue. Deliberately: a bare `ALTER PUBLICATION` publishes with no row filter and no RLS, sending every row to every subscriber, and nothing in the bridge can detect that — it is a pass-through by design.
 
-✅ Manual for the refusal itself (NOTES §1.8); 
+✅ Manual for the refusal itself; 
 ✅ `scripts/scenarios/render.py` proves the guard **exists** after a render, which is the failure that actually happened — the trigger vanished along with six functions when `envsubst` ate a dollar tag.
 
 `SELECT * FROM zebridge_audit_publications();` answers *is anything published without being scoped?* — the invariant a pass-through bridge cannot check for itself.
@@ -200,7 +200,7 @@ name + no opt-in = a raise naming both ways out.
 The matching bridge runs `--pub pub_orders --slot slot_orders`. ⚠️ Running several
 bridges concurrently against one NATS deployment is not yet supported: the MUTATIONS
 durable is a fixed name shared by every bridge, so two bridges steal each other's
-ingress messages — NOTES.md §1.13 carries the details and the missing piece.
+ingress messages.
 
 ### 1.3 PostgreSQL: what the schema must satisfy
 
@@ -398,15 +398,15 @@ Two credential shapes, on purpose:
 | --- | --- | --- |
 | the bridge | nkey, seed passed on the command line, in no env file | `publish: >`, `subscribe: >` — it is the trusted writer and already holds replication rights |
 | a client | user/password today, JWT next | allow-listed to its own subtree, **its reply inbox included** (`_INBOX.<principal>.>`) |
-| a responder | JWT under the account's **responder** signing key, tagged with the tenants it serves | a client's read side, plus `subscribe: query.<tenant>.>` for its tenants, `publish: _INBOX.>` for the replies, and create/write on `OBJ_res-<tenant>` for answers too large to send inline (§10hq) — no mutations, no heartbeat key, no asking |
+| a responder | JWT under the account's **responder** signing key, tagged with the tenants it serves | a client's read side, plus `subscribe: query.<tenant>.>` for its tenants, `publish: _INBOX.>` for the replies, and create/write on `OBJ_res-<tenant>` for answers too large to send inline — no mutations, no heartbeat key, no asking |
 
 **A responder answers, it never writes.** A service that answers `query.<tenant>.<name>`
 from a replica (PROTOCOL §2) holds a responder credential, not the bridge's: it follows
 the same streams a client follows, subscribes the query subjects of the tenants in its
 tags, and publishes to inboxes. The write side is absent from its template, so a
 compromised service cannot reach PostgreSQL through the bridge, and a client credential
-is refused a `query.>` subscription, so nobody can pose as a service. Both are measured
-(NOTES §10hk). Minted by `scripts/native/jwt-bootstrap.sh` (nsc) or, in the stack the
+is refused a `query.>` subscription, so nobody can pose as a service. Both are measured.
+Minted by `scripts/native/jwt-bootstrap.sh` (nsc) or, in the stack the
 bridge generated, by `bridge --mint-responder --store operator.store`, offline: the
 responder signing seed is never on the bridge host.
 
@@ -444,7 +444,7 @@ not try.
 ✅ `examples/05-tables/web-consumer/zb-probe.mjs` replays the client's startup against the real allow-list
 and prints ok/FAIL per step — it is how the missing `$JS.API.INFO` and `CONSUMER.INFO.*`
 grants were found. The refusals (`mutation.bob.…`, `cdc.>`, `$KV.>`, `MUTATIONS`, `INIT`
-purge, `mutation_ack.bob.>`, forging a verdict) are manual, recorded in NOTES §1.8.
+purge, `mutation_ack.bob.>`, forging a verdict) are tested by hand.
 
 ⚠️ **JetStream denials surface as client timeouts, not errors.** The server drops the
 denied `$JS.API.…` publish and the caller waits out its own deadline. A too-narrow
@@ -480,7 +480,7 @@ identity to grant against.
 ⚠️ **A key-scoped grant holds only if neither a consumer nor STREAM.INFO is granted on the same stream.** A
 consumer reads its whole stream, whatever the keys: with `CONSUMER.CREATE.KV_generations.>`
 granted beside the tenant-scoped direct gets, any client listed and watched every
-tenant's generation manifests (NOTES §10jr — tenant names, table names, when each last
+tenant's generation manifests (tenant names, table names, when each last
 wrote). Manifests, the tenants key and stored verdicts are therefore read by DIRECT GET
 of an exact key only, and no client template grants a consumer — or STREAM.INFO, whose
 `subjects_filter` sits in the request body where no grant reaches and lists every key
@@ -596,7 +596,7 @@ The endpoint is a **scoped signing key**:
 ```shell
 nsc edit signing-key --account APP --role client --sk A… \
   --allow-pub "mutation.{{name()}}.>" \
-  --allow-pub "$KV.live.{{tag(tenant)}}.{{name()}}" \   # its OWN heartbeat key, nothing else (PROTOCOL §9)
+  --allow-pub "$KV.live.{{tag(tenant)}}.{{name()}}" \   # its OWN heartbeat key, nothing else (PROTOCOL §11)
   --allow-pub "$KV.live._default.{{name()}}" \
   --allow-sub "cdc.{{tag(tenant)}}.>" --allow-sub "_INBOX.>"
 ```
@@ -762,7 +762,7 @@ refactor, or a migration — and most of the defects found while building this w
 | mutation envelope round trip, and the verdict it returns | ✅ `scripts/scenarios/mutate.py`, `examples/05-tables/web-consumer/zb-mutate.mjs` |
 | the principal reaches RLS: `set_config` and the upsert share one transaction, now the pipeline's implicit one | ✅ `scripts/scenarios/writable.py`, `tiebreak.py`, `invalidate.py` — every RLS-scoped write would be refused if it did not |
 | client's JetStream permission set is complete | ✅ `examples/05-tables/web-consumer/zb-probe.mjs` |
-| ~~the snapshot-serving invariants~~ | retired with snapshot-on-demand (NOTES §10o–§10p): `wide.py`, `snapshot.py`, `stampede.py` deleted with the path they tested |
+| ~~the snapshot-serving invariants~~ | retired with snapshot-on-demand: `wide.py`, `snapshot.py`, `stampede.py` deleted with the path they tested |
 | a schema change reaches every cache: KV schema, relation decode, refusal registry, write-path catalog | ✅ `scripts/scenarios/invalidate.py` — found the added-column half unwritable until restart, and verified to *fail* before the fix |
 | a malformed mutation dead-letters and does not block the queue | ✅ `scripts/scenarios/poison.py` |
 | credentials and endpoint resolution | ✅ `scripts/scenarios/credentials.py`, `endpoint.py` |
@@ -780,7 +780,7 @@ refactor, or a migration — and most of the defects found while building this w
 | the subject's principal **is** the authenticated user (`bob`, `alicex`, `admin` all refused) | ✅ `scripts/scenarios/credentials.py` §D |
 | a client cannot **forge a verdict** — to itself, or to another principal — nor a dead letter on `mutation_error.>`, which is what makes PROTOCOL §7.1's outbox rules safe to follow | ✅ `scripts/scenarios/credentials.py` §D |
 | the dead-letter channel `mutation_error.>` is **operator-only**: readable by the bridge's own credentials and granted to no client, because its payload carries the server's full message and a `DETAIL` can quote another tenant's rows. ⚠️ Deliberately absent from PROTOCOL.md — a client has no use for it, and naming a forbidden subject in the client's document only advertises it | ✅ `nats-server.conf.template` (not in any client's allow-list) |
-| other NATS refusals (`cdc.>`, `$KV.>`, `MUTATIONS`, purge, verdict forging) | ⚠️ manual — NOTES §1.8 |
+| other NATS refusals (`cdc.>`, `$KV.>`, `MUTATIONS`, purge, verdict forging) | ⚠️ manual |
 | **publication guard refuses a bare `ALTER PUBLICATION`** | ⚠️ manual |
 | **tenant CDC routing, including DELETE carrying its tenant** | ⚠️ manual |
 | **hostile tenant values quarantined end to end** | ⚠️ manual |

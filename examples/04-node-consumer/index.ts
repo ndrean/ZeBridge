@@ -29,7 +29,7 @@ const zb = new ZeBridge({
   natsUrl: process.env.NATS_URL ?? 'nats://127.0.0.1:4222',
   principal: PRINCIPAL,
   creds: CREDS,
-  heartbeatMs: Number(process.env.ZB_HEARTBEAT_MS ?? 30_000), // PROTOCOL §9
+  heartbeatMs: Number(process.env.ZB_HEARTBEAT_MS ?? 30_000), // PROTOCOL §11
   // §10hn: every published table, said out loud — nothing is followed by default.
   tables: process.env.ZB_TABLES ? process.env.ZB_TABLES.split(',').map((t) => t.trim()).filter(Boolean) : '*',
   dbPath: DB,

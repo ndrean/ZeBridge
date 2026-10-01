@@ -6,7 +6,7 @@ libzb, the ZeBridge C client (Zig inside), as an Expo module. Two uses:
   The options are the ones zb-client-ts takes (CLIENTS.md).
 * **native zstd for zb-client-ts** — installed in an app, it is picked up by
   zb-client-ts's react-native entry with no code: chain objects inflate in libzb instead
-  of fzstd (an iPhone 12 seed, 3M rows: 393.8 → 309.8 s, NOTES §10ja).
+  of fzstd (an iPhone 12 seed, 3M rows: 393.8 → 309.8 s).
 
 ```ts
 import { Libzb } from 'zb-react-native';

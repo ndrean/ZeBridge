@@ -21,7 +21,7 @@ python3 -m venv scripts/scenarios/.venv
 scripts/scenarios/.venv/bin/pip install -r scripts/scenarios/requirements.txt
 
 set -a && . ./.env.bridge && set +a          # DATABASE_READER_URL, DATABASE_WRITER_URL, NATS_URL, BRIDGE_PORT
-export BRIDGE_CDC_PUBLICATION=my_pub         # named, never guessed (NOTES §10ad)
+export BRIDGE_CDC_PUBLICATION=my_pub         # named, never guessed
 
 scripts/scenarios/run.py offline             # no stack needed
 scripts/scenarios/run.py live                # against the running stack + bridge on :27434

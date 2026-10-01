@@ -1132,7 +1132,7 @@ export const subjectSafeToken = (v: string): string => v.replace(/[.*>\s]/g, '-'
 
 /// `prefix` is grammar.json's `subjects.mutations_prefix`; the shell passes it, the
 /// fixtures rely on the protocol default.
-/// PROTOCOL §9: the fleet heartbeat a client writes to `$KV.live.<tenant>.<principal>`.
+/// PROTOCOL §11: the fleet heartbeat a client writes to `$KV.live.<tenant>.<principal>`.
 /// Byte-identical across cores: stream keys sorted bytewise (JS default sort on ASCII
 /// names is bytewise), fixed key order, integers verbatim. Pinned in fixtures/heartbeat.
 /// §10kj: `pending` — per stream, JetStream's `num_pending` on the last message applied

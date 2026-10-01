@@ -104,7 +104,7 @@ appliance; it is not the default.
 
 ## Sizes
 
-Measured on macOS arm64 (NOTES §10iq, §10ir):
+Measured on macOS arm64:
 
 | build | size |
 | --- | --- |

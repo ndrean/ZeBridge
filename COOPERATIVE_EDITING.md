@@ -5,8 +5,7 @@ it. This is the contract: what the table must be, what the document must look li
 the client library does, and what this construction does **not** promise.
 
 Proven by `scripts/scenarios/route_crdt.py` (two libzb clients of two tenants) and by
-the `mergeRegisters` fixtures (8 cases, both client libraries). The story is NOTES §10ho;
-the earlier experiment that decided the design is §10cr.
+the `mergeRegisters` fixtures (8 cases, both client libraries).
 
 ---
 
@@ -144,7 +143,7 @@ stale?  the row moved under you: the echo brings the winner — merge into it, w
 settle  repeat until merge(observed, mine) == observed
 ```
 
-Two rules earned by measurement (§10cr), both of which look unnecessary until they are
+Two rules earned by measurement, both of which look unnecessary until they are
 not:
 
 1. **Ship state, not deltas.** Every write carries the union of ALL your own registers,
@@ -196,8 +195,8 @@ truth and the table stays a table anyone can query.
 
 ## Not to be confused with `ingest`
 
-`zb_client_ingest` (libzb) and `zb.ingest` (zb-client-ts) belong to the ON-DEMAND path
-(§10hj), not to this one. `ingest` takes a SERVICE's answer — `{columns, rows}`, the
+`zb_client_ingest` (libzb) and `zb.ingest` (zb-client-ts) belong to the ON-DEMAND path,
+not to this one. `ingest` takes a SERVICE's answer — `{columns, rows}`, the
 chain object's own shape — and applies it into a table the client holds on demand,
 through the same version-guarded upsert a seed uses, with an optional `scope` naming the
 area the answer is complete for so rows there that the answer did not carry are deleted.
@@ -208,4 +207,4 @@ It writes only the LOCAL replica; nothing reaches PostgreSQL.
 | `mutate` | this client's write request | yes, judged there, echoed back |
 | `ingest` | a service's answer into a local table | no |
 | `mergeRegisters` | a pure function on two documents | no, it touches no table at all |
-| `serve` / `reply` | this client ANSWERS questions about its replica (§10hp) | no |
+| `serve` / `reply` | this client ANSWERS questions about its replica | no |

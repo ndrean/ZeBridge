@@ -20,7 +20,7 @@ writes.
 What it does and does not do, continued: a hit is served only when its stored
 `Content-Range` is exactly the range asked for — the cache key carries the range in the
 query string, and a colliding or stale entry is treated as a miss rather than served
-(version 3 answered concurrent range requests with another range's body; NOTES §10hj).
+(version 3 answered concurrent range requests with another range's body).
 `X-Worker` carries the version constant at the top of `src/index.js`; bump it with every
 change, it is how a deploy is told apart from the previous one.
 

@@ -34,8 +34,9 @@ from the click, so what is on screen is what the row holds, whoever moved it las
 editors converge because each ships the union of its own registers merged into the
 document it last saw (`mergeRegisters`, the library's own rule, the same one libzb
 gives the phone), and reconciles until the row contains what it wrote. The row
-underneath is ordinary last-write-wins. NOTES §10ho; `scripts/scenarios/route_crdt.py`
-asserts the same war between two libzb clients.
+underneath is ordinary last-write-wins. [COOPERATIVE_EDITING.md](../../../COOPERATIVE_EDITING.md)
+explains the construction; `scripts/scenarios/route_crdt.py` asserts the same war between
+two libzb clients.
 
 Needs the dev stack (bridge, nats-server, PostgreSQL), the POI service running for the
 fuel, and `examples/08-map/load_routes.py --create` once for the table.

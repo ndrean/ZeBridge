@@ -446,11 +446,11 @@ first run measured the disk. Sized, PostgreSQL runs the script in time and the b
 publishes 99,007 events a second with 79 MiB of lag at most. The chain is the limit at a
 128 MiB cap: about a second of margin per cut, and whole-table fulls of 10 to 30 s rebuilt
 back to back by the depth rotation. Memory peaks at 4 GB: 589 MB of ring, the rest deltas
-built in memory (§10gj).
+built in memory.
 
 ## 100,000 events a second: the delta floor (2026-09-15)
 
-Same command as above, after NOTES §10gl (a delta reads from the oldest open transaction's
+Same command as above, after two changes (a delta reads from the oldest open transaction's
 start instead of the cutoff minus 5 s; no `count(*)` per cut on a table with the delete
 guard, which the firehose table now has).
 

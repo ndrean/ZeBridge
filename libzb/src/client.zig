@@ -4806,7 +4806,7 @@ pub const SyncClient = struct {
         try self.syncSchemas();
         try self.gapAndSeed(null, null);
         try self.drainCdc();
-        // A host that syncs before it ever polls is a client too (PROTOCOL §9).
+        // A host that syncs before it ever polls is a client too (PROTOCOL §11).
         self.heartbeatIfDue() catch |err| std.debug.print("heartbeat: {s}\n", .{@errorName(err)});
         return .{ .tenant = self.tenant, .tenants = self.tenants, .first = first };
     }

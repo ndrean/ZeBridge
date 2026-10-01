@@ -133,7 +133,7 @@ export interface ZeBridgeConfig {
   bridgeUrl?: string;
   /** @internal The compiled-in grammar (§10dq). Not a consumer input: any value passed here is replaced. */
   grammar?: any;
-  /// PROTOCOL §9: the fleet heartbeat cadence in ms (default 30 000; 0 disables).
+  /// PROTOCOL §11: the fleet heartbeat cadence in ms (default 30 000; 0 disables).
   heartbeatMs?: number;
   /// §10fb: follow only these tables. Default: every table the schemas bucket names
   /// (a job that wants one table of a tenant with a big one should say so — libzb
@@ -1049,7 +1049,7 @@ export class ZeBridge {
       // §10dm: a ban published while this client was away is retained — one direct get.
       await this.collectMissedVerdicts([{ msg_id: 'revoked' }]);
       if (this.revoked) throw new Error(`'${this.config.principal}' is revoked`);
-      // PROTOCOL §9: beat from HERE, before the seed — a client stuck seeding (a chain
+      // PROTOCOL §11: beat from HERE, before the seed — a client stuck seeding (a chain
       // that never comes, a slow device) is exactly the one an operator must see, with
       // its zero positions. libzb beats from its first poll for the same reason.
       const hb = this.config.heartbeatMs ?? 30_000;
@@ -4071,7 +4071,7 @@ export class ZeBridge {
   /// A real PING against a possibly-lying transport: a frozen server can leave the
   /// WebSocket believing it is open with no 'disconnect' ever fired. Acts only on
   /// transitions — the recovery transition is the one nc.status() might never report.
-  /// PROTOCOL §9: the fleet heartbeat — this client's applied position per CDC stream,
+  /// PROTOCOL §11: the fleet heartbeat — this client's applied position per CDC stream,
   /// to `$KV.live.<tenant>.<principal>` (last value per key, TTL on the bucket, so a
   /// client that stops beating drops off the bridge's fleet metrics by itself). The
   /// payload is core.heartbeatPayload, fixture-pinned with libzb. Cooperative: a failed

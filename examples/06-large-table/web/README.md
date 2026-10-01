@@ -1,7 +1,7 @@
 # 06-large-table / web — one big table, seeded in a browser
 
 One table, one progress bar, one clock. The page connects as `bob`, follows
-`test_types` (3,055,002 rows on tenant globex, the firehose fixture of NOTES §10iw),
+`test_types` (3,055,002 rows on tenant globex, the firehose fixture),
 seeds it from the generation chain into OPFS-SQLite, and prints three facts at the end:
 
 ```
@@ -40,7 +40,7 @@ storage.
 
 `window.zb` is the client, for `zb.query('PRAGMA journal_mode')` and the like.
 
-`?table=<name>` follows another table (`test_types_v7`, NOTES §10ja); `?spill=0` forces
+`?table=<name>` follows another table (`test_types_v7`); `?spill=0` forces
 the one-window-at-a-time path instead of staging, to measure what arrival order does.
 
 ## How the seed runs in a browser
@@ -57,7 +57,7 @@ run after that with `done` still false, ~1.5 min for this table.
 The alternative — one sorted window at a time into the real table — is bounded too,
 but each window scatters across the whole b-tree, and over OPFS every page miss is a
 round trip to the OPFS worker: it fell from 20k to 2k rows/s by 750k rows and was
-aborted (NOTES §10ix).
+aborted.
 
 ## ⚠️ Chrome and "delete site data on close"
 
@@ -85,5 +85,4 @@ in place, 1.5 GB in 1 s.
 
 The temp files the stage and the sort leave in OPFS (~1.3 GB here) are swept by the
 client once the seed lands, and orphans of an interrupted seed at the next open —
-watch the log line "reclaimed … MB of temp files". Details and the runs that failed
-first: NOTES §10ix, "in Chrome".
+watch the log line "reclaimed … MB of temp files".

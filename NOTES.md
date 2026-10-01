@@ -291,7 +291,15 @@ two bridges on one database and one NATS:
   bridge still feeds;
 - `/enroll` and `/renew` answer on both.
 
----
+### 1.9 OPEN — one stream for a family of regions, written down, never built (2026-10-01)
+
+The third shape of geographic division (§10fp, 2026-09-14), between cells as tenants
+(§10fo: a stream per cell, reach frozen at enrolment, a city at most) and design B
+(§10hj: the data whole, regional responders). One family stream `CDC_REGIONS` under its
+own subject prefix `cdc_r.<cell>.>`, one object bucket `gen-regions`, a `region` role
+with its own signing key, and a client tail that is a FILTERED consumer — which needs a
+second gap rule (a sequence jump on a filtered tail is not a gap). The owner called it a
+forgotten point on 2026-10-01; the README describes the two built shapes only.
 
 ## 2. Bugs found — with the mechanism, so they are not reintroduced
 
@@ -18072,3 +18080,19 @@ streams, read back with `nats stream info -j` (MUTATIONS `max_msgs_per_subject` 
 the env, `discard_new_per_subject` true); the dev bridge restarted on existing streams
 created nothing and left MUTATIONS at 5000. Both `T4 nats` texts checked with a dry run
 on the dev DB, where the function was applied by hand.
+
+## §10kl — the dev stack's bridge speaks TLS to NATS (2026-10-01)
+
+Production needs TLS on the client port, so the bridge's hop to NATS is TLS there (§10fz
+measured it costs no event rate). The dev stack still ran it plain, so every dev
+measurement left TLS out. Now `scripts/native/nats-server-jwt.conf` has a `tls` block (the
+nats.zig test certificates, which name `localhost` and `127.0.0.1`) and
+`allow_non_tls: true`, so the dev scripts and apps that still dial `nats://` keep working;
+production leaves that option out. `allow_non_tls` cannot be reloaded: the server was
+restarted.
+
+The bridge dials `tls://localhost:4222` with `NATS_TLS_CA=nats.zig/tests/configs/certs/ca.pem`.
+Not `tls://127.0.0.1`: Zig's TLS client checks the certificate against a host name and
+refused the IP (`CertificateHostMismatch`), although the certificate lists it. Checked on
+`/connz`: the bridge's connections are TLS 1.3 (`TLS_AES_128_GCM_SHA256`); the browser
+(WebSocket) and a Flutter app on `nats://` stay plain.

@@ -27,7 +27,7 @@ a clock, not a bar — a `seeding` field in `zb_client_poll`'s report is the nex
 libzb, on a stderr nobody could see (attach it: `xcrun devicectl device process launch
 --console --device <udid> dev.zebridge.zebridgeLargeTable`). The cause was a
 slow-consumer runaway in the object reader over a real network — fixed in nats.zig
-(patch 18) and told in NOTES §10iy. `zb_client_connect`/`zb_client_sync` reporting
+(patch 18). `zb_client_connect`/`zb_client_sync` reporting
 their failure reason through the C ABI is the other lesson.
 
 ## Build
@@ -62,7 +62,7 @@ What `ios/Flutter/*.xcconfig` carries, and why (each was a failed link or launch
     flutter build apk --release --target-platform android-arm64 --dart-define=ZB_NATS_URL=nats://192.168.1.11:4222
     adb install build/app/outputs/flutter-apk/app-release.apk
 
-Zig cannot synthesise Android's libc (NOTES §10ir), so libzb is built as a static
+Zig cannot synthesise Android's libc, so libzb is built as a static
 archive — position-independent on Android targets, `libzb/build.zig` — and the NDK's
 `clang --shared -Wl,--whole-archive` makes the `.so` dart:ffi loads from
 `android/app/src/main/jniLibs/<abi>/` (git-ignored). The manifest declares `INTERNET`.

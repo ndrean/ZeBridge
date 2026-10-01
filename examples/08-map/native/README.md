@@ -2,7 +2,7 @@
 
 The same service, the same queries and the same shared route row as `../flutter` and
 `../web`, through **zb-client-ts**. Nothing of ours is cross-compiled: no Zig, no NDK,
-no `.xcframework`. That is the whole reason this app exists (NOTES §10ih).
+no `.xcframework`. That is the whole reason this app exists.
 
 ## Why not the Flutter app
 
@@ -70,7 +70,7 @@ iOS simulator shares the Mac's network stack, so `127.0.0.1` is the Mac. The And
 emulator sits behind its own NAT and reserves `10.0.2.2` for the host — `127.0.0.1` there
 is the emulator. `src/client.ts` picks by `Platform.OS`, so ONE bundler serves both. Do
 NOT set `EXPO_PUBLIC_NATS_URL` unless you mean to override it, because it is inlined at
-bundle time and whatever you pass wins on every platform (§10io). A real device on your
+bundle time and whatever you pass wins on every platform. A real device on your
 network is exactly when to set it, to the Mac's LAN address.
 
 First build here: 3m 59s, 300 Gradle tasks.
@@ -81,6 +81,6 @@ OpenStreetMap raster, the same as `../web` and the same as the Flutter app's fal
 No account, no API key. MapLibre can read the R2 vector archive the Flutter app uses,
 which is the upgrade when this app has a style sheet of its own.
 
-The markers are the ANSWER and are never stored (§10ic): what is on screen is what was
+The markers are the ANSWER and are never stored: what is on screen is what was
 just asked for. `charge_points` stays DECLARED on-demand so a mutation has its
 descriptor, and the only charge point this phone would store is one it wrote itself.

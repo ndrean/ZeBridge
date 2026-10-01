@@ -1,8 +1,7 @@
 # A region answers its own phones: the leaf node
 
 A regional nats-server as a LEAF of the hub, in a container on OrbStack, and the POI
-service beside it answering the phones of that region from its own replica. NOTES §10hl
-has the measurements; this is how to run them.
+service beside it answering the phones of that region from its own replica. This is how to run it, and what it measured.
 
 ## The hub
 
@@ -26,7 +25,7 @@ principal's traffic. Phones connect to `nats://127.0.0.1:4223`; monitoring on 82
         --db /tmp/pois-leaf.duckdb --label leaf
 
 Two connections on purpose: the replica follows the hub (`--url`; the JetStream API does
-not cross a leaf link from a standalone hub, §10hl), the answers go out on the leaf
+not cross a leaf link from a standalone hub), the answers go out on the leaf
 (`--serve-url`). The hub's own responder runs as before, `--label hub`.
 
 ## Who answers
