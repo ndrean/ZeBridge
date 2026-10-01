@@ -63,10 +63,11 @@ Bindings exist for Python, Kotlin (Android), Dart/Flutter and React Native. See 
 
 **Design**: built to keep many small consumers in sync with a small to medium PostgreSQL database, through NATS.
 
-* **Performance**: data travels three ways, each measured on one machine running PostgreSQL, NATS and the bridge. **Changes**: the bridge streams over 100k rows/s from PostgreSQL into NATS, and a connected client applies 30k–50k of them a second (about 12k on an iPhone 12). **Snapshots**: a new client seeds a table at 90k–125k rows/s, and still about 6k rows/s on a low-end Android phone (a Motorola E20), which the library feeds in chunks so the seed fits in its memory. **Writes**: client writes reach PostgreSQL at about 8,500/s per ingress lane (`ZB_INGRESS_LANES`).
-Trust is earned. Test first. See [Some performance measurements](#some-performance-measurements).
-
-~~See [SPEED_TEST.md](https://github.com/ndrean/zebridge/blob/main/SPEED_TEST.md)~~
+* **Performance**: data travels three ways, each measured on one machine running PostgreSQL, NATS and the bridge. See [Some performance measurements](#some-performance-measurements).
+  * **Changes**: the bridge streams over 100k rows/s from PostgreSQL into NATS, and a connected client applies 30k–50k of them a second (about 12k on an iPhone 12).
+  * **Snapshots**: a new client seeds a table at 90k–125k rows/s, and still about 6k rows/s on a low-end Android phone (a Motorola E20), which the library feeds in chunks so the seed fits in its memory.
+  * **Writes**: client writes reach PostgreSQL at about 8,500/s per ingress lane (`ZB_INGRESS_LANES`).
+Trust is earned. Test first.
 
 * **Topology**: The preferred topology is the daemon colocated with the NATS server over TLS (as opposed to terminating TLS at a reverse-proxy). Since clients join NATS over TLS on the same port, the bridge talks to NATS over TLS too. Ideally PostgreSQL, NATS and ZeBridge are colocated; a cloud PostgreSQL should work but is untested (see [Using a cloud PostgreSQL](#using-a-cloud-postgresql)).
 * **Standby Read Replica ready**: you can use a dedicated Postgres standby replica for all the reads as ZeBridge uses separate reader and writer roles.
@@ -87,8 +88,7 @@ See [OBSERVABILITY_TELEMETRY](OBSERVABILITY_TELEMETRY.md).
   
 **Opinionated**: Because our goal is to sync Postgres databases locally with strict predictability by preventing unexpected concurrent writes, we have a few rules that we stamped 💡 _good practices_: strict memory boundaries, safety enforced by tenant, enrollment by tenant and JWT, enforced schemas, foreign key cascade mitigation, conflict resolution by last-writer-wins (LWW) with cooperative editing on top of it, table suspension, and local writes that go through the library only. See [Conflict resolution](#conflict-resolution) below.
 
-They may look strict, but they are mostly standard and well known, and applying them to a schema is almost mechanical.
-See [The daemon](#the-daemon) below for more details and [SCOPE ## Consistency model](SCOPE.md).
+They may look strict, but they are mostly standard and well known, and applying them to a schema is almost mechanical. See [The daemon](#the-daemon) below for more details and [SCOPE ## Consistency model](SCOPE.md).
 
 #### Main Configuration
 
