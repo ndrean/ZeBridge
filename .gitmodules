@@ -1,0 +1,14 @@
+# ⚠️ The gitlink for nats.zig existed before this file did, which meant a fresh clone got an
+# empty `nats.zig/` directory and no way to populate it: git recorded the commit but had no
+# URL to fetch it from. `git submodule update --init` failed with "No url found for submodule
+# path 'nats.zig'".
+#
+# The URL is UPSTREAM, not a fork — local fixes to this submodule cannot be pushed here.
+# They live in the parent repo as `nats.zig-*.patch` plus NATS_ZIG_NOTES.md, so they survive
+# independently of the submodule and are ready to send upstream. Re-apply with:
+#
+#     cd nats.zig && git apply ../nats.zig-jetstream-stale-408.patch
+[submodule "nats.zig"]
+	path = nats.zig
+	url = https://github.com/lalinsky/nats.zig.git
+	branch = main

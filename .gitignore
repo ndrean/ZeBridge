@@ -1,0 +1,107 @@
+# Zig build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+.lexical/
+zig-pkg/
+
+/spike/.zig-cache/
+/spike/zig-pkg/
+# Downloaded packages
+*.deb
+
+# NATS data
+nats-data/
+.claude/
+
+# Dependencies (vendored)
+libs/
+
+/consumer/.elixir_ls/
+# IDE
+.vscode/
+.idea/
+
+# Docker
+postgres-data/
+postgres-standby/
+*.tar.gz
+*.tar.xz
+
+src/test_files/
+/docs/
+/demo/
+.superpowers/
+.expert/
+.DS_Store
+docs/
+/zold/
+zz-changes/
+
+examples/01-micro_vm-nodejs/node_modules/
+examples/02-micro_vm-python/__pycache__/
+examples/03-browser-python-django/venv/
+examples/03-browser-python-django/mysite/__pycache__/
+
+# Local log sink (see README "Writing the log to a file")
+*.log
+logs.txt
+bridge.txt
+skills-lock.json
+/.agents/
+
+# Scenario harness venv
+scripts/scenarios/.venv/
+scripts/scenarios/__pycache__/
+
+# Native (no-Docker) stack runtime artifacts — see scripts/native/
+# (postgres-data/ and nats-data/ are already covered above)
+scripts/native/*.log
+scripts/native/*.pid
+scripts/native/seed.txt
+scripts/native/nsc-store/
+scripts/native/creds/
+nats-data.pre-jwt/
+
+# zb-client-ts package
+zb-client-ts/node_modules/
+
+examples/04-node-consumer/node_modules/
+README.md.bak
+reorganize.py
+test_map.zig
+seed.txt
+# The pre-split .env, removed 2026-08-28. The three files that replaced it
+# (.env.bridge, .env.docker, .env.admin) are tracked; a bare .env is not, so a
+# local scratch copy cannot drift back into the repo.
+# /.env
+
+# Vite's local overrides. `.env.local` is per-developer by convention and by name —
+# which stack you happen to be pointed at, and (via VITE_AUTH) which credential that
+# broker accepts. `.env.compose.example` is the tracked copy worth reading.
+examples/05-tables/web-consumer/.env.local
+examples/05-tables/web-consumer/.env.*.local
+libzb/soak-uids.txt
+libzb/zbz-*.sqlite3*
+zb-client-ts/zebridge_*.sqlite3
+zb-client-ts/zebridge_*.sqlite3-*
+
+.env.grafana
+/node_modules/
+
+examples/08-map/**/.env*
+examples/08-map/flutter/data/
+# The map's raw datasets: downloaded, large, and rebuilt by their loaders (§10hr).
+examples/08-map/poi-ocm.json
+
+# Python bytecode, anywhere (the three per-directory rules above are covered by this one)
+__pycache__/
+*.pyc
+
+# Lockfiles stay local (2026-09-26): every example and package regenerates its own with pnpm install.
+pnpm-lock.yaml
+examples/08-map/prix-des-carburants-en-france-flux-instantane-v2.csv
+zb.sqlite*
+
+# `bridge --init-nats` output: seeds, creds and .env.bridge (mode 0600). Never committed.
+/zb-nats/
