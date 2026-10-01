@@ -7,7 +7,7 @@
 
 ![Zig support](https://img.shields.io/badge/Zig-0.16.0-color?logo=zig&color=%23f3ab20)
 
-**What is it?**: ZeBridge is a bidirectional single PostgreSQL-to-local-database synchronization layer for offline-first applications. PostgreSQL remains authoritative; consumers optimistically mutate local state and eventually converge with PostgreSQL through durable, replayable change distribution. It uses NATS/JetSteam to solve the distribution problem.
+**What is it?**: ZeBridge is a bidirectional single PostgreSQL-to-local-database synchronization layer for offline-first applications. PostgreSQL remains authoritative; consumers optimistically mutate local state and eventually converge with PostgreSQL through durable, replayable change distribution. It uses NATS JetStream to solve the distribution problem.
 
 ZeBridge has a two-pillar architecture where you run a daemon between your Postgres master server and a NATS server, and where consumers build upon the client library.
 
@@ -58,31 +58,31 @@ Shims for Python, Kotlin, Flutter are available. See [CLIENTS](https://github.co
 * Mobile Native Apps: Utilizing native file system storage: React Native running the TypeScript or C ABI library, Flutter running the C ABI library, with an SQLite replica.
 * Desktop apps: Flutter running the C ABI library with an SQLite replica.
 * Browsers and Webapps: Leveraging OPFS support for SQLite-WASM or PGlite via the TS library.
-* Backend responder Services /  micro-VM. For example, A warm micro-VM as a client with the columnar in-process database DuckDB syncing Postgres. This client does not push mutations, it just responds to other conencted client.
-➡ The use case: a  client - a phone app, connected to NATS using the library - runs one query command - via the library - like "which Point Of Interest around me?" and the micro-VM receives the query, runs the corersponding analytics, or geospatial or timebased query against its replicated PG fork and responds back via NATS. Zero cost for PostgreSQL, no PostGIS nor TimeScaleDB extension used.
+* Backend responder Services /  micro-VM. For example, A warm micro-VM as a client with the columnar in-process database DuckDB syncing Postgres. This client does not push mutations, it just answers other connected clients.
+➡ The use case: a  client - a phone app, connected to NATS using the library - runs one query command - via the library - like "which Point Of Interest around me?" and the micro-VM receives the query, runs the corresponding analytics, or geospatial or timebased query against its replicated PG fork and responds back via NATS. Zero cost for PostgreSQL, no PostGIS nor TimeScaleDB extension used.
 
 **Design**: This tool is built to keep synchronized replicas of a large volume of small to medium consumers via the NATS message broker with small to medium Postgres databases.
 
-* **Performance**: On a machine with colocated Postgres, ZeBridge and NATS, you can expect to push sustained rates of 50-100k req/s into NATS, ready to be consumed. You can expect a sustained rate of 20-50k mut/s writes back to Postgres,  boundary scoped, using several threads (set by `ZB_INGRESS_LANES`, default 1).
+* **Performance**: On a machine with colocated Postgres, ZeBridge and NATS, the bridge pushed 100k–140k rows/s from PostgreSQL into NATS in bursts. Client writes back to PostgreSQL, tenant-scoped, reached about 8,500/s on one lane and 20,000/s on four (`ZB_INGRESS_LANES`, default 1).
 The consumer's local database ingress for events depends a lot upon your device. Values around 50k evt/s can be reached.
 The client library can seed at rates up to 100k rows/s, and  it applies auto-streaming by chunks for large tables as we target constrained hosts (eg Motorola E20, 2021 model).
 Trust is earned. Test first. See [SPEED_TEST.md](https://github.com/ndrean/zebridge/blob/main/SPEED_TEST.md)
-* **Topology**: The prefered topology is the daemon colocated to the NATS server over TLS (as opposed of terminating TLS at a reverse-proxy). Since every client can join NATS over TLS, then NATS and Zebridge must communicate over TLS too. Ideally, Postgres, NATS and ZeBridge are colocated, but ZeBridge accepts a Cloud database PostgreSQL.
-* **Standby Read Replica ready**: you can use a dedicated Postgres standby replica for all the reads as ZeBrdige uses dedicated reader and writer users role.
-* **CLI**: it offers diagnostic (`--diagnose`) and client onboarding (`--init-nats`), JWT revocation (`--revoke`) and slot management (`--view-slot`). See [The CLI](#the-cli) below.
+* **Topology**: The preferred topology is the daemon colocated with the NATS server over TLS (as opposed to terminating TLS at a reverse-proxy). Since every client can join NATS over TLS, then NATS and Zebridge must communicate over TLS too. Ideally, Postgres, NATS and ZeBridge are colocated, but ZeBridge accepts a Cloud database PostgreSQL.
+* **Standby Read Replica ready**: you can use a dedicated Postgres standby replica for all the reads as ZeBridge uses separate reader and writer roles.
+* **CLI**: the same binary sets the system up (`--init-nats`, `--init-sql`, `--mint-responder`), checks it (`--diagnose`), revokes users (`--revoke`) and manages slots (`--view-slots`, `--drop-slot`). See [The CLI](#the-cli) below.
 * **Multiple instances**: run several instances of ZeBridge on the same Postgres publication, each with its own slot (and port). This enables you to follow large slow moving tables independently from small tables with heavy changes and optimize memory usage.
 * **Mobile-First Synchronization**: to optimize mobile bandwidth and reliability, we use a delta-chain process with aggressive compression for seeding and reseeding, and streaming when needed. This mitigates the need for long, expensive unitary CDC catchups.
-* **Geographic or Tenant division**: a tenant is in practice a column in a table and a consumer brings his identity, and Postgres resolves the tenant from it. Tenants serves to set a division, along with define NATS grants, by  business, or dynamically, a geography (like mobile apps). The scope is by tenant. See [SCOPE ## Replication is by TENANT, not by query](https://github.com/ndrean/ZeBridge/blob/main/SCOPE.md).
-* **Strict authentication, JWT rotation**: because NATS is exposed to the internet and contains data, users are strictly tenant scoped and access grants are encoded in a JWT, immediately revokable by the DBA. The client app is responsible for the Oauth process and handles the ID to hte library. The JWT is auto-rotated every `ENROLL_JWT_TTL_SECONDS`.
-* **Encryption**: In transit is under TLS. At rest, the Postgres disk can be encrypted globally, and so does NATS. The replicas are normally not encrypted (the native SQLite does not propose it). The data that matters for ZeBridge are encrypted.
+* **Geographic or Tenant division**: a tenant is in practice a column in a table and a consumer brings their identity, and Postgres resolves the tenant from it. Tenants serve to set a division, along with define NATS grants, by  business, or dynamically, a geography (like mobile apps). The scope is by tenant. See [SCOPE ## Replication is by TENANT, not by query](https://github.com/ndrean/ZeBridge/blob/main/SCOPE.md).
+* **Strict authentication, JWT rotation**: because NATS is exposed to the internet and contains data, users are strictly tenant scoped and access grants are encoded in a JWT, immediately revokable by the DBA. Your app signs users in (OAuth or anything else) and its backend issues a one-time invite; the library enrolls the device with it and renews its JWT before it expires (`ENROLL_JWT_TTL_SECONDS`).
+* **Encryption**: In transit is under TLS. At rest, the Postgres disk can be encrypted globally, and so does NATS. The replicas are normally not encrypted (the native SQLite does not propose it).
 * **Schema translation**: the replicas are built using schemas transcriptions. For PGlite, it is a native transcription. For SQLite, schemas are STRICT.
-* **PostGIS and pgvector ready**: support of`PostGIS` (binary EWKB as BLOB) and `pgvector` types out of the box.
+* **PostGIS and pgvector ready**: support of `PostGIS` (binary EWKB as BLOB) and `pgvector` types out of the box.
 * **Anti-client flood**: writes per client can be controlled in rate and backlog size, designed to evict new messages that could overflow the NATS buffer.
 * **Replicas**: besides SQLite and PGlite/Postgres, the columnar in-process database DuckDB can sync with Postgres to add analytical capabilities to the clients.
-**Observability**: production-ready out of the box. It exposes standard Prometheus metrics for performance tracking and structured logs optimized for Loki and Grafana dashboards. The metrics are all owned by the daemon, meaning metrics from its Postgres catalogue and self reflecting metrics.
+* **Observability**: production-ready out of the box. It exposes standard Prometheus metrics for performance tracking and structured logs optimized for Loki and Grafana dashboards. The metrics are all owned by the daemon, meaning metrics from its Postgres catalogue and self reflecting metrics.
 See the detailed file [OBSERVABILITY_TELEMETRY](OBSERVABILITY_TELEMETRY.md)
   
-**Opinionated**: Because our goal is to sync Postgres databases locally with strict predictability by preventing unexpected concurrent writes, we have a few rules that we stamped 💡 _good practices_: strict memory boundaries, safety enforced by tenant, enrollment by tenant and JWT, enforced schemas, foreign key cascade mitigation, conflict resolution via last-writer-win (LWW) enforced in the schema and cooperative editing on top of it, table suspension, and controlled local writes propagation. We also have a Cooperative editing via a jsonb field. See [Conflict resolution](#conflict-resolution) below.
+**Opinionated**: Because our goal is to sync Postgres databases locally with strict predictability by preventing unexpected concurrent writes, we have a few rules that we stamped 💡 _good practices_: strict memory boundaries, safety enforced by tenant, enrollment by tenant and JWT, enforced schemas, foreign key cascade mitigation, conflict resolution via last-writer-win (LWW) enforced in the schema and cooperative editing on top of it, table suspension, and controlled local writes propagation. See [Conflict resolution](#conflict-resolution) below.
 
 Although they might seem rigorous, these rules are mostly standard and well known, almost mechanical, schemas.
 See [The daemon](#the-daemon) below for more details and [SCOPE ## Consistency model](https://github.com/ndrean/ZeBridge/blob/main/SCOPE.md)
@@ -91,16 +91,16 @@ See [The daemon](#the-daemon) below for more details and [SCOPE ## Consistency m
 
 ZeBridge operates with a **fixed-size buffer** for the changes egress (PG-WAL →  bridge → NATS), and can parallelize mutations ingestion (client → NATS → bridge → PG).
 
-**1. Change Data Capture**: because the engine uses a pre-allocated ring buffer with zero allocation on the hot path, the primary runtime configuration for the CDC propagation from Postgres into NATS is by setting `BASE_BUF` (an integer between 10 and 20) and `RING_BUFFER_COUNT` (an integer between 1024 and 1M+). There is also `MAX_COLUMNS` (an integer which defaults to 128).
-Defaults are `BASE_BUF=12` (4 KB/row), `RING_BUFFER_COUNT=32768`and `MAX_COLUMNS=128`, consuming around 150MB.
+**1. Change Data Capture**: because the engine uses a pre-allocated ring buffer with zero allocation on the hot path, the primary runtime configuration for the CDC propagation from Postgres into NATS is by setting `BASE_BUF` (an integer between 10 and 20) and `RING_BUFFER_COUNT` (an integer between 1024 and 1M+). `MAX_COLUMNS` is detected at boot from the widest published table.
+The defaults, `BASE_BUF=12` (4 KB per row) and `RING_BUFFER_COUNT=32768`, use about 150 MB.
 
 Depending on the change volume, the schema sizes of your published tables, and if you have lengthy cascading transactions, the total buffer allocation can be configured anywhere from 16 MB to 6+ GB.
 
 ❗️ Read [Sizing the ring](#sizing-the-ring) below.
 
-Any change in the buffer, for special live migrations that could enable larger tables than the current setting, or for tables with numerous columns exceeding the max column expected to be larger than the current setting, needs a daemon restart: see [Restart Rules](#restart-rules) below.
+Changing `BASE_BUF`, `RING_BUFFER_COUNT` or `MAX_COLUMNS` needs a restart: see [Restart rules](#restart-rules) below.
 
-**2. Mutations**: On the other side, for inserting client mutations into Postgres via NATS, you may need to tweak `ZB_INGRESS_LANES` (an integer betwween default=1 and 8) depending upon the mutation rate. For example, if messages arrive in less than 200µs, you may want to add another lane with `ZB_INGRES_LANES=2` to run another mutation lanes.
+**2. Mutations**: On the other side, for inserting client mutations into Postgres via NATS, you may need to raise `ZB_INGRESS_LANES` (1 to 8, default 1) with the write rate: one lane applies about 8,500 writes/s, and each lane adds a writer connection.
 Postgres `max_connections` setting is checked against this number when the bridge is started.
 
 More details in [Configuration](#configuration) below.
@@ -111,12 +111,12 @@ More details in [Configuration](#configuration) below.
 
 We expose them directly so you can judge.
 
-**Type sanitization** 🔔 XML, RANGE, TSVECTOR, TSQUERY should be ignored.
+**Types left out** 🔔 xml, ranges, tsvector and tsquery never travel: `zebridge_enable()` leaves them out of the publication.
 
 🚦 CDC events that contain unsupported columns **suspends** the table.
 See [Suspended tables](#suspended-tables).
 
-**Size limitation**: `ZeBridge` is not designed for massive databases or tables storing large objects (BLOB) or an extra large number of columns. Firstly because NATS restricts payloads (< $2^{20}$=1 MB by default, safe up to 8 MB). This default limit of 1 MB is already very large for text - 200.000 words, 400 pages, or a huge JSON. On the other side, you have to adjust the fixed-size buffer used by ZeBridge to support such payloads.
+**Size limitation**: `ZeBridge` is not designed for massive databases or tables storing large objects (BLOB) or an extra large number of columns. Firstly because NATS restricts payloads (< $2^{20}$=1 MB by default, safe up to 8 MB). This default limit of 1 MB is already very large for text - 200,000 words, 400 pages, or a huge JSON. On the other side, you have to adjust the fixed-size buffer used by ZeBridge to support such payloads.
 
 🚦Because of our memory model, tables can get **suspended** _at runtime_ for `row_too_large`.
 See [Suspended tables](#suspended-tables).
@@ -125,7 +125,7 @@ See [Suspended tables](#suspended-tables).
 
 **Cross-tenant ordering limitation**: If fields are referenced across tenant without a foreign key, the result can look wrong for a moment. For example, an order scoped to the tenant `accounting` referencing a document that arrives as public data can, for a moment, arrive first and look wrong before the document lands. It is not related to LWW.
 
->💡 _Good practice_: the solution is a choice made when designing tables. Only a **foreign key** guarantees that order, because the bridge then knows the schema constraint so that a child must be hold until the parent lands when a foreign is declared. Without this, impossible to know.
+>💡 _Good practice_: the solution is a choice made when designing tables. Only a **foreign key** guarantees that order, because the client then holds a child until its parent lands. Without a foreign key, it cannot know.
 
 **Restricted columns on tables**: ZeBridge supports restricting the columns in a publication. Currently, this will affect **every tenant**.
 
@@ -155,7 +155,7 @@ See [Suspended tables](#suspended-tables).
       * [Schemas - guards and suspension](#schemas---guards-and-suspension)
       * [Checks](#checks)
       * [Scoped by tenant, authorized by grants](#scoped-by-tenant-authorized-by-grants)
-      * [Payload limits are not flexbile](#payload-limits-are-not-flexbile)
+      * [Payload limits are not flexible](#payload-limits-are-not-flexible)
       * [Conflict resolution](#conflict-resolution)
       * [Cooperative editing: several editors on one row](#cooperative-editing-several-editors-on-one-row)
       * [Cascade rules](#cascade-rules)
@@ -238,20 +238,19 @@ See [Suspended tables](#suspended-tables).
 
 The daemon `zebridge` projects Postgres into NATS and back. It defines a protocol—a set of rules and workflows—for a consumer to connect to NATS and to the local replica.
 
-The client C-ABI `libzb` library - for FFI users - and the `zb-client-ts` library (no WASM) - for any JavaScript-based consumers - implements this protocol.
+The client C-ABI `libzb` library - for FFI users - and the `zb-client-ts` library (no WASM) - for any JavaScript-based consumers - implement this protocol.
 
-The client library abstracts away the complex choregraphy required to manage NATS streams, KV buckets, data decompression and deserialization, retries, holding queries with foreign keys...and sets up the local tables needed to hold the state of a client.
+The client library abstracts away the complex choreography required to manage NATS streams, KV buckets, data decompression and deserialization, retries, holding queries with foreign keys...and sets up the local tables needed to hold the state of a client.
 
 A developer will build an app using the client library. We have bindings for specific idioms.
 See [CLIENTS](https://github.com/ndrean/zebridge/blob/main/CLIENTS.md)
 
 | artifact | what it is | who uses it |
 | -- | -- | -- |
-| zebridge | POSIX based background executable <br>- Linux, FreeBSD, OSX | daemon running  next to PostgreSQL and  NATS |
-| bridge_sweeper | background executable | daemon running next to Postgres and to  `zebridge` |
-| | |
+| bridge | POSIX based background executable <br>- Linux, FreeBSD, OSX | daemon running  next to PostgreSQL and  NATS |
+| bridge_sweeper | background executable | daemon running next to Postgres and to the bridge |
 | libzb | native client library, C ABI | FFI Consumers: mobile apps, desktop apps, microservices |
-| zb-client | client npm package <br>(self-contained TS) | JS Consumers: browsers, Node, Electron, Deno, Bun, React Native |
+| zb-client-ts | client npm package <br>(self-contained TS) | JS Consumers: browsers, Node, Electron, Deno, Bun, React Native |
 
 The client library shrinks this orchestration down to a few primitives: `connect()`, `close()`, `newVersion()`, `query()`, `mutate()` and `onChange()`.
 
@@ -265,8 +264,8 @@ Two independent questions. **Which library** depends on whether the host can lin
 | -- | -- | -- | -- |
 | Flutter desktop | libzb, vendored | `.dylib` / `.so` | nothing |
 | a service in Python, Go, Java, Elixir… | libzb, vendored | `.dylib` / `.so` | only its own engine, if it uses one |
-| React Native (iOS **and** Android) | zb-client-ts | — | nothing native |
-| browser, Node, Electron, Bun, React Native | zb-client-ts | — | nothing |
+| React Native (iOS **and** Android) | zb-client-ts, or libzb in a native module | — | nothing native with zb-client-ts |
+| browser, Node, Electron, Bun | zb-client-ts | — | nothing |
 | native Swift on iOS | libzb, vendored | **static** `.a` | nothing |
 | native Kotlin on Android | libzb, vendored | **static** `.a`, linked into your JNI `.so` | nothing |
 
@@ -288,14 +287,15 @@ See `examples/08-map/native/README.md` for the exact commands, and NOTES §10ir.
 ⚠️ Do not compare an archive against a shared library — 22 MB of `.a` is 4 MB once linked, for identical code. Object files keep every symbol, nothing is dead-stripped, and the linker pulls only what an app references.
 
 JavaScript hosts need no native build at all. That is why the React Native app in
-`examples/08-map/native` runs on both phones with one storage adapter and three small shims, while libzb was still learning to cross-compile.
+`examples/08-map/native` runs on both phones with one storage adapter and three small shims.
 
 ### Setup steps at a glance
 
-* **PostgreSQL**: three steps guarantees the sync of the engine
-  * the DBA defines two Postgres users,  READER and WRITER, and uses them to install the Postgres functions and triggers needed by ZeBridge,
-  * the DBA migrates the database, runs a diagnose to ensure the schemas follow the 💡 _good practice rules_, and removes any deviation.
-  * the DBA finalizes each table by running `zebridge_enable` where the sync rules are declared:
+* **NATS and the bridge's configuration**: `bridge --init-nats operator` writes the NATS server config, the bridge's credentials and `.env.bridge`, where the DBA sets the READER and WRITER database URLs.
+* **PostgreSQL**:
+  * `bridge --init-sql | psql` creates the two roles, READER and WRITER, the functions and triggers ZeBridge needs, and the publication,
+  * the DBA migrates the database and fixes what does not follow the 💡 _good practice rules_,
+  * the DBA enables each table with `zebridge_enable`, where its sync rules are declared:
 
    ```sql
    SELECT * FROM zebridge_enable('public.orders', 
@@ -308,18 +308,11 @@ JavaScript hosts need no native build at all. That is why the React Native app i
   );
    ```
 
-* **NATS**:
-  * the DBA generates an NKEY pair for authentication: `bridge --gen-nkey`.
-  * the DBA starts NATS with the NKEY seed in the config, and enables JetStream,
-* **ZeBridge**:
-  * the DBA sources the `.env.bridge` file that contains the READER and the WRITER and the public NKEY part,
-  * starts with `bridge --pub my_pub -slot my_slot`,
-  * start the `bridge_sweeper` daemon,
-* **Client Authentication**: since NATS is exposed to the internet, users are strictly authenticated.
-  * the bridge is OAuth agnostic; the DBA assigns the user identity returned by the OAuth in a tenant in the table `'public.zb_user_tenants'`.
-  * the JWT setup: see []
-* **Frontend**: the dev builds on top of the library, `libzb` or `zb-client`. He will interact only with the storage, no NATS incantations.
-  * he sets up the `ZeBrdige()` class with the storage / database flavour (SQLite, PGlite, DuckDB) and the domain to reach NATS,
+* **Run**: `bridge --diagnose` checks everything first; then start NATS, the bridge (`bridge --pub my_pub --slot my_slot`) and the `bridge_sweeper` daemon.
+* **Users**: since NATS is exposed to the internet, every user is authenticated. The bridge is OAuth agnostic: your backend writes a one-time invite naming the user (the principal) and their tenant in `zebridge_invites`. See [Identity and access](#identity-and-access).
+* **Frontend**: the developer builds on the library, `libzb` or `zb-client-ts`, and works only with the local database, never with NATS. They create a `ZeBridge` client with the bridge's URL, the invite, and the storage flavour (SQLite, PGlite, DuckDB).
+
+The full procedure is [Host setup on VPS or bare-metal](#host-setup-on-vps-or-bare-metal).
 
 ### Architecture Example
 
@@ -366,7 +359,7 @@ graph TD
         NATS@{shape: data-store}
         
         %% TLS termination for the bridge's HTTP surface
-        HA -.->|http:27434/enroll<br>http::27434/renew| Bridge
+        HA -.->|http:27434/enroll<br>http:27434/renew| Bridge
         
         Sweeper[[Sweeper]]:::bridge
     end
@@ -399,13 +392,13 @@ graph TD
     classDef daemon fill:#bdf3ff,stroke:#ac0100,stroke-width:2px;
 
     subgraph Mobile
-      UserMobile([mobile<br>React Native<br>--- zb-client ---]):::external
+      UserMobile([mobile<br>React Native<br>--- zb-client-ts ---]):::external
       LocalSQLite[(local<br>SQLite)]:::secure
       LocalSQLite <==>  UserMobile
     end
 
     subgraph Browser
-      B([Browser<br>---zb-client---]):::external
+      B([Browser<br>---zb-client-ts---]):::external
       LocalLite[(PGlite<br>SQLite)]:::secure
       B<==> LocalLite
     end
@@ -459,10 +452,10 @@ The cost is that Cloudflare closes a proxied websocket after about 100 seconds w
 You can test on bare metal or a VPS with for example 6-vCPU, 24 GB RAM and 200GB NVMe SSD, and run comfortably the following stack:
 
 * a master `PostgreSQL` (colocated in this example to communicate over plain TCP, but a remote on an EC2 instance over TLS is possible),
-* a `NATS` server and his companion `NATS-exporter` for telemetry,
+* a `NATS` server and its companion `NATS-exporter` for telemetry,
 * a daemon `ZeBridge` on one publication, one slot, and the sweeper companion,
 * a TSDB `Prometheus` (scraping telemetry from ZeBridge and NATS-exporter, and pushing to a cloud `Grafana`),
-* the reverse-proxy `HAProxy` for TLS termination of the internal ZeBridge endpoints _/enroll_ and _/renew_, and let Prometheus push to a Grafana cloud,
+* the reverse-proxy `HAProxy` for TLS termination of the bridge's endpoints _/enroll_ and _/renew_,
 
 This can serve the following clients:
 
@@ -479,8 +472,8 @@ Measured figures, not estimates. PostgreSQL, nats-server and the bridge run on o
 ### PostgreSQL to NATS
 
 A Postgres CDC event takes ~5µs/event to land into a NATS stream through zebridge (all colocated, PG, zebridge, NATS, plain TCP).
-ZeBridge builds an image of a Postgres table at ~2.5µs/row into a NATS object storage: twice faster.
-The client builds his local table locally automatically via the client library.
+ZeBridge builds an image of a Postgres table at ~2.5µs/row into a NATS object store: twice as fast.
+The client library builds the local table from it.
 
 | what | measured |
 | --- | --- |
@@ -493,7 +486,7 @@ Above its ceiling a client falls behind the stream, seeds again from the chain a
 
 ### Seeding a replica
 
-A 3.1M-row table, about 1 GB on disk, tested on an iPhone 12 and a lower-end Android device.
+A 3.1M-row table, about 1 GB in PostgreSQL, seeded on a Mac, an iPhone 12 and a low-end Android phone.
 
 | client | device | time | rate |
 | --- | --- | --- | -- |
@@ -543,7 +536,7 @@ A Python service keeps a DuckDB replica (using libzb library) and answers time-s
 
 "Newest age" is how old the newest reading was when the service answered: the whole path from sensor to NATS, bridge, PostgreSQL, CDC and replica.
 
-**First test**: Connect 20 sensors sending a message every 20ms during 60s, then 1000 sensors sending every 20ms during 60s.
+**First test**: Connect 20 sensors sending a message every 20ms during 60s, then 100 sensors sending every 20ms during 60s.
 
 | sensors | readings/s | writes accepted | write verdict p50 / p99 | newest age p50 | question round trip p50 |
 | --- | --- | --- | --- | --- | --- |
@@ -556,7 +549,7 @@ After both runs the replica and PostgreSQL held the same 359,996 rows and the sa
 
 | lanes | readings/s sent | accepted/s | refused | write verdict p50 / p99 | newest age p50 |
 | --- | --- | --- | --- | --- | --- |
- 1 | 5,000 | 8,535 | 0% ✅ | 3.5 / 14.1 ms | 11 ms |
+| 1 | 5,000 | 5,000 | 0% ✅ | 3.5 / 14.1 ms | 11 ms |
 | 1 | 10,000 | 8,535 | 15% | 592 / 620 ms | 595 ms |
 | 2 | 10,000 | 10,000 | 0% ✅ | 4.9 / 14.8 ms | 10 ms |
 | 2 | 20,000 | 14,149 | 29% | 355 / 410 ms | 356 ms |
@@ -568,7 +561,7 @@ With 4 lanes, the whole architecture colocated on a single Mac absorbed 20,000 w
 
 Past a lane count's ceiling the writes queue, and at 5,000 waiting writes per principal the stream refuses more, so the delay jumps to hundreds of milliseconds. At 8 lanes the CPU was saturated: the limit was the machine, not the bridge. The DuckDB replica kept up throughout, and after the ramp it matched PostgreSQL exactly: 3,515,172 rows, the same sum.
 
-> this architecture is just illustrative. The "right" architecture is sensors connected to NATS MQTT, itself connected to a DuckDB service run by a daemon that saves the data as a Paquet into a remote bucket.
+> this architecture is just illustrative. The "right" architecture is sensors connected to NATS MQTT, itself connected to a DuckDB service run by a daemon that saves the data as Parquet into a remote bucket.
 
 [⬆️](#table-of-contents)
 
@@ -576,7 +569,7 @@ Past a lane count's ceiling the writes queue, and at 5,000 waiting writes per pr
 
 ## The daemon
 
-Once the DBA has migrated the Zebridge functions into Postgres, checked for the **compliance** of the database, configured the NATS with the needed streams and buckets and operator/JWT, you are ready to run ZeBridge, the first pillar of the architecture.
+Once the DBA has migrated the ZeBridge functions into Postgres, checked for the **compliance** of the database, configured the NATS with the needed streams and buckets and operator/JWT, you are ready to run ZeBridge, the first pillar of the architecture.
 
 **Compliance**: In this paragraph, we explain that this "compliance" means to follow "good practices" of a general sync engine, as the engine makes choices usually left to you. This aims in one direction: many small consumers that read freely, write safely, and never cross the tenant line.
 
@@ -587,8 +580,8 @@ Literature-2: <https://www.digitalocean.com/community/tutorials/database-normali
 
 Here they are, so you can judge the fit before adopting it.
 
-* **Strict Memory Boundaries**: Because ZB uses a **fixed pre-allocated buffer**, its memory footprint must be defined at runtime.
-🚦 Overflows are detected, wether originated from a consumer write, or directly loaded within Postgres, or after a schema migration. They are rolled back and the table is suspended. See [Suspended tables](#suspended-tables)
+* **Strict Memory Boundaries**: Because ZB uses a **fixed pre-allocated buffer**, its memory footprint is fixed at startup.
+🚦 Overflows are detected, whether they come from a consumer write, or directly loaded within Postgres, or after a schema migration. They are rolled back and the table is suspended. See [Suspended tables](#suspended-tables)
 * **💡 Enforcement of Good practices on Schemas**:  Because we are syncing databases, the schema rules are enforced, not suggested: a primary key, `uuid` keys and `timestamptz` columns on writable tables, and a deliberate choice about deletes across a foreign key.
 We have added tools in Postgres to diagnose tables as:
 
@@ -607,24 +600,24 @@ This reports every rule before touching anything, and `bridge --diagnose` checks
 
 * **Suspension**: 🚦 When a table stops meeting a rule while the bridge runs, the bridge **suspends** it and keeps everything else flowing. Fix the table and most suspensions lift by themselves; two cases need a restart, [Suspended tables](#suspended-tables) and [Restart rules](#restart-rules).
 * **Soft-delete Cascade Transaction Mitigation with Sweeper**: when consumers apply _soft-deletion_ this can lead to bloated databases. Soft deletion is enforced by using a `tombstone` column in the schema.
-The client library always applies a local HARD DELETE, but a _soft delete_ (via the `tombstone` timestampz) is sent to Postgres. ZeBridge solves the Postgres bloat with a companion garbage collector, the `bridge_sweeper` daemon which runs with a WRITER privilege.
+The client library always applies a local HARD DELETE, but a _soft delete_ (via the `tombstone` timestamptz) is sent to Postgres. ZeBridge solves the Postgres bloat with a companion garbage collector, the `bridge_sweeper` daemon which runs with a WRITER privilege.
 The sweeper: reaps old tombstones _families_, in order, children first, in batches of `GC_BATCH_ROWS` (1000), so a million expired tombstones is a thousand small deletes and never one transaction.
 
 * **A cascade storm, when PostgreSQL does cascade**: if a table is loaded with a schema declared with a physical cascade on a cascade-declared family, it is one transaction, and the bridge takes it as one: its events land in the ring buffer, `RING_BUFFER_COUNT` slots (32,768 by default), and are published in order as batches. A transaction larger than the ring is published as several batches, in order, and the clients apply each as one unit and hold what crosses a batch boundary until its parent arrives;
 proven with a 1,500-row family against a 1,024-slot ring.
 * **Ring buffer**: the ring exists to buffer possible large transactions and naturally for the broker's ordinary jitter. It is not for a NATS outage: a publish that fails is retried five times with a backoff from 100 ms doubling to 5 s, and if the broker is still gone the bridge stops rather than acknowledge WAL it never delivered, and resumes from the slot when the broker returns.
-* **Attach tables to a publication**: when running a migration, the DBA must attach each table to a publication with `SELECT zb_enable;`. See [Good practices](#good-practices)
-* **Writable is not automatic**: client-side writable tables are enabled `SELECT zebridge_enable(writable => true);` when running the database migration. See [Good practices](#good-practices)
-* **Writes with Conflict Resolution policy-LWW**: ZeBridge makes decisions for you that other sync engines leave you to : writes are not merely accepted, but enforced with Last-Write-Win (LWW) strategy server-side _per row_.
+* **Attach tables to a publication**: when running a migration, the DBA attaches each table to the publication with `zebridge_enable()`. See [Good practices](#good-practices)
+* **Writable is not automatic**: client-side writable tables are enabled with `zebridge_enable(..., writable => true)` when running the database migration. See [Good practices](#good-practices)
+* **Writes with Conflict Resolution policy-LWW**: ZeBridge makes decisions for you that other sync engines leave you to : writes are not merely accepted, but enforced with last-writer-wins (LWW) server-side _per row_.
 Postgres judges a write by its version, per row: an edit stamped below the row's version is refused as `stale`. The client then looks at which columns the winner changed. If the refused edit touched none of them, it is resubmitted with a fresh stamp and lands; if both edited the same column, the edit is dropped and the loss is surfaced. So an edit is lost only on a column that was genuinely contested.
 Clock skew is absorbed the same way: a slow clock is judged stale, and its edit is rebased onto the row it was made on, stamped above what the client has seen (a hybrid logical clock). The client implements a Hybrid Logical Clock (HLC) to neutralize the clock drift problem.
-See [Good practices](#good-practices) and [Understanding the LWW rules at a glance](#understanding-the-lww-rules-at-a-glance).
+See [Good practices](#good-practices) and [Understanding the LWW rules](#understanding-the-lww-rules).
 
-* **Controlled Local Writes**: On the consumer side, we expect a standard SQLite or PGlite engine. While clients are free to read from their local database, all writes **must** route through the `libzb` library to ensure tracking. Enforcement depends upon the local engine.
+* **Controlled Local Writes**: On the consumer side, we expect a standard SQLite or PGlite engine. While clients are free to read from their local database, all writes **must** go through the client library's `mutate()` to be tracked. Enforcement depends upon the local engine.
 * **Safety enforced by Tenant isolation and NATS grants**: we enforce a strict tenant model in Postgres: every principal -consumer- operates within a designated tenant boundary. This defines the RLS. Access control - grants-  and permissions within  NATS are cryptographically secured and mapped via NATS JWT tokens tied to each tenant.
-For these tasks, you can run `ZeBridge` as a CLI with a dedicated helpers  (`--init-nats`, `--gen-nkey`, `--revoke`).
-This tenant structure makes sense for B2B services, less for B2C operations because clients have basically all the same rights. By dividing the database by tenants, you can use advantageously NATS leaf nodes and assign a tenant per node; the main benefit is that NATS will contains only one full copy of the database.
-If you face clients, you have in practice one tenant. Thanks to NATS leafs nodes, you can distribute geographically the load where each leaf nodes will contain a copy of the database close to the consumers.
+For these tasks, you run the bridge's own commands (`--init-nats`, `--mint-responder`, `--revoke`).
+This tenant structure makes sense for B2B services, less for B2C operations because clients have basically all the same rights. By dividing the database by tenants, you can use advantageously NATS leaf nodes and assign a tenant per node; the main benefit is that NATS will contain only one full copy of the database.
+If you face clients, you have in practice one tenant. Thanks to NATS leaf nodes, you can spread the load geographically: each leaf node holds a copy of the database close to the consumers.
 A leaf topology gives the hub's JetStream a **domain**; the bridge, the grants and both client libraries carry it as one setting (`NATS_JS_DOMAIN`, `--init-nats --js-domain`, `jsDomain`), and a client learns it from `/enroll`. See PROTOCOL §1.
 * **Delta-chain seeding**: a client that missed part of the stream does not ask PostgreSQL for a dump. The bridge cuts a snapshot per table and tenant on a cadence, once for everyone, and the client reloads from it. How the two windows fit together is the subject of [Catching up: the chain and the stream](#catching-up-the-chain-and-the-stream).
 
@@ -632,7 +625,8 @@ A leaf topology gives the hub's JetStream a **domain**; the bridge, the grants a
 
 #### Schemas and zebridge_enable
 
-> [!WARNING] Every table must be attached to a publication with `zebridge_enable()`.
+> [!WARNING]
+> Every table must be attached to a publication with `zebridge_enable()`.
 
 The schema rules below are the ones needed in terms of column types and mandatory columns.
 
@@ -640,7 +634,6 @@ Tables are either public or private/tenant-scoped:
 
 | Action | column | type | note |
 | -- | -- | -- | -- |
-| | | | |
 | public table | no column, but a public reason is declared | text | ✚ `zebridge_enable(public_reason => 'this table is public')` for example |
 | private table | `tenant_id` | text | ✚ `zebridge_enable(tenant_col => 'tenant_id')` |
 
@@ -653,9 +646,9 @@ Tables are either read-only or writable with a LWW conflict resolution policy.
 |  Read  | id    | **bigint** or **uuid** | composite pk possible (2)|
 |  Write  | id    | **uuid** (1)| composite pk possible (2)|
 |||||
-| Write  | updated_at | **timestamptz**  (3)| no bigserial ✚ `zebridge_enable(version_col => 'updated_at')` or with your prefered field identifier|
-| Write  | delete_at | **timestamptz** | soft-deleted ✚ `zebridge_enable(tombstone_col => 'deleted_at')` or with your prefered field identifier |
-| Write | last_writer | text | `zebridge_enable(tiebreak_col => 'last_writer')` or with your prefered field identifier|
+| Write  | updated_at | **timestamptz**  (3)| ✚ `zebridge_enable(version_col => 'updated_at')`, or your own column name |
+| Write  | deleted_at | **timestamptz** | soft-deleted ✚ `zebridge_enable(tombstone_col => 'deleted_at')`, or your own column name |
+| Write | last_writer | text | `zebridge_enable(tiebreak_col => 'last_writer')`, or your own column name |
 
 (1) _in a writable table, a client mints its own keys offline, so a writable table's key must be **client-generable** — a `uuid-v7` (time-ordered), NOT a `bigserial` that the database hands out (an edge write to a sequence key would collide with the server's next insert, so the bridge refuses it)_.
 
@@ -688,15 +681,13 @@ For example, two public tables and a tenant scoped one:
 
 #### Private Columns on Tables
 
-The bridge can handle partial tables by column, and the cut applies for **every tenant**. You need to inform the bridge infrastructure by `zebridge_enable(...)`
-
-🔔 [TODO]
+Publish only some columns with `zebridge_enable(..., columns => ARRAY['id', 'title', …])`: see _Columns that never travel_ above. The column list applies to **every tenant**.
 
 #### Types
 
-The two worked extensions out of the box: `PostGis` and `pgvector` "ready".
+Two extensions work out of the box: `PostGIS` and `pgvector`.
 
-🔔 XML, RANGE, TSVECTOR, TSQUERY should be ignored by `zebridge_enable()`.
+🔔 xml, ranges, tsvector and tsquery are left out of the publication by `zebridge_enable()`.
 
 Postgres' schemas are directly used by PGlite whilst SQLite schemas have the following casting:
 
@@ -707,7 +698,7 @@ Postgres' schemas are directly used by PGlite whilst SQLite schemas have the fol
 | float4/8            | float64                  | REAL       | as is                       |
 | numeric/decimal     | string, stored scale     | TEXT       | TEXT, see below             |
 | uuid                | 36-char string           | TEXT       | as is                       |
-| timestamptz /       | ISO text, Z or none      | TEXT       | as is, SQLite's date functions read it       |
+| timestamptz         | ISO text, Z or none      | TEXT       | as is, SQLite's date functions read it       |
 | jsonb               | JSON text                | TEXT       | TEXT, see below             |
 | arrays              | JSON text `["a","b"]`    | TEXT       | as is: `json_each`, `json_extract` read it; a PostgreSQL-engine replica gets the native array |
 | bytea               | msgpack `bin` (bytes)    | BLOB       | as is                       |
@@ -722,14 +713,12 @@ Every type lands in one of SQLite's four storage classes, so a replica's tables 
 
 **Numeric**: SQLite has no decimal type, and its own documentation says: store exact decimals as TEXT, or as INTEGER in minor units when the scale is fixed. REAL is the one wrong answer, since money loses digits silently, and it would contradict the data the wire already carries as digits. 💡 So TEXT is the good practice.
 The cost is that TEXT compares lexicographically, so ORDER BY price puts '9.5' after '10.25', and arithmetic needs a cast. The exact alternative, INTEGER scaled by ten to the column's scale, needs the scale, and the descriptor strips modifiers today, so it reports numeric for numeric(20,8).
-[TODO?] That could become a per-column opt-in later?
 
 **jsonb**: TEXT is exactly what SQLite's `json_*()` family wants as input, so a replica can run `json_extract(metadata, '$.src')`. SQLite's newer internal JSONB format is a storage optimisation you opt into with `jsonb()`, and it changes what a plain SELECT returns.
 => leave that to the application
 
 **Extensions**: `PostGIS` and `pgvector` are the two supported extensions. Their type OIDs are per database, so the bridge reads them from `pg_type` at boot. PostGIS `geometry` and `geography` travel as the EWKB bytes PostgreSQL sends, a BLOB the client decodes itself. pgvector's types are normalised on the bridge: pgvector sends a dimension header and big-endian floats, which nothing on a device reads as is, so the bridge drops the header and turns the numbers little-endian. The BLOB a replica holds is then exactly what [sqlite-vec](https://github.com/asg017/sqlite-vec) reads (`vec_distance_L2(emb, '[1,2,3]')` on the column as it is), and what a `Float32Array` or `struct.unpack` reads. A client writes such a column with the same BLOB; the bridge renders pgvector's text form for PostgreSQL. A column of any other extension type refuses the table at boot.
 
-**Out of publication**: 🔔 TODO
 
 #### Schemas - guards and suspension
 
@@ -747,7 +736,7 @@ The cost is that TEXT compares lexicographically, so ORDER BY price puts '9.5' a
 | column types the decoder knows | an unknown binary type would be passed through as garbage | ❗️ suspended: `unsupported_column_type` |
 | rows under `2^BASE_BUF` bytes, columns under `MAX_COLUMNS` | one event holds one row; both sizes are fixed at boot | ❗️ suspended: `row_too_large` / `too_many_columns` |
 
-🔔 See [Suspended table](#suspended-tables) to see how to **revoke** a suspension.
+🔔 See [Suspended tables](#suspended-tables) to lift a suspension.
 
 #### Checks
 
@@ -780,7 +769,8 @@ The two systems that already hold the data hold the rules, and the principal is 
 
 There is _no anonymous consumer_ and no cross-tenant read, so:
 
-> [!NOTE] Enrollment is a new row in `zebridge_user_tenants` ✚ a JWT minted under a scoped signing key.
+> [!NOTE]
+> Enrollment is a new row in `zebridge_user_tenants` ✚ a JWT minted under a scoped signing key.
 
 ```sql
 postgres=# \d zebridge_user_tenants
@@ -794,7 +784,7 @@ postgres=#
 INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('alice', 'acme');
 ```
 
-#### Payload limits are not flexbile
+#### Payload limits are not flexible
 
 **Payload size are limited** because NATS caps the message payload with an already generous default 1 MB, and because the bridge runs on a fixed buffer.
 
@@ -804,14 +794,14 @@ See [Suspended tables](#suspended-tables)
 
 #### Conflict resolution
 
-The current version has a built-in  ready to use conflict resolution policy last-writer-wins (LWW).
+The current version has a built-in conflict resolution policy: last-writer-wins (LWW).
 
 * A writable table needs a **version column**, `updated_at`, which should be a `timestamptz` — ⚠️ never a naive `timestamp`.
 
 🚦 The timestamp guard refuses one at `CREATE`/`ALTER`, because "newer" must be an absolute instant, otherwise last-write-wins is meaningless.
 
-* A writable table needs a **tombstone_col** column for _SOFT-DELETE_, with a column `deleted_at` (a delete becomes a soft-delete so an offline client cannot resurrect a removed row) and an optional **tiebreak_col** column `last_writer` (resolves equal versions instead of refusing both).
-➡ If there is no tombstone column, a delete becomes a HARD DELETE in Postgres.
+* A writable table normally has a **tombstone_col** column for _SOFT-DELETE_, with a column `deleted_at` (a delete becomes a soft-delete so an offline client cannot resurrect a removed row) and an optional **tiebreak_col** column `last_writer` (resolves equal versions instead of refusing both).
+➡ Without one (`allow_physical_deletes => true`), a delete is a HARD DELETE in Postgres.
   
 * Writes are **resolved, not merely accepted — last-write-wins**: A write carries the version the client holds; the bridge applies it **only if it is newer** than what Postgres has, and rejects a stale one.
 The writes use three verbs (`INSERT`, `DELETE`, `UPDATE`), resolved via **last-write-wins** (LWW).
@@ -850,7 +840,7 @@ See [COOPERATIVE_EDITING.md](COOPERATIVE_EDITING.md) for the table, the register
 
 #### Cascade rules
 
-You must run the Postgres function `zebridge_enable` on each table to build th attachment  all this and needs inputs reflecting the table.
+Run `zebridge_enable` on each table: it checks the cascade rules below.
 
 Two designs are allowed, per key:
 
@@ -891,7 +881,7 @@ More in [Verify the wiring](#7-verify-the-wiring).
 
 The `bridge_sweeper` companion is run as a daemon that scans periodically PostgreSQL to prune rows marked for deletion.
 
-It uses the `WRITER` role and reaps tombstones older than `GC_THRESHOLD_MS` (an hour by default; the setting sits with the chain's in [Configuration](#chain-sweeper-and-stream-retention), because the two clocks are coupled).
+It uses the `WRITER` role and reaps tombstones older than `GC_THRESHOLD_MS` (an hour by default; the setting sits with the chain's in [Configuration](#configuration), because the two clocks are coupled).
 
 ```sh
 DATABASE_WRITER_URL=xxx bridge_sweeper [--once]
@@ -900,7 +890,7 @@ DATABASE_WRITER_URL=xxx bridge_sweeper [--once]
 💡 It also accepts an immediate action with the flag `--once`.
 
 **Why this**? This garbage collector is standard practice and needed to keep Postgres in sync with replicas, because LOCAL deletes are HARD deletes, but they are **propagated back as soft-deletes** via an `UPDATE SET tombstone ...` by the daemon.
-This operation naturally echoed back to all connected clients via the CDC event. Upon reception of  an **UPDATE with a tombstone**, the client will apply the hard delete on their replica.
+This update is echoed back to every connected client as a CDC event. On an **UPDATE with a tombstone**, the client hard-deletes the row in its replica.
 
 The Sweeper captures this lifecycle to emit lightweight telemetry about the garbage-collected records.
 
@@ -933,7 +923,7 @@ See [Replication slot management](#replication-slot-management) for details abou
   
   --init-sql      The init SQL for this database, on stdout (pipe it to psql). Reads
                   DATABASE_READER_URL, DATABASE_WRITER_URL, BRIDGE_CDC_PUBLICATION
-  --mint-responder --name NAME [--tenant T]... [--store PATH]
+  --mint-responder --name NAME [--tenant T]... [--store PATH] [--ttl-days D]
                   Creds for a responder service, on stdout, signed from operator.store
   --revoke <principal>  Revoke: mapping + unused invites, three-clock narration.
                   Needs ADMIN_DATABASE_URL for the invocation (never stored in env)
@@ -1021,9 +1011,9 @@ SELECT * FROM zebridge_enable(
 
 **Client writable tables** need a **primary key** that the client creates, so a `uuid`: clients mint keys offline, and a key from a database sequence would collide with the rows PostgreSQL creates itself. A writable table also needs:
 
-* a tenant column, `tenant_id`, for scoping,
+* a tenant column, `tenant_id`, for scoping (or a `public_reason` for a table every client shares),
 * a version column (`updated_at`, `modified_at`, `last_modified`…) of type `timestamptz`,
-* a tombstone column (`deleted_at`, `removed_at`…) of type `timestamptz`, for soft deletes,
+* a tombstone column (`deleted_at`, `removed_at`…) of type `timestamptz`, for soft deletes (or `allow_physical_deletes => true`),
 * optionally, a tiebreak column, `last_writer`, of type `text`: without it, two writes carrying the same version are both refused.
 
 ```sql
@@ -1205,7 +1195,7 @@ One rule covers almost everything:
 | ✚ new table <br> (public or tenant-scoped) | ❗️ `zebridge_enable(...)` migration, <br> **no restart** — the bridge sees the catalogue row in the WAL, reloads its rules, reconciles CDC_PUBLIC's subjects, lifts the table's refusal and publishes its schema. No env edit, no stream edit by hand. |
 | changed _rule_ on an existing table (version / tombstone / tiebreak / tenant column) | ❗️re-run `zebridge_enable`, <br> **no restart** — same path (the write path re-reads the catalogue on the same signal; the sweeper still re-reads on its own restart) |
 | ✚ new tenant | **nothing** — a tenant is born with its first mapping (an invite redeemed, or an INSERT into `zebridge_user_tenants`): the bridge creates `CDC_<tenant>` on the spot, the producer its `gen-<tenant>` store on the first row, and the JWT's `tenant` tag carries the grants (the role's template, no server change) |
-| ✚ new user on an existing tenant | conf grant + a server reload only — with the JWT operator model, not even that |
+| ✚ new user on an existing tenant | **nothing** — an invite (or an INSERT into `zebridge_user_tenants`); the JWT carries the tenant tag |
 | generations on/off, tenant growth, invites, enrollment | **nothing** — the producer and the mint read the database per tick/request |
 | `DROP TABLE` | nothing for the bridge — the DDL trigger tombstones the schema and reaps the guard |
 | `ADD` / `RENAME` / `DROP COLUMN`, an index, a foreign key | **nothing** — the DDL trigger publishes the new descriptor, every replica applies it live, rows kept ([MIGRATIONS.md](MIGRATIONS.md)) |
@@ -1221,8 +1211,6 @@ The running bridge never sees a rule it should refuse. What it does see it treat
 `zebridge_enable()` prints the bridge side as its `T3 bridge` step and the NATS side as `T4 nats`: both say there is nothing to do, since a new table needs no grant.
 
 ### Checking a table / database against the bridge's rules
-
-> **TODO**: clean picture between `zebridge_enable(dry_run => true)` complementary to `zbdoctor`, and a TODO? `psql -f diagnose.sql`
 
 After a migration, before (or without) a bridge, ask the database itself — the same
 questions the bridge's preflight asks, from the same source of truth:
@@ -1268,7 +1256,7 @@ Start from what you see. Each row names the check and the rule behind it.
 | writes never get a verdict | the client's outbox count; `nats consumer info MUTATIONS <principal>` | the client is offline, or the principal's grant does not cover `mutation.<principal>.>` |
 | the client waits 90 s at connect | the client's log for `no generation chain yet` | a followed table with no chain: enable it, or remove a stale key from the `schemas` bucket |
 | the bridge refuses to start | its first error line | a held slot, a missing `DATABASE_READER_URL`, a publication that does not exist; see [Restart rules](#restart-rules) |
-| `bridge_wal_confirmed_lag_bytes` keeps rising | `bridge_queue_usage_percent`, `bridge_connected` | NATS is not draining, or the bridge lost PostgreSQL; see [Monitoring](#monitoring--telemetry) |
+| `bridge_wal_confirmed_lag_bytes` keeps rising | `bridge_queue_usage_percent`, `bridge_connected` | NATS is not draining, or the bridge lost PostgreSQL; see [OBSERVABILITY_TELEMETRY.md](OBSERVABILITY_TELEMETRY.md) |
 | retained WAL grows for a slot nobody reads | `bridge_replication_slot_active` | an abandoned instance: `SELECT pg_drop_replication_slot('<slot>')` |
 
 [⬆️](#table-of-contents)
@@ -1282,9 +1270,9 @@ Start from what you see. Each row names the check and the rule behind it.
 * you do not talk to NATS: the library does all of it.
 * you talk to the replica via the library primitives.
 
-The client libray comes in two flavours: TypeScript (for any JavaScript engine) and a native dynamic Zig library with a C ABI `libzb` (mobile Flutter, Python/PHP/Elixir... services).
+The client library comes in two flavours: TypeScript (for any JavaScript engine) and a native dynamic Zig library with a C ABI `libzb` (mobile Flutter, Python/PHP/Elixir... services).
 
-* **`zb-client-ts`** — a self-contained TypeScript package that runs **as-is** in any JS runtime: browsers, Node, Electron, Deno, Bun. No wasm and no native library needed — a JavaScript host just uses this.
+* **`zb-client-ts`** — a self-contained TypeScript package that runs **as-is** in any JS runtime: browsers, Node, Electron, Deno, Bun, React Native. No wasm and no native library needed — a JavaScript host just uses this.
 * **`libzb`** — a native library with a C ABI for mobile apps, desktop apps and microservices (FFI-compatible).
 
 💡 One big difference: The TypeScript client drives itself, the C ABI library is driven by its host.
@@ -1295,8 +1283,8 @@ in TypeScript, Python, Kotlin, Dart, and C for any other language. Every binding
 
 ### The TypeScript API
 
-The consumer app uses one websocket connection to NATS, one storage (persisted or in-memory, storage defaults to SQLite, or declared PGlite)
-Developers handle their own OAuth onboarding strategy. With the credentials, the dev builds a `zb = new ZeBridge()` object and calls `zb.connect()`. If the dev needs to query the replica, he uses `zb.query(sql)`. When they want to mutate the replica, they use `mutate(table, key, values)`. You get reactivity by implementing `onChange(table, cb)` and the callback takes a granular event for smart rendering.
+The consumer app uses one connection to NATS (WebSocket in the browser and React Native, TCP on Node), one storage (persisted or in-memory, storage defaults to SQLite, or declared PGlite)
+Developers handle their own OAuth onboarding strategy. With the credentials, the dev builds a `zb = new ZeBridge()` object and calls `zb.connect()`. To query the replica, they use `zb.query(sql)`. To change it, they use `mutate(table, op, key, values)`. You get reactivity by implementing `onChange(table, cb)` and the callback takes a granular event for smart rendering.
 
 **Constructor**: describe your infrastructure and the user in `new ZeBridge()` and `connect()`.
 
@@ -1304,7 +1292,7 @@ Developers handle their own OAuth onboarding strategy. With the credentials, the
 import { ZeBridge } from 'zb-client-ts';   // the bundler picks the Node, browser or React Native entry
 
 const zb = new ZeBridge({
-  natsUrl: 'my-domain',
+  natsUrl: 'wss://ws.mydom.com',
   principal: "alice",
   creds: credsText,   // the .creds file's text (JWT + seed), from your own onboarding
   tables: ['orders'],
@@ -1333,7 +1321,7 @@ The UPDATE query:
 UPDATE orders
 SET status = 'Expired'
 WHERE id IN (
-    SELECT status 
+    SELECT id
     FROM orders 
     WHERE order_date < '2023-01-01' AND status = 'Pending'
 );
@@ -1377,9 +1365,6 @@ A change event arrives from NATS as:
 
 💡 Two things to know when writing a handler. The same row rings twice for your own writes: once for the optimistic apply, once for the CDC echo, so an **INSERT handler must upsert**, never append blindly. And on a table that keeps tombstones, a delete arrives as an UPDATE whose tombstone column is set: treat that as the delete it is.
 
-```js
-```
-
 You define the callback tailored to your table which mimics the mutations and action the signals accordingly to have granular rendering.
 The example in _App.tsx_ uses `SolidJS` and looks like:
 
@@ -1389,11 +1374,9 @@ const [counters, setCounters] = createSignal();
 zb.onChange("counter_public", (ev) => {
   // seeding return ev = undefined, need a UI refresh
   if (!ev) {
-    void refresh(['app_orders']); return;
+    void refresh(['counter_public']); return;
   }
 
-
-  const pk = ev.data.uid; // Or your composite key
   if (ev.data.uid !== counterUid('counter_public')) return;
   setCounters((prev) => ({
     ...prev,
@@ -1410,7 +1393,7 @@ That is the whole contract for an app author. A callback to implement by table, 
 
 ### The C ABI library
 
-`libzb` does nothing on its own. It moves only when the host calls it. Seven verbs make the card:
+`libzb` does nothing on its own. It moves only when the host calls it. Eight functions make the card:
 
 | verb | what it does | returns |
 | --- | --- | --- |
@@ -1460,7 +1443,7 @@ reason is the C ABI, not a choice:
 C-only by necessity: `zb_free` (no GC), `zb_abi_version`, and `zb_client_live` (open
 handles in this process — a leak check for tests, and not to be confused with
 `zb_client_revoked`).
-Beside them: `zb_client_mutate_at` (a write with the caller's own version stamp), `zb_client_wipe` (the explicit wipe: close and delete the replica files), `zb_grammar_hash` and `zb_grammar_json` (what this build of the library speaks), `zb_client_live` and `zb_abi_version`.
+Beside them: `zb_client_mutate_at` (a write with the caller's own version stamp), `zb_client_wipe` (the explicit wipe: close and delete the replica files), `zb_grammar_hash` and `zb_grammar_json` (what this build of the library speaks).
 
 **How data crosses.** Everything is a C string of JSON, in and out, so a binding is three declarations in any language with an FFI. One value is not JSON-shaped: a BLOB column (`bytea`, a PostGIS geometry) comes back from `zb_client_query` as `{"$bin": "<base64>"}` and is written the same way in a mutation's values. Two ownership rules make it safe:
 
@@ -1499,14 +1482,19 @@ zb.reports.listen((report) {
 final rows = await zb.query("SELECT item, count FROM app_orders WHERE deleted_at IS NULL");
 await zb.mutate('app_orders', 'UPDATE', {'user_id': uid, 'item': 'laptop'}, {'count': 2});
 
-// App lifecycle: nothing polls while the app is in the background.
+// App lifecycle: nothing polls while the app is in the background. `inactive` is not
+// a pause: on a desktop another window has focus, and the app must keep syncing.
 @override
 void didChangeAppLifecycleState(AppLifecycleState state) {
-  state == AppLifecycleState.resumed ? zb.resume() : zb.pause();
+  switch (state) {
+    case AppLifecycleState.resumed: zb.resume();
+    case AppLifecycleState.inactive: break;
+    default: zb.pause();
+  }
 }
 ```
 
-and the worker isolate is a loop over the card using `zb.sync`, `zb.poll`, `zb.flush`, `zb.close`, and the data as the key `changedTables`.
+and the worker isolate is a loop over the card using `zb.sync`, `zb.poll`, `zb.flush`, `zb.close`; each report names its `changedTables`.
 
 ```dart
 // Worker isolate: the only place the handle is ever used.
@@ -1527,66 +1515,27 @@ zb.close();
 
 The bound on a click is one poll's `wait_ms`: commands are served between two polls. When the app resumes, the next `poll` catches up on everything it missed and the next `flush` sends what was written meanwhile — the outbox is what makes the pause harmless. A Python service is the same loop without the isolate (`scripts/scenarios/clients.py`), and a Swift app puts it on a background queue (`examples/05-tables/ios`).
 
-<details><summary>or in React Native</summary>
-
-```js
-import { ZeBridge } from 'react-native-zebridge';
-import { DeviceEventEmitter } from 'react-native';
-
-const zb = new ZeBridge({ url: '...', dbPath: '...' });
-
-// Run a continuous async loop
-const startPolling = async () => {
-  while (true) {
-    // Await pauses the loop without freezing the UI!
-    // Under the hood, C++ is running zb_client_poll on a background thread.
-    const report = await zb.poll(1000);
-
-    if (report.changedTables.length > 0) {
-        // Granular UI updates
-        DeviceEventEmitter.emit('zb_changes', report.changedTables);
-    }
-    
-    if (report.seeded.length > 0) {
-        // Bulk reload for specific tables
-        DeviceEventEmitter.emit('zb_seeds', report.seeded);
-    }
-    
-    if (report.settled > 0) {
-        // Pending writes succeeded
-        DeviceEventEmitter.emit('zb_settled', report.settled);
-    }
-
-    await zb.flush(0);
-  }
-};
-
-startPolling();
-```
-
-</details>
-<br>
 
 💡 **One consequence to note when testing your client implementation**: because `libzb` sends a mutation to the outbox the moment `mutate()` returns, testing how your UI reacts to a "late arrival" (simulating a slow network) should be done by explicitly stamping the mutation into the future via `zb_client_mutate_at`, rather than trying to manually delay the flush.
 
 ### Code examples
 
 * [App.tsx](/examples/05-tables/web-consumer/src/App.tsx) (browser, live),
-* [Flutter](/flutter) example,
+* [Flutter](/examples/05-tables/flutter) example,
 * [DuckDB over a synced replica](/examples/07-duckdb/analyze.py): PostgreSQL → SQLite → DuckDB, an analytical job that never touches PostgreSQL,
-* Node, Go, Python and Elixir microservices.
+* Node, Python and Elixir services (`examples/01` to `04`).
 
 A device gets its identity from an invite, once; the library does the rest. See [Identity and access](#identity-and-access).
 
 ### Understanding the LWW rules
 
-We have two users in the same tenant. Mary went offline, and Bob is online and work on the **same row**.
+We have two users in the same tenant. Mary went offline, and Bob is online and works on the **same row**.
 
 |                 what happened             |                         result                          |
 |-----------------------------------------------|---------------------------------------------------------|
 | Mary is off, Bob edits online, then Mary deletes, then reconnects | delete wins: her stamp is newer than the row's |
 | Mary is off, Bob deletes online, then Mary edits, then reconnects | delete wins: the tombstone is terminal, her newer stamp does not revive it   |
-| Mary is off, deletes, then bob edits online, she reconnects  | edit wins: her delete reaches the server with a stamp older |
+| Mary is off, deletes, then Bob edits online, she reconnects  | edit wins: her delete reaches the server with a stamp older |
 
 So the delete is terminal once it has landed, and it wins against anything older than itself.
 
@@ -1606,8 +1555,8 @@ The one case it loses is when it arrives late with an older stamp than an edit t
 
 **How** that is enforced depends on the local engine, and here is how we approach it:
 
-* **Browser SQLite (one OPFS connection)**: Enforced. the library owns the single connection and hands the app a **read-only** handle — a direct write is simply unreachable.  today.
-* **Mobile and microservice SQLite**: Enforced. SQLite is the only mobile engine, and there the library does not own the connection the same way — so the lock moves into the schema: an **initial migration** makes the app-facing tables read-only (views + triggers) and routes writes through the library's own path. ➡ Enforced by the schema, not the handle.
+* **Browser SQLite (one OPFS connection)**: Enforced. the library owns the single connection and hands the app a **read-only** handle — a direct write is simply unreachable.
+* **Mobile and service SQLite (libzb)**: Enforced. `query()` runs on a second connection opened read-only, so a direct write fails.
 * **PGlite:** a supported engine (`?engine=pglite` in examples/05-tables/web-consumer; `engine: 'pglite'`, dialect seam in `zb-client-ts/src/dialect.ts`). The library owns PGlite's single in-memory connection exactly as it owns the OPFS one, so the same handle-level lock applies.
 * **Local Postgres (microservice):** the same choice as PGlite, ➡ schema-enforced.
 
@@ -1621,52 +1570,39 @@ The rule is the same everywhere; the _mechanism_ that guarantees it is engine-sp
 
 #### Schemas Postgres -> SQLite
 
-It is quite forgiving, because of the limited native SQLite types:
-
-* Integers/Booleans -> INTEGER
-* Floats (real, float4, float8) -> REAL
-* Everything else (including NUMERIC and unknown types) safely falls back to TEXT.
+Every PostgreSQL type maps to one SQLite storage class, listed in [Types](#types), and replica tables are created `STRICT`.
 
 #### Internal WAL decoder and refused types
 
-The internal WAL decoder Supported Types are:
+The decoder reads every type in the [Types](#types) table, and enums as their text label.
 
-* Standard integers, floats, and booleans.
-* numeric / decimal
-* text, varchar, char
-* date, timestamp, timestamptz
-* uuid
-* json, jsonb
-* Arrays of any of the above (e.g. text[], int4[])
-* Custom ENUM types: (ZeBridge safely passes these through as TEXT because Postgres natively sends enums as their text label).
-
-**Refused Types**: If you try to replicate a table with exotic base types like hstore, xml, macaddr, geometric types (box, circle), or money, ZeBridge will **refuse** the table: see [Suspend Table](#suspended-table).
+**Refused types**: a column of any other base type (hstore, macaddr, geometric types such as box or circle, money…) **suspends** the table: see [Suspended tables](#suspended-tables).
 
 **Why?**: When PostgreSQL streams data in binary mode (pgoutput), an unknown base type arrives as raw, unformatted bytes. If ZeBridge just guessed and passed it as a UTF-8 string to your SQLite edge database,it would corrupt your data. Instead, it fails closed and refuses to replicate the table 🔔 until the column is either dropped or cast to a supported type.
 
 #### At-Least-Once Delivery
 
-The full mechanism — bridge ACKs Postgres only after JetStream confirms, what happens if the bridge crashes, what happens if NATS crashes — is covered in [Bridge ACK Flow and NATS outages](#bridge-ack-flow-and-nats-outages). The guarantee no data loss between Postgres and NATS, because the ACK to Postgres only happens after JetStream has durably persisted the message, and JetStream's Msg-ID deduplication absorbs any retry.
+The full mechanism — bridge ACKs Postgres only after JetStream confirms, what happens if the bridge crashes, what happens if NATS crashes — is covered in [The main loop PG/ZB/NATS](#the-main-loop-pgzbnats). The guarantee: no data loss between Postgres and NATS, because the ACK to Postgres only happens after JetStream has durably persisted the message, and JetStream's Msg-ID deduplication absorbs any retry.
 
 #### Zero-Consumer Protection & Storage Bounds
 
-**What happens if PostgreSQL emits CDC events when no NATS clients are connected?** Nothing accumulates unbounded on either side. The bridge keeps ACKing PostgreSQL as normal — that only depends on JetStream, not on a consumer being present — so PostgreSQL's WAL stays bounded regardless. On the NATS side, the `CDC` stream's own retention policy (`--max-age`, `--max-bytes` — see [The NATS streams and buckets](#the-nats-streams-and-buckets)) purges old events even with zero subscribers. A client that reconnects after being offline re-seeds from the latest **generation chain** and resumes from `CDC`.
+**What happens if PostgreSQL emits CDC events when no NATS clients are connected?** Nothing accumulates unbounded on either side. The bridge keeps ACKing PostgreSQL as normal — that only depends on JetStream, not on a consumer being present — so PostgreSQL's WAL stays bounded regardless. On the NATS side, the `CDC` stream's own retention policy (`CDC_MAX_AGE_SECONDS`, `CDC_MAX_BYTES` — see [NATS streams and buckets](#nats-streams-and-buckets)) purges old events even with zero subscribers. A client that reconnects after being offline re-seeds from the latest **generation chain** and resumes from its CDC stream.
 
 #### Idempotent Delivery
 
-The Message ID pattern is`{lsn}-{table}-{operation}`, eg `25cb3c8-users-insert`.
+Each event's id is `{lsn}-{table}-{operation}` (e.g. `25cb3c8-users-insert`), and a published batch carries `batch-<first id>-to-<last id>` as its `Nats-Msg-Id`.
 
 **NATS JetStream deduplication:**
 
-* Duplicate Msg-IDs are rejected
-* Ensures exactly-once semantics even with retries
+* A message with an id already seen is dropped
+* A retry inside the duplicate window is stored once
 
 #### Durability
 
 **PostgreSQL side:**
 
 * Logical replication slot preserves WAL
-* `max_slot_wal_keep_size=10GB` prevents unbounded growth
+* `max_slot_wal_keep_size` (e.g. `10GB`, set by the DBA) bounds it
 
 **NATS JetStream side:**
 
@@ -1675,14 +1611,13 @@ The Message ID pattern is`{lsn}-{table}-{operation}`, eg `25cb3c8-users-insert`.
 
 **Consumer side:**
 
-* Durable consumer name persists progress
-* Survives consumer restarts
+* The client stores the last stream sequence it applied in its replica, and resumes from it after a restart
 
 #### Schema Consistency
 
-Each chain manifest carries its cutoff — `cutoff_lsn`, and `cutoff_seq`, the CDC stream sequence captured before the build — so a consumer knows exactly which events its seed already contains and discards them (the library handles this — [the consumer side](#the-consumer-side--use-the-library)).
+Each chain manifest carries its cutoff — `cutoff_lsn`, and `cutoff_seq`, the CDC stream sequence captured before the build — so a consumer knows exactly which events its seed already contains and discards them (the library handles this — [the consumer side](#the-consumer-side)).
 
-Event ordering follows from [one WAL-reading thread per bridge](#design-overview): PostgreSQL hands the bridge a strict total order — transactions in **commit** order, and each transaction's changes in execution order — and the bridge reads it sequentially.
+Event ordering follows from [one WAL-reading thread per bridge](#the-main-loop-pgzbnats): PostgreSQL hands the bridge a strict total order — transactions in **commit** order, and each transaction's changes in execution order — and the bridge reads it sequentially.
 
 ⚠️ **Order is preserved WITHIN a table, not ACROSS tables.** A flush is grouped by subject before publishing, which collapses interleaving: when a run begins mid-pair, a child's batch can be published before the batch carrying its parents. Most consumers never notice — rows are applied by primary key, last-write-wins, idempotent — but a consumer holding a constraint that spans tables (a foreign key) must be order-tolerant, which is why the client library `libzb` holds a row whose parent has not arrived and retries it after the next batch.
 
@@ -1701,7 +1636,7 @@ Event ordering follows from [one WAL-reading thread per bridge](#design-overview
 ```sh
 CTRL-C
 
-systemctl stop zebridge | pkill zebridge | docker stop zebridge
+systemctl stop zebridge | pkill -x bridge | docker stop zebridge
 ```
 
 **Guarantees:**
@@ -1772,7 +1707,7 @@ authorization {
 }
 ```
 
-After subsitution, the DBA can start the server:
+After substitution, the DBA can start the server:
 
 ```sh
 export NATS_BRIDGE_NKEY_PUB=UD...
@@ -2028,10 +1963,11 @@ NATS_CREDS=scripts/native/creds/omar.creds     python3 scripts/scenarios/mutate.
 
 Once the publication is created, a bridge runs one replication slot and processes the WAL in order.
 
->[!IMPORTANT] One instance of a bridge = one slot, one port
+> [!IMPORTANT]
+> One instance of a bridge = one slot, one port
 
 ```sh
-set -a; source .env.bridge: set +a &&\
+set -a; source .env.bridge; set +a &&\
 bridge --pub my_pub --slot my_slot
 ```
 
@@ -2067,25 +2003,11 @@ Egress (Postgres → NATS) is a **push**: the bridge publishes as changes happen
 
 ### The NATS/Consumer loop
 
-Bootstrap and ingress (consumer ↔ NATS) are **pull**: the consumer pulls CDC and chain objects at its own pace and pushes its writes on its own subject. The consumer controls replay.
+Bootstrap and ingress (consumer ↔ NATS) are **pull**: the consumer pulls CDC and chain objects at its own pace and publishes its writes on its own subject.
 
-The NATS ACK flow remains outside of the bridge scope:
+The client keeps its own position: the last stream sequence it applied, stored in its replica. After a restart it reads on from there. The CDC streams use limits retention, so an event ages out after `CDC_MAX_AGE_SECONDS` whether anyone read it or not; a client that fell behind that window re-seeds from the chain.
 
-```txt
-NATS JetStream → Consumer
-       ↑              ↓
-       └──── Consumer ACKs (or NAKs)
-```
-
-1. Consumer pulls messages from JetStream
-2. Consumer processes message
-3. Consumer ACKs to JetStream (or NAKs on error)
-4. JetStream tracks consumer position (durable consumer)
-5. JetStream can prune messages acknowledged by all consumers
-
-The consumer controls replay (NAK → redeliver). Its durable name survives restarts, and multiple consumers can each track independent positions.
-
-**Backpressure**: consumer slow → JetStream buffers → consumer catches up at its own pace. Retention policies prevent unbounded growth in the meantime.
+**Backpressure**: a slow client only falls behind; neither the stream nor the bridge waits for it.
 
 ### Seeding
 
@@ -2108,8 +2030,7 @@ In short:
 **On startup:**
 
 1. Bridge creates replication slot (if not exists)
-2. Gets current LSN to skip historical data
-3. Starts streaming from current LSN
+2. On a new slot, starts from the current LSN (no history); on an existing slot, from its confirmed position
 
 **During operation:**
 
@@ -2121,9 +2042,10 @@ In short:
 * Bridge sends final ACK with last confirmed LSN
 * Postgres' replication slot preserves position for restart
 
-There is **no automatic slot cleanup** because an instance can be stopped/restart on-the-fly, as a normal process.
+There is **no automatic slot cleanup** because an instance can be stopped and restarted on the fly, as a normal process.
 
-> [!WARNING] If you stop definitely an instance (with say `--slot my_slot`), do not forget to discard the slot, otherwise Postgres will not recycle the WAL, worse, it will grow indefinitely from the last position.
+> [!WARNING]
+> If you retire an instance (say `--slot my_slot`), drop its slot: otherwise PostgreSQL keeps all WAL from the slot's last position, and it grows without limit.
 
 In details: A bridge creates its replication slot at its first start and leaves it in place when it stops: the slot is the bridge's bookmark in the WAL, and a restart resumes from it without a client noticing. That bookmark is also a promise PostgreSQL keeps on the bridge's behalf. Every WAL segment written after the slot's `restart_lsn` is retained on disk until the slot confirms it, so a slot that nobody reads, an instance stopped for good or renamed, keeps the WAL growing at the database's full write rate while every dashboard of the bridge that matters stays green. Three settings decide how far that goes:
 
@@ -2189,8 +2111,7 @@ CHECKPOINT;
 **PostgreSQL reconnection:**
 
 * Connection lost → Bridge waits 5 seconds
-* Gets latest LSN
-* Reconnects and resumes streaming
+* Reconnects and resumes from the slot's confirmed LSN
 * Metrics track reconnection count
 
 **NATS reconnection:**
@@ -2210,7 +2131,7 @@ Every `GENERATION_CADENCE_SECONDS` the bridge walks the published tables and, fo
 
 Every `GENERATION_CHECKPOINT_SECONDS` a background lane cuts a **checkpoint**: every row that moved since the previous checkpoint, tombstones included. It is the middle level — one object that covers a whole window of deltas, so a client that was away for hours walks a handful of checkpoints instead of hundreds of deltas, and never reloads the table for being away.
 
-A **base** — the live rows only, since a client applies it as a wipe and a reload — is cut when only a base can carry what happened (a hard delete on a table without the soft-delete guard, a truncate, a changed column shape, a re-seed asked with `zebridge_reseed`), when a delta would carry more than half the table (a burst re-stamping the same rows would otherwise put them in every delta), and, routinely, when the checkpoints above it weigh more than it does (`GENERATION_BASE_REBUILD_PERCENT`): past that bar a returning client pays more to walk them than to reload. `GENERATION_CHAIN_DEPTH` rotates a base in only when the lane has stalled and no checkpoint stands above the base. The objects are MessagePack, compressed with zstd and a dictionary trained on the base, streamed straight into the tenant's object store — the producer never holds a table in memory — and a manifest in the `generations` bucket names the chain.
+A **base** — the live rows only, since a client applies it as a wipe and a reload — is cut when only a base can carry what happened (a hard delete on a table without the soft-delete guard, a truncate, a changed column shape, a re-seed asked with `zebridge_reseed`), when a delta would carry more than half the table (a burst re-stamping the same rows would otherwise put them in every delta), and, routinely, when the checkpoints above it weigh more than it does (`GENERATION_BASE_REBUILD_PERCENT`): past that bar a returning client pays more to walk them than to reload. `GENERATION_CHAIN_DEPTH` rotates a base in only when the lane has stalled and no checkpoint stands above the base. The objects are MessagePack compressed with zstd, streamed straight into the tenant's object store — the producer never holds a table in memory — and a manifest in the `generations` bucket names the chain.
 
 A client that was away applies the deltas cut after its watermark when the oldest of them begins at or before it, so the chain continues from where the replica stands; when no kept delta reaches that far back, it applies the checkpoints that cover the absence and then those deltas; and it reloads the base only when nothing covers the absence, or when its watermark is older than the sweeper's `gc_watermark` — past that, a delete it missed may have had its tombstone reaped, and only a base states absence. Either way it then resumes the stream at the sequence recorded in the manifest.
 
@@ -2225,7 +2146,7 @@ That resume works only if the stream still holds the manifest's cut. The newest 
 | a fresh libzb replica applies the 75,000-row full | 1.6 s |
 | a fresh browser or Node replica applies it | 1.6 s |
 
-So a build costs about 60 ms plus 2.3 µs per row, and 60 ms + 75,000 × 2.3 µs is the 0.21 s above; a delta of the same rows costs the same again. Every generation's log line carries its build time and its breakdown (query, encode, dictionary, zstd, upload), so a deployment reads its own numbers and sums them per tick.
+So a build costs about 60 ms plus 2.3 µs per row, and 60 ms + 75,000 × 2.3 µs is the 0.21 s above; a delta of the same rows costs the same again. Every generation's log line carries its build time and its breakdown (query, encode, zstd, upload), so a deployment reads its own numbers and sums them per tick.
 
 Two other limits end the stream's window before the age does: `CDC_MAX_BYTES` and `CDC_MAX_MSGS`. They are disk valves, and a burst of large rows can make them cut the window to seconds while the age still reads as three comfortable cadences. The fleet monitor measures the window each stream really holds (`bridge_cdc_window_seconds`) and flags one that is pruning under two cadences (`bridge_cdc_window_short`).
 
@@ -2235,7 +2156,7 @@ The producer does not wait for the cadence when a stream moves fast. The publish
 
 Nothing resumes past a hole. A client whose manifest's cut is older than the stream's oldest message says `chain predates the stream` and waits; the producer sees the same thing at its next tick and cuts a delta with a fresh cut, empty if the table did not move, so the wait is at most one cadence. A client that stayed connected but stopped reading for longer than the window, a phone in the background, a throttled tab, sees the jump in sequence numbers on its next message and reloads from the chain at once. If the stream prunes faster than a build, the producer retries the build three times and then says so; the next step, pausing publication for one build while the WAL absorbs the burst, is not built yet.
 
-The sweeper's clock is coupled to the same chain: what the chain promises must stay under `GC_THRESHOLD_MS`, or a tombstone can be reaped inside the window a client still catches up through. With checkpoints on, the promise is `2 × GENERATION_CHECKPOINT_SECONDS`; with them off, `GENERATION_CHAIN_DEPTH × GENERATION_CADENCE_SECONDS`. `bridge --diagnose` refuses a configuration that breaks it and the boot warns. The knobs are together in [Configuration](#chain-sweeper-and-stream-retention) below.
+The sweeper's clock is coupled to the same chain: what the chain promises must stay under `GC_THRESHOLD_MS`, or a tombstone can be reaped inside the window a client still catches up through. With checkpoints on, the promise is `2 × GENERATION_CHECKPOINT_SECONDS`; with them off, `GENERATION_CHAIN_DEPTH × GENERATION_CADENCE_SECONDS`. `bridge --diagnose` refuses a configuration that breaks it and the boot warns. The knobs are together in [Configuration](#configuration) below.
 
 [⬆️](#table-of-contents)
 
@@ -2247,13 +2168,13 @@ ZeBridge runs in three contexts:
 
 * **the test suite** runs Postgres and NATS natively on the host — fast to iterate, and driven by the test scenarios. For development only.
 * **the docker compose evaluation** — trying ZeBridge out — is best as a `docker compose` stack: all the infrastructure in one code file, Postgres, NATS, NATS-exporter, Prometheus, Grafana, bridge_sweeper, ZeBridge and the reverse proxy HAProxy.
-* **Production** is your own topology, and here compose is not a recommendation to avoid any overhead. Postgres may be a managed or remote instance and the system will inevitably suffer from latency. NATS may be remote too, although for performance, the bridge should sit to the `nats-server` and communicate by _plain text_, over TCP.
+* **Production** is your own topology, and here compose is not a recommendation to avoid any overhead. Postgres may be a managed or remote instance and the system will inevitably suffer from latency. NATS may be remote too, although for performance the bridge should sit next to `nats-server`; they talk over TLS, which measured no throughput cost.
 
-For example, when all three run on host, during a spike (800 k writes/s), CPU usage is largely dominated by Postgres with around 70% of the host CPU, delivering 300 kCDC/s whilst ZeBridge uses ~20-25% and NATS ~5-10%.
+For example, with all three on one host during a write burst, PostgreSQL takes around 70% of the CPU, ZeBridge ~20-25% and NATS ~5-10%.
 
- So what actually matters is **colocation**: the bridge should sit next to `nats-server` — their hop is plain TCP for speed, so it must not cross a network.
+ So what actually matters is **colocation**: the bridge should sit next to `nats-server`, so their hop does not cross a network.
 
-The strong setup puts **Postgres + zebridge + nats-server + Prometheus scrapper + nats-exporter + bridge_sweeper + HAProxy** together behind one boundary, one domain. Consumers connect directly to NATS via WSS and the reverse proxy fronts Prometheus (for a cloud Grafana) and ZeBridge's HTTP surface over TLS — for the consumer **JWT enrollment dance** (`/enroll`) — with a domain and whatever auth you put in front.
+The strong setup puts **Postgres + bridge + nats-server + Prometheus + nats-exporter + bridge_sweeper + HAProxy** together behind one boundary, one domain. Consumers connect directly to NATS (TLS or WSS); the reverse proxy fronts the bridge's HTTP surface over TLS for the consumer **JWT enrollment** (`/enroll`, `/renew`), and Prometheus pushes to Grafana Cloud on its own.
 
 The bridge holds no certificates of its own, and HAProxy should terminate the SSL (or slightly less secure, Cloudflare's own certificate).
 
@@ -2268,7 +2189,7 @@ docker compose -f docker-compose.full.yml --env-file .env.docker up -d
 ```
 
 > The NATS setup is a bit acrobatic. The image "nats-box" already contains `jq` (to substitute _grammar.json_).
-> Postgres is setup with `wal_level=logical`, and then we run a on-shot PG server initialization (it does not contain ``gettext-base` for `envsubst` so the image brings it in).
+> Postgres is setup with `wal_level=logical`, and then we run a one-shot PG server initialization (it does not contain `gettext-base` for `envsubst` so the image brings it in).
 
 You now have access to a Grafana dashboard at <http://localhost:3000> (admin|admin) and query the bridge at <http://localhost:8090/status>, and <http://localhost:8090/metrics>.
 
@@ -2322,7 +2243,7 @@ bridge --init-sql | psql "postgres://postgres:…@db-host:5432/app" -v ON_ERROR_
 
 🔔 Without `DATABASE_WRITER_URL` it prints the read-only setup (no writes from clients). The superuser URL is used for this pipe only; the bridge never runs with it.
 
-⚠️ Always create the publication this way (or with `zebridge_create_publication`), never with `CREATE PUBLICATION`: three tables every bridge needs (`zebridge_ddl_events`, `zebridge_gc_watermark`, `zebridge_user_tenants`) are added only by that function.
+⚠️ Always create the publication this way (or with `zebridge_create_publication`), never with `CREATE PUBLICATION`: four tables every bridge needs (`zebridge_ddl_events`, `zebridge_gc_watermark`, `zebridge_user_tenants`, `zebridge_catalogue`) are added only by that function.
 
 #### 4. Declare your tables and diagnose
 
@@ -2350,7 +2271,7 @@ It ends with `🩺 DIAGNOSE: all clear` (exit 0), or lists what to fix (exit 1).
 
 #### 5. Start NATS, then the bridge
 
-Run both under your service manager. With systemd, two units:
+Run them under your service manager. With systemd, three units:
 
 ```ini
 # /etc/systemd/system/nats.service
@@ -2383,11 +2304,28 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
+```ini
+# /etc/systemd/system/zebridge-sweeper.service — reaps old tombstones (see Sweeper)
+[Unit]
+After=zebridge.service
+
+[Service]
+User=zebridge
+EnvironmentFile=/etc/zebridge/.env.bridge
+ExecStart=/usr/local/bin/bridge_sweeper
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
 ```sh
 install -d -o nats /etc/zebridge/nats-data                               # JetStream's store_dir
 chown zebridge /etc/zebridge/.env.bridge /etc/zebridge/creds/bridge.creds  # the bridge's secrets, still 0600
-systemctl enable --now nats zebridge
+systemctl enable --now nats zebridge zebridge-sweeper
 ```
+
+At its first start the bridge creates the streams and buckets it needs in NATS: nothing to provision by hand.
 
 `systemctl reload nats` is the same as `nats-server --signal reload`. The bridge stops cleanly on `SIGTERM` (`systemctl stop zebridge`) and resumes from its slot.
 
@@ -2412,7 +2350,7 @@ One command, one verdict (exit 0 green, 1 red, `--json` for CI). It checks that 
 
 #### 8. Invite the first user
 
-A new user on a client sends to the backend (the DBA currently) his `principal`(his ID). The backend (DBA here) assigns a `tenant_id` with a default role of "client".
+A new user's app sends their `principal` (their ID) to the backend (today, the DBA). The backend (DBA here) assigns a `tenant_id` with a default role of "client".
 
 ```sql
 INSERT INTO zebridge_invites (code, principal, tenant_id)
@@ -2437,10 +2375,8 @@ The app passes that code to the library once, with the bridge's URL: [Onboard a 
 
 ### NATS streams and buckets
 
-ZeBridge authenticates to the NATS server using nkeys.
-
 ZeBridge uses two stream families and several KV buckets (schemas, tenants, generations) plus per-tenant object stores for the bidirectional flow ZeBridge ↔ NATS ↔ consumer.
-The naming is **shared** and declared in [grammar.json](grammar.json).
+The naming is **shared** and declared in [grammar.json](src/grammar.json).
 
 A ZeBridge instance is started with one config. The DBA starts the NATS server with its own config. `grammar.json` is the static wire grammar shared between the two: stream names, subject prefixes, and KV bucket names, declared once (`streams`, `subjects`, `kv`, `cdc_streams`, `open_tenant`, `generations`). Which tables replicate, and how, lives in the database: one `zebridge_catalogue` row per table, written by `zebridge_enable(...)`. The bridge creates what is missing at boot: the MUTATIONS and VERDICTS streams, the `schemas`, `tenants`, `generations` and `live` buckets, and the CDC stream family, which it also reconciles to the catalogue. An existing MUTATIONS or VERDICTS stream keeps the limits it has.
 
@@ -2453,7 +2389,7 @@ A ZeBridge instance is started with one config. The DBA starts the NATS server w
 | Stream | Purpose | Retention (default) | Consumer Pattern | Role |
 | -------- | ------------------- | ------------- | ----------------------- | -- |
 | **CDC** | Real-time egress changes | `CDC_MAX_AGE_SECONDS`, 3 × the generation cadence; `CDC_MAX_BYTES` 1 GiB and `CDC_MAX_MSGS` 10 M as disk valves | Continuous subscription | READ |
-| **MUTATIONS** | Real-time ingress changes | 2 h, 1 GB, discard new (`scripts/native/up.sh`): a full stream refuses writes | Continuous subscription | WRITE |
+| **MUTATIONS** | Real-time ingress changes | 2 h, 1 GB, discard new, `MUTATION_BACKLOG_PER_PRINCIPAL` queued writes per principal: past it, that principal's writes are refused | Continuous subscription | WRITE |
 | **VERDICTS** | Write verdicts and the revocation ban | 2 h, 1 GB, discard old: the window a missed verdict can be recovered in | Direct get by key | WRITE |
 
 Besides the streams, the bridge maintains the seeding buckets: the **`generations` KV** holds one chain manifest per `<tenant>.<table>`, and a per-tenant **`gen-<tenant>` object store** holds the full and delta objects the manifest points to. The producer provisions the object stores at runtime, the same way the bridge provisions per-tenant CDC streams.
@@ -2468,7 +2404,7 @@ Consumers use these streams to interact with NATS; the exact names are declared 
 
 The fixed memory used by ZeBridge has three dimensions: the slot size, `BASE_BUF` and the number of slots, `RING_BUFFER_COUNT`, and `MAX_COLUMNS` (auto-detected).
 
-NATS messages default to `max_payload=1M`, which is already quite large. It can be safely extend fo 8MB.
+NATS messages default to `max_payload=1M`, which is already quite large. It can safely be raised to 8 MB.
 
 Depending on the size of the published tables you wish to track, the maximum row size, the maximum number of rows per transaction, and the CDC emission rate you want to buffer during possible NATS reconnections (e.g. buffer 100 to 50,000 evt/s during 1s)
 
@@ -2484,7 +2420,7 @@ Ceiling is NATS/JS, the host capacity, not ZeBridge.
 
 ❇️ Read [Sizing the ring](#sizing-the-ring)
 
-❇️ Read [Bridge ACK Flow and NATS outages](#bridge-ack-flow-and-nats-outages)
+❇️ Read [The main loop PG/ZB/NATS](#the-main-loop-pgzbnats)
 
 A ZeBridge instance, in one line:
 
@@ -2501,50 +2437,7 @@ Before starting a bridge:
 
 * Postgres has run the needed migrations and has a `PUBLICATION` with WAL logging enabled.
 
-**Principal authentication** (the end user of a consumer app):
-
-The principal is authenticated by the consumer app, and carried through NATS's JWT/operator model so the bridge can pass it to Postgres for RLS policies.
-
-|  |  subscribe  |   publish  | needs an account |
-|--|--|--|--|
-| read-only consumer  | cdc.>, KV.schemas.>, its tenants' manifests by direct get (KV.generations.`<tenant>`.`<table>`), the gen-`<tenant>` objects | —       | no |
-| read-write consumer | the same | + mutation.`<principal>`.> | yes |
-
-```txt
-# user public key:
-NATS_BRIDGE_NKEY_PUB=UDXU4RCSJNZOIQHZNWXHXORDPRTGNJAHAHFRGZNEEJCPQTT2M7NLCNF4
-```
-
-<details>
-<summary>Example <code>nats.conf</code></summary>
-
-```yml
-port: 4222
-
-jetstream {
-    store_dir: "/data"
-    max_memory_store: 1GB
-    max_file_store: 10GB
-}
-
-accounts {
-  BRIDGE: {
-    jetstream: {
-      max_memory: 1GB
-      max_file: 10GB
-      max_streams: 10
-      max_consumers: 10
-    }
-    users: [
-      { nkey: "${NATS_BRIDGE_NKEY_PUB}" }
-    ]
-  }
-}
-```
-
-</details>
-
-**Configure Authentication NATS ↔ Consumer**: Prefer the JWT/Operator mechanism. Transport only over TLS/WSS in production.
+Clients authenticate with JWTs: see [Identity and access](#identity-and-access).
 
 ---
 
@@ -2552,13 +2445,13 @@ accounts {
 
 A bridge instance is one slot, one port. You declare which slot and which publication to use, and refuses to start without both.
 
-The slot is created by the bridge if it does not exist; the publication is not — ❗️ the publication must already exist, and the bridge stops at boot if it does not (see `zebridge_enable`).
+The slot is created by the bridge if it does not exist; the publication is not — ❗️ the publication must already exist, and the bridge stops at boot if it does not (it is created by `bridge --init-sql`, or `zebridge_create_publication`).
 
-⚠️ If you stop definitely an instance, purge the slot! [Replication Slot Management](#replication-slot-management).
+⚠️ If you retire an instance, drop its slot! [Replication Slot Management](#replication-slot-management).
 
 The bridge accepts runtime env var configuration:
 
-* a memory budget: `BASE_BUF` (default 2^12 = 4 KB) and `RING_BUFFER_COUNT` (default 32_768), sized to the tables this instance handles — see [Sizing BASE_BUF and RING_BUFFER_COUNT](#sizing-base_buf-and-ring_buffer_count). `MAX_COLUMNS` is usually left unset and auto-detected.
+* a memory budget: `BASE_BUF` (default 2^12 = 4 KB) and `RING_BUFFER_COUNT` (default 32_768), sized to the tables this instance handles — see [Sizing the ring](#sizing-the-ring). `MAX_COLUMNS` is usually left unset and auto-detected.
 * a unique `--slot` — the WAL pointer PostgreSQL keeps for this instance. Each running instance needs its own.
 * a unique `--port` for its telemetry webserver. Each running instance needs its own.
 * the NATS credential: `NATS_CREDS`, the creds file `--init-nats operator` wrote (or `NATS_BRIDGE_NKEY_SEED` on a server without operator mode).
@@ -2586,7 +2479,7 @@ All configuration constants are centralized in `src/config.zig` and `grammar.jso
 
 | variable | default | what it sets |
 | --- | --- | --- |
-| `GENERATION_CADENCE_SECONDS` | 600 (300 in `.env.bridge`) | how often the producer cuts a generation |
+| `GENERATION_CADENCE_SECONDS` | 600 | how often the producer cuts a generation |
 | `GENERATION_CHAIN_DEPTH` | 6 | generations kept per table and tenant when there are no checkpoints; with them, only how far a stalled lane may drift before a base is rotated in |
 | `GENERATION_CHECKPOINT_SECONDS` | 1800 (0 turns the level off) | how often the lane cuts a checkpoint — the middle level a returning client walks instead of every delta. Only for tables of at least 100,000 rows |
 | `GENERATION_BASE_REBUILD_PERCENT` | 100 | rebuild the base once the checkpoints above it weigh this percentage of it |
@@ -2617,15 +2510,15 @@ The manifests live in the `generations` KV bucket, keyed `{tenant}.{table}`; the
 **CDC configuration:**
 
 * Batch size: `5000` events or `500ms` or `256KB` (whichever first)
-* Subject pattern: `cdc.{table}.{operation}`
-* Message ID: `{lsn}-{table}-{operation}`
+* Subject: `cdc.<tenant>.<table>.<operation>` for a tenant's row, `cdc.<table>.<operation>` for a public table
+* Message ID: `{lsn}-{table}-{operation}` per event, `batch-<first>-to-<last>` per published batch
 
 **NATS configuration:**
 
 * Max reconnect attempts: `-1` (infinite)
 * Reconnect wait: `2000ms`
 * Flush timeout: `10_000ms` (10 seconds)
-* Status update interval: `1` second OR `1MB` data
+* Status update to PostgreSQL: every `100 ms` or `1 MB` of data
 
 **WAL monitoring:**
 
@@ -2654,7 +2547,7 @@ These values are not independent, and getting them wrong has a visible consequen
 
 ⚠️ In particular, **`BASE_BUF` is a one-way door**: lowering it after rows have already been processed, meaning **already stored** (ie can be used freely by consumers), means the next write that touches such a row can 🚦 suspend the table, impacting every client.
 
-❗️ preflight check this at boot and refuses to let it pass silently (PROTOCOL.md §9).
+❗️ The bridge checks this at boot and refuses to start (PROTOCOL.md §9).
 
 The bridge pre-allocates the ring at startup, in **three parts**:
 
@@ -2670,7 +2563,7 @@ ring = ( 2^BASE_BUF  +  sizeof(CDCEvent)  +  MAX_COLUMNS × sizeof(ColumnView) )
 Each knob answers a different question:
 
 * **`BASE_BUF`** (log2 bytes, range 10–20) is _how large a single row may be_. Size it to your widest row: a `jsonb` document, a long `text` column, a big array.
-* **`RING_BUFFER_COUNT`** (range 1024–1048576, **clamped** to the nearest bound if you go outside it — an out-of-range value used to fall back to the _default_, so asking for 64 got you 65536) is _how many events can queue while NATS is unreachable_. 65536 slots ≈ 1 second at 60K events/s. It is also useful for long transactions, like an `ON DELETE CASCADE`. Below that, a NATS blip starts back-pressuring the WAL reader sooner.
+* **`RING_BUFFER_COUNT`** (range 1024–1048576, **clamped** to the nearest bound if you go outside it) is _how many events can queue while NATS is unreachable_. 65536 slots ≈ 1 second at 60K events/s. It is also useful for long transactions, like an `ON DELETE CASCADE`. Below that, a NATS blip starts back-pressuring the WAL reader sooner.
 * **`MAX_COLUMNS`** is _how many columns one event may carry_ — normally left to auto-detection; override it only to widen the ceiling ahead of a migration or to pin the value across instances. It is resolved **per instance, at boot**:
 
   * Unset (the default): **auto-detected** from the widest table actually in the publication, rounded up to the next multiple of 8 for migration headroom (a table with 6 columns → `MAX_COLUMNS=8`; see the "MAX_COLUMNS=…" line at boot).
@@ -2678,7 +2571,7 @@ Each knob answers a different question:
 
 🚦 A table past the resolved `MAX_COLUMNS` is refused with `TooManyColumns` — loudly, with its events dropped and its clients told why — rather than truncated.
 
-🔔 Changing theses values needs a **restart**. See [Restart Rules](#restart-rules)
+🔔 Changing these values needs a **restart**. See [Restart Rules](#restart-rules)
 
 **Examples**:
 
@@ -2693,11 +2586,11 @@ defaults
 * You can increase the slot size if you expect large payloads (64 kB) across larger tables (< 32 cols) and more events (64 k evt/s):
 
 ```txt
-16 / 65_536, MAX_COLUMNS=32   = 4.3 GB data +  21 MB meta +  8 MB cols 
+16 / 65_536, MAX_COLUMNS=32   = 4.3 GB data +  21 MB meta +  17 MB cols 
 = 4.3 GB  ← 64 KB/row
 ```
 
-* if you expect many small events (< 2 kB), and possibly long cascade transactions, or losts of events:
+* if you expect many small events (< 2 kB), and possibly long cascade transactions, or lots of events:
 
 ```txt
 11 / 131_072, MAX_COLUMNS=8  =  268 MB data +  43 MB meta + 8 MB cols 
@@ -2707,7 +2600,7 @@ defaults
 * if you expect possibly large payload (1 MB) with low event count
 
 ```txt
-20 /  256, MAX_COLUMNS=128 = 268 MB data + 84 MB meta +  < 1 MB cols
+20 /  256, MAX_COLUMNS=128 = 268 MB data + 84 kB meta +  < 1 MB cols
 = 269 MB  ← 1 MB rows, wide table, minimum ring length
 ```
 
@@ -2791,10 +2684,10 @@ Raising `max_payload` in `nats-server.conf` is possible but affects every client
 
 **System dependencies**:
 
-* `libpq`(install: `sudo apt install libpq-dev`, `brew install libpq`) ≧ 14  at build time (pipeline mode). License MIT
+* `libpq`(install: `sudo apt install libpq-dev`, `brew install libpq`) ≧ 14  at build time (pipeline mode). PostgreSQL License
 * `libzstd`, (install: `sudo apt install libzstd-dev`, `brew install zstd`). License BSD 3-Clause
-* `duckdb`, ([install](https://duckdb.org/install/?platform=macos&environment=cli)). License MIT
-* `Zig` ([install](https://ziglang.org/learn/getting-started/)) to compile `zebridge`, `libzb` and `bridge_sweeper`. License MIT
+* `duckdb`, optional, for a DuckDB replica ([install](https://duckdb.org/install/?platform=macos&environment=cli)). License MIT
+* `Zig` ([install](https://ziglang.org/learn/getting-started/)) to compile `bridge`, `libzb` and `bridge_sweeper`. License MIT
 
 **Version Requirements**:
 
