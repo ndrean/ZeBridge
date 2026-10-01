@@ -921,10 +921,21 @@ pub const GenerationProducer = struct {
     /// fresh table for a column of the old one. The bookkeeping is the authority:
     /// every (tenant, table) it holds that is not published now is swept — objects
     /// first, then the manifest, then the rows — so a re-created table starts at g1.
+    ///
+    /// §10kp: "not in MY publication" is not "gone". With several bridges, one per
+    /// publication, each producer saw the others' chains as departed and swept them,
+    /// and the owner rebuilt them, round after round (multi_bridge.py). A chain is swept
+    /// only when its table is in NO publication: dropped, or disabled everywhere.
     fn sweepDeparted(self: *GenerationProducer, alloc: std.mem.Allocator, bkc: *c.PGconn, js: *nats.JetStream, published_lit: []const u8) !void {
         const lit_z = try alloc.dupeZ(u8, published_lit);
         const params = [_]?[*:0]const u8{lit_z.ptr};
-        const gone = try queryOne(bkc, "SELECT DISTINCT tenant, tbl FROM public.zebridge_generations WHERE NOT (tbl = ANY($1::text[])) ORDER BY 1, 2", &params);
+        const gone = try queryOne(bkc,
+            \\SELECT DISTINCT g.tenant, g.tbl FROM public.zebridge_generations g
+            \\WHERE NOT (g.tbl = ANY($1::text[]))
+            \\  AND NOT EXISTS (SELECT 1 FROM pg_publication_tables pt
+            \\                  WHERE pt.schemaname = 'public' AND pt.tablename = g.tbl)
+            \\ORDER BY 1, 2
+        , &params);
         defer c.PQclear(gone);
         const n: usize = @intCast(c.PQntuples(gone));
         for (0..n) |i| {

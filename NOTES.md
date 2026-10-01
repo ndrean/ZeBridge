@@ -270,7 +270,7 @@ without disruption.
   same change (web `applySchema`, Flutter `db_manager.dart`) — this IS a wire break,
   taken deliberately while breaking is still free.
 
-### 1.8 OPEN — several bridges, one per publication, never tested end to end (2026-10-01)
+### 1.8 CLOSED (§10kp) — several bridges, one per publication, never tested end to end (2026-10-01)
 
 The README says several bridges can run side by side, each with its own publication,
 slot and port. Only throughput was ever measured that way (2026-08-24, "The multi-slot
@@ -18202,3 +18202,50 @@ Dev-stack note: with TLS on 4222 (§10kl), scenarios must run with
 `NATS_URL=nats://127.0.0.1:4222` (the sourced env says tls://, and the Python libzb client
 gets no CA) and `NODE_EXTRA_CA_CERTS=nats.zig/tests/configs/certs/ca.pem` (the Node NATS
 client upgrades to TLS whenever the server offers it).
+
+## §10kp — two bridges, one database: each producer swept the other's chains (2026-10-01)
+
+`multi_bridge.py` (closes §1.8): bridges A and B, publications/slots `zb_mb_a`/`zb_mb_b`,
+ports 9097/9098, on the dev database and a generated `--init-nats operator` NATS on 14225.
+
+Found: `sweepDeparted` swept every (tenant, table) in `zebridge_generations` that was not
+in THIS bridge's publication. The bookkeeping table is shared, so A swept B's chains and
+B swept A's, every cycle: manifest deleted, rows deleted, the owner rebuilt g1 and bumped
+the seed epoch ("a chain manifest with no bookkeeping behind it"), clients re-seeded
+forever. Fix: a pair is departed only when its table is in NO publication
+(`NOT EXISTS pg_publication_tables`). "Not in my publication" is not "gone".
+
+Second symptom, same bug: after the fix the warning still came back every 10 s. The dev
+bridge, still on the old binary, was a third producer sweeping mb_a/mb_b as "left the
+publication". Restarted on the new binary: 0 rebuilds. The scenario now fails on that
+warning in either log, so any bridge sharing the database is checked too.
+
+What holds (all ✓): each boots on its own publication; one INSERT reaches NATS once, from
+its own bridge; each builds snapshots for its own table only, and neither chain is
+rebuilt; one libzb client enrolled at A seeds both tables, receives a live row in each,
+and its writes to both land; one ALTER on mb_a stores ONE new schema revision (counted
+as stored KV revisions; a core subscription also sees the duplicates JetStream drops by
+message id). Reported: both bridges serve `bridge_fleet_*`, so a dashboard sum double
+counts. Not exercised: `ZB_FEED_RESTART=1` on one bridge deletes the other's CDC streams.
+
+Also: `zig build test` failed on `init_sql`'s render test, which passes but printed its two
+refusals to stderr; the prints are skipped under test.
+
+## §10kq — the standby read replica, scripted (2026-10-01)
+
+§10cz was measured by hand (2026-09-05, a postgres-standby/ directory since deleted).
+`standby.py` makes it a test: `pg_basebackup -R -C -S zb_standby_phys -X stream` of the
+dev cluster (2 s for 1.3 GB on APFS), started on 15433 with `wal_level=logical
+hot_standby=on hot_standby_feedback=on`, a probe bridge with DATABASE_READER_URL on the
+standby and DATABASE_WRITER_URL on the primary, on its own NATS (14225).
+
+Gotcha: the standby needs `-c wal_level=logical` on its command line. The dev primary
+gets it from up.sh's command line, which the copy does not carry, and the slot creation
+fails with "logical decoding requires wal_level >= logical". A logical slot on a standby
+also waits for the primary to log a running-xacts snapshot; the scenario calls
+`pg_log_standby_snapshot()` while it waits instead of the bgwriter's 15 s.
+
+8/8: the bridge logs 🛰️ STANDBY and no feedback warning; slot `zb_sb` on the standby, not
+the primary; the g1 bookkeeping row on the primary; a libzb client seeds, receives a row
+inserted on the primary (decoded on the standby), and its INSERT lands on the primary.
+Teardown stops the standby, drops the physical slot and removes the copy.

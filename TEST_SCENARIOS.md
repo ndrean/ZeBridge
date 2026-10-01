@@ -1,6 +1,6 @@
 # Test scenarios
 
-What is tested, by which command, and what a pass proves. Current state only.
+What is tested, by which command, and what a pass proves. Current state only. This document is the evidence for the claims in the README. Every [test] link points to a file in scripts/scenarios/ unless named otherwise.
 
 ## The stack under test
 
@@ -56,8 +56,19 @@ scripts/scenarios/run.py --list      # groups, roles, one line each
 ```
 
 Every scenario's exit code is its verdict. `run.py` sequences a group and fails if any
-failed; the `manual` group (`speed`, `burst`, `leaksoak`, `objstore_race`, `tls`) is
-listed and never run by it — those report, they do not assert.
+failed. The `manual` group is listed and never run by it (`run.py --list` names them),
+for one of three reasons:
+
+* **they measure, they do not judge**: benchmarks and soaks (`speed`, `burst_tls`,
+  `firehose_tls`, `tls_cost`, `version_index`…) report rates, CPU and memory, and
+  take minutes to hours. A number is read by a person against the last one, not
+  passed or failed by a script;
+* **they need what not every machine has**: PostGIS, pgvector, sqlite-vec, a libzb
+  built with DuckDB, or a second database (`blobs`, `vectors`, `pgreplica`,
+  `duckdb_replica`). They assert, and are run where those are installed;
+* **they take over the stack**: they stop the dev bridge, run their own scratch
+  PostgreSQL or bridge on the live slot (`cdc_wall`, `firehose_topology`), and are run
+  alone, on purpose.
 
 ## What the tests prove, in plain words
 
@@ -131,6 +142,42 @@ Each row: something that could go wrong, what the test shows instead, and the te
 | sustained writes slowly degrade | 4 million writes at a steady 21,500 per second for three minutes | `stamp.py` |
 | repeated disconnections leak memory or lose messages | memory, files and threads stay flat; no message lost or doubled | `churn.py` |
 | NATS dies under a steady stream of changes | the bridge holds back and stops cleanly, then delivers everything when NATS returns | `cascade.py` |
+| one client floods the write path and the others wait | its writes are served at the set rate, each answered once, none lost; a user of another tenant is answered within two seconds during the flood. Past the queue cap, its new writes are refused at the door (that phase runs only on a stack built with a small cap, `ZB_RATELIMIT_CAP_PHASE=1`) | `ratelimit.py` |
+
+### Types, extensions and setups
+
+"(by hand)" marks a test of the `manual` group: see [How to run](#how-to-run) for why.
+
+| what could go wrong | what the test shows | test |
+| --- | --- | --- |
+| a PostGIS geometry or a `bytea` changes on the way | the bytes arrive exact, in the seed and over CDC, and a client's write lands as the same value (by hand: needs PostGIS) | `blobs.py` |
+| a pgvector column is unusable on the device | it arrives as the BLOB sqlite-vec reads as is (`vec_distance_L2`), and a client's BLOB lands back as the same vector (by hand: needs pgvector and sqlite-vec) | `vectors.py` |
+| arrays lose their shape | SQLite reads them as JSON, PGlite holds native arrays, and a client's arrays land as native arrays (by hand) | `arrays.py` |
+| a PostgreSQL or DuckDB replica gets the types wrong | each builds its tables with its own types, and the seed, CDC and a client's write land natively (by hand: needs PostGIS, pgvector, a second database, a DuckDB build) | `pgreplica.py`, `duckdb_replica.py` |
+| the link to NATS is encrypted in name only | a connect with the right CA does a JetStream round trip; the same connect without the CA fails on the certificate (by hand) | `tls.py` |
+| TLS between the bridge and NATS slows it down | measured: the same event rate as plain TCP (by hand: a measurement) | `burst_tls.py` |
+| reads moved to a standby break the bridge | with the reader on a hot standby and the writer on the primary, the slot lives on the standby, a client seeds and receives changes, and its writes land on the primary | `standby.py` |
+| two bridges on one database step on each other | each publishes and snapshots only its own tables, neither touches the other's snapshots, one client follows and writes the tables of both, and a schema change is published once (this test found that each bridge deleted the other's snapshots, and the fix) | `multi_bridge.py` |
+
+## The README's claims and their tests
+
+Each claim of the README's feature list, the tests behind it, and how far they go. "Partial" says what is not shown.
+
+| the README says | tests | how far |
+| --- | --- | --- |
+| clients reconnect without a stampede: a client that was away reloads from snapshots | `client_gap`, `stream_wipe`, `slot_loss` | each device reloads from a snapshot, not from the change feed |
+| PostgreSQL never sees a reconnection storm | `client_gap`, `matrix`, `nats_outage` | partial: in these tests devices seed and catch up from NATS, and the bridge resumes from its slot; no test measures PostgreSQL's load while many devices reconnect at once |
+| no retry loop for the common case: the library queues, retries and reports verdicts | `race`, `replies`, `offline` | every write gets one verdict, queued writes are sent on reconnection |
+| PostgreSQL judges every write | `mutate`, `offline`, `tiebreak`, `clockskew`, `gc_resurrect` | stale writes refused, ties broken the same way everywhere, clocks bounded |
+| data travels three ways (changes, snapshots, writes) | `stamp`, `churn`; `speed`, `burst` by hand | the rates are measurements, read by a person; `stamp` and `churn` judge that they hold steady |
+| standby read replica | `standby` | the whole path: slot on the standby, seed, live change, write to the primary |
+| `--revoke --purge` deletes the local replica | `revoke_purge` | both libraries, connected and on return, at reconnection and at renewal |
+| multiple instances | `multi_bridge` | two bridges, one database, one NATS |
+| the JWT renews itself | `revoke_purge` (F), `jwt_expiry` | partial: a device asks for renewal once a quarter of its JWT's life is left (F, where it is refused because it was revoked), and an expired JWT fails with a named error; no test shows a device still working past its first JWT's lifetime |
+| TLS in transit | `tls`, `burst_tls` | the certificate is checked; the cost is measured |
+| schema changes reach every replica live | `migrate_both`, `invalidate`, `offline_migrate` | online and offline, both libraries |
+| PostGIS and pgvector ready | `blobs`, `vectors`, `pgreplica`, `duckdb_replica` | byte-exact both ways, by hand |
+| anti-client flood | `ratelimit` | the rate, always; the backlog cap only on a stack built with a small cap |
 
 ## In detail, by property
 
@@ -162,7 +209,7 @@ Each row: something that could go wrong, what the test shows instead, and the te
 | a CDC stream deleted wholesale under a live client: deliberate stop, boot recreates, slot replays, client resets to the fresh numbering and converges | `stream_wipe.py` |
 | PostgreSQL stopped and restarted under the bridge: refused connections waited out (connected=0 on /metrics), self-reconnect, durable slot, no loss — and `pg_ctl stop` completes in ~1 s, not wal_sender_timeout | `pg_restart.py` |
 | the permutation matrix: NATS and PostgreSQL down together in both orders, restored in both orders, plus both down with the bridge killed on top — one process survives four double outages, the 3 a.m. case reboots from the slot | `matrix.py` |
-| PostgreSQL restarts under a FIRING sweeper: it warns and retries, and the reconnect re-arms the whole session (prepared statements, principal, UTC pin) — fresh ripe tombstones reaped after | `sweeper_restart.py` |
+| PostgreSQL restarts under a running sweeper: it warns and retries, and the reconnect re-arms the whole session (prepared statements, principal, UTC pin) — fresh ripe tombstones reaped after | `sweeper_restart.py` |
 | the backpressure cascade, observable end to end: broker dies under a steady feed → queue climbs to ~86%, WAL dams behind the slot (~1 MB), bridge halts — then the broker returns and the same process drains it all, 1,199/1,199 rows | `cascade.py` |
 | the CLIENT's host SIGKILLed mid-seed, twice: the torn SQLite file reopens, the seed re-applies idempotently — 120k rows, all distinct, equal to PostgreSQL | `client_kill.py` |
 | `bridge --revoke` (ADMIN_DATABASE_URL, non-ambient): mapping + unused invites in one command, the three clocks narrated, KV purged by the live bridge, double-revoke distinguishable | `revoke.py` |
@@ -174,7 +221,7 @@ Each row: something that could go wrong, what the test shows instead, and the te
 | clock skew under LWW: a 4 s-fast clock steals the row — audibly (`stale`) and only until the wall clock catches up; a 30 s-slow clock is starved writing from its wrist but writes through with §7.3's rule (libzb's `hlcVersion`); the feed's last word equals PostgreSQL's and no stale write leaves a trace | `clockskew.py` |
 | the CRDT ladder's top rung: a jsonb map-of-LWW-registers — blind replace demonstrably loses an accepted intent; state-based merge with reconcile-to-fixed-point loses none of 18 concurrent keys, settles the contested one by its register tiebreak, and terminates | `crdt.py` |
 | the capacity stamp: saturated and fault-free for 3 minutes — 4M mutations at a flat 21.5k/s (2 lanes), one consumer sustaining 10.4k rows/s downstream beside it; FAILs on a sagging bucket | `stamp.py` |
-| a row written outside the client is in its replica in single-digit ms; a 300-row transaction lands in one poll | `libzb/python/tail.py`, `bench_poll.py` (benchmark) |
+| a row written outside the client is in its replica under 10 ms; a 300-row transaction lands in one poll | `libzb/python/tail.py`, `bench_poll.py` (benchmark) |
 | a pre-guard oversized row quarantines the table, boot re-derives it, removing the row lifts it | `legacybait.py` |
 | a `row_too_large` suspension lifts LIVE once the table can be carried again — after a 30 s anti-flap cooldown — and the descriptor is republished; `zebridge_catalogue.suspended`/`suspended_reason` mirror both transitions for psql | `suspension_lift.py` |
 | the broker gone for minutes: the bridge waits, ACKs nothing (`confirmed_flush_lsn` holds), the same process resumes, every row lands | `nats_outage.py` |

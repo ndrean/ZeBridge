@@ -150,7 +150,7 @@ fn render(a: std.mem.Allocator, sql: *std.ArrayList(u8), template: []const u8, v
         const v = for (vars) |v| {
             if (std.mem.eql(u8, v.name, name)) break v;
         } else {
-            out("🔴 the template names ${{{s}}}, which --init-sql does not know\n", .{name});
+            if (!@import("builtin").is_test) out("🔴 the template names ${{{s}}}, which --init-sql does not know\n", .{name});
             return error.UnknownVariable;
         };
         if (v.value.len == 0) {
@@ -162,7 +162,7 @@ fn render(a: std.mem.Allocator, sql: *std.ArrayList(u8), template: []const u8, v
                 i = close + 1;
                 continue;
             }
-            out("🔴 ${{{s}}} has no value\n", .{name});
+            if (!@import("builtin").is_test) out("🔴 ${{{s}}} has no value\n", .{name});
             return error.EmptyVariable;
         }
         try sql.appendSlice(a, v.value);
