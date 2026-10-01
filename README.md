@@ -132,6 +132,8 @@ We expose them directly so you can judge.
 
 **Restricted columns on tables**: ZeBridge supports restricting the columns in a publication. Currently, this will affect **every tenant**.
 
+**No cascading soft delete**: on a table that keeps tombstones, no `ON DELETE` action ever fires (a soft delete is an `UPDATE`), and a parent's delete is refused while a live child references it. The app deletes the children first, or clears their reference with `mutate()`. PostgreSQL's own cascades work on tables without tombstones only. See [Cascade rules](#cascade-rules).
+
 ---
 
 ## Table of Contents
@@ -524,6 +526,7 @@ A 3.1M-row table, about 1 GB in PostgreSQL, seeded on a Mac, an iPhone 12 and a 
 |zb-client-ts, from React Native (200k rows)|moto e20 (*)|10 s|20k row/s<br>in one window|
 
 iPhone 12: 64-bit ARM NAND storage
+
 (*) moto e20: Android Go, 32-bit ARM eMMC storage with 1.8 GB of RAM. It builds a 1.5 GB replica while the app stays at ~250 MB of RAM, because libzb streams the seed a window at a time.
 
 The gap between libzb and zb-client-ts on a phone is per-row JavaScript, not the phone: the host framework (React Native or Flutter) costs nothing.
@@ -583,50 +586,34 @@ Past a lane count's ceiling the writes queue, and at 5,000 waiting writes per pr
 
 ## The daemon
 
-Once the DBA has migrated the ZeBridge functions into Postgres, checked for the **compliance** of the database, configured the NATS with the needed streams and buckets and operator/JWT, you are ready to run ZeBridge, the first pillar of the architecture.
+Once the DBA has installed the ZeBridge functions into PostgreSQL (`--init-sql`), checked the database's **compliance**, and generated the NATS configuration (`--init-nats`), ZeBridge, the first pillar of the architecture, is ready to run. It creates the streams and buckets it needs at its first start.
 
-**Compliance**: In this paragraph, we explain that this "compliance" means to follow "good practices" of a general sync engine, as the engine makes choices usually left to you. This aims in one direction: many small consumers that read freely, write safely, and never cross the tenant line.
+**Compliance** means following the good practices of a sync engine, because ZeBridge makes choices other tools leave to you. They all aim one way: many small consumers that read freely, write safely, and never cross the tenant line.
 
 These good practices act as constraints—though mostly mechanical—and that is the point: each one buys a specific guarantee.
 
 Literature-1: <https://hatchet.run/blog/postgres-survival-guide>
+
 Literature-2: <https://www.digitalocean.com/community/tutorials/database-normalization>
 
 Here they are, so you can judge the fit before adopting it.
 
 * **Strict Memory Boundaries**: Because ZB uses a **fixed pre-allocated buffer**, its memory footprint is fixed at startup.
-🚦 Overflows are detected, whether they come from a consumer write, or directly loaded within Postgres, or after a schema migration. They are rolled back and the table is suspended. See [Suspended tables](#suspended-tables)
+🚦 A row too wide for that buffer is refused by PostgreSQL itself, whether it comes from a client or from `psql`: a width guard on the table raises, and the transaction rolls back. A row that gets past the guard anyway (after `BASE_BUF` was lowered, say) suspends the table. See [Suspended tables](#suspended-tables).
 * **💡 Enforcement of Good practices on Schemas**:  Because we are syncing databases, the schema rules are enforced, not suggested: a primary key, `uuid` keys and `timestamptz` columns on writable tables, and a deliberate choice about deletes across a foreign key.
-We have added tools in Postgres to diagnose tables as:
-
-  ```sql
-  SELECT * FROM zebridge_enable('public.orders', 
-    tenant_col => 'tenant_id',
-    writable => true,
-    version_col => 'updated_at',
-    tombstone_col => 'deleted_at',
-    publication => 'my_pub',
-    dry_run => true
-  );
-  ```
-
-This reports every rule before touching anything, and `bridge --diagnose` checks a whole database, the cascade rule included. See [diagnose](#diagnose).
+`zebridge_enable(..., dry_run => true)` reports every rule for a table before touching anything, and `bridge --diagnose` checks a whole database, the cascade rule included. See [Checks](#checks) and [Diagnose](#diagnose).
 
 * **Suspension**: 🚦 When a table stops meeting a rule while the bridge runs, the bridge **suspends** it and keeps everything else flowing. Fix the table and most suspensions lift by themselves; two cases need a restart, [Suspended tables](#suspended-tables) and [Restart rules](#restart-rules).
 * **Soft deletes, reaped by the sweeper**: a delete is sent to PostgreSQL as a soft delete (the `tombstone` column), and the companion `bridge_sweeper` daemon reaps old tombstones so the database does not bloat. See [Sweeper](#sweeper).
 
-* **A cascade storm, when PostgreSQL does cascade**: if a table is loaded with a schema declared with a physical cascade on a cascade-declared family, it is one transaction, and the bridge takes it as one: its events land in the ring buffer, `RING_BUFFER_COUNT` slots (32,768 by default), and are published in order as batches. A transaction larger than the ring is published as several batches, in order, and the clients apply each as one unit and hold what crosses a batch boundary until its parent arrives;
-proven with a 1,500-row family against a 1,024-slot ring.
+* **A cascade storm, when PostgreSQL does cascade**: on tables without tombstones, one `DELETE` with `ON DELETE CASCADE` can remove a whole family in one transaction, and the bridge takes it as one: its events land in the ring buffer, `RING_BUFFER_COUNT` slots (32,768 by default), and are published in order as batches. A transaction larger than the ring is published as several batches, in order; clients apply each as one unit and hold a child that crosses a batch boundary until its parent arrives. Proven with a 1,500-row family against a 1,024-slot ring.
 * **Ring buffer**: the ring exists to buffer possible large transactions and naturally for the broker's ordinary jitter. It is not for a NATS outage: a publish that fails is retried five times with a backoff from 100 ms doubling to 5 s, and if the broker is still gone the bridge stops rather than acknowledge WAL it never delivered, and resumes from the slot when the broker returns.
 * **Tables join through `zebridge_enable()`**: the DBA attaches each table to the publication with it during a migration, and marks a table writable there (`writable => true`); no table is writable by default. See [Good practices](#good-practices).
 * **Writes resolved by last-writer-wins (LWW)**: ZeBridge makes a decision other sync engines leave to you: PostgreSQL judges every client write by its version, per row, and refuses a stale one. See [Conflict resolution](#conflict-resolution).
 
-* **Controlled Local Writes**: On the consumer side, we expect a standard SQLite or PGlite engine. While clients are free to read from their local database, all writes **must** go through the client library's `mutate()` to be tracked. Enforcement depends upon the local engine.
-* **Safety enforced by Tenant isolation and NATS grants**: we enforce a strict tenant model in Postgres: every principal -consumer- operates within a designated tenant boundary. This defines the RLS. Access control - grants-  and permissions within  NATS are cryptographically secured and mapped via NATS JWT tokens tied to each tenant.
-For these tasks, you run the bridge's own commands (`--init-nats`, `--mint-responder`, `--revoke`).
-This tenant structure makes sense for B2B services, less for B2C operations because clients have basically all the same rights. By dividing the database by tenants, you can use advantageously NATS leaf nodes and assign a tenant per node; the main benefit is that NATS will contain only one full copy of the database.
-If you face clients, you have in practice one tenant. Thanks to NATS leaf nodes, you can spread the load geographically: each leaf node holds a copy of the database close to the consumers.
-A leaf topology gives the hub's JetStream a **domain**; the bridge, the grants and both client libraries carry it as one setting (`NATS_JS_DOMAIN`, `--init-nats --js-domain`, `jsDomain`), and a client learns it from `/enroll`. See PROTOCOL §1.
+* **Controlled Local Writes**: clients read their local database freely, but every write **must** go through the client library's `mutate()` to be tracked. How that is enforced depends on the engine: see [Local database writes are owned](#local-database-writes-are-owned).
+* **Safety enforced by tenant isolation and NATS grants**: every principal (a consumer) works inside its tenants. In PostgreSQL that boundary is row-level security; in NATS it is the grants of a signed JWT, tied to the principal's tenants. The bridge's own commands set it up and take it away (`--init-nats`, `--mint-responder`, `--revoke`).
+How to divide the data into tenants (by business, by map cell, or by region with NATS leaf nodes) is described under _Division by tenant, or by place_ in the introduction. A leaf topology gives the hub's JetStream a **domain**; the bridge, the grants and both client libraries carry it as one setting (`NATS_JS_DOMAIN`, `--init-nats --js-domain`, `jsDomain`), and a client learns it from `/enroll`. See PROTOCOL §1.
 * **Delta-chain seeding**: a client that missed part of the stream does not ask PostgreSQL for a dump. The bridge cuts a snapshot per table and tenant on a cadence, once for everyone, and the client reloads from it. How the two windows fit together is the subject of [Catching up: the chain and the stream](#catching-up-the-chain-and-the-stream).
 
 ### Good practices
@@ -648,6 +635,18 @@ Tables are either public or private/tenant-scoped:
 **Columns that never travel.** `zebridge_enable()` gives the table a publication column list when it has columns no replica can use: `tsvector`, `tsquery`, `xml`, ranges. They stay in PostgreSQL; the descriptor, the chain and the change feed carry the rest. Leave out more with `columns => ARRAY['id', 'title', …]`. A column list does not grow on its own: after `ALTER TABLE … ADD COLUMN`, run `zebridge_enable()` again to refresh it. Keep the key and the tenant column in the list: PostgreSQL requires a column list to cover the replica identity, or it refuses every UPDATE on the table.
 
 Tables are either read-only or writable with a LWW conflict resolution policy.
+
+Two choices decide how a table travels: whether clients write to it, and whether its deletes leave a tombstone.
+
+| | no tombstone column | tombstone column |
+| --- | --- | --- |
+| **read-only** (clients only read) | any standard SQL from the server side (`INSERT`, `UPDATE`, `DELETE`, `ON DELETE CASCADE`, `TRUNCATE`) | deletes must be soft: a physical `DELETE` on a tombstone table never reaches the replicas |
+| **writable** (clients write too) | refused, unless `allow_physical_deletes => true`, accepted with a warning | the normal writable table |
+
+* **Read-only without tombstones**: connected clients receive every change, deletes included. A client that was away learns of a delete from a full snapshot, which the bridge cuts when it sees the table's row count drop; when deletes and inserts cancel out within one cut, a deleted row can reappear on a re-seeding client until the next full snapshot.
+* **Why writable tables want tombstones**: a client that was offline may still hold a deleted row and edit it. With a tombstone, PostgreSQL knows the row is deleted and refuses the edit (`row_deleted`); without one, the edit can bring the row back.
+* Whatever the choice, the guards apply to every published table: `timestamptz` timestamps, rows that fit the change feed's buffer, a primary key. How deletes meet foreign keys: [Cascade rules](#cascade-rules).
+
 
 | Action | column | type | note |
 | --  |  --    | --   | --   |
@@ -827,14 +826,28 @@ See [COOPERATIVE_EDITING.md](COOPERATIVE_EDITING.md) for the table, the register
 
 #### Cascade rules
 
-Run `zebridge_enable` on each table: it checks the cascade rules below.
+A foreign key's `ON DELETE` action reacts to a real `DELETE` of the parent row. In PostgreSQL:
 
-Two designs are allowed, per key:
+* `CASCADE` deletes the children with their parent (on a big family, a storm of deletes);
+* `RESTRICT` / `NO ACTION` refuse to delete a parent that still has children (patient records);
+* `SET NULL` / `SET DEFAULT` keep the children and clear their reference (employees after their company, a blog post after its author).
 
-* `ON DELETE NO ACTION` with a tombstone column, where children are deleted before their parent and the parent's tombstone is refused while a child still lives;
-* or `ON DELETE CASCADE` with no tombstone, where PostgreSQL deletes the family and every delete reaches the replicas as a CDC event.
+In ZeBridge, what happens depends on how the parent is deleted:
 
-Mixing the two on one key is **refused**, at `zebridge_enable` and at the migration that would introduce it, because a cascade's deletes never reach a replica of a tombstone table.
+| the parent is… | `ON DELETE CASCADE` | `ON DELETE RESTRICT` / `NO ACTION` | `ON DELETE SET NULL` / `SET DEFAULT` |
+| --- | --- | --- | --- |
+| **hard-deleted** (no tombstone column) | works as in PostgreSQL; each deleted child reaches the replicas as a CDC event. **Refused** if the child table keeps tombstones | works as in PostgreSQL | works as in PostgreSQL; each cleared reference reaches the replicas as an `UPDATE` |
+| **soft-deleted** (tombstone column) | never fires | never fires | never fires |
+
+**Why the second row.** A soft delete is an `UPDATE` that sets the tombstone column, so PostgreSQL never sees a `DELETE` and no `ON DELETE` action runs. ZeBridge puts one rule in their place: a parent's tombstone is **refused while a live child still references it**, whatever action the key declares. It behaves like `RESTRICT`, so a replica never holds a child whose parent is gone. On a soft-delete table, the app does the rest with ordinary writes, each of which reaches every replica:
+
+* to keep the children (patient records): nothing to do, the rule does it;
+* to clear their reference (company → employees, blog → author): `mutate()` the children to drop the reference, then delete the parent;
+* to delete the whole family: delete the children first, then the parent.
+
+**The one refusal.** `ON DELETE CASCADE` into a child table that keeps tombstones is refused, by `zebridge_enable` and by the DDL guard at the migration that would introduce it: the cascade would delete the children physically, and a physical delete on a tombstone table never reaches a replica.
+
+**`ON UPDATE`**: every action is allowed and works as in PostgreSQL. It fires only when the parent's key value changes, which is a real `UPDATE`: the parent's new key reaches the replicas as a key change (the client deletes the old row and writes the new one), and the children's changed references as ordinary `UPDATE`s. Only the server side changes a key (a migration, `psql`): a client cannot, the library refuses it before it leaves the device, and a rename is a delete plus a create.
 
 💡 Cascades stay small by design: what a client may delete is a row without children.
 
