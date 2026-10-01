@@ -155,7 +155,6 @@ See [Suspended tables](#suspended-tables).
       * [Schemas - guards and suspension](#schemas---guards-and-suspension)
       * [Checks](#checks)
       * [Scoped by tenant, authorized by grants](#scoped-by-tenant-authorized-by-grants)
-      * [Payload limits are not flexible](#payload-limits-are-not-flexible)
       * [Conflict resolution](#conflict-resolution)
       * [Cooperative editing: several editors on one row](#cooperative-editing-several-editors-on-one-row)
       * [Cascade rules](#cascade-rules)
@@ -222,7 +221,6 @@ See [Suspended tables](#suspended-tables).
       * [8. Invite the first user](#8-invite-the-first-user)
     * [Using a cloud PostgreSQL](#using-a-cloud-postgresql)
     * [NATS streams and buckets](#nats-streams-and-buckets)
-    * [The memory setting](#the-memory-setting)
     * [Running the Bridge](#running-the-bridge)
   * [Configuration](#configuration)
   * [Sizing the ring](#sizing-the-ring)
@@ -599,19 +597,13 @@ We have added tools in Postgres to diagnose tables as:
 This reports every rule before touching anything, and `bridge --diagnose` checks a whole database, the cascade rule included. See [diagnose](#diagnose).
 
 * **Suspension**: 🚦 When a table stops meeting a rule while the bridge runs, the bridge **suspends** it and keeps everything else flowing. Fix the table and most suspensions lift by themselves; two cases need a restart, [Suspended tables](#suspended-tables) and [Restart rules](#restart-rules).
-* **Soft-delete Cascade Transaction Mitigation with Sweeper**: when consumers apply _soft-deletion_ this can lead to bloated databases. Soft deletion is enforced by using a `tombstone` column in the schema.
-The client library always applies a local HARD DELETE, but a _soft delete_ (via the `tombstone` timestamptz) is sent to Postgres. ZeBridge solves the Postgres bloat with a companion garbage collector, the `bridge_sweeper` daemon which runs with a WRITER privilege.
-The sweeper: reaps old tombstones _families_, in order, children first, in batches of `GC_BATCH_ROWS` (1000), so a million expired tombstones is a thousand small deletes and never one transaction.
+* **Soft deletes, reaped by the sweeper**: a delete is sent to PostgreSQL as a soft delete (the `tombstone` column), and the companion `bridge_sweeper` daemon reaps old tombstones so the database does not bloat. See [Sweeper](#sweeper).
 
 * **A cascade storm, when PostgreSQL does cascade**: if a table is loaded with a schema declared with a physical cascade on a cascade-declared family, it is one transaction, and the bridge takes it as one: its events land in the ring buffer, `RING_BUFFER_COUNT` slots (32,768 by default), and are published in order as batches. A transaction larger than the ring is published as several batches, in order, and the clients apply each as one unit and hold what crosses a batch boundary until its parent arrives;
 proven with a 1,500-row family against a 1,024-slot ring.
 * **Ring buffer**: the ring exists to buffer possible large transactions and naturally for the broker's ordinary jitter. It is not for a NATS outage: a publish that fails is retried five times with a backoff from 100 ms doubling to 5 s, and if the broker is still gone the bridge stops rather than acknowledge WAL it never delivered, and resumes from the slot when the broker returns.
-* **Attach tables to a publication**: when running a migration, the DBA attaches each table to the publication with `zebridge_enable()`. See [Good practices](#good-practices)
-* **Writable is not automatic**: client-side writable tables are enabled with `zebridge_enable(..., writable => true)` when running the database migration. See [Good practices](#good-practices)
-* **Writes with Conflict Resolution policy-LWW**: ZeBridge makes decisions for you that other sync engines leave you to : writes are not merely accepted, but enforced with last-writer-wins (LWW) server-side _per row_.
-Postgres judges a write by its version, per row: an edit stamped below the row's version is refused as `stale`. The client then looks at which columns the winner changed. If the refused edit touched none of them, it is resubmitted with a fresh stamp and lands; if both edited the same column, the edit is dropped and the loss is surfaced. So an edit is lost only on a column that was genuinely contested.
-Clock skew is absorbed the same way: a slow clock is judged stale, and its edit is rebased onto the row it was made on, stamped above what the client has seen (a hybrid logical clock). The client implements a Hybrid Logical Clock (HLC) to neutralize the clock drift problem.
-See [Good practices](#good-practices) and [Understanding the LWW rules](#understanding-the-lww-rules).
+* **Tables join through `zebridge_enable()`**: the DBA attaches each table to the publication with it during a migration, and marks a table writable there (`writable => true`); no table is writable by default. See [Good practices](#good-practices).
+* **Writes resolved by last-writer-wins (LWW)**: ZeBridge makes a decision other sync engines leave to you: PostgreSQL judges every client write by its version, per row, and refuses a stale one. See [Conflict resolution](#conflict-resolution).
 
 * **Controlled Local Writes**: On the consumer side, we expect a standard SQLite or PGlite engine. While clients are free to read from their local database, all writes **must** go through the client library's `mutate()` to be tracked. Enforcement depends upon the local engine.
 * **Safety enforced by Tenant isolation and NATS grants**: we enforce a strict tenant model in Postgres: every principal -consumer- operates within a designated tenant boundary. This defines the RLS. Access control - grants-  and permissions within  NATS are cryptographically secured and mapped via NATS JWT tokens tied to each tenant.
@@ -746,16 +738,7 @@ Can I check if my schemas will be accepted?
 
 ✅ On a live database, the `bridge --diagnose` tool.
 
-🔔 The table `zebridge_catalogue` gives you the state of each table with reference to the constraints:
-
-```txt
-postgres=# select * from zebridge_catalogue;
-                        my_db
-
-tbl        | tenant_col | public_reason | version_col | tombstone_col | tiebreak_col |
------------+------------+---------------+-------------+---------------+--------------+
-test_types | tenant_id  |               | updated_at  | deleted_at    | last_writer
-```
+🔔 `SELECT * FROM zebridge_catalogue` lists every enabled table with its rules (an example is in [Schemas and zebridge_enable](#schemas-and-zebridge_enable)).
 
 #### Scoped by tenant, authorized by grants
 
@@ -784,32 +767,21 @@ postgres=#
 INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('alice', 'acme');
 ```
 
-#### Payload limits are not flexible
-
-**Payload size are limited** because NATS caps the message payload with an already generous default 1 MB, and because the bridge runs on a fixed buffer.
-
-❗️ A row too wide for the change feed is **suspended** _at write time_, both from the edge and from `psql`.
-
-See [Suspended tables](#suspended-tables)
-
 #### Conflict resolution
 
-The current version has a built-in conflict resolution policy: last-writer-wins (LWW).
+Writes are resolved, not merely accepted: the policy is last-writer-wins (LWW), per row.
 
-* A writable table needs a **version column**, `updated_at`, which should be a `timestamptz` — ⚠️ never a naive `timestamp`.
+* A writable table has a **version column** (`updated_at`) of type `timestamptz` — ⚠️ never a naive `timestamp`. 🚦 The timestamp guard refuses one at `CREATE`/`ALTER`: "newer" must be an absolute instant.
+* It normally has a **tombstone column** (`deleted_at`) for soft deletes, so an offline client cannot bring a removed row back. Without one (`allow_physical_deletes => true`), a delete is a hard delete in PostgreSQL.
+* An optional **tiebreak column** (`last_writer`) settles equal versions instead of refusing both.
 
-🚦 The timestamp guard refuses one at `CREATE`/`ALTER`, because "newer" must be an absolute instant, otherwise last-write-wins is meaningless.
+**How a write is judged.** It carries the version the client holds, and PostgreSQL applies it only if it is newer than the row's; an older one is refused as `stale`. The three verbs, `INSERT`, `UPDATE` and `DELETE`, follow the same rule.
 
-* A writable table normally has a **tombstone_col** column for _SOFT-DELETE_, with a column `deleted_at` (a delete becomes a soft-delete so an offline client cannot resurrect a removed row) and an optional **tiebreak_col** column `last_writer` (resolves equal versions instead of refusing both).
-➡ Without one (`allow_physical_deletes => true`), a delete is a HARD DELETE in Postgres.
-  
-* Writes are **resolved, not merely accepted — last-write-wins**: A write carries the version the client holds; the bridge applies it **only if it is newer** than what Postgres has, and rejects a stale one.
-The writes use three verbs (`INSERT`, `DELETE`, `UPDATE`), resolved via **last-write-wins** (LWW).
+**A refused edit is not always lost.** The client looks at which columns the winner changed. If its own edit touched none of them, it resends it with a fresh stamp and it lands; if both touched the same column, the edit is dropped and the loss is reported (`edit LOST`). An edit is lost only on a column that was really contested.
 
-* Furthermore, against **clock drift**: the client uses a Hybrid Logical Clock (HLC) algorithm to neutralize the clock drift / synchronization problems and disallow silent data overwrite issues.
+**Clock skew** is handled the same way. The client stamps its writes with a hybrid logical clock (HLC): an edit from a slow clock is judged stale, then rebased and stamped above what the client has seen.
 
-This is a deliberate design choice, otherwise you observe whatever results. ZeBridge arbitrates at ingest, so a slow or offline client cannot silently clobber a newer edit, and a stale queued write cannot undo a delete.
-The cost is that LWW decides per **row**: when two people edit the same row at once, one edit wins and the other is refused as `stale`. The client rebases it when the two touched different columns, and drops it only when they touched the same one.
+This is deliberate: ZeBridge arbitrates at ingest, so a slow or offline client cannot silently overwrite a newer edit, and a stale queued write cannot undo a delete. The cost is that LWW decides per **row**; for several editors on one row, see the next section. Worked cases: [Understanding the LWW rules](#understanding-the-lww-rules).
 
 #### Cooperative editing: several editors on one row
 
@@ -887,7 +859,9 @@ It uses the `WRITER` role and reaps tombstones older than `GC_THRESHOLD_MS` (an 
 DATABASE_WRITER_URL=xxx bridge_sweeper [--once]
 ```
 
-💡 It also accepts an immediate action with the flag `--once`.
+💡 `--once` runs a single pass and exits.
+
+It reaps tombstone _families_ in order, children first, in batches of `GC_BATCH_ROWS` (1000), so a million expired tombstones is a thousand small deletes, never one transaction.
 
 **Why this**? This garbage collector is standard practice and needed to keep Postgres in sync with replicas, because LOCAL deletes are HARD deletes, but they are **propagated back as soft-deletes** via an `UPDATE SET tombstone ...` by the daemon.
 This update is echoed back to every connected client as a CDC event. On an **UPDATE with a tombstone**, the client hard-deletes the row in its replica.
@@ -1987,7 +1961,7 @@ We use `REPLICA IDENTITY DEFAULT` to limit the volume, thus increase the speed o
 
 1. **Read the WAL.** One thread follows PostgreSQL's logical replication stream (`pgoutput`), in order.
 2. **Decode into a fixed buffer.** Each change is decoded into a pre-allocated slot — memory is bounded at startup, not grown per event.
-3. **Batch to NATS.** Decoded events are published to JetStream in batches of 5000 events or 500 ms or 256 KB
+3. **Batch to NATS.** Decoded events are published to JetStream in batches, closed by a count, an age or a size (see [Configuration](#configuration)).
 4. **Acknowledge.** Only after JetStream confirms does the bridge ACK that position to Postgres (no data loss).
 5. **Reclaim**: Postgres can then reclaim WAL. If the bridge crashes, Postgres keeps the unpublished WAL — nothing is lost.
 
@@ -2116,10 +2090,7 @@ CHECKPOINT;
 
 **NATS reconnection:**
 
-* Automatic (handled by `nats.zig`)
-* Max attempts: -1 (infinite)
-* Wait between attempts: 2 seconds
-* Flush timeout: 10 seconds
+* Automatic (handled by `nats.zig`), retrying for ever; the timings are in [Configuration](#configuration)
 
 ### Catching up: the chain and the stream
 
@@ -2400,50 +2371,17 @@ The CDC stream family is owned by the bridge: at boot it creates any missing `CD
 
 Consumers use these streams to interact with NATS; the exact names are declared in `grammar.json`.
 
-### The memory setting
+### Running the Bridge
 
-The fixed memory used by ZeBridge has three dimensions: the slot size, `BASE_BUF` and the number of slots, `RING_BUFFER_COUNT`, and `MAX_COLUMNS` (auto-detected).
-
-NATS messages default to `max_payload=1M`, which is already quite large. It can safely be raised to 8 MB.
-
-Depending on the size of the published tables you wish to track, the maximum row size, the maximum number of rows per transaction, and the CDC emission rate you want to buffer during possible NATS reconnections (e.g. buffer 100 to 50,000 evt/s during 1s)
-
-**Row width**: ZeBridge will suspend a table whose rows are wider than the NATS message limit (<1 MB). The NATS cap also means a consumer cannot push a large row to NATS. As explained, above this limit, we are in the domain of Object storage for large blobs, and URLs should be saved in the database instead.
-
-**CDC**: The `RING_BUFFER_COUNT` is designed to buffer the received events during potential NATS jitters or outages. Its count depends naturally upon the emitting rate.
-The `BASE_BUF` is the max payload size, capped at 1MB.
-The `MAX_COLUMNS` is the maximum number of possible columns per table. Unset (the normal case), it is **auto-detected at boot** from the widest table in the publication, rounded up for migration headroom — not a fixed compile-time guess. Set it explicitly only to override that.
-
-➡ It caps the event size, suspends a table and drives the total memory used.
-
-Ceiling is NATS/JS, the host capacity, not ZeBridge.
-
-❇️ Read [Sizing the ring](#sizing-the-ring)
-
-❇️ Read [The main loop PG/ZB/NATS](#the-main-loop-pgzbnats)
-
-A ZeBridge instance, in one line:
+A bridge instance is one slot, one port, and reads its slot in order:
 
 ```txt
 one bridge instance = one replication slot = sequential processing
 ```
 
-Two ways to run several instances, depending on the isolation you need:
+You declare which slot and which publication to use; the bridge refuses to start without both. One bridge serves every tenant of its publication.
 
-* **Multi-tenant instance**: one bridge, one slot, serving several tenants — cheaper, but every tenant's data flows through the same process.
-* **Single-tenant instance**: one bridge per tenant, enforced at the PostgreSQL level — more processes, but a tenant's data never crosses another's.
-
-Before starting a bridge:
-
-* Postgres has run the needed migrations and has a `PUBLICATION` with WAL logging enabled.
-
-Clients authenticate with JWTs: see [Identity and access](#identity-and-access).
-
----
-
-### Running the Bridge
-
-A bridge instance is one slot, one port. You declare which slot and which publication to use, and refuses to start without both.
+The memory each instance takes is fixed at startup: see [Sizing the ring](#sizing-the-ring).
 
 The slot is created by the bridge if it does not exist; the publication is not — ❗️ the publication must already exist, and the bridge stops at boot if it does not (it is created by `bridge --init-sql`, or `zebridge_create_publication`).
 
@@ -2668,7 +2606,7 @@ info(bridge): NATS max_payload: 1024 KB (server-advertised) → CDC per-event bu
 
 and warns if the two cannot coexist.
 
-Raising `max_payload` in `nats-server.conf` is possible but affects every client and every subject on that server. JetStream's memory use scales with it — so for genuinely large values, prefer **keeping the blob out of the replicated table** and replicating a reference to it (URL object storage).
+Raising `max_payload` in `nats-server.conf` (up to 8 MB is safe) is possible but affects every client and every subject on that server. The cap also stops a client from writing a row wider than it. JetStream's memory use scales with it — so for genuinely large values, prefer **keeping the blob out of the replicated table** and replicating a reference to it (URL object storage).
 
 [⬆️](#table-of-contents)
 
