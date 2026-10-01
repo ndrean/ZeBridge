@@ -1,0 +1,84 @@
+# ZeBridge in one command, for evaluation:
+#
+#   docker compose -f docker-compose.quickstart.yml up --build
+#
+# then open the links the `init` service prints (http://localhost:5173/?invite=…).
+# PostgreSQL, NATS in operator mode, the bridge, the sweeper and the browser demo.
+# Only the demo (5173) and the bridge's /status and /metrics (27434) are published.
+# Not a production layout: see the README's "Host setup on VPS or bare-metal".
+#
+# Start again from scratch: docker compose -f docker-compose.quickstart.yml down -v
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: app
+      # The compose network only: no port is published, so trust stands in for a
+      # superuser password that would otherwise have to live in this file.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_slot_wal_keep_size=2GB"]
+    volumes:
+      - pg-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "app"]
+      interval: 2s
+      retries: 30
+
+  init:
+    build: { context: ., dockerfile: Dockerfile.bridge }
+    image: zebridge/bridge:quickstart
+    entrypoint: ["/bin/sh", "/quickstart/init.sh"]
+    environment:
+      QS_WEB_PORT: ${QS_WEB_PORT:-5173}
+    volumes:
+      - zb-nats:/zb-nats
+      - ./quickstart/init.sh:/quickstart/init.sh:ro
+      - ./examples/05-tables/web-consumer/demo.sql:/quickstart/demo.sql:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  nats:
+    image: nats:alpine
+    command: ["-js", "-c", "/zb-nats/nats-server.conf"]
+    volumes:
+      - zb-nats:/zb-nats
+    depends_on:
+      init: { condition: service_completed_successfully }
+
+  bridge:
+    image: zebridge/bridge:quickstart
+    entrypoint: ["/bin/sh", "-c", "set -a; . /zb-nats/.env.bridge; set +a; exec bridge"]
+    environment:
+      # Inside the container: the web service reaches /enroll over the compose
+      # network. The host still sees the port on 127.0.0.1 only (below).
+      BRIDGE_BIND: 0.0.0.0
+    volumes:
+      - zb-nats:/zb-nats
+    ports:
+      - "127.0.0.1:${QS_BRIDGE_PORT:-27434}:27434"
+    depends_on:
+      nats: { condition: service_started }
+      init: { condition: service_completed_successfully }
+    restart: on-failure
+
+  sweeper:
+    build: { context: ., dockerfile: Dockerfile.sweeper }
+    entrypoint: ["/bin/sh", "-c", "set -a; . /zb-nats/.env.bridge; set +a; exec sweeper"]
+    volumes:
+      - zb-nats:/zb-nats
+    depends_on:
+      init: { condition: service_completed_successfully }
+    restart: on-failure
+
+  web:
+    build: { context: ., dockerfile: quickstart/Dockerfile.web }
+    ports:
+      - "127.0.0.1:${QS_WEB_PORT:-5173}:5173"
+    depends_on:
+      bridge: { condition: service_started }
+    restart: on-failure
+
+volumes:
+  pg-data:
+  zb-nats:

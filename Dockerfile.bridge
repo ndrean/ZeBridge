@@ -50,11 +50,13 @@ FROM ${BASE_IMAGE}
 
 # Runtime dependencies (dynamically linked)
 # libpq pulls in libssl3/libcrypto3 transitively on Alpine; zstd-libs carries
-# libzstd.so for the chain compressor.
+# libzstd.so for the chain compressor. postgresql-client is `psql`, which
+# `bridge --init-sql | psql` needs (and the quickstart's init step runs).
 RUN apk add --no-cache \
     libpq \
     zstd-libs \
-    ca-certificates
+    ca-certificates \
+    postgresql-client
 
 COPY --from=builder /build/zig-out/bin/bridge /usr/local/bin/bridge
 

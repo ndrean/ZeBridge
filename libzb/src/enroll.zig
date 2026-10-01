@@ -23,6 +23,9 @@ const Value = std.json.Value;
 /// Why the last enrollment or identity step failed on this thread, for zb_last_error.
 pub threadlocal var last_failure: ?[]const u8 = null;
 threadlocal var failure_buf: [512]u8 = undefined;
+/// §10kn: the last `renew` on this thread was refused with `"purge": true` (`bridge
+/// --revoke --purge`): the caller deletes the replica and the identity file.
+pub threadlocal var last_purge: bool = false;
 
 fn fail(comptime fmt: []const u8, args: anytype) error{EnrollFailed} {
     last_failure = std.fmt.bufPrint(&failure_buf, fmt, args) catch failure_buf[0..];
@@ -213,8 +216,18 @@ pub fn renew(a: std.mem.Allocator, id: Identity) !Identity {
     const res = client.fetch(.{ .location = .{ .url = url }, .response_writer = &body.writer }) catch |err|
         return fail("renew: {s} unreachable ({s})", .{ id.bridge_url, @errorName(err) });
     const text = body.written();
+    last_purge = false;
     if (res.status != .ok) {
         const why = std.mem.trim(u8, text, " \r\n");
+        if (res.status == .forbidden) {
+            if (std.json.parseFromSlice(Value, a, text, .{})) |p| {
+                defer p.deinit();
+                if (p.value == .object) if (p.value.object.get("purge")) |v| if (v == .bool and v.bool) {
+                    last_purge = true;
+                    return fail("renew: refused — the principal was revoked, and its local data must be deleted", .{});
+                };
+            } else |_| {}
+        }
         return switch (res.status) {
             .forbidden => fail("renew: refused — the key is revoked or no membership is left: a new invite is needed", .{}),
             .unauthorized => fail("renew: refused ({s})", .{why[0..@min(why.len, 160)]}),

@@ -18096,3 +18096,109 @@ Not `tls://127.0.0.1`: Zig's TLS client checks the certificate against a host na
 refused the IP (`CertificateHostMismatch`), although the certificate lists it. Checked on
 `/connz`: the bridge's connections are TLS 1.3 (`TLS_AES_128_GCM_SHA256`); the browser
 (WebSocket) and a Flutter app on `nats://` stay plain.
+
+## §10km — the bridge refuses a write stamped before the GC watermark (2026-10-01)
+
+The dangerous case for soft deletes: a client offline with a queued write; the row is
+deleted; the sweeper reaps the tombstone, and PostgreSQL forgets the row was deleted; the
+client sends its old write. An UPDATE then matches nothing, but an INSERT creates the row
+again on every replica. The clients refuse such a write themselves (PROTOCOL MUST 6), but
+only against the watermark they last saw: zb-client-ts, on an automatic NATS reconnect,
+starts `flushOutbox()` and the re-sync together (libzb.ts, the status loop), so a phone
+asleep for a week flushes against a week-old watermark.
+
+Now the mutation listener reads `zebridge_gc_watermark` before each batch and each single
+attempt (outside pipeline mode; null on any error, and the guard is then off), and refuses
+a write whose version, as a timestamp, is at or before it: `rejected`,
+`PredatesGcWatermark`, permanent (dead-lettered, never retried). The same rule as the
+clients' gate (version <= watermark). An integer version, or a timestamp with no zone, is
+not compared. `versionMicros` parses the forms a version arrives in (unit test, 11 cases).
+
+Fixtures that stamped pinned past days (offline.py: 2026-08-16; mutate.py) now stamp just
+behind PostgreSQL's now() with `zb.recent_version`; offline.py marks its rows with the
+microseconds .777777 instead of the day. adversarial.py and credentials.py are unaffected
+(their writes are refused for other reasons, or never reach the bridge).
+
+`gc_resurrect.py` plays the four steps with versions around PostgreSQL's clock (seed −3h,
+soft delete −2h, reap as the sweeper does, watermark −1h, the offline write −90m): the
+stale UPDATE and INSERT are `rejected`/`PredatesGcWatermark` and the row stays gone; a
+fresh INSERT is accepted; and the control, with the watermark moved behind the deletion,
+shows the same stale INSERT landing — the resurrection. 9/9. A plain `DELETE` from psql
+is NOT a reap: `zebridge_soft_delete` turns it into a soft delete stamped now() unless the
+session sets `zb.principal = 'zb_sweeper'`, as the sweeper does. offline, mutate,
+clockskew, tiebreak and clamp still pass; their clock offsets are seconds, well inside a
+one-hour watermark.
+
+## §10kn — `bridge --revoke <principal> --purge`: the device deletes its local data (2026-10-01)
+
+A plain revocation cuts access and leaves the rows on the device (`wipe()` was the app's
+act). The owner wanted the data to go with the access. A promise that holds only if the
+device reconnects: a device offline for good keeps its data, a modified client can ignore
+it.
+
+- **Database**: `zebridge_purges (principal PK, requested_at)`, by principal, not by key
+  (a principal minted without a recorded key, as the dev stack's are, is purged too).
+  `--revoke --purge` upserts the row, a plain `--revoke` deletes it: the latest command
+  decides. Written FIRST, before the mapping delete: each statement commits on its own,
+  and the running bridge publishes the ban the moment the mapping delete reaches it.
+- **The ban**: `publishRevoked` reads the row and adds `"purge": true` to
+  `mutation_ack.<principal>.revoked`.
+- **`/renew`**: a revoked key whose principal has the row gets 403
+  `{"error":"key revoked","revoked":true,"purge":true}` (after the signature check). The
+  channel that still reaches a device after a FULL revocation, when NATS refuses its token
+  and the ban is out of reach.
+- **zb-client-ts**: `purged` flag; `purgeLocal()` (close, delete the replica, save an empty
+  identity, which every platform's loader reads as none) on a purge ban, or on
+  `RevokedPurge` from `renewAt` (at connect, then the connect fails; or on the renewal
+  timer, then no more renewals).
+- **libzb**: `SyncClient.purge_requested`, set by `notePurge` on the ban (live drain and
+  the connect probe) or by `maybeRenew` on `enroll.last_purge`. The C layer purges after
+  `zb_client_poll` / `zb_client_sync` (`purgeIfAsked`): the zb_client_wipe steps plus the
+  identity file; the handle is remembered, so `zb_client_revoked` answers 1 and every other
+  call `Revoked` (`goneJson`). At connect, a renewal refused with a purge unlinks the files
+  before failing. A first `notePurge` parsed into a 1 KB fixed buffer and silently failed:
+  std.json needs more; now the C allocator.
+
+`revoke_purge.py`, on its own stack (a generated `--init-nats operator` NATS on 14224, a
+probe bridge on zb_probe/9096 with the generated signing key and a 10 s cadence; the dev
+`.env.bridge` has no signing seed, so the dev bridge's /enroll is off), 13/13: libzb
+connected `--purge` (Revoked, files gone, revoked = 1), libzb plain revoke (files stay),
+zb-client-ts connected `--purge` (purged, replica gone, identity empty), /renew answers
+purge, libzb closed during `--purge` then reopened (refused, files gone). The probe slot
+is dropped and the test principals removed at the end.
+
+§10kn, the renewal path (same day): phase F of `revoke_purge.py` runs on a second stack
+minting 20 s JWTs (`ENROLL_JWT_TTL_SECONDS=20`, accepted: no lower bound). A libzb and a
+zb-client-ts device enroll, close with their identity stored; `--purge` runs; 17 s later
+both JWTs are due, and each reopen renews at connect, gets the purge answer, deletes the
+replica and the identity before anything else, and fails the connect with "the principal
+was revoked, and its local data must be deleted". 18/18 with phases A–E.
+
+## §10ko — DROP COLUMN broke every later write: the width guard named the dropped column (2026-10-01)
+
+Found by `offline_migrate.py` (new): after `ALTER TABLE … DROP COLUMN note`, an ordinary
+`UPDATE` from psql failed with `record "new" has no field "note"` in
+`zebridge_width_guard_om_t()`. The width guard is a GENERATED function with explicit column
+references (`zebridge_install_width_guard`), installed only by `zebridge_enable`; nothing
+regenerated it on DDL. So after a DROP or RENAME of a column measured by the guard (text,
+bytea, json, arrays), every INSERT and UPDATE on the table — from clients and from psql —
+failed until someone re-ran `zebridge_enable`. `migrate_both.py` had not caught it: it
+drops a column and checks the replicas, but writes nothing to the table afterwards.
+
+Fix: `zebridge_ddl_trigger_fn` re-installs the guard for every catalogued table the DDL
+touched, before snapshotting the schema (the install reads the current columns, and drops
+the trigger when the table no longer needs one; the catalogue lookup goes through EXECUTE
+because a bare `tbl` clashes with the catalogue's column in PL/pgSQL). Applied to the dev
+DB by hand (the one function, from the rendered init SQL).
+
+`offline_migrate.py` (registered, group `bridge`): libzb and zb-client-ts sync a writable
+table, go offline (closed / disconnected), zb-client-ts queues an UPDATE on the column about
+to be dropped; PostgreSQL adds `extra DEFAULT 'filled'`, drops `note`, updates another row;
+both come back. 8/8: equal to PostgreSQL, `extra` filled on old rows, `note` gone, the
+server's update present, the queued write settled (outbox empty). widthguard.py 6/6 and
+migrate_both.py 14/14 after the change.
+
+Dev-stack note: with TLS on 4222 (§10kl), scenarios must run with
+`NATS_URL=nats://127.0.0.1:4222` (the sourced env says tls://, and the Python libzb client
+gets no CA) and `NODE_EXTRA_CA_CERTS=nats.zig/tests/configs/certs/ca.pem` (the Node NATS
+client upgrades to TLS whenever the server offers it).

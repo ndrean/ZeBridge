@@ -924,6 +924,7 @@ DECLARE
     tbl         text;
     tables      text[] := '{}';
     cmd_tag     text   := 'UNKNOWN';
+    catalogued  boolean;
     schema_json jsonb;
     last_def    jsonb;
     pre_def     jsonb;
@@ -945,6 +946,22 @@ BEGIN
             -- schemas are meaningless to clients and would provoke pointless migrations.
             IF NOT public.zebridge_is_internal_table(tbl) AND NOT (tbl = ANY(tables)) THEN
                 tables := array_append(tables, tbl);
+            END IF;
+        END IF;
+    END LOOP;
+
+    -- §10ko: the width guard is a generated function that names the table's columns, so a
+    -- DROP or RENAME COLUMN left it referring to a column that no longer exists, and every
+    -- INSERT and UPDATE on the table failed ("record "new" has no field …") until someone
+    -- re-ran zebridge_enable. Re-install it for every catalogued table this DDL touched:
+    -- the install reads the current columns, and drops the trigger when none is needed.
+    FOREACH tbl IN ARRAY tables
+    LOOP
+        IF to_regclass('public.' || quote_ident(tbl)) IS NOT NULL THEN
+            EXECUTE format('SELECT EXISTS (SELECT 1 FROM public.zebridge_catalogue WHERE tbl = %L)', tbl)
+                INTO catalogued;
+            IF catalogued THEN
+                PERFORM public.zebridge_install_width_guard(('public.' || quote_ident(tbl))::regclass);
             END IF;
         END IF;
     END LOOP;

@@ -207,6 +207,21 @@ def psql(sql: str, quiet: bool = False) -> str:
     return res.stdout.strip()
 
 
+def recent_version(minutes_ago: float, micros: int = 0) -> str:
+    """A version `minutes_ago` minutes before PostgreSQL's now(), in the clients' form.
+
+    The bridge refuses a write stamped at or before the GC watermark (PROTOCOL MUST 6,
+    §10km), and the watermark trails now() by GC_THRESHOLD_MS (an hour by default), so a
+    fixture stamps just behind now, never on a pinned day. `micros` lets a scenario mark
+    its own rows (the seconds are truncated, then these microseconds are set).
+    """
+    return psql(
+        "SELECT to_char(date_trunc('second', now() - make_interval(mins => "
+        f"{int(minutes_ago)})) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS')"
+        f" || '.{int(micros):06d}Z'"
+    )
+
+
 def decode(data: bytes):
     """CDC events and mutation payloads are MessagePack; verdicts and KV descriptors are
     JSON. Chain objects are msgpack under zstd (a per-era dictionary) — decode those with

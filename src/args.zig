@@ -37,6 +37,9 @@ const usage =
     \\      [--conf PATH]           …and close the token now: with OPERATOR_SEED and
     \\                              ZB_ACCOUNT_PUB, re-sign the account's revocations
     \\                              into this nats-server.conf (then reload the server)
+    \\      [--purge]               …and ask its devices to delete their local replica
+    \\                              and identity: at once if connected, when they renew
+    \\                              otherwise. Best-effort: offline for good keeps its data
     \\
     \\  --view-slots    Every replication slot on the server: active, pid, LSNs, retained WAL
     \\  --view-slot <slot>  The same for one slot

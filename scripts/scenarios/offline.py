@@ -62,10 +62,11 @@ TABLE = sys.argv[1] if len(sys.argv) > 1 else "test_types"
 # Two client identities. Case 3 needs them ordered, and the rule is "higher id wins".
 LOW, HIGH = "c-aaa", "c-zzz"
 
-# Pinned wall-clock versions. Only their ORDER matters; the date is arbitrary and fixed so
-# a rerun compares the same values.
-DAY = "2026-08-16"
-V_OLD, V_MID, V_NEW = f"{DAY}T09:00:00.000000", f"{DAY}T10:00:00.000000", f"{DAY}T11:00:00.000000"
+# Versions just behind PostgreSQL's clock. Only their ORDER matters. Not a pinned day: the
+# bridge refuses a write stamped before the GC watermark, which trails now() by an hour by
+# default (§10km). The microseconds, .777777, mark this scenario's rows for the debris sweep.
+MARK = 777777
+V_OLD, V_MID, V_NEW = (zb.recent_version(m, MARK) for m in (40, 30, 20))
 
 # How long to wait for the bridge to apply a mutation before reading the row back. The
 # mutation listener pulls with a 500ms timeout and PostgreSQL commits immediately, so this
@@ -173,14 +174,14 @@ async def main():
     def sweep_debris():
         """Remove rows a previous *crashed* run left behind.
 
-        Every row this scenario writes carries a version on the pinned DAY, which nothing
-        real does — that date is the marker. Without this, one interrupted run leaves
+        Every row this scenario writes carries a version whose microseconds are MARK,
+        which a real write almost never does: that is the marker. Without this, one interrupted run leaves
         rows that the next run's counts and reads have to step around, and the failure
         shows up later as an unrelated assertion.
         """
         n = zb.psql(
             f"WITH d AS (DELETE FROM public.{TABLE} "
-            f"WHERE {version_col}::date = DATE '{DAY}' RETURNING 1) SELECT count(*) FROM d",
+            f"WHERE to_char({version_col}, 'US') = '{MARK}' RETURNING 1) SELECT count(*) FROM d",
             quiet=True,
         ).strip()
         if n and n != "0":
@@ -253,10 +254,9 @@ async def main():
     await send("update", uid, "OFFLINE resurrects?", V_MID)
     _, state, _ = read(uid)
     # ⚠️ Two ways to stay dead, and a colocated sweeper decides which one this run sees.
-    # The tombstones here are BACKDATED (DAY is weeks old, deliberately — see above), so
-    # they are GC-ripe the instant they land; a running bridge_sweeper's next pass may
-    # reap the row between the delete and this read (measured 2026-09-03: reaped=2 on
-    # the watermark, state None). Reaped is still "stayed deleted" — the stale UPDATE
+    # A running bridge_sweeper with a GC_THRESHOLD_MS shorter than these versions' age
+    # may reap the row between the delete and this read (measured 2026-09-03 with
+    # backdated versions: reaped=2 on the watermark, state None). Reaped is still "stayed deleted" — the stale UPDATE
     # then matches no row and writes nothing — but through a different mechanism than
     # the tombstone-overrules-late-writer one this phase is really about, so say which
     # path this run took. Only a LIVE row with the stale value is a failure.

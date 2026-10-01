@@ -1104,13 +1104,37 @@ pub const EventProcessor = struct {
         const js = if (publ.js) |*j| j else return;
         var buf: [256]u8 = undefined;
         const subject = std.fmt.bufPrint(&buf, "{s}.{s}.revoked", .{ self.topology.mutation_ack_prefix, principal }) catch return;
-        const body = "{\"status\":\"revoked\",\"reason\":\"mapping removed by the operator\"}";
+        // §10kn: `--revoke --purge` recorded before the mapping delete that brought us
+        // here: the libraries then delete the device's replica and identity too.
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena_state.deinit();
+        const purge = self.purgeRequested(arena_state.allocator(), principal);
+        const body = if (purge)
+            "{\"status\":\"revoked\",\"reason\":\"mapping removed by the operator\",\"purge\":true}"
+        else
+            "{\"status\":\"revoked\",\"reason\":\"mapping removed by the operator\"}";
         var res = js.publish(subject, body, .{}) catch |err| {
             log.warn("⛔ '{s}': the ban could not be stored on {s} ({s}) — its live clients read until expiry or the JWT revocation", .{ principal, subject, @errorName(err) });
             return;
         };
         res.deinit();
-        log.info("⛔ '{s}' revoked — the ban is on {s}: its live clients hang up, a reconnecting one finds it retained", .{ principal, subject });
+        log.info("⛔ '{s}' revoked — the ban is on {s}: its live clients hang up, a reconnecting one finds it retained{s}", .{ principal, subject, if (purge) "; it asks them to delete their local data" else "" });
+    }
+
+    /// §10kn: whether the latest `bridge --revoke` of `principal` asked for a purge.
+    /// False when the question cannot be asked: a missed purge leaves data on a device
+    /// that is already cut off, a wrong one would delete data nobody asked to delete.
+    fn purgeRequested(self: *EventProcessor, arena: std.mem.Allocator, principal: []const u8) bool {
+        var standard_pg_config = self.pg_config.*;
+        standard_pg_config.replication = false;
+        const conn = pg_conn.connect(arena, standard_pg_config) catch return false;
+        defer c.PQfinish(conn);
+        const p_z = arena.dupeZ(u8, principal) catch return false;
+        const params = [_]?[*:0]const u8{p_z.ptr};
+        const res = c.PQexecParams(conn, "SELECT EXISTS (SELECT 1 FROM public.zebridge_purges WHERE principal = $1)::text", 1, null, &params, null, null, 0);
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) return false;
+        return std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, 0, 0)), "true");
     }
 
     /// §10jj: the ban's undo. A principal that gets a mapping back (its first membership

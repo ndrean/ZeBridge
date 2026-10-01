@@ -382,6 +382,15 @@ export function renewDue(creds: string, now = Math.floor(Date.now() / 1000)): bo
   return !!t && t.exp > t.iat && (t.exp - now) * 4 < t.exp - t.iat;
 }
 
+/// §10kn: `/renew` refused a revoked key AND asked for its local data to be deleted
+/// (`bridge --revoke <principal> --purge`).
+export class RevokedPurge extends Error {
+  readonly purge = true;
+  constructor() {
+    super('renew: refused — the principal was revoked, and its local data must be deleted');
+  }
+}
+
 /// §10jt: a new JWT for the SAME key, no invite — sign `zebridge-renew:<pub>:<ts>` with the
 /// identity's seed, `GET <bridge>/renew`, and rebuild the identity (NATS URLs, grammar
 /// hash and memberships come back current). libzb's `renew`, the same wire.
@@ -397,7 +406,13 @@ export async function renewAt(id: EnrolledIdentity, transport: Transport = natsT
   } catch (e) {
     throw new Error(`renew: ${id.bridge_url} unreachable (${(e as Error).message})`);
   }
-  if (res.status === 403) throw new Error('renew: refused — the key is revoked or no membership is left: a new invite is needed');
+  if (res.status === 403) {
+    // §10kn: `bridge --revoke --purge` — the answer says so, and the caller deletes the
+    // device's replica and identity.
+    const body = await res.json().catch(() => ({})) as { purge?: boolean };
+    if (body.purge) throw new RevokedPurge();
+    throw new Error('renew: refused — the key is revoked or no membership is left: a new invite is needed');
+  }
   if (!res.ok) throw new Error(`renew: ${id.bridge_url} answered ${res.status}: ${(await res.text()).slice(0, 160)}`);
   const p = await res.json() as Record<string, string | undefined>;
   if (!p.jwt) throw new Error('renew: the bridge\'s answer has no jwt');
@@ -552,6 +567,9 @@ export class ZeBridge {
   /// §10dm: the ban was seen (`mutation_ack.<principal>.revoked`) — closed, and staying
   /// closed. The rows stay; the wipe is the application's explicit `wipe()`.
   public revoked = false;
+  /// §10kn: the revocation asked for a purge (`bridge --revoke --purge`), and this
+  /// client deleted its replica and forgot its identity.
+  public purged = false;
   private sweepId?: ReturnType<typeof setInterval>;
   private rttIntervalId?: ReturnType<typeof setInterval>;
   private hbIntervalId?: ReturnType<typeof setInterval>;
@@ -613,6 +631,10 @@ export class ZeBridge {
           if (this.identityKey) await this.platform.identity?.save(this.identityKey, JSON.stringify(fresh));
           this.appendLog('SYS', `Renewed '${fresh.principal}' — the next reconnect presents the new JWT`, 'INFO');
         } catch (e) {
+          if (e instanceof RevokedPurge) {
+            await this.purgeLocal();
+            return; // no more renewals: there is nothing left to renew
+          }
           this.appendLog('SYS', `${(e as Error).message} — retried shortly`, 'WARN');
         }
       }
@@ -644,6 +666,13 @@ export class ZeBridge {
             if (store) await store.save(key, JSON.stringify(id));
             this.appendLog('SYS', `Renewed '${id.principal}' at ${id.bridge_url}`, 'INFO');
           } catch (e) {
+            if (e instanceof RevokedPurge) {
+              // §10kn: revoked with a purge — delete the replica and the identity, then
+              // fail the connect: this device has nothing left to connect with.
+              this.identityKey = key;
+              await this.purgeLocal();
+              throw e;
+            }
             const t = jwtTimes(id.creds);
             if (!t || t.exp <= Date.now() / 1000) throw e;
             this.appendLog('SYS', `${(e as Error).message} — carrying on with the current JWT`, 'WARN');
@@ -1145,6 +1174,32 @@ export class ZeBridge {
   public async wipe(): Promise<void> {
     await this.close();
     await this.deleteDatabaseFile();
+  }
+
+  /// §10kn: the operator revoked this principal with `--purge`. Delete the replica and
+  /// forget the identity, so the device holds neither the data nor a key. Only on that
+  /// instruction: a plain revocation still leaves the rows, and wipe() to the app.
+  private async purgeLocal(): Promise<void> {
+    if (this.purged) return;
+    this.purged = true;
+    this.revoked = true;
+    try { await this.initializeStorage(); } catch { /* nothing opened, nothing to keep */ }
+    try {
+      await this.wipe();
+    } catch (e) {
+      this.appendLog('SYS', `purge: the replica could not be deleted (${(e as Error).message})`, 'ERROR');
+    }
+    const key = this.identityKey ?? this.identityKeyFor();
+    try { await this.platform.identity?.save(key, ''); } catch { /* no store: nothing kept */ }
+    this.identityNow = null;
+    this.appendLog('SYS', `'${this.config.principal}' REVOKED with a purge by the operator — the local replica and identity are deleted`, 'ERROR');
+    this.emitStatus('disconnected');
+  }
+
+  /// Where the identity is kept: `identityPath`, else `<dbPath>.identity`, else the default.
+  private identityKeyFor(): string {
+    const c = this.config;
+    return c.identityPath ?? (c.dbPath ? `${c.dbPath}.identity` : 'zebridge.identity');
   }
 
   public async close(): Promise<void> {
@@ -3812,6 +3867,11 @@ export class ZeBridge {
           // §10dm: the ban — hang up now, stay hung up. Cooperative: this library obeys;
           // the account JWT's revocation is the enforcement.
           this.revoked = true;
+          if (verdict.purge) {
+            // §10kn: `--revoke --purge` — the data goes with the access.
+            void this.purgeLocal();
+            return true;
+          }
           this.appendLog('SYS', `'${this.config.principal}' REVOKED by the operator (${verdict.reason ?? ''}) — hanging up now. The local rows stay; wipe() is the application's explicit act.`, 'ERROR');
           this.emitStatus('disconnected');
           void this.close();

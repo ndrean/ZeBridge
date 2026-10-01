@@ -33,17 +33,18 @@ The durable outbox lives in the client's SQLite. Reinstalling the app or clearin
 The client never runs migrations — it adapts to the schema the bridge publishes.
 Two migration shapes need care:
 
-- **ADD COLUMN with a non-NULL default diverges silently.** The client does `ALTER TABLE ADD COLUMN` with no default, so existing local rows read NULL. A constant-default ADD COLUMN in PostgreSQL emits no per-row WAL, so no CDC carries the default to the client — PostgreSQL's old rows have the default every client's old rows have NULL, and nothing reconciles them. **Bump the generation to force a re-seed** after such a migration, or old rows stay NULL on every client forever. A column added with no default (NULL everywhere) is fine.
-- **A primary-key TYPE change forces a full re-seed.** Changing a pk from `bigserial` to `uuid` changes the key *values*, not just the type — the client's rows are keyed by the old values and cannot be migrated in place. This is a re-key, not an ALTER; it must trigger a full re-seed. Treat any pk-shape change as re-seed-forcing.
+- **ADD COLUMN with an expression default diverges silently.** A constant default travels with the schema, and every replica fills its old rows with it. An expression (`DEFAULT now()`) is evaluated by PostgreSQL alone: its old rows get a value, every replica's old rows get NULL, and no change event reconciles them. Run `zebridge_reseed('t')` after such a migration. See [MIGRATIONS.md](MIGRATIONS.md).
+- **A primary-key change re-seeds the table.** Changing a key's type or columns changes the key *values*, so replicas cannot migrate their rows in place. The DDL trigger notices and every replica re-seeds the table from a fresh full snapshot, by itself; re-run `zebridge_enable` for the table afterwards. Plan it like a downtime, not like an `ALTER`.
 
-## Per-principal write rate-limiting does not exist yet
+## Write flooding is limited per principal, not prevented upstream
 
-HAProxy rate-limits `/enroll` and edge connections, but mutations flow down the
-NATS WebSocket, which the proxy treats as one opaque long-lived tunnel — it never sees the individual writes inside it. Nor does NATS throttle per user: a user JWT's `payload`/`subs`/`data` limits are caps (message size, subscription count, a byte budget), not rates, and JetStream's ingest limit is server-wide — a flooding principal degrades its neighbours before it is stopped. So today one authenticated client can flood a tenant's writes. The fix belongs in the bridge's mutation listener: a token bucket per principal at classify time, refusing over-budget writes with a `rate_limited` verdict (shelved). Set the JWT caps at enrollment anyway — cheap hygiene, not the answer.
+A reverse proxy cannot see individual writes: they travel inside the NATS connection, one long-lived tunnel. NATS does not throttle per user either: a JWT's limits are caps (message size, subscriptions, bytes), not rates. So the limits sit where the writes arrive, in two layers:
+
+- **A backlog per principal**, at the MUTATIONS stream: past `MUTATION_BACKLOG_PER_PRINCIPAL` queued writes (5,000 by default), that principal's next writes are refused at the door. Nobody else notices.
+- **A rate per principal and per tenant**, in the bridge (`MUTATION_RATE_PER_PRINCIPAL`, off by default): a write over the rate is delayed, not dropped. JetStream redelivers it when its turn comes, so a flood is served at the rate while other tenants' writes go through as if it were not there. Only a write still over the rate after its last redelivery is answered `rate_limited`, with a `retry_after_ms`.
+
+What remains: a flooder still fills its own backlog, and it can cost a share of the bridge's ingress time until the limits catch it. Set `MUTATION_RATE_PER_PRINCIPAL` in production; it is off by default.
 
 ## Not yet battle-tested at scale
 
-Chaos-tested and stress-tested to ~21.5k mutations/s sustained on one machine, but not run against a real fleet. Untested at time of writing: a genuinely large
-initial seed on a constrained device, whole-system disaster recovery (the claim
-that NATS state rebuilds from PostgreSQL at boot is sound but unproven as a
-runbook), and fleet-wide client-lag observability.
+Chaos-tested and stress-tested to about 20k client writes/s sustained on one machine, and a 3.2M-row table seeded on a low-end Android phone, but not run against a real fleet. Untested: whole-system disaster recovery (the claim that NATS state rebuilds from PostgreSQL at boot is sound but unproven as a runbook), and several bridges side by side on one database.

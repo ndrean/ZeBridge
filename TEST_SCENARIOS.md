@@ -18,15 +18,15 @@ Three clients exist, and the same protocol is asserted through each:
 
 | client | where | its suite |
 | --- | --- | --- |
-| `zb-client-ts` <br> (TS shell + pure core) | `zb-client-ts/` | `pnpm test` — 127 fixture cases in `fixtures/core-fixtures.json` |
-| `libzb` (Zig, C ABI) | `libzb/` | `zig build test`; `python/runner.py` runs the SAME 127 fixtures through the C ABI |
+| `zb-client-ts` <br> (TS shell + pure core) | `zb-client-ts/` | `pnpm test` — the shared test cases in `fixtures/core-fixtures.json` |
+| `libzb` (Zig, C ABI) | `libzb/` | `zig build test`; `python/runner.py` runs the SAME shared cases through the C ABI |
 | `examples/05-tables/web-consumer` (vite, OPFS/PGlite) | `examples/05-tables/web-consumer/` | driven by hand; `window.zb` exposes the index card for scripted checks |
 
 ## How to run
 
 ```bash
 # unit
-zig build test                       # the bridge (264)
+zig build test                       # the bridge
 (cd libzb && zig build test)         # the Zig client (+1 live test, ZB_LIVE=1)
 (cd nats.zig && zig build test)      # the vendored NATS client (e2e needs docker)
 (cd zb-client-ts && pnpm test)       # the TS core, fixture-pinned
@@ -40,6 +40,11 @@ psql -c "SELECT * FROM zebridge_check_all('{\"users\":\"read_only\",\"orders\":{
 scripts/zbdoctor.py --intent intent.json      # the same, plus the live bridge/NATS gates
 
 # the scenarios (scripts/scenarios/README.md for setup)
+# ⚠️ The dev NATS serves TLS on 4222 and the sourced env says tls://localhost:4222. The
+# scenarios' clients get no CA, so point them at the plain URL (the server still accepts
+# it), and give Node clients the test CA (they upgrade to TLS whenever it is offered):
+#   export NATS_URL=nats://127.0.0.1:4222
+#   export NODE_EXTRA_CA_CERTS=$PWD/nats.zig/tests/configs/certs/ca.pem
 set -a && . ./.env.bridge && set +a
 scripts/scenarios/run.py offline     # no stack needed
 scripts/scenarios/run.py live        # against the running bridge
@@ -54,7 +59,80 @@ Every scenario's exit code is its verdict. `run.py` sequences a group and fails 
 failed; the `manual` group (`speed`, `burst`, `leaksoak`, `objstore_race`, `tls`) is
 listed and never run by it — those report, they do not assert.
 
-## What is asserted, by property
+## What the tests prove, in plain words
+
+Each row: something that could go wrong, what the test shows instead, and the test that shows it (in `scripts/scenarios/` unless named otherwise). The tables after this section give the same ground in more detail.
+
+### Nothing is lost
+
+| what could go wrong | what the test shows | test |
+| --- | --- | --- |
+| the bridge crashes, or is killed, while PostgreSQL keeps changing | every change made meanwhile arrives after the restart | `downtime.py` |
+| the bridge is killed in the middle of a big transaction | the whole transaction is sent again; no row is lost, none is doubled | `txn_kill.py` |
+| NATS is down for minutes | the bridge waits, confirms nothing to PostgreSQL, and delivers every row when NATS is back | `nats_outage.py` |
+| PostgreSQL restarts under the bridge | the bridge reconnects and carries on from where it was; nothing is lost | `pg_restart.py` |
+| NATS and PostgreSQL both go down, in either order, even with the bridge killed too | one bridge survives all four cases and loses nothing | `matrix.py` |
+| the NATS stream is full and refuses messages | the bridge stops on its own instead of losing data; after the fix, a restart loses nothing | `stream_full.py` |
+| a phone app is killed while it loads a table, twice | it reopens, finishes loading, and holds exactly what PostgreSQL holds | `client_kill.py` |
+| the snapshot builder is killed half-way | no snapshot ever points to data that is not there | `chain_kill.py` |
+
+### Nothing comes out wrong
+
+| what could go wrong | what the test shows | test |
+| --- | --- | --- |
+| an old write, sent by a device that was offline, overwrites newer data | it is refused as `stale`; a write that really is newer still lands | `offline.py`, `mutate.py` |
+| an old write brings back a deleted row | the row stays deleted | `offline.py` |
+| an old write brings back a deleted row after the sweeper removed its tombstone | the bridge refuses the write (`PredatesGcWatermark`); without that guard the same write does bring the row back, which the test also shows | `gc_resurrect.py` |
+| two writes carry the same version | the tiebreak column picks the same winner everywhere | `tiebreak.py` |
+| a device's clock is fast or slow | a fast clock wins only until real time catches up; a slow clock can still write | `clockskew.py` |
+| a device's clock is far in the future | the version is cut back to the server's time, and the answer says so | `clamp.py` |
+| a write gets no answer, or blocks the ones behind it | every write gets an answer, and the write path never stalls | `replies.py`, `race.py` |
+| a value changes on the way from PostgreSQL to a device | every value arrives identical, field by field, wide rows included | `decode_integrity.py` |
+| two people edit the same row at once and one edit disappears | edits to different fields both survive; the same field ends with one winner | `crdt.py`, `route_crdt.py` |
+
+### Schema changes
+
+| what could go wrong | what the test shows | test |
+| --- | --- | --- |
+| a column is added, renamed or dropped while devices are connected | every replica follows, and the values are kept | `migrate_both.py` |
+| a device is offline during an `ADD` / `DROP COLUMN`, with a write queued | it comes back with the new columns, the queued write is settled, and it equals PostgreSQL | `offline_migrate.py` |
+| after a `DROP COLUMN`, writes to the table fail | writes keep working (this test found that they did not, and the fix) | `offline_migrate.py` |
+| a device is offline while the table's key changes | it rebuilds the table, loads it again, and equals PostgreSQL | `rekey_offline.py` |
+| queued writes meet a new schema (a dropped column, a new required column, a new key) | each one gets a clear answer, and the replicas equal PostgreSQL | `write_stale.py` |
+| a column without a time zone makes "newer" ambiguous | the database refuses it when the table is created or altered | `tzguard.py` |
+| one oversized row blocks a table for everyone | the row is refused, in PostgreSQL and from a device; only its sender gets the refusal | `widthguard.py`, `rowsize.py` |
+| a table that breaks a rule stops everything | only that table is suspended, and it resumes by itself once fixed | `suspension_lift.py`, `legacybait.py` |
+
+### Catching up after being away
+
+| what could go wrong | what the test shows | test |
+| --- | --- | --- |
+| a device is away longer than the change stream keeps | it reloads the table from a snapshot and converges | `client_gap.py` |
+| the change stream is deleted under a connected device | the bridge recreates it, the device starts again from a snapshot, and converges | `stream_wipe.py` |
+| the replication slot is lost | the bridge refuses to start and says how to recover; after recovery every device reloads | `slot_loss.py` |
+| rows deleted since the last snapshot come back on a device that reloads | a full snapshot is cut instead, so they do not | `genproducer.py` |
+
+### Who can see and change what
+
+| what could go wrong | what the test shows | test |
+| --- | --- | --- |
+| a device reaches another tenant's data through NATS | each way a client could try is attempted, and the outcome recorded | `crosstenant.py`, `inbox_sniff.py` |
+| a device writes into another tenant | PostgreSQL refuses it; a user with no tenant can write nothing | `tenant_writes.py` |
+| a device writes under someone else's name, or the bridge falls back to admin rights | neither is possible | `credentials.py` |
+| hostile or malformed messages stall or crash the bridge | each one is refused; nothing stalls, nothing leaks | `adversarial.py` |
+| a revoked user keeps access | their writes are refused at once; a full revocation also cuts their reads and ends their open session at once | `revoke.py`, `revoke_full.py` |
+| a revoked user's data stays on their device | with `--purge`, the device deletes its replica and identity when it reconnects or renews its JWT; a plain revocation leaves them | `revoke_purge.py` |
+| an expired JWT fails silently and the device retries forever | it fails with a clear, named error | `jwt_expiry.py` |
+
+### Under load
+
+| what could go wrong | what the test shows | test |
+| --- | --- | --- |
+| sustained writes slowly degrade | 4 million writes at a steady 21,500 per second for three minutes | `stamp.py` |
+| repeated disconnections leak memory or lose messages | memory, files and threads stay flat; no message lost or doubled | `churn.py` |
+| NATS dies under a steady stream of changes | the bridge holds back and stops cleanly, then delivers everything when NATS returns | `cascade.py` |
+
+## In detail, by property
 
 ### Schema and CDC
 

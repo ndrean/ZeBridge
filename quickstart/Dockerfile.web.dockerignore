@@ -1,0 +1,10 @@
+# Only what the web image copies; nothing built locally.
+*
+!zb-client-ts/
+!examples/05-tables/web-consumer/
+!quickstart/nginx.conf
+**/node_modules
+**/dist
+**/*.sqlite3*
+# the dev stack's creds files (a symlink): the quickstart enrolls with invites
+examples/05-tables/web-consumer/public/creds

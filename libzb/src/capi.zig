@@ -584,6 +584,12 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
                 cur.* = fresh;
                 try enroll.save(a, id_path, cur.*);
             } else |_| {
+                if (enroll.last_purge) {
+                    // §10kn: revoked with a purge — delete the replica and the identity
+                    // before failing the connect; nothing is left to connect with.
+                    unlinkLocal(db_given, id_path);
+                    return error.EnrollFailed;
+                }
                 const expired = if (enroll.jwtTimes(cur.creds)) |t| t.exp <= nowSeconds() else false;
                 if (expired) return error.EnrollFailed;
                 std.debug.print("zebridge: {s} — carrying on with the current JWT\n", .{enroll.last_failure orelse "renew failed"});
@@ -824,7 +830,7 @@ export fn zb_creds_file_text(jwt: ?[*:0]const u8, seed: ?[*:0]const u8) ?[*:0]u8
 /// `1` revoked, `0` live, `-1` unknown handle — an `int`, not JSON, so a host can poll
 /// it without allocating.
 export fn zb_client_revoked(handle: u64) c_int {
-    const b = lookup(handle) orelse return -1;
+    const b = lookup(handle) orelse return if (wasPurged(handle)) 1 else -1;
     return if (b.c.revoked) 1 else 0;
 }
 
@@ -927,7 +933,7 @@ fn membershipJson(a: std.mem.Allocator, b: *ClientBox, tenant: []const u8, joini
 /// local tables. The JWT decides whether the broker allows it. Returns
 /// `{"tenants":[…]}` or `{"error":…}`.
 export fn zb_client_join(handle: u64, tenant: ?[*:0]const u8) ?[*:0]u8 {
-    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const b = lookup(handle) orelse return goneJson(handle);
     const t = std.mem.span(tenant orelse return errJson("NullArgument"));
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
@@ -938,7 +944,7 @@ export fn zb_client_join(handle: u64, tenant: ?[*:0]const u8) ?[*:0]u8 {
 /// Stop following a tenant: its rows leave the local tables, its watermarks and
 /// positions are forgotten, its tail is closed. Returns `{"tenants":[…]}`.
 export fn zb_client_leave(handle: u64, tenant: ?[*:0]const u8) ?[*:0]u8 {
-    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const b = lookup(handle) orelse return goneJson(handle);
     const t = std.mem.span(tenant orelse return errJson("NullArgument"));
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
@@ -947,10 +953,13 @@ export fn zb_client_leave(handle: u64, tenant: ?[*:0]const u8) ?[*:0]u8 {
 }
 
 export fn zb_client_sync(handle: u64) ?[*:0]u8 {
-    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const b = lookup(handle) orelse return goneJson(handle);
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
-    const out = syncJson(arena.allocator(), b) catch |err| return errJson(@errorName(err));
+    const out = syncJson(arena.allocator(), b) catch |err| {
+        if (purgeIfAsked(handle, b)) return errJson("Revoked");
+        return errJson(@errorName(err));
+    };
     return dupeZ(out);
 }
 
@@ -964,7 +973,7 @@ fn queryJson(a: std.mem.Allocator, b: *ClientBox, sql: []const u8, params_text: 
 }
 
 export fn zb_client_query(handle: u64, sql: ?[*:0]const u8, params_json: ?[*:0]const u8) ?[*:0]u8 {
-    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const b = lookup(handle) orelse return goneJson(handle);
     const q = std.mem.span(sql orelse return null);
     const p = if (params_json) |pj| std.mem.span(pj) else "";
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -989,7 +998,7 @@ fn mutateJson(a: std.mem.Allocator, b: *ClientBox, table: []const u8, op: []cons
 }
 
 export fn zb_client_mutate(handle: u64, table: ?[*:0]const u8, op: ?[*:0]const u8, key_json: ?[*:0]const u8, values_json: ?[*:0]const u8) ?[*:0]u8 {
-    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const b = lookup(handle) orelse return goneJson(handle);
     const t = std.mem.span(table orelse return null);
     const o = std.mem.span(op orelse return null);
     const k = std.mem.span(key_json orelse return null);
@@ -1003,7 +1012,7 @@ export fn zb_client_mutate(handle: u64, table: ?[*:0]const u8, op: ?[*:0]const u
 /// `zb_client_mutate` with the caller's own version stamp (RFC 3339 UTC, the wire
 /// form): a host that keeps its own clock, or a test modelling a slow one.
 export fn zb_client_mutate_at(handle: u64, table: ?[*:0]const u8, op: ?[*:0]const u8, key_json: ?[*:0]const u8, values_json: ?[*:0]const u8, version: ?[*:0]const u8) ?[*:0]u8 {
-    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const b = lookup(handle) orelse return goneJson(handle);
     const t = std.mem.span(table orelse return null);
     const o = std.mem.span(op orelse return null);
     const k = std.mem.span(key_json orelse return null);
@@ -1084,7 +1093,7 @@ fn pollJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
 /// with `zb_client_reply`. No second connection, no thread, no lock: a responder is a
 /// client that answers questions about its own replica.
 export fn zb_client_serve(handle: u64, opts_json: ?[*:0]const u8) ?[*:0]u8 {
-    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const b = lookup(handle) orelse return goneJson(handle);
     const text = std.mem.span(opts_json orelse return errJson("NoOptions"));
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
@@ -1105,7 +1114,7 @@ export fn zb_client_serve(handle: u64, opts_json: ?[*:0]const u8) ?[*:0]u8 {
 /// §10hp: the answer to one question from `poll`'s `requests`, on the asker's inbox.
 /// `answer_json` is sent as it stands. Returns {"replied":<id>}.
 export fn zb_client_reply(handle: u64, id: u64, answer_json: ?[*:0]const u8) ?[*:0]u8 {
-    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const b = lookup(handle) orelse return goneJson(handle);
     const answer = std.mem.span(answer_json orelse return errJson("NoAnswer"));
     b.c.reply(id, answer) catch |err| return errJson(@errorName(err));
     var buf: [64]u8 = undefined;
@@ -1142,6 +1151,12 @@ fn maybeRenew(b: *ClientBox) void {
     defer id.deinit(a);
     // Another process sharing the identity may have renewed it already.
     var fresh = if (enroll.renewDue(id.creds, now)) (enroll.renew(a, id) catch {
+        if (enroll.last_purge) {
+            // §10kn: the next entry point (`zb_client_poll`, right after this) purges.
+            b.c.revoked = true;
+            b.c.purge_requested = true;
+            return;
+        }
         std.debug.print("zebridge: {s} — retried in a minute\n", .{enroll.last_failure orelse "renew failed"});
         return;
     }) else (enroll.load(a, path) catch null) orelse return;
@@ -1162,11 +1177,13 @@ fn maybeRenew(b: *ClientBox) void {
 }
 
 export fn zb_client_poll(handle: u64, wait_ms: u64) ?[*:0]u8 {
-    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const b = lookup(handle) orelse return goneJson(handle);
     maybeRenew(b);
+    if (purgeIfAsked(handle, b)) return errJson("Revoked");
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
     const out = pollJson(arena.allocator(), b, wait_ms) catch |err| {
+        if (purgeIfAsked(handle, b)) return errJson("Revoked");
         // The single door every poll error passes — so the auth verdict is named
         // HERE, once, whichever `try` inside poll surfaced the dead socket (§10cj:
         // a mid-session JWT expiry may appear as ConnectionClosed, a read error or a
@@ -1177,11 +1194,62 @@ export fn zb_client_poll(handle: u64, wait_ms: u64) ?[*:0]u8 {
     return dupeZ(out);
 }
 
+// ── §10kn: `bridge --revoke --purge`, honoured ──────────────────────────────────
+//
+// The ban (or `/renew`) asked for the device's data to go. The C layer does it because
+// it owns what must be deleted: the handle's database files and its identity file. The
+// same steps as zb_client_wipe, plus the identity; the handle is then gone, and
+// remembered, so zb_client_revoked still answers 1 and every other call `Revoked`.
+
+var purged_handles: [64]u64 = [_]u64{0} ** 64;
+var purged_next: usize = 0;
+
+fn wasPurged(handle: u64) bool {
+    for (purged_handles) |h| if (h == handle and h != 0) return true;
+    return false;
+}
+
+/// `Revoked` for a handle a purge removed, `UnknownHandle` otherwise.
+fn goneJson(handle: u64) ?[*:0]u8 {
+    return errJson(if (wasPurged(handle)) "Revoked" else "UnknownHandle");
+}
+
+/// Unlink the replica (with its -wal and -shm) and, when there is one, the identity file.
+fn unlinkLocal(db: []const u8, id_path: ?[]const u8) void {
+    for ([_][]const u8{ "", "-wal", "-shm" }) |suffix| {
+        var buf: [1040]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ db, suffix }) catch continue;
+        _ = std.c.unlink(p.ptr);
+    }
+    if (id_path) |ip| {
+        var buf: [1040]u8 = undefined;
+        if (std.fmt.bufPrintZ(&buf, "{s}", .{ip})) |p| _ = std.c.unlink(p.ptr) else |_| {}
+    }
+}
+
+/// True when this handle was just purged (the caller answers `Revoked`).
+fn purgeIfAsked(handle: u64, b: *ClientBox) bool {
+    if (!b.c.purge_requested) return false;
+    var db_buf: [1024]u8 = undefined;
+    const db = std.fmt.bufPrint(&db_buf, "{s}", .{b.db}) catch "";
+    var id_buf: [1024]u8 = undefined;
+    const id_path: ?[]const u8 = if (b.id_path) |p| (std.fmt.bufPrint(&id_buf, "{s}", .{p}) catch null) else null;
+    var who_buf: [256]u8 = undefined;
+    const who = std.fmt.bufPrint(&who_buf, "{s}", .{b.principal}) catch "";
+    const box = clients.remove(handle) orelse return false;
+    box.destroy(std.heap.c_allocator);
+    unlinkLocal(db, id_path);
+    purged_handles[purged_next % purged_handles.len] = handle;
+    purged_next += 1;
+    std.debug.print("zebridge: '{s}' REVOKED with a purge by the operator — the local replica and identity are deleted\n", .{who});
+    return true;
+}
+
 /// §10hj: one request/reply on the card's connection. `subject` a query subject the
 /// principal may publish to (`query.<tenant>.<name>`), `payload_json` the question;
 /// the service's reply comes back verbatim (JSON by convention), or {"error":…}.
 export fn zb_client_request(handle: u64, subject: ?[*:0]const u8, payload_json: ?[*:0]const u8, timeout_ms: u64) ?[*:0]u8 {
-    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const b = lookup(handle) orelse return goneJson(handle);
     const subj = std.mem.span(subject orelse return null);
     const payload = if (payload_json) |p| std.mem.span(p) else "";
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -1195,7 +1263,7 @@ export fn zb_client_request(handle: u64, subject: ?[*:0]const u8, payload_json: 
 /// table's columns, ? params>", "params": […]}`: the area the answer is authoritative
 /// for, whose local rows the answer did not carry are deleted. {"applied": n}.
 export fn zb_client_ingest(handle: u64, table: ?[*:0]const u8, answer_json: ?[*:0]const u8, scope_json: ?[*:0]const u8) ?[*:0]u8 {
-    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const b = lookup(handle) orelse return goneJson(handle);
     const tbl = std.mem.span(table orelse return null);
     const ans = std.mem.span(answer_json orelse return null);
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -1217,7 +1285,7 @@ export fn zb_client_ingest(handle: u64, table: ?[*:0]const u8, answer_json: ?[*:
 
 /// Send the outbox and wait up to `wait_ms` for verdicts — zb-client-ts's `flushOutbox()`.
 export fn zb_client_flush_outbox(handle: u64, wait_ms: u64) ?[*:0]u8 {
-    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const b = lookup(handle) orelse return goneJson(handle);
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
     const out = flushJson(arena.allocator(), b, wait_ms) catch |err| return errJson(@errorName(err));

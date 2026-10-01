@@ -170,6 +170,7 @@ Everything below the core — the shells — is where parity is by hand, and whe
 | one identity format: a file libzb writes, zb-client-ts on Node reads, and back | ✓ | ✓ |
 | https enrollment and renewal | ✓, except iOS: Zig cannot read the system trust store, so the app enrolls itself and passes `creds` | ✓ |
 | JWT renewal: checked every eighth of the JWT's life (at most every 60 s), renewed with a quarter left, by signing with the device's key (`/renew`); the next reconnect uses the new JWT | ✓ in `poll` | ✓ on a timer |
+| purge on revocation (`bridge --revoke --purge`): the ban's `"purge": true`, or `/renew`'s 403 with it, deletes the replica and the stored identity | ✓ in the C layer after `poll` / `sync`; `zb_client_revoked` still answers 1, every other call `Revoked` | ✓ `purged` set, the replica deleted, the identity emptied |
 | seed gate by stream seq, never by LSN | ✓ | ✓ |
 | on-demand tables: schema followed, nothing seeded or tailed, rows from `request` + `ingest` | ✓ | ✓ |
 | seeding scoped to gapped streams, shared route included | ✓ | ✓ |

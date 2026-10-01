@@ -1446,7 +1446,7 @@ Two things follow, and they are the whole reason this section is long:
    | `accepted` | pop |
    | `stale` | pop — do **not** hand-revert; the winning row arrives via CDC. An UPDATE is kept aside until that row is here (its version is above the refused stamp): resubmitted with a fresh stamp when the winner changed none of its columns, dropped and surfaced when they overlap (§7.6) |
    | `row_deleted` | pop, revert the local row to "deleted," and surface it to the user |
-   | `revoked` | not a reply to a write: the ban. Published as `mutation_ack.<principal>.revoked` when the principal's last mapping is deleted, retained by `VERDICTS` until a mapping is given back or 2 h pass. Close the connection now, stay closed on reconnect (probe it by direct get before reading anything), answer `Revoked` to every call; leave the rows — the wipe is the application's explicit act |
+   | `revoked` | not a reply to a write: the ban. Published as `mutation_ack.<principal>.revoked` when the principal's last mapping is deleted, retained by `VERDICTS` until a mapping is given back or 2 h pass. Close the connection now, stay closed on reconnect (probe it by direct get before reading anything), answer `Revoked` to every call; leave the rows — the wipe is the application's explicit act. **Unless** the body carries `"purge": true` (`bridge --revoke --purge`): then close, delete the replica (and its `-wal`/`-shm`), and forget the stored identity. The same purge applies when `/renew` answers 403 with `"purge": true`, the channel that still reaches a device whose token NATS already refuses |
    | `rejected` | pop, revert the local row to its pre-write state |
    | timeout / error | keep, retry (idempotent via `msg_id` for 2 minutes — §2) |
 
@@ -1467,7 +1467,11 @@ Two things follow, and they are the whole reason this section is long:
 6. **Check the GC watermark before flushing after a long offline period** — the one row of
    `zebridge_gc_watermark`, which arrives over CDC like any other table (§7.5). A queued
    mutation older than the watermark cannot be applied safely — the tombstone that would
-   have overruled it has been reaped (§7.5).
+   have overruled it has been reaped (§7.5). Drop it, revert its optimistic copy, and say
+   the edit is lost. The bridge refuses such a write too (`rejected`,
+   `PredatesGcWatermark`), against the current watermark, so a client that flushes before
+   it has caught up gets a verdict instead of resurrecting a row; the client-side check
+   saves the round trip.
 
 7. **Collect the verdicts you missed before replaying anything.** A verdict is retained
    on `mutation_ack.<principal>.<msg_id>`, and the outbox knows every `msg_id` it awaits:
@@ -1683,6 +1687,7 @@ with no SQLSTATE at all — are retried up to `max_deliver` and then reported as
 | `MissingTable` / `MissingOperation` | the subject has a token missing (a malformed principal usually gets `MalformedSubject` first) |
 | `DbAllocatedKey` | the table's primary key is sequence-backed — see "Who allocates the key" |
 | `RowTooLargeToReplicate` | the payload is wider than `max_row_bytes` (§3) — storing it would suspend the table for every client |
+| `PredatesGcWatermark` | the write's version is at or before the GC watermark (§7.5): its row's tombstone may have been reaped, and applying it could bring a deleted row back. The bridge compares against the current watermark, so this holds even for a client whose own copy of the watermark is old |
 | `UnsupportedPayloadType` | a value's MessagePack type cannot be rendered for its column — an array or a map sent to a scalar column |
 
 ⚠️ **A verdict can only have come from the bridge.** A client may publish under its own

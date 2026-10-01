@@ -574,6 +574,16 @@ pub const Server = struct {
         const res = c.PQexecParams(conn, "SELECT principal FROM public.zebridge_principal_keys WHERE user_pubkey = $1 AND revoked_at IS NULL", 1, null, &params[0], null, null, 0);
         defer c.PQclear(res);
         if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) {
+            // §10kn: a revoked key whose principal's latest revocation asked for a purge
+            // is told so: the library deletes the device's replica and identity. This is
+            // the channel that still reaches a device after a FULL revocation, when NATS
+            // refuses its token and the ban on its verdict channel is out of reach.
+            const pr = c.PQexecParams(conn, "SELECT 1 FROM public.zebridge_principal_keys k JOIN public.zebridge_purges p USING (principal) WHERE k.user_pubkey = $1 AND k.revoked_at IS NOT NULL", 1, null, &params[0], null, null, 0);
+            defer c.PQclear(pr);
+            if (c.PQresultStatus(pr) == c.PGRES_TUPLES_OK and c.PQntuples(pr) == 1) {
+                log.warn("🔁 renewal refused: key revoked — the device is told to purge its local data", .{});
+                return bad.respond(req, cors, .forbidden, "{\"error\":\"key revoked\",\"revoked\":true,\"purge\":true}\n");
+            }
             log.warn("🔁 renewal refused: key unknown or revoked", .{});
             return bad.respond(req, cors, .forbidden, "{\"error\":\"key unknown or revoked — a new invite is needed\"}\n");
         }

@@ -479,6 +479,10 @@ pub const MutationListener = struct {
     /// True when PostgreSQL stored something other than what the client sent, which for a
     /// successful write means the future-version clamp fired.
     last_clamped: bool = false,
+    /// §10km: `zebridge_gc_watermark.watermark` in Unix microseconds, read before each
+    /// batch and each single attempt; null when there is no row (no sweeper yet) or the
+    /// read failed, and then the guard is off. See `refreshGcWatermark`.
+    gc_watermark_us: ?i64 = null,
     /// What actually became of the last successfully-executed write — the three outcomes
     /// PROTOCOL.md §7.1 tells clients to key their outbox on.
     last_outcome: WriteOutcome = .applied,
@@ -755,6 +759,7 @@ pub const MutationListener = struct {
             error.UnknownColumn,
             error.KeyChange,
             error.RowTooLargeToReplicate,
+            error.PredatesGcWatermark,
             error.MissingVersion,
             error.NoVersionColumn,
             error.NoTombstoneColumn,
@@ -1055,6 +1060,7 @@ pub const MutationListener = struct {
         // Each attempt starts with no remembered reason, so a verdict can only
         // ever quote a failure from *this* message.
         self.clearFailure();
+        self.refreshGcWatermark(conn);
         self.handleMutation(mutation, payload, conn) catch |err| {
             // Retrying a malformed payload cannot help: the bytes will not
             // improve. Before this split, one bad message NAK'd forever at one
@@ -1207,6 +1213,8 @@ pub const MutationListener = struct {
         const Parsed = struct { msg: *nats.JetStreamMessage, mutation: Mutation };
         var parsed: std.ArrayListUnmanaged(Parsed) = .empty;
         defer parsed.deinit(self.allocator);
+        // Outside pipeline mode, once for the whole batch (§10km).
+        self.refreshGcWatermark(conn);
 
         for (msgs) |msg| {
             const payload = msg.msg.data;
@@ -1820,6 +1828,17 @@ pub const MutationListener = struct {
     ///     SQLSTATE to react to.
     ///
     /// Neither is a timer: nothing here polls the catalog.
+    /// §10km: re-read the GC watermark the guard in `handleMutation` compares against.
+    /// It never fails the write path: on any error the guard is off for this round, and
+    /// the clients' own gate still holds. Must run outside pipeline mode.
+    fn refreshGcWatermark(self: *MutationListener, conn: ?*c.PGconn) void {
+        self.gc_watermark_us = null;
+        const res = c.PQexec(conn, "SELECT (extract(epoch FROM watermark) * 1000000)::bigint FROM public.zebridge_gc_watermark WHERE id = 1") orelse return;
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) return;
+        self.gc_watermark_us = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch null;
+    }
+
     fn tableMeta(self: *MutationListener, conn: ?*c.PGconn, table: []const u8) !*const TableMeta {
         const epoch = self.catalog_epoch.current();
         if (self.meta_cache.getPtr(table)) |cached| {
@@ -2123,6 +2142,26 @@ pub const MutationListener = struct {
 
         const version_val = map.getByString("version") orelse return error.MissingVersion;
         const version_text = try self.payloadToString(alloc, version_val) orelse return error.MissingVersion;
+
+        // ── §10km: a write from before the GC watermark is never applied ────────
+        //
+        // The sweeper reaps tombstones older than the watermark, and with them
+        // PostgreSQL's memory that those rows were deleted. A write stamped at or before
+        // it may target a reaped row, and applying it would resurrect a deleted row on
+        // every replica. The clients refuse such a write themselves (PROTOCOL MUST 6),
+        // but only with the watermark they last saw: a client back from a long sleep
+        // that flushes before it has caught up holds an old one. So the bridge, which
+        // reads the current watermark, refuses it too: `rejected`, reason
+        // `PredatesGcWatermark`, and the client reverts its optimistic copy. Same rule
+        // as the clients' gate: version <= watermark. A version that is not a timestamp
+        // (an integer version column) is not compared.
+        if (self.gc_watermark_us) |wm| if (versionMicros(std.mem.span(version_text))) |v| if (v <= wm) {
+            log.info(
+                "⛔ Mutation refused [{s}] on '{s}': version {s} predates the GC watermark — its tombstone may be reaped, and applying it could resurrect a deleted row",
+                .{ mutation.principal, mutation.table, version_text },
+            );
+            return error.PredatesGcWatermark;
+        };
 
         const key_val = map.getByString("key") orelse return error.MissingPrimaryKey;
         if (key_val != .map) return error.InvalidPrimaryKeyFormat;
@@ -3162,6 +3201,88 @@ pub const MutationListener = struct {
         }
     }
 };
+
+/// §10km: a write's version as Unix microseconds, when it is a timestamp with a zone:
+/// `YYYY-MM-DD` then `T` or a space, `HH:MM:SS`, an optional fraction (cut to
+/// microseconds), then `Z` or `±HH`, `±HH:MM`, `±HHMM`. Anything else is null and is not
+/// compared: an integer version, or a timestamp without a zone, whose instant is unknown.
+fn versionMicros(text: []const u8) ?i64 {
+    const s = std.mem.trim(u8, text, " ");
+    if (s.len < 19 or s[4] != '-' or s[7] != '-' or s[13] != ':' or s[16] != ':') return null;
+    if (s[10] != 'T' and s[10] != 't' and s[10] != ' ') return null;
+    const num = struct {
+        fn at(t: []const u8, from: usize, len: usize) ?i64 {
+            if (from + len > t.len) return null;
+            return std.fmt.parseInt(i64, t[from .. from + len], 10) catch null;
+        }
+    };
+    const y = num.at(s, 0, 4) orelse return null;
+    const mo = num.at(s, 5, 2) orelse return null;
+    const d = num.at(s, 8, 2) orelse return null;
+    const h = num.at(s, 11, 2) orelse return null;
+    const mi = num.at(s, 14, 2) orelse return null;
+    const sec = num.at(s, 17, 2) orelse return null;
+    if (mo < 1 or mo > 12 or d < 1 or d > 31 or h > 23 or mi > 59 or sec > 60) return null;
+
+    var i: usize = 19;
+    var frac_us: i64 = 0;
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        var digits: usize = 0;
+        while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) {
+            if (digits < 6) frac_us = frac_us * 10 + (s[i] - '0');
+            digits += 1;
+        }
+        if (digits == 0) return null;
+        var pad = digits;
+        while (pad < 6) : (pad += 1) frac_us *= 10;
+    }
+    if (i >= s.len) return null; // no zone: not an instant
+    var offset_s: i64 = 0;
+    switch (s[i]) {
+        'Z', 'z' => i += 1,
+        '+', '-' => {
+            const sign: i64 = if (s[i] == '+') 1 else -1;
+            const oh = num.at(s, i + 1, 2) orelse return null;
+            i += 3;
+            var om: i64 = 0;
+            if (i < s.len and s[i] == ':') i += 1;
+            if (i < s.len) {
+                om = num.at(s, i, 2) orelse return null;
+                i += 2;
+            }
+            offset_s = sign * (oh * 3600 + om * 60);
+        },
+        else => return null,
+    }
+    if (i != s.len) return null;
+
+    // Days from the civil date (Howard Hinnant's algorithm).
+    const yy = if (mo <= 2) y - 1 else y;
+    const era = @divFloor(yy, 400);
+    const yoe = yy - era * 400;
+    const doy = @divFloor(153 * @mod(mo + 9, 12) + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    const days = era * 146097 + doe - 719468;
+    const secs = days * 86400 + h * 3600 + mi * 60 + sec - offset_s;
+    return secs * 1_000_000 + frac_us;
+}
+
+test "§10km: versionMicros reads every timestamp shape a version arrives in" {
+    // The clients' canonical form, PostgreSQL's text form, and offsets all agree.
+    try std.testing.expectEqual(@as(?i64, 1789885226474000), versionMicros("2026-09-20T06:20:26.474000Z"));
+    try std.testing.expectEqual(@as(?i64, 1789885226474000), versionMicros("2026-09-20 06:20:26.474+00"));
+    try std.testing.expectEqual(@as(?i64, 1789885226474000), versionMicros("2026-09-20T08:20:26.474+02:00"));
+    try std.testing.expectEqual(@as(?i64, 1789885226474000), versionMicros("2026-09-20T01:20:26.474-0500"));
+    try std.testing.expectEqual(@as(?i64, 1789885226474000), versionMicros("2026-09-20T06:20:26.474000999Z")); // cut, not rounded
+    try std.testing.expectEqual(@as(?i64, 946684799999999), versionMicros("1999-12-31T23:59:59.999999Z"));
+    try std.testing.expectEqual(@as(?i64, 0), versionMicros("1970-01-01T00:00:00Z"));
+    // Not compared: an integer version, a timestamp without a zone, garbage.
+    try std.testing.expectEqual(@as(?i64, null), versionMicros("42"));
+    try std.testing.expectEqual(@as(?i64, null), versionMicros("2026-09-20T06:20:26.474"));
+    try std.testing.expectEqual(@as(?i64, null), versionMicros("2026-13-20T06:20:26Z"));
+    try std.testing.expectEqual(@as(?i64, null), versionMicros("2026-09-20T06:20:26.Z"));
+}
 
 test "hexText - bytea input form" {
     const a = std.testing.allocator;

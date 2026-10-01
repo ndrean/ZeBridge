@@ -490,6 +490,8 @@ fn runDev(
         \\BRIDGE_CDC_PUBLICATION=zb_pub
         \\BRIDGE_PORT=27434
         \\LOG_LEVEL=info
+        \\# The snapshots clients seed from; without them a new client cannot load a table.
+        \\GENERATIONS_ENABLED=1
         \\
         \\# The bridge's nkey identity — unused by the OPEN dev server, but generated now
         \\# so the upgrade to operator mode is a conf swap, not a credential migration.
@@ -706,6 +708,8 @@ fn runOperator(
         \\BRIDGE_CDC_PUBLICATION=zb_pub
         \\BRIDGE_PORT=27434
         \\LOG_LEVEL=info
+        \\# The snapshots clients seed from; without them a new client cannot load a table.
+        \\GENERATIONS_ENABLED=1
         \\
         \\# Enrollment: the bridge as online signer (GET /enroll). The seed below is the
         \\# account's SCOPED client signing key — it can mint client-role users and

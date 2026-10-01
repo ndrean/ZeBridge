@@ -613,6 +613,17 @@ GRANT SELECT ON public.zebridge_principal_keys TO ${POSTGRES_READER_USER}, ${POS
 -- its ownership row). Never DELETE: the rows outlive revocation on purpose.
 GRANT INSERT, UPDATE ON public.zebridge_principal_keys TO ${POSTGRES_WRITER_USER};
 
+-- §10kn: `bridge --revoke <p> --purge` asks the principal's devices to delete their local
+-- replica and identity. A row here means the latest revocation of <p> asked for it: the
+-- bridge adds `"purge": true` to the ban, and `/renew` answers a revoked key with it. A
+-- plain `--revoke` deletes the row. Written only by the admin command; read by both roles.
+-- By principal, not by key: a principal minted without a recorded key is purged too.
+CREATE TABLE IF NOT EXISTS public.zebridge_purges (
+    principal    text PRIMARY KEY,
+    requested_at timestamptz NOT NULL DEFAULT now()
+);
+GRANT SELECT ON public.zebridge_purges TO ${POSTGRES_READER_USER}, ${POSTGRES_WRITER_USER};
+
 -- A revoked principal is dead for good (§10dm, §10kb). `bridge --revoke` deletes its
 -- mappings and stamps its keys; /enroll then refuses any invite for the name and /renew
 -- refuses its keys. A mapping put back by hand would still reopen the door: writes pass

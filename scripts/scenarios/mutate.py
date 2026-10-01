@@ -172,12 +172,14 @@ async def main():
 
     try:
         print()
-        for op, text, hhmmss, expect in [
-            ("insert", "from the edge", "10:00:00", "applied"),
-            ("update", "STALE must not win", "09:00:00", "rejected as stale"),
-            ("update", "NEWER wins", "11:00:00", "applied"),
+        # Minutes behind now, not a pinned day: a write stamped before the GC watermark
+        # is refused before LWW is asked (§10km). Only the order matters.
+        for op, text, minutes_ago, expect in [
+            ("insert", "from the edge", 30, "applied"),
+            ("update", "STALE must not win", 40, "rejected as stale"),
+            ("update", "NEWER wins", 20, "applied"),
         ]:
-            version = f"2026-08-16T{hhmmss}.000000"
+            version = zb.recent_version(minutes_ago)
             await js.publish(
                 f"{base}.{op}",
                 msgpack.packb({
@@ -187,7 +189,7 @@ async def main():
                     "client_id": "c1",
                 }),
             )
-            print(f"  {op:6} version {hhmmss} — expect {expect}")
+            print(f"  {op:6} version {version} — expect {expect}")
             await asyncio.sleep(2)
 
         # ⚠️ An empty row here is a FAILURE, not a physical delete: nothing has deleted

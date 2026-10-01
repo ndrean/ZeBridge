@@ -26,6 +26,7 @@ pub fn run(init: *const std.process.Init) u8 {
     // ── the principal, from argv ────────────────────────────────────────────────
     var principal: ?[]const u8 = null;
     var conf_path: ?[]const u8 = null;
+    var purge = false;
     {
         var it = init.minimal.args.iterate();
         _ = it.next();
@@ -34,6 +35,8 @@ pub fn run(init: *const std.process.Init) u8 {
                 principal = it.next();
             } else if (std.mem.eql(u8, arg, "--conf")) {
                 conf_path = it.next();
+            } else if (std.mem.eql(u8, arg, "--purge")) {
+                purge = true;
             }
         }
     }
@@ -73,6 +76,21 @@ pub fn run(init: *const std.process.Init) u8 {
     var p_buf: [300]u8 = undefined;
     const p_z = std.fmt.bufPrintZ(&p_buf, "{s}", .{p}) catch return 1;
     const params = [_]?[*:0]const u8{p_z.ptr};
+
+    // ── 0. the purge request (§10kn), BEFORE the mapping delete ─────────────────
+    // Each statement here commits on its own, and the running bridge publishes the ban
+    // as soon as the mapping delete reaches it: the purge must already be recorded then,
+    // or the ban goes out without it. A plain --revoke clears an earlier request, so the
+    // latest revocation decides.
+    const r0 = c.PQexecParams(conn, if (purge)
+        "INSERT INTO public.zebridge_purges (principal) VALUES ($1) ON CONFLICT (principal) DO UPDATE SET requested_at = now()"
+    else
+        "DELETE FROM public.zebridge_purges WHERE principal = $1", 1, null, &params[0], null, null, 0);
+    defer c.PQclear(r0);
+    if (c.PQresultStatus(r0) != c.PGRES_COMMAND_OK) {
+        out("🔴 purge request failed: {s}(is the init SQL up to date? zebridge_purges)\n", .{c.PQerrorMessage(conn)});
+        return 1;
+    }
 
     // ── 1. the mapping ──────────────────────────────────────────────────────────
     const r1 = c.PQexecParams(conn, "DELETE FROM public.zebridge_user_tenants WHERE principal = $1", 1, null, &params[0], null, null, 0);
@@ -123,6 +141,12 @@ pub fn run(init: *const std.process.Init) u8 {
         \\               it amends the account JWT's revocations map (see below)
         \\
     , .{ p, mappings, invites, keys_stamped });
+    if (purge) out(
+        \\   local data  devices are asked to DELETE their replica and identity: a connected
+        \\               one at once (the ban carries it), a returning one when it renews its
+        \\               JWT. Best-effort: a device that never reconnects keeps its data
+        \\
+    , .{});
 
     // ── 4. FULL revocation, when the credentials allow it (§10cm) ───────────────
     // Partial is never a choice, only a fallback: with OPERATOR_SEED and --conf the

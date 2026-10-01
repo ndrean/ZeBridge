@@ -302,6 +302,9 @@ pub const SyncClient = struct {
     /// closed and every later call answers `error.Revoked`. The rows stay; the wipe is
     /// the application's explicit act (`zb_client_wipe`).
     revoked: bool = false,
+    /// §10kn: the ban (or `/renew`) said `"purge": true` — `bridge --revoke --purge`. The
+    /// C layer then deletes the replica and the identity file (`purgeIfAsked`).
+    purge_requested: bool = false,
     hung_up: bool = false,
     stream_verdicts: []const u8 = undefined, // streams.verdicts: stored verdicts and the ban
     subject_mutations_prefix: []const u8 = undefined, // subjects.mutations_prefix
@@ -4586,7 +4589,10 @@ pub const SyncClient = struct {
                 break :blk last;
             };
             if (mid.len == 0) continue;
-            if (std.mem.eql(u8, mid, "revoked")) return self.hangUpRevoked();
+            if (std.mem.eql(u8, mid, "revoked")) {
+                self.notePurge(msg.data);
+                return self.hangUpRevoked();
+            }
 
             // ⚠️ JSON, not msgpack. CDC and mutations are msgpack; a verdict is JSON —
             // it is read by humans and by `nats sub` as often as by a client. The wire
@@ -4624,8 +4630,19 @@ pub const SyncClient = struct {
         var buf: [256]u8 = undefined;
         const subject = try std.fmt.bufPrint(&buf, "{s}.{s}.revoked", .{ self.subject_mutation_ack_prefix, self.opts.principal });
         if (self.t.lastBySubject(self.stream_verdicts, subject) catch null) |m| {
+            self.notePurge(m.data);
             m.deinit();
             return self.hangUpRevoked();
+        }
+    }
+
+    /// §10kn: whether the ban asks for the device's data to go too (`"purge": true`).
+    fn notePurge(self: *SyncClient, data: []const u8) void {
+        const parsed = std.json.parseFromSlice(std.json.Value, std.heap.c_allocator, data, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        if (parsed.value.object.get("purge")) |v| {
+            if (v == .bool and v.bool) self.purge_requested = true;
         }
     }
 
