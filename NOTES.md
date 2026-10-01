@@ -18282,3 +18282,36 @@ A. both clients connected 100 s: 3 JWTs each, the row inserted at the end receiv
 B. stored offset +7200: renewal due at once, the stamp refused with the bridge's time,
 re-stamped, renewed, offset back to 0, connected; C. offset −7200 and the JWT left to
 expire: NATS refuses, renewed anyway, connected. revoke_purge 19/19 after the change.
+
+## §10ks — real iPhone JWT renewal testing; libzb counts on a steady clock (2026-10-01)
+
+`scripts/phone/renew`: a Flutter app (the 06-large-table iOS setup) with libzb, enrolled
+by invite, following `counter_public`; the screen shows the phone's clock, the estimate
+of the bridge's, the JWT's times and each renewal. iPhone 12, dev bridge with
+`ENROLL_JWT_TTL_SECONDS=300` and `BRIDGE_BIND=0.0.0.0`, the clock moved in Settings.
+
+With §10kr alone (the stored offset), every move ahead was fine (one refused stamp, then
+corrected) but a move BACK past the renewal window (75 s here) made the renewal late: at
+21:52 NATS ended the session, refused three automatic reconnects ("authentication
+error"), libzb reported `ConnectionClosed` (not AuthExpired: the verdict was lost in the
+reconnects), and the app's reopen renewed on NATS's refusal. Recovered, with one drop.
+
+Now:
+- libzb anchors the bridge's time at open (stored offset) and at each renewal it makes
+  (the new JWT's `iat`), and counts from there on `steadySeconds` (Apple's
+  CLOCK_MONOTONIC, which counts sleep; Linux/Android BOOTTIME). Renewal timing, the
+  stamp and the check spacing use it. Moving the clock while the app runs changes
+  nothing: measured on the phone, ±5 min and ±1 h, renewals exactly on the bridge's
+  schedule, no refusal, no drop;
+- a stored offset over 60 s renews once at open (`offset_recheck_seconds`): the clock was
+  wrong at the last JWT and may have been fixed since. Measured: reopened after the
+  clock was fixed, one refused stamp (−461 s) and a renewal at open, then normal;
+- `poll` also forces a renewal on `AuthorizationViolation`, not only `AuthExpired`.
+- zb-client-ts keeps the device clock (+ stored offset): a browser does not promise a
+  clock that runs through sleep.
+
+Left: the clock moved while the app is closed AND the reopen cannot reach the bridge —
+the JWT then expires once and the next connect renews. One scare on the phone was the
+app's bin icon (deletes replica and identity), tapped next to "reopen": now a long press.
+The identity's stored offset reads wrong while the clock is wrong; that is by design, it
+only seeds the next launch. jwt_renew.py 10/10 on the final libzb.

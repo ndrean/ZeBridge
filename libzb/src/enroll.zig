@@ -156,6 +156,23 @@ pub fn enroll(a: std.mem.Allocator, bridge_url: []const u8, code: []const u8) !I
     return id;
 }
 
+/// A stored offset beyond this (the bridge's own window for a renewal stamp) is
+/// measured again at the next open, with a renewal (§10ks).
+pub const offset_recheck_seconds: i64 = 60;
+
+/// Seconds on a clock that keeps running while the phone sleeps and that no setting
+/// moves: Apple's CLOCK_MONOTONIC counts sleep, Linux's does not (BOOTTIME does).
+/// Its zero is arbitrary (boot): only differences mean anything.
+pub fn steadySeconds() i64 {
+    const id: std.c.clockid_t = switch (builtin.os.tag) {
+        .linux => .BOOTTIME,
+        else => .MONOTONIC,
+    };
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(id, &ts);
+    return @intCast(ts.sec);
+}
+
 /// This device's clock, unix seconds.
 pub fn localNow() i64 {
     var ts: std.c.timespec = undefined;
@@ -210,8 +227,9 @@ fn section(text: []const u8, begin: []const u8, end: []const u8) ?[]const u8 {
 
 /// §10jt: a new JWT for the SAME key, no invite: sign `zebridge-renew:<pub>:<ts>` with
 /// the identity's seed, `GET <bridge>/renew`, and rebuild the identity from the answer
-/// (the NATS URLs, grammar hash and memberships come back current).
-pub fn renew(a: std.mem.Allocator, id: Identity) !Identity {
+/// (the NATS URLs, grammar hash and memberships come back current). `server_now` is the
+/// caller's best estimate of the bridge's time: the stamp.
+pub fn renew(a: std.mem.Allocator, id: Identity, server_now: i64) !Identity {
     if (id.bridge_url.len == 0) return fail("renew: the identity names no bridge", .{});
     if (builtin.os.tag == .ios and std.ascii.startsWithIgnoreCase(id.bridge_url, "https://"))
         return fail("renew: https on iOS needs the system trust store, which libzb cannot read", .{});
@@ -227,12 +245,11 @@ pub fn renew(a: std.mem.Allocator, id: Identity) !Identity {
     defer client.deinit();
     var body: std.Io.Writer.Allocating = .init(a);
     defer body.deinit();
-    // Stamped in the bridge's time. If the device's clock moved since the offset was
-    // taken, the bridge refuses the stamp and says its time: one more try with it.
-    var offset = id.clock_offset;
+    // Stamped in the bridge's time. If the estimate is off, the bridge refuses the stamp
+    // and says its time: one more try with it.
+    var ts = server_now;
     var res: std.http.Client.FetchResult = undefined;
     for (0..2) |attempt| {
-        const ts = localNow() + offset;
         var msg_buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "zebridge-renew:{s}:{d}", .{ public, ts }) catch unreachable;
         const sig = skp.sign(msg) catch return fail("renew: signing failed", .{});
@@ -246,8 +263,7 @@ pub fn renew(a: std.mem.Allocator, id: Identity) !Identity {
         res = client.fetch(.{ .location = .{ .url = url }, .response_writer = &body.writer, .keep_alive = false }) catch |err|
             return fail("renew: {s} unreachable ({s})", .{ id.bridge_url, @errorName(err) });
         if (attempt > 0 or res.status != .unauthorized) break;
-        const server_time = serverTimeIn(a, body.written()) orelse break;
-        offset = server_time - localNow();
+        ts = serverTimeIn(a, body.written()) orelse break;
     }
     const text = body.written();
     last_purge = false;

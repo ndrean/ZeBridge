@@ -456,9 +456,16 @@ const ClientBox = struct {
     /// `poll` last asked whether its JWT is due for renewal.
     id_path: ?[]u8 = null,
     next_renew_check: i64 = 0,
-    /// The bridge's clock minus this device's (`Identity.clock_offset`): renewal is
-    /// timed in the bridge's time.
-    clock_offset: i64 = 0,
+    /// The bridge's time at `anchor_steady` (§10ks). Renewal is timed and stamped with
+    /// `serverNow`, which counts on the steady clock from there, so a user who moves the
+    /// phone's clock in Settings does not move it. Set at open from the identity's
+    /// stored offset, then at each renewal from the new JWT's `iat`.
+    anchor_server: i64 = 0,
+    anchor_steady: i64 = 0,
+
+    fn serverNow(self: *const ClientBox) i64 {
+        return self.anchor_server + (enroll.steadySeconds() - self.anchor_steady);
+    }
 
     fn destroy(self: *ClientBox, a: std.mem.Allocator) void {
         self.c.deinit();
@@ -593,8 +600,13 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         // §10jt: a stored identity close to (or past) its JWT's expiry renews here,
         // with its key — no invite. Before expiry a failed renewal is only a warning
         // (the JWT still works); after it, the reason is the connect's error.
-        if (ident) |*cur| if (force_renew or enroll.renewDue(cur.creds, cur.serverNow())) {
-            if (enroll.renew(a, cur.*)) |fresh| {
+        // §10ks: a stored offset past the bridge's tolerance says this phone's clock was
+        // wrong when the last JWT arrived, and it may have been fixed since (or moved
+        // again): the offset is stale either way, so renew once to measure it again.
+        if (ident) |*cur| if (force_renew or @abs(cur.clock_offset) > enroll.offset_recheck_seconds or
+            enroll.renewDue(cur.creds, cur.serverNow()))
+        {
+            if (enroll.renew(a, cur.*, cur.serverNow())) |fresh| {
                 cur.deinit(a);
                 cur.* = fresh;
                 try enroll.save(a, id_path, cur.*);
@@ -769,7 +781,8 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         .ondemand = ondemand,
         .all_tables = all_tables,
         .id_path = kept_id_path,
-        .clock_offset = if (ident) |i| i.clock_offset else 0,
+        .anchor_server = if (ident) |i| i.serverNow() else enroll.localNow(),
+        .anchor_steady = enroll.steadySeconds(),
     };
     return box;
 }
@@ -1141,17 +1154,7 @@ export fn zb_client_reply(handle: u64, id: u64, answer_json: ?[*:0]const u8) ?[*
 /// The host's loop body: `while (running) poll(h, 1000)`. Returns as soon as a CDC
 /// batch was applied, or after `wait_ms` with nothing — never earlier on idle, so the
 /// host's loop does not spin. Requires a prior `zb_client_sync` (schemas, positions).
-fn nowSeconds() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    return @intCast(ts.sec);
-}
 
-fn monoSeconds() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @intCast(ts.sec);
-}
 
 /// §10jt: every eighth of the JWT's life (at most a minute), from the host's poll thread: a JWT with less than
 /// a quarter of its life left is renewed with the identity's key, the identity file is
@@ -1160,22 +1163,22 @@ fn monoSeconds() i64 {
 /// server ends it at the old JWT's expiry and the reconnect presents the new one.
 fn maybeRenew(b: *ClientBox, force: bool) void {
     const path = b.id_path orelse return;
-    const now = nowSeconds();
-    // The spacing runs on the monotonic clock: a user who sets the wall clock back by
-    // a day must not stop the checks for a day.
-    const tick = monoSeconds();
+    // The spacing runs on the steady clock: a user who sets the wall clock back by a
+    // day must not stop the checks for a day.
+    const tick = enroll.steadySeconds();
     if (!force and tick < b.next_renew_check) return;
     // An eighth of the JWT's life between checks, at most a minute: several chances
     // inside the last quarter, whatever the lifetime (24 h in production, seconds in
     // a test).
     const life: i64 = if (enroll.jwtTimes(b.creds_text)) |t| t.exp - t.iat else 480;
     b.next_renew_check = tick + std.math.clamp(@divTrunc(life, 8), 1, 60);
-    if (!force and !enroll.renewDue(b.creds_text, now + b.clock_offset)) return;
+    if (!force and !enroll.renewDue(b.creds_text, b.serverNow())) return;
     const a = std.heap.c_allocator;
     var id = (enroll.load(a, path) catch null) orelse return;
     defer id.deinit(a);
     // Another process sharing the identity may have renewed it already.
-    var fresh = if (force or enroll.renewDue(id.creds, id.serverNow())) (enroll.renew(a, id) catch {
+    const ours = force or enroll.renewDue(id.creds, b.serverNow());
+    var fresh = if (ours) (enroll.renew(a, id, b.serverNow()) catch {
         if (enroll.last_purge) {
             // §10kn: the next entry point (`zb_client_poll`, right after this) purges.
             b.c.revoked = true;
@@ -1196,7 +1199,12 @@ fn maybeRenew(b: *ClientBox, force: bool) void {
     const old = b.creds_text;
     b.creds_text = text;
     b.c.opts.creds = text;
-    b.clock_offset = fresh.clock_offset;
+    // A JWT this client just received: its `iat` is the bridge's time, now. (One that
+    // another process renewed may be minutes old: the anchor stays.)
+    if (ours) if (enroll.jwtTimes(fresh.creds)) |t| {
+        b.anchor_server = t.iat;
+        b.anchor_steady = enroll.steadySeconds();
+    };
     std.crypto.secureZero(u8, old);
     a.free(old);
     std.debug.print("zebridge: renewed '{s}' — the next reconnect presents the new JWT\n", .{fresh.principal});
@@ -1209,9 +1217,9 @@ export fn zb_client_poll(handle: u64, wait_ms: u64) ?[*:0]u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
     const out = pollJson(arena.allocator(), b, wait_ms) catch |err| {
-        // The server ended the session on the JWT: renew now, whatever the clock says,
-        // so the host's reconnect presents a fresh one (§10kr).
-        if (b.c.authError()) |auth_err| if (auth_err == error.AuthExpired) maybeRenew(b, true);
+        // The server ended the session on the JWT, or refused it on a reconnect: renew
+        // now, whatever the clock says, so the host's reopen presents a fresh one (§10kr).
+        if (b.c.authError()) |auth_err| if (auth_err == error.AuthExpired or auth_err == error.AuthorizationViolation) maybeRenew(b, true);
         if (purgeIfAsked(handle, b)) return errJson("Revoked");
         // The single door every poll error passes — so the auth verdict is named
         // HERE, once, whichever `try` inside poll surfaced the dead socket (§10cj:
