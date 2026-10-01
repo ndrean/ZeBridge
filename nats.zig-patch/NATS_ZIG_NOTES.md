@@ -1055,3 +1055,19 @@ expiry ("User Authentication Expired") and the reconnect presents the new one.
 **Verified** (with 28): libzb polled for 100 s across 40 s JWTs — two renewals, two
 server cut-offs each followed by a reconnect with the new JWT, no poll error, and a row
 written after the first expiry arrived.
+
+## 30. A stream can refuse new messages per subject (2026-09-30)
+
+**How it appeared.** The bridge now creates MUTATIONS itself when it is missing (ZeBridge
+NOTES §10kk). That stream caps each principal's queued writes with `max_msgs_per_subject`
+and `discard new` per subject, and `StreamConfig` had no field for the per-subject part:
+without it a full principal would refuse writes for the whole stream.
+
+**Change** (`30-nats.zig-discard-new-per-subject.patch`): `StreamConfig` gains
+`discard_new_per_subject: ?bool = null`, the server's `discard_new_per_subject`. Null is
+omitted from the JSON, so every existing caller sends what it sent before.
+
+**Verified:** a bridge booted against an empty nats-server 2.15 created MUTATIONS with
+`discard: new`, `max_msgs_per_subject: 777` (from `MUTATION_BACKLOG_PER_PRINCIPAL`) and
+`discard_new_per_subject: true`, read back with `nats stream info -j`; `check-series.sh`
+green over 30 patches.

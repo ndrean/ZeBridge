@@ -1,0 +1,14 @@
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+index 53a8da9..983ad96 100644
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -115,6 +115,9 @@ pub const StreamConfig = struct {
+     no_ack: bool = false,
+     /// When a Stream reaches its limits either old messages are deleted or new ones are denied
+     discard: enum { old, new } = .old,
++    /// With `discard = .new` and `max_msgs_per_subject`, refuse a new message on a subject
++    /// that is full instead of on the whole stream (requires NATS 2.10+)
++    discard_new_per_subject: ?bool = null,
+     /// The time window to track duplicate messages for, in nanoseconds. 0 for default
+     duplicate_window: u64 = 0,
+     /// Allow direct get on any replica instead of just the leader

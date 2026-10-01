@@ -131,6 +131,8 @@ const usage =
     \\                        JetStream when their turn comes (default: 0 = off)
     \\  MUTATION_RATE_BURST   how many writes a quiet client may send at once
     \\                        (default: one second's worth)
+    \\  MUTATION_BACKLOG_PER_PRINCIPAL  writes one principal may have queued, used
+    \\                        only when the bridge creates MUTATIONS (default: 5000)
     \\  CDC_MAX_AGE_SECONDS   how long a CDC stream keeps an event (default:
     \\                        3 × cadence). The contract with the chain: a
     \\                        client further behind re-seeds and resumes at

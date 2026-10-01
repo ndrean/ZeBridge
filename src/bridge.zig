@@ -1239,6 +1239,15 @@ pub fn main(init: std.process.Init) !void {
             log.warn("🔁 new replication slot '{s}' on existing streams: if this slot REPLACES a lost one, every change since its loss is missing from the feed and clients resume past the hole — start once with ZB_FEED_RESTART=1 to restart the feed (NOTES §10bm)", .{parsed_args.slot_name});
         }
     }
+    const backlog_per_principal: i64 = if (init.minimal.environ.getPosix("MUTATION_BACKLOG_PER_PRINCIPAL")) |v|
+        std.fmt.parseInt(i64, v, 10) catch 5000
+    else
+        5000;
+    ensureBaseTopology(allocator, &publisher, &runtime_config.topology, backlog_per_principal) catch |err| {
+        log.err("🔴 FATAL: could not ensure the MUTATIONS / VERDICTS streams and the KV buckets ({s}) — refusing to start.", .{@errorName(err)});
+        should_stop.store(true, .seq_cst);
+        return err;
+    };
     reconcileCdcStreams(allocator, &publisher, &runtime_config.topology, cdcLimits(&runtime_config)) catch |err| {
         log.err("🔴 FATAL: stream reconciliation failed ({s}) — refusing to start rather than FATAL under load.", .{@errorName(err)});
         should_stop.store(true, .seq_cst);
@@ -2710,6 +2719,91 @@ fn dupWindowFor(max_age_ns: u64, stored: u64) u64 {
     const default_ns: u64 = 2 * 60 * std.time.ns_per_s;
     const current = if (stored == 0) default_ns else stored;
     return if (max_age_ns > 0 and current > max_age_ns) max_age_ns else current;
+}
+
+/// §10kk: the streams and buckets the CDC reconciliation does not cover — MUTATIONS,
+/// VERDICTS and the schemas / tenants / generations KV buckets — created when missing,
+/// so a production host needs no provisioning step (only the dev scripts had one). An
+/// existing one is left exactly as it is: its limits are the deployment's policy. The
+/// `live` bucket stays with the fleet monitor, which also reconciles its TTL.
+fn ensureBaseTopology(
+    allocator: std.mem.Allocator,
+    publisher: anytype,
+    topo: *const topology_mod.Topology,
+    backlog_per_principal: i64,
+) !void {
+    const js = if (publisher.js) |*j| j else return error.NotConnected;
+    const two_hours: u64 = 2 * 3600 * std.time.ns_per_s;
+    const one_gib: i64 = 1 << 30;
+
+    if (js.getStreamInfo(topo.stream_mutations)) |info_const| {
+        var info = info_const;
+        info.deinit();
+    } else |_| {
+        const writes = try std.fmt.allocPrint(allocator, "{s}.>", .{topo.subject_mutations_prefix});
+        defer allocator.free(writes);
+        const dead = try std.fmt.allocPrint(allocator, "{s}.>", .{topo.mutation_error_prefix});
+        defer allocator.free(dead);
+        // Workqueue: a write leaves once the bridge acks it, so the per-subject cap
+        // counts what is QUEUED per principal (the subject carries it), and `discard
+        // new` per subject refuses that principal's next write at the door — nobody
+        // else notices (§10fk).
+        var res = try js.addStream(.{
+            .name = topo.stream_mutations,
+            .subjects = &.{ writes, dead },
+            .retention = .workqueue,
+            .max_age = two_hours,
+            .max_bytes = one_gib,
+            .discard = .new,
+            .max_msgs_per_subject = backlog_per_principal,
+            .discard_new_per_subject = true,
+        });
+        res.deinit();
+        log.info("🆕 created stream {s} ({s}, {s}; {d} queued writes per principal)", .{ topo.stream_mutations, writes, dead, backlog_per_principal });
+    }
+
+    if (js.getStreamInfo(topo.stream_verdicts)) |info_const| {
+        var info = info_const;
+        info.deinit();
+    } else |_| {
+        const acks = try std.fmt.allocPrint(allocator, "{s}.>", .{topo.mutation_ack_prefix});
+        defer allocator.free(acks);
+        // One verdict per msg_id, and a new ban replaces the old one; `discard old`: a
+        // verdict pushed out early costs an offline client one idempotent replay (§10jj).
+        var res = try js.addStream(.{
+            .name = topo.stream_verdicts,
+            .subjects = &.{acks},
+            .max_age = two_hours,
+            .max_bytes = one_gib,
+            .discard = .old,
+            .max_msgs_per_subject = 1,
+            .allow_direct = true,
+        });
+        res.deinit();
+        log.info("🆕 created stream {s} ({s})", .{ topo.stream_verdicts, acks });
+    }
+
+    const km = js.kvManager();
+    const buckets = [_]struct { name: []const u8, history: u8 }{
+        .{ .name = topo.kv_schemas, .history = 10 },
+        .{ .name = topo.kv_tenants, .history = 1 },
+        .{ .name = topo.kv_generations, .history = 1 },
+    };
+    for (buckets) |b| {
+        // Open first: creating over an existing bucket is refused (10058) and logged at
+        // error level by the library (§10dr).
+        if (km.openBucket(b.name)) |kv_const| {
+            var kv = kv_const;
+            kv.deinit();
+        } else |err| switch (err) {
+            error.BucketNotFound, error.StreamNotFound => {
+                var kv = try km.createBucket(.{ .bucket = b.name, .history = b.history });
+                kv.deinit();
+                log.info("🆕 created bucket {s} (history {d})", .{ b.name, b.history });
+            },
+            else => return err,
+        }
+    }
 }
 
 fn reconcileCdcStreams(

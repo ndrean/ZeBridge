@@ -145,11 +145,11 @@ REQUESTS streams carried nothing else.
 
 | key | read by |
 | --- | --- |
-| `streams.*` | `nats-init` creates `MUTATIONS` and `VERDICTS`; the bridge names `MUTATIONS` for its ingress consumer, and clients name `VERDICTS` to collect stored verdicts and the ban (§7.4b). `streams.cdc` is the pre-tenant name of the single CDC stream: the bridge echoes it at boot, and a client falls back to it only when `cdc_streams` is absent |
+| `streams.*` | the bridge creates `MUTATIONS` and `VERDICTS` at boot when missing, and never edits them; the bridge names `MUTATIONS` for its ingress consumer, and clients name `VERDICTS` to collect stored verdicts and the ban (§7.4b). `streams.cdc` is the pre-tenant name of the single CDC stream: the bridge echoes it at boot, and a client falls back to it only when `cdc_streams` is absent |
 | `open_tenant` | bridge (routing for tenant-agnostic tables), clients (the shared subject/KV token) |
 | `cdc_streams.*` | bridge — at boot it creates any missing `CDC_<TENANT>` stream and sets `CDC_PUBLIC`'s subjects from the catalogue |
 | `subjects.cdc_prefix` | bridge (CDC subject), clients (subscription) |
-| `subjects.mutations_prefix` | bridge (consumer filter), `nats-init` (MUTATIONS subjects) |
+| `subjects.mutations_prefix` | bridge (consumer filter, and the MUTATIONS subjects when it creates the stream) |
 | `kv.schemas` | bridge (`$KV.schemas.<table>`), clients |
 | `kv.tenants` | bridge (`$KV.tenants.<principal>`), clients |
 | `generations.*` | bridge (generation producer), clients (the `gen-<tenant>` buckets) |

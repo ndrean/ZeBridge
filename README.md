@@ -59,7 +59,7 @@ Shims for Python, Kotlin, Flutter are available. See [CLIENTS](https://github.co
 * Desktop apps: Flutter running the C ABI library with an SQLite replica.
 * Browsers and Webapps: Leveraging OPFS support for SQLite-WASM or PGlite via the TS library.
 * Backend responder Services /  micro-VM. For example, A warm micro-VM as a client with the columnar in-process database DuckDB syncing Postgres. This client does not push mutations, it just responds to other conencted client.
-➡ The use case: a  client - a phone app, connected to NATS using the library - runs one query command - via the library - like "which Point Of Interest around me?" and the micro-VM receives the query via a stream, runs the corersponding analytics, or geospatial or timebased queries against its replicated PG fork and responds back via NATS. Zero cost for PostgreSQL, no PostGIS nor TimeScaleDB extension used.
+➡ The use case: a  client - a phone app, connected to NATS using the library - runs one query command - via the library - like "which Point Of Interest around me?" and the micro-VM receives the query, runs the corersponding analytics, or geospatial or timebased query against its replicated PG fork and responds back via NATS. Zero cost for PostgreSQL, no PostGIS nor TimeScaleDB extension used.
 
 **Design**: This tool is built to keep synchronized replicas of a large volume of small to medium consumers via the NATS message broker with small to medium Postgres databases.
 
@@ -1218,7 +1218,7 @@ One rule covers almost everything:
 
 What makes this safe is that `zebridge_enable()` is the gate: its own preflight (the tombstone gate, the tenant column's existence, the width guard, the publication check) returns `preflight ERROR` rows and writes **no catalogue row** for a table that fails.
 The running bridge never sees a rule it should refuse. What it does see it treats the way boot does — a table it cannot route (or that lost its row) is refused on the spot and its clients get a suspension, never a bare subject that blocks the publisher.
-`zebridge_enable()` prints the bridge side as its `T3 bridge LIVE` step; `T4 nats conf` is the one step that stays outside the database.
+`zebridge_enable()` prints the bridge side as its `T3 bridge` step and the NATS side as `T4 nats`: both say there is nothing to do, since a new table needs no grant.
 
 ### Checking a table / database against the bridge's rules
 
@@ -2442,7 +2442,7 @@ ZeBridge authenticates to the NATS server using nkeys.
 ZeBridge uses two stream families and several KV buckets (schemas, tenants, generations) plus per-tenant object stores for the bidirectional flow ZeBridge ↔ NATS ↔ consumer.
 The naming is **shared** and declared in [grammar.json](grammar.json).
 
-A ZeBridge instance is started with one config. The DBA starts the NATS server with its own config. `grammar.json` is the static wire grammar shared between the two: stream names, subject prefixes, and KV bucket names, declared once (`streams`, `subjects`, `kv`, `cdc_streams`, `open_tenant`, `generations`). Which tables replicate, and how, lives in the database: one `zebridge_catalogue` row per table, written by `zebridge_enable(...)`. `nats-init` creates only the MUTATIONS stream and the KV buckets; the bridge creates and reconciles the CDC stream family itself at boot, from the catalogue. Both sides authenticate with nkeys.
+A ZeBridge instance is started with one config. The DBA starts the NATS server with its own config. `grammar.json` is the static wire grammar shared between the two: stream names, subject prefixes, and KV bucket names, declared once (`streams`, `subjects`, `kv`, `cdc_streams`, `open_tenant`, `generations`). Which tables replicate, and how, lives in the database: one `zebridge_catalogue` row per table, written by `zebridge_enable(...)`. The bridge creates what is missing at boot: the MUTATIONS and VERDICTS streams, the `schemas`, `tenants`, `generations` and `live` buckets, and the CDC stream family, which it also reconciles to the catalogue. An existing MUTATIONS or VERDICTS stream keeps the limits it has.
 
 **Three data flows**:
 
@@ -2458,7 +2458,7 @@ A ZeBridge instance is started with one config. The DBA starts the NATS server w
 
 Besides the streams, the bridge maintains the seeding buckets: the **`generations` KV** holds one chain manifest per `<tenant>.<table>`, and a per-tenant **`gen-<tenant>` object store** holds the full and delta objects the manifest points to. The producer provisions the object stores at runtime, the same way the bridge provisions per-tenant CDC streams.
 
-The CDC stream family is owned by the bridge: at boot it creates any missing `CDC_<TENANT>` stream with file storage, limits retention and s2 compression, and reconciles every existing one to the configured age, byte and message limits, naming each move in its log. The byte cap is deliberately modest, because JetStream `max_bytes` is a reservation against the server's storage budget. It also sets `CDC_PUBLIC`'s subjects authoritatively to `cdc.<tbl>.>` for every catalogue-public table plus `cdc.<open_tenant>.>`. MUTATIONS keeps the limits `nats-init` gives it.
+The CDC stream family is owned by the bridge: at boot it creates any missing `CDC_<TENANT>` stream with file storage, limits retention and s2 compression, and reconciles every existing one to the configured age, byte and message limits, naming each move in its log. The byte cap is deliberately modest, because JetStream `max_bytes` is a reservation against the server's storage budget. It also sets `CDC_PUBLIC`'s subjects authoritatively to `cdc.<tbl>.>` for every catalogue-public table plus `cdc.<open_tenant>.>`. MUTATIONS and VERDICTS are created once and never edited: their limits are the deployment's.
 
 ⚠️ **Retention is a correctness parameter.** A client offline past the stream's window re-seeds from the chain, and the chain's cut must still be in the stream: see [Catching up: the chain and the stream](#catching-up-the-chain-and-the-stream).
 
@@ -2500,7 +2500,6 @@ Two ways to run several instances, depending on the isolation you need:
 Before starting a bridge:
 
 * Postgres has run the needed migrations and has a `PUBLICATION` with WAL logging enabled.
-* NATS has the MUTATIONS stream and the KV buckets (the bridge creates the CDC streams itself at boot).
 
 **Principal authentication** (the end user of a consumer app):
 
@@ -2596,7 +2595,7 @@ All configuration constants are centralized in `src/config.zig` and `grammar.jso
 | `GENERATION_ASYNC_FULLS` | true | the routine full (every depth) is built in the background while deltas keep being cut, then attached behind them; fulls a correctness rule asks for stay with their delta |
 | `GENERATION_DEFER_FULLS` | true | while a stream has less time left than three builds of a table's full, that full waits and deltas continue; at 4 × depth generations it is built anyway |
 | `GENERATION_WORKERS` | 1 | builders for the early cuts of bursting streams; more re-cut those pairs in parallel, each on its own connections, so a round lasts as long as its longest build. The cadence tick builds in turn whatever this says. Memory: workers × the biggest full's MessagePack size |
-| `MUTATION_BACKLOG_PER_PRINCIPAL` | 5000 | **a variable of the NATS setup, not of the bridge** (`scripts/native/up.sh` for the native stack, the `nats-init` service in `docker-compose.full.yml` for Docker): the MUTATIONS stream's `max_msgs_per_subject` with `discard new per subject` and workqueue retention. The subject carries the principal, so this is how many writes one principal may have queued before its publishes are refused at the door; nobody else notices. The bridge never edits the stream (NATS policy is the deployment's); `zbdoctor` checks the stream against the rate the bridge declares on `/status` |
+| `MUTATION_BACKLOG_PER_PRINCIPAL` | 5000 | the MUTATIONS stream's `max_msgs_per_subject`, with `discard new per subject` and workqueue retention, used when the bridge creates the stream. The subject carries the principal, so this is how many writes one principal may have queued before its publishes are refused at the door; nobody else notices. On an existing stream it changes nothing: the bridge never edits MUTATIONS (edit it with `nats stream edit`); `zbdoctor` checks the stream against the rate the bridge declares on `/status` |
 | `MUTATION_RATE_PER_PRINCIPAL` | 0 (off) | writes per second one principal, and one tenant, may send. Beyond it a write is NAK'd with the delay of its place in the queue and redelivered by JetStream when its turn comes: a flood is served at the rate, other tenants' writes are answered as if it were not there, nothing is dropped. `MUTATION_RATE_BURST` (default: one second's worth) is what a quiet client may send at once |
 | `ZB_INGRESS_LANES` | 1 (max 8) | parallel mutation listeners on the one ingress stream. Each lane pulls up to 64 writes and applies them in one transaction, on its own PostgreSQL writer connection and NATS connection; JetStream spreads the writes across lanes. Measured on one Mac: one lane ~8,500 writes/s, two ~14,000, four ~19,500 ([examples/09-event](examples/09-event/README.md#the-ramp-how-far-one-mac-goes)). Set at start, no rebuild |
 | `GC_THRESHOLD_MS` | 3600000 | the sweeper's age: a tombstone older than this is reaped (floor 60000) |

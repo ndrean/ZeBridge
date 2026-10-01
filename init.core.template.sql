@@ -2219,7 +2219,7 @@ BEGIN
                    'UPDATE/DELETE are refused at the source (NOTES.md §1.8)', tenant_col);
     END IF;
 
-    -- ── T3 and T4 live outside the database and always will ───────────────────
+    -- ── T3 and T4: the bridge and NATS, outside the database ──────────────────
     RETURN QUERY SELECT 'T3 bridge', 'LIVE',
         CASE WHEN tenant_col IS NULL
              THEN 'nothing to do — the catalogue row this wrote reaches a running bridge '
@@ -2230,14 +2230,14 @@ BEGIN
                   'through the WAL; it reloads its routing, lifts the table''s refusal and '
                   'publishes its schema on the spot (NOTES §10bj). The generation chain '
                   'needs nothing either — the producer reads the catalogue per tick.' END;
-    RETURN QUERY SELECT 'T4 nats conf', 'MANUAL',
+    -- §10kk: the grants are the client role's template (bridge --init-nats), written per
+    -- stream, not per table: a new table changes nothing in NATS.
+    RETURN QUERY SELECT 'T4 nats', 'LIVE',
         CASE WHEN tenant_col IS NULL
-             THEN format('grant subscribe on cdc.%s.> — and init.snap.%s.> to match, because a '
-                         'client must not be able to dump what it cannot subscribe to', short, short)
-             ELSE 'grant subscribe on cdc.<tenant>.>, init.snap.<tenant>.> and '
-                  '$KV.snapshots.<tenant>.> per principal — one stream (INIT_<TENANT>) per '
-                  'tenant, same reason as CDC_<TENANT> (a JetStream filter_subject is '
-                  'reader-chosen, not ACL-checked); reload NATS, not the bridge' END;
+             THEN 'nothing to do — the table rides CDC_PUBLIC, which every client may read '
+                  'already; the bridge adds its subject to the stream (T3)'
+             ELSE 'nothing to do — the table rides each tenant''s CDC_<tenant> stream, which '
+                  'the client role grants per tenant tag already; no grant, no NATS reload' END;
 
     IF dry_run THEN
         RETURN QUERY SELECT 'summary', 'DRY RUN', 'nothing was applied — re-run with dry_run => false';

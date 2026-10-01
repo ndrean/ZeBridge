@@ -18026,3 +18026,28 @@ delivered there since the load), so the old head − applied reading applied, wi
 position she persisted before the reload. Now a client that reports `pending` at all gets
 0 for a stream it has not reported yet; the stall test still catches one that never
 moves (7 cases).
+
+## §10kk — the bridge creates MUTATIONS, VERDICTS and the KV buckets; `T4 nats` is current (2026-09-30)
+
+Found by a README read-through. The bridge created only the CDC streams (and `live`, from
+the fleet monitor); MUTATIONS, VERDICTS and the `schemas`, `tenants` and `generations`
+buckets came from `scripts/native/up.sh` or the compose `nats-init` service. The README's
+production procedure had no such step, so a host set up by it had no write path.
+
+Now `ensureBaseTopology` runs at boot, before the CDC reconciliation: each of those five is
+created when missing, with the settings up.sh used (MUTATIONS: workqueue, 2 h, 1 GiB,
+discard new, `MUTATION_BACKLOG_PER_PRINCIPAL` per subject with discard-new-per-subject;
+VERDICTS: limits, 2 h, 1 GiB, discard old, one per subject, direct get; the buckets with
+history 10, 1, 1). An existing one is never edited: its limits are the deployment's. The
+per-subject discard needed a `StreamConfig` field nats.zig did not have: patch 30.
+
+`zebridge_enable`'s last step said `T4 nats conf MANUAL` and asked for grants on
+`init.snap.*`, `$KV.snapshots.*` and `INIT_<TENANT>` streams, none of which exist since the
+generation chain. The client role's template grants per stream, not per table, so the step
+is now `T4 nats LIVE`: nothing to do.
+
+Verified: a bridge booted against an empty nats-server 2.15 created all five and the CDC
+streams, read back with `nats stream info -j` (MUTATIONS `max_msgs_per_subject` 777 from
+the env, `discard_new_per_subject` true); the dev bridge restarted on existing streams
+created nothing and left MUTATIONS at 5000. Both `T4 nats` texts checked with a dry run
+on the dev DB, where the function was applied by hand.
