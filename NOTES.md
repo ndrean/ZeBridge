@@ -270,6 +270,27 @@ without disruption.
   same change (web `applySchema`, Flutter `db_manager.dart`) — this IS a wire break,
   taken deliberately while breaking is still free.
 
+### 1.8 OPEN — several bridges, one per publication, never tested end to end (2026-10-01)
+
+The README says several bridges can run side by side, each with its own publication,
+slot and port. Only throughput was ever measured that way (2026-08-24, "The multi-slot
+partition lever, tried"), before the generation producer, the fleet monitor, enrollment,
+the CDC reconcile and ingress lanes. What a test must check, with two publications and
+two bridges on one database and one NATS:
+
+- each bridge publishes, and builds chains for, only its own publication's tables (the
+  producer reads `pg_publication_tables` for its publication);
+- the shared parts agree: both reconcile `CDC_PUBLIC`'s subjects to the whole
+  catalogue, both create the base streams and buckets (§10kk), both consume
+  `bridge_mutations_worker` and apply writes for any writable table;
+- a DDL on a table of one publication publishes one descriptor, not two
+  (`zebridge_ddl_events` rides every publication);
+- `/metrics`: fleet, catalogue and slot-inventory series come from both bridges, so a
+  dashboard that sums them counts twice;
+- `ZB_FEED_RESTART=1` on one bridge's new slot deletes the CDC streams the other
+  bridge still feeds;
+- `/enroll` and `/renew` answer on both.
+
 ---
 
 ## 2. Bugs found — with the mechanism, so they are not reintroduced

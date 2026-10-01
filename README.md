@@ -70,7 +70,7 @@ Trust is earned. Test first. See [SPEED_TEST.md](https://github.com/ndrean/zebri
 * **Topology**: The preferred topology is the daemon colocated with the NATS server over TLS (as opposed to terminating TLS at a reverse-proxy). Since every client can join NATS over TLS, then NATS and Zebridge must communicate over TLS too. Ideally, Postgres, NATS and ZeBridge are colocated, but ZeBridge accepts a Cloud database PostgreSQL.
 * **Standby Read Replica ready**: you can use a dedicated Postgres standby replica for all the reads as ZeBridge uses separate reader and writer roles.
 * **CLI**: the same binary sets the system up (`--init-nats`, `--init-sql`, `--mint-responder`), checks it (`--diagnose`), revokes users (`--revoke`) and manages slots (`--view-slots`, `--drop-slot`). See [The CLI](#the-cli) below.
-* **Multiple instances**: run several instances of ZeBridge, each with its own publication, slot and port. Splitting the tables between publications lets you follow large slow-moving tables apart from small tables with heavy changes, each instance with a buffer sized to its own tables.
+* **Multiple instances**: run several instances of ZeBridge, each with its own publication, slot and port. Splitting the tables between publications lets you follow large slow-moving tables apart from small tables with heavy changes, each instance with a buffer sized to its own tables. ⚠️ Not yet tested end to end.
 * **Mobile-First Synchronization**: to optimize mobile bandwidth and reliability, we use a delta-chain process with aggressive compression for seeding and reseeding, and streaming when needed. This mitigates the need for long, expensive unitary CDC catchups.
 * **Geographic or Tenant division**: a tenant is in practice a column in a table and a consumer brings their identity, and Postgres resolves the tenant from it. Tenants serve to set a division, along with define NATS grants, by  business, or dynamically, a geography (like mobile apps). The scope is by tenant. See [SCOPE ## Replication is by TENANT, not by query](https://github.com/ndrean/ZeBridge/blob/main/SCOPE.md).
 * **Strict authentication, JWT rotation**: because NATS is exposed to the internet and contains data, users are strictly tenant scoped and access grants are encoded in a JWT, immediately revokable by the DBA. Your app signs users in (OAuth or anything else) and its backend issues a one-time invite; the library enrolls the device with it and renews its JWT before it expires (`ENROLL_JWT_TTL_SECONDS`).
@@ -2404,6 +2404,8 @@ BASE_BUF=10 RING_BUFFER_COUNT=4096 bridge --pub my_pub_2 --slot my_slot_2 --port
 ```
 
 ⚠️ Never point two bridges at the same publication: each publishes what its publication carries and builds those tables' chains, so both would publish every change and race on the same chain manifests. Create the second publication with `zebridge_create_publication('my_pub_2')`, and enable each table into one publication only (`zebridge_enable(..., publication => 'my_pub_2')`).
+
+⚠️ **Untested.** Several bridges side by side were only measured for throughput, before the chain producer, the fleet monitor and enrollment existed; NOTES §1.8 lists what a test must check.
 
 The flags win over the environment, so `.env.bridge` can carry the usual pair and a one-off run can still point at another publication.
 
