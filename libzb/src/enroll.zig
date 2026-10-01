@@ -39,6 +39,15 @@ pub const Identity = struct {
     nats_url: ?[]u8 = null,
     grammar_hash: ?[]u8 = null,
     js_domain: ?[]u8 = null,
+    /// The bridge's clock minus this device's, in seconds, taken from the JWT's `iat`
+    /// when it arrived. Renewal is timed and stamped in the bridge's time with it, so a
+    /// device whose clock is off still renews on time and is not refused.
+    clock_offset: i64 = 0,
+
+    /// Now, on the bridge's clock.
+    pub fn serverNow(self: Identity) i64 {
+        return localNow() + self.clock_offset;
+    }
 
     pub fn deinit(self: *Identity, a: std.mem.Allocator) void {
         std.crypto.secureZero(u8, self.creds); // the seed is in there
@@ -143,7 +152,22 @@ pub fn enroll(a: std.mem.Allocator, bridge_url: []const u8, code: []const u8) !I
     if (str(o, "nats_url")) |v| id.nats_url = try a.dupe(u8, v);
     if (str(o, "grammar_hash")) |v| id.grammar_hash = try a.dupe(u8, v);
     if (str(o, "js_domain")) |v| id.js_domain = try a.dupe(u8, v);
+    id.clock_offset = offsetFrom(id.creds, localNow());
     return id;
+}
+
+/// This device's clock, unix seconds.
+pub fn localNow() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    return @intCast(ts.sec);
+}
+
+/// The bridge's clock minus the device's, from a JWT just received: its `iat` is the
+/// bridge's time when it was minted (one network trip ago).
+pub fn offsetFrom(creds: []const u8, local_now: i64) i64 {
+    const t = jwtTimes(creds) orelse return 0;
+    return t.iat - local_now;
 }
 
 /// §10jt: the JWT's issue and expiry times (unix seconds), read from its payload —
@@ -169,7 +193,8 @@ pub fn jwtTimes(creds: []const u8) ?JwtTimes {
     return .{ .iat = iat.integer, .exp = exp.integer };
 }
 
-/// Renew when less than a quarter of the JWT's life is left (or it is gone).
+/// Renew when less than a quarter of the JWT's life is left (or it is gone). `now` is
+/// the bridge's time (`Identity.serverNow`), the clock the JWT's times come from.
 pub fn renewDue(creds: []const u8, now: i64) bool {
     const t = jwtTimes(creds) orelse return false;
     const life = t.exp - t.iat;
@@ -196,25 +221,34 @@ pub fn renew(a: std.mem.Allocator, id: Identity) !Identity {
     defer skp.wipe();
     var pub_buf: [nats.nkeys.public_key_text_len]u8 = undefined;
     const public = skp.publicKeyText(&pub_buf);
-    var ts_c: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts_c);
-    const ts: i64 = @intCast(ts_c.sec);
-    var msg_buf: [128]u8 = undefined;
-    const msg = std.fmt.bufPrint(&msg_buf, "zebridge-renew:{s}:{d}", .{ public, ts }) catch unreachable;
-    const sig = skp.sign(msg) catch return fail("renew: signing failed", .{});
-    var sig_buf: [88]u8 = undefined;
-    const sig_s = std.base64.url_safe_no_pad.Encoder.encode(&sig_buf, &sig);
-
-    const url = try std.fmt.allocPrint(a, "{s}/renew?user_pubkey={s}&ts={d}&sig={s}", .{ id.bridge_url, public, ts, sig_s });
-    defer a.free(url);
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
     var client: std.http.Client = .{ .allocator = a, .io = threaded.io() };
     defer client.deinit();
     var body: std.Io.Writer.Allocating = .init(a);
     defer body.deinit();
-    const res = client.fetch(.{ .location = .{ .url = url }, .response_writer = &body.writer }) catch |err|
-        return fail("renew: {s} unreachable ({s})", .{ id.bridge_url, @errorName(err) });
+    // Stamped in the bridge's time. If the device's clock moved since the offset was
+    // taken, the bridge refuses the stamp and says its time: one more try with it.
+    var offset = id.clock_offset;
+    var res: std.http.Client.FetchResult = undefined;
+    for (0..2) |attempt| {
+        const ts = localNow() + offset;
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "zebridge-renew:{s}:{d}", .{ public, ts }) catch unreachable;
+        const sig = skp.sign(msg) catch return fail("renew: signing failed", .{});
+        var sig_buf: [88]u8 = undefined;
+        const sig_s = std.base64.url_safe_no_pad.Encoder.encode(&sig_buf, &sig);
+        const url = try std.fmt.allocPrint(a, "{s}/renew?user_pubkey={s}&ts={d}&sig={s}", .{ id.bridge_url, public, ts, sig_s });
+        defer a.free(url);
+        body.clearRetainingCapacity();
+        // keep_alive off: the bridge closes after each answer, and the retry must not
+        // pick that closed connection back out of the pool.
+        res = client.fetch(.{ .location = .{ .url = url }, .response_writer = &body.writer, .keep_alive = false }) catch |err|
+            return fail("renew: {s} unreachable ({s})", .{ id.bridge_url, @errorName(err) });
+        if (attempt > 0 or res.status != .unauthorized) break;
+        const server_time = serverTimeIn(a, body.written()) orelse break;
+        offset = server_time - localNow();
+    }
     const text = body.written();
     last_purge = false;
     if (res.status != .ok) {
@@ -247,7 +281,17 @@ pub fn renew(a: std.mem.Allocator, id: Identity) !Identity {
     if (str(o, "nats_url")) |v| out.nats_url = try a.dupe(u8, v);
     if (str(o, "grammar_hash")) |v| out.grammar_hash = try a.dupe(u8, v);
     if (str(o, "js_domain")) |v| out.js_domain = try a.dupe(u8, v);
+    out.clock_offset = offsetFrom(out.creds, localNow());
     return out;
+}
+
+/// The bridge's time in a refusal of a renewal stamp (`"server_time"`), if any.
+fn serverTimeIn(a: std.mem.Allocator, text: []const u8) ?i64 {
+    const p = std.json.parseFromSlice(Value, a, text, .{}) catch return null;
+    defer p.deinit();
+    if (p.value != .object) return null;
+    const v = p.value.object.get("server_time") orelse return null;
+    return if (v == .integer) v.integer else null;
 }
 
 fn str(o: Value, k: []const u8) ?[]const u8 {
@@ -290,6 +334,9 @@ pub fn load(a: std.mem.Allocator, path: []const u8) !?Identity {
     if (str(o, "nats_url")) |v| id.nats_url = try a.dupe(u8, v);
     if (str(o, "grammar_hash")) |v| id.grammar_hash = try a.dupe(u8, v);
     if (str(o, "js_domain")) |v| id.js_domain = try a.dupe(u8, v);
+    if (o.object.get("clock_offset")) |v| if (v == .integer) {
+        id.clock_offset = v.integer;
+    };
     return id;
 }
 
@@ -306,6 +353,7 @@ pub fn save(a: std.mem.Allocator, path: []const u8, id: Identity) !void {
     if (id.nats_url) |v| try obj.put(aa, "nats_url", .{ .string = v });
     if (id.grammar_hash) |v| try obj.put(aa, "grammar_hash", .{ .string = v });
     if (id.js_domain) |v| try obj.put(aa, "js_domain", .{ .string = v });
+    try obj.put(aa, "clock_offset", .{ .integer = id.clock_offset });
     const text = try core.valueToString(aa, .{ .object = obj });
     defer std.crypto.secureZero(u8, @constCast(text));
 
@@ -341,6 +389,7 @@ test "an identity survives save and load, and the file is private" {
         .creds = try credsText(a, "eyJ0eXAi.jwt.sig", "SUAEXAMPLESEED"),
         .nats_url = try a.dupe(u8, "tls://zb.example.com:4222"),
         .grammar_hash = try a.dupe(u8, "848d9fc8"),
+        .clock_offset = -3600,
     };
     defer id.deinit(a);
     try save(a, path, id);
@@ -350,6 +399,7 @@ test "an identity survives save and load, and the file is private" {
     try std.testing.expectEqualStrings("alice", back.principal);
     try std.testing.expectEqualStrings("tls://zb.example.com:4222", back.nats_url.?);
     try std.testing.expect(back.js_domain == null);
+    try std.testing.expectEqual(@as(i64, -3600), back.clock_offset);
     const st = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
     try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(@intFromEnum(st.permissions))) & 0o777);
     try std.testing.expect((try load(a, "zbz-no-such-identity.json")) == null);
@@ -369,4 +419,17 @@ test "renewDue: a quarter of the life left is the line" {
     try std.testing.expect(!renewDue(creds, 1750));
     try std.testing.expect(renewDue(creds, 1751));
     try std.testing.expect(renewDue(creds, 2500));
+}
+
+test "a device clock an hour ahead renews on the bridge's schedule" {
+    // {"iat":1000,"exp":2000}, received when the device's clock read 4600.
+    const payload = "eyJpYXQiOjEwMDAsImV4cCI6MjAwMH0";
+    const creds = "-----BEGIN NATS USER JWT-----\nxx." ++ payload ++ ".yy\n------END NATS USER JWT------\n";
+    const offset = offsetFrom(creds, 4600);
+    try std.testing.expectEqual(@as(i64, -3600), offset);
+    // On its own clock it would renew at once, and forever; in the bridge's time it waits.
+    try std.testing.expect(renewDue(creds, 4600));
+    try std.testing.expect(!renewDue(creds, 4600 + offset));
+    try std.testing.expect(!renewDue(creds, 5350 + offset));
+    try std.testing.expect(renewDue(creds, 5351 + offset));
 }

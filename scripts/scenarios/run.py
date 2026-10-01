@@ -57,6 +57,7 @@ GROUPS = {
         "revoke_full":   ("none",   "the hard kill: --revoke --conf amends the account JWT; reload kicks the live session"),
         "revoke_purge":  ("none",   "--revoke --purge: libzb and zb-client-ts delete their replica and identity, live and on return; /renew says purge; a plain revoke leaves them (own NATS stack and probe bridge, §10kn)"),
         "grammar_served": ("bridge", "the embedded grammar served at /grammar and /enroll; a file-free libzb client syncs"),
+        "jwt_renew":     ("none",   "40 s JWTs: libzb and zb-client-ts stay connected 100 s and keep receiving (two renewals each); a stored clock estimate 2 h ahead (stamp refused with the bridge's time, re-stamped) and 2 h behind with the JWT expired (NATS refuses, renewed anyway): both reconnect (own NATS stack, §10kr)"),
         "standby":       ("none",   "DATABASE_READER_URL on a hot standby (pg_basebackup on port 15433), DATABASE_WRITER_URL on the primary: the bridge says so, its logical slot is on the standby, bookkeeping on the primary; a client seeds, receives a primary change decoded on the standby, and writes to the primary (own NATS stack)"),
         "multi_bridge":  ("none",   "two bridges, one publication, slot and port each, on one database and one NATS: each publishes and snapshots its own table only, neither sweeps the other's chain, one client enrolled at A follows and writes both, one ALTER is described once (own NATS stack, §10kp)"),
         "telemetry":     ("none",   "HTTP surface"),

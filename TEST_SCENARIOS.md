@@ -134,6 +134,7 @@ Each row: something that could go wrong, what the test shows instead, and the te
 | a revoked user keeps access | their writes are refused at once; a full revocation also cuts their reads and ends their open session at once | `revoke.py`, `revoke_full.py` |
 | a revoked user's data stays on their device | with `--purge`, the device deletes its replica and identity when it reconnects or renews its JWT; a plain revocation leaves them | `revoke_purge.py` |
 | an expired JWT fails silently and the device retries forever | it fails with a clear, named error | `jwt_expiry.py` |
+| a device in use is cut off when its JWT runs out, or its wrong clock stops it renewing | both libraries hold 40 s JWTs across 100 s and keep receiving; with a clock estimate 2 h ahead or 2 h behind (the JWT expired meanwhile), each renews and connects | `jwt_renew.py` |
 
 ### Under load
 
@@ -173,7 +174,7 @@ Each claim of the README's feature list, the tests behind it, and how far they g
 | standby read replica | `standby` | the whole path: slot on the standby, seed, live change, write to the primary |
 | `--revoke --purge` deletes the local replica | `revoke_purge` | both libraries, connected and on return, at reconnection and at renewal |
 | multiple instances | `multi_bridge` | two bridges, one database, one NATS |
-| the JWT renews itself | `revoke_purge` (F), `jwt_expiry` | partial: a device asks for renewal once a quarter of its JWT's life is left (F, where it is refused because it was revoked), and an expired JWT fails with a named error; no test shows a device still working past its first JWT's lifetime |
+| the JWT renews itself | `jwt_renew`, `revoke_purge` (F), `jwt_expiry` | both libraries keep working past two JWT lifetimes, and through a device clock 2 h off either way; a revoked device's renewal gets the purge answer |
 | TLS in transit | `tls`, `burst_tls` | the certificate is checked; the cost is measured |
 | schema changes reach every replica live | `migrate_both`, `invalidate`, `offline_migrate` | online and offline, both libraries |
 | PostGIS and pgvector ready | `blobs`, `vectors`, `pgreplica`, `duckdb_replica` | byte-exact both ways, by hand |

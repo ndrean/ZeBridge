@@ -456,6 +456,9 @@ const ClientBox = struct {
     /// `poll` last asked whether its JWT is due for renewal.
     id_path: ?[]u8 = null,
     next_renew_check: i64 = 0,
+    /// The bridge's clock minus this device's (`Identity.clock_offset`): renewal is
+    /// timed in the bridge's time.
+    clock_offset: i64 = 0,
 
     fn destroy(self: *ClientBox, a: std.mem.Allocator) void {
         self.c.deinit();
@@ -494,7 +497,16 @@ export fn zb_client_connect(opts_json: ?[*:0]const u8) u64 {
     // a phone has no stderr anyone reads — so the words are kept for `zb_last_error`.
     engines.last_failure = null;
     enroll.last_failure = null;
-    const box = openBox(std.heap.c_allocator, text) catch |err| {
+    force_renew = false;
+    // NATS refused the JWT: renew it once whatever the clock says, and try again. The
+    // device's estimate of the bridge's time can be wrong (its clock moved back since
+    // the last JWT), and a renewal is the one step that corrects it.
+    const box = openBox(std.heap.c_allocator, text) catch |first| retry: {
+        if (first != error.AuthExpired and first != error.AuthorizationViolation) break :retry first;
+        force_renew = true;
+        defer force_renew = false;
+        break :retry openBox(std.heap.c_allocator, text);
+    } catch |err| {
         // §10jk: an engine whose library did not open says which, and what to do.
         // §10jq: an enrollment or identity step that failed says why, the same way.
         if (engines.last_failure orelse enroll.last_failure) |why| {
@@ -548,6 +560,9 @@ export fn zb_last_error() ?[*:0]const u8 {
 /// unreachable `errdefer` is not an error — it is just never scheduled.
 ///
 /// So: nothing fallible above the boundary, and the boundary only maps error -> 0.
+/// Set by `zb_client_connect` for its one retry after NATS refused the JWT.
+threadlocal var force_renew: bool = false;
+
 fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     const parsed = try std.json.parseFromSlice(Value, a, text, .{});
     defer parsed.deinit();
@@ -578,7 +593,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         // §10jt: a stored identity close to (or past) its JWT's expiry renews here,
         // with its key — no invite. Before expiry a failed renewal is only a warning
         // (the JWT still works); after it, the reason is the connect's error.
-        if (ident) |*cur| if (enroll.renewDue(cur.creds, nowSeconds())) {
+        if (ident) |*cur| if (force_renew or enroll.renewDue(cur.creds, cur.serverNow())) {
             if (enroll.renew(a, cur.*)) |fresh| {
                 cur.deinit(a);
                 cur.* = fresh;
@@ -590,7 +605,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
                     unlinkLocal(db_given, id_path);
                     return error.EnrollFailed;
                 }
-                const expired = if (enroll.jwtTimes(cur.creds)) |t| t.exp <= nowSeconds() else false;
+                const expired = if (enroll.jwtTimes(cur.creds)) |t| t.exp <= cur.serverNow() else false;
                 if (expired) return error.EnrollFailed;
                 std.debug.print("zebridge: {s} — carrying on with the current JWT\n", .{enroll.last_failure orelse "renew failed"});
                 enroll.last_failure = null;
@@ -754,6 +769,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         .ondemand = ondemand,
         .all_tables = all_tables,
         .id_path = kept_id_path,
+        .clock_offset = if (ident) |i| i.clock_offset else 0,
     };
     return box;
 }
@@ -1131,26 +1147,35 @@ fn nowSeconds() i64 {
     return @intCast(ts.sec);
 }
 
+fn monoSeconds() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @intCast(ts.sec);
+}
+
 /// §10jt: every eighth of the JWT's life (at most a minute), from the host's poll thread: a JWT with less than
 /// a quarter of its life left is renewed with the identity's key, the identity file is
 /// rewritten, and the new creds go to the connection for its NEXT handshake (nats.zig
 /// patch 29, under the connection's mutex). The current socket is left alone: the
 /// server ends it at the old JWT's expiry and the reconnect presents the new one.
-fn maybeRenew(b: *ClientBox) void {
+fn maybeRenew(b: *ClientBox, force: bool) void {
     const path = b.id_path orelse return;
     const now = nowSeconds();
-    if (now < b.next_renew_check) return;
+    // The spacing runs on the monotonic clock: a user who sets the wall clock back by
+    // a day must not stop the checks for a day.
+    const tick = monoSeconds();
+    if (!force and tick < b.next_renew_check) return;
     // An eighth of the JWT's life between checks, at most a minute: several chances
     // inside the last quarter, whatever the lifetime (24 h in production, seconds in
     // a test).
     const life: i64 = if (enroll.jwtTimes(b.creds_text)) |t| t.exp - t.iat else 480;
-    b.next_renew_check = now + std.math.clamp(@divTrunc(life, 8), 1, 60);
-    if (!enroll.renewDue(b.creds_text, now)) return;
+    b.next_renew_check = tick + std.math.clamp(@divTrunc(life, 8), 1, 60);
+    if (!force and !enroll.renewDue(b.creds_text, now + b.clock_offset)) return;
     const a = std.heap.c_allocator;
     var id = (enroll.load(a, path) catch null) orelse return;
     defer id.deinit(a);
     // Another process sharing the identity may have renewed it already.
-    var fresh = if (enroll.renewDue(id.creds, now)) (enroll.renew(a, id) catch {
+    var fresh = if (force or enroll.renewDue(id.creds, id.serverNow())) (enroll.renew(a, id) catch {
         if (enroll.last_purge) {
             // §10kn: the next entry point (`zb_client_poll`, right after this) purges.
             b.c.revoked = true;
@@ -1171,6 +1196,7 @@ fn maybeRenew(b: *ClientBox) void {
     const old = b.creds_text;
     b.creds_text = text;
     b.c.opts.creds = text;
+    b.clock_offset = fresh.clock_offset;
     std.crypto.secureZero(u8, old);
     a.free(old);
     std.debug.print("zebridge: renewed '{s}' — the next reconnect presents the new JWT\n", .{fresh.principal});
@@ -1178,11 +1204,14 @@ fn maybeRenew(b: *ClientBox) void {
 
 export fn zb_client_poll(handle: u64, wait_ms: u64) ?[*:0]u8 {
     const b = lookup(handle) orelse return goneJson(handle);
-    maybeRenew(b);
+    maybeRenew(b, false);
     if (purgeIfAsked(handle, b)) return errJson("Revoked");
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
     const out = pollJson(arena.allocator(), b, wait_ms) catch |err| {
+        // The server ended the session on the JWT: renew now, whatever the clock says,
+        // so the host's reconnect presents a fresh one (§10kr).
+        if (b.c.authError()) |auth_err| if (auth_err == error.AuthExpired) maybeRenew(b, true);
         if (purgeIfAsked(handle, b)) return errJson("Revoked");
         // The single door every poll error passes — so the auth verdict is named
         // HERE, once, whichever `try` inside poll surfaced the dead socket (§10cj:

@@ -1869,8 +1869,8 @@ sequenceDiagram
     participant N as NATS
 
     A->>A: load the identity (JWT, seed, NATS URL, grammar hash)
-    opt the JWT has less than a quarter of its life left, or has expired
-        A->>B: GET /renew?user_pubkey=U…&ts=now&sig=Ed25519(seed)
+    opt less than a quarter of the JWT's life left (on the bridge's clock), or NATS refused it
+        A->>B: GET /renew?user_pubkey=U…&ts=bridge time&sig=Ed25519(seed)
         B->>PG: key on record, not revoked? a tenant left?
         B-->>A: a new JWT for the same key, current tenants
         A->>A: rewrite the identity
@@ -1890,7 +1890,7 @@ sequenceDiagram
 </details>
 <br>
 
-No secret crosses the wire: NATS sends a nonce, the device signs it with its seed, and NATS checks the signature and the JWT's chain up to the operator. JWTs live `ENROLL_JWT_TTL_SECONDS` (24 h by default). The library renews with a quarter of that left, by proving it holds the device's key, so there is no invite and no backend call. Only a revoked key, or a principal with no tenant left, needs a new invite.
+No secret crosses the wire: NATS sends a nonce, the device signs it with its seed, and NATS checks the signature and the JWT's chain up to the operator. JWTs live `ENROLL_JWT_TTL_SECONDS` (24 h by default). The library renews with a quarter of that left, by proving it holds the device's key, so there is no invite and no backend call. The quarter is counted on the bridge's clock, not the device's: the identity keeps the difference, taken from each JWT's issue time, so a phone with a wrong clock still renews on time. If its clock moved since, the bridge refuses the stamp and answers with its time, and the library tries once more with it; a JWT that NATS refuses is renewed at once. Only a revoked key, or a principal with no tenant left, needs a new invite.
 
 The same flow runs for every consumer (web app, phone, microservice) and in every language ([the first ten lines](CLIENTS.md#the-first-ten-lines)). Only the transport (WebSocket in the browser, TLS-TCP elsewhere) and the identity's storage differ.
 

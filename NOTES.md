@@ -18228,8 +18228,9 @@ as stored KV revisions; a core subscription also sees the duplicates JetStream d
 message id). Reported: both bridges serve `bridge_fleet_*`, so a dashboard sum double
 counts. Not exercised: `ZB_FEED_RESTART=1` on one bridge deletes the other's CDC streams.
 
-Also: `zig build test` failed on `init_sql`'s render test, which passes but printed its two
-refusals to stderr; the prints are skipped under test.
+Also: `init_sql`'s render test printed its two refusals to stderr, and Zig then echoes
+"failed command:" although the step passes (exit 0); the prints are skipped under test.
+Read the exit code or `--summary all`, not that line.
 
 ## §10kq — the standby read replica, scripted (2026-10-01)
 
@@ -18249,3 +18250,35 @@ also waits for the primary to log a running-xacts snapshot; the scenario calls
 the primary; the g1 bookkeeping row on the primary; a libzb client seeds, receives a row
 inserted on the primary (decoded on the standby), and its INSERT lands on the primary.
 Teardown stops the standby, drops the physical slot and removes the copy.
+
+## §10kr — JWT renewal on the bridge's clock; a NATS refusal forces a renewal (2026-10-01)
+
+Asked: does the JWT really renew, and can a device stay blocked? Two clocks were mixed.
+Both libraries compared the DEVICE's clock with the JWT's `exp` (the bridge's clock), and
+`/renew` refuses a `ts` more than 60 s off the bridge's clock. A phone whose clock was two
+minutes off was refused every renewal, its JWT expired, and it stayed out. A clock hours
+ahead would also have renewed on every check; hours behind, never before expiry.
+
+Now, in libzb and zb-client-ts alike:
+- the identity keeps `clock_offset` = the bridge's clock minus the device's, taken from
+  each JWT's `iat` on arrival (enroll and renew); `renewDue` and the `/renew` stamp use
+  `local now + offset`. The quarter-of-the-life threshold is unchanged;
+- `/renew`'s 401 for a stamp out of the window carries `"server_time"`; the client
+  re-stamps with it and retries once (the signature still binds the stamp, so a replay
+  stays bounded by the 60 s window);
+- a JWT that NATS refuses forces a renewal whatever the estimate says: libzb retries
+  `zb_client_connect` once after AuthExpired / Authorization Violation, and `poll`
+  renews on AuthExpired before returning it, so the host's reopen presents a fresh JWT;
+  zb-client-ts does the same in `connect()` and on the status loop's
+  "Authentication Expired".
+- libzb spaced its checks (`next_renew_check`) on the wall clock: a clock set back by
+  a day stopped the checks for a day. Now the monotonic clock (zb-client-ts's
+  setTimeout already was). jwt_renew 10/10 after it.
+- libzb's renew fetch has keep-alive off: the bridge closes after each answer, and the
+  retry picked the closed connection out of the pool (`HttpConnectionClosing`).
+
+`jwt_renew.py` (own NATS 14225, publication/slot zb_jr, port 9096, 40 s JWTs), 10/10:
+A. both clients connected 100 s: 3 JWTs each, the row inserted at the end received;
+B. stored offset +7200: renewal due at once, the stamp refused with the bridge's time,
+re-stamped, renewed, offset back to 0, connected; C. offset −7200 and the JWT left to
+expire: NATS refuses, renewed anyway, connected. revoke_purge 19/19 after the change.

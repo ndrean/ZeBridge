@@ -554,8 +554,13 @@ pub const Server = struct {
 
         const now = @as(i64, @intCast(c.time(null)));
         if (@abs(now - ts) > Config.Http.renew_clock_skew_seconds) {
-            log.warn("🔁 renewal refused: timestamp {d} s off the bridge's clock", .{now - ts});
-            return bad.respond(req, cors, .unauthorized, "{\"error\":\"stale or future timestamp — check the device clock\"}\n");
+            log.warn("🔁 renewal refused: timestamp {d} s off the bridge's clock — the answer carries the bridge's time", .{now - ts});
+            // The bridge's time goes back with the refusal: the device re-stamps with it
+            // and tries once more, so a wrong device clock never locks a device out.
+            // The signature still binds the stamp, so a replay stays bounded by the window.
+            var skew_buf: [128]u8 = undefined;
+            const skew_body = std.fmt.bufPrint(&skew_buf, "{{\"error\":\"stale or future timestamp\",\"server_time\":{d}}}\n", .{now}) catch unreachable;
+            return bad.respond(req, cors, .unauthorized, skew_body);
         }
         var msg_buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "zebridge-renew:{s}:{d}", .{ user_pub, ts }) catch unreachable;
