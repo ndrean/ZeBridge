@@ -1,6 +1,9 @@
-# 10-airports — the world's airports, on a map, without querying PostgreSQL
+# 10-airports — a shared flight and a map service over NATS
 
-9,253 airports in one PostgreSQL table. A DuckDB service holds a replica and answers the map's questions over NATS; the browser asks it, and PostgreSQL never sees a query.
+This demo shows two things:
+
+1. **A write travels through PostgreSQL to the other browsers.** Users of one tenant edit the same flight. When one sets the departure or the arrival, PostgreSQL accepts the write and every other browser of that tenant draws the new route.
+2. **A browser asks a service over NATS and gets an answer.** A DuckDB service holds a copy of 9,253 airports and answers "which airports are near here?" for the map. PostgreSQL never sees these questions.
 
 You need a running ZeBridge: PostgreSQL with the init SQL applied, NATS, and the bridge ([SUPABASE_TEST.md](../../SUPABASE_TEST.md) sets one up on a cloud database). The commands below run from the repository root, with the admin URL of your database in `$ADMIN_URL`.
 
