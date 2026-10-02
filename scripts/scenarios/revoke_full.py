@@ -44,8 +44,8 @@ def main() -> int:
         c = conf.read_text().replace("port: 4222", f"port: {PORT}") \
                             .replace("port: 8222", "port: 18223").replace("port: 8080", "port: 18081")
         conf.write_text(c)
-        env_text = (tmp / "zb-nats" / ".env.bridge").read_text()
-        store = tmp / "zb-nats" / "operator.store"  # the offline seeds, never in .env.bridge
+        env_text = (tmp / "zb-nats" / ".env.nats").read_text()
+        store = tmp / "zb-nats" / "operator.store"  # the offline seeds, never in .env.nats
         op_seed = re.search(r"^OPERATOR_SEED=(SO[A-Z0-9]+)", store.read_text(), re.M).group(1)
         acct = re.search(r"^ZB_ACCOUNT_PUB=(A[A-Z0-9]+)", env_text, re.M).group(1)
         creds = tmp / "zb-nats" / "creds" / "bridge.creds"

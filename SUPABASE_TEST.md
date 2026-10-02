@@ -35,6 +35,8 @@ SB_ADMIN_URL=postgresql://postgres:<password>@$host:5432/postgres
 DATABASE_READER_URL=postgresql://zb_reader:$(openssl rand -hex 16)@$host:5432/postgres?sslmode=require
 DATABASE_WRITER_URL=postgresql://zb_writer:$(openssl rand -hex 16)@$host:5432/postgres?sslmode=require
 BRIDGE_CDC_PUBLICATION=my_pub
+BRIDGE_CDC_SLOT=zb_slot
+GENERATIONS_ENABLED=1
 EOF
 ```
 
@@ -82,29 +84,30 @@ select rolname, rolreplication, rolbypassrls from pg_roles where rolname in ('zb
 
 ## 4. NATS
 
-The bridge generates the whole NATS setup (operator, account, signing keys, the bridge's credentials) into `./zb-nats/` (git-ignored):
+The bridge generates the whole NATS setup (operator, account, signing keys, the bridge's credentials, and `.env.nats`) into `./zb-nats/` (git-ignored). The ports here are off the defaults (4222, 8222, 8080), so another NATS can run beside it:
 
 ```sh
-./zig-out/bin/bridge --init-nats operator
+./zig-out/bin/bridge --init-nats operator --port 4232 --http-port 8232 --ws-port 8082
+# --dir zb-nats is the default
+
 nats-server -c zb-nats/nats-server.conf
 ```
 
-Here the ports were moved off the defaults (client 4232, monitoring 8232, WebSocket 8082) so another NATS could run beside it: edit `port`, `http_port` and the websocket `port` in `zb-nats/nats-server.conf` before starting it.
+`zb-nats/.env.nats` holds the NATS settings only: `NATS_URL` (with the port above), the bridge's credentials, and the enrollment keys.
 
 `zb-nats/operator.store` holds every seed: keep it off the server.
 
 ## 5. The bridge
 
-The generated `zb-nats/.env.bridge` names NATS and the enrollment keys; `.env.supabase` names the database. Load both, the database last:
+The bridge loads two files: `zb-nats/.env.nats` (NATS, generated) and `.env.supabase` (the database, the slot, the publication). They share no setting, so the order does not matter:
 
 ```sh
 #!/bin/sh
 # zb-nats/run-bridge.sh
 cd "$(dirname "$0")/.."
 set -a
-. zb-nats/.env.bridge
+. zb-nats/.env.nats
 . ./.env.supabase
-NATS_URL=nats://127.0.0.1:4232
 set +a
 exec ./zig-out/bin/bridge
 ```

@@ -10,14 +10,14 @@
 //!
 //! Two modes, and an update:
 //!   dev              10 seconds flat: an OPEN server conf (JetStream on, no auth at
-//!                    all) plus a matching .env.bridge. No JWT in sight. Enrollment
+//!                    all) plus a matching .env.nats. No JWT in sight. Enrollment
 //!                    stays off (no ZB_SIGNING_SEED) — the bridge already treats that
 //!                    as "endpoint dark". Loudly marked dev-only.
 //!   operator         the full stack, self-contained: every key generated here, the
 //!                    operator and account JWTs minted by `jwt_mint.signClaims`, the
 //!                    client template's subject list derived FROM THE TOPOLOGY —
 //!                    grammar renames propagate instead of drifting from a shell
-//!                    script — and .env.bridge ready for enrollment (`ZB_SIGNING_SEED`
+//!                    script — and .env.nats ready for enrollment (`ZB_SIGNING_SEED`
 //!                    is the scoped client key, exactly what /enroll mints with).
 //!                    Every seed also goes to operator.store (0600), which the bridge
 //!                    never reads: the operator and account seeds live ONLY there.
@@ -326,15 +326,14 @@ pub fn run(
     defer arena.deinit();
     const a = arena.allocator();
 
-    // ── self-contained by design (review: "no needs for these args") — the mode
-    //    word and --force are the whole surface. Ports, directory and topology are
-    //    the well-known defaults; a deployment that needs different ones edits the
-    //    two generated files, which are plain text and theirs.
+    // ── the mode word and --force are the core; directory, ports and the JetStream
+    //    domain have flags, and everything else is the well-known defaults. The
+    //    generated files are plain text and the deployment's to edit.
     var mode: Mode = .dev;
     var force = false;
     // `--js-domain NAME`: the deployment reaches JetStream across a leaf link. The
     // server conf declares the domain, the grants name `$JS.<NAME>.API.`, and
-    // .env.bridge carries NATS_JS_DOMAIN so the bridge and /enroll say the same.
+    // .env.nats carries NATS_JS_DOMAIN so the bridge and /enroll say the same.
     var js_domain: ?[]const u8 = null;
     // `--update [--store PATH]`: re-sign the account from the offline store (runUpdate).
     var update = false;
@@ -343,6 +342,12 @@ pub fn run(
     // absolute paths inside them (JetStream's store_dir, NATS_CREDS) point there. Run
     // it on the host that will use the files: `--dir /etc/zebridge`.
     var dir: []const u8 = "zb-nats";
+    // `--port`, `--http-port`, `--ws-port`: the server's client, monitoring and WebSocket
+    // ports, written into the conf (and the client one into NATS_URL), so a second NATS
+    // beside another needs no hand edit.
+    var nats_port: u32 = 4222;
+    var http_port: u32 = 8222;
+    var ws_port: u32 = 8080;
     {
         var it = init.minimal.args.iterate();
         _ = it.next();
@@ -357,6 +362,12 @@ pub fn run(
             } else if (std.mem.eql(u8, arg, "--dir")) {
                 dir = it.next() orelse return usageErr("--dir needs a path");
                 if (dir.len == 0) return usageErr("--dir needs a path");
+            } else if (std.mem.eql(u8, arg, "--port")) {
+                nats_port = portArg(it.next()) orelse return usageErr("--port needs a port number (1-65535)");
+            } else if (std.mem.eql(u8, arg, "--http-port")) {
+                http_port = portArg(it.next()) orelse return usageErr("--http-port needs a port number (1-65535)");
+            } else if (std.mem.eql(u8, arg, "--ws-port")) {
+                ws_port = portArg(it.next()) orelse return usageErr("--ws-port needs a port number (1-65535)");
             } else if (std.mem.eql(u8, arg, "--js-domain")) {
                 const v = it.next() orelse return usageErr("--js-domain needs a name");
                 for (v) |ch| if (ch == '.' or ch == ' ' or ch == '*' or ch == '>') return usageErr("--js-domain must be one subject token (no '.', ' ', '*', '>')");
@@ -374,9 +385,8 @@ pub fn run(
         return runUpdate(io, dir, store_path);
     }
     if (store_path != null) return usageErr("--store goes with --update");
-    const nats_port: u32 = 4222;
-    const ws_port: u32 = 8080;
-    const http_port: u32 = 8222;
+    if (nats_port == http_port or nats_port == ws_port or http_port == ws_port)
+        return usageErr("--port, --http-port and --ws-port must differ");
 
     std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
         out("🔴 could not create {s}: {}\n", .{ dir, err });
@@ -415,8 +425,13 @@ pub fn run(
 }
 
 fn usageErr(msg: []const u8) u8 {
-    out("🔴 {s}\n  bridge --init-nats [dev|operator] [--dir DIR] [--js-domain NAME] [--force]\n  bridge --init-nats --update [--dir DIR] [--store PATH]\n", .{msg});
+    out("🔴 {s}\n  bridge --init-nats [dev|operator] [--dir DIR] [--port N] [--http-port N] [--ws-port N] [--js-domain NAME] [--force]\n  bridge --init-nats --update [--dir DIR] [--store PATH]\n", .{msg});
     return 1;
+}
+
+fn portArg(v: ?[]const u8) ?u32 {
+    const n = std.fmt.parseInt(u32, v orelse return null, 10) catch return null;
+    return if (n >= 1 and n <= 65535) n else null;
 }
 
 /// What `--js-domain` renders: the conf's `domain:` line inside `jetstream {}`, and the
@@ -450,7 +465,7 @@ fn runDev(
     js_domain: ?[]const u8,
 ) u8 {
     // The nkey is generated even though the open server ignores it: the SAME
-    // .env.bridge then survives the upgrade to operator mode with only the conf
+    // .env.nats then survives the upgrade to operator mode with only the conf
     // swapped — the seed is already in place for the server to authorize.
     const bridge_kp = genKey(io, .user) catch return 1;
     const lines = domainLines(a, js_domain) catch return 1;
@@ -482,16 +497,12 @@ fn runDev(
     const env = std.fmt.allocPrint(
         a,
         \\# Generated by `bridge --init-nats dev` — DEV ONLY (open NATS, no JWT).
-        \\DATABASE_READER_URL=postgres://bridge_reader:reader_password_changeme@127.0.0.1:5432/postgres
-        \\DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:5432/postgres
+        \\# NATS only. The bridge also loads the DBA's .env.bridge, which names the database
+        \\# and the bridge's own settings: DATABASE_READER_URL, DATABASE_WRITER_URL,
+        \\# BRIDGE_CDC_SLOT, BRIDGE_CDC_PUBLICATION, and GENERATIONS_ENABLED=1 (the snapshots
+        \\# clients seed from). The two files share no setting: load them in any order.
         \\NATS_URL=nats://127.0.0.1:{d}
         \\{s}
-        \\BRIDGE_CDC_SLOT=zb_slot
-        \\BRIDGE_CDC_PUBLICATION=zb_pub
-        \\BRIDGE_PORT=27434
-        \\LOG_LEVEL=info
-        \\# The snapshots clients seed from; without them a new client cannot load a table.
-        \\GENERATIONS_ENABLED=1
         \\
         \\# The bridge's nkey identity — unused by the OPEN dev server, but generated now
         \\# so the upgrade to operator mode is a conf swap, not a credential migration.
@@ -507,15 +518,15 @@ fn runDev(
     ) catch return 1;
 
     const conf_path = std.fs.path.join(a, &.{ dir, "nats-server.conf" }) catch return 1;
-    const env_path = std.fs.path.join(a, &.{ dir, ".env.bridge" }) catch return 1;
+    const env_path = std.fs.path.join(a, &.{ dir, ".env.nats" }) catch return 1;
     writeFile(io, conf_path, conf, force) catch return 1;
     writeFile(io, env_path, env, force) catch return 1;
 
     out(
         \\✅ dev stack generated (OPEN server — dev only):
         \\   {s}/nats-server.conf     nats-server -c {s}/nats-server.conf
-        \\   {s}/.env.bridge          set -a; . {s}/.env.bridge; set +a; ./bridge
-        \\   Edit the two postgres URLs, run init.sql, and you are live. No JWT anywhere.
+        \\   {s}/.env.nats            set -a; . {s}/.env.nats; . ./.env.bridge; set +a; ./bridge
+        \\   .env.bridge is yours: the database URLs, the slot, the publication. No JWT anywhere.
         \\
     ,
         .{ dir, dir, dir, dir },
@@ -699,17 +710,13 @@ fn runOperator(
     const env = std.fmt.allocPrint(
         a,
         \\# Generated by `bridge --init-nats operator` — the full JWT stack.
-        \\DATABASE_READER_URL=postgres://bridge_reader:reader_password_changeme@127.0.0.1:5432/postgres
-        \\DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:5432/postgres
+        \\# NATS only. The bridge also loads the DBA's .env.bridge, which names the database
+        \\# and the bridge's own settings: DATABASE_READER_URL, DATABASE_WRITER_URL,
+        \\# BRIDGE_CDC_SLOT, BRIDGE_CDC_PUBLICATION, and GENERATIONS_ENABLED=1 (the snapshots
+        \\# clients seed from). The two files share no setting: load them in any order.
         \\NATS_URL=nats://127.0.0.1:{d}
         \\NATS_CREDS={s}/creds/bridge.creds
         \\{s}
-        \\BRIDGE_CDC_SLOT=zb_slot
-        \\BRIDGE_CDC_PUBLICATION=zb_pub
-        \\BRIDGE_PORT=27434
-        \\LOG_LEVEL=info
-        \\# The snapshots clients seed from; without them a new client cannot load a table.
-        \\GENERATIONS_ENABLED=1
         \\
         \\# Enrollment: the bridge as online signer (GET /enroll). The seed below is the
         \\# account's SCOPED client signing key — it can mint client-role users and
@@ -739,7 +746,7 @@ fn runOperator(
     const creds_dir = std.fs.path.join(a, &.{ dir, "creds" }) catch return 1;
     std.Io.Dir.cwd().createDirPath(io, creds_dir) catch return 1;
     const conf_path = std.fs.path.join(a, &.{ dir, "nats-server.conf" }) catch return 1;
-    const env_path = std.fs.path.join(a, &.{ dir, ".env.bridge" }) catch return 1;
+    const env_path = std.fs.path.join(a, &.{ dir, ".env.nats" }) catch return 1;
     const creds_path = std.fs.path.join(a, &.{ dir, "creds", "bridge.creds" }) catch return 1;
     // The store first: if it cannot be written, no conf may exist signed by keys
     // that nobody kept.
@@ -770,7 +777,8 @@ fn runOperator(
         \\✅ operator stack generated — no nsc involved:
         \\   {s}/nats-server.conf   operator + ZEBRIDGE account (3 scoped signing keys: client, responder, service), resolver preload
         \\   {s}/creds/bridge.creds the bridge's identity (service scope)
-        \\   {s}/.env.bridge        NATS_CREDS + ZB_SIGNING_SEED wired for /enroll
+        \\   {s}/.env.nats          NATS_URL, NATS_CREDS, ZB_SIGNING_SEED for /enroll — NATS only;
+        \\                           the database and the bridge's settings stay in your .env.bridge
         \\   {s}/operator.store     every seed, 0600 — the bridge never reads it: move it OFF this host
         \\   Client onboarding is now ONLY the enrollment flow: invite row → GET /enroll →
         \\   creds. Nobody needs to understand accounts or claims.

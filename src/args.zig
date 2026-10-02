@@ -21,6 +21,9 @@ const usage =
     \\
     \\  --init-nats [dev|operator]  Generate the whole NATS stack, no nsc (--force overwrites)
     \\      [--dir DIR]             …where the files live on their host (default ./zb-nats)
+    \\      [--port N]              …the client port (default 4222), also in NATS_URL
+    \\      [--http-port N]         …the monitoring port (default 8222)
+    \\      [--ws-port N]           …the WebSocket port (default 8080)
     \\      [--js-domain NAME]      …for a JetStream reached across a leaf link (conf, grants, env)
     \\
     \\  --init-nats --update        Re-sign the account after a grammar change, same keys

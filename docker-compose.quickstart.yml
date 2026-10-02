@@ -48,7 +48,7 @@ services:
 
   bridge:
     image: zebridge/bridge:quickstart
-    entrypoint: ["/bin/sh", "-c", "set -a; . /zb-nats/.env.bridge; set +a; exec bridge"]
+    entrypoint: ["/bin/sh", "-c", "set -a; . /zb-nats/.env.nats; . /zb-nats/.env.bridge; set +a; exec bridge"]
     environment:
       # Inside the container: the web service reaches /enroll over the compose
       # network. The host still sees the port on 127.0.0.1 only (below).
@@ -64,7 +64,7 @@ services:
 
   sweeper:
     build: { context: ., dockerfile: Dockerfile.sweeper }
-    entrypoint: ["/bin/sh", "-c", "set -a; . /zb-nats/.env.bridge; set +a; exec sweeper"]
+    entrypoint: ["/bin/sh", "-c", "set -a; . /zb-nats/.env.nats; . /zb-nats/.env.bridge; set +a; exec sweeper"]
     volumes:
       - zb-nats:/zb-nats
     depends_on:

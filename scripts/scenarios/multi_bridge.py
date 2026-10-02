@@ -101,7 +101,7 @@ def start_stack(tmp: str) -> tuple[subprocess.Popen, dict]:
     text = open(conf).read().replace("port: 4222", f"port: {NATS_PORT}") \
         .replace("port: 8222", "port: 18225").replace("port: 8080", "port: 18083")
     open(conf, "w").write(text)
-    genv = dict(line.split("=", 1) for line in open(os.path.join(gen, "." + "env.bridge")).read().splitlines()
+    genv = dict(line.split("=", 1) for line in open(os.path.join(gen, "." + "env.nats")).read().splitlines()
                 if "=" in line and not line.startswith("#"))
     ns = subprocess.Popen(["nats-server", "-c", conf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     deadline = time.monotonic() + 10

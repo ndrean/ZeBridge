@@ -301,8 +301,13 @@ CREATE TABLE IF NOT EXISTS public.zebridge_catalogue (
     -- schema descriptor and the chain manifest; a client whose stored epoch is lower
     -- forgets its watermark and seeds a fresh full. The producer builds that full.
     seed_epoch    integer NOT NULL DEFAULT 0,
+    -- The operator's acceptance of physical deletes on a writable table with no
+    -- tombstone (zebridge_enable's allow_physical_deletes), kept so zebridge_check
+    -- reads it too: the catalogue is the intent, nothing has to be repeated.
+    allow_physical_deletes boolean NOT NULL DEFAULT false,
     CHECK ((tenant_col IS NULL) <> (public_reason IS NULL))
 );
+ALTER TABLE public.zebridge_catalogue ADD COLUMN IF NOT EXISTS allow_physical_deletes boolean NOT NULL DEFAULT false;
 GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_READER_USER};
 
 -- The bridge's runtime verdicts, made queryable (NOTES §10cf). A row_too_large
@@ -2074,20 +2079,20 @@ BEGIN
     -- with the replica's stored epoch means anything.
     IF NOT dry_run THEN
         EXECUTE format(
-            'INSERT INTO public.zebridge_catalogue (tbl, tenant_col, public_reason, version_col, tombstone_col, tiebreak_col, generations) '
-            'VALUES (%L, %L, %L, COALESCE(%L, ''updated_at''), %L, %L, %L) '
+            'INSERT INTO public.zebridge_catalogue (tbl, tenant_col, public_reason, version_col, tombstone_col, tiebreak_col, generations, allow_physical_deletes) '
+            'VALUES (%L, %L, %L, COALESCE(%L, ''updated_at''), %L, %L, %L, %L) '
             'ON CONFLICT (tbl) DO UPDATE SET tenant_col = EXCLUDED.tenant_col, '
             'public_reason = EXCLUDED.public_reason, version_col = EXCLUDED.version_col, '
             'tombstone_col = EXCLUDED.tombstone_col, tiebreak_col = EXCLUDED.tiebreak_col, '
-            'generations = EXCLUDED.generations',
-            short, tenant_col, public_reason, version_col, tombstone_col, tiebreak_col, generations);
+            'generations = EXCLUDED.generations, allow_physical_deletes = EXCLUDED.allow_physical_deletes',
+            short, tenant_col, public_reason, version_col, tombstone_col, tiebreak_col, generations, allow_physical_deletes);
     END IF;
     RETURN QUERY SELECT 'catalogue', verb,
-        format('zebridge_catalogue[%s]: tenant_col=%s version_col=%s tombstone=%s tiebreak=%s generations=%s '
+        format('zebridge_catalogue[%s]: tenant_col=%s version_col=%s tombstone=%s tiebreak=%s generations=%s allow_physical_deletes=%s '
                '— the bridge reads this at boot (env rules become overrides) and the '
                'generation producer per tick', short,
                COALESCE(tenant_col::text, 'NULL(public)'), COALESCE(version_col::text, 'updated_at'),
-               COALESCE(tombstone_col::text, '-'), COALESCE(tiebreak_col::text, '-'), generations);
+               COALESCE(tombstone_col::text, '-'), COALESCE(tiebreak_col::text, '-'), generations, allow_physical_deletes);
 
     -- ── the version index (§10gc): a delta must not read the whole table ──────
     -- The generation producer selects a delta's rows `WHERE version > previous cutoff`.
@@ -2296,9 +2301,10 @@ CREATE OR REPLACE FUNCTION public.zebridge_check(
     tombstone_col name DEFAULT NULL,
     tiebreak_col  name DEFAULT NULL,
     tenant_col    name DEFAULT NULL,
-    -- The operator's recorded acceptance of physical deletes (zebridge_enable's
-    -- allow_physical_deletes): the catalogue does not persist it, so say it here and a
-    -- missing tombstone is a WARNING — the resurrection risk stated — not an ERROR.
+    -- The acceptance of physical deletes for a table not yet catalogued. A catalogued
+    -- table's own acceptance (zebridge_enable's allow_physical_deletes, kept in the
+    -- catalogue) counts without being repeated here. Either way, a missing tombstone
+    -- is then a WARNING — the resurrection risk stated — not an ERROR.
     allow_physical_deletes boolean DEFAULT false
 ) RETURNS TABLE (check_name text, status text, detail text) AS $$
 DECLARE
@@ -2540,7 +2546,7 @@ BEGIN
         ELSE
             RETURN QUERY SELECT 'tombstone', 'ok', format('%I %s', cat.tombstone_col, tcol.typname);
         END IF;
-    ELSIF want_writable AND allow_physical_deletes THEN
+    ELSIF want_writable AND (allow_physical_deletes OR coalesce(cat.allow_physical_deletes, false)) THEN
         warns := warns + 1;
         RETURN QUERY SELECT 'tombstone', 'WARNING',
             'physical deletes ACCEPTED: a hard-deleted row resurrects on a fresh seed until the next full '

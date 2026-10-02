@@ -5,37 +5,40 @@
 #
 # No password is written anywhere in the repository: PostgreSQL trusts connections on
 # the compose network (it publishes no port), and the bridge's two roles get random
-# passwords on the first run, kept only in the generated .env.bridge in the volume.
+# passwords on the first run, kept only in the volume's .env.bridge.
 set -eu
 
 DIR=/zb-nats
 ADMIN_URL="postgres://postgres@postgres:5432/app"
 
-# 1. NATS: an operator, an account, three scoped signing keys, the bridge's creds.
+# 1. NATS: an operator, an account, three scoped signing keys, the bridge's creds, and
+#    .env.nats (NATS only).
 if [ ! -f "$DIR/nats-server.conf" ]; then
   bridge --init-nats operator --dir "$DIR"
 fi
-
-# 2. Point the generated .env.bridge at the quickstart's services.
-set_env() {
-  if grep -q "^$1=" "$DIR/.env.bridge"; then
-    sed -i "s|^$1=.*|$1=$2|" "$DIR/.env.bridge"
-  else
-    echo "$1=$2" >> "$DIR/.env.bridge"
-  fi
-}
-random() { head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
-# --init-nats writes placeholder URLs: replace them once, on the first run.
-if ! grep -q "^DATABASE_READER_URL=.*@postgres:5432/app" "$DIR/.env.bridge"; then
-  set_env DATABASE_READER_URL "postgres://bridge_reader:$(random)@postgres:5432/app"
-  set_env DATABASE_WRITER_URL "postgres://bridge_writer:$(random)@postgres:5432/app"
+if [ ! -f "$DIR/.env.nats" ]; then
+  echo "This volume was made by an older quickstart (no .env.nats). Start again:"
+  echo "  docker compose -f docker-compose.quickstart.yml down -v"
+  exit 1
 fi
-set_env NATS_URL "nats://nats:4222"
-set_env BRIDGE_CDC_PUBLICATION "quickstart"
-set_env BRIDGE_CDC_SLOT "quickstart"
-set_env BRIDGE_PORT "27434"
-set_env GENERATION_CADENCE_SECONDS "60"
-set -a; . "$DIR/.env.bridge"; set +a
+
+# 2. Two files: .env.nats (generated) points at the compose NATS; .env.bridge holds the
+#    database and the bridge's own settings, written once with random role passwords.
+sed -i "s|^NATS_URL=.*|NATS_URL=nats://nats:4222|" "$DIR/.env.nats"
+random() { head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+if [ ! -f "$DIR/.env.bridge" ]; then
+  umask 077
+  cat > "$DIR/.env.bridge" <<EOF
+DATABASE_READER_URL=postgres://bridge_reader:$(random)@postgres:5432/app
+DATABASE_WRITER_URL=postgres://bridge_writer:$(random)@postgres:5432/app
+BRIDGE_CDC_PUBLICATION=quickstart
+BRIDGE_CDC_SLOT=quickstart
+BRIDGE_PORT=27434
+GENERATIONS_ENABLED=1
+GENERATION_CADENCE_SECONDS=60
+EOF
+fi
+set -a; . "$DIR/.env.nats"; . "$DIR/.env.bridge"; set +a
 
 # 3. PostgreSQL: roles, functions, triggers and the publication, then the demo tables.
 if ! psql "$ADMIN_URL" -tAc "SELECT 1 FROM pg_publication WHERE pubname = 'quickstart'" | grep -q 1; then

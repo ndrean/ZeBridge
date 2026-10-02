@@ -18355,3 +18355,29 @@ went down that path. Fix: that branch drops the trigger and the generated functi
 Applied to Supabase and to the dev DB (the one function, from the rendered init SQL);
 widthguard.py gains check 2b (add text, drop it: the guard comes and goes, writes work) —
 not run yet, it needs the dev stack (stopped to spare memory).
+
+## §10ku — the catalogue keeps physical-delete acceptance; `--init-nats` writes `.env.nats`, NATS only, with port flags (2026-10-02)
+
+1. `zebridge_check('counter_public', 'writable')` said ERROR (no tombstone) on a table
+   `zebridge_enable` had accepted with `allow_physical_deletes => true`: the catalogue did
+   not keep the acceptance, so the check had to be told again. Now
+   `zebridge_catalogue.allow_physical_deletes` (ADD COLUMN IF NOT EXISTS for existing
+   databases) is written by `zebridge_enable` and read by `zebridge_check`. A table enabled
+   before the upgrade needs one more `zebridge_enable` to record it. Re-running the whole
+   init SQL on Supabase and on dev: 0 errors (upgrading is re-running it).
+2. `--init-nats` wrote placeholder `DATABASE_*` URLs and the bridge's own settings into its
+   `.env.bridge`, so a DBA's database file had to be loaded AFTER it to overwrite them.
+   Now it writes `zb-nats/.env.nats`: NATS_URL, NATS_CREDS, the JS domain line, the
+   enrollment keys, nothing else. The DBA's `.env.bridge` holds the database URLs, slot,
+   publication, port, GENERATIONS_ENABLED. No shared setting: any load order. A clean break,
+   no alias: quickstart init.sh writes its own `.env.bridge` once (random role
+   passwords) and refuses an old volume (no .env.nats) with the `down -v` hint; compose,
+   the scenarios (init_nats, revoke_full, revoke_purge, multi_bridge), README production
+   setup (systemd: two EnvironmentFile lines), SUPABASE_TEST all follow.
+3. `--port`, `--http-port`, `--ws-port` (defaults 4222, 8222, 8080), checked distinct; the
+   client port also goes into NATS_URL. init_nats.py uses them instead of rewriting the
+   conf, and checks `.env.nats` carries no database setting: 10/10.
+Quickstart from scratch (`down -v`, `up --build`, bridge on 27444 beside the Supabase
+one): all services up, init printed the links, the bridge loaded both files, a throwaway
+invite enrolled (tenant tag, mapping published). Supabase bridge restarted on the two
+files.

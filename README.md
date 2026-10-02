@@ -306,7 +306,7 @@ JavaScript hosts need no native build at all. That is why the React Native app i
 
 ### Setup steps at a glance
 
-- **NATS and the bridge's configuration**: `bridge --init-nats operator` writes the NATS server config, the bridge's credentials and `.env.bridge`, where the DBA sets the READER and WRITER database URLs.
+- **NATS and the bridge's configuration**: `bridge --init-nats operator` writes the NATS server config, the bridge's credentials and `.env.nats`, which holds NATS settings only. The DBA's own `.env.bridge` names the database (the READER and WRITER URLs), the slot and the publication. The two files share no setting, so the order they are loaded in does not matter.
 - **PostgreSQL**:
   - `bridge --init-sql | psql` creates the two roles, READER and WRITER, the functions and triggers ZeBridge needs, and the publication,
   - the DBA migrates the database and fixes what does not follow the 💡 _good practice rules_,
@@ -927,6 +927,9 @@ See [Replication slot management](#replication-slot-management) for details abou
 
   --init-nats [dev|operator]  Generate the whole NATS stack, no nsc (--force overwrites)
       [--dir DIR]             …where the files live on their host (default ./zb-nats)
+      [--port N]              …the client port (default 4222), also in NATS_URL
+      [--http-port N]         …the monitoring port (default 8222)
+      [--ws-port N]           …the WebSocket port (default 8080)
       [--js-domain NAME]      …for a JetStream reached across a leaf link (conf, grants, env)
   --init-nats --update        Re-sign the account after a grammar change, same keys
       [--dir DIR]             …the directory holding nats-server.conf (default ./zb-nats)
@@ -2201,10 +2204,13 @@ On the server that will run NATS and the bridge, once:
 bridge --init-nats operator --dir /etc/zebridge
 ```
 
-It writes four files, `nats-server.conf`, `.env.bridge`, `creds/bridge.creds` and `operator.store` into `/etc/zebridge` (what each file is: [Set up, once per deployment](#1-set-up-once-per-deployment)). The paths written inside them point into `--dir`; if NATS runs on another host, copy `nats-server.conf` there and change its `store_dir`. Then edit `/etc/zebridge/.env.bridge`:
+It writes four files, `nats-server.conf`, `.env.nats`, `creds/bridge.creds` and `operator.store` into `/etc/zebridge` (what each file is: [Set up, once per deployment](#1-set-up-once-per-deployment)). The paths written inside them point into `--dir`; if NATS runs on another host, copy `nats-server.conf` there and change its `store_dir`. `--port`, `--http-port` and `--ws-port` choose the server's ports. `.env.nats` holds the NATS settings only: the URL, the bridge's credentials, the enrollment keys.
+
+Then create `/etc/zebridge/.env.bridge` (mode 0600), the bridge's database side:
 
 - `DATABASE_READER_URL` and `DATABASE_WRITER_URL`: choose the two roles' passwords here. The next step creates the roles from these URLs.
 - `BRIDGE_CDC_PUBLICATION` and `BRIDGE_CDC_SLOT`: the publication you will create, and a slot name for this bridge.
+- `GENERATIONS_ENABLED=1`: the snapshots new clients seed from.
 - `ENROLL_NATS_URL` and `ENROLL_NATS_WS_URL`: the NATS addresses clients are given.
 
 Clients on the internet need TLS: add a `tls` block to `nats-server.conf` (see the NATS documentation), and give clients `tls://` and `wss://` addresses.
@@ -2243,7 +2249,7 @@ One call writes the table's catalogue row, installs its guards, scopes RLS and a
 Then check everything the bridge will decide at boot. It reads PostgreSQL only, needs no NATS, and changes nothing:
 
 ```sh
-set -a; . /etc/zebridge/.env.bridge; set +a
+set -a; . /etc/zebridge/.env.nats; . /etc/zebridge/.env.bridge; set +a
 bridge --diagnose
 ```
 
@@ -2276,6 +2282,7 @@ Wants=nats.service
 
 [Service]
 User=zebridge
+EnvironmentFile=/etc/zebridge/.env.nats
 EnvironmentFile=/etc/zebridge/.env.bridge
 ExecStart=/usr/local/bin/bridge
 Restart=on-failure
@@ -2291,6 +2298,7 @@ After=zebridge.service
 
 [Service]
 User=zebridge
+EnvironmentFile=/etc/zebridge/.env.nats
 EnvironmentFile=/etc/zebridge/.env.bridge
 ExecStart=/usr/local/bin/bridge_sweeper
 Restart=on-failure
@@ -2301,7 +2309,7 @@ WantedBy=multi-user.target
 
 ```sh
 install -d -o nats /etc/zebridge/nats-data                               # JetStream's store_dir
-chown zebridge /etc/zebridge/.env.bridge /etc/zebridge/creds/bridge.creds  # the bridge's secrets, still 0600
+chown zebridge /etc/zebridge/.env.nats /etc/zebridge/.env.bridge /etc/zebridge/creds/bridge.creds  # the bridge's secrets, 0600
 systemctl enable --now nats zebridge zebridge-sweeper
 ```
 
@@ -2322,7 +2330,7 @@ mv /etc/zebridge/operator.store /your/offline/place/
 The bridge is up and running, you run the final diagnose script:
 
 ```sh
-set -a; . /etc/zebridge/.env.bridge; set +a
+set -a; . /etc/zebridge/.env.nats; . /etc/zebridge/.env.bridge; set +a
 python3 scripts/zbdoctor.py
 ```
 
@@ -2409,7 +2417,7 @@ The bridge accepts runtime env var configuration:
 For example, a second instance next to the one in `.env.bridge`, on its own publication, slot and port, with a smaller buffer:
 
 ```sh
-set -a; . /etc/zebridge/.env.bridge; set +a
+set -a; . /etc/zebridge/.env.nats; . /etc/zebridge/.env.bridge; set +a
 BASE_BUF=10 RING_BUFFER_COUNT=4096 bridge --pub my_pub_2 --slot my_slot_2 --port 27435
 ```
 

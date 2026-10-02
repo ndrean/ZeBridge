@@ -32,7 +32,7 @@ def main() -> int:
         # ── dev mode: the ten-second path ────────────────────────────────────
         r = subprocess.run([str(BRIDGE), "--init-nats", "dev"], cwd=tmp, capture_output=True, text=True)
         conf = (tmp / "zb-nats" / "nats-server.conf").read_text()
-        env = (tmp / "zb-nats" / ".env.bridge").read_text()
+        env = (tmp / "zb-nats" / ".env.nats").read_text()
         # the block SYNTAX, not the word: the dev conf's comment explains there is no
         # authorization block, and the word in the comment matched the naive check
         if r.returncode == 0 and not re.search(r"^\s*authorization\s*\{", conf, re.M) and "jetstream" in conf:
@@ -43,6 +43,12 @@ def main() -> int:
             zb.ok("dev mode: no ZB_SIGNING_SEED — enrollment stays dark, as documented")
         else:
             zb.bad("dev mode leaked a signing seed"); failed += 1
+        db_lines = [l for l in env.splitlines() if l.split("=", 1)[0] in
+                    ("DATABASE_READER_URL", "DATABASE_WRITER_URL", "BRIDGE_CDC_SLOT", "BRIDGE_CDC_PUBLICATION")]
+        if not db_lines and "NATS_URL=" in env:
+            zb.ok(".env.nats is NATS only: no database URL, slot or publication (those are the DBA's .env.bridge)")
+        else:
+            zb.bad(f".env.nats carries non-NATS settings: {db_lines}"); failed += 1
 
         # ── refusal to overwrite ─────────────────────────────────────────────
         r = subprocess.run([str(BRIDGE), "--init-nats", "dev"], cwd=tmp, capture_output=True, text=True)
@@ -52,12 +58,17 @@ def main() -> int:
             zb.bad("a second run silently overwrote generated credentials"); failed += 1
 
         # ── operator mode: generate, then BOOT it ────────────────────────────
-        r = subprocess.run([str(BRIDGE), "--init-nats", "operator", "--force"], cwd=tmp, capture_output=True, text=True)
+        r = subprocess.run([str(BRIDGE), "--init-nats", "operator", "--force", "--port", str(PORT),
+                            "--http-port", "18222", "--ws-port", "18080"], cwd=tmp, capture_output=True, text=True)
         if r.returncode != 0:
             zb.bad(f"operator generation failed: {r.stdout[-200:]}{r.stderr[-200:]}"); return failed + 1
         conf_path = tmp / "zb-nats" / "nats-server.conf"
         c = conf_path.read_text()
-        c = c.replace("port: 4222", f"port: {PORT}").replace("port: 8222", "port: 18222").replace("port: 8080", "port: 18080")
+        if f"port: {PORT}" in c and "http_port: 18222" in c and "port: 18080" in c \
+                and f"NATS_URL=nats://127.0.0.1:{PORT}" in (tmp / "zb-nats" / ".env.nats").read_text():
+            zb.ok("--port, --http-port and --ws-port reach the conf, and --port the NATS_URL")
+        else:
+            zb.bad("the port flags did not reach the conf or NATS_URL"); failed += 1
         conf_path.write_text(c)
         ns = subprocess.Popen(["nats-server", "-c", str(conf_path)],
                               stdout=open(tmp / "ns.log", "w"), stderr=subprocess.STDOUT)
@@ -98,9 +109,9 @@ def main() -> int:
         else:
             zb.bad("a credless connection was accepted under operator mode"); failed += 1
 
-        env2 = (tmp / "zb-nats" / ".env.bridge").read_text()
+        env2 = (tmp / "zb-nats" / ".env.nats").read_text()
         if re.search(r"^ZB_SIGNING_SEED=SA", env2, re.M) and re.search(r"^ZB_ACCOUNT_PUB=A", env2, re.M):
-            zb.ok("enrollment wired: ZB_SIGNING_SEED (scoped client key) + ZB_ACCOUNT_PUB in .env.bridge")
+            zb.ok("enrollment wired: ZB_SIGNING_SEED (scoped client key) + ZB_ACCOUNT_PUB in .env.nats")
         else:
             zb.bad("the enrollment seed/account are missing from the generated env"); failed += 1
 
@@ -108,7 +119,7 @@ def main() -> int:
         mode = store.stat().st_mode & 0o777 if store.exists() else None
         if mode == 0o600 and "OPERATOR_SEED=SO" in store.read_text() and "OPERATOR_SEED" not in env2 \
                 and "ACCOUNT_SEED" not in env2:
-            zb.ok("the operator and account seeds live in operator.store (0600), not in .env.bridge")
+            zb.ok("the operator and account seeds live in operator.store (0600), not in .env.nats")
         else:
             zb.bad(f"offline seeds misplaced (store mode={mode and oct(mode)})"); failed += 1
     finally:
