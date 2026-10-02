@@ -52,7 +52,7 @@ flowchart LR
 
 **What you need to run it**: A PostgreSQL database you can configure — logical replication, a replication slot — and a NATS server you are willing to operate. The PostgreSQL side is automated: `bridge --init-sql` prints the init SQL — the two roles, the functions, the four event triggers, the publication — and pipes straight into `psql`, on bare metal or a VPS.
 
-On a managed PostgreSQL, where the provider does not give you a superuser shell, the same SQL can run as a migration: `bridge --init-sql > zebridge_init.sql`, applied with your migration tool. ⚠️ Untested: see [Using a cloud PostgreSQL](#using-a-cloud-postgresql).
+On a managed PostgreSQL, where the provider does not give you a superuser shell, the same SQL can run as a migration: `bridge --init-sql > zebridge_init.sql`, applied with your migration tool. Tested on Supabase: see [Using a cloud PostgreSQL](#using-a-cloud-postgresql).
 
 The NATS side is one command too (`bridge --init-nats operator`), but NATS is a server you now run, next to the bridge. The Quick start does all of it in one command; a production deployment does not hide it. ZeBridge adds two daemons to your stack, the bridge and NATS, and it is not the right choice if you cannot run them.
 
@@ -227,7 +227,7 @@ Bindings exist for Python, Kotlin (Android), Dart/Flutter and React Native. See 
   - **Changes**: the bridge streams over 100k rows/s from PostgreSQL into NATS, and a connected client applies 30k–50k of them a second (about 12k on an iPhone 12).
   - **Snapshots**: a new client seeds a table at 90k–125k rows/s, and still about 6k rows/s on a low-end Android phone (a Motorola E20), which the library feeds in chunks so the seed fits in its memory.
   - **Writes**: client writes reach PostgreSQL at about 8,500/s per ingress lane (`ZB_INGRESS_LANES`).
-- **Topology**: The preferred topology is the daemon colocated with the NATS server over TLS (as opposed to terminating TLS at a reverse-proxy). Since clients join NATS over TLS on the same port, the bridge talks to NATS over TLS too. Ideally PostgreSQL, NATS and ZeBridge are colocated; a cloud PostgreSQL should work but is untested (see [Using a cloud PostgreSQL](#using-a-cloud-postgresql)).
+- **Topology**: The preferred topology is the daemon colocated with the NATS server over TLS (as opposed to terminating TLS at a reverse-proxy). Since clients join NATS over TLS on the same port, the bridge talks to NATS over TLS too. Ideally PostgreSQL, NATS and ZeBridge are colocated; a cloud PostgreSQL works too, tested on Supabase (see [Using a cloud PostgreSQL](#using-a-cloud-postgresql)).
 - **Standby Read Replica ready**: you can use a dedicated Postgres standby replica for all the reads as ZeBridge uses separate reader and writer roles. Point `DATABASE_READER_URL` at the standby and `DATABASE_WRITER_URL` at the primary: the slot and every read stay on the standby, and the bridge's few writes go to the primary. The standby needs PostgreSQL 16+, `wal_level=logical` and `hot_standby_feedback=on` (the bridge warns when it is off). Tested by `scripts/scenarios/standby.py`.
 - **CLI**: the same binary sets the system up (`--init-nats`, `--init-sql`, `--mint-responder`), checks it (`--diagnose`), revokes users (`--revoke` or `--revoke --purge` to prune the local replica on reconnection) and manages slots (`--view-slot(s)`, `--drop-slot`). See [The CLI](#the-cli) below.
 - **Multiple instances**: possible, not recommended yet. Several instances of ZeBridge can run side by side, each with its own publication, slot and port, to follow large slow-moving tables apart from small tables with heavy changes, each instance with a buffer sized to its own tables. Two bridges on one database and one NATS pass `scripts/scenarios/multi_bridge.py`, but one bridge is the setup we run and recommend.
@@ -2342,16 +2342,17 @@ The app passes that code to the library once, with the bridge's URL: [Onboard a 
 
 ### Using a cloud PostgreSQL
 
-⚠️ **Untested.** These are the differences we expect with a managed PostgreSQL (RDS, Cloud SQL, Supabase, Neon…); the init SQL will likely need changes for some providers.
+Tested on **Supabase** (PostgreSQL 17, free tier): the init SQL applies unchanged, and the bridge, a client, writes and live schema changes all work. Other providers (RDS, Cloud SQL, Neon…) are untested; the same conditions apply.
 
-- **The condition.** A managed service gives no true superuser, and the init SQL needs two things vanilla PostgreSQL reserves for one: **event triggers** (four of them; they carry schema changes to the bridge and install two guards) and the **replication** right for `bridge_reader` (`ALTER USER … WITH REPLICATION`). Check that your provider's admin role can do both before choosing it. On RDS, event triggers are allowed to `rds_superuser`, and replication is granted with `GRANT rds_replication TO bridge_reader`.
-- **Step 1.** There is no `postgresql.conf`: logical replication and `max_slot_wal_keep_size` are provider settings (RDS: `rds.logical_replication = 1` in the parameter group; Cloud SQL: the `cloudsql.logical_decoding` flag).
-- **Step 2.** The two URLs name the provider's host, with TLS: `?sslmode=verify-full`.
-- **Step 3.** Pipe `bridge --init-sql` into the provider's admin URL, and adapt the replication grant if the provider refuses `ALTER USER … WITH REPLICATION`.
+- **What the provider must allow.** No managed service gives a true superuser, and the init SQL needs two things vanilla PostgreSQL reserves for one: **event triggers** (four of them: they carry schema changes to the bridge and install two guards) and the **replication** right for the reader role (`ALTER USER … WITH REPLICATION`). Supabase's `postgres` role can do both. On RDS, event triggers are allowed to `rds_superuser`, and replication is granted with `GRANT rds_replication TO <reader role>`. Neon allows both, but a connected replication client keeps its compute running around the clock, billed by the hour, and Neon drops a slot left inactive for about 40 hours.
+- **Logical replication** is a provider setting, not a `postgresql.conf` line. Supabase has it on (`wal_level = logical`); RDS: `rds.logical_replication = 1` in the parameter group; Cloud SQL: the `cloudsql.logical_decoding` flag.
+- **The direct connection, never the pooler.** Replication does not pass through a connection pooler (Supabase's Supavisor, PgBouncer): both URLs use the provider's direct connection. Supabase's is IPv6 only unless you buy its IPv4 add-on, so check that the bridge's host has IPv6: `curl -6 https://ifconfig.co`.
+- **The URLs** name the provider's host with TLS: `?sslmode=require`, or `verify-full` with the provider's CA.
+- **Install**: `bridge --init-sql | psql "<admin URL>"`, the admin URL being the provider's admin role (`postgres` on Supabase) over the direct connection. If a provider refuses `ALTER USER … WITH REPLICATION`, grant replication its own way.
 - **Running it.**
-  - A stopped bridge makes the provider keep WAL for its slot: disk you pay for, up to `max_slot_wal_keep_size`.
+  - A stopped bridge makes the provider keep WAL for its slot, up to `max_slot_wal_keep_size` (512 MB on Supabase's free tier, already set). Past it the slot is dropped, and the bridge refuses to start and says how to recover.
   - A failover to a standby usually loses logical slots; the bridge then needs one start with `ZB_FEED_RESTART=1`.
-  - Every CDC batch crosses the network: run the bridge in the same region as the database.
+  - Run the bridge in the database's region. Measured with the bridge on a laptop in France and Supabase about 200 ms away by `psql` (a new connection each time): a write's verdict in about 40 ms, a change made in Supabase reaching a client in 20 ms, an `ALTER TABLE … ADD COLUMN` reaching the client's table in about a second.
 
 ### NATS streams and buckets
 

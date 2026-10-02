@@ -99,6 +99,9 @@ pub const Server = struct {
         /// The WebSocket URL (ENROLL_NATS_WS_URL) for clients that cannot open TCP — a
         /// browser, React Native — handed out as `nats_ws_url`.
         nats_ws_url: ?[]const u8 = null,
+        /// `$KV.<tenants bucket>.{[principal]s}`: /enroll puts the device's mapping
+        /// there itself, acknowledged, before answering (§10kt).
+        kv_tenants_subject_pattern: []const u8,
     };
 
     pub fn init(
@@ -488,10 +491,30 @@ pub const Server = struct {
         };
         defer self.allocator.free(jwt);
 
+        // §10kt: the device reads `$KV.tenants.<principal>` as soon as it connects, and
+        // the replication path publishes that key only once the roster row has come
+        // back from PostgreSQL: a database 200 ms away (measured on Supabase) loses the
+        // race, and the device skips its tenant's tables for the whole session. So put
+        // the same value here and wait for JetStream's acknowledgement. The replication
+        // path writes the same bytes a moment later (one encoder, sorted). A failed put
+        // only brings back the race: answer anyway.
+        self.putTenantMapping(tenants_arena.allocator(), ctx, principal, if (tenants.len > 0) tenants else &.{tenant});
+
         const body = try self.identityPayload(ctx, jwt, principal);
         defer self.allocator.free(body);
         log.info("🎟️ enrolled '{s}' (tenant '{s}', {d} membership(s) tagged) — JWT minted, mapping registered", .{ principal, tenant, tenants.len });
         try req.respond(body, .{ .status = .ok, .extra_headers = cors });
+    }
+
+    fn putTenantMapping(self: *Server, arena: std.mem.Allocator, ctx: EnrollCtx, principal: []const u8, tenants: []const []const u8) void {
+        const publisher = self.nats_publisher orelse return;
+        const value = topology_mod.tenantsValue(arena, tenants) catch return;
+        const subject = topology_mod.render(arena, ctx.kv_tenants_subject_pattern, &.{.{ .name = "principal", .value = principal }}, null) catch return;
+        publisher.publish(subject, null, value) catch |err| {
+            log.warn("🎟️ '{s}': the tenant mapping was not put on enrollment ({s}) — it follows by replication, after the device's first read", .{ principal, @errorName(err) });
+            return;
+        };
+        log.debug("🎟️ '{s}': {s} = {s}, acknowledged before the answer", .{ principal, subject, value });
     }
 
     /// What /enroll and /renew answer (§10ci, §10jq, §10jt): the JWT and every fact a

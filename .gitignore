@@ -87,6 +87,8 @@ zb-client-ts/zebridge_*.sqlite3
 zb-client-ts/zebridge_*.sqlite3-*
 
 .env.grafana
+# A cloud PostgreSQL's connection strings (the Supabase demo project): never committed.
+.env.supabase
 /node_modules/
 
 examples/08-map/**/.env*

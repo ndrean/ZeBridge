@@ -84,10 +84,28 @@ async def main():
         zb.psql(f"CREATE TABLE IF NOT EXISTS {FIX}_bounded (id int PRIMARY KEY, label varchar(64))")
         msg = zb.psql(f"SELECT public.zebridge_install_width_guard('public.{FIX}_bounded'::regclass)")
         has_trg = zb.psql(f"SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.{FIX}_bounded'::regclass AND tgname = 'zebridge_width_guard'").strip()
-        if "no guard installed" in msg and has_trg == "0":
+        if "no guard" in msg and has_trg == "0":
             zb.ok("bounded-only table: statically safe, no trigger, zero hot-path cost")
         else:
             zb.bad(f"unexpected: {msg!r}, triggers={has_trg}")
+            failed += 1
+
+        # ── 2b. its last unbounded column dropped: the old guard goes too (§10kt) ──
+        # Measured on Supabase: a text column added then dropped left the guard naming
+        # it, and every write failed ("record "new" has no field …").
+        def guards() -> str:
+            return zb.psql(f"SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.{FIX}_bounded'::regclass AND tgname = 'zebridge_width_guard'").strip()
+        zb.psql(f"ALTER TABLE {FIX}_bounded ADD COLUMN note text")
+        zb.psql(f"SELECT public.zebridge_install_width_guard('public.{FIX}_bounded'::regclass)")
+        with_text = guards()
+        zb.psql(f"ALTER TABLE {FIX}_bounded DROP COLUMN note")
+        zb.psql(f"SELECT public.zebridge_install_width_guard('public.{FIX}_bounded'::regclass)")
+        after_drop = guards()
+        wrote = zb.psql(f"INSERT INTO {FIX}_bounded VALUES (2, 'after the drop') RETURNING id", quiet=True).strip()
+        if with_text == "1" and after_drop == "0" and wrote.startswith("2"):
+            zb.ok("text column added then dropped: the guard came and went, and writes still work")
+        else:
+            zb.bad(f"guard with the text column {with_text}, after the drop {after_drop}, insert {wrote!r}")
             failed += 1
 
         # ── 3+4. psql door: over refused (23514), under applies ────────────────

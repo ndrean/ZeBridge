@@ -2141,15 +2141,8 @@ pub const EventProcessor = struct {
     /// A client follows every tenant listed; the JWT's tags are minted from the same
     /// roster, so what it may read and what it is told to read agree.
     fn packRosterSet(self: *EventProcessor, arena: std.mem.Allocator, principal: []const u8, relation_id: u32, wal_end: u64) !u32 {
-        var value: std.ArrayListUnmanaged(u8) = .empty;
-        try value.append(arena, '[');
-        if (self.roster.get(principal)) |list| for (list.items, 0..) |t, i| {
-            if (i > 0) try value.append(arena, ',');
-            try value.append(arena, '"');
-            try value.appendSlice(arena, t);
-            try value.append(arena, '"');
-        };
-        try value.append(arena, ']');
+        const tenants: []const []const u8 = if (self.roster.get(principal)) |list| list.items else &.{};
+        const value = try Topology.tenantsValue(arena, tenants);
         const kv_subject = try Topology.render(
             arena,
             self.topology.kv_tenants_subject_pattern,
@@ -2158,7 +2151,7 @@ pub const EventProcessor = struct {
         );
         const msg_id = try std.fmt.allocPrint(arena, "tenant-{s}-{d}", .{ principal, wal_end });
         var cols: std.ArrayList(pgoutput.Column) = .empty;
-        try cols.append(arena, .{ .name = "tenants", .value = .{ .text = value.items } });
+        try cols.append(arena, .{ .name = "tenants", .value = .{ .text = value } });
         return try self.acquireAndFillSlot(kv_subject, principal, "TENANT", msg_id, relation_id, cols, wal_end);
     }
 

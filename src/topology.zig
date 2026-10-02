@@ -442,6 +442,30 @@ pub const Arg = struct {
     value: []const u8,
 };
 
+/// The value of `$KV.tenants.<principal>`: the tenants as a JSON list, sorted. Two
+/// writers use it — this file's replication path and `/enroll` (§10kt), which puts
+/// the key before answering so a device's first read finds it — and the sort makes
+/// their bytes identical whatever order each read the roster in.
+pub fn tenantsValue(arena: std.mem.Allocator, tenants: []const []const u8) ![]u8 {
+    const sorted = try arena.dupe([]const u8, tenants);
+    std.mem.sort([]const u8, sorted, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    var value: std.ArrayListUnmanaged(u8) = .empty;
+    try value.append(arena, '[');
+    for (sorted, 0..) |t, i| {
+        if (i > 0) try value.append(arena, ',');
+        try value.append(arena, '"');
+        try value.appendSlice(arena, t);
+        try value.append(arena, '"');
+    }
+    try value.append(arena, ']');
+    return value.items;
+}
+
+
 /// Substitute `{[name]s}` / `{[name]d}` placeholders in a pattern.
 ///
 /// `std.fmt.allocPrint` needs a **comptime** format string, so the moment these patterns
@@ -671,4 +695,13 @@ test "the test fixture matches the repository's own grammar.json" {
             try testing.expectEqual(@field(fixture, f.name), @field(real, f.name));
         }
     }
+}
+
+test "tenantsValue: one sorted JSON list, whatever order the roster was read in" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("[\"acme\",\"globex\"]", try tenantsValue(a, &.{ "globex", "acme" }));
+    try std.testing.expectEqualStrings("[\"acme\"]", try tenantsValue(a, &.{"acme"}));
+    try std.testing.expectEqualStrings("[]", try tenantsValue(a, &.{}));
 }

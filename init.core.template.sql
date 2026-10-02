@@ -1715,8 +1715,14 @@ BEGIN
         END IF;
     END LOOP;
 
+    -- §10kt: a table that needs no guard must not KEEP one. Dropping its last unbounded
+    -- column (a text added, then dropped) left the previous guard naming the dropped
+    -- column, and every INSERT and UPDATE failed (measured on Supabase: "record "new"
+    -- has no field …"). §10ko's re-install on DDL came through here and changed nothing.
     IF n_unbounded = 0 THEN
-        RETURN format('%s: no unbounded columns — statically inside every budget, no guard installed', short);
+        EXECUTE format('DROP TRIGGER IF EXISTS zebridge_width_guard ON %s', tbl);
+        EXECUTE 'DROP FUNCTION IF EXISTS public.' || quote_ident('zebridge_width_guard_' || short) || '()';
+        RETURN format('%s: no unbounded columns — statically inside every budget, no guard (any earlier one removed)', short);
     END IF;
 
     -- ⚠️ The generated body is assembled as a STRING and attached via quote_literal,

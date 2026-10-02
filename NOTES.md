@@ -18315,3 +18315,43 @@ the JWT then expires once and the next connect renews. One scare on the phone wa
 app's bin icon (deletes replica and identity), tapped next to "reopen": now a long press.
 The identity's stored offset reads wrong while the clock is wrong; that is by design, it
 only seeds the next launch. jwt_renew.py 10/10 on the final libzb.
+
+## §10kt — first cloud PostgreSQL: Supabase, and two bugs it found (2026-10-02)
+
+A free Supabase project (PostgreSQL 17.11), reached from the Mac over the IPv6
+direct connection (no IPv4 add-on needed). Its `postgres` role: not superuser, but
+REPLICATION and CREATEROLE; `wal_level=logical`, 5 slots, `max_slot_wal_keep_size=512MB`
+already set; event triggers allowed (supautils). Secrets in `.env.supabase` (git-ignored).
+
+- `bridge --init-sql`, applied as `postgres` over the direct connection: 0 errors, 0
+  warnings. 10 tables, 39 functions, the 4 event triggers, `zb_reader` (replication, no
+  BYPASSRLS) and `zb_writer`, the publication. Nothing to change for Supabase.
+- A bridge on its own generated NATS (`zb-nats/`, ports 4232/8232/8082 so the dev stack
+  can run beside it, `zb-nats/run-bridge.sh`): slot created on Supabase, streaming.
+- `zebridge_enable` on the two counters: live, no restart (T3/T4 LIVE). It first refused
+  them: writable + generations needs a tombstone or `allow_physical_deletes => true`, a
+  rule newer than the dev counters; counters are never deleted, so the latter.
+- A libzb client: enroll + seed 2.1 s; a change made in Supabase reached it in 20 ms;
+  writes send → verdict median 42 ms (min 40, max 127) — a `psql` connect from here costs
+  ~200 ms, which made my first measurement meaningless; ADD COLUMN reached it in 0.9 s.
+
+Bug 1 — the tenant mapping lost the race to the device. `/enroll` committed the roster row
+and answered; `$KV.tenants.<principal>` was published only when that row came back by
+replication. Locally the device always read after it; with PostgreSQL ~200 ms away the
+device read first, found "no mapping", and skipped its tenant's tables for the session.
+Fix: `/enroll` puts the key itself (the roster it already read for the JWT) and waits for
+the PubAck before answering. One encoder for both writers (`topology.tenantsValue`, a
+sorted JSON list, so the bytes are identical); a failed put is logged and the answer goes
+anyway (the replication path follows, as before). The publisher is shared with the main
+loop: nats.zig publishes under the connection mutex and requests through its response
+manager, so the HTTP thread may use it. Verified on Supabase: tenant on the first connect.
+
+Bug 2 — §10ko's width-guard re-install did nothing when the table no longer NEEDS a
+guard. `zebridge_install_width_guard` returned "no unbounded columns, no guard installed"
+and left the previous guard in place: a text column added then dropped on a table of
+bounded columns kept a guard naming the dropped column, and every write was refused
+(`record "new" has no field "note"`). §10ko's test table kept a text column, so it never
+went down that path. Fix: that branch drops the trigger and the generated function.
+Applied to Supabase and to the dev DB (the one function, from the rendered init SQL);
+widthguard.py gains check 2b (add text, drop it: the guard comes and goes, writes work) —
+not run yet, it needs the dev stack (stopped to spare memory).
