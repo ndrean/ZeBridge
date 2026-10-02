@@ -2352,7 +2352,7 @@ Tested on **Supabase** (PostgreSQL 17, free tier): the init SQL applies unchange
 - **Running it.**
   - A stopped bridge makes the provider keep WAL for its slot, up to `max_slot_wal_keep_size` (512 MB on Supabase's free tier, already set). Past it the slot is dropped, and the bridge refuses to start and says how to recover.
   - A failover to a standby usually loses logical slots; the bridge then needs one start with `ZB_FEED_RESTART=1`.
-  - Run the bridge in the database's region. Measured with the bridge on a laptop in France and Supabase about 200 ms away by `psql` (a new connection each time): a write's verdict in about 40 ms, a change made in Supabase reaching a client in 20 ms, an `ALTER TABLE … ADD COLUMN` reaching the client's table in about a second.
+  - Run the bridge in the database's region. Measured with the bridge on a laptop in France and Supabase in London (its recommended region), a new `psql` connection costing about 200 ms: a write's verdict in about 40 ms, a change made in Supabase reaching a client in 20 ms, an `ALTER TABLE … ADD COLUMN` reaching the client's table in about a second.
 
 ### NATS streams and buckets
 
