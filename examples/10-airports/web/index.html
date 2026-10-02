@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Airports around the map</title>
+    <title>Airports and a shared flight</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
     <style>
       :root { color-scheme: light dark; font: 14px/1.45 system-ui, sans-serif; }
@@ -12,11 +12,15 @@
       footer { padding: 8px 12px; border-top: 1px solid #8884; }
       #count { font-size: 16px; font-weight: 600; }
       #detail { font-size: 12px; opacity: .75; }
+      #flight { font-size: 15px; font-weight: 600; color: #7a1fd1; }
+      #notice { font-size: 13px; color: #b35900; min-height: 1.2em; }
     </style>
   </head>
   <body>
     <div id="map"></div>
     <footer>
+      <div id="flight">click an airport to choose the departure or the arrival</div>
+      <div id="notice"></div>
       <div id="count">connecting…</div>
       <div id="detail"></div>
     </footer>

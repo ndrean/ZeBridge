@@ -80,3 +80,34 @@ tiles are OpenStreetMap's, for testing only: their usage policy forbids more.
 
 PostgreSQL plays no part in an answer: the data was loaded at Supabase in London, and
 every question is answered from the service's DuckDB on the laptop.
+
+## 6. A flight, edited together
+
+```sh
+psql "$ADMIN_URL" -f examples/10-airports/flights.sql
+```
+
+[flights.sql](flights.sql) creates `flights`, one row per tenant, and enables it: writable,
+divided by tenant, with a version, a tiebreak and a tombstone. Its `doc` holds two
+registers, the departure and the arrival, each `{v, t, w}`: the airport, its stamp and its
+writer ([COOPERATIVE_EDITING.md](../../COOPERATIVE_EDITING.md)).
+
+The page follows `flights` into the browser's own SQLite. Click an airport, choose
+**Departure** or **Arrival**: the end shows hollow until PostgreSQL accepts the write, then
+solid, and the great circle between the two ends is drawn with its distance and heading.
+Everyone in the same tenant sees the same flight, live:
+
+- two people move different ends at once: both moves survive;
+- they move the same end: the later stamp wins, on every screen, and the other is told
+  ("bob's LAX came after your SFO");
+- whoever changes an end, the others read who did it, and when, under the map.
+
+Someone in another tenant has a flight of their own and never sees this one. A stamp is
+the bridge's time as the browser estimates it (`zb.stamp()`), never behind what the browser
+has seen: a device whose clock is off does not win a race by its error.
+
+To try it with two people in one browser, give each an invite in the same tenant and a
+name: `?as=alice&invite=…` in one tab, `?as=bob&invite=…` in another. Measured on Supabase:
+an end set in one tab appears in the other with its author, and a third person in another
+tenant sees an empty flight.
+

@@ -1054,8 +1054,24 @@ export class ZeBridge {
     // core.hlcVersion (§10q): the wall clock floored by the newest version
     // seen arriving — a slow clock lifts to just past the observed floor, and
     // arrival time never becomes the comparator (that would punish offline).
-    this.lastVersion = hlcVersion(new Date().toISOString(), this.lastVersion, this.hlcFloor);
+    // The wall clock is the BRIDGE's, as this device estimates it (§10kr: the
+    // identity's clock_offset), so a device whose clock is off stamps near true time.
+    this.lastVersion = hlcVersion(new Date(Date.now() + this.clockOffsetMs()).toISOString(), this.lastVersion, this.hlcFloor);
     return this.lastVersion;
+  }
+
+  /// A register stamp (COOPERATIVE_EDITING.md, `t` of {v, t, w}): the same clock as a
+  /// row version — the bridge's time as estimated here, never behind what this client
+  /// has seen. A phone whose clock runs fast no longer wins a register race by its error.
+  public stamp(): string {
+    return this.newVersion();
+  }
+
+  /// Who this client is: the `w` of a register it writes.
+  public get principal(): string { return this.config.principal ?? ''; }
+
+  private clockOffsetMs(): number {
+    return (this.identityNow?.clock_offset ?? 0) * 1000;
   }
 
   // ─── lifecycle ────────────────────────────────────────────────────────────
