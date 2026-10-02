@@ -51,7 +51,7 @@ Two questions:
 | `airports_in_view` | `south`, `west`, `north`, `east`, `limit` (500) | the airports in the box. A box across the antimeridian wraps. When more than `limit` are inside, one per cell of a grid over the box, so a world view spreads over every continent (`complete: false`, `total`). |
 | `airports_near` | `lat`, `lng`, `radius_km` (100), `limit` (20) | the nearest airports, with `distance_km` |
 
-Measured against Supabase in London from a laptop in France: a view of Western Europe, 158 airports, 49 ms in DuckDB, 119 ms round trip; the world, 153 airports spread over 74 countries, 66 ms in DuckDB.
+The service answers on libzb's own thread, inside the callback that hands it the question, and polls every 5 ms: a question arriving during a poll's wait is only handed over when the wait ends. Measured over NATS on the same host: 3 to 5 ms in DuckDB, 8 to 9 ms round trip; idle, it uses 1 to 2% of a core.
 
 ## 5. The map
 
@@ -78,6 +78,5 @@ and `/renew`), so the page talks only to its own origin. Their addresses are the
 of [vite.config.ts](web/vite.config.ts), `ZB_NATS_WS_ORIGIN` and `ZB_BRIDGE_ORIGIN`. The
 tiles are OpenStreetMap's, for testing only: their usage policy forbids more.
 
-Measured, the bridge and the service on a laptop in France, PostgreSQL at Supabase in
-London: 19 airports around San Mateo, 3 to 65 ms in DuckDB, 70 to 100 ms from the
-browser's question to its answer.
+PostgreSQL plays no part in an answer: the data was loaded at Supabase in London, and
+every question is answered from the service's DuckDB on the laptop.
