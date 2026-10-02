@@ -1,0 +1,23 @@
+name: zebridge_airports
+description: "10-airports on a phone: the shared flight and the airports service, through libzb."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.13.4
+
+dependencies:
+  zebridge:
+    path: ../../../zb-dart   # the shared Dart package: libzb over FFI + the isolate worker
+  flutter:
+    sdk: flutter
+  ffi: ^2.2.0
+  path_provider: ^2.1.0
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

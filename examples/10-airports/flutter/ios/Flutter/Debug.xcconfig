@@ -1,0 +1,12 @@
+#include "Generated.xcconfig"
+// libzb (06-large-table): the static library must be force-loaded — nothing in the
+// app references its symbols by name, Dart looks them up at run time through
+// DynamicLibrary.process(), and the linker would otherwise drop every zb_* object.
+OTHER_LDFLAGS[sdk=iphoneos*] = $(inherited) -force_load "$(SRCROOT)/libzb/libzb.xcframework/ios-arm64/libzbcore.a"
+OTHER_LDFLAGS[sdk=iphonesimulator*] = $(inherited) -force_load "$(SRCROOT)/libzb/libzb.xcframework/ios-arm64-simulator/libzbcore.a"
+// A personal team signs the device build (README).
+DEVELOPMENT_TEAM = 6UM77KAJ7Q
+// Debug keeps every symbol, so no export list here — and it MUST not have one: Xcode
+// runs a debug app from a "debug dylib" whose entry point has to stay exported, and
+// the Release list below (`_zb_*` only) made the stub abort with
+// `could_not_find_entry_point___debug_dylib` (2026-09-24).

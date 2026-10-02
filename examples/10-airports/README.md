@@ -114,3 +114,25 @@ name: `?as=alice&invite=…` in one tab, `?as=bob&invite=…` in another. Measur
 an end set in one tab appears in the other with its author, and a third person in another
 tenant sees an empty flight.
 
+
+## 7. On an iPhone
+
+[flutter/](flutter) is the same map and the same flight in a Flutter app on libzb (through
+zb-dart). The phone and the browsers of one tenant edit the one flight: an end set on the
+phone appears in the browsers, and the other way round. The stamp comes from libzb's
+`stamp()`, the merge from libzb's `mergeRegisters`.
+
+The bridge must listen on your network (`BRIDGE_BIND=0.0.0.0`), and the phone needs an
+invite in the same tenant as the browsers. From `examples/10-airports/flutter`, with your
+machine's address:
+
+```sh
+tool/build-libzb-ios.sh
+flutter pub get
+flutter build ios --release --dart-define=ZB_BRIDGE_URL=http://192.168.1.22:27434 \
+  --dart-define=ZB_NATS_URL=nats://192.168.1.22:4232 --dart-define=ZB_INVITE=<code>
+xcrun devicectl device install app --device <udid> build/ios/iphoneos/Runner.app
+```
+
+Allow "Local Network" when iOS asks. The invite is used once; later launches open on the
+identity kept on the phone. Tap an airport to make it the departure or the arrival.

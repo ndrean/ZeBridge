@@ -18449,3 +18449,15 @@ matched nothing past −180. The page now asks with `centre.wrap()` and draws ai
 the flight on the world copy in view (`onView`); the service normalises the longitude and
 splits a box that crosses ±180 into two ranges. Tokyo asked at −220.23 and at 139.77 both
 return 18 airports; Fiji at 178.4 and −181.6 both return 28.
+
+## §10ky — the shared flight on an iPhone, through libzb (2026-10-02)
+
+examples/10-airports/flutter: the flight page ported to Flutter on zb-dart (iOS skeleton
+from scripts/phone/renew: force-loaded xcframework, `_zb_*` export list, personal team).
+Stamps from libzb `stamp()` (ABI 4), merges from libzb `mergeRegisters` called on the UI
+isolate (no handle needed); airports asked over `query._default.airports_near`. The
+Supabase bridge was restarted with `BRIDGE_BIND=0.0.0.0` for `/enroll` from the LAN.
+Enrolled as `iphone` in acme; tested by the owner: ends set on the phone appear in both
+browser tabs and the other way round; the service answers the phone in 2–5 ms. Not tested:
+a pan past ±180 on Flutter (latlong2 asserts the range in debug builds; the app is built
+release).
