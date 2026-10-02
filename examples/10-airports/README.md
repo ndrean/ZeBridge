@@ -1,11 +1,8 @@
 # 10-airports — the world's airports, on a map, without querying PostgreSQL
 
-9,253 airports in one PostgreSQL table. A DuckDB service holds a replica and answers the
-map's questions over NATS; the browser asks it, and PostgreSQL never sees a query.
+9,253 airports in one PostgreSQL table. A DuckDB service holds a replica and answers the map's questions over NATS; the browser asks it, and PostgreSQL never sees a query.
 
-You need a running ZeBridge: PostgreSQL with the init SQL applied, NATS, and the bridge
-([SUPABASE_TEST.md](../../SUPABASE_TEST.md) sets one up on a cloud database). The commands
-below run from the repository root, with the admin URL of your database in `$ADMIN_URL`.
+You need a running ZeBridge: PostgreSQL with the init SQL applied, NATS, and the bridge ([SUPABASE_TEST.md](../../SUPABASE_TEST.md) sets one up on a cloud database). The commands below run from the repository root, with the admin URL of your database in `$ADMIN_URL`.
 
 ## 1. The table
 
@@ -13,12 +10,7 @@ below run from the repository root, with the admin URL of your database in `$ADM
 psql "$ADMIN_URL" -f examples/10-airports/airports.sql
 ```
 
-[airports.sql](airports.sql) names the publication `my_pub`: change it to your bridge's
-(`BRIDGE_CDC_PUBLICATION`). It creates `airports` and enables it: public (the same rows for
-every client) and read-only (clients read it, nobody writes to it from a device). Every
-text column is bounded, so no row can outgrow the bridge's buffer. The bridge follows the
-new table at once, with no restart: the last two lines of the output read `T3 bridge LIVE`
-and `T4 nats LIVE`.
+[airports.sql](airports.sql) names the publication `my_pub`: change it to your bridge's (`BRIDGE_CDC_PUBLICATION`). It creates `airports` and enables it: public (the same rows for every client) and read-only (clients read it, nobody writes to it from a device). Every text column is bounded, so no row can outgrow the bridge's buffer. The bridge follows the new table at once, with no restart: the last two lines of the output read `T3 bridge LIVE` and `T4 nats LIVE`.
 
 ## 2. Check
 
@@ -27,8 +19,7 @@ set -a; . zb-nats/.env.nats; . ./.env.bridge; set +a    # the bridge's own two f
 bridge --diagnose
 ```
 
-It ends with `🩺 DIAGNOSE: all clear`. Two notes about `airports` are expected: it is
-outbound-only, and it has no tombstone column (rows are never deleted).
+It ends with `🩺 DIAGNOSE: all clear`. Two notes about `airports` are expected: it is outbound-only, and it has no tombstone column (rows are never deleted).
 
 ## 3. The data
 
@@ -36,10 +27,57 @@ outbound-only, and it has no tombstone column (rows are never deleted).
 psql "$ADMIN_URL" -c "\copy airports(code, icao, name, latitude, longitude, elevation, url, time_zone, city_code, country, city, state, county, type) FROM 'examples/10-airports/airports-world.csv' WITH (FORMAT csv, HEADER)"
 ```
 
-`COPY 9253`. The bridge streams the rows to NATS as they commit, and its next snapshot
-holds them all.
+`COPY 9253`. The bridge streams the rows to NATS as they commit, and its next snapshot holds them all.
 
-## 4. The DuckDB service and the map
+## 4. The DuckDB service
 
-To come: a service that follows `airports` into DuckDB and answers `airports_in_view`
-for the map, and a page that asks it as you pan.
+[airport_service.py](airport_service.py) follows `airports` into a local DuckDB file and answers on `query._default.<name>`: the open tenant, which every client may ask. It needs a responder's credentials, minted from the NATS setup's offline store, and libzb built:
+
+```sh
+bridge --mint-responder --name airports --tenant _default --store zb-nats/operator.store > zb-nats/creds/airports.creds
+```
+
+```sh
+PYTHONPATH=zb-python/src python3 examples/10-airports/airport_service.py \
+  --url nats://127.0.0.1:4222 --creds zb-nats/creds/airports.creds
+```
+
+It seeds the 9,253 airports from the snapshot (about a second) and keeps them live from the change stream.
+
+Two questions:
+
+| question | parameters | answer |
+| --- | --- | --- |
+| `airports_in_view` | `south`, `west`, `north`, `east`, `limit` (500) | the airports in the box. A box across the antimeridian wraps. When more than `limit` are inside, one per cell of a grid over the box, so a world view spreads over every continent (`complete: false`, `total`). |
+| `airports_near` | `lat`, `lng`, `radius_km` (100), `limit` (20) | the nearest airports, with `distance_km` |
+
+Measured against Supabase in London from a laptop in France: a view of Western Europe, 158 airports, 49 ms in DuckDB, 119 ms round trip; the world, 153 airports spread over 74 countries, 66 ms in DuckDB.
+
+## 5. The map
+
+[web/](web/) is one page: a map centred on San Mateo, California, about 200 km across.
+After every pan or zoom it asks `airports_near` for the airports within 100 km of the
+centre (the dashed circle), draws them, and writes the count under the map. It follows no
+table: the answer is all it holds.
+
+```sh
+cd examples/10-airports/web
+pnpm install --ignore-workspace
+pnpm dev                     # http://localhost:5175/?invite=<code>
+```
+
+The first visit enrolls with an invite (any tenant: the service answers on the open one),
+and the browser keeps the identity, so later visits need no invite:
+
+```sql
+INSERT INTO zebridge_invites (code, principal, tenant_id) VALUES ('<a random code>', 'alice', 'acme');
+```
+
+The dev server proxies NATS's WebSocket (`/nats`) and the bridge (`/bridge`, for `/enroll`
+and `/renew`), so the page talks only to its own origin. Their addresses are the two lines
+of [vite.config.ts](web/vite.config.ts), `ZB_NATS_WS_ORIGIN` and `ZB_BRIDGE_ORIGIN`. The
+tiles are OpenStreetMap's, for testing only: their usage policy forbids more.
+
+Measured, the bridge and the service on a laptop in France, PostgreSQL at Supabase in
+London: 19 airports around San Mateo, 3 to 65 ms in DuckDB, 70 to 100 ms from the
+browser's question to its answer.
