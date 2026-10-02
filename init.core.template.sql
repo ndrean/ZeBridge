@@ -1725,8 +1725,14 @@ BEGIN
     -- column, and every INSERT and UPDATE failed (measured on Supabase: "record "new"
     -- has no field …"). §10ko's re-install on DDL came through here and changed nothing.
     IF n_unbounded = 0 THEN
-        EXECUTE format('DROP TRIGGER IF EXISTS zebridge_width_guard ON %s', tbl);
-        EXECUTE 'DROP FUNCTION IF EXISTS public.' || quote_ident('zebridge_width_guard_' || short) || '()';
+        -- Only when there is one: a bare DROP … IF EXISTS prints a notice for every
+        -- table that never had a guard, which is most of them.
+        IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = tbl AND tgname = 'zebridge_width_guard') THEN
+            EXECUTE format('DROP TRIGGER zebridge_width_guard ON %s', tbl);
+        END IF;
+        IF to_regprocedure('public.' || quote_ident('zebridge_width_guard_' || short) || '()') IS NOT NULL THEN
+            EXECUTE 'DROP FUNCTION public.' || quote_ident('zebridge_width_guard_' || short) || '()';
+        END IF;
         RETURN format('%s: no unbounded columns — statically inside every budget, no guard (any earlier one removed)', short);
     END IF;
 
@@ -1775,7 +1781,9 @@ BEGIN
          || '() RETURNS trigger AS ' || quote_literal(fn_body)
          || ' LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_catalog';
 
-    EXECUTE format('DROP TRIGGER IF EXISTS zebridge_width_guard ON %s', tbl);
+    IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = tbl AND tgname = 'zebridge_width_guard') THEN
+        EXECUTE format('DROP TRIGGER zebridge_width_guard ON %s', tbl);
+    END IF;
     EXECUTE format('CREATE TRIGGER zebridge_width_guard BEFORE INSERT OR UPDATE ON %s FOR EACH ROW EXECUTE FUNCTION public.%I()',
                    tbl, 'zebridge_width_guard_' || short);
     RETURN format('%s: width guard installed over %s unbounded column(s)', short, n_unbounded);
