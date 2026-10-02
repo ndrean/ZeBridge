@@ -1,0 +1,87 @@
+// Grafana Alloy on the VPS: scrapes the bridge and the NATS exporter, reads the three
+// services' journal, and sends both to Grafana Cloud. The key comes from the
+// environment (GRAFANA_PASSWORD, from .env.grafana), never from this file.
+
+// ── metrics ──────────────────────────────────────────────────────────────────
+prometheus.scrape "zebridge" {
+  targets = [{__address__ = "127.0.0.1:27434", service = "cdc-bridge", environment = "production"}]
+  job_name        = "zebridge"
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.scrape "nats" {
+  targets = [{__address__ = "127.0.0.1:7777", service = "nats-server", environment = "production"}]
+  job_name        = "nats"
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.remote_write "grafana_cloud" {
+  endpoint {
+    url = "https://prometheus-prod-55-prod-gb-south-1.grafana.net/api/prom/push"
+    basic_auth {
+      username = "2500869"                        // the Prometheus instance ID
+      password = sys.env("GRAFANA_PASSWORD")
+    }
+  }
+}
+
+// ── logs: the systemd journal of the three units ─────────────────────────────
+loki.relabel "journal" {
+  forward_to = []
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+}
+
+loki.source.journal "zebridge" {
+  // only these three units, and only what happens from now on
+  matches       = "_SYSTEMD_UNIT=nats.service _SYSTEMD_UNIT=zebridge.service _SYSTEMD_UNIT=zebridge-sweeper.service"
+  max_age       = "1h"
+  relabel_rules = loki.relabel.journal.rules
+  labels        = {environment = "production"}
+  forward_to    = [loki.process.zebridge.receiver]
+}
+
+loki.process "zebridge" {
+  // the unit names the service, with the labels the dev stack uses
+  stage.match {
+    selector = "{unit=~\"zebridge(-sweeper)?.service\"}"
+    stage.static_labels {
+      values = {service = "cdc-bridge"}
+    }
+    // the bridge logs `info(fleet): …`, `warning(preflight): …`: level and scope
+    stage.regex {
+      expression = "^(?P<level>debug|info|warning|error)\\((?P<scope>[a-z_]+)\\):"
+    }
+    stage.labels {
+      values = {level = "", scope = ""}
+    }
+  }
+  stage.match {
+    selector = "{unit=\"nats.service\"}"
+    stage.static_labels {
+      values = {service = "nats-server"}
+    }
+    // nats-server logs `[pid] date time [INF] …`
+    stage.regex {
+      expression = "\\[(?P<level>INF|WRN|ERR|DBG|FTL|TRC)\\]"
+    }
+    stage.labels {
+      values = {level = ""}
+    }
+  }
+  forward_to = [loki.write.grafana_cloud.receiver]
+}
+
+loki.write "grafana_cloud" {
+  endpoint {
+    url = "https://logs-prod-035.grafana.net/loki/api/v1/push"
+    basic_auth {
+      username = "1246111"                        // the Loki user
+      password = sys.env("GRAFANA_PASSWORD")
+    }
+  }
+}

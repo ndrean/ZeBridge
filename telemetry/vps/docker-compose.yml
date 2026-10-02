@@ -1,0 +1,35 @@
+# Telemetry for a VPS where nats-server, the bridge and the sweeper run under systemd:
+# Grafana Alloy and the NATS exporter in containers, everything sent to Grafana Cloud.
+#
+#   docker compose -f /opt/zebridge-telemetry/docker-compose.yml up -d
+#
+# Host networking: the bridge's /metrics (127.0.0.1:27434) and NATS monitoring
+# (127.0.0.1:8222) listen on loopback only, which a bridged container cannot reach.
+# Needs the Grafana Cloud key in .env.grafana next to this file (GRAFANA_PASSWORD=…, 0600).
+services:
+  alloy:
+    image: grafana/alloy:latest
+    container_name: zb_alloy
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env.grafana
+    command: ["run", "/etc/alloy/config.alloy", "--storage.path=/var/lib/alloy/data",
+              "--server.http.listen-addr=127.0.0.1:12345"]
+    volumes:
+      - ./config.alloy:/etc/alloy/config.alloy:ro
+      - alloy-data:/var/lib/alloy/data
+      # the systemd journal, where nats, zebridge and zebridge-sweeper write
+      - /var/log/journal:/var/log/journal:ro
+      - /run/log/journal:/run/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:latest
+    container_name: zb_nats_exporter
+    restart: unless-stopped
+    network_mode: host
+    command: ["-addr", "127.0.0.1", "-port", "7777",
+              "-jsz", "all", "-varz", "-connz", "-leafz", "http://127.0.0.1:8222"]
+
+volumes:
+  alloy-data:
