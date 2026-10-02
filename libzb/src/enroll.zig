@@ -210,6 +210,44 @@ pub fn jwtTimes(creds: []const u8) ?JwtTimes {
     return .{ .iat = iat.integer, .exp = exp.integer };
 }
 
+/// The principal the creds were minted for: the JWT's `name` claim, which /enroll and
+/// `bridge --mint-responder` both set. A host that passes creds need not repeat it.
+/// zb-client-ts: principalFromCreds.
+pub fn principalFromCreds(a: std.mem.Allocator, creds: []const u8) ?[]u8 {
+    const jwt = section(creds, "-----BEGIN NATS USER JWT-----", "------END NATS USER JWT------") orelse return null;
+    var parts = std.mem.splitScalar(u8, jwt, '.');
+    _ = parts.next() orelse return null;
+    const payload = parts.next() orelse return null;
+    var buf: [4096]u8 = undefined;
+    const dec = std.base64.url_safe_no_pad.Decoder;
+    const n = dec.calcSizeForSlice(payload) catch return null;
+    if (n > buf.len) return null;
+    dec.decode(buf[0..n], payload) catch return null;
+    var fba = std.heap.FixedBufferAllocator.init(buf[n..]);
+    const parsed = std.json.parseFromSliceLeaky(Value, fba.allocator(), buf[0..n], .{}) catch return null;
+    if (parsed != .object) return null;
+    const name = parsed.object.get("name") orelse return null;
+    if (name != .string or name.string.len == 0) return null;
+    return a.dupe(u8, name.string) catch null;
+}
+
+/// The same, from a creds file.
+pub fn principalFromCredsFile(a: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const pz = a.dupeZ(u8, path) catch return null;
+    defer a.free(pz);
+    const fd = std.posix.openat(std.posix.AT.FDCWD, pz, .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer _ = std.posix.system.close(fd);
+    var text: [16384]u8 = undefined;
+    var len: usize = 0;
+    while (len < text.len) {
+        const got = std.posix.read(fd, text[len..]) catch return null;
+        if (got == 0) break;
+        len += got;
+    }
+    defer std.crypto.secureZero(u8, text[0..len]); // the seed is in there
+    return principalFromCreds(a, text[0..len]);
+}
+
 /// Renew when less than a quarter of the JWT's life is left (or it is gone). `now` is
 /// the bridge's time (`Identity.serverNow`), the clock the JWT's times come from.
 pub fn renewDue(creds: []const u8, now: i64) bool {
@@ -448,4 +486,28 @@ test "a device clock an hour ahead renews on the bridge's schedule" {
     try std.testing.expect(!renewDue(creds, 4600 + offset));
     try std.testing.expect(!renewDue(creds, 5350 + offset));
     try std.testing.expect(renewDue(creds, 5351 + offset));
+}
+
+test "principalFromCreds: the JWT's name claim, from text or a file" {
+    const a = std.testing.allocator;
+    // header.payload.sig with payload {"name":"airports","iat":1000,"exp":2000}
+    const creds = "-----BEGIN NATS USER JWT-----\nxx.eyJuYW1lIjoiYWlycG9ydHMiLCJpYXQiOjEwMDAsImV4cCI6MjAwMH0.yy\n------END NATS USER JWT------\n";
+    const p = principalFromCreds(a, creds).?;
+    defer a.free(p);
+    try std.testing.expectEqualStrings("airports", p);
+    // {"iat":1000,"exp":2000}: no name, no principal
+    try std.testing.expect(principalFromCreds(a, "-----BEGIN NATS USER JWT-----\nxx.eyJpYXQiOjEwMDAsImV4cCI6MjAwMH0.yy\n------END NATS USER JWT------\n") == null);
+    try std.testing.expect(principalFromCreds(a, "not creds") == null);
+
+    const path = "zbz-test-principal.creds";
+    defer _ = std.c.unlink(path);
+    {
+        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+        defer _ = std.posix.system.close(fd);
+        _ = std.c.write(fd, creds.ptr, creds.len);
+    }
+    const f = principalFromCredsFile(a, path).?;
+    defer a.free(f);
+    try std.testing.expectEqualStrings("airports", f);
+    try std.testing.expect(principalFromCredsFile(a, "zbz-no-such.creds") == null);
 }

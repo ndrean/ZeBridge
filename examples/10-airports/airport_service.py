@@ -83,7 +83,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default=os.environ.get("NATS_URL", "nats://127.0.0.1:4222"))
     ap.add_argument("--creds", required=True, help="a responder's creds (bridge --mint-responder)")
-    ap.add_argument("--principal", default="airports", help="the name the creds were minted with (--mint-responder --name)")
     ap.add_argument("--db", default="/tmp/airports-service.duckdb")
     ap.add_argument("--queue", default="airports", help="instances in one queue group share the questions")
     a = ap.parse_args()
@@ -99,7 +98,7 @@ def main():
                 pending.extend(r["requests"])
 
     t0 = time.time()
-    with ZeBridge(nats_url=a.url, creds_path=a.creds, principal=a.principal, db_path=a.db, engine="duckdb",
+    with ZeBridge(nats_url=a.url, creds_path=a.creds, db_path=a.db, engine="duckdb",
                   tables=[TABLE], client_id="airport-service", heartbeat_ms=0,
                   on_change=on_change, poll_ms=50) as zb:
         held = zb.query(f"SELECT count(*) AS n FROM {TABLE}")[0]["n"]

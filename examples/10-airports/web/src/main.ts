@@ -39,7 +39,7 @@ map.fitBounds(L.latLng(SAN_MATEO).toBounds(RADIUS_KM * 2 * 1000));
 // until it is told.
 new ResizeObserver(() => map.invalidateSize()).observe(document.getElementById('map')!);
 
-const circle = L.circle(SAN_MATEO, { radius: RADIUS_KM * 1000, fill: false, weight: 1, dashArray: '4 4' }).addTo(map);
+const circle = L.circle(SAN_MATEO, { radius: RADIUS_KM * 1000, fill: false, color: '#1f4fd1', weight: 3, dashArray: '8 6' }).addTo(map);
 const markers = L.layerGroup().addTo(map);
 
 let asked = 0;
@@ -60,7 +60,9 @@ async function ask(): Promise<void> {
     const col = (name: string) => a.columns.indexOf(name);
     markers.clearLayers();
     for (const r of a.rows) {
-      L.circleMarker([Number(r[col('latitude')]), Number(r[col('longitude')])], { radius: 5, weight: 1 })
+      L.circleMarker([Number(r[col('latitude')]), Number(r[col('longitude')])], {
+        radius: 9, weight: 2, color: '#fff', fillColor: '#d1361f', fillOpacity: 0.9,
+      })
         .bindTooltip(`${r[col('code')]} — ${r[col('name')]}, ${r[col('distance_km')]} km`)
         .addTo(markers);
     }

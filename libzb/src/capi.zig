@@ -671,7 +671,18 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     // engine (§10fl): "sqlite" (default) or "duckdb", both on dbPath; dbUrl implies postgres.
     const engine_s = str.get(o, "engine", "sqlite");
     const engine: client.storage.Engine = if (std.mem.eql(u8, engine_s, "duckdb")) .duckdb else .sqlite;
-    const principal = try a.dupeZ(u8, idv.or_(str.get(o, "principal", ""), if (ident) |i| i.principal else null));
+    // The principal: the option, else the identity's, else the name the creds' JWT was
+    // minted with (a service started with only `credsPath` must not run nameless: its
+    // tenant lookup would read `$KV.tenants.` and fail on the subject).
+    const principal_opt = idv.or_(str.get(o, "principal", ""), if (ident) |i| i.principal else null);
+    const from_jwt: ?[]u8 = if (principal_opt.len > 0) null else if (creds_text.len > 0)
+        enroll.principalFromCreds(a, creds_text)
+    else if (creds.len > 0)
+        enroll.principalFromCredsFile(a, creds)
+    else
+        null;
+    defer if (from_jwt) |p| a.free(p);
+    const principal = try a.dupeZ(u8, if (principal_opt.len > 0) principal_opt else from_jwt orelse "");
     errdefer a.free(principal);
     // The same defaults as zb-client-ts: one replica per principal, kept across runs;
     // a random client id per instance (it prefixes every mutation's msg_id — a fixed
