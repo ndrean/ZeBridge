@@ -87,42 +87,40 @@ def main():
     ap.add_argument("--queue", default="airports", help="instances in one queue group share the questions")
     a = ap.parse_args()
 
-    pending: list = []
-    lock = threading.Lock()
+    zb_ref: list = []
 
+    # Questions are answered HERE, on libzb's own thread, the moment a poll hands them
+    # over: query and reply run at once. Answered from another thread, each call would
+    # wait for the worker's current poll to end — measured, ~100 ms per question.
     def on_change(r: dict) -> None:
         if r.get("applied"):
             print(f"cdc: {r['applied']} row(s) applied", flush=True)
-        if r.get("requests"):
-            with lock:
-                pending.extend(r["requests"])
+        for req in r.get("requests") or []:
+            zb = zb_ref[0]
+            fn = QUERIES.get(req["name"])
+            try:
+                ans = fn(zb, req.get("payload") or {}) if fn else {"error": f"unknown query {req['name']!r}", "known": sorted(QUERIES)}
+            except Exception as e:  # a bad parameter is the asker's problem
+                ans = {"error": f"{type(e).__name__}: {e}"}
+            zb.reply(req["id"], ans)
+            print(f"{req['name']}: {ans.get('count', '?')} airport(s) in {ans.get('ms', '?')} ms", flush=True)
 
     t0 = time.time()
+    # poll_ms=5: a question arriving during a poll's wait is handed over when the wait
+    # ends, not when the question lands. 5 ms keeps the answer near DuckDB's own time
+    # (round trip ~9 ms) for 1-2% of a core when idle; 50 ms made it ~50 ms.
     with ZeBridge(nats_url=a.url, creds_path=a.creds, db_path=a.db, engine="duckdb",
                   tables=[TABLE], client_id="airport-service", heartbeat_ms=0,
-                  on_change=on_change, poll_ms=50) as zb:
+                  on_change=on_change, poll_ms=5) as zb:
+        zb_ref.append(zb)
         held = zb.query(f"SELECT count(*) AS n FROM {TABLE}")[0]["n"]
         print(f"replica: {held} airports in {a.db}, {time.time() - t0:.1f} s", flush=True)
         r = zb.serve({"tenants": ["_default"], "queries": sorted(QUERIES), "queue": a.queue})
         print(f"answering {sorted(QUERIES)} on query._default.<name>, queue group {a.queue!r} ({r.get('serving')} subject(s))", flush=True)
-
         stop = threading.Event()
         signal.signal(signal.SIGINT, lambda *_: stop.set())
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
-        served = 0
-        while not stop.is_set():
-            with lock:
-                batch, pending[:] = list(pending), []
-            for req in batch:
-                fn = QUERIES.get(req["name"])
-                try:
-                    ans = fn(zb, req.get("payload") or {}) if fn else {"error": f"unknown query {req['name']!r}", "known": sorted(QUERIES)}
-                except Exception as e:  # a bad parameter is the asker's problem
-                    ans = {"error": f"{type(e).__name__}: {e}"}
-                zb.reply(req["id"], ans)
-                served += 1
-                print(f"{req['name']}: {ans.get('count', '?')} airport(s) in {ans.get('ms', '?')} ms", flush=True)
-            stop.wait(0.02)
+        stop.wait()
 
 
 if __name__ == "__main__":
