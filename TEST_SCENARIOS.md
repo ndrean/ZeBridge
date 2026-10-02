@@ -36,8 +36,8 @@ zig build test                       # the bridge
 
 # the database, after a migration, with no bridge running
 psql -c "SELECT * FROM zebridge_check('orders', 'writable')"
-psql -c "SELECT * FROM zebridge_check_all('{\"users\":\"read_only\",\"orders\":{\"mode\":\"writable\",\"version\":\"updated_at\",\"tombstone\":\"deleted_at\",\"tiebreak\":\"last_writer\",\"tenant\":\"tenant_id\"}}') WHERE status = 'ERROR'"
-scripts/zbdoctor.py --intent intent.json      # the same, plus the live bridge/NATS gates
+psql -c "SELECT * FROM zebridge_check_all() WHERE status = 'ERROR'"
+bridge --diagnose                             # the same, plus slots, NATS and, bridge running, what a client finds
 
 # the scenarios (scripts/scenarios/README.md for setup)
 # ⚠️ The dev NATS serves TLS on 4222 and the sourced env says tls://localhost:4222. The
@@ -262,7 +262,7 @@ Each claim of the README's feature list, the tests behind it, and how far they g
 | `BASE_BUF` / ring sizing refusals and clamps, the allocator agreeing with the startup check | `sizing.py` |
 | one NATS address, never a second one from a stale env | `endpoint.py` |
 | broker kill/restart, PG backend kill, socket exhaustion — the bridge survives each | `chaos.py` |
-| declared vs actual drift: catalogue, publication, streams, slots (grants live in JWTs and are skipped loudly) | `check.py`, `zbdoctor.py` |
+| declared vs actual drift: catalogue, publication, streams, slots (grants live in JWTs and are skipped loudly) | `check.py`, `bridge --diagnose` |
 | both SQL templates render and apply with nothing lost; the publication is named, never guessed | `render.py`, `pubname.py` |
 | the two env files agree with the native stack | `envcheck.py` |
 

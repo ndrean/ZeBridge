@@ -65,7 +65,7 @@ If you put every client in one tenant, every client holds everything that tenant
 
 **Security**: tenant-based, with NATS grants and a rotating JWT chain. See [SECURITY](SECURITY.md).
 
-**The documentation set**: README (this file), [Security](), [Scope](), [Tested scenarios](), [Clients](), [Observability](), [Migrations](),  [Cooperative editing](), [Protocol]().
+**The documentation set**: README (this file), [Security](https://github.com/ndrean/zebridge/blob/main/SECURITY.md), [Scope](https://github.com/ndrean/zebridge/blob/main/SCOPE.md), [Tested scenarios](https://github.com/ndrean/zebridge/blob/main/TEST_SCENARIOS.md), [Clients](https://github.com/ndrean/zebridge/blob/main/CLIENTS.md), [Observability](https://github.com/ndrean/zebridge/blob/main/OBSERVABILITY_TELEMETRY.md), [Migrations](https://github.com/ndrean/zebridge/blob/main/MIGRATIONS.md),  [Cooperative editing](https://github.com/ndrean/zebridge/blob/main/COOPERATIVE_EDITING.md), [Protocol](https://github.com/ndrean/zebridge/blob/main/PROTOCOL.md), [SUPABASE_TEST](https://github.com/ndrean/zebridge/blob/main/SUPABASE_TEST.md)
 
 **Glossary**:
 
@@ -328,6 +328,8 @@ JavaScript hosts need no native build at all. That is why the React Native app i
 - **Frontend**: the developer builds on the library, `libzb` or `zb-client-ts`, and works only with the local database, never with NATS. They create a `ZeBridge` client with the bridge's URL, the invite, and the storage flavour (SQLite, PGlite, DuckDB).
 
 The full procedure is [Host setup on VPS or bare-metal](#host-setup-on-vps-or-bare-metal).
+
+See also [SUPABASE_TEST](https://github.com/ndrean/zebridge/blob/main/SUPABASE_TEST.md) for a cloud Postgres setup.
 
 ### Architecture Example
 
@@ -862,27 +864,23 @@ In ZeBridge, what happens depends on how the parent is deleted:
 
 ### Diagnose
 
-Two tools, for two moments.
-
-**Before starting the bridge: `bridge --diagnose`.** It reads PostgreSQL only, never connects to NATS, and changes nothing. Give it the publication and the slot of the bridge you are about to start; neither has a default:
+One command, whether the bridge is running or not: `bridge --diagnose`. It reads PostgreSQL, NATS and the bridge's own HTTP port, and changes nothing. Load the same files as the bridge it checks; the publication and the slot have no default:
 
 ```sh
-bridge --diagnose --pub my_pub --slot my_slot     
-# or 
-# BRIDGE_CDC_PUBLICATION=my_pub BRIDGE_CDC_SLOT=my_slot  bridge --diagnose
+set -a; . zb-nats/.env.nats; . ./.env.bridge; set +a
+bridge --diagnose            # or: bridge --diagnose --pub my_pub --slot my_slot
 ```
 
-It reports what the boot would decide: whether the init SQL was applied, the publication, each table's verdict (primary key, writable or not, tenant scoping), whether the stored rows fit `BASE_BUF` and the smallest value that would, whether the buffer would shrink since the last boot, cascades against tombstones, and the CDC window against the chain's cadence.
+What it checks, in order:
+
+- **The configuration**, as the boot would decide it: the init SQL applied, the publication, each table's verdict (primary key, writable or not, tenant scoping), whether the stored rows fit `BASE_BUF` and the smallest value that would, whether the buffer would shrink since the last boot, cascades against tombstones, the CDC window against the chain's cadence.
+- **The catalogue**: `zebridge_check_all()`, every catalogued table against its own catalogue row; tenant-scoped tables whose writes nothing bounds; tenants the sweeper cannot reach; bridge instances with an empty publication, or disagreeing on the row budget.
+- **The slots**: an invalidated slot, an inactive one holding WAL, and this bridge's own.
+- **The bridge**: if it answers on its port, whether it is connected to NATS, its suspended tables, its reconnects. If not, the checks that need a running bridge are skipped, and said to be.
+- **NATS**: reachable with these credentials; every stream and bucket (with the bridge stopped, a missing one is a note: the bridge creates them at boot); the MUTATIONS backlog cap and the VERDICTS policy.
+- **What a fresh client finds**, with the bridge running: a schema for every table, a tenant entry for every principal, and for every tenant and table a chain whose full object exists.
 
 It ends with `🩺 DIAGNOSE: all clear` (exit 0) or the number of findings (exit 1).
-
-**After the bridge is up**:
-
-```sh
-python3 scripts/zbdoctor.py
-```
-
-It checks the running system end to end: the bridge answers (`/health`, `/status`), PostgreSQL is wired, NATS holds the streams and buckets, and a fresh client can resolve its tenant, read every schema and seed. One verdict, exit 0 or 1, `--json` for CI. It reads `BRIDGE_URL` (default `http://127.0.0.1:27434`), `NATS_URL`, `NATS_CREDS`, and `DATABASE_READER_URL` for `psql`.
 
 More in [Verify the wiring](#7-verify-the-wiring).
 
@@ -923,7 +921,7 @@ See [Replication slot management](#replication-slot-management) for details abou
   --port <PORT>     HTTP telemetry port (default: 27434)
 
   --gen-nkey      Mint the bridge<->NATS nkey pair (seed to stdout, once)
-  --diagnose      Pre-run doctor: report everything boot would decide, write nothing
+  --diagnose      Doctor, bridge stopped or running: report what it meets, write nothing
 
   --init-nats [dev|operator]  Generate the whole NATS stack, no nsc (--force overwrites)
       [--dir DIR]             …where the files live on their host (default ./zb-nats)
@@ -1236,19 +1234,15 @@ questions the bridge's preflight asks, from the same source of truth:
 ```sql
 SELECT * FROM zebridge_check('orders', 'writable');
 SELECT * FROM zebridge_check('orders', 'writable', 'updated_at', 'deleted_at', 'last_writer', 'tenant_id');
-SELECT * FROM zebridge_check_all('{"users": "read_only",
-  "orders": {"mode": "writable", "version": "updated_at", "tombstone": "deleted_at",
-             "tiebreak": "last_writer", "tenant": "tenant_id"},
-  "audit":  {"mode": "writable", "physical_deletes": true}}')   -- accepted, so a WARNING not an ERROR
-WHERE status = 'ERROR';           -- an empty result is a clean bill
+SELECT * FROM zebridge_check_all() WHERE status = 'ERROR';   -- an empty result is a clean bill
 ```
 
 `intent` is what you _mean_ the table to be; the check compares it with the grants (who holds INSERT+UPDATE) and with the catalogue row.
 Naming the columns makes it a pre-migration check: a declared name that disagrees with the catalogue is a finding, and a table with no row yet is checked against the names you gave.
 
-`zebridge_check_all()` treats every catalogue table you did not name as an ERROR — the ones people forget — unless you pass `partial => true`.
+`zebridge_check_all()` checks every catalogued table against its own catalogue row: the intent you already wrote with `zebridge_enable(...)` in your migration, including an accepted `allow_physical_deletes` (a WARNING, not an ERROR). A catalogue row whose table is gone is an ERROR.
 
-`scripts/zbdoctor.py --intent intent.json` runs the same map and adds the live gates (bridge, streams, KV, chains).
+`bridge --diagnose` runs it too, along with the slots, NATS and, with the bridge running, what a fresh client finds.
 
 [⬆️](#table-of-contents)
 
@@ -1954,7 +1948,7 @@ scripts/native/creds/{alice,bob,mary,nina,omar,bridge,zbdoctor}.creds
 Anything that reads `NATS_CREDS` points at one:
 
 ```sh
-NATS_CREDS=scripts/native/creds/zbdoctor.creds python3 scripts/zbdoctor.py
+NATS_CREDS=scripts/native/creds/zbdoctor.creds bridge --diagnose
 NATS_CREDS=scripts/native/creds/omar.creds     python3 scripts/scenarios/mutate.py
 ```
 
@@ -2246,7 +2240,7 @@ SELECT * FROM zebridge_enable('public.notes',
 
 One call writes the table's catalogue row, installs its guards, scopes RLS and adds it to the publication, atomically.
 
-Then check everything the bridge will decide at boot. It reads PostgreSQL only, needs no NATS, and changes nothing:
+Then check everything the bridge will meet at its start. It changes nothing:
 
 ```sh
 set -a; . /etc/zebridge/.env.nats; . /etc/zebridge/.env.bridge; set +a
@@ -2327,14 +2321,12 @@ mv /etc/zebridge/operator.store /your/offline/place/
 
 #### 7. Verify the wiring
 
-The bridge is up and running, you run the final diagnose script:
+The bridge is up and running: run the same doctor again. It now also checks the running bridge and what a fresh client finds:
 
 ```sh
 set -a; . /etc/zebridge/.env.nats; . /etc/zebridge/.env.bridge; set +a
-python3 scripts/zbdoctor.py
+bridge --diagnose
 ```
-
-One command, one verdict (exit 0 green, 1 red, `--json` for CI). It checks that the bridge answers, that PostgreSQL is wired, that NATS holds the streams and buckets, and that a fresh client can resolve its tenant, read every schema and seed. It needs only `python3`, `psql` and `nats`.
 
 #### 8. Invite the first user
 

@@ -17,7 +17,7 @@ const usage =
     \\
     \\  --gen-nkey      Mint the bridge<->NATS nkey pair (seed to stdout, once)
     \\
-    \\  --diagnose      Pre-run doctor: report everything boot would decide, write nothing
+    \\  --diagnose      Doctor, bridge stopped or running: report what it meets, write nothing
     \\
     \\  --init-nats [dev|operator]  Generate the whole NATS stack, no nsc (--force overwrites)
     \\      [--dir DIR]             …where the files live on their host (default ./zb-nats)

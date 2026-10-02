@@ -256,7 +256,7 @@ scrape_configs:
 }
 ```
 
-The three `ingress_*` fields are what `zbdoctor` reads to check the MUTATIONS stream's own policy (`MUTATION_BACKLOG_PER_PRINCIPAL`, set where NATS is set up) against the rate the bridge declares: how long a full backlog drains.
+The three `ingress_*` fields describe the rate the bridge applies. Next to the MUTATIONS stream's own backlog cap (`MUTATION_BACKLOG_PER_PRINCIPAL`, set where NATS is set up), they say how long a full backlog takes to drain.
 
 </details>
 

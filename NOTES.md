@@ -18381,3 +18381,30 @@ Quickstart from scratch (`down -v`, `up --build`, bridge on 27444 beside the Sup
 one): all services up, init printed the links, the bridge loaded both files, a throwaway
 invite enrolled (tenant tag, mapping published). Supabase bridge restarted on the two
 files.
+
+## §10kv — one doctor: `bridge --diagnose`, bridge stopped or running; the catalogue is the intent (2026-10-02)
+
+`zebridge_check_all()` takes no argument now: every catalogued table against its own
+catalogue row (with §10ku's recorded acceptance), plus a row whose table is gone as an
+ERROR. The JSON intent form is dropped (a second source of truth beside the migration).
+
+`--diagnose` keeps its pre-boot checks and adds `src/diagnose_live.zig`, read-only:
+6 the catalogue (`zebridge_check_all()`, plus zbdoctor's cross-table audits: tenant tables
+  with unbounded writes, tenants the sweeper cannot reach, an instance whose publication is
+  empty, instances disagreeing on the budget);
+7 the slots (invalidated = finding; this bridge's own inactive = note when stopped, finding
+  when it answers; others inactive = warning);
+8 the bridge: GET /status on 127.0.0.1:<its port>; nothing answering = "stopped";
+9 NATS through the bridge's own publisher (connect creates nothing): streams and buckets
+  (missing = note when stopped, finding when running), MUTATIONS cap, VERDICTS policy;
+10 with the bridge running: a schema per catalogue table, a tenant entry per principal, a
+  chain manifest whose full object exists per (mapped tenant with rows, table).
+`scripts/zbdoctor.py` removed; its auditor principal stays (read-only grants fit).
+
+Supabase: all clear running (catalogue 3 tables, 2 accepted-delete warnings; 7 streams; 3
+schemas; 4 tenant entries; 3 chains) and stopped (contract skipped, said so). Dev: 18
+real findings — 9 catalogue rows whose table scenarios dropped, 6 writable tables without
+tombstone or recorded acceptance (counter_public, counter_tenant, memo, note_t, orders,
+salaries), a `zebridge_limits` row for slot zb_sb left by standby.py (fixed: its teardown
+now deletes it), and the dev NATS (stopped). diagnose.py: 5/6, the "clean bill" check
+fails on that dev state, not on the doctor; read-only still proven.

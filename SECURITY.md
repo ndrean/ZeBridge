@@ -329,7 +329,7 @@ so it quarantines the table on its own feed (boot preflight, or
 `suspendForRowTooLarge` on the next touch) while the other bridge carries on — a
 partial, per-feed outage, correct but silent about its cause. `zebridge_enable`
 returns a `WARNING` row when the table is already in another publication, and
-`scripts/zbdoctor.py` reports instances that disagree on the budget. Keep their
+`bridge --diagnose` reports instances that disagree on the budget. Keep their
 `BASE_BUF` equal, or keep the publications disjoint. Column lists do not soften
 this: the guard is per table, not per projection.
 

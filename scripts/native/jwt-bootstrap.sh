@@ -220,7 +220,8 @@ nsc add user --account ZEBRIDGE --name mqttgw \
 # read every tenant's data. Signed by the identity key, the user's own
 # permissions are what the server enforces.
 #
-# The grant set is the MEASURED minimum for scripts/zbdoctor.py (NOTES §10y),
+# The grant set is the MEASURED minimum for the auditor (NOTES §10y: measured with the
+# zbdoctor.py script, whose checks `bridge --diagnose` now runs),
 # narrowed by removing grants until a gate went red:
 #   INFO          the account probe every JetStream client issues first
 #   STREAM.NAMES  the topology gate (does CDC_<tenant> exist?)

@@ -154,8 +154,7 @@ if [ "$FRESH_NATS" = "1" ]; then
   # letters. Workqueue retention deletes a mutation once the bridge acks it, so the
   # cap counts what is QUEUED; with `limits` it would count every write of the last
   # max-age, a quota per two hours. Dead letters have no consumer and stay until
-  # max-age. The bridge declares its rate on /status; zbdoctor checks the two against
-  # each other.
+  # max-age. The bridge declares its rate on /status.
   MUTATION_BACKLOG_PER_PRINCIPAL="${MUTATION_BACKLOG_PER_PRINCIPAL:-5000}"
   nats --server "$NATS_URL" --nkey "$SEED" stream add "$MUTATIONS_STREAM" \
     --subjects="$MUTATIONS_PREFIX.>,$MUTATION_ERROR_PREFIX.>" \

@@ -352,7 +352,7 @@ services:
         # max-msgs-per-subject is a per-principal backlog; discard=new refuses rather than
         # evicting; workqueue retention drops a mutation once the bridge acks it, so the
         # cap counts what is queued). The same policy as scripts/native/up.sh; the bridge
-        # declares its rate on /status and zbdoctor gate C checks the two.
+        # declares its rate on /status.
         nats stream add $$MUTATIONS_STREAM --subjects="$$MUTATIONS_PREFIX.>,$$MUTATION_ERROR_PREFIX.>" --storage=file --retention=work --max-age=2h --max-bytes=1G --replicas=1 --discard=new --max-msgs-per-subject=$${MUTATION_BACKLOG_PER_PRINCIPAL:-5000} --discard-per-subject --defaults \
           || nats stream edit $$MUTATIONS_STREAM --subjects="$$MUTATIONS_PREFIX.>,$$MUTATION_ERROR_PREFIX.>" --discard=new --max-msgs-per-subject=$${MUTATION_BACKLOG_PER_PRINCIPAL:-5000} --discard-per-subject -f \
           || true

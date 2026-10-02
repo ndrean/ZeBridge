@@ -75,6 +75,9 @@ def teardown_db(principal: str):
     zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{T}'", quiet=True)
     zb.psql(f"DELETE FROM public.zebridge_generations WHERE tbl = '{T}'", quiet=True)
     zb.psql(f"DROP PUBLICATION IF EXISTS {PUB}", quiet=True)
+    # The slot lived on the standby copy, deleted with it: its registration on the
+    # primary would otherwise stay, an instance replicating nothing.
+    zb.psql(f"DELETE FROM public.zebridge_limits WHERE slot = '{SLOT}'", quiet=True)
     for t in ("zebridge_principal_keys", "zebridge_invites", "zebridge_user_tenants"):
         zb.psql(f"DELETE FROM public.{t} WHERE principal = '{principal}'", quiet=True)
 

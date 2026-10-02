@@ -2279,8 +2279,7 @@ $$ LANGUAGE plpgsql;
 --
 --     SELECT * FROM zebridge_check('orders', 'writable');
 --     SELECT * FROM zebridge_check('orders', 'writable', 'updated_at', 'deleted_at', 'last_writer', 'tenant_id');
---     SELECT * FROM zebridge_check_all('{"users":"read_only",
---         "orders":{"mode":"writable","version":"updated_at","tombstone":"deleted_at","tiebreak":"last_writer","tenant":"tenant_id"}}');
+--     SELECT * FROM zebridge_check_all();   -- every catalogued table, against its row
 --
 -- It asks pg_catalog and our own tables the same questions the bridge's preflight
 -- asks at boot and at every DDL event (preflight.zig, mutation_listener.zig), from
@@ -2624,51 +2623,27 @@ BEGIN
                CASE WHEN intent IS NOT NULL THEN ' against intent ' || intent ELSE '' END);
 END $$ LANGUAGE plpgsql STABLE;
 
--- The intent map, in one call. Every table you name is checked against what you
--- said; every catalogue table you did NOT name is an ERROR — the map is the whole
--- intent unless `partial` says it is a subset. Exits are the caller's: in psql,
---   SELECT * FROM zebridge_check_all('{"users":"read_only","orders":"writable"}')
---   WHERE status = 'ERROR';   -- an empty result is a clean bill
-CREATE OR REPLACE FUNCTION public.zebridge_check_all(
-    spec    jsonb,
-    partial boolean DEFAULT false
-) RETURNS TABLE (tbl text, check_name text, status text, detail text) AS $$
-DECLARE
-    k text;
-    v text;
-    rc regclass;
+-- Every catalogued table, checked against its catalogue row: the intent the DBA already
+-- wrote with zebridge_enable, in the migration. Nothing to repeat, no second file.
+-- A catalogue row whose table is gone is an ERROR. In psql:
+--   SELECT * FROM zebridge_check_all() WHERE status = 'ERROR';   -- empty: a clean bill
+DROP FUNCTION IF EXISTS public.zebridge_check_all(jsonb, boolean);
+CREATE OR REPLACE FUNCTION public.zebridge_check_all()
+RETURNS TABLE (tbl text, check_name text, status text, detail text) AS $$
 BEGIN
-    IF jsonb_typeof(spec) <> 'object' THEN
-        RAISE EXCEPTION 'zebridge_check_all: spec must be a JSON object {"table": "read_only"|"writable"}';
-    END IF;
-    -- A value is either the mode as a string — "writable" — or an object naming the
-    -- columns too: {"mode":"writable","version":"updated_at","tombstone":"deleted_at",
-    -- "tiebreak":"last_writer","tenant":"tenant_id","physical_deletes":true}.
-    FOR k, v IN SELECT key, value::text FROM jsonb_each(spec) ORDER BY key LOOP
-        rc := to_regclass(k);
-        IF rc IS NULL THEN
-            RETURN QUERY SELECT k, 'exists'::text, 'ERROR'::text, format('no such table %s', k);
-            CONTINUE;
-        END IF;
-        IF jsonb_typeof(spec -> k) = 'object' THEN
-            RETURN QUERY SELECT k, c.check_name, c.status, c.detail
-            FROM public.zebridge_check(rc,
-                spec -> k ->> 'mode',
-                (spec -> k ->> 'version')::name,
-                (spec -> k ->> 'tombstone')::name,
-                (spec -> k ->> 'tiebreak')::name,
-                (spec -> k ->> 'tenant')::name,
-                coalesce((spec -> k ->> 'physical_deletes')::boolean, false)) c;
-        ELSE
-            RETURN QUERY SELECT k, c.check_name, c.status, c.detail FROM public.zebridge_check(rc, spec ->> k) c;
-        END IF;
-    END LOOP;
-    IF NOT partial THEN
-        RETURN QUERY
-            SELECT c.tbl, 'declared'::text, 'ERROR'::text,
-                   format('%s is in zebridge_catalogue but not in your intent map: undeclared tables are the ones people forget', c.tbl)
-            FROM public.zebridge_catalogue c
-            WHERE NOT spec ? c.tbl AND NOT public.zebridge_is_internal_table(c.tbl)
-            ORDER BY c.tbl;
-    END IF;
+    RETURN QUERY
+        SELECT c.tbl, k.check_name, k.status, k.detail
+        FROM (SELECT cat.tbl, to_regclass('public.' || quote_ident(cat.tbl)) AS rc
+                FROM public.zebridge_catalogue cat
+               WHERE NOT public.zebridge_is_internal_table(cat.tbl)) c
+        CROSS JOIN LATERAL public.zebridge_check(c.rc) k
+        WHERE c.rc IS NOT NULL
+        ORDER BY c.tbl;
+    RETURN QUERY
+        SELECT cat.tbl, 'exists'::text, 'ERROR'::text,
+               format('%s is in zebridge_catalogue but the table is gone: drop the row, or restore the table', cat.tbl)
+        FROM public.zebridge_catalogue cat
+        WHERE NOT public.zebridge_is_internal_table(cat.tbl)
+          AND to_regclass('public.' || quote_ident(cat.tbl)) IS NULL
+        ORDER BY cat.tbl;
 END $$ LANGUAGE plpgsql STABLE;

@@ -37,6 +37,7 @@ const refused_tables = @import("refused_tables.zig");
 const writable_tables = @import("writable_tables.zig");
 const type_registry = @import("type_registry.zig");
 const topology_mod = @import("topology.zig");
+const diagnose_live = @import("diagnose_live.zig");
 
 // Force test discovery for imported modules.
 // Zig only collects tests from files the root actually references, so every module
@@ -376,9 +377,12 @@ fn runDiagnose(
     gc_threshold_ms: ?u64,
     checkpoint_seconds: u64,
     async_fulls: bool,
+    io: std.Io,
+    bridge_port: u16,
+    nats_endpoint: ?Config.Nats.Endpoint,
 ) u8 {
     var findings: usize = 0;
-    log.info("🩺 DIAGNOSE (dry run): BASE_BUF gives a {d}-byte event buffer; slot '{s}', publication '{s}'. Nothing will be created, registered, or dialled.", .{ event_buf, slot_name, pub_name });
+    log.info("🩺 DIAGNOSE: BASE_BUF gives a {d}-byte event buffer; slot '{s}', publication '{s}'. Read-only: PostgreSQL, NATS and the bridge's port are read; nothing is created or changed.", .{ event_buf, slot_name, pub_name });
 
     var cfg = pg_config.*;
     cfg.replication = false;
@@ -557,8 +561,20 @@ fn runDiagnose(
         log.info("✅ CDC window: streams keep {d}s of events ≥ 2 × cadence {d}s", .{ cdc_max_age_seconds, cadence_seconds * 2 });
     }
 
+    // ── 6–10. beyond this configuration: the catalogue against the tables, the slots,
+    // the running bridge if any, NATS, and what a fresh client would find there.
+    findings += diagnose_live.run(allocator, io, .{
+        .conn = conn,
+        .core_ok = core_ok,
+        .write_ok = write_ok,
+        .slot_name = slot_name,
+        .bridge_port = bridge_port,
+        .endpoint = nats_endpoint,
+        .topo = topo,
+    });
+
     if (findings == 0) {
-        log.info("🩺 DIAGNOSE: all clear — a bridge started with this configuration carries every published table. Nothing was changed.", .{});
+        log.info("🩺 DIAGNOSE: all clear. Nothing was changed.", .{});
         return 0;
     }
     log.err("🩺 DIAGNOSE: {d} finding(s) above. Nothing was changed — fix and re-run.", .{findings});
@@ -964,6 +980,9 @@ pub fn main(init: std.process.Init) !void {
             if (init.minimal.environ.getPosix("GC_THRESHOLD_MS")) |t| (std.fmt.parseInt(u64, t, 10) catch null) else null,
             runtime_config.generation_checkpoint_seconds,
             runtime_config.generation_async_fulls,
+            io,
+            parsed_args.http_port,
+            Config.Nats.Endpoint.resolve(&runtime_config) catch null,
         );
         std.process.exit(code);
     }
