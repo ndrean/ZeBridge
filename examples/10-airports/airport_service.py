@@ -12,11 +12,13 @@ tenant every client may ask. PostgreSQL never sees a query.
     airports_near {"lat", "lng", "radius_km": 100, "limit": 20}
       → the nearest airports within the radius, with their distance.
 
-Every answer: {"columns": [...], "rows": [[...], ...], "count", "complete", "ms"}.
+Every answer: {"columns": [...], "rows": [[...], ...], "count", "complete", "ms"} — `ms`: the time
+spent in this service on the question (the SQL, the rows to JSON and back).
 
     PYTHONPATH=zb-python/src python3 examples/10-airports/airport_service.py --creds airports.creds
 """
 import argparse
+import math
 import os
 import signal
 import threading
@@ -56,11 +58,16 @@ def airports_near(zb: ZeBridge, q: dict) -> dict:
     lat, lng = float(q["lat"]), float(q["lng"])
     radius_km = float(q.get("radius_km", 100))
     limit = min(int(q.get("limit", 20)), 500)
+    # A box around the circle first (plain comparisons), the exact distance only inside
+    # it: half the time on this table, and it grows with the table.
+    dlat = radius_km / 111.32
+    dlng = radius_km / (111.32 * max(0.01, math.cos(math.radians(lat))))
+    box = f"latitude BETWEEN {lat - dlat} AND {lat + dlat} AND longitude BETWEEN {lng - dlng} AND {lng + dlng}"
     # haversine, in kilometres
     dist = (f"2 * 6371 * asin(sqrt(pow(sin(radians(latitude - {lat}) / 2), 2) + "
             f"cos(radians({lat})) * cos(radians(latitude)) * pow(sin(radians(longitude - {lng}) / 2), 2)))")
     return answer(zb, f"SELECT {', '.join(COLUMNS)}, round({dist}, 1) AS distance_km FROM {TABLE} "
-                      f"WHERE {dist} <= {radius_km} ORDER BY {dist} LIMIT {limit + 1}",
+                      f"WHERE {box} AND {dist} <= {radius_km} ORDER BY distance_km LIMIT {limit + 1}",
                   [], limit)
 
 

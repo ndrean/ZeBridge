@@ -67,7 +67,7 @@ async function ask(): Promise<void> {
         .addTo(markers);
     }
     count.textContent = `${a.count}${a.complete ? '' : '+'} airport${a.count === 1 ? '' : 's'} within ${RADIUS_KM} km of the centre`;
-    detail.textContent = `${a.ms} ms in DuckDB, ${Math.round(performance.now() - t0)} ms round trip`;
+    detail.textContent = `${a.ms} ms in the service, ${Math.round(performance.now() - t0)} ms round trip`;
   } catch (e) {
     if (mine === asked) count.textContent = `no answer: ${(e as Error).message}`;
   }
