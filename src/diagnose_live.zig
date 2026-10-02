@@ -55,7 +55,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, in: Inputs) usize {
     defer publisher.deinit();
     publisher.connect() catch |err| {
         findings += 1;
-        log.err("🔴 NATS is not reachable at {s}:{d} ({s}) with this environment's credentials: a bridge started now would not connect. Check NATS_URL and NATS_CREDS (zb-nats/.env.nats).", .{ endpoint.host, endpoint.port, @errorName(err) });
+        if (endpoint.user == null and endpoint.seed == null) {
+            log.err("🔴 NATS refused at {s}:{d} ({s}): this environment carries no NATS credentials. NATS_CREDS is not set: load .env.nats in the same shell (sudo starts a clean environment, and the file is readable by its owner only).", .{ endpoint.host, endpoint.port, @errorName(err) });
+        } else {
+            log.err("🔴 NATS is not reachable at {s}:{d} ({s}) with this environment's credentials: a bridge started now would not connect. Check NATS_URL and NATS_CREDS in .env.nats.", .{ endpoint.host, endpoint.port, @errorName(err) });
+        }
         return findings;
     };
     const js = publisher.js orelse return findings;
