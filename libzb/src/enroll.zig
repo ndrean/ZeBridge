@@ -173,6 +173,25 @@ pub fn steadySeconds() i64 {
     return @intCast(ts.sec);
 }
 
+/// The same steady clock, in milliseconds: the bridge-time estimate a register stamp
+/// starts from must not jump a whole second when this clock ticks before the wall's.
+pub fn steadyMillis() i64 {
+    const id: std.c.clockid_t = switch (builtin.os.tag) {
+        .linux => .BOOTTIME,
+        else => .MONOTONIC,
+    };
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(id, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
+/// This device's clock, unix milliseconds.
+pub fn localNowMillis() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
 /// This device's clock, unix seconds.
 pub fn localNow() i64 {
     var ts: std.c.timespec = undefined;

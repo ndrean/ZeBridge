@@ -56,14 +56,20 @@ const flightLayer = L.layerGroup().addTo(map);
 type Airport = { code: string; name: string; lat: number; lng: number };
 
 let asked = 0;
+/// Leaflet does not wrap longitudes: pan west across the Pacific and the centre reads
+/// -200, not 160. The service is asked with the wrapped value, and whatever is drawn is
+/// moved onto the copy of the world in view (360° to the left or right).
+const onView = (lng: number) => lng + 360 * Math.round((map.getCenter().lng - lng) / 360);
+
 async function ask(): Promise<void> {
   const centre = map.getCenter();
   circle.setLatLng(centre);
+  const wrapped = centre.wrap();
   const mine = ++asked;
   const t0 = performance.now();
   try {
     const a = await zb.request('query._default.airports_near', {
-      lat: centre.lat, lng: centre.lng, radius_km: RADIUS_KM, limit: LIMIT,
+      lat: wrapped.lat, lng: wrapped.lng, radius_km: RADIUS_KM, limit: LIMIT,
     });
     if (mine !== asked) return; // a newer pan asked meanwhile: its answer wins
     if (a.error) {
@@ -74,7 +80,7 @@ async function ask(): Promise<void> {
     markers.clearLayers();
     for (const r of a.rows) {
       const ap: Airport = { code: r[col('code')], name: r[col('name')], lat: Number(r[col('latitude')]), lng: Number(r[col('longitude')]) };
-      L.circleMarker([ap.lat, ap.lng], { radius: 9, weight: 2, color: '#fff', fillColor: '#d1361f', fillOpacity: 0.9 })
+      L.circleMarker([ap.lat, onView(ap.lng)], { radius: 9, weight: 2, color: '#fff', fillColor: '#d1361f', fillOpacity: 0.9 })
         .bindTooltip(`${ap.code} — ${ap.name}, ${r[col('distance_km')]} km`)
         .bindPopup(() => choose(ap))
         .addTo(markers);
@@ -165,12 +171,18 @@ function drawFlight(): void {
     if (reg) ends[end] = { ap: reg.v, pending: !!m, reg };
   }
   const o = ends.origin, d = ends.destination;
+  // The whole flight moves by one shift (the departure's), so the line stays continuous;
+  // the arrival is drawn at the line's end, which may be past ±180.
+  const shift = o ? onView(o.ap.lng) - o.ap.lng : d ? onView(d.ap.lng) - d.ap.lng : 0;
+  let arrivalLng = d ? d.ap.lng + shift : 0;
   if (o && d) {
-    L.polyline(greatCircle(o.ap, d.ap), { color: '#7a1fd1', weight: 3 }).addTo(flightLayer);
+    const line = greatCircle(o.ap, d.ap).map(([la, ln]) => [la, ln + shift] as L.LatLngTuple);
+    arrivalLng = line[line.length - 1][1];
+    L.polyline(line, { color: '#7a1fd1', weight: 3 }).addTo(flightLayer);
   }
   for (const [end, e] of Object.entries(ends) as [End, NonNullable<typeof o>][]) {
     const colour = end === 'origin' ? '#1a7f37' : '#7a1fd1';
-    L.circleMarker([e.ap.lat, e.ap.lng], {
+    L.circleMarker([e.ap.lat, end === 'origin' ? e.ap.lng + shift : arrivalLng], {
       radius: 12, weight: 4, color: colour, fillColor: colour, fillOpacity: e.pending ? 0 : 1,
     }).bindTooltip(`${LABEL[end]}: ${e.ap.code}${e.pending ? ' (waiting for PostgreSQL)' : ` · ${e.reg.w}`}`).addTo(flightLayer);
   }
@@ -231,7 +243,7 @@ function greatCircle(a: Airport, b: Airport, n = 128): L.LatLngTuple[] {
 }
 
 // ── go ─────────────────────────────────────────────────────────────────────────
-map.on('moveend', () => void ask());
+map.on('moveend', () => { drawFlight(); void ask(); });
 await zb.connect();
 flightId = `flight-${zb.tenant}`;
 await readFlight();

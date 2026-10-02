@@ -24,6 +24,7 @@ internal object Native {
     @JvmStatic external fun flushOutbox(h: Long, waitMs: Long): ByteArray?
     @JvmStatic external fun query(h: Long, sql: ByteArray, params: ByteArray): ByteArray?
     @JvmStatic external fun mutate(h: Long, table: ByteArray, op: ByteArray, key: ByteArray, values: ByteArray?, version: ByteArray?): ByteArray?
+    @JvmStatic external fun stamp(h: Long): ByteArray?
     @JvmStatic external fun join(h: Long, tenant: ByteArray): ByteArray?
     @JvmStatic external fun leave(h: Long, tenant: ByteArray): ByteArray?
     @JvmStatic external fun request(h: Long, subject: ByteArray, payload: ByteArray, timeoutMs: Long): ByteArray?

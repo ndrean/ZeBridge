@@ -34,6 +34,7 @@
 //!   char* zb_client_reply(uint64_t h, uint64_t id, const char* answer_json);  // §10hp: answer one request from poll
 //!   char* zb_client_join(uint64_t h, const char* tenant);          // {"tenants":[…]} — follow one more tenant (§10fn)
 //!   char* zb_client_leave(uint64_t h, const char* tenant);         // {"tenants":[…]} — drop one: its rows, watermarks, tail
+//!   char* zb_client_stamp(uint64_t h);                             // {"stamp":"…"} — a register's `t`, on the bridge's clock
 //! `opts_json`: natsUrl, creds (the .creds text) or credsPath (a file), dbPath, principal, tables (array, parents first — or
 //! the string "*": every published table, §10hn; absent: nothing is followed),
 //! ondemandTables (§10hj: schema yes, seed and tail no — filled by `zb_client_ingest`;
@@ -81,7 +82,7 @@ var clients: handles.Table(ClientBox, 64) = .{};
 
 /// The ABI version — libzb/abi.json's `version`, which python/abi_check.py keeps in
 /// step with what this file exports and what `openBox` reads.
-pub const abi_version: c_int = 3;
+pub const abi_version: c_int = 4;
 
 export fn zb_abi_version() c_int {
     return abi_version;
@@ -460,11 +461,15 @@ const ClientBox = struct {
     /// `serverNow`, which counts on the steady clock from there, so a user who moves the
     /// phone's clock in Settings does not move it. Set at open from the identity's
     /// stored offset, then at each renewal from the new JWT's `iat`.
-    anchor_server: i64 = 0,
-    anchor_steady: i64 = 0,
+    anchor_server_ms: i64 = 0,
+    anchor_steady_ms: i64 = 0,
+
+    fn serverNowMs(self: *const ClientBox) i64 {
+        return self.anchor_server_ms + (enroll.steadyMillis() - self.anchor_steady_ms);
+    }
 
     fn serverNow(self: *const ClientBox) i64 {
-        return self.anchor_server + (enroll.steadySeconds() - self.anchor_steady);
+        return @divFloor(self.serverNowMs(), 1000);
     }
 
     fn destroy(self: *ClientBox, a: std.mem.Allocator) void {
@@ -792,8 +797,8 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         .ondemand = ondemand,
         .all_tables = all_tables,
         .id_path = kept_id_path,
-        .anchor_server = if (ident) |i| i.serverNow() else enroll.localNow(),
-        .anchor_steady = enroll.steadySeconds(),
+        .anchor_server_ms = enroll.localNowMillis() + (if (ident) |i| i.clock_offset * 1000 else 0),
+        .anchor_steady_ms = enroll.steadyMillis(),
     };
     return box;
 }
@@ -869,6 +874,25 @@ export fn zb_creds_file_text(jwt: ?[*:0]const u8, seed: ?[*:0]const u8) ?[*:0]u8
 ///
 /// `1` revoked, `0` live, `-1` unknown handle — an `int`, not JSON, so a host can poll
 /// it without allocating.
+/// The bridge's clock minus this device's, as `serverNow` counts it (§10ks), handed to
+/// the client so its versions and stamps start from the bridge's time.
+fn syncClockOffset(b: *ClientBox) void {
+    b.c.clock_offset_ms = b.serverNowMs() - enroll.localNowMillis();
+}
+
+/// A register stamp (COOPERATIVE_EDITING.md, the `t` of {v, t, w}) on the bridge's
+/// clock: what a cooperative document's writer puts beside a value. zb-client-ts: stamp().
+export fn zb_client_stamp(handle: u64) ?[*:0]u8 {
+    const b = lookup(handle) orelse return goneJson(handle);
+    syncClockOffset(b);
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = b.c.registerStamp(a) catch |err| return errJson(@errorName(err));
+    const out = std.fmt.allocPrint(a, "{{\"stamp\":\"{s}\"}}", .{s}) catch return errJson("OutOfMemory");
+    return dupeZ(out);
+}
+
 export fn zb_client_revoked(handle: u64) c_int {
     const b = lookup(handle) orelse return if (wasPurged(handle)) 1 else -1;
     return if (b.c.revoked) 1 else 0;
@@ -1213,8 +1237,8 @@ fn maybeRenew(b: *ClientBox, force: bool) void {
     // A JWT this client just received: its `iat` is the bridge's time, now. (One that
     // another process renewed may be minutes old: the anchor stays.)
     if (ours) if (enroll.jwtTimes(fresh.creds)) |t| {
-        b.anchor_server = t.iat;
-        b.anchor_steady = enroll.steadySeconds();
+        b.anchor_server_ms = t.iat * 1000;
+        b.anchor_steady_ms = enroll.steadyMillis();
     };
     std.crypto.secureZero(u8, old);
     a.free(old);
@@ -1223,6 +1247,7 @@ fn maybeRenew(b: *ClientBox, force: bool) void {
 
 export fn zb_client_poll(handle: u64, wait_ms: u64) ?[*:0]u8 {
     const b = lookup(handle) orelse return goneJson(handle);
+    syncClockOffset(b);
     maybeRenew(b, false);
     if (purgeIfAsked(handle, b)) return errJson("Revoked");
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);

@@ -25,6 +25,7 @@ extern int zb_client_close(uint64_t h);
 extern int zb_client_wipe(uint64_t h);
 extern int zb_client_revoked(uint64_t h);
 extern char *zb_client_sync(uint64_t h);
+extern char *zb_client_stamp(uint64_t h);
 extern char *zb_client_poll(uint64_t h, uint64_t wait_ms);
 extern char *zb_client_query(uint64_t h, const char *sql, const char *params_json);
 extern char *zb_client_mutate(uint64_t h, const char *table, const char *op, const char *key_json, const char *values_json);
@@ -107,6 +108,8 @@ FN(jbyteArray, mutate)(JNIEnv *env, jclass cls, jlong h, jbyteArray table, jbyte
     free(t); free(o); free(k); free(v); free(ver);
     return r;
 }
+
+FN(jbyteArray, stamp)(JNIEnv *env, jclass cls, jlong h) { return owned(env, zb_client_stamp(U64(h))); }
 
 FN(jbyteArray, join)(JNIEnv *env, jclass cls, jlong h, jbyteArray tenant) {
     char *t = in(env, tenant);

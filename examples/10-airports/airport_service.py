@@ -60,9 +60,19 @@ def airports_near(zb: ZeBridge, q: dict) -> dict:
     limit = min(int(q.get("limit", 20)), 500)
     # A box around the circle first (plain comparisons), the exact distance only inside
     # it: half the time on this table, and it grows with the table.
+    lng = (lng + 180) % 360 - 180  # a map may hand over -200 for 160
     dlat = radius_km / 111.32
     dlng = radius_km / (111.32 * max(0.01, math.cos(math.radians(lat))))
-    box = f"latitude BETWEEN {lat - dlat} AND {lat + dlat} AND longitude BETWEEN {lng - dlng} AND {lng + dlng}"
+    west, east = lng - dlng, lng + dlng
+    if dlng >= 180:
+        lng_box = "TRUE"
+    elif west < -180:   # the box crosses the date line: two halves
+        lng_box = f"(longitude >= {west + 360} OR longitude <= {east})"
+    elif east > 180:
+        lng_box = f"(longitude >= {west} OR longitude <= {east - 360})"
+    else:
+        lng_box = f"longitude BETWEEN {west} AND {east}"
+    box = f"latitude BETWEEN {lat - dlat} AND {lat + dlat} AND {lng_box}"
     # haversine, in kilometres
     dist = (f"2 * 6371 * asin(sqrt(pow(sin(radians(latitude - {lat}) / 2), 2) + "
             f"cos(radians({lat})) * cos(radians(latitude)) * pow(sin(radians(longitude - {lng}) / 2), 2)))")

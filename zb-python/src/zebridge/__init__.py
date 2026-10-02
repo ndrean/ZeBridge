@@ -30,7 +30,7 @@ from . import _native as n
 __all__ = ["ZeBridge", "ZeBridgeError", "ZB_ABI", "create_user", "creds_file_text", "grammar_hash"]
 
 #: libzb's C ABI version this package was written for; libzb/python/abi_check.py checks it.
-ZB_ABI = 3
+ZB_ABI = 4
 
 
 class ZeBridgeError(RuntimeError):
@@ -186,6 +186,11 @@ class ZeBridge:
     def flush(self, wait_ms: int = 0) -> dict:
         """Send queued writes now, waiting up to `wait_ms` for their verdicts."""
         return self._call(lambda: _check(n.take(n.lib.zb_client_flush_outbox(self._handle, wait_ms))))
+
+    def stamp(self) -> str:
+        """A register stamp (the `t` of {v, t, w}, COOPERATIVE_EDITING.md): the bridge's time
+        as this client estimates it, never behind what it has seen or stamped."""
+        return self._call(lambda: _check(n.take(n.lib.zb_client_stamp(self._handle))))["stamp"]
 
     def join(self, tenant: str) -> dict:
         return self._call(lambda: _check(n.take(n.lib.zb_client_join(self._handle, tenant.encode()))))

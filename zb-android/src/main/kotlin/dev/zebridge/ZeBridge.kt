@@ -9,7 +9,7 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
 /** libzb's C ABI version this binding was written for; libzb/python/abi_check.py checks it. */
-const val ZB_ABI = 3
+const val ZB_ABI = 4
 
 /** A call libzb refused, with libzb's own words (`{"error": …}` or `zb_last_error`). */
 class ZeBridgeException(message: String) : RuntimeException(message)
@@ -203,6 +203,10 @@ class ZeBridge @JvmOverloads constructor(
     /** Send queued writes now, waiting up to [waitMs] for their verdicts. */
     @JvmOverloads
     fun flush(waitMs: Long = 0): JSONObject = onWorker { result(Native.flushOutbox(handle, waitMs)) }
+
+    /** A register stamp (the `t` of {v, t, w}, COOPERATIVE_EDITING.md): the bridge's time as
+     *  this client estimates it, never behind what it has seen or stamped. */
+    fun stamp(): String = onWorker { result(Native.stamp(handle)).getString("stamp") }
 
     /** Follow one more tenant (its grants permitting). */
     fun join(tenant: String): JSONObject = onWorker { result(Native.join(handle, tenant.toByteArray(Charsets.UTF_8))) }

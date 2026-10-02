@@ -18424,3 +18424,28 @@ service now runs the default 250 ms poll: 6.4 ms round trip, 0.1% CPU idle, CDC 
 Every host with `serve` gains it (Python, Kotlin, Dart, the C ABI): nothing to configure.
 Not covered: a client following NO stream waits on verdicts instead, which the wake does
 not reach (a service always follows its table).
+
+## §10kx — `stamp()` in libzb (ABI 4); the airports example crosses the date line (2026-10-02)
+
+The cooperative flight (examples/10-airports) stamps each register `t` on the bridge's
+clock in zb-client-ts (`stamp()`, 44fefba); phones need the same through libzb. New C
+export `zb_client_stamp` → `{"stamp":"…"}`, ABI 4, wrapped in zb-python, zb-android,
+zb-dart (zb-react-native only bumps its pin: its writes go through zb-client-ts). The
+stamp is `hlcVersion(now + clock_offset, last_version, seen_floor)` and advances
+`last_version`, as a write does, so a stamp is never behind what this client has seen or
+written. libzb's own write versions (`mutateAt`) now start from the same offset.
+
+The offset is `serverNow − localNow`, refreshed at each poll and each stamp. First cut
+counted in whole seconds (`steadySeconds`, `localNow`) and stamped ~1 s ahead of a correct
+clock: the steady clock and the wall clock tick their seconds at different moments. The
+anchor and the offset are now milliseconds (`steadyMillis`, `localNowMillis`); renewal
+spacing and expiry still read whole seconds from them. Measured through Python, no skew:
+each stamp within 0.1 ms of the call's return. Kotlin binding not compiled (no compiler
+on this machine); `dart analyze` clean; `abi_check` passes.
+
+Date line: panning west across the Pacific showed no airports, east worked. Leaflet does
+not wrap longitudes (a centre can read −220), and the service's box `BETWEEN west AND east`
+matched nothing past −180. The page now asks with `centre.wrap()` and draws airports and
+the flight on the world copy in view (`onView`); the service normalises the longitude and
+splits a box that crosses ±180 into two ranges. Tokyo asked at −220.23 and at 139.77 both
+return 18 airports; Fiji at 178.4 and −181.6 both return 28.

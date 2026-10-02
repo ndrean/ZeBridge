@@ -13,7 +13,7 @@ import 'dart:io';
 import 'package:ffi/ffi.dart';
 
 /// libzb's C ABI version this package was written for; libzb/python/abi_check.py checks it.
-const zbAbi = 3;
+const zbAbi = 4;
 
 /// A call libzb refused, with libzb's own words.
 class ZeBridgeException implements Exception {
@@ -126,6 +126,7 @@ class ZeBridge {
   static late _Open _connect;
   static late _IntOfH _close, _wipe, _revoked;
   static late _PtrOfH _sync;
+  static late _PtrOfH _stamp;
   static late _PtrOfHN _poll, _flush;
   static late _PtrOfHSS _query;
   static late _PtrOfHSSSS _mutate;
@@ -148,6 +149,7 @@ class ZeBridge {
     _wipe = _lib.lookupFunction<_IntOfHC, _IntOfH>('zb_client_wipe');
     _revoked = _lib.lookupFunction<_IntOfHC, _IntOfH>('zb_client_revoked');
     _sync = _lib.lookupFunction<_PtrOfHC, _PtrOfH>('zb_client_sync');
+    _stamp = _lib.lookupFunction<_PtrOfHC, _PtrOfH>('zb_client_stamp');
     _poll = _lib.lookupFunction<_PtrOfHNC, _PtrOfHN>('zb_client_poll');
     _flush = _lib.lookupFunction<_PtrOfHNC, _PtrOfHN>('zb_client_flush_outbox');
     _query = _lib.lookupFunction<_PtrOfHSSC, _PtrOfHSS>('zb_client_query');
@@ -220,6 +222,10 @@ class ZeBridge {
   /// Write a row (INSERT, UPDATE or DELETE, any case): local at once, settled by its verdict.
   Map<String, dynamic> mutate(String table, String op, Map<String, dynamic> key, [Map<String, dynamic>? values]) =>
       Map<String, dynamic>.from(_with([table, op, key, values], (p) => _take(_mutate(_handle, p[0], p[1], p[2], p[3]))) as Map);
+
+  /// A register stamp (the `t` of {v, t, w}, COOPERATIVE_EDITING.md): the bridge's time as
+  /// this client estimates it, never behind what it has seen or stamped.
+  String stamp() => (_take(_stamp(_handle)) as Map)['stamp'] as String;
 
   List<String> join(String tenant) => List<String>.from((_with([tenant], (p) => _take(_join(_handle, p[0]))) as Map)['tenants'] as List);
   List<String> leave(String tenant) => List<String>.from((_with([tenant], (p) => _take(_leave(_handle, p[0]))) as Map)['tenants'] as List);

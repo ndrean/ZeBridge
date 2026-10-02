@@ -139,6 +139,9 @@ class ZeBridgeWorker {
       Map<String, dynamic>.from(
           await _call<dynamic>('flush', {'waitMs': waitMs}) as Map);
 
+  /// A register stamp (the `t` of {v, t, w}), on the bridge's clock as estimated.
+  Future<String> stamp() async => await _call<dynamic>('stamp', {}) as String;
+
   /// §10fn: follow one more tenant / drop one. Served between polls like the rest;
   /// a join seeds the tenant's chains before it answers, so it takes a moment.
   Future<List<String>> join(String tenant) async => List<String>.from(
@@ -275,6 +278,9 @@ Future<void> _workerMain(_Boot boot) async {
               m['scope'] == null
                   ? null
                   : Map<String, dynamic>.from(m['scope'] as Map)));
+          break;
+        case 'stamp':
+          reply(zb.stamp());
           break;
         case 'join':
           reply(zb.join(m['tenant'] as String));

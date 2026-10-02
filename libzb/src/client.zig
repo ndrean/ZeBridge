@@ -393,6 +393,11 @@ pub const SyncClient = struct {
     schema_watch: ?@import("nats").KVWatcher = null,
     last_version: []const u8 = "",
     last_version_buf: [64]u8 = undefined,
+    /// The bridge's clock minus this device's, in milliseconds, as the C layer estimates it
+    /// (§10ks: anchored on a steady clock, refreshed at every poll). Versions and stamps
+    /// start from `now + clock_offset_ms`, so a device whose clock is off stamps near the
+    /// bridge's time instead of its own error. 0 for a host that never sets it.
+    clock_offset_ms: i64 = 0,
     /// Held open across mutate/flush: a CORE subscription only delivers what arrives
     /// while it exists, so subscribing after publishing misses the verdict every time
     /// (measured — the demo settled 0 of 1 until this was split out of drainVerdicts).
@@ -4199,6 +4204,17 @@ pub const SyncClient = struct {
     /// `mutate` with the caller's own stamp (the TypeScript client's `opts.version`):
     /// a host that keeps its own clock, or a test modelling a slow one. The HLC only
     /// advances: a stamp above it is followed, one below it is sent and forgotten.
+    /// A register stamp (COOPERATIVE_EDITING.md, the `t` of {v, t, w}): the same clock a
+    /// write's version comes from — the bridge's time as estimated here, never behind what
+    /// this client has seen or stamped — and it advances that clock, as a write does.
+    pub fn registerStamp(self: *SyncClient, a: std.mem.Allocator) ![]const u8 {
+        const version = try core.hlcVersion(a, try nowWireIsoAt(a, self.clock_offset_ms), self.last_version, self.seen_floor);
+        if (version.len > self.last_version_buf.len) return error.VersionTooLong;
+        @memcpy(self.last_version_buf[0..version.len], version);
+        self.last_version = self.last_version_buf[0..version.len];
+        return version;
+    }
+
     pub fn mutateAt(self: *SyncClient, result_a: std.mem.Allocator, table: []const u8, op_in: []const u8, key: Value, values: ?Value, stamp: ?[]const u8) ![]const u8 {
         // §10jm: any case in, capitals from here on — the `"DELETE"` checks below read this.
         const op = core.normalizeOp(op_in) orelse return error.UnknownOperation;
@@ -4208,7 +4224,7 @@ pub const SyncClient = struct {
         const st = self.states.get(table) orelse return error.UnknownTable;
         try self.ensureOutbox();
 
-        const version = stamp orelse try core.hlcVersion(a, try nowWireIso(a), self.last_version, self.seen_floor);
+        const version = stamp orelse try core.hlcVersion(a, try nowWireIsoAt(a, self.clock_offset_ms), self.last_version, self.seen_floor);
         if (version.len > self.last_version_buf.len) return error.VersionTooLong;
         // The clock only moves forward: a caller's stamp from the past is sent as
         // given but never becomes what the next unstamped write follows.
@@ -5468,9 +5484,16 @@ fn nowMillis() i64 {
 
 /// Wall clock in the §7.2 wire format: UTC, six fractional digits, trailing Z.
 fn nowWireIso(a: std.mem.Allocator) ![]const u8 {
+    return nowWireIsoAt(a, 0);
+}
+
+/// Now as a wire version (RFC 3339 UTC, microseconds), `offset_ms` milliseconds ahead of
+/// this device's clock — the bridge's time, when the offset is the estimated one.
+fn nowWireIsoAt(a: std.mem.Allocator, offset_ms: i64) ![]const u8 {
     const ts = nowRealtime();
-    const secs: u64 = @intCast(ts.sec);
-    const micros: u64 = @intCast(@divTrunc(@as(i64, ts.nsec), 1000));
+    const total_us: i64 = @as(i64, ts.sec) * 1_000_000 + @divTrunc(@as(i64, ts.nsec), 1000) + offset_ms * 1000;
+    const secs: u64 = @intCast(@divFloor(total_us, 1_000_000));
+    const micros: u64 = @intCast(@mod(total_us, 1_000_000));
     const es = std.time.epoch.EpochSeconds{ .secs = secs };
     const yd = es.getEpochDay().calculateYearDay();
     const md = yd.calculateMonthDay();

@@ -51,6 +51,7 @@ for name, res, args in [
     ("zb_client_mutate", _P, [_H, _S, _S, _S, _S]),
     ("zb_client_mutate_at", _P, [_H, _S, _S, _S, _S, _S]),
     ("zb_client_join", _P, [_H, _S]),
+    ("zb_client_stamp", _P, [_H]),
     ("zb_client_leave", _P, [_H, _S]),
     ("zb_client_request", _P, [_H, _S, _S, ctypes.c_uint64]),
     ("zb_client_reply", _P, [_H, ctypes.c_uint64, _S]),
