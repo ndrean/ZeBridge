@@ -1,0 +1,129 @@
+diff --git a/src/connection.zig b/src/connection.zig
+index 602d1c9..befd36f 100644
+--- a/src/connection.zig
++++ b/src/connection.zig
+@@ -2283,6 +2283,7 @@ pub const Connection = struct {
+             owns_message = false;
+             // A successful delivery ends a slow-consumer episode.
+             s.slow_consumer.store(false, .release);
++            if (s.wake_on_message) |peer| peer.messages.wake();
+         } else {
+             // No sub subscription found, try to send UNSUB command
+             self.unsubscribeInternal(message.sid, null) catch |err| {
+diff --git a/src/queue.zig b/src/queue.zig
+index a0096f8..e7520af 100644
+--- a/src/queue.zig
++++ b/src/queue.zig
+@@ -204,6 +204,9 @@ pub fn ConcurrentQueue(comptime T: type, comptime chunk_size: usize) type {
+         is_closed: bool,
+         /// Reset counter to detect buffer state changes
+         reset_id: u64,
++        /// Wakes asked for (`wake`) and not yet seen by a reader. A reader waiting with
++        /// nothing to read returns `Timeout` when there is one; any wait consumes them.
++        wakes: usize,
+ 
+         const Self = @This();
+         const Chunk = ChunkType(T, chunk_size);
+@@ -240,9 +243,20 @@ pub fn ConcurrentQueue(comptime T: type, comptime chunk_size: usize) type {
+                 .chunk_pool = Pool.init(allocator, config.max_pool_size),
+                 .is_closed = false,
+                 .reset_id = 0,
++                .wakes = 0,
+             };
+         }
+ 
++        /// End the current (or the next) wait for data, as a timeout would, without
++        /// putting anything in the queue. For a reader that also watches something else:
++        /// a subscription waking another one's reader when its own message arrives.
++        pub fn wake(self: *Self) void {
++            self.mutex.lockUncancelable(self.io);
++            defer self.mutex.unlock(self.io);
++            self.wakes += 1;
++            self.data_cond.signal(self.io);
++        }
++
+         pub fn deinit(self: *Self) void {
+             // Free all chunks in the linked list
+             var current = self.head;
+@@ -375,15 +389,18 @@ pub fn ConcurrentQueue(comptime T: type, comptime chunk_size: usize) type {
+         /// Internal helper to wait for data availability with timeout handling.
+         /// Assumes mutex is already held.
+         fn waitForDataInternal(self: *Self, timeout: Io.Timeout) (Io.Cancelable || PopError)!void {
++            // Whatever this wait ends with, the wakes asked for so far have been seen.
++            defer self.wakes = 0;
+             switch (timeout) {
+                 .none => {
+-                    while (self.items_available == 0 and !self.is_closed) {
++                    while (self.items_available == 0 and !self.is_closed and self.wakes == 0) {
+                         try self.data_cond.wait(self.io, &self.mutex);
+                     }
+ 
+                     if (self.is_closed and self.items_available == 0) {
+                         return PopError.Closed;
+                     }
++                    if (self.items_available == 0) return PopError.Timeout; // woken
+                     return;
+                 },
+                 .duration, .deadline => {},
+@@ -392,6 +409,7 @@ pub fn ConcurrentQueue(comptime T: type, comptime chunk_size: usize) type {
+             const deadline_timeout = timeout.toDeadline(self.io);
+ 
+             while (self.items_available == 0 and !self.is_closed) {
++                if (self.wakes > 0) return PopError.Timeout; // woken: end the wait early
+                 if (io_util.expired(self.io, deadline_timeout)) {
+                     if (self.is_closed and self.items_available == 0) {
+                         return PopError.Closed;
+@@ -1617,3 +1635,37 @@ test "moveToBuffer ignores the destination size limit" {
+     try std.testing.expectEqual(@as(usize, 0), src.queue.getItemsAvailable());
+     try std.testing.expectEqual(@as(usize, 32), dest.queue.getItemsAvailable());
+ }
++
++test "wake ends a reader's wait early, and does not hide queued data" {
++    const allocator = std.testing.allocator;
++    const io = std.testing.io;
++    const IntQueue = ConcurrentQueue(i32, 4);
++    var queue = IntQueue.init(allocator, io, .{});
++    defer queue.deinit();
++    const long: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(30_000), .clock = .awake } };
++
++    // A wake asked for before the wait: the wait returns at once.
++    queue.wake();
++    var soon = (Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(1_000), .clock = .awake } }).toDeadline(io);
++    try std.testing.expectError(PopError.Timeout, queue.pop(long));
++    try std.testing.expect(!io_util.expired(io, soon));
++
++    // A wake from another thread during the wait.
++    const Waker = struct {
++        fn run(q: *IntQueue, i: Io) void {
++            (Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }).sleep(i) catch {};
++            q.wake();
++        }
++    };
++    soon = (Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(1_000), .clock = .awake } }).toDeadline(io);
++    const t = try std.Thread.spawn(.{}, Waker.run, .{ &queue, io });
++    try std.testing.expectError(PopError.Timeout, queue.pop(long));
++    t.join();
++    try std.testing.expect(!io_util.expired(io, soon));
++
++    // Data already queued is returned, wake or not; the wait consumed the wake.
++    try queue.push(7);
++    queue.wake();
++    try std.testing.expectEqual(@as(i32, 7), try queue.pop(long));
++    try std.testing.expect(queue.tryPop() == null);
++}
+diff --git a/src/subscription.zig b/src/subscription.zig
+index 6811bca..170e3eb 100644
+--- a/src/subscription.zig
++++ b/src/subscription.zig
+@@ -65,6 +65,11 @@ pub const Subscription = struct {
+     // incoming messages for this subscription are dropped and counted
+     // (0 = unlimited). Defaults match nats.go.
+     pending_msgs_limit: std.atomic.Value(u32) = std.atomic.Value(u32).init(default_pending_msgs_limit),
++    /// Another subscription whose reader is woken (its wait ends as a timeout would)
++    /// whenever a message arrives here: one thread can wait on one subscription and
++    /// still be told at once that this one has something. Set before messages flow;
++    /// the peer must outlive this subscription.
++    wake_on_message: ?*Subscription = null,
+     pending_bytes_limit: AtomicU64 = AtomicU64.init(default_pending_bytes_limit),
+     dropped_msgs: AtomicU64 = AtomicU64.init(0),
+     slow_consumer: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),

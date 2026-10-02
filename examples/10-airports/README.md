@@ -51,7 +51,7 @@ Two questions:
 | `airports_in_view` | `south`, `west`, `north`, `east`, `limit` (500) | the airports in the box. A box across the antimeridian wraps. When more than `limit` are inside, one per cell of a grid over the box, so a world view spreads over every continent (`complete: false`, `total`). |
 | `airports_near` | `lat`, `lng`, `radius_km` (100), `limit` (20) | the nearest airports, with `distance_km` |
 
-The service answers on libzb's own thread, inside the callback that hands it the question, and polls every 5 ms: a question arriving during a poll's wait is only handed over when the wait ends. Measured over NATS on the same host: 3 to 5 ms in DuckDB, 8 to 9 ms round trip; idle, it uses 1 to 2% of a core.
+The service answers on libzb's own thread, inside the callback that hands it the question; a question wakes libzb's poll the moment it lands. Measured over NATS on the same host: 3 to 5 ms in DuckDB, about 6 ms round trip; idle, it uses 0.1% of a core.
 
 ## 5. The map
 

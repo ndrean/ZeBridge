@@ -3169,7 +3169,17 @@ pub const SyncClient = struct {
         // server closes the connection (an iPhone on Wi-Fi: 66 disconnects, every
         // delivery in flight lost each time).
         self.tail_inbox.?.max_bytes = pull_max_bytes;
+        self.wireServeWakes();
         return self.tail_inbox.?;
+    }
+
+    /// A question to a service must not wait for the poll's wait to end: `poll` waits on
+    /// the tail inbox, so each serve subscription wakes it when a question arrives
+    /// (nats.zig patch 31). The inbox lives as long as the client (dropped in deinit,
+    /// after the serve subscriptions), so the pointer never outlives what it names.
+    fn wireServeWakes(self: *SyncClient) void {
+        const ib = self.tail_inbox orelse return;
+        for (self.serve_subs) |sub| sub.wake_on_message = ib.inbox_subscription;
     }
 
     /// Set aside and not yet due for a retry.
@@ -3357,6 +3367,7 @@ pub const SyncClient = struct {
         }
         self.serve_queue = try ca.dupe(u8, queue);
         self.serve_subs = try subs.toOwnedSlice(ca);
+        self.wireServeWakes();
         return self.serve_subs.len;
     }
 

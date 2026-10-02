@@ -106,12 +106,11 @@ def main():
             print(f"{req['name']}: {ans.get('count', '?')} airport(s) in {ans.get('ms', '?')} ms", flush=True)
 
     t0 = time.time()
-    # poll_ms=5: a question arriving during a poll's wait is handed over when the wait
-    # ends, not when the question lands. 5 ms keeps the answer near DuckDB's own time
-    # (round trip ~9 ms) for 1-2% of a core when idle; 50 ms made it ~50 ms.
+    # A question wakes libzb's poll when it lands, so the default 250 ms poll answers
+    # at once and costs nothing when idle.
     with ZeBridge(nats_url=a.url, creds_path=a.creds, db_path=a.db, engine="duckdb",
                   tables=[TABLE], client_id="airport-service", heartbeat_ms=0,
-                  on_change=on_change, poll_ms=5) as zb:
+                  on_change=on_change) as zb:
         zb_ref.append(zb)
         held = zb.query(f"SELECT count(*) AS n FROM {TABLE}")[0]["n"]
         print(f"replica: {held} airports in {a.db}, {time.time() - t0:.1f} s", flush=True)

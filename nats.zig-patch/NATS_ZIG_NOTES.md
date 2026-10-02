@@ -1071,3 +1071,28 @@ omitted from the JSON, so every existing caller sends what it sent before.
 `discard: new`, `max_msgs_per_subject: 777` (from `MUTATION_BACKLOG_PER_PRINCIPAL`) and
 `discard_new_per_subject: true`, read back with `nats stream info -j`; `check-series.sh`
 green over 30 patches.
+
+## 31. A subscription can wake another one's reader (2026-10-02)
+
+**How it appeared.** A libzb service (ZeBridge `examples/10-airports`) answers questions
+on `serve` subscriptions while its `poll` waits on the tail inbox for CDC. A question that
+arrived during that wait sat in its own subscription until the wait ran out: the answer
+took one poll interval (50 ms polls → ~52 ms round trip; 5 ms polls → ~9 ms, at 1–2% of a
+core idle). Nothing in the library let one thread wait on one subscription and be told
+another had something.
+
+**Change** (`31-nats.zig-wake-reader.patch`):
+- `ConcurrentQueue.wake()`: ends the current (or the next) wait for data as a timeout
+  would, without queuing anything. A pending wake is consumed by any wait; data already
+  queued is still returned.
+- `Subscription.wake_on_message: ?*Subscription`: when a message is queued here, the
+  dispatch calls `peer.messages.wake()`. The peer must outlive the subscription; the
+  caller sets it before messages flow.
+- `PullInbox.fetch` needs nothing: a woken wait reads as `Timeout`, which ends its receive
+  loop with what has arrived; open pull requests stay registered for the next fetch.
+
+**Verified:** `queue.test.wake…` (a wake given before the wait, one from another thread
+during a 30 s wait — returned in ~24 ms, and queued data not hidden); nats.zig 138/138.
+libzb wires every serve subscription to its tail inbox (which lives as long as the
+client). The airport service on the default 250 ms poll: round trip 6.4 ms (was 9.3 ms at
+5 ms polls), 0.1% CPU idle (was 1–2%), CDC still applied. `check-series.sh` green over 31.

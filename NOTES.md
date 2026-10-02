@@ -18408,3 +18408,19 @@ tombstone or recorded acceptance (counter_public, counter_tenant, memo, note_t, 
 salaries), a `zebridge_limits` row for slot zb_sb left by standby.py (fixed: its teardown
 now deletes it), and the dev NATS (stopped). diagnose.py: 5/6, the "clean bill" check
 fails on that dev state, not on the doctor; read-only still proven.
+
+## §10kw — a question wakes libzb's poll (nats.zig patch 31) (2026-10-02)
+
+The airport service measured ~50 ms per answer ("ms in DuckDB" ~49). Two waits, neither
+DuckDB (3–5 ms): (1) zb-python runs libzb on one worker thread, and the service called
+`query`/`reply` from its main thread, each waiting for the worker's 50 ms poll; answering
+inside `on_change` (on the worker) halved it, 110 → 53 ms. (2) libzb's poll waits on the
+tail inbox for CDC, and a question arriving mid-wait sat in its serve subscription until
+the wait ended: a 5 ms poll gave 9 ms at 1–2% CPU idle. Fix at the source: nats.zig patch
+31 (`ConcurrentQueue.wake`, `Subscription.wake_on_message`), and libzb points every serve
+subscription at the tail inbox (`wireServeWakes`, on `serve` and on the inbox's creation;
+the inbox lives as long as the client and is dropped after the serve subscriptions). The
+service now runs the default 250 ms poll: 6.4 ms round trip, 0.1% CPU idle, CDC applied.
+Every host with `serve` gains it (Python, Kotlin, Dart, the C ABI): nothing to configure.
+Not covered: a client following NO stream waits on verdicts instead, which the wake does
+not reach (a service always follows its table).
