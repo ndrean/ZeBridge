@@ -18461,3 +18461,22 @@ Enrolled as `iphone` in acme; tested by the owner: ends set on the phone appear 
 browser tabs and the other way round; the service answers the phone in 2–5 ms. Not tested:
 a pan past ±180 on Flutter (latlong2 asserts the range in debug builds; the app is built
 release).
+
+## §10kz — a bridge moved to a new NATS on the same slot builds fulls (2026-10-03)
+
+Found on the VPS: the bridge moved from the Mac's NATS to a new one, same Supabase database
+and slot. `--diagnose` on the running bridge: "no chain" for every table. The producer's
+memory is `zebridge_generations` in PostgreSQL, which recorded the Mac's chains; each idle
+table read "unchanged since gN" and was skipped, and the new NATS never got a manifest. A
+changed table would have been worse: a delta on top of fulls that live in the other
+server's object store. `restartFeed` covers a NEW slot on the same NATS (§10bm), not the
+same slot on a new NATS.
+
+Fix in the producer, where it already reads the previous manifest: when PostgreSQL records
+gN but this NATS has no manifest for the pair (bucket or key missing), or a manifest for
+another generation, the next cut is a full (`chain_absent`), whatever the counts say.
+Measured on the dev stack (71 chains): the same slot on an empty NATS forced 71 fulls and
+every existing table had its chain; moving back to the original NATS (manifests two
+generations behind) forced 71 fulls again; a restart on the same NATS forced none and
+built nothing. The only "no chain" left were tables dropped from the database but still
+in the catalogue (scenario residue).

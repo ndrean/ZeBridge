@@ -1346,17 +1346,37 @@ pub const GenerationProducer = struct {
         // not rebuild (§10eq), and the fall-off test (§10ei).
         // −1: no previous cut known. 0 is a real cut — on an empty, brand-new stream
         // (§10ja) — and falls off the moment the stream prunes its first message.
+        // `chain_absent`: PostgreSQL records a chain for the pair, but THIS NATS holds no
+        // manifest for it, or a manifest for another generation — the bridge was moved to
+        // a new NATS on the same slot, moved back to an older one, or the bucket was
+        // dropped. The recorded generations live in another server's object store, so a
+        // delta on top of them would point at nothing: the next cut is a full.
+        var chain_absent = false;
         const prev_cut: i64 = blk: {
             if (last_gen == 0) break :blk -1;
-            var kvb = js.kvBucket(self.topo.kv_generations) catch break :blk -1;
+            var kvb = js.kvBucket(self.topo.kv_generations) catch |err| {
+                if (err == error.BucketNotFound or err == error.StreamNotFound) chain_absent = true;
+                break :blk -1;
+            };
             defer kvb.deinit();
             const mkey = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ tenant, table });
-            var entry = kvb.get(mkey) catch break :blk -1;
+            var entry = kvb.get(mkey) catch |err| {
+                if (err == error.KeyNotFound) chain_absent = true;
+                break :blk -1;
+            };
             defer entry.deinit();
             const man = std.json.parseFromSliceLeaky(std.json.Value, alloc, entry.value, .{}) catch break :blk -1;
             if (man != .object) break :blk -1;
+            if (man.object.get("gen")) |g| if (g == .integer and g.integer != last_gen) {
+                chain_absent = true;
+                break :blk -1;
+            };
             break :blk if (man.object.get("cutoff_seq")) |v| (if (v == .integer) v.integer else -1) else -1;
         };
+        if (chain_absent) {
+            log.info("🧬 '{s}'/'{s}': g{d} is recorded in PostgreSQL but this NATS holds no manifest for it (a new NATS on the same slot, an older one, or a dropped bucket) — forcing a full", .{ tenant, table, last_gen });
+            build_full = true;
+        }
         const chain_fell_off: bool = prev_cut >= 0 and stream_first > 1 and prev_cut + 1 < @as(i64, @intCast(stream_first));
         if (chain_fell_off) log.warn("🧬 '{s}'/'{s}': chain g{d} fell off {s} (its cutoff is below the stream's oldest message, seq {d}) — a returning client could not splice; cutting a delta with a fresh cut point", .{ tenant, table, last_gen, cdc_stream, stream_first });
 
@@ -1505,7 +1525,7 @@ pub const GenerationProducer = struct {
         if (unchanged_by_version) {
             if (!recorded) {
                 log.info("🧬 '{s}'/'{s}': nothing recorded to compare with at g{d} ({s}) — building once to record it", .{ tenant, table, last_gen, if (guarded) "relfilenode or delete count" else "row count or delete count" });
-            } else if (rows_held and !deletes_moved and !epoch_moved and !shape_moved) {
+            } else if (rows_held and !deletes_moved and !epoch_moved and !shape_moved and !chain_absent) {
                 // An epoch move is a change even when nothing else moved (§10df): the
                 // whole point of zebridge_reseed() is a full for data CDC never carried.
                 if (!chain_fell_off and !force_cut) {
@@ -1523,6 +1543,8 @@ pub const GenerationProducer = struct {
                 // large idle table because the stream moved, on both sides. The
                 // depth clock still decides a full when one is due.
                 repair_only = true;
+            } else if (chain_absent) {
+                // said where it was found
             } else if (epoch_moved) {
                 log.info("🧬 '{s}'/'{s}': no version moved since g{d} but the seed epoch did (§10df) — forcing a full", .{ tenant, table, last_gen });
             } else if (shape_moved) {
