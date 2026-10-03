@@ -18543,3 +18543,27 @@ Bindings call it right after queuing a command: zb-dart (the handle's number com
 in the worker's `ready` message), zb-python (`_call`), Kotlin (`onWorker`, not compiled
 here). A/B through zb-python to zebridge.eu, 20 requests at random moments, 250 ms poll:
 median 209 → 31 ms, p90 259 → 66 ms, max 271 → 68 ms.
+
+## §10ld — production test: zebridge.eu, a phone in Nantes, a browser, PostgreSQL in London (2026-10-03)
+
+The demo on real infrastructure: Supabase (London) → bridge, sweeper, NATS and the DuckDB
+airport service on one OVH VPS (Germany, 6 vCPU / 12 GB, Debian 13) → clients through
+Cloudflare. `bridge.zebridge.eu` (proxied) → HAProxy → bridge, for /enroll, /renew,
+/status; `ws.zebridge.eu` (proxied, Origin Rule → 8080) → NATS websocket with a Cloudflare
+origin certificate; `nats.zebridge.eu` (DNS only) → NATS 4222 with Let's Encrypt (DNS-01,
+deploy hook). The page on Cloudflare Pages (`airports.zebridge.eu`, `_headers` for COOP and
+COEP). Telemetry: Alloy + nats-exporter in Docker on the host network, to Grafana Cloud.
+
+Measured: the iPhone (libzb, `caFile`) and a private browser window (zb-client-ts, wss)
+both enroll at bridge.zebridge.eu, ask `airports_near` (4–6 ms in the service, 30–40 ms
+round trip, ping 24 ms) and edit one flight that both screens draw; a write stamped on
+the phone was stored in London ~106 ms later. Footprint on the VPS: bridge ~180 MB (mostly
+the ring slab, 32768 × 4 KB), airport service 46 MB, NATS 23 MB, HAProxy 3 MB, Docker ~1 GB.
+
+Found on the way, each fixed: the producer skipping chains on a new NATS (§10kz); /renew
+missing from proxy/haproxy.cfg; TLS impossible for libzb on iOS (§10lb); host commands
+waiting for the poll (§10lc); Supabase opening ZeBridge's tables and definer functions to
+`anon` and `authenticated` (revoked by hand; the init SQL follows). Operator traps for the
+playbook: Cloudflare importing the registrar's parking records, an Origin Rule written on
+"URI Full", the ips-v4 list without a final newline, a deploy hook never run once, a
+router caching NXDOMAIN for a subdomain visited before its record existed (SOA 1800 s).

@@ -2690,20 +2690,18 @@ Worth knowing: ElectricSQL joined Databricks in August 2026 and syncs reads only
 **External dependencies**, via `build.zig.zon`:
 
 - [zig-msgpack](https://github.com/zigcc/zig-msgpack) - MessagePack encoding. License MIT
-
-- [nats.zig](https://github.com/lalinsky/nats.zig) by Lalinsky, License Apache 2. **Currently vendored** (in `nats.zig`)
+- [nats.zig](https://github.com/lalinsky/nats.zig) by Lalinsky, License Apache 2. **Currently vendored and patched** (in `nats.zig`)
 
 **System dependencies**:
 
-- `libpq`(install: `sudo apt install libpq-dev`, `brew install libpq`) ≧ 14  at build time (pipeline mode). PostgreSQL License
-- `libzstd`, (install: `sudo apt install libzstd-dev`, `brew install zstd`). License BSD 3-Clause
+- `libpq`: install: `sudo apt install libpq-dev`, `brew install libpq` at build time (≧ 14 with pipeline mode), or `sudo apt install libpq5` at runtime. PostgreSQL License
+- `libzstd`: install `sudo apt install libzstd-dev`, `brew install zstd` at build time, or `sudo apt install libzstd1` at runtime. License BSD 3-Clause
 - `duckdb`, optional, for a DuckDB replica ([install](https://duckdb.org/install/?platform=macos&environment=cli)). License MIT
 - `Zig` ([install](https://ziglang.org/learn/getting-started/)) to compile `bridge`, `libzb` and `bridge_sweeper`. License MIT
 
 **Version Requirements**:
 
 - `PostgreSQL` 14+/16+ (for standby read replica). Uses `pgoutput` v1 binary mode.
-
 - `Nats/JetStream` 2.10+
 - `SQLite` 3.37.0+ (for STRICT)
 - `Zig v0.16`
