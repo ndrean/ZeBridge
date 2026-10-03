@@ -2415,10 +2415,11 @@ BASE_BUF=10 RING_BUFFER_COUNT=4096 bridge --pub my_pub_2 --slot my_slot_2 --port
 
 ⚠️ Never point two bridges at the same publication: each publishes what its publication carries and builds those tables' chains, so both would publish every change and race on the same chain manifests. Create the second publication with `zebridge_create_publication('my_pub_2')`, and enable each table into one publication only (`zebridge_enable(..., publication => 'my_pub_2')`).
 
-Possible, not recommended yet: one bridge is the setup we run and recommend. Two bridges side by side, on one database and one NATS, pass `scripts/scenarios/multi_bridge.py`: each publishes and snapshots only its own tables, neither touches the other's snapshots, a client enrolled at one follows and writes the tables of both, and a schema change is published once. Two things to know:
+Possible, not recommended yet: one bridge is the setup we run and recommend. Two bridges side by side, on one database and one NATS, pass `scripts/scenarios/multi_bridge.py`: each publishes and snapshots only its own tables, neither touches the other's snapshots, a client enrolled at one follows and writes the tables of both, and a schema change is published once. Three things to know:
 
 - each bridge serves the fleet series (`bridge_fleet_*`) on its `/metrics`, so a dashboard that sums them counts every client twice;
-- `ZB_FEED_RESTART=1` on one bridge's new slot deletes the CDC streams the other bridge still feeds.
+- `ZB_FEED_RESTART=1` on one bridge's new slot deletes the CDC streams the other bridge still feeds;
+- the bridges of one database use one NATS (leaf nodes included, with JetStream at the hub). A few internal tables are in every publication, and their snapshot records in PostgreSQL are shared: two bridges on two separate NATS servers would each rebuild those snapshots on every tick.
 
 The flags win over the environment, so `.env.bridge` can carry the usual pair and a one-off run can still point at another publication.
 

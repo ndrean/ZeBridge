@@ -18480,3 +18480,27 @@ every existing table had its chain; moving back to the original NATS (manifests 
 generations behind) forced 71 fulls again; a restart on the same NATS forced none and
 built nothing. The only "no chain" left were tables dropped from the database but still
 in the catalogue (scenario residue).
+
+## §10la — chain records are keyed by table, not by bridge: one NATS per database (2026-10-03)
+
+Found by `nats_move.py` (d026e34): `zebridge_gc_watermark` is in every publication, and its
+chain record in `zebridge_generations` (key `(tenant, tbl, gen)`) is shared by every bridge
+on the database. With §10kz's check, a bridge whose NATS does not hold the generation
+PostgreSQL records last forces a full; two bridges on one database but on two separate
+NATS servers would therefore force a full of that table on every tick, each overwriting
+the other's record. A user table published by two bridges would collide the same way.
+
+Not fixed, by decision: every planned layout keeps one JetStream per database. Several
+bridges (heavy slow tables on one, small fast tables on another) share one NATS; leaf
+nodes add servers near the clients, with JetStream at the hub (the domain option). The
+README's multi-bridge section states the constraint.
+
+The plan, if separate NATS servers per bridge ever become a layout:
+- `zebridge_generations` gets `publication text NOT NULL`; the key becomes
+  `(publication, tenant, tbl, gen)`;
+- every producer query on it adds `AND publication = $pub` (about 20), as do
+  `restartFeed`'s DELETE and the diagnosis's chain checks;
+- a migration for existing databases: add the column, fill it with the one publication
+  that has chains, change the key;
+- `multi_bridge.py` gains a variant with two NATS servers: no forced full after the first
+  tick, on either side.
