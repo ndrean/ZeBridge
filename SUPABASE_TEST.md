@@ -82,6 +82,14 @@ select tablename from pg_publication_tables where pubname = 'my_pub';           
 select rolname, rolreplication, rolbypassrls from pg_roles where rolname in ('zb_reader', 'zb_writer');
 ```
 
+**Supabase's REST API.** Supabase serves the `public` schema over HTTP to its API roles, `anon` and `authenticated`, and grants them every new table and function there. The `anon` key is public by design: whatever `anon` may do, anyone with the project's URL may do. The init SQL takes ZeBridge's own tables and functions back from both roles and fixes every function's `search_path`, which settles Supabase's security advisor for ZeBridge's objects. Your own tables stay yours to decide: `zebridge_check_all()` warns when one is open to those roles without RLS.
+
+ZeBridge does not use the REST API. If your application does not either, turn it off: Project Settings → Data API, or remove `public` from the exposed schemas. Check that nothing of ZeBridge's is open:
+
+```sql
+select tbl, check_name, detail from zebridge_check_all() where check_name in ('api roles', 'definer function');   -- no rows
+```
+
 ## 4. NATS
 
 The bridge generates the whole NATS setup (operator, account, signing keys, the bridge's credentials, and `.env.nats`) into `./zb-nats/` (git-ignored). The ports here are off the defaults (4222, 8222, 8080), so another NATS can run beside it:

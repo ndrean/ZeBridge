@@ -492,9 +492,9 @@ BEGIN
     EXECUTE format(
         'CREATE POLICY zb_tenant_write ON %s FOR ALL TO %I'
         ' USING (%I IN (SELECT tenant_id FROM public.zebridge_user_tenants'
-        '   WHERE principal = current_setting(''zb.principal'', true)) OR %I = ''${OPEN_TENANT}'')'
+        '   WHERE principal = (SELECT current_setting(''zb.principal'', true))) OR %I = ''${OPEN_TENANT}'')'
         ' WITH CHECK (%I IN (SELECT tenant_id FROM public.zebridge_user_tenants'
-        '   WHERE principal = current_setting(''zb.principal'', true)) OR %I = ''${OPEN_TENANT}'')',
+        '   WHERE principal = (SELECT current_setting(''zb.principal'', true))) OR %I = ''${OPEN_TENANT}'')',
         tbl, '${POSTGRES_WRITER_USER}', tenant_col, tenant_col, tenant_col, tenant_col);
 
     -- Reads: CDC stays subject-scoped regardless (RLS cannot see it — see
@@ -746,9 +746,9 @@ BEGIN
         EXECUTE format(
             'CREATE POLICY zb_tenant_write ON %s FOR ALL TO %I'
             ' USING (%I IN (SELECT tenant_id FROM public.zebridge_user_tenants'
-            '   WHERE principal = current_setting(''zb.principal'', true)))'
+            '   WHERE principal = (SELECT current_setting(''zb.principal'', true))))'
             ' WITH CHECK (%I IN (SELECT tenant_id FROM public.zebridge_user_tenants'
-            '   WHERE principal = current_setting(''zb.principal'', true)))',
+            '   WHERE principal = (SELECT current_setting(''zb.principal'', true))))',
             tbl, 'bridge_writer', tenant_col, tenant_col);
     END IF;
 
@@ -880,3 +880,45 @@ BEGIN
 END $$;
 
 GRANT SELECT, INSERT, UPDATE ON public.zebridge_gc_watermark TO ${POSTGRES_WRITER_USER};
+
+
+-- ─── The writer's EXECUTE, and the same rules for this file's functions ───────────────
+-- init.core took EXECUTE from PUBLIC and gave it to the reader; the writer needs it too
+-- (it applies mutations, the sweeper connects as it), and the functions created here get
+-- the same search_path and revocations. The write policies are rewritten as the reader's.
+DO $$
+DECLARE
+    f regprocedure;
+    api text[] := ARRAY(SELECT rolname::text FROM pg_roles WHERE rolname IN ('anon', 'authenticated'));
+    t record;
+BEGIN
+    FOR f IN SELECT p.oid::regprocedure FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'public' AND p.proname LIKE 'zebridge\_%'
+    LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE oid = f AND proconfig::text LIKE '%search_path=%') THEN
+            EXECUTE format('ALTER FUNCTION %s SET search_path = pg_catalog, public', f);
+        END IF;
+        EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', f);
+        EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %I, %I', f, '${POSTGRES_READER_USER}', '${POSTGRES_WRITER_USER}');
+        IF cardinality(api) > 0 THEN
+            EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM %s', f, array_to_string(ARRAY(SELECT quote_ident(a) FROM unnest(api) a), ', '));
+        END IF;
+    END LOOP;
+    IF cardinality(api) > 0 THEN
+        FOR t IN SELECT c.oid::regclass AS rel FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'S') AND c.relname LIKE 'zebridge\_%'
+        LOOP
+            EXECUTE format('REVOKE ALL ON %s FROM %s', t.rel, array_to_string(ARRAY(SELECT quote_ident(a) FROM unnest(api) a), ', '));
+        END LOOP;
+    END IF;
+    FOR t IN SELECT pol.polname, pol.polrelid::regclass AS rel,
+                    pg_get_expr(pol.polqual, pol.polrelid) AS q, pg_get_expr(pol.polwithcheck, pol.polrelid) AS c
+               FROM pg_policy pol WHERE pol.polname = 'zb_tenant_write'
+                AND pg_get_expr(pol.polqual, pol.polrelid) LIKE '%current_setting(%'
+                AND pg_get_expr(pol.polqual, pol.polrelid) NOT LIKE '%SELECT current_setting(%'
+    LOOP
+        EXECUTE format('ALTER POLICY %I ON %s USING (%s) WITH CHECK (%s)', t.polname, t.rel,
+            regexp_replace(t.q, 'current_setting\(''([a-z_.]+)''::text, true\)', '(SELECT current_setting(''\1''::text, true))', 'g'),
+            regexp_replace(t.c, 'current_setting\(''([a-z_.]+)''::text, true\)', '(SELECT current_setting(''\1''::text, true))', 'g'));
+    END LOOP;
+END $$;

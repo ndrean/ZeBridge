@@ -183,7 +183,7 @@ BEGIN
         -- have put it there in the first place — audience says everyone, contents says only
         -- the open tenant itself, and a client's local copy of the row depends on whether it
         -- happened to be connected for a live CDC write, not on what its snapshot returned.
-        ' USING (coalesce(current_setting(''zb.tenant'', true), '''') = '''' OR %I::text = current_setting(''zb.tenant'', true) OR %I::text = ''${OPEN_TENANT}'')',
+        ' USING (coalesce((SELECT current_setting(''zb.tenant'', true)), '''') = '''' OR %I::text = (SELECT current_setting(''zb.tenant'', true)) OR %I::text = ''${OPEN_TENANT}'')',
         tbl, '${POSTGRES_READER_USER}', tenant_col, tenant_col);
 
     RAISE NOTICE 'reads on % now filtered by % when zb.tenant is set — CDC is unaffected (RLS does not apply to replication); a client-scoped connection sets zb.tenant to scope it',
@@ -348,12 +348,12 @@ RETURNS void AS $$
     SELECT p_tbl, p_reason
      WHERE p_reason IS NOT NULL
     ON CONFLICT (tbl) DO UPDATE SET reason = EXCLUDED.reason, since = now();
-$$ LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_catalog;
+$$ LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, public;
 
 CREATE OR REPLACE FUNCTION public.zebridge_clear_suspensions()
 RETURNS void AS $$
     DELETE FROM public.zebridge_suspensions;
-$$ LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_catalog;
+$$ LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, public;
 
 GRANT EXECUTE ON FUNCTION public.zebridge_set_suspended(text, text) TO ${POSTGRES_READER_USER};
 GRANT EXECUTE ON FUNCTION public.zebridge_clear_suspensions() TO ${POSTGRES_READER_USER};
@@ -403,7 +403,7 @@ RETURNS TABLE (tbl text, seed_epoch integer) AS $$
     )
     SELECT b.tbl, b.seed_epoch
       FROM bumped b, LATERAL set_config('zebridge.reseeded_' || md5(b.tbl), '1', true) AS marked;
-$$ LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_catalog;
+$$ LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, public;
 REVOKE ALL ON FUNCTION public.zebridge_reseed(regclass) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.zebridge_reseed(regclass) TO ${POSTGRES_READER_USER};
 -- The writer's grant lives in init.write.template.sql, NOT here: roles are
@@ -1547,7 +1547,7 @@ BEGIN
 
     RETURN n_guard;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_catalog;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public;
 
 -- Rewrite ONE guard's budget, body only. Returns true if a guard was rewritten.
 --
@@ -1627,10 +1627,10 @@ BEGIN
 
     EXECUTE 'CREATE OR REPLACE FUNCTION public.' || quote_ident('zebridge_width_guard_' || short)
          || '() RETURNS trigger AS ' || quote_literal(fn_body)
-         || ' LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_catalog';
+         || ' LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public';
     RETURN true;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_catalog;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public;
 
 GRANT EXECUTE ON FUNCTION public.zebridge_register_limits(text, name, integer, boolean)
     TO ${POSTGRES_READER_USER};
@@ -1673,7 +1673,7 @@ BEGIN
             'SELECT DISTINCT %I::text FROM %s WHERE %I IS NOT NULL', tenant_col, tbl, tenant_col);
     END IF;
 END;
-$$ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_catalog;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, public;
 
 -- Install (or refresh) the per-table width guard. Only unbounded columns are
 -- measured — text, unbounded varchar, bytea (×2: the feed renders it as hex),
@@ -1779,7 +1779,7 @@ BEGIN
 
     EXECUTE 'CREATE OR REPLACE FUNCTION public.' || quote_ident('zebridge_width_guard_' || short)
          || '() RETURNS trigger AS ' || quote_literal(fn_body)
-         || ' LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_catalog';
+         || ' LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public';
 
     IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = tbl AND tgname = 'zebridge_width_guard') THEN
         EXECUTE format('DROP TRIGGER zebridge_width_guard ON %s', tbl);
@@ -2626,6 +2626,25 @@ BEGIN
         END IF;
     END IF;
 
+    -- ── 11. the API roles of a PostgREST deployment (Supabase) ──────────────
+    -- `anon` and `authenticated` reach `public` over HTTP, with the project's public key.
+    -- A grant to either without RLS is the table, readable or writable by anyone who has
+    -- that key, outside ZeBridge: no tenant, no version rule, no verdict.
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname IN ('anon', 'authenticated'))
+       AND NOT (SELECT relrowsecurity FROM pg_class WHERE oid = tbl) THEN
+        DECLARE open_to text;
+        BEGIN
+            SELECT string_agg(r, ', ') INTO open_to FROM unnest(ARRAY['anon', 'authenticated']) r
+             WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r)
+               AND has_table_privilege(r, tbl, 'SELECT, INSERT, UPDATE, DELETE');
+            IF open_to IS NOT NULL THEN
+                warns := warns + 1;
+                RETURN QUERY SELECT 'api roles', 'WARNING',
+                    format('%s can use %s over the REST API, and RLS is off: revoke it (REVOKE ALL ON %s FROM %s), or enable RLS', open_to, tname, tname, open_to);
+            END IF;
+        END;
+    END IF;
+
     RETURN QUERY SELECT 'summary', CASE WHEN errors > 0 THEN 'ERROR' WHEN warns > 0 THEN 'WARNING' ELSE 'ok' END,
         format('%s: %s error(s), %s warning(s)%s', tname, errors, warns,
                CASE WHEN intent IS NOT NULL THEN ' against intent ' || intent ELSE '' END);
@@ -2654,4 +2673,74 @@ BEGIN
         WHERE NOT public.zebridge_is_internal_table(cat.tbl)
           AND to_regclass('public.' || quote_ident(cat.tbl)) IS NULL
         ORDER BY cat.tbl;
+    -- ZeBridge's own tables and functions, open to a PostgREST deployment's API roles
+    -- (Supabase grants them every new object in `public`): anyone with the project's
+    -- public key could write an invite, a tenant mapping, or call a definer function.
+    -- The init SQL revokes them; a later grant, or an older install, shows here.
+    RETURN QUERY
+        SELECT c.relname::text, 'api roles'::text, 'ERROR'::text,
+               format('%s is open to %s over the REST API: re-run the init SQL, or REVOKE ALL ON public.%I FROM anon, authenticated', c.relname, r.rolname, c.relname)
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        CROSS JOIN pg_roles r
+        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v') AND c.relname LIKE 'zebridge\_%'
+          AND r.rolname IN ('anon', 'authenticated')
+          AND has_table_privilege(r.oid, c.oid, 'SELECT, INSERT, UPDATE, DELETE')
+        ORDER BY 1;
+    RETURN QUERY
+        SELECT p.proname::text, 'definer function'::text, 'ERROR'::text,
+               format('%s runs as its owner and anyone may call it (EXECUTE for PUBLIC%s): re-run the init SQL', p.oid::regprocedure,
+                      CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN ', so Supabase''s anon role too' ELSE '' END)
+        FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public' AND p.proname LIKE 'zebridge\_%' AND p.prosecdef
+          AND has_function_privilege('public', p.oid, 'EXECUTE')
+        ORDER BY 1;
 END $$ LANGUAGE plpgsql STABLE;
+
+
+-- ─── Who may call ZeBridge's functions, and what Supabase's API roles may touch ───────
+-- Last, so it covers every function this file created. Three rules:
+--   * every ZeBridge function runs with a fixed search_path, pg_catalog first: a function
+--     named like a built-in, created in `public` by another role, is never called in its
+--     place — which matters most for SECURITY DEFINER functions, run as their owner;
+--   * PostgreSQL grants EXECUTE on a new function to PUBLIC, every role: taken back here,
+--     and given to the bridge's reader. The writer gets the same in init.write;
+--   * a PostgREST deployment (Supabase) exposes `public` to its API roles `anon` and
+--     `authenticated`, and grants them every new object: they lose ZeBridge's tables and
+--     functions. The application's own tables are the application's to decide; the
+--     catalogue check says when one is open without RLS.
+DO $$
+DECLARE
+    f regprocedure;
+    api text[] := ARRAY(SELECT rolname::text FROM pg_roles WHERE rolname IN ('anon', 'authenticated'));
+    t record;
+BEGIN
+    FOR f IN SELECT p.oid::regprocedure FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'public' AND p.proname LIKE 'zebridge\_%'
+    LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE oid = f AND proconfig::text LIKE '%search_path=%') THEN
+            EXECUTE format('ALTER FUNCTION %s SET search_path = pg_catalog, public', f);
+        END IF;
+        EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', f);
+        EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %I', f, '${POSTGRES_READER_USER}');
+        IF cardinality(api) > 0 THEN
+            EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM %s', f, array_to_string(ARRAY(SELECT quote_ident(a) FROM unnest(api) a), ', '));
+        END IF;
+    END LOOP;
+    IF cardinality(api) > 0 THEN
+        FOR t IN SELECT c.oid::regclass AS rel FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'S') AND c.relname LIKE 'zebridge\_%'
+        LOOP
+            EXECUTE format('REVOKE ALL ON %s FROM %s', t.rel, array_to_string(ARRAY(SELECT quote_ident(a) FROM unnest(api) a), ', '));
+        END LOOP;
+    END IF;
+    -- The reader policies made before this rule re-evaluated current_setting() per row:
+    -- rewritten in place, once (the wrapped form contains `SELECT current_setting`).
+    FOR t IN SELECT pol.polname, pol.polrelid::regclass AS rel, pg_get_expr(pol.polqual, pol.polrelid) AS q
+               FROM pg_policy pol WHERE pol.polname = 'zb_reader_all'
+                AND pg_get_expr(pol.polqual, pol.polrelid) LIKE '%current_setting(%'
+                AND pg_get_expr(pol.polqual, pol.polrelid) NOT LIKE '%SELECT current_setting(%'
+    LOOP
+        EXECUTE format('ALTER POLICY %I ON %s USING (%s)', t.polname, t.rel,
+            regexp_replace(t.q, 'current_setting\(''([a-z_.]+)''::text, true\)', '(SELECT current_setting(''\1''::text, true))', 'g'));
+    END LOOP;
+END $$;

@@ -18567,3 +18567,36 @@ waiting for the poll (§10lc); Supabase opening ZeBridge's tables and definer fu
 playbook: Cloudflare importing the registrar's parking records, an Origin Rule written on
 "URI Full", the ips-v4 list without a final newline, a deploy hook never run once, a
 router caching NXDOMAIN for a subdomain visited before its record existed (SOA 1800 s).
+
+## §10le — the init SQL takes ZeBridge back from PUBLIC and from Supabase's API roles (2026-10-03)
+
+Supabase's security advisor on the demo project: every `zebridge_*` table open to `anon`
+and `authenticated` with RLS off (Supabase's default privileges grant every new object in
+`public` to its API roles), 10 SECURITY DEFINER functions callable by them, ~30 functions
+without a fixed search_path, and a per-row `current_setting()` in the RLS policies. With
+the `anon` key, anyone could have written an invite or a tenant mapping over REST.
+
+The EXECUTE default is PostgreSQL's, not Supabase's: a new function is granted to PUBLIC,
+and the bridge's roles relied on it for 13 functions the init SQL never granted (the
+producer's `zebridge_tenants_of`, the diagnosis's `zebridge_check_all`, …). A plain
+REVOKE FROM PUBLIC would have broken the bridge; revoking from anon alone does nothing,
+since anon inherits PUBLIC.
+
+Now, at the end of each template (idempotent, re-run on every init):
+- every `zebridge_*` function gets `search_path = pg_catalog, public` unless it has one,
+  and the existing ones moved from `public, pg_catalog` to `pg_catalog, public` (a
+  built-in cannot be shadowed by a function created in `public`);
+- EXECUTE revoked from PUBLIC, granted to the reader (core) and the writer (write);
+- where `anon`/`authenticated` exist: EXECUTE and every privilege on `zebridge_*` tables,
+  views and sequences revoked from them;
+- the policies use `(SELECT current_setting(…))`, evaluated once per query; existing
+  `zb_reader_all`/`zb_tenant_write` policies are rewritten in place (ALTER POLICY).
+`zebridge_check` gains "api roles" (an application table open to them with RLS off:
+WARNING); `zebridge_check_all` reports ZeBridge's own tables open to them and definer
+functions open to PUBLIC (ERROR). Dev database: 0 open definer functions, 0 functions
+without search_path, reader and writer can run every function, 23 policies rewritten;
+applied twice, the second a no-op. Scenarios green on it: mutate, tiebreak, crdt,
+crosstenant, widthguard, reaps, sweeper, writable, route_crdt, and the offline group
+(render and pubname failed on environment only: no .env.admin, NATS stopped). check and
+diagnose fail on dev-database residue that predates this (dropped tables still
+catalogued, fire_types unscoped), none from the new checks.
