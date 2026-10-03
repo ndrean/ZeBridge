@@ -7,9 +7,12 @@
 ///     `mutate`. Its `doc` holds two registers {v, t, w}, the departure and the arrival; `t`
 ///     comes from libzb's `stamp()`, on the bridge's clock (COOPERATIVE_EDITING.md).
 ///
-///   --dart-define=ZB_BRIDGE_URL=http://192.168.1.22:27434   the bridge (/enroll, /renew)
-///   --dart-define=ZB_NATS_URL=nats://192.168.1.22:4232
-///   --dart-define=ZB_INVITE=<code>                          used once, at enrollment
+///   --dart-define=ZB_BRIDGE_URL=https://bridge.zebridge.eu   the bridge (/enroll, /renew)
+///   --dart-define=ZB_NATS_URL=…   optional: the enrollment answer names the NATS URL
+///   --dart-define=ZB_INVITE=<code>   used once, at enrollment
+///
+/// TLS: Zig reads no trust store on iOS, so the app ships Apple's roots (assets/roots.pem,
+/// from tool/export-roots.sh) and hands libzb the file as `caFile`.
 library;
 
 import 'dart:async';
@@ -18,14 +21,15 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'package:zebridge/zebridge.dart';
 
-const bridgeUrl = String.fromEnvironment('ZB_BRIDGE_URL', defaultValue: 'http://192.168.1.22:27434');
-const natsUrl = String.fromEnvironment('ZB_NATS_URL', defaultValue: 'nats://192.168.1.22:4232');
+const bridgeUrl = String.fromEnvironment('ZB_BRIDGE_URL', defaultValue: 'https://bridge.zebridge.eu');
+const natsUrl = String.fromEnvironment('ZB_NATS_URL');
 const invite = String.fromEnvironment('ZB_INVITE');
 
 const sanMateo = LatLng(37.563, -122.326);
@@ -81,7 +85,11 @@ class _AirportsScreenState extends State<AirportsScreen> {
 
   Future<void> _open() async {
     final dir = await getApplicationSupportDirectory();
-    final dbPath = '${dir.path}/airports.sqlite3';
+    // One replica and identity per bridge: an identity from another deployment (another
+    // operator, another address) is not this one's.
+    final dbPath = '${dir.path}/airports-${Uri.parse(bridgeUrl).host}.sqlite3';
+    final roots = File('${dir.path}/roots.pem');
+    roots.writeAsBytesSync((await rootBundle.load('assets/roots.pem')).buffer.asUint8List());
     final identity = File('$dbPath.identity');
     final enrolled = identity.existsSync();
     if (!enrolled && invite.isEmpty) {
@@ -91,7 +99,8 @@ class _AirportsScreenState extends State<AirportsScreen> {
     try {
       final w = await ZeBridgeWorker.spawn({
         'bridgeUrl': bridgeUrl,
-        'natsUrl': natsUrl,
+        if (natsUrl.isNotEmpty) 'natsUrl': natsUrl,
+        'caFile': roots.path,
         'dbPath': dbPath,
         'tables': ['flights'],
         if (!enrolled) 'invite': invite,

@@ -34,6 +34,7 @@
   ],
   "connectOptions": [
     "bridgeUrl",
+    "caFile",
     "clientId",
     "creds",
     "credsPath",

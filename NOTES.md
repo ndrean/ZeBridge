@@ -18504,3 +18504,22 @@ The plan, if separate NATS servers per bridge ever become a layout:
   that has chains, change the key;
 - `multi_bridge.py` gains a variant with two NATS servers: no forced full after the first
   tick, on either side.
+
+## §10lb — `caFile`: libzb over TLS on iOS; a phone in Nantes on zebridge.eu (2026-10-03)
+
+The production test (iPhone in Nantes → Cloudflare → OVH VPS in Germany → Supabase in
+London) found that libzb could not use TLS on iOS at all. Zig's `Bundle.rescan` reads
+the system's roots on Linux (Android included), macOS, Windows and the BSDs, and does
+nothing on iOS (`else => {}`): libzb already refused `https://` enrollment and renewal
+there, and a `tls://` NATS URL would have failed with an empty trust list. Every earlier
+iPhone test was plain `nats://` on the LAN.
+
+Fix: a connect option, `caFile`, a PEM bundle of trusted roots. libzb hands it to nats.zig
+(`TlsOptions.ca_file`, on `tls://` URLs only) and loads it into std.http.Client for
+`/enroll` and `/renew` (`ca_bundle` plus `now`, so the client does not rescan); with it,
+the iOS refusal no longer applies. The Flutter app ships Apple's roots exported from the
+Mac (`tool/export-roots.sh`, 158 roots, not committed) and passes the file. Checked on
+the Mac against zebridge.eu: Apple's roots connect; a file with one unrelated root is
+refused with `CertificateIssuerNotFound`, so the file, not the system, decides. Then on
+the iPhone: enrolled `joanna` over HTTPS, NATS connections 3 → 4 at launch, airports
+answered, and the departure WJF stored in PostgreSQL ~106 ms after the phone's stamp.

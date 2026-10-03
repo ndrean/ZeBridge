@@ -49,6 +49,9 @@ pub const Options = struct {
     /// hub's. The wrong value is not a mismatch the library can detect: every API call
     /// simply gets no responder, so it fails at the first request, not at connect.
     js_domain: ?[]const u8 = null,
+    /// A PEM bundle of trusted roots for a `tls://` URL (`caFile`), in place of the
+    /// system's — which Zig cannot read on iOS.
+    ca_file: ?[]const u8 = null,
     db_path: [*:0]const u8,
     /// §10fd: a PostgreSQL replica instead of the SQLite file — a libpq URL. The
     /// replica is then a database any PostgreSQL tool reads (the micro-VM case).
@@ -511,7 +514,7 @@ pub const SyncClient = struct {
             try std.fmt.allocPrint(self.aa(), "_INBOX.{s}", .{opts.principal})
         else
             "_INBOX";
-        self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = if (opts.creds_path.len > 0) opts.creds_path else null, .creds = if (opts.creds.len > 0) opts.creds else null, .inbox_prefix = inbox_prefix, .js_domain = opts.js_domain });
+        self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = if (opts.creds_path.len > 0) opts.creds_path else null, .creds = if (opts.creds.len > 0) opts.creds else null, .inbox_prefix = inbox_prefix, .js_domain = opts.js_domain, .ca_file = opts.ca_file });
         errdefer self.t.deinit();
 
         return self;

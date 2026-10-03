@@ -42,7 +42,9 @@
 //! clientId (stable across restarts — it is the msg_id prefix), grammarHash
 //! (optional: the hash the host received from /enroll or GET /grammar; a mismatch
 //! refuses to open), jsDomain (optional: the /enroll payload's `js_domain` — the
-//! JetStream domain the grants name, when JetStream is reached across a leaf link).
+//! JetStream domain the grants name, when JetStream is reached across a leaf link),
+//! caFile (optional: a PEM bundle of trusted roots for https:// enrollment and renewal
+//! and a tls:// NATS URL, in place of the system's — which Zig cannot read on iOS).
 //! The grammar itself is compiled in — `zb_grammar_hash()` says which (§10dq).
 //!
 //! `fn` names a fixture section of core-fixtures.json; `args_json` is that
@@ -447,6 +449,7 @@ const ClientBox = struct {
     creds_text: []u8,
     grammar_hash: ?[]u8,
     js_domain: ?[]u8,
+    ca_file: ?[]u8,
     db: [:0]u8,
     principal: [:0]u8,
     client_id: [:0]u8,
@@ -481,6 +484,7 @@ const ClientBox = struct {
         a.free(self.creds_text);
         if (self.grammar_hash) |g| a.free(g);
         if (self.js_domain) |d| a.free(d);
+        if (self.ca_file) |p| a.free(p);
         a.free(self.db);
         a.free(self.principal);
         a.free(self.client_id);
@@ -592,6 +596,11 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     // the identity file (`identityPath`, default `<dbPath>.identity`, else
     // `zebridge.identity`), and without that `bridgeUrl` + `invite` enroll here and write
     // it. What the identity knows fills every option the app left out.
+    // "caFile": the trusted roots, for every https:// and tls:// connection this client
+    // makes — on iOS the only ones it has.
+    const ca_raw = str.get(o, "caFile", "");
+    const ca_file: ?[]u8 = if (ca_raw.len > 0) try a.dupe(u8, ca_raw) else null;
+    errdefer if (ca_file) |p| a.free(p);
     var ident: ?enroll.Identity = null;
     defer if (ident) |*i| i.deinit(a);
     var kept_id_path: ?[]u8 = null;
@@ -611,7 +620,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         if (ident) |*cur| if (force_renew or @abs(cur.clock_offset) > enroll.offset_recheck_seconds or
             enroll.renewDue(cur.creds, cur.serverNow()))
         {
-            if (enroll.renew(a, cur.*, cur.serverNow())) |fresh| {
+            if (enroll.renew(a, cur.*, cur.serverNow(), ca_file)) |fresh| {
                 cur.deinit(a);
                 cur.* = fresh;
                 try enroll.save(a, id_path, cur.*);
@@ -633,7 +642,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             const bridge = str.get(o, "bridgeUrl", "");
             const invite = str.get(o, "invite", "");
             if (bridge.len > 0 and invite.len > 0) {
-                ident = try enroll.enroll(a, bridge, invite);
+                ident = try enroll.enroll(a, bridge, invite, ca_file);
                 try enroll.save(a, id_path, ident.?);
                 kept_id_path = try a.dupe(u8, id_path);
             } else if (invite.len > 0) {
@@ -772,6 +781,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             .creds = creds_text,
             .grammar_hash = grammar_hash,
             .js_domain = js_domain,
+            .ca_file = ca_file,
             .heartbeat_ms = heartbeat_ms,
             .seed_chunk_rows = seed_chunk_rows,
             .seed_streaming = seed_streaming,
@@ -790,6 +800,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         .creds_text = creds_text,
         .grammar_hash = grammar_hash,
         .js_domain = js_domain,
+        .ca_file = ca_file,
         .db = db,
         .principal = principal,
         .client_id = client_id,
@@ -1213,7 +1224,7 @@ fn maybeRenew(b: *ClientBox, force: bool) void {
     defer id.deinit(a);
     // Another process sharing the identity may have renewed it already.
     const ours = force or enroll.renewDue(id.creds, b.serverNow());
-    var fresh = if (ours) (enroll.renew(a, id, b.serverNow()) catch {
+    var fresh = if (ours) (enroll.renew(a, id, b.serverNow(), b.ca_file) catch {
         if (enroll.last_purge) {
             // §10kn: the next entry point (`zb_client_poll`, right after this) purges.
             b.c.revoked = true;

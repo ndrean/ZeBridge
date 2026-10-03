@@ -26,6 +26,9 @@ pub const ConnectOptions = struct {
     /// when JetStream is reached across a leaf link. The /enroll payload's `js_domain`
     /// says whether the deployment has one; null is the server's own JetStream.
     js_domain: ?[]const u8 = null,
+    /// A PEM bundle of trusted root certificates for a `tls://` URL, in place of the
+    /// system's: Zig reads no trust store on iOS, so a phone host ships its own.
+    ca_file: ?[]const u8 = null,
 };
 
 /// §10fh: a chain object read through a PULL consumer, a few chunks at a time — the
@@ -225,6 +228,9 @@ pub const Transport = struct {
             .password = opts.password,
             .inbox_prefix = opts.inbox_prefix,
             .reconnect = .{ .allow_reconnect = true },
+            // Only on a tls:// URL: TLS options on a nats:// URL would force TLS on a
+            // server that does not speak it.
+            .tls = if (opts.ca_file != null and std.ascii.startsWithIgnoreCase(opts.url, "tls://")) .{ .ca_file = opts.ca_file } else null,
         });
         errdefer self.conn.deinit();
         try self.conn.connect(opts.url);

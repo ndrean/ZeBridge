@@ -122,17 +122,22 @@ zb-dart). The phone and the browsers of one tenant edit the one flight: an end s
 phone appears in the browsers, and the other way round. The stamp comes from libzb's
 `stamp()`, the merge from libzb's `mergeRegisters`.
 
-The bridge must listen on your network (`BRIDGE_BIND=0.0.0.0`), and the phone needs an
-invite in the same tenant as the browsers. From `examples/10-airports/flutter`, with your
-machine's address:
+The phone needs an invite in the same tenant as the browsers. From
+`examples/10-airports/flutter`:
 
 ```sh
 tool/build-libzb-ios.sh
+tool/export-roots.sh            # the trusted roots the app ships (see below)
 flutter pub get
-flutter build ios --release --dart-define=ZB_BRIDGE_URL=http://192.168.1.22:27434 \
-  --dart-define=ZB_NATS_URL=nats://192.168.1.22:4232 --dart-define=ZB_INVITE=<code>
+flutter build ios --release --dart-define=ZB_BRIDGE_URL=https://bridge.example.com --dart-define=ZB_INVITE=<code>
 xcrun devicectl device install app --device <udid> build/ios/iphoneos/Runner.app
 ```
 
-Allow "Local Network" when iOS asks. The invite is used once; later launches open on the
-identity kept on the phone. Tap an airport to make it the departure or the arrival.
+The enrollment answer gives the app its NATS address (`tls://…:4222`). Zig reads no
+trust store on iOS, so the app ships Apple's root certificates, exported from your Mac by
+`tool/export-roots.sh`, and gives libzb the file as `caFile`: libzb checks the bridge's
+`https://` certificate and the NATS server's against it. On a local network without TLS,
+pass `http://` and `nats://` addresses instead (`ZB_NATS_URL`), with the bridge listening on
+the network (`BRIDGE_BIND=0.0.0.0`), and allow "Local Network" when iOS asks.
+
+The invite is used once; later launches open on the identity kept on the phone. Tap an airport to make it the departure or the arrival.

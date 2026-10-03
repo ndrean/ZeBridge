@@ -11,8 +11,9 @@
 //! (the same as a `.creds` file, which is what apps kept before).
 //!
 //! HTTPS uses std.http.Client, whose trust store is the system's on macOS, Linux and
-//! Android — NOT on iOS, where Zig cannot read the keychain: an https:// enrollment
-//! there fails with a message saying so (§10jq), and the host enrolls itself.
+//! Android — NOT on iOS, where Zig cannot read the keychain. There the host passes
+//! `caFile`, a PEM bundle of trusted roots it ships; without one an https:// enrollment
+//! fails with a message saying so (§10jq).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -26,6 +27,16 @@ threadlocal var failure_buf: [512]u8 = undefined;
 /// §10kn: the last `renew` on this thread was refused with `"purge": true` (`bridge
 /// --revoke --purge`): the caller deletes the replica and the identity file.
 pub threadlocal var last_purge: bool = false;
+
+/// `caFile`: trust the roots in this PEM bundle instead of the system's. Setting `now`
+/// tells std.http.Client the bundle is loaded, so it does not rescan the system.
+fn trustFrom(client: *std.http.Client, a: std.mem.Allocator, io: std.Io, ca_file: ?[]const u8) !void {
+    const path = ca_file orelse return;
+    const now = std.Io.Clock.real.now(io);
+    client.ca_bundle.addCertsFromFilePath(a, io, now, std.Io.Dir.cwd(), path) catch |err|
+        return fail("caFile {s} could not be read ({s})", .{ path, @errorName(err) });
+    client.now = now;
+}
 
 fn fail(comptime fmt: []const u8, args: anytype) error{EnrollFailed} {
     last_failure = std.fmt.bufPrint(&failure_buf, fmt, args) catch failure_buf[0..];
@@ -105,12 +116,12 @@ pub fn newUserKeys(out: *UserKeys) !void {
 }
 
 /// Redeem `code` at `bridge_url`: a new identity, not yet saved.
-pub fn enroll(a: std.mem.Allocator, bridge_url: []const u8, code: []const u8) !Identity {
+pub fn enroll(a: std.mem.Allocator, bridge_url: []const u8, code: []const u8, ca_file: ?[]const u8) !Identity {
     for (code) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.' or ch == '~'))
         return fail("enroll: the invite code has a character outside [A-Za-z0-9-_.~]", .{});
     const base = std.mem.trimEnd(u8, bridge_url, "/");
-    if (builtin.os.tag == .ios and std.ascii.startsWithIgnoreCase(base, "https://"))
-        return fail("enroll: https on iOS needs the system trust store, which libzb cannot read — enroll in the app (URLSession) and pass `creds`", .{});
+    if (builtin.os.tag == .ios and ca_file == null and std.ascii.startsWithIgnoreCase(base, "https://"))
+        return fail("enroll: https on iOS needs trusted roots, and libzb cannot read the system's — pass `caFile`, a PEM bundle the app ships", .{});
 
     var keys: UserKeys = .{};
     defer keys.wipe();
@@ -123,6 +134,7 @@ pub fn enroll(a: std.mem.Allocator, bridge_url: []const u8, code: []const u8) !I
     defer threaded.deinit();
     var client: std.http.Client = .{ .allocator = a, .io = threaded.io() };
     defer client.deinit();
+    try trustFrom(&client, a, threaded.io(), ca_file);
     var body: std.Io.Writer.Allocating = .init(a);
     defer body.deinit();
     const res = client.fetch(.{ .location = .{ .url = url }, .response_writer = &body.writer }) catch |err|
@@ -286,10 +298,10 @@ fn section(text: []const u8, begin: []const u8, end: []const u8) ?[]const u8 {
 /// the identity's seed, `GET <bridge>/renew`, and rebuild the identity from the answer
 /// (the NATS URLs, grammar hash and memberships come back current). `server_now` is the
 /// caller's best estimate of the bridge's time: the stamp.
-pub fn renew(a: std.mem.Allocator, id: Identity, server_now: i64) !Identity {
+pub fn renew(a: std.mem.Allocator, id: Identity, server_now: i64, ca_file: ?[]const u8) !Identity {
     if (id.bridge_url.len == 0) return fail("renew: the identity names no bridge", .{});
-    if (builtin.os.tag == .ios and std.ascii.startsWithIgnoreCase(id.bridge_url, "https://"))
-        return fail("renew: https on iOS needs the system trust store, which libzb cannot read", .{});
+    if (builtin.os.tag == .ios and ca_file == null and std.ascii.startsWithIgnoreCase(id.bridge_url, "https://"))
+        return fail("renew: https on iOS needs trusted roots, and libzb cannot read the system's — pass `caFile`", .{});
     const seed = section(id.creds, "-----BEGIN USER NKEY SEED-----", "------END USER NKEY SEED------") orelse
         return fail("renew: the identity's creds hold no seed", .{});
     var skp = nats.nkeys.SeedKeyPair.fromSeed(seed) catch return fail("renew: the identity's seed does not decode", .{});
@@ -300,6 +312,7 @@ pub fn renew(a: std.mem.Allocator, id: Identity, server_now: i64) !Identity {
     defer threaded.deinit();
     var client: std.http.Client = .{ .allocator = a, .io = threaded.io() };
     defer client.deinit();
+    try trustFrom(&client, a, threaded.io(), ca_file);
     var body: std.Io.Writer.Allocating = .init(a);
     defer body.deinit();
     // Stamped in the bridge's time. If the estimate is off, the bridge refuses the stamp
@@ -479,8 +492,13 @@ test "an identity survives save and load, and the file is private" {
 }
 
 test "a code outside the safe alphabet is refused before any request" {
-    try std.testing.expectError(error.EnrollFailed, enroll(std.testing.allocator, "http://127.0.0.1:1", "bad code&x=1"));
+    try std.testing.expectError(error.EnrollFailed, enroll(std.testing.allocator, "http://127.0.0.1:1", "bad code&x=1", null));
     try std.testing.expect(std.mem.indexOf(u8, last_failure.?, "invite code") != null);
+}
+
+test "a caFile that cannot be read is named, before any request" {
+    try std.testing.expectError(error.EnrollFailed, enroll(std.testing.allocator, "http://127.0.0.1:1", "fl-0123456789abcdef", "/no/such/roots.pem"));
+    try std.testing.expect(std.mem.indexOf(u8, last_failure.?, "caFile /no/such/roots.pem") != null);
 }
 
 test "renewDue: a quarter of the life left is the line" {

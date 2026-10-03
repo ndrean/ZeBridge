@@ -149,6 +149,7 @@ One vocabulary: the same key means the same thing in libzb's `opts_json` and in 
 | `seedChunkRows` | ✅ | ✅ |
 | `seedStreaming`, `seedStreamingAboveBytes` | ✅ | ✅ |
 | `jsDomain` | ✅ | ✅ |
+| `caFile` | ✅ a PEM bundle of trusted roots for `https://` enrollment and renewal and a `tls://` NATS URL, in place of the system's. Required on iOS, where Zig cannot read the system's trust store | — (the platform's TLS: browser, Node, React Native) |
 | `bulkCdc`, `bulkStatement`, `cdcBatchEvents` | — (the DuckDB path is always bulk, SQLite per event) | ✅ tuning |
 | `platform` | — (one build per platform) | asserts the entry the bundler picked |
 | `storage`, `transport`, `connect`, `zstdDecompress`, `zstdDecompressStream`, `zstdCompress` | — | overrides, for a test or a storage of your own; an app never needs them |
