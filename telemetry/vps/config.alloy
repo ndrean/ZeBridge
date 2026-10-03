@@ -37,8 +37,8 @@ loki.relabel "journal" {
 }
 
 loki.source.journal "zebridge" {
-  // only these three units, and only what happens from now on
-  matches       = "_SYSTEMD_UNIT=nats.service _SYSTEMD_UNIT=zebridge.service _SYSTEMD_UNIT=zebridge-sweeper.service"
+  // only these units, and only what happens from now on
+  matches       = "_SYSTEMD_UNIT=nats.service _SYSTEMD_UNIT=zebridge.service _SYSTEMD_UNIT=zebridge-sweeper.service _SYSTEMD_UNIT=airports.service"
   max_age       = "1h"
   relabel_rules = loki.relabel.journal.rules
   labels        = {environment = "production"}
@@ -68,6 +68,19 @@ loki.process "zebridge" {
     // nats-server logs `[pid] date time [INF] …`
     stage.regex {
       expression = "\\[(?P<level>INF|WRN|ERR|DBG|FTL|TRC)\\]"
+    }
+    stage.labels {
+      values = {level = ""}
+    }
+  }
+  // the airports responder (examples/10-airports): its own lines, and libzb's `info(nats): …`
+  stage.match {
+    selector = "{unit=\"airports.service\"}"
+    stage.static_labels {
+      values = {service = "airports"}
+    }
+    stage.regex {
+      expression = "^(?P<level>debug|info|warning|error)\\("
     }
     stage.labels {
       values = {level = ""}
