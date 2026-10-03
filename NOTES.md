@@ -18577,7 +18577,7 @@ without a fixed search_path, and a per-row `current_setting()` in the RLS polici
 the `anon` key, anyone could have written an invite or a tenant mapping over REST.
 
 The EXECUTE default is PostgreSQL's, not Supabase's: a new function is granted to PUBLIC,
-and the bridge's roles relied on it for 13 functions the init SQL never granted (the
+and the bridge's roles relied on it for 15 of the 22 functions they call, never granted (the
 producer's `zebridge_tenants_of`, the diagnosis's `zebridge_check_all`, …). A plain
 REVOKE FROM PUBLIC would have broken the bridge; revoking from anon alone does nothing,
 since anon inherits PUBLIC.
