@@ -2419,7 +2419,7 @@ Possible, not recommended yet: one bridge is the setup we run and recommend. Two
 
 - each bridge serves the fleet series (`bridge_fleet_*`) on its `/metrics`, so a dashboard that sums them counts every client twice;
 - `ZB_FEED_RESTART=1` on one bridge's new slot deletes the CDC streams the other bridge still feeds;
-- the bridges of one database use one NATS (leaf nodes included, with JetStream at the hub). A few internal tables are in every publication, and their snapshot records in PostgreSQL are shared: two bridges on two separate NATS servers would each rebuild those snapshots on every tick.
+- the bridges of one database use one JetStream: one server, or one cluster, with leaf nodes around it if you like. A few internal tables are in every publication, and their snapshot records in PostgreSQL are shared: two bridges on two independent JetStreams would each rebuild those snapshots on every tick.
 
 The flags win over the environment, so `.env.bridge` can carry the usual pair and a one-off run can still point at another publication.
 
