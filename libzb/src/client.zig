@@ -3164,7 +3164,8 @@ pub const SyncClient = struct {
     /// The tail for `stream`, opened on first use.
     fn tailInbox(self: *SyncClient) !*@import("nats").PullInbox {
         if (self.tail_inbox) |ib| return ib;
-        self.tail_inbox = try self.t.js.pullInbox();
+        // Atomic: `wake` reads it from the host's other thread.
+        @atomicStore(?*@import("nats").PullInbox, &self.tail_inbox, try self.t.js.pullInbox(), .release);
         // §10jb: the inbox holds what the server sent and this thread has not fetched —
         // at most about two batches since nats.zig patch 20 requests only the deficit. The
         // library's 64 MB byte limit was one message from a drop at 75k events/s (~45 MB
@@ -3185,6 +3186,19 @@ pub const SyncClient = struct {
     /// the tail inbox, so each serve subscription wakes it when a question arrives
     /// (nats.zig patch 31). The inbox lives as long as the client (dropped in deinit,
     /// after the serve subscriptions), so the pointer never outlives what it names.
+    /// The host's other thread has a command for this client (`zb_client_wake`): end
+    /// the poll's wait now, so the command runs on the next turn instead of after
+    /// `wait_ms`. A wake while the poll is not waiting is counted, and the next wait
+    /// returns at once: nothing is lost either way. Safe from any thread — the inbox is
+    /// set once and lives as long as the client, and the C layer holds the handle
+    /// table's lock, so a close cannot free the client under it. Before the first
+    /// stream is tailed there is no inbox and nothing to wake: the poll then waits on
+    /// verdicts, and the command waits for the wait to end.
+    pub fn wake(self: *SyncClient) void {
+        const ib = @atomicLoad(?*@import("nats").PullInbox, &self.tail_inbox, .acquire) orelse return;
+        ib.inbox_subscription.messages.wake();
+    }
+
     fn wireServeWakes(self: *SyncClient) void {
         const ib = self.tail_inbox orelse return;
         for (self.serve_subs) |sub| sub.wake_on_message = ib.inbox_subscription;

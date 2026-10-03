@@ -9,7 +9,7 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
 /** libzb's C ABI version this binding was written for; libzb/python/abi_check.py checks it. */
-const val ZB_ABI = 4
+const val ZB_ABI = 5
 
 /** A call libzb refused, with libzb's own words (`{"error": …}` or `zb_last_error`). */
 class ZeBridgeException(message: String) : RuntimeException(message)
@@ -162,7 +162,11 @@ class ZeBridge @JvmOverloads constructor(
     private fun <T> onWorker(block: () -> T): T {
         if (Thread.currentThread() === workerThread) return block()
         try {
-            return worker.submit<T> { block() }.get()
+            val task = worker.submit<T> { block() }
+            // The worker may be waiting in poll: end the wait so this runs now. libzb
+            // allows this one call from any thread.
+            Native.wake(handle)
+            return task.get()
         } catch (e: ExecutionException) {
             throw (e.cause as? ZeBridgeException) ?: ZeBridgeException(e.cause?.toString() ?: e.toString())
         }

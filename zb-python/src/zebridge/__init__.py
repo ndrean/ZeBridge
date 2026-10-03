@@ -30,7 +30,7 @@ from . import _native as n
 __all__ = ["ZeBridge", "ZeBridgeError", "ZB_ABI", "create_user", "creds_file_text", "grammar_hash"]
 
 #: libzb's C ABI version this package was written for; libzb/python/abi_check.py checks it.
-ZB_ABI = 4
+ZB_ABI = 5
 
 
 class ZeBridgeError(RuntimeError):
@@ -162,6 +162,9 @@ class ZeBridge:
             raise ZeBridgeError("the client is closed")
         fut: Future = Future()
         self._tasks.put((fn, fut))
+        # The worker may be waiting in poll: end the wait, so this runs now (any thread).
+        if self._handle:
+            n.lib.zb_client_wake(self._handle)
         return fut.result()
 
     # ─── the client ─────────────────────────────────────────────────────────────

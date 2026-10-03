@@ -19,6 +19,7 @@ internal object Native {
     @JvmStatic external fun close(h: Long): Int
     @JvmStatic external fun wipe(h: Long): Int
     @JvmStatic external fun revoked(h: Long): Int
+    @JvmStatic external fun wake(h: Long): Int
     @JvmStatic external fun sync(h: Long): ByteArray?
     @JvmStatic external fun poll(h: Long, waitMs: Long): ByteArray?
     @JvmStatic external fun flushOutbox(h: Long, waitMs: Long): ByteArray?

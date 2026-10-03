@@ -13,7 +13,7 @@ import 'dart:io';
 import 'package:ffi/ffi.dart';
 
 /// libzb's C ABI version this package was written for; libzb/python/abi_check.py checks it.
-const zbAbi = 4;
+const zbAbi = 5;
 
 /// A call libzb refused, with libzb's own words.
 class ZeBridgeException implements Exception {
@@ -124,7 +124,7 @@ class ZeBridge {
   static late _PtrOf0 _lastError;
   static late _Free _free;
   static late _Open _connect;
-  static late _IntOfH _close, _wipe, _revoked;
+  static late _IntOfH _close, _wipe, _revoked, _wake;
   static late _PtrOfH _sync;
   static late _PtrOfH _stamp;
   static late _PtrOfHN _poll, _flush;
@@ -148,6 +148,7 @@ class ZeBridge {
     _close = _lib.lookupFunction<_IntOfHC, _IntOfH>('zb_client_close');
     _wipe = _lib.lookupFunction<_IntOfHC, _IntOfH>('zb_client_wipe');
     _revoked = _lib.lookupFunction<_IntOfHC, _IntOfH>('zb_client_revoked');
+    _wake = _lib.lookupFunction<_IntOfHC, _IntOfH>('zb_client_wake');
     _sync = _lib.lookupFunction<_PtrOfHC, _PtrOfH>('zb_client_sync');
     _stamp = _lib.lookupFunction<_PtrOfHC, _PtrOfH>('zb_client_stamp');
     _poll = _lib.lookupFunction<_PtrOfHNC, _PtrOfHN>('zb_client_poll');
@@ -249,6 +250,16 @@ class ZeBridge {
   }
 
   bool get revoked => _revoked(_handle) == 1;
+
+  /// The handle, for [wake] from another isolate (it is a number, safe to send).
+  int get handle => _handle;
+
+  /// End the poll's wait on [handle] — the one call allowed from an isolate that does
+  /// not own the client: the UI isolate has queued a command for the worker.
+  static void wake(int handle) {
+    init();
+    _wake(handle);
+  }
   void close() => _close(_handle);
   void wipe() => _wipe(_handle);
 }

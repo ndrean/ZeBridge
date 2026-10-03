@@ -1,6 +1,6 @@
 {
   "_": "libzb's C ABI as a host sees it: the exported functions and the options zb_client_connect reads. Bump `version` (and capi.zig's abi_version) on any change — python/abi_check.py fails until you do. A host embedding libzb checks zb_abi_version() against the version its own code was written for (zb-react-native does).",
-  "version": 4,
+  "version": 5,
   "functions": [
     "zb_abi_version",
     "zb_call",
@@ -21,6 +21,7 @@
     "zb_client_serve",
     "zb_client_stamp",
     "zb_client_sync",
+    "zb_client_wake",
     "zb_client_wipe",
     "zb_create_user",
     "zb_creds_file_text",

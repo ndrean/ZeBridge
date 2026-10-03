@@ -35,6 +35,7 @@
 //!   char* zb_client_join(uint64_t h, const char* tenant);          // {"tenants":[…]} — follow one more tenant (§10fn)
 //!   char* zb_client_leave(uint64_t h, const char* tenant);         // {"tenants":[…]} — drop one: its rows, watermarks, tail
 //!   char* zb_client_stamp(uint64_t h);                             // {"stamp":"…"} — a register's `t`, on the bridge's clock
+//!   int   zb_client_wake(uint64_t h);                              // 0, or 1 for no such client — ANY thread: ends the poll's wait
 //! `opts_json`: natsUrl, creds (the .creds text) or credsPath (a file), dbPath, principal, tables (array, parents first — or
 //! the string "*": every published table, §10hn; absent: nothing is followed),
 //! ondemandTables (§10hj: schema yes, seed and tail no — filled by `zb_client_ingest`;
@@ -84,7 +85,7 @@ var clients: handles.Table(ClientBox, 64) = .{};
 
 /// The ABI version — libzb/abi.json's `version`, which python/abi_check.py keeps in
 /// step with what this file exports and what `openBox` reads.
-pub const abi_version: c_int = 4;
+pub const abi_version: c_int = 5;
 
 export fn zb_abi_version() c_int {
     return abi_version;
@@ -893,6 +894,18 @@ fn syncClockOffset(b: *ClientBox) void {
 
 /// A register stamp (COOPERATIVE_EDITING.md, the `t` of {v, t, w}) on the bridge's
 /// clock: what a cooperative document's writer puts beside a value. zb-client-ts: stamp().
+/// The one call a host may make from a thread that does not own the client: its UI
+/// thread has queued a command for the worker that polls, and the poll's wait should
+/// end now rather than after `wait_ms`. Runs under the handle table's lock, so a
+/// concurrent close waits for it. 0, or 1 when the handle names no client.
+export fn zb_client_wake(handle: u64) c_int {
+    return if (clients.visit(handle, wakeBox)) 0 else 1;
+}
+
+fn wakeBox(b: *ClientBox) void {
+    b.c.wake();
+}
+
 export fn zb_client_stamp(handle: u64) ?[*:0]u8 {
     const b = lookup(handle) orelse return goneJson(handle);
     syncClockOffset(b);

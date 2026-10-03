@@ -26,6 +26,7 @@ extern int zb_client_wipe(uint64_t h);
 extern int zb_client_revoked(uint64_t h);
 extern char *zb_client_sync(uint64_t h);
 extern char *zb_client_stamp(uint64_t h);
+extern int zb_client_wake(uint64_t h);
 extern char *zb_client_poll(uint64_t h, uint64_t wait_ms);
 extern char *zb_client_query(uint64_t h, const char *sql, const char *params_json);
 extern char *zb_client_mutate(uint64_t h, const char *table, const char *op, const char *key_json, const char *values_json);
@@ -90,6 +91,8 @@ FN(jlong, connect)(JNIEnv *env, jclass cls, jbyteArray opts) {
 FN(jint, close)(JNIEnv *env, jclass cls, jlong h) { return zb_client_close(U64(h)); }
 FN(jint, wipe)(JNIEnv *env, jclass cls, jlong h) { return zb_client_wipe(U64(h)); }
 FN(jint, revoked)(JNIEnv *env, jclass cls, jlong h) { return zb_client_revoked(U64(h)); }
+/* The one call allowed from any thread: ends the worker's poll wait. */
+FN(jint, wake)(JNIEnv *env, jclass cls, jlong h) { return zb_client_wake(U64(h)); }
 FN(jbyteArray, sync)(JNIEnv *env, jclass cls, jlong h) { return owned(env, zb_client_sync(U64(h))); }
 FN(jbyteArray, poll)(JNIEnv *env, jclass cls, jlong h, jlong wait_ms) { return owned(env, zb_client_poll(U64(h), U64(wait_ms))); }
 FN(jbyteArray, flushOutbox)(JNIEnv *env, jclass cls, jlong h, jlong wait_ms) { return owned(env, zb_client_flush_outbox(U64(h), U64(wait_ms))); }

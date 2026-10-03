@@ -18523,3 +18523,23 @@ the Mac against zebridge.eu: Apple's roots connect; a file with one unrelated ro
 refused with `CertificateIssuerNotFound`, so the file, not the system, decides. Then on
 the iPhone: enrolled `joanna` over HTTPS, NATS connections 3 → 4 at launch, airports
 answered, and the departure WJF stored in PostgreSQL ~106 ms after the phone's stamp.
+
+## §10lc — `zb_client_wake`: a host command ends the poll's wait (ABI 5) (2026-10-03)
+
+The iPhone in Nantes saw 30–40 ms round trips to the airport service with occasional
+~120 ms, as it had on the LAN. Cause on the phone, not the network: zb-dart's worker
+isolate blocks in `zb_client_poll(100)`, and a command from the UI isolate waits until
+the poll returns. Patch 31 woke the poll for an incoming question (the serve side);
+nothing woke it for the host's own commands. zb-python and the Kotlin binding have the
+same shape (one worker thread).
+
+`zb_client_wake(handle)`: the one call a host may make from a thread that does not own
+the client. It wakes the tail inbox's queue (patch 31's `ConcurrentQueue.wake`); a wake
+while the poll is not waiting is counted, so the next wait returns at once. Safety: it
+runs under the handle table's lock (`Table.visit`), so a concurrent close waits for it;
+the inbox pointer is stored and loaded atomically and lives as long as the client.
+Before the first stream is tailed there is no inbox to wake (the poll waits on verdicts).
+Bindings call it right after queuing a command: zb-dart (the handle's number comes back
+in the worker's `ready` message), zb-python (`_call`), Kotlin (`onWorker`, not compiled
+here). A/B through zb-python to zebridge.eu, 20 requests at random moments, 250 ms poll:
+median 209 → 31 ms, p90 259 → 66 ms, max 271 → 68 ms.

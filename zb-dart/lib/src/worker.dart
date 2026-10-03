@@ -5,14 +5,15 @@
 /// for the whole call — on the UI isolate that was a frozen frame every idle second.
 ///
 /// Everything that touches the handle runs here: poll, flush, query, mutate, close.
-/// libzb's client is single-threaded by contract (the host owns the thread), so the
-/// handle is never shared between isolates — the UI isolate only ever sends messages.
+/// libzb's client is single-threaded by contract (the host owns the thread). The one
+/// exception is `zb_client_wake`, which libzb allows from any thread: the UI isolate
+/// calls it with the handle's number after each message it sends.
 ///
 /// Reports flow UI-ward as a stream, one per poll that changed something; commands
 /// (query, mutate, flush, close, pause, resume) flow worker-ward and are answered by
-/// id. Commands are served BETWEEN polls: the loop waits at most `pollWaitMs` on the
-/// broker, then yields to the command port, so a click reaches the handle within that
-/// bound (100 ms by default — the trade between broker round trips and UI latency).
+/// id. Commands are served BETWEEN polls: the loop waits up to `pollWaitMs` on the
+/// broker, then yields to the command port. A command ends that wait (the wake), so a
+/// click reaches the handle at once, while an idle loop still sleeps its full wait.
 ///
 /// The options are passed to libzb as they are (CLIENTS.md): the first run needs only
 /// `bridgeUrl` and `invite` — libzb enrolls, keeps the identity beside the replica, and
@@ -31,9 +32,12 @@ import 'dart:isolate';
 import 'native.dart';
 
 class ZeBridgeWorker {
-  ZeBridgeWorker._(this._toWorker, this._fromWorker, this.tenant, this.tenants, this.unseeded);
+  ZeBridgeWorker._(this._toWorker, this._fromWorker, this._handle, this.tenant, this.tenants, this.unseeded);
 
   final SendPort _toWorker;
+
+  /// The worker's libzb handle: only ever passed to `ZeBridge.wake`, never used here.
+  final int _handle;
   final ReceivePort _fromWorker;
 
   /// The first membership (sorted), or the open tenant.
@@ -99,6 +103,7 @@ class ZeBridgeWorker {
     worker = ZeBridgeWorker._(
         toWorker!,
         fromWorker,
+        info['handle'] as int,
         (info['tenant'] as String?) ?? '—',
         List<String>.from((info['tenants'] as List?) ?? const []),
         ((info['unseeded'] as List?) ?? const []).map((e) => Map<String, dynamic>.from(e as Map)).toList());
@@ -115,6 +120,8 @@ class ZeBridgeWorker {
     final c = Completer<T>();
     _pending[id] = c;
     _toWorker.send({'id': id, 'op': op, ...args});
+    // The worker may be blocked in poll: end the wait, so the command runs now.
+    ZeBridge.wake(_handle);
     return c.future;
   }
 
@@ -212,6 +219,7 @@ Future<void> _workerMain(_Boot boot) async {
     final info = zb.sync();
     toUi.send({
       'type': 'ready',
+      'handle': zb.handle,
       'tenant': info['tenant'],
       'tenants': info['tenants'],
       'unseeded': info['unseeded'],

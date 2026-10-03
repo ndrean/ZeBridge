@@ -84,6 +84,21 @@ pub fn Table(comptime T: type, comptime capacity: usize) type {
             return slot.ptr;
         }
 
+        /// Run `f` on the pointer this handle names, with the table's lock held, so a
+        /// close on another thread waits for `f` to return before it can destroy the
+        /// pointer. The one safe way to touch a handle from a thread that does not own
+        /// it (`zb_client_wake`). `f` must be short and must not take this lock.
+        pub fn visit(self: *Self, h: u64, f: *const fn (*T) void) bool {
+            const p = split(h);
+            if (p.index >= capacity) return false;
+            self.lock.lock();
+            defer self.lock.unlock();
+            const slot = &self.slots[p.index];
+            if (slot.generation != p.generation) return false;
+            f(slot.ptr orelse return false);
+            return true;
+        }
+
         /// Detach the pointer so the caller can destroy it. Returns null when the
         /// handle names nothing — which is exactly what a DOUBLE CLOSE looks like, and
         /// why a double close is a no-op here instead of a second free.
