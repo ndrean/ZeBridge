@@ -159,6 +159,7 @@ Each row: something that could go wrong, what the test shows instead, and the te
 | TLS between the bridge and NATS slows it down | measured: the same event rate as plain TCP (by hand: a measurement) | `burst_tls.py` |
 | reads moved to a standby break the bridge | with the reader on a hot standby and the writer on the primary, the slot lives on the standby, a client seeds and receives changes, and its writes land on the primary | `standby.py` |
 | two bridges on one database step on each other | each publishes and snapshots only its own tables, neither touches the other's snapshots, one client follows and writes the tables of both, and a schema change is published once (this test found that each bridge deleted the other's snapshots, and the fix) | `multi_bridge.py` |
+| a bridge moved to a new NATS (a new server, the same database and slot) leaves it without snapshots | on an empty NATS, the bridge builds a full snapshot of every table, and again when moved back to the old NATS, whose snapshots are out of date; restarted on the same NATS, it rebuilds nothing. Without the fix, the new NATS got no snapshot at all | `nats_move.py` |
 
 ## The README's claims and their tests
 
