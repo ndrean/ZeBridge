@@ -25,9 +25,14 @@ const AS = qs.get('as');
 const el = (id: string) => document.getElementById(id)!;
 const count = el('count'), detail = el('detail'), flightLine = el('flight'), notice = el('notice');
 
+/// Built for a deployment (`VITE_ZB_BRIDGE_URL=https://bridge.example.com pnpm build`): the
+/// page enrolls there, and the answer names the NATS websocket. Without it, the dev
+/// server's proxy carries both, on this page's own origin.
+const DEPLOYED_BRIDGE = import.meta.env.VITE_ZB_BRIDGE_URL as string | undefined;
+
 const zb = new ZeBridge({
-  natsUrl: `${location.origin.replace(/^http/, 'ws')}/nats`,
-  bridgeUrl: `${location.origin}/bridge`,
+  natsUrl: DEPLOYED_BRIDGE ? undefined : `${location.origin.replace(/^http/, 'ws')}/nats`,
+  bridgeUrl: DEPLOYED_BRIDGE ?? `${location.origin}/bridge`,
   invite: qs.get('invite') ?? undefined,
   // A fixed name: the identity is kept under `<dbPath>.identity`, found again on reload.
   dbPath: AS ? `airports-${AS}.sqlite3` : 'airports.sqlite3',

@@ -21,6 +21,15 @@ export default defineConfig({
       'Cross-Origin-Embedder-Policy': 'require-corp',
     },
   },
+  // `pnpm build && pnpm preview`: the built page, with the same two headers
+  // (a static host sends them from public/_headers).
+  preview: {
+    port: 5176,
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
+  },
   optimizeDeps: { exclude: ['sqlocal'] },
   resolve: {
     dedupe: ['sqlocal', 'fzstd', '@nats-io/nats-core', '@nats-io/jetstream', '@nats-io/kv', '@nats-io/obj', '@msgpack/msgpack', 'uuid'],

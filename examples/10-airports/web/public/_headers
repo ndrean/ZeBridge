@@ -1,0 +1,5 @@
+# Cloudflare Pages (and Netlify) read this file: the replica's storage (OPFS, through
+# SQLite in a worker) needs a cross-origin isolated page, which these two headers make.
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp

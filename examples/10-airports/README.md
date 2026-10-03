@@ -60,8 +60,8 @@ The service answers on libzb's own thread, inside the callback that hands it the
 
 [web/](web/) is one page: a map centred on San Mateo, California, about 200 km across.
 After every pan or zoom it asks `airports_near` for the airports within 100 km of the
-centre (the dashed circle), draws them, and writes the count under the map. It follows no
-table: the answer is all it holds.
+centre (the dashed circle), draws them, and writes the count under the map. It keeps no
+airport: the answer is all it holds.
 
 ```sh
 cd examples/10-airports/web
@@ -82,7 +82,20 @@ of [vite.config.ts](web/vite.config.ts), `ZB_NATS_WS_ORIGIN` and `ZB_BRIDGE_ORIG
 tiles are OpenStreetMap's, for testing only: their usage policy forbids more.
 
 PostgreSQL plays no part in an answer: the data was loaded at Supabase in London, and
-every question is answered from the service's DuckDB on the laptop.
+every question is answered from the service's DuckDB, wherever the service runs.
+
+**Published**, on a static host: build with the bridge's public address, and the page
+enrolls there; the enrollment answer gives it the NATS WebSocket address.
+
+```sh
+VITE_ZB_BRIDGE_URL=https://bridge.example.com pnpm build
+pnpm preview                 # the built page on http://localhost:5176, to check it first
+npx wrangler pages deploy dist --project-name <name>    # Cloudflare Pages, for example
+```
+
+The replica's storage (OPFS) needs a cross-origin isolated page: the host must send
+`Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`.
+[web/public/_headers](web/public/_headers) sets them on Cloudflare Pages and Netlify.
 
 ## 6. A flight, edited together
 
