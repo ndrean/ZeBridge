@@ -611,7 +611,16 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         const id_path_opt = str.get(o, "identityPath", "");
         const id_path = if (id_path_opt.len > 0) try a.dupe(u8, id_path_opt) else if (db_given.len > 0) try std.fmt.allocPrint(a, "{s}.identity", .{db_given}) else try a.dupe(u8, "zebridge.identity");
         defer a.free(id_path);
-        ident = try enroll.load(a, id_path);
+        // A stored identity wins over an invite (a bookmarked invite must not spend a code
+        // on every start) — when it can be used. One that cannot be read, or holds no
+        // creds, would only fail later: with an invite and a bridge given, enroll instead.
+        const can_enroll = str.get(o, "bridgeUrl", "").len > 0 and str.get(o, "invite", "").len > 0;
+        ident = if (can_enroll) enroll.load(a, id_path) catch null else try enroll.load(a, id_path);
+        if (can_enroll) if (ident) |*cur| if (cur.creds.len == 0) {
+            std.debug.print("zebridge: the stored identity holds no creds — enrolling with the invite instead\n", .{});
+            cur.deinit(a);
+            ident = null;
+        };
         // §10jt: a stored identity close to (or past) its JWT's expiry renews here,
         // with its key — no invite. Before expiry a failed renewal is only a warning
         // (the JWT still works); after it, the reason is the connect's error.
@@ -648,6 +657,11 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
                 kept_id_path = try a.dupe(u8, id_path);
             } else if (invite.len > 0) {
                 enroll.last_failure = "an invite needs `bridgeUrl`: the bridge that redeems it";
+                return error.EnrollFailed;
+            } else if (bridge.len > 0) {
+                // A deployment with enrollment, and this device never enrolled in it: say
+                // so, rather than dial NATS with no creds and be refused.
+                enroll.last_failure = "not enrolled: no identity is stored here, and no invite was given — pass `invite` (the code from the invite link)";
                 return error.EnrollFailed;
             }
         }

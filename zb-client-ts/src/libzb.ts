@@ -411,6 +411,27 @@ export class RevokedPurge extends Error {
   }
 }
 
+/// No stored identity and no invite: this device was never enrolled here. Its own class,
+/// so an app can tell "ask the user for the invite link" from a real failure.
+export class NotEnrolled extends Error {
+  readonly notEnrolled = true;
+  constructor() {
+    super('not enrolled: no identity is stored here, and no invite was given — open the invite link (an `invite` with `bridgeUrl`)');
+  }
+}
+
+/// A stored identity this client can connect with: creds, and a NATS URL for its
+/// platform (or one the app passes itself). Text that does not parse cannot be used.
+export function identityUsable(text: string, natsUrl: string | undefined, overWebSocket: boolean): boolean {
+  try {
+    const id = JSON.parse(text) as Partial<EnrolledIdentity>;
+    if (typeof id.creds !== 'string' || id.creds.length === 0) return false;
+    return !!(natsUrl || (overWebSocket ? id.nats_ws_url : id.nats_url));
+  } catch {
+    return false;
+  }
+}
+
 /// §10jt: a new JWT for the SAME key, no invite — sign `zebridge-renew:<pub>:<ts>` with the
 /// identity's seed, `GET <bridge>/renew`, and rebuild the identity (NATS URLs, grammar
 /// hash and memberships come back current). libzb's `renew`, the same wire.
@@ -685,6 +706,14 @@ export class ZeBridge {
       const key = c.identityPath ?? (c.dbPath ? `${c.dbPath}.identity` : 'zebridge.identity');
       const store = this.platform.identity;
       let text = store ? await store.load(key) : null;
+      // A stored identity wins over an invite (a bookmarked invite link must not spend a
+      // code on every visit) — when it can be used. One that cannot (unreadable, or from
+      // a deployment that named no NATS URL) would only fail below: with an invite given,
+      // enroll instead and replace it.
+      if (text && c.invite && !identityUsable(text, c.natsUrl, this.platform.natsOverWebSocket === true)) {
+        this.appendLog('SYS', 'the stored identity cannot be used (no creds, or no NATS URL): enrolling with the invite instead', 'WARN');
+        text = null;
+      }
       if (!text && c.invite) {
         if (!c.bridgeUrl) throw new Error('zb-client-ts: an invite needs `bridgeUrl`: the bridge that redeems it');
         const id = await enrollAt(c.bridgeUrl, c.invite, this.transport);
@@ -725,6 +754,7 @@ export class ZeBridge {
         c.bridgeUrl ??= id.bridge_url;
       }
     }
+    if (!c.natsUrl && !c.creds && !this.identityNow) throw new NotEnrolled();
     if (!c.natsUrl) throw new Error('zb-client-ts: no `natsUrl`, and no identity that names one (the bridge sets ENROLL_NATS_URL / ENROLL_NATS_WS_URL)');
     if (!c.principal) throw new Error('zb-client-ts: no principal: pass `creds`, an `invite` with `bridgeUrl`, or `principal` + `password`');
     if (!this.dbName) (this as { dbName: string }).dbName = `zebridge_${c.principal}.sqlite3`;

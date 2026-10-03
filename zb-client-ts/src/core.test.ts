@@ -319,3 +319,18 @@ test('msgpackScan: at every cut, only complete values count — every type and s
   assert.deepEqual(msgpackDecodeScanned(decode, all, end, count), vals.map((v) => decode(encode(v))));
   assert.throws(() => msgpackScan(new Uint8Array([0xc1]), 1), /not a type/);
 });
+
+test('a stored identity is usable with creds and a NATS URL for its platform', async () => {
+  const { identityUsable } = await import('./libzb.ts');
+  const creds = '-----BEGIN NATS USER JWT-----\nx\n------END NATS USER JWT------';
+  const both = JSON.stringify({ creds, nats_url: 'tls://n:4222', nats_ws_url: 'wss://w' });
+  const tcpOnly = JSON.stringify({ creds, nats_url: 'tls://n:4222' });
+  assert.equal(identityUsable(both, undefined, true), true);
+  assert.equal(identityUsable(tcpOnly, undefined, false), true);
+  // a browser needs the websocket URL: a TCP-only identity is not enough, unless the app passes one
+  assert.equal(identityUsable(tcpOnly, undefined, true), false);
+  assert.equal(identityUsable(tcpOnly, 'wss://app-given', true), true);
+  // no creds, or text that does not parse: not usable
+  assert.equal(identityUsable(JSON.stringify({ nats_ws_url: 'wss://w' }), undefined, true), false);
+  assert.equal(identityUsable('{not json', undefined, true), false);
+});

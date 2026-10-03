@@ -18600,3 +18600,23 @@ crosstenant, widthguard, reaps, sweeper, writable, route_crdt, and the offline g
 (render and pubname failed on environment only: no .env.admin, NATS stopped). check and
 diagnose fail on dev-database residue that predates this (dropped tables still
 catalogued, fire_types unscoped), none from the new checks.
+
+## §10lf — a stored identity yields to an invite when it cannot be used; "not enrolled" said plainly (2026-10-03)
+
+On airports.zebridge.eu, a browser profile that had opened the page before ignored a later
+`?invite=` and failed with "no `natsUrl`, and no identity that names one": the stored
+identity (localStorage, per origin) is read before the invite and wins, and this one named
+no NATS websocket URL. A fresh private window worked (empty storage).
+
+The order stays — a stored identity first, so a bookmarked invite link does not spend a
+code on every visit — but only for an identity that can be used. zb-client-ts:
+`identityUsable` (parses, holds creds, names a NATS URL for the platform, or the app passes
+one); with an invite given and an unusable identity, it enrolls and replaces it. No
+identity and no invite: `NotEnrolled`, its own class, so a page can ask for the invite
+link (the airports page now does). libzb, the same rule: with `bridgeUrl` and `invite`, an
+identity that cannot be read or holds no creds yields to the invite; with `bridgeUrl`, no
+identity and no invite, "not enrolled" instead of an anonymous dial (no NATS URL check:
+libzb falls back to the local default). Checked: zb-client-ts 247 tests (new:
+identityUsable's six cases); libzb through zb-python against an unreachable bridge — a
+corrupt identity with an invite reaches the enrollment, no identity and no invite says
+"not enrolled".
