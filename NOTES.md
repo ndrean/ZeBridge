@@ -18709,7 +18709,7 @@ Preparing a leaf for zebridge.eu, whose hub was generated without a domain. Two 
 talk to the wrong JetStream"). Measured on a stack made with `--js-domain hub`, a
 responder connected to the hub: plain prefix → `Publish Violation` logged; domain prefix
 → no violation logged, and the request never answers. The hub maps its own domain's
-prefix onto `$JS.API.` and checks permissions on the result, silently (your §10hl note:
+prefix onto `$JS.API.` and checks permissions on the result, silently (§10hl already noted
 "permissions are checked on the mapped subject"). §10is-b proved only clients BEHIND a
 leaf, checked by the leaf before the link. So every `--js-domain` stack served leaf
 clients and refused direct ones.
