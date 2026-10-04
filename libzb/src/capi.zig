@@ -906,8 +906,6 @@ fn syncClockOffset(b: *ClientBox) void {
     b.c.clock_offset_ms = b.serverNowMs() - enroll.localNowMillis();
 }
 
-/// A register stamp (COOPERATIVE_EDITING.md, the `t` of {v, t, w}) on the bridge's
-/// clock: what a cooperative document's writer puts beside a value. zb-client-ts: stamp().
 /// The one call a host may make from a thread that does not own the client: its UI
 /// thread has queued a command for the worker that polls, and the poll's wait should
 /// end now rather than after `wait_ms`. Runs under the handle table's lock, so a
@@ -920,6 +918,8 @@ fn wakeBox(b: *ClientBox) void {
     b.c.wake();
 }
 
+/// A register stamp (COOPERATIVE_EDITING.md, the `t` of {v, t, w}) on the bridge's
+/// clock: what a cooperative document's writer puts beside a value. zb-client-ts: stamp().
 export fn zb_client_stamp(handle: u64) ?[*:0]u8 {
     const b = lookup(handle) orelse return goneJson(handle);
     syncClockOffset(b);

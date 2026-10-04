@@ -65,7 +65,7 @@ If you put every client in one tenant, every client holds everything that tenant
 
 **Security**: tenant-based, with NATS grants and a rotating JWT chain. See [SECURITY](SECURITY.md).
 
-**The documentation set**: README (this file), [Security](https://github.com/ndrean/zebridge/blob/main/SECURITY.md), [Scope](https://github.com/ndrean/zebridge/blob/main/SCOPE.md), [Tested scenarios](https://github.com/ndrean/zebridge/blob/main/TEST_SCENARIOS.md), [Clients](https://github.com/ndrean/zebridge/blob/main/CLIENTS.md), [Observability](https://github.com/ndrean/zebridge/blob/main/OBSERVABILITY_TELEMETRY.md), [Migrations](https://github.com/ndrean/zebridge/blob/main/MIGRATIONS.md),  [Cooperative editing](https://github.com/ndrean/zebridge/blob/main/COOPERATIVE_EDITING.md), [Protocol](https://github.com/ndrean/zebridge/blob/main/PROTOCOL.md), [SUPABASE_TEST](https://github.com/ndrean/zebridge/blob/main/SUPABASE_TEST.md)
+**The documentation set**: README (this file), [Security](https://github.com/ndrean/zebridge/blob/main/SECURITY.md), [Scope](https://github.com/ndrean/zebridge/blob/main/SCOPE.md), [Tested scenarios](https://github.com/ndrean/zebridge/blob/main/TEST_SCENARIOS.md), [Clients](https://github.com/ndrean/zebridge/blob/main/CLIENTS.md), [Distribution](https://github.com/ndrean/zebridge/blob/main/DISTRIBUTION.md), [Observability](https://github.com/ndrean/zebridge/blob/main/OBSERVABILITY_TELEMETRY.md), [Migrations](https://github.com/ndrean/zebridge/blob/main/MIGRATIONS.md),  [Cooperative editing](https://github.com/ndrean/zebridge/blob/main/COOPERATIVE_EDITING.md), [Protocol](https://github.com/ndrean/zebridge/blob/main/PROTOCOL.md), [SUPABASE_TEST](https://github.com/ndrean/zebridge/blob/main/SUPABASE_TEST.md)
 
 **Glossary**:
 
@@ -1409,7 +1409,7 @@ That is the whole contract for an app author: one callback per table.
 
 ### The C ABI library
 
-`libzb` does nothing on its own. It moves only when the host calls it. Eight functions make the card:
+`libzb` does nothing on its own. It moves only when the host calls it. Which build a host needs (an xcframework, an AAR, a shared library) and how the optional DuckDB and PostgreSQL engines load: [DISTRIBUTION](DISTRIBUTION.md). Eight functions make the card:
 
 | verb | what it does | returns |
 | --- | --- | --- |
@@ -1442,7 +1442,7 @@ reason is the C ABI, not a choice:
 C-only by necessity: `zb_free` (no GC), `zb_abi_version`, and `zb_client_live` (open
 handles in this process — a leak check for tests, and not to be confused with
 `zb_client_revoked`).
-Beside them: `zb_client_mutate_at` (a write with the caller's own version stamp; `mutate(…, { version })` in TypeScript), `zb_client_join` and `zb_client_leave` (follow one more tenant, or stop; libzb only), `zb_grammar_hash` and `zb_grammar_json` (what this build of the library speaks).
+Beside them: `zb_client_mutate_at` (a write with the caller's own version stamp; `mutate(…, { version })` in TypeScript), `zb_client_stamp` (a register stamp on the bridge's clock, for [cooperative editing](COOPERATIVE_EDITING.md); `stamp()` in TypeScript), `zb_client_wake` (see below), `zb_client_join` and `zb_client_leave` (follow one more tenant, or stop; libzb only), `zb_grammar_hash` and `zb_grammar_json` (what this build of the library speaks).
 
 **How data crosses.** Everything is a C string of JSON, in and out, so a binding is three declarations in any language with an FFI. One value is not JSON-shaped: a BLOB column (`bytea`, a PostGIS geometry) comes back from `zb_client_query` as `{"$bin": "<base64>"}` and is written the same way in a mutation's values. Two ownership rules make it safe:
 
@@ -1452,6 +1452,8 @@ Beside them: `zb_client_mutate_at` (a write with the caller's own version stamp;
 A failure comes back as `{"error": "<name>"}` on the same channel, and `zb_client_connect` returns `0`: check both before anything else. A query the replica refuses adds `"detail"` with SQLite's own words (`no such table: test_types`: a table this client does not follow).
 
 **Who holds the handle.** The client is single-threaded by contract: the host owns the thread, and only one thread ever calls into a handle. `zb_client_poll` BLOCKS that thread for up to `wait_ms` when nothing arrives, so the loop cannot live on a UI thread. The honest shape is one worker that owns the handle and everything that touches it — poll, flush, query, mutate, close — while the UI talks to it over messages. In Flutter that is an isolate; on iOS a background queue; in React Native a native thread behind a promise.
+
+A command sent to that worker should not wait for the poll's `wait_ms` to run out: `zb_client_wake(h)` ends the wait at once. It is the one call allowed from any thread, and the bindings make it with every command they send.
 
 The Flutter examples do exactly this, through the shared Dart package `zb-dart` (`zb-dart/lib/src/worker.dart`):
 
@@ -2171,7 +2173,7 @@ For example, with all three on one host during a write burst, PostgreSQL takes a
 
  So what actually matters is **colocation**: the bridge should sit next to `nats-server`, so their hop does not cross a network.
 
-The strong setup puts **Postgres + bridge + nats-server + Prometheus + nats-exporter + bridge_sweeper + HAProxy** together behind one boundary, one domain. Consumers connect directly to NATS (TLS or WSS); the reverse proxy fronts the bridge's HTTP surface over TLS for the consumer **JWT enrollment** (`/enroll`, `/renew`), and Prometheus pushes to Grafana Cloud on its own.
+The strong setup puts **Postgres + bridge + nats-server + Prometheus + nats-exporter + bridge_sweeper + HAProxy** together behind one boundary, one domain. Consumers connect directly to NATS (TLS or WSS); the reverse proxy fronts the bridge's HTTP surface over TLS for the consumer **JWT enrollment** (`/enroll`, `/renew`), and the metrics and logs go to Grafana: a local Prometheus, or Grafana Alloy pushing to Grafana Cloud (`telemetry/vps/`, see [Observability](OBSERVABILITY_TELEMETRY.md)).
 
 The bridge holds no certificates of its own, and HAProxy should terminate the SSL (or slightly less secure, Cloudflare's own certificate).
 
@@ -2191,7 +2193,7 @@ The production procedure, in order. For the development stack of this repository
   wal_sender_timeout = 300s
   ```
 
-- `nats-server`, and the `bridge` binary (`zig build -Doptimize=ReleaseFast`, then `zig-out/bin/bridge`), with `libpq` and `zstd` installed on the host. The DBA needs only this binary and `psql`: the init SQL is inside it.
+- `nats-server`, and the `bridge` binary (`zig build -Doptimize=ReleaseFast`, then `zig-out/bin/bridge`), with `libpq` and `zstd` installed on the host. The DBA needs only this binary and `psql`: the init SQL is inside it. From a Mac, `deploy/build-linux.sh` builds the Linux `bridge`, `bridge_sweeper` and `libzbcore.so` in a Debian container (x86_64 by default, `aarch64` for an ARM server); they run on Debian 12+ and Ubuntu 22.04+.
 
 #### 2. Generate the configuration
 
@@ -2342,6 +2344,61 @@ RETURNING code;
 ```
 
 The app passes that code to the library once, with the bridge's URL: [Onboard a device](#2-onboard-a-device).
+
+### Adding a leaf node
+
+A leaf node is a second `nats-server` close to a group of devices. It has no JetStream of its own: the devices' stream calls cross to the hub's JetStream through a **domain**, and their writes and questions cross like any other message. The hub keeps the only copy of the streams; the leaf shortens the devices' path to it.
+
+1. **Give the hub a domain.** A new stack: `bridge --init-nats operator --js-domain hub`. A running one: `bridge --init-nats --update --dir /etc/zebridge --js-domain hub`, then restart NATS and the bridge. The grants then allow both `$JS.API.` and `$JS.hub.API.`, and `/enroll` hands `js_domain` to every device. Devices enrolled before keep working on the hub.
+
+2. **Open the hub to leaves.** In the hub's `nats-server.conf`, then restart NATS:
+
+   ```
+   leafnodes {
+     port: 7422
+     no_advertise: true
+     tls { cert_file: "/etc/zebridge/tls/nats.crt", key_file: "/etc/zebridge/tls/nats.key" }
+   }
+   ```
+
+   Open 7422 in the firewall to the leaf's addresses: one rule per address family, IPv4 and IPv6.
+
+3. **Mint the leaf's credentials**, where `operator.store` lives:
+
+   ```sh
+   bridge --mint-leaf --name leaf1 --store operator.store > leaf1.creds
+   ```
+
+   They allow what the devices may do, and nothing more (see [SECURITY](SECURITY.md)). Mint them again after a grammar change.
+
+4. **Configure the leaf.** Copy the trust lines of the hub's `nats-server.conf` into the leaf's `trust.conf`: `operator`, `system_account`, `resolver: MEMORY` and the `resolver_preload` block. The leaf's own `nats-server.conf`, with no `jetstream` block:
+
+   ```
+   include ./trust.conf
+   port: 4222
+   http: "127.0.0.1:8222"
+   tls { cert_file: "/etc/zebridge/tls/leaf.crt", key_file: "/etc/zebridge/tls/leaf.key" }
+
+   websocket {                                   # for browsers
+     port: 8443
+     tls { cert_file: "/etc/zebridge/tls/leaf.crt", key_file: "/etc/zebridge/tls/leaf.key" }
+     allowed_origins: ["https://app.example.com"]
+   }
+
+   leafnodes {
+     remotes: [{
+       url: "tls://nats.example.com:7422"
+       credentials: "/etc/zebridge/creds/leaf1.creds"
+       account: "<ZB_ACCOUNT_PUB from the hub's .env.nats>"
+     }]
+   }
+   ```
+
+   The creds file must be readable by the user `nats-server` runs as. Both servers log `Leafnode connection created`.
+
+5. **Point the devices at the leaf.** A device still enrolls at the hub's bridge; only its NATS address changes: `natsUrl` is `tls://leaf.example.com:4222`, or `wss://leaf.example.com:8443` in a browser. The `js_domain` from its enrollment carries its stream calls across the leaf.
+
+6. **After every `--update` on the hub**, copy the new ZEBRIDGE account JWT into the leaf's `trust.conf` and reload the leaf: the leaf checks the devices' JWTs against its own copy.
 
 ### Using a cloud PostgreSQL
 

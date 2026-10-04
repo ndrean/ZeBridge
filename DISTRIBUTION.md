@@ -43,9 +43,9 @@ A phone never has libpq or libduckdb, so on a phone those two engines answer wit
 message above. The desktop library is the same file for an app and for a service; what
 differs is what is installed next to it.
 
-Built today: iOS (both slices), the Android AAR (all three CPUs), macOS. Not yet: Linux
-and Windows release builds (on Windows the two
-optional engines do not load yet), and packaging (see
+Built today: iOS (both slices), the Android AAR (all three CPUs), macOS, and Linux
+(`deploy/build-linux.sh`: x86_64 or aarch64, glibc 2.35). Not yet: Windows release builds
+(on Windows the two optional engines do not load yet), and packaging (see
 [What is missing](#what-is-missing)).
 
 ## How each host uses it
@@ -53,7 +53,7 @@ optional engines do not load yet), and packaging (see
 **iOS (Swift, Flutter, React Native).** A static library, packed as an xcframework:
 iOS apps link code in, they do not load it at run time. React Native wraps it in an
 Expo module (`zb-react-native/scripts/build-ios.sh`); Flutter looks the functions up in
-its own process (`examples/06-large-table/flutter/tool/build-libzb-ios.sh`).
+its own process (`examples/10-airports/flutter/tool/build-libzb-ios.sh`).
 
 **Android.** A Kotlin or Java app adds the AAR ([zb-android](zb-android/README.md)): the
 JNI layer, a `ZeBridge` class that owns the client's thread, and `libzb.so` per CPU. Flutter
@@ -124,8 +124,11 @@ machine that runs the service.
 
     # phones
     zb-react-native/scripts/build-ios.sh
-    examples/06-large-table/flutter/tool/build-libzb-ios.sh
+    examples/10-airports/flutter/tool/build-libzb-ios.sh
     examples/06-large-table/flutter/tool/build-libzb-android.sh
+
+    # Linux servers, from a Mac: bridge, bridge_sweeper and libzbcore.so
+    deploy/build-linux.sh              # x86_64; `aarch64` for an ARM server
     zb-android/scripts/build.sh        # the AAR
 
 The engines' headers are in `libzb/include-engines/`, so building needs neither DuckDB

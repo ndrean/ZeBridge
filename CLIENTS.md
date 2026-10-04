@@ -218,7 +218,8 @@ Everything below the core — the shells — is where parity is by hand, and whe
 | outbox watermark gate before a flush | ✓ | ✓ |
 | a failed optimistic echo still queues the write | ✓ | ✓ |
 | liveness of the NATS connection | host-driven (`NoResponders` → reopen tails) | RTT poll every 10 s, re-sync on recovery |
-| fleet heartbeat (PROTOCOL §11) | on every poll and at sync end | from tenant resolution, before the seed |
+| fleet heartbeat (PROTOCOL §11): a core publish, through `$JS.<domain>.API.` with a domain | on every poll and at sync end | from tenant resolution, before the seed |
+| a command from another thread ends the poll's wait | `zb_client_wake(h)`, made by the bindings with every command | — (self-driven) |
 | auth error named | ✓ `AuthorizationViolation` / `AuthExpired` from `poll` | ✓ the server's `error` status and `closed()`'s reason logged by name (2026-09-06) |
 | the ban (`mutation_ack.<p>.revoked`): hang up now, stay hung up on reconnect, every call answers Revoked | ✓ `error.Revoked` | ✓ `revoked`, logged, closed |
 | the wipe is explicit, never automatic | ✓ `zb_client_wipe` | ✓ `wipe()` |
