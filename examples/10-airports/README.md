@@ -93,6 +93,10 @@ pnpm preview                 # the built page on http://localhost:5176, to check
 npx wrangler pages deploy dist --project-name <name>    # Cloudflare Pages, for example
 ```
 
+To connect through a NATS leaf node instead of the hub, add its WebSocket address:
+`VITE_ZB_NATS_URL=wss://leaf.example.com:8443`. The page still enrolls at the bridge,
+and the enrollment answer's JetStream domain carries its stream calls across the leaf.
+
 The replica's storage (OPFS) needs a cross-origin isolated page: the host must send
 `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`.
 [web/public/_headers](web/public/_headers) sets them on Cloudflare Pages and Netlify.

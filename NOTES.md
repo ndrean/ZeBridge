@@ -18762,3 +18762,22 @@ the bridge, which uses the same client.
 Not done: a dedicated leaf identity (the link uses the bridge's creds, full rights on the
 account, now on a second machine); the leaf in the Ansible playbook (leaf.yml), tested on
 a reinstalled VPS.
+
+## §10lj — browser and phone through the leaf (2026-10-04)
+
+Both client kinds now reach zebridge.eu through `leaf1`, as well as directly. The leaf
+gained `websocket { port 8443, tls, allowed_origins }` with its own Let's Encrypt
+certificate (DNS only, no Cloudflare); its 4222 already served TLS. The web page takes
+`VITE_ZB_NATS_URL` (here `wss://leaf1.zebridge.eu:8443`, served from `pnpm preview`), the
+Flutter app `ZB_NATS_URL` (`tls://leaf1.zebridge.eu:4222`). Both still enroll at the hub's
+bridge, whose answer carries `js_domain: hub`; that is what carries their stream calls
+across the leaf. An identity enrolled before the domain existed has none, so the phone's
+replica and identity are now named per NATS host as well as per bridge, and each leaf
+client got a fresh invite. Writes made on the leaf reach clients on the hub and back;
+airports questions cross to the service on the hub.
+
+Found on the way: deploying the ABI 5 `libzbcore.so` to the hub without the matching
+zb-python package stopped the airports service (`libzb speaks ABI 5, this package 4`),
+restart loop, "no responders" for every client. A libzb update on a host must ship every
+binding that loads it there; the Ansible `airports` role should copy the package from the
+same build as the library.

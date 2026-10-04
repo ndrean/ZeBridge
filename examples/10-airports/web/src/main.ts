@@ -29,9 +29,12 @@ const count = el('count'), detail = el('detail'), flightLine = el('flight'), not
 /// page enrolls there, and the answer names the NATS websocket. Without it, the dev
 /// server's proxy carries both, on this page's own origin.
 const DEPLOYED_BRIDGE = import.meta.env.VITE_ZB_BRIDGE_URL as string | undefined;
+/// `VITE_ZB_NATS_URL` connects elsewhere than the websocket the bridge names, such as a
+/// leaf node (`wss://leaf.example.com:8443`).
+const NATS_URL = import.meta.env.VITE_ZB_NATS_URL as string | undefined;
 
 const zb = new ZeBridge({
-  natsUrl: DEPLOYED_BRIDGE ? undefined : `${location.origin.replace(/^http/, 'ws')}/nats`,
+  natsUrl: NATS_URL ?? (DEPLOYED_BRIDGE ? undefined : `${location.origin.replace(/^http/, 'ws')}/nats`),
   bridgeUrl: DEPLOYED_BRIDGE ?? `${location.origin}/bridge`,
   invite: qs.get('invite') ?? undefined,
   // A fixed name: the identity is kept under `<dbPath>.identity`, found again on reload.

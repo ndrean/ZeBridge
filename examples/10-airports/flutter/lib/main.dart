@@ -85,9 +85,10 @@ class _AirportsScreenState extends State<AirportsScreen> {
 
   Future<void> _open() async {
     final dir = await getApplicationSupportDirectory();
-    // One replica and identity per bridge: an identity from another deployment (another
-    // operator, another address) is not this one's.
-    final dbPath = '${dir.path}/airports-${Uri.parse(bridgeUrl).host}.sqlite3';
+    // One replica and identity per bridge, and per NATS server when one is named (a leaf):
+    // an identity from another deployment (another operator, another address) is not this one's.
+    final nats = natsUrl.isEmpty ? '' : '-${Uri.parse(natsUrl).host}';
+    final dbPath = '${dir.path}/airports-${Uri.parse(bridgeUrl).host}$nats.sqlite3';
     final roots = File('${dir.path}/roots.pem');
     roots.writeAsBytesSync((await rootBundle.load('assets/roots.pem')).buffer.asUint8List());
     final identity = File('$dbPath.identity');
