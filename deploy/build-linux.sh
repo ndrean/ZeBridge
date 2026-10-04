@@ -6,9 +6,11 @@
 #   deploy/build-linux.sh            # x86_64 (default)
 #   deploy/build-linux.sh aarch64    # an ARM server (Ampere)
 #
-# The bridge links libpq and zstd, so it is built against Ubuntu 22.04's packages for the
-# target CPU (glibc 2.35: runs on Ubuntu 22.04+, Debian 12+). The container is arm64 and
-# cross-compiles: an amd64 container under Rosetta crashes Zig's translate-c
+# The bridge links libpq and zstd: the container supplies their headers and link names, for
+# the target CPU, from Debian's packages (multiarch, one mirror for every architecture).
+# The binary's own floor is Zig's target, glibc 2.35: it runs on Ubuntu 22.04+ and Debian
+# 12+, with the server's libpq5 (14 or later: pipeline mode) and libzstd1. The container is
+# arm64 and cross-compiles: an amd64 container under Rosetta crashes Zig's translate-c
 # ("bss_size overflow"). libzb vendors its C, so it cross-compiles with no container.
 set -eu
 arch=${1:-x86_64}
@@ -21,13 +23,9 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 cache=${ZB_LINUX_CACHE:-$HOME/.cache/zebridge-linux-build}
 mkdir -p "$cache"
 
-docker run --rm --platform linux/arm64 -v "$root":/src -v "$cache":/cache ubuntu:22.04 sh -eu -c "
+docker run --rm --platform linux/arm64 -v "$root":/src -v "$cache":/cache debian:13-slim sh -eu -c "
 export DEBIAN_FRONTEND=noninteractive
-if [ $deb != arm64 ]; then
-  sed -i 's/^deb /deb [arch=arm64] /' /etc/apt/sources.list
-  for s in jammy jammy-updates jammy-security; do echo \"deb [arch=$deb] http://archive.ubuntu.com/ubuntu \$s main\" >> /etc/apt/sources.list; done
-  dpkg --add-architecture $deb
-fi
+dpkg --add-architecture $deb
 apt-get update -qq >/dev/null
 apt-get install -y -qq curl xz-utils ca-certificates libpq-dev:$deb libzstd-dev:$deb >/dev/null
 ln -sf /usr/lib/$arch-linux-gnu/libpq.so /usr/lib/libpq.so
