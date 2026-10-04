@@ -18620,3 +18620,44 @@ libzb falls back to the local default). Checked: zb-client-ts 247 tests (new:
 identityUsable's six cases); libzb through zb-python against an unreachable bridge — a
 corrupt identity with an invite reaches the enrollment, no identity and no invite says
 "not enrolled".
+
+## §10lg — Upgrading to Zig 0.17: what it takes, in order (2026-10-04)
+
+Not started: ZeBridge stays on Zig 0.16.0 (zvm; Homebrew has no Zig installed, so a
+`brew upgrade` cannot change the compiler). The owner's view: a project on Zig < 1.0 is
+judged by that alone, so following the releases matters until 1.0, and each upgrade
+should be cheap.
+
+What 0.17.0 changes that touches us (release notes, "C Translation Moving to External
+Package" and the removals):
+- `@cImport` is removed: we have none left (only comments mention it).
+- `std.Build.Step.TranslateC` / `b.addTranslateC` is DEPRECATED, not removed: build.zig
+  (2) and libzb/build.zig (2) keep working; the replacement is the ZSF package
+  `zig fetch --save git+https://codeberg.org/ziglang/translate-c`, used as
+  `b.dependency("translate_c", .{})` + `Translator.init(…, .{ .c_source_file = … })`,
+  `translator.mod`. Move when it is convenient, not as part of the upgrade.
+- array multiplication `[_]T{x} ** n` is removed (`@splat`): src/pgoutput.zig:126,
+  src/topology.zig:491, src/generation_producer.zig:650, libzb/src/capi.zig:1315, and
+  nats.zig's src/timestamp.zig:56 and src/nuid.zig:227.
+- `void{}`, `errdefer |err|` captures, `i0`, `internal`/`link_once` linkage: none in
+  ours or nats.zig.
+- `std` API changes are not all listed in the notes: std.Io, std.http.Client
+  (`ca_bundle`, `now`), std.crypto.Certificate.Bundle (`rescan`, `addCertsFromFilePath`)
+  are the likely surprises; only a compile tells.
+
+The order:
+1. zig-msgpack first, still on 0.16: its README (2026-10-04) says the current version
+   supports 0.16.0 and 0.17.0-dev, CI tracking Zig master. We pin a `main` tarball by
+   hash (build.zig.zon, zig-pkg/zig_msgpack-0.0.14…, 24 array multiplications and 5
+   `void{}` in that copy): re-fetch a current commit, build and test on 0.16.
+2. nats.zig (vendored, 31 local patches, the owner controls it): its two array
+   multiplications and whatever std changes hit it, in a patch of its own (ledger in
+   NATS_ZIG_NOTES.md), checked by its own test suite.
+3. A trial compile beside 0.16 without switching: `zvm i 0.17.0`, then
+   `~/.zvm/0.17.0/zig build` and `zig build test` in the root and in libzb/; fix ours.
+4. The batteries: zig build test (both), the offline and live scenario groups, libzb's
+   ABI check, the iOS xcframework and the Android .so (tool/build-libzb-*.sh), and
+   deploy/build-linux.sh (it downloads Zig by version: bump it there too).
+5. Then switch the default (`zvm use 0.17.0`) and the CI/Dockerfiles' Zig URLs
+   (Dockerfile.bridge, Dockerfile.sweeper, deploy/build-linux.sh, the build-libzb
+   scripts' docs).
