@@ -1,0 +1,6 @@
+- name: Restart airports
+  ansible.builtin.systemd_service:
+    name: airports
+    state: restarted
+    daemon_reload: true
+  when: zb_airports | bool

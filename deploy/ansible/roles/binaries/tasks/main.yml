@@ -1,0 +1,29 @@
+# nats-server from its release; bridge and bridge_sweeper from this repository's Linux
+# build (README.md). Owned by root, so the services cannot replace their own binary.
+
+- name: The nats-server release
+  ansible.builtin.unarchive:
+    src: "https://github.com/nats-io/nats-server/releases/download/v{{ nats_version }}/nats-server-v{{ nats_version }}-linux-{{ zb_arch }}.tar.gz"
+    dest: /tmp
+    remote_src: true
+    creates: "/tmp/nats-server-v{{ nats_version }}-linux-{{ zb_arch }}/nats-server"
+
+- name: The nats-server binary in /usr/local/bin
+  ansible.builtin.copy:
+    src: "/tmp/nats-server-v{{ nats_version }}-linux-{{ zb_arch }}/nats-server"
+    dest: /usr/local/bin/nats-server
+    remote_src: true
+    mode: "0755"
+    owner: root
+    group: root
+  notify: Restart nats
+
+- name: The bridge and bridge_sweeper binaries
+  ansible.builtin.copy:
+    src: "{{ zb_bin_dir }}/{{ item }}"
+    dest: "/usr/local/bin/{{ item }}"
+    mode: "0755"
+    owner: root
+    group: root
+  loop: [bridge, bridge_sweeper]
+  notify: Restart zebridge

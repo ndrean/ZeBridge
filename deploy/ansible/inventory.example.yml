@@ -1,0 +1,8 @@
+# Copy to inventory.yml (git-ignored) and set the host.
+all:
+  children:
+    zebridge:
+      hosts:
+        vps:
+          ansible_host: 141.95.95.12
+          ansible_user: debian

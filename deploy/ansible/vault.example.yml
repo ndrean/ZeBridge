@@ -1,0 +1,19 @@
+# The secrets, as names. Copy to group_vars/zebridge/vault.yml, fill, then encrypt:
+#   ansible-vault encrypt group_vars/zebridge/vault.yml
+# vault.yml is git-ignored even encrypted: it is yours, not the repository's.
+
+# The bridge's two database roles (the DBA chose their passwords for the init SQL):
+# the same two URLs as in the DBA's .env.bridge.
+vault_database_reader_url: "<the reader's postgresql:// URL, sslmode=require>"
+vault_database_writer_url: "<the writer's postgresql:// URL, sslmode=require>"
+
+# Cloudflare: an API token with Zone / DNS / Edit on the zone only (certbot's DNS-01).
+vault_cloudflare_dns_token: "<Cloudflare API token>"
+
+# The Cloudflare origin certificate and its key (SSL/TLS / Origin Server), for
+# bridge.<domain> and ws.<domain> (or *.<domain>): paste each as a YAML block (|).
+vault_origin_cert: "<the origin certificate, PEM>"
+vault_origin_key: "<its private key, PEM>"
+
+# Grafana Cloud: an access policy token that may write metrics and logs.
+vault_grafana_password: "<Grafana Cloud token>"

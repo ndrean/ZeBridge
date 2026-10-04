@@ -1,0 +1,63 @@
+# Packages, the two service users, a journal that survives reboots, the local name for
+# NATS, and the firewall.
+
+- name: Packages
+  ansible.builtin.apt:
+    name: [libpq5, libzstd1, ca-certificates, curl, unzip, python3, ufw]
+    update_cache: true
+
+- name: The service users
+  ansible.builtin.user:
+    name: "{{ item }}"
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+  loop: [nats, zebridge]
+
+# Debian keeps the journal in memory by default: Alloy reads it, and a reboot would lose it.
+- name: A journal kept on disk
+  ansible.builtin.file:
+    path: /var/log/journal
+    state: directory
+    mode: "2755"
+  notify: Restart journald
+
+# NATS's certificate names nats.<domain>: services on this host dial that name, and it
+# must stay on the machine (TLS checks the name, not the address).
+- name: The name nats.<domain> resolves to this host, for the services on it
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "127.0.0.1 {{ zb_host_nats }}"
+
+- name: Cloudflare's address ranges
+  ansible.builtin.uri:
+    url: "https://www.cloudflare.com/{{ item }}"
+    return_content: true
+  loop: [ips-v4, ips-v6]
+  register: base_cf_lists
+
+# The lists end without a newline: joined line by line, never concatenated.
+- name: Cloudflare's ranges as one list
+  ansible.builtin.set_fact:
+    base_cloudflare_ranges: "{{ base_cf_lists.results | map(attribute='content') | map('split', '\n') | flatten | map('trim') | select | list }}"
+
+- name: Firewall — SSH and NATS for everyone
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop: ["22", "4222"]
+
+- name: Firewall — HAProxy (443) and NATS's websocket (8080) for Cloudflare only
+  community.general.ufw:
+    rule: allow
+    src: "{{ item.0 }}"
+    port: "{{ item.1 }}"
+    proto: tcp
+  loop: "{{ base_cloudflare_ranges | product(['443', '8080']) | list }}"
+
+- name: Firewall — on, everything else refused
+  community.general.ufw:
+    state: enabled
+    default: deny
+    direction: incoming

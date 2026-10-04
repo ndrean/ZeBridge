@@ -1,0 +1,72 @@
+# Two certificates, for two kinds of client:
+#   * nats.<domain> is DNS only: phones connect directly, so it needs a publicly trusted
+#     certificate — Let's Encrypt, by DNS-01 through Cloudflare's API (no port 80);
+#   * bridge.<domain> and ws.<domain> are behind Cloudflare: its origin certificate is
+#     enough, and HAProxy and NATS's websocket listener use it.
+# Both end up in /etc/zebridge/tls, readable by the nats group.
+
+- name: Certbot with the Cloudflare DNS plugin
+  ansible.builtin.apt:
+    name: [certbot, python3-certbot-dns-cloudflare]
+
+- name: The token's directory
+  ansible.builtin.file:
+    path: /root/.secrets
+    state: directory
+    mode: "0700"
+
+- name: The Cloudflare token, for certbot (0600)
+  ansible.builtin.copy:
+    dest: /root/.secrets/cloudflare.ini
+    content: "dns_cloudflare_api_token = {{ vault_cloudflare_dns_token }}\n"
+    mode: "0600"
+  no_log: true
+
+- name: The certificates' directory
+  ansible.builtin.file:
+    path: /etc/zebridge/tls
+    state: directory
+    owner: root
+    group: nats
+    mode: "0750"
+
+# After each renewal, the certificate is copied where the nats user can read it (the
+# originals under /etc/letsencrypt are root's), then NATS reloads without dropping anyone.
+- name: The renewal hook
+  ansible.builtin.copy:
+    dest: /etc/letsencrypt/renewal-hooks/deploy/nats.sh
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      # After each renewal of {{ zb_host_nats }}: copy where the nats user can read it, then reload.
+      install -m 0640 -o root -g nats /etc/letsencrypt/live/{{ zb_host_nats }}/fullchain.pem /etc/zebridge/tls/nats.crt
+      install -m 0640 -o root -g nats /etc/letsencrypt/live/{{ zb_host_nats }}/privkey.pem /etc/zebridge/tls/nats.key
+      systemctl reload nats 2>/dev/null || true
+
+- name: Let's Encrypt for nats.<domain> (first time only)
+  ansible.builtin.command: >-
+    certbot certonly --non-interactive --agree-tos -m {{ letsencrypt_email }}
+    --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini
+    --dns-cloudflare-propagation-seconds 30 -d {{ zb_host_nats }}
+  args:
+    creates: "/etc/letsencrypt/live/{{ zb_host_nats }}/fullchain.pem"
+
+# A hook runs only after a renewal: the first copy is made here, every run, so a missing
+# nats.crt (the trap of 2026-10-03) cannot happen.
+- name: The certificate where NATS reads it
+  ansible.builtin.command: /etc/letsencrypt/renewal-hooks/deploy/nats.sh
+  args:
+    creates: /etc/zebridge/tls/nats.crt
+
+- name: Cloudflare's origin certificate and key
+  ansible.builtin.copy:
+    dest: "/etc/zebridge/tls/{{ item.name }}"
+    content: "{{ item.content }}"
+    owner: root
+    group: nats
+    mode: "0640"
+  loop:
+    - { name: origin.crt, content: "{{ vault_origin_cert }}" }
+    - { name: origin.key, content: "{{ vault_origin_key }}" }
+  no_log: true
+  notify: Restart nats

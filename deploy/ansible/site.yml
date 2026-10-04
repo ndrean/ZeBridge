@@ -1,0 +1,18 @@
+# One VPS running ZeBridge behind Cloudflare: NATS (TLS), the bridge and the sweeper,
+# HAProxy for /enroll and /renew, telemetry to Grafana Cloud, and optionally the
+# examples/10-airports responder. README.md says what stays manual (DNS, the database).
+#
+#   ansible-playbook -i inventory.yml site.yml --ask-vault-pass
+- name: ZeBridge on a VPS
+  hosts: zebridge
+  become: true
+  roles:
+    - base        # packages, users, journald, /etc/hosts, firewall
+    - binaries    # nats-server, bridge, bridge_sweeper
+    - tls         # Let's Encrypt for nats.<domain>, the Cloudflare origin certificate
+    - nats        # --init-nats once, then the listeners; nats.service
+    - zebridge    # .env.bridge, .env.nats, zebridge and zebridge-sweeper services
+    - haproxy     # bridge.<domain>: Cloudflare only, /enroll /renew /status
+    - telemetry   # Alloy + nats-exporter, to Grafana Cloud
+    - airports    # the DuckDB responder (zb_airports: true)
+    - verify      # bridge --diagnose, as the service user

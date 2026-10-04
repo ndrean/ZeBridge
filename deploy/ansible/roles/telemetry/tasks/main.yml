@@ -1,0 +1,43 @@
+# Alloy and the NATS exporter in containers, on the host network (the bridge's /metrics and
+# NATS's monitoring listen on loopback only): telemetry/vps/ as it is.
+
+- name: Is Docker there?
+  ansible.builtin.command: docker compose version
+  register: telemetry_docker
+  changed_when: false
+  failed_when: false
+
+# Only when missing: a host with Docker's own packages keeps them (Debian's would conflict).
+- name: Docker from Debian
+  ansible.builtin.apt:
+    name: [docker.io, docker-compose]
+  when: telemetry_docker.rc != 0
+
+- name: The telemetry directory
+  ansible.builtin.file:
+    path: /opt/zebridge-telemetry
+    state: directory
+    mode: "0755"
+
+- name: The compose file and Alloy's configuration (telemetry/vps)
+  ansible.builtin.copy:
+    src: "{{ zb_repo }}/telemetry/vps/{{ item }}"
+    dest: "/opt/zebridge-telemetry/{{ item }}"
+    mode: "0644"
+  loop: [docker-compose.yml, config.alloy]
+  register: telemetry_files
+
+- name: The Grafana Cloud token (0600)
+  ansible.builtin.copy:
+    dest: /opt/zebridge-telemetry/.env.grafana
+    content: "GRAFANA_PASSWORD={{ vault_grafana_password }}\n"
+    mode: "0600"
+  no_log: true
+  register: telemetry_token
+
+- name: Alloy and the exporter up (recreated when a file changed)
+  ansible.builtin.command: docker compose up -d --remove-orphans {{ '--force-recreate' if (telemetry_files.changed or telemetry_token.changed) else '' }}
+  args:
+    chdir: /opt/zebridge-telemetry
+  register: telemetry_compose_up
+  changed_when: "'Started' in telemetry_compose_up.stderr or 'Recreated' in telemetry_compose_up.stderr or 'Created' in telemetry_compose_up.stderr"

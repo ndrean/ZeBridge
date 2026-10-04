@@ -1,0 +1,3 @@
+# Yours, not the repository's: the host, and the secrets (even encrypted).
+inventory.yml
+group_vars/zebridge/vault.yml

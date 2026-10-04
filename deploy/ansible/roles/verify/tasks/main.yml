@@ -1,0 +1,25 @@
+# The doctor, as the service user: its env files loaded in the same shell (sudo starts a
+# clean environment), its permissions — what the bridge itself will have. The run fails
+# when the diagnosis is not clean.
+
+- name: The diagnosis (bridge --diagnose)
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - "set -a; . /etc/zebridge/.env.bridge; . /etc/zebridge/.env.nats; set +a; exec bridge --diagnose"
+  become: true
+  become_user: zebridge
+  register: verify_diagnose
+  changed_when: false
+  failed_when: false
+
+- name: The diagnosis's last lines
+  ansible.builtin.debug:
+    msg: "{{ (verify_diagnose.stderr_lines + verify_diagnose.stdout_lines) | select('search', '🔴|DIAGNOSE') | list }}"
+
+- name: All clear, or stop here
+  ansible.builtin.assert:
+    that: verify_diagnose.rc == 0
+    fail_msg: "bridge --diagnose found problems (exit {{ verify_diagnose.rc }}): see the lines above"
+    success_msg: "🩺 DIAGNOSE: all clear"

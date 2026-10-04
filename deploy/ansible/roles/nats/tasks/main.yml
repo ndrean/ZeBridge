@@ -1,0 +1,88 @@
+# The NATS configuration comes from the bridge (`--init-nats operator`), ONCE: running it
+# again would make a new operator, and every enrolled device would be refused. Then the
+# listeners are set, each edit checked by `nats-server -t` before it is written.
+
+- name: The configuration, generated once (operator, accounts, the bridge's creds)
+  ansible.builtin.command: bridge --init-nats operator --dir /etc/zebridge
+  args:
+    creates: /etc/zebridge/nats-server.conf
+
+- name: JetStream's directory
+  ansible.builtin.file:
+    path: /etc/zebridge/nats-data
+    state: directory
+    owner: nats
+    group: nats
+    mode: "0750"
+
+# Monitoring (/varz, /jsz) for the exporter on this host only: it lists connections and
+# subjects.
+- name: Monitoring on loopback
+  ansible.builtin.replace:
+    path: /etc/zebridge/nats-server.conf
+    regexp: '^http_port: 8222$'
+    replace: 'http: "127.0.0.1:8222"'
+    validate: nats-server -t -c %s
+  notify: Restart nats
+
+# Clients on the internet: TLS on 4222 with the Let's Encrypt certificate. Every client of
+# this port must then use TLS — the bridge and the services included (tls://nats.<domain>).
+- name: TLS on the client port, and a ping under Cloudflare's 100 s idle cut
+  ansible.builtin.blockinfile:
+    path: /etc/zebridge/nats-server.conf
+    marker: "# {mark} zebridge ansible: client TLS"
+    insertafter: '^port: 4222$'
+    block: |
+      tls {
+        cert_file: "/etc/zebridge/tls/nats.crt"
+        key_file:  "/etc/zebridge/tls/nats.key"
+      }
+      ping_interval: "1m"
+    validate: nats-server -t -c %s
+  notify: Restart nats
+
+# Browsers through Cloudflare ("Full (strict)"): TLS with the origin certificate.
+- name: The websocket listener with TLS
+  ansible.builtin.replace:
+    path: /etc/zebridge/nats-server.conf
+    regexp: '(?ms)^websocket \{\n  port: 8080\n  no_tls: true\n\}'
+    replace: |-
+      websocket {
+        port: 8080
+        tls {
+          cert_file: "/etc/zebridge/tls/origin.crt"
+          key_file:  "/etc/zebridge/tls/origin.key"
+        }
+      }
+    validate: nats-server -t -c %s
+  notify: Restart nats
+
+- name: The nats.service unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/nats.service
+    mode: "0644"
+    content: |
+      [Unit]
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      User=nats
+      ExecStart=/usr/local/bin/nats-server -c /etc/zebridge/nats-server.conf
+      ExecReload=/bin/kill -s HUP $MAINPID
+      Restart=on-failure
+      LimitNOFILE=65536
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: Restart nats
+
+- name: NATS running
+  ansible.builtin.systemd_service:
+    name: nats
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Restart NATS now if its configuration changed, before the bridge starts
+  ansible.builtin.meta: flush_handlers

@@ -1,0 +1,95 @@
+# examples/10-airports' responder: Python, zb-python, libzb for Linux, DuckDB's library.
+# Its creds are minted once, from operator.store — which must still be on the server
+# (README.md: move it off afterwards).
+
+- name: The airports responder
+  when: zb_airports | bool
+  block:
+    - name: DuckDB's library (official release)
+      ansible.builtin.unarchive:
+        src: "https://github.com/duckdb/duckdb/releases/download/v{{ duckdb_version }}/libduckdb-linux-{{ zb_arch }}.zip"
+        dest: /usr/local/lib
+        remote_src: true
+        include: [libduckdb.so]
+        creates: /usr/local/lib/libduckdb.so
+      notify: Restart airports
+
+    - name: The libzb library for Linux
+      ansible.builtin.copy:
+        src: "{{ zb_libzb }}"
+        dest: /usr/local/lib/libzbcore.so
+        mode: "0644"
+      notify: Restart airports
+
+    - name: The library cache (ldconfig)
+      ansible.builtin.command: ldconfig
+      changed_when: false
+
+    - name: The service's code directory
+      ansible.builtin.file:
+        path: /opt/airports
+        state: directory
+        mode: "0755"
+
+    - name: The zb-python package and the service
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "0644"
+      loop:
+        - { src: "{{ zb_repo }}/zb-python/src/zebridge", dest: /opt/airports/ }
+        - { src: "{{ zb_repo }}/examples/10-airports/airport_service.py", dest: /opt/airports/airport_service.py }
+      notify: Restart airports
+
+    - name: The replica's directory
+      ansible.builtin.file:
+        path: /var/lib/airports
+        state: directory
+        owner: zebridge
+        mode: "0750"
+
+    - name: The responder's creds, minted once (needs operator.store on the server)
+      ansible.builtin.shell: >-
+        umask 077 &&
+        bridge --mint-responder --store /etc/zebridge/operator.store --name airports --tenant _default
+        > /etc/zebridge/creds/airports.creds
+      args:
+        creates: /etc/zebridge/creds/airports.creds
+
+    - name: The creds belong to the service user
+      ansible.builtin.file:
+        path: /etc/zebridge/creds/airports.creds
+        owner: zebridge
+        mode: "0600"
+
+    - name: The airports.service unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/airports.service
+        mode: "0644"
+        content: |
+          [Unit]
+          After=zebridge.service
+          Wants=zebridge.service
+
+          [Service]
+          User=zebridge
+          Environment=ZB_LIB=/usr/local/lib/libzbcore.so
+          Environment=PYTHONPATH=/opt/airports
+          # A pipe, not a terminal: without this, Python holds each line in a buffer and
+          # the questions reach the journal (and Grafana) late, in bursts.
+          Environment=PYTHONUNBUFFERED=1
+          ExecStart=/usr/bin/python3 /opt/airports/airport_service.py --url tls://{{ zb_host_nats }}:4222 \
+            --creds /etc/zebridge/creds/airports.creds --db /var/lib/airports/airports.duckdb
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart airports
+
+    - name: The responder running
+      ansible.builtin.systemd_service:
+        name: airports
+        enabled: true
+        state: started
+        daemon_reload: true

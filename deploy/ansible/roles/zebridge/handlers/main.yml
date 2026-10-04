@@ -1,0 +1,7 @@
+# The bridge stops cleanly on SIGTERM and resumes from its slot; clients reconnect.
+- name: Restart zebridge
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: restarted
+    daemon_reload: true
+  loop: [zebridge, zebridge-sweeper]

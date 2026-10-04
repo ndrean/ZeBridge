@@ -1,0 +1,41 @@
+# HAProxy guards the bridge's HTTP endpoint behind Cloudflare. Its configuration is the
+# repository's proxy/haproxy.cfg — one source — with Debian's paths and this domain.
+
+- name: HAProxy
+  ansible.builtin.apt:
+    name: haproxy
+
+- name: The certificates' directory
+  ansible.builtin.file:
+    path: /etc/haproxy/certs
+    state: directory
+    mode: "0700"
+
+- name: The origin certificate and key, in one file
+  ansible.builtin.copy:
+    dest: /etc/haproxy/certs/bridge.pem
+    content: "{{ vault_origin_cert | trim }}\n{{ vault_origin_key | trim }}\n"
+    mode: "0600"
+  no_log: true
+  notify: Restart haproxy
+
+- name: Cloudflare's ranges, one per line
+  ansible.builtin.copy:
+    dest: /etc/haproxy/cloudflare-ips.lst
+    content: "{{ base_cloudflare_ranges | join('\n') }}\n"
+    mode: "0644"
+  notify: Restart haproxy
+
+- name: HAProxy's configuration, from proxy/haproxy.cfg
+  ansible.builtin.copy:
+    dest: /etc/haproxy/haproxy.cfg
+    content: "{{ lookup('file', zb_repo + '/proxy/haproxy.cfg') | replace('/usr/local/etc/haproxy', '/etc/haproxy') | replace('my-domain.com', zb_domain) }}\n"
+    mode: "0644"
+    validate: haproxy -c -f %s
+  notify: Restart haproxy
+
+- name: HAProxy running
+  ansible.builtin.systemd_service:
+    name: haproxy
+    enabled: true
+    state: started

@@ -1,0 +1,31 @@
+# Settings that are not secrets. The secrets are in vault.yml (see vault.example.yml).
+
+zb_domain: zebridge.eu
+zb_host_bridge: "bridge.{{ zb_domain }}"     # proxied (orange) -> HAProxy :443
+zb_host_ws: "ws.{{ zb_domain }}"             # proxied, Origin Rule -> NATS websocket :8080
+zb_host_nats: "nats.{{ zb_domain }}"         # DNS only (grey) -> NATS :4222
+
+# The database side the DBA prepared (the init SQL is applied from their machine).
+zb_publication: my_pub
+zb_slot: zb_slot
+
+# What gets copied: the Linux builds from this repository (see README.md).
+zb_repo: "{{ playbook_dir }}/../.."
+zb_bin_dir: "{{ zb_repo }}/zig-out/linux-x86_64/bin"
+zb_libzb: "{{ zb_repo }}/libzb/zig-out/linux-x86_64/lib/libzbcore.so"
+
+# Downloaded on the server. arch: amd64 or arm64.
+zb_arch: amd64
+nats_version: "2.15.0"   # what the VPS runs
+duckdb_version: "1.5.5"
+
+letsencrypt_email: "you@example.com"
+
+# The enrollment JWT lifetime handed to clients.
+enroll_jwt_ttl_seconds: 86400
+
+# The airports responder (examples/10-airports).
+zb_airports: true
+
+# Telemetry: telemetry/vps/ is copied as it is (its config.alloy names the Grafana Cloud
+# endpoints); the token is vault_grafana_password.
