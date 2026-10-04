@@ -327,8 +327,9 @@ Kotlin, Dart, Swift, React Native's native module) and zb-client-ts (TypeScript:
 browser, Node, React Native's JS). The owner is not settled:
 - **Keep zb-client-ts.** Stable against Zig's churn (a Zig release cannot break the
   browser client) — but double work on every protocol change (the fixtures catch drift,
-  not effort), and slower where it matters: seeding the large table took 725 s in
-  JavaScript (Hermes) against 71 s in libzb on the same iPhone (§10ix).
+  not effort), and slower where it matters: seeding the large table (3 M rows, 1 GB)
+  took 518 s in JavaScript (Hermes, Release; 725 s in Debug) against 71 s in libzb on
+  the same iPhone 12 (§10iy, §10ja).
 - **One core, libzb everywhere.** Native hosts already use it; the browser would run it
   as WebAssembly. One implementation of the rules; but Zig's churn now reaches the
   browser, and the I/O a browser forces (WebSocket, OPFS, timers) needs a JS shell anyway.
