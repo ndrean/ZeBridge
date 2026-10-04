@@ -2450,6 +2450,7 @@ reading and how far behind. Clients say so themselves, cooperatively.
 **A client writes one key, its own:**
 
     subject  $KV.<kv.live>.<tenant>.<principal>          (kv.live is "live" in grammar.json)
+             $JS.<domain>.API.$KV.<kv.live>.<tenant>.<principal>   with a JetStream domain
     payload  {"principal":"omar","tenant":"acme","ts":1757150000123,
               "streams":{"CDC_acme":1234,"CDC_PUBLIC":56},
               "pending":{"CDC_acme":0,"CDC_PUBLIC":3}}
@@ -2457,6 +2458,10 @@ reading and how far behind. Clients say so themselves, cooperatively.
 - `<tenant>` is the tenant the client resolved (§6 "The Connection Flow"), `_default`
   for an unmapped principal; `<principal>` is its NATS user name. The per-principal
   grant allows exactly this key and no other (`$KV.live.{{tag(tenant)}}.{{name()}}`).
+- With a JetStream domain (`js_domain` from /enroll), the beat goes through the
+  domain's API, on the hub as behind a leaf: the hub maps `$JS.<domain>.API.$KV.>`
+  onto its buckets, and does not announce a bare `$KV.>` across a leaf link. The grant
+  then allows both forms of the key.
 - `ts` is the client's clock, unix milliseconds. `streams` maps each CDC stream the
   client tails to the **last sequence it has applied** — the same number it persists
   as its position (§5 "Two positions").
@@ -2468,8 +2473,10 @@ reading and how far behind. Clients say so themselves, cooperatively.
   inside `poll`, so a host that polls is a host that beats. The bucket keeps ONE value
   per key and carries a TTL (bridge `FLEET_TTL_SECONDS`, default 90): a client that
   stops beating drops out by itself. Nothing is ever deleted by hand.
-- A failed beat is not an error a client should surface: it is retried on the next
-  turn. The beat is a report, never a request.
+- The beat is a report, never a request: a plain NATS publish, with no PubAck awaited
+  and no retry. A lost beat is replaced by the next one, and a client whose beats never
+  arrive drops out through the TTL. A failed beat is not an error a client should
+  surface.
 
 **The bridge reads the whole bucket** on its own cadence (`FLEET_POLL_SECONDS`,
 default 60), asks JetStream for each named stream's head, and exposes on `/metrics`.

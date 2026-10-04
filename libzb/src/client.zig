@@ -4772,10 +4772,14 @@ pub const SyncClient = struct {
     }
 
     /// Fleet observability (NOTES §10dc): once per `heartbeat_ms`, publish this client's
-    /// applied position per CDC stream to `$KV.<live>.<tenant>.<principal>` — last value
+    /// applied position per CDC stream to `$KV.<live>.<tenant>.<principal>` (behind
+    /// `$JS.<domain>.API.` when the deployment has a JetStream domain) — last value
     /// per key, TTL on the bucket, so a client that stops beating simply goes stale. The
     /// bridge reads the bucket on its own cadence and turns head − applied into lag.
-    /// Cooperative: a failed beat is printed and retried on the next turn, never fatal.
+    /// A report, never a request: a core publish, no PubAck awaited. A JetStream publish
+    /// blocked the host's thread on the ack, and where no stream answered (through a
+    /// leaf node, §10lj) nats.zig retried twice 250 ms apart — every poll, since a failed
+    /// beat stayed due. A lost beat is replaced by the next; the bucket's TTL says stale.
     fn notePending(self: *SyncClient, stream: []const u8, n: u64) void {
         if (self.last_pending.getPtr(stream)) |p| {
             p.* = n;
@@ -4802,8 +4806,14 @@ pub const SyncClient = struct {
         const beats: []const []const u8 = if (self.tenants.len > 0) self.tenants else self.open_tenants;
         for (beats) |tenant| {
             const payload = try core.heartbeatPayload(a, self.opts.principal, tenant, now, streams, seqs, pending);
-            const subject = try std.fmt.allocPrint(a, "$KV.{s}.{s}.{s}", .{ self.kv_live, tenant, self.opts.principal });
-            try self.t.publish(subject, payload, null);
+            // With a JetStream domain, a KV put goes through the domain's API: the hub maps
+            // `$JS.<domain>.API.$KV.>` onto its buckets and never announces a bare `$KV.>`
+            // to a leaf (§10lk). The same subject works on the hub itself.
+            const subject = if (self.opts.js_domain) |d|
+                try std.fmt.allocPrint(a, "$JS.{s}.API.$KV.{s}.{s}.{s}", .{ d, self.kv_live, tenant, self.opts.principal })
+            else
+                try std.fmt.allocPrint(a, "$KV.{s}.{s}.{s}", .{ self.kv_live, tenant, self.opts.principal });
+            try self.t.publishCore(subject, payload);
         }
         self.last_heartbeat_ms = now;
     }

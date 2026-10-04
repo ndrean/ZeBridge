@@ -345,8 +345,9 @@ pub const Transport = struct {
         return self.conn.queueSubscribeSync(subject, queue);
     }
 
-    /// A CORE publish, not JetStream: a reply goes to the asker's inbox, where no
-    /// stream is listening and no ack is coming.
+    /// A CORE publish, not JetStream: nothing is awaited. For a reply (it goes to the
+    /// asker's inbox, where no stream is listening and no ack is coming) and for the
+    /// fleet heartbeat (a report: the stream stores it, nobody waits for the ack).
     pub fn publishCore(self: *Transport, subject: []const u8, data: []const u8) !void {
         try self.conn.publish(subject, data);
     }

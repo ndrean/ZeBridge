@@ -18781,3 +18781,33 @@ zb-python package stopped the airports service (`libzb speaks ABI 5, this packag
 restart loop, "no responders" for every client. A libzb update on a host must ship every
 binding that loads it there; the Ansible `airports` role should copy the package from the
 same build as the library.
+
+## §10lk — the fleet heartbeat blocked libzb's poll through the leaf: now a core publish (2026-10-04)
+
+Through the leaf, the iPhone's airports requests took 250–500 ms, against 30–40 ms with
+the same build on the hub and 33 ms for libzb from the Mac. TCP was clean on the leaf
+(`ss -ti`: rtt 17 ms, no retransmits, pmtu 1500). The leaf's protocol trace showed the
+cause: once per poll the phone published its heartbeat to `$KV.live.acme.leaf1-phone`
+three times, 270 ms apart, and nothing answered. libzb sent the beat with a JetStream
+publish, which waits for a PubAck; on no responders nats.zig retries twice after 250 ms
+(nats.go's defaults); a failed beat stayed due, so every poll paid ~540 ms, and a request
+waited behind it. The Mac test had missed it with `heartbeat_ms=0`; reproduced with the
+beat on (leaf: median 240 ms, max 544 ms, 15 × `heartbeat: NoStreamResponse`). The
+browser beats the same way but does not wait, so it stayed fast.
+
+The beat is now a core publish in libzb and zb-client-ts, as PROTOCOL §11 already said
+("a report, never a request"). Leaf, beat on: median 34 ms, max 40 ms; the phone on the
+leaf is as fast as on the hub. Built into the iPhone app and the Linux `libzbcore.so`.
+
+Then why no stream answered: the leaf forwarded neither the phone's `PUB` nor the
+browser's `HPUB` on `$KV.live.>`. The hub announces to the leaf the subjects of its other
+streams (`cdc.*`, `mutation.>`, `$O.gen-*`) but no `$KV.*` at all; it announces
+`$JS.hub.API.$KV.>` instead, its mapping of a put from another domain onto its buckets
+(two domains may each hold a bucket of the same name). Probed with the `nats` CLI: a put
+to `$JS.hub.API.$KV.live.acme.probe` from the leaf and on the hub itself is acked by
+`KV_live`, domain hub; a bare `$KV.live…` from the leaf has no responders. So with a
+JetStream domain, libzb and zb-client-ts beat to `$JS.<domain>.API.$KV.live.<tenant>.
+<principal>`, and `--init-nats` grants that form beside the bare one (clients enrolled
+before the domain still beat bare, on the hub). Deployed by `--init-nats --update` on
+the hub (account re-signed, same keys, no device re-issued) and the new account JWT
+copied into the leaf's `trust.conf`: the phone's beat lands in `live` through the leaf.

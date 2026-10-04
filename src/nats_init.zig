@@ -236,9 +236,12 @@ fn roleAllows(
     try P.add(&pubs, a, "{s}DIRECT.GET.{s}.{s}.{{{{name()}}}}.>", .{ js_api, verdicts, subj_ack });
     switch (role) {
         .client => {
-            // §10dc: the fleet heartbeat — a client may write ONLY its own key.
-            try P.add(&pubs, a, "$KV.{s}.{{{{tag(tenant)}}}}.{{{{name()}}}}", .{kv_live});
-            try P.add(&pubs, a, "$KV.{s}.{s}.{{{{name()}}}}", .{ kv_live, open });
+            // §10dc: the fleet heartbeat — a client may write ONLY its own key. With a
+            // domain the put goes through `$JS.<domain>.API.$KV.` (§10lk): a leaf never
+            // sees a bare `$KV.>`. roleAllowsFor merges this with the plain call's bare key.
+            const kv_put: []const u8 = if (std.mem.eql(u8, js_api, "$JS.API.")) "" else js_api;
+            try P.add(&pubs, a, "{s}$KV.{s}.{{{{tag(tenant)}}}}.{{{{name()}}}}", .{ kv_put, kv_live });
+            try P.add(&pubs, a, "{s}$KV.{s}.{s}.{{{{name()}}}}", .{ kv_put, kv_live, open });
             // §10hj: a client may ASK its tenant's services (request/reply; the reply lands on
             // its own inbox, granted below).
             try P.add(&pubs, a, "{s}.{{{{tag(tenant)}}}}.>", .{subj_query});
@@ -326,9 +329,13 @@ test "a domain grants both prefixes, once each" {
     const mut = "\"mutation.{{name()}}.>\"";
     const first = std.mem.indexOf(u8, both.pub_json, mut).?;
     try std.testing.expect(std.mem.indexOfPos(u8, both.pub_json, first + 1, mut) == null);
+    // the heartbeat key: through the domain's API, and bare for a server without one
+    try std.testing.expect(std.mem.indexOf(u8, both.pub_json, "\"$JS.hub.API.$KV.live.{{tag(tenant)}}.{{name()}}\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, both.pub_json, "\"$KV.live.{{tag(tenant)}}.{{name()}}\"") != null);
     // without a domain: the plain prefix alone
     const plain = try roleAllowsFor(aa, &owned.topology, .client, null);
     try std.testing.expect(std.mem.indexOf(u8, plain.pub_json, "$JS.hub.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain.pub_json, "$JS.API.$KV.") == null);
 }
 
 fn joinJson(

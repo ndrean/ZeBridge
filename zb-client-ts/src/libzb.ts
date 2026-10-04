@@ -4229,20 +4229,25 @@ export class ZeBridge {
   /// WebSocket believing it is open with no 'disconnect' ever fired. Acts only on
   /// transitions — the recovery transition is the one nc.status() might never report.
   /// PROTOCOL §11: the fleet heartbeat — this client's applied position per CDC stream,
-  /// to `$KV.live.<tenant>.<principal>` (last value per key, TTL on the bucket, so a
+  /// to `$KV.live.<tenant>.<principal>`, behind `$JS.<domain>.API.` with a JetStream
+  /// domain (last value per key, TTL on the bucket, so a
   /// client that stops beating drops off the bridge's fleet metrics by itself). The
-  /// payload is core.heartbeatPayload, fixture-pinned with libzb. Cooperative: a failed
-  /// beat is logged and the next interval tries again.
+  /// payload is core.heartbeatPayload, fixture-pinned with libzb. A report, never a
+  /// request: a core publish, no PubAck awaited (as libzb); a lost beat is replaced by
+  /// the next, and the bucket's TTL says stale.
   private async sendHeartbeat() {
     if (!this.nc) return;
     const tenant = this.tenantValue || this.config.grammar?.open_tenant || '_default';
     const bucket = this.config.grammar?.kv?.live ?? 'live';
-    const subject = `$KV.${bucket}.${tenant}.${this.config.principal}`;
+    // With a JetStream domain, through the domain's API (as libzb): the hub maps
+    // `$JS.<domain>.API.$KV.>` onto its buckets and never announces a bare `$KV.>` to a leaf.
+    const pre = this.config.jsDomain ? `$JS.${this.config.jsDomain}.API.` : '';
+    const subject = `${pre}$KV.${bucket}.${tenant}.${this.config.principal}`;
     try {
       const payload = heartbeatPayload(this.config.principal!, tenant, Date.now(), this.globalSyncState.seq, this.lastPending);
-      await this.transport.jetstream(this.nc, this.jsOpts()).publish(subject, new TextEncoder().encode(payload));
+      this.nc.publish(subject, new TextEncoder().encode(payload));
     } catch (err) {
-      this.appendLog('SYS', `heartbeat not accepted (${subject}): ${err}`, 'WARNING');
+      this.appendLog('SYS', `heartbeat not sent (${subject}): ${err}`, 'WARNING');
     }
   }
 
