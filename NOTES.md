@@ -311,14 +311,32 @@ installs a package ever meets the compiler.
   `zebridge` users, the systemd units, an empty /etc/zebridge — what the playbook's base,
   binaries and zebridge roles do. NATS stays a separate package (nats-server). Served
   from an apt repository (a signed repo on R2 or GitHub Pages, or Cloudsmith, or a PPA).
-  A `libzb` .deb for services on Linux (libzbcore.so; DuckDB stays the host's).
 - **Homebrew:** a tap (`ndrean/zebridge`) with bottles for macOS arm64 and Linux: the
-  bridge and the sweeper (`depends_on "libpq"`, `"zstd"`), and libzb (the .dylib and,
-  later, `zb.h`). `brew services` can run the bridge on a Mac for development.
+  bridge and the sweeper (`depends_on "libpq"`, `"zstd"`). `brew services` can run the
+  bridge on a Mac for development.
 - Built by CI on each tag, with the cross-builds deploy/build-linux.sh already does;
   checksums and signatures beside the artifacts.
-Related: DISTRIBUTION.md "What is missing" (the client-side packages: xcframework zip,
-AAR on Maven, desktop tarballs with the header).
+- **Not decided — the client side.** Which client packages exist depends on the open
+  question of one client core (§1.11): libzb as a .deb/.dylib, an npm package, both, or
+  libzb compiled to WebAssembly for the browser. The server packages above do not wait
+  for it. Not proposed publicly yet (DISTRIBUTION.md lists the client artifacts only).
+
+### 1.11 OPEN — one client core, or two (2026-10-04)
+Today two cores, pinned identical by the fixtures (39 groups): libzb (Zig, C ABI: Python,
+Kotlin, Dart, Swift, React Native's native module) and zb-client-ts (TypeScript: the
+browser, Node, React Native's JS). The owner is not settled:
+- **Keep zb-client-ts.** Stable against Zig's churn (a Zig release cannot break the
+  browser client) — but double work on every protocol change (the fixtures catch drift,
+  not effort), and slower where it matters: seeding the large table took 725 s in
+  JavaScript (Hermes) against 71 s in libzb on the same iPhone (§10ix).
+- **One core, libzb everywhere.** Native hosts already use it; the browser would run it
+  as WebAssembly. One implementation of the rules; but Zig's churn now reaches the
+  browser, and the I/O a browser forces (WebSocket, OPFS, timers) needs a JS shell anyway.
+- **A middle path to weigh:** only the pure decisions (`core.zig`: seed gates, chain
+  plans, merges, versions — what the fixtures pin) as WebAssembly inside zb-client-ts,
+  the I/O staying TypeScript. Removes the second implementation of the rules without
+  porting the I/O; first measure the cost of a WASM call in the per-event CDC path.
+Packaging (§1.10, client side) waits for this.
 
 ## 2. Bugs found — with the mechanism, so they are not reintroduced
 
