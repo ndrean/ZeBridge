@@ -301,6 +301,25 @@ with its own signing key, and a client tail that is a FILTERED consumer — whic
 second gap rule (a sequence jump on a filtered tail is not a gap). The owner called it a
 forgotten point on 2026-10-01; the README describes the two built shapes only.
 
+### 1.10 OPEN — `brew install zebridge`, `apt install zebridge` (2026-10-04)
+Today a server is set up from binaries built on a Mac (deploy/build-linux.sh) and copied,
+or by the Ansible playbook (deploy/ansible); a developer builds libzb from source. The
+owner wants the usual one-line installs, which also answer "Zig is < 1.0": nobody who
+installs a package ever meets the compiler.
+- **apt:** a `zebridge` .deb per architecture (amd64, arm64): `bridge` and
+  `bridge_sweeper` in /usr/bin, `Depends: libpq5 (>= 14), libzstd1`, the `nats` and
+  `zebridge` users, the systemd units, an empty /etc/zebridge — what the playbook's base,
+  binaries and zebridge roles do. NATS stays a separate package (nats-server). Served
+  from an apt repository (a signed repo on R2 or GitHub Pages, or Cloudsmith, or a PPA).
+  A `libzb` .deb for services on Linux (libzbcore.so; DuckDB stays the host's).
+- **Homebrew:** a tap (`ndrean/zebridge`) with bottles for macOS arm64 and Linux: the
+  bridge and the sweeper (`depends_on "libpq"`, `"zstd"`), and libzb (the .dylib and,
+  later, `zb.h`). `brew services` can run the bridge on a Mac for development.
+- Built by CI on each tag, with the cross-builds deploy/build-linux.sh already does;
+  checksums and signatures beside the artifacts.
+Related: DISTRIBUTION.md "What is missing" (the client-side packages: xcframework zip,
+AAR on Maven, desktop tarballs with the header).
+
 ## 2. Bugs found — with the mechanism, so they are not reintroduced
 
 ### 2.1 Heterogeneous batches published under one subject  ← worst of the session

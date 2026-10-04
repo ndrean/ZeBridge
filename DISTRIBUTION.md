@@ -144,3 +144,6 @@ connect: rebuild every native client when `grammar.json` changes.
   own declarations. The header should be generated from that file.
 - **Release packaging:** an xcframework zip, the AAR, a tarball per desktop platform
   with the header, and checksums.
+- **Packages for the server and for desktop hosts:** `apt install zebridge` (the bridge,
+  the sweeper, their users and systemd units) and `brew install zebridge` (the same, and
+  libzb), so that running ZeBridge never needs a Zig compiler.
