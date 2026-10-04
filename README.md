@@ -932,6 +932,7 @@ See [Replication slot management](#replication-slot-management) for details abou
   --init-nats --update        Re-sign the account after a grammar change, same keys
       [--dir DIR]             …the directory holding nats-server.conf (default ./zb-nats)
       [--store PATH]          …the offline seeds (default DIR/operator.store)
+      [--js-domain NAME]      …add a domain to a running stack that has none (a first leaf); enrolled devices keep working
   
   --init-sql      The init SQL for this database, on stdout (pipe it to psql). Reads
                   DATABASE_READER_URL, DATABASE_WRITER_URL, BRIDGE_CDC_PUBLICATION

@@ -18699,3 +18699,42 @@ The order:
 5. Then switch the default (`zvm use 0.17.0`) and the CI/Dockerfiles' Zig URLs
    (Dockerfile.bridge, Dockerfile.sweeper, deploy/build-linux.sh, the build-libzb
    scripts' docs).
+
+## §10lh — a JetStream domain needs BOTH prefixes granted; `--update --js-domain` adds one to a running stack (2026-10-04)
+
+Preparing a leaf for zebridge.eu, whose hub was generated without a domain. Two findings.
+
+**A domain-only grant refuses clients connected to the hub itself.** `--init-nats
+--js-domain` granted `$JS.<domain>.API.` alone (§10is: "a grant there would let a client
+talk to the wrong JetStream"). Measured on a stack made with `--js-domain hub`, a
+responder connected to the hub: plain prefix → `Publish Violation` logged; domain prefix
+→ no violation logged, and the request never answers. The hub maps its own domain's
+prefix onto `$JS.API.` and checks permissions on the result, silently (your §10hl note:
+"permissions are checked on the mapped subject"). §10is-b proved only clients BEHIND a
+leaf, checked by the leaf before the link. So every `--js-domain` stack served leaf
+clients and refused direct ones.
+
+Fix: with a domain, `roleAllowsFor` grants both prefixes, deduplicated. The "wrong
+JetStream" worry does not hold for the planned leaves: a JetStream-less leaf (T1) does
+not carry `$JS.API.` over the link (measured below), and a leaf with its own JetStream
+would answer only for streams that exist there, which ZeBridge's grants do not name.
+
+**`--update --js-domain NAME`** adds a domain to a stack that has none, same keys:
+`JS_DOMAIN` in operator.store, `domain:` in the conf's `jetstream {}`, `NATS_JS_DOMAIN`
+in .env.nats, the account re-signed with both prefixes. Enrolled devices keep working (the
+plain prefix stays granted); their next renewal hands them `js_domain`. Changing an
+existing domain is still refused: devices behind its leaves would lose JetStream. Restart
+NATS after it (a JetStream setting), then the bridge.
+
+Measured locally, a stream with one message, a responder as the client:
+
+| | plain prefix | domain prefix |
+| --- | --- | --- |
+| live stack, before `--update` | ok | refused (no domain) |
+| after `--update --js-domain hub` + restart | ok, message kept | ok |
+| new stack `--js-domain hub`, client on the hub | ok (refused before the fix) | ok (refused before the fix) |
+| client on a JetStream-less leaf | refused (the link) | ok, over the link |
+
+Not generated: the hub's `leafnodes { port: 7422; no_advertise: true; tls {…} }` and the
+leaf's conf (the hub's operator and resolver_preload, a remote with the bridge's creds and
+`account: <ZEBRIDGE key>`) — written by hand for now.

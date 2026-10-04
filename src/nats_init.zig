@@ -131,8 +131,7 @@ test "roleAllows names the API under the domain's prefix, or the plain one" {
     try std.testing.expect(std.mem.indexOf(u8, plain.pub_json, "$JS.hub.") == null);
     const hub = try roleAllows(aa, &owned.topology, .responder, try jsApiPrefix(aa, "hub"));
     try std.testing.expect(std.mem.indexOf(u8, hub.pub_json, "\"$JS.hub.API.INFO\"") != null);
-    // Nothing under the plain prefix survives: a grant there would let a client
-    // talk to the wrong JetStream.
+    // roleAllows renders ONE prefix; roleAllowsFor adds the plain one beside a domain.
     try std.testing.expect(std.mem.indexOf(u8, hub.pub_json, "$JS.API.") == null);
     // The ack subjects carry the domain too, and `$JS.ACK.>` still covers them.
     try std.testing.expect(std.mem.indexOf(u8, hub.pub_json, "\"$JS.ACK.>\"") != null);
@@ -277,6 +276,61 @@ fn roleAllows(
     };
 }
 
+/// A role's grants: under `$JS.API.`, and with a domain under `$JS.<domain>.API.` too.
+/// Both are needed, measured 2026-10-04 (NOTES §10lh): a client behind a leaf sends
+/// `$JS.<domain>.API.…`, checked by the leaf before the link; a client connected to the
+/// hub itself may send either, but the hub maps its own domain's prefix onto `$JS.API.`
+/// and checks permissions on the result — silently: no violation is logged, the request
+/// just never answers. So a domain-only grant served leaf clients and refused direct ones.
+fn roleAllowsFor(
+    a: std.mem.Allocator,
+    topo: *const topology_mod.Topology,
+    role: Role,
+    js_domain: ?[]const u8,
+) !struct { pub_json: []u8, sub_json: []u8 } {
+    const own = try roleAllows(a, topo, role, try jsApiPrefix(a, js_domain));
+    if (js_domain == null) return .{ .pub_json = own.pub_json, .sub_json = own.sub_json };
+    const plain = try roleAllows(a, topo, role, try jsApiPrefix(a, null));
+    return .{
+        .pub_json = try mergeJsonLists(a, own.pub_json, plain.pub_json),
+        .sub_json = try mergeJsonLists(a, own.sub_json, plain.sub_json),
+    };
+}
+
+/// Two `"a","b"` lists as one, first-seen order, no duplicates (subjects hold no comma).
+fn mergeJsonLists(a: std.mem.Allocator, x: []const u8, y: []const u8) ![]u8 {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var buf: std.ArrayList(u8) = .empty;
+    for ([_][]const u8{ x, y }) |list| {
+        var it = std.mem.splitScalar(u8, list, ',');
+        while (it.next()) |item| {
+            if (item.len == 0) continue;
+            const gop = try seen.getOrPut(a, item);
+            if (gop.found_existing) continue;
+            if (buf.items.len > 0) try buf.append(a, ',');
+            try buf.appendSlice(a, item);
+        }
+    }
+    return buf.toOwnedSlice(a);
+}
+
+test "a domain grants both prefixes, once each" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const owned = try topology_mod.loadEmbedded(aa);
+    const both = try roleAllowsFor(aa, &owned.topology, .client, "hub");
+    try std.testing.expect(std.mem.indexOf(u8, both.pub_json, "\"$JS.hub.API.INFO\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, both.pub_json, "\"$JS.API.INFO\"") != null);
+    // the lines without a prefix (mutations, acks, inboxes) appear once
+    const mut = "\"mutation.{{name()}}.>\"";
+    const first = std.mem.indexOf(u8, both.pub_json, mut).?;
+    try std.testing.expect(std.mem.indexOfPos(u8, both.pub_json, first + 1, mut) == null);
+    // without a domain: the plain prefix alone
+    const plain = try roleAllowsFor(aa, &owned.topology, .client, null);
+    try std.testing.expect(std.mem.indexOf(u8, plain.pub_json, "$JS.hub.") == null);
+}
+
 fn joinJson(
     a: std.mem.Allocator,
     items: [][]u8,
@@ -357,6 +411,7 @@ pub fn run(
                 force = true;
             } else if (std.mem.eql(u8, arg, "--update")) {
                 update = true;
+
             } else if (std.mem.eql(u8, arg, "--store")) {
                 store_path = it.next() orelse return usageErr("--store needs a path");
             } else if (std.mem.eql(u8, arg, "--dir")) {
@@ -379,10 +434,9 @@ pub fn run(
         }
     }
     if (update) {
-        // The domain is part of the conf and the env as well as the grants: changing it
-        // is a new stack, not an update.
-        if (js_domain != null) return usageErr("--update keeps the store's JS domain; --js-domain is for a new stack");
-        return runUpdate(io, dir, store_path);
+        // `--js-domain` with `--update` ADDS a domain to a stack that has none (a leaf
+        // joins a running deployment); changing one stays a new stack (runUpdate says so).
+        return runUpdate(io, dir, store_path, js_domain);
     }
     if (store_path != null) return usageErr("--store goes with --update");
     if (nats_port == http_port or nats_port == ws_port or http_port == ws_port)
@@ -425,7 +479,7 @@ pub fn run(
 }
 
 fn usageErr(msg: []const u8) u8 {
-    out("🔴 {s}\n  bridge --init-nats [dev|operator] [--dir DIR] [--port N] [--http-port N] [--ws-port N] [--js-domain NAME] [--force]\n  bridge --init-nats --update [--dir DIR] [--store PATH]\n", .{msg});
+    out("🔴 {s}\n  bridge --init-nats [dev|operator] [--dir DIR] [--port N] [--http-port N] [--ws-port N] [--js-domain NAME] [--force]\n  bridge --init-nats --update [--dir DIR] [--store PATH] [--js-domain NAME]\n", .{msg});
     return 1;
 }
 
@@ -551,9 +605,8 @@ fn accountJwt(
     sk_service_pub: []const u8,
     revocations: []const u8,
 ) ![]const u8 {
-    const js_api = try jsApiPrefix(a, js_domain);
-    const allows = try roleAllows(a, topo, .client, js_api);
-    const answers = try roleAllows(a, topo, .responder, js_api);
+    const allows = try roleAllowsFor(a, topo, .client, js_domain);
+    const answers = try roleAllowsFor(a, topo, .responder, js_domain);
     const acct_claims = try std.fmt.allocPrint(
         a,
         "{{\"jti\":\"__JTI__\",\"iat\":{d},\"iss\":\"{s}\",\"name\":\"ZEBRIDGE\",\"sub\":\"{s}\",\"nats\":{{" ++
@@ -797,18 +850,18 @@ fn runOperator(
 /// issued stays valid. Only the account's line in the conf's resolver_preload changes;
 /// hand edits elsewhere in the conf survive. The revocations `bridge --revoke --full`
 /// wrote into the account are carried over: an update never un-revokes a key.
-fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8) u8 {
+fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[]const u8) u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const store_path = store_arg orelse (std.fs.path.join(a, &.{ dir, "operator.store" }) catch return 1);
     const conf_path = std.fs.path.join(a, &.{ dir, "nats-server.conf" }) catch return 1;
-    const store = std.Io.Dir.cwd().readFileAlloc(io, store_path, a, .limited(1 << 16)) catch {
+    var store = std.Io.Dir.cwd().readFileAlloc(io, store_path, a, .limited(1 << 16)) catch {
         out("🔴 cannot read the store {s} (--store PATH if it lives elsewhere)\n", .{store_path});
         return 1;
     };
-    const conf = std.Io.Dir.cwd().readFileAlloc(io, conf_path, a, .limited(1 << 20)) catch {
+    var conf = std.Io.Dir.cwd().readFileAlloc(io, conf_path, a, .limited(1 << 20)) catch {
         out("🔴 cannot read {s}\n", .{conf_path});
         return 1;
     };
@@ -826,7 +879,27 @@ fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8) u8 {
         };
     }
     const op_kp, const acct_kp, const sk_client, const sk_responder, const sk_service = keys;
-    const domain = storeValue(store, "JS_DOMAIN") orelse "";
+    var domain = storeValue(store, "JS_DOMAIN") orelse "";
+    var env_line: ?[]const u8 = null; // NATS_JS_DOMAIN=… for .env.nats, when the domain is added
+
+    // `--js-domain`: add a domain to a stack that has none (a leaf joins a running
+    // deployment). The grants gain the domain's prefix beside the plain one
+    // (roleAllowsFor), the conf names the domain, .env.nats carries it.
+    if (add_domain) |d| {
+        if (domain.len > 0 and !std.mem.eql(u8, domain, d)) {
+            out("🔴 this stack's JetStream domain is {s}: changing it would cut off the devices behind its leaves — that is a new stack (--init-nats --js-domain)\n", .{domain});
+            return 1;
+        }
+        if (domain.len == 0) {
+            domain = d;
+            store = setStoreValue(a, store, "JS_DOMAIN", d) catch return 1;
+            conf = addConfDomain(a, conf, d) orelse {
+                out("🔴 {s} has no `jetstream {{` block to name the domain in\n", .{conf_path});
+                return 1;
+            };
+            env_line = std.fmt.allocPrint(a, "NATS_JS_DOMAIN={s}", .{d}) catch return 1;
+        }
+    }
     const js_domain: ?[]const u8 = if (domain.len == 0) null else domain;
 
     // ── the account's current JWT in the conf, and a check it is OURS ───────────
@@ -865,14 +938,107 @@ fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8) u8 {
 
     const new_conf = std.mem.concat(a, u8, &.{ conf[0..jwt_start], new_jwt, conf[jwt_end..] }) catch return 1;
     writeFile(io, conf_path, new_conf, true) catch return 1;
+    if (env_line != null) writeFile(io, store_path, store, true) catch return 1;
+    if (env_line) |line| {
+        const env_path = std.fs.path.join(a, &.{ dir, ".env.nats" }) catch return 1;
+        const env = std.Io.Dir.cwd().readFileAlloc(io, env_path, a, .limited(1 << 16)) catch {
+            out("⚠️  {s} not found: set {s} in the bridge's environment yourself\n", .{ env_path, line });
+            return 0;
+        };
+        writeFile(io, env_path, setEnvDomain(a, env, line) catch return 1, true) catch return 1;
+    }
     out(
         \\✅ ZEBRIDGE account re-signed with the same keys ({s})
         \\   templates re-derived from the grammar; revocations carried over: {s}
-        \\   Issued creds and device JWTs stay valid. Now reload the server:
-        \\     nats-server --signal reload
+        \\   Issued creds and device JWTs stay valid.
         \\
     , .{ conf_path, if (revocations.len == 0) "none" else "yes" });
+    if (env_line != null) {
+        out(
+            \\   JetStream domain {s} added: the conf names it, .env.nats carries NATS_JS_DOMAIN, and the
+            \\   grants allow $JS.{s}.API. (clients behind a leaf) beside $JS.API. (clients on this server).
+            \\   Devices enrolled before it keep working; their next renewal hands them js_domain.
+            \\   Restart NATS (a JetStream setting: a reload does not apply it), then the bridge.
+            \\
+        , .{ domain, domain });
+    } else {
+        out("   Now reload the server:\n     nats-server --signal reload\n", .{});
+    }
     return 0;
+}
+
+/// `NAME=value` set in the store's text: the line replaced, or appended.
+fn setStoreValue(a: std.mem.Allocator, store: []const u8, name: []const u8, value: []const u8) ![]u8 {
+    var out_buf: std.ArrayList(u8) = .empty;
+    var found = false;
+    var lines = std.mem.splitScalar(u8, store, '\n');
+    var first = true;
+    while (lines.next()) |raw| {
+        if (!first) try out_buf.append(a, '\n');
+        first = false;
+        const line = std.mem.trim(u8, raw, " \t\r");
+        const eq = std.mem.indexOfScalar(u8, line, '=');
+        if (line.len > 0 and line[0] != '#' and eq != null and std.mem.eql(u8, line[0..eq.?], name)) {
+            try out_buf.print(a, "{s}={s}", .{ name, value });
+            found = true;
+        } else try out_buf.appendSlice(a, raw);
+    }
+    if (!found) {
+        if (out_buf.items.len > 0 and out_buf.items[out_buf.items.len - 1] != '\n') try out_buf.append(a, '\n');
+        try out_buf.print(a, "{s}={s}\n", .{ name, value });
+    }
+    return out_buf.toOwnedSlice(a);
+}
+
+/// The conf's `jetstream {` block gains `domain: <d>` (null when there is no such block).
+fn addConfDomain(a: std.mem.Allocator, conf: []const u8, d: []const u8) ?[]u8 {
+    const open = std.mem.indexOf(u8, conf, "jetstream {") orelse return null;
+    const eol = std.mem.indexOfScalarPos(u8, conf, open, '\n') orelse return null;
+    const line = std.fmt.allocPrint(a, "  domain: {s}\n", .{d}) catch return null;
+    return std.mem.concat(a, u8, &.{ conf[0 .. eol + 1], line, conf[eol + 1 ..] }) catch null;
+}
+
+/// .env.nats with `NATS_JS_DOMAIN=…` in place of the commented hint (or a stale value).
+fn setEnvDomain(a: std.mem.Allocator, env: []const u8, line: []const u8) ![]u8 {
+    var out_buf: std.ArrayList(u8) = .empty;
+    var found = false;
+    var lines = std.mem.splitScalar(u8, env, '\n');
+    var first = true;
+    while (lines.next()) |raw| {
+        if (!first) try out_buf.append(a, '\n');
+        first = false;
+        const t = std.mem.trim(u8, raw, " \t\r");
+        if (std.mem.startsWith(u8, t, "NATS_JS_DOMAIN=") or std.mem.startsWith(u8, t, "# NATS_JS_DOMAIN=")) {
+            try out_buf.appendSlice(a, line);
+            found = true;
+        } else try out_buf.appendSlice(a, raw);
+    }
+    if (!found) {
+        if (out_buf.items.len > 0 and out_buf.items[out_buf.items.len - 1] != '\n') try out_buf.append(a, '\n');
+        try out_buf.print(a, "{s}\n", .{line});
+    }
+    return out_buf.toOwnedSlice(a);
+}
+
+test "setStoreValue replaces a line or appends one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const s1 = try setStoreValue(aa, "# seeds\nACCOUNT_SEED=SA\nJS_DOMAIN=\n", "JS_DOMAIN", "hub");
+    try std.testing.expectEqualStrings("# seeds\nACCOUNT_SEED=SA\nJS_DOMAIN=hub\n", s1);
+    const s2 = try setStoreValue(aa, s1, "NOTE", "1");
+    try std.testing.expect(std.mem.endsWith(u8, s2, "JS_DOMAIN=hub\nNOTE=1\n"));
+}
+
+test "addConfDomain and setEnvDomain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const conf = try std.testing.allocator.dupe(u8, "port: 4222\njetstream {\n  store_dir: \"/x\"\n}\n");
+    defer std.testing.allocator.free(conf);
+    try std.testing.expectEqualStrings("port: 4222\njetstream {\n  domain: hub\n  store_dir: \"/x\"\n}\n", addConfDomain(aa, conf, "hub").?);
+    const env = try setEnvDomain(aa, "NATS_URL=tls://n:4222\n# NATS_JS_DOMAIN=            # set when…\n", "NATS_JS_DOMAIN=hub");
+    try std.testing.expectEqualStrings("NATS_URL=tls://n:4222\nNATS_JS_DOMAIN=hub\n", env);
 }
 
 /// `NAME=value` from the store; comments and blank lines skipped.
