@@ -18738,3 +18738,27 @@ Measured locally, a stream with one message, a responder as the client:
 Not generated: the hub's `leafnodes { port: 7422; no_advertise: true; tls {…} }` and the
 leaf's conf (the hub's operator and resolver_preload, a remote with the bridge's creds and
 `account: <ZEBRIDGE key>`) — written by hand for now.
+
+## §10li — a leaf on zebridge.eu; nats.zig patch 32: TCP_NODELAY (2026-10-04)
+
+The small VPS (OVH, `leaf1.zebridge.eu`, A + AAAA, DNS only) runs a JetStream-less NATS
+leaf (T1): the hub's operator and accounts by `include ./trust.conf`, its own Let's
+Encrypt certificate (DNS-01), a remote to `tls://nats.zebridge.eu:7422` with the bridge's
+creds and `account: <ZEBRIDGE key>`. The hub gained `domain: hub` through `--update
+--js-domain hub` (§10lh) and a `leafnodes { port 7422, no_advertise, tls }` block. Both
+servers log `JetStream using domains: local "hub", remote ""` and the reverse. Setup traps:
+the hub's ufw rule for 7422 existed for the leaf's IPv6 only, and the leaf dialled over
+IPv4 (`dial tcp …: i/o timeout`); every address-scoped rule needs one per family.
+
+Through the leaf, a libzb client (dana, `jsDomain: hub`, `caFile`) seeds `flights` from
+the hub's chain over the domain and asks the airports service on the hub. First runs:
+205–289 ms a request against ~31 ms direct; the cause was nats.zig without TCP_NODELAY
+(NATS_ZIG_NOTES §32), found by elimination — the host's queue and the wake were fine
+(libzb's own call took the time), NATS's JS client through the same leaf took ~33 ms over
+IPv4 and IPv6, and every slow run had connected over IPv6. With patch 32: 32–55 ms in 11
+of 12 runs. Every libzb build must be rebuilt to get it (macOS, Linux, iOS, Android), and
+the bridge, which uses the same client.
+
+Not done: a dedicated leaf identity (the link uses the bridge's creds, full rights on the
+account, now on a second machine); the leaf in the Ansible playbook (leaf.yml), tested on
+a reinstalled VPS.

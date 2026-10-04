@@ -1,0 +1,43 @@
+diff --git a/src/connection.zig b/src/connection.zig
+index befd36f..6510040 100644
+--- a/src/connection.zig
++++ b/src/connection.zig
+@@ -1664,6 +1664,7 @@ pub const Connection = struct {
+         errdefer stream.close(self.io);
+ 
+         try net_util.setKeepAlive(stream.socket, true);
++        try net_util.setNoDelay(stream.socket, true);
+ 
+         if (self.options.trace) {
+             log.debug("Connected, starting handshake...", .{});
+diff --git a/src/net_util.zig b/src/net_util.zig
+index b1f1092..bd6590d 100644
+--- a/src/net_util.zig
++++ b/src/net_util.zig
+@@ -97,6 +97,18 @@ pub fn setKeepAlive(socket: net.Socket, enabled: bool) SetKeepAliveError!void {
+     try std.posix.setsockopt(socket.handle, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, std.mem.asBytes(&value));
+ }
+ 
++/// Turn off Nagle's algorithm: a small write leaves at once instead of waiting for the
++/// previous segment's acknowledgement. NATS writes many small frames (a request, a pull,
++/// a PONG); with Nagle on, one held behind a delayed ACK cost a request ~200 ms (measured
++/// 2026-10-04 through a leaf over IPv6, NATS_ZIG_NOTES §32). The Go and JS clients set
++/// it by default.
++pub fn setNoDelay(socket: net.Socket, enabled: bool) SetKeepAliveError!void {
++    if (builtin.os.tag == .windows) return;
++
++    const value: c_int = @intFromBool(enabled);
++    try std.posix.setsockopt(socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&value));
++}
++
+ test "tcpConnectToHost with an IP literal" {
+     const io = std.testing.io;
+ 
+@@ -108,6 +120,7 @@ test "tcpConnectToHost with an IP literal" {
+     defer stream.close(io);
+ 
+     try setKeepAlive(stream.socket, true);
++    try setNoDelay(stream.socket, true);
+ }
+ 
+ test "tcpConnectToHost with a host name" {

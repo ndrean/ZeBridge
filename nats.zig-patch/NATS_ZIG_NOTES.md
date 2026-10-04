@@ -1096,3 +1096,26 @@ during a 30 s wait — returned in ~24 ms, and queued data not hidden); nats.zig
 libzb wires every serve subscription to its tail inbox (which lives as long as the
 client). The airport service on the default 250 ms poll: round trip 6.4 ms (was 9.3 ms at
 5 ms polls), 0.1% CPU idle (was 1–2%), CDC still applied. `check-series.sh` green over 31.
+
+## 32. TCP_NODELAY on every connection (2026-10-04)
+
+**How it appeared.** A libzb client connected to a NATS leaf (`leaf1.zebridge.eu`, in the
+`hub` domain) asked a service on the hub: median 205–289 ms a request, in every run, while
+the same client straight to the hub took ~31 ms, and NATS's JavaScript client through the
+same leaf ~33 ms (over IPv4 and IPv6 alike). Every slow run had connected to the leaf over
+IPv6. Inside libzb, `conn.request` itself took the time (363 ms against 31 ms), not the
+host's queue or the poll. nats.zig never set `TCP_NODELAY`: Nagle's algorithm held a small
+write until the previous segment was acknowledged, and a delayed ACK on the far side turned
+that into ~200 ms per request. The Go and JS clients set NODELAY by default; whether Nagle
+bites depends on timing, which is why it showed on this path and not on others.
+
+**Change** (`32-nats.zig-tcp-nodelay.patch`): `net_util.setNoDelay(socket, enabled)`,
+beside `setKeepAlive`, through the raw handle (`IPPROTO.TCP`, `TCP.NODELAY`; no-op on
+Windows); `establishConnection` calls it after `setKeepAlive`, so every connection and
+every reconnect has it. The IP-literal socket test calls it too.
+
+**Verified:** nats.zig unit tests 138/138; the integration step fails with and without
+the patch (`autounsubscribe async basic functionality`: a subscription still live at
+`Connection.deinit()` — pre-existing, unrelated). libzb rebuilt, the same client through
+the leaf over IPv6, 12 runs of 10 requests: medians 32–55 ms in 11 runs, one at 213 ms
+(was 205–289 ms in all 6 runs before). `check-series.sh` green over 32.
