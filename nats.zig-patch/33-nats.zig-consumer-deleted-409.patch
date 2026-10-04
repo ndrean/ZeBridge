@@ -1,0 +1,53 @@
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+index 983ad96..667add3 100644
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -22,6 +22,21 @@ const STATUS_NOT_FOUND = message_mod.STATUS_NOT_FOUND;
+ const STATUS_TIMEOUT = message_mod.STATUS_TIMEOUT;
+ const STATUS_MAX_BYTES = message_mod.STATUS_MAX_BYTES;
+ const STATUS_NO_RESPONSE = message_mod.STATUS_NO_RESPONSE;
++const STATUS_CONFLICT: u16 = 409;
++
++/// A status frame saying the consumer behind a pull no longer exists. Two shapes: a NEW
++/// pull request to a missing consumer answers 503 "No Responders"; a pull request already
++/// OPEN when the consumer is deleted answers 409 "Consumer Deleted" (the Go client's
++/// `ErrConsumerDeleted`). Since a fetch keeps requests open across calls (patches 22–24),
++/// the second is the usual one: counted as an expiry, it hid a gone consumer until the
++/// next new request (NATS_ZIG_NOTES §33).
++fn consumerGone(msg: *Message) bool {
++    if (msg.status_code == STATUS_NO_RESPONSE) return true;
++    if (msg.status_code != STATUS_CONFLICT) return false;
++    const description = msg.headerGet("Description") orelse return false;
++    return std.ascii.startsWithIgnoreCase(description, "Consumer Deleted");
++}
++
+ const Connection = @import("connection.zig").Connection;
+ const Subscription = @import("subscription.zig").Subscription;
+ const subscription_mod = @import("subscription.zig");
+@@ -730,8 +745,9 @@ pub const PullSubscription = struct {
+                     if (messages.items.len == 0) fetch_error = error.Timeout;
+                     batch_complete = true;
+                     break;
+-                } else if (raw_msg.status_code == STATUS_NO_RESPONSE) {
+-                    // ⚠️ 503 "No Responders": nothing serves this consumer's pull subject —
++                } else if (consumerGone(raw_msg)) {
++                    // ⚠️ 503 "No Responders" (or 409 "Consumer Deleted" on a request that
++                    // was already open, see consumerGone): nothing serves this consumer's pull subject —
+                     // the consumer was deleted, reaped by its inactive threshold, or never
+                     // created. Folding it into the unknown-status branch (as before) made
+                     // a gone consumer look exactly like an idle one: the caller waited out
+@@ -964,12 +980,13 @@ pub const PullInbox = struct {
+                     if (sub.hasReply(raw_msg.subject)) break i;
+                 } else null;
+                 const code = raw_msg.status_code;
++                const is_gone = consumerGone(raw_msg); // read before the frame is freed
+                 if (idx) |hit| if (code != STATUS_CONTROL) subs[hit].requestEndReply(raw_msg.subject);
+                 raw_msg.deinit();
+                 const i = idx orelse continue;
+                 if (code == STATUS_CONTROL) continue; // heartbeat
+                 if (done[i]) continue;
+-                if (code == STATUS_NO_RESPONSE) gone[i] = true;
++                if (is_gone) gone[i] = true;
+                 // 404, 408, 409, 503 — all terminal for this consumer's pull.
+                 done[i] = true;
+                 open -= 1;

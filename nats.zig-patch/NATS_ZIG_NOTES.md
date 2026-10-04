@@ -1119,3 +1119,31 @@ the patch (`autounsubscribe async basic functionality`: a subscription still liv
 `Connection.deinit()` — pre-existing, unrelated). libzb rebuilt, the same client through
 the leaf over IPv6, 12 runs of 10 requests: medians 32–55 ms in 11 runs, one at 213 ms
 (was 205–289 ms in all 6 runs before). `check-series.sh` green over 32.
+
+## 33. A pull open when its consumer is deleted reports it gone (2026-10-04)
+
+**How it appeared.** `test-e2e` failed one test on every run, 184/185: "JetStream shared
+pull inbox: one wait over two streams, partial failure per consumer". After consumer A was
+deleted, the next `PullInbox.fetch` waited its whole 300 ms and reported
+`gone=[false, false]`. Since patches 22–24 a fetch keeps a consumer's pull request open
+across calls and sends a new one only for the deficit: A's request from the previous fetch
+was still open when A was deleted, and the server answered it `409 Consumer Deleted` —
+not the 503 a NEW request to a missing consumer gets, which is the only status `fetch`
+read as gone. The test was written before 22–24 and had not been run since (it needs the
+Docker cluster). Effect beyond the test: libzb reopens a tail whose consumer went away
+(inactive threshold, a stream recreated) when `fetch` says gone — one poll late, after a
+new request finally drew the 503.
+
+**Change** (`33-nats.zig-consumer-deleted-409.patch`): `consumerGone(msg)` — 503, or 409
+whose Description starts with "Consumer Deleted" (the Go client's `ErrConsumerDeleted`) —
+used by `PullInbox.fetch` (`gone[i]`, read before the frame is freed) and by
+`PullSubscription.fetch` (`error.NoResponders`, as for a 503).
+
+**Verified:** the server's frame is `NATS/1.0 409 Consumer Deleted` (seen in the e2e
+output); `test-e2e` 185/185 twice, the test now reporting `gone=[true, false]`; unit tests
+green; libzb 38/40 (2 skipped) and the bridge 342/342 rebuilt on it. `check-series.sh`
+green over 33.
+
+**Also seen, not fixed:** once today, `autounsubscribe async basic functionality`
+panicked in `Connection.deinit()` with one subscription still live; not in the four e2e
+runs after it. Intermittent, timing-dependent; to look at if it returns.
