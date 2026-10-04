@@ -743,6 +743,7 @@ pub fn main(init: std.process.Init) !void {
         .gen_nkey => return nkey_gen.genNkey(init.io),
         .init_nats => return std.process.exit(nats_init.run(init.io, &init)),
         .mint_responder => return std.process.exit(nats_init.mintResponder(init.io, &init)),
+        .mint_leaf => return std.process.exit(nats_init.mintLeaf(init.io, &init)),
         .init_sql => return std.process.exit(init_sql.run(init.io, &init)),
         .revoke => return std.process.exit(admin_revoke.run(&init)),
         .view_slots => return std.process.exit(admin_slots.run(&init, .view_all)),

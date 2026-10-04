@@ -36,6 +36,8 @@ const usage =
     \\
     \\  --mint-responder --name NAME [--tenant T]... [--store PATH]
     \\                  Creds for a responder service, on stdout, signed from operator.store
+    \\  --mint-leaf --name NAME [--store PATH]
+    \\                  Creds for a leaf node's remote, on stdout: what its clients may carry
     \\  --revoke <principal>  Revoke: mapping + unused invites, three-clock narration.
     \\                  Needs ADMIN_DATABASE_URL for the invocation (never stored in env)
     \\      [--conf PATH]           …and close the token now: with OPERATOR_SEED and
@@ -166,7 +168,7 @@ pub const gen_nkey_flag = "--gen-nkey";
 
 /// Flags that REPLACE the program instead of configuring it: they read no environment,
 /// open nothing, and their whole output IS the answer.
-pub const EarlyExit = enum { help, gen_nkey, init_nats, init_sql, mint_responder, revoke, view_slots, view_slot, drop_slot };
+pub const EarlyExit = enum { help, gen_nkey, init_nats, init_sql, mint_responder, mint_leaf, revoke, view_slots, view_slot, drop_slot };
 
 /// Answered from argv by `main` BEFORE the log level is resolved and before anything
 /// else prints — boot noise on stderr is noise in a command meant to be piped
@@ -185,6 +187,7 @@ pub fn earlyExit(init: *const std.process.Init) ?EarlyExit {
         if (std.mem.eql(u8, arg, gen_nkey_flag)) return .gen_nkey;
         if (std.mem.eql(u8, arg, "--init-nats")) return .init_nats;
         if (std.mem.eql(u8, arg, "--mint-responder")) return .mint_responder;
+        if (std.mem.eql(u8, arg, "--mint-leaf")) return .mint_leaf;
         if (std.mem.eql(u8, arg, "--init-sql")) return .init_sql;
         if (std.mem.eql(u8, arg, "--revoke")) return .revoke;
         if (std.mem.eql(u8, arg, "--view-slots")) return .view_slots;

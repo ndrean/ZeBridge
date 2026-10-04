@@ -1199,3 +1199,187 @@ fn mintUsage(msg: []const u8) u8 {
     out("🔴 {s}\n  bridge --mint-responder --name NAME [--tenant T]... [--store PATH] [--ttl-days D] > NAME.creds\n", .{msg});
     return 1;
 }
+
+/// `bridge --mint-leaf --name N [--store PATH] [--ttl-days D]` (§10ll): the creds a leaf
+/// node's remote presents to the hub. Not a scoped user: signed by the account key, its
+/// permissions in its own JWT — what a client or a responder may do, for any tenant and
+/// any name (each template becomes `*`). The leaf carries its devices' traffic and
+/// nothing else: no stream admin, no `cdc.*` or generation writes, which the bridge's
+/// own creds (`>`) handed to a second machine. Runs where the store lives; a grammar
+/// change means minting again, like a responder's.
+pub fn mintLeaf(io: std.Io, init: *const std.process.Init) u8 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var store_path: []const u8 = "zb-nats/operator.store";
+    var name: ?[]const u8 = null;
+    var ttl_days: i64 = 3650; // a leaf rotates with a redeploy, not a TTL
+    {
+        var it = init.minimal.args.iterate();
+        _ = it.next();
+        while (it.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--mint-leaf")) continue;
+            if (std.mem.eql(u8, arg, "--store")) {
+                store_path = it.next() orelse return mintLeafUsage("--store needs a path");
+            } else if (std.mem.eql(u8, arg, "--name")) {
+                name = it.next() orelse return mintLeafUsage("--name needs a value");
+            } else if (std.mem.eql(u8, arg, "--ttl-days")) {
+                const v = it.next() orelse return mintLeafUsage("--ttl-days needs a number");
+                ttl_days = std.fmt.parseInt(i64, v, 10) catch return mintLeafUsage("--ttl-days needs a number");
+                if (ttl_days < 1) return mintLeafUsage("--ttl-days must be at least 1");
+            } else return mintLeafUsage("unknown argument");
+        }
+    }
+    const who = name orelse return mintLeafUsage("--name is required");
+    for (who) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-')) return mintLeafUsage("--name: letters, digits, '_' and '-' only");
+
+    const store = std.Io.Dir.cwd().readFileAlloc(io, store_path, a, .limited(1 << 16)) catch {
+        out("🔴 cannot read the store {s} (--store PATH)\n", .{store_path});
+        return 1;
+    };
+    const acct_text = storeValue(store, "ACCOUNT_SEED") orelse {
+        out("🔴 {s} has no ACCOUNT_SEED — is it an operator.store?\n", .{store_path});
+        return 1;
+    };
+    const acct = keyFromSeed(acct_text) catch {
+        out("🔴 ACCOUNT_SEED in {s} is not a valid seed\n", .{store_path});
+        return 1;
+    };
+    const domain = storeValue(store, "JS_DOMAIN") orelse "";
+    const js_domain: ?[]const u8 = if (domain.len == 0) null else domain;
+
+    const owned = topology_mod.loadEmbedded(a) catch return 1;
+    const allows = leafAllows(a, &owned.topology, js_domain) catch return 1;
+    const user = genKey(io, .user) catch return 1;
+    const now: i64 = @intCast(c.time(null));
+    const claims = std.fmt.allocPrint(
+        a,
+        "{{\"jti\":\"__JTI__\",\"iat\":{d},\"exp\":{d},\"iss\":\"{s}\",\"name\":\"{s}\",\"sub\":\"{s}\",\"nats\":{{" ++
+            "\"pub\":{{\"allow\":[{s}]}},\"sub\":{{\"allow\":[{s}]}},\"subs\":-1,\"data\":-1,\"payload\":-1," ++
+            "\"type\":\"user\",\"version\":2}}}}",
+        .{ now, now + ttl_days * 24 * 3600, acct.public(), who, user.public(), allows.pub_json, allows.sub_json },
+    ) catch return 1;
+    var acct_seed_kp = nats.nkeys.SeedKeyPair.fromSeed(acct.seed()) catch return 1;
+    defer acct_seed_kp.wipe();
+    const jwt = jwt_mint.signClaims(a, &acct_seed_kp, claims, "__JTI__") catch |err| {
+        out("🔴 mint failed: {}\n", .{err});
+        return 1;
+    };
+    const creds = credsFile(a, jwt, user.seed()) catch return 1;
+    std.Io.File.stdout().writeStreamingAll(io, creds) catch return 1;
+    out("✅ leaf '{s}' minted ({s}, {d} days) — keep the creds file like any secret\n", .{ who, if (js_domain) |d| d else "no JetStream domain", ttl_days });
+    return 0;
+}
+
+fn mintLeafUsage(msg: []const u8) u8 {
+    out("🔴 {s}\n  bridge --mint-leaf --name NAME [--store PATH] [--ttl-days D] > NAME.creds\n", .{msg});
+    return 1;
+}
+
+/// What a leaf link may carry: the client's grants for any principal. A NATS wildcard is a
+/// whole token, so a token holding a template (`CDC_{{tag(tenant)}}`) becomes `*`: reads
+/// (consumers, info, direct gets) open to every stream, while writes, admin and CDC stay
+/// shut. Clients only: a responder's `STREAM.CREATE.OBJ_res-…` would become "create any
+/// stream", and no responder runs behind a leaf yet.
+fn leafAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, js_domain: ?[]const u8) !struct { pub_json: []u8, sub_json: []u8 } {
+    const cl = try roleAllowsFor(a, topo, .client, js_domain);
+    // The hub announces a subscription to the leaf only when the leaf may publish to its
+    // subject AS WRITTEN: the MUTATIONS stream listens on `mutation.>`, which
+    // `mutation.*.>` does not cover, so without this line no write left the leaf (§10ll).
+    // Each device's own JWT still holds it to `mutation.<itself>.>`.
+    const stream_subjects = try std.fmt.allocPrint(a, "\"{s}.>\"", .{topo.subject_mutations_prefix});
+    return .{
+        .pub_json = try pruneCovered(a, try mergeJsonLists(a, try anyPrincipal(a, cl.pub_json), stream_subjects)),
+        .sub_json = try pruneCovered(a, try anyPrincipal(a, cl.sub_json)),
+    };
+}
+
+/// The list without the subjects a broader one already covers (`X.CDC_PUBLIC` under `X.*`):
+/// the whole grant rides in the JWT, and every connect sends the JWT.
+fn pruneCovered(a: std.mem.Allocator, list: []const u8) ![]u8 {
+    var items: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |item| if (item.len >= 2) try items.append(a, item[1 .. item.len - 1]);
+    var buf: std.ArrayList(u8) = .empty;
+    for (items.items, 0..) |x, i| {
+        const covered = for (items.items, 0..) |y, j| {
+            if (i != j and !std.mem.eql(u8, x, y) and covers(y, x)) break true;
+        } else false;
+        if (covered) continue;
+        if (buf.items.len > 0) try buf.append(a, ',');
+        try buf.print(a, "\"{s}\"", .{x});
+    }
+    return buf.toOwnedSlice(a);
+}
+
+/// Whether the pattern `y` matches every subject the pattern `x` matches (NATS tokens).
+fn covers(y: []const u8, x: []const u8) bool {
+    var yt = std.mem.splitScalar(u8, y, '.');
+    var xt = std.mem.splitScalar(u8, x, '.');
+    while (yt.next()) |ytok| {
+        const xtok = xt.next() orelse return false;
+        if (std.mem.eql(u8, ytok, ">")) return true;
+        if (std.mem.eql(u8, xtok, ">")) return false;
+        if (std.mem.eql(u8, ytok, "*") or std.mem.eql(u8, ytok, xtok)) continue;
+        return false;
+    }
+    return xt.next() == null;
+}
+
+test "covers: NATS token rules" {
+    try std.testing.expect(covers("a.*", "a.b"));
+    try std.testing.expect(covers("a.>", "a.b.c"));
+    try std.testing.expect(covers("a.*.>", "a.b.>"));
+    try std.testing.expect(!covers("a.*.>", "a.>"));
+    try std.testing.expect(!covers("a.*", "a.>"));
+    try std.testing.expect(!covers("a.*", "a.b.c"));
+    try std.testing.expect(!covers("a.b", "a.*"));
+}
+
+/// Every token holding a template becomes `*` (a `"a","b"` list in, the same out, deduplicated).
+fn anyPrincipal(a: std.mem.Allocator, list: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    var items = std.mem.splitScalar(u8, list, ',');
+    while (items.next()) |item| {
+        if (item.len < 2) continue;
+        if (buf.items.len > 0) try buf.append(a, ',');
+        try buf.append(a, '"');
+        var tokens = std.mem.splitScalar(u8, item[1 .. item.len - 1], '.');
+        var first = true;
+        while (tokens.next()) |tok| {
+            if (!first) try buf.append(a, '.');
+            first = false;
+            try buf.appendSlice(a, if (std.mem.indexOf(u8, tok, "{{") != null) "*" else tok);
+        }
+        try buf.append(a, '"');
+    }
+    return mergeJsonLists(a, buf.items, "");
+}
+
+test "a leaf link carries what its clients and responders may, for anyone, and no more" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const owned = try topology_mod.loadEmbedded(aa);
+    const l = try leafAllows(aa, &owned.topology, "hub");
+    // pruned: what `*` covers is not listed again, and the token stays small
+    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "CONSUMER.CREATE.CDC_PUBLIC") == null);
+    try std.testing.expect(l.pub_json.len + l.sub_json.len < 2000);
+    // no template left, no blanket grant
+    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "{{") == null);
+    try std.testing.expect(std.mem.indexOf(u8, l.sub_json, "{{") == null);
+    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "\">\"") == null);
+    // the heartbeat of any client, through the domain and bare
+    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "\"$JS.hub.API.$KV.live.*.*\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "\"$KV.live.*.*\"") != null);
+    // the MUTATIONS stream's own subject, so the hub announces it across the link
+    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "\"mutation.>\"") != null);
+    // a template inside a token widens the whole token: no `CDC_*` (a literal name to NATS)
+    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "_*") == null);
+    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "\"$JS.hub.API.CONSUMER.MSG.NEXT.*.>\"") != null);
+    // nobody on a leaf writes CDC, creates or deletes a stream
+    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "STREAM.CREATE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "\"cdc.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "STREAM.DELETE") == null);
+}

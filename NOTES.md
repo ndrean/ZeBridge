@@ -18811,3 +18811,37 @@ JetStream domain, libzb and zb-client-ts beat to `$JS.<domain>.API.$KV.live.<ten
 before the domain still beat bare, on the hub). Deployed by `--init-nats --update` on
 the hub (account re-signed, same keys, no device re-issued) and the new account JWT
 copied into the leaf's `trust.conf`: the phone's beat lands in `live` through the leaf.
+
+## §10ll — a dedicated leaf identity: `--mint-leaf` (2026-10-04)
+
+The leaf joined the hub with the bridge's creds (`>`, on a second machine). It now uses
+its own: `bridge --mint-leaf --name leaf1 --store operator.store`, a user signed by the
+account key with its permissions in the JWT (no scope, no account re-sign). The grant is
+the client template for any principal, plus `mutation.>`. Responders are left out:
+their `STREAM.CREATE.OBJ_res-…` would become "create any stream"; a leaf that hosts one
+needs a flag later.
+
+Two NATS rules, each found by a broken phone:
+- A wildcard is a whole token. Replacing the template inside `CDC_{{tag(tenant)}}` gave
+  `CDC_*`, a literal stream name to NATS: every consumer call from the leaf was refused.
+  A token that holds a template now becomes `*` (reads open to any stream).
+- The hub announces a subscription to the leaf only when the leaf may publish to its
+  subject as written. `mutation.*.>` does not cover the MUTATIONS stream's `mutation.>`,
+  so it was not announced and every write from the leaf found no stream. `cdc.*` is no
+  longer announced either, which is the point. The domain's API (`$JS.hub.API.*`) is
+  announced regardless of the grant, so the phone connected and seeded but could not
+  write — it looked like a connection problem.
+
+A third, smaller one: the first JWT listed every subject twice (plain and under `hub`)
+and came to 8 KB; the leafnode port took it, but a client CONNECT with it failed with
+"maximum control line exceeded" (4096 bytes). Subjects a broader one covers are now
+dropped (`X.CDC_PUBLIC` under `X.*`, `mutation.*.>` under `mutation.>`): 17 publish and
+4 subscribe entries, about 1.7 KB with the domain.
+
+Proof, `leaf1.creds` straight against the hub: `$JS.hub.API.STREAM.DELETE.CDC_acme` is
+refused, and the violation names `$JS.API.STREAM.DELETE.CDC_acme` (the hub maps its own
+domain's prefix and checks the result, §10lh); `STREAM.INFO.CDC_acme` answers. Deploy
+traps: the creds file must be readable by the `nats` group like the old one (`chmod
+--reference`); a mint on the hub runs the binary installed there, so check its hash
+first. Phone and browser work through the leaf on `leaf1`'s creds; the bridge's creds
+are off the leaf.

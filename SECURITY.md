@@ -399,6 +399,7 @@ Two credential shapes, on purpose:
 | the bridge | nkey, seed passed on the command line, in no env file | `publish: >`, `subscribe: >` — it is the trusted writer and already holds replication rights |
 | a client | user/password today, JWT next | allow-listed to its own subtree, **its reply inbox included** (`_INBOX.<principal>.>`) |
 | a responder | JWT under the account's **responder** signing key, tagged with the tenants it serves | a client's read side, plus `subscribe: query.<tenant>.>` for its tenants, `publish: _INBOX.>` for the replies, and create/write on `OBJ_res-<tenant>` for answers too large to send inline — no mutations, no heartbeat key, no asking |
+| a leaf node's link | JWT signed by the account key, its permissions in the JWT | what any client may do, for any tenant and name, plus `publish: mutation.>` — no stream admin, no `cdc.*`, no generation writes |
 
 **A responder answers, it never writes.** A service that answers `query.<tenant>.<name>`
 from a replica (PROTOCOL §2) holds a responder credential, not the bridge's: it follows
@@ -409,6 +410,17 @@ is refused a `query.>` subscription, so nobody can pose as a service. Both are m
 Minted by `scripts/native/jwt-bootstrap.sh` (nsc) or, in the stack the
 bridge generated, by `bridge --mint-responder --store operator.store`, offline: the
 responder signing seed is never on the bridge host.
+
+**A leaf link carries its clients' traffic, nothing more.** A leaf node joins the hub
+with its own credential, minted by `bridge --mint-leaf --store operator.store`: the
+client template with every tenant and name widened to `*` (a NATS wildcard is a whole
+token, so `CDC_<tenant>` becomes any stream), plus `mutation.>`, the subject the hub's
+MUTATIONS stream listens on — the hub announces a subscription to a leaf only when the
+leaf may publish to it as written. Each device behind the leaf is still held to its own
+JWT by the leaf. A compromised leaf host can read every stream, but cannot create,
+delete or reconfigure one, publish CDC events or write generations, which the bridge's
+own credential (`>`) would allow. Responders behind a leaf are not covered yet: their
+`STREAM.CREATE` would widen to any stream.
 
 **The reply inbox is a read boundary.** JetStream does not deliver a pulled message, a
 KV answer or an object chunk on the subject the reader filtered on: it delivers to the
