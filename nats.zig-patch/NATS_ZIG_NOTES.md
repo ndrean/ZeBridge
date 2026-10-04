@@ -1147,3 +1147,34 @@ green over 33.
 **Also seen, not fixed:** once today, `autounsubscribe async basic functionality`
 panicked in `Connection.deinit()` with one subscription still live; not in the four e2e
 runs after it. Intermittent, timing-dependent; to look at if it returns.
+
+## 34. Host names are dialled Happy Eyeballs style (2026-10-04)
+
+**How it appeared.** An audit after §32 (what Go's runtime does that a port must do by
+hand). `tcpConnectToHost` dialled a host name's addresses one at a time, in resolver order
+(IPv6 first), with no limit per address — Zig 0.16 cannot bound one connect
+(`ConnectOptions.timeout` panics "TODO implement netConnectIpPosix with timeout"). On a
+network that silently drops IPv6, the IPv6 attempt waits for the OS's TCP timeout before
+IPv4 is tried, while the connection's handshake limit (`Options.timeout`, 5 s) has long
+expired, and every reconnect starts with IPv6 again: such a client never connects to a
+dual-stack name. Go's dialer races the families (300 ms); nats.c dials one at a time but
+gives each address its share of the timeout (`timeoutPerIP = totalTimeout / numIPs`) and
+lets the order be chosen (`46`, `64`).
+
+Reproduced on a real host: a port on the leaf VPS (`leaf1.zebridge.eu:4299`) allowed by its
+firewall for IPv4 only, so IPv6 to it is dropped silently. `tcpConnectToHost` connected
+over IPv4 after **75,024 ms** (macOS's TCP timeout).
+
+**Change** (`34-nats.zig-happy-eyeballs.patch`), RFC 8305 simplified: `resolveAll` (every
+address, at most 16), `interleaveFamilies` (alternating, the resolver's first family
+first, order kept within each), then `race`: an `Io.Select` dials the first address and
+starts a 250 ms delay; the delay or a failure starts the next address beside the ones
+still trying; the first success wins, the rest are cancelled and a late success closed.
+IP literals still connect directly. Tests: `interleaveFamilies`; "localhost" (::1 and
+127.0.0.1) connecting to an IPv4-only listener.
+
+**Verified:** the same port, three runs: connected over IPv4 after 285–288 ms (the 250 ms
+head start plus a round trip) — cancelling the hanging IPv6 dial returns at once; the
+leaf's open port over IPv6 in 24–31 ms as before; the hub (IPv4 only) 48 ms. nats.zig unit
+140/140, e2e 185/185; libzb 38/40 (2 skipped), the bridge 342/342; a libzb client through
+the leaf 36 ms median, straight to the hub 33–41 ms. `check-series.sh` green over 34.
