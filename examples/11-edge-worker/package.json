@@ -1,5 +1,5 @@
 {
-  "name": "zb-edge-worker",
+  "name": "zb-edge-gateway",
   "private": true,
   "type": "module",
   "dependencies": {
@@ -9,7 +9,7 @@
   "devDependencies": {
     "wrangler": "^4"
   },
-  "description": "A Cloudflare Worker that asks a ZeBridge responder over NATS",
+  "description": "An HTTP front at the edge for ZeBridge responders: a Worker and a Durable Object holding the NATS connection",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"

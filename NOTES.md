@@ -19023,3 +19023,22 @@ random, and an answer from Paris detours Mac → Frankfurt → Paris → Frankfu
 The rule both tests bracket: a responder serves fast the askers connected to its own NATS
 server. An edge container helps when the region's devices connect to a leaf beside it, not as
 a lone member joined to the hub.
+
+## §10ls — the edge Worker as a generic HTTP front, its connection held by a Durable Object (2026-10-05)
+
+examples/11-edge-worker becomes a gateway: `GET /q/<name>?…` or `POST /q/<name>` (JSON) asks
+`query.<tenant>.<name>` (`ZB_TENANT`, `_default` by default; the name must be one subject token)
+through one Durable Object (`idFromName("nats")`) that holds the NATS connection. A client needs
+no library, no enrollment, no NATS. Deployed (principal `edge-gateway`), measured, deleted:
+from Cloudflare's Paris location, `connect_ms: 0` after the first request and 26–32 ms per
+question (the stateless version paid 65–240 ms to connect, every request); from a laptop with
+curl the whole HTTP call went from 240–450 ms to about 115 ms, most of it curl's new TLS
+connection to Cloudflare. Locally in workerd: first connect 191 ms, then 0. An unknown name
+gets NATS's "no responders"; a dotted name is refused before NATS.
+
+What it does not do, and the README says so: authenticate users (everyone asks with the
+gateway's identity, so the Worker must check its callers before exposing a tenant), writes,
+replicas, live updates; renewal (a one-day JWT; a production gateway needs a longer-lived
+identity or to keep and renew its JWT in the Durable Object's storage). The Durable Object is
+billed by duration while its outbound WebSocket is open. Cloudflare's bot protection answers
+403 to Python's default user agent on workers.dev; curl passes.

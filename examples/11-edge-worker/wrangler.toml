@@ -1,3 +1,12 @@
-name = "zb-edge-worker"
+name = "zb-edge-gateway"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
+
+# The NATS connection lives here, between requests.
+[[durable_objects.bindings]]
+name = "NATS"
+class_name = "NatsGateway"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NatsGateway"]
