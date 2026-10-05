@@ -18899,3 +18899,20 @@ permission in the release manifest, and tool/build-libzb-android.sh (06-large-ta
 arm64-v8a and armeabi-v7a). The AAR (zb-android) is rebuilt with the fix and nats.zig
 patches 32–34. A leaf build (`ZB_NATS_URL=tls://leaf1.zebridge.eu:4222`) works on the
 moto e20 too: Android through the leaf, with the domain from its enrollment.
+
+## §10lo — 10-airports in React Native: zb-client-ts on Android against zebridge.eu (2026-10-05)
+
+A one-screen React Native app (examples/10-airports/react-native, `dev.zebridge.airports.rn`):
+five cities, `airports_near` for the one chosen, and the shared flight with Dep/Arr
+buttons — the web page's registers, `stamp()`, `mergeRegisters` and reconcile, without a
+map. On the moto e20 it enrolled at bridge.zebridge.eu, connected over wss through
+Cloudflare to the hub, answered the questions, and a departure set on it reached the
+iPhone. The first run of zb-client-ts on Android (Hermes, expo-sqlite) against the real
+deployment: enrollment over HTTPS, the `hub` domain, the core-publish heartbeat.
+
+Build traps: JDK 17 (React Native 0.76's Gradle 8.10 refuses Android Studio's JDK 25);
+`ANDROID_HOME` (the generated project has no local.properties); `expo-asset` as a direct
+dependency (pnpm hides it inside `expo`, and the release bundler needs it); and
+`expo run:android`, not Gradle alone — its first step writes the autolinking for Expo's
+modules, without which the Java compile cannot find `ExpoModulesPackage`. Not yet: the
+iOS side through libzb's Expo module.

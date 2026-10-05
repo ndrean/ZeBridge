@@ -1,0 +1,24 @@
+{
+  "expo": {
+    "name": "Airports",
+    "slug": "zb-airports",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "zbairports",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "dev.zebridge.airports.rn",
+      "appleTeamId": "6UM77KAJ7Q"
+    },
+    "android": {
+      "package": "dev.zebridge.airports.rn"
+    },
+    "plugins": [
+      "expo-sqlite",
+      "./plugins/with-fmt-consteval",
+      "expo-asset"
+    ]
+  }
+}
