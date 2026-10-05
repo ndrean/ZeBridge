@@ -707,13 +707,13 @@
         "y": 30
       },
       "id": 14,
-      "title": "Bridge memory (peak RSS)",
+      "title": "Bridge memory (now and peak)",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "The event slab is pre-allocated at startup, so this should sit near 2^BASE_BUF x RING_BUFFER_COUNT plus ~400 MB of metadata and stay flat. Growth over time is a leak, not load.",
+      "description": "The event slab is pre-allocated at startup, so memory should sit near 2^BASE_BUF x RING_BUFFER_COUNT plus ~400 MB of metadata and stay flat. \"now\" falls as well as rises; \"peak\" never falls. A \"now\" that keeps climbing is a leak, not load.",
       "targets": [
         {
           "datasource": {
@@ -721,9 +721,19 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "bridge_max_rss_bytes",
-          "legendFormat": "peak RSS",
+          "expr": "process_resident_memory_bytes{job=\"zebridge\"}",
+          "legendFormat": "now",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "bridge_max_rss_bytes",
+          "legendFormat": "peak",
+          "refId": "B"
         }
       ],
       "fieldConfig": {
@@ -1406,6 +1416,99 @@
         "graphMode": "none",
         "textMode": "value_and_name"
       }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 86
+      },
+      "id": 33,
+      "title": "Services",
+      "type": "row",
+      "panels": []
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 87
+      },
+      "id": 34,
+      "title": "Service memory (working set)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "What systemd shows as Memory: for each unit, read from its cgroup by Alloy (cAdvisor). Includes file cache the kernel can reclaim: NATS's JetStream files count here. A line that climbs and never comes back down is a leak.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "container_memory_working_set_bytes{unit=~\"zebridge|zebridge-sweeper|nats|airports\"}",
+          "legendFormat": "{{unit}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 87
+      },
+      "id": 35,
+      "title": "Service memory (RSS)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "The processes' own memory, without file cache: the number to watch for a leak.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "container_memory_rss{unit=~\"zebridge|zebridge-sweeper|nats|airports\"}",
+          "legendFormat": "{{unit}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": []
+      }
     }
   ],
   "refresh": "5s",
@@ -1426,7 +1529,7 @@
   "timezone": "browser",
   "title": "ZeBridge - Postgres CDC to NATS",
   "uid": "zebridge-overview",
-  "version": 4,
+  "version": 5,
   "templating": {
     "list": [
       {
