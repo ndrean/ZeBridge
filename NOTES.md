@@ -19059,3 +19059,10 @@ time, keys sorted so the same revocations sign the same claims. And admin_revoke
 never run (the file was not imported by the test root): 348/348 now. Tested on a copy of the dev
 conf: two keys revoked one after the other both in the re-signed JWT; nats-server -t accepts it.
 A leaf node checks against its own trust.conf: refresh it after a revocation (leaf.yml does).
+
+On zebridge.eu (bridge 93e0a486…): a throwaway responder `revoke-probe` minted on the hub (its
+key printed, and equal to the JWT's `sub`), connected from the leaf to the hub in 4 ms; revoked
+by key ("1 revoked key(s) … 0 it already held": the account had never revoked anyone); after
+`systemctl reload nats`, the same creds were refused, while the bridge, the responders and the
+devices kept their connections. leaf.yml then copied the account JWT into the leaf's
+trust.conf (changed=2: the file and the reload), so the key is refused through the leaf too.
