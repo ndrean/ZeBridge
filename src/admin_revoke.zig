@@ -15,6 +15,12 @@
 //!
 //! No NATS access, same doctrine as the sweeper: the CLI is a pure PostgreSQL client;
 //! the running bridge performs the KV purge when the delete rides the publication.
+//!
+//! `bridge --revoke --key U… --conf nats-server.conf` (OPERATOR_SEED, ZB_ACCOUNT_PUB) revokes
+//! one user key, with no database: the identities minted offline (`--mint-responder`,
+//! `--mint-leaf`) were never enrolled, so PostgreSQL knows nothing of them — and a creds file
+//! known to have leaked. The account JWT's revocations only ever grow: a full revocation
+//! merges the map it finds with PostgreSQL's rows, it never rebuilds it from them alone.
 const std = @import("std");
 const c = @import("c_imports.zig").c;
 const nats = @import("nats");
@@ -25,6 +31,7 @@ const out = std.debug.print;
 pub fn run(init: *const std.process.Init) u8 {
     // ── the principal, from argv ────────────────────────────────────────────────
     var principal: ?[]const u8 = null;
+    var key: ?[]const u8 = null;
     var conf_path: ?[]const u8 = null;
     var purge = false;
     {
@@ -32,16 +39,22 @@ pub fn run(init: *const std.process.Init) u8 {
         _ = it.next();
         while (it.next()) |arg| {
             if (std.mem.eql(u8, arg, "--revoke")) {
-                principal = it.next();
+                continue;
+            } else if (std.mem.eql(u8, arg, "--key")) {
+                key = it.next();
             } else if (std.mem.eql(u8, arg, "--conf")) {
                 conf_path = it.next();
             } else if (std.mem.eql(u8, arg, "--purge")) {
                 purge = true;
+            } else if (principal == null and !std.mem.startsWith(u8, arg, "--")) {
+                principal = arg;
             }
         }
     }
+    if (key) |k| return revokeKey(init, k, conf_path);
     const p = principal orelse {
-        out("🔴 usage: ADMIN_DATABASE_URL=postgres://… bridge --revoke <principal>\n", .{});
+        out("🔴 usage: ADMIN_DATABASE_URL=postgres://… bridge --revoke <principal>\n" ++
+            "        OPERATOR_SEED=SO… ZB_ACCOUNT_PUB=A… bridge --revoke --key U… --conf nats-server.conf\n", .{});
         return 1;
     };
     if (p.len == 0 or p.len > 256) {
@@ -163,10 +176,29 @@ pub fn run(init: *const std.process.Init) u8 {
         , .{p});
         return 0;
     }
-    return fullRevoke(conn, init, op_seed.?, conf_path.?);
+    return amendRevocations(conn, init, op_seed.?, conf_path.?, null);
 }
 
-fn fullRevoke(conn: ?*c.PGconn, init: *const std.process.Init, op_seed: []const u8, conf_path: []const u8) u8 {
+/// `--revoke --key U…`: one user key into the account JWT's revocations, no database.
+fn revokeKey(init: *const std.process.Init, key: []const u8, conf_path: ?[]const u8) u8 {
+    // A user key decodes (prefix U, checksum): the signature itself does not matter here.
+    _ = nats.nkeys.verify(.user, key, "", [_]u8{0} ** 64) catch {
+        out("🔴 {s} is not a user public key (U…, 56 characters: the `user key` a mint printed)\n", .{key});
+        return 1;
+    };
+    const op_seed = init.minimal.environ.getPosix("OPERATOR_SEED");
+    if (op_seed == null or conf_path == null) {
+        out("🔴 revoking a key amends the account JWT: it needs OPERATOR_SEED, ZB_ACCOUNT_PUB and --conf\n" ++
+            "     OPERATOR_SEED=SO… ZB_ACCOUNT_PUB=A… bridge --revoke --key {s} --conf /path/to/nats-server.conf\n", .{key});
+        return 1;
+    }
+    return amendRevocations(null, init, op_seed.?, conf_path.?, key);
+}
+
+/// The account JWT's revocations: the map it carries, PostgreSQL's revoked keys (when `conn`)
+/// and `extra` (one key, revoked now), merged — a key keeps its latest time — then re-signed
+/// and spliced into the conf. Revocations only grow: nothing already in the JWT is dropped.
+fn amendRevocations(conn: ?*c.PGconn, init: *const std.process.Init, op_seed: []const u8, conf_path: []const u8, extra: ?[]const u8) u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -176,21 +208,7 @@ fn fullRevoke(conn: ?*c.PGconn, init: *const std.process.Init, op_seed: []const 
         return 1;
     };
 
-    // ── the complete map, from PG — the source of truth ─────────────────────────
-    const rres = c.PQexec(conn, "SELECT user_pubkey, floor(extract(epoch FROM revoked_at))::bigint::text FROM public.zebridge_principal_keys WHERE revoked_at IS NOT NULL ORDER BY user_pubkey");
-    defer c.PQclear(rres);
-    if (c.PQresultStatus(rres) != c.PGRES_TUPLES_OK) {
-        out("🔴 could not read the revocation rows: {s}\n", .{c.PQerrorMessage(conn)});
-        return 1;
-    }
-    var map: std.ArrayList(u8) = .empty;
-    var i: c_int = 0;
-    while (i < c.PQntuples(rres)) : (i += 1) {
-        if (i > 0) map.append(a, ',') catch return 1;
-        map.print(a, "\"{s}\":{s}", .{ std.mem.span(c.PQgetvalue(rres, i, 0)), std.mem.span(c.PQgetvalue(rres, i, 1)) }) catch return 1;
-    }
-
-    // ── the conf: find the account JWT, amend its claims, re-sign, splice ───────
+    // ── the conf: find the account JWT and decode its claims ────────────────────
     const conf = std.Io.Dir.cwd().readFileAlloc(init.io, conf_path, a, .limited(1 << 20)) catch {
         out("🔴 cannot read {s}\n", .{conf_path});
         return 1;
@@ -206,7 +224,6 @@ fn fullRevoke(conn: ?*c.PGconn, init: *const std.process.Init, op_seed: []const 
     while (jwt_end < conf.len and (std.ascii.isAlphanumeric(conf[jwt_end]) or conf[jwt_end] == '.' or conf[jwt_end] == '_' or conf[jwt_end] == '-')) jwt_end += 1;
     const old_jwt = conf[jwt_start..jwt_end];
 
-    // decode the claims segment
     var it = std.mem.splitScalar(u8, old_jwt, '.');
     _ = it.next();
     const claims_b64 = it.next() orelse return 1;
@@ -215,8 +232,36 @@ fn fullRevoke(conn: ?*c.PGconn, init: *const std.process.Init, op_seed: []const 
     const claims = a.alloc(u8, claims_len) catch return 1;
     dec.decode(claims, claims_b64) catch return 1;
 
+    // ── the complete map: the JWT's own, PostgreSQL's rows, the extra key ───────
+    var revoked: std.StringArrayHashMapUnmanaged(i64) = .empty;
+    const parsed = std.json.parseFromSlice(std.json.Value, a, claims, .{}) catch {
+        out("🔴 {s}'s JWT claims do not parse\n", .{account_pub});
+        return 1;
+    };
+    if (parsed.value.object.get("nats")) |n| if (n == .object) if (n.object.get("revocations")) |r| if (r == .object) {
+        var ri = r.object.iterator();
+        while (ri.next()) |e| if (e.value_ptr.* == .integer) keep(a, &revoked, e.key_ptr.*, e.value_ptr.integer) catch return 1;
+    };
+    const from_jwt = revoked.count();
+    if (conn) |pg| {
+        const rres = c.PQexec(pg, "SELECT user_pubkey, floor(extract(epoch FROM revoked_at))::bigint::text FROM public.zebridge_principal_keys WHERE revoked_at IS NOT NULL ORDER BY user_pubkey");
+        defer c.PQclear(rres);
+        if (c.PQresultStatus(rres) != c.PGRES_TUPLES_OK) {
+            out("🔴 could not read the revocation rows: {s}\n", .{c.PQerrorMessage(pg)});
+            return 1;
+        }
+        var i: c_int = 0;
+        while (i < c.PQntuples(rres)) : (i += 1) {
+            const t = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(rres, i, 1)), 10) catch continue;
+            const k = a.dupe(u8, std.mem.span(c.PQgetvalue(rres, i, 0))) catch return 1;
+            keep(a, &revoked, k, t) catch return 1;
+        }
+    }
+    if (extra) |k| keep(a, &revoked, k, std.Io.Clock.real.now(init.io).toSeconds()) catch return 1;
+    const map = revocationsJson(a, &revoked) catch return 1;
+
     // ── byte-precise surgery: only the revocations map changes ──────────────────
-    const rev_json = std.fmt.allocPrint(a, "\"revocations\":{{{s}}},", .{map.items}) catch return 1;
+    const rev_json = std.fmt.allocPrint(a, "\"revocations\":{{{s}}},", .{map}) catch return 1;
     var amended: []u8 = undefined;
     if (std.mem.indexOf(u8, claims, "\"revocations\":{")) |rstart| {
         const rbody = rstart + "\"revocations\":{".len;
@@ -248,12 +293,49 @@ fn fullRevoke(conn: ?*c.PGconn, init: *const std.process.Init, op_seed: []const 
     defer f.close(init.io);
     f.writeStreamingAll(init.io, new_conf) catch return 1;
 
+    if (extra) |k| out("✅ key {s} revoked in the account JWT ({s})\n", .{ k, account_pub });
     out(
-        \\✅ FULL revocation written: {d} revoked key(s) in the account JWT ({s})
+        \\✅ FULL revocation written: {d} revoked key(s) in the account JWT ({d} it already held)
         \\   {s} amended in place. Now reload the server and the live session is kicked
         \\   with "Authentication Revoked":
         \\     nats-server --signal reload
+        \\   A leaf node checks the devices against its own copy: refresh its trust.conf too
+        \\   (deploy/ansible/leaf.yml does it on every run).
         \\
-    , .{ @as(usize, @intCast(c.PQntuples(rres))), account_pub, conf_path });
+    , .{ revoked.count(), from_jwt, conf_path });
     return 0;
+}
+
+/// A revoked key keeps its latest time: a later revocation covers every JWT issued before it.
+fn keep(a: std.mem.Allocator, m: *std.StringArrayHashMapUnmanaged(i64), k: []const u8, t: i64) !void {
+    const gop = try m.getOrPut(a, k);
+    if (!gop.found_existing or gop.value_ptr.* < t) gop.value_ptr.* = t;
+}
+
+/// The map as JSON members, keys sorted: the same revocations always sign the same claims.
+fn revocationsJson(a: std.mem.Allocator, m: *std.StringArrayHashMapUnmanaged(i64)) ![]u8 {
+    const keys = try a.dupe([]const u8, m.keys());
+    std.mem.sort([]const u8, keys, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    var out_buf: std.ArrayList(u8) = .empty;
+    for (keys, 0..) |k, i| {
+        if (i > 0) try out_buf.append(a, ',');
+        try out_buf.print(a, "\"{s}\":{d}", .{ k, m.get(k).? });
+    }
+    return out_buf.toOwnedSlice(a);
+}
+
+test "revocations merge: a key keeps its latest time, the order is stable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m: std.StringArrayHashMapUnmanaged(i64) = .empty;
+    try keep(a, &m, "UB", 100); // from the JWT
+    try keep(a, &m, "UA", 50);
+    try keep(a, &m, "UB", 90); // an older row from PostgreSQL does not move it back
+    try keep(a, &m, "UA", 70); // a later one does
+    try std.testing.expectEqualStrings("\"UA\":70,\"UB\":100", try revocationsJson(a, &m));
 }

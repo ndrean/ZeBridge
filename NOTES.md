@@ -19042,3 +19042,20 @@ replicas, live updates; renewal (a one-day JWT; a production gateway needs a lon
 identity or to keep and renew its JWT in the Durable Object's storage). The Durable Object is
 billed by duration while its outbound WebSocket is open. Cloudflare's bot protection answers
 403 to Python's default user agent on workers.dev; curl passes.
+
+## §10lt — revoking a minted identity by its key: `--revoke --key` (2026-10-05)
+
+`bridge --revoke airports-fly` found nothing: `--revoke` works from the tables enrollment fills
+(mapping, invites, `zebridge_principal_keys`), and `--mint-responder` / `--mint-leaf` run
+offline, where `operator.store` lives, recording nothing. NATS revokes by user public key,
+never by name. Now each mint prints the user key, and `bridge --revoke --key U… --conf
+nats-server.conf` (OPERATOR_SEED, ZB_ACCOUNT_PUB, no database) adds it to the account JWT's
+revocations — for minted identities and for a creds file known to have leaked.
+
+Found on the way: the full revocation REBUILT the map from PostgreSQL alone, so the next
+`--revoke` of an enrolled principal would have silently dropped a key revoked by `--key`. The
+map now only grows: the JWT's own entries merged with PostgreSQL's, a key keeping its latest
+time, keys sorted so the same revocations sign the same claims. And admin_revoke.zig's tests had
+never run (the file was not imported by the test root): 348/348 now. Tested on a copy of the dev
+conf: two keys revoked one after the other both in the re-signed JWT; nats-server -t accepts it.
+A leaf node checks against its own trust.conf: refresh it after a revocation (leaf.yml does).

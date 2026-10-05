@@ -47,6 +47,9 @@ const usage =
     \\                              and identity: at once if connected, when they renew
     \\                              otherwise. Best-effort: offline for good keeps its data
     \\
+    \\  --revoke --key U… --conf PATH  Revoke one user key, no database: a minted identity
+    \\                  (the `user key` a mint printed) or leaked creds. OPERATOR_SEED and
+    \\                  ZB_ACCOUNT_PUB; the account's revocations only grow
     \\  --view-slots    Every replication slot on the server: active, pid, LSNs, retained WAL
     \\  --view-slot <slot>  The same for one slot
     \\  --drop-slot <slot>  Drop an INACTIVE slot (frees its retained WAL). Needs

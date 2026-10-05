@@ -43,6 +43,7 @@ const diagnose_live = @import("diagnose_live.zig");
 // Zig only collects tests from files the root actually references, so every module
 // carrying `test` blocks must be listed here or its tests silently never run.
 comptime {
+    _ = @import("admin_revoke.zig");
     _ = @import("array.zig");
     _ = @import("batch_publisher.zig");
     _ = @import("config.zig");

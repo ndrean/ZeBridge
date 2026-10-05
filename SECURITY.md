@@ -658,16 +658,26 @@ there is no per-JWT revoke command anywhere in NATS; the mechanism is a `revocat
 map ({user_pubkey: timestamp}) INSIDE the account JWT, operator-signed and pushed to
 the resolver. `bridge --revoke` escalates to it automatically when the credentials
 allow: given `OPERATOR_SEED` and `--conf /path/to/nats-server.conf` (both for the
-invocation — the operator seed stays offline otherwise), it rebuilds the complete map
-from `zebridge_principal_keys.revoked_at` (PostgreSQL is the source of truth, so
-revoking B can never un-revoke A), re-signs the account JWT, splices the conf in
-place, and tells you to reload. On the reload the live session is KICKED and a
+invocation — the operator seed stays offline otherwise), it merges the map the account
+JWT already carries with every key `zebridge_principal_keys.revoked_at` marks, a key
+keeping its latest time, re-signs the account JWT, splices the conf in place, and tells
+you to reload. The map only grows: revoking B can never un-revoke A, nor a key revoked by
+`--key`. On the reload the live session is KICKED and a
 reconnect with the dead token is refused. /enroll records every key at the door
 (`zebridge_principal_keys`, same transaction as the redemption) precisely so this map
 can always be built. Without the operator seed at hand, the command does everything
 DB-reachable and prints how to escalate — partial is a fallback dictated by the
 credentials present, never a choice. The TTL remains the passive bound: size
 `ENROLL_JWT_TTL_SECONDS` to the exposure you tolerate between revocation and reload.
+
+**Identities minted offline are revoked by key.** `--mint-responder` and `--mint-leaf`
+run where `operator.store` lives, with no database: their keys are in no table, and
+`--revoke <principal>` finds nothing to revoke. Each mint prints the identity's user key;
+file it with the creds. `OPERATOR_SEED=… ZB_ACCOUNT_PUB=… bridge --revoke --key U… --conf
+nats-server.conf` adds that key to the account JWT's revocations, with no database, and is
+also the answer to a creds file known to have leaked. A leaf node checks the devices
+against its own copy of the account JWT: refresh its `trust.conf` after a revocation
+(`deploy/ansible/leaf.yml` does it on every run).
 
 Two corollaries reviewers keep re-deriving, pinned here:
 - **restarting nats-server is not a revocation event — it is the opposite.** The

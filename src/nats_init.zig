@@ -1192,6 +1192,7 @@ pub fn mintResponder(io: std.Io, init: *const std.process.Init) u8 {
     const creds = credsFile(a, jwt, user.seed()) catch return 1;
     std.Io.File.stdout().writeStreamingAll(io, creds) catch return 1;
     out("✅ responder '{s}' minted ({d} tenant tag(s), {d} days) — keep the creds file like any secret\n", .{ who, tenants.items.len, ttl_days });
+    out("   user key {s} — file it with the creds: `bridge --revoke --key` revokes this identity\n", .{user.public()});
     return 0;
 }
 
@@ -1269,6 +1270,7 @@ pub fn mintLeaf(io: std.Io, init: *const std.process.Init) u8 {
     const creds = credsFile(a, jwt, user.seed()) catch return 1;
     std.Io.File.stdout().writeStreamingAll(io, creds) catch return 1;
     out("✅ leaf '{s}' minted ({s}, {d} days) — keep the creds file like any secret\n", .{ who, if (js_domain) |d| d else "no JetStream domain", ttl_days });
+    out("   user key {s} — file it with the creds: `bridge --revoke --key` revokes this identity\n", .{user.public()});
     return 0;
 }
 
