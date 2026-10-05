@@ -47,6 +47,9 @@
               restart: unless-stopped
               ports: ["127.0.0.1:8002:8002"]
               mem_limit: {{ valhalla_mem_limit }}
+              # A cgroup with a fixed name: Alloy's cAdvisor reads its memory there
+              # (telemetry/vps/config.alloy) without the Docker socket.
+              cgroup_parent: valhalla.slice
               environment:
                 use_tiles_ignore_pbf: "True"
                 force_rebuild: "False"

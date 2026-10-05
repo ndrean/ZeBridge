@@ -32,6 +32,9 @@ prometheus.exporter.cadvisor "units" {
     "/system.slice/nats.service",
     "/system.slice/airports.service",
     "/system.slice/routing.service",
+    // Valhalla's container, under a fixed cgroup parent (the routing role's compose
+    // file): the slice itself, not the container's scope, which is named by its id.
+    "/valhalla.slice",
   ]
 }
 
@@ -54,6 +57,12 @@ prometheus.relabel "units" {
     source_labels = ["id"]
     regex         = "/system.slice/(.+)\\.service"
     target_label  = "unit"
+  }
+  rule {
+    source_labels = ["id"]
+    regex         = "/valhalla\\.slice"
+    target_label  = "unit"
+    replacement   = "valhalla"
   }
   rule {
     source_labels = ["unit"]
