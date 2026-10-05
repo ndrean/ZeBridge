@@ -19012,3 +19012,14 @@ Traps: the Mac has two Docker engines (Docker Desktop and OrbStack, the owner's)
 (`apt install docker.io`). Not yet: the hub's service runs the previous airport_service.py
 (no `by`) until site.yml runs; a responder on the leaf serving the hub's askers would need a
 responder option on --mint-leaf.
+
+The same image on Fly.io (region cdg, shared CPU, 512 MB, no public port: it dials out),
+joined directly to the hub as `airports-fly` (its own --mint-responder identity, a Fly secret
+mounted as /creds; `fly deploy --local-only` pushes the OrbStack image, the dashboard wanted a
+repository). Seeded in 4.2 s (chain from Frankfurt to Paris); DuckDB 4.8–10.6 ms. 30
+questions through the hub: the hub's service answered 17 (33 ms round trip), `airports-fly` 13
+(52 ms). Both are members on the same server, so NATS shares the questions between them at
+random, and an answer from Paris detours Mac → Frankfurt → Paris → Frankfurt → Mac: +19 ms.
+The rule both tests bracket: a responder serves fast the askers connected to its own NATS
+server. An edge container helps when the region's devices connect to a leaf beside it, not as
+a lone member joined to the hub.
