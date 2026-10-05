@@ -16,6 +16,7 @@
 //! fails with a message saying so (§10jq).
 
 const std = @import("std");
+const android_io = @import("android_io.zig"); // Android: names through getaddrinfo (§10ln)
 const builtin = @import("builtin");
 const nats = @import("nats");
 const core = @import("core.zig");
@@ -108,7 +109,7 @@ pub const UserKeys = struct {
 pub fn newUserKeys(out: *UserKeys) !void {
     var threaded: std.Io.Threaded = .init(std.heap.c_allocator, .{});
     defer threaded.deinit();
-    const kp = std.crypto.sign.Ed25519.KeyPair.generate(threaded.io());
+    const kp = std.crypto.sign.Ed25519.KeyPair.generate(android_io.io(&threaded));
     out.seed = nats.nkeys.encodeSeed(.user, &kp.secret_key.seed(), &out.seed_buf);
     var skp = try nats.nkeys.SeedKeyPair.fromSeed(out.seed);
     defer skp.wipe();
@@ -132,9 +133,9 @@ pub fn enroll(a: std.mem.Allocator, bridge_url: []const u8, code: []const u8, ca
 
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
-    var client: std.http.Client = .{ .allocator = a, .io = threaded.io() };
+    var client: std.http.Client = .{ .allocator = a, .io = android_io.io(&threaded) };
     defer client.deinit();
-    try trustFrom(&client, a, threaded.io(), ca_file);
+    try trustFrom(&client, a, android_io.io(&threaded), ca_file);
     var body: std.Io.Writer.Allocating = .init(a);
     defer body.deinit();
     const res = client.fetch(.{ .location = .{ .url = url }, .response_writer = &body.writer }) catch |err|
@@ -310,9 +311,9 @@ pub fn renew(a: std.mem.Allocator, id: Identity, server_now: i64, ca_file: ?[]co
     const public = skp.publicKeyText(&pub_buf);
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
-    var client: std.http.Client = .{ .allocator = a, .io = threaded.io() };
+    var client: std.http.Client = .{ .allocator = a, .io = android_io.io(&threaded) };
     defer client.deinit();
-    try trustFrom(&client, a, threaded.io(), ca_file);
+    try trustFrom(&client, a, android_io.io(&threaded), ca_file);
     var body: std.Io.Writer.Allocating = .init(a);
     defer body.deinit();
     // Stamped in the bridge's time. If the estimate is off, the bridge refuses the stamp

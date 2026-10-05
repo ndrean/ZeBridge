@@ -18876,3 +18876,26 @@ run (a leaf follows each `--update`), and mints a leaf's creds only when it has 
 
 Open: zb-client-ts should detect Safari's private windows, which have no OPFS, and say so
 (or fall back to an in-memory replica) instead of failing on a storage error.
+
+## §10ln — libzb on Android resolves names through bionic; 10-airports on Android (2026-10-05)
+
+The first run of 10-airports on Android (moto e20, 32-bit userspace, armeabi-v7a) failed at
+once: `enroll: https://bridge.zebridge.eu unreachable`. Zig treats Android as Linux and
+resolves host names itself, reading /etc/resolv.conf; Android has none, so Zig asks
+127.0.0.1:53, where nothing answers, and every name fails — enrollment and the NATS dial
+alike. Earlier Android runs dialled IP addresses on the dev network, so it never showed.
+Android resolves through libc (bionic asks netd).
+
+Fix, libzb/src/android_io.zig: on Android, libzb's `Io` is Zig's Threaded with one entry of
+its function table replaced — `netLookup` calls getaddrinfo (addresses, then the canonical
+name, at most 15, the queue closed on return: HostName.lookup's contract). enroll.zig and
+transport.zig take their `Io` from it; everywhere else it is `t.io()` unchanged. One seam
+covers std.http.Client (enroll, renew) and nats.zig's dial (patch 34 resolves through the
+same `netLookup`). The phone enrolled, seeded and shares the flight with the iPhone and the
+browser through the hub.
+
+The app gained its Android platform (`flutter create --platforms=android`), the INTERNET
+permission in the release manifest, and tool/build-libzb-android.sh (06-large-table's:
+arm64-v8a and armeabi-v7a). The AAR (zb-android) is rebuilt with the fix and nats.zig
+patches 32–34. A leaf build (`ZB_NATS_URL=tls://leaf1.zebridge.eu:4222`) works on the
+moto e20 too: Android through the leaf, with the domain from its enrollment.

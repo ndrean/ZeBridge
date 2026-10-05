@@ -6,6 +6,7 @@
 //! generation, nonce signing) is nats.zig's own nkeys.zig; nothing to add.
 
 const std = @import("std");
+const android_io = @import("android_io.zig"); // Android: names through getaddrinfo (§10ln)
 const nats = @import("nats");
 
 pub const ConnectOptions = struct {
@@ -217,7 +218,7 @@ pub const Transport = struct {
             .js = undefined,
         };
         errdefer self.threaded.deinit();
-        const io = self.threaded.io();
+        const io = android_io.io(&self.threaded);
 
         self.conn = try allocator.create(nats.Connection);
         errdefer allocator.destroy(self.conn);

@@ -2746,6 +2746,13 @@ Checked against each project's documentation in October 2026:
 
 Worth knowing: ElectricSQL joined Databricks in August 2026 and syncs reads only; Replicache is in maintenance mode, and its authors point to Zero; Triplit's founder joined Supabase in 2025 and its site is gone, so treat it as unmaintained.
 
+**Closer to the bridge alone**: PostgreSQL and NATS, with no client side.
+
+- [Debezium Server](https://debezium.io/documentation/reference/stable/operations/debezium-server.html) has a NATS JetStream sink (`debezium.sink.type=nats-jetstream`): it reads PostgreSQL's logical replication like the bridge, and publishes each change, in Debezium's JSON envelope, to JetStream subjects; it can create a basic stream, and authenticates with a JWT or a password. It carries the change feed one way. Splitting it by tenant, the snapshots a new client seeds from, the write path back with its verdicts, and a client that applies it all locally are left to you. A Java service, Apache-2.0.
+- [pgnats](https://github.com/luxms/pgnats) is a PostgreSQL extension (Rust, pgrx, MIT): SQL functions that publish to NATS and JetStream, send requests, read and write the KV and object stores, and subscribe a SQL function to a subject. It has no change capture of its own: you call it, from a trigger for example. Its README does not say whether a publish waits for the transaction to commit.
+
+ZeBridge does both directions: changes out, by logical replication and per tenant, and writes in, each judged by PostgreSQL, with the client library on the device.
+
 ## Requirements, Dependencies, Licenses & Sources
 
 **External dependencies**, via `build.zig.zon`:
