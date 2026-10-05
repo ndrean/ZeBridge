@@ -154,6 +154,25 @@ One vocabulary: the same key means the same thing in libzb's `opts_json` and in 
 | `platform` | — (one build per platform) | asserts the entry the bundler picked |
 | `storage`, `transport`, `connect`, `zstdDecompress`, `zstdDecompressStream`, `zstdCompress` | — | overrides, for a test or a storage of your own; an app never needs them |
 
+## TLS on iOS and Android
+
+libzb checks every `https://` (enrollment, renewal) and `tls://` (NATS) connection against
+trusted root certificates. On macOS, Linux and Windows it reads the system's. On iOS and
+Android it cannot: Zig, which libzb is written in, reads no trust store there. So libzb
+carries its own: Mozilla's CA bundle, the one curl, Python's certifi, Debian's
+`ca-certificates` and Node.js use, compiled into the iOS and Android builds only. When the
+app passes no `caFile`, libzb writes the bundle once beside the replica (`zb-roots.pem`)
+and uses it. An app ships no certificates, and every binding (Flutter, React Native,
+Kotlin, Swift) gets this from libzb.
+
+Pass `caFile` yourself to trust something else: a private CA for a server of your own, or
+only the roots your servers chain to (stricter, but a certificate from another CA is then
+refused).
+
+The roots are those of the libzb build: a CA that Mozilla adds or removes reaches users with
+the next build. The bundle is refreshed before a release (`libzb/scripts/refresh-roots.sh`,
+in [DISTRIBUTION](DISTRIBUTION.md#building)).
+
 ## Pinned by fixtures — identical by construction
 
 One conformance suite, `zb-client-ts/fixtures/core-fixtures.json`, drives both cores (`core.ts` through `core.test.ts`, `core.zig` through `libzb/python/runner.py`). A rule in a fixture group cannot diverge without a test failing on one side.

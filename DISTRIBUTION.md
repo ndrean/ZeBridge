@@ -11,6 +11,7 @@ local storage engines. This page says which build a host needs, and why.
 | --- | --- | --- |
 | core | the protocol, the NATS client, the C ABI | always compiled in |
 | SQLite + zstd | the default engine, and chain decompression | compiled in from pinned sources (`-Dvendor=true`), or linked from the machine |
+| TLS roots | Mozilla's CA bundle, for `https://` and `tls://` on iOS and Android, where Zig reads no trust store | compiled into iOS and Android builds only (about 190 KB); desktop builds read the system's store |
 | PostgreSQL engine | a replica in a PostgreSQL database (`dbUrl`) | compiled in; libpq opened at run time |
 | DuckDB engine | an analytical replica in a `.duckdb` file (`engine: "duckdb"`) | compiled in; libduckdb (~47 MB) opened at run time |
 
@@ -133,6 +134,16 @@ machine that runs the service.
 
 The engines' headers are in `libzb/include-engines/`, so building needs neither DuckDB
 nor PostgreSQL installed.
+
+**The TLS roots, before a release.** iOS and Android builds carry Mozilla's CA bundle from
+`libzb/src/roots/`. It is refreshed by hand:
+
+    libzb/scripts/refresh-roots.sh
+
+The script downloads the bundle curl publishes (`curl.se/ca/cacert.pem`), checks it against
+curl's published SHA-256, and records the date of Mozilla's data. Review the diff and commit
+it like any change. An iOS or Android build prints a warning once the bundle is more than six
+months old. Users get the new roots with the next build of the app.
 
 Every build embeds `grammar.json` and reports its hash (`zb_grammar_hash`). A client
 whose hash differs from the bridge's (`X-Grammar-Hash` on `/grammar`) refuses to

@@ -1410,7 +1410,7 @@ That is the whole contract for an app author: one callback per table.
 
 ### The C ABI library
 
-`libzb` does nothing on its own. It moves only when the host calls it. Which build a host needs (an xcframework, an AAR, a shared library) and how the optional DuckDB and PostgreSQL engines load: [DISTRIBUTION](DISTRIBUTION.md). Eight functions make the card:
+`libzb` does nothing on its own. It moves only when the host calls it. Which build a host needs (an xcframework, an AAR, a shared library) and how the optional DuckDB and PostgreSQL engines load: [DISTRIBUTION](DISTRIBUTION.md). On iOS and Android it carries its own TLS root certificates, so an app passes none ([CLIENTS](CLIENTS.md#tls-on-ios-and-android)). Eight functions make the card:
 
 | verb | what it does | returns |
 | --- | --- | --- |
