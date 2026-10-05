@@ -19066,3 +19066,13 @@ by key ("1 revoked key(s) … 0 it already held": the account had never revoked 
 `systemctl reload nats`, the same creds were refused, while the bridge, the responders and the
 devices kept their connections. leaf.yml then copied the account JWT into the leaf's
 trust.conf (changed=2: the file and the reload), so the key is refused through the leaf too.
+
+## §10lu — `--store -`: the offline store from standard input (2026-10-05)
+
+`--init-nats --update`, `--mint-responder` and `--mint-leaf` read `operator.store` from a
+file; `--store -` reads it from standard input, so it can live only in a password manager
+(KeePassXC, a self-hosted Bitwarden) and be piped in for the run: the seeds never touch the
+server's disk, and the README's advice to keep the store off the hub costs nothing. When
+`--update` adds a domain it used to write `JS_DOMAIN=` back into the store; from standard
+input it says the line to add to the operator's copy. Tested on the dev store: a mint, an
+`--update`, and an empty pipe refused.

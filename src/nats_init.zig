@@ -857,6 +857,17 @@ fn runOperator(
 /// issued stays valid. Only the account's line in the conf's resolver_preload changes;
 /// hand edits elsewhere in the conf survive. The revocations `bridge --revoke --full`
 /// wrote into the account are carried over: an update never un-revokes a key.
+/// The offline store: a file, or `-` for standard input — piped from a password manager, so
+/// the seeds never touch this host's disk (`keepassxc-cli attachment-export … - | bridge …`).
+fn readStore(io: std.Io, a: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (std.mem.eql(u8, path, "-")) {
+        var buf: [4096]u8 = undefined;
+        var r = std.Io.File.stdin().reader(io, &buf);
+        return r.interface.allocRemaining(a, .limited(1 << 16));
+    }
+    return std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 16));
+}
+
 fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[]const u8) u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
@@ -864,8 +875,8 @@ fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[
 
     const store_path = store_arg orelse (std.fs.path.join(a, &.{ dir, "operator.store" }) catch return 1);
     const conf_path = std.fs.path.join(a, &.{ dir, "nats-server.conf" }) catch return 1;
-    var store = std.Io.Dir.cwd().readFileAlloc(io, store_path, a, .limited(1 << 16)) catch {
-        out("🔴 cannot read the store {s} (--store PATH if it lives elsewhere)\n", .{store_path});
+    var store = readStore(io, a, store_path) catch {
+        out("🔴 cannot read the store {s} (--store PATH if it lives elsewhere, - for standard input)\n", .{store_path});
         return 1;
     };
     var conf = std.Io.Dir.cwd().readFileAlloc(io, conf_path, a, .limited(1 << 20)) catch {
@@ -945,7 +956,12 @@ fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[
 
     const new_conf = std.mem.concat(a, u8, &.{ conf[0..jwt_start], new_jwt, conf[jwt_end..] }) catch return 1;
     writeFile(io, conf_path, new_conf, true) catch return 1;
-    if (env_line != null) writeFile(io, store_path, store, true) catch return 1;
+    if (env_line != null) {
+        // From standard input there is no file to write back: say the line to add.
+        if (std.mem.eql(u8, store_path, "-")) {
+            out("⚠️  add `JS_DOMAIN={s}` to your copy of the store (it was read from standard input)\n", .{domain});
+        } else writeFile(io, store_path, store, true) catch return 1;
+    }
     if (env_line) |line| {
         const env_path = std.fs.path.join(a, &.{ dir, ".env.nats" }) catch return 1;
         const env = std.Io.Dir.cwd().readFileAlloc(io, env_path, a, .limited(1 << 16)) catch {
@@ -1163,8 +1179,8 @@ pub fn mintResponder(io: std.Io, init: *const std.process.Init) u8 {
     // template expansion all accept it.
     for (who) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-')) return mintUsage("--name: letters, digits, '_' and '-' only");
 
-    const store = std.Io.Dir.cwd().readFileAlloc(io, store_path, a, .limited(1 << 16)) catch {
-        out("🔴 cannot read the store {s} (--store PATH)\n", .{store_path});
+    const store = readStore(io, a, store_path) catch {
+        out("🔴 cannot read the store {s} (--store PATH, - for standard input)\n", .{store_path});
         return 1;
     };
     const sk_text = storeValue(store, "SK_RESPONDER_SEED") orelse {
@@ -1235,8 +1251,8 @@ pub fn mintLeaf(io: std.Io, init: *const std.process.Init) u8 {
     const who = name orelse return mintLeafUsage("--name is required");
     for (who) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-')) return mintLeafUsage("--name: letters, digits, '_' and '-' only");
 
-    const store = std.Io.Dir.cwd().readFileAlloc(io, store_path, a, .limited(1 << 16)) catch {
-        out("🔴 cannot read the store {s} (--store PATH)\n", .{store_path});
+    const store = readStore(io, a, store_path) catch {
+        out("🔴 cannot read the store {s} (--store PATH, - for standard input)\n", .{store_path});
         return 1;
     };
     const acct_text = storeValue(store, "ACCOUNT_SEED") orelse {

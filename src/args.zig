@@ -28,7 +28,7 @@ const usage =
     \\
     \\  --init-nats --update        Re-sign the account after a grammar change, same keys
     \\      [--dir DIR]             …the directory holding nats-server.conf (default ./zb-nats)
-    \\      [--store PATH]          …the offline seeds (default DIR/operator.store)
+    \\      [--store PATH]          …the offline seeds (default DIR/operator.store; - reads standard input)
     \\      [--js-domain NAME]      …add a domain to a running stack that has none (a first leaf)
     \\
     \\  --init-sql      The init SQL for this database, on stdout (pipe it to psql). Reads
@@ -38,6 +38,8 @@ const usage =
     \\                  Creds for a responder service, on stdout, signed from operator.store
     \\  --mint-leaf --name NAME [--store PATH]
     \\                  Creds for a leaf node's remote, on stdout: what its clients may carry
+    \\                  --store - reads the store from standard input (a password manager's pipe):
+    \\                  the seeds never touch this host's disk
     \\  --revoke <principal>  Revoke: mapping + unused invites, three-clock narration.
     \\                  Needs ADMIN_DATABASE_URL for the invocation (never stored in env)
     \\      [--conf PATH]           …and close the token now: with OPERATOR_SEED and

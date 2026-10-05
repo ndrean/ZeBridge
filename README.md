@@ -241,6 +241,10 @@ Bindings exist for Python, Kotlin (Android), Dart/Flutter and React Native. See 
   - **By place, at country scale**: the data stays whole, and a responder service per region, on a NATS leaf node close to its users, answers "what is around me?". The phone keeps the answers in a local table, so they stay available offline. The region's phones are served by their own leaf; the hub sees their questions only when that leaf has no responder ([examples/08-map](examples/08-map)).
 - **Strict authentication, JWT rotation**: because NATS is exposed to the internet and contains data, users are strictly tenant scoped and access grants are encoded in a JWT, immediately revokable by the DBA. Your app signs users in (OAuth or anything else) and its backend issues a one-time invite; the library enrolls the device with it and renews its JWT before it expires (`ENROLL_JWT_TTL_SECONDS`).
 - **Encryption**: in transit, TLS. At rest, the PostgreSQL disk can be encrypted, and so can NATS's store. The replicas are normally not encrypted (plain SQLite does not offer it).
+
+> [!WARNING]
+> Encryption protects data between two points, not at the points themselves. Wherever TLS ends, the data is readable by whoever runs that point: a proxy that terminates TLS (in the demo, Cloudflare in front of the bridge and the browsers' WebSocket), a managed PostgreSQL (the database reads every row it judges), a hosted telemetry service. Each of these operators, and the rules they answer to, can see what passes through them. If you need full control over who may read your data, run the database yourself, and choose the services in the chain with care, or leave them out: clients can reach NATS and the bridge directly, without a proxy.
+
 - **Schema translation**: replicas are built from PostgreSQL's schemas: as is for PGlite, translated for SQLite, with `STRICT` tables.
 - **PostGIS and pgvector ready**: support of `PostGIS` (binary EWKB as BLOB) and `pgvector` types out of the box.
 - **Anti-client flood**: writes per client are limited in backlog, on by default (`MUTATION_BACKLOG_PER_PRINCIPAL`, 5,000 queued writes: past it, that client's new writes are refused, and nothing already queued is evicted), and optionally in rate (`MUTATION_RATE_PER_PRINCIPAL`, off by default: over the rate, writes are delayed, not dropped).
@@ -934,7 +938,7 @@ See [Replication slot management](#replication-slot-management) for details abou
       [--js-domain NAME]      …for a JetStream reached across a leaf link (conf, grants, env)
   --init-nats --update        Re-sign the account after a grammar change, same keys
       [--dir DIR]             …the directory holding nats-server.conf (default ./zb-nats)
-      [--store PATH]          …the offline seeds (default DIR/operator.store)
+      [--store PATH]          …the offline seeds (default DIR/operator.store; - reads standard input)
       [--js-domain NAME]      …add a domain to a running stack that has none (a first leaf); enrolled devices keep working
   
   --init-sql      The init SQL for this database, on stdout (pipe it to psql). Reads
@@ -943,6 +947,8 @@ See [Replication slot management](#replication-slot-management) for details abou
                   Creds for a responder service, on stdout, signed from operator.store
   --mint-leaf --name NAME [--store PATH] [--ttl-days D]
                   Creds for a leaf node's remote, on stdout: what its clients may carry
+                  --store - reads the store from standard input (a password manager's pipe):
+                  the seeds never touch this host's disk
   --revoke <principal>  Revoke: mapping + unused invites, three-clock narration.
                   Needs ADMIN_DATABASE_URL for the invocation (never stored in env)
       [--conf PATH]           …and close the token now: with OPERATOR_SEED and
