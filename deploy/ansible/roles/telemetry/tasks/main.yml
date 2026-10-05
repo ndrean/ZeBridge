@@ -6,6 +6,7 @@
   register: telemetry_docker
   changed_when: false
   failed_when: false
+  check_mode: false   # a read: --check needs its answer
 
 # Only when missing: a host with Docker's own packages keeps them (Debian's would conflict).
 - name: Docker from Debian
@@ -31,6 +32,7 @@
   ansible.builtin.copy:
     dest: /opt/zebridge-telemetry/.env.grafana
     content: "GRAFANA_PASSWORD={{ vault_grafana_password }}\n"
+    force: "{{ zb_rewrite_secrets | bool }}"   # an existing file stays (see vars.yml)
     mode: "0600"
   no_log: true
   register: telemetry_token

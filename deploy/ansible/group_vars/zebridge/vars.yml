@@ -21,6 +21,17 @@ duckdb_version: "1.5.5"
 
 letsencrypt_email: "you@example.com"
 
+# Leaf nodes (README "Adding a leaf node"): the JetStream domain the hub's JetStream
+# answers to, and the leaves' addresses, one per family — the hub opens 7422 to them
+# only. An empty list: no leafnodes listener.
+zb_js_domain: hub
+zb_leaf_addresses: ["54.37.13.184", "2001:41d0:404:200::5858"]
+
+# The secrets (vault.yml) are written only where their file is missing: a server keeps
+# its own certificates, tokens and database URLs, and the vault matters for a new server.
+# To replace them from the vault (a rotation): -e zb_rewrite_secrets=true.
+zb_rewrite_secrets: false
+
 # The enrollment JWT lifetime handed to clients.
 enroll_jwt_ttl_seconds: 86400
 

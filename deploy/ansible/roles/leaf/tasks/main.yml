@@ -1,0 +1,199 @@
+# One leaf: nats-server with TLS for phones (4222) and browsers (a websocket), the hub's
+# trust, and a remote to the hub's leafnodes port with the leaf's own credentials. No
+# JetStream: the devices' stream calls reach the hub's through the domain they enrolled
+# with (js_domain).
+
+- name: Packages
+  ansible.builtin.apt:
+    name: [ca-certificates, curl, unzip, ufw, acl, certbot, python3-certbot-dns-cloudflare]
+    update_cache: true
+
+- name: The nats user
+  ansible.builtin.user:
+    name: nats
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+
+- name: The nats-server binary
+  ansible.builtin.include_role:
+    name: binaries
+    tasks_from: nats
+
+- name: The directories, readable by the nats group
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: nats
+    mode: "0750"
+  loop: [/etc/zebridge, /etc/zebridge/tls, /etc/zebridge/creds]
+
+# ── the certificate: Let's Encrypt for the leaf's own name, by DNS-01 ──────────────────
+
+- name: The token's directory
+  ansible.builtin.file:
+    path: /root/.secrets
+    state: directory
+    mode: "0700"
+
+- name: The Cloudflare token, for certbot (written when missing)
+  ansible.builtin.copy:
+    dest: /root/.secrets/cloudflare.ini
+    content: "dns_cloudflare_api_token = {{ vault_cloudflare_dns_token }}\n"
+    mode: "0600"
+    force: "{{ zb_rewrite_secrets | bool }}"
+  no_log: true
+
+- name: The renewal hook
+  ansible.builtin.copy:
+    dest: /etc/letsencrypt/renewal-hooks/deploy/nats.sh
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      # After each renewal of {{ leaf_host }}: copy where the nats user can read it, then reload.
+      install -m 0640 -o root -g nats /etc/letsencrypt/live/{{ leaf_host }}/fullchain.pem /etc/zebridge/tls/leaf.crt
+      install -m 0640 -o root -g nats /etc/letsencrypt/live/{{ leaf_host }}/privkey.pem /etc/zebridge/tls/leaf.key
+      systemctl reload nats 2>/dev/null || true
+
+- name: Let's Encrypt for the leaf (first time only)
+  ansible.builtin.command: >-
+    certbot certonly --non-interactive --agree-tos -m {{ letsencrypt_email }}
+    --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini
+    --dns-cloudflare-propagation-seconds 30 -d {{ leaf_host }}
+  args:
+    creates: "/etc/letsencrypt/live/{{ leaf_host }}/fullchain.pem"
+
+- name: The certificate where NATS reads it
+  ansible.builtin.command: /etc/letsencrypt/renewal-hooks/deploy/nats.sh
+  args:
+    creates: /etc/zebridge/tls/leaf.crt
+
+# ── what the hub gave: its trust, and this leaf's credentials ──────────────────────────
+
+# Every run: after an `--update` on the hub (a grammar change, a domain), the leaf checks
+# the devices' JWTs against the new account at once.
+- name: The hub's trust (operator and accounts)
+  ansible.builtin.copy:
+    dest: /etc/zebridge/trust.conf
+    content: "{{ hostvars[leaf_hub].hub_trust }}\n"
+    owner: root
+    group: nats
+    mode: "0640"
+  notify: Reload nats
+
+- name: This leaf's credentials, when the hub just minted them
+  ansible.builtin.copy:
+    dest: "/etc/zebridge/creds/{{ leaf_name }}.creds"
+    content: "{{ leaf_minted.stdout }}"
+    owner: root
+    group: nats
+    mode: "0640"
+  vars:
+    leaf_minted: "{{ hostvars[leaf_hub].hub_leaf_mints.results | selectattr('item', 'equalto', inventory_hostname) | first }}"
+  when: leaf_minted.stdout is defined
+  no_log: true
+  notify: Restart nats
+
+# ── the server ─────────────────────────────────────────────────────────────────────────
+
+- name: The leaf's nats-server.conf
+  ansible.builtin.copy:
+    dest: /etc/zebridge/nats-server.conf
+    owner: root
+    group: nats
+    mode: "0640"
+    content: |
+      # Managed by deploy/ansible (leaf.yml). A leaf: no jetstream block.
+      include ./trust.conf
+      port: 4222
+      http: "127.0.0.1:8222"
+      ping_interval: "1m"
+      tls {
+        cert_file: "/etc/zebridge/tls/leaf.crt"
+        key_file:  "/etc/zebridge/tls/leaf.key"
+      }
+      {% if leaf_ws_port %}
+
+      websocket {
+        port: {{ leaf_ws_port }}
+        tls {
+          cert_file: "/etc/zebridge/tls/leaf.crt"
+          key_file:  "/etc/zebridge/tls/leaf.key"
+        }
+        allowed_origins: {{ leaf_allowed_origins | to_json }}
+      }
+      {% endif %}
+
+      leafnodes {
+        remotes: [{
+          url: "tls://{{ zb_host_nats }}:7422"
+          credentials: "/etc/zebridge/creds/{{ leaf_name }}.creds"
+          account: "{{ hostvars[leaf_hub].hub_account }}"
+        }]
+      }
+  notify: Restart nats
+
+# Checked as written, with its include beside it (a copy's `validate` runs on a temporary
+# file elsewhere, where ./trust.conf is not).
+- name: The configuration passes nats-server -t
+  ansible.builtin.command: nats-server -t -c /etc/zebridge/nats-server.conf
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: The nats.service unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/nats.service
+    mode: "0644"
+    content: |
+      [Unit]
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      User=nats
+      ExecStart=/usr/local/bin/nats-server -c /etc/zebridge/nats-server.conf
+      ExecReload=/bin/kill -s HUP $MAINPID
+      Restart=on-failure
+      LimitNOFILE=65536
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: Restart nats
+
+- name: NATS running
+  ansible.builtin.systemd_service:
+    name: nats
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# ── the firewall: SSH, phones, browsers; nothing else ─────────────────────────────────
+
+- name: Firewall — SSH, the client port, and the websocket
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop: "{{ ['22', '4222'] + ([leaf_ws_port | string] if leaf_ws_port else []) }}"
+
+- name: Firewall — on, everything else refused
+  community.general.ufw:
+    state: enabled
+    default: deny
+    direction: incoming
+
+# ── the link ───────────────────────────────────────────────────────────────────────────
+
+- name: Restart NATS now if anything changed
+  ansible.builtin.meta: flush_handlers
+
+- name: The link to the hub is up (/leafz)
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8222/leafz
+    return_content: true
+  register: leaf_leafz
+  until: leaf_leafz.json.leafnodes | default(0) | int > 0
+  retries: 10
+  delay: 3
+  check_mode: false

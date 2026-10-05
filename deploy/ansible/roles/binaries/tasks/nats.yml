@@ -1,0 +1,34 @@
+# nats-server from its release, at nats_version: the hub's and the leaves' (leaf.yml).
+
+- name: The nats-server installed
+  ansible.builtin.command: /usr/local/bin/nats-server --version
+  register: binaries_nats
+  changed_when: false
+  failed_when: false
+  check_mode: false   # a read: decides whether to download
+
+# Only when it is missing or another version: a release download per run is not needed.
+- name: The nats-server release, when another version is installed
+  when: binaries_nats.rc != 0 or ('v' + nats_version) not in binaries_nats.stdout
+  block:
+    - name: The release, unpacked in /tmp
+      ansible.builtin.unarchive:
+        src: "https://github.com/nats-io/nats-server/releases/download/v{{ nats_version }}/nats-server-v{{ nats_version }}-linux-{{ zb_arch }}.tar.gz"
+        dest: /tmp
+        remote_src: true
+
+    - name: The nats-server binary in /usr/local/bin
+      ansible.builtin.copy:
+        src: "/tmp/nats-server-v{{ nats_version }}-linux-{{ zb_arch }}/nats-server"
+        dest: /usr/local/bin/nats-server
+        remote_src: true
+        mode: "0755"
+        owner: root
+        group: root
+      when: not ansible_check_mode   # --check unpacks nothing: it reports the version below
+      notify: Restart nats
+
+    - name: Under --check, would install nats-server {{ nats_version }}
+      ansible.builtin.debug:
+        msg: "installed: {{ binaries_nats.stdout | default('none') }}"
+      when: ansible_check_mode

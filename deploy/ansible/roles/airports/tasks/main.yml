@@ -31,14 +31,27 @@
         state: directory
         mode: "0755"
 
-    - name: The zb-python package and the service
+    # The binding and the library from the same build: an ABI mismatch stops the service
+    # at start (2026-10-04, `libzb speaks ABI 5, this package 4`).
+    - name: The zb-python package's directory
+      ansible.builtin.file:
+        path: /opt/airports/zebridge
+        state: directory
+        mode: "0755"
+
+    - name: The zb-python package (its .py files, no __pycache__)
       ansible.builtin.copy:
-        src: "{{ item.src }}"
-        dest: "{{ item.dest }}"
+        src: "{{ item }}"
+        dest: /opt/airports/zebridge/
         mode: "0644"
-      loop:
-        - { src: "{{ zb_repo }}/zb-python/src/zebridge", dest: /opt/airports/ }
-        - { src: "{{ zb_repo }}/examples/10-airports/airport_service.py", dest: /opt/airports/airport_service.py }
+      with_fileglob: "{{ zb_repo }}/zb-python/src/zebridge/*.py"
+      notify: Restart airports
+
+    - name: The service
+      ansible.builtin.copy:
+        src: "{{ zb_repo }}/examples/10-airports/airport_service.py"
+        dest: /opt/airports/airport_service.py
+        mode: "0644"
       notify: Restart airports
 
     - name: The replica's directory

@@ -15,6 +15,7 @@
   ansible.builtin.copy:
     dest: /etc/haproxy/certs/bridge.pem
     content: "{{ vault_origin_cert | trim }}\n{{ vault_origin_key | trim }}\n"
+    force: "{{ zb_rewrite_secrets | bool }}"   # an existing file stays (see vars.yml)
     mode: "0600"
   no_log: true
   notify: Restart haproxy

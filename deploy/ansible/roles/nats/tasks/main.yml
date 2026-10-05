@@ -3,9 +3,32 @@
 # listeners are set, each edit checked by `nats-server -t` before it is written.
 
 - name: The configuration, generated once (operator, accounts, the bridge's creds)
-  ansible.builtin.command: bridge --init-nats operator --dir /etc/zebridge
+  ansible.builtin.command: >-
+    bridge --init-nats operator --dir /etc/zebridge
+    {{ ('--js-domain ' + zb_js_domain) if zb_js_domain else '' }}
   args:
     creates: /etc/zebridge/nats-server.conf
+
+# What is already in the file: a server set up by hand keeps its own blocks (a second
+# `tls {}` or `leafnodes {}` beside them would not be the same server).
+- name: The configuration as it is
+  ansible.builtin.slurp:
+    src: /etc/zebridge/nats-server.conf
+  register: nats_conf_raw
+  check_mode: false
+
+- name: The configuration's text
+  ansible.builtin.set_fact:
+    nats_conf: "{{ nats_conf_raw.content | b64decode }}"
+
+# A stack made before its first leaf: the domain is added once, by the bridge, which
+# re-signs the grants with both API prefixes (needs operator.store on the server).
+- name: The JetStream domain, added to a stack that has none
+  ansible.builtin.command: bridge --init-nats --update --dir /etc/zebridge --js-domain {{ zb_js_domain }}
+  when: >-
+    zb_js_domain | length > 0 and nats_conf is not search('(?m)^ *domain: *' + zb_js_domain + ' *$')
+  changed_when: true
+  notify: [Restart nats, Restart zebridge]
 
 - name: JetStream's directory
   ansible.builtin.file:
@@ -28,6 +51,8 @@
 # Clients on the internet: TLS on 4222 with the Let's Encrypt certificate. Every client of
 # this port must then use TLS — the bridge and the services included (tls://nats.<domain>).
 - name: TLS on the client port, and a ping under Cloudflare's 100 s idle cut
+  when: >-
+    nats_conf is not search('(?m)^tls [{]') or nats_conf is search('BEGIN zebridge ansible: client TLS')
   ansible.builtin.blockinfile:
     path: /etc/zebridge/nats-server.conf
     marker: "# {mark} zebridge ansible: client TLS"
@@ -52,6 +77,27 @@
         tls {
           cert_file: "/etc/zebridge/tls/origin.crt"
           key_file:  "/etc/zebridge/tls/origin.key"
+        }
+      }
+    validate: nats-server -t -c %s
+  notify: Restart nats
+
+# The leaves' door: 7422 with the client port's certificate (the leaves dial
+# tls://nats.<domain>:7422). Each leaf joins with its own creds (bridge --mint-leaf).
+- name: The leafnodes listener
+  when: >-
+    zb_leaf_addresses | length > 0 and
+    (nats_conf is not search('(?m)^leafnodes [{]') or nats_conf is search('BEGIN zebridge ansible: leafnodes'))
+  ansible.builtin.blockinfile:
+    path: /etc/zebridge/nats-server.conf
+    marker: "# {mark} zebridge ansible: leafnodes"
+    block: |
+      leafnodes {
+        port: 7422
+        no_advertise: true
+        tls {
+          cert_file: "/etc/zebridge/tls/nats.crt"
+          key_file:  "/etc/zebridge/tls/nats.key"
         }
       }
     validate: nats-server -t -c %s

@@ -3,7 +3,7 @@
 #     edited in place, never rewritten;
 #   * .env.bridge is the DBA's side: the database URLs, the slot, the publication.
 
-- name: .env.bridge — the database side (0600, the service user's)
+- name: .env.bridge — the database URLs (secrets, written only where the file is missing)
   ansible.builtin.copy:
     dest: /etc/zebridge/.env.bridge
     owner: zebridge
@@ -12,12 +12,27 @@
     content: |
       DATABASE_READER_URL={{ vault_database_reader_url }}
       DATABASE_WRITER_URL={{ vault_database_writer_url }}
-      BRIDGE_CDC_PUBLICATION={{ zb_publication }}
-      BRIDGE_CDC_SLOT={{ zb_slot }}
-      GENERATIONS_ENABLED=1
-      ENROLL_NATS_URL=tls://{{ zb_host_nats }}:4222
-      ENROLL_NATS_WS_URL=wss://{{ zb_host_ws }}:443
+    force: "{{ zb_rewrite_secrets | bool }}"   # an existing file stays (see vars.yml)
   no_log: true
+  notify: Restart zebridge
+
+- name: .env.bridge — the settings, line by line
+  ansible.builtin.lineinfile:
+    path: /etc/zebridge/.env.bridge
+    regexp: "^{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
+    create: true      # --check on a new server: the file above is not written yet
+    owner: zebridge
+    group: zebridge
+    mode: "0600"
+  loop: "{{ zb_bridge_settings | dict2items }}"
+  vars:
+    zb_bridge_settings:
+      BRIDGE_CDC_PUBLICATION: "{{ zb_publication }}"
+      BRIDGE_CDC_SLOT: "{{ zb_slot }}"
+      GENERATIONS_ENABLED: "1"
+      ENROLL_NATS_URL: "tls://{{ zb_host_nats }}:4222"
+      ENROLL_NATS_WS_URL: "wss://{{ zb_host_ws }}:443"
   notify: Restart zebridge
 
 # 4222 speaks TLS only: the bridge dials it by name (the certificate's), which /etc/hosts

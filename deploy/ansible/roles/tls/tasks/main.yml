@@ -19,6 +19,7 @@
   ansible.builtin.copy:
     dest: /root/.secrets/cloudflare.ini
     content: "dns_cloudflare_api_token = {{ vault_cloudflare_dns_token }}\n"
+    force: "{{ zb_rewrite_secrets | bool }}"   # an existing file stays (see vars.yml)
     mode: "0600"
   no_log: true
 
@@ -62,6 +63,7 @@
   ansible.builtin.copy:
     dest: "/etc/zebridge/tls/{{ item.name }}"
     content: "{{ item.content }}"
+    force: "{{ zb_rewrite_secrets | bool }}"   # an existing file stays (see vars.yml)
     owner: root
     group: nats
     mode: "0640"

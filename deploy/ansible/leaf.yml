@@ -1,0 +1,65 @@
+# Leaf nodes (main README, "Adding a leaf node"): a nats-server near a group of devices,
+# with no JetStream of its own, joined to the hub with its own credentials.
+#
+#   ansible-playbook leaf.yml --ask-vault-pass
+#
+# Three plays, because a leaf needs two things only the hub has: the trust lines of its
+# nats-server.conf (the operator and the accounts), and a leaf credential minted from
+# operator.store. They travel through Ansible's memory, never through a file here.
+
+- name: What each leaf already holds
+  hosts: leaves
+  become: true
+  gather_facts: false
+  tasks:
+    - name: The leaf's credentials, if any
+      ansible.builtin.stat:
+        path: "/etc/zebridge/creds/{{ leaf_name }}.creds"
+      register: leaf_creds_file
+
+- name: From the hub, its trust and the missing leaf credentials
+  hosts: zebridge
+  become: true
+  gather_facts: false
+  tasks:
+    - name: The hub's NATS configuration
+      ansible.builtin.slurp:
+        src: /etc/zebridge/nats-server.conf
+      register: hub_conf_raw
+      check_mode: false
+
+    # From `operator:` to the end of `resolver_preload { … }`: who signs, and the accounts.
+    # The account key is the one the leaves' remote binds to.
+    - name: The trust lines and the ZEBRIDGE account key
+      ansible.builtin.set_fact:
+        hub_trust: "{{ hub_conf_raw.content | b64decode | regex_search('(?ms)^operator: .*?^resolver_preload: [{].*?^[}]') }}"
+        hub_account: "{{ hub_conf_raw.content | b64decode | regex_findall('Account \"ZEBRIDGE\"[^A]*(A[A-Z2-7]{55})') | first }}"
+
+    - name: Both found
+      ansible.builtin.assert:
+        that: [hub_trust | length > 0, hub_account | length == 56]
+        fail_msg: the hub's nats-server.conf has no operator/resolver_preload block, or no ZEBRIDGE account
+        quiet: true
+
+    # Minted only for a leaf that has none (or on request): every mint is a new user, and
+    # the leaf would restart for nothing.
+    - name: A credential for each leaf that has none (bridge --mint-leaf)
+      ansible.builtin.command: >-
+        bridge --mint-leaf --name {{ hostvars[item].leaf_name }} --store /etc/zebridge/operator.store
+      loop: "{{ groups['leaves'] }}"
+      when: zb_rewrite_secrets | bool or not hostvars[item].leaf_creds_file.stat.exists
+      register: hub_leaf_mints
+      changed_when: true
+      no_log: true
+
+- name: The leaves
+  hosts: leaves
+  become: true
+  # The settings and secrets the hub's group has (the domain, nats_version, the
+  # Cloudflare token for certbot), read when the play runs.
+  pre_tasks:
+    - name: The hub's settings and secrets (group_vars/zebridge)
+      ansible.builtin.include_vars:
+        dir: group_vars/zebridge
+  roles:
+    - leaf

@@ -1,0 +1,12 @@
+# Every leaf. Per leaf, in the inventory: leaf_name (its credentials' name, as
+# `bridge --mint-leaf --name`) and leaf_host (its DNS name, A and AAAA, DNS only: the
+# certificate names it, and phones and browsers dial it).
+
+# The hub the leaves join: the inventory name of the zebridge host whose trust and
+# operator.store they use.
+leaf_hub: "{{ groups['zebridge'][0] }}"
+
+# Browsers dial wss://<leaf_host>:<leaf_ws_port> (0: no websocket). The origins allowed
+# to open it: the published app, and a local preview while testing.
+leaf_ws_port: 8443
+leaf_allowed_origins: ["https://airports.zebridge.eu", "http://localhost:5176"]

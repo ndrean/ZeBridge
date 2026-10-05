@@ -18845,3 +18845,34 @@ traps: the creds file must be readable by the `nats` group like the old one (`ch
 --reference`); a mint on the hub runs the binary installed there, so check its hash
 first. Phone and browser work through the leaf on `leaf1`'s creds; the bridge's creds
 are off the leaf.
+
+## §10lm — the playbooks run: the hub adopted, the leaf added (2026-10-04/05)
+
+`site.yml` ran on the hand-built hub after three `--check --diff` passes, and `leaf.yml`
+(new) on the leaf; a second `--check` on both reports changed=0, and phone and browser
+work through the hub and through the leaf.
+
+What the dry runs found:
+- `--check` skips `command`, `shell` and `uri`, so whatever they register is empty and the
+  next step fails. The steps that only read (Cloudflare's lists, `nats-server --version`,
+  `--diagnose`) run with `check_mode: false`.
+- Becoming the unprivileged `zebridge` (`verify`) needs `setfacl`: `acl` is installed, and
+  `pipelining = true` avoids the temporary file altogether.
+- A hand-written `tls {}` (and `leafnodes {}`) would have got a second, managed copy. The
+  role reads the conf first and adopts such blocks. The conditions' regexes avoid every
+  backslash (`[{]`, ` *`): YAML, Jinja's string literal and `re` each treat escapes their
+  own way, and a local test showed `\\{` never reached `re` as `\{`.
+- The vault held placeholders; a real run would have overwritten the hub's origin
+  certificate and key, its tokens and its database URLs. Secret files are now written only
+  where missing (`force: false`, `-e zb_rewrite_secrets=true` to rotate), and a guard stops
+  the run if a placeholder would be written.
+- `.env.bridge` on the hub was 0644, group root: the database passwords readable by every
+  account. Now 0600 `zebridge`; its settings stay managed line by line.
+- The firewall writes ufw's multiport form (`443,8080/tcp` per Cloudflare range), as the
+  hand-made rules did.
+
+`leaf.yml` takes the hub's trust block and account key from its `nats-server.conf` on every
+run (a leaf follows each `--update`), and mints a leaf's creds only when it has none.
+
+Open: zb-client-ts should detect Safari's private windows, which have no OPFS, and say so
+(or fall back to an in-memory replica) instead of failing on a storage error.

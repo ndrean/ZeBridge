@@ -55,13 +55,42 @@ ansible-playbook site.yml --ask-vault-pass
 The NATS configuration is generated once, by `bridge --init-nats operator`: a later run
 keeps it, since a new operator would lock out every enrolled device. On a server set up by
 hand, the playbook adopts what is there, as long as the files are where the main README
-puts them (`/etc/zebridge`).
+puts them (`/etc/zebridge`): hand-written `tls {}` and `leafnodes {}` blocks are kept, and
+so are the secret files already there (next section). Try it first with `--check --diff`:
+it changes nothing and shows every difference.
+
+**Secrets.** Each secret from `vault.yml` is written only where its file is missing: a
+server keeps its own certificates, tokens and database URLs, and the vault matters for a
+new server. To replace them from the vault (a rotation), add `-e zb_rewrite_secrets=true`.
+A run that would write a placeholder from `vault.example.yml` stops before writing
+anything.
+
+## Leaf nodes
+
+`leaf.yml` sets up the hosts of the inventory's `leaves` group (see
+`inventory.example.yml`: each one names its credentials, `leaf_name`, and its DNS name,
+`leaf_host`, with A and AAAA records, DNS only):
+
+```sh
+ansible-playbook leaf.yml --ask-vault-pass
+```
+
+It reads the trust block (operator, accounts) of the hub's `nats-server.conf` on every run,
+so a leaf follows each `--init-nats --update` on the hub. It mints a leaf's credentials on
+the hub (`bridge --mint-leaf`) only when the leaf has none; `-e zb_rewrite_secrets=true`
+mints new ones. Then the Let's Encrypt certificate for `leaf_host`, the server with TLS
+on 4222 and a websocket (`leaf_ws_port`, `leaf_allowed_origins` in
+`group_vars/leaves/vars.yml`), the firewall, and a last check that the link is up
+(`/leafz`). The hub's side (its domain, `leafnodes` on 7422, the firewall for the
+leaves' addresses) is in `site.yml`: `zb_js_domain` and `zb_leaf_addresses` in
+`group_vars/zebridge/vars.yml`.
 
 ## After the first run
 
 * Move `/etc/zebridge/operator.store` off the server (a password manager, an offline
-  disk): it signs everything. The playbook needs it only to mint the airports responder's
-  creds, the first time.
+  disk): it signs everything. The playbooks need it only for what they create once: the
+  airports responder's creds, a leaf's creds, and a JetStream domain added to a running
+  stack. Put it back for those runs.
 * Check from outside: `https://bridge.<domain>/status` answers 200, and a direct
   connection to the server on 443 is refused (403).
 * Grafana Cloud: `bridge_connected{environment="production"}` is 1, and
@@ -70,6 +99,9 @@ puts them (`/etc/zebridge`).
 ## What each step guards against
 
 The order and the checks come from setting a server up by hand:
+
+* `--check` runs the steps that only read (Cloudflare's lists, the installed nats-server's
+  version, the diagnosis), so a dry run sees what a real one would;
 
 * the Let's Encrypt certificate is copied where NATS reads it on every run, not only after
   a renewal (the renewal hook alone left NATS without a certificate);

@@ -1,9 +1,40 @@
 # Packages, the two service users, a journal that survives reboots, the local name for
 # NATS, and the firewall.
 
+# A placeholder from vault.example.yml must never reach a file: stop before anything is
+# written when one would (a missing file, or zb_rewrite_secrets).
+- name: Which secret files exist
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - /root/.secrets/cloudflare.ini
+    - /etc/zebridge/tls/origin.crt
+    - /etc/zebridge/tls/origin.key
+    - /etc/haproxy/certs/bridge.pem
+    - /opt/zebridge-telemetry/.env.grafana
+    - /etc/zebridge/.env.bridge
+  register: base_secret_files
+
+- name: No placeholder would be written
+  ansible.builtin.assert:
+    that: >-
+      not (zb_rewrite_secrets | bool or (base_secret_files.results | rejectattr('stat.exists') | list | length > 0))
+      or (base_vault_values | select('match', '^<') | list | length == 0)
+    fail_msg: "a secret file would be written from vault.yml, and vault.yml still holds a placeholder (<…>)"
+    quiet: true
+  vars:
+    base_vault_values:
+      - "{{ vault_cloudflare_dns_token }}"
+      - "{{ vault_origin_cert }}"
+      - "{{ vault_origin_key }}"
+      - "{{ vault_grafana_password }}"
+      - "{{ vault_database_reader_url }}"
+      - "{{ vault_database_writer_url }}"
+  no_log: true
+
 - name: Packages
   ansible.builtin.apt:
-    name: [libpq5, libzstd1, ca-certificates, curl, unzip, python3, ufw]
+    name: [libpq5, libzstd1, ca-certificates, curl, unzip, python3, ufw, acl]   # acl: become_user zebridge
     update_cache: true
 
 - name: The service users
@@ -35,6 +66,7 @@
     return_content: true
   loop: [ips-v4, ips-v6]
   register: base_cf_lists
+  check_mode: false   # a read: --check needs the lists too
 
 # The lists end without a newline: joined line by line, never concatenated.
 - name: Cloudflare's ranges as one list
@@ -51,10 +83,18 @@
 - name: Firewall — HAProxy (443) and NATS's websocket (8080) for Cloudflare only
   community.general.ufw:
     rule: allow
-    src: "{{ item.0 }}"
-    port: "{{ item.1 }}"
+    src: "{{ item }}"
+    port: "443,8080"   # one multiport rule per range, as `ufw allow … port 443,8080 proto tcp`
     proto: tcp
-  loop: "{{ base_cloudflare_ranges | product(['443', '8080']) | list }}"
+  loop: "{{ base_cloudflare_ranges }}"
+
+- name: Firewall — the leafnodes port (7422) for the leaves only, one rule per address
+  community.general.ufw:
+    rule: allow
+    src: "{{ item }}"
+    port: "7422"
+    proto: tcp
+  loop: "{{ zb_leaf_addresses }}"
 
 - name: Firewall — on, everything else refused
   community.general.ufw:

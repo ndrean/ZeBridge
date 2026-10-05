@@ -1,0 +1,11 @@
+- name: Restart nats
+  ansible.builtin.systemd_service:
+    name: nats
+    state: restarted
+    daemon_reload: true
+
+# The trust changed: a reload reads it again without dropping the devices.
+- name: Reload nats
+  ansible.builtin.systemd_service:
+    name: nats
+    state: reloaded
