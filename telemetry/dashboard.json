@@ -763,7 +763,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Memory of the hub's four services as systemd counts it (working set, from their cgroups). Next to the bridge's own memory: one look for all four. A line that keeps climbing is a leak.",
+      "description": "Memory of the hub's services as systemd counts it (working set, from their cgroups): the bridge, the sweeper, NATS, airports, routing (zb-respond) and Valhalla. Next to the bridge's own memory, one look for all of them. A line that keeps climbing is a leak.",
       "targets": [
         {
           "datasource": {
@@ -1525,7 +1525,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "The processes' own memory, without file cache: the number to watch for a leak.",
+      "description": "The processes' own memory, without file cache: the number to watch for a leak. Valhalla is not here: its memory is mostly the routing tiles it maps from disk, which RSS does not count (and cAdvisor reports 0 for its slice) — see the working-set panels.",
       "targets": [
         {
           "datasource": {
@@ -1533,7 +1533,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "container_memory_rss{unit=~\"zebridge|zebridge-sweeper|nats|airports|routing|valhalla\"}",
+          "expr": "container_memory_rss{unit=~\"zebridge|zebridge-sweeper|nats|airports|routing\"}",
           "legendFormat": "{{unit}}",
           "refId": "A"
         }
@@ -1569,7 +1569,7 @@
   "timezone": "browser",
   "title": "ZeBridge - Postgres CDC to NATS",
   "uid": "zebridge-overview",
-  "version": 6,
+  "version": 7,
   "templating": {
     "list": [
       {
