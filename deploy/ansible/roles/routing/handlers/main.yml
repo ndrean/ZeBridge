@@ -10,4 +10,4 @@
     name: routing
     state: restarted
     daemon_reload: true
-  when: zb_routing | bool
+  when: zb_routing | bool and not ansible_check_mode   # the unit may be only pretended

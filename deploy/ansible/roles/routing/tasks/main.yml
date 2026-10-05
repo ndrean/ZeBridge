@@ -92,11 +92,18 @@
       args:
         creates: /etc/zebridge/creds/routing.creds
 
+    - name: Are the creds there? (under --check the mint above did not run)
+      ansible.builtin.stat:
+        path: /etc/zebridge/creds/routing.creds
+      register: routing_creds
+      check_mode: false
+
     - name: The creds belong to the service user
       ansible.builtin.file:
         path: /etc/zebridge/creds/routing.creds
         owner: zebridge
         mode: "0600"
+      when: routing_creds.stat.exists
 
     - name: The zb-respond configuration
       ansible.builtin.copy:
@@ -137,12 +144,20 @@
           WantedBy=multi-user.target
       notify: Restart routing
 
+    # Under --check on a first run the unit above is only pretended: systemd has none.
+    - name: Is the unit there?
+      ansible.builtin.stat:
+        path: /etc/systemd/system/routing.service
+      register: routing_unit
+      check_mode: false
+
     - name: The responder running
       ansible.builtin.systemd_service:
         name: routing
         enabled: true
         state: started
         daemon_reload: true
+      when: routing_unit.stat.exists
 
 # Outside the block: flush_handlers takes no `when`. Pending restarts now, so the check
 # below sees the new versions.
