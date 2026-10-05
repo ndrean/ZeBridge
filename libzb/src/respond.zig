@@ -141,7 +141,7 @@ pub fn main(init: std.process.Init) !u8 {
     var http: std.http.Client = .{ .allocator = a, .io = threaded.io() };
     defer http.deinit();
 
-    const on_signal: std.posix.Sigaction = .{ .handler = .{ .handler = onSignal }, .mask = std.mem.zeroes(std.posix.sigset_t), .flags = 0 },;
+    const on_signal: std.posix.Sigaction = .{ .handler = .{ .handler = onSignal }, .mask = std.mem.zeroes(std.posix.sigset_t), .flags = 0 };
     std.posix.sigaction(std.posix.SIG.INT, &on_signal, null);
     std.posix.sigaction(std.posix.SIG.TERM, &on_signal, null);
 

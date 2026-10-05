@@ -229,7 +229,10 @@ pub const Transport = struct {
             .user = opts.user,
             .password = opts.password,
             .inbox_prefix = opts.inbox_prefix,
-            .reconnect = .{ .allow_reconnect = true },
+            // Never give up on the server: nats.zig's default stops after 60 tries (about
+            // two minutes), and a client whose NATS was down longer stayed dead after it
+            // came back. The host decides when to stop, by closing.
+            .reconnect = .{ .allow_reconnect = true, .max_reconnect = std.math.maxInt(u32) },
             // Only on a tls:// URL: TLS options on a nats:// URL would force TLS on a
             // server that does not speak it.
             .tls = if (opts.ca_file != null and std.ascii.startsWithIgnoreCase(opts.url, "tls://")) .{ .ca_file = opts.ca_file } else null,

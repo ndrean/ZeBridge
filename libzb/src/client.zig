@@ -3484,6 +3484,12 @@ pub const SyncClient = struct {
 
     fn pollInner(self: *SyncClient, report_a: std.mem.Allocator, wait_ms: u64) !PollReport {
         try self.refuseIfRevoked();
+        // A connection closed for good (credentials refused, say) fails every call at
+        // once: without this wait, a host's poll loop spun, logging a line per pass.
+        if (self.t.conn.getStatus() == .closed) {
+            if (wait_ms > 0) std.Io.sleep(self.t.conn.io, .fromMilliseconds(@intCast(wait_ms)), .awake) catch {};
+            return error.ConnectionClosed;
+        }
 
         var changed_map: std.array_hash_map.String(void) = .empty;
         var seeded_map: std.array_hash_map.String(void) = .empty;
