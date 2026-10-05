@@ -185,6 +185,7 @@ To start again from scratch: `docker compose -f docker-compose.quickstart.yml do
       - [6. Secure the credentials](#6-secure-the-credentials)
       - [7. Verify the wiring](#7-verify-the-wiring)
       - [8. Invite the first user](#8-invite-the-first-user)
+    - [Adding a leaf node](#adding-a-leaf-node)
     - [Using a cloud PostgreSQL](#using-a-cloud-postgresql)
     - [NATS streams and buckets](#nats-streams-and-buckets)
     - [Running the Bridge](#running-the-bridge)
@@ -435,7 +436,7 @@ graph TD
 
     
 
-    subgraph VPS ["VPS (includes NATS server or leaf node)"]
+    subgraph VPS ["NATS server or leaf node"]
         NATS[NATS<br>tls:4222<br>wss:8080]:::internal
         NATS@{ shape: data-store }
     end
