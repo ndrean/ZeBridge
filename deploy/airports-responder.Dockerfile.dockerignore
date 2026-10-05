@@ -1,0 +1,6 @@
+# The responder image (airports-responder.Dockerfile) sends only what it copies; the root
+# .dockerignore is the bridge image's.
+*
+!libzb/zig-out/linux-*/lib/libzbcore.so
+!zb-python/src/zebridge/*.py
+!examples/10-airports/airport_service.py

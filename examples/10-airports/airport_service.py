@@ -18,6 +18,7 @@ spent in this service on the question (the SQL, the rows to JSON and back).
     PYTHONPATH=zb-python/src python3 examples/10-airports/airport_service.py --creds airports.creds
 """
 import argparse
+import socket
 import math
 import os
 import signal
@@ -102,6 +103,10 @@ def main():
     ap.add_argument("--creds", required=True, help="a responder's creds (bridge --mint-responder)")
     ap.add_argument("--db", default="/tmp/airports-service.duckdb")
     ap.add_argument("--queue", default="airports", help="instances in one queue group share the questions")
+    ap.add_argument("--js-domain", default=os.environ.get("NATS_JS_DOMAIN") or None,
+                    help="the hub's JetStream domain, when this service runs behind a leaf node")
+    ap.add_argument("--name", default=os.environ.get("ZB_SERVICE_NAME") or socket.gethostname(),
+                    help="said in every answer (`by`): which instance of the queue group answered")
     a = ap.parse_args()
 
     zb_ref: list = []
@@ -119,15 +124,17 @@ def main():
                 ans = fn(zb, req.get("payload") or {}) if fn else {"error": f"unknown query {req['name']!r}", "known": sorted(QUERIES)}
             except Exception as e:  # a bad parameter is the asker's problem
                 ans = {"error": f"{type(e).__name__}: {e}"}
+            ans["by"] = a.name
             zb.reply(req["id"], ans)
             print(f"{req['name']}: {ans.get('count', '?')} airport(s) in {ans.get('ms', '?')} ms", flush=True)
 
     t0 = time.time()
     # A question wakes libzb's poll when it lands, so the default 250 ms poll answers
     # at once and costs nothing when idle.
+    opts = {"js_domain": a.js_domain} if a.js_domain else {}
     with ZeBridge(nats_url=a.url, creds_path=a.creds, db_path=a.db, engine="duckdb",
                   tables=[TABLE], client_id="airport-service", heartbeat_ms=0,
-                  on_change=on_change) as zb:
+                  on_change=on_change, **opts) as zb:
         zb_ref.append(zb)
         held = zb.query(f"SELECT count(*) AS n FROM {TABLE}")[0]["n"]
         print(f"replica: {held} airports in {a.db}, {time.time() - t0:.1f} s", flush=True)

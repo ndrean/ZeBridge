@@ -18988,3 +18988,27 @@ a call. A Durable Object could hold one connection (and a replica in its SQLite)
 container runs libzb natively. Open: zb-client-ts has no "ask only" mode (connect() opens a
 replica), and an edge identity outlives a day only with a longer-lived principal or a renewal
 the function can store.
+
+## §10lr — the airports responder as a container, on the leaf (2026-10-05)
+
+deploy/airports-responder.Dockerfile: Debian 13 slim, python3, ca-certificates, libzb
+(build-linux.sh), DuckDB's release library, zb-python and the service — 223 MB. Debian, not
+Alpine: libzbcore.so and DuckDB's release are glibc builds, musl would need both rebuilt.
+Its own `.Dockerfile.dockerignore` (the root one is the bridge image's, and excludes
+examples/, libzb/ and *.py); the scratch `zig-out/*/repack` folders had to go, Docker's walk
+for the `!` exceptions stopped on an unreadable `__.SYMDEF`. airport_service.py gains
+`--js-domain` (behind a leaf) and `--name`, said in every answer as `by`.
+
+On leaf1 (2 vCPU, 3.8 GB), with a responder identity (`--mint-responder --name
+airports-leaf`, ten years, no daily renewal) and a volume for the DuckDB replica: seeded 9,253
+airports through the `hub` domain in 1.9 s; DuckDB answers in 6.5–9.8 ms, as on the hub's 6
+vCPUs. A question asked through the leaf is answered by `airports-leaf`, one asked through
+the hub by the hub's service: NATS gives a queue-group question to the nearest member, and
+the leaf link's grant (clients only, §10ll) keeps the leaf's responder from the hub's askers
+anyway. From the Mac both paths take ~32 ms (Strasbourg and Frankfurt are equally far).
+
+Traps: the Mac has two Docker engines (Docker Desktop and OrbStack, the owner's): build and
+`docker save` in the same context (`--context orbstack`). The leaf had no Docker
+(`apt install docker.io`). Not yet: the hub's service runs the previous airport_service.py
+(no `by`) until site.yml runs; a responder on the leaf serving the hub's askers would need a
+responder option on --mint-leaf.
