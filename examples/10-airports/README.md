@@ -144,16 +144,14 @@ The phone needs an invite in the same tenant as the browsers. From
 
 ```sh
 tool/build-libzb-ios.sh
-tool/export-roots.sh            # the trusted roots the app ships (see below)
 flutter pub get
 flutter build ios --release --dart-define=ZB_BRIDGE_URL=https://bridge.example.com --dart-define=ZB_INVITE=<code>
 xcrun devicectl device install app --device <udid> build/ios/iphoneos/Runner.app
 ```
 
-The enrollment answer gives the app its NATS address (`tls://…:4222`). Zig reads no
-trust store on iOS, so the app ships Apple's root certificates, exported from your Mac by
-`tool/export-roots.sh`, and gives libzb the file as `caFile`: libzb checks the bridge's
-`https://` certificate and the NATS server's against it. On a local network without TLS,
+The enrollment answer gives the app its NATS address (`tls://…:4222`). libzb checks the
+bridge's `https://` certificate and the NATS server's against its own copy of Mozilla's
+root certificates, since Zig reads no trust store on iOS or Android: the app passes none. On a local network without TLS,
 pass `http://` and `nats://` addresses instead (`ZB_NATS_URL`), with the bridge listening on
 the network (`BRIDGE_BIND=0.0.0.0`), and allow "Local Network" when iOS asks.
 

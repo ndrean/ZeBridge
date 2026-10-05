@@ -4,7 +4,6 @@ import dev.zebridge.Native
 import expo.modules.kotlin.Promise
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
-import java.io.File
 import java.util.concurrent.Executors
 
 /**
@@ -52,22 +51,6 @@ class ZbNativeModule : Module() {
     // NOT on the worker: the one call libzb allows from any thread. A poll may hold the
     // worker for its whole wait; this ends the wait, so the call queued behind it runs.
     Function("wake") { h: String -> Native.wake(handle(h)) }
-
-    // Zig reads no trust store on Android either: libzb checks https:// and tls:// against
-    // a PEM file. The module ships the roots as an asset (scripts/build-android.sh); copied
-    // to the app's files once, and src/index.ts passes the path when the app names none.
-    Function("defaultCaFile") {
-      val ctx = appContext.reactContext ?: return@Function null
-      val out = File(ctx.filesDir, "zb-roots.pem")
-      if (!out.exists()) {
-        try {
-          ctx.assets.open("zb-roots.pem").use { input -> out.outputStream().use { input.copyTo(it) } }
-        } catch (e: java.io.IOException) {
-          return@Function null
-        }
-      }
-      out.absolutePath
-    }
   }
 
   private fun run(promise: Promise, call: () -> Any?) {

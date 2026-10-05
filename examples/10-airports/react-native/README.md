@@ -16,7 +16,7 @@ Needs JDK 17 (React Native 0.76's Gradle does not run on newer ones; Android Stu
 bundled JDK is too new) and the Android SDK.
 
 ```sh
-../../../zb-react-native/scripts/build-android.sh   # libzb for the module, and the TLS roots
+../../../zb-react-native/scripts/build-android.sh   # libzb for the module
 pnpm install
 npx expo prebuild --platform android --clean
 
@@ -52,7 +52,7 @@ libzb is built into the module first, then the app. A new bundle id needs Xcode 
 its signing profile, which `expo run:ios` does not allow, so the build is `xcodebuild`'s:
 
 ```sh
-../../../zb-react-native/scripts/build-ios.sh     # libzb for the module, and Apple's roots
+../../../zb-react-native/scripts/build-ios.sh     # libzb for the module
 pnpm install
 npx expo prebuild --platform ios --clean
 
@@ -64,6 +64,6 @@ xcrun devicectl device install app --device <device> ios/build/Build/Products/Re
 ```
 
 `xcrun xctrace list devices` gives the UDID. On iOS libzb speaks TLS over TCP, so a leaf is
-`tls://…:4222`, not the websocket. The TLS roots come with the module: the app passes no
+`tls://…:4222`, not the websocket. libzb carries its own TLS roots: the app passes no
 `caFile`.
 

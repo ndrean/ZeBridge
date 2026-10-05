@@ -67,15 +67,6 @@ public class ZbNativeModule: Module {
       Int(zb_client_wake(try Self.handle(h)))
     }
 
-    // Zig reads no trust store on iOS: libzb checks https:// and tls:// against a PEM file
-    // (`caFile`). The module ships Apple's roots (scripts/build-ios.sh exports them), and
-    // src/index.ts passes this path when the app names none.
-    Function("defaultCaFile") { () -> String? in
-      guard let url = Bundle(for: ZbNativeModule.self).url(forResource: "ZbNativeRoots", withExtension: "bundle"),
-            let bundle = Bundle(url: url) else { return nil }
-      return bundle.path(forResource: "roots", ofType: "pem")
-    }
-
     AsyncFunction("close") { (h: String) throws -> Int in
       Int(zb_client_close(try Self.handle(h)))
     }.runOnQueue(queue)

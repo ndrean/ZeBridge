@@ -18948,3 +18948,25 @@ Build trap: `EXPO_PUBLIC_*` values are written into the code by Metro's transfor
 Metro's cache and Gradle's up-to-date check ignore the environment: a new invite was
 silently dropped twice. Clear Metro's cache (`$TMPDIR/metro-*`) and Gradle's bundle output
 after changing one; the README says how. A product would take the invite from a link.
+
+## §10lp — libzb carries its TLS roots on iOS and Android: Mozilla's bundle (2026-10-05)
+
+Zig reads no trust store on iOS or Android, and three places had worked around it: the
+Flutter airports app shipped Apple's roots as an asset and passed `caFile`, and
+zb-react-native shipped them twice, as an iOS resource bundle and an Android asset. Every
+other host would have had to do the same. Now libzb does it: for iOS and Android targets it
+embeds Mozilla's CA bundle as curl publishes it (src/roots/, 121 roots, Mozilla's data of
+2026-09-25) and, when the host names no `caFile`, writes it once beside the replica
+(`zb-roots.pem`, rewritten when a newer libzb carries newer roots) for enrollment, renewal
+and the NATS TLS. Desktop builds embed nothing and read the system's store. The per-app
+copies are gone; zb-dart never needed a change. Mozilla's rather than Apple's: its
+inclusion and removal decisions are public, and the file is the same on every build
+machine (the keychain export worked on a Mac only). Node.js compiles in the same roots.
+
+libzb/scripts/refresh-roots.sh downloads curl's copy, checks curl's SHA-256 and records
+Mozilla's date; it is run by hand before a release, and an iOS or Android build warns once
+the bundle is over six months old. The roots are frozen per build: a CA Mozilla removes is
+removed for users with the next libzb; `caFile` still overrides. All four clients
+(Flutter and React Native, iPhone and moto e20) work on the embedded roots, hub and leaf.
+The bundle is committed (public certificates, reviewable on refresh), added by hand past
+the secrets hook, which refuses any untracked PEM file.

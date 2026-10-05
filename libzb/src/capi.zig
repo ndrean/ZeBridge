@@ -45,7 +45,8 @@
 //! refuses to open), jsDomain (optional: the /enroll payload's `js_domain` — the
 //! JetStream domain the grants name, when JetStream is reached across a leaf link),
 //! caFile (optional: a PEM bundle of trusted roots for https:// enrollment and renewal
-//! and a tls:// NATS URL, in place of the system's — which Zig cannot read on iOS).
+//! and a tls:// NATS URL, in place of the system's; unset on iOS and Android, where Zig
+//! reads no trust store, libzb uses its own copy of Mozilla's bundle, roots.zig).
 //! The grammar itself is compiled in — `zb_grammar_hash()` says which (§10dq).
 //!
 //! `fn` names a fixture section of core-fixtures.json; `args_json` is that
@@ -70,6 +71,7 @@ const client = @import("client.zig");
 const handles = @import("handles.zig");
 const engines = @import("engines.zig");
 const enroll = @import("enroll.zig");
+const roots = @import("roots.zig");
 const Value = std.json.Value;
 
 /// ⚠️ The host never receives a pointer — only a generation-tagged u64 (handles.zig).
@@ -598,9 +600,15 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     // `zebridge.identity`), and without that `bridgeUrl` + `invite` enroll here and write
     // it. What the identity knows fills every option the app left out.
     // "caFile": the trusted roots, for every https:// and tls:// connection this client
-    // makes — on iOS the only ones it has.
+    // makes. Unset on iOS and Android, where Zig reads no trust store, libzb's own copy of
+    // Mozilla's bundle, written beside the replica (roots.zig); unset elsewhere, the system's.
     const ca_raw = str.get(o, "caFile", "");
-    const ca_file: ?[]u8 = if (ca_raw.len > 0) try a.dupe(u8, ca_raw) else null;
+    const ca_file: ?[]u8 = if (ca_raw.len > 0) try a.dupe(u8, ca_raw) else roots.fileBeside(a, blk: {
+        const d = str.get(o, "dbPath", "");
+        if (d.len > 0) break :blk d;
+        const i = str.get(o, "identityPath", "");
+        break :blk if (i.len > 0) i else "zebridge.sqlite3";
+    });
     errdefer if (ca_file) |p| a.free(p);
     var ident: ?enroll.Identity = null;
     defer if (ident) |*i| i.deinit(a);

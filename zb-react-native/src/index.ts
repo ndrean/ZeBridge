@@ -26,7 +26,6 @@ type Native = {
   flushOutbox(handle: string, waitMs: number): Promise<string>;
   stamp(handle: string): Promise<string>;
   wake(handle: string): number;
-  defaultCaFile(): string | null;
   zstdNew(): number;
   zstdPush(id: number, chunk: Uint8Array): number;
   zstdTake(id: number, dest: Uint8Array): void;
@@ -67,8 +66,8 @@ export type LibzbOptions = {
   identityPath?: string;
   natsUrl?: string;
   principal?: string;
-  /// A PEM file of trusted roots for https:// and tls:// — the module's own copy when
-  /// unset (Zig reads no trust store on iOS or Android).
+  /// A PEM file of trusted roots for https:// and tls://; unset, libzb's own copy of
+  /// Mozilla's bundle (Zig reads no trust store on iOS or Android).
   caFile?: string;
   /// The .creds text (what /enroll returns), or `credsPath` to a file.
   creds?: string;
@@ -95,8 +94,7 @@ export class Libzb {
 
   static async connect(opts: LibzbOptions): Promise<Libzb> {
     assertAbi();
-    const caFile = opts.caFile ?? native().defaultCaFile() ?? undefined;
-    return new Libzb(await native().connect(JSON.stringify({ ...opts, ...(caFile ? { caFile } : {}) })));
+    return new Libzb(await native().connect(JSON.stringify(opts)));
   }
 
   /// Every command first ends a running poll's wait (`zb_client_wake`): the module runs one

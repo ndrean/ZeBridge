@@ -11,8 +11,8 @@
 ///   --dart-define=ZB_NATS_URL=…   optional: the enrollment answer names the NATS URL
 ///   --dart-define=ZB_INVITE=<code>   used once, at enrollment
 ///
-/// TLS: Zig reads no trust store on iOS, so the app ships Apple's roots (assets/roots.pem,
-/// from tool/export-roots.sh) and hands libzb the file as `caFile`.
+/// TLS: libzb carries its own trusted roots on iOS and Android (Mozilla's bundle): the app
+/// passes no certificates.
 library;
 
 import 'dart:async';
@@ -21,7 +21,6 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:path_provider/path_provider.dart';
@@ -89,8 +88,6 @@ class _AirportsScreenState extends State<AirportsScreen> {
     // an identity from another deployment (another operator, another address) is not this one's.
     final nats = natsUrl.isEmpty ? '' : '-${Uri.parse(natsUrl).host}';
     final dbPath = '${dir.path}/airports-${Uri.parse(bridgeUrl).host}$nats.sqlite3';
-    final roots = File('${dir.path}/roots.pem');
-    roots.writeAsBytesSync((await rootBundle.load('assets/roots.pem')).buffer.asUint8List());
     final identity = File('$dbPath.identity');
     final enrolled = identity.existsSync();
     if (!enrolled && invite.isEmpty) {
@@ -101,7 +98,6 @@ class _AirportsScreenState extends State<AirportsScreen> {
       final w = await ZeBridgeWorker.spawn({
         'bridgeUrl': bridgeUrl,
         if (natsUrl.isNotEmpty) 'natsUrl': natsUrl,
-        'caFile': roots.path,
         'dbPath': dbPath,
         'tables': ['flights'],
         if (!enrolled) 'invite': invite,

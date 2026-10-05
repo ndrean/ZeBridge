@@ -1,5 +1,3 @@
 # built by scripts/build-ios.sh
 ios/ZbCore.xcframework/
-ios/roots.pem
-android/src/main/assets/zb-roots.pem
 android/build/

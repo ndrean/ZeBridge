@@ -252,6 +252,8 @@ pub fn build(b: *std.Build) void {
     // Compare linked artefacts, never an archive against a shared library.
     const default_static = target.result.os.tag == .ios or
         target.result.abi == .android or target.result.abi == .androideabi;
+    // iOS and Android carry Mozilla's CA bundle (src/roots.zig): say when it has aged.
+    if (default_static) warnStaleRoots(b);
     const static = b.option(bool, "static", "Build a static archive instead of a shared library") orelse default_static;
     const lib = b.addLibrary(.{
         .name = "zbcore",
@@ -351,3 +353,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests (ZB_LIVE=1 adds the live transport test)");
     test_step.dependOn(&run_tests.step);
 }
+
+/// The embedded CA bundle (src/roots/cacert.pem) is refreshed by hand, before a release
+/// (scripts/refresh-roots.sh): a phone build over six months past Mozilla's date says so.
+fn warnStaleRoots(b: *std.Build) void {
+    const io = b.graph.io;
+    const text = std.Io.Dir.cwd().readFileAlloc(io, b.pathFromRoot("src/roots/cacert.date"), b.allocator, .limited(64)) catch {
+        std.debug.print("warning: src/roots/cacert.date is missing: run scripts/refresh-roots.sh\n", .{});
+        return;
+    };
+    const asof = std.fmt.parseInt(i64, std.mem.trim(u8, text, " \n\r\t"), 10) catch return;
+    const age_days = @divTrunc(std.Io.Clock.real.now(io).toSeconds() - asof, 86400);
+    if (age_days > 182) {
+        std.debug.print("warning: the CA bundle iOS and Android carry is {d} days old: run scripts/refresh-roots.sh before a release\n", .{age_days});
+    }
+}
+

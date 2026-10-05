@@ -21,5 +21,3 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
-  assets:
-    - assets/roots.pem   # tool/export-roots.sh: the caFile libzb verifies TLS against
