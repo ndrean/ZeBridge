@@ -169,7 +169,7 @@ pub fn run(init: *const std.process.Init) u8 {
     if (!full_mode) {
         out(
             \\ⓘ  reads continue until the JWT expires. To CUT them now (full revocation):
-            \\     OPERATOR_SEED=SO… ADMIN_DATABASE_URL=… \\
+            \\     OPERATOR_SEED=SO… ADMIN_DATABASE_URL=… \
             \\       bridge --revoke {s} --conf /path/to/nats-server.conf
             \\   (amends the account JWT's revocations map and tells you how to reload)
             \\
