@@ -1,0 +1,29 @@
+// libzb for React Native on Android: an Expo module over zb-android's JNI binding. It
+// compiles zb-android's own Kotlin (`dev.zebridge.Native`, the C ABI one-to-one) and ships
+// its libzb.so per CPU — the JNI functions are bound to that class name, so one binding
+// serves both. zb-android/scripts/build.sh builds the .so files; scripts/build-android.sh
+// runs it and adds the TLS roots.
+apply plugin: 'com.android.library'
+
+group = 'dev.zebridge'
+version = '0.1.0'
+
+def expoModulesCorePlugin = new File(project(":expo-modules-core").projectDir.absolutePath, "ExpoModulesCorePlugin.gradle")
+apply from: expoModulesCorePlugin
+applyKotlinExpoModulesCorePlugin()
+useCoreDependencies()
+useDefaultAndroidSdkVersions()
+
+// The package is linked into the app's node_modules: resolve the link before walking up,
+// or `../..` lands in node_modules instead of this repository.
+def zbAndroid = new File(projectDir.canonicalFile, "../../zb-android/src/main").canonicalFile
+
+android {
+  namespace "dev.zebridge.zbnative"
+  sourceSets {
+    main {
+      java.srcDirs += [new File(zbAndroid, "kotlin")]
+      jniLibs.srcDirs += [new File(zbAndroid, "jniLibs")]
+    }
+  }
+}

@@ -1,8 +1,9 @@
 # 10-airports in React Native
 
-The airports example on a phone, without a map. On Android through zb-client-ts; on iOS
-through libzb, the C client, behind zb-react-native's Expo module (`src/client.ts` picks one;
-the status line names it): five cities, the
+The airports example on a phone, without a map, through libzb, the C client, behind
+zb-react-native's Expo module, on iOS and Android. `EXPO_PUBLIC_ZB_ENGINE=ts` runs it on
+zb-client-ts instead, to compare the two on one phone (`src/client.ts`; the status line
+names the engine): five cities, the
 airports within 100 km of the one chosen (asked of the DuckDB service), and the shared
 flight, whose departure and arrival any airport in the list can set. The flight is the same
 row the web page and the Flutter app write, with the same registers.
@@ -15,6 +16,7 @@ Needs JDK 17 (React Native 0.76's Gradle does not run on newer ones; Android Stu
 bundled JDK is too new) and the Android SDK.
 
 ```sh
+../../../zb-react-native/scripts/build-android.sh   # libzb for the module, and the TLS roots
 pnpm install
 npx expo prebuild --platform android --clean
 
@@ -26,7 +28,16 @@ EXPO_PUBLIC_ZB_INVITE=fl-… npx expo run:android --variant release --no-bundler
 Build with `expo run:android`, not Gradle alone: its first step writes the autolinking
 for Expo's modules, without which the Java compile cannot find `ExpoModulesPackage`.
 
-The settings are read at build time:
+The settings are read at build time, and two caches ignore them: Gradle reuses the
+JavaScript bundle when no file changed, and Metro reuses each file's transformed code, where
+Expo wrote the old values. After changing one, clear both:
+
+```sh
+find "$TMPDIR" -maxdepth 1 -name 'metro-*' -exec rm -rf {} +
+rm -rf android/app/build/generated/assets/createBundleReleaseJsAndAssets
+```
+
+The settings:
 
 * `EXPO_PUBLIC_ZB_INVITE`: the invite, for the first run. The identity is kept on the phone
   afterwards.

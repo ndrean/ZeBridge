@@ -1,6 +1,16 @@
 {
-  "platforms": ["apple"],
+  "platforms": [
+    "apple",
+    "android"
+  ],
   "apple": {
-    "modules": ["ZbNativeModule"]
+    "modules": [
+      "ZbNativeModule"
+    ]
+  },
+  "android": {
+    "modules": [
+      "dev.zebridge.zbnative.ZbNativeModule"
+    ]
   }
 }

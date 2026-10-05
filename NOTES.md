@@ -18932,5 +18932,19 @@ the iPhone 12 (React Native, libzb, through the leaf) 36 ms round trip; the moto
 libzb (Flutter) 40–60 ms; the moto e20 with zb-client-ts (React Native, Hermes, wss through
 Cloudflare to the hub) 87 ms. The moto's own network: ping 30 ms average (min 18, jitter
 ±10) to the hub and the leaf, against ~24 ms from the iPhone. So on a low-end Android phone
-the JavaScript stack costs 30–45 ms a request, and the device and its Wi-Fi the rest. The
-case for building libzb into zb-react-native for Android too (iOS only today).
+the JavaScript stack costs 30–45 ms a request, and the device and its Wi-Fi the rest.
+
+So zb-react-native gained its Android side: an Expo module in Kotlin over zb-android's JNI
+binding — its build.gradle compiles zb-android's own Kotlin (`dev.zebridge.Native`, whose
+JNI functions are bound to that class name) and takes its libzb.so per CPU, so one binding
+serves both. The same functions as the Swift module, on one worker thread, `wake` off it;
+the TLS roots as an asset, copied to the app's files and passed as `caFile` (Zig reads no
+trust store on Android either). scripts/build-android.sh builds both. The app takes libzb
+wherever the module is built in (`EXPO_PUBLIC_ZB_ENGINE=ts` forces zb-client-ts). On the
+moto e20 through the hub, React Native on libzb: round trips lower than the 87 ms of
+zb-client-ts on the same phone and path.
+
+Build trap: `EXPO_PUBLIC_*` values are written into the code by Metro's transform, and both
+Metro's cache and Gradle's up-to-date check ignore the environment: a new invite was
+silently dropped twice. Clear Metro's cache (`$TMPDIR/metro-*`) and Gradle's bundle output
+after changing one; the README says how. A product would take the invite from a link.

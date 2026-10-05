@@ -1,7 +1,7 @@
-/// The few calls the screen makes, over either client library: zb-client-ts (TypeScript,
-/// on Android) or libzb (the C client, through zb-react-native, on iOS). Both enroll with
-/// the same invite flow, keep the same registers and talk to the same bridge.
-import { Platform } from 'react-native';
+/// The few calls the screen makes, over either client library: libzb (the C client,
+/// through zb-react-native) when the app was built with it, else zb-client-ts (TypeScript).
+/// EXPO_PUBLIC_ZB_ENGINE=ts forces zb-client-ts, to compare the two on one phone. Both enroll
+/// with the same invite flow, keep the same registers and talk to the same bridge.
 import * as FileSystem from 'expo-file-system';
 import { ZeBridge } from 'zb-client-ts';
 import { Libzb, libzbAvailable } from 'zb-react-native';
@@ -25,8 +25,10 @@ export interface AirportsClient {
 
 export type Settings = { bridgeUrl: string; invite?: string; natsUrl?: string; dbName: string };
 
+declare const process: { env: Record<string, string | undefined> };
+
 export function makeClient(s: Settings): AirportsClient {
-  return Platform.OS === 'ios' && libzbAvailable ? new LibzbClient(s) : new TsClient(s);
+  return libzbAvailable && process.env.EXPO_PUBLIC_ZB_ENGINE !== 'ts' ? new LibzbClient(s) : new TsClient(s);
 }
 
 class TsClient implements AirportsClient {

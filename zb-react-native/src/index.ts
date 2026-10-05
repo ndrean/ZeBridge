@@ -33,17 +33,17 @@ type Native = {
   zstdFree(id: number): void;
 };
 
-/// The native module, or null where this package has no native side (Android, today).
+/// The native module, or null where the app was built without it (Expo Go, the web).
 /// Required OPTIONALLY: an app that merely imports the package — a screen offering libzb
 /// next to zb-client-ts — must still start there; `requireNativeModule` threw at import and
 /// took the whole app down on Android. Using libzb without it throws `native()`'s error.
 export const ZbNative: Native | null = requireOptionalNativeModule<Native>('ZbNative');
 
-/// libzb is embedded in this app (iOS today).
+/// libzb is embedded in this app (iOS and Android).
 export const libzbAvailable = ZbNative !== null;
 
 function native(): Native {
-  if (!ZbNative) throw new Error('zb-react-native: libzb is not built for this platform (iOS only today) — use zb-client-ts here');
+  if (!ZbNative) throw new Error('zb-react-native: libzb is not built into this app — rebuild it with the module (scripts/build-ios.sh, scripts/build-android.sh), or use zb-client-ts here');
   return ZbNative;
 }
 
@@ -53,7 +53,7 @@ export function assertAbi(): void {
   if (abiChecked) return;
   const got = native().abiVersion();
   if (got !== ZB_ABI) {
-    throw new Error(`zb-react-native: the embedded libzb is ABI ${got}, this package is ABI ${ZB_ABI} — rebuild it (zb-react-native/scripts/build-ios.sh), then the app`);
+    throw new Error(`zb-react-native: the embedded libzb is ABI ${got}, this package is ABI ${ZB_ABI} — rebuild it (zb-react-native/scripts/build-ios.sh or build-android.sh), then the app`);
   }
   abiChecked = true;
 }
@@ -67,8 +67,8 @@ export type LibzbOptions = {
   identityPath?: string;
   natsUrl?: string;
   principal?: string;
-  /// A PEM file of trusted roots for https:// and tls:// — on iOS the module's own copy
-  /// of Apple's roots when unset (Zig reads no trust store there).
+  /// A PEM file of trusted roots for https:// and tls:// — the module's own copy when
+  /// unset (Zig reads no trust store on iOS or Android).
   caFile?: string;
   /// The .creds text (what /enroll returns), or `credsPath` to a file.
   creds?: string;
