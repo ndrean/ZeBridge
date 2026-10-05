@@ -18,17 +18,25 @@
       button { padding: 7px; font: inherit; cursor: pointer; }
       #result { font-size: 16px; font-weight: 600; min-height: 1.4em; }
       #status, #detail { font-size: 12px; opacity: .75; }
+      #eta { font-size: 14px; color: #1a7f37; min-height: 1.2em; }
+      #notice { font-size: 13px; color: #b35900; min-height: 1.2em; }
+      select { font: inherit; padding: 5px; }
+      .truck { font-size: 20px; line-height: 20px; text-align: center; filter: drop-shadow(0 0 2px #fff); }
+      .depot { width: 14px; height: 14px; background: #333; border: 2px solid #fff; box-sizing: border-box; }
       @media (max-width: 640px) { body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; } aside { border-right: 0; border-bottom: 1px solid #8884; } }
     </style>
   </head>
   <body>
     <aside>
       <strong>Depot routing</strong>
+      <label>Truck <select id="truck"></select></label>
       <label>From <div id="from" class="point empty" tabindex="0">click here, then a charger</div></label>
       <label>To <div id="to" class="point empty" tabindex="0">click here, then a charger</div></label>
       <button id="trace" disabled>Trace route</button>
       <div id="result"></div>
+      <div id="eta"></div>
       <div id="detail"></div>
+      <div id="notice"></div>
       <div id="status">connecting…</div>
     </aside>
     <div id="map"></div>

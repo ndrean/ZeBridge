@@ -1,26 +1,40 @@
-/// The depot demo, first milestone: a road route between two charge points.
+/// The depot demo: trucks, their plans, and a route from Valhalla.
 ///
 /// Two flows meet on this page:
 ///
-///   * the CHARGE POINTS are a replicated table — `charge_points`, all of France, followed
-///     into this browser's SQLite. The chargers in view are a local query on every pan:
-///     no service is asked for them.
-///   * the ROUTE is a question — `query._default.route` to the routing service, which
-///     forwards it to Valhalla. Valhalla knows roads only: the page sends the two
-///     chargers' coordinates, and draws the shape that comes back.
+///   * DATA, replicated into this browser's SQLite: `charge_points` (all of France; the
+///     chargers in view are a local query on every pan) and `trucks` (five trucks, each
+///     with a depot and a plan).
+///   * QUESTIONS, answered by the routing service: `query._default.route` forwards to
+///     Valhalla, which knows roads only. The page sends coordinates, draws the line.
+///
+/// A truck's `plan` is a document of three registers {v, t, w} (COOPERATIVE_EDITING.md):
+///
+///   from, to   the planned ends, edited together: two people setting different ends both
+///              survive; on the same end the later stamp wins on every screen.
+///   leg        the trip under way: {from, to, started_at}. "Trace route" writes it. A
+///              change of destination after departure writes a NEW leg from the truck's
+///              position at that moment (AB → C).
+///
+/// The route's line is never stored: every browser asks for its leg's route and walks the
+/// truck along it by the maneuvers' durations, from `started_at`. Every screen shows the
+/// truck at the same spot, and nothing is sent while it moves.
 ///
 /// The first load enrolls with `?invite=<code>`; the identity is kept in this browser.
+/// `?as=<name>` keeps a separate identity and replica (two editors in one browser).
 import L from 'leaflet';
-import { ZeBridge, NotEnrolled } from 'zb-client-ts';
+import { ZeBridge, NotEnrolled, mergeRegisters } from 'zb-client-ts';
 
+const T0 = performance.now();
 const NANTES: L.LatLngTuple = [47.2184, -1.5536];
 /// Chargers drawn at once: past this the view is too wide to pick one anyway.
 const MAX_DRAWN = 1500;
 
 const qs = new URLSearchParams(location.search);
 const el = (id: string) => document.getElementById(id)!;
-const status = el('status'), result = el('result'), detail = el('detail');
+const status = el('status'), result = el('result'), detail = el('detail'), eta = el('eta'), notice = el('notice');
 const traceButton = el('trace') as HTMLButtonElement;
+const truckSelect = el('truck') as HTMLSelectElement;
 
 /// Built for a deployment (`VITE_ZB_BRIDGE_URL=https://bridge.example.com pnpm build`), the
 /// page enrolls there and the answer names the NATS websocket. Without it, the dev
@@ -32,14 +46,15 @@ const zb = new ZeBridge({
   natsUrl: NATS_URL ?? (DEPLOYED_BRIDGE ? undefined : `${location.origin.replace(/^http/, 'ws')}/nats`),
   bridgeUrl: DEPLOYED_BRIDGE ?? `${location.origin}/bridge`,
   invite: qs.get('invite') ?? undefined,
-  dbPath: 'depot.sqlite3',
-  tables: ['charge_points'],
+  // `?as=<name>`: a separate identity and replica, so two people can share one browser.
+  dbPath: qs.get('as') ? `depot-${qs.get('as')}.sqlite3` : 'depot.sqlite3',
+  tables: ['charge_points', 'trucks'],
 });
 (window as any).zb = zb;
 
 // ── the map ────────────────────────────────────────────────────────────────────
 // Canvas, not one DOM element per marker: a wide view holds a thousand chargers.
-const map = L.map('map', { preferCanvas: true }).setView(NANTES, 11);
+const map = L.map('map', { preferCanvas: true }).setView(NANTES, 9);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 18,
   attribution: '&copy; OpenStreetMap contributors',
@@ -49,71 +64,107 @@ L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
 new ResizeObserver(() => map.invalidateSize()).observe(el('map'));
 const chargerLayer = L.layerGroup().addTo(map);
 const routeLayer = L.layerGroup().addTo(map);
+const truckLayer = L.layerGroup().addTo(map);
 
-// ── From and To ────────────────────────────────────────────────────────────────
-type Charger = { id: string; title: string; town: string | null; lat: number; lng: number; max_power_kw: number | null };
+// ── types ──────────────────────────────────────────────────────────────────────
+type Point = { lat: number; lng: number; label: string; charger?: string };
+type Leg = { from: Point; to: Point; started_at: string };
+type Register<T> = { v: T; t: string; w: string };
+type Plan = { from?: Register<Point>; to?: Register<Point>; leg?: Register<Leg> };
 type End = 'from' | 'to';
-const picked: Record<End, Charger | null> = { from: null, to: null };
-/// Which input the next charger click fills.
-let active: End | null = 'from';
+type Truck = { id: string; name: string; depot: Point; plan: Plan };
+type Charger = { id: string; title: string; town: string | null; lat: number; lng: number; max_power_kw: number | null };
 
-function showPoints() {
-  for (const end of ['from', 'to'] as const) {
-    const box = el(end);
-    const c = picked[end];
-    box.textContent = c ? `${c.title}${c.town ? ` · ${c.town}` : ''}` : 'click here, then a charger';
-    box.classList.toggle('empty', !c);
-    box.classList.toggle('active', active === end);
+const pointOf = (c: Charger): Point => ({ lat: c.lat, lng: c.lng, label: `${c.title}${c.town ? ` · ${c.town}` : ''}`, charger: c.id });
+
+// ── trucks: rows, and what this browser wrote that the row does not show yet ─────
+const trucks = new Map<string, Truck>();
+const mine = new Map<string, Plan>();       // per truck: registers written here, not yet in the row
+const rounds = new Map<string, number>();
+let selected = '';
+/// Which planned end the next charger click fills.
+let active: End | null = null;
+
+/// The plan as this browser sees it: its own pending registers over the row's.
+const viewPlan = (id: string): Plan => ({ ...(trucks.get(id)?.plan ?? {}), ...(mine.get(id) ?? {}) });
+
+async function readTrucks(): Promise<void> {
+  const rows = await zb.query(
+    `SELECT t.id, t.name, t.plan, c.id AS depot_id, c.title, c.town, c.lat, c.lng
+     FROM trucks t JOIN charge_points c ON c.id = t.depot WHERE t.deleted_at IS NULL ORDER BY t.id`,
+  );
+  for (const r of rows) {
+    const plan: Plan = r.plan ? (typeof r.plan === 'string' ? JSON.parse(r.plan) : r.plan) : {};
+    const before = trucks.get(r.id)?.plan ?? {};
+    trucks.set(r.id, {
+      id: r.id, name: r.name, plan,
+      depot: { lat: r.lat, lng: r.lng, label: `${r.title}${r.town ? ` · ${r.town}` : ''}`, charger: r.depot_id },
+    });
+    // Say what someone else changed, and drop what the row now holds of mine.
+    const m = mine.get(r.id);
+    for (const k of ['from', 'to', 'leg'] as const) {
+      const now = plan[k];
+      if (!now || now.t === before[k]?.t) continue;
+      if (now.w !== zb.principal) notice.textContent = `${now.w} changed ${r.name}'s ${k === 'leg' ? 'trip' : k}`;
+      if (m?.[k] && now.t >= m[k]!.t) delete m[k];
+    }
+    if (m && !Object.keys(m).length) mine.delete(r.id);
   }
-  traceButton.disabled = !(picked.from && picked.to);
-}
-
-for (const end of ['from', 'to'] as const) {
-  const box = el(end);
-  const choose = () => { active = active === end ? null : end; showPoints(); };
-  box.addEventListener('click', choose);
-  box.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); choose(); } });
-}
-
-function pick(c: Charger) {
-  if (!active) return;
-  picked[active] = c;
-  // After From, the next click goes to To; after To, nothing is held.
-  active = active === 'from' && !picked.to ? 'to' : null;
-  routeLayer.clearLayers();
-  result.textContent = '';
-  detail.textContent = '';
-  showPoints();
-  drawChargers();
-}
-
-// ── the chargers in view: a local query ────────────────────────────────────────
-async function drawChargers() {
-  const b = map.getBounds();
-  const rows = (await zb.query(
-    `SELECT id, title, town, lat, lng, max_power_kw FROM charge_points
-     WHERE deleted_at IS NULL AND lat BETWEEN ? AND ? AND lng BETWEEN ? AND ? LIMIT ?`,
-    b.getSouth(), b.getNorth(), b.getWest(), b.getEast(), MAX_DRAWN + 1,
-  )) as Charger[];
-  chargerLayer.clearLayers();
-  if (rows.length > MAX_DRAWN) {
-    status.textContent = `more than ${MAX_DRAWN} chargers in view: zoom in to pick one`;
-    return;
+  if (truckSelect.options.length !== trucks.size) {
+    truckSelect.innerHTML = '';
+    for (const t of trucks.values()) truckSelect.add(new Option(t.name, t.id));
+    if (!selected && trucks.size) selected = [...trucks.keys()][0];
+    truckSelect.value = selected;
   }
-  for (const c of rows) {
-    const chosen = picked.from?.id === c.id || picked.to?.id === c.id;
-    const kw = Number(c.max_power_kw ?? 0);
-    const colour = chosen ? '#d1361f' : kw >= 43 ? '#1a7f37' : '#1f6feb';
-    L.circleMarker([c.lat, c.lng], { radius: chosen ? 9 : 6, color: colour, fillColor: colour, fillOpacity: 0.85, weight: 1 })
-      .bindTooltip(`${c.title}${c.town ? ` · ${c.town}` : ''} · ${c.max_power_kw ?? '?'} kW`)
-      .on('click', () => pick(c))
-      .addTo(chargerLayer);
-  }
-  status.textContent = `${rows.length} charger(s) in view`;
 }
-map.on('moveend', () => { void drawChargers(); });
 
-// ── the route: a question to Valhalla ──────────────────────────────────────────
+async function writePlan(id: string): Promise<void> {
+  const merged = mergeRegisters((trucks.get(id)?.plan ?? {}) as any, (mine.get(id) ?? {}) as any);
+  await zb.mutate('trucks', 'UPDATE', { id }, { plan: merged });
+}
+
+function setRegister<K extends keyof Plan>(id: string, key: K, v: NonNullable<Plan[K]>['v']): void {
+  const m = mine.get(id) ?? {};
+  (m as any)[key] = { v, t: zb.stamp(), w: zb.principal };
+  mine.set(id, m);
+  rounds.set(id, 0);
+  void writePlan(id).catch((e) => { notice.textContent = `write: ${(e as Error).message}`; });
+  void refresh();
+}
+
+/// The row moved, by me or by someone else: redraw from it, then reconcile — write the
+/// merge again while the row does not hold what this browser wrote.
+zb.onChange('trucks', () => {
+  void (async () => {
+    await readTrucks();
+    for (const [id, m] of mine) {
+      const n = rounds.get(id) ?? 0;
+      if (!Object.keys(m).length || n >= 10) continue;
+      const merged = mergeRegisters((trucks.get(id)?.plan ?? {}) as any, m as any);
+      if (JSON.stringify(merged) !== JSON.stringify(trucks.get(id)?.plan ?? {})) {
+        rounds.set(id, n + 1);
+        await writePlan(id);
+      }
+    }
+    await refresh();
+  })();
+});
+
+// ── routes: asked per leg, never stored ────────────────────────────────────────
+/// A leg's route: the line, the distance along it, and the maneuvers' timing — what the
+/// truck is walked along.
+type Route = {
+  line: L.LatLngTuple[];
+  cum: number[];                                  // metres from the start, per point
+  maneuvers: { b: number; e: number; t0: number; time: number }[];
+  seconds: number;
+  km: number;
+  by: string;
+  ms: number;
+};
+const routes = new Map<string, Route | 'asking' | { error: string }>();
+const legKey = (leg: Leg) => JSON.stringify([leg.from.lat, leg.from.lng, leg.to.lat, leg.to.lng]);
+
 /// Valhalla's shapes are Google's encoded polyline at 6 decimals (not 5).
 function decodePolyline6(s: string): L.LatLngTuple[] {
   const out: L.LatLngTuple[] = [];
@@ -130,45 +181,259 @@ function decodePolyline6(s: string): L.LatLngTuple[] {
   return out;
 }
 
-async function trace() {
-  const { from, to } = picked;
-  if (!from || !to) return;
-  traceButton.disabled = true;
-  result.textContent = 'asking…';
-  detail.textContent = '';
+async function askRoute(from: Point, to: Point): Promise<Route> {
   const t0 = performance.now();
-  try {
-    const a = await zb.request('query._default.route', {
-      locations: [{ lat: from.lat, lon: from.lng }, { lat: to.lat, lon: to.lng }],
-      costing: 'truck',
-      units: 'km',
-    }, 15_000);
-    const ms = Math.round(performance.now() - t0);
-    if (a.error || !a.trip) {
-      result.textContent = 'no route';
-      detail.textContent = String(a.error ?? a.detail ?? JSON.stringify(a)).slice(0, 300);
-      return;
-    }
-    const s = a.trip.summary;
-    const line = a.trip.legs.flatMap((leg: any) => decodePolyline6(leg.shape));
-    routeLayer.clearLayers();
-    L.polyline(line, { color: '#d1361f', weight: 5, opacity: 0.85 }).addTo(routeLayer);
-    map.fitBounds(L.latLngBounds(line), { padding: [40, 40] });
-    result.textContent = `${s.length.toFixed(1)} km · ${Math.round(s.time / 60)} min by truck`;
-    detail.textContent = `by ${a.by ?? '?'} · ${a.ms ?? '?'} ms in Valhalla · ${ms} ms round trip`;
-  } catch (e) {
-    result.textContent = 'no answer';
-    detail.textContent = `${(e as Error).message} — is the routing service running?`;
-  } finally {
-    traceButton.disabled = !(picked.from && picked.to);
-  }
+  const a = await zb.request('query._default.route', {
+    locations: [{ lat: from.lat, lon: from.lng }, { lat: to.lat, lon: to.lng }],
+    costing: 'truck',
+    units: 'km',
+  }, 15_000);
+  if (a.error || !a.trip) throw new Error(String(a.error ?? a.detail ?? 'no route').slice(0, 200));
+  const leg = a.trip.legs[0];
+  const line = decodePolyline6(leg.shape);
+  const cum = [0];
+  for (let i = 1; i < line.length; i++) cum.push(cum[i - 1] + map.distance(line[i - 1], line[i]));
+  let t = 0;
+  const maneuvers = (leg.maneuvers ?? []).map((m: any) => {
+    const out = { b: m.begin_shape_index, e: m.end_shape_index, t0: t, time: m.time ?? 0 };
+    t += out.time;
+    return out;
+  });
+  return { line, cum, maneuvers, seconds: a.trip.summary.time, km: a.trip.summary.length, by: a.by ?? '?', ms: Math.round(performance.now() - t0) };
 }
-traceButton.addEventListener('click', () => { void trace(); });
+
+function routeFor(leg: Leg): Route | null {
+  const key = legKey(leg);
+  const r = routes.get(key);
+  if (r && r !== 'asking' && !('error' in r)) return r;
+  if (!r) {
+    routes.set(key, 'asking');
+    askRoute(leg.from, leg.to)
+      .then((route) => { routes.set(key, route); void refresh(); })
+      .catch((e) => { routes.set(key, { error: (e as Error).message }); void refresh(); });
+  }
+  return null;
+}
+
+/// Where the truck is, `elapsed` seconds into its leg: the maneuver it is in by time,
+/// then that stretch of line by distance. Slower in town, faster on the motorway.
+function positionAt(r: Route, elapsed: number): L.LatLngTuple {
+  if (elapsed <= 0) return r.line[0];
+  if (elapsed >= r.seconds) return r.line[r.line.length - 1];
+  const m = r.maneuvers.find((x) => elapsed < x.t0 + x.time) ?? r.maneuvers[r.maneuvers.length - 1];
+  const f = m.time > 0 ? (elapsed - m.t0) / m.time : 1;
+  const target = r.cum[m.b] + f * (r.cum[m.e] - r.cum[m.b]);
+  let i = m.b;
+  while (i < m.e && r.cum[i + 1] < target) i++;
+  const span = r.cum[i + 1] - r.cum[i];
+  const g = span > 0 ? (target - r.cum[i]) / span : 0;
+  const [a, b] = [r.line[i], r.line[Math.min(i + 1, r.line.length - 1)]];
+  return [a[0] + g * (b[0] - a[0]), a[1] + g * (b[1] - a[1])];
+}
+
+const elapsedOf = (leg: Leg) => (Date.now() - Date.parse(leg.started_at)) / 1000;
+
+/// The truck's position now: on its leg's route, at its depot, or null while the
+/// route is being asked.
+function whereIs(t: Truck): L.LatLngTuple | null {
+  const leg = viewPlan(t.id).leg?.v;
+  if (!leg) return [t.depot.lat, t.depot.lng];
+  const r = routeFor(leg);
+  return r ? positionAt(r, elapsedOf(leg)) : null;
+}
+
+// ── drawing ────────────────────────────────────────────────────────────────────
+const fmtMin = (s: number) => (s >= 3600 ? `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} min` : `${Math.round(s / 60)} min`);
+const truckMarkers = new Map<string, L.Marker>();
+
+async function refresh(): Promise<void> {
+  routeLayer.clearLayers();
+  truckLayer.clearLayers();
+  truckMarkers.clear();
+  for (const t of trucks.values()) {
+    const plan = viewPlan(t.id);
+    const leg = plan.leg?.v;
+    const isSel = t.id === selected;
+    L.marker([t.depot.lat, t.depot.lng], { icon: L.divIcon({ className: 'depot', iconSize: [14, 14] }) })
+      .bindTooltip(`${t.name}'s depot · ${t.depot.label}`).addTo(truckLayer);
+    if (leg) {
+      const r = routeFor(leg);
+      if (r) L.polyline(r.line, { color: isSel ? '#d1361f' : '#888', weight: isSel ? 5 : 3, opacity: isSel ? 0.85 : 0.6 }).addTo(routeLayer);
+    }
+    const at = whereIs(t);
+    if (at) {
+      const mk = L.marker(at, { icon: L.divIcon({ className: 'truck', html: '🚚', iconSize: [22, 22] }), zIndexOffset: isSel ? 1000 : 0 })
+        .bindPopup(() => truckPopup(t))
+        .on('click', () => selectTruck(t.id))
+        .addTo(truckLayer);
+      truckMarkers.set(t.id, mk);
+    }
+  }
+  showPanel();
+}
+
+function truckPopup(t: Truck): string {
+  const leg = viewPlan(t.id).leg?.v;
+  if (!leg) return `<b>${t.name}</b><br>at its depot<br>${t.depot.label}`;
+  const r = routeFor(leg);
+  if (!r) return `<b>${t.name}</b><br>to ${leg.to.label}<br>route…`;
+  const left = r.seconds - elapsedOf(leg);
+  return `<b>${t.name}</b><br>to ${leg.to.label}<br>${left > 0 ? `arrives in ${fmtMin(left)} (${new Date(Date.parse(leg.started_at) + r.seconds * 1000).toLocaleTimeString()})` : 'arrived'}`;
+}
+
+/// Every second: move the trucks and the ETA. Positions only; the layers stay.
+setInterval(() => {
+  for (const [id, mk] of truckMarkers) {
+    const t = trucks.get(id);
+    const at = t && whereIs(t);
+    if (at) mk.setLatLng(at);
+  }
+  showEta();
+}, 1000);
+
+function showEta() {
+  const t = trucks.get(selected);
+  const leg = t && viewPlan(t.id).leg?.v;
+  if (!t || !leg) { eta.textContent = ''; return; }
+  const r = routeFor(leg);
+  if (!r) { eta.textContent = ''; return; }
+  const left = r.seconds - elapsedOf(leg);
+  eta.textContent = left > 0
+    ? `${t.name}: ${fmtMin(left)} to ${leg.to.label}`
+    : `${t.name} arrived at ${leg.to.label}`;
+}
+
+// ── the panel ──────────────────────────────────────────────────────────────────
+/// The leg is under way (not arrived): a new destination then starts from where the
+/// truck is now.
+function enRoute(id: string): boolean {
+  const leg = viewPlan(id).leg?.v;
+  const r = leg && routeFor(leg);
+  return !!(leg && r && elapsedOf(leg) < r.seconds);
+}
+
+function showPanel() {
+  const t = trucks.get(selected);
+  const plan = t ? viewPlan(t.id) : {};
+  const moving = t ? enRoute(t.id) : false;
+  const arrived = t && plan.leg && !moving;
+  for (const end of ['from', 'to'] as const) {
+    const box = el(end);
+    let text = 'click here, then a charger';
+    let empty = true;
+    if (end === 'from' && t && plan.leg) {
+      text = moving ? `${t.name}'s position (en route)` : `${t.name}'s position (${plan.leg.v.to.label})`;
+      empty = false;
+    } else {
+      const reg = plan[end] ?? (end === 'from' && t ? { v: t.depot, t: '', w: '' } : undefined);
+      if (reg) {
+        const pending = !!mine.get(selected)?.[end];
+        text = `${reg.v.label}${pending ? ' (pending)' : reg.w ? ` · ${reg.w}` : ' (depot)'}`;
+        empty = false;
+      }
+    }
+    box.textContent = text;
+    box.classList.toggle('empty', empty);
+    box.classList.toggle('active', active === end);
+  }
+  const to = plan.to?.v;
+  const sameTrip = plan.leg && to && legKey({ ...plan.leg.v, to }) === legKey(plan.leg.v);
+  traceButton.textContent = moving ? 'Change destination' : 'Trace route';
+  traceButton.disabled = !t || !to || !!sameTrip && (moving || !!arrived);
+  const leg = plan.leg?.v;
+  const r = leg && routes.get(legKey(leg));
+  if (!leg) { result.textContent = ''; detail.textContent = ''; }
+  else if (!r || r === 'asking') { result.textContent = 'asking the route…'; detail.textContent = ''; }
+  else if ('error' in r) { result.textContent = 'no route'; detail.textContent = r.error; }
+  else {
+    result.textContent = `${r.km.toFixed(1)} km · ${fmtMin(r.seconds)} by truck`;
+    detail.textContent = `by ${r.by} · ${r.ms} ms round trip · leg by ${plan.leg!.w}`;
+  }
+  showEta();
+}
+
+function selectTruck(id: string) {
+  selected = id;
+  truckSelect.value = id;
+  active = null;
+  notice.textContent = '';
+  void refresh();
+}
+truckSelect.addEventListener('change', () => selectTruck(truckSelect.value));
+
+for (const end of ['from', 'to'] as const) {
+  const box = el(end);
+  const choose = () => {
+    if (end === 'from' && viewPlan(selected).leg) return;   // once under way, the start is the truck
+    active = active === end ? null : end;
+    showPanel();
+  };
+  box.addEventListener('click', choose);
+  box.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); choose(); } });
+}
+
+function pick(c: Charger) {
+  if (!active || !selected) return;
+  setRegister(selected, active, pointOf(c));
+  active = active === 'from' && !viewPlan(selected).to ? 'to' : null;
+  showPanel();
+  void drawChargers();
+}
+
+/// Trace route: the first leg from the planned From (or the depot); once a leg exists,
+/// a new one from where the truck is now (AB → C).
+traceButton.addEventListener('click', () => {
+  const t = trucks.get(selected);
+  if (!t) return;
+  const plan = viewPlan(t.id);
+  const to = plan.to?.v;
+  if (!to) return;
+  let from: Point;
+  if (plan.leg) {
+    const at = whereIs(t);
+    if (!at) { notice.textContent = 'the current route is still being asked — try again in a second'; return; }
+    from = { lat: at[0], lng: at[1], label: `${t.name}'s position` };
+  } else {
+    from = plan.from?.v ?? t.depot;
+  }
+  setRegister(t.id, 'leg', { from, to, started_at: new Date().toISOString() });
+});
+
+// ── the chargers in view: a local query ────────────────────────────────────────
+async function drawChargers() {
+  const b = map.getBounds();
+  const rows = (await zb.query(
+    `SELECT id, title, town, lat, lng, max_power_kw FROM charge_points
+     WHERE deleted_at IS NULL AND lat BETWEEN ? AND ? AND lng BETWEEN ? AND ? LIMIT ?`,
+    b.getSouth(), b.getNorth(), b.getWest(), b.getEast(), MAX_DRAWN + 1,
+  )) as Charger[];
+  chargerLayer.clearLayers();
+  if (rows.length > MAX_DRAWN) {
+    status.textContent = `more than ${MAX_DRAWN} chargers in view: zoom in to pick one`;
+    return;
+  }
+  const plan = viewPlan(selected);
+  const chosen = new Set([plan.from?.v.charger, plan.to?.v.charger].filter(Boolean));
+  for (const c of rows) {
+    const isChosen = chosen.has(c.id);
+    const kw = Number(c.max_power_kw ?? 0);
+    const colour = isChosen ? '#d1361f' : kw >= 43 ? '#1a7f37' : '#1f6feb';
+    L.circleMarker([c.lat, c.lng], { radius: isChosen ? 9 : 5, color: colour, fillColor: colour, fillOpacity: 0.85, weight: 1 })
+      .bindTooltip(`${c.title}${c.town ? ` · ${c.town}` : ''} · ${c.max_power_kw ?? '?'} kW`)
+      .on('click', () => pick(c))
+      .addTo(chargerLayer);
+  }
+  status.textContent = `${rows.length} charger(s) in view${timing}`;
+}
+map.on('moveend', () => { void drawChargers(); });
 
 // ── go ─────────────────────────────────────────────────────────────────────────
-showPoints();
+/// How long the first screen took, once: connecting (enrolment and the replica's
+/// catch-up included), then the first local queries.
+let timing = '';
+const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
 try {
-  status.textContent = 'connecting… (the first visit copies 16,000 chargers into this browser)';
+  status.textContent = 'connecting… (a first visit copies 16,000 chargers into this browser)';
   await zb.connect();
 } catch (e) {
   status.textContent = e instanceof NotEnrolled
@@ -176,5 +441,10 @@ try {
     : `Could not connect: ${(e as Error).message}`;
   throw e;
 }
+const tConnected = performance.now();
 zb.onChange('charge_points', () => { void drawChargers(); });
+await readTrucks();
 await drawChargers();
+timing = ` · ready in ${secs(performance.now() - T0)} (connect ${secs(tConnected - T0)}, first draw ${secs(performance.now() - tConnected)})`;
+status.textContent += timing;
+await refresh();
