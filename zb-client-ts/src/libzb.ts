@@ -38,7 +38,7 @@ import { heartbeatPayload,
   mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent, normalizeOp,
   normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate,
-  isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, parseChainHead, msgpackScan, msgpackDecodeScanned, chainStageSql, vecColsOf, pgVectorValues, vecLiteral, strictMissing,
+  isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, chainChunkJson, parseChainHead, msgpackScan, msgpackDecodeScanned, chainStageSql, vecColsOf, pgVectorValues, vecLiteral, strictMissing,
   planCdcBulk, type CdcBulkTable, cdcValue,
 } from './core.ts';
 import type { VecCol } from './core.ts';
@@ -200,8 +200,8 @@ export type TableState = {
   /// §10ey: the columns whose PostgreSQL type is an array — the wire carries them as
   /// JSON text, and a PostgreSQL engine binds them from the literal on apply.
   arrayCols?: string[];
-  /// §10fc: the columns declared BLOB in the sqlite block — a table with one seeds
-  /// row by row (JSON has no bytes); the rest seed a chunk per statement.
+  /// §10fc: the columns declared BLOB in the sqlite block — their bytes cross a seed
+  /// chunk's JSON as {"$x": hex}, back through unhex (core.chainChunkJson).
   blobCols?: string[];
   /// §10fg: the pgvector/bit columns (`pg` block) — a PostgreSQL engine binds the
   /// text form of the wire BLOB; SQLite keeps the BLOB.
@@ -3068,8 +3068,11 @@ export class ZeBridge {
         const size = chunk > 0 ? chunk : Math.max(stream ? stream.nrows : rows.length, 1);
         const sqlite = this.dialect.name === 'sqlite';
         // §10fc: on SQLite, a chunk is ONE statement — the live rows as JSON text through
-        // json_each — unless a column is a BLOB (JSON has no bytes: row by row then).
-        const bulk = sqlite && !(state.blobCols?.length) ? chainBulkSql(table, cols, state.pkCols, vcol && cols.includes(vcol) ? vcol : null) : null;
+        // json_each. A BLOB column's bytes cross as {"$x": hex} and come back through
+        // unhex (chainChunkJson): row by row cost a worker round trip per row in a
+        // browser — ~20 s for 16k rows with a PostGIS column (2026-10-05).
+        const blobIdx = (state.blobCols ?? []).map((c) => cols.indexOf(c)).filter((i) => i >= 0);
+        const bulk = sqlite ? chainBulkSql(table, cols, state.pkCols, vcol && cols.includes(vcol) ? vcol : null, blobIdx) : null;
         // One window, one transaction — the body both paths share.
         const applyWindow = async (win: any[][], first: boolean) => {
             await this.transaction(async (txExec) => {
@@ -3094,7 +3097,7 @@ export class ZeBridge {
                 for (const { i, vc } of vecIdx) if (isBytes(params[i])) params[i] = vecLiteral(vc.kind, params[i], vc.bits);
                 await txExec(q, ...params);
               }
-              if (bulk && live.length) await txExec(bulk, JSON.stringify(live));
+              if (bulk && live.length) await txExec(bulk, chainChunkJson(live, blobIdx));
             });
         };
         if (sqlite) { try { await this.run('PRAGMA cache_size = -131072'); } catch { /* an adapter that refuses PRAGMA: the default cache */ } }
@@ -3115,10 +3118,10 @@ export class ZeBridge {
             // same rule. Tombstoned rows are simply not staged — a full replaces all.
             const colList = cols.map((c) => `"${c}"`).join(', ');
             const order = state.pkCols.map((c) => `"${c}"`).join(', ');
-            const stageSql = chainStageSql('temp._zb_seed_stage', cols);
+            const stageSql = chainStageSql('temp._zb_seed_stage', cols, blobIdx);
             let win: any[][] = []; let n = 0;
             const flush = async () => {
-              if (win.length) { await this.run(stageSql, JSON.stringify(win)); win = []; }
+              if (win.length) { await this.run(stageSql, chainChunkJson(win, blobIdx)); win = []; }
               this.seedProgress({ table, step: step.name, kind: step.kind, applied: n, total: stream.nrows, done: false });
             };
             const tempBefore = await this.storage.tempFiles?.();

@@ -2406,7 +2406,7 @@
       ]
     },
     {
-      "name": "a table with a BLOB column stays row by row (JSON has no bytes), as the chain does",
+      "name": "a table with a BLOB column stays row by row on the live stream (JSON has no bytes; a chain seed goes through unhex)",
       "engine": "sqlite",
       "tables": {
         "pics": {

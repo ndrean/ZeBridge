@@ -665,22 +665,53 @@ export function chainUpsertSql(
   return sql;
 }
 
+/// One cell of a chunk row, picked from `json_each`'s `value`. A BLOB column's bytes
+/// cross JSON as `{"$x": "<hex>"}` (`chainChunkJson`) and come back as bytes with
+/// `unhex` — anything else in that column (text, a number, null) passes as it is, so a
+/// BLOB column holding text loses nothing. Other columns: the plain pick.
+const chunkPick = (i: number, blob: boolean): string =>
+  blob
+    ? `CASE WHEN json_type(value, '$[${i}]') = 'object' THEN unhex(json_extract(value, '$[${i}].$x')) ELSE json_extract(value, '$[${i}]') END`
+    : `json_extract(value, '$[${i}]')`;
+
+const HEX = Array.from({ length: 256 }, (_, b) => b.toString(16).padStart(2, '0'));
+const toHex = (bytes: Uint8Array): string => {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += HEX[bytes[i]];
+  return s;
+};
+
+/// A chunk of chain rows as the JSON text `chainBulkSql`/`chainStageSql` bind: the
+/// bytes of the BLOB columns (`blobIdx`) marked `{"$x": "<hex>"}`. Measured on the
+/// depot demo (2026-10-05): 16,173 charge points with a PostGIS `geom` took ~20 s to
+/// seed in a browser one statement per row (a worker round trip each); in chunks, a
+/// statement per chunk like any other table.
+export function chainChunkJson(rows: any[][], blobIdx: number[] = []): string {
+  if (!blobIdx.length) return JSON.stringify(rows);
+  return JSON.stringify(rows.map((row) => {
+    const out = row.slice();
+    for (const i of blobIdx) if (isBytes(out[i])) out[i] = { $x: toHex(out[i]) };
+    return out;
+  }));
+}
+
 /// §10fc: a whole chunk of chain rows in ONE statement — the rows as a JSON array
 /// text bound once, exploded by SQLite's own `json_each`, each cell picked with
 /// `json_extract` (a JSON string is TEXT, a number INTEGER or REAL, true/false 1/0,
 /// null NULL, a nested value its JSON text — the shapes `chainRowParams` binds).
 /// The conflict clause is the upsert's, so the version guard holds row by row. The
 /// `WHERE true` is SQLite's disambiguation of INSERT … SELECT … ON CONFLICT.
-/// Not for a table with a BLOB column (JSON has no bytes) nor for PostgreSQL.
+/// BLOB columns (`blobIdx`) through `unhex` — bind the rows with `chainChunkJson`.
+/// Not for PostgreSQL.
 /// §10ix: the staging insert of a streamed FULL on SQLite — the same `json_extract`
 /// picks as `chainBulkSql`, into a keyless TEMP table, with no conflict clause: a heap
 /// append, no sort, no b-tree. The real table is filled once at the end, `SELECT …
 /// ORDER BY <pk>`, so SQLite's external sorter puts the rows in key order and the
 /// b-tree is built sequentially — the property the buffered path had from sorting the
 /// whole document in memory, without holding it.
-export function chainStageSql(stage: string, cols: string[]): string {
+export function chainStageSql(stage: string, cols: string[], blobIdx: number[] = []): string {
   const colList = cols.map((c) => `"${c}"`).join(', ');
-  const picks = cols.map((_, i) => `json_extract(value, '$[${i}]')`).join(', ');
+  const picks = cols.map((_, i) => chunkPick(i, blobIdx.includes(i))).join(', ');
   return `INSERT INTO ${stage} (${colList}) SELECT ${picks} FROM json_each(?)`;
 }
 
@@ -689,9 +720,10 @@ export function chainBulkSql(
   cols: string[],
   pkCols: string[],
   versionCol: string | null,
+  blobIdx: number[] = [],
 ): string {
   const colList = cols.map((c) => `"${c}"`).join(', ');
-  const picks = cols.map((_, i) => `json_extract(value, '$[${i}]')`).join(', ');
+  const picks = cols.map((_, i) => chunkPick(i, blobIdx.includes(i))).join(', ');
   const conflict = pkCols.map((c) => `"${c}"`).join(', ');
   const sets = cols.filter((c) => !pkCols.includes(c))
                    .map((c) => `"${c}" = excluded."${c}"`).join(', ');

@@ -5,12 +5,41 @@ import { test } from 'node:test';
 import { encode, decode, decodeMulti } from '@msgpack/msgpack';
 import { parseChainHead, chainStageSql, msgpackScan, msgpackDecodeScanned } from './core.ts';
 import { sha256 } from 'js-sha256';
-import { cdcValue, pgEngineValues, isBytes, pgArrayValues, sortRowsByKey, chainBulkSql, vecColsOf, vecLiteral, pgVectorValues } from './core.ts';
+import { cdcValue, pgEngineValues, isBytes, pgArrayValues, sortRowsByKey, chainBulkSql, chainChunkJson, vecColsOf, vecLiteral, pgVectorValues } from './core.ts';
 
 test('a chunk in one statement through json_each, version-guarded (§10fc)', () => {
   const sql = chainBulkSql('t', ['uid', 'n', 'updated_at'], ['uid'], 'updated_at');
   assert.equal(sql, `INSERT INTO t ("uid", "n", "updated_at") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?) WHERE true ON CONFLICT("uid") DO UPDATE SET "n" = excluded."n", "updated_at" = excluded."updated_at" WHERE excluded."updated_at" > t."updated_at"`);
   assert.ok(chainBulkSql('t', ['uid'], ['uid'], null).endsWith('DO NOTHING'));
+});
+
+test('a chunk with a BLOB column in one statement: bytes back through unhex, text and null as they are', async () => {
+  const { default: Database } = await import('better-sqlite3');
+  const db = new Database(':memory:');
+  db.exec('CREATE TABLE t (uid TEXT PRIMARY KEY, geom BLOB, n INTEGER, updated_at TEXT)');
+  const ewkb = new Uint8Array([1, 1, 0, 0, 32, 230, 16, 0, 0, 0, 0, 0, 0, 0, 0, 255]);
+  const rows = [
+    ['a', ewkb, 1, '2026-10-05T00:00:00.000000Z'],
+    ['b', null, 2, '2026-10-05T00:00:00.000000Z'],
+    ['c', 'not bytes', 3, '2026-10-05T00:00:00.000000Z'],   // a BLOB column holding text loses nothing
+    ['d', new Uint8Array(0), 4, '2026-10-05T00:00:00.000000Z'],
+  ];
+  const cols = ['uid', 'geom', 'n', 'updated_at'];
+  db.prepare(chainBulkSql('t', cols, ['uid'], 'updated_at', [1])).run(chainChunkJson(rows, [1]));
+  const got = db.prepare('SELECT uid, geom, typeof(geom) AS ty, n FROM t ORDER BY uid').all() as any[];
+  assert.deepEqual(Buffer.from(got[0].geom), Buffer.from(ewkb));
+  assert.equal(got[0].ty, 'blob');
+  assert.equal(got[1].geom, null);
+  assert.equal(got[2].geom, 'not bytes');
+  assert.equal(got[3].ty, 'blob');
+  assert.equal(got[3].geom.length, 0);
+  assert.equal(got[3].n, 4);
+  // the staging insert takes the same picks
+  db.exec('CREATE TEMP TABLE s (uid, geom, n, updated_at)');
+  db.prepare(chainStageSql('temp.s', cols, [1])).run(chainChunkJson(rows, [1]));
+  assert.deepEqual(Buffer.from((db.prepare("SELECT geom FROM temp.s WHERE uid = 'a'").get() as any).geom), Buffer.from(ewkb));
+  // and a table with no BLOB column binds exactly what it did before
+  assert.equal(chainChunkJson([[1, 'x']]), JSON.stringify([[1, 'x']]));
 });
 
 test('chain rows sort by their key cell, stable for the rest (§10fb)', () => {
