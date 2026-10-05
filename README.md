@@ -44,10 +44,11 @@ flowchart LR
 
 **Tested**: what could go wrong, and the test that shows it does not, in plain words: [What the tests prove](TEST_SCENARIOS.md#what-the-tests-prove-in-plain-words).
 
-**Who is it for?**: Teams shipping an app backed by PostgreSQL that has to work offline, on devices they do not control, where a reconnection storm would hurt the database. Three shapes show up most:
+**Who is it for?**: Teams shipping an app backed by PostgreSQL that has to work offline, on devices they do not control, where a reconnection storm would hurt the database. Four shapes show up most:
 
 - An offline-first app with a local replica. A phone, a browser, a robot, a laptop. The device holds its tenants' rows, works with no network, and syncs back on reconnection. The library queues every write, PostgreSQL judges it last-writer-wins, and the device converges. zb-client-ts for JavaScript hosts, libzb for native ones. A robot that goes offline, updates its own database, and syncs back is the same shape as a phone on a train.
 - An analytical or geospatial responder, without extending PostgreSQL. A warm micro-VM holds its replica in DuckDB and answers "what is around me?" or "what happened in the last hour?" over NATS. No PostGIS, no TimescaleDB, no query load on the primary. See [examples/08-map](examples/08-map) and [examples/09-event](examples/09-event).
+- An app whose screens open from local data. After the first sync, reads never reach the server: a screen renders from the replica, online or not, with no round trip. A static shell from a CDN gives the first paint; a phone app needs nothing more, and a browser app only a small service worker for its static files, since the replica and the outbox replace the data half of one (cached responses, queued writes, background sync). Server-side rendering keeps public pages and first visits.
 - Several editors on one row. A shared route, a shared form, a shared map. Put the editable fields in one jsonb column as registers, and two editors changing different fields never lose a move — LWW on the row decides who merges, LWW on each register decides the winner. No server change, no CRDT, no causal bookkeeping. See [COOPERATIVE_EDITING](COOPERATIVE_EDITING.md).
 
 **What you need to run it**: A PostgreSQL database you can configure — logical replication, a replication slot — and a NATS server you are willing to operate. The PostgreSQL side is automated: `bridge --init-sql` prints the init SQL — the two roles, the functions, the four event triggers, the publication — and pipes straight into `psql`, on bare metal or a VPS.
@@ -216,11 +217,12 @@ Bindings exist for Python, Kotlin (Android), Dart/Flutter and React Native. See 
 
 **Consumers**: The client library can be integrated across a wide range of runtime environments.
 
-- Mobile Native Apps: Utilizing native file system storage: React Native running the TypeScript or C ABI library, Flutter running the C ABI library, with an SQLite replica.
+- Mobile Native Apps: Utilizing native file system storage: React Native running the C ABI library through its Expo module (or the TypeScript library), Flutter running the C ABI library, with an SQLite replica.
 - Desktop apps: Flutter running the C ABI library, or Electron running the TypeScript library, with an SQLite replica.
 - Browsers and Webapps: Leveraging OPFS support for SQLite-WASM or PGlite via the TS library.
 - Backend responder services / micro-VMs. For example, a warm micro-VM as a client, with the columnar in-process database DuckDB as its replica. This client does not write; it answers other connected clients through NATS only.
 ➡ The use case: a phone app asks, through the library, "which points of interest are around me?"; the responder service receives the question, runs the analytical, geospatial or time-based query against its replica, and answers over NATS. No query load on PostgreSQL, and no PostGIS or TimescaleDB extension needed there.
+- Edge functions. A Cloudflare Worker asks a responder over NATS (WebSocket, the NATS client inside zb-client-ts) and returns its answer, with no replica: from Cloudflare's Paris location to the hub in Frankfurt, the question takes about 22 ms, but connecting takes 70–240 ms, paid on every request since a Worker keeps nothing between them. A Durable Object could hold the connection, and a replica in its SQLite; an edge container runs libzb natively, like the micro-VM above. See [examples/11-edge-worker](examples/11-edge-worker).
 
 **Design**: built to keep many small consumers in sync with a small to medium PostgreSQL database, through NATS.
 

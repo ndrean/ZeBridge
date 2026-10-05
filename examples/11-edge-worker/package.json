@@ -1,0 +1,17 @@
+{
+  "name": "zb-edge-worker",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@nats-io/nats-core": "^3.4.0",
+    "fzstd": "0.1.1"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  },
+  "description": "A Cloudflare Worker that asks a ZeBridge responder over NATS",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  }
+}

@@ -18970,3 +18970,21 @@ removed for users with the next libzb; `caFile` still overrides. All four client
 (Flutter and React Native, iPhone and moto e20) work on the embedded roots, hub and leaf.
 The bundle is committed (public certificates, reviewable on refresh), added by hand past
 the secrets hook, which refuses any untracked PEM file.
+
+## §10lq — an edge Worker asks a responder (examples/11-edge-worker) (2026-10-05)
+
+A Cloudflare Worker, nats.js over WebSocket (the client inside zb-client-ts), asks the
+airports service `airports_near` and returns the answer; no replica. The principal
+`edge-worker` was enrolled once on the Mac (enroll.py, libzb); the Worker only reads its creds
+from secrets and never contacts the bridge. Two things the client library does that a
+hand-written client must too: the inbox prefix `_INBOX.<principal>` (the grants allow replies
+nowhere else) and zstd (the service compresses its answers; fzstd).
+
+Deployed for the measurement, then deleted: served from Cloudflare's Paris location, the hub
+in Frankfurt, the question takes 21–25 ms (DuckDB 6–10 ms) — faster than from a home line —
+but the NATS connection takes 70–240 ms, about 65 ms once the isolate and the route are warm,
+and a Worker pays it on every request. So a stateless Worker costs about a quarter of a second
+a call. A Durable Object could hold one connection (and a replica in its SQLite); an edge
+container runs libzb natively. Open: zb-client-ts has no "ask only" mode (connect() opens a
+replica), and an edge identity outlives a day only with a longer-lived principal or a renewal
+the function can store.
