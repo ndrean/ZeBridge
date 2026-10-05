@@ -67,7 +67,8 @@ const routeLayer = L.layerGroup().addTo(map);
 const truckLayer = L.layerGroup().addTo(map);
 
 // ── types ──────────────────────────────────────────────────────────────────────
-type Point = { lat: number; lng: number; label: string; charger?: string };
+/// `heading`: a mid-route start's direction of travel, degrees from north (Valhalla's own field).
+type Point = { lat: number; lng: number; label: string; charger?: string; heading?: number };
 type Leg = { from: Point; to: Point; started_at: string };
 type Register<T> = { v: T; t: string; w: string };
 type Plan = { from?: Register<Point>; to?: Register<Point>; leg?: Register<Leg> };
@@ -163,7 +164,7 @@ type Route = {
   ms: number;
 };
 const routes = new Map<string, Route | 'asking' | { error: string }>();
-const legKey = (leg: Leg) => JSON.stringify([leg.from.lat, leg.from.lng, leg.to.lat, leg.to.lng]);
+const legKey = (leg: Leg) => JSON.stringify([leg.from.lat, leg.from.lng, leg.from.heading ?? null, leg.to.lat, leg.to.lng]);
 
 /// Valhalla's shapes are Google's encoded polyline at 6 decimals (not 5).
 function decodePolyline6(s: string): L.LatLngTuple[] {
@@ -184,7 +185,12 @@ function decodePolyline6(s: string): L.LatLngTuple[] {
 async function askRoute(from: Point, to: Point): Promise<Route> {
   const t0 = performance.now();
   const a = await zb.request('query._default.route', {
-    locations: [{ lat: from.lat, lon: from.lng }, { lat: to.lat, lon: to.lng }],
+    // A start with a heading: Valhalla keeps to roads leaving within 45° of it — no U-turn
+    // in the street where the truck changed its mind.
+    locations: [
+      { lat: from.lat, lon: from.lng, ...(from.heading !== undefined ? { heading: from.heading, heading_tolerance: 45 } : {}) },
+      { lat: to.lat, lon: to.lng },
+    ],
     costing: 'truck',
     units: 'km',
   }, 15_000);
@@ -218,8 +224,14 @@ function routeFor(leg: Leg): Route | null {
 /// Where the truck is, `elapsed` seconds into its leg: the maneuver it is in by time,
 /// then that stretch of line by distance. Slower in town, faster on the motorway.
 function positionAt(r: Route, elapsed: number): L.LatLngTuple {
-  if (elapsed <= 0) return r.line[0];
-  if (elapsed >= r.seconds) return r.line[r.line.length - 1];
+  return locate(r, elapsed).at;
+}
+
+/// The position and the stretch of line it is on (`i` → `i + 1`).
+function locate(r: Route, elapsed: number): { at: L.LatLngTuple; i: number } {
+  const last = r.line.length - 1;
+  if (elapsed <= 0) return { at: r.line[0], i: 0 };
+  if (elapsed >= r.seconds) return { at: r.line[last], i: Math.max(0, last - 1) };
   const m = r.maneuvers.find((x) => elapsed < x.t0 + x.time) ?? r.maneuvers[r.maneuvers.length - 1];
   const f = m.time > 0 ? (elapsed - m.t0) / m.time : 1;
   const target = r.cum[m.b] + f * (r.cum[m.e] - r.cum[m.b]);
@@ -227,8 +239,21 @@ function positionAt(r: Route, elapsed: number): L.LatLngTuple {
   while (i < m.e && r.cum[i + 1] < target) i++;
   const span = r.cum[i + 1] - r.cum[i];
   const g = span > 0 ? (target - r.cum[i]) / span : 0;
-  const [a, b] = [r.line[i], r.line[Math.min(i + 1, r.line.length - 1)]];
-  return [a[0] + g * (b[0] - a[0]), a[1] + g * (b[1] - a[1])];
+  const [a, b] = [r.line[i], r.line[Math.min(i + 1, last)]];
+  return { at: [a[0] + g * (b[0] - a[0]), a[1] + g * (b[1] - a[1])], i: Math.min(i, Math.max(0, last - 1)) };
+}
+
+/// The truck's direction of travel, in degrees clockwise from north: the bearing of the
+/// stretch of line it is on. Sent with a new leg's start, so Valhalla prefers to carry on
+/// forward instead of planning a U-turn in the street.
+function headingAt(r: Route, elapsed: number): number | undefined {
+  const { i } = locate(r, elapsed);
+  const [a, b] = [r.line[i], r.line[i + 1]];
+  if (!a || !b || (a[0] === b[0] && a[1] === b[1])) return undefined;
+  const rad = Math.PI / 180;
+  const y = Math.sin((b[1] - a[1]) * rad) * Math.cos(b[0] * rad);
+  const x = Math.cos(a[0] * rad) * Math.sin(b[0] * rad) - Math.sin(a[0] * rad) * Math.cos(b[0] * rad) * Math.cos((b[1] - a[1]) * rad);
+  return Math.round(((Math.atan2(y, x) / rad) + 360) % 360);
 }
 
 const elapsedOf = (leg: Leg) => (Date.now() - Date.parse(leg.started_at)) / 1000;
@@ -390,9 +415,14 @@ traceButton.addEventListener('click', () => {
   if (!to) return;
   let from: Point;
   if (plan.leg) {
-    const at = whereIs(t);
-    if (!at) { notice.textContent = 'the current route is still being asked — try again in a second'; return; }
-    from = { lat: at[0], lng: at[1], label: `${t.name}'s position` };
+    const r = routeFor(plan.leg.v);
+    if (!r) { notice.textContent = 'the current route is still being asked — try again in a second'; return; }
+    const elapsed = elapsedOf(plan.leg.v);
+    const at = positionAt(r, elapsed);
+    // Arrived: no direction to keep. On the way: the one it is driving in, stored in the
+    // leg so every screen asks Valhalla the same question.
+    const heading = elapsed < r.seconds ? headingAt(r, elapsed) : undefined;
+    from = { lat: at[0], lng: at[1], label: `${t.name}'s position`, ...(heading !== undefined ? { heading } : {}) };
   } else {
     from = plan.from?.v ?? t.depot;
   }
