@@ -60,11 +60,13 @@
                 - ./custom_files:/custom_files
       notify: Recreate valhalla
 
+    # Not under --check: the directory above is only pretended, and `chdir` fails on it.
     - name: Valhalla up
       ansible.builtin.command: docker compose up -d
       args:
         chdir: /opt/zebridge-routing
       register: routing_compose_up
+      when: not ansible_check_mode
       changed_when: "'Started' in routing_compose_up.stderr or 'Created' in routing_compose_up.stderr"
 
     # ── zb-respond ────────────────────────────────────────────────────────────
@@ -154,5 +156,4 @@
   retries: 12
   delay: 5
   until: routing_valhalla_status.status == 200
-  check_mode: false
-  when: zb_routing | bool
+  when: zb_routing | bool and not ansible_check_mode   # under --check, nothing was started

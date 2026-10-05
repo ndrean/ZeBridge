@@ -3,7 +3,7 @@
   args:
     chdir: /opt/zebridge-routing
   changed_when: true
-  when: zb_routing | bool
+  when: zb_routing | bool and not ansible_check_mode   # the directory may be only pretended
 
 - name: Restart routing
   ansible.builtin.systemd_service:
