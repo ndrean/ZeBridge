@@ -1,0 +1,158 @@
+# Routing (examples/13-routing): Valhalla in a container, answering HTTP on loopback only,
+# and zb-respond — native, a systemd unit — forwarding the questions query._default.route,
+# .matrix and .tour to it. Only zb-respond is on NATS. The tiles are built off the server
+# (Valhalla's tiles from an OSM extract) and shipped as they are; the server never reads OSM.
+
+- name: Routing (Valhalla and zb-respond)
+  when: zb_routing | bool
+  block:
+    # ── Valhalla ──────────────────────────────────────────────────────────────
+    - name: Valhalla's directory
+      ansible.builtin.file:
+        path: /opt/zebridge-routing
+        state: directory
+        mode: "0755"
+
+    # Owned by the image's user (uid 59999): Valhalla writes file_hashes.txt there.
+    - name: Valhalla's data directory, for the image's user
+      ansible.builtin.file:
+        path: /opt/zebridge-routing/custom_files
+        state: directory
+        owner: "59999"
+        group: "59999"
+        mode: "0755"
+
+    - name: The routing tiles and Valhalla's configuration
+      ansible.builtin.copy:
+        src: "{{ zb_routing_tiles }}/{{ item }}"
+        dest: "/opt/zebridge-routing/custom_files/{{ item }}"
+        owner: "59999"
+        group: "59999"
+        mode: "0644"
+      loop: [valhalla_tiles.tar, valhalla.json]
+      notify: Recreate valhalla
+
+    # update_existing_config and build_tar off: Valhalla reads the shipped files as they
+    # are and rewrites nothing the playbook copies, so a run with no new tiles changes
+    # nothing. Pinned by digest: the release tested in OrbStack (2026-10-05).
+    - name: Valhalla's compose file
+      ansible.builtin.copy:
+        dest: /opt/zebridge-routing/docker-compose.yml
+        mode: "0644"
+        content: |
+          services:
+            valhalla:
+              image: ghcr.io/gis-ops/docker-valhalla/valhalla@{{ valhalla_image_digest }}
+              container_name: zb_valhalla
+              restart: unless-stopped
+              ports: ["127.0.0.1:8002:8002"]
+              mem_limit: {{ valhalla_mem_limit }}
+              environment:
+                use_tiles_ignore_pbf: "True"
+                force_rebuild: "False"
+                serve_tiles: "True"
+                build_elevation: "False"
+                build_admins: "False"
+                build_time_zones: "False"
+                build_tar: "False"
+                update_existing_config: "False"
+              volumes:
+                - ./custom_files:/custom_files
+      notify: Recreate valhalla
+
+    - name: Valhalla up
+      ansible.builtin.command: docker compose up -d
+      args:
+        chdir: /opt/zebridge-routing
+      register: routing_compose_up
+      changed_when: "'Started' in routing_compose_up.stderr or 'Created' in routing_compose_up.stderr"
+
+    # ── zb-respond ────────────────────────────────────────────────────────────
+    - name: The zb-respond binary
+      ansible.builtin.copy:
+        src: "{{ zb_respond_bin }}"
+        dest: /usr/local/bin/zb-respond
+        mode: "0755"
+      notify: Restart routing
+
+    - name: Its state directory (the client's own small database)
+      ansible.builtin.file:
+        path: /var/lib/routing
+        state: directory
+        owner: zebridge
+        mode: "0750"
+
+    - name: The responder's creds, minted once (needs operator.store on the server)
+      ansible.builtin.shell: >-
+        umask 077 &&
+        bridge --mint-responder --store /etc/zebridge/operator.store --name routing --tenant _default
+        > /etc/zebridge/creds/routing.creds
+      args:
+        creates: /etc/zebridge/creds/routing.creds
+
+    - name: The creds belong to the service user
+      ansible.builtin.file:
+        path: /etc/zebridge/creds/routing.creds
+        owner: zebridge
+        mode: "0600"
+
+    - name: The zb-respond configuration
+      ansible.builtin.copy:
+        dest: /etc/zebridge/routing.json
+        mode: "0644"
+        content: "{{ routing_config | to_nice_json }}\n"
+      vars:
+        routing_config:
+          url: "tls://{{ zb_host_nats }}:4222"
+          creds: /etc/zebridge/creds/routing.creds
+          db: /var/lib/routing/zb-respond.sqlite3
+          name: "routing-{{ inventory_hostname }}"
+          queue: routing
+          tenants: [_default]
+          questions:
+            route: {http: "http://127.0.0.1:8002/route"}
+            matrix: {http: "http://127.0.0.1:8002/sources_to_targets"}
+            tour: {http: "http://127.0.0.1:8002/optimized_route"}
+      notify: Restart routing
+
+    - name: The routing.service unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/routing.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=zb-respond: routing questions, answered by Valhalla
+          After=nats.service docker.service
+          Wants=nats.service docker.service
+
+          [Service]
+          User=zebridge
+          ExecStart=/usr/local/bin/zb-respond /etc/zebridge/routing.json
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart routing
+
+    - name: The responder running
+      ansible.builtin.systemd_service:
+        name: routing
+        enabled: true
+        state: started
+        daemon_reload: true
+
+# Outside the block: flush_handlers takes no `when`. Pending restarts now, so the check
+# below sees the new versions.
+- name: Pending restarts now
+  ansible.builtin.meta: flush_handlers
+
+- name: Valhalla answers (its /status, on loopback)
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8002/status
+  register: routing_valhalla_status
+  retries: 12
+  delay: 5
+  until: routing_valhalla_status.status == 200
+  check_mode: false
+  when: zb_routing | bool

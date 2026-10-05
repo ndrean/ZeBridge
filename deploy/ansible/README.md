@@ -7,6 +7,7 @@ One playbook sets up a Debian server running ZeBridge behind Cloudflare:
 * HAProxy for `bridge.<domain>`: Cloudflare only, `/enroll`, `/renew` and `/status`;
 * Alloy and the NATS exporter, sending metrics and logs to Grafana Cloud;
 * the airports responder of `examples/10-airports` (optional);
+* routing (`examples/13-routing`, optional): Valhalla in a container on loopback, and `zb-respond` as a systemd service answering `query._default.route`, `.matrix` and `.tour`. The tiles are built on your machine and copied as they are;
 * and, last, `bridge --diagnose` as the service user: the run fails unless it is clean.
 
 It can be run again at any time: each step checks before it changes anything.
@@ -63,7 +64,7 @@ It reads the trust block (operator, accounts) of the hub's `nats-server.conf` on
 
 ## After the first run
 
-* Move `/etc/zebridge/operator.store` off the server (a password manager, an offline disk): it signs everything. The playbooks need it only for what they create once: the airports responder's creds, a leaf's creds, and a JetStream domain added to a running stack. Put it back for those runs.
+* Move `/etc/zebridge/operator.store` off the server (a password manager, an offline disk): it signs everything. The playbooks need it only for what they create once: the airports and routing responders' creds, a leaf's creds, and a JetStream domain added to a running stack. Put it back for those runs.
 * Check from outside: `https://bridge.<domain>/status` answers 200, and a direct connection to the server on 443 is refused (403).
 * Grafana Cloud: `bridge_connected{environment="production"}` is 1, and `{unit="zebridge.service"}` shows the bridge's log.
 

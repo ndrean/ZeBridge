@@ -2,6 +2,7 @@
 # The Linux builds a server needs, from a Mac (or any Docker host):
 #   zig-out/linux-<arch>/bin/{bridge,bridge_sweeper}   — link the system's libpq and zstd
 #   libzb/zig-out/linux-<arch>/lib/libzbcore.so        — SQLite and zstd compiled in
+#   libzb/zig-out/linux-<arch>/bin/zb-respond          — the native responder, the same way
 #
 #   deploy/build-linux.sh            # x86_64 (default)
 #   deploy/build-linux.sh aarch64    # an ARM server (Ampere)
@@ -39,6 +40,6 @@ cd /src
   -p /src/zig-out/linux-$arch --cache-dir /cache/local-$arch --global-cache-dir /cache/global
 "
 
-(cd "$root/libzb" && zig build lib -Dtarget="$arch-linux-gnu.2.35" -Dvendor=true -Doptimize=ReleaseFast -p "zig-out/linux-$arch")
+(cd "$root/libzb" && zig build lib respond -Dtarget="$arch-linux-gnu.2.35" -Dvendor=true -Doptimize=ReleaseFast -p "zig-out/linux-$arch")
 
-ls -la "$root/zig-out/linux-$arch/bin" "$root/libzb/zig-out/linux-$arch/lib"
+ls -la "$root/zig-out/linux-$arch/bin" "$root/libzb/zig-out/linux-$arch/lib" "$root/libzb/zig-out/linux-$arch/bin"

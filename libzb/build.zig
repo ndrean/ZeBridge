@@ -369,7 +369,11 @@ pub fn build(b: *std.Build) void {
     }
     respond_mod.link_libc = true;
     respond_mod.addImport("duckdb", duckdb_mod);
-    b.installArtifact(b.addExecutable(.{ .name = "zb-respond", .root_module = respond_mod }));
+    const respond_exe = b.addExecutable(.{ .name = "zb-respond", .root_module = respond_mod });
+    b.installArtifact(respond_exe);
+    // `zig build respond` — the responder alone (deploy/build-linux.sh, for a server).
+    const respond_step = b.step("respond", "Build ONLY zb-respond (the native responder)");
+    respond_step.dependOn(&b.addInstallArtifact(respond_exe, .{}).step);
 
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);

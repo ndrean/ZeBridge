@@ -38,5 +38,13 @@ enroll_jwt_ttl_seconds: 86400
 # The airports responder (examples/10-airports).
 zb_airports: true
 
+# Routing (examples/13-routing): Valhalla on loopback, zb-respond on NATS. The tiles are
+# built off the server; the directory holds valhalla_tiles.tar and valhalla.json.
+zb_routing: true
+zb_routing_tiles: "{{ zb_repo }}/examples/08-map/valhalla/custom_files"
+zb_respond_bin: "{{ zb_repo }}/libzb/zig-out/linux-x86_64/bin/zb-respond"
+valhalla_image_digest: "sha256:060da5b92e6024a67f65135c236d918b021d63e73d1808a0d55b7e7cbd17240c"
+valhalla_mem_limit: 1g
+
 # Telemetry: telemetry/vps/ is copied as it is (its config.alloy names the Grafana Cloud
 # endpoints); the token is vault_grafana_password.

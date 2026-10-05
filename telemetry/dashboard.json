@@ -771,7 +771,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "container_memory_working_set_bytes{unit=~\"zebridge|zebridge-sweeper|nats|airports\"}",
+          "expr": "container_memory_working_set_bytes{unit=~\"zebridge|zebridge-sweeper|nats|airports|routing\"}",
           "legendFormat": "{{unit}}",
           "refId": "A"
         }
@@ -1493,7 +1493,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "container_memory_working_set_bytes{unit=~\"zebridge|zebridge-sweeper|nats|airports\"}",
+          "expr": "container_memory_working_set_bytes{unit=~\"zebridge|zebridge-sweeper|nats|airports|routing\"}",
           "legendFormat": "{{unit}}",
           "refId": "A"
         }
@@ -1533,7 +1533,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "container_memory_rss{unit=~\"zebridge|zebridge-sweeper|nats|airports\"}",
+          "expr": "container_memory_rss{unit=~\"zebridge|zebridge-sweeper|nats|airports|routing\"}",
           "legendFormat": "{{unit}}",
           "refId": "A"
         }

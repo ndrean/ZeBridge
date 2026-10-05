@@ -1,0 +1,13 @@
+- name: Recreate valhalla
+  ansible.builtin.command: docker compose up -d --force-recreate
+  args:
+    chdir: /opt/zebridge-routing
+  changed_when: true
+  when: zb_routing | bool
+
+- name: Restart routing
+  ansible.builtin.systemd_service:
+    name: routing
+    state: restarted
+    daemon_reload: true
+  when: zb_routing | bool
