@@ -1,0 +1,21 @@
+# The airports responder on Fly.io: the zb-airports image (deploy/airports-responder.Dockerfile),
+# no public port (it only dials out to NATS), joining the hub directly as one more member of
+# queue group `airports`. Change `app` (names are global on Fly) and the region.
+app = "zb-airports-test"
+primary_region = "cdg"
+
+[build]
+  image = "zb-airports"
+
+[env]
+  NATS_URL = "tls://nats.example.com:4222"
+  ZB_SERVICE_NAME = "airports-fly"
+
+# The responder's creds, from a Fly secret (base64), written as the file the image reads.
+[[files]]
+  guest_path = "/creds"
+  secret_name = "ZB_CREDS_B64"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
