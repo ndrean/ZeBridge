@@ -60,18 +60,23 @@
     path: /etc/hosts
     line: "127.0.0.1 {{ zb_host_nats }}"
 
+# The API, not www.cloudflare.com/ips-v4: the web pages sit behind Cloudflare's bot
+# protection, which answers Python's client (this module) with 403.
 - name: Cloudflare's address ranges
   ansible.builtin.uri:
-    url: "https://www.cloudflare.com/{{ item }}"
+    url: https://api.cloudflare.com/client/v4/ips
     return_content: true
-  loop: [ips-v4, ips-v6]
-  register: base_cf_lists
+  register: base_cf_ips
   check_mode: false   # a read: --check needs the lists too
 
-# The lists end without a newline: joined line by line, never concatenated.
 - name: Cloudflare's ranges as one list
   ansible.builtin.set_fact:
-    base_cloudflare_ranges: "{{ base_cf_lists.results | map(attribute='content') | map('split', '\n') | flatten | map('trim') | select | list }}"
+    base_cloudflare_ranges: "{{ base_cf_ips.json.result.ipv4_cidrs + base_cf_ips.json.result.ipv6_cidrs }}"
+
+- name: The list is not empty
+  ansible.builtin.assert:
+    that: base_cloudflare_ranges | length > 0
+    fail_msg: "Cloudflare's API returned no ranges: the firewall would shut HAProxy out"
 
 - name: Firewall — SSH and NATS for everyone
   community.general.ufw:
