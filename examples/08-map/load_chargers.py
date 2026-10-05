@@ -4,6 +4,7 @@
     examples/08-map/load_chargers.py --create     # the table, its indexes, published
     examples/08-map/load_chargers.py              # load poi-ocm.json (France: 16,173 points)
     examples/08-map/load_chargers.py --country 80 --json later.json   # a later export: the diff moves
+    ADMIN_DATABASE_URL=postgresql://… examples/08-map/load_chargers.py --create   # a remote database
 
 It replaces `osm_pois` as the map's dataset. The HOT OpenStreetMap export was 2.1M
 points of everything — pharmacies, benches, bars — and a map of it is noise. This is
@@ -98,10 +99,28 @@ SELECT (SELECT count(*) FROM up WHERE inserted) AS inserted, (SELECT count(*) FR
 """
 
 
+def pg_env() -> dict:
+    """ADMIN_DATABASE_URL (a remote PostgreSQL: Supabase, say) as libpq's variables, so
+    the password never reaches psql's command line (`ps` shows that); unset, the local
+    database as before."""
+    url = os.environ.get("ADMIN_DATABASE_URL")
+    if not url:
+        return {**os.environ, "PGHOST": "127.0.0.1", "PGPORT": "5432", "PGUSER": "postgres", "PGDATABASE": "postgres"}
+    from urllib.parse import urlsplit, unquote, parse_qs
+    u = urlsplit(url)
+    env = {**os.environ, "PGHOST": u.hostname or "", "PGPORT": str(u.port or 5432),
+           "PGUSER": unquote(u.username or ""), "PGDATABASE": (u.path or "/postgres").lstrip("/") or "postgres"}
+    if u.password:
+        env["PGPASSWORD"] = unquote(u.password)
+    if "sslmode" in (q := parse_qs(u.query)):
+        env["PGSSLMODE"] = q["sslmode"][0]
+    return env
+
+
 def psql(sql: str, *, file: pathlib.Path | None = None) -> str:
-    cmd = [PSQL, "-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-d", "postgres", "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1"]
+    cmd = [PSQL, "-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1"]
     cmd += ["-f", str(file)] if file else ["-c", sql]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, env=pg_env())
     if r.returncode != 0:
         sys.exit(r.stderr.strip())
     return r.stdout.strip()
