@@ -851,6 +851,10 @@ pub const Server = struct {
                 \\# TYPE bridge_max_rss_bytes gauge
                 \\bridge_max_rss_bytes {d}
                 \\
+                \\# HELP process_resident_memory_bytes Resident set size of the bridge process now (falls as well as rises, unlike the peak)
+                \\# TYPE process_resident_memory_bytes gauge
+                \\process_resident_memory_bytes {d}
+                \\
             , .{
                 snap.uptime_seconds,
                 snap.wal_messages_received,
@@ -872,6 +876,7 @@ pub const Server = struct {
                 cpu_ns / std.time.ns_per_s,
                 (cpu_ns % std.time.ns_per_s) / std.time.ns_per_ms,
                 utils.maxRssBytes(),
+                utils.residentBytes(),
             });
 
             // Appended rather than folded into the format string: the registry owns its

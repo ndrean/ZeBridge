@@ -47,6 +47,38 @@ pub fn maxRssBytes() u64 {
     return if (builtin.os.tag == .linux) raw * 1024 else raw;
 }
 
+/// The resident set size NOW, in bytes, or 0 when the platform will not say. Unlike
+/// `maxRssBytes` it comes back down, so a leak shows as a climb and a cache as a plateau.
+/// Linux: /proc/self/statm (pages); Darwin: task_info.
+pub fn residentBytes() u64 {
+    switch (builtin.os.tag) {
+        .linux => {
+            var buf: [128]u8 = undefined;
+            const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/statm", .{ .ACCMODE = .RDONLY }, 0) catch return 0;
+            defer _ = std.posix.system.close(fd);
+            const n = std.posix.read(fd, &buf) catch return 0;
+            // "size resident shared text lib data dt", in pages.
+            var it = std.mem.tokenizeScalar(u8, buf[0..n], ' ');
+            _ = it.next() orelse return 0;
+            const pages = std.fmt.parseInt(u64, it.next() orelse return 0, 10) catch return 0;
+            return pages * std.heap.pageSize();
+        },
+        .macos => {
+            var info: std.c.mach_task_basic_info = undefined;
+            var count: std.c.mach_msg_type_number_t = std.c.MACH.TASK.BASIC.INFO_COUNT;
+            if (std.c.task_info(std.c.mach_task_self(), std.c.MACH.TASK.BASIC.INFO, @ptrCast(&info), &count) != 0) return 0;
+            return info.resident_size;
+        },
+        else => return 0,
+    }
+}
+
+test "residentBytes: a live process is resident, and within its peak" {
+    const now = residentBytes();
+    try std.testing.expect(now > 0);
+    try std.testing.expect(now <= maxRssBytes() + std.heap.pageSize());
+}
+
 /// The memory limit this process actually has, in bytes, or 0 when unknown.
 ///
 /// Prefers the **cgroup v2 / v1 limit** over physical RAM, because the deployment that
