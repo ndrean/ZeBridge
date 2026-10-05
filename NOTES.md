@@ -18941,8 +18941,8 @@ serves both. The same functions as the Swift module, on one worker thread, `wake
 the TLS roots as an asset, copied to the app's files and passed as `caFile` (Zig reads no
 trust store on Android either). scripts/build-android.sh builds both. The app takes libzb
 wherever the module is built in (`EXPO_PUBLIC_ZB_ENGINE=ts` forces zb-client-ts). On the
-moto e20 through the hub, React Native on libzb: round trips lower than the 87 ms of
-zb-client-ts on the same phone and path.
+moto e20 through the hub, around Frankfurt: React Native on libzb 53 ms, against 87 ms on
+zb-client-ts with the same phone, path and service time — the Flutter app's 40–60 ms.
 
 Build trap: `EXPO_PUBLIC_*` values are written into the code by Metro's transform, and both
 Metro's cache and Gradle's up-to-date check ignore the environment: a new invite was
