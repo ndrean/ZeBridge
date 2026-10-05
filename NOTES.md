@@ -18914,5 +18914,15 @@ Build traps: JDK 17 (React Native 0.76's Gradle 8.10 refuses Android Studio's JD
 `ANDROID_HOME` (the generated project has no local.properties); `expo-asset` as a direct
 dependency (pnpm hides it inside `expo`, and the release bundler needs it); and
 `expo run:android`, not Gradle alone — its first step writes the autolinking for Expo's
-modules, without which the Java compile cannot find `ExpoModulesPackage`. Not yet: the
-iOS side through libzb's Expo module.
+modules, without which the Java compile cannot find `ExpoModulesPackage`.
+
+iOS through libzb, behind zb-react-native, the same screen (src/client.ts: libzb on iOS,
+zb-client-ts elsewhere), through the leaf (`tls://leaf1.zebridge.eu:4222`): a change on the
+iPhone reaches the moto e20, and the reverse. The module had only connect, sync, poll and
+query (06's seed); it gains mutate, request, flushOutbox and stamp on its serial queue, and
+wake off it — the one call libzb allows from any thread, made before each command so a poll
+holding the queue ends its wait. It ships Apple's roots (build-ios.sh exports them, a pod
+resource bundle) and passes them as `caFile` when the app names none: the library owns the
+TLS glue on iOS. `zb_client_sync` now reports `principal`, so a binding knows who it enrolled
+as without reading the identity file. Build trap: a new bundle id needs
+`xcodebuild -allowProvisioningUpdates`; `expo run:ios` stops at "No profiles".

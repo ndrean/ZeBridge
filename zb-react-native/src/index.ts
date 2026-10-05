@@ -21,6 +21,12 @@ type Native = {
   poll(handle: string, waitMs: number): Promise<string>;
   query(handle: string, sql: string, paramsJson: string): Promise<string>;
   close(handle: string): Promise<number>;
+  mutate(handle: string, table: string, op: string, keyJson: string, valuesJson: string): Promise<string>;
+  request(handle: string, subject: string, payloadJson: string, timeoutMs: number): Promise<string>;
+  flushOutbox(handle: string, waitMs: number): Promise<string>;
+  stamp(handle: string): Promise<string>;
+  wake(handle: string): number;
+  defaultCaFile(): string | null;
   zstdNew(): number;
   zstdPush(id: number, chunk: Uint8Array): number;
   zstdTake(id: number, dest: Uint8Array): void;
@@ -54,8 +60,16 @@ export function assertAbi(): void {
 
 /// libzb's connect options — the names zb-client-ts uses too.
 export type LibzbOptions = {
-  natsUrl: string;
-  principal: string;
+  /// With `bridgeUrl` and `invite`, the first run enrolls and later runs read the identity
+  /// kept beside the replica; `natsUrl` then only overrides the address it names (a leaf).
+  bridgeUrl?: string;
+  invite?: string;
+  identityPath?: string;
+  natsUrl?: string;
+  principal?: string;
+  /// A PEM file of trusted roots for https:// and tls:// — on iOS the module's own copy
+  /// of Apple's roots when unset (Zig reads no trust store there).
+  caFile?: string;
   /// The .creds text (what /enroll returns), or `credsPath` to a file.
   creds?: string;
   credsPath?: string;
@@ -81,7 +95,15 @@ export class Libzb {
 
   static async connect(opts: LibzbOptions): Promise<Libzb> {
     assertAbi();
-    return new Libzb(await native().connect(JSON.stringify(opts)));
+    const caFile = opts.caFile ?? native().defaultCaFile() ?? undefined;
+    return new Libzb(await native().connect(JSON.stringify({ ...opts, ...(caFile ? { caFile } : {}) })));
+  }
+
+  /// Every command first ends a running poll's wait (`zb_client_wake`): the module runs one
+  /// call at a time, and a poll would otherwise hold the queue for its whole `waitMs`.
+  private woken(): string {
+    native().wake(this.handle);
+    return this.handle;
   }
 
   /// The first sync is schema, seed and positions: the table is usable after it.
@@ -95,10 +117,30 @@ export class Libzb {
   }
 
   async query(sql: string, params: unknown[] = []): Promise<QueryResult> {
-    return JSON.parse(await native().query(this.handle, sql, JSON.stringify(params)));
+    return JSON.parse(await native().query(this.woken(), sql, JSON.stringify(params)));
+  }
+
+  /// One write: applied locally at once, sent to the bridge, judged by PostgreSQL.
+  async mutate(table: string, op: 'INSERT' | 'UPDATE' | 'DELETE', key: Record<string, unknown>, values: Record<string, unknown> = {}): Promise<any> {
+    return JSON.parse(await native().mutate(this.woken(), table, op, JSON.stringify(key), JSON.stringify(values)));
+  }
+
+  /// A question to a service (`query.<tenant>.<name>`): its answer, parsed.
+  async request(subject: string, payload: unknown = {}, timeoutMs = 5000): Promise<any> {
+    return JSON.parse(await native().request(this.woken(), subject, JSON.stringify(payload), timeoutMs));
+  }
+
+  /// Sends the outbox, waiting up to `waitMs` for the verdicts.
+  async flush(waitMs = 0): Promise<any> {
+    return JSON.parse(await native().flushOutbox(this.woken(), waitMs));
+  }
+
+  /// A register stamp on the bridge's clock (COOPERATIVE_EDITING.md): zb-client-ts's stamp().
+  async stamp(): Promise<string> {
+    return JSON.parse(await native().stamp(this.woken())).stamp;
   }
 
   async close(): Promise<void> {
-    await native().close(this.handle);
+    await native().close(this.woken());
   }
 }

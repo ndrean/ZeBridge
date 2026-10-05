@@ -20,4 +20,6 @@ Pod::Spec.new do |s|
   s.source_files = '*.{h,swift}'
   s.public_header_files = 'zb.h'
   s.vendored_frameworks = 'ZbCore.xcframework'
+  # Apple's root certificates, for libzb's TLS (scripts/build-ios.sh writes roots.pem).
+  s.resource_bundles = { 'ZbNativeRoots' => ['roots.pem'] }
 end

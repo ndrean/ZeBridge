@@ -36,6 +36,11 @@ for slice in ios ios-sim; do
   fi
 done
 
+# The roots libzb checks TLS against on iOS (Zig reads no trust store there): this Mac's
+# system roots, which are Apple's, the set iOS trusts. Shipped in the pod as a resource.
+security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain > "$here/ios/roots.pem"
+echo "ok: $(grep -c 'BEGIN CERTIFICATE' "$here/ios/roots.pem") roots in ios/roots.pem"
+
 dest="$here/ios/ZbCore.xcframework"
 rm -rf "$dest"
 xcodebuild -create-xcframework \

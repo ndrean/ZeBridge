@@ -45,6 +45,37 @@ public class ZbNativeModule: Module {
       try Self.take(zb_client_query(try Self.handle(h), sql, params), "zb_client_query")
     }.runOnQueue(queue)
 
+    AsyncFunction("mutate") { (h: String, table: String, op: String, key: String, values: String) throws -> String in
+      try Self.take(zb_client_mutate(try Self.handle(h), table, op, key, values), "zb_client_mutate")
+    }.runOnQueue(queue)
+
+    AsyncFunction("request") { (h: String, subject: String, payload: String, timeoutMs: Double) throws -> String in
+      try Self.take(zb_client_request(try Self.handle(h), subject, payload, UInt64(max(0, timeoutMs))), "zb_client_request")
+    }.runOnQueue(queue)
+
+    AsyncFunction("flushOutbox") { (h: String, waitMs: Double) throws -> String in
+      try Self.take(zb_client_flush_outbox(try Self.handle(h), UInt64(max(0, waitMs))), "zb_client_flush_outbox")
+    }.runOnQueue(queue)
+
+    AsyncFunction("stamp") { (h: String) throws -> String in
+      try Self.take(zb_client_stamp(try Self.handle(h)), "zb_client_stamp")
+    }.runOnQueue(queue)
+
+    // NOT on the queue: the one call libzb allows from any thread. A poll may be holding
+    // the queue for its whole wait; this ends the wait, so the call queued behind it runs.
+    Function("wake") { (h: String) throws -> Int in
+      Int(zb_client_wake(try Self.handle(h)))
+    }
+
+    // Zig reads no trust store on iOS: libzb checks https:// and tls:// against a PEM file
+    // (`caFile`). The module ships Apple's roots (scripts/build-ios.sh exports them), and
+    // src/index.ts passes this path when the app names none.
+    Function("defaultCaFile") { () -> String? in
+      guard let url = Bundle(for: ZbNativeModule.self).url(forResource: "ZbNativeRoots", withExtension: "bundle"),
+            let bundle = Bundle(url: url) else { return nil }
+      return bundle.path(forResource: "roots", ofType: "pem")
+    }
+
     AsyncFunction("close") { (h: String) throws -> Int in
       Int(zb_client_close(try Self.handle(h)))
     }.runOnQueue(queue)

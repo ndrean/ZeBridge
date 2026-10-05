@@ -1,6 +1,8 @@
 # 10-airports in React Native
 
-The airports example on a phone through zb-client-ts, without a map: five cities, the
+The airports example on a phone, without a map. On Android through zb-client-ts; on iOS
+through libzb, the C client, behind zb-react-native's Expo module (`src/client.ts` picks one;
+the status line names it): five cities, the
 airports within 100 km of the one chosen (asked of the DuckDB service), and the shared
 flight, whose departure and arrival any airport in the list can set. The flight is the same
 row the web page and the Flutter app write, with the same registers.
@@ -32,3 +34,25 @@ The settings are read at build time:
   leaf node (`wss://leaf.example.com:8443`). The replica and identity are kept per NATS
   host, so a leaf build needs its own invite.
 * `EXPO_PUBLIC_ZB_BRIDGE_URL`: the bridge, `https://bridge.zebridge.eu` by default.
+
+## iOS
+
+libzb is built into the module first, then the app. A new bundle id needs Xcode to make
+its signing profile, which `expo run:ios` does not allow, so the build is `xcodebuild`'s:
+
+```sh
+../../../zb-react-native/scripts/build-ios.sh     # libzb for the module, and Apple's roots
+pnpm install
+npx expo prebuild --platform ios --clean
+
+EXPO_PUBLIC_ZB_INVITE=fl-… EXPO_PUBLIC_ZB_NATS_URL=tls://leaf1.example.com:4222 \
+  xcodebuild -workspace ios/Airports.xcworkspace -scheme Airports -configuration Release \
+  -destination id=<the iPhone's UDID> -allowProvisioningUpdates DEVELOPMENT_TEAM=<team> \
+  -derivedDataPath ios/build build
+xcrun devicectl device install app --device <device> ios/build/Build/Products/Release-iphoneos/Airports.app
+```
+
+`xcrun xctrace list devices` gives the UDID. On iOS libzb speaks TLS over TCP, so a leaf is
+`tls://…:4222`, not the websocket. The TLS roots come with the module: the app passes no
+`caFile`.
+

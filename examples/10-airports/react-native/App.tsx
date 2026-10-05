@@ -9,7 +9,8 @@
 /// for a leaf node (wss://leaf.example.com:8443).
 import { useEffect, useRef, useState } from 'react';
 import { FlatList, Pressable, SafeAreaView, StyleSheet, Text, View } from 'react-native';
-import { ZeBridge, NotEnrolled, mergeRegisters } from 'zb-client-ts';
+import { NotEnrolled, mergeRegisters } from 'zb-client-ts';
+import { makeClient, type AirportsClient } from './src/client';
 
 // Expo inlines EXPO_PUBLIC_* at bundle time; `process` exists only for that.
 declare const process: { env: Record<string, string | undefined> };
@@ -41,7 +42,7 @@ const host = (u: string) => u.replace(/^[a-z]+:\/\//, '').split(/[:/]/)[0];
 const DB_PATH = `airports-${host(BRIDGE_URL)}${NATS_URL ? `-${host(NATS_URL)}` : ''}.sqlite3`;
 
 export default function App() {
-  const zbRef = useRef<ZeBridge | null>(null);
+  const zbRef = useRef<AirportsClient | null>(null);
   const [status, setStatus] = useState('connecting…');
   const [city, setCity] = useState(CITIES[0]);
   const [airports, setAirports] = useState<Airport[]>([]);
@@ -78,7 +79,7 @@ export default function App() {
   async function readFlight() {
     const zb = zbRef.current!;
     const f = flight.current;
-    const r = (await zb.query('SELECT doc FROM flights WHERE id = ?', f.id))[0];
+    const r = (await zb.query('SELECT doc FROM flights WHERE id = ?', [f.id]))[0];
     const next: Doc = r ? (typeof r.doc === 'string' ? JSON.parse(r.doc) : (r.doc ?? {})) : {};
     f.rowExists = !!r;
     for (const end of ['origin', 'destination'] as End[]) {
@@ -103,23 +104,23 @@ export default function App() {
     else await zb.mutate('flights', 'INSERT', { id: f.id }, { tenant_id: zb.tenant, doc: merged });
   }
 
-  function setEnd(end: End, ap: Airport) {
+  async function setEnd(end: End, ap: Airport) {
     const zb = zbRef.current;
     if (!zb) return;
     const f = flight.current;
     const { km: _km, ...v } = ap;
-    f.mine[end] = { v, t: zb.stamp(), w: zb.principal! };
+    f.mine[end] = { v, t: await zb.stamp(), w: zb.principal };
     f.rounds = 0;
     setDoc({ ...mergeRegisters(f.doc as any, f.mine as any) } as Doc);
     void writeFlight().catch((e) => say(`write: ${(e as Error).message}`));
   }
 
   useEffect(() => {
-    const zb = new ZeBridge({ bridgeUrl: BRIDGE_URL, invite: INVITE, natsUrl: NATS_URL, dbPath: DB_PATH, tables: ['flights'] });
+    const zb = makeClient({ bridgeUrl: BRIDGE_URL, invite: INVITE, natsUrl: NATS_URL, dbName: DB_PATH });
     zbRef.current = zb;
     // The row moved, by me or by someone else: redraw from it, then write the merge
     // again while the row does not hold what this phone wrote.
-    zb.onChange('flights', () => {
+    zb.onFlights(() => {
       void (async () => {
         await readFlight();
         const f = flight.current;
@@ -135,17 +136,17 @@ export default function App() {
       try {
         await zb.connect();
       } catch (e) {
-        setStatus(e instanceof NotEnrolled
+        setStatus(e instanceof NotEnrolled || /not enrolled/i.test(String((e as Error).message))
           ? 'Not enrolled: build with EXPO_PUBLIC_ZB_INVITE=<code> for the first run.'
           : `Could not connect: ${(e as Error).message}`);
         return;
       }
-      setStatus(`${zb.principal} · ${zb.tenant}${NATS_URL ? ` · via ${host(NATS_URL)}` : ''}`);
+      setStatus(`${zb.principal} · ${zb.tenant} · ${zb.engine}${NATS_URL ? ` · via ${host(NATS_URL)}` : ''}`);
       flight.current.id = `flight-${zb.tenant}`;
       await readFlight();
       await ask(CITIES[0]);
     })();
-    return () => { void zb.close(); };
+    return () => zb.close();
   }, []);
 
   const pending = (end: End) => !!flight.current.mine[end];
@@ -181,8 +182,8 @@ export default function App() {
         renderItem={({ item }) => (
           <View style={s.row}>
             <Text style={s.rowText} numberOfLines={1}><Text style={s.code}>{item.code}</Text>  {item.name} · {item.km} km</Text>
-            <Pressable onPress={() => setEnd('origin', item)} style={[s.btn, s.btnDep]}><Text style={s.btnText}>Dep</Text></Pressable>
-            <Pressable onPress={() => setEnd('destination', item)} style={[s.btn, s.btnArr]}><Text style={s.btnText}>Arr</Text></Pressable>
+            <Pressable onPress={() => void setEnd('origin', item)} style={[s.btn, s.btnDep]}><Text style={s.btnText}>Dep</Text></Pressable>
+            <Pressable onPress={() => void setEnd('destination', item)} style={[s.btn, s.btnArr]}><Text style={s.btnText}>Arr</Text></Pressable>
           </View>
         )}
       />

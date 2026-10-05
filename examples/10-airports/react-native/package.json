@@ -21,6 +21,7 @@
     "expo": "~52.0.0",
     "expo-asset": "~11.0.5",
     "expo-dev-client": "~5.0.0",
+    "expo-file-system": "~18.0.0",
     "expo-sqlite": "~15.1.4",
     "fzstd": "^0.1.1",
     "js-sha256": "^0.11.1",
@@ -28,7 +29,8 @@
     "react-native": "0.76.9",
     "react-native-get-random-values": "~1.11.0",
     "uuid": "^14.0.1",
-    "zb-client-ts": "link:../../../zb-client-ts"
+    "zb-client-ts": "link:../../../zb-client-ts",
+    "zb-react-native": "link:../../../zb-react-native"
   },
   "devDependencies": {
     "@types/react": "~18.3.12",

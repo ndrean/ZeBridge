@@ -17,7 +17,7 @@
 //! Every call answers `{"error":"<Name>"}` on failure and never a NULL except for a
 //! NULL argument or a failed malloc. A handle is NOT thread-safe: one thread drives
 //! one client; the table only makes the WRONG thread's mistakes non-fatal.
-//!   char* zb_client_sync(uint64_t h);                              // {"tenant":…,"tenants":[…],"first":bool}
+//!   char* zb_client_sync(uint64_t h);                              // {"tenant":…,"tenants":[…],"principal":…,"first":bool}
 //!   char* zb_client_query(uint64_t h, const char* sql, const char* params_json);
 //!                                                                  // {"columns":[…],"rows":[[…],…]} — read-only connection
 //!   char* zb_client_mutate(uint64_t h, const char* table, const char* op,
@@ -996,6 +996,9 @@ fn syncJson(a: std.mem.Allocator, b: *ClientBox) ![]const u8 {
     var out: std.json.ObjectMap = .empty;
     try out.put(a, "tenant", .{ .string = r.tenant });
     try out.put(a, "tenants", try tenantsJson(a, r.tenants));
+    // Who this client is: after an enrollment the host never named it (the invite did),
+    // and a cooperative register records its writer (COOPERATIVE_EDITING.md).
+    try out.put(a, "principal", .{ .string = b.c.opts.principal });
     try out.put(a, "first", .{ .bool = r.first });
     // §10iz: always present here, empty when every followed table seeded — the host's
     // "usable" test is this list, not the absence of a stderr line.
