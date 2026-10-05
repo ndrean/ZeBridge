@@ -3491,7 +3491,19 @@ pub const SyncClient = struct {
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const streams = try self.cdcStreams(ca.allocator());
-        if (streams.len == 0) return .{ .applied = 0, .settled = 0, .changed_tables = changed_map.keys(), .seeded = seeded_map.keys() };
+        if (streams.len == 0) {
+            // A responder with no table to follow (one that forwards to a routing engine,
+            // say): nothing to tail, so wait on its questions instead. Each serve
+            // subscription wakes the tail inbox (patch 31), and a wake that lands between
+            // two waits is counted: the next wait returns at once, nothing is missed.
+            // Without this, `poll` returned at once and the host's loop spun.
+            if (self.serve_subs.len > 0 and wait_ms > 0) {
+                const ib = try self.tailInbox();
+                const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(@intCast(wait_ms)), .clock = .awake } };
+                if (ib.inbox_subscription.nextMsgTimeout(t)) |stray| stray.deinit() else |_| {}
+            }
+            return .{ .applied = 0, .settled = 0, .changed_tables = changed_map.keys(), .seeded = seeded_map.keys() };
+        }
 
         // ONE wait over every stream (nats.zig `PullInbox`, §10bh): one pull per
         // tail into a shared inbox, and the first message from any of them ends the

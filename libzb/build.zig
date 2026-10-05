@@ -348,6 +348,29 @@ pub fn build(b: *std.Build) void {
     zb_mod.addImport("duckdb", duckdb_mod);
     b.installArtifact(b.addExecutable(.{ .name = "zb", .root_module = zb_mod }));
 
+    // `zb-respond config.json`: a responder with no Python — questions forwarded to a local
+    // HTTP service (a routing engine), answers back to the askers.
+    const respond_mod = b.createModule(.{
+        .root_source_file = b.path("src/respond.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    respond_mod.addImport("c", c_mod);
+    respond_mod.addAnonymousImport("grammar", .{ .root_source_file = b.path("../src/grammar.json") });
+    respond_mod.addImport("nats", nats_dep.module("nats"));
+    respond_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
+    if (vendor) {
+        addVendored(b, respond_mod, sqlite_dep, zstd_dep, &zstd_srcs, arch_include, android_api);
+    } else {
+        respond_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
+        respond_mod.linkSystemLibrary("sqlite3", .{});
+        respond_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
+        respond_mod.linkSystemLibrary("zstd", .{});
+    }
+    respond_mod.link_libc = true;
+    respond_mod.addImport("duckdb", duckdb_mod);
+    b.installArtifact(b.addExecutable(.{ .name = "zb-respond", .root_module = respond_mod }));
+
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests (ZB_LIVE=1 adds the live transport test)");

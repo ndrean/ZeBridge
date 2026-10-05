@@ -1,0 +1,12 @@
+{
+  "url": "tls://nats.example.com:4222",
+  "creds": "/creds",
+  "name": "routing-nantes",
+  "queue": "routing",
+  "tenants": ["_default"],
+  "questions": {
+    "route":  { "http": "http://127.0.0.1:8002/route" },
+    "matrix": { "http": "http://127.0.0.1:8002/sources_to_targets" },
+    "tour":   { "http": "http://127.0.0.1:8002/optimized_route" }
+  }
+}

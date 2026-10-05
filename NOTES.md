@@ -19076,3 +19076,19 @@ server's disk, and the README's advice to keep the store off the hub costs nothi
 `--update` adds a domain it used to write `JS_DOMAIN=` back into the store; from standard
 input it says the line to add to the operator's copy. Tested on the dev store: a mint, an
 `--update`, and an empty pipe refused.
+
+## §10lv — `zb-respond`: a native responder; Valhalla routing over NATS (2026-10-05)
+
+libzb/src/respond.zig: a JSON config maps question names to HTTP targets; libzb (as a Zig
+module, no C ABI, no Python) serves `query.<tenant>.<name>` in a queue group and POSTs each
+payload to its target, replying with the answer plus `by` and `ms`, or `{"error","status",
+"detail"}` on an HTTP error. First target: Valhalla (gis-ops image, the Pays de la Loire tiles of
+08-map) for `route`, `matrix` (sources_to_targets) and `tour` (optimized_route). On a laptop:
+Nantes → Angers 92.5 km 56 min, 36–48 ms in the service; a four-stop tour 208 ms; Valhalla's own
+errors pass through. examples/13-routing.
+
+Found on the way: a responder with no table SPUN — `poll` returned at once when there was no
+stream to tail (the Python services never hit it, they follow a table). Now `poll` waits on the
+tail inbox's queue, which the serve subscriptions wake (patch 31); a wake between two waits is
+counted, nothing is missed. Idle CPU 0%. `leaks` on the running process: none, and 250 more
+questions left the allocation count unchanged (3,999, 770 KB).
