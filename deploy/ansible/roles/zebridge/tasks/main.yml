@@ -31,6 +31,7 @@
       BRIDGE_CDC_PUBLICATION: "{{ zb_publication }}"
       BRIDGE_CDC_SLOT: "{{ zb_slot }}"
       GENERATIONS_ENABLED: "1"
+      BASE_BUF: "{{ zb_base_buf }}"
       ENROLL_NATS_URL: "tls://{{ zb_host_nats }}:4222"
       ENROLL_NATS_WS_URL: "wss://{{ zb_host_ws }}:443"
   notify: Restart zebridge

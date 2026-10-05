@@ -1628,6 +1628,15 @@ BEGIN
     EXECUTE 'CREATE OR REPLACE FUNCTION public.' || quote_ident('zebridge_width_guard_' || short)
          || '() RETURNS trigger AS ' || quote_literal(fn_body)
          || ' LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public';
+    -- A guard created here for the first time would keep PUBLIC's EXECUTE (CREATE OR
+    -- REPLACE keeps an existing function's grants, so a re-bake changes nothing).
+    EXECUTE format('REVOKE EXECUTE ON FUNCTION public.%I() FROM PUBLIC', 'zebridge_width_guard_' || short);
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+        EXECUTE format('REVOKE EXECUTE ON FUNCTION public.%I() FROM anon', 'zebridge_width_guard_' || short);
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        EXECUTE format('REVOKE EXECUTE ON FUNCTION public.%I() FROM authenticated', 'zebridge_width_guard_' || short);
+    END IF;
     RETURN true;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public;
@@ -1780,6 +1789,18 @@ BEGIN
     EXECUTE 'CREATE OR REPLACE FUNCTION public.' || quote_ident('zebridge_width_guard_' || short)
          || '() RETURNS trigger AS ' || quote_literal(fn_body)
          || ' LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public';
+    -- PostgreSQL grants EXECUTE on a new function to PUBLIC, and Supabase's API roles get
+    -- every new object in `public`. The sweep at the end of this file takes that back, but
+    -- only for the functions that exist when it runs: a guard installed later, by
+    -- zebridge_enable on a new table, kept it (bridge --diagnose, 2026-10-06). A trigger
+    -- fires without EXECUTE, so nobody needs it.
+    EXECUTE format('REVOKE EXECUTE ON FUNCTION public.%I() FROM PUBLIC', 'zebridge_width_guard_' || short);
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+        EXECUTE format('REVOKE EXECUTE ON FUNCTION public.%I() FROM anon', 'zebridge_width_guard_' || short);
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        EXECUTE format('REVOKE EXECUTE ON FUNCTION public.%I() FROM authenticated', 'zebridge_width_guard_' || short);
+    END IF;
 
     IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = tbl AND tgname = 'zebridge_width_guard') THEN
         EXECUTE format('DROP TRIGGER zebridge_width_guard ON %s', tbl);

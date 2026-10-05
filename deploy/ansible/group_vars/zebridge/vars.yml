@@ -32,6 +32,13 @@ zb_leaf_addresses: ["54.37.13.184", "2001:41d0:404:200::5858"]
 # To replace them from the vault (a rotation): -e zb_rewrite_secrets=true.
 zb_rewrite_secrets: false
 
+# The event buffer, 2^BASE_BUF bytes: the widest row, and the widest table description
+# (~150 bytes a column), must fit. 13 (8 KB) since 2026-10-06: charge_points' 25 columns
+# made a 4,221-byte DDL event. ⚠️ Raise only — never below what is already stored
+# (bridge --diagnose says the smallest value that fits). Costs RING_BUFFER_COUNT × 2^BASE_BUF
+# of memory: 32,768 × 8 KB = 256 MB.
+zb_base_buf: 13
+
 # The enrollment JWT lifetime handed to clients.
 enroll_jwt_ttl_seconds: 86400
 

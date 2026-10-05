@@ -292,7 +292,12 @@ fn topologyChecks(a: std.mem.Allocator, js: nats.JetStream, topo: *const topolog
     var findings: usize = 0;
     var wanted: std.ArrayList([]const u8) = .empty;
     wanted.append(a, topo.cdc_stream_public) catch {};
-    for (tenants) |t| wanted.append(a, std.fmt.allocPrint(a, "{s}{s}", .{ topo.cdc_stream_prefix, t }) catch continue) catch {};
+    for (tenants) |t| {
+        // The open tenant's rows ride CDC_PUBLIC: the bridge skips it when it creates the
+        // tenant streams (a `_default` invite maps someone into it), and so does this check.
+        if (std.mem.eql(u8, t, topo.open_tenant)) continue;
+        wanted.append(a, std.fmt.allocPrint(a, "{s}{s}", .{ topo.cdc_stream_prefix, t }) catch continue) catch {};
+    }
     wanted.append(a, topo.stream_mutations) catch {};
     wanted.append(a, topo.stream_verdicts) catch {};
     for ([_][]const u8{ topo.kv_schemas, topo.kv_tenants, topo.kv_generations }) |b|
