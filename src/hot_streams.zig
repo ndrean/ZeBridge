@@ -31,7 +31,7 @@ pub const HotStreams = struct {
     hot_ttl_ms: i64 = 10_000,
     mutex: utils.SpinLock = .{},
     /// stream → the current second's accounting and the hot mark.
-    streams: std.StringArrayHashMapUnmanaged(Entry) = .empty,
+    streams: std.array_hash_map.String(Entry) = .empty,
 
     const Entry = struct {
         second: i64 = 0,
@@ -121,7 +121,7 @@ pub const HotStreams = struct {
     /// The streams hot right now, names duped into `a` — the producer's thread.
     pub fn hotNow(self: *HotStreams, a: std.mem.Allocator) ![]const []const u8 {
         const now_ms = utils.unixMillis();
-        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        var out: std.ArrayList([]const u8) = .empty;
         self.mutex.lock();
         defer self.mutex.unlock();
         var it = self.streams.iterator();

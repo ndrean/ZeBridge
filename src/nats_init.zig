@@ -127,14 +127,14 @@ test "roleAllows names the API under the domain's prefix, or the plain one" {
     const aa = arena.allocator();
     const owned = try topology_mod.loadEmbedded(aa);
     const plain = try roleAllows(aa, &owned.topology, .client, try jsApiPrefix(aa, null));
-    try std.testing.expect(std.mem.indexOf(u8, plain.pub_json, "\"$JS.API.INFO\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, plain.pub_json, "$JS.hub.") == null);
+    try std.testing.expect(std.mem.find(u8, plain.pub_json, "\"$JS.API.INFO\"") != null);
+    try std.testing.expect(std.mem.find(u8, plain.pub_json, "$JS.hub.") == null);
     const hub = try roleAllows(aa, &owned.topology, .responder, try jsApiPrefix(aa, "hub"));
-    try std.testing.expect(std.mem.indexOf(u8, hub.pub_json, "\"$JS.hub.API.INFO\"") != null);
+    try std.testing.expect(std.mem.find(u8, hub.pub_json, "\"$JS.hub.API.INFO\"") != null);
     // roleAllows renders ONE prefix; roleAllowsFor adds the plain one beside a domain.
-    try std.testing.expect(std.mem.indexOf(u8, hub.pub_json, "$JS.API.") == null);
+    try std.testing.expect(std.mem.find(u8, hub.pub_json, "$JS.API.") == null);
     // The ack subjects carry the domain too, and `$JS.ACK.>` still covers them.
-    try std.testing.expect(std.mem.indexOf(u8, hub.pub_json, "\"$JS.ACK.>\"") != null);
+    try std.testing.expect(std.mem.find(u8, hub.pub_json, "\"$JS.ACK.>\"") != null);
 }
 
 /// `js_api` is the JetStream API prefix the grants name — `$JS.API.` or, with a
@@ -323,19 +323,19 @@ test "a domain grants both prefixes, once each" {
     const aa = arena.allocator();
     const owned = try topology_mod.loadEmbedded(aa);
     const both = try roleAllowsFor(aa, &owned.topology, .client, "hub");
-    try std.testing.expect(std.mem.indexOf(u8, both.pub_json, "\"$JS.hub.API.INFO\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, both.pub_json, "\"$JS.API.INFO\"") != null);
+    try std.testing.expect(std.mem.find(u8, both.pub_json, "\"$JS.hub.API.INFO\"") != null);
+    try std.testing.expect(std.mem.find(u8, both.pub_json, "\"$JS.API.INFO\"") != null);
     // the lines without a prefix (mutations, acks, inboxes) appear once
     const mut = "\"mutation.{{name()}}.>\"";
-    const first = std.mem.indexOf(u8, both.pub_json, mut).?;
-    try std.testing.expect(std.mem.indexOfPos(u8, both.pub_json, first + 1, mut) == null);
+    const first = std.mem.find(u8, both.pub_json, mut).?;
+    try std.testing.expect(std.mem.findPos(u8, both.pub_json, first + 1, mut) == null);
     // the heartbeat key: through the domain's API, and bare for a server without one
-    try std.testing.expect(std.mem.indexOf(u8, both.pub_json, "\"$JS.hub.API.$KV.live.{{tag(tenant)}}.{{name()}}\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, both.pub_json, "\"$KV.live.{{tag(tenant)}}.{{name()}}\"") != null);
+    try std.testing.expect(std.mem.find(u8, both.pub_json, "\"$JS.hub.API.$KV.live.{{tag(tenant)}}.{{name()}}\"") != null);
+    try std.testing.expect(std.mem.find(u8, both.pub_json, "\"$KV.live.{{tag(tenant)}}.{{name()}}\"") != null);
     // without a domain: the plain prefix alone
     const plain = try roleAllowsFor(aa, &owned.topology, .client, null);
-    try std.testing.expect(std.mem.indexOf(u8, plain.pub_json, "$JS.hub.") == null);
-    try std.testing.expect(std.mem.indexOf(u8, plain.pub_json, "$JS.API.$KV.") == null);
+    try std.testing.expect(std.mem.find(u8, plain.pub_json, "$JS.hub.") == null);
+    try std.testing.expect(std.mem.find(u8, plain.pub_json, "$JS.API.$KV.") == null);
 }
 
 fn joinJson(
@@ -578,8 +578,8 @@ fn runDev(
         .{ nats_port, env_line, bridge_kp.public(), bridge_kp.seed() },
     ) catch return 1;
 
-    const conf_path = std.fs.path.join(a, &.{ dir, "nats-server.conf" }) catch return 1;
-    const env_path = std.fs.path.join(a, &.{ dir, ".env.nats" }) catch return 1;
+    const conf_path = std.Io.Dir.path.join(a, &.{ dir, "nats-server.conf" }) catch return 1;
+    const env_path = std.Io.Dir.path.join(a, &.{ dir, ".env.nats" }) catch return 1;
     writeFile(io, conf_path, conf, force) catch return 1;
     writeFile(io, env_path, env, force) catch return 1;
 
@@ -803,11 +803,11 @@ fn runOperator(
         },
     ) catch return 1;
 
-    const creds_dir = std.fs.path.join(a, &.{ dir, "creds" }) catch return 1;
+    const creds_dir = std.Io.Dir.path.join(a, &.{ dir, "creds" }) catch return 1;
     std.Io.Dir.cwd().createDirPath(io, creds_dir) catch return 1;
-    const conf_path = std.fs.path.join(a, &.{ dir, "nats-server.conf" }) catch return 1;
-    const env_path = std.fs.path.join(a, &.{ dir, ".env.nats" }) catch return 1;
-    const creds_path = std.fs.path.join(a, &.{ dir, "creds", "bridge.creds" }) catch return 1;
+    const conf_path = std.Io.Dir.path.join(a, &.{ dir, "nats-server.conf" }) catch return 1;
+    const env_path = std.Io.Dir.path.join(a, &.{ dir, ".env.nats" }) catch return 1;
+    const creds_path = std.Io.Dir.path.join(a, &.{ dir, "creds", "bridge.creds" }) catch return 1;
     // The store first: if it cannot be written, no conf may exist signed by keys
     // that nobody kept.
     const store = std.fmt.allocPrint(
@@ -826,7 +826,7 @@ fn runOperator(
     ,
         .{ op_kp.seed(), sys_kp.seed(), acct_kp.seed(), sk_client.seed(), sk_responder.seed(), sk_service.seed(), js_domain orelse "" },
     ) catch return 1;
-    const store_path = std.fs.path.join(a, &.{ dir, "operator.store" }) catch return 1;
+    const store_path = std.Io.Dir.path.join(a, &.{ dir, "operator.store" }) catch return 1;
     writeSecret(io, store_path, store, force) catch return 1;
     writeFile(io, conf_path, conf, force) catch return 1;
     writeSecret(io, env_path, env, force) catch return 1;
@@ -873,8 +873,8 @@ fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[
     defer arena.deinit();
     const a = arena.allocator();
 
-    const store_path = store_arg orelse (std.fs.path.join(a, &.{ dir, "operator.store" }) catch return 1);
-    const conf_path = std.fs.path.join(a, &.{ dir, "nats-server.conf" }) catch return 1;
+    const store_path = store_arg orelse (std.Io.Dir.path.join(a, &.{ dir, "operator.store" }) catch return 1);
+    const conf_path = std.Io.Dir.path.join(a, &.{ dir, "nats-server.conf" }) catch return 1;
     var store = readStore(io, a, store_path) catch {
         out("🔴 cannot read the store {s} (--store PATH if it lives elsewhere, - for standard input)\n", .{store_path});
         return 1;
@@ -922,7 +922,7 @@ fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[
 
     // ── the account's current JWT in the conf, and a check it is OURS ───────────
     const needle = std.fmt.allocPrint(a, "{s}: ey", .{acct_kp.public()}) catch return 1;
-    const at = std.mem.indexOf(u8, conf, needle) orelse {
+    const at = std.mem.find(u8, conf, needle) orelse {
         out("🔴 the store's account {s} is not in {s} — wrong store for this conf?\n", .{ acct_kp.public(), conf_path });
         return 1;
     };
@@ -934,7 +934,7 @@ fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[
         return 1;
     };
     const iss = std.fmt.allocPrint(a, "\"iss\":\"{s}\"", .{op_kp.public()}) catch return 1;
-    if (std.mem.indexOf(u8, old_claims, iss) == null) {
+    if (std.mem.find(u8, old_claims, iss) == null) {
         out("🔴 the account JWT in {s} was not signed by the store's operator\n", .{conf_path});
         return 1;
     }
@@ -963,7 +963,7 @@ fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[
         } else writeFile(io, store_path, store, true) catch return 1;
     }
     if (env_line) |line| {
-        const env_path = std.fs.path.join(a, &.{ dir, ".env.nats" }) catch return 1;
+        const env_path = std.Io.Dir.path.join(a, &.{ dir, ".env.nats" }) catch return 1;
         const env = std.Io.Dir.cwd().readFileAlloc(io, env_path, a, .limited(1 << 16)) catch {
             out("⚠️  {s} not found: set {s} in the bridge's environment yourself\n", .{ env_path, line });
             return 0;
@@ -1000,7 +1000,7 @@ fn setStoreValue(a: std.mem.Allocator, store: []const u8, name: []const u8, valu
         if (!first) try out_buf.append(a, '\n');
         first = false;
         const line = std.mem.trim(u8, raw, " \t\r");
-        const eq = std.mem.indexOfScalar(u8, line, '=');
+        const eq = std.mem.findScalar(u8, line, '=');
         if (line.len > 0 and line[0] != '#' and eq != null and std.mem.eql(u8, line[0..eq.?], name)) {
             try out_buf.print(a, "{s}={s}", .{ name, value });
             found = true;
@@ -1015,8 +1015,8 @@ fn setStoreValue(a: std.mem.Allocator, store: []const u8, name: []const u8, valu
 
 /// The conf's `jetstream {` block gains `domain: <d>` (null when there is no such block).
 fn addConfDomain(a: std.mem.Allocator, conf: []const u8, d: []const u8) ?[]u8 {
-    const open = std.mem.indexOf(u8, conf, "jetstream {") orelse return null;
-    const eol = std.mem.indexOfScalarPos(u8, conf, open, '\n') orelse return null;
+    const open = std.mem.find(u8, conf, "jetstream {") orelse return null;
+    const eol = std.mem.findScalarPos(u8, conf, open, '\n') orelse return null;
     const line = std.fmt.allocPrint(a, "  domain: {s}\n", .{d}) catch return null;
     return std.mem.concat(a, u8, &.{ conf[0 .. eol + 1], line, conf[eol + 1 ..] }) catch null;
 }
@@ -1070,7 +1070,7 @@ fn storeValue(store: []const u8, name: []const u8) ?[]const u8 {
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, line, '=') orelse continue;
         if (std.mem.eql(u8, line[0..eq], name)) return line[eq + 1 ..];
     }
     return null;
@@ -1091,8 +1091,8 @@ fn jwtClaims(a: std.mem.Allocator, jwt: []const u8) ?[]const u8 {
 /// `"revocations":{…},` as it stands in the claims — the map holds only
 /// `"U…":seconds` pairs, so the first `}` closes it — or "" when there is none.
 fn revocationsOf(claims: []const u8) []const u8 {
-    const start = std.mem.indexOf(u8, claims, "\"revocations\":{") orelse return "";
-    const close = std.mem.indexOfScalarPos(u8, claims, start, '}') orelse return "";
+    const start = std.mem.find(u8, claims, "\"revocations\":{") orelse return "";
+    const close = std.mem.findScalarPos(u8, claims, start, '}') orelse return "";
     var end = close + 1;
     if (end < claims.len and claims[end] == ',') end += 1;
     return claims[start..end];
@@ -1101,7 +1101,7 @@ fn revocationsOf(claims: []const u8) []const u8 {
 /// What an update can change: the signing keys and their templates, up to the end of
 /// the claims. jti and iat differ on every signing and are left out.
 fn grantsOf(claims: []const u8) []const u8 {
-    const start = std.mem.indexOf(u8, claims, "\"signing_keys\"") orelse return claims;
+    const start = std.mem.find(u8, claims, "\"signing_keys\"") orelse return claims;
     return claims[start..];
 }
 
@@ -1165,7 +1165,7 @@ pub fn mintResponder(io: std.Io, init: *const std.process.Init) u8 {
                 name = it.next() orelse return mintUsage("--name needs a value");
             } else if (std.mem.eql(u8, arg, "--tenant")) {
                 const t = it.next() orelse return mintUsage("--tenant needs a value");
-                if (t.len == 0 or std.mem.indexOfAny(u8, t, ".*> ") != null) return mintUsage("a tenant is one subject token (no '.', '*', '>', ' ')");
+                if (t.len == 0 or std.mem.findAny(u8, t, ".*> ") != null) return mintUsage("a tenant is one subject token (no '.', '*', '>', ' ')");
                 tenants.append(a, t) catch return 1;
             } else if (std.mem.eql(u8, arg, "--ttl-days")) {
                 const v = it.next() orelse return mintUsage("--ttl-days needs a number");
@@ -1368,7 +1368,7 @@ fn anyPrincipal(a: std.mem.Allocator, list: []const u8) ![]u8 {
         while (tokens.next()) |tok| {
             if (!first) try buf.append(a, '.');
             first = false;
-            try buf.appendSlice(a, if (std.mem.indexOf(u8, tok, "{{") != null) "*" else tok);
+            try buf.appendSlice(a, if (std.mem.find(u8, tok, "{{") != null) "*" else tok);
         }
         try buf.append(a, '"');
     }
@@ -1382,22 +1382,22 @@ test "a leaf link carries what its clients and responders may, for anyone, and n
     const owned = try topology_mod.loadEmbedded(aa);
     const l = try leafAllows(aa, &owned.topology, "hub");
     // pruned: what `*` covers is not listed again, and the token stays small
-    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "CONSUMER.CREATE.CDC_PUBLIC") == null);
+    try std.testing.expect(std.mem.find(u8, l.pub_json, "CONSUMER.CREATE.CDC_PUBLIC") == null);
     try std.testing.expect(l.pub_json.len + l.sub_json.len < 2000);
     // no template left, no blanket grant
-    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "{{") == null);
-    try std.testing.expect(std.mem.indexOf(u8, l.sub_json, "{{") == null);
-    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "\">\"") == null);
+    try std.testing.expect(std.mem.find(u8, l.pub_json, "{{") == null);
+    try std.testing.expect(std.mem.find(u8, l.sub_json, "{{") == null);
+    try std.testing.expect(std.mem.find(u8, l.pub_json, "\">\"") == null);
     // the heartbeat of any client, through the domain and bare
-    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "\"$JS.hub.API.$KV.live.*.*\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "\"$KV.live.*.*\"") != null);
+    try std.testing.expect(std.mem.find(u8, l.pub_json, "\"$JS.hub.API.$KV.live.*.*\"") != null);
+    try std.testing.expect(std.mem.find(u8, l.pub_json, "\"$KV.live.*.*\"") != null);
     // the MUTATIONS stream's own subject, so the hub announces it across the link
-    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "\"mutation.>\"") != null);
+    try std.testing.expect(std.mem.find(u8, l.pub_json, "\"mutation.>\"") != null);
     // a template inside a token widens the whole token: no `CDC_*` (a literal name to NATS)
-    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "_*") == null);
-    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "\"$JS.hub.API.CONSUMER.MSG.NEXT.*.>\"") != null);
+    try std.testing.expect(std.mem.find(u8, l.pub_json, "_*") == null);
+    try std.testing.expect(std.mem.find(u8, l.pub_json, "\"$JS.hub.API.CONSUMER.MSG.NEXT.*.>\"") != null);
     // nobody on a leaf writes CDC, creates or deletes a stream
-    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "STREAM.CREATE") == null);
-    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "\"cdc.") == null);
-    try std.testing.expect(std.mem.indexOf(u8, l.pub_json, "STREAM.DELETE") == null);
+    try std.testing.expect(std.mem.find(u8, l.pub_json, "STREAM.CREATE") == null);
+    try std.testing.expect(std.mem.find(u8, l.pub_json, "\"cdc.") == null);
+    try std.testing.expect(std.mem.find(u8, l.pub_json, "STREAM.DELETE") == null);
 }

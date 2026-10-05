@@ -86,7 +86,7 @@ fn isInternalTable(name: []const u8) bool {
 /// from the beginning of the stream", which is the permissive choice: a client will
 /// apply CDC rather than stall waiting for a schema it will never get.
 fn parsePgLsnText(text: []const u8) u64 {
-    const slash = std.mem.indexOfScalar(u8, text, '/') orelse return 0;
+    const slash = std.mem.findScalar(u8, text, '/') orelse return 0;
     const hi = std.fmt.parseInt(u64, text[0..slash], 16) catch return 0;
     const lo = std.fmt.parseInt(u64, text[slash + 1 ..], 16) catch return 0;
     return (hi << 32) | lo;
@@ -153,7 +153,7 @@ pub const EventProcessor = struct {
     /// holds the WHOLE set (a JSON array), so one roster row's change needs the rest
     /// of the set: filled at boot from the table, then kept by every INSERT/UPDATE/
     /// DELETE the slot sees. Strings live for the process (the roster is small).
-    roster: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
+    roster: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty,
     /// §10js: set when a mapping names a tenant the topology does not list; read and
     /// cleared by the replication loop (`takeNewTenant`), which reloads the catalogue.
     new_tenant_seen: bool = false,
@@ -276,8 +276,8 @@ pub const EventProcessor = struct {
         standard_pg_config.replication = false;
         const conn = pg_conn.connect(arena, standard_pg_config) catch return cols;
         defer c.PQfinish(conn);
-        const table_z = arena.dupeZ(u8, table) catch return cols;
-        const pub_z = arena.dupeZ(u8, self.publication) catch return cols;
+        const table_z = arena.dupeSentinel(u8, table, 0) catch return cols;
+        const pub_z = arena.dupeSentinel(u8, self.publication, 0) catch return cols;
         const params = [_]?[*:0]const u8{ table_z.ptr, pub_z.ptr };
         const res = c.PQexecParams(conn, "SELECT a.attname::text FROM pg_attribute a WHERE a.attrelid = to_regclass(format('%I.%I', 'public', $1::text)) " ++
             "AND a.attnum > 0 AND NOT a.attisdropped " ++
@@ -286,7 +286,7 @@ pub const EventProcessor = struct {
         if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) return cols;
         const n_out: usize = @intCast(c.PQntuples(res));
         if (n_out == 0) return cols;
-        var kept = std.ArrayListUnmanaged(std.json.Value).empty;
+        var kept = std.ArrayList(std.json.Value).empty;
         for (cols) |col_val| {
             const name = if (col_val == .object) col_val.object.get("name") else null;
             if (name != null and name.? == .string) {
@@ -722,27 +722,31 @@ pub const EventProcessor = struct {
         // principal first (§7.1): an identity token is only a useful grant if everything
         // that can vary sits after it.
         const subject = if (routed) |t| (if (suffix) |s|
-            try std.fmt.bufPrintZ(
+            try std.fmt.bufPrintSentinel(
                 &subject_buf,
                 "{s}.{s}.{s}.{s}.{s}",
                 .{ self.topology.subject_cdc_prefix, t, rel.name, operation_lower, s },
+                0,
             )
         else
-            try std.fmt.bufPrintZ(
+            try std.fmt.bufPrintSentinel(
                 &subject_buf,
                 "{s}.{s}.{s}.{s}",
                 .{ self.topology.subject_cdc_prefix, t, rel.name, operation_lower },
+                0,
             )) else if (suffix) |s|
-            try std.fmt.bufPrintZ(
+            try std.fmt.bufPrintSentinel(
                 &subject_buf,
                 "{s}.{s}.{s}.{s}",
                 .{ self.topology.subject_cdc_prefix, rel.name, operation_lower, s },
+                0,
             )
         else
-            try std.fmt.bufPrintZ(
+            try std.fmt.bufPrintSentinel(
                 &subject_buf,
                 "{s}.{s}.{s}",
                 .{ self.topology.subject_cdc_prefix, rel.name, operation_lower },
+                0,
             );
 
         // Generate message ID from WAL LSN for idempotent delivery
@@ -1129,7 +1133,7 @@ pub const EventProcessor = struct {
         standard_pg_config.replication = false;
         const conn = pg_conn.connect(arena, standard_pg_config) catch return false;
         defer c.PQfinish(conn);
-        const p_z = arena.dupeZ(u8, principal) catch return false;
+        const p_z = arena.dupeSentinel(u8, principal, 0) catch return false;
         const params = [_]?[*:0]const u8{p_z.ptr};
         const res = c.PQexecParams(conn, "SELECT EXISTS (SELECT 1 FROM public.zebridge_purges WHERE principal = $1)::text", 1, null, &params, null, null, 0);
         defer c.PQclear(res);
@@ -1176,7 +1180,7 @@ pub const EventProcessor = struct {
         standard_pg_config.replication = false;
         const conn = pg_conn.connect(arena, standard_pg_config) catch return true;
         defer c.PQfinish(conn);
-        const p_z = arena.dupeZ(u8, principal) catch return true;
+        const p_z = arena.dupeSentinel(u8, principal, 0) catch return true;
         const params = [_]?[*:0]const u8{p_z.ptr};
         const res = c.PQexecParams(conn, "SELECT EXISTS (SELECT 1 FROM public.zebridge_principal_keys WHERE principal = $1 AND revoked_at IS NOT NULL)::text", 1, null, &params, null, null, 0);
         defer c.PQclear(res);
@@ -1352,7 +1356,7 @@ pub const EventProcessor = struct {
     fn appendWriteContract(
         self: *EventProcessor,
         arena: std.mem.Allocator,
-        json_str: *std.ArrayListUnmanaged(u8),
+        json_str: *std.ArrayList(u8),
         table: []const u8,
         column_names: []const []const u8,
     ) !void {
@@ -1650,7 +1654,7 @@ pub const EventProcessor = struct {
         ));
         // Column names, kept so the write contract can say whether the configured
         // version/tombstone columns actually exist on this table.
-        var column_names: std.ArrayListUnmanaged([]const u8) = .empty;
+        var column_names: std.ArrayList([]const u8) = .empty;
         for (columns, 0..) |col_val, i| {
             const name = if (col_val == .object) col_val.object.get("name") else null;
             const ty = if (col_val == .object) col_val.object.get("type") else null;
@@ -2311,10 +2315,10 @@ pub const EventProcessor = struct {
             if (kv.get(key)) |entry_const| {
                 var entry = entry_const;
                 defer entry.deinit();
-                if (std.mem.indexOf(u8, entry.value, "\"dropped\":true") != null) continue;
+                if (std.mem.find(u8, entry.value, "\"dropped\":true") != null) continue;
             } else |_| {}
 
-            const key_z = try arena.dupeZ(u8, key);
+            const key_z = try arena.dupeSentinel(u8, key, 0);
             const params = [_]?[*:0]const u8{key_z.ptr};
             const pr = c.PQexecParams(conn, "SELECT to_regclass(format('%I.%I', 'public', $1::text)) IS NOT NULL", 1, null, &params[0], null, null, 0);
             defer c.PQclear(pr);
@@ -2414,7 +2418,7 @@ pub const EventProcessor = struct {
                 // is one way a stale key came BACK after being tombstoned. Measured
                 // 2026-09-17 while adding `reconcileDroppedSchemas`, which hit the same
                 // wall and silently tombstoned nothing.
-                const tbl_z = try arena.dupeZ(u8, clean_table);
+                const tbl_z = try arena.dupeSentinel(u8, clean_table, 0);
                 const params = [_]?[*:0]const u8{tbl_z.ptr};
                 const pr = c.PQexecParams(conn, "SELECT to_regclass(format('%I.%I', 'public', $1::text)) IS NOT NULL", 1, null, &params[0], null, null, 0);
                 defer c.PQclear(pr);
@@ -2511,7 +2515,7 @@ pub const EventProcessor = struct {
                 .{clean_table},
             ));
 
-            var column_names: std.ArrayListUnmanaged([]const u8) = .empty;
+            var column_names: std.ArrayList([]const u8) = .empty;
             // §10dk: the decoder's verdict on every column, HERE — a column it refuses
             // used to be found at the table's first row after boot, so a restart
             // published a clean descriptor over a table whose next event suspends it.

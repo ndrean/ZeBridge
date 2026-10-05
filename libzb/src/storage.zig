@@ -8,6 +8,7 @@
 //!     refused loudly; here the coercion is the typed bind itself).
 
 const std = @import("std");
+const log = std.log.scoped(.libzb);
 const c = @import("c");
 
 pub const Error = error{
@@ -411,8 +412,8 @@ pub const Storage = struct {
     /// `BEGIN IMMEDIATE` becomes `BEGIN`. NUL-terminated for libpq.
     fn pgSql(a: std.mem.Allocator, sql: []const u8) Error![:0]u8 {
         const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
-        if (std.ascii.eqlIgnoreCase(trimmed, "BEGIN IMMEDIATE")) return a.dupeZ(u8, "BEGIN");
-        var out: std.ArrayListUnmanaged(u8) = .empty;
+        if (std.ascii.eqlIgnoreCase(trimmed, "BEGIN IMMEDIATE")) return a.dupeSentinel(u8, "BEGIN", 0);
+        var out: std.ArrayList(u8) = .empty;
         var n: usize = 0;
         var in_single = false;
         var in_double = false;
@@ -453,7 +454,7 @@ pub const Storage = struct {
                 .integer => |v| vals[i] = (try std.fmt.allocPrintSentinel(a, "{d}", .{v}, 0)).ptr,
                 .real => |v| vals[i] = (try std.fmt.allocPrintSentinel(a, "{d}", .{v}, 0)).ptr,
                 .boolean => |v| vals[i] = if (v) "t" else "f",
-                .text => |v| vals[i] = (try a.dupeZ(u8, v)).ptr,
+                .text => |v| vals[i] = (try a.dupeSentinel(u8, v, 0)).ptr,
                 .blob => |v| {
                     vals[i] = v.ptr;
                     lens[i] = @intCast(v.len);
@@ -493,7 +494,7 @@ pub const Storage = struct {
                 const msg = std.mem.span(P().PQresultErrorMessage(res));
                 self.pgRecordError(msg);
                 // A plan cached before a DDL on its table: forget it and go once more.
-                if (attempt == 0 and std.mem.indexOf(u8, msg, "cached plan") != null) {
+                if (attempt == 0 and std.mem.find(u8, msg, "cached plan") != null) {
                     if (self.pg_stmts.fetchRemove(zsql)) |kv| {
                         const dl = std.fmt.allocPrintSentinel(a, "DEALLOCATE {s}", .{kv.value}, 0) catch "";
                         if (dl.len > 0) {
@@ -558,9 +559,9 @@ pub const Storage = struct {
         const con: dk.duckdb_connection = @ptrCast(@alignCast(self.dk_con orelse return Error.ExecFailed));
         const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
         if (std.ascii.startsWithIgnoreCase(trimmed, "PRAGMA")) return .{ .columns = &.{}, .rows = try a.alloc(Row, 0) };
-        const zsql: [:0]const u8 = if (std.ascii.eqlIgnoreCase(trimmed, "BEGIN IMMEDIATE")) "BEGIN TRANSACTION" else try a.dupeZ(u8, trimmed);
+        const zsql: [:0]const u8 = if (std.ascii.eqlIgnoreCase(trimmed, "BEGIN IMMEDIATE")) "BEGIN TRANSACTION" else try a.dupeSentinel(u8, trimmed, 0);
         // ZB_DEBUG_SQL=1 prints every DuckDB statement — how §10hh's double execution was seen.
-        if (std.c.getenv("ZB_DEBUG_SQL") != null) std.debug.print("SQL[{d}] {s}\n", .{ params.len, zsql[0..@min(zsql.len, 300)] });
+        if (std.c.getenv("ZB_DEBUG_SQL") != null) log.info("SQL[{d}] {s}", .{ params.len, zsql[0..@min(zsql.len, 300)] });
         // A statement without parameters runs as a plain query: DDL in particular —
         // a prepared `CREATE OR REPLACE … AS SELECT` executed but left the old table
         // in place (measured: the appender then saw the old column count), and a
@@ -782,7 +783,7 @@ test "DuckDB engine: typed cells, bytes, lists from JSON text, the appender, BEG
     defer st.close();
     try st.execSimple("PRAGMA journal_mode = WAL;");
     st.execSimple("CREATE TABLE t (id BIGINT PRIMARY KEY, flag BOOLEAN, note TEXT, bytes BLOB, amount DECIMAL(8,2), ratio DOUBLE, ts TIMESTAMPTZ, tags TEXT[], emb FLOAT[3])") catch |err| {
-        std.debug.print("duckdb: {s}\n", .{st.errMsg()});
+        log.info("duckdb: {s}", .{st.errMsg()});
         return err;
     };
     try st.execSimple("BEGIN IMMEDIATE;");
@@ -815,7 +816,7 @@ test "DuckDB engine: typed cells, bytes, lists from JSON text, the appender, BEG
     try st.execSimple("CREATE TABLE u (id BIGINT, tags TEXT[], emb FLOAT[3], ts TIMESTAMPTZ, amount DECIMAL(8,2), uid UUID)");
     const r4 = [_]Value{ .{ .integer = 7 }, .{ .text = "[\"x\",\"y z\"]" }, .{ .text = "[1.5,2.5,3.5]" }, .{ .text = "2026-09-12T16:51:10.307895Z" }, .{ .text = "12.50" }, .{ .text = "0f2a3c4e-1b2d-4e5f-8a9b-0c1d2e3f4a5b" } };
     st.dkAppend("u", &.{&r4}) catch |err| {
-        std.debug.print("duckdb appender casts: {s}\n", .{st.errMsg()});
+        log.info("duckdb appender casts: {s}", .{st.errMsg()});
         return err;
     };
     const u = try st.query(a, "SELECT tags[2], emb[2], ts, amount, uid, tags, emb FROM u", &.{});
@@ -837,7 +838,7 @@ test "DuckDB engine: typed cells, bytes, lists from JSON text, the appender, BEG
         row.* = r;
     }
     st.dkAppend("_zbz_copy2", many) catch |err| {
-        std.debug.print("duckdb appender 5000 rows: {s}\n", .{st.errMsg()});
+        log.info("duckdb appender 5000 rows: {s}", .{st.errMsg()});
         return err;
     };
     try std.testing.expectEqual(@as(i64, 5000), (try st.query(a, "SELECT count(*) FROM _zbz_copy2", &.{}))[0][0].integer);
@@ -846,7 +847,7 @@ test "DuckDB engine: typed cells, bytes, lists from JSON text, the appender, BEG
     try st.execSimple("CREATE OR REPLACE TEMP TABLE _zbz_copy AS SELECT \"uid\", \"age\", \"temperature\", \"price\", \"is_true\", \"some_text\", \"tags\", \"matrix\", \"metadata\", \"deleted_at\", \"tenant_id\", \"last_writer\", \"inserted_at\", \"updated_at\" FROM tt LIMIT 0");
     const tr = [_]Value{ .{ .text = "0f2a3c4e-1b2d-4e5f-8a9b-0c1d2e3f4a5c" }, .{ .integer = 30 }, .{ .real = 21.5 }, .{ .text = "12.50" }, .{ .boolean = true }, .{ .text = "hello" }, .{ .text = "[\"a\",\"b\"]" }, .{ .text = "[[1,2],[3,4]]" }, .{ .text = "{\"k\":1}" }, .null, .{ .text = "globex" }, .null, .{ .text = "2026-09-12T16:51:10.307895Z" }, .{ .text = "2026-09-12T16:51:10.307895Z" } };
     st.dkAppend("_zbz_copy", &.{ &tr, &tr }) catch |err| {
-        std.debug.print("duckdb appender test_types shape: {s}\n", .{st.errMsg()});
+        log.info("duckdb appender test_types shape: {s}", .{st.errMsg()});
         return err;
     };
     try st.execSimple("INSERT INTO tt SELECT * FROM _zbz_copy WHERE age = 30 LIMIT 1");
@@ -872,7 +873,7 @@ test "PostgreSQL engine: typed cells, bytes, placeholders, a PRAGMA answers noth
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var st = try Storage.openPostgres(try a.dupeZ(u8, url), false);
+    var st = try Storage.openPostgres(try a.dupeSentinel(u8, url, 0), false);
     defer st.close();
     try st.execSimple("DROP TABLE IF EXISTS _zbz_engine_test");
     try st.execSimple("CREATE TABLE _zbz_engine_test (id bigint PRIMARY KEY, flag boolean, note text, bytes bytea, amount numeric(8,2), ratio double precision)");

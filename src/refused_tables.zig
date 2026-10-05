@@ -212,10 +212,10 @@ pub const Registry = struct {
         defer c.PQfinish(conn);
         if (c.PQstatus(conn) != c.CONNECTION_OK) return;
         var tbl_buf: [256]u8 = undefined;
-        const tbl_z = std.fmt.bufPrintZ(&tbl_buf, "{s}", .{table}) catch return;
+        const tbl_z = std.fmt.bufPrintSentinel(&tbl_buf, "{s}", .{table}, 0) catch return;
         var reason_buf: [64]u8 = undefined;
         const reason_z: ?[*:0]const u8 = if (reason) |r|
-            (std.fmt.bufPrintZ(&reason_buf, "{s}", .{r.wireName()}) catch return).ptr
+            (std.fmt.bufPrintSentinel(&reason_buf, "{s}", .{r.wireName()}, 0) catch return).ptr
         else
             null;
         const params = [_]?[*:0]const u8{ tbl_z.ptr, reason_z };
@@ -314,7 +314,7 @@ pub const Registry = struct {
         var why_buf: [64]u8 = undefined;
         const why: []const u8 = if (dropped) |n| (std.fmt.bufPrint(&why_buf, "{d} event(s) were dropped while suspended", .{n}) catch "events were dropped while suspended") else "events were dropped while it was suspended across a restart (count unknown)";
         var tbl_buf: [256]u8 = undefined;
-        const tbl_z = std.fmt.bufPrintZ(&tbl_buf, "{s}", .{table}) catch return;
+        const tbl_z = std.fmt.bufPrintSentinel(&tbl_buf, "{s}", .{table}, 0) catch return;
         const params = [_]?[*:0]const u8{tbl_z.ptr};
         const res = c.PQexecParams(conn, "SELECT string_agg(tbl || '=' || seed_epoch, ',') FROM public.zebridge_reseed(to_regclass('public.' || quote_ident($1)))", 1, null, &params[0], null, null, 0);
         defer c.PQclear(res);
@@ -514,16 +514,16 @@ test "refused tables drop and count" {
     var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try r.writePrometheus(&w);
-    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "bridge_refused_tables 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "bridge_refused_events_dropped_total 3") != null);
+    try std.testing.expect(std.mem.find(u8, w.buffered(), "bridge_refused_tables 1") != null);
+    try std.testing.expect(std.mem.find(u8, w.buffered(), "bridge_refused_events_dropped_total 3") != null);
     // The NAMED series (§10cg): 1 while refused…
-    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "bridge_refused_table{table=\"t_nopk\",reason=\"no_primary_key\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, w.buffered(), "bridge_refused_table{table=\"t_nopk\",reason=\"no_primary_key\"} 1") != null);
     // …and an explicit 0 after the lift — the visible edge, not a vanished series.
     r.clear("t_nopk");
     var buf2: [1024]u8 = undefined;
     var w2 = std.Io.Writer.fixed(&buf2);
     try r.writePrometheus(&w2);
-    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "bridge_refused_table{table=\"t_nopk\",reason=\"no_primary_key\"} 0") != null);
+    try std.testing.expect(std.mem.find(u8, w2.buffered(), "bridge_refused_table{table=\"t_nopk\",reason=\"no_primary_key\"} 0") != null);
 }
 
 test "re-refusing keeps the running count" {
@@ -543,7 +543,7 @@ test "re-refusing keeps the running count" {
     var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try r.writePrometheus(&w);
-    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "bridge_refused_events_dropped_total 3") != null);
+    try std.testing.expect(std.mem.find(u8, w.buffered(), "bridge_refused_events_dropped_total 3") != null);
 }
 
 test "clearing a refusal resumes replication" {

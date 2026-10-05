@@ -284,8 +284,8 @@ test "encoder: create and encode simple json map" {
 
     try std.testing.expect(encoded.len > 0);
     // JSON should contain the keys
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "name") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "Alice") != null);
+    try std.testing.expect(std.mem.find(u8, encoded, "name") != null);
+    try std.testing.expect(std.mem.find(u8, encoded, "Alice") != null);
 }
 
 test "encoder: create and encode array msgpack" {
@@ -324,8 +324,8 @@ test "encoder: create and encode array json" {
     defer allocator.free(encoded);
 
     try std.testing.expect(encoded.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "one") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "two") != null);
+    try std.testing.expect(std.mem.find(u8, encoded, "one") != null);
+    try std.testing.expect(std.mem.find(u8, encoded, "two") != null);
 }
 
 test "encoder: nested structures msgpack" {
@@ -370,8 +370,8 @@ test "encoder: nested structures json" {
     defer allocator.free(encoded);
 
     try std.testing.expect(encoded.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "Bob") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "NYC") != null);
+    try std.testing.expect(std.mem.find(u8, encoded, "Bob") != null);
+    try std.testing.expect(std.mem.find(u8, encoded, "NYC") != null);
 }
 
 test "encoder: all value types msgpack" {
@@ -416,10 +416,10 @@ test "encoder: all value types json" {
     defer allocator.free(encoded);
 
     try std.testing.expect(encoded.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "test") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "null") != null);
+    try std.testing.expect(std.mem.find(u8, encoded, "test") != null);
+    try std.testing.expect(std.mem.find(u8, encoded, "true") != null);
+    try std.testing.expect(std.mem.find(u8, encoded, "false") != null);
+    try std.testing.expect(std.mem.find(u8, encoded, "null") != null);
 }
 
 test "encoder: format selection from runtime value" {
@@ -454,6 +454,6 @@ test "encoder: format selection from runtime value" {
     defer allocator.free(encoded2);
 
     // JSON is text, should contain readable "test" and "json"
-    try std.testing.expect(std.mem.indexOf(u8, encoded2, "test") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded2, "json") != null);
+    try std.testing.expect(std.mem.find(u8, encoded2, "test") != null);
+    try std.testing.expect(std.mem.find(u8, encoded2, "json") != null);
 }

@@ -265,7 +265,7 @@ pub fn principalFromCreds(a: std.mem.Allocator, creds: []const u8) ?[]u8 {
 
 /// The same, from a creds file.
 pub fn principalFromCredsFile(a: std.mem.Allocator, path: []const u8) ?[]u8 {
-    const pz = a.dupeZ(u8, path) catch return null;
+    const pz = a.dupeSentinel(u8, path, 0) catch return null;
     defer a.free(pz);
     const fd = std.posix.openat(std.posix.AT.FDCWD, pz, .{ .ACCMODE = .RDONLY }, 0) catch return null;
     defer _ = std.posix.system.close(fd);
@@ -289,9 +289,9 @@ pub fn renewDue(creds: []const u8, now: i64) bool {
 }
 
 fn section(text: []const u8, begin: []const u8, end: []const u8) ?[]const u8 {
-    const b = std.mem.indexOf(u8, text, begin) orelse return null;
+    const b = std.mem.find(u8, text, begin) orelse return null;
     const from = b + begin.len;
-    const e = std.mem.indexOfPos(u8, text, from, end) orelse return null;
+    const e = std.mem.findPos(u8, text, from, end) orelse return null;
     return std.mem.trim(u8, text[from..e], " \r\n\t");
 }
 
@@ -389,14 +389,14 @@ fn str(o: Value, k: []const u8) ?[]const u8 {
 
 /// The identity at `path`, or null when there is none yet.
 pub fn load(a: std.mem.Allocator, path: []const u8) !?Identity {
-    const pz = try a.dupeZ(u8, path);
+    const pz = try a.dupeSentinel(u8, path, 0);
     defer a.free(pz);
     const fd = std.posix.openat(std.posix.AT.FDCWD, pz, .{ .ACCMODE = .RDONLY }, 0) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return fail("identity: cannot open {s} ({s})", .{ path, @errorName(err) }),
     };
     defer _ = std.posix.system.close(fd);
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var buf: std.ArrayList(u8) = .empty;
     defer {
         std.crypto.secureZero(u8, buf.items);
         buf.deinit(a);
@@ -445,7 +445,7 @@ pub fn save(a: std.mem.Allocator, path: []const u8, id: Identity) !void {
     defer std.crypto.secureZero(u8, @constCast(text));
 
     const tmp = try std.fmt.allocPrintSentinel(aa, "{s}.tmp", .{path}, 0);
-    const final = try aa.dupeZ(u8, path);
+    const final = try aa.dupeSentinel(u8, path, 0);
     const fd = std.posix.openat(std.posix.AT.FDCWD, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600) catch |err|
         return fail("identity: cannot write {s} ({s})", .{ path, @errorName(err) });
     var off: usize = 0;
@@ -494,12 +494,12 @@ test "an identity survives save and load, and the file is private" {
 
 test "a code outside the safe alphabet is refused before any request" {
     try std.testing.expectError(error.EnrollFailed, enroll(std.testing.allocator, "http://127.0.0.1:1", "bad code&x=1", null));
-    try std.testing.expect(std.mem.indexOf(u8, last_failure.?, "invite code") != null);
+    try std.testing.expect(std.mem.find(u8, last_failure.?, "invite code") != null);
 }
 
 test "a caFile that cannot be read is named, before any request" {
     try std.testing.expectError(error.EnrollFailed, enroll(std.testing.allocator, "http://127.0.0.1:1", "fl-0123456789abcdef", "/no/such/roots.pem"));
-    try std.testing.expect(std.mem.indexOf(u8, last_failure.?, "caFile /no/such/roots.pem") != null);
+    try std.testing.expect(std.mem.find(u8, last_failure.?, "caFile /no/such/roots.pem") != null);
 }
 
 test "renewDue: a quarter of the life left is the line" {

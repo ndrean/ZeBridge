@@ -103,7 +103,7 @@ pub const ReplicationStream = struct {
             // check and here, or during a mid-run reconnect. Distinguished because the
             // answer differs: a held slot is not a transient, and retrying it means two
             // bridges fighting at reconnect cadence forever.
-            if (std.mem.indexOf(u8, err_msg, "is active for PID") != null) {
+            if (std.mem.find(u8, err_msg, "is active for PID") != null) {
                 log.err("🔴 FATAL: replication slot is HELD by another bridge — {s}", .{err_msg});
                 log.err("   One bridge per slot: stop the other instance, or give this one its own slot (--slot).", .{});
                 return error.SlotHeldByAnother;

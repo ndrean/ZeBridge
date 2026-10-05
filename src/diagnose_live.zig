@@ -290,7 +290,7 @@ fn mappedTenants(a: std.mem.Allocator, conn: *c.PGconn, write_ok: bool) []const 
 // it running, a finding.
 fn topologyChecks(a: std.mem.Allocator, js: nats.JetStream, topo: *const topology_mod.Topology, tenants: []const []const u8, running: bool) usize {
     var findings: usize = 0;
-    var wanted: std.ArrayListUnmanaged([]const u8) = .empty;
+    var wanted: std.ArrayList([]const u8) = .empty;
     wanted.append(a, topo.cdc_stream_public) catch {};
     for (tenants) |t| wanted.append(a, std.fmt.allocPrint(a, "{s}{s}", .{ topo.cdc_stream_prefix, t }) catch continue) catch {};
     wanted.append(a, topo.stream_mutations) catch {};
@@ -441,8 +441,8 @@ fn kvHas(kv: anytype, key: []const u8) bool {
 /// is expected for it. Asked of the database, every name passed as a parameter.
 fn tenantHasRows(a: std.mem.Allocator, conn: *c.PGconn, tbl: []const u8, tenant_col: []const u8, tenant: []const u8) bool {
     const reg = std.fmt.allocPrintSentinel(a, "public.{s}", .{tbl}, 0) catch return true;
-    const col = a.dupeZ(u8, tenant_col) catch return true;
-    const tz = a.dupeZ(u8, tenant) catch return true;
+    const col = a.dupeSentinel(u8, tenant_col, 0) catch return true;
+    const tz = a.dupeSentinel(u8, tenant, 0) catch return true;
     const params = [_]?[*:0]const u8{ reg.ptr, col.ptr, tz.ptr };
     const res = c.PQexecParams(conn, "SELECT $3 = ANY (ARRAY(SELECT t::text FROM public.zebridge_tenants_of(quote_ident($1)::regclass, $2::name) t))", 3, null, &params[0], null, null, 0);
     defer c.PQclear(res);

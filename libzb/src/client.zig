@@ -11,6 +11,7 @@
 //! same functions the 91 fixtures pin.
 
 const std = @import("std");
+const log = std.log.scoped(.libzb);
 const core = @import("core.zig");
 pub const storage = @import("storage.zig");
 const transport = @import("transport.zig");
@@ -141,7 +142,7 @@ const BulkStats = struct {
         self.bulked += b;
         self.statements += s;
         self.singles += one;
-        if ((self.statements % 50) == 0 and s > 0) std.debug.print("bulk cdc: {d} events in {d} statements, {d} per event\n", .{ self.bulked, self.statements, self.singles });
+        if ((self.statements % 50) == 0 and s > 0) log.debug("bulk cdc: {d} events in {d} statements, {d} per event", .{ self.bulked, self.statements, self.singles });
     }
 };
 
@@ -185,7 +186,7 @@ const TableState = struct {
     /// table was cut on: events at or below `seq` on that stream are inside the chain
     /// already applied. §10fn: a tenant-scoped table has one chain per tenant, each
     /// on its own stream, so the gate is per stream.
-    anchors: std.ArrayListUnmanaged(SeedAnchor) = .empty,
+    anchors: std.ArrayList(SeedAnchor) = .empty,
     /// The catalogue's seed_epoch the descriptor carried (§10df).
     seed_epoch: i64 = 0,
 };
@@ -236,7 +237,7 @@ const ApplyStats = struct {
         if (now - self.window_us < 5_000_000) return;
         const b: i64 = @intCast(@max(self.batches, 1));
         const inside = self.decode + self.plan + self.shape + self.append + self.upsert + self.single;
-        std.debug.print("apply stats: {d} batches, {d} msgs, {d} events ({d}/s), {d} avg / {d} max events per batch — per batch, ms: total {d:.2} = decode {d:.2} + plan {d:.2} + shape {d:.2} + append {d:.2} + upsert {d:.2} + single {d:.2} + commit/rest {d:.2}; acks {d:.2}; {d} segment(s) appended direct ({d} split with an upsert), {d} batch(es) fell back\n", .{
+        log.info("apply stats: {d} batches, {d} msgs, {d} events ({d}/s), {d} avg / {d} max events per batch — per batch, ms: total {d:.2} = decode {d:.2} + plan {d:.2} + shape {d:.2} + append {d:.2} + upsert {d:.2} + single {d:.2} + commit/rest {d:.2}; acks {d:.2}; {d} segment(s) appended direct ({d} split with an upsert), {d} batch(es) fell back", .{
             self.batches, self.msgs, self.events, @divTrunc(self.events * 1_000_000, @as(u64, @intCast(now - self.window_us))), self.events / @as(u64, @intCast(b)), self.max_events,
             ms(self.batch, b), ms(self.decode, b), ms(self.plan, b), ms(self.shape, b), ms(self.append, b), ms(self.upsert, b), ms(self.single, b), ms(self.batch - inside, b), ms(self.ack, b), self.direct, self.split, self.fallbacks,
         });
@@ -253,7 +254,7 @@ const ApplyStats = struct {
 var test_drop_every: u64 = 0;
 var test_drop_count: u64 = 0;
 fn tr(comptime fmt: []const u8, args: anytype) void {
-    if (trace_enabled) std.debug.print("trace: " ++ fmt ++ "\n", args);
+    if (trace_enabled) log.info("trace: " ++ fmt, args);
 }
 
 pub const SyncClient = struct {
@@ -341,13 +342,13 @@ pub const SyncClient = struct {
     /// old anchor (163), and every event of the recreated stream (seq 3–14) was dropped
     /// as "in the chain" — replica 1 row, PostgreSQL 13.
     restarted: std.StringHashMapUnmanaged(void) = .empty,
-    states: std.StringArrayHashMapUnmanaged(TableState) = .empty,
+    states: std.array_hash_map.String(TableState) = .empty,
     /// §10hp: this client SERVES — the queue subscriptions it drains in `poll`, and the
     /// requests it has handed the host but not yet answered. A responder is a client
     /// that answers questions about its own replica; nothing else changes.
     serve_subs: []*@import("nats").Subscription = &.{},
     serve_queue: []const u8 = "",
-    pending: std.ArrayListUnmanaged(Pending) = .empty,
+    pending: std.ArrayList(Pending) = .empty,
     next_request_id: u64 = 1,
 
     /// §10hn: the tables this replica holds — `opts.tables` (the declared union) or,
@@ -356,7 +357,7 @@ pub const SyncClient = struct {
     followed: []const []const u8 = &.{},
     /// §10do: UPDATEs judged `stale` whose columns may still be rebased onto the
     /// winning row, keyed by msg_id; strings live in the client arena (rare, small).
-    rebase: std.StringArrayHashMapUnmanaged(Rebase) = .empty,
+    rebase: std.array_hash_map.String(Rebase) = .empty,
     rebase_due: bool = false,
     /// Cumulative verdict counts by status, for the host (the flush report carries
     /// them): a single-writer run with anything but `accepted` here has a finding.
@@ -392,7 +393,7 @@ pub const SyncClient = struct {
     /// `zb_client_poll` report it as `unseeded`, so a host never calls a replica
     /// "usable" over a stderr line it cannot see (the iPhone said "usable in 15.8 s"
     /// with 0 rows). Keys in the client arena, one per table at most.
-    unseeded: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    unseeded: std.array_hash_map.String([]const u8) = .empty,
     schema_watch: ?@import("nats").KVWatcher = null,
     last_version: []const u8 = "",
     last_version_buf: [64]u8 = undefined,
@@ -408,18 +409,18 @@ pub const SyncClient = struct {
     /// Live tailing (§10bh): one persistent pull consumer per CDC stream, created by
     /// the first `poll` and kept across calls. `stream` points into `states`' routes
     /// (client-lifetime memory).
-    tails: std.ArrayListUnmanaged(Tail) = .empty,
+    tails: std.ArrayList(Tail) = .empty,
     /// §10fq: streams set aside because they cannot be read right now — deleted under
     /// a live tail, denied after an account update, not created yet. A dark stream is
     /// left out of the shared fetch and the seed pass, so the others keep being
     /// served; it is retried after `retry_at_ms` with a doubling backoff, and the poll
     /// report names its tenant (`unreadable`). Keys in the client arena.
-    dark: std.StringArrayHashMapUnmanaged(Dark) = .empty,
+    dark: std.array_hash_map.String(Dark) = .empty,
     /// The ONE inbox every tail answers into (nats.zig `PullInbox`): `poll` is a single
     /// wait over all streams, ended by the first message from any of them.
     tail_inbox: ?*@import("nats").PullInbox = null,
     /// §10jc: per stream, the contiguity of what was applied (`Flow`). Keys in the arena.
-    flows: std.StringArrayHashMapUnmanaged(Flow) = .empty,
+    flows: std.array_hash_map.String(Flow) = .empty,
 
     const Tail = struct {
         stream: []const u8,
@@ -613,7 +614,7 @@ pub const SyncClient = struct {
             var buf: [64]u8 = undefined;
             const have = grammarHashHex(&buf);
             if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, want, " \t\r\n"), have)) {
-                std.debug.print("grammar mismatch: this library embeds {s}, the bridge serves {s} — built for another protocol; rebuild the client\n", .{ have, want });
+                log.warn("grammar mismatch: this library embeds {s}, the bridge serves {s} — built for another protocol; rebuild the client", .{ have, want });
                 return error.GrammarMismatch;
             }
         }
@@ -651,25 +652,26 @@ pub const SyncClient = struct {
             self.tenants = &.{};
             self.tenant = self.open_tenant;
             self.tenant_missing = true;
-            std.debug.print("tenant: {s} has no mapping ($KV.tenants.{s}) — revoked, or never enrolled: tenant-scoped tables are skipped, public tables follow\n", .{ self.opts.principal, self.opts.principal });
+            log.warn("tenant: {s} has no mapping ($KV.tenants.{s}) — revoked, or never enrolled: tenant-scoped tables are skipped, public tables follow", .{ self.opts.principal, self.opts.principal });
             return;
         };
         self.tenants = try parseTenantList(self.aa(), decodeMaybeMsgpackString(self.aa(), bytes) catch bytes);
         self.tenant_missing = self.tenants.len == 0;
         self.tenant = if (self.tenants.len > 0) self.tenants[0] else self.open_tenant;
         if (self.tenants.len == 1) {
-            std.debug.print("tenant: {s} -> {s}\n", .{ self.opts.principal, self.tenant });
+            log.info("tenant: {s} -> {s}", .{ self.opts.principal, self.tenant });
         } else {
-            std.debug.print("tenant: {s} -> {d} membership(s)", .{ self.opts.principal, self.tenants.len });
-            for (self.tenants) |t| std.debug.print(" {s}", .{t});
-            std.debug.print("\n", .{});
+            var buf: [512]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            for (self.tenants) |t| w.print(" {s}", .{t}) catch break;
+            log.info("tenant: {s} -> {d} membership(s):{s}", .{ self.opts.principal, self.tenants.len, w.buffered() });
         }
     }
 
     /// §10fn: the roster set as the bridge writes it — `["acme","globex"]` — or a
     /// bare tenant string (one tenant, the pre-§10fn value). Sorted, deduplicated.
     fn parseTenantList(a: std.mem.Allocator, text: []const u8) ![]const []const u8 {
-        var list: std.ArrayListUnmanaged([]const u8) = .empty;
+        var list: std.ArrayList([]const u8) = .empty;
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len > 0 and trimmed[0] == '[') {
             const v = std.json.parseFromSliceLeaky(Value, a, trimmed, .{}) catch return error.TenantListMalformed;
@@ -682,7 +684,7 @@ pub const SyncClient = struct {
         return list.items;
     }
 
-    fn appendUnique(a: std.mem.Allocator, list: *std.ArrayListUnmanaged([]const u8), t: []const u8) !void {
+    fn appendUnique(a: std.mem.Allocator, list: *std.ArrayList([]const u8), t: []const u8) !void {
         for (list.items) |x| if (std.mem.eql(u8, x, t)) return;
         try list.append(a, try a.dupe(u8, t));
     }
@@ -714,7 +716,7 @@ pub const SyncClient = struct {
     fn routesFor(self: *SyncClient, tenant_col: ?[]const u8) ![]const []const u8 {
         const ca = self.aa();
         if (tenant_col == null) return try ca.dupe([]const u8, &.{self.cdc_public});
-        var routes: std.ArrayListUnmanaged([]const u8) = .empty;
+        var routes: std.ArrayList([]const u8) = .empty;
         for (self.tenants) |t| try routes.append(ca, try self.routeFor(ca, t));
         return routes.items;
     }
@@ -775,7 +777,7 @@ pub const SyncClient = struct {
             const real_info = try st.tableColumns(a, table);
             if (tmp_info.len > 0 and real_info.len == 0) {
                 try execSql(st, a, try std.fmt.allocPrint(a, "ALTER TABLE \"{s}\" RENAME TO \"{s}\";", .{ tmp, table }));
-                std.debug.print("{s}: a rebuild was interrupted before its rename — adopted {s}\n", .{ table, tmp });
+                log.warn("{s}: a rebuild was interrupted before its rename — adopted {s}", .{ table, tmp });
             }
         }
         // FINDING 9: existence — and the existing columns — are the DATABASE's to answer.
@@ -812,7 +814,7 @@ pub const SyncClient = struct {
                 // replica with no recorded shape — one from before the record, or one a
                 // kill interrupted — where the PHYSICAL pk columns decided the re-key.
                 // Unwrapping it aborted the whole client process (measured: rebuild_kill).
-                std.debug.print("{s}: key shape changed ({s} -> {s}) — rebuilding EMPTY\n", .{ table, key_before orelse "no recorded shape; the physical key decided", key_now });
+                log.warn("{s}: key shape changed ({s} -> {s}) — rebuilding EMPTY", .{ table, key_before orelse "no recorded shape; the physical key decided", key_now });
                 try execSql(st, a, try std.fmt.allocPrint(a, "DROP VIEW IF EXISTS {s}_view;", .{table}));
                 try execSql(st, a, "PRAGMA foreign_keys = OFF;");
             }
@@ -835,7 +837,7 @@ pub const SyncClient = struct {
             const fk_differs = if (st.engine == .postgres) false else try core.fkTextDiffers(a, ddl, fk_clauses);
             // §10fi: a table from before STRICT is rebuilt once, rows carried.
             const strict_missing = st.engine == .sqlite and core.strictMissing(ddl);
-            if (strict_missing) std.debug.print("{s}: not a STRICT table — rebuilding, rows kept\n", .{table});
+            if (strict_missing) log.warn("{s}: not a STRICT table — rebuilding, rows kept", .{table});
             const shape_changed = renames.len > 0 or added.len > 0 or removed.len > 0 or retyped.len > 0;
 
             if (shape_changed or fk_differs or strict_missing) {
@@ -866,7 +868,7 @@ pub const SyncClient = struct {
                     // Nor ALTER COLUMN TYPE (§10dg): a re-typed column is a rebuild that
                     // copies the rows — affinity converts what converts.
                     if (retyped.len > 0) {
-                        std.debug.print("{s}: {d} column(s) re-typed — rebuilding, rows kept\n", .{ table, retyped.len });
+                        log.warn("{s}: {d} column(s) re-typed — rebuilding, rows kept", .{ table, retyped.len });
                         break :blk false;
                     }
                     break :blk true;
@@ -881,7 +883,7 @@ pub const SyncClient = struct {
                         for (steps.array.items) |stp| {
                             const sql = stp.object.get("sql").?.string;
                             execSql(st, a, sql) catch {
-                                std.debug.print("{s}: rows could not be carried through the rebuild ({s}) at: {s}\n", .{ table, st.errMsg(), sql });
+                                log.err("{s}: rows could not be carried through the rebuild ({s}) at: {s}", .{ table, st.errMsg(), sql });
                                 break :blk false;
                             };
                         }
@@ -955,8 +957,8 @@ pub const SyncClient = struct {
     /// numeric with a modifier as the same DECIMAL, one without as DECIMAL(38,10)
     /// (DuckDB has no unbounded decimal), bit as BIT.
     pub fn duckdbType(a: std.mem.Allocator, pg: []const u8) ![]const u8 {
-        const bare = if (std.mem.indexOfScalar(u8, pg, '(')) |i| pg[0..i] else pg;
-        const mod: ?[]const u8 = if (std.mem.indexOfScalar(u8, pg, '(')) |i| pg[i + 1 .. (std.mem.lastIndexOfScalar(u8, pg, ')') orelse pg.len)] else null;
+        const bare = if (std.mem.findScalar(u8, pg, '(')) |i| pg[0..i] else pg;
+        const mod: ?[]const u8 = if (std.mem.findScalar(u8, pg, '(')) |i| pg[i + 1 .. (std.mem.findScalarLast(u8, pg, ')') orelse pg.len)] else null;
         if (std.mem.eql(u8, bare, "bytea") or std.mem.eql(u8, bare, "geometry") or std.mem.eql(u8, bare, "geography") or std.mem.eql(u8, bare, "sparsevec")) return "BLOB";
         if (std.mem.eql(u8, bare, "vector") or std.mem.eql(u8, bare, "halfvec")) return if (mod) |m| try std.fmt.allocPrint(a, "FLOAT[{s}]", .{m}) else "FLOAT[]";
         if (std.mem.eql(u8, bare, "json") or std.mem.eql(u8, bare, "jsonb")) return "JSON";
@@ -968,7 +970,7 @@ pub const SyncClient = struct {
 
     /// §10fe: the PostGIS columns named by the descriptor's `pg` block.
     fn geomColsOf(a: std.mem.Allocator, val: Value) ![]const []const u8 {
-        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        var out: std.ArrayList([]const u8) = .empty;
         const pg = if (val == .object) (val.object.get("pg") orelse Value.null) else Value.null;
         if (pg != .object) return out.items;
         const cols = pg.object.get("columns") orelse return out.items;
@@ -985,7 +987,7 @@ pub const SyncClient = struct {
     /// §10fg: the pgvector and bit(n) columns named by the descriptor's `pg` block,
     /// with a bit(n)'s declared length. `bit varying` is not one: it travels as text.
     fn vecColsOf(a: std.mem.Allocator, val: Value) ![]const VecCol {
-        var out: std.ArrayListUnmanaged(VecCol) = .empty;
+        var out: std.ArrayList(VecCol) = .empty;
         const pg = if (val == .object) (val.object.get("pg") orelse Value.null) else Value.null;
         if (pg != .object) return out.items;
         const cols = pg.object.get("columns") orelse return out.items;
@@ -996,11 +998,11 @@ pub const SyncClient = struct {
             const t = c.object.get("type") orelse continue;
             if (n != .string or t != .string) continue;
             const ty = t.string;
-            const bare = if (std.mem.indexOfScalar(u8, ty, '(')) |i| ty[0..i] else ty;
+            const bare = if (std.mem.findScalar(u8, ty, '(')) |i| ty[0..i] else ty;
             const kind: core.VecKind = if (std.mem.eql(u8, bare, "vector")) .vector else if (std.mem.eql(u8, bare, "halfvec")) .halfvec else if (std.mem.eql(u8, bare, "sparsevec")) .sparsevec else if (std.mem.eql(u8, bare, "bit")) .bit else continue;
             var bits: u32 = 0;
-            if (kind == .bit) if (std.mem.indexOfScalar(u8, ty, '(')) |i| {
-                const close = std.mem.indexOfScalar(u8, ty, ')') orelse ty.len;
+            if (kind == .bit) if (std.mem.findScalar(u8, ty, '(')) |i| {
+                const close = std.mem.findScalar(u8, ty, ')') orelse ty.len;
                 bits = std.fmt.parseInt(u32, ty[i + 1 .. close], 10) catch 0;
             };
             try out.append(a, .{ .name = n.string, .kind = kind, .bits = bits });
@@ -1016,7 +1018,7 @@ pub const SyncClient = struct {
 
     /// §10fd: the array columns named by the descriptor's `pg` block (`type` ending in `[]`).
     fn arrayColsOf(a: std.mem.Allocator, val: Value) ![]const []const u8 {
-        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        var out: std.ArrayList([]const u8) = .empty;
         const pg = if (val == .object) (val.object.get("pg") orelse Value.null) else Value.null;
         if (pg != .object) return out.items;
         const cols = pg.object.get("columns") orelse return out.items;
@@ -1075,7 +1077,7 @@ pub const SyncClient = struct {
     fn execSql(st: *storage.Storage, a: std.mem.Allocator, sql: []const u8) !void {
         // §10fd: a rebuild drops a table other tables may reference; PostgreSQL wants
         // that said (SQLite has the FK pragma off for the duration instead).
-        if ((st.engine == .postgres or st.engine == .duckdb) and std.mem.startsWith(u8, sql, "DROP TABLE IF EXISTS ") and std.mem.indexOf(u8, sql, "CASCADE") == null) {
+        if ((st.engine == .postgres or st.engine == .duckdb) and std.mem.startsWith(u8, sql, "DROP TABLE IF EXISTS ") and std.mem.find(u8, sql, "CASCADE") == null) {
             const body = std.mem.trimEnd(u8, sql, "; ");
             _ = try st.query(a, try std.fmt.allocPrint(a, "{s} CASCADE;", .{body}), &.{});
             return;
@@ -1093,7 +1095,7 @@ pub const SyncClient = struct {
         if (self.opts.follow_all) try self.refreshFollowed(a);
         for (self.followed) |table| {
             const bytes = (try self.t.kvGet(a, self.kv_schemas, table)) orelse {
-                std.debug.print("schema missing for {s}\n", .{table});
+                log.info("schema missing for {s}", .{table});
                 continue;
             };
             const val = (try std.json.parseFromSlice(Value, a, bytes, .{})).value;
@@ -1148,7 +1150,7 @@ pub const SyncClient = struct {
                 _ = try self.st.query(a, "INSERT OR REPLACE INTO _zbz_generations (tbl, tenant, watermark, cutoff_lsn, seed_epoch) VALUES (?, ?, ?, ?, ?)", &.{ r[0], .{ .text = tenant[0] }, r[1], r[2], r[3] });
             }
             try execDdl(&self.st, "DROP TABLE _zbz_generations_v1");
-            std.debug.print("_zbz_generations: keyed by (table, tenant) now — {d} watermark(s) carried over\n", .{old.len});
+            log.info("_zbz_generations: keyed by (table, tenant) now — {d} watermark(s) carried over", .{old.len});
         }
     }
 
@@ -1163,7 +1165,7 @@ pub const SyncClient = struct {
                 // table stays as it is locally, and stays out of `states` if it was
                 // never usable, so no CDC event is applied against a missing table.
                 const why = if (val == .object) (val.object.get("suspended") orelse Value{ .null = {} }) else Value{ .null = {} };
-                std.debug.print("{s}: schema unusable ({s}) — skipped\n", .{ table, if (why == .string) why.string else "no columns" });
+                log.warn("{s}: schema unusable ({s}) — skipped", .{ table, if (why == .string) why.string else "no columns" });
                 // Dropped upstream: whatever was held for it will never find a parent.
                 const dropped = if (val == .object) (val.object.get("dropped") orelse Value{ .null = {} }) else Value{ .null = {} };
                 if (dropped == .bool and dropped.bool) try self.dropLocalTable(a, table);
@@ -1175,7 +1177,7 @@ pub const SyncClient = struct {
         // form says and then what follows from it, so the short form is for the
         // outcomes that branch does not cover (an ALTER that kept the rows).
         const watermark_dropped = outcome == .rekeyed or outcome == .emptied or outcome == .created;
-        if (outcome != .unchanged and !watermark_dropped) std.debug.print("{s}: {s}\n", .{ table, @tagName(outcome) });
+        if (outcome != .unchanged and !watermark_dropped) log.info("{s}: {s}", .{ table, @tagName(outcome) });
         if (watermark_dropped) {
             // §10dg: the rows are gone (with the old key, or because the rebuild could
             // not carry them); so is everything that referred to them — the watermark
@@ -1194,10 +1196,10 @@ pub const SyncClient = struct {
             // and leave `reseed_pending` alone: a pass raised for a table that cannot
             // seed is a wasted pass, and every table that DOES need one raises it.
             if (self.isOnDemand(table)) {
-                std.debug.print("{s}: {s} — on demand, so no chain seed; rows arrive as query answers\n", .{ table, @tagName(outcome) });
+                log.info("{s}: {s} — on demand, so no chain seed; rows arrive as query answers", .{ table, @tagName(outcome) });
             } else {
                 self.reseed_pending = true;
-                std.debug.print("{s}: {s} — watermark dropped, re-seeding from a fresh full\n", .{ table, @tagName(outcome) });
+                log.warn("{s}: {s} — watermark dropped, re-seeding from a fresh full", .{ table, @tagName(outcome) });
             }
         }
 
@@ -1218,7 +1220,7 @@ pub const SyncClient = struct {
             if (outcome == .unchanged and sameStrings(st.cols, names.items) and sameStrings(st.pk, pk)) return;
         }
         if (tenant_col != null and self.tenant_missing) {
-            std.debug.print("{s}: tenant-scoped and '{s}' has no tenant — not followed (the local rows stay as they are)\n", .{ table, self.opts.principal });
+            log.info("{s}: tenant-scoped and '{s}' has no tenant — not followed (the local rows stay as they are)", .{ table, self.opts.principal });
             return;
         }
         // Changed, or first time: into the client-lifetime arena.
@@ -1294,11 +1296,11 @@ pub const SyncClient = struct {
         }
         const stored: i64 = if (rows[0][0] == .integer) rows[0][0].integer else 0;
         if (stored >= epoch) {
-            if (stored > epoch) std.debug.print("{s}: descriptor carries seed epoch {d}, the replica was seeded under {d} — nothing to do\n", .{ table, epoch, stored });
+            if (stored > epoch) log.info("{s}: descriptor carries seed epoch {d}, the replica was seeded under {d} — nothing to do", .{ table, epoch, stored });
             return;
         }
         _ = try self.st.query(a, "DELETE FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }});
-        std.debug.print("{s}: seed epoch {d} -> {d} (zebridge_reseed) — watermark dropped, re-seeding from a fresh full\n", .{ table, stored, epoch });
+        log.warn("{s}: seed epoch {d} -> {d} (zebridge_reseed) — watermark dropped, re-seeding from a fresh full", .{ table, stored, epoch });
         self.reseed_pending = true;
     }
 
@@ -1311,7 +1313,7 @@ pub const SyncClient = struct {
         try execSql(&self.st, a, try std.fmt.allocPrint(a, "DROP VIEW IF EXISTS \"{s}_view\";", .{table}));
         try execSql(&self.st, a, try std.fmt.allocPrint(a, "DROP TABLE IF EXISTS \"{s}\";", .{table}));
         _ = self.states.orderedRemove(table);
-        std.debug.print("{s}: dropped locally — the table was dropped upstream\n", .{table});
+        log.warn("{s}: dropped locally — the table was dropped upstream", .{table});
     }
 
     /// §10hn: `tables: "*"` — the followed set is the schemas bucket's key list, plus
@@ -1319,7 +1321,7 @@ pub const SyncClient = struct {
     /// sync with nothing new allocates nothing that outlives it.
     fn refreshFollowed(self: *SyncClient, a: std.mem.Allocator) !void {
         const keys = self.t.kvKeys(a, self.kv_schemas) catch |err| {
-            std.debug.print("schemas: keys not listed ({s}) — following what is known\n", .{@errorName(err)});
+            log.info("schemas: keys not listed ({s}) — following what is known", .{@errorName(err)});
             return;
         };
         for (keys) |k| try self.follow(k);
@@ -1343,7 +1345,7 @@ pub const SyncClient = struct {
     /// Drain the schemas watch: every descriptor that changed since the last poll,
     /// applied through the same path `sync()` uses. Non-blocking (1 ms). Opens the
     /// watch on first use — after the grammar named the bucket.
-    fn drainSchemaWatch(self: *SyncClient, report_a: std.mem.Allocator, changed_map: *std.StringArrayHashMapUnmanaged(void), seeded_map: *std.StringArrayHashMapUnmanaged(void)) !void {
+    fn drainSchemaWatch(self: *SyncClient, report_a: std.mem.Allocator, changed_map: *std.array_hash_map.String(void), seeded_map: *std.array_hash_map.String(void)) !void {
         if (self.schema_watch == null) {
             self.schema_kv = try self.t.js.kvBucket(self.kv_schemas);
             self.schema_watch = try self.schema_kv.?.watchAll(.{ .updates_only = true });
@@ -1365,7 +1367,7 @@ pub const SyncClient = struct {
             const val = std.json.parseFromSliceLeaky(Value, a, entry.value, .{}) catch continue;
             const key = try a.dupe(u8, entry.key);
             self.applyDescriptor(a, key, val) catch |err| {
-                std.debug.print("{s}: live schema not applied: {s}\n", .{ key, @errorName(err) });
+                log.warn("{s}: live schema not applied: {s}", .{ key, @errorName(err) });
                 continue;
             };
             moved += 1;
@@ -1373,7 +1375,7 @@ pub const SyncClient = struct {
         if (moved > 0) self.retryHeld(report_a, changed_map);
         if (self.reseed_pending) {
             self.reseed_pending = false;
-            self.gapAndSeed(report_a, seeded_map) catch |err| std.debug.print("re-seed after epoch move: {s} — {s}\n", .{ @errorName(err), self.st.errMsg() });
+            self.gapAndSeed(report_a, seeded_map) catch |err| log.info("re-seed after epoch move: {s} — {s}", .{ @errorName(err), self.st.errMsg() });
         }
     }
 
@@ -1437,7 +1439,7 @@ pub const SyncClient = struct {
             f.gap = false;
         }
         const pos = try self.storedSeq(stream);
-        var keep: std.ArrayListUnmanaged(*@import("nats").JetStreamMessage) = .empty;
+        var keep: std.ArrayList(*@import("nats").JetStreamMessage) = .empty;
         var dups: usize = 0;
         var stragglers: usize = 0;
         for (msgs) |m| {
@@ -1445,7 +1447,7 @@ pub const SyncClient = struct {
             if (test_drop_every > 0) {
                 test_drop_count += 1;
                 if (test_drop_count % test_drop_every == 0) {
-                    std.debug.print("test: delivery of seq {d} (consumer seq {d}) discarded as lost in transit\n", .{ m.metadata.sequence.stream, m.metadata.sequence.consumer });
+                    log.warn("test: delivery of seq {d} (consumer seq {d}) discarded as lost in transit", .{ m.metadata.sequence.stream, m.metadata.sequence.consumer });
                     continue;
                 }
             }
@@ -1456,7 +1458,7 @@ pub const SyncClient = struct {
             const c = m.metadata.sequence.consumer;
             if (c > f.cseq + 1) {
                 f.gap = true;
-                std.debug.print("{s}: delivery lost in transit on {s} (consumer seq {d} after {d}) — applying up to the gap, then recreating the consumer from the position\n", .{ stream, consumer, c, f.cseq });
+                log.warn("{s}: delivery lost in transit on {s} (consumer seq {d} after {d}) — applying up to the gap, then recreating the consumer from the position", .{ stream, consumer, c, f.cseq });
                 break;
             }
             if (c > f.cseq) f.cseq = c;
@@ -1489,16 +1491,16 @@ pub const SyncClient = struct {
 
     // ─── step 2: the gap rule (per stream) + scoped seeding (§10n) ──────────
 
-    pub fn gapAndSeed(self: *SyncClient, report_a: ?std.mem.Allocator, seeded_map: ?*std.StringArrayHashMapUnmanaged(void)) !void {
+    pub fn gapAndSeed(self: *SyncClient, report_a: ?std.mem.Allocator, seeded_map: ?*std.array_hash_map.String(void)) !void {
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const a = ca.allocator();
         // Gapped stream → its `first_seq`: the resume point once the gap is healed.
-        var gapped: std.StringArrayHashMapUnmanaged(i64) = .empty;
+        var gapped: std.array_hash_map.String(i64) = .empty;
         // Every stream any table depends on — a tenant-scoped table names two (§10bq),
         // and a client with no public table would otherwise never inspect CDC_PUBLIC at
         // all, so its shared rows could fall off the back unnoticed.
-        var streams: std.StringArrayHashMapUnmanaged(void) = .empty;
+        var streams: std.array_hash_map.String(void) = .empty;
         var sit = self.states.iterator();
         while (sit.next()) |e| {
             for (e.value_ptr.routes) |r| try streams.put(a, r, {});
@@ -1535,9 +1537,9 @@ pub const SyncClient = struct {
                 // very full this gap needs (measured: slot_loss.py, 2026-08-29).
                 if (recreated or (last >= 0 and stored > last)) {
                     if (recreated) {
-                        std.debug.print("{s}: stream recreated (created {s}, was {s}) — position {d} reset\n", .{ stream, created, known_created.?, stored });
+                        log.warn("{s}: stream recreated (created {s}, was {s}) — position {d} reset", .{ stream, created, known_created.?, stored });
                     } else {
-                        std.debug.print("{s}: stream restarted (position {d} beyond last_seq {d}) — position reset\n", .{ stream, stored, last });
+                        log.warn("{s}: stream restarted (position {d} beyond last_seq {d}) — position reset", .{ stream, stored, last });
                     }
                     try self.persistSeq(stream, 0);
                     if (!self.restarted.contains(stream)) try self.restarted.put(self.aa(), try self.aa().dupe(u8, stream), {});
@@ -1569,7 +1571,7 @@ pub const SyncClient = struct {
         // the gap — every chain carries the open rows. The heal used to wait for the
         // whole pass (`reseed_pending`), so one tenant with no chain yet kept the shared
         // stream "gapped" for ever, and every sibling re-seeded on every poll.
-        var blocked: std.StringArrayHashMapUnmanaged(void) = .empty;
+        var blocked: std.array_hash_map.String(void) = .empty;
         for (self.followed) |table| {
             if (self.isOnDemand(table)) continue; // §10hj: never seeded from a chain
             const st = self.states.get(table) orelse continue;
@@ -1592,7 +1594,7 @@ pub const SyncClient = struct {
                 const pending_before = self.reseed_pending;
                 self.reseed_pending = false;
                 const ok = if (self.applyChain(table, tenant)) |_| !self.reseed_pending else |err| blk: {
-                    std.debug.print("{s}: seeding failed: {s} — retried at the next poll\n", .{ table, @errorName(err) });
+                    log.err("{s}: seeding failed: {s} — retried at the next poll", .{ table, @errorName(err) });
                     self.rememberUnseeded(table, @errorName(err));
                     break :blk false;
                 };
@@ -1641,15 +1643,15 @@ pub const SyncClient = struct {
                 const stored: i64 = @intCast(try self.storedSeq(ge.key_ptr.*));
                 if (first > 1 and stored < first - 1) {
                     // A first run (stored 0) resumes there too, silently: it is not a healed gap.
-                    if (stored > 0) std.debug.print("{s}: gap healed — resuming at the stream's oldest message ({d}; was {d})\n", .{ ge.key_ptr.*, first - 1, stored });
+                    if (stored > 0) log.info("{s}: gap healed — resuming at the stream's oldest message ({d}; was {d})", .{ ge.key_ptr.*, first - 1, stored });
                     try self.persistSeq(ge.key_ptr.*, @intCast(first - 1));
                 }
             }
         }
         const orphans = try self.st.query(a, "PRAGMA foreign_key_check;", &.{});
         if (orphans.len > 0) {
-            std.debug.print(
-                "⚠️ {d} foreign key violation(s) survive seeding — cross-chain skew; the tail reconciles or holds them\n",
+            log.warn(
+                "{d} foreign key violation(s) survive seeding — cross-chain skew; the tail reconciles or holds them",
                 .{orphans.len},
             );
         }
@@ -1691,7 +1693,7 @@ pub const SyncClient = struct {
         /// §10fe: the delta's upsert from the COPY's temporary table (core.pgUpsertFromCopySql).
         copy_upsert_sql: []const u8,
         /// §10fe: the step's COPY text buffer, reused across its chunks.
-        copy_buf: *std.ArrayListUnmanaged(u8),
+        copy_buf: *std.ArrayList(u8),
         /// §10fn: what a full clears before its first chunk — the whole table, or,
         /// for a tenant-scoped table under several memberships, only this tenant's
         /// rows (`wipe_arg`), the rest going in as upserts (`wipe_whole` false).
@@ -1747,7 +1749,7 @@ pub const SyncClient = struct {
                 _ = st.query(ra, cs.sql, params) catch |err| {
                     // Read the SQLite text HERE, before the rollback clears it: it is
                     // what tells an FK refusal from a bad column apart.
-                    std.debug.print("{s}: row {d} of {d} refused: {any} — sqlite: {s}\n", .{
+                    log.warn("{s}: row {d} of {d} refused: {any} — sqlite: {s}", .{
                         cs.table, ri + 1, cs.offsets.len, err, st.errMsg(),
                     });
                     return err;
@@ -1768,7 +1770,7 @@ pub const SyncClient = struct {
         var chunk_arena = std.heap.ArenaAllocator.init(cs.client.a);
         defer chunk_arena.deinit();
         const ca = chunk_arena.allocator();
-        var rows: std.ArrayListUnmanaged([]const storage.Value) = .empty;
+        var rows: std.ArrayList([]const storage.Value) = .empty;
         for (cs.order[cs.from..cs.to]) |ri| {
             _ = row_arena.reset(.retain_capacity);
             const ra = row_arena.allocator();
@@ -1877,7 +1879,7 @@ pub const SyncClient = struct {
 
     /// One cell in COPY text. Bytes are bytea's `\\x` hex, or bare EWKB hex into a
     /// PostGIS column; a JSON array text becomes the literal for an array column.
-    fn writeCopyCell(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, ra: std.mem.Allocator, p: msgpack.Payload, is_array: bool, is_geom: bool, vec: ?VecIdx) !void {
+    fn writeCopyCell(out: *std.ArrayList(u8), a: std.mem.Allocator, ra: std.mem.Allocator, p: msgpack.Payload, is_array: bool, is_geom: bool, vec: ?VecIdx) !void {
         switch (p) {
             .nil => try out.appendSlice(a, "\\N"),
             .bool => |b| try out.append(a, if (b) 't' else 'f'),
@@ -1902,7 +1904,7 @@ pub const SyncClient = struct {
         }
     }
 
-    fn copyEscape(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, s: []const u8) !void {
+    fn copyEscape(out: *std.ArrayList(u8), a: std.mem.Allocator, s: []const u8) !void {
         for (s) |ch| switch (ch) {
             '\\' => try out.appendSlice(a, "\\\\"),
             '\t' => try out.appendSlice(a, "\\t"),
@@ -1990,7 +1992,7 @@ pub const SyncClient = struct {
         const a = ca.allocator();
         const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ tenant, table });
         const man_bytes = (try self.t.kvGet(a, self.kv_generations, key)) orelse {
-            std.debug.print("{s}: no chain yet ({s})\n", .{ table, tenant });
+            log.info("{s}: no chain yet ({s})", .{ table, tenant });
             return;
         };
         const man = (try std.json.parseFromSlice(Value, a, man_bytes, .{})).value;
@@ -2002,7 +2004,7 @@ pub const SyncClient = struct {
         const man_epoch: i64 = if (man.object.get("seed_epoch")) |v| (if (v == .integer) v.integer else 0) else 0;
         const want_epoch: i64 = if (self.states.get(table)) |s0| s0.seed_epoch else 0;
         if (man_epoch < want_epoch) {
-            std.debug.print("{s}: chain g{d} predates the re-seed (epoch {d} < {d}) — waiting for the producer's full\n", .{ table, if (man.object.get("gen")) |v| v.integer else 0, man_epoch, want_epoch });
+            log.warn("{s}: chain g{d} predates the re-seed (epoch {d} < {d}) — waiting for the producer's full", .{ table, if (man.object.get("gen")) |v| v.integer else 0, man_epoch, want_epoch });
             self.reseed_pending = true;
             return;
         }
@@ -2016,7 +2018,7 @@ pub const SyncClient = struct {
         const cdc_stream = if (man.object.get("cdc_stream")) |v| (if (v == .string) v.string else "") else "";
         const pos: i64 = if (cdc_stream.len > 0) @intCast(try self.storedSeq(cdc_stream)) else 0;
         if (core.fullPredatesReplica(man, plan.array, pos)) {
-            std.debug.print("{s}: chain predates replica — refusing the full (D2)\n", .{table});
+            log.warn("{s}: chain predates replica — refusing the full (D2)", .{table});
             return;
         }
         // §10ei: a chain older than the STREAM cannot splice — the events between its
@@ -2045,21 +2047,21 @@ pub const SyncClient = struct {
                 const last: i64 = @intCast(info.value.state.last_seq);
                 if (man_created.len > 0 and info.value.created.len > 0) {
                     if (!std.mem.eql(u8, man_created, info.value.created)) {
-                        std.debug.print("{s}: chain g{d} was cut on a previous incarnation of {s} (created {s}, now {s}) — seeding it, gating nothing until a newer generation\n", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cdc_stream, man_created, info.value.created });
+                        log.info("{s}: chain g{d} was cut on a previous incarnation of {s} (created {s}, now {s}) — seeding it, gating nothing until a newer generation", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cdc_stream, man_created, info.value.created });
                         gate_seq = 0;
                     } else {
                         _ = self.restarted.remove(cdc_stream);
                     }
                 } else if (self.restarted.contains(cdc_stream)) {
                     if (cutoff_seq > last) {
-                        std.debug.print("{s}: chain g{d} was cut before {s} restarted (cutoff seq {d} beyond last_seq {d}) — seeding it, gating nothing until a newer generation\n", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cdc_stream, cutoff_seq, last });
+                        log.info("{s}: chain g{d} was cut before {s} restarted (cutoff seq {d} beyond last_seq {d}) — seeding it, gating nothing until a newer generation", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cdc_stream, cutoff_seq, last });
                         gate_seq = 0;
                     } else {
                         _ = self.restarted.remove(cdc_stream);
                     }
                 }
                 if (cutoff_seq + 1 < first) {
-                    std.debug.print("{s}: chain g{d} predates the stream (cutoff seq {d} < first {d} on {s}) — the events between are gone; waiting for the producer's next generation\n", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, first, cdc_stream });
+                    log.warn("{s}: chain g{d} predates the stream (cutoff seq {d} < first {d} on {s}) — the events between are gone; waiting for the producer's next generation", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, first, cdc_stream });
                     self.reseed_pending = true;
                     return;
                 }
@@ -2120,7 +2122,7 @@ pub const SyncClient = struct {
                     const v = cur.readValue(step_a) catch return error.ChainObjectMalformed;
                     cols = try jsonStrList(step_a, try mpToJson(step_a, v));
                     for (cols) |col| if (!contains(st.cols, col)) {
-                        std.debug.print("{s}: chain object {s} names column {s}, which the replica lacks — predates the schema, waiting for the producer's full\n", .{ table, step.object.get("name").?.string, col });
+                        log.warn("{s}: chain object {s} names column {s}, which the replica lacks — predates the schema, waiting for the producer's full", .{ table, step.object.get("name").?.string, col });
                         return;
                     };
                 } else if (std.mem.eql(u8, mkey, "rows")) {
@@ -2137,7 +2139,7 @@ pub const SyncClient = struct {
             const vcol: ?[]const u8 = if (vcol_v != null and contains(cols, vcol_v.?)) vcol_v else null;
             const order = try sortedByKeys(step_a, idx.keys);
             const shape = try self.stepShape(step_a, table, tenant, st.*, cols, vcol, is_full);
-            var copy_buf: std.ArrayListUnmanaged(u8) = .empty;
+            var copy_buf: std.ArrayList(u8) = .empty;
             defer copy_buf.deinit(self.a);
             ph[2] += msNow() - t_ph;
             t_ph = msNow();
@@ -2147,7 +2149,7 @@ pub const SyncClient = struct {
                 const to = @min(from + chunk, idx.offsets.len);
                 const cs = shape.step(self, step_a, blob, idx.offsets, order, from, to, from == 0, &copy_buf);
                 self.st.transaction(cs, ChainStep.apply) catch |err| {
-                    std.debug.print("{s}: chain step {s} ({s}, rows {d}..{d} of {d}) rolled back: {any} — {s}\n", .{
+                    log.info("{s}: chain step {s} ({s}, rows {d}..{d} of {d}) rolled back: {any} — {s}", .{
                         table, step.object.get("name").?.string, if (is_full) "full" else "delta", from, to, idx.offsets.len, err, self.st.errMsg(),
                     });
                     return err;
@@ -2190,9 +2192,9 @@ pub const SyncClient = struct {
         // superseded, not waiting (the TS client's pruneInboxSeeded).
         try pruneInboxSeeded(&self.st, a, table, seed_lsn);
         if (streamed > 0) {
-            std.debug.print("{s}: seeded {d} row(s) from chain g{d} — fetch {d} ms, inflate {d} ms, decode {d} ms, apply {d} ms ({d} of {d} step(s) streamed: fetch+inflate as read, decode = the stage's sort)\n", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0, ph[0], ph[1], ph[2], ph[3], streamed, plan.array.items.len });
+            log.info("{s}: seeded {d} row(s) from chain g{d} — fetch {d} ms, inflate {d} ms, decode {d} ms, apply {d} ms ({d} of {d} step(s) streamed: fetch+inflate as read, decode = the stage's sort)", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0, ph[0], ph[1], ph[2], ph[3], streamed, plan.array.items.len });
         } else {
-            std.debug.print("{s}: seeded {d} row(s) from chain g{d} ({s}) — fetch {d} ms, inflate {d} ms, decode {d} ms, apply {d} ms\n", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0, tenant, ph[0], ph[1], ph[2], ph[3] });
+            log.info("{s}: seeded {d} row(s) from chain g{d} ({s}) — fetch {d} ms, inflate {d} ms, decode {d} ms, apply {d} ms", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0, tenant, ph[0], ph[1], ph[2], ph[3] });
         }
     }
 
@@ -2227,7 +2229,7 @@ pub const SyncClient = struct {
                 const v = try zs.parseValue(&scratch);
                 cols = try dupeStrings(step_a, try jsonStrList(scratch.allocator(), try mpToJson(scratch.allocator(), v)));
                 for (cols) |col| if (!contains(st.cols, col)) {
-                    std.debug.print("{s}: chain object {s} names column {s}, which the replica lacks — predates the schema, waiting for the producer's full\n", .{ table, name, col });
+                    log.warn("{s}: chain object {s} names column {s}, which the replica lacks — predates the schema, waiting for the producer's full", .{ table, name, col });
                     return error.ChainObjectMalformed;
                 };
             } else if (std.mem.eql(u8, mkey, "rows")) {
@@ -2245,7 +2247,7 @@ pub const SyncClient = struct {
         const vcol_v: ?[]const u8 = if (man.object.get("version_column")) |v| (if (v == .string) v.string else null) else null;
         const vcol: ?[]const u8 = if (vcol_v != null and contains(cols, vcol_v.?)) vcol_v else null;
         const shape = try self.stepShape(step_a, table, tenant, st.*, cols, vcol, is_full);
-        var copy_buf: std.ArrayListUnmanaged(u8) = .empty;
+        var copy_buf: std.ArrayList(u8) = .empty;
         defer copy_buf.deinit(self.a);
         const chunk_rows: usize = if (self.opts.seed_chunk_rows == 0) @max(total, 1) else self.opts.seed_chunk_rows;
 
@@ -2276,12 +2278,12 @@ pub const SyncClient = struct {
         defer if (staged) self.st.execSimple("DROP TABLE IF EXISTS temp._zbz_stage") catch {};
         const stage_sql = try stageInsertSql(step_a, stage_batch);
 
-        var chunk_buf: std.ArrayListUnmanaged(u8) = .empty;
+        var chunk_buf: std.ArrayList(u8) = .empty;
         defer chunk_buf.deinit(self.a);
         var chunk_arena = std.heap.ArenaAllocator.init(self.a);
         defer chunk_arena.deinit();
-        var batch_keys: std.ArrayListUnmanaged([]const u8) = .empty;
-        var batch_offs: std.ArrayListUnmanaged(usize) = .empty;
+        var batch_keys: std.ArrayList([]const u8) = .empty;
+        var batch_offs: std.ArrayList(usize) = .empty;
         var in_chunk: usize = 0;
         var chunk_no: usize = 0;
         var applied: usize = 0;
@@ -2349,7 +2351,7 @@ pub const SyncClient = struct {
                 t_ph = msNow();
                 const cs = shape.step(self, ca, chunk_buf.items, idx.offsets, order, 0, in_chunk, chunk_no == 0, &copy_buf);
                 self.st.transaction(cs, ChainStep.apply) catch |err| {
-                    std.debug.print("{s}: chain step {s} ({s}, streaming chunk {d}, {d} row(s), {d} of {d} read) rolled back: {any}\n", .{
+                    log.info("{s}: chain step {s} ({s}, streaming chunk {d}, {d} row(s), {d} of {d} read) rolled back: {any}", .{
                         table, name, if (is_full) "full" else "delta", chunk_no, in_chunk, i, total, err,
                     });
                     return err;
@@ -2374,7 +2376,7 @@ pub const SyncClient = struct {
         try res.verify();
         if (!staged) return applied;
         const trace = std.c.getenv("ZB_SEED_TRACE") != null;
-        if (trace) std.debug.print("  trace: staged {d} rows in {d} ms, maxrss {d} MB\n", .{ total, msNow() - t_ph + ph[1], maxRssMb() });
+        if (trace) log.debug("  trace: staged {d} rows in {d} ms, maxrss {d} MB", .{ total, msNow() - t_ph + ph[1], maxRssMb() });
 
         // ── the staged apply: one sort, then pages in key order ──────────────────
         // The index CARRIES the row: building it is the external sort of the rows
@@ -2390,14 +2392,14 @@ pub const SyncClient = struct {
         try self.st.execSimple("CREATE INDEX _zbz_stage_k ON _zbz_stage (k, row)");
         self.st.execSimple("PRAGMA cache_size = -131072") catch {};
         ph[2] += msNow() - t_ph;
-        if (trace) std.debug.print("  trace: index built in {d} ms, maxrss {d} MB\n", .{ msNow() - t_ph, maxRssMb() });
+        if (trace) log.debug("  trace: index built in {d} ms, maxrss {d} MB", .{ msNow() - t_ph, maxRssMb() });
         t_ph = msNow();
         var sel_ms: i64 = 0;
         var app_ms: i64 = 0;
         var inversions: usize = 0;
-        var prev_k: std.ArrayListUnmanaged(u8) = .empty;
+        var prev_k: std.ArrayList(u8) = .empty;
         defer prev_k.deinit(self.a);
-        var last_k: std.ArrayListUnmanaged(u8) = .empty;
+        var last_k: std.ArrayList(u8) = .empty;
         defer last_k.deinit(self.a);
         var page_no: usize = 0;
         while (true) {
@@ -2440,25 +2442,25 @@ pub const SyncClient = struct {
             const cs = shape.step(self, ca, chunk_buf.items, offsets, order, 0, rows.len, page_no == 0, &copy_buf);
             const t_app = msNow();
             self.st.transaction(cs, ChainStep.apply) catch |err| {
-                std.debug.print("{s}: chain step {s} ({s}, staged page {d}, {d} row(s)) rolled back: {any}\n", .{
+                log.info("{s}: chain step {s} ({s}, staged page {d}, {d} row(s)) rolled back: {any}", .{
                     table, name, if (is_full) "full" else "delta", page_no, rows.len, err,
                 });
                 return err;
             };
             app_ms += msNow() - t_app;
-            if (trace and (page_no < 3 or page_no % 20 == 0)) std.debug.print("  trace: page {d}: {d} rows, apply {d} ms, maxrss {d} MB, inversions so far {d}\n", .{ page_no, rows.len, msNow() - t_app, maxRssMb(), inversions });
+            if (trace and (page_no < 3 or page_no % 20 == 0)) log.debug("  trace: page {d}: {d} rows, apply {d} ms, maxrss {d} MB, inversions so far {d}", .{ page_no, rows.len, msNow() - t_app, maxRssMb(), inversions });
             applied += rows.len;
             page_no += 1;
             if (rows.len < chunk_rows) break;
         }
         ph[3] += msNow() - t_ph;
-        if (trace) std.debug.print("  trace: {d} page(s): select {d} ms, apply {d} ms, maxrss {d} MB\n", .{ page_no, sel_ms, app_ms, maxRssMb() });
+        if (trace) log.debug("  trace: {d} page(s): select {d} ms, apply {d} ms, maxrss {d} MB", .{ page_no, sel_ms, app_ms, maxRssMb() });
         return applied;
     }
 
     /// `INSERT INTO _zbz_stage (k, row) VALUES (?, ?), …` for `n` rows.
     fn stageInsertSql(a: std.mem.Allocator, n: usize) ![]const u8 {
-        var out: std.ArrayListUnmanaged(u8) = .empty;
+        var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(a, "INSERT INTO _zbz_stage (k, row) VALUES ");
         for (0..n) |k| try out.appendSlice(a, if (k == 0) "(?, ?)" else ", (?, ?)");
         return out.toOwnedSlice(a);
@@ -2482,7 +2484,7 @@ pub const SyncClient = struct {
         wipe_arg: ?[]const u8,
         wipe_whole: bool,
 
-        fn step(self: StepShape, client: *SyncClient, a: std.mem.Allocator, bytes: []const u8, offsets: []const usize, order: []const usize, from: usize, to: usize, first_chunk: bool, copy_buf: *std.ArrayListUnmanaged(u8)) ChainStep {
+        fn step(self: StepShape, client: *SyncClient, a: std.mem.Allocator, bytes: []const u8, offsets: []const usize, order: []const usize, from: usize, to: usize, first_chunk: bool, copy_buf: *std.ArrayList(u8)) ChainStep {
             return .{
                 .client = client,
                 .a = a,
@@ -2513,15 +2515,15 @@ pub const SyncClient = struct {
 
     fn stepShape(self: *SyncClient, a: std.mem.Allocator, table: []const u8, tenant: []const u8, st: TableState, cols: []const []const u8, vcol: ?[]const u8, is_full: bool) !StepShape {
         const whole = !self.multiTenant(st);
-        var array_idx_list: std.ArrayListUnmanaged(usize) = .empty;
+        var array_idx_list: std.ArrayList(usize) = .empty;
         if (self.st.engine == .postgres) for (st.array_cols) |ac| {
             if (indexOf(cols, ac)) |i| try array_idx_list.append(a, i);
         };
-        var geom_idx_list: std.ArrayListUnmanaged(usize) = .empty;
+        var geom_idx_list: std.ArrayList(usize) = .empty;
         if (self.st.engine == .postgres) for (st.geom_cols) |gc| {
             if (indexOf(cols, gc)) |i| try geom_idx_list.append(a, i);
         };
-        var vec_idx_list: std.ArrayListUnmanaged(VecIdx) = .empty;
+        var vec_idx_list: std.ArrayList(VecIdx) = .empty;
         // §10fl: DuckDB takes a vector as its list text (`[1,2,3]` into FLOAT[n], '101'
         // into BIT) and keeps a sparsevec as the wire's BLOB; arrays stay JSON text,
         // which DuckDB casts to a list itself.
@@ -2554,7 +2556,7 @@ pub const SyncClient = struct {
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const a = ca.allocator();
-        var streams: std.StringArrayHashMapUnmanaged(void) = .empty;
+        var streams: std.array_hash_map.String(void) = .empty;
         // Public first: parents (users) ride CDC_PUBLIC — fewer FK holds.
         var it = self.states.iterator();
         while (it.next()) |e| {
@@ -2572,7 +2574,7 @@ pub const SyncClient = struct {
     /// The streams this client reads, public first: parents (users) ride
     /// CDC_PUBLIC — fewer FK holds. Allocated from `a`.
     fn cdcStreams(self: *SyncClient, a: std.mem.Allocator) ![]const []const u8 {
-        var streams: std.StringArrayHashMapUnmanaged(void) = .empty;
+        var streams: std.array_hash_map.String(void) = .empty;
         var it = self.states.iterator();
         while (it.next()) |e| {
             for (e.value_ptr.routes) |r| if (std.mem.eql(u8, r, self.cdc_public)) try streams.put(a, r, {});
@@ -2592,7 +2594,7 @@ pub const SyncClient = struct {
     /// Passes until a pass resolves nothing (§10dg): a child held behind a parent that
     /// is itself held behind a grandparent needs the second pass — measured, the
     /// single pass left the child in the inbox until an unrelated event arrived.
-    fn retryHeld(self: *SyncClient, report_a: ?std.mem.Allocator, changed_map: ?*std.StringArrayHashMapUnmanaged(void)) void {
+    fn retryHeld(self: *SyncClient, report_a: ?std.mem.Allocator, changed_map: ?*std.array_hash_map.String(void)) void {
         var passes: usize = 0;
         var total_len: usize = 0;
         var total_resolved: usize = 0;
@@ -2606,13 +2608,13 @@ pub const SyncClient = struct {
             if (r.resolved == 0 or r.len == r.resolved + r.dropped) break;
         }
         if (total_resolved > 0 or total_dropped > 0) {
-            std.debug.print("fk held: {d}, applied on retry: {d}, dropped: {d}, still waiting: {d} ({d} pass(es))\n", .{ total_len, total_resolved, total_dropped, total_len -| (total_resolved + total_dropped), passes + 1 });
+            log.warn("fk held: {d}, applied on retry: {d}, dropped: {d}, still waiting: {d} ({d} pass(es))", .{ total_len, total_resolved, total_dropped, total_len -| (total_resolved + total_dropped), passes + 1 });
         }
     }
 
     const RetryPass = struct { len: usize, resolved: usize, dropped: usize };
 
-    fn retryHeldPass(self: *SyncClient, report_a: ?std.mem.Allocator, changed_map: ?*std.StringArrayHashMapUnmanaged(void)) !RetryPass {
+    fn retryHeldPass(self: *SyncClient, report_a: ?std.mem.Allocator, changed_map: ?*std.array_hash_map.String(void)) !RetryPass {
         var ra = std.heap.ArenaAllocator.init(self.a);
         defer ra.deinit();
         const a = ra.allocator();
@@ -2640,7 +2642,7 @@ pub const SyncClient = struct {
                     _ = self.st.query(a, "UPDATE _zbz_inbox SET attempts = attempts + 1 WHERE id = ?", &.{id}) catch {};
                 },
                 else => {
-                    std.debug.print("DROPPED held event on {s}: {s}\n", .{ table, @errorName(err) });
+                    log.warn("DROPPED held event on {s}: {s}", .{ table, @errorName(err) });
                     _ = self.st.query(a, "DELETE FROM _zbz_inbox WHERE id = ?", &.{id}) catch {};
                     dropped += 1;
                 },
@@ -2656,7 +2658,7 @@ pub const SyncClient = struct {
     /// client does not follow: a phone that follows one table pays for the whole feed.
     /// Nothing else rides a CDC stream (PROTOCOL §4), so the filters lose nothing.
     fn cdcFilters(self: *SyncClient, a: std.mem.Allocator, stream: []const u8) ![]const []const u8 {
-        var subs: std.ArrayListUnmanaged([]const u8) = .empty;
+        var subs: std.ArrayList([]const u8) = .empty;
         var it = self.states.iterator();
         while (it.next()) |e| {
             const table = e.key_ptr.*;
@@ -2718,7 +2720,7 @@ pub const SyncClient = struct {
         } else {
             cfg.deliver_policy = .all;
         }
-        std.debug.print("{s}: tail consumer {s} from seq {d}\n", .{ stream, cname, cfg.opt_start_seq orelse 0 });
+        log.info("{s}: tail consumer {s} from seq {d}", .{ stream, cname, cfg.opt_start_seq orelse 0 });
         const sub = try self.t.js.pullSubscribe(null, cname, .{ .stream = stream, .config = cfg, .inbox = shared });
         sub.max_bytes = pull_max_bytes; // §10jc: the drain's own requests too (see `tailInbox`)
         // §10jc: two requests outstanding — the next 8 MB downloads while this client
@@ -2802,10 +2804,10 @@ pub const SyncClient = struct {
             if (!try self.drainStreamOnce(stream)) return;
             attempt += 1;
             if (attempt >= 3) {
-                std.debug.print("{s}: pruned under the drain three times — this client applies slower than the stream prunes; the live tail continues from the chain's cutoff\n", .{stream});
+                log.warn("{s}: pruned under the drain three times — this client applies slower than the stream prunes; the live tail continues from the chain's cutoff", .{stream});
                 return;
             }
-            std.debug.print("{s}: re-seeding the tables routed to it, then draining again ({d}/3)\n", .{ stream, attempt });
+            log.info("{s}: re-seeding the tables routed to it, then draining again ({d}/3)", .{ stream, attempt });
             try self.gapAndSeed(null, null);
         }
     }
@@ -2853,7 +2855,7 @@ pub const SyncClient = struct {
                         reopen_pos = idle_pos;
                     }
                     if (gap_reopens < 50 and self.unackedOn(stream, sub.consumer_name) > 0) {
-                        std.debug.print("{s}: drain idle with deliveries unacknowledged on {s} — lost in transit; recreating the consumer from position {d}\n", .{ stream, sub.consumer_name, try self.storedSeq(stream) });
+                        log.warn("{s}: drain idle with deliveries unacknowledged on {s} — lost in transit; recreating the consumer from position {d}", .{ stream, sub.consumer_name, try self.storedSeq(stream) });
                         gap_reopens += 1;
                         self.resetFlow(stream);
                         const fresh = try self.openConsumer(stream, 30 * std.time.ns_per_s, null);
@@ -2891,7 +2893,7 @@ pub const SyncClient = struct {
                 if (j > 0) _ = try self.applyBatch(null, stream, keep[0..j], pos, &ms, null);
                 const at = try self.storedSeq(stream);
                 const first_here = keep[j].metadata.sequence.stream;
-                std.debug.print("{s}: {d} message(s) pruned under the drain (position {d}, delivered {d})\n", .{ stream, first_here - at - 1, at, first_here });
+                log.warn("{s}: {d} message(s) pruned under the drain (position {d}, delivered {d})", .{ stream, first_here - at - 1, at, first_here });
                 return true;
             }
             var ms = pos;
@@ -2906,12 +2908,12 @@ pub const SyncClient = struct {
                 // loudly, and leave the flow clean — the live tail reopens from the
                 // position with no cap, rather than this consumer refusing every
                 // delivery for ever.
-                std.debug.print("{s}: 50 consumer recreations without progress (position {d}) — ending the drain; the tail takes over\n", .{ stream, now_pos });
+                log.warn("{s}: 50 consumer recreations without progress (position {d}) — ending the drain; the tail takes over", .{ stream, now_pos });
                 self.resetFlow(stream);
                 break;
             }
             if ((try self.flowFor(stream)).gap) {
-                std.debug.print("{s}: recreating the drain's consumer from position {d} after a lost delivery\n", .{ stream, try self.storedSeq(stream) });
+                log.warn("{s}: recreating the drain's consumer from position {d} after a lost delivery", .{ stream, try self.storedSeq(stream) });
                 gap_reopens += 1;
                 self.resetFlow(stream);
                 const fresh = try self.openConsumer(stream, 30 * std.time.ns_per_s, null);
@@ -2922,14 +2924,14 @@ pub const SyncClient = struct {
         const at = try self.storedSeq(stream);
         const to = self.caughtUpTo(stream, sub.consumer_name, at);
         if (to > at) try self.persistSeq(stream, to);
-        std.debug.print("{s}: drained to seq {d}\n", .{ stream, @max(to, at) });
+        log.info("{s}: drained to seq {d}", .{ stream, @max(to, at) });
         return false;
     }
 
     /// One fetched batch through the gate → apply → hold → position path, shared by
     /// the bounded drain and the live tail. Returns the number of events offered to
     /// `applyEvent` (applied, gated or held — D1: all three ARE the position).
-    fn applyBatch(self: *SyncClient, report_a: ?std.mem.Allocator, stream: []const u8, messages: []const *@import("nats").JetStreamMessage, last: u64, max_seq: *u64, changed_map: ?*std.StringArrayHashMapUnmanaged(void)) !usize {
+    fn applyBatch(self: *SyncClient, report_a: ?std.mem.Allocator, stream: []const u8, messages: []const *@import("nats").JetStreamMessage, last: u64, max_seq: *u64, changed_map: ?*std.array_hash_map.String(void)) !usize {
         // Per-batch: every decoded event dies with the batch, except the FK-held
         // ones, which are held DURABLY in `_zbz_inbox` below (§10de finding 1).
         var ba = std.heap.ArenaAllocator.init(self.a);
@@ -2955,7 +2957,7 @@ pub const SyncClient = struct {
             max_seq: *u64,
             offered: *usize,
             report_a: ?std.mem.Allocator,
-            changed_map: ?*std.StringArrayHashMapUnmanaged(void),
+            changed_map: ?*std.array_hash_map.String(void),
             /// §10dg: FOREIGN KEY checks deferred to COMMIT for the whole batch (the TS
             /// client's `defer_foreign_keys`): a family inserted child-first, or a
             /// cascade's deletes arriving parent-first, lands as one unit with no hold at
@@ -2998,10 +3000,10 @@ pub const SyncClient = struct {
                                 // batch would be acked with nothing applied. Hand it to the
                                 // isolated replay instead.
                                 if (st_.engine == .duckdb) {
-                                    std.debug.print("{s}: event at seq {d} aborted the batch: {s} — duckdb: {s}\n", .{ table, seq, @errorName(e), st_.errMsg() });
+                                    log.err("{s}: event at seq {d} aborted the batch: {s} — duckdb: {s}", .{ table, seq, @errorName(e), st_.errMsg() });
                                     return e;
                                 }
-                                std.debug.print("{s}: event at seq {d} not applied: {s} — sqlite: {s}\n", .{ table, seq, @errorName(e), st_.errMsg() });
+                                log.warn("{s}: event at seq {d} not applied: {s} — sqlite: {s}", .{ table, seq, @errorName(e), st_.errMsg() });
                             },
                         };
                         // The host's `changed_tables` (§10ee): only what was APPLIED — a
@@ -3035,8 +3037,8 @@ pub const SyncClient = struct {
             if (self.st.engine == .duckdb) {
                 // §10jn: usually the insert-only fast path meeting a key already there (a
                 // batch redelivered between commit and ack); the second pass upserts.
-                std.debug.print("{s}: batch of {d} message(s) refused as a unit ({s}: {s}) — applying it again through the upsert\n", .{ stream, messages.len, @errorName(err), self.st.errMsg() });
-            } else std.debug.print("{s}: batch of {d} message(s) refused as a unit ({s}: {s}) — replaying event by event, holding what cannot land\n", .{ stream, messages.len, @errorName(err), self.st.commitErr() });
+                log.warn("{s}: batch of {d} message(s) refused as a unit ({s}: {s}) — applying it again through the upsert", .{ stream, messages.len, @errorName(err), self.st.errMsg() });
+            } else log.err("{s}: batch of {d} message(s) refused as a unit ({s}: {s}) — replaying event by event, holding what cannot land", .{ stream, messages.len, @errorName(err), self.st.commitErr() });
             offered = 0;
             max_seq.* = last;
             ctx.deferred = false;
@@ -3044,7 +3046,7 @@ pub const SyncClient = struct {
                 // §10hf: refused even with immediate checks. On DuckDB one bad row aborts
                 // the transaction and takes every other row with it; the third pass is one
                 // transaction per EVENT, so only the bad event is lost — and said.
-                std.debug.print("{s}: batch refused again ({s}: {s}) — one transaction per event\n", .{ stream, @errorName(err2), self.st.commitErr() });
+                log.warn("{s}: batch refused again ({s}: {s}) — one transaction per event", .{ stream, @errorName(err2), self.st.commitErr() });
                 offered = 0;
                 max_seq.* = last;
                 try self.applyBatchIsolated(report_a, stream, messages, max_seq, changed_map, &offered);
@@ -3066,7 +3068,7 @@ pub const SyncClient = struct {
     /// §10hf: the batch one event per transaction — the TS client's `applyBatchIsolated`.
     /// A held event is held durably as in the batch path; a refused one is printed and
     /// skipped, never poisoning its neighbours. The position is persisted last.
-    fn applyBatchIsolated(self: *SyncClient, report_a: ?std.mem.Allocator, stream: []const u8, messages: []const *@import("nats").JetStreamMessage, max_seq: *u64, changed_map: ?*std.StringArrayHashMapUnmanaged(void), offered: *usize) !void {
+    fn applyBatchIsolated(self: *SyncClient, report_a: ?std.mem.Allocator, stream: []const u8, messages: []const *@import("nats").JetStreamMessage, max_seq: *u64, changed_map: ?*std.array_hash_map.String(void), offered: *usize) !void {
         const pos_before = max_seq.*;
         var ba = std.heap.ArenaAllocator.init(self.a);
         defer ba.deinit();
@@ -3122,13 +3124,13 @@ pub const SyncClient = struct {
                         // after the batch like every held event (§10dg).
                         self.st.transaction(Hold{ .a = a, .table = table, .ev = ev, .reason = why }, Hold.apply) catch |e2| {
                             refused += 1;
-                            std.debug.print("{s}: event at seq {d} could not be held ({s}: {s}) — dropped\n", .{ table, seq, @errorName(e2), self.st.errMsg() });
+                            log.err("{s}: event at seq {d} could not be held ({s}: {s}) — dropped", .{ table, seq, @errorName(e2), self.st.errMsg() });
                             continue;
                         };
                         outcome = .held;
                     } else {
                         refused += 1;
-                        std.debug.print("{s}: event at seq {d} refused alone ({s}: {s}) — dropped\n", .{ table, seq, @errorName(err), self.st.errMsg() });
+                        log.warn("{s}: event at seq {d} refused alone ({s}: {s}) — dropped", .{ table, seq, @errorName(err), self.st.errMsg() });
                         continue;
                     }
                 };
@@ -3156,7 +3158,7 @@ pub const SyncClient = struct {
             }
         };
         try self.st.transaction(Pos{ .client = self, .stream = stream, .last = pos_before, .seq = max_seq.*, .messages = messages }, Pos.apply);
-        std.debug.print("{s}: isolated replay of {d} message(s): {d} applied, {d} held, {d} refused\n", .{ stream, messages.len, applied, held, refused });
+        log.warn("{s}: isolated replay of {d} message(s): {d} applied, {d} held, {d} refused", .{ stream, messages.len, applied, held, refused });
     }
 
     // ─── live tailing (§10bh): the host-driven poll ─────────────────────────
@@ -3221,7 +3223,7 @@ pub const SyncClient = struct {
         } else {
             const key = self.aa().dupe(u8, stream) catch return;
             self.dark.put(self.aa(), key, .{ .retry_at_ms = now + dark_backoff_first_ms, .backoff_ms = dark_backoff_first_ms }) catch return;
-            std.debug.print("⚠️ {s}: unreadable ({s}) — set aside, the other streams go on; retried with backoff\n", .{ stream, @errorName(err) });
+            log.warn("⚠️ {s}: unreadable ({s}) — set aside, the other streams go on; retried with backoff", .{ stream, @errorName(err) });
         }
         self.dropTail(stream);
     }
@@ -3229,7 +3231,7 @@ pub const SyncClient = struct {
     /// Readable again: back into the fetch, and whatever it left unseeded is asked for.
     fn clearDark(self: *SyncClient, stream: []const u8) void {
         if (self.dark.fetchOrderedRemove(stream) != null) {
-            std.debug.print("✅ {s}: readable again — back in the tail\n", .{stream});
+            log.info("✅ {s}: readable again — back in the tail", .{stream});
             self.reseed_pending = true;
         }
     }
@@ -3238,7 +3240,7 @@ pub const SyncClient = struct {
         var k: usize = 0;
         while (k < self.tails.items.len) {
             if (std.mem.eql(u8, self.tails.items[k].stream, stream)) {
-                std.debug.print("{s}: tail dropped\n", .{stream});
+                log.warn("{s}: tail dropped", .{stream});
                 self.tails.items[k].sub.deinit();
                 _ = self.tails.orderedRemove(k);
             } else k += 1;
@@ -3248,7 +3250,7 @@ pub const SyncClient = struct {
     /// The tenants whose streams are set aside, for the host (a stream's tenant is its
     /// name past the prefix; CDC_PUBLIC's is the open tenant).
     fn unreadableTenants(self: *SyncClient, a: std.mem.Allocator) ![]const []const u8 {
-        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        var out: std.ArrayList([]const u8) = .empty;
         for (self.dark.keys()) |stream| {
             const t = if (std.mem.eql(u8, stream, self.cdc_public)) self.open_tenant else if (std.mem.startsWith(u8, stream, self.cdc_prefix)) stream[self.cdc_prefix.len..] else stream;
             try out.append(a, try a.dupe(u8, t));
@@ -3379,7 +3381,7 @@ pub const SyncClient = struct {
     /// client's socket and are handed to the host by `poll`, like everything else.
     pub fn serve(self: *SyncClient, tenants: []const []const u8, names: []const []const u8, queue: []const u8) !usize {
         const ca = self.aa();
-        var subs: std.ArrayListUnmanaged(*@import("nats").Subscription) = .empty;
+        var subs: std.ArrayList(*@import("nats").Subscription) = .empty;
         try subs.appendSlice(ca, self.serve_subs);
         for (tenants) |tenant| {
             for (names) |name| {
@@ -3395,7 +3397,7 @@ pub const SyncClient = struct {
 
     /// Take what is waiting on the serve subscriptions, without blocking. Each becomes
     /// a `Request` for the host and a `Pending` here, holding the inbox to answer on.
-    fn drainServe(self: *SyncClient, report_a: std.mem.Allocator, out: *std.ArrayListUnmanaged(Request)) !void {
+    fn drainServe(self: *SyncClient, report_a: std.mem.Allocator, out: *std.ArrayList(Request)) !void {
         const now: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(0), .clock = .awake } };
         for (self.serve_subs) |sub| {
             while (true) {
@@ -3403,9 +3405,9 @@ pub const SyncClient = struct {
                 defer msg.deinit();
                 // No reply subject: nobody is waiting, so there is nothing to answer.
                 const reply_subject = msg.reply orelse continue;
-                const dot = std.mem.lastIndexOfScalar(u8, msg.subject, '.') orelse continue;
+                const dot = std.mem.findScalarLast(u8, msg.subject, '.') orelse continue;
                 const head = msg.subject[0..dot];
-                const tenant_dot = std.mem.lastIndexOfScalar(u8, head, '.') orelse continue;
+                const tenant_dot = std.mem.findScalarLast(u8, head, '.') orelse continue;
                 const id = self.next_request_id;
                 self.next_request_id += 1;
                 try self.pending.append(self.a, .{
@@ -3470,7 +3472,7 @@ pub const SyncClient = struct {
     /// BEFORE the CDC wait and again after it, so `wait_ms` bounds how long a question
     /// can sit unseen: a responder polls with a short wait.
     pub fn poll(self: *SyncClient, report_a: std.mem.Allocator, wait_ms: u64) !PollReport {
-        var requests: std.ArrayListUnmanaged(Request) = .empty;
+        var requests: std.ArrayList(Request) = .empty;
         if (self.serve_subs.len > 0) try self.drainServe(report_a, &requests);
         var r = try self.pollInner(report_a, wait_ms);
         if (self.serve_subs.len > 0) {
@@ -3483,11 +3485,11 @@ pub const SyncClient = struct {
     fn pollInner(self: *SyncClient, report_a: std.mem.Allocator, wait_ms: u64) !PollReport {
         try self.refuseIfRevoked();
 
-        var changed_map: std.StringArrayHashMapUnmanaged(void) = .empty;
-        var seeded_map: std.StringArrayHashMapUnmanaged(void) = .empty;
+        var changed_map: std.array_hash_map.String(void) = .empty;
+        var seeded_map: std.array_hash_map.String(void) = .empty;
 
         // Schema first: a row in a new shape must find its table already moved.
-        self.drainSchemaWatch(report_a, &changed_map, &seeded_map) catch |err| std.debug.print("schema watch: {s}\n", .{@errorName(err)});
+        self.drainSchemaWatch(report_a, &changed_map, &seeded_map) catch |err| log.info("schema watch: {s}", .{@errorName(err)});
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const streams = try self.cdcStreams(ca.allocator());
@@ -3515,8 +3517,8 @@ pub const SyncClient = struct {
         // §10fq: one unreadable stream must not stall the others. A tail that cannot be
         // opened sets its stream aside instead of failing the poll; the fetch runs over
         // what is readable, in the same order as `live`.
-        var live: std.ArrayListUnmanaged([]const u8) = .empty;
-        var subs_list: std.ArrayListUnmanaged(*@import("nats").PullSubscription) = .empty;
+        var live: std.ArrayList([]const u8) = .empty;
+        var subs_list: std.ArrayList(*@import("nats").PullSubscription) = .empty;
         for (streams) |stream| {
             if (self.isDark(stream)) continue;
             const tl = self.tailFor(stream) catch |err| {
@@ -3564,7 +3566,7 @@ pub const SyncClient = struct {
         // (the stream was deleted, the grant withdrawn) sets that stream aside.
         for (mb.gone, 0..) |g, i| {
             if (!g) continue;
-            std.debug.print("{s}: tail consumer gone — reopening\n", .{live.items[i]});
+            log.warn("{s}: tail consumer gone — reopening", .{live.items[i]});
             const tl = self.tailFor(live.items[i]) catch |e| {
                 self.markDark(live.items[i], e);
                 continue;
@@ -3574,7 +3576,7 @@ pub const SyncClient = struct {
         // Messages come interleaved across streams; the applier positions per stream,
         // so group them (order within a stream is preserved).
         for (streams) |stream| {
-            var mine: std.ArrayListUnmanaged(*@import("nats").JetStreamMessage) = .empty;
+            var mine: std.ArrayList(*@import("nats").JetStreamMessage) = .empty;
             for (mb.messages) |m| {
                 if (std.mem.eql(u8, m.metadata.stream, stream)) try mine.append(a, m);
             }
@@ -3597,11 +3599,11 @@ pub const SyncClient = struct {
                 switch (self.tailHealth(stream, tl.sub.consumer_name, pos, now - tl.delivered_ms)) {
                     .fine => |to| if (to > pos) try self.persistSeq(stream, to),
                     .deaf => |pending| {
-                        std.debug.print("{s}: tail deaf — {d} message(s) pending on the server for {s}, nothing delivered for {d} s (position {d}); reopening\n", .{ stream, pending, tl.sub.consumer_name, @divTrunc(now - tl.delivered_ms, 1000), pos });
+                        log.warn("{s}: tail deaf — {d} message(s) pending on the server for {s}, nothing delivered for {d} s (position {d}); reopening", .{ stream, pending, tl.sub.consumer_name, @divTrunc(now - tl.delivered_ms, 1000), pos });
                         self.reopenTail(tl) catch |e| self.markDark(stream, e);
                     },
                     .gone => {
-                        std.debug.print("{s}: tail consumer {s} gone from the server (position {d}) — reopening\n", .{ stream, tl.sub.consumer_name, pos });
+                        log.warn("{s}: tail consumer {s} gone from the server (position {d}) — reopening", .{ stream, tl.sub.consumer_name, pos });
                         self.reopenTail(tl) catch |e| self.markDark(stream, e);
                     },
                     .pruned => |first| {
@@ -3609,10 +3611,10 @@ pub const SyncClient = struct {
                         // (the position is below first - 1) and brings every table on
                         // the stream to a chain cutoff at or past it — the deltas if the
                         // table changed, nothing if it did not — then resumes there.
-                        std.debug.print("{s}: the stream dropped {d} message(s) after position {d} before they were delivered — healing from the chain\n", .{ stream, first - pos - 1, pos });
+                        log.warn("{s}: the stream dropped {d} message(s) after position {d} before they were delivered — healing from the chain", .{ stream, first - pos - 1, pos });
                         self.reseed_pending = false;
-                        self.gapAndSeed(report_a, &seeded_map) catch |err| std.debug.print("{s}: re-seed after the prune failed: {s}\n", .{ stream, @errorName(err) });
-                        if (self.reseed_pending) std.debug.print("{s}: the gap stays open — waiting for the producer's next generation\n", .{stream});
+                        self.gapAndSeed(report_a, &seeded_map) catch |err| log.err("{s}: re-seed after the prune failed: {s}", .{ stream, @errorName(err) });
+                        if (self.reseed_pending) log.warn("{s}: the gap stays open — waiting for the producer's next generation", .{stream});
                     },
                 }
                 continue;
@@ -3652,11 +3654,11 @@ pub const SyncClient = struct {
                 };
                 if (cut != null) {
                     const first_here = pending[0].metadata.sequence.stream;
-                    std.debug.print("{s}: {d} message(s) pruned under the live consumer (position {d}, delivered {d}) — taking the gap: re-seeding the tables routed to it\n", .{ stream, first_here - last - 1, last, first_here });
+                    log.warn("{s}: {d} message(s) pruned under the live consumer (position {d}, delivered {d}) — taking the gap: re-seeding the tables routed to it", .{ stream, first_here - last - 1, last, first_here });
                     self.reseed_pending = false;
-                    self.gapAndSeed(report_a, &seeded_map) catch |err| std.debug.print("{s}: re-seed after the hole failed: {s}\n", .{ stream, @errorName(err) });
+                    self.gapAndSeed(report_a, &seeded_map) catch |err| log.err("{s}: re-seed after the hole failed: {s}", .{ stream, @errorName(err) });
                     if (self.reseed_pending) {
-                        std.debug.print("{s}: the hole stays open — waiting for the producer's next generation before moving past it\n", .{stream});
+                        log.warn("{s}: the hole stays open — waiting for the producer's next generation before moving past it", .{stream});
                         break;
                     }
                     // §10ja: the batch in hand was fetched BEFORE this re-seed, and the chain
@@ -3669,7 +3671,7 @@ pub const SyncClient = struct {
                     // is acked, not applied; zb-client-ts drops the batch in hand the same way.
                     const healed = try self.storedSeq(stream);
                     if (healed > last) {
-                        var beyond: std.ArrayListUnmanaged(*@import("nats").JetStreamMessage) = .empty;
+                        var beyond: std.ArrayList(*@import("nats").JetStreamMessage) = .empty;
                         for (pending) |m| {
                             if (m.metadata.sequence.stream > healed) try beyond.append(a, m) else m.ack() catch {};
                         }
@@ -3688,7 +3690,7 @@ pub const SyncClient = struct {
             // §10jc: a delivery lost — this tail is closed; the next poll reopens it from the
             // position and the server re-sends from the lost message on, in order.
             if ((try self.flowFor(stream)).gap) {
-                std.debug.print("{s}: reopening the tail from position {d} after a lost delivery\n", .{ stream, try self.storedSeq(stream) });
+                log.warn("{s}: reopening the tail from position {d} after a lost delivery", .{ stream, try self.storedSeq(stream) });
                 self.dropTail(stream);
                 self.resetFlow(stream);
             }
@@ -3696,7 +3698,7 @@ pub const SyncClient = struct {
         if (applied > 0) self.retryHeld(report_a, &changed_map);
         self.drainRebase();
         const settled = try self.drainVerdictsWith(0, 1);
-        self.heartbeatIfDue() catch |err| std.debug.print("heartbeat: {s}\n", .{@errorName(err)});
+        self.heartbeatIfDue() catch |err| log.info("heartbeat: {s}", .{@errorName(err)});
         return .{ .applied = applied, .settled = settled, .changed_tables = changed_map.keys(), .seeded = seeded_map.keys(), .unreadable = try self.unreadableTenants(report_a) };
     }
 
@@ -3788,7 +3790,7 @@ pub const SyncClient = struct {
     /// that arrived ahead of its children's (measured: 50 closed stations kept, §10hh);
     /// recognised, it is HELD and lands on the retry, as §10dg designed.
     fn fkRefused(self: *SyncClient) bool {
-        return std.ascii.indexOfIgnoreCase(self.st.errMsg(), "foreign key") != null;
+        return std.ascii.findIgnoreCase(self.st.errMsg(), "foreign key") != null;
     }
 
     /// §10q: the HLC floor, fed from every arriving row's version column — observed
@@ -3841,7 +3843,7 @@ pub const SyncClient = struct {
         const ps = &self.apply_stats;
         var t_ph = usMono();
         const Ev = struct { table: []const u8, ev: Value, seq: u64, stream: []const u8 };
-        var evs: std.ArrayListUnmanaged(Ev) = .empty;
+        var evs: std.ArrayList(Ev) = .empty;
         var tables_v: std.json.ObjectMap = .empty;
         var events_v = std.json.Array.init(a);
         for (cx.messages) |m| {
@@ -3927,7 +3929,7 @@ pub const SyncClient = struct {
                         try holdEvent(st_, a, e.table, e.ev, "unknown-column");
                     },
                     else => |err2| {
-                        std.debug.print("{s}: event at seq {d} aborted the batch: {s} — duckdb: {s}\n", .{ e.table, e.seq, @errorName(err2), st_.errMsg() });
+                        log.err("{s}: event at seq {d} aborted the batch: {s} — duckdb: {s}", .{ e.table, e.seq, @errorName(err2), st_.errMsg() });
                         return err2;
                     },
                 };
@@ -3950,14 +3952,14 @@ pub const SyncClient = struct {
                     if (std.mem.eql(u8, cn, pc)) break ci;
                 } else return error.ChainObjectMalformed;
             }
-            var slot: std.StringArrayHashMapUnmanaged(usize) = .empty;
-            var rows: std.ArrayListUnmanaged([]const storage.Value) = .empty;
+            var slot: std.array_hash_map.String(usize) = .empty;
+            var rows: std.ArrayList([]const storage.Value) = .empty;
             // §10jn: per key, whether its FIRST event in this segment is an INSERT — a key
             // born here, whose final row can be appended straight into the table.
-            var born: std.ArrayListUnmanaged(bool) = .empty;
+            var born: std.ArrayList(bool) = .empty;
             for (rows_v, 0..) |rv, ri_v| {
                 const cells = rv.array.items;
-                var key: std.ArrayListUnmanaged(u8) = .empty;
+                var key: std.ArrayList(u8) = .empty;
                 for (pk_idx) |ci| {
                     try key.appendSlice(a, try core.valueToString(a, cells[ci]));
                     try key.append(a, 0x1f);
@@ -3982,13 +3984,13 @@ pub const SyncClient = struct {
             // exactly the table's columns: a born key that is in fact already there (a
             // batch redelivered between commit and ack) makes the appender refuse, DuckDB
             // aborts the transaction, and applyBatch's second pass upserts every row.
-            const direct_order: ?[]const usize = if (cx.deferred and std.mem.indexOfScalar(bool, born.items, true) != null) try self.appendOrder(a, st_, table, cols) else null;
+            const direct_order: ?[]const usize = if (cx.deferred and std.mem.findScalar(bool, born.items, true) != null) try self.appendOrder(a, st_, table, cols) else null;
             var upsert_rows = rows.items;
             ps.shape += usMono() - t_ph;
             t_ph = usMono();
             if (direct_order) |order| {
-                var appended: std.ArrayListUnmanaged([]const storage.Value) = .empty;
-                var rest: std.ArrayListUnmanaged([]const storage.Value) = .empty;
+                var appended: std.ArrayList([]const storage.Value) = .empty;
+                var rest: std.ArrayList([]const storage.Value) = .empty;
                 for (rows.items, born.items) |r, is_born| {
                     if (!is_born) {
                         try rest.append(a, r);
@@ -3998,7 +4000,7 @@ pub const SyncClient = struct {
                     for (order, 0..) |ci, oi| out[oi] = r[ci];
                     try appended.append(a, out);
                 }
-                try st_.dkAppend(try a.dupeZ(u8, table), appended.items);
+                try st_.dkAppend(try a.dupeSentinel(u8, table, 0), appended.items);
                 ps.append += usMono() - t_ph;
                 ps.direct += 1;
                 if (rest.items.len > 0) ps.split += 1;
@@ -4105,7 +4107,7 @@ pub const SyncClient = struct {
     /// answer: a service is free to send a body that happens to have one of these keys.
     fn objectEnvelope(self: *SyncClient, a: std.mem.Allocator, body: []const u8) !?[]u8 {
         if (body.len == 0 or body[0] != '{') return null;
-        if (std.mem.indexOf(u8, body, "\"zb_object\"") == null) return null;
+        if (std.mem.find(u8, body, "\"zb_object\"") == null) return null;
         var sa = std.heap.ArenaAllocator.init(self.a);
         defer sa.deinit();
         const parsed = std.json.parseFromSlice(Value, sa.allocator(), body, .{}) catch return null;
@@ -4150,9 +4152,9 @@ pub const SyncClient = struct {
             applied: *usize,
             fn apply(cx: @This(), st_: *storage.Storage) !void {
                 // The engine's text is gone once the wrapper rolls back: say it here.
-                errdefer std.debug.print("ingest {s}: refused — {s}\n", .{ cx.table, st_.errMsg() });
+                errdefer log.warn("ingest {s}: refused — {s}", .{ cx.table, st_.errMsg() });
                 const sql = try core.chainUpsertSql(cx.a, cx.table, cx.cols, cx.st.pk, cx.vcol);
-                var keys_seen: std.ArrayListUnmanaged(storage.Value) = .empty;
+                var keys_seen: std.ArrayList(storage.Value) = .empty;
                 const pk_idx: ?usize = if (cx.st.pk.len == 1) (for (cx.cols, 0..) |cn, i| {
                     if (std.mem.eql(u8, cn, cx.st.pk[0])) break i;
                 } else null) else null;
@@ -4333,7 +4335,7 @@ pub const SyncClient = struct {
         // idempotent.
         _ = self.flushOutbox() catch |err| {
             // Kept, not lost: the entry is durable and the next flush retries.
-            std.debug.print("mutate: send failed ({any}) — queued as {s}\n", .{ err, msg_id });
+            log.err("mutate: send failed ({any}) — queued as {s}", .{ err, msg_id });
         };
         return try result_a.dupe(u8, msg_id);
     }
@@ -4368,7 +4370,7 @@ pub const SyncClient = struct {
         }
         const gate = try core.outboxWatermarkGate(a, entries, watermark);
 
-        var refused: std.StringArrayHashMapUnmanaged(void) = .empty;
+        var refused: std.array_hash_map.String(void) = .empty;
         for (gate.object.get("refuse").?.array.items) |v| try refused.put(a, v.string, {});
         // §10el: the grace — the bridge answers in milliseconds and its ack wait is ten
         // seconds; five leaves the subscription its turn and still replays a straggler
@@ -4404,10 +4406,10 @@ pub const SyncClient = struct {
                 // divergence. Restore and SAY SO — the user's edit is being dropped.
                 try self.revertOptimistic(a, r);
                 _ = try self.st.query(a, "DELETE FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = msg_id }});
-                std.debug.print(
+                log.warn(
                     "outbox: {s}[{s}] {s} predates the GC watermark ({s}) and CANNOT be sent — " ++
                         "its tombstone was reaped, so sending it would resurrect a deleted row " ++
-                        "(PROTOCOL MUST 6). Local copy reverted; this edit is lost.\n",
+                        "(PROTOCOL MUST 6). Local copy reverted; this edit is lost.",
                     .{ if (r[3] == .text) r[3].text else "?", if (r[4] == .text) r[4].text else "?", msg_id, watermark orelse "?" },
                 );
                 continue;
@@ -4416,7 +4418,7 @@ pub const SyncClient = struct {
             self.publishEnvelope(a, r[1].text, env, msg_id) catch |err| {
                 failed += 1;
                 last_err = err;
-                std.debug.print("outbox: {s} not sent ({any}) — still queued\n", .{ msg_id, err });
+                log.info("outbox: {s} not sent ({any}) — still queued", .{ msg_id, err });
                 continue;
             };
             sent += 1;
@@ -4426,7 +4428,7 @@ pub const SyncClient = struct {
                 self.sent_at.put(self.a, key, now_ms) catch self.a.free(key);
             } else |_| {}
         }
-        if (collected > 0) std.debug.print("outbox: collected {d} verdict(s) published while this client was away — settled without replay\n", .{collected});
+        if (collected > 0) log.info("outbox: collected {d} verdict(s) published while this client was away — settled without replay", .{collected});
         if (sent == 0 and failed > 0) return last_err.?;
         return sent;
     }
@@ -4453,7 +4455,7 @@ pub const SyncClient = struct {
             // whose every INSERT was rejected in silence (§10dx).
             const reason = reason0;
             const detail = if (v == .object) (if (v.object.get("detail")) |x| (if (x == .string) x.string else "") else "") else "";
-            std.debug.print("libzb: verdict {s} for {s}{s}{s}{s}{s}\n", .{ status, mid, if (reason.len > 0) " — " else "", reason, if (detail.len > 0) ": " else "", detail });
+            log.info("libzb: verdict {s} for {s}{s}{s}{s}{s}", .{ status, mid, if (reason.len > 0) " — " else "", reason, if (detail.len > 0) ": " else "", detail });
         }
         if (std.mem.eql(u8, status, "failed")) return false;
         if (std.mem.eql(u8, status, "rejected") or std.mem.eql(u8, status, "row_deleted")) {
@@ -4471,7 +4473,7 @@ pub const SyncClient = struct {
         // is kept aside instead — resubmitted if its columns are disjoint from the
         // winner's, dropped and surfaced otherwise (see `tryRebase`).
         if (std.mem.eql(u8, status, "stale")) {
-            self.holdForRebase(a, mid) catch |err| std.debug.print("libzb: rebase hold for {s} failed: {any}\n", .{ mid, err });
+            self.holdForRebase(a, mid) catch |err| log.err("libzb: rebase hold for {s} failed: {any}", .{ mid, err });
         }
         _ = try self.st.query(a, "DELETE FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
         return true;
@@ -4490,7 +4492,7 @@ pub const SyncClient = struct {
         if (rows.len != 1) return;
         const r = rows[0];
         if (r[0] != .text or r[1] != .text or r[2] != .text) return;
-        const dot = std.mem.lastIndexOfScalar(u8, r[0].text, '.') orelse return;
+        const dot = std.mem.findScalarLast(u8, r[0].text, '.') orelse return;
         if (!std.mem.eql(u8, r[0].text[dot + 1 ..], "update")) return;
         const env = try parseStoredJson(a, r[1].text);
         if (env != .object) return;
@@ -4521,7 +4523,7 @@ pub const SyncClient = struct {
         while (i < self.rebase.count()) {
             const mid = self.rebase.keys()[i];
             const done = self.tryRebase(ta.allocator(), mid) catch |err| blk: {
-                std.debug.print("libzb: rebase of {s} deferred: {any}\n", .{ mid, err });
+                log.info("libzb: rebase of {s} deferred: {any}", .{ mid, err });
                 self.rebase_due = true;
                 break :blk false;
             };
@@ -4537,7 +4539,7 @@ pub const SyncClient = struct {
         const vcol = st.version_col orelse return true;
         const key = try parseStoredJson(a, e.key);
         const cur = (try self.beforeImage(a, e.table, st, key)) orelse {
-            std.debug.print("libzb: rebase of {s} abandoned: the row is gone\n", .{mid});
+            log.warn("libzb: rebase of {s} abandoned: the row is gone", .{mid});
             return true;
         };
         if (cur != .object) return true;
@@ -4563,11 +4565,11 @@ pub const SyncClient = struct {
             }
         }
         if (overlap.items.len > 0) {
-            std.debug.print("libzb: {s} edit LOST to a newer version on the same column(s) {s} — the winning row stands; surface this to the user\n", .{ e.table, overlap.items });
+            log.warn("libzb: {s} edit LOST to a newer version on the same column(s) {s} — the winning row stands; surface this to the user", .{ e.table, overlap.items });
             return true;
         }
         const ver = try self.mutate(a, e.table, "UPDATE", key, values);
-        std.debug.print("libzb: rebased {s} of {s} onto the newer row as {s}\n", .{ mine.items, e.table, ver });
+        log.info("libzb: rebased {s} of {s} onto the newer row as {s}", .{ mine.items, e.table, ver });
         return true;
     }
 
@@ -4663,7 +4665,7 @@ pub const SyncClient = struct {
     /// call. Cooperative: this library obeys; the JWT revocation is the enforcement.
     fn hangUpRevoked(self: *SyncClient) error{Revoked} {
         self.revoked = true;
-        std.debug.print("{s}: REVOKED by the operator (mutation_ack.{s}.revoked) — hanging up now; every later call answers Revoked. The local rows stay; the wipe is the application's (zb_client_wipe).\n", .{ self.opts.principal, self.opts.principal });
+        log.info("{s}: REVOKED by the operator (mutation_ack.{s}.revoked) — hanging up now; every later call answers Revoked. The local rows stay; the wipe is the application's (zb_client_wipe).", .{ self.opts.principal, self.opts.principal });
         // The socket is dropped at the NEXT entry point, not here: this runs inside the
         // verdict drain, over a subscription the close would free under the loop's feet
         // (measured: SIGSEGV in the host right after the ban).
@@ -4749,8 +4751,8 @@ pub const SyncClient = struct {
         }
         const up = try self.updateOrUpsert(taa, table, st, op, data);
         _ = self.stepExec(taa, up) catch |err| {
-            std.debug.print(
-                "optimistic apply of {s} failed: {any} — sqlite: {s}\n",
+            log.err(
+                "optimistic apply of {s} failed: {any} — sqlite: {s}",
                 .{ table, err, self.st.errMsg() },
             );
             return err;
@@ -4890,7 +4892,7 @@ pub const SyncClient = struct {
         try self.gapAndSeed(null, null);
         try self.drainCdc();
         // A host that syncs before it ever polls is a client too (PROTOCOL §11).
-        self.heartbeatIfDue() catch |err| std.debug.print("heartbeat: {s}\n", .{@errorName(err)});
+        self.heartbeatIfDue() catch |err| log.info("heartbeat: {s}", .{@errorName(err)});
         return .{ .tenant = self.tenant, .tenants = self.tenants, .first = first };
     }
 
@@ -4901,7 +4903,7 @@ pub const SyncClient = struct {
     /// needs the tenant among its tags — a join outside the grant fails at the
     /// consumer, loudly, and is retried at the next poll like any unseeded table.
     pub fn join(self: *SyncClient, tenant: []const u8) !void {
-        if (tenant.len == 0 or std.mem.indexOfAny(u8, tenant, ".*> ") != null) return error.TenantMalformed;
+        if (tenant.len == 0 or std.mem.findAny(u8, tenant, ".*> ") != null) return error.TenantMalformed;
         for (self.tenants) |t| if (std.mem.eql(u8, t, tenant)) return;
         // Ask the broker FIRST (§10fo): a tenant outside the JWT's tags, or one whose
         // stream does not exist yet, answers here and the membership is never taken.
@@ -4913,12 +4915,12 @@ pub const SyncClient = struct {
             defer qa.deinit();
             const route = try self.routeFor(qa.allocator(), tenant);
             var info = self.t.js.getStreamInfo(route) catch |err| {
-                std.debug.print("tenant: join {s} refused — {s} is not readable with these credentials ({s}): not among the JWT's tenants, or its stream does not exist yet\n", .{ tenant, route, @errorName(err) });
+                log.warn("tenant: join {s} refused — {s} is not readable with these credentials ({s}): not among the JWT's tenants, or its stream does not exist yet", .{ tenant, route, @errorName(err) });
                 return error.JoinRefused;
             };
             info.deinit();
         }
-        var list: std.ArrayListUnmanaged([]const u8) = .empty;
+        var list: std.ArrayList([]const u8) = .empty;
         try list.appendSlice(self.aa(), self.tenants);
         try list.append(self.aa(), try self.aa().dupe(u8, tenant));
         std.mem.sort([]const u8, list.items, {}, lessStr);
@@ -4926,7 +4928,7 @@ pub const SyncClient = struct {
         self.tenant_missing = false;
         self.tenant = self.tenants[0];
         try self.refreshRoutes();
-        std.debug.print("tenant: joined {s} ({d} membership(s))\n", .{ tenant, self.tenants.len });
+        log.info("tenant: joined {s} ({d} membership(s))", .{ tenant, self.tenants.len });
         // Tables skipped for want of a tenant get their descriptor applied now; then
         // the unseeded (table, tenant) pairs seed. The tail opens at the next poll.
         try self.syncSchemas();
@@ -4940,7 +4942,7 @@ pub const SyncClient = struct {
     /// the verdict, not the membership, settles a write.
     pub fn leave(self: *SyncClient, tenant: []const u8) !void {
         var found = false;
-        var list: std.ArrayListUnmanaged([]const u8) = .empty;
+        var list: std.ArrayList([]const u8) = .empty;
         for (self.tenants) |t| {
             if (std.mem.eql(u8, t, tenant)) {
                 found = true;
@@ -4978,7 +4980,7 @@ pub const SyncClient = struct {
         }
         _ = try self.st.query(a, "DELETE FROM _zbz_stream_seq WHERE stream = ?", &.{.{ .text = route }});
         _ = self.dark.fetchOrderedRemove(route);
-        std.debug.print("tenant: left {s} ({d} membership(s) left)\n", .{ tenant, self.tenants.len });
+        log.info("tenant: left {s} ({d} membership(s) left)", .{ tenant, self.tenants.len });
     }
 
     /// The membership moved: every tenant-scoped table's routes follow it.
@@ -5042,9 +5044,10 @@ fn grammarMissing(path: []const []const u8) error{GrammarKeyMissing} {
     // Not under test: the grammar test provokes this on purpose, and the build
     // runner reports any stderr from a test step as a failed command.
     if (!@import("builtin").is_test) {
-        std.debug.print("grammar.json: required key missing or not a string: ", .{});
-        for (path, 0..) |k, i| std.debug.print("{s}{s}", .{ if (i > 0) "." else "", k });
-        std.debug.print("\n", .{});
+        var buf: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        for (path, 0..) |k, i| w.print("{s}{s}", .{ if (i > 0) "." else "", k }) catch break;
+        log.err("grammar.json: required key missing or not a string: {s}", .{w.buffered()});
     }
     return error.GrammarKeyMissing;
 }
@@ -5071,7 +5074,7 @@ pub fn execDdl(st: *storage.Storage, sql: []const u8) !void {
     const a = std.heap.c_allocator;
     if (st.engine == .duckdb) {
         // §10fl: no serial — a sequence, created first when the inbox needs one.
-        if (std.mem.indexOf(u8, sql, "INTEGER PRIMARY KEY AUTOINCREMENT") != null) try st.execSimple("CREATE SEQUENCE IF NOT EXISTS _zbz_inbox_seq");
+        if (std.mem.find(u8, sql, "INTEGER PRIMARY KEY AUTOINCREMENT") != null) try st.execSimple("CREATE SEQUENCE IF NOT EXISTS _zbz_inbox_seq");
         const d1 = try std.mem.replaceOwned(u8, a, sql, "INTEGER PRIMARY KEY AUTOINCREMENT", "BIGINT PRIMARY KEY DEFAULT nextval('_zbz_inbox_seq')");
         defer a.free(d1);
         const d2 = try std.mem.replaceOwned(u8, a, d1, " INTEGER", " BIGINT");
@@ -5134,7 +5137,7 @@ pub fn pruneInboxKey(st: *storage.Storage, a: std.mem.Allocator, table: []const 
         }
         if (same) {
             _ = try st.query(a, "DELETE FROM _zbz_inbox WHERE id = ?", &.{r[0]});
-            std.debug.print("{s}: a held event for a row deleted upstream was discarded\n", .{table});
+            log.info("{s}: a held event for a row deleted upstream was discarded", .{table});
         }
     }
 }
@@ -5163,7 +5166,7 @@ pub fn pruneInboxSeeded(st: *storage.Storage, a: std.mem.Allocator, table: []con
 pub fn pruneInboxDropped(st: *storage.Storage, a: std.mem.Allocator, table: []const u8) !void {
     const q = try st.query(a, "SELECT count(*) FROM _zbz_inbox WHERE tbl = ?", &.{.{ .text = table }});
     const k: i64 = if (q.len > 0 and q[0][0] == .integer) q[0][0].integer else 0;
-    if (k > 0) std.debug.print("{s}: discarding {d} held event(s) — the table was dropped upstream\n", .{ table, k });
+    if (k > 0) log.warn("{s}: discarding {d} held event(s) — the table was dropped upstream", .{ table, k });
     _ = try st.query(a, "DELETE FROM _zbz_inbox WHERE tbl = ?", &.{.{ .text = table }});
 }
 
@@ -5177,7 +5180,7 @@ pub fn discardOutbox(st: *storage.Storage, a: std.mem.Allocator, table: []const 
     const k: i64 = if (q.len > 0 and q[0][0] == .integer) q[0][0].integer else 0;
     if (k == 0) return;
     _ = try st.query(a, "DELETE FROM _zebridge_outbox WHERE tbl = ?", &.{.{ .text = table }});
-    std.debug.print("{s}: {d} queued write(s) discarded — the table was {s} — surface this to the user\n", .{ table, k, why });
+    log.info("{s}: {d} queued write(s) discarded — the table was {s} — surface this to the user", .{ table, k, why });
 }
 
 test "inbox: a held event survives closing the database, and a seed past it prunes it" {
@@ -5372,7 +5375,7 @@ fn maybeZstd(a: std.mem.Allocator, b: []const u8) ![]const u8 {
     // output grown as it fills.
     const dctx = C.ZSTD_createDCtx() orelse return error.ZstdDecompressFailed;
     defer _ = C.ZSTD_freeDCtx(dctx);
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     try out.ensureTotalCapacity(a, @max(b.len * 4, 64 * 1024));
     var in: C.ZSTD_inBuffer = .{ .src = b.ptr, .size = b.len, .pos = 0 };
@@ -5681,7 +5684,7 @@ const StreamInflate = struct {
     in: C.ZSTD_inBuffer,
     sniffed: bool = false,
     plain: bool = false,
-    window: std.ArrayListUnmanaged(u8) = .empty,
+    window: std.ArrayList(u8) = .empty,
     consumed: usize = 0,
     src_eof: bool = false,
     eof: bool = false,
@@ -6109,7 +6112,7 @@ test "migrateTable: create, ALTER add/remove, rename hint, FK change rebuilds �
     rows = try st.query(aa_, "SELECT c FROM t", &.{});
     try std.testing.expectEqual(1, rows.len);
     try std.testing.expectEqualStrings("kept", rows[0][0].text);
-    try std.testing.expect(std.mem.indexOf(u8, (try st.query(aa_, "SELECT sql FROM sqlite_master WHERE name='t'", &.{}))[0][0].text, "FOREIGN KEY") != null);
+    try std.testing.expect(std.mem.find(u8, (try st.query(aa_, "SELECT sql FROM sqlite_master WHERE name='t'", &.{}))[0][0].text, "FOREIGN KEY") != null);
     try std.testing.expectEqual(1, (try st.query(aa_, "SELECT name FROM sqlite_master WHERE type='index' AND name='t_c'", &.{})).len);
     try std.testing.expectEqual(SyncClient.Migration.unchanged, try SyncClient.migrateTable(&st, aa_, "t", d4));
     // and the FK is live again after the surgery
@@ -6124,7 +6127,7 @@ test "migrateTable: create, ALTER add/remove, rename hint, FK change rebuilds �
     try std.testing.expectEqual(SyncClient.Migration.rebuilt, try SyncClient.migrateTable(&st, aa_, "t", d5));
     rows = try st.query(aa_, "SELECT c FROM t", &.{});
     try std.testing.expectEqual(1, rows.len);
-    try std.testing.expect(std.mem.indexOf(u8, (try st.query(aa_, "SELECT sql FROM sqlite_master WHERE name='t'", &.{}))[0][0].text, "\"c\" REAL") != null);
+    try std.testing.expect(std.mem.find(u8, (try st.query(aa_, "SELECT sql FROM sqlite_master WHERE name='t'", &.{}))[0][0].text, "\"c\" REAL") != null);
     try std.testing.expectEqual(SyncClient.Migration.unchanged, try SyncClient.migrateTable(&st, aa_, "t", d5));
 
     // 6. §10dg re-key: the pk uid TEXT → INTEGER (the bigserial→uuid shape, mirrored).
@@ -6136,7 +6139,7 @@ test "migrateTable: create, ALTER add/remove, rename hint, FK change rebuilds �
     );
     try std.testing.expectEqual(SyncClient.Migration.rekeyed, try SyncClient.migrateTable(&st, aa_, "t", d6));
     try std.testing.expectEqual(0, (try st.query(aa_, "SELECT uid FROM t", &.{})).len);
-    try std.testing.expect(std.mem.indexOf(u8, (try st.query(aa_, "SELECT sql FROM sqlite_master WHERE name='t'", &.{}))[0][0].text, "\"uid\" INTEGER NOT NULL PRIMARY KEY") != null);
+    try std.testing.expect(std.mem.find(u8, (try st.query(aa_, "SELECT sql FROM sqlite_master WHERE name='t'", &.{}))[0][0].text, "\"uid\" INTEGER NOT NULL PRIMARY KEY") != null);
     try std.testing.expectEqualStrings("[[\"uid\",\"INTEGER\"]]", (try st.query(aa_, "SELECT key_shape FROM _zbz_shape WHERE tbl='t'", &.{}))[0][0].text);
     try std.testing.expectEqual(1, (try st.query(aa_, "SELECT name FROM sqlite_master WHERE type='view' AND name='t_view'", &.{})).len);
     try std.testing.expectEqual(SyncClient.Migration.unchanged, try SyncClient.migrateTable(&st, aa_, "t", d6));
@@ -6146,7 +6149,7 @@ test "migrateTable: create, ALTER add/remove, rename hint, FK change rebuilds �
         \\ "foreign_keys":[],"indexes":[]}
     );
     try std.testing.expectEqual(SyncClient.Migration.rekeyed, try SyncClient.migrateTable(&st, aa_, "t", d7));
-    try std.testing.expect(std.mem.indexOf(u8, (try st.query(aa_, "SELECT sql FROM sqlite_master WHERE name='t'", &.{}))[0][0].text, "PRIMARY KEY (\"uid\", \"c\")") != null);
+    try std.testing.expect(std.mem.find(u8, (try st.query(aa_, "SELECT sql FROM sqlite_master WHERE name='t'", &.{}))[0][0].text, "PRIMARY KEY (\"uid\", \"c\")") != null);
 }
 
 test "migrateTable: a suspension descriptor is an error, never a panic" {
@@ -6174,7 +6177,7 @@ test "maybeZstd: a frame without its content size inflates (§10gi)" {
         const cctx = C.ZSTD_createCCtx().?;
         defer _ = C.ZSTD_freeCCtx(cctx);
         // Streamed in small pieces, like the producer's full: no size in the header.
-        var z: std.ArrayListUnmanaged(u8) = .empty;
+        var z: std.ArrayList(u8) = .empty;
         // (A first call with ZSTD_e_end and all the input would state the size.)
         var chunk: [4096]u8 = undefined;
         var fed: usize = 0;

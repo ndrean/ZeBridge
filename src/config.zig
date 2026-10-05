@@ -112,15 +112,15 @@ pub const Nats = struct {
 
             // A trailing path is not part of the address. `nats://host:4222/` is a URL a
             // person will reasonably type, and parsing "4222/" as a port fails.
-            if (std.mem.indexOfScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
+            if (std.mem.findScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
 
             var out = Endpoint{ .tls = is_tls };
 
             // Rightmost '@': a password may legally contain one.
-            if (std.mem.lastIndexOfScalar(u8, rest, '@')) |at| {
+            if (std.mem.findScalarLast(u8, rest, '@')) |at| {
                 const creds = rest[0..at];
                 rest = rest[at + 1 ..];
-                if (std.mem.indexOfScalar(u8, creds, ':')) |colon| {
+                if (std.mem.findScalar(u8, creds, ':')) |colon| {
                     out.user = creds[0..colon];
                     out.pass = creds[colon + 1 ..];
                 } else if (creds.len > 0) {
@@ -128,7 +128,7 @@ pub const Nats = struct {
                 }
             }
 
-            if (std.mem.lastIndexOfScalar(u8, rest, ':')) |colon| {
+            if (std.mem.findScalarLast(u8, rest, ':')) |colon| {
                 out.host = rest[0..colon];
                 out.port = std.fmt.parseInt(u16, rest[colon + 1 ..], 10) catch return error.BadPort;
             } else {

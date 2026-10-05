@@ -6,6 +6,7 @@
 //! generation, nonce signing) is nats.zig's own nkeys.zig; nothing to add.
 
 const std = @import("std");
+const log = std.log.scoped(.libzb);
 const android_io = @import("android_io.zig"); // Android: names through getaddrinfo (§10ln)
 const nats = @import("nats");
 
@@ -152,7 +153,7 @@ pub const ObjectPull = struct {
                     error.NoResponders, error.ConsumerSequenceMismatch => {
                         if (reopened >= 5) return err;
                         reopened += 1;
-                        std.debug.print("object reader: consumer gone at chunk {d} of {d} ({s}) — reopening from stream seq {d}\n", .{ self.chunk_index, self.chunks, @errorName(err), self.next_seq });
+                        log.warn("object reader: consumer gone at chunk {d} of {d} ({s}) — reopening from stream seq {d}", .{ self.chunk_index, self.chunks, @errorName(err), self.next_seq });
                         const fresh = try openChunks(self.t, self.a, self.stream, self.chunk_subject, self.next_seq);
                         self.sub.deinit();
                         self.sub = fresh;

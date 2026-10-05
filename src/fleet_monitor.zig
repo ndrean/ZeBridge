@@ -106,7 +106,7 @@ pub const Registry = struct {
         // Per-tenant live count, always emitted (a tenant with zero live clients is a
         // fact worth graphing, but a tenant we have never heard of is not — only the
         // tenants present in the bucket appear).
-        var counts: std.StringArrayHashMapUnmanaged(usize) = .empty;
+        var counts: std.array_hash_map.String(usize) = .empty;
         defer counts.deinit(self.allocator);
         for (self.clients) |cl| {
             const gop = try counts.getOrPut(self.allocator, cl.tenant);
@@ -259,7 +259,7 @@ pub const FleetMonitor = struct {
         };
         defer if (keys) |*k| k.deinit();
 
-        var heads: std.StringArrayHashMapUnmanaged(u64) = .empty;
+        var heads: std.array_hash_map.String(u64) = .empty;
         var clients: std.ArrayList(Client) = .empty;
         const now_ms = utils.unixMillis();
 
@@ -283,7 +283,7 @@ pub const FleetMonitor = struct {
             // The key is the identity: `<tenant>.<principal>` — both subject tokens, so
             // the first dot is the boundary. The payload repeats them for readers of the
             // bucket itself; the key is what the JWT grant scoped.
-            const dot = std.mem.indexOfScalar(u8, key, '.') orelse continue;
+            const dot = std.mem.findScalar(u8, key, '.') orelse continue;
             const tenant = try a.dupe(u8, key[0..dot]);
             const principal = try a.dupe(u8, key[dot + 1 ..]);
             const ts: i64 = if (o.get("ts")) |v| (if (v == .integer) v.integer else 0) else 0;
@@ -314,7 +314,7 @@ pub const FleetMonitor = struct {
     /// A stream that does not exist yet (a tenant enrolled before its first row) is
     /// skipped, not failed. Short windows are SAID every poll while they last: a
     /// breached floor is not routine.
-    fn windowOf(self: *FleetMonitor, js: nats.JetStream, heads: *std.StringArrayHashMapUnmanaged(u64), windows: *std.ArrayList(StreamWindow), a: std.mem.Allocator, stream: []const u8, now_ms: i64) !void {
+    fn windowOf(self: *FleetMonitor, js: nats.JetStream, heads: *std.array_hash_map.String(u64), windows: *std.ArrayList(StreamWindow), a: std.mem.Allocator, stream: []const u8, now_ms: i64) !void {
         var info = js.getStreamInfo(stream) catch return;
         defer info.deinit();
         const st = info.value.state;
@@ -334,7 +334,7 @@ pub const FleetMonitor = struct {
         try windows.append(a, .{ .stream = name, .messages = st.messages, .bytes = st.bytes, .first_seq = st.first_seq, .window_seconds = window, .short = short });
     }
 
-    fn headOf(self: *FleetMonitor, js: nats.JetStream, heads: *std.StringArrayHashMapUnmanaged(u64), a: std.mem.Allocator, stream: []const u8) !u64 {
+    fn headOf(self: *FleetMonitor, js: nats.JetStream, heads: *std.array_hash_map.String(u64), a: std.mem.Allocator, stream: []const u8) !u64 {
         _ = self;
         if (heads.get(stream)) |h| return h;
         var info = js.getStreamInfo(stream) catch {

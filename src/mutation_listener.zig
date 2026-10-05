@@ -409,7 +409,7 @@ const TableMeta = struct {
 /// Every identifier reaching SQL passes through here. The names themselves come from the
 /// catalog, so the escaping is belt-and-braces rather than the primary defence — but it
 /// is what makes that claim checkable in one place.
-fn appendIdent(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, ident: []const u8) !void {
+fn appendIdent(out: *std.ArrayList(u8), alloc: std.mem.Allocator, ident: []const u8) !void {
     try out.append(alloc, '"');
     for (ident) |ch| {
         if (ch == '"') try out.append(alloc, '"');
@@ -1001,7 +1001,7 @@ pub const MutationListener = struct {
         if (self.tenant_cache.get(principal)) |t| return t;
         const cn = conn orelse return "";
         var pbuf: [128]u8 = undefined;
-        const pz = std.fmt.bufPrintZ(&pbuf, "{s}", .{principal}) catch return "";
+        const pz = std.fmt.bufPrintSentinel(&pbuf, "{s}", .{principal}, 0) catch return "";
         const params = [_]?[*:0]const u8{pz.ptr};
         const res = c.PQexecParams(cn, "SELECT tenant_id::text FROM public.zebridge_user_tenants WHERE principal = $1 ORDER BY tenant_id LIMIT 1", 1, null, &params[0], null, null, 0);
         defer c.PQclear(res);
@@ -1167,7 +1167,7 @@ pub const MutationListener = struct {
 
     const BatchCtx = struct {
         arena: std.heap.ArenaAllocator,
-        pending: std.ArrayListUnmanaged(Pending) = .empty,
+        pending: std.ArrayList(Pending) = .empty,
         entered: bool = false,
 
         const Pending = struct {
@@ -1211,7 +1211,7 @@ pub const MutationListener = struct {
         defer bc.pending.deinit(self.allocator);
 
         const Parsed = struct { msg: *nats.JetStreamMessage, mutation: Mutation };
-        var parsed: std.ArrayListUnmanaged(Parsed) = .empty;
+        var parsed: std.ArrayList(Parsed) = .empty;
         defer parsed.deinit(self.allocator);
         // Outside pipeline mode, once for the whole batch (§10km).
         self.refreshGcWatermark(conn);
@@ -1316,7 +1316,7 @@ pub const MutationListener = struct {
             bc.entered = true;
         }
         const a = bc.arena.allocator();
-        const principal_z = try a.dupeZ(u8, mutation.principal);
+        const principal_z = try a.dupeSentinel(u8, mutation.principal, 0);
         const set_params = [_]?[*:0]const u8{principal_z.ptr};
         const set_sql = "SELECT set_config('" ++ config.Sync.principal_setting ++ "', $1, true)";
         if (c.PQsendQueryParams(conn, set_sql, 1, null, &set_params[0], null, null, 0) != 1 or
@@ -1336,10 +1336,10 @@ pub const MutationListener = struct {
             return error.MutationFailed;
         }
         // The classify materials outlive handleMutation's arena — copy them.
-        const csql = try a.dupeZ(u8, classify_sql);
+        const csql = try a.dupeSentinel(u8, classify_sql, 0);
         const cps = try a.alloc(?[*:0]const u8, classify_params.len);
         for (classify_params, 0..) |cp, k| {
-            cps[k] = if (cp) |v| (try a.dupeZ(u8, std.mem.span(v))).ptr else null;
+            cps[k] = if (cp) |v| (try a.dupeSentinel(u8, std.mem.span(v), 0)).ptr else null;
         }
         try bc.pending.append(self.allocator, .{
             .msg = undefined, // the caller stamps it right after handleMutation returns
@@ -1569,7 +1569,7 @@ pub const MutationListener = struct {
         // which is what a client author needs and what the schema descriptor cannot tell
         // them. The full text stays in the operator's log via `log.err`.
         const first_line = blk: {
-            const nl = std.mem.indexOfScalar(u8, message, '\n') orelse break :blk message;
+            const nl = std.mem.findScalar(u8, message, '\n') orelse break :blk message;
             break :blk message[0..nl];
         };
 
@@ -1876,7 +1876,7 @@ pub const MutationListener = struct {
             \\ORDER BY a.attnum
         ;
 
-        const table_z = try alloc.dupeZ(u8, table);
+        const table_z = try alloc.dupeSentinel(u8, table, 0);
         defer alloc.free(table_z);
         const params = [_]?[*:0]const u8{table_z.ptr};
 
@@ -1969,7 +1969,7 @@ pub const MutationListener = struct {
         var cat_res: ?*c.PGresult = null;
         defer if (cat_res) |res_| c.PQclear(res_);
         if (conn) |cn| {
-            const tbl_z = try alloc.dupeZ(u8, table);
+            const tbl_z = try alloc.dupeSentinel(u8, table, 0);
             defer alloc.free(tbl_z);
             const cat_params = [_]?[*:0]const u8{tbl_z.ptr};
             cat_res = c.PQexecParams(cn, "SELECT version_col::text, COALESCE(tombstone_col::text, ''), COALESCE(tiebreak_col::text, '') FROM public.zebridge_catalogue WHERE tbl = $1", 1, null, &cat_params, null, null, 0);
@@ -2238,7 +2238,7 @@ pub const MutationListener = struct {
     /// including the ones that succeeded, which is the price of being able to answer
     /// without a second exchange in the cases that did not.
     fn buildClassify(alloc: std.mem.Allocator, meta: *const TableMeta, table: []const u8) ![]const u8 {
-        var out: std.ArrayListUnmanaged(u8) = .empty;
+        var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(alloc, "SELECT ");
         if (meta.tombstone_col) |tombstone| {
             try appendIdent(&out, alloc, tombstone);
@@ -2286,7 +2286,7 @@ pub const MutationListener = struct {
         meta: *const TableMeta,
         version_param: usize,
     ) ![]const u8 {
-        var out: std.ArrayListUnmanaged(u8) = .empty;
+        var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(alloc, " RETURNING ");
         if (meta.version_type.wireFormat()) |wire| {
             try out.appendSlice(alloc, wire.prefix);
@@ -2356,7 +2356,7 @@ pub const MutationListener = struct {
     /// existing row — the table in `ON CONFLICT DO UPDATE`, nothing in a plain UPDATE).
     fn versionStoreExpr(alloc: std.mem.Allocator, meta: *const TableMeta, qualifier: ?[]const u8, n: usize) ![]const u8 {
         if (meta.version_type != .integer) return renderVersionExpr(alloc, meta, n);
-        var out: std.ArrayListUnmanaged(u8) = .empty;
+        var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "LEAST(${d}::bigint, ", .{n}));
         if (qualifier) |q| {
             try appendIdent(&out, alloc, q);
@@ -2461,7 +2461,7 @@ pub const MutationListener = struct {
             try vals.append(alloc, cid);
         }
 
-        var sql: std.ArrayListUnmanaged(u8) = .empty;
+        var sql: std.ArrayList(u8) = .empty;
         try sql.appendSlice(alloc, "INSERT INTO ");
         try appendIdent(&sql, alloc, mutation.table);
         try sql.appendSlice(alloc, " (");
@@ -2659,7 +2659,7 @@ pub const MutationListener = struct {
         // value; the version column stores at most one step up.
         const version_expr = try versionGuardExpr(alloc, meta, version_param);
 
-        var sql: std.ArrayListUnmanaged(u8) = .empty;
+        var sql: std.ArrayList(u8) = .empty;
         try sql.appendSlice(alloc, "UPDATE ");
         try appendIdent(&sql, alloc, mutation.table);
         try sql.appendSlice(alloc, " SET ");
@@ -2733,7 +2733,7 @@ pub const MutationListener = struct {
         key_values: []const ?[*:0]const u8,
         version_text: [*:0]const u8,
     ) !void {
-        var sql: std.ArrayListUnmanaged(u8) = .empty;
+        var sql: std.ArrayList(u8) = .empty;
         var params: std.ArrayList(?[*:0]const u8) = .empty;
 
         // `$1` capped at the database's clock, exactly as the upsert caps it — see
@@ -2819,10 +2819,10 @@ pub const MutationListener = struct {
         //
         // Returns no row when the last-write-wins guard rejects the write, which is the
         // same signal as the zero row count already handled below.
-        var full: std.ArrayListUnmanaged(u8) = .empty;
+        var full: std.ArrayList(u8) = .empty;
         try full.appendSlice(alloc, sql);
         try full.appendSlice(alloc, returning);
-        const sql_z = try alloc.dupeZ(u8, full.items);
+        const sql_z = try alloc.dupeSentinel(u8, full.items, 0);
         log.debug("mutation [{s}] {s}", .{ mutation.principal, sql_z });
 
         // ── The principal, handed to PostgreSQL so its policies can use it ──────────
@@ -2904,7 +2904,7 @@ pub const MutationListener = struct {
             }
         }
 
-        const principal_z = try alloc.dupeZ(u8, mutation.principal);
+        const principal_z = try alloc.dupeSentinel(u8, mutation.principal, 0);
         const set_params = [_]?[*:0]const u8{principal_z.ptr};
         const set_sql = "SELECT set_config('" ++ config.Sync.principal_setting ++ "', $1, true)";
 
@@ -2921,7 +2921,7 @@ pub const MutationListener = struct {
             ) != 1 or
             c.PQsendQueryParams(
                 conn,
-                (alloc.dupeZ(u8, classify_sql) catch return error.MutationFailed).ptr,
+                (alloc.dupeSentinel(u8, classify_sql, 0) catch return error.MutationFailed).ptr,
                 @intCast(classify_params.len),
                 null,
                 if (classify_params.len > 0) &classify_params[0] else null,
@@ -3176,25 +3176,25 @@ pub const MutationListener = struct {
             .nil => return null,
             .bool => |b| return if (b) "true" else "false",
             .int => |i| {
-                const s = try alloc.dupeZ(u8, try std.fmt.allocPrint(alloc, "{d}", .{i}));
+                const s = try alloc.dupeSentinel(u8, try std.fmt.allocPrint(alloc, "{d}", .{i}), 0);
                 return s.ptr;
             },
             .uint => |u| {
-                const s = try alloc.dupeZ(u8, try std.fmt.allocPrint(alloc, "{d}", .{u}));
+                const s = try alloc.dupeSentinel(u8, try std.fmt.allocPrint(alloc, "{d}", .{u}), 0);
                 return s.ptr;
             },
             .float => |f| {
-                const s = try alloc.dupeZ(u8, try std.fmt.allocPrint(alloc, "{d}", .{f}));
+                const s = try alloc.dupeSentinel(u8, try std.fmt.allocPrint(alloc, "{d}", .{f}), 0);
                 return s.ptr;
             },
             .str => |str| {
-                const s = try alloc.dupeZ(u8, str.value());
+                const s = try alloc.dupeSentinel(u8, str.value(), 0);
                 return s.ptr;
             },
             // §10ex: bytes into a column that is not bytea — text as they are; PostgreSQL
             // judges them like any other text.
             .bin => |b| {
-                const s = try alloc.dupeZ(u8, b.value());
+                const s = try alloc.dupeSentinel(u8, b.value(), 0);
                 return s.ptr;
             },
             else => return error.UnsupportedPayloadType,
@@ -3319,7 +3319,7 @@ test "the bridge's own tables are never writable from the edge" {
 
 test "identifiers are quoted, and an embedded quote cannot escape" {
     const alloc = testing.allocator;
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
 
     try appendIdent(&out, alloc, "users");
@@ -3354,9 +3354,9 @@ test "rememberFailure: newlines and quotes cannot break the JSON body" {
 
     l.rememberFailure("23502", "ERROR:  null value\nDETAIL:  Failing row contains \"x\"");
     const got = l.lastError();
-    try std.testing.expect(std.mem.indexOfScalar(u8, got, '\n') == null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, got, '"') == null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "null value") != null);
+    try std.testing.expect(std.mem.findScalar(u8, got, '\n') == null);
+    try std.testing.expect(std.mem.findScalar(u8, got, '"') == null);
+    try std.testing.expect(std.mem.find(u8, got, "null value") != null);
 }
 
 test "rememberFailure: an over-long message truncates instead of overflowing" {
@@ -3417,10 +3417,10 @@ test "rememberFailure: DETAIL never reaches the verdict" {
         "ERROR:  duplicate key value violates unique constraint \"users_email_key\"\nDETAIL:  Key (email)=(alice@example.com) already exists.",
     );
     const got = l.lastError();
-    try std.testing.expect(std.mem.indexOf(u8, got, "alice@example.com") == null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "DETAIL") == null);
+    try std.testing.expect(std.mem.find(u8, got, "alice@example.com") == null);
+    try std.testing.expect(std.mem.find(u8, got, "DETAIL") == null);
     // The actionable half survives: which constraint was violated.
-    try std.testing.expect(std.mem.indexOf(u8, got, "users_email_key") != null);
+    try std.testing.expect(std.mem.find(u8, got, "users_email_key") != null);
 }
 
 test "rememberFailure: the column name survives for a NOT NULL violation" {
@@ -3435,8 +3435,8 @@ test "rememberFailure: the column name survives for a NOT NULL violation" {
         "ERROR:  null value in column \"inserted_at\" of relation \"test_types\" violates not-null constraint\nDETAIL:  Failing row contains (uuid, null, secret).",
     );
     const got = l.lastError();
-    try std.testing.expect(std.mem.indexOf(u8, got, "inserted_at") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "secret") == null);
+    try std.testing.expect(std.mem.find(u8, got, "inserted_at") != null);
+    try std.testing.expect(std.mem.find(u8, got, "secret") == null);
 }
 
 // ─── array / json literal tests ─────────────────────────────────────────────
@@ -3514,8 +3514,8 @@ test "json: an object, with the string escapes jsonb needs" {
     const got = try jsonLit(a, m);
     defer a.free(got);
     // Key order follows the map's iteration order, so assert on the pieces.
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"cycle\":355") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"quote\":\"say \\\"hi\\\"\"") != null);
+    try std.testing.expect(std.mem.find(u8, got, "\"cycle\":355") != null);
+    try std.testing.expect(std.mem.find(u8, got, "\"quote\":\"say \\\"hi\\\"\"") != null);
     try std.testing.expect(got[0] == '{' and got[got.len - 1] == '}');
 }
 

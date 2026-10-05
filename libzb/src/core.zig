@@ -232,7 +232,7 @@ pub fn pgTsToWire(a: std.mem.Allocator, v: []const u8) ![]const u8 {
 
 /// core.ts lsnToNumber: "2/97B6ED8" -> hi * 2^32 + lo.
 pub fn lsnToNumber(lsn: []const u8) i64 {
-    const slash = std.mem.indexOfScalar(u8, lsn, '/') orelse return 0;
+    const slash = std.mem.findScalar(u8, lsn, '/') orelse return 0;
     const hi = std.fmt.parseInt(i64, lsn[0..slash], 16) catch 0;
     const lo = std.fmt.parseInt(i64, lsn[slash + 1 ..], 16) catch 0;
     return hi * 0x1_0000_0000 + lo;
@@ -482,7 +482,7 @@ pub fn heartbeatPayload(a: std.mem.Allocator, principal: []const u8, tenant: []c
 pub const VecKind = enum { vector, halfvec, sparsevec, bit };
 
 pub fn vecLiteral(a: std.mem.Allocator, kind: VecKind, bytes: []const u8, bits: u32) error{ OutOfMemory, InvalidVector }![]const u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     switch (kind) {
         .vector, .halfvec => {
@@ -778,9 +778,9 @@ pub fn planCdcBulk(a: std.mem.Allocator, engine: []const u8, tables: Value, even
         events: std.json.Array,
     };
     var out = std.json.Array.init(a);
-    var open: std.StringArrayHashMapUnmanaged(Group) = .empty;
+    var open: std.array_hash_map.String(Group) = .empty;
     const Closer = struct {
-        fn close(a_: std.mem.Allocator, out_: *std.json.Array, open_: *std.StringArrayHashMapUnmanaged(Group), table: []const u8) !void {
+        fn close(a_: std.mem.Allocator, out_: *std.json.Array, open_: *std.array_hash_map.String(Group), table: []const u8) !void {
             const g = open_.get(table) orelse return;
             _ = open_.orderedRemove(table);
             var cols = std.json.Array.init(a_);
@@ -1324,12 +1324,12 @@ pub fn rebuildSteps(a: std.mem.Allocator, table: []const u8, cols: std.json.Arra
 pub const TableSet = struct { follow: []const []const u8, ondemand: []const []const u8 };
 
 pub fn tableSet(a: std.mem.Allocator, all: bool, tables: []const []const u8, ondemand: []const []const u8, keys: []const []const u8) !TableSet {
-    var od: std.ArrayListUnmanaged([]const u8) = .empty;
+    var od: std.ArrayList([]const u8) = .empty;
     for (ondemand) |t| {
         if (t.len == 0 or contains(od.items, t)) continue;
         try od.append(a, t);
     }
-    var follow: std.ArrayListUnmanaged([]const u8) = .empty;
+    var follow: std.ArrayList([]const u8) = .empty;
     const src = if (all) keys else tables;
     for (src) |t| {
         if (t.len == 0 or contains(od.items, t) or contains(follow.items, t)) continue;
@@ -1448,7 +1448,7 @@ pub fn isReadOnlySql(sql: []const u8) bool {
     var s = std.mem.trim(u8, buf[0..n], " \t\r\n");
     if (s.len == 0) return false;
     s = std.mem.trimEnd(u8, s, "; \t\r\n");
-    if (std.mem.indexOfScalar(u8, s, ';') != null) return false;
+    if (std.mem.findScalar(u8, s, ';') != null) return false;
     var end: usize = 0;
     while (end < s.len and (std.ascii.isAlphabetic(s[end]) or s[end] == '_')) end += 1;
     const first = s[0..end];
@@ -1458,13 +1458,13 @@ pub fn isReadOnlySql(sql: []const u8) bool {
     if (!ok) return false;
     const writes = [_][]const u8{ "insert", "update", "delete", "replace", "drop", "alter", "create", "attach", "detach", "vacuum", "reindex", "truncate" };
     for (writes) |w| if (containsWord(s, w)) return false;
-    if (std.mem.eql(u8, first, "pragma") and std.mem.indexOfScalar(u8, s, '=') != null) return false;
+    if (std.mem.eql(u8, first, "pragma") and std.mem.findScalar(u8, s, '=') != null) return false;
     return true;
 }
 
 fn containsWord(s: []const u8, w: []const u8) bool {
     var from: usize = 0;
-    while (std.mem.indexOfPos(u8, s, from, w)) |at| {
+    while (std.mem.findPos(u8, s, from, w)) |at| {
         const before_ok = at == 0 or !(std.ascii.isAlphanumeric(s[at - 1]) or s[at - 1] == '_');
         const after = at + w.len;
         const after_ok = after >= s.len or !(std.ascii.isAlphanumeric(s[after]) or s[after] == '_');
@@ -1616,7 +1616,7 @@ pub fn fkTextDiffers(a: std.mem.Allocator, ddl: []const u8, fk_clauses: []const 
     }
     const want_n = try collapseWs(a, want);
     const ddl_n = try collapseWs(a, ddl);
-    return std.mem.indexOf(u8, ddl_n, want_n) == null;
+    return std.mem.find(u8, ddl_n, want_n) == null;
 }
 
 /// core.ts viewSteps: the plumbing-column exclusion.

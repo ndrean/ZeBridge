@@ -375,7 +375,7 @@ fn optStrArray(a: std.mem.Allocator, root: std.json.ObjectMap, key: []const u8) 
         .array => |x| x,
         else => return &.{},
     };
-    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    var out: std.ArrayList([]const u8) = .empty;
     for (arr.items) |item| switch (item) {
         .string => |sv| try out.append(a, try a.dupe(u8, sv)),
         else => {},
@@ -453,7 +453,7 @@ pub fn tenantsValue(arena: std.mem.Allocator, tenants: []const []const u8) ![]u8
             return std.mem.lessThan(u8, x, y);
         }
     }.lt);
-    var value: std.ArrayListUnmanaged(u8) = .empty;
+    var value: std.ArrayList(u8) = .empty;
     try value.append(arena, '[');
     for (sorted, 0..) |t, i| {
         if (i > 0) try value.append(arena, ',');
@@ -484,7 +484,7 @@ pub fn render(
     args: []const Arg,
     diag: ?*Diagnostic,
 ) RenderError![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
     // One bit per argument; every one must be consumed.
@@ -520,9 +520,9 @@ pub fn render(
         // Expect `{[name]x}`.
         if (i + 1 >= pattern.len or pattern[i + 1] != '[') return RenderError.MalformedPattern;
         const name_start = i + 2;
-        const name_end = std.mem.indexOfScalarPos(u8, pattern, name_start, ']') orelse
+        const name_end = std.mem.findScalarPos(u8, pattern, name_start, ']') orelse
             return RenderError.MalformedPattern;
-        const close = std.mem.indexOfScalarPos(u8, pattern, name_end, '}') orelse
+        const close = std.mem.findScalarPos(u8, pattern, name_end, '}') orelse
             return RenderError.MalformedPattern;
 
         const name = pattern[name_start..name_end];

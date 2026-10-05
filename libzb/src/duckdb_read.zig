@@ -25,7 +25,7 @@ pub fn readResult(a: std.mem.Allocator, res: *dk.duckdb_result, want_names: bool
     if (want_names) for (cols, 0..) |*nm, i| {
         nm.* = try a.dupe(u8, std.mem.span(D().duckdb_column_name(res, @intCast(i))));
     };
-    var rows: std.ArrayListUnmanaged(Row) = .empty;
+    var rows: std.ArrayList(Row) = .empty;
     const nchunks: usize = @intCast(D().duckdb_result_chunk_count(res.*));
     for (0..nchunks) |ci| {
         var chunk = D().duckdb_result_get_chunk(res.*, @intCast(ci));
@@ -145,7 +145,7 @@ fn readCell(a: std.mem.Allocator, vec: dk.duckdb_vector, lt: dk.duckdb_logical_t
             const child = D().duckdb_list_vector_get_child(vec);
             var clt = D().duckdb_vector_get_column_type(child);
             defer D().duckdb_destroy_logical_type(&clt);
-            var out: std.ArrayListUnmanaged(u8) = .empty;
+            var out: std.ArrayList(u8) = .empty;
             try out.append(a, '[');
             for (0..@intCast(entries.length)) |k| {
                 if (k > 0) try out.append(a, ',');
@@ -159,7 +159,7 @@ fn readCell(a: std.mem.Allocator, vec: dk.duckdb_vector, lt: dk.duckdb_logical_t
             const child = D().duckdb_array_vector_get_child(vec);
             var clt = D().duckdb_vector_get_column_type(child);
             defer D().duckdb_destroy_logical_type(&clt);
-            var out: std.ArrayListUnmanaged(u8) = .empty;
+            var out: std.ArrayList(u8) = .empty;
             try out.append(a, '[');
             for (0..n) |k| {
                 if (k > 0) try out.append(a, ',');
@@ -170,7 +170,7 @@ fn readCell(a: std.mem.Allocator, vec: dk.duckdb_vector, lt: dk.duckdb_logical_t
         },
         dk.DUCKDB_TYPE_STRUCT => {
             const n: usize = @intCast(D().duckdb_struct_type_child_count(lt));
-            var out: std.ArrayListUnmanaged(u8) = .empty;
+            var out: std.ArrayList(u8) = .empty;
             try out.append(a, '{');
             for (0..n) |k| {
                 if (k > 0) try out.append(a, ',');
@@ -218,7 +218,7 @@ fn decimalText(a: std.mem.Allocator, raw: i128, scale: u8) ![]const u8 {
     const mag: u128 = if (neg) @intCast(-raw) else @intCast(raw);
     const digits = try std.fmt.allocPrint(a, "{d}", .{mag});
     defer a.free(digits);
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     if (neg) try out.append(a, '-');
     if (scale == 0) {
         try out.appendSlice(a, digits);
@@ -234,7 +234,7 @@ fn decimalText(a: std.mem.Allocator, raw: i128, scale: u8) ![]const u8 {
     return out.toOwnedSlice(a);
 }
 
-fn jsonValue(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), v: Value) !void {
+fn jsonValue(a: std.mem.Allocator, out: *std.ArrayList(u8), v: Value) !void {
     switch (v) {
         .null => try out.appendSlice(a, "null"),
         .boolean => |b| try out.appendSlice(a, if (b) "true" else "false"),
@@ -250,7 +250,7 @@ fn jsonValue(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), v: Value) !
     }
 }
 
-fn jsonString(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
+fn jsonString(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
     try out.append(a, '"');
     for (s) |ch| switch (ch) {
         '"' => try out.appendSlice(a, "\\\""),

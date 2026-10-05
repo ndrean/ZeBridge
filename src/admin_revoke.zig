@@ -71,7 +71,7 @@ pub fn run(init: *const std.process.Init) u8 {
         return 1;
     };
     var url_buf: [1024]u8 = undefined;
-    const url_z = std.fmt.bufPrintZ(&url_buf, "{s}", .{url}) catch {
+    const url_z = std.fmt.bufPrintSentinel(&url_buf, "{s}", .{url}, 0) catch {
         out("🔴 ADMIN_DATABASE_URL too long\n", .{});
         return 1;
     };
@@ -87,7 +87,7 @@ pub fn run(init: *const std.process.Init) u8 {
     }
 
     var p_buf: [300]u8 = undefined;
-    const p_z = std.fmt.bufPrintZ(&p_buf, "{s}", .{p}) catch return 1;
+    const p_z = std.fmt.bufPrintSentinel(&p_buf, "{s}", .{p}, 0) catch return 1;
     const params = [_]?[*:0]const u8{p_z.ptr};
 
     // ── 0. the purge request (§10kn), BEFORE the mapping delete ─────────────────
@@ -215,7 +215,7 @@ fn amendRevocations(conn: ?*c.PGconn, init: *const std.process.Init, op_seed: []
     };
     var needle_buf: [128]u8 = undefined;
     const needle = std.fmt.bufPrint(&needle_buf, "{s}: ey", .{account_pub}) catch return 1;
-    const at = std.mem.indexOf(u8, conf, needle) orelse {
+    const at = std.mem.find(u8, conf, needle) orelse {
         out("🔴 account {s} not found in {s}'s resolver_preload\n", .{ account_pub, conf_path });
         return 1;
     };
@@ -233,7 +233,7 @@ fn amendRevocations(conn: ?*c.PGconn, init: *const std.process.Init, op_seed: []
     dec.decode(claims, claims_b64) catch return 1;
 
     // ── the complete map: the JWT's own, PostgreSQL's rows, the extra key ───────
-    var revoked: std.StringArrayHashMapUnmanaged(i64) = .empty;
+    var revoked: std.array_hash_map.String(i64) = .empty;
     const parsed = std.json.parseFromSlice(std.json.Value, a, claims, .{}) catch {
         out("🔴 {s}'s JWT claims do not parse\n", .{account_pub});
         return 1;
@@ -263,22 +263,22 @@ fn amendRevocations(conn: ?*c.PGconn, init: *const std.process.Init, op_seed: []
     // ── byte-precise surgery: only the revocations map changes ──────────────────
     const rev_json = std.fmt.allocPrint(a, "\"revocations\":{{{s}}},", .{map}) catch return 1;
     var amended: []u8 = undefined;
-    if (std.mem.indexOf(u8, claims, "\"revocations\":{")) |rstart| {
+    if (std.mem.find(u8, claims, "\"revocations\":{")) |rstart| {
         const rbody = rstart + "\"revocations\":{".len;
-        const rclose = std.mem.indexOfScalarPos(u8, claims, rbody, '}') orelse return 1;
+        const rclose = std.mem.findScalarPos(u8, claims, rbody, '}') orelse return 1;
         var after = rclose + 1;
         if (after < claims.len and claims[after] == ',') after += 1;
         amended = std.mem.concat(a, u8, &.{ claims[0..rstart], rev_json, claims[after..] }) catch return 1;
     } else {
-        const t = std.mem.indexOf(u8, claims, "\"type\":\"account\"") orelse {
+        const t = std.mem.find(u8, claims, "\"type\":\"account\"") orelse {
             out("🔴 {s}'s JWT does not look like an account JWT\n", .{account_pub});
             return 1;
         };
         amended = std.mem.concat(a, u8, &.{ claims[0..t], rev_json, claims[t..] }) catch return 1;
     }
     // fresh jti: swap the existing value for the signer's token
-    const jstart = (std.mem.indexOf(u8, amended, "\"jti\":\"") orelse return 1) + "\"jti\":\"".len;
-    const jend = std.mem.indexOfScalarPos(u8, amended, jstart, '"') orelse return 1;
+    const jstart = (std.mem.find(u8, amended, "\"jti\":\"") orelse return 1) + "\"jti\":\"".len;
+    const jend = std.mem.findScalarPos(u8, amended, jstart, '"') orelse return 1;
     const pre = std.mem.concat(a, u8, &.{ amended[0..jstart], "__JTI__", amended[jend..] }) catch return 1;
 
     var op_kp = nats.nkeys.SeedKeyPair.fromSeed(op_seed) catch {
@@ -307,13 +307,13 @@ fn amendRevocations(conn: ?*c.PGconn, init: *const std.process.Init, op_seed: []
 }
 
 /// A revoked key keeps its latest time: a later revocation covers every JWT issued before it.
-fn keep(a: std.mem.Allocator, m: *std.StringArrayHashMapUnmanaged(i64), k: []const u8, t: i64) !void {
+fn keep(a: std.mem.Allocator, m: *std.array_hash_map.String(i64), k: []const u8, t: i64) !void {
     const gop = try m.getOrPut(a, k);
     if (!gop.found_existing or gop.value_ptr.* < t) gop.value_ptr.* = t;
 }
 
 /// The map as JSON members, keys sorted: the same revocations always sign the same claims.
-fn revocationsJson(a: std.mem.Allocator, m: *std.StringArrayHashMapUnmanaged(i64)) ![]u8 {
+fn revocationsJson(a: std.mem.Allocator, m: *std.array_hash_map.String(i64)) ![]u8 {
     const keys = try a.dupe([]const u8, m.keys());
     std.mem.sort([]const u8, keys, {}, struct {
         fn lt(_: void, x: []const u8, y: []const u8) bool {
@@ -332,7 +332,7 @@ test "revocations merge: a key keeps its latest time, the order is stable" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var m: std.StringArrayHashMapUnmanaged(i64) = .empty;
+    var m: std.array_hash_map.String(i64) = .empty;
     try keep(a, &m, "UB", 100); // from the JWT
     try keep(a, &m, "UA", 50);
     try keep(a, &m, "UB", 90); // an older row from PostgreSQL does not move it back

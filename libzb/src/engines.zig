@@ -12,6 +12,7 @@
 //! and has every function wins; the library stays open for the life of the process.
 
 const std = @import("std");
+const log = std.log.scoped(.libzb);
 const builtin = @import("builtin");
 const c = @import("c");
 const dk = @import("duckdb");
@@ -89,7 +90,7 @@ fn Engine(comptime T: type, comptime label: []const u8, comptime env: [:0]const 
 
         fn fail(comptime fmt: []const u8, args: anytype) bool {
             reason = std.fmt.bufPrint(&reason_buf, fmt, args) catch reason_buf[0..];
-            std.debug.print("{s}\n", .{reason});
+            log.info("{s}", .{reason});
             return false;
         }
 

@@ -991,7 +991,7 @@ pub const BatchPublisher = struct {
 
         log.debug("📦 Encoding {d} events for publish", .{event_count});
 
-        var cdc_indices: std.ArrayListUnmanaged(usize) = .empty;
+        var cdc_indices: std.ArrayList(usize) = .empty;
         defer cdc_indices.deinit(flush_alloc);
 
         for (indices) |slot_idx| {
@@ -1058,8 +1058,8 @@ pub const BatchPublisher = struct {
         // Same arena as doPublish, which called this and reset it fresh.
         const flush_alloc = self.encode_arena.allocator();
 
-        const Group = struct { subject: []const u8, indices: std.ArrayListUnmanaged(usize) };
-        var groups: std.ArrayListUnmanaged(Group) = .empty;
+        const Group = struct { subject: []const u8, indices: std.ArrayList(usize) };
+        var groups: std.ArrayList(Group) = .empty;
         const Lane = struct { subject: []const u8, group: usize };
         var lanes = std.StringHashMap(Lane).init(flush_alloc);
         defer lanes.deinit();
@@ -1069,7 +1069,7 @@ pub const BatchPublisher = struct {
             // Slices into the slot's inline subject_buf; slots are not reset until
             // after publishing, so these stay valid for the life of this call.
             const subject = self.events[slot_idx].getSubject();
-            const lane_key = subject[0 .. std.mem.lastIndexOfScalar(u8, subject, '.') orelse subject.len];
+            const lane_key = subject[0 .. std.mem.findScalarLast(u8, subject, '.') orelse subject.len];
             const gop = try lanes.getOrPut(lane_key);
             if (gop.found_existing and std.mem.eql(u8, gop.value_ptr.subject, subject)) {
                 try groups.items[gop.value_ptr.group].indices.append(flush_alloc, slot_idx);

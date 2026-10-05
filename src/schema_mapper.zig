@@ -51,7 +51,7 @@ pub const sqlite_type_map = std.StaticStringMap([]const u8).initComptime(.{
 pub fn pgToSqliteType(pg_type: []const u8) []const u8 {
     // `format_type` spells modifiers — `numeric(20,8)`, `geometry(Point,4326)`,
     // `character varying(255)` — and the map is keyed by the bare name.
-    const bare = if (std.mem.indexOfScalar(u8, pg_type, '(')) |i| pg_type[0..i] else pg_type;
+    const bare = if (std.mem.findScalar(u8, pg_type, '(')) |i| pg_type[0..i] else pg_type;
     return sqlite_type_map.get(bare) orelse "TEXT";
 }
 

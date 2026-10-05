@@ -52,7 +52,7 @@ pub fn run(init: *const std.process.Init, mode: Mode) u8 {
         },
     };
     var url_buf: [1024]u8 = undefined;
-    const url_z = std.fmt.bufPrintZ(&url_buf, "{s}", .{url}) catch {
+    const url_z = std.fmt.bufPrintSentinel(&url_buf, "{s}", .{url}, 0) catch {
         out("🔴 the database URL is too long ({d} bytes)\n", .{url.len});
         return 1;
     };
@@ -105,7 +105,7 @@ pub fn run(init: *const std.process.Init, mode: Mode) u8 {
         return 1;
     }
     var name_buf: [64]u8 = undefined;
-    const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch return 1;
+    const name_z = std.fmt.bufPrintSentinel(&name_buf, "{s}", .{name}, 0) catch return 1;
     const params = [_]?[*:0]const u8{name_z.ptr};
     const dropped = c.PQexecParams(conn, "SELECT pg_drop_replication_slot($1)", 1, null, &params[0], null, null, 0);
     defer c.PQclear(dropped);
@@ -125,10 +125,10 @@ fn queryInventory(conn: *c.PGconn, buf: []u8, head: []const u8, slot: ?[]const u
     // The head expression fills the one `{s}` of `cols_fmt`; the WHERE takes the name as a parameter.
     var cols_buf: [512]u8 = undefined;
     const cols_s = std.fmt.bufPrint(&cols_buf, cols_fmt, .{head}) catch return null;
-    const sql = std.fmt.bufPrintZ(buf, "SELECT {s} FROM pg_replication_slots{s} ORDER BY slot_name", .{ cols_s, if (slot != null) " WHERE slot_name = $1" else "" }) catch return null;
+    const sql = std.fmt.bufPrintSentinel(buf, "SELECT {s} FROM pg_replication_slots{s} ORDER BY slot_name", .{ cols_s, if (slot != null) " WHERE slot_name = $1" else "" }, 0) catch return null;
     var name_buf: [64]u8 = undefined;
     const res = if (slot) |s| blk: {
-        const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{s}) catch return null;
+        const name_z = std.fmt.bufPrintSentinel(&name_buf, "{s}", .{s}, 0) catch return null;
         const params = [_]?[*:0]const u8{name_z.ptr};
         break :blk c.PQexecParams(conn, sql.ptr, 1, null, &params[0], null, null, 0);
     } else c.PQexec(conn, sql.ptr);

@@ -15,7 +15,7 @@ pub const bundle: []const u8 = if (needed) @embedFile("roots/cacert.pem") else "
 /// written: then TLS fails with its own error, which names the certificate.
 pub fn fileBeside(a: std.mem.Allocator, replica_path: []const u8) ?[]u8 {
     if (comptime !needed) return null;
-    const dir = std.fs.path.dirname(replica_path) orelse ".";
+    const dir = std.Io.Dir.path.dirname(replica_path) orelse ".";
     const path = std.fmt.allocPrint(a, "{s}/zb-roots.pem", .{dir}) catch return null;
     if (holds(a, path)) return path;
     write(a, path) catch {
@@ -27,7 +27,7 @@ pub fn fileBeside(a: std.mem.Allocator, replica_path: []const u8) ?[]u8 {
 
 /// Whether `path` already holds exactly the bundle.
 fn holds(a: std.mem.Allocator, path: []const u8) bool {
-    const pz = a.dupeZ(u8, path) catch return false;
+    const pz = a.dupeSentinel(u8, path, 0) catch return false;
     defer a.free(pz);
     const fd = std.posix.openat(std.posix.AT.FDCWD, pz, .{ .ACCMODE = .RDONLY }, 0) catch return false;
     defer _ = std.posix.system.close(fd);
@@ -46,7 +46,7 @@ fn holds(a: std.mem.Allocator, path: []const u8) bool {
 fn write(a: std.mem.Allocator, path: []const u8) !void {
     const tmp = try std.fmt.allocPrintSentinel(a, "{s}.tmp", .{path}, 0);
     defer a.free(tmp);
-    const final = try a.dupeZ(u8, path);
+    const final = try a.dupeSentinel(u8, path, 0);
     defer a.free(final);
     const fd = try std.posix.openat(std.posix.AT.FDCWD, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     var off: usize = 0;

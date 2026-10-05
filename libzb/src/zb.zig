@@ -14,6 +14,9 @@
 //! No Python, no nats CLI: every step is libzb's own, the same the C card takes.
 
 const std = @import("std");
+const zblog = @import("zblog.zig");
+
+pub const std_options: std.Options = .{ .log_level = .debug, .logFn = zblog.logFn };
 const client = @import("client.zig");
 const Value = std.json.Value;
 
@@ -45,7 +48,7 @@ fn usage() void {
 pub fn main(init: std.process.Init) !u8 {
     const a = std.heap.c_allocator;
     // Zig 0.16: argv comes through std.process.Init; the strings outlive the process.
-    var argv_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    var argv_list: std.ArrayList([]const u8) = .empty;
     var ait = init.minimal.args.iterate();
     while (ait.next()) |arg| try argv_list.append(a, arg);
     const argv = argv_list.items;
@@ -68,7 +71,7 @@ pub fn main(init: std.process.Init) !u8 {
         } else {
             i += 1;
             const v = next.?;
-            if (std.mem.eql(u8, arg, "--url")) args.url = v else if (std.mem.eql(u8, arg, "--creds")) args.creds = v else if (std.mem.eql(u8, arg, "--principal")) args.principal = v else if (std.mem.eql(u8, arg, "--tables")) args.tables = v else if (std.mem.eql(u8, arg, "--db")) args.db = try a.dupeZ(u8, v) else if (std.mem.eql(u8, arg, "--db-url")) args.db_url = try a.dupeZ(u8, v) else if (std.mem.eql(u8, arg, "--client-id")) args.client_id = v else if (std.mem.eql(u8, arg, "--js-domain")) args.js_domain = v else if (std.mem.eql(u8, arg, "--engine")) {
+            if (std.mem.eql(u8, arg, "--url")) args.url = v else if (std.mem.eql(u8, arg, "--creds")) args.creds = v else if (std.mem.eql(u8, arg, "--principal")) args.principal = v else if (std.mem.eql(u8, arg, "--tables")) args.tables = v else if (std.mem.eql(u8, arg, "--db")) args.db = try a.dupeSentinel(u8, v, 0) else if (std.mem.eql(u8, arg, "--db-url")) args.db_url = try a.dupeSentinel(u8, v, 0) else if (std.mem.eql(u8, arg, "--client-id")) args.client_id = v else if (std.mem.eql(u8, arg, "--js-domain")) args.js_domain = v else if (std.mem.eql(u8, arg, "--engine")) {
                 args.engine = if (std.mem.eql(u8, v, "duckdb")) .duckdb else if (std.mem.eql(u8, v, "sqlite")) .sqlite else {
                     std.debug.print("--engine: sqlite or duckdb (postgres is --db-url)\n", .{});
                     return 2;
@@ -84,7 +87,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     }
     if (args.db.len == 0) args.db = try std.fmt.allocPrintSentinel(a, "zebridge_{s}.sqlite3", .{args.principal}, 0);
-    var tables: std.ArrayListUnmanaged([]const u8) = .empty;
+    var tables: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, args.tables, ',');
     while (it.next()) |t| if (t.len > 0) try tables.append(a, t);
 
@@ -126,7 +129,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     // The summary: one JSON line a script reads.
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     const took: u64 = @intCast(nowMs() - t0);
     try out.print(a, "{{\"tenant\":\"{s}\",\"engine\":\"{s}\",\"seconds\":{d}.{d},\"tables\":{{", .{ rep.tenant, if (args.db_url != null) "postgres" else @tagName(args.engine), took / 1000, (took % 1000) / 100 });
     for (tables.items, 0..) |t, k| {

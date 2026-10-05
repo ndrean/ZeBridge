@@ -57,6 +57,10 @@
 //! SKIP loudly instead of crashing.
 
 const std = @import("std");
+const zblog = @import("zblog.zig");
+
+pub const std_options: std.Options = .{ .log_level = .debug, .logFn = zblog.logFn };
+const log = std.log.scoped(.libzb);
 const builtin = @import("builtin");
 
 /// §10iy: no stack-trace machinery on iOS. std.debug's SelfInfo wants
@@ -532,7 +536,7 @@ export fn zb_client_connect(opts_json: ?[*:0]const u8) u64 {
             setLastError("zb_client_connect failed: {s}", .{why});
             return 0;
         }
-        std.debug.print("zb_client_connect failed: {s}\n", .{@errorName(err)});
+        log.warn("zb_client_connect failed: {s}", .{@errorName(err)});
         setLastError("zb_client_connect failed: {s}", .{@errorName(err)});
         return 0;
     };
@@ -625,7 +629,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         const can_enroll = str.get(o, "bridgeUrl", "").len > 0 and str.get(o, "invite", "").len > 0;
         ident = if (can_enroll) enroll.load(a, id_path) catch null else try enroll.load(a, id_path);
         if (can_enroll) if (ident) |*cur| if (cur.creds.len == 0) {
-            std.debug.print("zebridge: the stored identity holds no creds — enrolling with the invite instead\n", .{});
+            log.info("zebridge: the stored identity holds no creds — enrolling with the invite instead", .{});
             cur.deinit(a);
             ident = null;
         };
@@ -651,7 +655,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
                 }
                 const expired = if (enroll.jwtTimes(cur.creds)) |t| t.exp <= cur.serverNow() else false;
                 if (expired) return error.EnrollFailed;
-                std.debug.print("zebridge: {s} — carrying on with the current JWT\n", .{enroll.last_failure orelse "renew failed"});
+                log.warn("zebridge: {s} — carrying on with the current JWT", .{enroll.last_failure orelse "renew failed"});
                 enroll.last_failure = null;
             }
         };
@@ -684,9 +688,9 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     // because this function returns an error union.
     // §10hn: `natsUrl`, the one name both clients share; else where /enroll said to dial.
     const url_s = idv.or_(str.get(o, "natsUrl", ""), if (ident) |i| i.nats_url else null);
-    const url = try a.dupeZ(u8, if (url_s.len > 0) url_s else "nats://127.0.0.1:4222");
+    const url = try a.dupeSentinel(u8, if (url_s.len > 0) url_s else "nats://127.0.0.1:4222", 0);
     errdefer a.free(url);
-    const creds = try a.dupeZ(u8, str.get(o, "credsPath", ""));
+    const creds = try a.dupeSentinel(u8, str.get(o, "credsPath", ""), 0);
     errdefer a.free(creds);
     // "creds": the credentials as text (what /enroll hands an app) — the same option as
     // zb-client-ts's. Kept for the connection's life: every reconnect reads it.
@@ -703,7 +707,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     errdefer if (js_domain) |d| a.free(d);
     // dbUrl (§10fd): a PostgreSQL replica instead of the SQLite file.
     const db_url_raw = str.get(o, "dbUrl", "");
-    const db_url: ?[:0]u8 = if (db_url_raw.len > 0) try a.dupeZ(u8, db_url_raw) else null;
+    const db_url: ?[:0]u8 = if (db_url_raw.len > 0) try a.dupeSentinel(u8, db_url_raw, 0) else null;
     errdefer if (db_url) |u| a.free(u);
     // engine (§10fl): "sqlite" (default) or "duckdb", both on dbPath; dbUrl implies postgres.
     const engine_s = str.get(o, "engine", "sqlite");
@@ -719,16 +723,16 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     else
         null;
     defer if (from_jwt) |p| a.free(p);
-    const principal = try a.dupeZ(u8, if (principal_opt.len > 0) principal_opt else from_jwt orelse "");
+    const principal = try a.dupeSentinel(u8, if (principal_opt.len > 0) principal_opt else from_jwt orelse "", 0);
     errdefer a.free(principal);
     // The same defaults as zb-client-ts: one replica per principal, kept across runs;
     // a random client id per instance (it prefixes every mutation's msg_id — a fixed
     // default would give every client that omits it the same prefix).
     const db_opt = str.get(o, "dbPath", "");
-    const db = if (db_opt.len > 0) try a.dupeZ(u8, db_opt) else try std.fmt.allocPrintSentinel(a, "zebridge_{s}.sqlite3", .{principal}, 0);
+    const db = if (db_opt.len > 0) try a.dupeSentinel(u8, db_opt, 0) else try std.fmt.allocPrintSentinel(a, "zebridge_{s}.sqlite3", .{principal}, 0);
     errdefer a.free(db);
     const cid_opt = str.get(o, "clientId", "");
-    const client_id = if (cid_opt.len > 0) try a.dupeZ(u8, cid_opt) else blk: {
+    const client_id = if (cid_opt.len > 0) try a.dupeSentinel(u8, cid_opt, 0) else blk: {
         var r: [4]u8 = undefined;
         std.Io.Threaded.global_single_threaded.io().random(&r); // as nats.zig nuid.zig
         break :blk try std.fmt.allocPrintSentinel(a, "c-{x}", .{&r}, 0);
@@ -851,11 +855,11 @@ export fn zb_client_close(handle: u64) c_int {
 export fn zb_client_wipe(handle: u64) c_int {
     const box = clients.remove(handle) orelse return 1;
     var path_buf: [1024]u8 = undefined;
-    const db = std.fmt.bufPrintZ(&path_buf, "{s}", .{box.db}) catch return 1;
+    const db = std.fmt.bufPrintSentinel(&path_buf, "{s}", .{box.db}, 0) catch return 1;
     box.destroy(std.heap.c_allocator);
     for ([_][]const u8{ "", "-wal", "-shm" }) |suffix| {
         var buf: [1040]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ db, suffix }) catch continue;
+        const p = std.fmt.bufPrintSentinel(&buf, "{s}{s}", .{ db, suffix }, 0) catch continue;
         _ = std.c.unlink(p.ptr);
     }
     return 0;
@@ -1269,7 +1273,7 @@ fn maybeRenew(b: *ClientBox, force: bool) void {
             b.c.purge_requested = true;
             return;
         }
-        std.debug.print("zebridge: {s} — retried in a minute\n", .{enroll.last_failure orelse "renew failed"});
+        log.warn("zebridge: {s} — retried in a minute", .{enroll.last_failure orelse "renew failed"});
         return;
     }) else (enroll.load(a, path) catch null) orelse return;
     defer fresh.deinit(a);
@@ -1291,7 +1295,7 @@ fn maybeRenew(b: *ClientBox, force: bool) void {
     };
     std.crypto.secureZero(u8, old);
     a.free(old);
-    std.debug.print("zebridge: renewed '{s}' — the next reconnect presents the new JWT\n", .{fresh.principal});
+    log.info("zebridge: renewed '{s}' — the next reconnect presents the new JWT", .{fresh.principal});
 }
 
 export fn zb_client_poll(handle: u64, wait_ms: u64) ?[*:0]u8 {
@@ -1340,12 +1344,12 @@ fn goneJson(handle: u64) ?[*:0]u8 {
 fn unlinkLocal(db: []const u8, id_path: ?[]const u8) void {
     for ([_][]const u8{ "", "-wal", "-shm" }) |suffix| {
         var buf: [1040]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ db, suffix }) catch continue;
+        const p = std.fmt.bufPrintSentinel(&buf, "{s}{s}", .{ db, suffix }, 0) catch continue;
         _ = std.c.unlink(p.ptr);
     }
     if (id_path) |ip| {
         var buf: [1040]u8 = undefined;
-        if (std.fmt.bufPrintZ(&buf, "{s}", .{ip})) |p| _ = std.c.unlink(p.ptr) else |_| {}
+        if (std.fmt.bufPrintSentinel(&buf, "{s}", .{ip}, 0)) |p| _ = std.c.unlink(p.ptr) else |_| {}
     }
 }
 
@@ -1363,7 +1367,7 @@ fn purgeIfAsked(handle: u64, b: *ClientBox) bool {
     unlinkLocal(db, id_path);
     purged_handles[purged_next % purged_handles.len] = handle;
     purged_next += 1;
-    std.debug.print("zebridge: '{s}' REVOKED with a purge by the operator — the local replica and identity are deleted\n", .{who});
+    log.warn("zebridge: '{s}' REVOKED with a purge by the operator — the local replica and identity are deleted", .{who});
     return true;
 }
 
@@ -1443,4 +1447,5 @@ test {
     // nobody is compiling.
     _ = @import("client.zig");
     _ = @import("handles.zig");
+    _ = @import("zblog.zig");
 }

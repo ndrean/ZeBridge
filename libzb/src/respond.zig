@@ -23,15 +23,34 @@
 //! It needs no replica: with no table to follow, libzb's poll waits on the questions.
 
 const std = @import("std");
+const zblog = @import("zblog.zig");
+
+pub const std_options: std.Options = .{ .log_level = .debug, .logFn = zblog.logFn };
+const log = std.log.scoped(.libzb);
 const client = @import("client.zig");
 const enroll = @import("enroll.zig");
 const Value = std.json.Value;
 
 const Question = struct { name: []const u8, http: []const u8 };
 
+/// Set by SIGINT/SIGTERM: the loop ends, every defer runs, and in Debug the allocator
+/// reports what was never freed.
+var stop = std.atomic.Value(bool).init(false);
+
+fn onSignal(_: std.posix.SIG) callconv(.c) void {
+    stop.store(true, .release);
+}
+
 pub fn main(init: std.process.Init) !u8 {
-    const a = std.heap.c_allocator;
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    // Debug: the leak-checking allocator, its report printed when main returns.
+    var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+    defer if (@import("builtin").mode == .Debug) {
+        _ = debug_alloc.deinit();
+    };
+    const a = if (@import("builtin").mode == .Debug) debug_alloc.allocator() else std.heap.c_allocator;
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(a);
     var ait = init.minimal.args.iterate();
     while (ait.next()) |arg| try argv.append(a, arg);
     if (argv.items.len != 2) {
@@ -41,13 +60,15 @@ pub fn main(init: std.process.Init) !u8 {
 
     // ── the configuration ──────────────────────────────────────────────────────
     const text = std.Io.Dir.cwd().readFileAlloc(init.io, argv.items[1], a, .limited(1 << 20)) catch |err| {
-        std.debug.print("🔴 cannot read {s}: {s}\n", .{ argv.items[1], @errorName(err) });
+        log.err("🔴 cannot read {s}: {s}", .{ argv.items[1], @errorName(err) });
         return 1;
     };
+    defer a.free(text);
     const parsed = std.json.parseFromSlice(Value, a, text, .{}) catch {
-        std.debug.print("🔴 {s} is not JSON\n", .{argv.items[1]});
+        log.err("🔴 {s} is not JSON", .{argv.items[1]});
         return 1;
     };
+    defer parsed.deinit();
     const cfg = parsed.value.object;
     const str = struct {
         fn get(o: std.json.ObjectMap, k: []const u8, d: []const u8) []const u8 {
@@ -60,29 +81,34 @@ pub fn main(init: std.process.Init) !u8 {
     const name = str(cfg, "name", "zb-respond");
     const queue = str(cfg, "queue", "zb-respond");
     const js_domain = str(cfg, "jsDomain", "");
-    const db = try a.dupeZ(u8, str(cfg, "db", "/tmp/zb-respond.sqlite3"));
+    const db = try a.dupeSentinel(u8, str(cfg, "db", "/tmp/zb-respond.sqlite3"), 0);
+    defer a.free(db);
     if (creds.len == 0) {
-        std.debug.print("🔴 the config names no `creds` (a responder's: bridge --mint-responder)\n", .{});
+        log.err("🔴 the config names no `creds` (a responder's: bridge --mint-responder)", .{});
         return 1;
     }
     const principal = enroll.principalFromCredsFile(a, creds) orelse {
-        std.debug.print("🔴 {s}: no principal in the creds\n", .{creds});
+        log.err("🔴 {s}: no principal in the creds", .{creds});
         return 1;
     };
+    defer a.free(principal);
 
-    var tenants: std.ArrayListUnmanaged([]const u8) = .empty;
+    var tenants: std.ArrayList([]const u8) = .empty;
+    defer tenants.deinit(a);
     if (cfg.get("tenants")) |tv| if (tv == .array) for (tv.array.items) |t| if (t == .string) try tenants.append(a, t.string);
     if (tenants.items.len == 0) try tenants.append(a, "_default");
 
-    var questions: std.ArrayListUnmanaged(Question) = .empty;
-    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    var questions: std.ArrayList(Question) = .empty;
+    defer questions.deinit(a);
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(a);
     if (cfg.get("questions")) |qv| if (qv == .object) {
         var it = qv.object.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.* != .object) continue;
             const target = str(e.value_ptr.object, "http", "");
             if (target.len == 0) {
-                std.debug.print("🔴 question {s}: only `http` targets are built\n", .{e.key_ptr.*});
+                log.err("🔴 question {s}: only `http` targets are built", .{e.key_ptr.*});
                 return 1;
             }
             try questions.append(a, .{ .name = e.key_ptr.*, .http = target });
@@ -90,7 +116,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     };
     if (questions.items.len == 0) {
-        std.debug.print("🔴 the config names no `questions`\n", .{});
+        log.err("🔴 the config names no `questions`", .{});
         return 1;
     }
 
@@ -108,21 +134,25 @@ pub fn main(init: std.process.Init) !u8 {
     defer c.deinit();
     _ = try c.syncOnce();
     const n = try c.serve(tenants.items, names.items, queue);
-    std.debug.print("{s}: answering {d} subject(s) in queue group {s}, as {s}\n", .{ name, n, queue, principal });
+    log.info("{s}: answering {d} subject(s) in queue group {s}, as {s}", .{ name, n, queue, principal });
 
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
     var http: std.http.Client = .{ .allocator = a, .io = threaded.io() };
     defer http.deinit();
 
+    const on_signal: std.posix.Sigaction = .{ .handler = .{ .handler = onSignal }, .mask = std.mem.zeroes(std.posix.sigset_t), .flags = 0 },;
+    std.posix.sigaction(std.posix.SIG.INT, &on_signal, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &on_signal, null);
+
     // ── the loop: wait for questions, forward, answer ──────────────────────────
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    while (true) {
+    while (!stop.load(.acquire)) {
         _ = arena.reset(.retain_capacity);
         const aa = arena.allocator();
         const report = c.poll(aa, 1000) catch |err| {
-            std.debug.print("poll: {s}\n", .{@errorName(err)});
+            log.warn("poll: {s}", .{@errorName(err)});
             continue;
         };
         for (report.requests) |req| {
@@ -132,10 +162,12 @@ pub fn main(init: std.process.Init) !u8 {
             } else "";
             const answer = forward(aa, &http, target, req.payload, name, t0) catch |err|
                 try std.fmt.allocPrint(aa, "{{\"error\":\"{s}\",\"by\":\"{s}\"}}", .{ @errorName(err), name });
-            c.reply(req.id, answer) catch |err| std.debug.print("reply {d}: {s}\n", .{ req.id, @errorName(err) });
-            std.debug.print("{s}: {d} bytes in {d} ms\n", .{ req.name, answer.len, nowMs() - t0 });
+            c.reply(req.id, answer) catch |err| log.err("reply {d}: {s}", .{ req.id, @errorName(err) });
+            log.info("{s}: {d} bytes in {d} ms", .{ req.name, answer.len, nowMs() - t0 });
         }
     }
+    log.info("{s}: stopped", .{name});
+    return 0;
 }
 
 /// POST the payload to `target`; the answer as JSON text, `by` and `ms` added to an object.

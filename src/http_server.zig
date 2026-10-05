@@ -367,10 +367,10 @@ pub const Server = struct {
     /// purpose: both accepted values are machine-generated from alphabets that
     /// never need escaping (hex code, base32 nkey).
     fn queryParam(target: []const u8, key: []const u8) ?[]const u8 {
-        const q = target[(std.mem.indexOfScalar(u8, target, '?') orelse return null) + 1 ..];
+        const q = target[(std.mem.findScalar(u8, target, '?') orelse return null) + 1 ..];
         var it = std.mem.splitScalar(u8, q, '&');
         while (it.next()) |pair| {
-            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            const eq = std.mem.findScalar(u8, pair, '=') orelse continue;
             if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
         }
         return null;
@@ -425,9 +425,9 @@ pub const Server = struct {
         }
 
         var code_buf: [Config.Http.enroll_code_max_len + 8]u8 = undefined;
-        const code_z = std.fmt.bufPrintZ(&code_buf, "{s}", .{code}) catch unreachable;
+        const code_z = std.fmt.bufPrintSentinel(&code_buf, "{s}", .{code}, 0) catch unreachable;
         var pub_buf: [nats.nkeys.public_key_text_len + 1]u8 = undefined;
-        const pub_z = std.fmt.bufPrintZ(&pub_buf, "{s}", .{user_pub}) catch unreachable;
+        const pub_z = std.fmt.bufPrintSentinel(&pub_buf, "{s}", .{user_pub}, 0) catch unreachable;
         const params = [_]?[*:0]const u8{ code_z.ptr, pub_z.ptr };
         // Redeem + register, atomically: the row's used_at is the single-use latch
         // (the WHERE arm makes replays lose the race), and the user_tenants insert
@@ -597,7 +597,7 @@ pub const Server = struct {
         defer c.PQfinish(conn);
         if (c.PQstatus(conn) != c.CONNECTION_OK) return bad.respond(req, cors, .service_unavailable, "{\"error\":\"backend unavailable\"}\n");
         var pub_buf: [nats.nkeys.public_key_text_len + 1]u8 = undefined;
-        const pub_z = std.fmt.bufPrintZ(&pub_buf, "{s}", .{user_pub}) catch unreachable;
+        const pub_z = std.fmt.bufPrintSentinel(&pub_buf, "{s}", .{user_pub}, 0) catch unreachable;
         const params = [_]?[*:0]const u8{pub_z.ptr};
         const res = c.PQexecParams(conn, "SELECT principal FROM public.zebridge_principal_keys WHERE user_pubkey = $1 AND revoked_at IS NULL", 1, null, &params[0], null, null, 0);
         defer c.PQclear(res);
@@ -911,10 +911,10 @@ pub const Server = struct {
     // -------------------------------------------------------------------------
 
     fn parseQueryParam(path: []const u8, param_name: []const u8) ?[]const u8 {
-        const query_start = std.mem.indexOf(u8, path, "?") orelse return null;
+        const query_start = std.mem.find(u8, path, "?") orelse return null;
         var it = std.mem.splitScalar(u8, path[query_start + 1 ..], '&');
         while (it.next()) |param| {
-            if (std.mem.indexOf(u8, param, "=")) |eq_pos| {
+            if (std.mem.find(u8, param, "=")) |eq_pos| {
                 if (std.mem.eql(u8, param[0..eq_pos], param_name)) {
                     return param[eq_pos + 1 ..];
                 }
@@ -946,7 +946,7 @@ pub const Server = struct {
 /// §10fn: the principal's memberships, sorted — what the JWT's tags and a client's
 /// `$KV.tenants.<principal>` list both come from.
 fn rosterTenants(a: std.mem.Allocator, conn: *c.PGconn, principal: []const u8) ![]const []const u8 {
-    const pz = try a.dupeZ(u8, principal);
+    const pz = try a.dupeSentinel(u8, principal, 0);
     const params = [_]?[*:0]const u8{pz.ptr};
     const res = c.PQexecParams(conn, "SELECT tenant_id::text FROM public.zebridge_user_tenants WHERE principal = $1 ORDER BY tenant_id", 1, null, &params[0], null, null, 0);
     defer c.PQclear(res);

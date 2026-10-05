@@ -10,6 +10,52 @@ const std = @import("std");
 const c = @import("c_imports.zig").c;
 const utils = @import("utils.zig");
 
+const log = std.log.scoped(.sweeper);
+
+/// LOG_LEVEL filters at run time, as in the bridge: every level is compiled in.
+var runtime_log_level: std.log.Level = .info;
+
+pub const std_options = std.Options{
+    .log_level = .debug,
+    .logFn = logFn,
+};
+
+fn logFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.EnumLiteral),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (@intFromEnum(level) > @intFromEnum(runtime_log_level)) return;
+    std.log.defaultLog(level, scope, format, args);
+}
+
+/// Set by SIGINT/SIGTERM: the loop ends at its next wake, every defer runs, and in Debug
+/// the allocator reports what was never freed.
+var stop = std.atomic.Value(bool).init(false);
+
+fn onSignal(_: std.posix.SIG) callconv(.c) void {
+    stop.store(true, .release);
+}
+
+/// The interval, slept in one-second steps so a signal ends the wait.
+fn sleepUnlessStopped(ms: u64) void {
+    var left = ms;
+    while (left > 0 and !stop.load(.acquire)) {
+        const step: u64 = @min(left, 1000);
+        utils.sleep(step * std.time.ns_per_ms);
+        left -= step;
+    }
+}
+
+fn levelFrom(raw: ?[]const u8) std.log.Level {
+    const v = raw orelse return .info;
+    if (std.mem.eql(u8, v, "debug")) return .debug;
+    if (std.mem.eql(u8, v, "warn") or std.mem.eql(u8, v, "warning")) return .warn;
+    if (std.mem.eql(u8, v, "err") or std.mem.eql(u8, v, "error")) return .err;
+    return .info;
+}
+
 const usage =
     \\Usage: bridge_sweeper [--once]
     \\
@@ -26,7 +72,13 @@ const usage =
 ;
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = std.heap.c_allocator;
+    // Debug: the leak-checking allocator, its report printed when main returns.
+    var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+    defer if (@import("builtin").mode == .Debug) {
+        _ = debug_alloc.deinit();
+    };
+    const allocator = if (@import("builtin").mode == .Debug) debug_alloc.allocator() else std.heap.c_allocator;
+    runtime_log_level = levelFrom(init.minimal.environ.getPosix("LOG_LEVEL"));
 
     // Arguments first, before anything touches the database: this process deletes
     // rows, so an argument it does not know is a refusal, never a pass with defaults
@@ -42,13 +94,13 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, arg, "--once")) {
                 once = true;
             } else {
-                std.debug.print("bridge_sweeper: unknown argument '{s}'\n\n{s}", .{ arg, usage });
+                log.err("unknown argument '{s}'\n\n{s}", .{ arg, usage });
                 std.process.exit(2);
             }
         }
     }
 
-    std.debug.print("ZeBridge GC Sidecar Starting...{s}\n", .{if (once) " (one pass)" else ""});
+    log.info("ZeBridge GC Sidecar Starting...{s}", .{if (once) " (one pass)" else ""});
 
     // Read Env Vars
     //
@@ -59,10 +111,10 @@ pub fn main(init: std.process.Init) !void {
     // output would say so.
     const env = init.minimal.environ;
     const db_url = env.getPosix("DATABASE_WRITER_URL") orelse {
-        std.debug.print(
-            "FATAL: DATABASE_WRITER_URL is required (postgres://bridge_writer:...@host:port/db). " ++
+        log.err(
+            "DATABASE_WRITER_URL is required (postgres://bridge_writer:...@host:port/db). " ++
                 "There is no PG_HOST/PG_USER fallback: this process deletes rows, and must not be " ++
-                "able to do it as the admin.\n",
+                "able to do it as the admin.",
             .{},
         );
         return;
@@ -95,7 +147,7 @@ pub fn main(init: std.process.Init) !void {
     // happened, and what is lost is the *evidence* that overrules a late writer.
     const threshold_ms_str = env.getPosix("GC_THRESHOLD_MS") orelse "3600000"; // 1 hour
     const threshold_ms = std.fmt.parseInt(u64, threshold_ms_str, 10) catch {
-        std.debug.print("FATAL: GC_THRESHOLD_MS is not a number: '{s}'\n", .{threshold_ms_str});
+        log.err("GC_THRESHOLD_MS is not a number: '{s}'", .{threshold_ms_str});
         return;
     };
 
@@ -107,34 +159,34 @@ pub fn main(init: std.process.Init) !void {
     // absorbs without notice; the operator sets GC_BATCH_ROWS to taste.
     const batch_rows_str = env.getPosix("GC_BATCH_ROWS") orelse "1000";
     const batch_rows = std.fmt.parseInt(u32, batch_rows_str, 10) catch {
-        std.debug.print("FATAL: GC_BATCH_ROWS is not a number: '{s}'\n", .{batch_rows_str});
+        log.err("GC_BATCH_ROWS is not a number: '{s}'", .{batch_rows_str});
         return;
     };
     if (batch_rows == 0) {
-        std.debug.print("FATAL: GC_BATCH_ROWS must be at least 1\n", .{});
+        log.err("GC_BATCH_ROWS must be at least 1", .{});
         return;
     }
-    if (dry_run) std.debug.print("GC: DRY RUN — counting only, nothing will be deleted\n", .{});
+    if (dry_run) log.info("DRY RUN — counting only, nothing will be deleted", .{});
 
     const min_threshold_ms: u64 = 60_000; // one minute
     if (threshold_ms < min_threshold_ms) {
-        std.debug.print(
-            "FATAL: GC_THRESHOLD_MS={d} is below the {d}ms floor.\n" ++
+        log.err(
+            "GC_THRESHOLD_MS={d} is below the {d}ms floor.\n" ++
                 "  This is the maximum offline window clients may have — below a minute it is\n" ++
                 "  almost certainly a units mistake (3600 is 3.6 SECONDS, not an hour), and the\n" ++
                 "  cost is silent: tombstones vanish and a late client resurrects deleted rows.\n" ++
-                "  Set GC_ALLOW_SHORT_THRESHOLD=1 if a sub-minute window is genuinely intended.\n",
+                "  Set GC_ALLOW_SHORT_THRESHOLD=1 if a sub-minute window is genuinely intended.",
             .{ threshold_ms, min_threshold_ms },
         );
         if (env.getPosix("GC_ALLOW_SHORT_THRESHOLD") == null) return;
-        std.debug.print("GC: proceeding anyway — GC_ALLOW_SHORT_THRESHOLD is set\n", .{});
+        log.info("proceeding anyway — GC_ALLOW_SHORT_THRESHOLD is set", .{});
     }
 
     // Refuses to start rather than reaping under a threshold nobody chose.
     if (env.getPosix("GC_THRESHOLD_MS") == null) {
-        std.debug.print(
-            "GC: GC_THRESHOLD_MS not set, using the {d}ms default. This is the maximum\n" ++
-                "    offline window clients may have — set it explicitly in production.\n",
+        log.warn(
+            "GC_THRESHOLD_MS not set, using the {d}ms default. This is the maximum\n" ++
+                "    offline window clients may have — set it explicitly in production.",
             .{threshold_ms},
         );
     }
@@ -144,7 +196,13 @@ pub fn main(init: std.process.Init) !void {
 
     const Sweep = struct { table: []const u8, tombstone: []const u8 };
     var sweeps = std.ArrayList(Sweep).empty;
-    defer sweeps.deinit(allocator);
+    defer {
+        for (sweeps.items) |sw| {
+            allocator.free(sw.table);
+            allocator.free(sw.tombstone);
+        }
+        sweeps.deinit(allocator);
+    }
 
     // Connect to PostgreSQL
     const conninfo = try utils.allocPrintZ(allocator, "{s}", .{db_url});
@@ -152,7 +210,7 @@ pub fn main(init: std.process.Init) !void {
 
     const pg_conn = c.PQconnectdb(conninfo.ptr);
     if (c.PQstatus(pg_conn) != c.CONNECTION_OK) {
-        std.debug.print("FATAL: Failed to connect to PostgreSQL: {s}\n", .{c.PQerrorMessage(pg_conn)});
+        log.err("Failed to connect to PostgreSQL: {s}", .{c.PQerrorMessage(pg_conn)});
         c.PQfinish(pg_conn);
         return;
     }
@@ -196,9 +254,9 @@ pub fn main(init: std.process.Init) !void {
                 });
                 added += 1;
             }
-            std.debug.print("GC: catalogue supplied {d} sweep table(s)\n", .{added});
+            log.info("catalogue supplied {d} sweep table(s)", .{added});
         } else {
-            std.debug.print("GC: no zebridge_catalogue — apply init.core.template.sql\n", .{});
+            log.info("no zebridge_catalogue — apply init.core.template.sql", .{});
         }
     }
 
@@ -211,29 +269,32 @@ pub fn main(init: std.process.Init) !void {
         var kept = std.ArrayList(Sweep).empty;
         for (sweeps.items) |sw| {
             var it = std.mem.splitScalar(u8, only, ',');
-            while (it.next()) |raw| {
-                if (std.mem.eql(u8, std.mem.trim(u8, raw, " "), sw.table)) {
-                    try kept.append(allocator, sw);
-                    break;
-                }
+            const wanted = while (it.next()) |raw| {
+                if (std.mem.eql(u8, std.mem.trim(u8, raw, " "), sw.table)) break true;
+            } else false;
+            if (wanted) {
+                try kept.append(allocator, sw);
+            } else {
+                allocator.free(sw.table);
+                allocator.free(sw.tombstone);
             }
         }
-        std.debug.print("GC: SWEEP_ONLY_TABLES='{s}' — scoped run, {d} of {d} table(s) kept\n", .{ only, kept.items.len, sweeps.items.len });
+        log.info("SWEEP_ONLY_TABLES='{s}' — scoped run, {d} of {d} table(s) kept", .{ only, kept.items.len, sweeps.items.len });
         sweeps.deinit(allocator);
         sweeps = kept;
     }
 
     if (sweeps.items.len == 0) {
-        std.debug.print(
+        log.warn(
             "The catalogue declares no tombstone column, so there " ++
                 "is nothing to sweep. Deletes on those tables are physical, and an offline " ++
-                "client's queued edit can resurrect a row (PROTOCOL.md \u{00a7}7.5).\n",
+                "client's queued edit can resurrect a row (PROTOCOL.md \u{00a7}7.5).",
             .{},
         );
         return;
     }
     for (sweeps.items) |sw| {
-        std.debug.print("GC: sweeping {s} on tombstone column '{s}'\n", .{ sw.table, sw.tombstone });
+        log.info("sweeping {s} on tombstone column '{s}'", .{ sw.table, sw.tombstone });
     }
 
     // ── The sweeper's identity ──────────────────────────────────────────────────
@@ -286,7 +347,7 @@ pub fn main(init: std.process.Init) !void {
                 const res = c.PQprepare(conn, stmt_name.ptr, sql.ptr, if (drun) 1 else 2, null);
                 defer c.PQclear(res);
                 if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) {
-                    std.debug.print("GC: cannot prepare the sweep of {s}: {s}", .{ sw.table, c.PQerrorMessage(conn) });
+                    log.err("cannot prepare the sweep of {s}: {s}", .{ sw.table, c.PQerrorMessage(conn) });
                     return error.PrepareFailed;
                 }
             }
@@ -296,10 +357,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }.do;
     setup_connection(allocator, pg_conn.?, principal, sweeps.items, dry_run) catch |err| {
-        std.debug.print("FATAL: failed to initialize connection: {any}\n", .{err});
+        log.err("failed to initialize connection: {any}", .{err});
         return;
     };
-    std.debug.print("GC: acting as principal '{s}'\n", .{principal});
+    log.info("acting as principal '{s}'", .{principal});
 
     // ⚠️ A tenant nobody mapped to the sweeper is invisible to it, and the symptom is
     // silence: tombstones accumulate, the GC watermark quietly stops holding for those
@@ -322,22 +383,26 @@ pub fn main(init: std.process.Init) !void {
     //     WHERE NOT EXISTS (SELECT 1 FROM zebridge_user_tenants m
     //                       WHERE m.principal = 'zb_sweeper' AND m.tenant_id = t.tenant_id);
     //
+    const on_signal: std.posix.Sigaction = .{ .handler = .{ .handler = onSignal }, .mask = std.mem.zeroes(std.posix.sigset_t), .flags = 0 };
+    std.posix.sigaction(std.posix.SIG.INT, &on_signal, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &on_signal, null);
+
     // Run loop
-    while (true) {
+    while (!stop.load(.acquire)) {
         if (c.PQstatus(pg_conn) == c.CONNECTION_BAD) {
-            std.debug.print("WARN: Connection lost. Reconnecting...\n", .{});
+            log.warn("Connection lost. Reconnecting...", .{});
             c.PQreset(pg_conn);
             if (c.PQstatus(pg_conn) != c.CONNECTION_OK) {
-                std.debug.print("ERROR: Reconnect failed: {s}\n", .{c.PQerrorMessage(pg_conn)});
-                utils.sleep(5 * std.time.ns_per_s);
+                log.err("Reconnect failed: {s}", .{c.PQerrorMessage(pg_conn)});
+                sleepUnlessStopped(5000);
                 continue;
             }
             setup_connection(allocator, pg_conn.?, principal, sweeps.items, dry_run) catch |err| {
-                std.debug.print("ERROR: failed to initialize reconnected session: {any}\n", .{err});
-                utils.sleep(5 * std.time.ns_per_s);
+                log.err("failed to initialize reconnected session: {any}", .{err});
+                sleepUnlessStopped(5000);
                 continue;
             };
-            std.debug.print("Reconnected and initialized.\n", .{});
+            log.info("Reconnected and initialized.", .{});
         }
 
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -371,8 +436,8 @@ pub fn main(init: std.process.Init) !void {
 
             if (dry_run) {
                 if (c.PQresultStatus(res) == c.PGRES_TUPLES_OK and c.PQntuples(res) > 0) {
-                    std.debug.print(
-                        "GC: [dry run] WOULD reap {s} tombstone(s) from {s} older than {d}ms\n",
+                    log.info(
+                        "[dry run] WOULD reap {s} tombstone(s) from {s} older than {d}ms",
                         .{ c.PQgetvalue(res, 0, 0), sw.table, threshold_ms },
                     );
                 }
@@ -380,7 +445,7 @@ pub fn main(init: std.process.Init) !void {
             }
 
             if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) {
-                std.debug.print("ERROR: GC failed for table {s}: {s}\n", .{ sw.table, c.PQerrorMessage(pg_conn) });
+                log.err("GC failed for table {s}: {s}", .{ sw.table, c.PQerrorMessage(pg_conn) });
             } else {
                 // Batches until one comes back short. Each is its own statement and its
                 // own transaction, so a family of a million tombstones is a thousand
@@ -391,7 +456,7 @@ pub fn main(init: std.process.Init) !void {
                     c.PQclear(res);
                     res = c.PQexecPrepared(pg_conn, stmt_name.ptr, 2, &param_vals[0], null, null, 0);
                     if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) {
-                        std.debug.print("ERROR: GC failed for table {s} after {d} batch(es): {s}\n", .{ sw.table, batches, c.PQerrorMessage(pg_conn) });
+                        log.err("GC failed for table {s} after {d} batch(es): {s}", .{ sw.table, batches, c.PQerrorMessage(pg_conn) });
                         break;
                     }
                     reaped_table += std.fmt.parseInt(u64, std.mem.span(c.PQcmdTuples(res)), 10) catch 0;
@@ -399,8 +464,8 @@ pub fn main(init: std.process.Init) !void {
                 }
                 reaped_this_pass += reaped_table;
                 if (reaped_table > 0) {
-                    std.debug.print(
-                        "GC: reaped {d} tombstone(s) from {s} older than {d}ms in {d} batch(es) of up to {d}\n",
+                    log.info(
+                        "reaped {d} tombstone(s) from {s} older than {d}ms in {d} batch(es) of up to {d}",
                         .{ reaped_table, sw.table, threshold_ms, batches, batch_rows },
                     );
                 }
@@ -440,23 +505,24 @@ pub fn main(init: std.process.Init) !void {
             defer c.PQclear(wm_res);
 
             if (c.PQresultStatus(wm_res) != c.PGRES_COMMAND_OK) {
-                std.debug.print(
-                    "GC: WARNING could not publish the watermark: {s}\n",
+                log.warn(
+                    "could not publish the watermark: {s}",
                     .{c.PQerrorMessage(pg_conn)},
                 );
             } else if (std.mem.eql(u8, std.mem.span(c.PQcmdTuples(wm_res)), "0")) {
-                std.debug.print(
-                    "GC: WARNING the watermark row is missing (zebridge_gc_watermark id=1)." ++
-                        " Clients cannot tell how far back tombstones survive. Re-run init.sql.\n",
+                log.warn(
+                    "the watermark row is missing (zebridge_gc_watermark id=1)." ++
+                        " Clients cannot tell how far back tombstones survive. Re-run init.sql.",
                     .{},
                 );
             }
         }
 
         if (once) {
-            std.debug.print("GC: one pass done, exiting (--once)\n", .{});
+            log.info("one pass done, exiting (--once)", .{});
             return;
         }
-        utils.sleep(interval_ms * std.time.ns_per_ms);
+        sleepUnlessStopped(interval_ms);
     }
+    log.info("stopped", .{});
 }

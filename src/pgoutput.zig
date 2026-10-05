@@ -1488,7 +1488,7 @@ test "UUID array → [\"uuid1\",\"uuid2\"]" {
 // ---------------------------------------------------------------------------
 
 /// Build a TupleData wire fragment: column count, then one entry per column.
-fn buildTuple(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, cols: []const ColumnValue) !void {
+fn buildTuple(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, cols: []const ColumnValue) !void {
     var count: [2]u8 = undefined;
     std.mem.writeInt(u16, &count, @intCast(cols.len), .big);
     try buf.appendSlice(alloc, &count);
@@ -1511,7 +1511,7 @@ fn buildTuple(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, cols: 
 test "tuple - each format byte keeps its own meaning" {
     const alloc = std.testing.allocator;
 
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     try buildTuple(&buf, alloc, &.{
         .null,
@@ -1536,7 +1536,7 @@ test "tuple - an unchanged TOAST value is not a NULL" {
     // UPDATE would erase a column PostgreSQL never touched.
     const alloc = std.testing.allocator;
 
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     try buildTuple(&buf, alloc, &.{ .null, .unchanged });
 
@@ -1554,7 +1554,7 @@ test "decodeTuple - text columns bypass the OID decoder" {
     // know: under the old code these bytes went through decodeBinColumnData anyway.
     const alloc = std.testing.allocator;
 
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     try buildTuple(&buf, alloc, &.{ .{ .text = @constCast("a=>1") }, .unchanged, .null });
 

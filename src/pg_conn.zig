@@ -75,14 +75,14 @@ pub const PgConf = struct {
 
         // A URL that already mentions keepalives was set deliberately; do not
         // second-guess it, and do not append a duplicate parameter.
-        const ka: []const u8 = if (std.mem.indexOf(u8, url, "keepalives") != null) "" else keepalives_uri;
+        const ka: []const u8 = if (std.mem.find(u8, url, "keepalives") != null) "" else keepalives_uri;
         const sep: []const u8 = if (ka.len == 0)
             ""
-        else if (std.mem.indexOfScalar(u8, url, '?') != null) "&" else "?";
+        else if (std.mem.findScalar(u8, url, '?') != null) "&" else "?";
 
         if (replication) {
             // Whatever came before, there is now a query string to extend.
-            const rep_sep: []const u8 = if (ka.len > 0 or std.mem.indexOfScalar(u8, url, '?') != null) "&" else "?";
+            const rep_sep: []const u8 = if (ka.len > 0 or std.mem.findScalar(u8, url, '?') != null) "&" else "?";
             return try utils.allocPrintZ(allocator, "{s}{s}{s}{s}replication=database", .{ url, sep, ka, rep_sep });
         }
         return try utils.allocPrintZ(allocator, "{s}{s}{s}", .{ url, sep, ka });
@@ -179,7 +179,7 @@ test "connInfo - a URL with no query gets '?', one with a query gets '&'" {
 
     const with_query = try testConf("postgres://u:p@h/d?sslmode=require").connInfo(alloc, false);
     defer alloc.free(with_query);
-    try testing.expect(std.mem.indexOf(u8, with_query, "?sslmode=require&keepalives=1") != null);
+    try testing.expect(std.mem.find(u8, with_query, "?sslmode=require&keepalives=1") != null);
 }
 
 test "connInfo - replication is appended after the keepalives, still one query string" {

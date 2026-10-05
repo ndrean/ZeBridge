@@ -319,7 +319,7 @@ fn checkWalLag(
         // own shutdown. The replication loop cannot see it (its connection is parked
         // in COPY), so this side channel is how the bridge learns to step aside.
         if (shutting_down) |flag| {
-            if (std.mem.indexOf(u8, emsg, "shutting down") != null) flag.store(true, .release);
+            if (std.mem.find(u8, emsg, "shutting down") != null) flag.store(true, .release);
         }
         log.warn("⚠️ WAL monitor connection failed: {s}", .{emsg});
         return error.ConnectionFailed;
@@ -342,7 +342,7 @@ fn checkWalLag(
         .{config.slot_name},
     );
     defer allocator.free(query_str);
-    const query = try allocator.dupeZ(u8, query_str);
+    const query = try allocator.dupeSentinel(u8, query_str, 0);
     defer allocator.free(query);
 
     const result = c.PQexec(conn, query.ptr);

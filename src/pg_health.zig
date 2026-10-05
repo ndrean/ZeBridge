@@ -240,7 +240,7 @@ fn num(s: []const u8) i64 {
 /// caller turns into "this section is missing".
 fn query(conn: *c.PGconn, a: std.mem.Allocator, sql: [:0]const u8, params: []const []const u8) ![]const []const []const u8 {
     var pz: [4]?[*:0]const u8 = .{ null, null, null, null };
-    for (params, 0..) |p, i| pz[i] = (try a.dupeZ(u8, p)).ptr;
+    for (params, 0..) |p, i| pz[i] = (try a.dupeSentinel(u8, p, 0)).ptr;
     const res = c.PQexecParams(conn, sql.ptr, @intCast(params.len), null, if (params.len > 0) &pz[0] else null, null, null, 0);
     defer c.PQclear(res);
     if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {

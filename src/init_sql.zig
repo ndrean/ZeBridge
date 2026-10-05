@@ -97,17 +97,17 @@ const Parsed = struct { user: []const u8, password: []const u8, db: []const u8 }
 /// split zb-derive-env.py made: the LAST '@' ends the credentials, the FIRST ':' in
 /// them ends the user, as libpq reads it.
 fn parseUrl(a: std.mem.Allocator, url: []const u8) !Parsed {
-    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.NotAUrl;
+    const scheme_end = std.mem.find(u8, url, "://") orelse return error.NotAUrl;
     const rest = url[scheme_end + 3 ..];
-    const at = std.mem.lastIndexOfScalar(u8, rest, '@') orelse return error.NoCredentials;
+    const at = std.mem.findScalarLast(u8, rest, '@') orelse return error.NoCredentials;
     const creds = rest[0..at];
-    const colon = std.mem.indexOfScalar(u8, creds, ':');
+    const colon = std.mem.findScalar(u8, creds, ':');
     const user = try percentDecode(a, if (colon) |c| creds[0..c] else creds);
     const password = try percentDecode(a, if (colon) |c| creds[c + 1 ..] else "");
     const hostpart = rest[at + 1 ..];
-    const slash = std.mem.indexOfScalar(u8, hostpart, '/') orelse return error.NoDatabase;
+    const slash = std.mem.findScalar(u8, hostpart, '/') orelse return error.NoDatabase;
     var db = hostpart[slash + 1 ..];
-    if (std.mem.indexOfScalar(u8, db, '?')) |q| db = db[0..q];
+    if (std.mem.findScalar(u8, db, '?')) |q| db = db[0..q];
     if (db.len == 0) return error.NoDatabase;
     if (!isIdent(user)) return error.BadRoleName;
     return .{ .user = user, .password = password, .db = try percentDecode(a, db) };
@@ -143,9 +143,9 @@ fn quoteDoubled(a: std.mem.Allocator, s: []const u8) ![]const u8 {
 /// shape is an error: the templates have exactly these, and a new one must be added here.
 fn render(a: std.mem.Allocator, sql: *std.ArrayList(u8), template: []const u8, vars: []const Var) !void {
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, template, i, "${")) |start| {
+    while (std.mem.findPos(u8, template, i, "${")) |start| {
         try sql.appendSlice(a, template[i..start]);
-        const close = std.mem.indexOfScalarPos(u8, template, start, '}') orelse return error.UnclosedVariable;
+        const close = std.mem.findScalarPos(u8, template, start, '}') orelse return error.UnclosedVariable;
         const name = template[start + 2 .. close];
         const v = for (vars) |v| {
             if (std.mem.eql(u8, v.name, name)) break v;
@@ -174,8 +174,8 @@ fn render(a: std.mem.Allocator, sql: *std.ArrayList(u8), template: []const u8, v
 /// Whether `pos` sits after a `--` on its own line (outside a string, near enough for
 /// these templates).
 fn inLineComment(text: []const u8, pos: usize) bool {
-    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..pos], '\n')) |n| n + 1 else 0;
-    return std.mem.indexOf(u8, text[line_start..pos], "--") != null;
+    const line_start = if (std.mem.findScalarLast(u8, text[0..pos], '\n')) |n| n + 1 else 0;
+    return std.mem.find(u8, text[line_start..pos], "--") != null;
 }
 
 fn urlError(which: []const u8, err: anyerror) u8 {
@@ -232,8 +232,8 @@ test "both embedded templates name only the six known variables" {
     const known = [_][]const u8{ "POSTGRES_READER_USER", "POSTGRES_READER_PASSWORD", "POSTGRES_WRITER_USER", "POSTGRES_WRITER_PASSWORD", "TARGET_DB", "OPEN_TENANT" };
     for ([_][]const u8{ core_template, write_template }) |t| {
         var i: usize = 0;
-        while (std.mem.indexOfPos(u8, t, i, "${")) |start| {
-            const close = std.mem.indexOfScalarPos(u8, t, start, '}').?;
+        while (std.mem.findPos(u8, t, i, "${")) |start| {
+            const close = std.mem.findScalarPos(u8, t, start, '}').?;
             const name = t[start + 2 .. close];
             var found = false;
             for (known) |k| if (std.mem.eql(u8, k, name)) {

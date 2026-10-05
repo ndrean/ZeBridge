@@ -468,7 +468,7 @@ pub const PublishWindow = struct {
     sub: *nats.Subscription,
     prefix: []u8,
     allocator: std.mem.Allocator,
-    inflight: std.ArrayListUnmanaged(InFlight) = .empty,
+    inflight: std.ArrayList(InFlight) = .empty,
     next_token: u64 = 0,
 
     const InFlight = struct { token: u64, sent_ns: u64 };
@@ -523,7 +523,7 @@ pub const PublishWindow = struct {
                 log.err("async publish {d} answered with status {d} — no stream listening?", .{ token, raw.status_code });
                 return error.NoStreamResponse;
             }
-            if (std.mem.indexOf(u8, raw.data, "\"error\"") != null) {
+            if (std.mem.find(u8, raw.data, "\"error\"") != null) {
                 log.err("async publish {d} refused: {s}", .{ token, raw.data });
                 return error.PublishNack;
             }

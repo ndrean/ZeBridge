@@ -113,7 +113,7 @@ pub fn mint(
         "\"nats\":{{\"pub\":{{}},\"sub\":{{}}," ++
         "\"issuer_account\":\"{s}\",\"tags\":[{s}],\"type\":\"user\",\"version\":2}}}}";
 
-    var tags: std.ArrayListUnmanaged(u8) = .empty;
+    var tags: std.ArrayList(u8) = .empty;
     defer tags.deinit(allocator);
     for (tenants, 0..) |t, i| {
         if (i > 0) try tags.append(allocator, ',');

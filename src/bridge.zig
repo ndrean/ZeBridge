@@ -427,7 +427,7 @@ fn runDiagnose(
     // ── 1. the publication ──────────────────────────────────────────────────────
     {
         var q_buf: [256]u8 = undefined;
-        const q = std.fmt.bufPrintZ(&q_buf, "SELECT count(*) FROM pg_publication_tables WHERE pubname = '{s}'", .{pub_name}) catch return 1;
+        const q = std.fmt.bufPrintSentinel(&q_buf, "SELECT count(*) FROM pg_publication_tables WHERE pubname = '{s}'", .{pub_name}, 0) catch return 1;
         const res = c.PQexec(conn, q.ptr);
         defer c.PQclear(res);
         const n: usize = if (c.PQresultStatus(res) == c.PGRES_TUPLES_OK and c.PQntuples(res) == 1)
@@ -483,7 +483,7 @@ fn runDiagnose(
     // ── 4. would this budget SHRINK what the slot ran with before? ──────────────
     {
         var q_buf: [256]u8 = undefined;
-        const q = std.fmt.bufPrintZ(&q_buf, "SELECT max_row_bytes FROM public.zebridge_limits WHERE slot = '{s}'", .{slot_name}) catch return 1;
+        const q = std.fmt.bufPrintSentinel(&q_buf, "SELECT max_row_bytes FROM public.zebridge_limits WHERE slot = '{s}'", .{slot_name}, 0) catch return 1;
         const res = c.PQexec(conn, q.ptr);
         defer c.PQclear(res);
         if (c.PQresultStatus(res) == c.PGRES_TUPLES_OK and c.PQntuples(res) == 1) {
@@ -608,9 +608,9 @@ fn registerRowWidthBudget(
     var slot_buf: [256]u8 = undefined;
     var pub_buf: [256]u8 = undefined;
     var bytes_buf: [32]u8 = undefined;
-    const slot_z = std.fmt.bufPrintZ(&slot_buf, "{s}", .{slot_name}) catch return null;
-    const pub_z = std.fmt.bufPrintZ(&pub_buf, "{s}", .{pub_name}) catch return null;
-    const bytes_z = std.fmt.bufPrintZ(&bytes_buf, "{d}", .{max_row_bytes}) catch return null;
+    const slot_z = std.fmt.bufPrintSentinel(&slot_buf, "{s}", .{slot_name}, 0) catch return null;
+    const pub_z = std.fmt.bufPrintSentinel(&pub_buf, "{s}", .{pub_name}, 0) catch return null;
+    const bytes_z = std.fmt.bufPrintSentinel(&bytes_buf, "{d}", .{max_row_bytes}, 0) catch return null;
     // on_standby (§10cz): this slot lives where the primary cannot list it, so the
     // function's GC must never read its absence as "retired".
     const standby_z: [*:0]const u8 = if (on_standby) "t" else "f";
@@ -802,9 +802,9 @@ pub fn main(init: std.process.Init) !void {
     log.info("Topology: built in (grammar.json embedded at compile time, §10ci)", .{});
 
     // Create null-terminated versions for C APIs (kept alive for entire program)
-    const slot_name_z = try allocator.dupeZ(u8, parsed_args.slot_name);
+    const slot_name_z = try allocator.dupeSentinel(u8, parsed_args.slot_name, 0);
     defer allocator.free(slot_name_z);
-    const pub_name_z = try allocator.dupeZ(u8, parsed_args.publication_name);
+    const pub_name_z = try allocator.dupeSentinel(u8, parsed_args.publication_name, 0);
     defer allocator.free(pub_name_z);
 
     log.info("▶️ Starting CDC Bridge with parameters:\n", .{});
@@ -853,7 +853,7 @@ pub fn main(init: std.process.Init) !void {
             if (runtime_config.pg_writer_url) |wurl| {
                 // connect_timeout: a hung PG must cost an enroll permit for
                 // seconds, not forever — the permits are the flood bound.
-                const sep: []const u8 = if (std.mem.indexOfScalar(u8, wurl, '?') != null) "&" else "?";
+                const sep: []const u8 = if (std.mem.findScalar(u8, wurl, '?') != null) "&" else "?";
                 enroll_conninfo = try std.fmt.allocPrintSentinel(allocator, "{s}{s}connect_timeout={d}", .{ wurl, sep, Config.Http.enroll_pg_connect_timeout_seconds }, 0);
                 http_srv.enroll = .{
                     .writer_conninfo = enroll_conninfo.?,
@@ -1050,7 +1050,7 @@ pub fn main(init: std.process.Init) !void {
                         // registry that is memory would otherwise lift it in silence and
                         // suspend again at that row's next event.
                         if (std.mem.eql(u8, reason, "row_too_large")) {
-                            const tbl_z = allocator.dupeZ(u8, tbl) catch continue;
+                            const tbl_z = allocator.dupeSentinel(u8, tbl, 0) catch continue;
                             defer allocator.free(tbl_z);
                             const params = [_]?[*:0]const u8{tbl_z.ptr};
                             const wr = c.PQexecParams(conn, "SELECT COALESCE(public.zebridge_widest_row(to_regclass(format('%I.%I', 'public', $1::text))), 0)::text", 1, null, &params[0], null, null, 0);
@@ -1592,7 +1592,7 @@ pub fn main(init: std.process.Init) !void {
     if (rate_limiter.enabled()) log.info("🚦 ingress rate limit: {d} write(s)/s per principal and per tenant, burst {d}", .{ runtime_config.mutation_rate_per_principal, @as(u32, @intFromFloat(rate_limiter.burst)) });
     http_srv.limiter = &rate_limiter;
     const ingress_lanes: usize = runtime_config.ingress_lanes;
-    var mut_listeners: std.ArrayListUnmanaged(*mutation_listener.MutationListener) = .empty;
+    var mut_listeners: std.ArrayList(*mutation_listener.MutationListener) = .empty;
     defer mut_listeners.deinit(allocator);
     if (writer_config) |*wc| {
         log.info("Starting {d} mutation listener lane(s) (role: {s})...", .{ ingress_lanes, wc.role });

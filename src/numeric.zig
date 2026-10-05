@@ -123,7 +123,7 @@ pub fn parseNumeric(allocator: std.mem.Allocator, buf: []const u8) NumericDecode
 /// trimmed are zeros by construction, since PostgreSQL rounds a numeric to its scale
 /// on input and the groups only pad to a multiple of four. Scale 0 drops the point.
 fn fitScale(out: []u8, len: usize, dscale: usize) usize {
-    const dot = std.mem.indexOfScalar(u8, out[0..len], '.');
+    const dot = std.mem.findScalar(u8, out[0..len], '.');
     if (dscale == 0) return if (dot) |d| d else len;
     if (dot) |d| {
         const frac = len - d - 1;

@@ -345,17 +345,17 @@ pub fn registerExtensionBinaryTypes(conn: *c.PGconn) void {
 }
 
 pub fn roleFromUrl(url: []const u8) ?[]const u8 {
-    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return null;
+    const scheme_end = std.mem.find(u8, url, "://") orelse return null;
     var rest = url[scheme_end + 3 ..];
 
     // Authority ends at the first '/', and the password may legally contain '@', so the
     // split is on the *last* '@' before that.
-    if (std.mem.indexOfScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
-    const at = std.mem.lastIndexOfScalar(u8, rest, '@') orelse return null;
+    if (std.mem.findScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
+    const at = std.mem.findScalarLast(u8, rest, '@') orelse return null;
     const userinfo = rest[0..at];
     if (userinfo.len == 0) return null;
 
-    const colon = std.mem.indexOfScalar(u8, userinfo, ':') orelse return userinfo;
+    const colon = std.mem.findScalar(u8, userinfo, ':') orelse return userinfo;
     return if (colon == 0) null else userinfo[0..colon];
 }
 
@@ -669,7 +669,7 @@ pub fn reportTable(
     );
     defer allocator.free(query);
 
-    const table_z = try allocator.dupeZ(u8, table);
+    const table_z = try allocator.dupeSentinel(u8, table, 0);
     defer allocator.free(table_z);
     const values = [_][*c]const u8{table_z.ptr};
 
@@ -1270,7 +1270,7 @@ fn reportConnectionBudget(conn: *c.PGconn, writer_role: ?[]const u8, ingress_lan
 
     var wr_buf: [128]u8 = undefined;
     const wr = writer_role orelse "";
-    const wr_z = std.fmt.bufPrintZ(&wr_buf, "{s}", .{wr}) catch return;
+    const wr_z = std.fmt.bufPrintSentinel(&wr_buf, "{s}", .{wr}, 0) catch return;
     const params = [_]?[*:0]const u8{wr_z.ptr};
     const res = c.PQexecParams(conn, "SELECT current_setting('max_connections')::int, " ++
         "COALESCE((SELECT rolconnlimit FROM pg_roles WHERE rolname = current_user), -1), " ++

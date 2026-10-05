@@ -92,7 +92,7 @@ pub const GenerationProducer = struct {
     /// GENERATION_WORKERS > 1 (§10ev) — and read by the edge watch on the producer's
     /// thread: `cuts_lock` guards the map, held for a lookup. Keys and strings are
     /// owned by `allocator` and live until deinit, so a copy of a Cut stays valid.
-    cuts: std.StringArrayHashMapUnmanaged(Cut) = .empty,
+    cuts: std.array_hash_map.String(Cut) = .empty,
     cuts_lock: utils.SpinLock = .{},
     /// §10ki: tenants that have rows but no CDC stream — nobody is mapped to them, so no
     /// client can follow a chain; their pairs are skipped. Said once per tenant, and once
@@ -104,7 +104,7 @@ pub const GenerationProducer = struct {
     workers: u32 = 1,
     /// Per CDC stream: `first_seq` at the previous edge check and when it was read —
     /// the prune rate is the difference over the interval.
-    edges: std.StringArrayHashMapUnmanaged(Edge) = .empty,
+    edges: std.array_hash_map.String(Edge) = .empty,
     /// §10er: the full scan of every cut stream, a quarter of the cadence apart (five
     /// seconds at least) — the safety net; the streams that burst are read within a
     /// second, on the publisher's mark.
@@ -132,9 +132,9 @@ pub const GenerationProducer = struct {
     /// database clock by that much. Null (tests), or a table it does not know: kept too.
     writable: ?*const writable_tables.Registry = null,
     floor_warned: std.atomic.Value(bool) = .init(false),
-    pair_busy: std.StringArrayHashMapUnmanaged(bool) = .empty,
-    full_pending: std.StringArrayHashMapUnmanaged(void) = .empty,
-    full_queue: std.ArrayListUnmanaged(FullJob) = .empty,
+    pair_busy: std.array_hash_map.String(bool) = .empty,
+    full_pending: std.array_hash_map.String(void) = .empty,
+    full_queue: std.ArrayList(FullJob) = .empty,
     full_thread: ?std.Thread = null,
     /// The CDC per-event buffer (2^BASE_BUF). The chain has no per-row ceiling —
     /// object chunking removes it — so the producer is where a row too wide for
@@ -320,7 +320,7 @@ pub const GenerationProducer = struct {
         var js = conn_nats.jetstream(.{ .domain = self.endpoint.js_domain });
 
         const StreamRead = struct { first: u64, last: u64, rate: f64, fill: f64, to_cap_s: f64, max_age_s: f64 };
-        var reads: std.StringArrayHashMapUnmanaged(StreamRead) = .empty;
+        var reads: std.array_hash_map.String(StreamRead) = .empty;
         const now_ms = utils.unixMillis();
         for (cuts) |cut| {
             if (reads.contains(cut.stream) or !wanted.in(only_streams, cut.stream)) continue;
@@ -353,7 +353,7 @@ pub const GenerationProducer = struct {
             try reads.put(alloc, cut.stream, .{ .first = st.first_seq, .last = st.last_seq, .rate = rate, .fill = fill, .to_cap_s = to_cap_s, .max_age_s = @as(f64, @floatFromInt(cfg.max_age)) / 1e9 });
         }
 
-        var urgent: std.ArrayListUnmanaged(Cut) = .empty;
+        var urgent: std.ArrayList(Cut) = .empty;
         for (cuts) |cut| {
             const r = reads.get(cut.stream) orelse continue;
             if (cut.hold_until_ms > now_ms) continue;
@@ -443,7 +443,7 @@ pub const GenerationProducer = struct {
         // explicit opt-outs (zebridge_enable(generations => false)). Routability and
         // tenancy are decided per table below; GENERATION_RULES, when set, only
         // INTERSECTS what was derived.
-        const pub_z = try alloc.dupeZ(u8, self.publication_name);
+        const pub_z = try alloc.dupeSentinel(u8, self.publication_name, 0);
         if (only) |pairs| {
             const jobs = try alloc.alloc(Job, pairs.len);
             for (pairs, 0..) |cut, i| jobs[i] = .{ .table = cut.table, .tenant = cut.tenant, .vcol = cut.vcol, .tcol = cut.tcol, .guarded = cut.guarded, .force_cut = true };
@@ -481,7 +481,7 @@ pub const GenerationProducer = struct {
 
         const restricted = self.rules.count() > 0;
         var pairs: usize = 0;
-        var jobs: std.ArrayListUnmanaged(Job) = .empty;
+        var jobs: std.ArrayList(Job) = .empty;
         const n_tables: usize = @intCast(c.PQntuples(derived));
         // The published set, for the departure sweep below (§10dg).
         var published_lit: std.ArrayList(u8) = .empty;
@@ -532,7 +532,7 @@ pub const GenerationProducer = struct {
                 // dyntenant lesson: a new tenant's first row creates its chain on the
                 // next tick, and a tenant with no rows has nothing to seed.
                 const tbl_ref = try utils.allocPrintZ(alloc, "public.\"{s}\"", .{table});
-                const col_z = try alloc.dupeZ(u8, tenant_col_eff);
+                const col_z = try alloc.dupeSentinel(u8, tenant_col_eff, 0);
                 const tparams = [_]?[*:0]const u8{ tbl_ref.ptr, col_z.ptr };
                 const tres = queryOne(pgc, "SELECT * FROM public.zebridge_tenants_of($1::regclass, $2::name)", &tparams) catch |err| {
                     log.err("🧬 tenants_of('{s}') failed: {} — table skipped this tick", .{ table, err });
@@ -752,7 +752,7 @@ pub const GenerationProducer = struct {
         // 1.2M-row fulls in flight (§10ev). Now a row costs its msgpack bytes and
         // nothing else. The `rows` array header is array32 with a count patched in at
         // the end, since the count is known only when COPY says so.
-        var out: std.ArrayListUnmanaged(u8) = .empty;
+        var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(payload_alloc);
         const rows_hdr = try docHead(&out, payload_alloc, cr.names, prev_cutoff != null, 0);
         while (true) {
@@ -927,7 +927,7 @@ pub const GenerationProducer = struct {
     /// and the owner rebuilt them, round after round (multi_bridge.py). A chain is swept
     /// only when its table is in NO publication: dropped, or disabled everywhere.
     fn sweepDeparted(self: *GenerationProducer, alloc: std.mem.Allocator, bkc: *c.PGconn, js: *nats.JetStream, published_lit: []const u8) !void {
-        const lit_z = try alloc.dupeZ(u8, published_lit);
+        const lit_z = try alloc.dupeSentinel(u8, published_lit, 0);
         const params = [_]?[*:0]const u8{lit_z.ptr};
         const gone = try queryOne(bkc,
             \\SELECT DISTINCT g.tenant, g.tbl FROM public.zebridge_generations g
@@ -948,8 +948,8 @@ pub const GenerationProducer = struct {
 
     /// One (tenant, table) chain gone for good: its objects, its manifest, its rows.
     fn sweepPair(self: *GenerationProducer, alloc: std.mem.Allocator, bkc: *c.PGconn, js: *nats.JetStream, tenant: []const u8, table: []const u8) !void {
-        const tenant_z = try alloc.dupeZ(u8, tenant);
-        const table_z = try alloc.dupeZ(u8, table);
+        const tenant_z = try alloc.dupeSentinel(u8, tenant, 0);
+        const table_z = try alloc.dupeSentinel(u8, table, 0);
         const pair = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
         const bucket = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.generation_bucket_prefix, tenant });
         var osm = js.objectStoreManager();
@@ -1028,13 +1028,13 @@ pub const GenerationProducer = struct {
         fell_off: *bool,
     ) !void {
         const build_started_ms = utils.unixMillis();
-        const table_z = try alloc.dupeZ(u8, table);
-        const tenant_z = try alloc.dupeZ(u8, tenant);
+        const table_z = try alloc.dupeSentinel(u8, table, 0);
+        const tenant_z = try alloc.dupeSentinel(u8, tenant, 0);
         // §10ff: a table with a publication column list has columns CDC never sends; the
         // chain must not carry them either, or a replica holds values no event updates.
         // The select list is the publication's, `*` when it has none.
         const cols_sel: []const u8 = blk: {
-            const pub_z = try alloc.dupeZ(u8, self.publication_name);
+            const pub_z = try alloc.dupeSentinel(u8, self.publication_name, 0);
             const params = [_]?[*:0]const u8{ pub_z.ptr, table_z.ptr };
             const res = try queryOne(pgc, "SELECT COALESCE((SELECT string_agg(quote_ident(n), ', ' ORDER BY ord) FROM unnest(pt.attnames) WITH ORDINALITY AS u(n, ord)), '*') " ++
                 "FROM pg_publication_tables pt WHERE pt.pubname = $1 AND pt.tablename = $2 AND pt.schemaname = 'public'", &params);
@@ -1483,7 +1483,7 @@ pub const GenerationProducer = struct {
         // The table's storage at the cut, from pg_class under this snapshot.
         const filenode_now: []const u8 = blk: {
             if (cur_relid.len == 0) break :blk "";
-            const res = try queryOne(pgc, "SELECT relfilenode::text FROM pg_class WHERE oid = $1::oid", &.{(try alloc.dupeZ(u8, cur_relid)).ptr});
+            const res = try queryOne(pgc, "SELECT relfilenode::text FROM pg_class WHERE oid = $1::oid", &.{(try alloc.dupeSentinel(u8, cur_relid, 0)).ptr});
             defer c.PQclear(res);
             if (c.PQntuples(res) == 0) break :blk "";
             break :blk try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0)));
@@ -1841,18 +1841,18 @@ pub const GenerationProducer = struct {
         // ── objects and manifest live: NOW the row becomes the producer's memory ──
         {
             const gen_str = try utils.allocPrintZ(alloc, "{d}", .{gen});
-            const lsn_z = try alloc.dupeZ(u8, lsn);
-            const cut_z = try alloc.dupeZ(u8, cutoff_version);
-            const prev_z: ?[*:0]const u8 = if (last_cutoff) |p| (try alloc.dupeZ(u8, p)).ptr else null;
+            const lsn_z = try alloc.dupeSentinel(u8, lsn, 0);
+            const cut_z = try alloc.dupeSentinel(u8, cutoff_version, 0);
+            const prev_z: ?[*:0]const u8 = if (last_cutoff) |p| (try alloc.dupeSentinel(u8, p, 0)).ptr else null;
             const count_z: ?[*:0]const u8 = if (row_count_now) |n| (try utils.allocPrintZ(alloc, "{d}", .{n})).ptr else null;
-            const floor_z: ?[*:0]const u8 = if (floor_now) |f| (try alloc.dupeZ(u8, f)).ptr else null;
-            const filenode_z: ?[*:0]const u8 = if (filenode_now.len > 0) (try alloc.dupeZ(u8, filenode_now)).ptr else null;
+            const floor_z: ?[*:0]const u8 = if (floor_now) |f| (try alloc.dupeSentinel(u8, f, 0)).ptr else null;
+            const filenode_z: ?[*:0]const u8 = if (filenode_now.len > 0) (try alloc.dupeSentinel(u8, filenode_now, 0)).ptr else null;
             // §10gw: what this row's full weighs, for the rule that decides the next base.
             const obj_bytes_z: ?[*:0]const u8 = if (full_obj) |fo| (try utils.allocPrintZ(alloc, "{d}", .{fo.z_bytes})).ptr else null;
             const del_z = try utils.allocPrintZ(alloc, "{d}", .{del_count_now});
             const epoch_z = try utils.allocPrintZ(alloc, "{d}", .{cat_epoch});
-            const shape_z = try alloc.dupeZ(u8, col_shape);
-            const relid_z: ?[*:0]const u8 = if (cur_relid.len > 0) (try alloc.dupeZ(u8, cur_relid)).ptr else null;
+            const shape_z = try alloc.dupeSentinel(u8, col_shape, 0);
+            const relid_z: ?[*:0]const u8 = if (cur_relid.len > 0) (try alloc.dupeSentinel(u8, cur_relid, 0)).ptr else null;
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", count_z, del_z.ptr, epoch_z.ptr, shape_z.ptr, relid_z, floor_z, filenode_z, obj_bytes_z };
             const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, row_count, del_count, seed_epoch, col_shape, relid, open_xact_floor, filenode, obj_bytes, delta_sorted, full_sorted) " ++
                 "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, $8::bigint, $9::bigint, $10::integer, $11, $12::oid, $13::timestamptz, $14::oid, $15::bigint, true, $7::boolean) " ++
@@ -2076,12 +2076,12 @@ pub const GenerationProducer = struct {
         var js = cs.conn_nats.jetstream(.{ .domain = self.endpoint.js_domain });
         const table = j.table;
         const tenant = j.tenant;
-        const table_z = try alloc.dupeZ(u8, table);
-        const tenant_z = try alloc.dupeZ(u8, tenant);
+        const table_z = try alloc.dupeSentinel(u8, table, 0);
+        const tenant_z = try alloc.dupeSentinel(u8, tenant, 0);
         const pair = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
 
         const cols_sel: []const u8 = blk: {
-            const pub_z = try alloc.dupeZ(u8, self.publication_name);
+            const pub_z = try alloc.dupeSentinel(u8, self.publication_name, 0);
             const params = [_]?[*:0]const u8{ pub_z.ptr, table_z.ptr };
             const res = try queryOne(pgc, "SELECT COALESCE((SELECT string_agg(quote_ident(n), ', ' ORDER BY ord) FROM unnest(pt.attnames) WITH ORDINALITY AS u(n, ord)), '*') " ++
                 "FROM pg_publication_tables pt WHERE pt.pubname = $1 AND pt.tablename = $2 AND pt.schemaname = 'public'", &params);
@@ -2183,7 +2183,7 @@ pub const GenerationProducer = struct {
             // window only while no tombstone inside it can have been reaped. The sweeper
             // reaps at `now() - threshold`, so a window reaching past that proves nothing
             // and a FULL is owed instead — said, not silently built.
-            const lower_z = try alloc.dupeZ(u8, ckpt_lower);
+            const lower_z = try alloc.dupeSentinel(u8, ckpt_lower, 0);
             const gp = [_]?[*:0]const u8{lower_z.ptr};
             // ⚠️ `threshold_ms > 0` is the whole guard's precondition: the row ships with
             // 0 and the SWEEPER stamps its real retention the first time it runs. Zero
@@ -2256,7 +2256,7 @@ pub const GenerationProducer = struct {
             return;
         }
         if (j.kind == .checkpoint) {
-            const lower_z = try alloc.dupeZ(u8, ckpt_lower);
+            const lower_z = try alloc.dupeSentinel(u8, ckpt_lower, 0);
             const bytes_z = try utils.allocPrintZ(alloc, "{d}", .{fo.z_bytes});
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_l_z.ptr, lower_z.ptr, bytes_z.ptr };
             const res = try queryOne(bkc, "UPDATE public.zebridge_generations SET has_checkpoint = true, ckpt_sorted = true, ckpt_lower = $4::timestamptz, obj_bytes = $5::bigint " ++
@@ -2361,7 +2361,7 @@ pub const GenerationProducer = struct {
 /// chain document uses, the smallest encoding of each, as the decoders on every
 /// client already accept (they read any width).
 const mp = struct {
-    const List = std.ArrayListUnmanaged(u8);
+    const List = std.ArrayList(u8);
 
     fn be(out: *List, a: std.mem.Allocator, comptime T: type, v: T) !void {
         try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(T, v)));
@@ -2976,7 +2976,7 @@ test "FullStreamOf: one zstd frame with no content size, the document intact, in
     _ = try docHead(&fs.raw, a, &names, false, total);
     fs.seen += fs.raw.items.len; // the head, as putChainObject counts it
 
-    var z: std.ArrayListUnmanaged(u8) = .empty;
+    var z: std.ArrayList(u8) = .empty;
     defer z.deinit(a);
     var chunk: [4096]u8 = undefined;
     while (true) {
@@ -3000,7 +3000,7 @@ test "FullStreamOf: one zstd frame with no content size, the document intact, in
     try std.testing.expectEqual(fs.seen, doc.len);
     // {columns, rows: array32(total) …, gen, kind, cutoff, version_column}
     try std.testing.expectEqual(@as(u8, 0x86), doc[0]);
-    const rows_at = std.mem.indexOf(u8, doc, "\xa4rows").? + 5;
+    const rows_at = std.mem.find(u8, doc, "\xa4rows").? + 5;
     try std.testing.expectEqual(@as(u8, 0xdd), doc[rows_at]);
     try std.testing.expectEqual(@as(u32, total), std.mem.readInt(u32, doc[rows_at + 1 ..][0..4], .big));
     try std.testing.expect(std.mem.endsWith(u8, doc, "\xaeversion_column\xaaupdated_at"));
