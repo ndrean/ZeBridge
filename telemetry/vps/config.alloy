@@ -1,4 +1,4 @@
-// Grafana Alloy on the VPS: scrapes the bridge and the NATS exporter, reads the three
+// Grafana Alloy on the VPS: scrapes the bridge, the NATS exporter and the services' memory, reads the three
 // services' journal, and sends both to Grafana Cloud. The key comes from the
 // environment (GRAFANA_PASSWORD, from .env.grafana), never from this file.
 
@@ -15,6 +15,54 @@ prometheus.scrape "nats" {
   job_name        = "nats"
   scrape_interval = "15s"
   forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+// The memory of the four services, as systemd counts it (`systemctl status` → Memory:),
+// read from their cgroups. Only these four: docker_only drops every other cgroup and the
+// allowlist brings these back; no Docker socket, so cAdvisor cannot see or touch the
+// containers. A leak shows as a climb that never comes back down.
+prometheus.exporter.cadvisor "units" {
+  docker_only                 = true
+  disable_root_cgroup_stats   = true
+  enabled_metrics             = ["memory"]
+  storage_duration            = "2m"
+  raw_cgroup_prefix_allowlist = [
+    "/system.slice/zebridge.service",
+    "/system.slice/zebridge-sweeper.service",
+    "/system.slice/nats.service",
+    "/system.slice/airports.service",
+  ]
+}
+
+prometheus.scrape "units" {
+  targets         = prometheus.exporter.cadvisor.units.targets
+  job_name        = "units"
+  scrape_interval = "30s"
+  forward_to      = [prometheus.relabel.units.receiver]
+}
+
+// Two series per unit: the working set (what systemd shows) and the RSS.
+prometheus.relabel "units" {
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+  rule {
+    source_labels = ["__name__"]
+    regex         = "container_memory_(working_set_bytes|rss)"
+    action        = "keep"
+  }
+  rule {
+    source_labels = ["id"]
+    regex         = "/system.slice/(.+)\\.service"
+    target_label  = "unit"
+  }
+  rule {
+    source_labels = ["unit"]
+    regex         = ""
+    action        = "drop"
+  }
+  rule {
+    target_label = "environment"
+    replacement  = "production"
+  }
 }
 
 prometheus.remote_write "grafana_cloud" {

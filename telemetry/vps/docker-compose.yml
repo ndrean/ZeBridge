@@ -12,6 +12,9 @@ services:
     container_name: zb_alloy
     restart: unless-stopped
     network_mode: host
+    # The host's cgroup namespace: cAdvisor (config.alloy) reads the services' memory at
+    # /sys/fs/cgroup/system.slice/<unit>.service, which a private namespace hides.
+    cgroup: host
     env_file: .env.grafana
     command: ["run", "/etc/alloy/config.alloy", "--storage.path=/var/lib/alloy/data",
               "--server.http.listen-addr=127.0.0.1:12345"]
@@ -22,6 +25,8 @@ services:
       - /var/log/journal:/var/log/journal:ro
       - /run/log/journal:/run/log/journal:ro
       - /etc/machine-id:/etc/machine-id:ro
+      # the services' cgroups, read-only (their memory; no Docker socket is mounted)
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
 
   nats-exporter:
     image: natsio/prometheus-nats-exporter:latest
