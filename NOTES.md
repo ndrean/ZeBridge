@@ -18926,3 +18926,11 @@ resource bundle) and passes them as `caFile` when the app names none: the librar
 TLS glue on iOS. `zb_client_sync` now reports `principal`, so a binding knows who it enrolled
 as without reading the identity file. Build trap: a new bundle id needs
 `xcodebuild -allowProvisioningUpdates`; `expo run:ios` stops at "No profiles".
+
+Measured, airports_near around Frankfurt, the same "ms in the service" on every phone:
+the iPhone 12 (React Native, libzb, through the leaf) 36 ms round trip; the moto e20 with
+libzb (Flutter) 40–60 ms; the moto e20 with zb-client-ts (React Native, Hermes, wss through
+Cloudflare to the hub) 87 ms. The moto's own network: ping 30 ms average (min 18, jitter
+±10) to the hub and the leaf, against ~24 ms from the iPhone. So on a low-end Android phone
+the JavaScript stack costs 30–45 ms a request, and the device and its Wi-Fi the rest. The
+case for building libzb into zb-react-native for Android too (iOS only today).
