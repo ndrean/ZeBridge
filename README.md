@@ -895,7 +895,7 @@ More in [Verify the wiring](#7-verify-the-wiring).
 
 The `bridge_sweeper` companion is run as a daemon that scans periodically PostgreSQL to prune rows marked for deletion.
 
-It uses the `WRITER` role and reaps tombstones older than `GC_THRESHOLD_MS` (an hour by default; the setting sits with the chain's in [Configuration](#configuration), because the two clocks are coupled).
+It uses the `WRITER` role and reaps tombstones older than `GC_THRESHOLD_MS` (7 days by default; the setting sits with the chain's in [Configuration](#configuration), because the two clocks are coupled).
 
 ```sh
 DATABASE_WRITER_URL=xxx bridge_sweeper [--once]
@@ -2539,7 +2539,7 @@ At boot the bridge checks the writer role's connection limit, and PostgreSQL's `
 | `MUTATION_BACKLOG_PER_PRINCIPAL` | 5000 | the MUTATIONS stream's `max_msgs_per_subject`, with `discard new per subject` and workqueue retention, used when the bridge creates the stream. The subject carries the principal, so this is how many writes one principal may have queued before its publishes are refused at the door; nobody else notices. On an existing stream it changes nothing: the bridge never edits MUTATIONS (edit it with `nats stream edit`); `zbdoctor` checks the stream against the rate the bridge declares on `/status` |
 | `MUTATION_RATE_PER_PRINCIPAL` | 0 (off) | writes per second one principal, and one tenant, may send. Beyond it a write is NAK'd with the delay of its place in the queue and redelivered by JetStream when its turn comes: a flood is served at the rate, other tenants' writes are answered as if it were not there, nothing is dropped. `MUTATION_RATE_BURST` (default: one second's worth) is what a quiet client may send at once |
 | `ZB_INGRESS_LANES` | 1 (max 8) | parallel mutation listeners on the one ingress stream. Each lane pulls up to 64 writes and applies them in one transaction, on its own PostgreSQL writer connection and NATS connection; JetStream spreads the writes across lanes. Measured on one Mac: one lane ~8,500 writes/s, two ~14,000, four ~19,500 ([examples/09-event](examples/09-event/README.md#the-ramp-how-far-one-mac-goes)). Set at start, no rebuild |
-| `GC_THRESHOLD_MS` | 3600000 | the sweeper's age: a tombstone older than this is reaped (floor 60000) |
+| `GC_THRESHOLD_MS` | 604800000 (7 days) | the sweeper's age: a tombstone older than this is reaped (floor 60000). It is the longest a client may stay offline and still catch up through the chain, with its pending edits |
 | `CDC_MAX_AGE_SECONDS` | 3 × cadence | how long a CDC stream keeps an event |
 | `CDC_MAX_BYTES` | 1 GiB | a CDC stream's size cap, a disk valve |
 | `CDC_MAX_MSGS` | 10,000,000 | a CDC stream's message cap, a disk valve |

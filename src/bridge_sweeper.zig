@@ -65,7 +65,7 @@ const usage =
     \\  --once     one pass, then exit (a controlled run: check, sweep, check)
     \\  --help     this text
     \\
-    \\Environment: DATABASE_WRITER_URL (required), GC_THRESHOLD_MS (default 3600000),
+    \\Environment: DATABASE_WRITER_URL (required), GC_THRESHOLD_MS (default 604800000, 7 days),
     \\  GC_INTERVAL_MS (default 60000), GC_BATCH_ROWS (default 1000), GC_DRY_RUN,
     \\  GC_ALLOW_SHORT_THRESHOLD, SWEEP_ONLY_TABLES.
     \\
@@ -145,7 +145,10 @@ pub fn main(init: std.process.Init) !void {
     //
     // ⚠️ There is no undo. A reaped tombstone is a deleted row: the delete already
     // happened, and what is lost is the *evidence* that overrules a late writer.
-    const threshold_ms_str = env.getPosix("GC_THRESHOLD_MS") orelse "3600000"; // 1 hour
+    // 7 days: a phone left off over a weekend or a short trip still catches up through the
+    // chain and keeps its queued edits. An hour sent every client offline longer than that
+    // to a full reload, and refused its pending edits ("predates the GC watermark").
+    const threshold_ms_str = env.getPosix("GC_THRESHOLD_MS") orelse "604800000"; // 7 days
     const threshold_ms = std.fmt.parseInt(u64, threshold_ms_str, 10) catch {
         log.err("GC_THRESHOLD_MS is not a number: '{s}'", .{threshold_ms_str});
         return;
@@ -182,11 +185,11 @@ pub fn main(init: std.process.Init) !void {
         log.info("proceeding anyway — GC_ALLOW_SHORT_THRESHOLD is set", .{});
     }
 
-    // Refuses to start rather than reaping under a threshold nobody chose.
+    // Said at start, set or not: the threshold is the deployment's offline window.
     if (env.getPosix("GC_THRESHOLD_MS") == null) {
-        log.warn(
-            "GC_THRESHOLD_MS not set, using the {d}ms default. This is the maximum\n" ++
-                "    offline window clients may have — set it explicitly in production.",
+        log.info(
+            "GC_THRESHOLD_MS not set: the default, {d}ms (7 days), is the longest a client may stay\n" ++
+                "    offline and still catch up with its pending edits — set it to change that window.",
             .{threshold_ms},
         );
     }
