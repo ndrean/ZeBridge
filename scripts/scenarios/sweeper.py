@@ -135,7 +135,7 @@ async def run():
     else:
         zb.ok("table and tombstone column derived from zebridge_catalogue")
 
-    swept = re.findall(r"GC: sweeping (\S+) on", out)
+    swept = re.findall(r"sweeping (\S+) on tombstone column", out)
     if swept == [FIX]:
         zb.ok(f"SWEEP_ONLY_TABLES scoped the pass to '{FIX}' alone")
     else:

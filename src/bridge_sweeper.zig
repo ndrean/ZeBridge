@@ -56,6 +56,91 @@ fn levelFrom(raw: ?[]const u8) std.log.Level {
     return .info;
 }
 
+const Sweep = struct { table: []const u8, tombstone: []const u8 };
+
+fn freeSweeps(a: std.mem.Allocator, list: *std.ArrayList(Sweep)) void {
+    for (list.items) |sw| {
+        a.free(sw.table);
+        a.free(sw.tombstone);
+    }
+    list.deinit(a);
+}
+
+/// The sweep set as the catalogue declares it now, and how many tables it declared before
+/// `SWEEP_ONLY_TABLES` narrowed it. Null when the catalogue cannot be read.
+///
+/// Children BEFORE parents (§10dn): a reap is a physical DELETE, and a parent whose
+/// tombstoned children are still rows is refused by NO ACTION — parent-first order costs
+/// one failed pass per level of the family. Ordered by the depth of the foreign-key chain
+/// above each table, deepest first. A catalogue row outlives its table (§10eu: late_t,
+/// dropped, still enabled): a sweep prepared against it fails, and the first version died
+/// there and reaped nothing anywhere. Rows whose table is gone are left out.
+///
+/// `SWEEP_ONLY_TABLES` is a pure filter, applied after: it cannot add a table the
+/// catalogue did not declare, and a name that matches nothing sweeps nothing.
+fn readSweeps(a: std.mem.Allocator, conn: *c.PGconn, only: ?[]const u8) !?struct { list: std.ArrayList(Sweep), declared: usize } {
+    const cres = c.PQexec(conn, "SELECT cat.tbl, cat.tombstone_col::text FROM public.zebridge_catalogue cat" ++
+        " WHERE cat.tombstone_col IS NOT NULL" ++
+        " AND to_regclass(format('%I.%I', 'public', cat.tbl)) IS NOT NULL" ++
+        " ORDER BY (WITH RECURSIVE up(oid, d) AS (" ++
+        "   SELECT to_regclass(format('%I.%I', 'public', cat.tbl))::oid, 0" ++
+        "   UNION ALL SELECT con.confrelid, up.d + 1 FROM pg_constraint con JOIN up ON con.conrelid = up.oid" ++
+        "   WHERE con.contype = 'f' AND con.confrelid <> up.oid AND up.d < 32)" ++
+        "   SELECT max(d) FROM up) DESC, cat.tbl");
+    defer c.PQclear(cres);
+    if (c.PQresultStatus(cres) != c.PGRES_TUPLES_OK) return null;
+
+    var list = std.ArrayList(Sweep).empty;
+    errdefer freeSweeps(a, &list);
+    var declared: usize = 0;
+    const n: usize = @intCast(c.PQntuples(cres));
+    for (0..n) |i| {
+        const tbl = std.mem.span(c.PQgetvalue(cres, @intCast(i), 0));
+        const tomb = std.mem.span(c.PQgetvalue(cres, @intCast(i), 1));
+        if (tbl.len == 0 or tomb.len == 0) continue;
+        declared += 1;
+        if (only) |o| {
+            var it = std.mem.splitScalar(u8, o, ',');
+            const wanted = while (it.next()) |raw| {
+                if (std.mem.eql(u8, std.mem.trim(u8, raw, " "), tbl)) break true;
+            } else false;
+            if (!wanted) continue;
+        }
+        const t = try a.dupe(u8, tbl);
+        errdefer a.free(t);
+        try list.append(a, .{ .table = t, .tombstone = try a.dupe(u8, tomb) });
+    }
+    return .{ .list = list, .declared = declared };
+}
+
+fn sameSweeps(x: []const Sweep, y: []const Sweep) bool {
+    if (x.len != y.len) return false;
+    for (x, y) |p, q| {
+        if (!std.mem.eql(u8, p.table, q.table) or !std.mem.eql(u8, p.tombstone, q.tombstone)) return false;
+    }
+    return true;
+}
+
+fn hasSweep(list: []const Sweep, sw: Sweep) bool {
+    for (list) |o| {
+        if (std.mem.eql(u8, o.table, sw.table) and std.mem.eql(u8, o.tombstone, sw.tombstone)) return true;
+    }
+    return false;
+}
+
+test "sameSweeps and hasSweep: a table, its column, and the order" {
+    const a = [_]Sweep{ .{ .table = "orders", .tombstone = "deleted_at" }, .{ .table = "users", .tombstone = "deleted_at" } };
+    const b = [_]Sweep{ .{ .table = "orders", .tombstone = "deleted_at" }, .{ .table = "users", .tombstone = "deleted_at" } };
+    const other_col = [_]Sweep{ .{ .table = "orders", .tombstone = "gone_at" }, .{ .table = "users", .tombstone = "deleted_at" } };
+    const swapped = [_]Sweep{ b[1], b[0] };
+    try std.testing.expect(sameSweeps(&a, &b));
+    try std.testing.expect(!sameSweeps(&a, &other_col));
+    try std.testing.expect(!sameSweeps(&a, &swapped)); // the order is the FK order: a change
+    try std.testing.expect(!sameSweeps(&a, a[0..1]));
+    try std.testing.expect(hasSweep(&a, b[1]));
+    try std.testing.expect(!hasSweep(&a, other_col[0]));
+}
+
 const usage =
     \\Usage: bridge_sweeper [--once]
     \\
@@ -197,15 +282,8 @@ pub fn main(init: std.process.Init) !void {
     const interval_ms_str = env.getPosix("GC_INTERVAL_MS") orelse "60000";
     const interval_ms = try std.fmt.parseInt(u64, interval_ms_str, 10);
 
-    const Sweep = struct { table: []const u8, tombstone: []const u8 };
     var sweeps = std.ArrayList(Sweep).empty;
-    defer {
-        for (sweeps.items) |sw| {
-            allocator.free(sw.table);
-            allocator.free(sw.tombstone);
-        }
-        sweeps.deinit(allocator);
-    }
+    defer freeSweeps(allocator, &sweeps);
 
     // Connect to PostgreSQL
     const conninfo = try utils.allocPrintZ(allocator, "{s}", .{db_url});
@@ -226,65 +304,18 @@ pub fn main(init: std.process.Init) !void {
     // ── The sweep set, from the catalogue ───────────────────────────────────────
     //
     // `zebridge_catalogue.tombstone_col` is written in the same transaction as the
-    // soft-delete trigger it names, so this read cannot disagree with the guard.
-    {
-        // Children BEFORE parents (§10dn): a reap is a physical DELETE, and a parent whose
-        // tombstoned children are still rows is refused by NO ACTION — parent-first order
-        // costs one failed pass per level of the family. Ordered by the depth of the
-        // foreign-key chain above each table, deepest first.
-        // A catalogue row outlives its table (§10eu: late_t, dropped, still enabled):
-        // a sweep prepared against it fails, and the first version died there and
-        // reaped nothing anywhere. Rows whose table is gone are left out.
-        const cres = c.PQexec(pg_conn, "SELECT cat.tbl, cat.tombstone_col::text FROM public.zebridge_catalogue cat" ++
-            " WHERE cat.tombstone_col IS NOT NULL" ++
-            " AND to_regclass(format('%I.%I', 'public', cat.tbl)) IS NOT NULL" ++
-            " ORDER BY (WITH RECURSIVE up(oid, d) AS (" ++
-            "   SELECT to_regclass(format('%I.%I', 'public', cat.tbl))::oid, 0" ++
-            "   UNION ALL SELECT con.confrelid, up.d + 1 FROM pg_constraint con JOIN up ON con.conrelid = up.oid" ++
-            "   WHERE con.contype = 'f' AND con.confrelid <> up.oid AND up.d < 32)" ++
-            "   SELECT max(d) FROM up) DESC, cat.tbl");
-        defer c.PQclear(cres);
-        if (c.PQresultStatus(cres) == c.PGRES_TUPLES_OK) {
-            const n: usize = @intCast(c.PQntuples(cres));
-            var added: usize = 0;
-            for (0..n) |i| {
-                const tbl = std.mem.span(c.PQgetvalue(cres, @intCast(i), 0));
-                const tomb = std.mem.span(c.PQgetvalue(cres, @intCast(i), 1));
-                if (tbl.len == 0 or tomb.len == 0) continue;
-                try sweeps.append(allocator, .{
-                    .table = try allocator.dupe(u8, tbl),
-                    .tombstone = try allocator.dupe(u8, tomb),
-                });
-                added += 1;
-            }
-            log.info("catalogue supplied {d} sweep table(s)", .{added});
-        } else {
-            log.info("no zebridge_catalogue — apply init.core.template.sql", .{});
-        }
-    }
-
-    // ── SWEEP_ONLY_TABLES: a scoped run ─────────────────────────────────────────
+    // soft-delete trigger it names, so this read cannot disagree with the guard. It is read
+    // again at the start of every pass: a table enabled while the sweeper runs is swept
+    // from the next pass on, with no restart — the sweeper is the process nobody remembers.
     //
-    // Applied AFTER the set is built, so it is a pure filter — it
-    // cannot add a table the catalogue did not declare, and a name that
-    // matches nothing sweeps nothing (reported below as "nothing to sweep").
-    if (env.getPosix("SWEEP_ONLY_TABLES")) |only| {
-        var kept = std.ArrayList(Sweep).empty;
-        for (sweeps.items) |sw| {
-            var it = std.mem.splitScalar(u8, only, ',');
-            const wanted = while (it.next()) |raw| {
-                if (std.mem.eql(u8, std.mem.trim(u8, raw, " "), sw.table)) break true;
-            } else false;
-            if (wanted) {
-                try kept.append(allocator, sw);
-            } else {
-                allocator.free(sw.table);
-                allocator.free(sw.tombstone);
-            }
-        }
-        log.info("SWEEP_ONLY_TABLES='{s}' — scoped run, {d} of {d} table(s) kept", .{ only, kept.items.len, sweeps.items.len });
-        sweeps.deinit(allocator);
-        sweeps = kept;
+    // `SWEEP_ONLY_TABLES` narrows a run to the named tables — a scoped run for tests.
+    const only = env.getPosix("SWEEP_ONLY_TABLES");
+    if (try readSweeps(allocator, pg_conn.?, only)) |first| {
+        sweeps = first.list;
+        log.info("catalogue supplied {d} sweep table(s)", .{first.declared});
+        if (only) |o| log.info("SWEEP_ONLY_TABLES='{s}' — scoped run, {d} of {d} table(s) kept", .{ o, sweeps.items.len, first.declared });
+    } else {
+        log.info("no zebridge_catalogue — apply init.core.template.sql", .{});
     }
 
     if (sweeps.items.len == 0) {
@@ -294,7 +325,8 @@ pub fn main(init: std.process.Init) !void {
                 "client's queued edit can resurrect a row (PROTOCOL.md \u{00a7}7.5).",
             .{},
         );
-        return;
+        // One pass asked for, nothing to do. Running, the sweeper waits for the first table.
+        if (once) return;
     }
     for (sweeps.items) |sw| {
         log.info("sweeping {s} on tombstone column '{s}'", .{ sw.table, sw.tombstone });
@@ -391,6 +423,7 @@ pub fn main(init: std.process.Init) !void {
     std.posix.sigaction(std.posix.SIG.TERM, &on_signal, null);
 
     // Run loop
+    var first_pass = true;
     while (!stop.load(.acquire)) {
         if (c.PQstatus(pg_conn) == c.CONNECTION_BAD) {
             log.warn("Connection lost. Reconnecting...", .{});
@@ -406,6 +439,41 @@ pub fn main(init: std.process.Init) !void {
                 continue;
             };
             log.info("Reconnected and initialized.", .{});
+        }
+
+        // The catalogue as it is now: a table enabled, dropped or given another tombstone
+        // column since the last pass. On a change, the statements are prepared again.
+        if (!first_pass) {
+            if (try readSweeps(allocator, pg_conn.?, only)) |now| {
+                var fresh = now.list;
+                if (sameSweeps(sweeps.items, fresh.items)) {
+                    freeSweeps(allocator, &fresh);
+                } else {
+                    for (fresh.items) |sw| if (!hasSweep(sweeps.items, sw))
+                        log.info("sweeping {s} on tombstone column '{s}'", .{ sw.table, sw.tombstone });
+                    for (sweeps.items) |sw| if (!hasSweep(fresh.items, sw))
+                        log.info("no longer sweeping {s}: the catalogue no longer declares its tombstone column '{s}'", .{ sw.table, sw.tombstone });
+                    freeSweeps(allocator, &sweeps);
+                    sweeps = fresh;
+                    const dealloc = c.PQexec(pg_conn, "DEALLOCATE ALL");
+                    c.PQclear(dealloc);
+                    setup_connection(allocator, pg_conn.?, principal, sweeps.items, dry_run) catch |err| {
+                        log.err("cannot prepare the new sweep set: {any} — retrying next pass", .{err});
+                        // Forget it, so the next pass sees a change and prepares again.
+                        freeSweeps(allocator, &sweeps);
+                        sweeps = .empty;
+                        sleepUnlessStopped(interval_ms);
+                        continue;
+                    };
+                }
+            } else {
+                log.warn("cannot read the catalogue: {s} — keeping the last sweep set", .{c.PQerrorMessage(pg_conn)});
+            }
+        }
+        first_pass = false;
+        if (sweeps.items.len == 0) {
+            sleepUnlessStopped(interval_ms);
+            continue;
         }
 
         var arena = std.heap.ArenaAllocator.init(allocator);
