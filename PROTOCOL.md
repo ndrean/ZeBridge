@@ -401,8 +401,10 @@ are ignored for the mapping (`geometry(Point,4326)` is `geometry`, `vector(1536)
 
 PostGIS and pgvector are the two supported extensions: their type OIDs are read
 from `pg_type` at boot, since an extension type's OID differs per database, and read
-again when a table's schema names an OID the bridge does not know, before refusing it.
-An extension created while the bridge runs therefore needs no restart. A column
+again when a new table's schema names an OID the bridge does not know, before refusing
+it: a table created with such a column after the extension, on a running bridge, needs no
+restart. A column of such a type added to a table already published is first met by the
+decoder, which cannot look types up; the table is suspended until a restart. A column
 of any other extension type, or of a built-in type the decoder does not implement,
 refuses the table at boot rather than shipping bytes it cannot name. `tsvector`,
 `tsquery`, `xml` and the range types are left out of the publication by
