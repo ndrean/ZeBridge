@@ -21,19 +21,22 @@ shows it at the same place, and nothing is sent while it drives.
 
 A truck's `plan` is a JSON document holding one register, `leg`: `{v, t, w}`, a value, a stamp and
 its writer (see [COOPERATIVE_EDITING.md](../../COOPERATIVE_EDITING.md)). Its value is the trip
-under way: `{from, to, started_at}`.
+under way: `{from, stops, to, started_at}`, the stops being the places between, in order.
 
-From and To are a draft, kept in the browser that picks them: choosing a charger writes nothing
+From, the stops and To are a draft, kept in the browser that picks them: choosing a charger writes nothing
 and moves no other screen. Only **Trace route** (or **Change destination**) writes, the leg. If two
 screens send the same truck somewhere at once, the later stamp wins on every screen; the other
 screen says who sent it, and drops the To it had picked.
 
-Each browser asks for the current leg's route and walks the truck along it by the durations
+Each browser asks for the current leg's route, one question through every stop, and walks the
+truck along it by the durations
 Valhalla gives for each part of the route (slower in town, faster on the motorway), from
-`started_at`. The arrival time is `started_at` plus the route's duration.
+`started_at`. The arrival time is `started_at` plus the route's duration; each stop's, the time
+Valhalla gives for the stretches before it.
 
-A new destination while the truck drives writes a new `leg` from the truck's position at that
-moment to the new charger: A → B becomes AB → C. The start of the new leg is stored as a point,
+While the truck drives, the panel shows what is left of its trip: the stops ahead, and To. Adding
+a stop, removing one or changing To starts from that, and **Update route** writes a new `leg` from
+the truck's position at that moment: A → B becomes AB → C, or AB → C → B with a stop added. The start of the new leg is stored as a point,
 with the truck's heading, so Valhalla carries on forward rather than plan a U-turn, and a browser
 that opens later does not have to replay the old leg.
 
@@ -77,8 +80,9 @@ in the browser. Two editors in one browser: `?as=a` and `?as=b`, each with its o
 Then:
 
 1. Choose a truck. From is its depot.
-2. Click To, then a charger, and press **Trace route**: the truck leaves.
-3. While it drives, set another To and press **Change destination**: it turns towards it.
+2. Click To, then a charger. Add stops with **+ Add a stop**, then a charger, as many as needed.
+3. Press **Trace route**: the truck leaves, and goes through the stops in order.
+4. While it drives, add a stop or change To, and press **Update route**: it turns from where it is.
 
 ## What it measured
 

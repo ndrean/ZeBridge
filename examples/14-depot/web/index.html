@@ -22,6 +22,11 @@
       #notice { font-size: 13px; color: #b35900; min-height: 1.2em; }
       select { font: inherit; padding: 5px; }
       .truck { font-size: 20px; line-height: 20px; text-align: center; filter: drop-shadow(0 0 2px #fff); }
+      .stoprow { display: grid; grid-template-columns: 1fr auto; gap: 4px; align-items: stretch; }
+      .stoprow button { padding: 0 9px; }
+      #stops { display: grid; gap: 6px; }
+      .add { font-style: normal; opacity: .7; border-style: dashed; }
+      .stopmark { background: #d1361f; color: #fff; border: 2px solid #fff; border-radius: 50%; font: bold 11px/16px system-ui; text-align: center; }
       .depot { width: 14px; height: 14px; background: #333; border: 2px solid #fff; box-sizing: border-box; }
       @media (max-width: 640px) { body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; } aside { border-right: 0; border-bottom: 1px solid #8884; } }
     </style>
@@ -31,6 +36,7 @@
       <strong>Depot routing</strong>
       <label>Truck <select id="truck"></select></label>
       <label>From <div id="from" class="point empty" tabindex="0">click here, then a charger</div></label>
+      <div id="stops"></div>
       <label>To <div id="to" class="point empty" tabindex="0">click here, then a charger</div></label>
       <button id="trace" disabled>Trace route</button>
       <div id="result"></div>

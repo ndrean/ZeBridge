@@ -76,12 +76,15 @@ const truckLayer = L.layerGroup().addTo(map);
 // ── types ──────────────────────────────────────────────────────────────────────
 /// `heading`: a mid-route start's direction of travel, degrees from north (Valhalla's own field).
 type Point = { lat: number; lng: number; label: string; charger?: string; heading?: number };
-type Leg = { from: Point; to: Point; started_at: string };
+/// `stops`: the places between from and to, in order (a delivery round).
+type Leg = { from: Point; stops?: Point[]; to: Point; started_at: string };
 type Register<T> = { v: T; t: string; w: string };
 type Plan = { leg?: Register<Leg> };
-type End = 'from' | 'to';
-/// This browser's own From/To per truck: chosen, not yet sent.
-const draft = new Map<string, { from?: Point; to?: Point }>();
+/// What the next charger click fills: From, To, a stop by its index, or a new stop.
+type Active = 'from' | 'to' | 'add' | number;
+/// This browser's own plan per truck: chosen, not yet sent.
+type Draft = { from?: Point; stops?: Point[]; to?: Point };
+const draft = new Map<string, Draft>();
 type Truck = { id: string; name: string; depot: Point; plan: Plan };
 type Charger = { id: string; title: string; town: string | null; lat: number; lng: number; max_power_kw: number | null };
 
@@ -92,8 +95,7 @@ const trucks = new Map<string, Truck>();
 const mine = new Map<string, Plan>();       // per truck: registers written here, not yet in the row
 const rounds = new Map<string, number>();
 let selected = '';
-/// Which planned end the next charger click fills.
-let active: End | null = null;
+let active: Active | null = null;
 
 /// The plan as this browser sees it: its own pending registers over the row's.
 const viewPlan = (id: string): Plan => ({ ...(trucks.get(id)?.plan ?? {}), ...(mine.get(id) ?? {}) });
@@ -117,10 +119,10 @@ async function readTrucks(): Promise<void> {
       const now = plan[k];
       if (!now || now.t === before[k]?.t) continue;
       if (known && now.w !== zb.principal) {
-        notice.textContent = `${now.w} sent ${r.name} to ${now.v.to.label}`;
-        // Someone else decided: a To picked here for this truck is stale now.
-        const d = draft.get(r.id);
-        if (d) delete d.to;
+        const n = now.v.stops?.length ?? 0;
+        notice.textContent = `${now.w} sent ${r.name} to ${now.v.to.label}${n ? ` via ${n} stop(s)` : ''}`;
+        // Someone else decided: what this screen was preparing for the truck is stale now.
+        draft.delete(r.id);
       }
       if (m?.[k] && now.t >= m[k]!.t) delete m[k];
     }
@@ -175,11 +177,14 @@ type Route = {
   maneuvers: { b: number; e: number; t0: number; time: number }[];
   seconds: number;
   km: number;
+  /// Seconds from the start at which each stop is reached (Valhalla's legs, one per stretch).
+  stopAt: number[];
   by: string;
   ms: number;
 };
 const routes = new Map<string, Route | 'asking' | { error: string }>();
-const legKey = (leg: Leg) => JSON.stringify([leg.from.lat, leg.from.lng, leg.from.heading ?? null, leg.to.lat, leg.to.lng]);
+const legKey = (leg: Leg) => JSON.stringify([leg.from.lat, leg.from.lng, leg.from.heading ?? null,
+  (leg.stops ?? []).map((p) => [p.lat, p.lng]), leg.to.lat, leg.to.lng]);
 
 /// Valhalla's shapes are Google's encoded polyline at 6 decimals (not 5).
 function decodePolyline6(s: string): L.LatLngTuple[] {
@@ -197,30 +202,43 @@ function decodePolyline6(s: string): L.LatLngTuple[] {
   return out;
 }
 
-async function askRoute(from: Point, to: Point): Promise<Route> {
+/// One question for the whole trip: from, every stop, to. Valhalla answers one leg per
+/// stretch; they are joined into one line (each leg starts where the last ended) with the
+/// maneuvers' shape indices moved along, and the time each stop is reached kept.
+async function askRoute(leg: Leg): Promise<Route> {
   const t0 = performance.now();
+  const { from, to } = leg;
   const a = await zb.request('query._default.route', {
     // A start with a heading: Valhalla keeps to roads leaving within 45° of it — no U-turn
     // in the street where the truck changed its mind.
     locations: [
       { lat: from.lat, lon: from.lng, ...(from.heading !== undefined ? { heading: from.heading, heading_tolerance: 45 } : {}) },
+      ...(leg.stops ?? []).map((p) => ({ lat: p.lat, lon: p.lng })),
       { lat: to.lat, lon: to.lng },
     ],
     costing: 'truck',
     units: 'km',
   }, 15_000);
   if (a.error || !a.trip) throw new Error(String(a.error ?? a.detail ?? 'no route').slice(0, 200));
-  const leg = a.trip.legs[0];
-  const line = decodePolyline6(leg.shape);
+  const line: L.LatLngTuple[] = [];
+  const maneuvers: Route['maneuvers'] = [];
+  const stopAt: number[] = [];
+  let t = 0;
+  a.trip.legs.forEach((lg: any, li: number) => {
+    const pts = decodePolyline6(lg.shape);
+    // Index 0 of this leg is the last point of the line so far (the stop itself).
+    const base = li === 0 ? 0 : line.length - 1;
+    line.push(...(li === 0 ? pts : pts.slice(1)));
+    for (const m of lg.maneuvers ?? []) {
+      maneuvers.push({ b: m.begin_shape_index + base, e: m.end_shape_index + base, t0: t, time: m.time ?? 0 });
+      t += m.time ?? 0;
+    }
+    if (li < a.trip.legs.length - 1) stopAt.push(t);
+  });
   const cum = [0];
   for (let i = 1; i < line.length; i++) cum.push(cum[i - 1] + map.distance(line[i - 1], line[i]));
-  let t = 0;
-  const maneuvers = (leg.maneuvers ?? []).map((m: any) => {
-    const out = { b: m.begin_shape_index, e: m.end_shape_index, t0: t, time: m.time ?? 0 };
-    t += out.time;
-    return out;
-  });
-  return { line, cum, maneuvers, seconds: a.trip.summary.time, km: a.trip.summary.length, by: a.by ?? '?', ms: Math.round(performance.now() - t0) };
+  return { line, cum, maneuvers, seconds: a.trip.summary.time, km: a.trip.summary.length, stopAt,
+           by: a.by ?? '?', ms: Math.round(performance.now() - t0) };
 }
 
 function routeFor(leg: Leg): Route | null {
@@ -229,7 +247,7 @@ function routeFor(leg: Leg): Route | null {
   if (r && r !== 'asking' && !('error' in r)) return r;
   if (!r) {
     routes.set(key, 'asking');
-    askRoute(leg.from, leg.to)
+    askRoute(leg)
       .then((route) => { routes.set(key, route); void refresh(); })
       .catch((e) => { routes.set(key, { error: (e as Error).message }); void refresh(); });
   }
@@ -299,6 +317,11 @@ async function refresh(): Promise<void> {
     if (leg) {
       const r = routeFor(leg);
       if (r) L.polyline(r.line, { color: isSel ? '#d1361f' : '#888', weight: isSel ? 5 : 3, opacity: isSel ? 0.85 : 0.6 }).addTo(routeLayer);
+      // The selected truck's stops still ahead, numbered as in the panel.
+      if (isSel) stopsLeft(leg, r, elapsedOf(leg)).forEach((p, k) => {
+        L.marker([p.lat, p.lng], { icon: L.divIcon({ className: 'stopmark', html: String(k + 1), iconSize: [18, 18] }), zIndexOffset: 500 })
+          .bindTooltip(`stop ${k + 1} · ${p.label}`).addTo(routeLayer);
+      });
     }
     const at = whereIs(t);
     if (at) {
@@ -315,10 +338,7 @@ async function refresh(): Promise<void> {
 function truckPopup(t: Truck): string {
   const leg = viewPlan(t.id).leg?.v;
   if (!leg) return `<b>${t.name}</b><br>at its depot<br>${t.depot.label}`;
-  const r = routeFor(leg);
-  if (!r) return `<b>${t.name}</b><br>to ${leg.to.label}<br>route…`;
-  const left = r.seconds - elapsedOf(leg);
-  return `<b>${t.name}</b><br>to ${leg.to.label}<br>${left > 0 ? `arrives in ${fmtMin(left)} (${new Date(Date.parse(leg.started_at) + r.seconds * 1000).toLocaleTimeString()})` : 'arrived'}`;
+  return `<b>${t.name}</b><br>${tripText(t) ?? `to ${leg.to.label}<br>route…`}`;
 }
 
 /// Every second: move the trucks and the ETA. Positions only; the layers stay.
@@ -331,16 +351,23 @@ setInterval(() => {
   showEta();
 }, 1000);
 
+/// Where the truck is in its trip: the next stop and when, then the end and when.
+function tripText(t: Truck): string | null {
+  const leg = viewPlan(t.id).leg?.v;
+  if (!leg) return null;
+  const r = routeFor(leg);
+  if (!r) return null;
+  const now = elapsedOf(leg);
+  if (now >= r.seconds) return `arrived at ${leg.to.label}`;
+  const end = `${fmtMin(r.seconds - now)} to ${leg.to.label} (${new Date(Date.parse(leg.started_at) + r.seconds * 1000).toLocaleTimeString()})`;
+  const k = (leg.stops ?? []).findIndex((_, i) => (r.stopAt[i] ?? 0) > now);
+  return k >= 0 ? `next stop ${leg.stops![k].label} in ${fmtMin(r.stopAt[k] - now)} · ${end}` : end;
+}
+
 function showEta() {
   const t = trucks.get(selected);
-  const leg = t && viewPlan(t.id).leg?.v;
-  if (!t || !leg) { eta.textContent = ''; return; }
-  const r = routeFor(leg);
-  if (!r) { eta.textContent = ''; return; }
-  const left = r.seconds - elapsedOf(leg);
-  eta.textContent = left > 0
-    ? `${t.name}: ${fmtMin(left)} to ${leg.to.label}`
-    : `${t.name} arrived at ${leg.to.label}`;
+  const text = t && tripText(t);
+  eta.textContent = text ? `${t!.name}: ${text}` : '';
 }
 
 // ── the panel ──────────────────────────────────────────────────────────────────
@@ -352,45 +379,116 @@ function enRoute(id: string): boolean {
   return !!(leg && r && elapsedOf(leg) < r.seconds);
 }
 
+/// The stops not reached yet, `elapsed` seconds into the leg.
+function stopsLeft(leg: Leg, r: Route | null, elapsed: number): Point[] {
+  const stops = leg.stops ?? [];
+  return r ? stops.filter((_, k) => (r.stopAt[k] ?? 0) > elapsed) : stops;
+}
+
+/// What is left of the truck's trip now: the stops ahead, and To.
+function remaining(t: Truck): Draft {
+  const leg = viewPlan(t.id).leg?.v;
+  if (!leg) return {};
+  return { stops: stopsLeft(leg, routeFor(leg), elapsedOf(leg)), to: leg.to };
+}
+
+/// What the panel shows: this browser's draft, or else the trip as it stands.
+const viewDraft = (t: Truck): Draft => draft.get(t.id) ?? remaining(t);
+
+/// Start editing: the trip as it stands becomes this browser's draft (AB → C → B).
+function editDraft(t: Truck): Draft {
+  let d = draft.get(t.id);
+  if (!d) {
+    const r = remaining(t);
+    d = { ...r, stops: [...(r.stops ?? [])] };
+    draft.set(t.id, d);
+  }
+  return d;
+}
+
+const placesOf = (x: Draft) => JSON.stringify([(x.stops ?? []).map((p) => [p.lat, p.lng]), x.to ? [x.to.lat, x.to.lng] : null]);
+
+const stopsBox = el('stops');
+/// The stops, in order, each with a ✕; then "+ Add a stop", always offered again.
+function showStops(t: Truck | undefined, stops: Point[]) {
+  stopsBox.innerHTML = '';
+  if (!t) return;
+  stops.forEach((p, k) => {
+    // A div, not a <label>: a label's click would also press the ✕ inside it.
+    const row = document.createElement('div');
+    row.className = 'stoplabel';
+    row.innerHTML = `<span style="font-size:12px;opacity:.8">Stop ${k + 1}</span>`;
+    const line = document.createElement('div');
+    line.className = 'stoprow';
+    const box = document.createElement('div');
+    box.className = `point${active === k ? ' active' : ''}`;
+    box.tabIndex = 0;
+    box.textContent = p.label;
+    box.addEventListener('click', () => { editDraft(t); active = active === k ? null : k; showPanel(); });
+    const x = document.createElement('button');
+    x.textContent = '✕';
+    x.title = 'remove this stop';
+    x.addEventListener('click', () => {
+      editDraft(t).stops!.splice(k, 1);
+      active = null;
+      showPanel();
+      void drawChargers();
+    });
+    line.append(box, x);
+    row.append(line);
+    stopsBox.append(row);
+  });
+  const add = document.createElement('div');
+  add.className = `point add${active === 'add' ? ' active' : ''}`;
+  add.tabIndex = 0;
+  add.textContent = active === 'add' ? 'now click a charger' : '+ Add a stop';
+  add.addEventListener('click', () => { editDraft(t); active = active === 'add' ? null : 'add'; showPanel(); });
+  stopsBox.append(add);
+}
+
 function showPanel() {
   const t = trucks.get(selected);
   const plan = t ? viewPlan(t.id) : {};
   const moving = t ? enRoute(t.id) : false;
-  const arrived = t && plan.leg && !moving;
-  for (const end of ['from', 'to'] as const) {
-    const box = el(end);
-    let text = 'click here, then a charger';
-    let empty = true;
-    if (end === 'from' && t && plan.leg) {
-      text = moving ? `${t.name}'s position (en route)` : `${t.name}'s position (${plan.leg.v.to.label})`;
-      empty = false;
-    } else {
-      const d = t ? draft.get(t.id) : undefined;
-      // To: this browser's pick, or else where the truck is going now — the same on every
-      // screen, including one whose own pick lost to another screen's.
-      const p = end === 'from' ? (d?.from ?? t?.depot) : (d?.to ?? plan.leg?.v.to);
-      if (p) {
-        const note = end === 'from' && !d?.from ? ' (depot)'
-          : end === 'to' && !d?.to ? (moving ? ' (on its way)' : ' (arrived)') : '';
-        text = `${p.label}${note}`;
-        empty = false;
-      }
-    }
-    box.textContent = text;
-    box.classList.toggle('empty', empty);
-    box.classList.toggle('active', active === end);
+  const d = t ? draft.get(t.id) : undefined;
+  const v = t ? viewDraft(t) : {};
+
+  const fromBox = el('from');
+  let fromText = 'click here, then a charger', fromEmpty = true;
+  if (t && plan.leg) {
+    fromText = moving ? `${t.name}'s position (en route)` : `${t.name}'s position (${plan.leg.v.to.label})`;
+    fromEmpty = false;
+  } else if (t) {
+    const p = d?.from ?? t.depot;
+    fromText = `${p.label}${d?.from ? '' : ' (depot)'}`;
+    fromEmpty = false;
   }
-  const to = t ? draft.get(t.id)?.to : undefined;
-  const sameTrip = plan.leg && to && to.lat === plan.leg.v.to.lat && to.lng === plan.leg.v.to.lng;
-  traceButton.textContent = moving ? 'Change destination' : 'Trace route';
-  traceButton.disabled = !t || !to || !!sameTrip && (moving || !!arrived);
+  fromBox.textContent = fromText;
+  fromBox.classList.toggle('empty', fromEmpty);
+  fromBox.classList.toggle('active', active === 'from');
+
+  showStops(t, v.stops ?? []);
+
+  // To: this browser's pick, or else where the truck is going now — the same on every
+  // screen, including one whose own pick lost to another screen's.
+  const toBox = el('to');
+  toBox.textContent = v.to ? `${v.to.label}${!d && plan.leg ? (moving ? ' (on its way)' : ' (arrived)') : ''}` : 'click here, then a charger';
+  toBox.classList.toggle('empty', !v.to);
+  toBox.classList.toggle('active', active === 'to');
+
+  // Something new to send: a draft with a To, different from the trip as it stands.
+  const changed = !!t && !!d?.to && placesOf(d) !== placesOf(remaining(t));
+  traceButton.textContent = moving ? 'Update route' : 'Trace route';
+  traceButton.disabled = !changed;
+
   const leg = plan.leg?.v;
   const r = leg && routes.get(legKey(leg));
   if (!leg) { result.textContent = ''; detail.textContent = ''; }
   else if (!r || r === 'asking') { result.textContent = 'asking the route…'; detail.textContent = ''; }
   else if ('error' in r) { result.textContent = 'no route'; detail.textContent = r.error; }
   else {
-    result.textContent = `${r.km.toFixed(1)} km · ${fmtMin(r.seconds)} by truck`;
+    const n = leg.stops?.length ?? 0;
+    result.textContent = `${r.km.toFixed(1)} km · ${fmtMin(r.seconds)} by truck${n ? ` · ${n} stop(s)` : ''}`;
     detail.textContent = `by ${r.by} · ${r.ms} ms round trip · leg by ${plan.leg!.w}`;
   }
   showEta();
@@ -409,6 +507,8 @@ for (const end of ['from', 'to'] as const) {
   const box = el(end);
   const choose = () => {
     if (end === 'from' && viewPlan(selected).leg) return;   // once under way, the start is the truck
+    const t = trucks.get(selected);
+    if (end === 'to' && t) editDraft(t);
     active = active === end ? null : end;
     showPanel();
   };
@@ -419,7 +519,7 @@ for (const end of ['from', 'to'] as const) {
 /// The chargers on screen now: a tap between them picks the nearest.
 let drawn: Charger[] = [];
 map.on('click', (e: L.LeafletMouseEvent) => {
-  if (!active || !drawn.length) return;
+  if (active === null || !drawn.length) return;
   const tap = map.latLngToContainerPoint(e.latlng);
   let best: Charger | null = null, bestPx = 30;
   for (const c of drawn) {
@@ -430,22 +530,26 @@ map.on('click', (e: L.LeafletMouseEvent) => {
 });
 
 function pick(c: Charger) {
-  if (!active || !selected) return;
-  const d = draft.get(selected) ?? {};
-  d[active] = pointOf(c);
-  draft.set(selected, d);
-  active = active === 'from' && !d.to ? 'to' : null;
+  const t = trucks.get(selected);
+  if (active === null || !t) return;
+  const d = editDraft(t);
+  const p = pointOf(c);
+  if (active === 'add') { d.stops = [...(d.stops ?? []), p]; active = null; }
+  else if (typeof active === 'number') { d.stops![active] = p; active = null; }
+  else { d[active] = p; active = active === 'from' && !d.to ? 'to' : null; }
   showPanel();
   void drawChargers();
 }
 
-/// Trace route: the first leg from the planned From (or the depot); once a leg exists,
-/// a new one from where the truck is now (AB → C).
+/// Trace route: the first leg from the planned From (or the depot), through the stops; once
+/// a leg exists, a new one from where the truck is now, through the stops still ahead
+/// and any added (AB → C → B).
 traceButton.addEventListener('click', () => {
   const t = trucks.get(selected);
   if (!t) return;
   const plan = viewPlan(t.id);
-  const to = draft.get(t.id)?.to;
+  const d = draft.get(t.id);
+  const to = d?.to;
   if (!to) return;
   let from: Point;
   if (plan.leg) {
@@ -458,9 +562,11 @@ traceButton.addEventListener('click', () => {
     const heading = elapsed < r.seconds ? headingAt(r, elapsed) : undefined;
     from = { lat: at[0], lng: at[1], label: `${t.name}'s position`, ...(heading !== undefined ? { heading } : {}) };
   } else {
-    from = draft.get(t.id)?.from ?? t.depot;
+    from = d?.from ?? t.depot;
   }
-  setRegister(t.id, 'leg', { from, to, started_at: new Date().toISOString() });
+  setRegister(t.id, 'leg', { from, stops: d?.stops ?? [], to, started_at: new Date().toISOString() });
+  draft.delete(t.id);   // sent: the panel shows the trip as it stands now
+  active = null;
 });
 
 // ── the chargers in view: a local query ────────────────────────────────────────
@@ -477,8 +583,9 @@ async function drawChargers() {
     status.textContent = `more than ${MAX_DRAWN} chargers in view: zoom in to pick one`;
     return;
   }
-  const d = draft.get(selected);
-  const chosen = new Set([d?.from?.charger, d?.to?.charger].filter(Boolean));
+  const st = trucks.get(selected);
+  const v = st ? viewDraft(st) : {};
+  const chosen = new Set([v.from?.charger, ...(v.stops ?? []).map((p) => p.charger), v.to?.charger].filter(Boolean));
   for (const c of rows) {
     const isChosen = chosen.has(c.id);
     const kw = Number(c.max_power_kw ?? 0);
