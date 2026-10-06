@@ -57,6 +57,11 @@ const zb = new ZeBridge({
 // ── the map ────────────────────────────────────────────────────────────────────
 // Canvas, not one DOM element per marker: a wide view holds a thousand chargers.
 const map = L.map('map', { preferCanvas: true }).setView(NANTES, 9);
+/// A finger is not a mouse pointer: on a touch screen, a tap counts within 12 px of a
+/// charger (the canvas renderer's tolerance), and a tap that still misses picks the nearest
+/// one within 30 px (below).
+const TOUCH = matchMedia('(pointer: coarse)').matches;
+const chargerRenderer = L.canvas({ tolerance: TOUCH ? 12 : 3 });
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 18,
   attribution: '&copy; OpenStreetMap contributors',
@@ -411,6 +416,19 @@ for (const end of ['from', 'to'] as const) {
   box.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); choose(); } });
 }
 
+/// The chargers on screen now: a tap between them picks the nearest.
+let drawn: Charger[] = [];
+map.on('click', (e: L.LeafletMouseEvent) => {
+  if (!active || !drawn.length) return;
+  const tap = map.latLngToContainerPoint(e.latlng);
+  let best: Charger | null = null, bestPx = 30;
+  for (const c of drawn) {
+    const px = tap.distanceTo(map.latLngToContainerPoint([c.lat, c.lng]));
+    if (px < bestPx) { best = c; bestPx = px; }
+  }
+  if (best) pick(best);
+});
+
 function pick(c: Charger) {
   if (!active || !selected) return;
   const d = draft.get(selected) ?? {};
@@ -454,6 +472,7 @@ async function drawChargers() {
     b.getSouth(), b.getNorth(), b.getWest(), b.getEast(), MAX_DRAWN + 1,
   )) as Charger[];
   chargerLayer.clearLayers();
+  drawn = rows.length > MAX_DRAWN ? [] : rows;   // nothing drawn: nothing to tap
   if (rows.length > MAX_DRAWN) {
     status.textContent = `more than ${MAX_DRAWN} chargers in view: zoom in to pick one`;
     return;
@@ -464,7 +483,7 @@ async function drawChargers() {
     const isChosen = chosen.has(c.id);
     const kw = Number(c.max_power_kw ?? 0);
     const colour = isChosen ? '#d1361f' : kw >= 43 ? '#1a7f37' : '#1f6feb';
-    L.circleMarker([c.lat, c.lng], { radius: isChosen ? 9 : 5, color: colour, fillColor: colour, fillOpacity: 0.85, weight: 1 })
+    L.circleMarker([c.lat, c.lng], { renderer: chargerRenderer, bubblingMouseEvents: false, radius: isChosen ? 9 : TOUCH ? 7 : 5, color: colour, fillColor: colour, fillOpacity: 0.85, weight: 1 })
       .bindTooltip(`${c.title}${c.town ? ` · ${c.town}` : ''} · ${c.max_power_kw ?? '?'} kW`)
       .on('click', () => pick(c))
       .addTo(chargerLayer);
