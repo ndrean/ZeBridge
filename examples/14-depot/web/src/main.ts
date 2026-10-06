@@ -218,6 +218,11 @@ function decodePolyline6(s: string): L.LatLngTuple[] {
   return out;
 }
 
+/// How far from a point Valhalla may look for a road a truck can use. Without it, a point
+/// snaps to the NEAREST road only — a charger's car park behind a height barrier, a lane
+/// closed to lorries — and the truck gets "no route" although a street runs 30 m away.
+const SNAP_M = 100;
+
 /// One question for the whole trip: from, every stop, to. Valhalla answers one leg per
 /// stretch; they are joined into one line (each leg starts where the last ended) with the
 /// maneuvers' shape indices moved along, and the time each stop is reached kept.
@@ -228,9 +233,9 @@ async function askRoute(leg: Leg): Promise<Route> {
     // A start with a heading: Valhalla keeps to roads leaving within 45° of it — no U-turn
     // in the street where the truck changed its mind.
     locations: [
-      { lat: from.lat, lon: from.lng, ...(from.heading !== undefined ? { heading: from.heading, heading_tolerance: 45 } : {}) },
-      ...(leg.stops ?? []).map((p) => ({ lat: p.lat, lon: p.lng })),
-      { lat: to.lat, lon: to.lng },
+      { lat: from.lat, lon: from.lng, radius: SNAP_M, ...(from.heading !== undefined ? { heading: from.heading, heading_tolerance: 45 } : {}) },
+      ...(leg.stops ?? []).map((p) => ({ lat: p.lat, lon: p.lng, radius: SNAP_M })),
+      { lat: to.lat, lon: to.lng, radius: SNAP_M },
     ],
     costing: 'truck',
     units: 'km',
@@ -685,13 +690,23 @@ async function trace() {
   let from: Point;
   if (plan.leg) {
     const r = routeFor(plan.leg.v);
-    if (!r) { notice.textContent = 'the current route is still being asked — try again in a second'; return; }
-    const elapsed = elapsedOf(plan.leg.v);
-    const at = positionAt(r, elapsed);
-    // Arrived: no direction to keep. On the way: the one it is driving in, stored in the
-    // leg so every screen asks Valhalla the same question.
-    const heading = elapsed < r.seconds ? headingAt(r, elapsed) : undefined;
-    from = { lat: at[0], lng: at[1], label: `${t.name}'s position`, ...(heading !== undefined ? { heading } : {}) };
+    const known = routes.get(legKey(plan.leg.v));
+    if (r) {
+      const elapsed = elapsedOf(plan.leg.v);
+      const at = positionAt(r, elapsed);
+      // Arrived: no direction to keep. On the way: the one it is driving in, stored in the
+      // leg so every screen asks Valhalla the same question.
+      const heading = elapsed < r.seconds ? headingAt(r, elapsed) : undefined;
+      from = { lat: at[0], lng: at[1], label: `${t.name}'s position`, ...(heading !== undefined ? { heading } : {}) };
+    } else if (known && known !== 'asking' && 'error' in known) {
+      // The current leg has no route: the truck never left its start (where the map shows
+      // it). The new leg starts there, with no heading to keep.
+      const { heading: _, ...start } = plan.leg.v.from;
+      from = start;
+    } else {
+      notice.textContent = 'the current route is still being asked — try again in a second';
+      return;
+    }
   } else {
     from = d?.from ?? t.depot;
   }
@@ -793,8 +808,8 @@ async function closestTo(lat: number, lng: number, label: string) {
   const t0 = performance.now();
   try {
     const a = await zb.request('query._default.matrix', {
-      sources: here.map(({ at }) => ({ lat: at[0], lon: at[1] })),
-      targets: [{ lat, lon: lng }],
+      sources: here.map(({ at }) => ({ lat: at[0], lon: at[1], radius: SNAP_M })),
+      targets: [{ lat, lon: lng, radius: SNAP_M }],
       costing: 'truck',
       units: 'km',
     }, 15_000);
