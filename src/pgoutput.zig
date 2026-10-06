@@ -125,17 +125,36 @@ pub const BinShape = enum(u8) {
 const ExtType = struct { oid: u32 = 0, shape: BinShape = .none };
 pub var extension_types: [8]ExtType = [_]ExtType{.{}} ** 8;
 
+/// Registered at boot, and again when the schema pass meets an OID it does not know (an
+/// extension created after boot) — while the replication thread reads. A new slot's
+/// shape is written BEFORE its OID, and the OID is published with a release store, so a
+/// reader that finds the OID finds its shape.
 pub fn registerExtensionType(oid: u32, shape: BinShape) void {
     for (&extension_types) |*slot| {
-        if (slot.oid == oid) {
+        const have = @atomicLoad(u32, &slot.oid, .acquire);
+        if (have == oid) {
             slot.shape = shape;
             return;
         }
-        if (slot.oid == 0) {
-            slot.* = .{ .oid = oid, .shape = shape };
+        if (have == 0) {
+            slot.shape = shape;
+            @atomicStore(u32, &slot.oid, oid, .release);
             return;
         }
     }
+}
+
+test "registerExtensionType: a second lookup (an extension created after boot) adds, never duplicates" {
+    const saved = extension_types;
+    defer extension_types = saved;
+    extension_types = [_]ExtType{.{}} ** 8;
+    try std.testing.expectEqual(BinShape.none, extensionShape(90001));
+    registerExtensionType(90001, .raw); // the boot lookup
+    registerExtensionType(90001, .raw); // the same type found again: one slot
+    registerExtensionType(90002, .vector); // a type created since
+    try std.testing.expectEqual(BinShape.raw, extensionShape(90001));
+    try std.testing.expectEqual(BinShape.vector, extensionShape(90002));
+    try std.testing.expectEqual(@as(u32, 0), extension_types[2].oid);
 }
 
 /// PostGIS's registration, and the tests': bytes as sent.
@@ -145,9 +164,10 @@ pub fn registerExtensionBytea(oid: u32) void {
 
 pub fn extensionShape(oid: u32) BinShape {
     if (oid == 0) return .none;
-    for (extension_types) |t| {
-        if (t.oid == 0) return .none;
-        if (t.oid == oid) return t.shape;
+    for (&extension_types) |*t| {
+        const have = @atomicLoad(u32, &t.oid, .acquire);
+        if (have == 0) return .none;
+        if (have == oid) return t.shape;
     }
     return .none;
 }

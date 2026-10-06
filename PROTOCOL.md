@@ -400,7 +400,9 @@ are ignored for the mapping (`geometry(Point,4326)` is `geometry`, `vector(1536)
 `vector`). Everything unrecognised falls back to `TEXT`.
 
 PostGIS and pgvector are the two supported extensions: their type OIDs are read
-from `pg_type` at boot, since an extension type's OID differs per database. A column
+from `pg_type` at boot, since an extension type's OID differs per database, and read
+again when a table's schema names an OID the bridge does not know, before refusing it.
+An extension created while the bridge runs therefore needs no restart. A column
 of any other extension type, or of a built-in type the decoder does not implement,
 refuses the table at boot rather than shipping bytes it cannot name. `tsvector`,
 `tsquery`, `xml` and the range types are left out of the publication by
@@ -1263,7 +1265,8 @@ Two consequences worth knowing:
 | typtype | example | behaviour |
 | --- | --- | --- |
 | `e` (enum) | `CREATE TYPE mood AS ENUM (...)` | ✅ passes through — Postgres sends enum **labels as text** in binary |
-| anything else | `hstore`, composite, range, PostGIS | 🔴 refused, naming the column and OID: CDC **suspends the table** (§3) and the producer skips it |
+| `b`, from a supported extension | PostGIS `geometry`, `geography`; pgvector `vector`, `halfvec`, `sparsevec` | ✅ carried as bytes, `BLOB` in the replica (see below) |
+| anything else | `hstore`, composite, range | 🔴 refused, naming the column and OID: CDC **suspends the table** (§3) and the producer skips it |
 
 The refusal exists because the alternative was observed in practice: an `hstore` column
 was emitting its binary wire form — `\0\0\0\1\0\0\0\1k\0\0\0\1v` — as a string value

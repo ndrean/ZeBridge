@@ -2520,6 +2520,7 @@ pub const EventProcessor = struct {
             // used to be found at the table's first row after boot, so a restart
             // published a clean descriptor over a table whose next event suspends it.
             var unsupported: ?[]const u8 = null;
+            var rechecked = false;
             var r: i32 = 0;
             while (r < num_rows) : (r += 1) {
                 if (r > 0) try json_str.appendSlice(arena, ",");
@@ -2538,7 +2539,19 @@ pub const EventProcessor = struct {
                             log.warn("could not record type OID {d}: {}", .{ oid, err });
                         };
                     }
-                    if (unsupported == null and self.types.verdict(oid) == .refuse) unsupported = col_name;
+                    if (unsupported == null and self.types.verdict(oid) == .refuse) {
+                        // An extension created after this bridge booted (CREATE EXTENSION
+                        // postgis on a running stack, then a table with a geometry column)
+                        // has OIDs the boot lookup never saw: look again before refusing.
+                        // Measured 2026-10-05: charge_points refused, 16,173 live events
+                        // dropped, until a restart. Once per pass: a second unknown type
+                        // in the same pass is unknown for good.
+                        if (!rechecked) {
+                            rechecked = true;
+                            Preflight.registerExtensionBinaryTypes(conn);
+                        }
+                        if (self.types.verdict(oid) == .refuse) unsupported = col_name;
+                    }
                 } else |_| {}
 
                 try column_names.append(arena, col_name);
