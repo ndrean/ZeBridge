@@ -13,8 +13,8 @@ ZeBridge has a three-pillar architecture with a projection daemon between your P
 
 ```mermaid
 flowchart LR
-     subgraph VPN["Server"]
-        PG[("Postgres")]
+     subgraph VPN["Backend"]
+        PG[("Postgres <br> cloud or local")]
         subgraph VPS ["VPS"]
             Bridge(("daemon"))
             NATS[("NATS")]
@@ -108,6 +108,7 @@ To start again from scratch: `docker compose -f docker-compose.quickstart.yml do
     - [Which library, and which artifact](#which-library-and-which-artifact)
     - [Setup steps at a glance](#setup-steps-at-a-glance)
     - [Architecture Example](#architecture-example)
+    - [Use case: a fleet of trucks](#use-case-a-fleet-of-trucks)
   - [Performance measurements](#performance-measurements)
     - [Changes: PostgreSQL → clients](#changes-postgresql--clients)
       - [A live phone under load, killed four times](#a-live-phone-under-load-killed-four-times)
@@ -147,13 +148,13 @@ To start again from scratch: `docker compose -f docker-compose.quickstart.yml do
     - [Understanding the LWW rules](#understanding-the-lww-rules)
     - [Local database writes are owned](#local-database-writes-are-owned)
   - [Safety \& Guarantees](#safety--guarantees)
-    - [Schemas Postgres -\> SQLite](#schemas-postgres---sqlite)
-    - [Internal WAL decoder and refused types](#internal-wal-decoder-and-refused-types)
-    - [At-Least-Once Delivery](#at-least-once-delivery)
-    - [Zero-Consumer Protection \& Storage Bounds](#zero-consumer-protection--storage-bounds)
-    - [Idempotent Delivery](#idempotent-delivery)
-    - [Durability](#durability)
-    - [Schema Consistency](#schema-consistency)
+      - [Schemas Postgres -\> SQLite](#schemas-postgres---sqlite)
+      - [Internal WAL decoder and refused types](#internal-wal-decoder-and-refused-types)
+      - [At-Least-Once Delivery](#at-least-once-delivery)
+      - [Zero-Consumer Protection \& Storage Bounds](#zero-consumer-protection--storage-bounds)
+      - [Idempotent Delivery](#idempotent-delivery)
+      - [Durability](#durability)
+      - [Schema Consistency](#schema-consistency)
     - [Graceful Shutdown](#graceful-shutdown)
   - [Authentication](#authentication)
     - [Authenticate ZeBridge with Postgres](#authenticate-zebridge-with-postgres)
@@ -191,7 +192,7 @@ To start again from scratch: `docker compose -f docker-compose.quickstart.yml do
     - [NATS streams and buckets](#nats-streams-and-buckets)
     - [Running the Bridge](#running-the-bridge)
   - [Configuration](#configuration)
-    - [Main Configuration](#main-configuration)
+      - [Main Configuration](#main-configuration)
   - [Sizing the ring](#sizing-the-ring)
     - [Two things checked at startup, before a byte is allocated](#two-things-checked-at-startup-before-a-byte-is-allocated)
     - [What happens when a row does not fit](#what-happens-when-a-row-does-not-fit)
@@ -489,6 +490,82 @@ This can serve the following clients:
 
 [⬆️](#table-of-contents)
 
+### Use case: a fleet of trucks
+
+A depot plans its trucks' trips; the people dispatching them work on browsers and phones, offline at times; trucks report where they are. Each kind of data takes the path that suits it:
+
+- **Decisions go through PostgreSQL**: the trucks, their plans, the places they serve. A dispatcher's screen holds a replica and edits it locally; the write goes to PostgreSQL through the bridge, and every other screen receives it. Two dispatchers sending the same truck at once: the later stamp wins on every screen.
+- **Questions go to services over NATS**: a route, which truck is closest by road. `zb-respond` forwards each question to Valhalla and returns its answer; more pairs of them in one queue group share the load.
+- **What moves stays on NATS**: positions are published on `pos.<tenant>.<truck>` and shown by the screens that follow them. They never reach PostgreSQL, so their rate is NATS's, not the database's.
+- **History goes to Parquet**: on each leaf, a collector embedding DuckDB packs the positions into Parquet files in one central bucket. On the hub, a DuckDB responder answers questions on that archive (mileage, occupancy), taking the tenant from the subject, which the asker's JWT bounds.
+
+10 services: a local replica (SQLite) per client, a NATS leaf node per region and its collector service (into Parquet compressor), the NATS server, the PostgreSQL server, the bridge daemon, a responder service, a Valhalla service, a DuckDB service (analytics on archives), and a bucket for the archives & vector tiles
+
+```mermaid
+flowchart TD
+    classDef external fill:#f9f,stroke:#333,stroke-width:2px;
+    classDef internal fill:#dfd,stroke:#333,stroke-width:1px;
+    classDef secure fill:#fdd,stroke:#333,stroke-width:1px;
+    classDef daemon fill:#bdf3ff,stroke:#ac0100,stroke-width:2px;
+
+    subgraph Clients ["Screens: browser, phone"]
+      S([dispatcher<br>--- zb-client-ts / libzb ---]):::external
+      R[(local<br>replica)]:::secure
+      S <==> R
+    end
+    
+    T([trucks<br>positions 0.1Hz]):::external
+
+    subgraph Leaf ["Leaf node, per region"]
+      LN[NATS leaf]:::internal
+      COL[collector<br>DuckDB → Parquet]:::daemon
+    end
+
+    subgraph Hub
+      direction LR
+      PG[(PostgreSQL<br>trucks, plans, places)]:::secure
+      ZB[ZeBridge]:::daemon
+      HN[NATS hub]:::internal
+      RESP[zb-respond]:::daemon
+      VAL[Valhalla]:::internal
+      DQ[DuckDB<br>responder]:::daemon
+      
+      %% Moving these internal Hub connections here forces the LR layout
+      PG -->|WAL| ZB
+      ZB -->|writes| PG
+      ZB <==>|CDC, mutations| HN
+      HN -->|query.t.route / matrix| RESP
+      RESP -->|HTTP| VAL
+      HN -->|query.t.mileage| DQ
+    end
+
+    B[(bucket<br>Parquet)]:::secure
+
+    %% Global connections
+    S <==>|replica, writes,<br>questions, positions| LN
+    T -->|pos.tenant.truck| LN
+    LN <==> HN
+    LN --> COL
+    COL -->|COPY … TO s3| B
+    DQ -->|reads| B
+```
+
+[examples/14-depot](examples/14-depot) runs the first two, with Supabase as the PostgreSQL and Valhalla on the hub: a plan, its places and its stops edited together on several screens, routes and the closest truck asked over NATS, positions computed by each screen from the plan. The live positions and their archive are the design for real trucks; they are not built yet.
+
+**Sizing, an estimate** for 20,000 trucks each reporting every 10 s (0.1 Hz: a dispatcher's map needs no more):
+
+| | |
+| --- | --- |
+| one position (id, time, lat, lng, speed, heading, one sensor value) | ~50 B in MessagePack, ~120 B in JSON; ~115–185 B stored with its subject and JetStream's overhead |
+| messages into NATS | 2,000/s, 0.25–0.4 MB/s |
+| the leaf stream, kept 7 min | 100–150 MB: memory storage is enough. Longer than the collector's 5 min, so a slow write or a restart loses nothing |
+| Parquet, at 10–15 B per row (zstd, 32-bit coordinates) | a file every 5 min: 600,000 rows and 6–9 MB for the whole fleet, shared among the leaves, 288 a day · compacted once a night into one file per tenant and day: 170 million rows, 1.7–2.6 GB |
+| the archive | 50–80 GB a month |
+
+A screen subscribes to its tenant or its region, not to the whole fleet: 2,000 messages a second is light for NATS and heavy for a phone.
+
+[⬆️](#table-of-contents)
+
 ## Performance measurements
 
 Measured figures, not estimates. PostgreSQL, nats-server and the bridge run on one Mac; the phones reach it over home Wi-Fi. Every run ends with the replica checked against PostgreSQL (row count and a column sum, or batch by batch), and every run below was exact. The harnesses are in `scripts/scenarios/`.
@@ -695,11 +772,11 @@ For example, two public tables and a tenant scoped one:
   ```txt
   postgres=# select * from zebridge_catalogue;
 
-            tbl          | tenant_col |                           public_reason                           | version_col | tombstone_col | tiebreak_col |
-  -----------------------+------------+-------------------------------------------------------------------+-------------+---------------+--------------+
-   users                 |            | no tenant column, readable by every consumer         | updated_at  |               |
-   counter_public        |            | demo — identical content for every tenant                 | updated_at  |               |
-   counter_tenant        | tenant_id  |                                                                   | updated_at  |               | 
+            tbl          | tenant_col |                         public_reason         | version_col | tombstone_col | tiebreak_col |
+  -----------------------+------------+-----------------------------------------------+-------------+---------------+--------------+
+   users                 |            | no tenant column, readable by every consumer  | updated_at  |               |
+   counter_public        |            | demo — identical content for every tenant     | updated_at  |               |
+   counter_tenant        | tenant_id  |                                               | updated_at  |               |
   ```
 
 (3) See [Conflict resolution](#conflict-resolution)
@@ -1226,8 +1303,8 @@ One rule covers almost everything:
 
 | change | what's needed |
 | --- | --- |
-| ✚ new table <br> (public or tenant-scoped) | ❗️ `zebridge_enable(...)` migration, <br> **no restart** — the bridge sees the catalogue row in the WAL, reloads its rules, reconciles CDC_PUBLIC's subjects, lifts the table's refusal and publishes its schema. No env edit, no stream edit by hand. |
-| changed _rule_ on an existing table (version / tombstone / tiebreak / tenant column) | ❗️re-run `zebridge_enable`, <br> **no restart** — same path (the write path re-reads the catalogue on the same signal; the sweeper still re-reads on its own restart) |
+| ✚ new table <br> (public or tenant-scoped) | ❗️ `zebridge_enable(...)` migration, <br> **no restart** — the bridge sees the catalogue row in the WAL, reloads its rules, reconciles CDC_PUBLIC's subjects, lifts the table's refusal and publishes its schema; the sweeper reaps its tombstones from its next pass. No env edit, no stream edit by hand. |
+| changed _rule_ on an existing table (version / tombstone / tiebreak / tenant column) | ❗️re-run `zebridge_enable`, <br> **no restart** — same path (the write path re-reads the catalogue on the same signal; the sweeper reads it at the start of every pass) |
 | ✚ new tenant | **nothing** — a tenant is born with its first mapping (an invite redeemed, or an INSERT into `zebridge_user_tenants`): the bridge creates `CDC_<tenant>` on the spot, the producer its `gen-<tenant>` store on the first row, and the JWT's `tenant` tag carries the grants (the role's template, no server change) |
 | ✚ new user on an existing tenant | **nothing** — an invite (or an INSERT into `zebridge_user_tenants`); the JWT carries the tenant tag |
 | generations on/off, tenant growth, invites, enrollment | **nothing** — the producer and the mint read the database per tick/request |

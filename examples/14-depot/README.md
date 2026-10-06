@@ -29,7 +29,9 @@ and moves no other screen. A tap on the map away from any charger (more than 30 
 drafts a new place there, written nowhere either. Only **Trace route** (or **Update route**)
 writes: first the new places the trip goes through, into `places`, then the leg. A place
 tapped and then dropped is never saved; a saved one appears on every screen, and can be picked
-like a charger. If two
+like a charger. Tapping a place opens **Remove this place**, unless a truck's trip through it
+is not over yet, or a truck is parked on it (a truck that has reached its final To frees the
+other places of that trip, and the To itself when it leaves): the row gets its tombstone, every screen drops it, and the sweeper reaps it later. If two
 screens send the same truck somewhere at once, the later stamp wins on every screen; the other
 screen says who sent it, and drops the To it had picked.
 

@@ -63,7 +63,11 @@ const map = L.map('map', { preferCanvas: true }).setView(NANTES, 9);
 /// charger (the canvas renderer's tolerance), and a tap that still misses picks the nearest
 /// one within 30 px (below).
 const TOUCH = matchMedia('(pointer: coarse)').matches;
-const chargerRenderer = L.canvas({ tolerance: TOUCH ? 12 : 3 });
+/// Their own pane, above the routes (overlayPane, 400) and below the trucks (markerPane,
+/// 600): each canvas renderer is one <canvas> over the whole map, and the top one takes
+/// every click — the routes' canvas, made later, would otherwise hide the chargers' taps.
+map.createPane('chargers').style.zIndex = '450';
+const chargerRenderer = L.canvas({ pane: 'chargers', tolerance: TOUCH ? 12 : 3 });
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 18,
   attribution: '&copy; OpenStreetMap contributors',
@@ -333,7 +337,8 @@ async function refresh(): Promise<void> {
       .bindTooltip(`${t.name}'s depot · ${t.depot.label}`).addTo(truckLayer);
     if (leg) {
       const r = routeFor(leg);
-      if (r) L.polyline(r.line, { color: colourOf(t.id), weight: isSel ? 6 : 4, opacity: isSel ? 0.95 : 0.7 }).addTo(routeLayer);
+      // A trip that is over leaves the map: the truck stays, parked on its To.
+      if (r && !arrivedOf(t.id)) L.polyline(r.line, { color: colourOf(t.id), weight: isSel ? 6 : 4, opacity: isSel ? 0.95 : 0.7, interactive: false }).addTo(routeLayer);
       // The selected truck's stops still ahead, numbered as in the panel.
       if (isSel) stopsLeft(leg, r, elapsedOf(leg)).forEach((p, k) => {
         L.marker([p.lat, p.lng], { icon: L.divIcon({ className: 'stopmark', html: `<span style="background:${colourOf(t.id)}">${k + 1}</span>`, iconSize: [18, 18] }), zIndexOffset: 500 })
@@ -358,13 +363,27 @@ function truckPopup(t: Truck): string {
   return `<b>${t.name}</b><br>${tripText(t) ?? `to ${leg.to.label}<br>route…`}`;
 }
 
-/// Every second: move the trucks and the ETA. Positions only; the layers stay.
+/// The truck has reached the final To of its current leg.
+function arrivedOf(id: string): boolean {
+  const leg = viewPlan(id).leg?.v;
+  const r = leg && routeFor(leg);
+  return !!(leg && r && elapsedOf(leg) >= r.seconds);
+}
+
+/// Every second: move the trucks and the ETA. Positions only; the layers stay — except
+/// when a truck arrives, which redraws once to take its route off the map.
+const arrivedSeen = new Map<string, boolean>();
 setInterval(() => {
+  let arrival = false;
   for (const [id, mk] of truckMarkers) {
     const t = trucks.get(id);
     const at = t && whereIs(t);
     if (at) mk.setLatLng(at);
+    const now = arrivedOf(id);
+    if (arrivedSeen.has(id) && arrivedSeen.get(id) !== now) arrival = true;
+    arrivedSeen.set(id, now);
   }
+  if (arrival) void refresh();
   showEta();
 }, 1000);
 
@@ -576,7 +595,58 @@ map.on('click', (e: L.LeafletMouseEvent) => {
 
 function pick(c: Charger) {
   if (closestArmed) { void closestTo(c.lat, c.lng, pointOf(c).label); return; }
+  // A place tapped while nothing waits for a point: its own popup, to remove it.
+  if (c.place && active === null) { placePopup(c); return; }
   fill(pointOf(c));
+}
+
+// ── removing a place ───────────────────────────────────────────────────────────
+const mentions = (x: { from?: Point; stops?: Point[]; to?: Point } | undefined, id: string) =>
+  !!x && [x.from, ...(x.stops ?? []), x.to].some((p) => p?.place === id);
+
+/// Who still needs a place: a truck whose current leg goes through it and has not reached
+/// its final To yet (the arrival is the leg's start plus Valhalla's duration, computed here
+/// as for the ETA; a route not known yet counts as not arrived), a truck parked on it (its
+/// leg is over and it was the To: freed when the truck leaves), and this browser's drafts.
+/// A trip that is over frees every other place of it.
+function usedBy(id: string): string[] {
+  const who: string[] = [];
+  for (const t of trucks.values()) {
+    const leg = viewPlan(t.id).leg?.v;
+    if (mentions(leg, id)) {
+      const r = routeFor(leg!);
+      if (!r || elapsedOf(leg!) < r.seconds) who.push(`${t.name}'s trip`);
+      else if (leg!.to.place === id) who.push(`${t.name}, parked there`);
+    }
+    if (mentions(draft.get(t.id), id)) who.push(`your plan for ${t.name}`);
+  }
+  return who;
+}
+
+function placePopup(c: Charger) {
+  const box = document.createElement('div');
+  const who = usedBy(c.id);
+  box.innerHTML = `<b>${escapeHtml(c.title)}</b><br>a place, not a charger<br>`;
+  if (who.length) {
+    box.insertAdjacentHTML('beforeend', `<span style="opacity:.8">in use by ${escapeHtml(who.join(', '))}</span>`);
+  } else {
+    const btn = document.createElement('button');
+    btn.textContent = 'Remove this place';
+    btn.style.marginTop = '6px';
+    btn.addEventListener('click', () => {
+      // Asked again on the press: a truck may have been sent there since the popup opened.
+      const now = usedBy(c.id);
+      if (now.length) { btn.replaceWith(`in use by ${now.join(', ')}`); return; }
+      btn.disabled = true;
+      // A DELETE on a table with a tombstone becomes `deleted_at` set: every screen drops
+      // the place, and the sweeper reaps the row once the GC window has passed.
+      zb.mutate('places', 'DELETE', { id: c.id })
+        .then(() => { map.closePopup(); void drawChargers(); })
+        .catch((e) => { btn.replaceWith(`not removed: ${(e as Error).message}`); });
+    });
+    box.append(btn);
+  }
+  L.popup().setLatLng([c.lat, c.lng]).setContent(box).openOn(map);
 }
 
 /// Put a point where the panel asked: From, To, a stop, or a new stop.
