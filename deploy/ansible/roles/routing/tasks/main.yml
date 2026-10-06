@@ -13,14 +13,16 @@
         state: directory
         mode: "0755"
 
-    # Owned by the image's user (uid 59999): Valhalla writes file_hashes.txt there.
+    # Owned by the image's user (uid 59999): Valhalla writes file_hashes.txt there. The
+    # modes are the image's own (it sets 0775/0664 at every start): asking for others made
+    # each run change them back, and the tiles' change recreated Valhalla every time.
     - name: Valhalla's data directory, for the image's user
       ansible.builtin.file:
         path: /opt/zebridge-routing/custom_files
         state: directory
         owner: "59999"
         group: "59999"
-        mode: "0755"
+        mode: "0775"
 
     - name: The routing tiles
       ansible.builtin.copy:
@@ -28,7 +30,7 @@
         dest: /opt/zebridge-routing/custom_files/valhalla_tiles.tar
         owner: "59999"
         group: "59999"
-        mode: "0644"
+        mode: "0664"
       notify: Recreate valhalla
 
     # Copied once: the image rewrites fields of it at every start (its thread count among
@@ -40,7 +42,7 @@
         dest: /opt/zebridge-routing/custom_files/valhalla.json
         owner: "59999"
         group: "59999"
-        mode: "0644"
+        mode: "0664"
         force: false
       notify: Recreate valhalla
 
