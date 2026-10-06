@@ -303,6 +303,10 @@ function whereIs(t: Truck): L.LatLngTuple | null {
 // ── drawing ────────────────────────────────────────────────────────────────────
 const fmtMin = (s: number) => (s >= 3600 ? `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} min` : `${Math.round(s / 60)} min`);
 const truckMarkers = new Map<string, L.Marker>();
+/// One colour per truck, by its place in the list: its route, its stops, the ring around
+/// it — the same on every screen. The selected truck's route is drawn thicker.
+const PALETTE = ['#d1361f', '#1f6feb', '#1a7f37', '#8e44ad', '#d68910', '#00838f'];
+const colourOf = (id: string) => PALETTE[Math.max(0, [...trucks.keys()].indexOf(id)) % PALETTE.length];
 
 async function refresh(): Promise<void> {
   routeLayer.clearLayers();
@@ -316,16 +320,16 @@ async function refresh(): Promise<void> {
       .bindTooltip(`${t.name}'s depot · ${t.depot.label}`).addTo(truckLayer);
     if (leg) {
       const r = routeFor(leg);
-      if (r) L.polyline(r.line, { color: isSel ? '#d1361f' : '#888', weight: isSel ? 5 : 3, opacity: isSel ? 0.85 : 0.6 }).addTo(routeLayer);
+      if (r) L.polyline(r.line, { color: colourOf(t.id), weight: isSel ? 6 : 4, opacity: isSel ? 0.95 : 0.7 }).addTo(routeLayer);
       // The selected truck's stops still ahead, numbered as in the panel.
       if (isSel) stopsLeft(leg, r, elapsedOf(leg)).forEach((p, k) => {
-        L.marker([p.lat, p.lng], { icon: L.divIcon({ className: 'stopmark', html: String(k + 1), iconSize: [18, 18] }), zIndexOffset: 500 })
+        L.marker([p.lat, p.lng], { icon: L.divIcon({ className: 'stopmark', html: `<span style="background:${colourOf(t.id)}">${k + 1}</span>`, iconSize: [18, 18] }), zIndexOffset: 500 })
           .bindTooltip(`stop ${k + 1} · ${p.label}`).addTo(routeLayer);
       });
     }
     const at = whereIs(t);
     if (at) {
-      const mk = L.marker(at, { icon: L.divIcon({ className: 'truck', html: '🚚', iconSize: [22, 22] }), zIndexOffset: isSel ? 1000 : 0 })
+      const mk = L.marker(at, { icon: L.divIcon({ className: 'truck', html: `<span style="border-color:${colourOf(t.id)}">🚚</span>`, iconSize: [26, 26] }), zIndexOffset: isSel ? 1000 : 0 })
         .bindPopup(() => truckPopup(t))
         .on('click', () => selectTruck(t.id))
         .addTo(truckLayer);
