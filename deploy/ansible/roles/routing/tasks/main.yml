@@ -22,14 +22,26 @@
         group: "59999"
         mode: "0755"
 
-    - name: The routing tiles and Valhalla's configuration
+    - name: The routing tiles
       ansible.builtin.copy:
-        src: "{{ zb_routing_tiles }}/{{ item }}"
-        dest: "/opt/zebridge-routing/custom_files/{{ item }}"
+        src: "{{ zb_routing_tiles }}/valhalla_tiles.tar"
+        dest: /opt/zebridge-routing/custom_files/valhalla_tiles.tar
         owner: "59999"
         group: "59999"
         mode: "0644"
-      loop: [valhalla_tiles.tar, valhalla.json]
+      notify: Recreate valhalla
+
+    # Copied once: the image rewrites fields of it at every start (its thread count among
+    # them, from the machine's), so a copy on every run would undo that rewrite, count as
+    # a change and recreate Valhalla each time (2026-10-07: "concurrency" 10 → 6 → 10).
+    - name: Valhalla's configuration (first deployment only)
+      ansible.builtin.copy:
+        src: "{{ zb_routing_tiles }}/valhalla.json"
+        dest: /opt/zebridge-routing/custom_files/valhalla.json
+        owner: "59999"
+        group: "59999"
+        mode: "0644"
+        force: false
       notify: Recreate valhalla
 
     # update_existing_config and build_tar off: Valhalla reads the shipped files as they
@@ -59,6 +71,9 @@
                 build_time_zones: "False"
                 build_tar: "False"
                 update_existing_config: "False"
+                # The threads Valhalla serves with, fixed rather than one per core: the
+                # bridge, NATS and the responders share the machine.
+                server_threads: "{{ valhalla_threads }}"
               volumes:
                 - ./custom_files:/custom_files
       notify: Recreate valhalla

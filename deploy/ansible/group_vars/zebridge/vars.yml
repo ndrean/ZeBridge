@@ -52,6 +52,7 @@ zb_routing_tiles: "{{ zb_repo }}/examples/08-map/valhalla/custom_files"
 zb_respond_bin: "{{ zb_repo }}/libzb/zig-out/linux-x86_64/bin/zb-respond"
 valhalla_image_digest: "sha256:060da5b92e6024a67f65135c236d918b021d63e73d1808a0d55b7e7cbd17240c"
 valhalla_mem_limit: 1g
+valhalla_threads: 4   # of the hub's 6 cores: the rest for the bridge, NATS, airports
 
 # Telemetry: telemetry/vps/ is copied as it is (its config.alloy names the Grafana Cloud
 # endpoints); the token is vault_grafana_password.
