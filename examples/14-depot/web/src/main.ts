@@ -604,6 +604,11 @@ map.on('moveend', () => { void drawChargers(); });
 /// catch-up included), then the first local queries.
 let timing = '';
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
+/// When the library first reached each phase, from the script's start: identity, storage
+/// and the NATS dial ('connected'), schemas ('migrated'), the seed ('snapshot'), the
+/// streams followed ('cdc').
+const phaseAt: Record<string, number> = {};
+zb.onPhase((p) => { if (!(p in phaseAt)) phaseAt[p] = performance.now() - T0; });
 try {
   status.textContent = 'connecting… (a first visit copies 16,000 chargers into this browser)';
   await zb.connect();
@@ -618,6 +623,8 @@ zb.onChange('charge_points', () => { void drawChargers(); });
 await readTrucks();
 await drawChargers();
 // T0 itself is the time from navigation to this script: the HTML, the script, the stylesheet.
-timing = ` · page ${secs(T0)} · ready in ${secs(performance.now() - T0)} (connect ${secs(tConnected - T0)}, first draw ${secs(performance.now() - tConnected)})`;
+const phases = (['connected', 'migrated', 'snapshot', 'cdc'] as const)
+  .filter((p) => p in phaseAt).map((p) => `${p} ${secs(phaseAt[p])}`).join(', ');
+timing = ` · page ${secs(T0)} · ready in ${secs(performance.now() - T0)} (connect ${secs(tConnected - T0)}: ${phases}; first draw ${secs(performance.now() - tConnected)})`;
 status.textContent += timing;
 await refresh();
