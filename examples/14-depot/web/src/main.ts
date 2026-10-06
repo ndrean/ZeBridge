@@ -487,6 +487,7 @@ const tConnected = performance.now();
 zb.onChange('charge_points', () => { void drawChargers(); });
 await readTrucks();
 await drawChargers();
-timing = ` · ready in ${secs(performance.now() - T0)} (connect ${secs(tConnected - T0)}, first draw ${secs(performance.now() - tConnected)})`;
+// T0 itself is the time from navigation to this script: the HTML, the script, the stylesheet.
+timing = ` · page ${secs(T0)} · ready in ${secs(performance.now() - T0)} (connect ${secs(tConnected - T0)}, first draw ${secs(performance.now() - tConnected)})`;
 status.textContent += timing;
 await refresh();
