@@ -43,6 +43,10 @@
       #sqlout table { border-collapse: collapse; font-size: 12px; }
       #sqlout th, #sqlout td { border: 1px solid #8884; padding: 2px 6px; text-align: left; vertical-align: top; }
       #sqlout th { position: sticky; top: 0; background: Canvas; }
+      #closest { font-size: 13px; }
+      #closest ol { margin: 4px 0 0; padding-left: 20px; }
+      #closestBtn.armed { outline: 2px solid #1f6feb; }
+      .target { font-size: 22px; line-height: 22px; text-align: center; filter: drop-shadow(0 0 2px #fff); }
       .depot { width: 14px; height: 14px; background: #333; border: 2px solid #fff; box-sizing: border-box; }
       /* A phone: the panel a fixed 40 % of the screen, scrolling inside; the map the rest,
          whatever the panel holds (stops added used to squeeze it). svh, not dvh: the
@@ -65,6 +69,8 @@
       <button id="trace" disabled>Trace route</button>
       <div id="result"></div>
       <div id="eta"></div>
+      <button id="closestBtn" title="then tap a place on the map">Closest truck…</button>
+      <div id="closest"></div>
       <div id="detail"></div>
       <div id="notice"></div>
       <div id="status">connecting…</div>

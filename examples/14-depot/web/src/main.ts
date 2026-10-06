@@ -523,6 +523,7 @@ for (const end of ['from', 'to'] as const) {
 /// The chargers on screen now: a tap between them picks the nearest.
 let drawn: Charger[] = [];
 map.on('click', (e: L.LeafletMouseEvent) => {
+  if (closestArmed) { void closestTo(e.latlng.lat, e.latlng.lng, 'the place tapped'); return; }
   if (active === null || !drawn.length) return;
   const tap = map.latLngToContainerPoint(e.latlng);
   let best: Charger | null = null, bestPx = 30;
@@ -534,6 +535,7 @@ map.on('click', (e: L.LeafletMouseEvent) => {
 });
 
 function pick(c: Charger) {
+  if (closestArmed) { void closestTo(c.lat, c.lng, pointOf(c).label); return; }
   const t = trucks.get(selected);
   if (active === null || !t) return;
   const d = editDraft(t);
@@ -602,6 +604,58 @@ async function drawChargers() {
   status.textContent = `${rows.length} charger(s) in view${timing}`;
 }
 map.on('moveend', () => { void drawChargers(); });
+
+// ── the closest truck: the positions the page computes, asked of Valhalla ──────
+/// Positions are never stored (every screen computes them from its leg and the clock), so
+/// this is not a SQL question: the page sends where each truck is now to the routing
+/// service's `matrix` — Valhalla, by truck, every truck to one place — and ranks them by
+/// driving time. Closest by road, not as the crow flies: a river changes the answer.
+let closestArmed = false;
+const closestBtn = el('closestBtn') as HTMLButtonElement;
+const closestBox = el('closest');
+const targetLayer = L.layerGroup().addTo(map);
+closestBtn.addEventListener('click', () => {
+  closestArmed = !closestArmed;
+  closestBtn.classList.toggle('armed', closestArmed);
+  closestBtn.textContent = closestArmed ? 'Tap a place on the map…' : 'Closest truck…';
+  if (closestArmed) { active = null; showPanel(); }
+});
+
+async function closestTo(lat: number, lng: number, label: string) {
+  closestArmed = false;
+  closestBtn.classList.remove('armed');
+  closestBtn.textContent = 'Closest truck…';
+  targetLayer.clearLayers();
+  L.marker([lat, lng], { icon: L.divIcon({ className: 'target', html: '📍', iconSize: [22, 22] }), zIndexOffset: 2000 })
+    .bindTooltip(label).addTo(targetLayer);
+  const here = [...trucks.values()].map((t) => ({ t, at: whereIs(t) })).filter((x) => x.at) as { t: Truck; at: L.LatLngTuple }[];
+  if (!here.length) { closestBox.textContent = 'no truck position yet'; return; }
+  closestBox.textContent = `asking Valhalla for ${here.length} trucks…`;
+  const t0 = performance.now();
+  try {
+    const a = await zb.request('query._default.matrix', {
+      sources: here.map(({ at }) => ({ lat: at[0], lon: at[1] })),
+      targets: [{ lat, lon: lng }],
+      costing: 'truck',
+      units: 'km',
+    }, 15_000);
+    const cells: any[] = (a.sources_to_targets ?? []).map((row: any[]) => row[0]);
+    if (a.error || !cells.length) throw new Error(String(a.error ?? 'no answer'));
+    const ranked = here.map((h, i) => ({ ...h, time: cells[i]?.time as number | null, km: cells[i]?.distance as number | null }))
+      .sort((x, y) => (x.time ?? Infinity) - (y.time ?? Infinity));
+    const ms = Math.round(performance.now() - t0);
+    closestBox.innerHTML = `<b>To ${escapeHtml(label)}</b>, by road:<ol>${ranked.map((r) =>
+      `<li><span style="color:${colourOf(r.t.id)}">●</span> ${escapeHtml(r.t.name)}: ${
+        r.time == null ? 'no road' : `${fmtMin(r.time)} · ${r.km!.toFixed(1)} km`}</li>`).join('')
+    }</ol><span style="font-size:12px;opacity:.75">one matrix question, ${ms} ms · by ${escapeHtml(a.by ?? '?')}</span>`;
+    const best = ranked[0];
+    if (best.time != null) {
+      truckMarkers.get(best.t.id)?.bindPopup(`<b>${escapeHtml(best.t.name)}</b><br>closest: ${fmtMin(best.time)} by road`).openPopup();
+    }
+  } catch (e) {
+    closestBox.textContent = `no answer: ${(e as Error).message}`;
+  }
+}
 
 // ── what does my fleet do? SQL on the replica ──────────────────────────────────
 /// The plan is JSON text in `trucks.plan`; the browser's SQLite opens it with its JSON
