@@ -17,18 +17,16 @@ PostgreSQL holds the decisions, never the routes. A route's line, about 2,000 po
 by each browser from its trip, and the truck is moved along it by each browser too: every screen
 shows it at the same place, and nothing is sent while it drives.
 
-## The plan: three registers
+## The plan: one register, and a draft
 
-A truck's `plan` is a JSON document of three registers, each `{v, t, w}`: a value, a stamp and
-its writer (see [COOPERATIVE_EDITING.md](../../COOPERATIVE_EDITING.md)).
+A truck's `plan` is a JSON document holding one register, `leg`: `{v, t, w}`, a value, a stamp and
+its writer (see [COOPERATIVE_EDITING.md](../../COOPERATIVE_EDITING.md)). Its value is the trip
+under way: `{from, to, started_at}`.
 
-| register | holds | written by |
-|---|---|---|
-| `from`, `to` | the planned ends, a charger each | a click on a charger |
-| `leg` | the trip under way: `{from, to, started_at}` | Trace route, or Change destination |
-
-Two people setting different ends both keep their change; on the same register, the later stamp
-wins on every screen, and the other screen says who changed it.
+From and To are a draft, kept in the browser that picks them: choosing a charger writes nothing
+and moves no other screen. Only **Trace route** (or **Change destination**) writes, the leg. If two
+screens send the same truck somewhere at once, the later stamp wins on every screen; the other
+screen says who sent it, and drops the To it had picked.
 
 Each browser asks for the current leg's route and walks the truck along it by the durations
 Valhalla gives for each part of the route (slower in town, faster on the motorway), from
@@ -36,7 +34,8 @@ Valhalla gives for each part of the route (slower in town, faster on the motorwa
 
 A new destination while the truck drives writes a new `leg` from the truck's position at that
 moment to the new charger: A → B becomes AB → C. The start of the new leg is stored as a point,
-so a browser that opens later does not have to replay the old one.
+with the truck's heading, so Valhalla carries on forward rather than plan a U-turn, and a browser
+that opens later does not have to replay the old leg.
 
 ## 1. The data
 

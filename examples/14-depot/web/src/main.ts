@@ -8,13 +8,15 @@
 ///   * QUESTIONS, answered by the routing service: `query._default.route` forwards to
 ///     Valhalla, which knows roads only. The page sends coordinates, draws the line.
 ///
-/// A truck's `plan` is a document of three registers {v, t, w} (COOPERATIVE_EDITING.md):
+/// A truck's `plan` is a document holding one register {v, t, w} (COOPERATIVE_EDITING.md):
 ///
-///   from, to   the planned ends, edited together: two people setting different ends both
-///              survive; on the same end the later stamp wins on every screen.
 ///   leg        the trip under way: {from, to, started_at}. "Trace route" writes it. A
 ///              change of destination after departure writes a NEW leg from the truck's
-///              position at that moment (AB → C).
+///              position at that moment (AB → C). Two screens sending the same truck
+///              somewhere at once: the later stamp wins on every screen.
+///
+/// From and To are a DRAFT, in this browser only: picking a charger writes nothing and
+/// moves no other screen. Only the button writes, the leg.
 ///
 /// The route's line is never stored: every browser asks for its leg's route and walks the
 /// truck along it by the maneuvers' durations, from `started_at`. Every screen shows the
@@ -71,8 +73,10 @@ const truckLayer = L.layerGroup().addTo(map);
 type Point = { lat: number; lng: number; label: string; charger?: string; heading?: number };
 type Leg = { from: Point; to: Point; started_at: string };
 type Register<T> = { v: T; t: string; w: string };
-type Plan = { from?: Register<Point>; to?: Register<Point>; leg?: Register<Leg> };
+type Plan = { leg?: Register<Leg> };
 type End = 'from' | 'to';
+/// This browser's own From/To per truck: chosen, not yet sent.
+const draft = new Map<string, { from?: Point; to?: Point }>();
 type Truck = { id: string; name: string; depot: Point; plan: Plan };
 type Charger = { id: string; title: string; town: string | null; lat: number; lng: number; max_power_kw: number | null };
 
@@ -96,6 +100,7 @@ async function readTrucks(): Promise<void> {
   );
   for (const r of rows) {
     const plan: Plan = r.plan ? (typeof r.plan === 'string' ? JSON.parse(r.plan) : r.plan) : {};
+    const known = trucks.has(r.id);   // first sight: its trip is not news
     const before = trucks.get(r.id)?.plan ?? {};
     trucks.set(r.id, {
       id: r.id, name: r.name, plan,
@@ -103,10 +108,15 @@ async function readTrucks(): Promise<void> {
     });
     // Say what someone else changed, and drop what the row now holds of mine.
     const m = mine.get(r.id);
-    for (const k of ['from', 'to', 'leg'] as const) {
+    for (const k of ['leg'] as const) {
       const now = plan[k];
       if (!now || now.t === before[k]?.t) continue;
-      if (now.w !== zb.principal) notice.textContent = `${now.w} changed ${r.name}'s ${k === 'leg' ? 'trip' : k}`;
+      if (known && now.w !== zb.principal) {
+        notice.textContent = `${now.w} sent ${r.name} to ${now.v.to.label}`;
+        // Someone else decided: a To picked here for this truck is stale now.
+        const d = draft.get(r.id);
+        if (d) delete d.to;
+      }
       if (m?.[k] && now.t >= m[k]!.t) delete m[k];
     }
     if (m && !Object.keys(m).length) mine.delete(r.id);
@@ -124,7 +134,7 @@ async function writePlan(id: string): Promise<void> {
   await zb.mutate('trucks', 'UPDATE', { id }, { plan: merged });
 }
 
-function setRegister<K extends keyof Plan>(id: string, key: K, v: NonNullable<Plan[K]>['v']): void {
+function setRegister(id: string, key: 'leg', v: Leg): void {
   const m = mine.get(id) ?? {};
   (m as any)[key] = { v, t: zb.stamp(), w: zb.principal };
   mine.set(id, m);
@@ -350,10 +360,10 @@ function showPanel() {
       text = moving ? `${t.name}'s position (en route)` : `${t.name}'s position (${plan.leg.v.to.label})`;
       empty = false;
     } else {
-      const reg = plan[end] ?? (end === 'from' && t ? { v: t.depot, t: '', w: '' } : undefined);
-      if (reg) {
-        const pending = !!mine.get(selected)?.[end];
-        text = `${reg.v.label}${pending ? ' (pending)' : reg.w ? ` · ${reg.w}` : ' (depot)'}`;
+      const d = t ? draft.get(t.id) : undefined;
+      const p = end === 'from' ? (d?.from ?? t?.depot) : d?.to;
+      if (p) {
+        text = `${p.label}${end === 'from' && !d?.from ? ' (depot)' : ''}`;
         empty = false;
       }
     }
@@ -361,8 +371,8 @@ function showPanel() {
     box.classList.toggle('empty', empty);
     box.classList.toggle('active', active === end);
   }
-  const to = plan.to?.v;
-  const sameTrip = plan.leg && to && legKey({ ...plan.leg.v, to }) === legKey(plan.leg.v);
+  const to = t ? draft.get(t.id)?.to : undefined;
+  const sameTrip = plan.leg && to && to.lat === plan.leg.v.to.lat && to.lng === plan.leg.v.to.lng;
   traceButton.textContent = moving ? 'Change destination' : 'Trace route';
   traceButton.disabled = !t || !to || !!sameTrip && (moving || !!arrived);
   const leg = plan.leg?.v;
@@ -399,8 +409,10 @@ for (const end of ['from', 'to'] as const) {
 
 function pick(c: Charger) {
   if (!active || !selected) return;
-  setRegister(selected, active, pointOf(c));
-  active = active === 'from' && !viewPlan(selected).to ? 'to' : null;
+  const d = draft.get(selected) ?? {};
+  d[active] = pointOf(c);
+  draft.set(selected, d);
+  active = active === 'from' && !d.to ? 'to' : null;
   showPanel();
   void drawChargers();
 }
@@ -411,7 +423,7 @@ traceButton.addEventListener('click', () => {
   const t = trucks.get(selected);
   if (!t) return;
   const plan = viewPlan(t.id);
-  const to = plan.to?.v;
+  const to = draft.get(t.id)?.to;
   if (!to) return;
   let from: Point;
   if (plan.leg) {
@@ -424,7 +436,7 @@ traceButton.addEventListener('click', () => {
     const heading = elapsed < r.seconds ? headingAt(r, elapsed) : undefined;
     from = { lat: at[0], lng: at[1], label: `${t.name}'s position`, ...(heading !== undefined ? { heading } : {}) };
   } else {
-    from = plan.from?.v ?? t.depot;
+    from = draft.get(t.id)?.from ?? t.depot;
   }
   setRegister(t.id, 'leg', { from, to, started_at: new Date().toISOString() });
 });
@@ -442,8 +454,8 @@ async function drawChargers() {
     status.textContent = `more than ${MAX_DRAWN} chargers in view: zoom in to pick one`;
     return;
   }
-  const plan = viewPlan(selected);
-  const chosen = new Set([plan.from?.v.charger, plan.to?.v.charger].filter(Boolean));
+  const d = draft.get(selected);
+  const chosen = new Set([d?.from?.charger, d?.to?.charger].filter(Boolean));
   for (const c of rows) {
     const isChosen = chosen.has(c.id);
     const kw = Number(c.max_power_kw ?? 0);
