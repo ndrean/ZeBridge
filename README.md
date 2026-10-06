@@ -334,7 +334,7 @@ JavaScript hosts need no native build at all. That is why the React Native app i
 - **Users**: since NATS is exposed to the internet, every user is authenticated. The bridge is OAuth agnostic: your backend writes a one-time invite naming the user (the principal) and their tenant in `zebridge_invites`. See [Identity and access](#identity-and-access).
 - **Frontend**: the developer builds on the library, `libzb` or `zb-client-ts`, and works only with the local database, never with NATS. They create a `ZeBridge` client with the bridge's URL, the invite, and the storage flavour (SQLite, PGlite, DuckDB).
 
-The full procedure is [Host setup on VPS or bare-metal](#host-setup-on-vps-or-bare-metal).
+The full procedure is [Host setup on VPS or bare-metal](#host-setup-on-vps-or-bare-metal). On a Debian server behind Cloudflare, [deploy/ansible](deploy/ansible/README.md) does it for you: `site.yml` for the hub (HAProxy with Cloudflare's origin certificate, NATS with Let's Encrypt), `leaf.yml` for the [leaf nodes](#adding-a-leaf-node).
 
 See also [SUPABASE_TEST](https://github.com/ndrean/zebridge/blob/main/SUPABASE_TEST.md) for a cloud Postgres setup.
 
@@ -2196,6 +2196,8 @@ The bridge holds no certificates of its own, and HAProxy should terminate the SS
 ### Host setup on VPS or bare-metal
 
 The production procedure, in order. For the development stack of this repository (`up.sh`, the test principals), see [scripts/native/README.md](scripts/native/README.md).
+
+The whole procedure is also automated, for a Debian server behind Cloudflare: [deploy/ansible](deploy/ansible/README.md). Its `site.yml` sets up the hub. HAProxy serves `bridge.<domain>` (`/enroll`, `/renew`, `/status`) with Cloudflare's origin certificate, which lasts years, and accepts Cloudflare's addresses only; NATS takes phones and services on `nats.<domain>:4222` with a Let's Encrypt certificate, and browsers on its websocket through Cloudflare. It installs the bridge and the sweeper as systemd services, the telemetry to Grafana Cloud, and optionally the example responders, then ends with `bridge --diagnose`. Its `leaf.yml` sets up [leaf nodes](#adding-a-leaf-node). Run again, either playbook changes only what differs.
 
 #### 1. Prerequisites
 
