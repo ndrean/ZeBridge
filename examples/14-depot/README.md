@@ -82,10 +82,19 @@ Then:
 
 ## What it measured
 
-On 2026-10-06, the page on a laptop, the hub on a VPS (Supabase, the bridge, NATS, Valhalla):
+On 2026-10-06 and 07, the page on a laptop and two phones, the hub on a VPS (Supabase, the bridge, NATS, Valhalla):
 
-- **A first visit**, from the invite link to the chargers in view: about 3 s, enrolment and the
-  copy of 16,173 chargers into the browser included. A returning visit is immediate.
+- **A first visit**, from the invite link to the chargers in view: enrolment and the copy of
+  16,173 chargers into the browser included, as the page's status line reports it.
+
+  | device | page loaded | ready |
+  |---|---|---|
+  | laptop browser | 0.2 s | 3.0 s |
+  | iPhone, Safari or Chrome | 0.1–0.3 s | 2.5 s |
+  | moto e20 (an old Android), Chrome | 0.8 s | 11.5 s |
+
+  The first draw of the chargers in view, 1,237 of them, takes 0.1 s. A returning visit is
+  immediate: the replica is still there and only catches up.
 - **A route**, Nantes → Angers by truck (92.5 km, 58 min): 88–190 ms in Valhalla, 119–264 ms
   round trip from the browser.
 - **A change of destination** on one screen: the new route is drawn at once there, and on the
