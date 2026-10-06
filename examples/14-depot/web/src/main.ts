@@ -361,9 +361,13 @@ function showPanel() {
       empty = false;
     } else {
       const d = t ? draft.get(t.id) : undefined;
-      const p = end === 'from' ? (d?.from ?? t?.depot) : d?.to;
+      // To: this browser's pick, or else where the truck is going now — the same on every
+      // screen, including one whose own pick lost to another screen's.
+      const p = end === 'from' ? (d?.from ?? t?.depot) : (d?.to ?? plan.leg?.v.to);
       if (p) {
-        text = `${p.label}${end === 'from' && !d?.from ? ' (depot)' : ''}`;
+        const note = end === 'from' && !d?.from ? ' (depot)'
+          : end === 'to' && !d?.to ? (moving ? ' (on its way)' : ' (arrived)') : '';
+        text = `${p.label}${note}`;
         empty = false;
       }
     }
