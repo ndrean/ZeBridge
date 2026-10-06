@@ -2053,6 +2053,21 @@ BEGIN
                    tbl::text, tenant_col);
     END IF;
 
+    -- ── the sweeper's reach on a read-only table that keeps tombstones ─────────
+    -- A loader's soft deletes (examples/08-map/load_fuel.py) are reaped like a client's;
+    -- the sweeper runs as the writer role, which a read-only table never granted. A
+    -- writable table already has the grant (zebridge_grant_edge_writes, above).
+    IF NOT writable AND tombstone_col IS NOT NULL THEN
+        IF to_regprocedure('public.zebridge_grant_sweeper_reaps(regclass)') IS NULL THEN
+            RETURN QUERY SELECT 'sweeper', 'skipped',
+                'the write half (init.write) is not installed: no writer role, no sweeper to grant';
+        ELSE
+            IF NOT dry_run THEN EXECUTE format('SELECT public.zebridge_grant_sweeper_reaps(%L::regclass)', tbl); END IF;
+            RETURN QUERY SELECT 'sweeper', verb,
+                format('zebridge_grant_sweeper_reaps(%L): SELECT and DELETE for the tombstone sweeper', tbl::text);
+        END IF;
+    END IF;
+
     -- Done inside the scoping call above, writable or read-only.
     IF tenant_col IS NOT NULL THEN
         RETURN QUERY SELECT 'replica identity',

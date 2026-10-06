@@ -144,6 +144,35 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- lets the tombstone sweeper reap a table that keeps tombstones but takes no edge writes — see PROTOCOL.md §7.5
+--
+-- A table can keep tombstones without being writable from the edge: a loader that
+-- soft-deletes and revives rows (examples/08-map/load_fuel.py), so a returning client
+-- learns what went. Those tombstones must be reaped too, and the sweeper runs as this
+-- role: without SELECT and DELETE it fails with `permission denied` on every pass, and
+-- the tombstones pile up for ever. zebridge_enable calls this for a read-only table with
+-- a tombstone_col; a writable one already has both (zebridge_grant_edge_writes).
+--
+-- Under row-level security (a tenant-scoped read-only table: the reader's SELECT policy
+-- only), the grant alone reaps nothing — the writer sees no row. So the sweeper's session,
+-- and only it (zb.principal = 'zb_sweeper', as the tombstone guard knows it), gets its
+-- own SELECT and DELETE policies. No INSERT, no UPDATE: the table stays read-only.
+CREATE OR REPLACE FUNCTION public.zebridge_grant_sweeper_reaps(tbl regclass)
+RETURNS void AS $$
+BEGIN
+    EXECUTE format('GRANT SELECT, DELETE ON %s TO ${POSTGRES_WRITER_USER}', tbl);
+    IF (SELECT relrowsecurity FROM pg_class WHERE oid = tbl) THEN
+        EXECUTE format('DROP POLICY IF EXISTS zb_sweeper_read ON %s', tbl);
+        EXECUTE format('CREATE POLICY zb_sweeper_read ON %s FOR SELECT TO ${POSTGRES_WRITER_USER} '
+                       'USING (coalesce(current_setting(''zb.principal'', true), '''') = ''zb_sweeper'')', tbl);
+        EXECUTE format('DROP POLICY IF EXISTS zb_sweeper_reap ON %s', tbl);
+        EXECUTE format('CREATE POLICY zb_sweeper_reap ON %s FOR DELETE TO ${POSTGRES_WRITER_USER} '
+                       'USING (coalesce(current_setting(''zb.principal'', true), '''') = ''zb_sweeper'')', tbl);
+    END IF;
+    RAISE NOTICE 'the sweeper may reap % (SELECT, DELETE for ${POSTGRES_WRITER_USER})', tbl;
+END;
+$$ LANGUAGE plpgsql;
+
 
 -- ---------------------------------------------------------
 -- Write guards — making the version column true for EVERY writer
