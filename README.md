@@ -550,6 +550,9 @@ flowchart TD
     DQ -->|reads| B
 ```
 
+<img width="1614" height="859" alt="Screenshot 2026-10-06 at 22 27 00" src="https://github.com/user-attachments/assets/266f62af-9192-436f-8980-207a3b6654aa" />
+
+
 [examples/14-depot](examples/14-depot) runs the first two, with Supabase as the PostgreSQL and Valhalla on the hub: a plan, its places and its stops edited together on several screens, routes and the closest truck asked over NATS, positions computed by each screen from the plan. The live positions and their archive are the design for real trucks; they are not built yet.
 
 **Sizing, an estimate** for 20,000 trucks each reporting every 10 s (0.1 Hz: a dispatcher's map needs no more):
