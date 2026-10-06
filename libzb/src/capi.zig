@@ -642,10 +642,12 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         if (ident) |*cur| if (force_renew or @abs(cur.clock_offset) > enroll.offset_recheck_seconds or
             enroll.renewDue(cur.creds, cur.serverNow()))
         {
+            const t_renew = enroll.steadyMillis();
             if (enroll.renew(a, cur.*, cur.serverNow(), ca_file)) |fresh| {
                 cur.deinit(a);
                 cur.* = fresh;
                 try enroll.save(a, id_path, cur.*);
+                log.info("zebridge: JWT renewed in {d} ms (the bridge's /renew)", .{enroll.steadyMillis() - t_renew});
             } else |_| {
                 if (enroll.last_purge) {
                     // §10kn: revoked with a purge — delete the replica and the identity
@@ -664,8 +666,12 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             const bridge = str.get(o, "bridgeUrl", "");
             const invite = str.get(o, "invite", "");
             if (bridge.len > 0 and invite.len > 0) {
+                const t_enroll = enroll.steadyMillis();
                 ident = try enroll.enroll(a, bridge, invite, ca_file);
                 try enroll.save(a, id_path, ident.?);
+                // The step before the connection's own line ("connected in …"): the
+                // invite redeemed over HTTPS, the identity written beside the replica.
+                log.info("zebridge: enrolled in {d} ms (the bridge's /enroll, the identity saved)", .{enroll.steadyMillis() - t_enroll});
                 kept_id_path = try a.dupe(u8, id_path);
             } else if (invite.len > 0) {
                 enroll.last_failure = "an invite needs `bridgeUrl`: the bridge that redeems it";

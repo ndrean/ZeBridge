@@ -257,6 +257,41 @@ fn tr(comptime fmt: []const u8, args: anytype) void {
     if (trace_enabled) log.info("trace: " ++ fmt, args);
 }
 
+/// The first connection's steps, timed, and said in one line at the end of the first
+/// sync: `connected in 1980 ms: db 12 · grammar 1 · dial 420 · …`. A phone took ~2 s to
+/// connect with nothing to load (2026-10-06); this says where those seconds go. Not
+/// thread-safe and not meant to be: one client, its own thread, once.
+const Startup = struct {
+    const Mark = struct { name: []const u8 = "", ms: i64 = 0 };
+    t0: i64 = 0,
+    last: i64 = 0,
+    marks: [16]Mark = [_]Mark{.{}} ** 16,
+    n: usize = 0,
+    done: bool = false,
+
+    fn start(s: *Startup) void {
+        s.t0 = @divTrunc(usMono(), 1000);
+        s.last = s.t0;
+    }
+
+    fn mark(s: *Startup, name: []const u8) void {
+        if (s.done or s.t0 == 0 or s.n >= s.marks.len) return;
+        const now = @divTrunc(usMono(), 1000);
+        s.marks[s.n] = .{ .name = name, .ms = now - s.last };
+        s.n += 1;
+        s.last = now;
+    }
+
+    fn report(s: *Startup, principal: []const u8) void {
+        if (s.done or s.t0 == 0) return;
+        s.done = true;
+        var buf: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        for (s.marks[0..s.n], 0..) |m, i| w.print("{s}{s} {d}", .{ if (i > 0) " · " else "", m.name, m.ms }) catch break;
+        log.info("{s}: connected in {d} ms: {s}", .{ principal, s.last - s.t0, w.buffered() });
+    }
+};
+
 pub const SyncClient = struct {
     a: std.mem.Allocator,
     arena: std.heap.ArenaAllocator, // client-lifetime allocations (states, grammar)
@@ -268,6 +303,7 @@ pub const SyncClient = struct {
     opts: Options,
     /// `syncOnce` runs the one-time steps once; the per-pass steps every call.
     schemas_synced: bool = false,
+    startup: Startup = .{},
 
     // ── grammar.json, and ONLY grammar.json (PROTOCOL §1) ─────────────────────
     // No defaults: every name below is REQUIRED by `loadGrammar`, which fails naming
@@ -482,6 +518,7 @@ pub const SyncClient = struct {
             .opts = opts,
             .followed = opts.tables,
         };
+        self.startup.start();
         errdefer self.arena.deinit();
 
         self.st = if (opts.db_url) |url|
@@ -501,10 +538,12 @@ pub const SyncClient = struct {
         else
             try storage.Storage.openReadOnly(opts.db_path);
         errdefer self.ro.close();
+        self.startup.mark("db");
 
         // Before the transport: the grammar is compiled in (§10dq), and a hash
         // mismatch must refuse before a socket is opened with the wrong names.
         try self.loadGrammar();
+        self.startup.mark("grammar");
 
         // An empty credsPath is "no creds" (an anonymous server), not a file named "": the
         // C ABI defaults the field to "" and nats.zig opened it — FileNotFound at open.
@@ -517,6 +556,7 @@ pub const SyncClient = struct {
             "_INBOX";
         self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = if (opts.creds_path.len > 0) opts.creds_path else null, .creds = if (opts.creds.len > 0) opts.creds else null, .inbox_prefix = inbox_prefix, .js_domain = opts.js_domain, .ca_file = opts.ca_file });
         errdefer self.t.deinit();
+        self.startup.mark("dial");
 
         return self;
     }
@@ -652,7 +692,11 @@ pub const SyncClient = struct {
             self.tenants = &.{};
             self.tenant = self.open_tenant;
             self.tenant_missing = true;
-            log.warn("tenant: {s} has no mapping ($KV.tenants.{s}) — revoked, or never enrolled: tenant-scoped tables are skipped, public tables follow", .{ self.opts.principal, self.opts.principal });
+            // A responder follows no table: no mapping is its normal state, not a warning.
+            if (self.opts.tables.len == 0)
+                log.info("tenant: {s} has no mapping ($KV.tenants.{s}) — it follows no table, so none is needed", .{ self.opts.principal, self.opts.principal })
+            else
+                log.warn("tenant: {s} has no mapping ($KV.tenants.{s}) — revoked, or never enrolled: tenant-scoped tables are skipped, public tables follow", .{ self.opts.principal, self.opts.principal });
             return;
         };
         self.tenants = try parseTenantList(self.aa(), decodeMaybeMsgpackString(self.aa(), bytes) catch bytes);
@@ -2812,6 +2856,13 @@ pub const SyncClient = struct {
         }
     }
 
+    /// The consumer, as the server described it when it was made (or found): nothing left to
+    /// deliver, and nothing delivered awaiting an ack. Then a drain has nothing to fetch.
+    fn nothingPending(sub: *@import("nats").PullSubscription) bool {
+        const ci = sub.consumer_info.value;
+        return ci.num_pending == 0 and ci.num_ack_pending == 0;
+    }
+
     /// One pass of the drain. True when the stream pruned under it (the caller re-seeds).
     fn drainStreamOnce(self: *SyncClient, stream: []const u8) !bool {
         const last = try self.storedSeq(stream);
@@ -2832,7 +2883,12 @@ pub const SyncClient = struct {
         // fresh consumer resumes exactly where the last batch left off. A second
         // death is a real fault and propagates.
         var reopened = false;
+        // Nothing to read, as the server said when the consumer was made: no fetch. Waiting
+        // out a fetch's 900 ms expiry to learn it cost every start ~1 s per stream —
+        // measured 2026-10-07, a client following two streams: 2.0 s of a 2.2 s connect.
+        var caught_up = nothingPending(sub);
         while (true) {
+            if (caught_up) break;
             // ⚠️ Only a TIMEOUT means "caught up". A closed connection or a slow
             // consumer used to break here too — and then persist the position, which
             // is how a network blip becomes a recorded claim to have read the tail.
@@ -2861,6 +2917,7 @@ pub const SyncClient = struct {
                         const fresh = try self.openConsumer(stream, 30 * std.time.ns_per_s, null);
                         sub.deinit();
                         sub = fresh;
+                        caught_up = nothingPending(sub);
                         continue;
                     }
                     break;
@@ -2871,12 +2928,16 @@ pub const SyncClient = struct {
                     const fresh = try self.openConsumer(stream, 30 * std.time.ns_per_s, null);
                     sub.deinit();
                     sub = fresh;
+                    caught_up = nothingPending(sub);
                     continue;
                 },
                 else => return err,
             };
             defer batch.deinit();
             if (batch.messages.len == 0) break;
+            // The last message says how many more the consumer holds: none, and this batch
+            // is the tail — no further fetch to wait out.
+            caught_up = batch.messages[batch.messages.len - 1].metadata.num_pending == 0;
             // The gap rule (§10ei), here too — on a jump, and only if the stream no longer
             // holds what follows the position (§10ja: a filtered consumer jumps over the
             // other tables' messages as a matter of course).
@@ -2919,6 +2980,7 @@ pub const SyncClient = struct {
                 const fresh = try self.openConsumer(stream, 30 * std.time.ns_per_s, null);
                 sub.deinit();
                 sub = fresh;
+                caught_up = nothingPending(sub);
             }
         }
         const at = try self.storedSeq(stream);
@@ -4886,19 +4948,28 @@ pub const SyncClient = struct {
         const first = !self.schemas_synced;
         if (first) {
             try self.resolveTenant();
+            self.startup.mark("tenant");
             try self.probeRevoked();
+            self.startup.mark("revoked?");
             try self.ensureOutbox();
+            self.startup.mark("outbox");
             try self.subscribeVerdicts();
+            self.startup.mark("verdicts");
             self.schemas_synced = true;
         }
         // Every pass, not only the first: `migrateTable` decides from the database and
         // is a no-op on an identical descriptor, so a schema change published while
         // this client runs lands on its next sync (§10v's alter/rebuild path).
         try self.syncSchemas();
+        self.startup.mark("schemas");
         try self.gapAndSeed(null, null);
+        self.startup.mark("seed");
         try self.drainCdc();
+        self.startup.mark("cdc");
         // A host that syncs before it ever polls is a client too (PROTOCOL §11).
         self.heartbeatIfDue() catch |err| log.info("heartbeat: {s}", .{@errorName(err)});
+        self.startup.mark("heartbeat");
+        if (first) self.startup.report(self.opts.principal);
         return .{ .tenant = self.tenant, .tenants = self.tenants, .first = first };
     }
 
