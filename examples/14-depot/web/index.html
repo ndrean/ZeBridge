@@ -27,6 +27,17 @@
       #stops { display: grid; gap: 6px; }
       .add { font-style: normal; opacity: .7; border-style: dashed; }
       .stopmark { background: #d1361f; color: #fff; border: 2px solid #fff; border-radius: 50%; font: bold 11px/16px system-ui; text-align: center; }
+      #fleet summary { cursor: pointer; font-weight: 600; }
+      #fleet[open] { display: grid; gap: 6px; }
+      #fleet .claim { font-size: 12px; opacity: .75; margin: 4px 0 0; }
+      #sql { font: 12px/1.4 ui-monospace, Menlo, monospace; width: 100%; box-sizing: border-box; }
+      .sqlbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px; }
+      .inline { display: inline-flex; gap: 4px; align-items: center; opacity: 1; }
+      #sqlerr { color: #c0392b; font-size: 12px; white-space: pre-wrap; }
+      #sqlout { overflow: auto; max-height: 40vh; }
+      #sqlout table { border-collapse: collapse; font-size: 12px; }
+      #sqlout th, #sqlout td { border: 1px solid #8884; padding: 2px 6px; text-align: left; vertical-align: top; }
+      #sqlout th { position: sticky; top: 0; background: Canvas; }
       .depot { width: 14px; height: 14px; background: #333; border: 2px solid #fff; box-sizing: border-box; }
       /* A phone: the panel a fixed 40 % of the screen, scrolling inside; the map the rest,
          whatever the panel holds (stops added used to squeeze it). svh, not dvh: the
@@ -51,6 +62,19 @@
       <div id="detail"></div>
       <div id="notice"></div>
       <div id="status">connecting…</div>
+      <details id="fleet">
+        <summary>What does my fleet do?</summary>
+        <p class="claim">SQL on this browser's own copy of the data: no server asked, offline too. Read-only — writes go through the buttons above.</p>
+        <select id="preset"></select>
+        <textarea id="sql" rows="7" spellcheck="false"></textarea>
+        <div class="sqlbar">
+          <button id="run">Run (⌘⏎)</button>
+          <label class="inline"><input type="checkbox" id="live" checked /> live</label>
+          <span id="sqlinfo"></span>
+        </div>
+        <div id="sqlerr"></div>
+        <div id="sqlout"></div>
+      </details>
     </aside>
     <div id="map"></div>
     <script type="module" src="/src/main.ts"></script>

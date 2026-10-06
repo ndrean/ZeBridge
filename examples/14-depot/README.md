@@ -83,6 +83,11 @@ Then:
 2. Click To, then a charger. Add stops with **+ Add a stop**, then a charger, as many as needed.
 3. Press **Trace route**: the truck leaves, and goes through the stops in order.
 4. While it drives, add a stop or change To, and press **Update route**: it turns from where it is.
+5. Open **What does my fleet do?**: SQL on the browser's own copy of the data, read-only and
+   offline too. The ready queries read the plans' JSON with SQLite's own functions: the
+   roadmaps (from, the stops in order, to, since when, sent by whom), every stop on its own
+   row, the depots, the fast chargers per town. With **live** on, a truck sent anywhere
+   re-runs the query.
 
 ## What it measured
 

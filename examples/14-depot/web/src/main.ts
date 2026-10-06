@@ -599,6 +599,82 @@ async function drawChargers() {
 }
 map.on('moveend', () => { void drawChargers(); });
 
+// ── what does my fleet do? SQL on the replica ──────────────────────────────────
+/// The plan is JSON text in `trucks.plan`; the browser's SQLite opens it with its JSON
+/// functions. `json_each` keeps an array's order, so the stops come out as driven.
+const PRESETS: { label: string; sql: string }[] = [
+  {
+    label: 'Roadmaps: from, stops, to, since when',
+    sql: `SELECT t.id                                   AS truck,
+       t.plan ->> '$.leg.v.from.label'        AS "from",
+       (SELECT group_concat(s.value ->> '$.label', ' → ')
+          FROM json_each(t.plan, '$.leg.v.stops') AS s) AS stops,
+       t.plan ->> '$.leg.v.to.label'          AS "to",
+       t.plan ->> '$.leg.v.started_at'        AS started_at,
+       t.plan ->> '$.leg.w'                   AS sent_by
+FROM trucks t
+ORDER BY t.id;`,
+  },
+  {
+    label: 'Every stop, one row each',
+    sql: `SELECT t.id AS truck, s.key + 1 AS stop, s.value ->> '$.label' AS charger
+FROM trucks t, json_each(t.plan, '$.leg.v.stops') AS s
+ORDER BY t.id, s.key;`,
+  },
+  {
+    label: 'The trucks and their depots',
+    sql: `SELECT t.id AS truck, t.name, c.title AS depot, c.town, c.max_power_kw AS kw
+FROM trucks t JOIN charge_points c ON c.id = t.depot
+ORDER BY t.id;`,
+  },
+  {
+    label: 'Fast chargers per town, Pays de la Loire',
+    sql: `SELECT town, count(*) AS chargers, max(max_power_kw) AS max_kw
+FROM charge_points
+WHERE deleted_at IS NULL AND max_power_kw >= 43
+  AND lat BETWEEN 46.2 AND 48.6 AND lng BETWEEN -2.6 AND 0.9
+GROUP BY town ORDER BY chargers DESC LIMIT 15;`,
+  },
+];
+const presetSelect = el('preset') as HTMLSelectElement;
+const sqlBox = el('sql') as HTMLTextAreaElement;
+const sqlInfo = el('sqlinfo'), sqlErr = el('sqlerr'), sqlOut = el('sqlout');
+const liveBox = el('live') as HTMLInputElement;
+PRESETS.forEach((p, i) => presetSelect.add(new Option(p.label, String(i))));
+sqlBox.value = PRESETS[0].sql;
+presetSelect.addEventListener('change', () => { sqlBox.value = PRESETS[Number(presetSelect.value)].sql; void runSql(); });
+
+const escapeHtml = (v: unknown) => String(v).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]!));
+let sqlHasRun = false;
+/// `zb.query` reads only: the library refuses anything that would write the replica.
+async function runSql() {
+  const q = sqlBox.value.trim();
+  if (!q) return;
+  sqlHasRun = true;
+  const t0 = performance.now();
+  try {
+    const rows = await zb.query(q);
+    const ms = Math.round(performance.now() - t0);
+    sqlErr.textContent = '';
+    const shown = rows.slice(0, 200);
+    sqlInfo.textContent = `${rows.length} row(s) · ${ms} ms${rows.length > 200 ? ' · first 200' : ''}`;
+    if (!shown.length) { sqlOut.innerHTML = ''; return; }
+    const cols = Object.keys(shown[0]);
+    sqlOut.innerHTML = `<table><thead><tr>${cols.map((c) => `<th>${escapeHtml(c)}</th>`).join('')}</tr></thead><tbody>${
+      shown.map((r: any) => `<tr>${cols.map((c) => `<td>${r[c] === null ? '<i>NULL</i>' : escapeHtml(r[c])}</td>`).join('')}</tr>`).join('')
+    }</tbody></table>`;
+  } catch (e) {
+    sqlErr.textContent = (e as Error).message;
+    sqlInfo.textContent = '';
+    sqlOut.innerHTML = '';
+  }
+}
+el('run').addEventListener('click', () => { void runSql(); });
+sqlBox.addEventListener('keydown', (e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); void runSql(); } });
+(el('fleet') as HTMLDetailsElement).addEventListener('toggle', (e) => { if ((e.target as HTMLDetailsElement).open && !sqlHasRun) void runSql(); });
+/// Live: a truck sent somewhere, on this screen or another, re-runs the query.
+zb.onChange('trucks', () => { if (liveBox.checked && sqlHasRun) void runSql(); });
+
 // ── go ─────────────────────────────────────────────────────────────────────────
 /// How long the first screen took, once: connecting (enrolment and the replica's
 /// catch-up included), then the first local queries.
