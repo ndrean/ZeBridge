@@ -28,7 +28,14 @@
       .add { font-style: normal; opacity: .7; border-style: dashed; }
       .stopmark { background: #d1361f; color: #fff; border: 2px solid #fff; border-radius: 50%; font: bold 11px/16px system-ui; text-align: center; }
       .depot { width: 14px; height: 14px; background: #333; border: 2px solid #fff; box-sizing: border-box; }
-      @media (max-width: 640px) { body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; } aside { border-right: 0; border-bottom: 1px solid #8884; } }
+      /* A phone: the panel a fixed 40 % of the screen, scrolling inside; the map the rest,
+         whatever the panel holds (stops added used to squeeze it). svh, not dvh: the
+         address bar showing or hiding does not move the split. min-height: 0 lets the
+         panel scroll rather than grow past its row. */
+      @media (max-width: 640px) {
+        body { grid-template-columns: 1fr; grid-template-rows: 40svh minmax(0, 1fr); }
+        aside { border-right: 0; border-bottom: 1px solid #8884; min-height: 0; }
+      }
     </style>
   </head>
   <body>
