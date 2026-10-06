@@ -8,7 +8,8 @@ Two flows meet on the page:
 
 - **Data**, replicated into the browser: `charge_points` (16,173 chargers from OpenChargeMap,
   all of France) and `trucks` (five trucks, each with a depot and a plan). The chargers in view
-  are a local query on every pan; no service is asked for them.
+  are a local query on every pan; no service is asked for them. And `places`: destinations
+  that are not chargers, added from the map.
 - **Questions**, answered on the hub: `query._default.route` goes to the routing service of
   [13-routing](../13-routing), which forwards it to Valhalla. Valhalla knows roads only: the page
   sends coordinates and draws the line it gets back.
@@ -24,7 +25,11 @@ its writer (see [COOPERATIVE_EDITING.md](../../COOPERATIVE_EDITING.md)). Its val
 under way: `{from, stops, to, started_at}`, the stops being the places between, in order.
 
 From, the stops and To are a draft, kept in the browser that picks them: choosing a charger writes nothing
-and moves no other screen. Only **Trace route** (or **Change destination**) writes, the leg. If two
+and moves no other screen. A tap on the map away from any charger (more than 30 px from one)
+drafts a new place there, written nowhere either. Only **Trace route** (or **Update route**)
+writes: first the new places the trip goes through, into `places`, then the leg. A place
+tapped and then dropped is never saved; a saved one appears on every screen, and can be picked
+like a charger. If two
 screens send the same truck somewhere at once, the later stamp wins on every screen; the other
 screen says who sent it, and drops the To it had picked.
 
@@ -51,14 +56,16 @@ ADMIN_DATABASE_URL=postgresql://… ../08-map/load_chargers.py --create    # 16,
 ```
 
 The trucks, each based at the charger nearest one town (Nantes, Angers, Saint-Nazaire, Cholet,
-La Roche-sur-Yon). `--check` runs everything in a transaction and rolls it back:
+La Roche-sur-Yon), and the empty `places` table. `--check` runs everything in a transaction
+and rolls it back:
 
 ```sh
 ADMIN_DATABASE_URL=postgresql://… ./load_trucks.py --check
 ADMIN_DATABASE_URL=postgresql://… ./load_trucks.py
 ```
 
-Both tables are public and writable from the edge. A table's description travels as one change
+All three tables are public and writable from the edge. Places have their own table so that
+a reload of the chargers, which removes what OpenChargeMap no longer lists, never touches them. A table's description travels as one change
 event: `charge_points` has 25 columns, which needs `BASE_BUF=13` (an 8 KB event buffer).
 
 ## 2. Routing
@@ -81,6 +88,7 @@ Then:
 
 1. Choose a truck. From is its depot.
 2. Click To, then a charger. Add stops with **+ Add a stop**, then a charger, as many as needed.
+   A tap away from the chargers makes a new place instead (a dashed ring until it is saved).
 3. Press **Trace route**: the truck leaves, and goes through the stops in order.
 4. While it drives, add a stop or change To, and press **Update route**: it turns from where it is.
 5. Press **Closest truck…** and tap a place: the page sends every truck's current position

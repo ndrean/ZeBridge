@@ -3,8 +3,8 @@
 /// Two flows meet on this page:
 ///
 ///   * DATA, replicated into this browser's SQLite: `charge_points` (all of France; the
-///     chargers in view are a local query on every pan) and `trucks` (five trucks, each
-///     with a depot and a plan).
+///     chargers in view are a local query on every pan), `trucks` (five trucks, each
+///     with a depot and a plan) and `places` (destinations that are not chargers).
 ///   * QUESTIONS, answered by the routing service: `query._default.route` forwards to
 ///     Valhalla, which knows roads only. The page sends coordinates, draws the line.
 ///
@@ -16,7 +16,8 @@
 ///              somewhere at once: the later stamp wins on every screen.
 ///
 /// From and To are a DRAFT, in this browser only: picking a charger writes nothing and
-/// moves no other screen. Only the button writes, the leg.
+/// moves no other screen. A tap away from any charger drafts a new place, written nowhere
+/// either. Only the button writes: the new places the leg uses, then the leg.
 ///
 /// The route's line is never stored: every browser asks for its leg's route and walks the
 /// truck along it by the maneuvers' durations, from `started_at`. Every screen shows the
@@ -29,7 +30,8 @@ import { ZeBridge, NotEnrolled, mergeRegisters } from 'zb-client-ts';
 
 const T0 = performance.now();
 const NANTES: L.LatLngTuple = [47.2184, -1.5536];
-/// Chargers drawn at once: past this the view is too wide to pick one anyway.
+/// Chargers drawn at once: past this the view is too wide to tell them apart (a tap still
+/// finds the nearest, by a query).
 const MAX_DRAWN = 1500;
 
 const qs = new URLSearchParams(location.search);
@@ -50,7 +52,7 @@ const zb = new ZeBridge({
   invite: qs.get('invite') ?? undefined,
   // `?as=<name>`: a separate identity and replica, so two people can share one browser.
   dbPath: qs.get('as') ? `depot-${qs.get('as')}.sqlite3` : 'depot.sqlite3',
-  tables: ['charge_points', 'trucks'],
+  tables: ['charge_points', 'trucks', 'places'],
 });
 (window as any).zb = zb;
 
@@ -75,7 +77,9 @@ const truckLayer = L.layerGroup().addTo(map);
 
 // ── types ──────────────────────────────────────────────────────────────────────
 /// `heading`: a mid-route start's direction of travel, degrees from north (Valhalla's own field).
-type Point = { lat: number; lng: number; label: string; charger?: string; heading?: number };
+/// `charger` or `place`: the row it was picked from. `fresh`: a place drafted here, not
+/// inserted yet — never part of a leg that is sent.
+type Point = { lat: number; lng: number; label: string; charger?: string; place?: string; fresh?: true; heading?: number };
 /// `stops`: the places between from and to, in order (a delivery round).
 type Leg = { from: Point; stops?: Point[]; to: Point; started_at: string };
 type Register<T> = { v: T; t: string; w: string };
@@ -86,9 +90,12 @@ type Active = 'from' | 'to' | 'add' | number;
 type Draft = { from?: Point; stops?: Point[]; to?: Point };
 const draft = new Map<string, Draft>();
 type Truck = { id: string; name: string; depot: Point; plan: Plan };
-type Charger = { id: string; title: string; town: string | null; lat: number; lng: number; max_power_kw: number | null };
+/// A charger, or a place (`place` set: a row of `places`, its label as the title).
+type Charger = { id: string; title: string; town: string | null; lat: number; lng: number; max_power_kw: number | null; place?: boolean };
 
-const pointOf = (c: Charger): Point => ({ lat: c.lat, lng: c.lng, label: `${c.title}${c.town ? ` · ${c.town}` : ''}`, charger: c.id });
+const pointOf = (c: Charger): Point => c.place
+  ? { lat: c.lat, lng: c.lng, label: c.title, place: c.id }
+  : { lat: c.lat, lng: c.lng, label: `${c.title}${c.town ? ` · ${c.town}` : ''}`, charger: c.id };
 
 // ── trucks: rows, and what this browser wrote that the row does not show yet ─────
 const trucks = new Map<string, Truck>();
@@ -182,7 +189,12 @@ type Route = {
   by: string;
   ms: number;
 };
-const routes = new Map<string, Route | 'asking' | { error: string }>();
+const routes = new Map<string, Route | 'asking' | { error: string; at: number }>();
+/// A failed question is asked again after this long: Valhalla busy, the link down, a restart.
+const RETRY_MS = 10_000;
+/// Routes are questions to the hub: none is asked before the connection is up (the page
+/// draws the replica first), and the draw after connecting asks them.
+let online = false;
 const legKey = (leg: Leg) => JSON.stringify([leg.from.lat, leg.from.lng, leg.from.heading ?? null,
   (leg.stops ?? []).map((p) => [p.lat, p.lng]), leg.to.lat, leg.to.lng]);
 
@@ -245,11 +257,12 @@ function routeFor(leg: Leg): Route | null {
   const key = legKey(leg);
   const r = routes.get(key);
   if (r && r !== 'asking' && !('error' in r)) return r;
-  if (!r) {
+  if (!online) return null;
+  if (!r || (r !== 'asking' && Date.now() - r.at > RETRY_MS)) {
     routes.set(key, 'asking');
     askRoute(leg)
       .then((route) => { routes.set(key, route); void refresh(); })
-      .catch((e) => { routes.set(key, { error: (e as Error).message }); void refresh(); });
+      .catch((e) => { routes.set(key, { error: (e as Error).message, at: Date.now() }); void refresh(); });
   }
   return null;
 }
@@ -291,13 +304,13 @@ function headingAt(r: Route, elapsed: number): number | undefined {
 
 const elapsedOf = (leg: Leg) => (Date.now() - Date.parse(leg.started_at)) / 1000;
 
-/// The truck's position now: on its leg's route, at its depot, or null while the
-/// route is being asked.
-function whereIs(t: Truck): L.LatLngTuple | null {
+/// The truck's position now: on its leg's route, or at its depot. While the route is not
+/// known (being asked, or no answer yet), the leg's start: the truck stays on the map.
+function whereIs(t: Truck): L.LatLngTuple {
   const leg = viewPlan(t.id).leg?.v;
   if (!leg) return [t.depot.lat, t.depot.lng];
   const r = routeFor(leg);
-  return r ? positionAt(r, elapsedOf(leg)) : null;
+  return r ? positionAt(r, elapsedOf(leg)) : [leg.from.lat, leg.from.lng];
 }
 
 // ── drawing ────────────────────────────────────────────────────────────────────
@@ -413,8 +426,14 @@ function editDraft(t: Truck): Draft {
 const placesOf = (x: Draft) => JSON.stringify([(x.stops ?? []).map((p) => [p.lat, p.lng]), x.to ? [x.to.lat, x.to.lng] : null]);
 
 const stopsBox = el('stops');
+let stopsShown = '';
 /// The stops, in order, each with a ✕; then "+ Add a stop", always offered again.
+/// Rebuilt only when what it shows changes: the panel redraws whenever a truck moves in the
+/// replica, and an element replaced between a press and its release never gets the click.
 function showStops(t: Truck | undefined, stops: Point[]) {
+  const shown = JSON.stringify([t?.id ?? null, stops.map((p) => p.label), active]);
+  if (shown === stopsShown) return;
+  stopsShown = shown;
   stopsBox.innerHTML = '';
   if (!t) return;
   stops.forEach((p, k) => {
@@ -445,7 +464,7 @@ function showStops(t: Truck | undefined, stops: Point[]) {
   const add = document.createElement('div');
   add.className = `point add${active === 'add' ? ' active' : ''}`;
   add.tabIndex = 0;
-  add.textContent = active === 'add' ? 'now click a charger' : '+ Add a stop';
+  add.textContent = active === 'add' ? 'now click a charger, or a place on the map' : '+ Add a stop';
   add.addEventListener('click', () => { editDraft(t); active = active === 'add' ? null : 'add'; showPanel(); });
   stopsBox.append(add);
 }
@@ -458,7 +477,7 @@ function showPanel() {
   const v = t ? viewDraft(t) : {};
 
   const fromBox = el('from');
-  let fromText = 'click here, then a charger', fromEmpty = true;
+  let fromText = 'click here, then a charger or a place', fromEmpty = true;
   if (t && plan.leg) {
     fromText = moving ? `${t.name}'s position (en route)` : `${t.name}'s position (${plan.leg.v.to.label})`;
     fromEmpty = false;
@@ -476,7 +495,7 @@ function showPanel() {
   // To: this browser's pick, or else where the truck is going now — the same on every
   // screen, including one whose own pick lost to another screen's.
   const toBox = el('to');
-  toBox.textContent = v.to ? `${v.to.label}${!d && plan.leg ? (moving ? ' (on its way)' : ' (arrived)') : ''}` : 'click here, then a charger';
+  toBox.textContent = v.to ? `${v.to.label}${!d && plan.leg ? (moving ? ' (on its way)' : ' (arrived)') : ''}` : 'click here, then a charger or a place';
   toBox.classList.toggle('empty', !v.to);
   toBox.classList.toggle('active', active === 'to');
 
@@ -520,26 +539,51 @@ for (const end of ['from', 'to'] as const) {
   box.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); choose(); } });
 }
 
-/// The chargers on screen now: a tap between them picks the nearest.
-let drawn: Charger[] = [];
+/// A tap picks the nearest charger or place within 30 px of it, asked of the replica —
+/// drawn or not, so a view too wide to draw them still finds them; a tap farther from all
+/// of them drafts a new place there.
+const PICK_PX = 30;
+async function nearestTo(at: L.LatLng): Promise<{ c: Charger; px: number } | null> {
+  const tap = map.latLngToContainerPoint(at);
+  const sw = map.containerPointToLatLng([tap.x - PICK_PX, tap.y + PICK_PX]);
+  const ne = map.containerPointToLatLng([tap.x + PICK_PX, tap.y - PICK_PX]);
+  const box = [sw.lat, ne.lat, sw.lng, ne.lng];
+  const chargers = (await zb.query(
+    `SELECT id, title, town, lat, lng, max_power_kw FROM charge_points
+     WHERE deleted_at IS NULL AND lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?`, ...box,
+  )) as Charger[];
+  const places = ((await zb.query(
+    `SELECT id, label AS title, lat, lng FROM places
+     WHERE deleted_at IS NULL AND lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?`, ...box,
+  ).catch(() => [])) as any[]).map((r) => ({ ...r, town: null, max_power_kw: null, place: true })) as Charger[];
+  let best: { c: Charger; px: number } | null = null;
+  for (const c of [...chargers, ...places]) {
+    const px = tap.distanceTo(map.latLngToContainerPoint([c.lat, c.lng]));
+    if (px < PICK_PX && (!best || px < best.px)) best = { c, px };
+  }
+  return best;
+}
+
 map.on('click', (e: L.LeafletMouseEvent) => {
   if (closestArmed) { void closestTo(e.latlng.lat, e.latlng.lng, 'the place tapped'); return; }
-  if (active === null || !drawn.length) return;
-  const tap = map.latLngToContainerPoint(e.latlng);
-  let best: Charger | null = null, bestPx = 30;
-  for (const c of drawn) {
-    const px = tap.distanceTo(map.latLngToContainerPoint([c.lat, c.lng]));
-    if (px < bestPx) { best = c; bestPx = px; }
-  }
-  if (best) pick(best);
+  if (active === null) return;
+  void nearestTo(e.latlng).then((best) => {
+    if (best) { pick(best.c); return; }
+    const { lat, lng } = e.latlng;
+    fill({ lat, lng, label: `place ${lat.toFixed(4)}, ${lng.toFixed(4)}`, place: crypto.randomUUID(), fresh: true });
+  });
 });
 
 function pick(c: Charger) {
   if (closestArmed) { void closestTo(c.lat, c.lng, pointOf(c).label); return; }
+  fill(pointOf(c));
+}
+
+/// Put a point where the panel asked: From, To, a stop, or a new stop.
+function fill(p: Point) {
   const t = trucks.get(selected);
   if (active === null || !t) return;
   const d = editDraft(t);
-  const p = pointOf(c);
   if (active === 'add') { d.stops = [...(d.stops ?? []), p]; active = null; }
   else if (typeof active === 'number') { d.stops![active] = p; active = null; }
   else { d[active] = p; active = active === 'from' && !d.to ? 'to' : null; }
@@ -549,8 +593,19 @@ function pick(c: Charger) {
 
 /// Trace route: the first leg from the planned From (or the depot), through the stops; once
 /// a leg exists, a new one from where the truck is now, through the stops still ahead
-/// and any added (AB → C → B).
-traceButton.addEventListener('click', () => {
+/// and any added (AB → C → B). The new places it goes through are inserted first: the
+/// button is the confirmation, so a place tapped and then dropped is never written.
+traceButton.addEventListener('click', () => { void trace(); });
+
+/// Insert a drafted place; the point the leg keeps is the same, without its `fresh` mark.
+async function confirmPlace(p: Point): Promise<Point> {
+  if (!p.fresh) return p;
+  await zb.mutate('places', 'INSERT', { id: p.place }, { label: p.label, lat: p.lat, lng: p.lng });
+  const { fresh: _, ...kept } = p;
+  return kept;
+}
+
+async function trace() {
   const t = trucks.get(selected);
   if (!t) return;
   const plan = viewPlan(t.id);
@@ -570,10 +625,23 @@ traceButton.addEventListener('click', () => {
   } else {
     from = d?.from ?? t.depot;
   }
-  setRegister(t.id, 'leg', { from, stops: d?.stops ?? [], to, started_at: new Date().toISOString() });
+  let stops: Point[], end: Point;
+  traceButton.disabled = true;
+  try {
+    from = await confirmPlace(from);
+    stops = [];
+    for (const p of d?.stops ?? []) stops.push(await confirmPlace(p));
+    end = await confirmPlace(to);
+  } catch (e) {
+    notice.textContent = `place not saved: ${(e as Error).message}`;
+    showPanel();
+    return;
+  }
+  setRegister(t.id, 'leg', { from, stops, to: end, started_at: new Date().toISOString() });
   draft.delete(t.id);   // sent: the panel shows the trip as it stands now
   active = null;
-});
+  void drawChargers();
+}
 
 // ── the chargers in view: a local query ────────────────────────────────────────
 async function drawChargers() {
@@ -583,15 +651,35 @@ async function drawChargers() {
      WHERE deleted_at IS NULL AND lat BETWEEN ? AND ? AND lng BETWEEN ? AND ? LIMIT ?`,
     b.getSouth(), b.getNorth(), b.getWest(), b.getEast(), MAX_DRAWN + 1,
   )) as Charger[];
+  // A replica made before `places` existed has no such table until the library migrates it.
+  const places = ((await zb.query(
+    `SELECT id, label AS title, lat, lng FROM places
+     WHERE deleted_at IS NULL AND lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?`,
+    b.getSouth(), b.getNorth(), b.getWest(), b.getEast(),
+  ).catch(() => [])) as any[]).map((r) => ({ ...r, town: null, max_power_kw: null, place: true })) as Charger[];
   chargerLayer.clearLayers();
-  drawn = rows.length > MAX_DRAWN ? [] : rows;   // nothing drawn: nothing to tap
-  if (rows.length > MAX_DRAWN) {
-    status.textContent = `more than ${MAX_DRAWN} chargers in view: zoom in to pick one`;
-    return;
-  }
   const st = trucks.get(selected);
   const v = st ? viewDraft(st) : {};
-  const chosen = new Set([v.from?.charger, ...(v.stops ?? []).map((p) => p.charger), v.to?.charger].filter(Boolean));
+  const picked = [v.from, ...(v.stops ?? []), v.to].filter(Boolean) as Point[];
+  const chosen = new Set(picked.map((p) => p.charger ?? p.place).filter(Boolean));
+  // Drafted here, not saved yet: a dashed ring until Trace route inserts them — at any zoom.
+  for (const p of picked.filter((x) => x.fresh)) {
+    L.circleMarker([p.lat, p.lng], { renderer: chargerRenderer, interactive: false, radius: 9, color: '#d1361f', dashArray: '3 3', fillColor: '#d1361f', fillOpacity: 0.3, weight: 2 })
+      .bindTooltip(`${p.label} · new, saved when the route is traced`)
+      .addTo(chargerLayer);
+  }
+  if (rows.length > MAX_DRAWN) {
+    status.textContent = `more than ${MAX_DRAWN} chargers in view: zoom in to see them (a tap still picks the nearest)`;
+    return;
+  }
+  // Places: purple with a white rim, so they read as "not a charger" at a glance.
+  for (const c of places) {
+    const colour = chosen.has(c.id) ? '#d1361f' : '#8e24aa';
+    L.circleMarker([c.lat, c.lng], { renderer: chargerRenderer, bubblingMouseEvents: false, radius: chosen.has(c.id) ? 9 : TOUCH ? 8 : 6, color: '#fff', fillColor: colour, fillOpacity: 0.95, weight: 2 })
+      .bindTooltip(`${c.title} · a place, not a charger`)
+      .on('click', () => pick(c))
+      .addTo(chargerLayer);
+  }
   for (const c of rows) {
     const isChosen = chosen.has(c.id);
     const kw = Number(c.max_power_kw ?? 0);
@@ -601,9 +689,10 @@ async function drawChargers() {
       .on('click', () => pick(c))
       .addTo(chargerLayer);
   }
-  status.textContent = `${rows.length} charger(s) in view${timing}`;
+  status.textContent = `${rows.length} charger(s)${places.length ? `, ${places.length} place(s)` : ''} in view${timing}`;
 }
-map.on('moveend', () => { void drawChargers(); });
+// Before the first visit's tables exist, a move has nothing to draw: the connect draws then.
+map.on('moveend', () => { drawChargers().catch(() => {}); });
 
 // ── the closest truck: the positions the page computes, asked of Valhalla ──────
 /// Positions are never stored (every screen computes them from its leg and the clock), so
@@ -680,6 +769,13 @@ FROM trucks t, json_each(t.plan, '$.leg.v.stops') AS s
 ORDER BY t.id, s.key;`,
   },
   {
+    label: 'The places added from the map',
+    sql: `SELECT label, round(lat, 5) AS lat, round(lng, 5) AS lng, updated_at
+FROM places
+WHERE deleted_at IS NULL
+ORDER BY updated_at DESC;`,
+  },
+  {
     label: 'The trucks and their depots',
     sql: `SELECT t.id AS truck, t.name, c.title AS depot, c.town, c.max_power_kw AS kw
 FROM trucks t JOIN charge_points c ON c.id = t.depot
@@ -743,6 +839,16 @@ const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
 /// streams followed ('cdc').
 const phaseAt: Record<string, number> = {};
 zb.onPhase((p) => { if (!(p in phaseAt)) phaseAt[p] = performance.now() - T0; });
+/// The library's own log, in the console, timed from the page's start: which step a slow
+/// connect waits on.
+zb.onLog((topic, data, level) => console.info(`[zb ${secs(performance.now() - T0)}] ${level} ${topic}`, data));
+/// A returning visit: the replica is already here, so draw it before connecting — the
+/// connect then only catches up. A first visit has no tables yet: nothing to draw.
+try {
+  await readTrucks();
+  await drawChargers();
+  await refresh();
+} catch { /* first visit */ }
 try {
   status.textContent = 'connecting… (a first visit copies 16,000 chargers into this browser)';
   await zb.connect();
@@ -753,7 +859,9 @@ try {
   throw e;
 }
 const tConnected = performance.now();
+online = true;
 zb.onChange('charge_points', () => { void drawChargers(); });
+zb.onChange('places', () => { void drawChargers(); });
 await readTrucks();
 await drawChargers();
 // T0 itself is the time from navigation to this script: the HTML, the script, the stylesheet.

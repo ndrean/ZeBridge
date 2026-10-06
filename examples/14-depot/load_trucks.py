@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""The depot demo's trucks: one table, published, five trucks seeded.
+"""The depot demo's tables: `trucks` (five seeded) and `places`, both published.
 
     examples/14-depot/load_trucks.py                     # the local database
     ADMIN_DATABASE_URL=postgresql://… examples/14-depot/load_trucks.py   # a remote one (Supabase)
     examples/14-depot/load_trucks.py --check             # everything in a transaction, rolled back
 
 Each truck is based at a depot: the charge point nearest one town, so `charge_points`
-(examples/08-map/load_chargers.py) must be loaded first. `plan` is what the page saves when
-a route is traced — {"from", "to", "km", "min", "shape"}, the shape as Valhalla encodes it —
-so every open page sees the same plan, and redraws it without asking again.
+(examples/08-map/load_chargers.py) must be loaded first. `plan` holds one register, `leg`:
+the trip under way, {from, stops, to, started_at}, written when a route is traced.
 
-Public, and writable from the edge: the page writes `plan`. Run it again at any time: the
-table and its publication are checked, and a truck already there keeps its plan.
+`places` are the destinations that are not chargers: a tap on the map, away from any
+charger, drafts one, and the page inserts it when the route through it is traced. They
+live in their own table so that a reload of the chargers never touches them.
+
+Both public, and writable from the edge. Run it again at any time: the tables and their
+publication are checked, a truck already there keeps its plan, and places are kept.
 """
 import argparse, os, subprocess, sys
 
@@ -36,15 +39,26 @@ CREATE TABLE IF NOT EXISTS public.trucks (
   updated_at  timestamptz NOT NULL DEFAULT now(),
   deleted_at  timestamptz
 );
+
+-- A destination that is not a charger. The key is minted by the page that adds it.
+CREATE TABLE IF NOT EXISTS public.places (
+  id          uuid PRIMARY KEY,
+  label       text NOT NULL,
+  lat         double precision NOT NULL,
+  lng         double precision NOT NULL,
+  updated_at  timestamptz NOT NULL DEFAULT now(),
+  deleted_at  timestamptz
+);
 """
 
-ENABLE = f"""
+
+def enable(table: str, reason: str) -> str:
+    return f"""
 SELECT step || ':' || status || ' ' || coalesce(detail, '')
-FROM zebridge_enable('public.trucks'::regclass,
+FROM zebridge_enable('public.{table}'::regclass,
   writable => true, version_col => 'updated_at', tombstone_col => 'deleted_at',
-  public_reason => 'the depot demo''s trucks', publication => '{PUB}', dry_run => false)
-WHERE status = 'ERROR';
-"""
+  public_reason => '{reason}', publication => '{PUB}', dry_run => false)
+WHERE status = 'ERROR'"""
 
 # The nearest live charge point to each town, by squared degrees (scaled for the latitude):
 # good enough to pick a depot, and it needs nothing but the lat/lng columns.
@@ -56,9 +70,10 @@ SEED = "INSERT INTO public.trucks (id, name, depot)\nVALUES\n" + ",\n".join(
 
 LIST = """
 SELECT t.id || '  ' || t.name || '  depot: ' || c.title || coalesce(' (' || c.town || ')', '')
-       || CASE WHEN t.plan IS NULL THEN '' ELSE '  plan: ' || (t.plan ->> 'km') || ' km' END
+       || coalesce('  to: ' || (t.plan #>> '{leg,v,to,label}'), '')
 FROM public.trucks t JOIN public.charge_points c ON c.id = t.depot
 WHERE t.deleted_at IS NULL ORDER BY t.id;
+SELECT 'places: ' || count(*) FROM public.places WHERE deleted_at IS NULL;
 """
 
 
@@ -95,17 +110,17 @@ def main():
     if psql("SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename = 'charge_points'") != "1":
         sys.exit("no public.charge_points: load the chargers first (examples/08-map/load_chargers.py --create)")
 
-    # One transaction: the table, its publication and the seed land together, or not at all.
-    # A refused zebridge_enable raises, so nothing half-done is left behind.
-    guard = f"""
+    # One transaction: the tables, their publication and the seed land together, or not at
+    # all. A refused zebridge_enable raises, so nothing half-done is left behind.
+    guard = "".join(f"""
 DO $$ DECLARE refusal text; BEGIN
-  SELECT string_agg(r, '; ') INTO refusal FROM ({ENABLE.strip().rstrip(';')}) AS e(r);
-  IF refusal IS NOT NULL THEN RAISE EXCEPTION 'zebridge_enable refused trucks: %', refusal; END IF;
-END $$;"""
+  SELECT string_agg(r, '; ') INTO refusal FROM ({enable(t, reason)}) AS e(r);
+  IF refusal IS NOT NULL THEN RAISE EXCEPTION 'zebridge_enable refused {t}: %', refusal; END IF;
+END $$;""" for t, reason in [("trucks", "the depot demo''s trucks"), ("places", "the depot demo''s places")])
     script = "BEGIN;\n" + DDL + guard + "\n" + SEED + LIST + ("ROLLBACK;" if a.check else "COMMIT;")
     out = psql(script)
     print("\n".join(l for l in out.splitlines() if l.strip()))
-    print("(--check: rolled back, nothing kept)" if a.check else "trucks: published — public, writable from the edge")
+    print("(--check: rolled back, nothing kept)" if a.check else "trucks, places: published — public, writable from the edge")
 
 
 if __name__ == "__main__":
