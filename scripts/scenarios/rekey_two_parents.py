@@ -105,7 +105,12 @@ def main():
             dt = both(py, nd, converged, 150)
             check(f"§2 both replicas: every child joins BOTH parents by the new uuid keys ({dt} s): {pg}", dt is not None)
             ty = lambda c, t, col: (c.q(f"SELECT type FROM pragma_table_info('{t}') WHERE name = ?", [col]) or [[None]])[0][0]
-            shapes = [ty(c, t, col) for c in (py, nd) for t, col in ((A, "id"), (B, "id"), (C, "a_id"), (C, "b_id"))]
+            cols = ((A, "id"), (B, "id"), (C, "a_id"), (C, "b_id"))
+            # The rows converge before the tables are rebuilt: CDC brings the new keys, and
+            # SQLite stores uuid text in the old INTEGER column meanwhile (measured: the
+            # types follow 0.3 s later). Wait for the rebuild, then read the types.
+            both(py, nd, lambda c: all(ty(c, t, col) == "TEXT" for t, col in cols), 30)
+            shapes = [ty(c, t, col) for c in (py, nd) for t, col in cols]
             check(f"§3 both parents re-keyed and both FK columns re-typed on both replicas: {shapes}", all(x == "TEXT" for x in shapes))
 
             na, nb = str(uuid.uuid4()), str(uuid.uuid4())

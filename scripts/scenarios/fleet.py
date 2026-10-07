@@ -103,7 +103,7 @@ async def main():
     h = 0
     try:
         with zb.Bridge(LOG, FLEET_POLL_SECONDS=str(POLL_S), FLEET_TTL_SECONDS=str(TTL_S),
-                       SLOT_INVENTORY_SECONDS="2") as bridge:
+                       SLOT_INVENTORY_SECONDS="5") as bridge:   # the bridge's minimum
             if not bridge.wait_for_log("Replication started successfully", timeout=60):
                 zb.bad("probe bridge did not start"); print(bridge.text()[-1500:]); return 1
             if not bridge.wait_for_log("fleet monitor started", timeout=10):
@@ -151,7 +151,13 @@ async def main():
                 zb.bad(f"clock mismatch: age={age}, poll_ts={polled} vs now={time.time():.0f} — a monotonic clock where wall time was needed"); failed += 1
 
             # ── 3. the slot inventory ──────────────────────────────────────────
+            # Its first pass waits one full interval (5 s) after the WAL monitor starts:
+            # wait for it rather than read whatever /metrics says at this moment.
+            t_inv = time.monotonic()
             m = metrics()
+            while not gauge(m, "bridge_replication_slot_inventory_timestamp_seconds") and time.monotonic() - t_inv < 20:
+                time.sleep(0.5)
+                m = metrics()
             slot = zb.BRIDGE_SLOT if hasattr(zb, "BRIDGE_SLOT") else None
             own = [l for l in m.splitlines() if l.startswith("bridge_replication_slot_active{") and 'self="true"' in l]
             retained = [l for l in m.splitlines() if l.startswith("bridge_replication_slot_retained_wal_bytes{") and 'self="true"' in l]

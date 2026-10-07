@@ -213,7 +213,9 @@ async def scenario() -> int:
             print("  ⓘ  enrollment not armed on this probe (no ZB_SIGNING_SEED) — /enroll fuzz skipped")
         else:
             cases = [
-                ("SQL-injection code", "code=" + "x'%3B DROP TABLE zebridge_invites%3B--" + "&user_pubkey=U" + "A" * 55),
+                # Spaces as %20: a raw space makes Python refuse to build the URL, and the
+                # request never left (status 0).
+                ("SQL-injection code", "code=" + "x'%3B%20DROP%20TABLE%20zebridge_invites%3B--" + "&user_pubkey=U" + "A" * 55),
                 ("oversized code", "code=" + "A" * 500 + "&user_pubkey=U" + "A" * 55),
                 ("missing user_pubkey", "code=" + "0" * 32),
                 ("missing code", "user_pubkey=U" + "A" * 55),

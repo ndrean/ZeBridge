@@ -9,8 +9,8 @@ preflight — plus the de-quarantine recipe, proven mechanical.
 
 The story, in acts:
 
-  1. **plant the bait** — width trigger disabled, one 20 KB row inserted, trigger
-     re-armed. Exactly what a pre-guard deployment looks like.
+  1. **plant the bait** — one 20 KB row inserted with triggers off
+     (`session_replication_role = replica`). Exactly what a pre-guard deployment looks like.
   2. **the producer detects** (fix 1, the measureWidestRow retirement survivor): the
      first generation build warns loudly — "widest row ... at or over the ... CDC
      event buffer" — chains carry the row, CDC is on notice.
@@ -58,10 +58,11 @@ def main_sync():
     uid_ok = str(uuid.uuid4())   # the narrow companion (phase 5)
     try:
         # ── 1. plant the bait ──────────────────────────────────────────────────
-        zb.psql("ALTER TABLE public.test_types DISABLE TRIGGER zebridge_width_guard")
-        zb.psql(f"""INSERT INTO public.test_types (uid, some_text, tenant_id, inserted_at, updated_at)
+        # Triggers OFF the way pre-guard rows really get in: `session_replication_role =
+        # replica` (pg_restore --disable-triggers). Not `ALTER TABLE … DISABLE TRIGGER`:
+        # that is DDL, and the DDL event trigger re-installs the width guard at once (§10ko).
+        zb.psql(f"""SET session_replication_role = replica; INSERT INTO public.test_types (uid, some_text, tenant_id, inserted_at, updated_at)
                     VALUES ('{uid}', repeat('x', 20000), 'acme', now(), now())""")
-        zb.psql("ALTER TABLE public.test_types ENABLE TRIGGER zebridge_width_guard")
         # A NARROW companion, planted alongside: after the bait is removed, touching this
         # proves the table actually carries events again. (The bait's own uid is gone by
         # then — it is hard-deleted in the repair.)
@@ -87,11 +88,9 @@ def main_sync():
             # ── 3. a touch quarantines ─────────────────────────────────────────
             # The touch must take the legacy path: the re-armed trigger refuses ANY
             # update to this row (it re-measures the whole row), which is itself
-            # correct — so disable, touch, re-arm, exactly like an old backend would
-            # have written before the guard existed.
-            zb.psql("ALTER TABLE public.test_types DISABLE TRIGGER zebridge_width_guard")
-            zb.psql(f"UPDATE public.test_types SET age = 99, updated_at = now() WHERE uid = '{uid}'")
-            zb.psql("ALTER TABLE public.test_types ENABLE TRIGGER zebridge_width_guard")
+            # correct — so the touch runs with triggers off, exactly like an old backend
+            # would have written before the guard existed.
+            zb.psql(f"SET session_replication_role = replica; UPDATE public.test_types SET age = 99, updated_at = now() WHERE uid = '{uid}'")
             if a.wait_for_log("SUSPENDING 'test_types'", timeout=30):
                 zb.ok("decode-time quarantine: the touch suspended the table (containment of last resort)")
             else:
@@ -133,9 +132,7 @@ def main_sync():
                 failed += 1
 
             # …and the touch re-earns it, which is the containment that remains.
-            zb.psql("ALTER TABLE public.test_types DISABLE TRIGGER zebridge_width_guard")
-            zb.psql(f"UPDATE public.test_types SET age = 98, updated_at = now() WHERE uid = '{uid}'")
-            zb.psql("ALTER TABLE public.test_types ENABLE TRIGGER zebridge_width_guard")
+            zb.psql(f"SET session_replication_role = replica; UPDATE public.test_types SET age = 98, updated_at = now() WHERE uid = '{uid}'")
             # A table refused at boot never reaches the decoder: its events are DROPPED at
             # the door, and the refusal's status line counts them. That count is the proof
             # the touch was contained.
@@ -149,9 +146,7 @@ def main_sync():
         # ── 5. de-quarantine is mechanical ─────────────────────────────────────
         # Hard-remove: the soft-delete guard would tombstone the row — still stored,
         # still too wide — so every user trigger steps aside for the repair.
-        zb.psql("ALTER TABLE public.test_types DISABLE TRIGGER USER")
-        zb.psql(f"DELETE FROM public.test_types WHERE uid = '{uid}'")
-        zb.psql("ALTER TABLE public.test_types ENABLE TRIGGER USER")
+        zb.psql(f"SET session_replication_role = replica; DELETE FROM public.test_types WHERE uid = '{uid}'")
 
         with zb.Bridge(LOG_C) as cbr:
             # The old needle here was preflight's "Stored rows and column defaults fit",
@@ -202,16 +197,13 @@ def main_sync():
             failed += 1
 
     finally:
-        # ONE transaction: disable the user triggers (the soft-delete guard would only
-        # tombstone the bait, still stored, still too wide), remove the row, re-arm.
-        # Four separate psql calls used to do this, and a crash between the DISABLE
-        # and the ENABLE left test_types with its guards off for every later scenario.
-        # A single -c string is one implicit transaction: either all of it applies —
-        # triggers back on — or none of it does and they were never off.
+        # Triggers off for this session only (the soft-delete guard would just tombstone
+        # the bait, still stored, still too wide). Nothing to re-arm: the table's
+        # triggers were never switched off, so a crash here cannot leave them off for
+        # every later scenario.
         zb.psql(
-            "ALTER TABLE public.test_types DISABLE TRIGGER USER; "
-            f"DELETE FROM public.test_types WHERE uid IN ('{uid}', '{uid_ok}'); "
-            "ALTER TABLE public.test_types ENABLE TRIGGER USER",
+            "SET session_replication_role = replica; "
+            f"DELETE FROM public.test_types WHERE uid IN ('{uid}', '{uid_ok}')",
             quiet=True,
         )
 

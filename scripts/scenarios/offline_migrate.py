@@ -14,7 +14,10 @@ is refused, and the optimistic copy is reverted), nothing is left in the outbox;
 replicas equal PostgreSQL.
 
 Owns the only bridge (a probe bridge on the dev NATS): stop the dev bridge first.
-Usage:  NATS_CREDS=scripts/native/creds/bridge.creds ZB_PRINCIPAL=omar python scripts/scenarios/offline_migrate.py
+Usage:  NATS_CREDS=scripts/native/creds/bridge.creds python scripts/scenarios/offline_migrate.py
+
+The clients are omar, as in clients.py and the other owns scenarios: run.py drops
+`ZB_PRINCIPAL` for a bridge-role scenario, and reading it made the clients `bridge`.
 """
 import os
 import sys
@@ -61,7 +64,7 @@ def main():
         (zb.ok if cond else zb.bad)(f"{label}{': ' + detail if detail else ''}")
         failed += 0 if cond else 1
 
-    who = zb.require_principal()
+    who = "omar"
     tenant = zb.tenant_of(who)
     os.environ["ZB_TABLES"] = T  # the Node worker follows this table only, not the whole tenant
     teardown()

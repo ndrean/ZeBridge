@@ -380,21 +380,32 @@ def main():
         "  AND a.attname='tenant_id' AND a.attnum>0 AND NOT a.attisdropped)"
     ).splitlines() if r]
 
+    # The tenant guard and the write policy protect the WRITE path: a read-only tenant table
+    # (the writer has no INSERT on it, e.g. a loader's data) has neither, by design.
+    from urllib.parse import urlsplit
+    writer = urlsplit(os.environ.get("DATABASE_WRITER_URL", "")).username
+
+    def edge_writable(tbl: str) -> bool:
+        if not writer:
+            return True   # unknown writer: ask for the guards on every table, as before
+        return zb.psql(f"SELECT has_table_privilege('{writer}', 'public.{tbl}', 'INSERT')::text").strip() in ("t", "true")
+
     for tbl in sensitive:
         problems = []
+        writable = edge_writable(tbl)
         # (a) routed by the bridge — else events publish bare, invisible to tenant consumers
         if tbl not in tenant_rules:
             problems.append("no tenant column declared in zebridge_catalogue "
                             f"(zebridge_enable('{tbl}', ..., tenant_col => 'tenant_id'))")
         # (b) the guard trigger — else omission/malformed is not corrected at the source
-        if zb.psql("SELECT count(*) FROM pg_trigger WHERE tgname='zebridge_guard_tenant_t' "
+        if writable and zb.psql("SELECT count(*) FROM pg_trigger WHERE tgname='zebridge_guard_tenant_t' "
                    f"AND tgrelid='public.{tbl}'::regclass").strip() == "0":
             problems.append("no tenant guard (run zebridge_install_write_guards with tenant_col, "
                             "or zebridge_enable — a forgotten or malformed tenant is not caught)")
         # (c) RLS on + the write policy — else a client can forge rows into another tenant
         if zb.psql(f"SELECT relrowsecurity::text FROM pg_class WHERE oid='public.{tbl}'::regclass").strip() not in ("t","true"):
             problems.append("row-level security is OFF (a writer can forge another tenant's rows)")
-        elif zb.psql("SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid "
+        elif writable and zb.psql("SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid "
                      f"WHERE c.relname='{tbl}' AND p.polname='zb_tenant_write'").strip() == "0":
             problems.append("no zb_tenant_write policy (run zebridge_scope_writes_by_tenant)")
         # (d) tenant in the replica identity — else a DELETE arrives with no tenant to route by
@@ -414,7 +425,8 @@ def main():
             bad(f"tenant-capable table '{tbl}' (has tenant_id) is not fully wired",
                 "\n".join(f"- {x}" for x in problems))
         else:
-            zb.ok(f"tenant-capable table '{tbl}': routed, guarded, RLS-scoped, tenant in replica identity")
+            zb.ok(f"tenant-capable table '{tbl}': " + ("routed, guarded, RLS-scoped, tenant in replica identity" if writable
+                  else "read-only from the edge — routed, RLS-scoped, tenant in replica identity"))
 
     print()
     if skipped:

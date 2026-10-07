@@ -47,6 +47,12 @@ PROBE_BASE_BUF = "11"       # 2048-byte event buffer for the probe bridge only
 BAIT_BYTES = 3000           # fits the live bridge's 4 KB, not the probe's 2 KB
 COOLDOWN_S = 30             # refused_tables.zig `lift_cooldown_ms`
 LOG = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_suspension_lift_bridge.log"
+# The probe's own publication: the table under test and the ZeBridge tables a bridge needs.
+# On the shared publication it would also publish every other table's schema at boot, and
+# one wider than its 2 KB buffer (the map examples' fuel_stations: 2,139 bytes) stops it.
+PROBE_PUB = "zb_probe_suspension"
+PROBE_PUB_TABLES = (f"public.{TABLE}", "public.zebridge_ddl_events", "public.zebridge_catalogue",
+                    "public.zebridge_gc_watermark", "public.zebridge_user_tenants")
 STATE: dict = {"marker": ""}
 
 
@@ -133,6 +139,7 @@ def cleanup() -> None:
     if STATE["marker"]:
         zb.psql(f"DELETE FROM public.{TABLE} WHERE some_text LIKE '%{STATE['marker']}'", quiet=True)
     zb.psql(f"DELETE FROM public.zebridge_limits WHERE slot = '{slot_name()}'", quiet=True)
+    zb.psql(f"DROP PUBLICATION IF EXISTS {PROBE_PUB}", quiet=True)
     zb.psql(f"SELECT pg_drop_replication_slot('{slot_name()}') FROM pg_replication_slots "
             f"WHERE slot_name = '{slot_name()}' AND NOT active", quiet=True)
     rebake_guard()
@@ -157,6 +164,9 @@ async def run() -> int:
     # the bait below is the first thing the probe replays.
     cleanup()   # includes rebake_guard(), so the bait below can be stored
     zb.psql(f"SELECT pg_create_logical_replication_slot('{slot_name()}', 'pgoutput')", quiet=True)
+    zb.psql(f"CREATE PUBLICATION {PROBE_PUB} FOR TABLE {', '.join(PROBE_PUB_TABLES)}")
+    pub_at = zb.BRIDGE_ARGS.index("--pub") + 1
+    zb.BRIDGE_ARGS[pub_at] = PROBE_PUB
 
     # Written while the guard is still the live bridge's 4 KB — this is the row the
     # probe's 2 KB buffer will not be able to carry.
@@ -172,6 +182,7 @@ async def run() -> int:
     with zb.Bridge(LOG, BASE_BUF=PROBE_BASE_BUF) as bridge:
         if not bridge.wait_for_log("Replication started successfully", timeout=40):
             zb.bad("probe bridge did not start")
+            print(bridge.text()[-1500:])
             return 1
 
         # ── 1. the stored row does not fit: suspended, live ──────────────────

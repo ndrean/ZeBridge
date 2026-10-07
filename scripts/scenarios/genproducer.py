@@ -204,7 +204,10 @@ async def main():
                 zb.bad(f"g1 full is not zstd-wrapped msgpack: {e}")
                 failed += 1
                 doc = None
-            if man["full"] == {"gen": 1, "object": f"{TABLE}-g1-full", "cutoff": man["cutoff_version"]} \
+            # The fields that name the full; the entry may carry more (`sorted`: the rows are
+            # in key order).
+            full = man["full"]
+            if (full.get("gen"), full.get("object"), full.get("cutoff")) == (1, f"{TABLE}-g1-full", man["cutoff_version"]) \
                     and man["deltas"] == [] and doc and doc["kind"] == "full" \
                     and len(doc["rows"]) == nrows and doc["gen"] == 1 \
                     and re.fullmatch(r"[0-9A-F]+/[0-9A-F]+", man["cutoff_lsn"]):

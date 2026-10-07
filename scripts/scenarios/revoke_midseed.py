@@ -44,10 +44,12 @@ def nats_pid() -> int:
         return pid
     except (OSError, ValueError):
         pass
-    r = subprocess.run(["pgrep", "-f", "nats-server -js"], capture_output=True, text=True)
+    # By the config it runs (the dev server is started with or without `-js`; the config
+    # enables JetStream either way).
+    r = subprocess.run(["pgrep", "-f", f"nats-server.*{CONF.name}"], capture_output=True, text=True)
     pids = [int(x) for x in r.stdout.split()]
     if not pids:
-        sys.exit("no nats-server running — cannot SIGHUP it")
+        raise RuntimeError(f"no nats-server running with {CONF.name} — cannot SIGHUP it")
     return pids[0]
 ADMIN_URL = "postgres://postgres@127.0.0.1:5432/postgres"
 LOG = "/tmp/zb_revoke_midseed_bridge.log"
@@ -232,7 +234,11 @@ def main():
             fired = {}
             def hard_hammer():
                 time.sleep(1.0)
-                fired["rc"], fired["out"] = revoke(HARD, hard=True)
+                # An exception in a thread ends it silently: keep it, so §H2 can name it.
+                try:
+                    fired["rc"], fired["out"] = revoke(HARD, hard=True)
+                except Exception as e:
+                    fired["rc"], fired["out"] = None, f"the hammer failed: {e}"
                 fired["at"] = time.strftime("%H:%M:%S.") + str(int(time.time() * 1000) % 1000)
             threading.Thread(target=hard_hammer, daemon=True).start()
             # poll libzb until its connection is gone (the seed runs inside these polls)
