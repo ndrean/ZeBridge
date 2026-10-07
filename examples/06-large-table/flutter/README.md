@@ -15,7 +15,7 @@ rows / distinct uid / sum(age)   →   3,055,002 / 3,055,002 / 138,916,285
 | | iPhone 17 simulator | **iPhone 12 (A14, iOS 26.6)** |
 | --- | --- | --- |
 | connect → usable, libzb | **30.2 s** | **70.8 s** (62.9 s on a rerun) |
-| connect → usable, zb-client-ts (../react-native) | 371.4 s | 725 s |
+| connect → usable, zb-client-ts on React Native | 371.4 s | 725 s |
 | replica | 1.02 GB | 1.02 GB |
 | rows / distinct uid / sum(age) | exact | exact |
 

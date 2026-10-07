@@ -1,12 +1,9 @@
 # 06-large-table / react-native — one big table, seeded on a phone
 
-The same seed-only page as `../web`, on React Native, with two engines behind a toggle:
-**zb-client-ts** in JavaScript, and **libzb** (the C client, Zig inside) through a native
-module. The zb-client-ts engine is `new ZeBridge(opts)` and nothing else: the library's
-react-native entry brings expo-sqlite, the crypto Hermes lacks and zstd — libzb's native
-decoder through this app's ZbNative module, fzstd without it. bob follows `test_types` (3,055,002 rows on tenant globex), seeds it from
-the generation chain into expo-sqlite, and prints the three facts checked against
-PostgreSQL:
+The same seed-only page as `../web`, on React Native, through **libzb** (the C client, Zig
+inside) behind the zb-react-native module. bob follows `test_types` (3,055,002 rows on
+tenant globex), seeds it from the generation chain, and prints the three facts checked
+against PostgreSQL:
 
 ```
 rows / distinct uid / sum(age)   →   3,055,002 / 3,055,002 / 138,916,285
@@ -14,115 +11,85 @@ rows / distinct uid / sum(age)   →   3,055,002 / 3,055,002 / 138,916,285
 
 ## How the seed runs on a phone
 
-zb-client-ts: `seedStreaming: true` with fzstd as the streaming decompressor. The
-producer writes every chain object in key order and says so (`"sorted": true` in the
-manifest), so each window goes straight into the table. A step without that flag takes
-the **staged** path instead, because the storage says `spillsTemp: true`: windows
-appended to a TEMP table, the real table filled once by `INSERT … SELECT … ORDER BY pk`.
-
-libzb: one `sync` call streams, inflates, decodes and applies in Zig, on the module's
-own queue. JS keeps the clock and asks for the facts. No bar: libzb reports nothing
-until `sync` returns. It has its own database file, `zebridge_bob_libzb.sqlite3`.
+One `sync` call streams, inflates, decodes and applies in Zig, on the module's own queue.
+JS keeps the clock and asks for the facts. No bar: libzb reports nothing until `sync`
+returns. Once usable, the app keeps following with `poll` in a loop.
 
 ## Run it
 
-Expo Go will not do — expo-sqlite is native, so this is a development build.
+Expo Go will not do — libzb is native, so this is a development build. `test_types` is
+the local dev stack's fixture, so the app enrolls with the local bridge.
 
-    scripts/native/up.sh                       # PostgreSQL, nats-server, the bridge
+    scripts/native/up.sh                             # PostgreSQL, nats-server, the bridge
+
+    ../../../zb-react-native/scripts/build-ios.sh       # → zb-react-native/ios/ZbCore.xcframework
+    ../../../zb-react-native/scripts/build-android.sh   # → libzb.so per CPU
 
     pnpm install --ignore-workspace
-    EXPO_PUBLIC_CREDS="$(cat ../../../scripts/native/creds/bob.creds)" pnpm ios
-    EXPO_PUBLIC_CREDS="$(cat ../../../scripts/native/creds/bob.creds)" pnpm android
+    pnpm prebuild
+    EXPO_PUBLIC_ZB_BRIDGE_URL=http://127.0.0.1:27434 \
+    EXPO_PUBLIC_ZB_NATS_URL=nats://127.0.0.1:4222 \
+    EXPO_PUBLIC_ZB_INVITE=<code for bob on globex> pnpm ios
 
-libzb comes from the `zb-react-native` package (the repo's `zb-react-native/`, linked
-here). Build its library first, and give the libzb engine the TCP URL too:
+`127.0.0.1` is the Mac from the iOS simulator only: the Android emulator reaches it as
+`10.0.2.2`, a real phone by its LAN address — and the bridge must then listen beyond
+loopback. The NATS address is named because the dev server's TLS certificate is signed by
+a test CA the phone does not trust; `nats://` on 4222 is allowed there.
 
-    ../../../zb-react-native/scripts/build-ios.sh   # → zb-react-native/ios/ZbCore.xcframework
-    (cd ios && pod install)                          # autolinking picks up ZbNative
-    EXPO_PUBLIC_NATS_URL=ws://<mac>:8080 EXPO_PUBLIC_ZB_NATS_URL=nats://<mac>:4222 \
-    EXPO_PUBLIC_ZB_ENGINE=libzb EXPO_PUBLIC_CREDS="$(cat ../../../scripts/native/creds/bob.creds)" \
-      npx expo run:ios --device <udid> --configuration Release --no-bundler
+A real phone, Release build:
 
-⚠️ Measure a Release build: Hermes compiles its bytecode ahead of time there. If
-`expo run:ios` fails to install, `xcrun devicectl device install app --device <udid>
-<the .app>`. (`metro.config.js` only links zb-client-ts from outside the app — a
-monorepo matter; the library sends no browser code to React Native.)
+    EXPO_PUBLIC_ZB_BRIDGE_URL=http://<mac>:27434 EXPO_PUBLIC_ZB_NATS_URL=nats://<mac>:4222 \
+    EXPO_PUBLIC_ZB_INVITE=<code> npx expo run:ios --device <udid> --configuration Release --no-bundler
 
-⚠️ `ws://`, not `nats://` — zb-client-ts speaks NATS over WebSocket, port 8080; libzb
-speaks TCP, port 4222. The iOS simulator reaches
-the Mac as `127.0.0.1`, the Android emulator as `10.0.2.2` (resolved at run time in
-`src/client.ts`); a real device needs the Mac's LAN address in `EXPO_PUBLIC_NATS_URL`.
+The module carries a COPY of libzb: after any libzb change, run the build script again
+and rebuild the app. ⚠️ Measure a Release build: Hermes compiles its bytecode ahead of
+time there. If `expo run:ios` fails to install, `xcrun devicectl device install app
+--device <udid> <the .app>`.
 
-⚠️ The creds are an app secret, passed at build time; a shipped app would enrol and
-store its own.
+The settings, read at build time (clear Metro's cache after changing one):
+
+* `EXPO_PUBLIC_ZB_INVITE`: the invite, for the first run. libzb keeps the identity beside
+  the replica afterwards, so later builds need none.
+* `EXPO_PUBLIC_ZB_BRIDGE_URL`: the bridge, `https://bridge.zebridge.eu` by default.
+* `EXPO_PUBLIC_ZB_NATS_URL`: another NATS address than the one the bridge names, such as a
+  leaf. The replica and identity are kept per bridge and NATS host, so a new address needs
+  its own invite.
+
+An invite is a row the backend writes:
+
+```sql
+INSERT INTO zebridge_invites (code, principal, tenant_id)
+VALUES (replace(gen_random_uuid()::text, '-', ''), '<principal>', '<tenant>')
+RETURNING code;
+```
 
 Android needs JDK 17 and Android Studio's SDK — see `examples/08-map/native/README.md`
 ("Android") for the exact environment. `ios/` and `android/` are generated by
 `expo prebuild` and git-ignored.
 
-⚠️ An Android release build allows `ws://` only through `plugins/with-cleartext.js`;
-without it the connection fails with "CLEARTEXT communication not permitted by network
-security policy" (the debug manifest allows it, the release one does not). A deployed
-app uses `wss://` and drops the plugin.
+One database in the app's Documents, named after the bridge (`largetable-<host>.sqlite3`),
+kept across launches: a second launch finds the table seeded and only tails. "wipe & seed
+again" deletes it, keeps the identity, and starts over.
 
-⚠️ Gradle's JS bundle task only watches this folder. A change in `zb-client-ts` (linked
-from outside) leaves `createBundleReleaseJsAndAssets` UP-TO-DATE and the APK ships the
-old library. After editing the library, delete the old bundle first:
+`EXPO_PUBLIC_ZB_TRACE=1` appends libzb's own lines (seeded, gap healed, one per fetch and
+applied batch with the peak RSS) to `Documents/libzb-stderr.log`. The screen's log goes to
+`Documents/app-log.txt`. Both are fetched the same way:
 
-    rm -rf android/app/build/generated/assets/createBundleReleaseJsAndAssets
+    xcrun devicectl device copy from --device <udid> --domain-type appDataContainer \
+      --domain-identifier dev.zebridge.largetable --source Documents/app-log.txt --destination .
 
-One database, `zebridge_bob.sqlite3` in the app's SQLite directory, kept across
-launches: a second launch finds the table seeded and only tails. "wipe & seed again"
-deletes it and starts over.
+Keep the screen on while measuring: a locked phone suspends the app and the pause
+lands in the time.
 
 ## Measured on the iPhone 12, 2026-09-25 (sorted chain)
 
 | | connect → usable | replica |
 | --- | --- | --- |
-| **RN + libzb** (native module, Release) | **35.0 s** | 1.02 GB |
+| **RN + libzb** (native module, Release) | **35.0 s**; **28.4 s** on 2026-10-08 (faster connect) | 1.02 GB |
 | Flutter + libzb (`../flutter`) | 34.7 s, 39.1 s | 1.02 GB |
 | RN + zb-client-ts (Release) | 518 s | 1.04 GB |
 
 All three exact: 3,055,002 / 3,055,002 / 138,916,285. RN with libzb matches Flutter
 with libzb, so the host framework costs nothing; the 15× gap is per-row JavaScript on
-Hermes (no JIT): fzstd, msgpack, parameter arrays. The TS rate also fell as it went
-(7.1k → 5.4k rows/s per 500k): the phone heating up. A trace shows the same work per row
-throughout and JS faster after a two-minute pause than at the start.
-
-`EXPO_PUBLIC_ZB_TRACE=1` writes where the zb-client-ts seed spends its time — SQLite vs
-JS, Hermes GC and heap, WAL size, every 100k rows — to the app's Documents:
-
-    xcrun devicectl device copy from --device <udid> --domain-type appDataContainer \
-      --domain-identifier dev.zebridge.largetable --source Documents/seed-trace.tsv --destination .
-
-The screen's log goes to `Documents/app-log.txt` the same way (both engines, timestamped).
-
-Keep the screen on while measuring: a locked phone suspends the app and the pause
-lands in the time.
-
-## Measured (2026-09-24, Expo SDK 52 / RN 0.76 / Hermes, unsorted chain, staged)
-
-| | iPhone 17 simulator | Android emulator (API 36) | **iPhone 12 (A14, iOS 26.6)** |
-| --- | --- | --- | --- |
-| seed, first window → done | **363.9 s → 8,395 rows/s** | **475.1 s → 6,431 rows/s** | — |
-| connect → CDC active | 371.4 s | 592.1 s | **725 s** |
-| replica | 1.04 GB | 1.04 GB | 1.04 GB |
-| rows / distinct uid / sum(age) | 3,055,002 / 3,055,002 / 138,916,285 — exact | the same — exact | the same — exact |
-
-The real phone slowed as it went: 1M rows at 200 s, 1.5M at 283 s, 2M at 440 s — the
-last million cost as much as the first two. A JS loop pinning one core for ten minutes
-on a phone is the thermal case, and the number to compare with is the native one
-(`../flutter`, libzb on the same phone).
-
-Hermes has no JIT: the JS side (fzstd inflate, msgpack decode, the JSON parameter of
-each stage insert) runs about 4× slower than Chrome's 156 s for the same table on the
-iOS simulator (which runs on the Mac's own CPU), and slower again in the Android
-emulator, a full VM; the staged path itself behaves as on Node. A real device is the
-next measurement. The first run on this host is what removed the chain's zstd
-dictionary.
-
-⚠️ Android would not resolve the library's `import('js-sha256')` (the streaming digest):
-Metro found it in zb-client-ts's own node_modules, outside the project root, and turned
-that into a relative path the Android bundle could not load — iOS had happened to load
-the same path. `metro.config.js` now resolves any bare specifier this app's node_modules
-holds from here, whichever file asked; `js-sha256` is a dependency of the app for that.
+Hermes (no JIT): fzstd, msgpack, parameter arrays. That gap is why React Native runs
+libzb.

@@ -5,8 +5,9 @@ Two client libraries speak the protocol.
 | | libzb | zb-client-ts |
 | --- | --- | --- |
 | language | Zig core + shell, C ABI | TypeScript core + shell |
-| hosts | through its bindings: Python (`zb-python`), Kotlin/Java (`zb-android`), Dart/Flutter (`zb-dart`); any other language through the C ABI directly | browser, Node, React Native |
+| hosts | through its bindings: Python (`zb-python`), Kotlin/Java (`zb-android`), Dart/Flutter (`zb-dart`), React Native (`zb-react-native`); any other language through the C ABI directly | browser, Node |
 | local engine | SQLite (a file), PostgreSQL (`dbUrl`; seeds through COPY), or DuckDB (`engine: "duckdb"`; libduckdb opened at run time; seeds through the appender; the micro-VM worker's analytical replica, a file DuckDB itself opens once libzb closes it) | SQLite (sqlocal, better-sqlite3), PGlite |
+| SQLite version | 3.49.1, compiled in | 3.41 or later (`unhex`, in the seed of a table with a BLOB); every backend bundles its own, newer: sqlocal's SQLite WASM 3.51, better-sqlite3's 3.53 — never the device's |
 | large answers | `reply` puts an answer past `results.inline_max_bytes` in `res-<tenant>` and sends an envelope; `request` resolves it | the same, in `serve`'s reply and in `request` |
 | being a service | `zb_client_serve` + the `requests` in `poll` + `zb_client_reply`: the host's loop answers | `serve({tenants, handlers, queue})`: async handlers, the library subscribes and replies |
 | cooperative documents | `mergeRegisters` through `zb_call` (COOPERATIVE_EDITING.md) | `mergeRegisters`, imported |
@@ -23,7 +24,7 @@ constructor. The first run on a device needs only the bridge's URL and the invit
 backend handed it; later runs need nothing but the tables. Enrollment, the identity file,
 the NATS URL and JWT renewal are the library's.
 
-TypeScript (browser, Node, React Native):
+TypeScript (browser, Node):
 
 ```ts
 import { ZeBridge } from 'zb-client-ts';
@@ -58,6 +59,17 @@ final zb = await ZeBridgeWorker.spawn({'bridgeUrl': 'https://zb.example.com', 'i
 zb.reports.listen((r) => refresh_ui_callback());
 final open = await zb.query('SELECT * FROM orders WHERE status = ?', ['open']);
 await zb.mutate('orders', 'UPDATE', {'id': 7}, {'status': 'done'});
+```
+
+React Native (iOS and Android), libzb through its Expo module — the host drives the loop:
+
+```ts
+import { Libzb } from 'zb-react-native';
+const zb = await Libzb.connect({ bridgeUrl: 'https://zb.example.com', invite: code, tables: ['orders'], dbPath });
+await zb.sync();                                     // seed and catch up
+for (;;) { const r = await zb.poll(1000); if (r.changed_tables?.includes('orders')) refresh_ui_callback(); }
+const open = await zb.query('SELECT * FROM orders WHERE status = ?', ['open']);
+await zb.mutate('orders', 'UPDATE', { id: 7 }, { status: 'done' });
 ```
 
 Any other language, through the C ABI — five calls, JSON in and out:
@@ -132,15 +144,15 @@ One vocabulary: the same key means the same thing in libzb's `opts_json` and in 
 | --- | --- | --- |
 | `bridgeUrl` | ✅ where `invite` is redeemed (`/enroll`) and the JWT renewed (`/renew`); kept in the identity | ✅ the same, and where the grammar hash is fetched when `grammarHash` is unset |
 | `invite` | ✅ first run only: with `bridgeUrl` and no stored identity, enrolls this device | ✅ the same |
-| `identityPath` | ✅ where the identity is kept (JSON, mode 0600); default `<dbPath>.identity`, else `zebridge.identity` | ✅ the same file on Node; a localStorage key in the browser; the app's SQLite store on React Native |
-| `natsUrl` | ✅ optional once enrolled: the identity carries it | ✅ the same (the identity's `nats_ws_url` in the browser and on React Native) |
+| `identityPath` | ✅ where the identity is kept (JSON, mode 0600); default `<dbPath>.identity`, else `zebridge.identity` | ✅ the same file on Node; a localStorage key in the browser |
+| `natsUrl` | ✅ optional once enrolled: the identity carries it | ✅ the same (the identity's `nats_ws_url` in the browser) |
 | `creds` | ✅ the .creds TEXT (nats.zig patch 19); wins over the identity | ✅ |
 | `credsPath` | ✅ a .creds file | ✅ where there is a filesystem (Node) |
 | `principal` | ✅ optional: the creds or the identity name it | ✅ the same (also the inbox prefix on both) |
 | `password` | — (creds only) | ✅ dev shape, user/password |
 | `grammarHash` | ✅ refuses to open on a mismatch | ✅ |
 | `tables`, `ondemandTables` | ✅ list or `"*"` | ✅ the same rule |
-| `dbPath` | ✅ SQLite or DuckDB file | ✅ a file (Node, React Native) or an OPFS name (browser) |
+| `dbPath` | ✅ SQLite or DuckDB file | ✅ a file (Node) or an OPFS name (browser) |
 | — default | `zebridge_<principal>.sqlite3`, kept across runs | the same |
 | `dbUrl` | ✅ a PostgreSQL replica | — |
 | `engine` | `sqlite` \| `duckdb` | `sqlite` \| `pglite` (browser, Node) |

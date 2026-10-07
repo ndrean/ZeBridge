@@ -78,7 +78,7 @@ export interface ZeBridgeConfig {
   /// the transport seam (transport.ts). Default: the @nats-io libraries.
   transport?: Transport;
   /// Where NATS is. Optional since §10jq: an enrolled client takes it from its identity
-  /// (`nats_url`, or `nats_ws_url` in the browser and on React Native).
+  /// (`nats_url`, or `nats_ws_url` in the browser).
   natsUrl?: string;
   /// Optional since §10jq: the creds (or the identity) name the principal.
   principal?: string;
@@ -88,12 +88,11 @@ export interface ZeBridgeConfig {
   /// keeps the result (`identityPath`) — every later run needs neither. libzb: same.
   invite?: string;
   /// §10jq: where the identity is kept: a file on Node, a key in the browser's
-  /// localStorage or React Native's store. Default `<dbPath>.identity`, else
+  /// localStorage. Default `<dbPath>.identity`, else
   /// `zebridge.identity`. libzb: same name, same default, same JSON.
   identityPath?: string;
   /// Override the platform's zstd (platform.ts). An app never needs to: Node inflates
-  /// with node:zlib, the browser with fzstd, React Native with libzb's native decoder
-  /// when the app has it, else fzstd.
+  /// with node:zlib, the browser with fzstd.
   zstdDecompress?: (b: Uint8Array) => Uint8Array | Promise<Uint8Array>;
   /// §10ip: override how a query ANSWER is compressed when this client SERVES. A host
   /// without a compressor answers uncompressed, and every asking client reads both.
@@ -105,8 +104,7 @@ export interface ZeBridgeConfig {
   creds?: string;
   /// The same credentials as a FILE, where there is a filesystem (Node). libzb: same.
   credsPath?: string;
-  /// Where the replica lives: a file on Node and React Native, an OPFS database name in
-  /// the browser. Default `zebridge_<principal>.sqlite3`, kept across runs (libzb: the
+  /// Where the replica lives: a file on Node, an OPFS database name in the browser. Default `zebridge_<principal>.sqlite3`, kept across runs (libzb: the
   /// same default). A fresh name per run — `zebridge_${Date.now()}.sqlite3` — is a
   /// clean room.
   dbPath?: string;
@@ -114,7 +112,7 @@ export interface ZeBridgeConfig {
   /// per instance. libzb: same.
   clientId?: string;
   /// Assert the platform. The bundler already picks the entry (package.json `exports`:
-  /// react-native, browser, node); this only refuses a build that loaded another one.
+  /// browser, node); this only refuses a build that loaded another one.
   platform?: PlatformName;
   /// The grammar hash this client RECEIVED — from the /enroll payload beside the JWT,
   /// or the bridge's `X-Grammar-Hash` header. When set, a mismatch refuses to connect:
@@ -177,7 +175,7 @@ export interface ZeBridgeConfig {
   engine?: 'sqlite' | 'pglite';
   /// Override the two seams (NOTES §10) — for a test, or a storage of your own. The
   /// platform provides both: better-sqlite3 + TCP on Node, sqlite-wasm on OPFS (or
-  /// PGlite) + WebSocket in the browser, expo-sqlite + WebSocket on React Native.
+  /// PGlite) + WebSocket in the browser.
   storage?: StorageFactory;
   connect?: (opts: any) => Promise<TransportConnection>;
 }

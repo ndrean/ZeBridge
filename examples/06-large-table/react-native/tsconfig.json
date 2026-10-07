@@ -15,9 +15,6 @@
       "@/*": [
         "./src/*"
       ],
-      "expo-sqlite": [
-        "./node_modules/expo-sqlite"
-      ],
       "expo": [
         "./node_modules/expo"
       ]

@@ -16,7 +16,6 @@
       "package": "dev.zebridge.airports.rn"
     },
     "plugins": [
-      "expo-sqlite",
       "./plugins/with-fmt-consteval",
       "expo-asset"
     ]

@@ -19156,3 +19156,36 @@ libzb.ts (where a position moves after a seed, which streams a table depends on)
 core one by one, until zb-client-ts is a thin host; the whole of libzb in WASM is then a
 transport and storage question, not a rewrite. First: a spike — `caughtUpPosition` from the
 WASM core, the module's size and the cost of a call. §10lw's coverage rule goes in that way.
+
+Decided the same day: React Native goes through libzb only (zb-react-native). Hermes has no
+WebAssembly, so zb-client-ts's React Native entry (expo-sqlite, the JS path — Expo Go's only
+way in) would need core.ts kept as a fallback, the very duplication this removes. zb-client-ts
+becomes the browser and Node client. To remove with it, everywhere at once (no alias): the
+entry and expo-storage, the package.json fields and optional peers, the docs, zb-react-native's
+"or use zb-client-ts here"; examples/08-map/native ported to zb-react-native,
+examples/06-large-table/react-native keeps its libzb mode only.
+Measured for the module: ReleaseSmall 66 KB, 7.7 µs per JSON call; ReleaseFast 970 KB, 5.1 µs —
+the cold rules stay ReleaseSmall; the hot paths will be judged on fire_types.
+
+Step 1 done the same day. Removed: zb-client-ts's entry-react-native, expo-storage, the
+expo-sqlite types, the `react-native` export condition and field, the two optional peers.
+Found on the way: libzb's `zb_zstd_new/push/free` existed only for that entry (§10ja), so they
+went too, and the ABI moved 5 → 6 (abi.json, capi.zig, the pins in zb-react-native, zb-android,
+zb-python, zb-dart). zb-react-native gained `call` (zb_call, a pure core rule, on the JS thread;
+Swift, JNI and Kotlin) and exports `mergeRegisters` from it: the map's and the airports' register
+merge is libzb's own now. Three apps ported, not two: 08-map/native (a `MapClient` modelled on
+10-airports' loop — `poll`, `changed_tables`, `flush`; stamps from `zb.stamp()`, the bridge's
+clock), 06-large-table/react-native (the libzb screen alone; `EXPO_PUBLIC_NATS_URL` now the TCP
+URL, `EXPO_PUBLIC_ZB_TRACE` libzb's stderr), and 10-airports/react-native (its TS fallback gone).
+Each app's Metro config links zb-react-native only; the Node built-in stub went with the
+@nats-io packages. Checked: tsc and an `expo export` for iOS and Android of all three; the
+phones are the owner's test.
+
+On the phones, 2026-10-08. 06-large-table through libzb, enrolled by invite on the dev stack
+(bridge on `BRIDGE_BIND=0.0.0.0`, NATS named as `nats://` because the dev certificate's CA is
+not in the phone's roots): simulator 8.3 s, iPhone 12 28.4 s connect → usable (35.0 s on
+09-25; the difference is the faster connect, 1e5ae00), both 3,055,004 rows / sum 138,916,285
+— globex's 3,055,002 plus the two `_default` rows the shared route carries, age NULL. 10-airports
+on the simulator against the hub, the flight's registers seen on the moto's Flutter app.
+08-map: chargers and fuel answer (poi_service.py on the Mac); the route tracing is awkward on
+a phone, not pursued.

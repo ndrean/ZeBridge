@@ -8,14 +8,12 @@
   "types": "src/entry-browser.ts",
   "exports": {
     ".": {
-      "react-native": "./src/entry-react-native.ts",
       "browser": "./src/entry-browser.ts",
       "node": "./src/entry-node.ts",
       "default": "./src/entry-browser.ts"
     },
     "./node": "./src/entry-node.ts",
     "./browser": "./src/entry-browser.ts",
-    "./react-native": "./src/entry-react-native.ts",
     "./storage": "./src/storage.ts"
   },
   "scripts": {
@@ -44,9 +42,7 @@
   },
   "peerDependencies": {
     "@nats-io/transport-node": ">=3",
-    "better-sqlite3": ">=11",
-    "expo-sqlite": ">=15",
-    "react-native-get-random-values": ">=1.11"
+    "better-sqlite3": ">=11"
   },
   "peerDependenciesMeta": {
     "better-sqlite3": {
@@ -54,13 +50,6 @@
     },
     "@nats-io/transport-node": {
       "optional": true
-    },
-    "expo-sqlite": {
-      "optional": true
-    },
-    "react-native-get-random-values": {
-      "optional": true
     }
-  },
-  "react-native": "src/entry-react-native.ts"
+  }
 }

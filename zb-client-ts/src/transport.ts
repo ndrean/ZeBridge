@@ -55,8 +55,7 @@ export interface Transport {
   credsAuthenticator(creds: Uint8Array | (() => Uint8Array)): unknown;
   headers(): any;
   /// Generate an enrolment key pair. On the seam because the key format is NATS's,
-  /// not ZeBridge's — and because a port may have to reach its platform's own crypto
-  /// (React Native has no WebCrypto until a shim provides one, §10hs).
+  /// not ZeBridge's — and because a port may have to reach its platform's own crypto.
   createUser(): UserKeyPair;
   /// §10jt: sign `data` with an nkey seed; the seed's public key comes back with it
   /// (renewal proves possession of the key the device enrolled with).

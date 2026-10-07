@@ -9,4 +9,4 @@ export * from './libzb.ts';
 export * from './dialect.ts';
 export type { Platform, PlatformName } from './platform.ts';
 // The platform itself (storage, zstd, transport) comes from the entry the bundler
-// picks — entry-node.ts, entry-browser.ts, entry-react-native.ts — never from here.
+// picks — entry-node.ts or entry-browser.ts — never from here.

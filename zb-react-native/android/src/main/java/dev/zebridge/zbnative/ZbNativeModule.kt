@@ -21,6 +21,10 @@ class ZbNativeModule : Module() {
 
     Function("abiVersion") { Native.abiVersion() }
 
+    // A pure rule of libzb's core (mergeRegisters, …): no client, no I/O, so it runs on
+    // the JS thread and answers at once.
+    Function("call") { fn: String, args: String -> take(Native.call(fn.toByteArray(), args.toByteArray()), "zb_call") }
+
     AsyncFunction("connect") { opts: String, promise: Promise ->
       run(promise) {
         val h = Native.connect(opts.toByteArray())

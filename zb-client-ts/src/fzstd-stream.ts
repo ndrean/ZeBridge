@@ -1,7 +1,6 @@
 /// fzstd's streaming decoder as a chunk stream: chunks in, inflated bytes out, block by
 /// block, so a large chain object is never whole in memory (§10ix). Pure JavaScript and
-/// plain frames only — every chain object since NOTES §10iy. The browser's decoder, and
-/// React Native's when the app has no native module.
+/// plain frames only — every chain object since NOTES §10iy. The browser's decoder.
 import { Decompress } from 'fzstd';
 
 export function fzstdStream(chunks: AsyncIterable<Uint8Array>): AsyncIterable<Uint8Array> {

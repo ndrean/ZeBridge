@@ -16,9 +16,7 @@
       "package": "dev.zebridge.largetable"
     },
     "plugins": [
-      "expo-sqlite",
-      "./plugins/with-fmt-consteval",
-      "./plugins/with-cleartext"
+      "./plugins/with-fmt-consteval"
     ]
   }
 }

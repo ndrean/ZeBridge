@@ -16,6 +16,7 @@
 
 extern int zb_abi_version(void);
 extern void zb_free(char *p);
+extern char *zb_call(const char *fn, const char *args_json);
 extern const char *zb_last_error(void);
 extern char *zb_grammar_hash(void);
 extern char *zb_create_user(void);
@@ -72,6 +73,13 @@ FN(jint, abiVersion)(JNIEnv *env, jclass cls) { return zb_abi_version(); }
 FN(jbyteArray, lastError)(JNIEnv *env, jclass cls) { return bytes(env, zb_last_error()); }
 FN(jbyteArray, grammarHash)(JNIEnv *env, jclass cls) { return owned(env, zb_grammar_hash()); }
 FN(jbyteArray, createUser)(JNIEnv *env, jclass cls) { return owned(env, zb_create_user()); }
+
+FN(jbyteArray, call)(JNIEnv *env, jclass cls, jbyteArray fn, jbyteArray args) {
+    char *f = in(env, fn), *a = in(env, args);
+    jbyteArray r = owned(env, zb_call(f, a));
+    free(f); free(a);
+    return r;
+}
 
 FN(jbyteArray, credsFileText)(JNIEnv *env, jclass cls, jbyteArray jwt, jbyteArray seed) {
     char *j = in(env, jwt), *s = in(env, seed);

@@ -16,7 +16,6 @@
     },
     "plugins": [
       "@maplibre/maplibre-react-native",
-      "expo-sqlite",
       "./plugins/with-fmt-consteval"
     ]
   }

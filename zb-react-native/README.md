@@ -1,12 +1,9 @@
 # zb-react-native — libzb for React Native
 
-libzb, the ZeBridge C client (Zig inside), as an Expo module. Two uses:
-
-* **the libzb engine** — `Libzb.connect(opts)`: seed, tail and query in native code.
-  The options are the ones zb-client-ts takes (CLIENTS.md).
-* **native zstd for zb-client-ts** — installed in an app, it is picked up by
-  zb-client-ts's react-native entry with no code: chain objects inflate in libzb instead
-  of fzstd (an iPhone 12 seed, 3M rows: 393.8 → 309.8 s).
+libzb, the ZeBridge C client (Zig inside), as an Expo module: the ZeBridge client for
+React Native, on iOS and Android. `Libzb.connect(opts)` seeds, tails, queries and writes in
+native code; the options are the ones zb-client-ts takes (CLIENTS.md). `mergeRegisters`
+is libzb's own register merge, the rule every client applies.
 
 ```ts
 import { Libzb } from 'zb-react-native';
@@ -18,9 +15,10 @@ const { rows } = await zb.query('SELECT count(*) FROM orders');
 
 ## Build
 
-    scripts/build-ios.sh      # both iOS slices → ios/ZbCore.xcframework, ABI checked first
+    scripts/build-ios.sh       # both iOS slices → ios/ZbCore.xcframework, ABI checked first
+    scripts/build-android.sh   # zb-android's libzb.so per CPU, for the Android module
 
-The xcframework is a **copy** of libzb. After any libzb change, run the script again and
+Each build is a **copy** of libzb. After any libzb change, run the script again and
 rebuild the app. The first call compares the copy's `zb_abi_version()` with `src/abi.ts`
 and refuses a mismatch with the fix — a stale copy once sat in `connect` for minutes.
 The version lives in `libzb/abi.json`; `libzb/python/abi_check.py` (the offline battery's
@@ -28,6 +26,5 @@ The version lives in `libzb/abi.json`; `libzb/python/abi_check.py` (the offline 
 and when this package's pin disagrees.
 
 ⚠️ Each slice is **prelinked** (`ld -r -exported_symbol '_zb_*'`): libzb's SQLite, zstd
-and nats stay private to it, so expo-sqlite's own SQLite can live in the same app.
-
-iOS only for now; Android is the NDK build of `examples/06-large-table/flutter/tool`.
+and nats stay private to it, so another SQLite in the same app (expo-sqlite's, say) does
+not collide with it.

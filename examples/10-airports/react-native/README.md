@@ -1,9 +1,7 @@
 # 10-airports in React Native
 
 The airports example on a phone, without a map, through libzb, the C client, behind
-zb-react-native's Expo module, on iOS and Android. `EXPO_PUBLIC_ZB_ENGINE=ts` runs it on
-zb-client-ts instead, to compare the two on one phone (`src/client.ts`; the status line
-names the engine): five cities, the
+zb-react-native's Expo module, on iOS and Android: five cities, the
 airports within 100 km of the one chosen (asked of the DuckDB service), and the shared
 flight, whose departure and arrival any airport in the list can set. The flight is the same
 row the web page and the Flutter app write, with the same registers.
@@ -42,7 +40,7 @@ The settings:
 * `EXPO_PUBLIC_ZB_INVITE`: the invite, for the first run. The identity is kept on the phone
   afterwards.
 * `EXPO_PUBLIC_ZB_NATS_URL`: another NATS address than the one the bridge names, such as a
-  leaf node (`wss://leaf.example.com:8443`). The replica and identity are kept per NATS
+  leaf node (`tls://leaf.example.com:4222`). The replica and identity are kept per NATS
   host, so a leaf build needs its own invite.
 * `EXPO_PUBLIC_ZB_BRIDGE_URL`: the bridge, `https://bridge.zebridge.eu` by default.
 

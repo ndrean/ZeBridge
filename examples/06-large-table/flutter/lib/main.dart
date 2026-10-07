@@ -4,7 +4,7 @@
 /// isolate, while this screen keeps the time. Nothing else — no mutation. The three
 /// facts at the end (rows, distinct keys, a sum) are the ones every other host is
 /// checked with against PostgreSQL, so a run here is a measurement — the native one,
-/// against ../react-native on the same phone (NOTES §10iy).
+/// against zb-client-ts on the same phone (NOTES §10iy).
 ///
 /// No progress bar yet: libzb reports nothing while `zb_client_sync` runs (it is one
 /// blocking call). A `seeding` field in `zb_client_poll`'s report is the next piece.

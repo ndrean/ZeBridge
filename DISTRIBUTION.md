@@ -1,7 +1,7 @@
 # Distribution — which libzb for which host
 
-ZeBridge has two client libraries. **zb-client-ts** is TypeScript source: browsers,
-Node and React Native import it, and there is nothing to build. **libzb** is a native
+ZeBridge has two client libraries. **zb-client-ts** is TypeScript source: browsers
+and Node import it, and there is nothing to build. **libzb** is a native
 library with a C ABI. It has to be built per platform, and it can carry up to three
 local storage engines. This page says which build a host needs, and why.
 
@@ -33,7 +33,7 @@ library.
 | artifact | targets | SQLite / zstd | PostgreSQL | DuckDB | form | used from |
 | --- | --- | --- | --- | --- | --- | --- |
 | **libzb-ios** | iPhone arm64, simulator arm64 | compiled in | – | – | xcframework (static) | Swift, Flutter (dart:ffi), React Native (Expo module) |
-| **libzb-android** | arm64-v8a, armeabi-v7a, x86_64 | compiled in | – | – | AAR (`zb-android`), or a `.so` per CPU | Kotlin/Java (`dev.zebridge.ZeBridge`), Flutter (dart:ffi) |
+| **libzb-android** | arm64-v8a, armeabi-v7a, x86_64 | compiled in | – | – | AAR (`zb-android`), or a `.so` per CPU | Kotlin/Java (`dev.zebridge.ZeBridge`), Flutter (dart:ffi), React Native (Expo module) |
 | **libzb-desktop** | macOS, Linux, Windows | compiled in | if libpq is installed | if libduckdb is installed | shared library | apps and services: Python (ctypes), Node, Dart, JVM (JNA, FFM), .NET (P/Invoke) |
 
 On top of these, one package per language gives libzb its idioms — `zb-python`,
@@ -57,16 +57,16 @@ Expo module (`zb-react-native/scripts/build-ios.sh`); Flutter looks the function
 its own process (`examples/10-airports/flutter/tool/build-libzb-ios.sh`).
 
 **Android.** A Kotlin or Java app adds the AAR ([zb-android](zb-android/README.md)): the
-JNI layer, a `ZeBridge` class that owns the client's thread, and `libzb.so` per CPU. Flutter
-loads its own `.so` with dart:ffi (`build-libzb-android.sh`). SQLite is compiled in either
+JNI layer, a `ZeBridge` class that owns the client's thread, and `libzb.so` per CPU. React
+Native's Expo module calls the same JNI layer (`zb-react-native/scripts/build-android.sh`).
+Flutter loads its own `.so` with dart:ffi (`build-libzb-android.sh`). SQLite is compiled in either
 way: Android's own SQLite is not reachable from native code (the NDK does not expose it).
 
 **Desktop.** A shared library that the host loads at run time. Python uses ctypes,
 Dart uses dart:ffi, a desktop JVM can use JNA or Java 22's FFM (no glue code needed),
 .NET uses P/Invoke.
 
-**React Native on Android, browsers, Node.** zb-client-ts, not libzb. It needs no
-native build at all.
+**Browsers, Node.** zb-client-ts, not libzb. It needs no native build at all.
 
 ## DuckDB: why it is not compiled in
 
@@ -125,6 +125,7 @@ machine that runs the service.
 
     # phones
     zb-react-native/scripts/build-ios.sh
+    zb-react-native/scripts/build-android.sh
     examples/10-airports/flutter/tool/build-libzb-ios.sh
     examples/06-large-table/flutter/tool/build-libzb-android.sh
 

@@ -218,7 +218,7 @@ Bindings exist for Python, Kotlin (Android), Dart/Flutter and React Native. See 
 
 **Consumers**: The client library can be integrated across a wide range of runtime environments.
 
-- Mobile Native Apps: Utilizing native file system storage: React Native running the C ABI library through its Expo module (or the TypeScript library), Flutter running the C ABI library, with an SQLite replica.
+- Mobile Native Apps: Utilizing native file system storage: React Native running the C ABI library through its Expo module, Flutter running the C ABI library, with an SQLite replica.
 - Desktop apps: Flutter running the C ABI library, or Electron running the TypeScript library, with an SQLite replica.
 - Browsers and Webapps: Leveraging OPFS support for SQLite-WASM or PGlite via the TS library.
 - Backend responder services / micro-VMs. For example, a warm micro-VM as a client, with the columnar in-process database DuckDB as its replica. This client does not write; it answers other connected clients through NATS only.
@@ -273,7 +273,7 @@ A developer will build an app using the client library. We have bindings for spe
 | bridge | POSIX based background executable <br>- Linux, FreeBSD, OSX | daemon running  next to PostgreSQL and  NATS |
 | bridge_sweeper | background executable | daemon running next to Postgres and to the bridge |
 | libzb | native client library, C ABI | FFI Consumers: mobile apps, desktop apps, microservices |
-| zb-client-ts | client npm package <br>(self-contained TS) | JS Consumers: browsers, Node, Electron, Deno, Bun, React Native |
+| zb-client-ts | client npm package <br>(self-contained TS) | JS Consumers: browsers, Node, Electron, Deno, Bun |
 
 The client library shrinks this orchestration down to a few primitives: `connect()`, `close()`, `newVersion()`, `query()`, `mutate()` and `onChange()`.
 
@@ -287,7 +287,7 @@ Two independent questions. **Which library** depends on whether the host can lin
 | -- | -- | -- | -- |
 | Flutter desktop | libzb, vendored | `.dylib` / `.so` | nothing |
 | a service in Python, Go, Java, Elixir… | libzb, vendored | `.dylib` / `.so` | only its own engine, if it uses one |
-| React Native (iOS **and** Android) | zb-client-ts, or libzb in a native module | — | nothing native with zb-client-ts |
+| React Native (iOS **and** Android) | libzb, in the zb-react-native Expo module | static on iOS, `.so` on Android | nothing |
 | browser, Node, Electron, Bun | zb-client-ts | — | nothing |
 | native Swift on iOS | libzb, vendored | **static** `.a` | nothing |
 | native Kotlin on Android | libzb, vendored | **static** `.a`, linked into your JNI `.so` | nothing |
@@ -309,8 +309,9 @@ See `examples/08-map/native/README.md` for the exact commands.
 
 ⚠️ Do not compare an archive against a shared library — 22 MB of `.a` is 4 MB once linked, for identical code. Object files keep every symbol, nothing is dead-stripped, and the linker pulls only what an app references.
 
-JavaScript hosts need no native build at all. That is why the React Native app in
-`examples/08-map/native` runs on both phones with one storage adapter and three small shims.
+Browser and Node hosts need no native build at all: zb-client-ts is plain TypeScript. React
+Native runs libzb instead, through `zb-react-native` (its build scripts make both phones'
+libraries).
 
 ### Setup steps at a glance
 
@@ -417,7 +418,7 @@ graph TD
     classDef daemon fill:#bdf3ff,stroke:#ac0100,stroke-width:2px;
 
     subgraph Mobile
-      UserMobile([mobile<br>React Native<br>--- zb-client-ts ---]):::external
+      UserMobile([mobile<br>React Native<br>--- libzb ---]):::external
       LocalSQLite[(local<br>SQLite)]:::secure
       LocalSQLite <==>  UserMobile
     end
@@ -485,7 +486,7 @@ You can test on bare metal or a VPS with for example 6-vCPU, 24 GB RAM and 200GB
 This can serve the following clients:
 
 - browsers with a local `PGlite` (or `SQLite`) replica that connects over WSS to NATS,
-- mobiles with their native in-process `SQLite` replica that connects to NATS over TLS or WSS (React Native using JS),
+- mobiles with their native in-process `SQLite` replica that connects to NATS over TLS (React Native and Flutter through libzb),
 - a warm micro-VM with an in-process `DuckDB` replica for fast analytics, geo-computations... that connects to NATS over TLS.
 
 [⬆️](#table-of-contents)
@@ -1383,9 +1384,9 @@ Start from what you see. Each row names the check and the rule behind it.
 > - you do not talk to NATS: the library does all of it.
 > - you talk to the replica via the library primitives.
 
-The client library comes in two flavours: TypeScript (for any JavaScript engine) and a native dynamic Zig library with a C ABI, `libzb` (Flutter, Swift, Kotlin, Python services, and any language with an FFI).
+The client library comes in two flavours: TypeScript (for any JavaScript engine) and a native dynamic Zig library with a C ABI, `libzb` (Flutter, React Native, Swift, Kotlin, Python services, and any language with an FFI).
 
-- **`zb-client-ts`** — a self-contained TypeScript package that runs **as-is** in any JS runtime: browsers, Node, Electron, Deno, Bun, React Native. No wasm and no native library needed — a JavaScript host just uses this.
+- **`zb-client-ts`** — a self-contained TypeScript package that runs **as-is** in browsers, Node, Electron, Deno and Bun. No wasm and no native library needed — a JavaScript host just uses this.
 - **`libzb`** — a native library with a C ABI for mobile apps, desktop apps and microservices (FFI-compatible).
 
 > [!CAUTION]
@@ -1402,17 +1403,17 @@ const zb = new ZeBridge({ bridgeUrl: 'https://bridge.mydom.com', invite: code, t
 await zb.connect();   // libzb: {"bridgeUrl": …, "invite": …, "tables": […]} to zb_client_connect
 ```
 
-The first connect generates the device's key pair (the seed never leaves it), redeems the invite at `GET /enroll`, and stores the identity (`identityPath`: a 0600 file, the browser's localStorage, React Native's store — the same JSON in both libraries). Every later connect needs neither the invite nor `natsUrl`: the identity names the principal, the NATS URL the bridge handed out, the grammar hash and the JetStream domain. The JWT **renews itself** before it expires (`GET /renew`, signed with the device's key — no invite, no backend call), so a device enrolls once and stays enrolled until it is revoked.
+The first connect generates the device's key pair (the seed never leaves it), redeems the invite at `GET /enroll`, and stores the identity (`identityPath`: a 0600 file, or the browser's localStorage — the same JSON in both libraries). Every later connect needs neither the invite nor `natsUrl`: the identity names the principal, the NATS URL the bridge handed out, the grammar hash and the JetStream domain. The JWT **renews itself** before it expires (`GET /renew`, signed with the device's key — no invite, no backend call), so a device enrolls once and stays enrolled until it is revoked.
 
 A host that manages identities itself passes `natsUrl`, `principal` and `creds` (the `.creds` text) instead, and has the low-level steps: `createUser()`/`zb_create_user()`, `enrollAt`, `credsFileText`/`zb_creds_file_text`.
 
 ### The TypeScript API
 
-The app gets one connection to NATS (WebSocket in the browser and React Native, TCP on Node) and one local database (SQLite by default, or PGlite). It builds a `ZeBridge` object, calls `connect()`, reads with `query(sql)`, writes with `mutate(table, op, key, values)`, and gets reactivity from `onChange(table, cb)`.
+The app gets one connection to NATS (WebSocket in the browser, TCP on Node) and one local database (SQLite by default, or PGlite). It builds a `ZeBridge` object, calls `connect()`, reads with `query(sql)`, writes with `mutate(table, op, key, values)`, and gets reactivity from `onChange(table, cb)`.
 
 Once you call `connect()`, it subscribes, receives, applies and fires your callbacks on its own: you do nothing.
 
-Storage, zstd and the NATS dial come from the platform: better-sqlite3 and TCP on Node, sqlite-wasm on OPFS and WebSocket in the browser, expo-sqlite and WebSocket on React Native. The replica lives at `dbPath`, by default `zebridge_<principal>.sqlite3`, kept across reloads — which is what an outbox needs: a write queued while the socket was down must still be there after the page comes back. A fresh name per load (`dbPath: \`zebridge_${Date.now()}.sqlite3\``) is a clean room for a dev loop.`engine` defaults to SQLite; `'pglite'` (browser and Node) loads PostgreSQL-in-process on demand, and a SQLite consumer never downloads it. libzb takes the same options (CLIENTS.md).
+Storage, zstd and the NATS dial come from the platform: better-sqlite3 and TCP on Node, sqlite-wasm on OPFS and WebSocket in the browser. The replica lives at `dbPath`, by default `zebridge_<principal>.sqlite3`, kept across reloads — which is what an outbox needs: a write queued while the socket was down must still be there after the page comes back. A fresh name per load (`dbPath: \`zebridge_${Date.now()}.sqlite3\``) is a clean room for a dev loop.`engine` defaults to SQLite; `'pglite'` (browser and Node) loads PostgreSQL-in-process on demand, and a SQLite consumer never downloads it. libzb takes the same options (CLIENTS.md).
 
 **Query**: `query(sql, ...params)` — read your local database directly. Any single read: joins, aggregates, offline. The replica _is_ the API. It returns the rows as objects.
 

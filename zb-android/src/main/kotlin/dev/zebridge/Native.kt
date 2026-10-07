@@ -14,6 +14,7 @@ internal object Native {
     @JvmStatic external fun lastError(): ByteArray?
     @JvmStatic external fun grammarHash(): ByteArray?
     @JvmStatic external fun createUser(): ByteArray?
+    @JvmStatic external fun call(fn: ByteArray, args: ByteArray): ByteArray?
     @JvmStatic external fun credsFileText(jwt: ByteArray, seed: ByteArray): ByteArray?
     @JvmStatic external fun connect(opts: ByteArray): Long
     @JvmStatic external fun close(h: Long): Int

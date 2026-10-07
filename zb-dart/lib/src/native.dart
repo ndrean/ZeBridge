@@ -13,7 +13,7 @@ import 'dart:io';
 import 'package:ffi/ffi.dart';
 
 /// libzb's C ABI version this package was written for; libzb/python/abi_check.py checks it.
-const zbAbi = 5;
+const zbAbi = 6;
 
 /// A call libzb refused, with libzb's own words.
 class ZeBridgeException implements Exception {

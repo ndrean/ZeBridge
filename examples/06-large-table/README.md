@@ -8,16 +8,16 @@ that are checked against PostgreSQL. Each host is a measurement of the same seed
 | host | client | path | status |
 | --- | --- | --- | --- |
 | `web/` | zb-client-ts, OPFS-SQLite in Chrome | staged (TEMP on OPFS) | 156 s, 988 MB |
-| `react-native/` | zb-client-ts, expo-sqlite | staged | iOS simulator 364 s, Android emulator 475 s, **iPhone 12: 725 s** |
+| `react-native/` | libzb (C ABI), the zb-react-native module | streamed, sorted per window in Zig | **iPhone 12: 35.0 s** |
 | `flutter/` | libzb (C ABI), dart:ffi | streamed, sorted per window in Zig | **iPhone 12: 70.8 s**, simulator 30.2 s |
 | `python/` | libzb (C ABI) | streamed | planned |
 
-The two TypeScript hosts share the streaming pipeline (`seedStreaming`, fzstd as the
-decompressor) and differ only in the storage adapter; both take the staged path because
-both storages can spill a TEMP table and a sort to disk. libzb streams and sorts per
+The browser host streams with fzstd as the decompressor and takes the staged path,
+because its storage can spill a TEMP table and a sort to disk. libzb streams and sorts per
 window in C, and reports nothing while it does — a clock instead of a bar until a
 `seeding` field in the poll report (the same six names as `SeedProgress`) exists. On the
-same iPhone 12 the native seed is 10× the JavaScript one: 70.8 s against 725 s.
+same iPhone 12, zb-client-ts on React Native took 725 s: per-row JavaScript on Hermes,
+which is why React Native now runs libzb.
 
 If PostgreSQL ever loses the fixture, the numbers change: compute them with
 

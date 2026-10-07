@@ -9,7 +9,7 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
 /** libzb's C ABI version this binding was written for; libzb/python/abi_check.py checks it. */
-const val ZB_ABI = 5
+const val ZB_ABI = 6
 
 /** A call libzb refused, with libzb's own words (`{"error": …}` or `zb_last_error`). */
 class ZeBridgeException(message: String) : RuntimeException(message)

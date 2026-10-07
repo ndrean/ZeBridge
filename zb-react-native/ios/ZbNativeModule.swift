@@ -16,6 +16,12 @@ public class ZbNativeModule: Module {
       Int(zb_abi_version())
     }
 
+    // A pure rule of libzb's core (mergeRegisters, …): no client, no I/O, so it runs on
+    // the JS thread and answers at once.
+    Function("call") { (fn: String, args: String) throws -> String in
+      try Self.take(zb_call(fn, args), "zb_call")
+    }
+
     // Diagnostics: libzb speaks on stderr (seeded, gap healed, seed anchor, pruned under)
     // and an app has no terminal. Appends stderr to `path`, line-buffered, for the rest of
     // the process; `trace` turns on ZB_TAIL_TRACE (a line per fetch and per applied batch)
@@ -70,61 +76,6 @@ public class ZbNativeModule: Module {
     AsyncFunction("close") { (h: String) throws -> Int in
       Int(zb_client_close(try Self.handle(h)))
     }.runOnQueue(queue)
-
-    // libzb's zstd for zb-client-ts's own decoder (`zstdDecompressStream`), on the JS
-    // thread: a chunk inflates in about a millisecond. Bytes cross only as arguments,
-    // which JSI hands over without a copy: `zstdPush` inflates into a buffer kept here
-    // and returns its length, JS allocates that and `zstdTake` fills it.
-    Function("zstdNew") { () throws -> Int in
-      guard let ctx = zb_zstd_new() else { throw ZbException("zb_zstd_new failed") }
-      let id = self.nextZstd
-      self.nextZstd += 1
-      self.zstd[id] = ZstdState(ctx: ctx)
-      return id
-    }
-
-    Function("zstdPush") { (id: Int, chunk: Uint8Array) throws -> Int in
-      guard let st = self.zstd[id] else { throw ZbException("no zstd stream \(id)") }
-      st.drop()
-      var out: UnsafeMutablePointer<UInt8>? = nil
-      var n = 0
-      let src = chunk.rawPointer.assumingMemoryBound(to: UInt8.self)
-      if zb_zstd_push(st.ctx, src, chunk.byteLength, &out, &n) != 0 {
-        throw ZbException(Self.lastError() ?? "zb_zstd_push failed")
-      }
-      st.buf = out
-      st.len = n
-      return n
-    }
-
-    Function("zstdTake") { (id: Int, dest: Uint8Array) throws in
-      guard let st = self.zstd[id], let buf = st.buf else { throw ZbException("nothing to take from zstd stream \(id)") }
-      guard dest.byteLength >= st.len else { throw ZbException("zstdTake: \(dest.byteLength) bytes for \(st.len)") }
-      dest.rawPointer.copyMemory(from: buf, byteCount: st.len)
-      st.drop()
-    }
-
-    Function("zstdFree") { (id: Int) in
-      if let st = self.zstd.removeValue(forKey: id) {
-        st.drop()
-        zb_zstd_free(st.ctx)
-      }
-    }
-  }
-
-  private var zstd: [Int: ZstdState] = [:]
-  private var nextZstd = 1
-
-  private final class ZstdState {
-    let ctx: UnsafeMutableRawPointer
-    var buf: UnsafeMutablePointer<UInt8>? = nil
-    var len = 0
-    init(ctx: UnsafeMutableRawPointer) { self.ctx = ctx }
-    func drop() {
-      if let b = buf { zb_free(UnsafeMutableRawPointer(b).assumingMemoryBound(to: CChar.self)) }
-      buf = nil
-      len = 0
-    }
   }
 
   private static func handle(_ h: String) throws -> UInt64 {

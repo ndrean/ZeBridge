@@ -18,12 +18,7 @@
     "noUnusedParameters": true,
     "noImplicitReturns": true,
     "allowImportingTsExtensions": true,
-    "verbatimModuleSyntax": true,
-    "paths": {
-      "expo-sqlite": [
-        "./types/expo-sqlite.d.ts"
-      ]
-    }
+    "verbatimModuleSyntax": true
   },
   "include": [
     "src"

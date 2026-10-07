@@ -15,6 +15,7 @@ import { ZB_ABI } from './abi';
 
 type Native = {
   abiVersion(): number;
+  call(fn: string, argsJson: string): string;
   captureStderr(path: string, trace: boolean): boolean;
   connect(optsJson: string): Promise<string>;
   sync(handle: string): Promise<string>;
@@ -26,15 +27,10 @@ type Native = {
   flushOutbox(handle: string, waitMs: number): Promise<string>;
   stamp(handle: string): Promise<string>;
   wake(handle: string): number;
-  zstdNew(): number;
-  zstdPush(id: number, chunk: Uint8Array): number;
-  zstdTake(id: number, dest: Uint8Array): void;
-  zstdFree(id: number): void;
 };
 
 /// The native module, or null where the app was built without it (Expo Go, the web).
-/// Required OPTIONALLY: an app that merely imports the package — a screen offering libzb
-/// next to zb-client-ts — must still start there; `requireNativeModule` threw at import and
+/// Required OPTIONALLY: an app that merely imports the package must still start there; `requireNativeModule` threw at import and
 /// took the whole app down on Android. Using libzb without it throws `native()`'s error.
 export const ZbNative: Native | null = requireOptionalNativeModule<Native>('ZbNative');
 
@@ -42,7 +38,7 @@ export const ZbNative: Native | null = requireOptionalNativeModule<Native>('ZbNa
 export const libzbAvailable = ZbNative !== null;
 
 function native(): Native {
-  if (!ZbNative) throw new Error('zb-react-native: libzb is not built into this app — rebuild it with the module (scripts/build-ios.sh, scripts/build-android.sh), or use zb-client-ts here');
+  if (!ZbNative) throw new Error('zb-react-native: libzb is not built into this app — rebuild it with the module (scripts/build-ios.sh, scripts/build-android.sh)');
   return ZbNative;
 }
 
@@ -55,6 +51,18 @@ export function assertAbi(): void {
     throw new Error(`zb-react-native: the embedded libzb is ABI ${got}, this package is ABI ${ZB_ABI} — rebuild it (zb-react-native/scripts/build-ios.sh or build-android.sh), then the app`);
   }
   abiChecked = true;
+}
+
+/// A register: a value with its stamp and writer (COOPERATIVE_EDITING.md).
+export type Register = { v: unknown; t?: string; w?: string };
+
+/// Two register maps merged, key by key, the later stamp winning — libzb's own rule, the
+/// one zb-client-ts applies too, so every client converges on the same document.
+export function mergeRegisters(a: Record<string, Register>, b: Record<string, Register>): Record<string, Register> {
+  assertAbi();
+  const out = JSON.parse(native().call('mergeRegisters', JSON.stringify({ a, b })));
+  if (out && typeof out.error === 'string') throw new Error(`zb-react-native: mergeRegisters: ${out.error}`);
+  return out;
 }
 
 /// libzb's connect options — the names zb-client-ts uses too.

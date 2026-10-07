@@ -1,12 +1,12 @@
 /// ZeMap on a phone: the SAME service, the SAME queries and the SAME shared route row as
-/// `../flutter` and `../web`, through zb-client-ts — nothing native of ours is compiled
-/// (§10ih). The markers are the ANSWER and are never stored (§10ic); the route is one
-/// `routes` row two clients edit at once, converging through `mergeRegisters` (§10ho).
+/// `../flutter` and `../web`, through libzb (the zb-react-native module). The markers are
+/// the ANSWER and are never stored (§10ic); the route is one `routes` row two clients edit
+/// at once, converging through `mergeRegisters` (§10ho).
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import MapLibreGL, { Camera, CircleLayer, LineLayer, MapView, MarkerView, PointAnnotation, ShapeSource } from '@maplibre/maplibre-react-native';
-import { mergeRegisters } from 'zb-client-ts';
-import { makeClient, PRINCIPAL, TENANT } from './src/client';
+import { mergeRegisters } from 'zb-react-native';
+import { MapClient, TENANT } from './src/client';
 
 MapLibreGL.setAccessToken(null);
 
@@ -28,7 +28,6 @@ const asMaps = (ans: any): Row[] => {
   const cols: string[] = ans?.columns ?? [];
   return (ans?.rows ?? []).map((r: any[]) => Object.fromEntries(cols.map((c, i) => [c, r[i]])));
 };
-const stamp = () => new Date().toISOString().replace('Z', '000Z');
 
 /// §10il: rows as ONE GeoJSON collection for the map to draw in a single layer.
 ///
@@ -65,7 +64,7 @@ const metres = (a: [number, number], b: [number, number]) => {
 };
 
 export default function App() {
-  const zb = useRef<ReturnType<typeof makeClient> | null>(null);
+  const zb = useRef<MapClient | null>(null);
   const map = useRef<any>(null);
   const cam = useRef<any>(null);
   /// §10ik: every ask carries a ticket. A pan fires many region events, their answers
@@ -92,21 +91,17 @@ export default function App() {
   const [held, setHeld] = useState<'start' | 'end' | null>(null);
   const mine = useRef<Record<string, any>>({});
   const routeReadPending = useRef<number | null>(null);
-  const writer = `phone-${PRINCIPAL}`;
 
   useEffect(() => {
     let live = true;
     (async () => {
       try {
-        const c = makeClient();
-        // The library's own progress, surfaced through its `onLog` hook — subscribed
-        // BEFORE connect, because everything interesting happens inside it.
-        c.onLog((topic, data, level) => console.log(`[zb ${level}] ${topic}: ${typeof data === 'string' ? data : JSON.stringify(data)}`));
+        const c = new MapClient();
         await c.connect();
-        if (!live) return;
+        if (!live) { c.close(); return; }
         zb.current = c;
         setConnected(true);
-        setStatus('connected');
+        setStatus(`connected as ${c.principal}`);
         // The row moved — mine or another editor's. Redraw from what the ROW holds.
         // COALESCED: a seed's backlog fired this 185 times and produced 183 identical
         // queries. One read per burst is the same answer for a fraction of the work.
@@ -119,17 +114,17 @@ export default function App() {
         });
         await readRoute();
       } catch (e) {
-        if (live) setStatus(`connect: ${e}`);
+        if (live) setStatus(/not enrolled/i.test(String(e)) ? 'Not enrolled: build with EXPO_PUBLIC_ZB_INVITE=<code> for the first run.' : `connect: ${e}`);
       }
     })();
-    return () => { live = false; void zb.current?.close(); };
+    return () => { live = false; zb.current?.close(); };
   }, []);
 
   const readRoute = useCallback(async () => {
     const c = zb.current;
     if (!c) return;
     try {
-      const r: any[] = await c.query('SELECT doc FROM routes WHERE id = ?', ROUTE_ID);
+      const r = await c.query('SELECT doc FROM routes WHERE id = ?', [ROUTE_ID]);
       const doc = r[0]?.doc;
       setRouteDoc(typeof doc === 'string' ? JSON.parse(doc) : (doc ?? {}));
     } catch { /* the table is not here yet */ }
@@ -174,8 +169,7 @@ export default function App() {
         }, 20000);
         if (mine !== seq.current) return;   // a newer ask overtook this one
         setChargers(asMaps(ans));
-        const t = ans.zb_transport ?? {};
-        if (mine === seq.current) setStatus(`${ans.count} charger(s) in ${(radius / 1000).toFixed(0)} km · ${t.via} ${t.bytes} B · wire ${t.wire_ms} ms · db ${ans.ms} ms · ${Date.now() - t0} ms`);
+        if (mine === seq.current) setStatus(`${ans.count} charger(s) in ${(radius / 1000).toFixed(0)} km · db ${ans.ms} ms · ${Date.now() - t0} ms`);
       } else if (mine === seq.current) setChargers([]);
       if (fuel !== null) {
         const radius = Math.min(20000, Math.max(3000, half));
@@ -227,10 +221,14 @@ export default function App() {
     if (!routeMode) { setPicked(null); return; }
     const [lng, lat] = f?.geometry?.coordinates ?? [];
     if (typeof lat !== 'number') return;
+    const c = zb.current;
+    if (!c) return;
     const which = target([lng, lat]);
-    mine.current[which] = { v: { lat, lng }, t: stamp(), w: writer };
     setHeld(which);
-    try { await writeRoute(); } catch (e) { setStatus(`route: ${e}`); }
+    try {
+      mine.current[which] = { v: { lat, lng }, t: await c.stamp(), w: c.principal };
+      await writeRoute();
+    } catch (e) { setStatus(`route: ${e}`); }
   };
 
   /// The cheapest and dearest in the ANSWER, so the ramp always spans what is on

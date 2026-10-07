@@ -1,22 +1,26 @@
-/// The same seed through libzb — the C client, Zig inside — from the zb-react-native
-/// package. What the Flutter app does over dart:ffi, from JavaScript:
-/// `connect`, then one `sync` that streams the chain and applies it in Zig. JS only
-/// keeps the clock and asks for the three facts. libzb reports nothing while `sync`
-/// runs, so there is no bar. Once usable it keeps following: `poll` in a loop (§10jc),
-/// the way a host drives libzb — the harness reads its consumer from nats-server.
+/// The seed through libzb — the C client, Zig inside — from the zb-react-native package.
+/// What the Flutter app does over dart:ffi, from JavaScript: `connect`, then one `sync`
+/// that streams the chain and applies it in Zig. JS only keeps the clock and asks for the
+/// three facts. libzb reports nothing while `sync` runs, so there is no bar. Once usable it
+/// keeps following: `poll` in a loop (§10jc), the way a host drives libzb — the harness
+/// reads its consumer from nats-server.
 import { useEffect, useRef, useState } from 'react';
-import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as FileSystem from 'expo-file-system';
 import { Libzb, ZbNative, libzbAvailable } from 'zb-react-native';
-import { PRINCIPAL, TABLE } from './client';
 import { fileLog } from './app-log';
 
-/// libzb speaks NATS over TCP (4222), not WebSocket: its own URL.
-const HOST = Platform.OS === 'android' ? '10.0.2.2' : '127.0.0.1';
-const NATS_URL = process.env.EXPO_PUBLIC_ZB_NATS_URL ?? `nats://${HOST}:4222`;
-const CREDS = process.env.EXPO_PUBLIC_CREDS ?? '';
-/// Its own file: the two engines never share a replica.
-const DB_FILE = `zebridge_${PRINCIPAL}_libzb.sqlite3`;
+// Expo inlines EXPO_PUBLIC_* at bundle time. The first run enrolls with the invite; libzb
+// keeps the identity beside the replica, and later runs need neither.
+const BRIDGE_URL = process.env.EXPO_PUBLIC_ZB_BRIDGE_URL ?? 'https://bridge.zebridge.eu';
+/// Another NATS address than the one the bridge names, such as a leaf.
+const NATS_URL = process.env.EXPO_PUBLIC_ZB_NATS_URL || undefined;
+const INVITE = process.env.EXPO_PUBLIC_ZB_INVITE || undefined;
+/// test_types: 3,055,002 rows on tenant globex, the firehose fixture.
+const TABLE = process.env.EXPO_PUBLIC_ZB_TABLE ?? 'test_types';
+/// One replica and identity per bridge, and per NATS server when one is named (a leaf).
+const host = (u: string) => u.replace(/^[a-z]+:\/\//, '').split(/[:/]/)[0];
+const DB_FILE = `largetable-${host(BRIDGE_URL)}${NATS_URL ? `-${host(NATS_URL)}` : ''}.sqlite3`;
 
 // A missing number (an empty table's sum is NULL) is "—", never a throw: an uncaught
 // error in a render is a native abort in a Release build (§10jc).
@@ -29,6 +33,7 @@ export function LibzbSeed() {
   const [elapsed, setElapsed] = useState(0);
   const [running, setRunning] = useState(false);
   const [phase, setPhase] = useState('starting');
+  const [who, setWho] = useState('');
   const [facts, setFacts] = useState<Facts | null>(null);
   const [lines, setLines] = useState<{ text: string; err: boolean }[]>([]);
   const [busy, setBusy] = useState(false);
@@ -63,23 +68,22 @@ export function LibzbSeed() {
     let closed = false;
     const log = (text: string, err = false) => { fileLog('libzb', text, err); setLines((prev) => [...prev.slice(-199), { text, err }]); };
     setFacts(null); setLines([]); setPhase('starting');
-    log(`— start (${PRINCIPAL}, ${TABLE})`);
+    log(`— start (${TABLE}, ${host(BRIDGE_URL)})`);
     (async () => {
-      if (!libzbAvailable) { setPhase('libzb is not built for this platform (iOS only) — use the zb-client-ts tab'); return; }
-      if (!CREDS) throw new Error("set EXPO_PUBLIC_CREDS to the principal's creds file contents");
+      if (!libzbAvailable) { setPhase('libzb is not built into this app — run zb-react-native/scripts/build-ios.sh or build-android.sh, then rebuild'); return; }
       // libzb's own lines (seeded, gap healed, seed anchor, one per fetch and batch with the
       // peak RSS) appended to Documents/libzb-stderr.log — the phone has no terminal.
-      if (process.env.EXPO_PUBLIC_ZB_TRACE_LIBZB === '1') {
+      if (process.env.EXPO_PUBLIC_ZB_TRACE === '1') {
         ZbNative?.captureStderr(dir.replace(/^file:\/\//, '') + 'libzb-stderr.log', true);
       }
       // A directory listing, not getInfoAsync: that one MD5s the file (see `check`).
       const fresh = !(await FileSystem.readDirectoryAsync(dir)).includes(DB_FILE);
       log(fresh ? 'fresh replica — the seed is the whole table' : 'replica present — no seed unless the chain moved');
-      log(`connecting to ${NATS_URL} as ${PRINCIPAL}, following [${TABLE}]`);
+      log(`connecting through ${BRIDGE_URL}${NATS_URL ? ` via ${NATS_URL}` : ''}, following [${TABLE}]`);
       t0Ref.current = Date.now(); setElapsed(0); setRunning(true); setPhase('connect + seed');
       const zb = await Libzb.connect({
-        natsUrl: NATS_URL, creds: CREDS, dbPath,
-        principal: PRINCIPAL, tables: [TABLE], seedStreaming: true,
+        bridgeUrl: BRIDGE_URL, invite: INVITE, natsUrl: NATS_URL, dbPath,
+        tables: [TABLE], seedStreaming: true,
       });
       if (closed) { await zb.close(); return; }
       clientRef.current = zb;
@@ -90,7 +94,8 @@ export function LibzbSeed() {
       const failed = (report.unseeded ?? []).filter((u: { table: string }) => u.table === TABLE);
       if (failed.length) { setPhase('failed'); log(`not seeded after ${secs(ms)}: ${failed[0].reason}`, true); return; }
       setPhase('usable');
-      log(`usable after ${secs(ms)} (tenant ${report.tenant ?? '—'})`);
+      setWho(report.principal ?? '');
+      log(`usable after ${secs(ms)} (${report.principal ?? '—'} on ${report.tenant ?? '—'})`);
       await check();
       // §10jc: follow — one poll at a time, a second of wait each; a re-seed or an error
       // is logged, the loop goes on until the tab closes or wipes.
@@ -128,7 +133,7 @@ export function LibzbSeed() {
   return (
     <View style={{ flex: 1 }}>
       <Text style={s.sub}>
-        {TABLE} as {PRINCIPAL}, seeded by libzb (Zig) through a native module: streamed, applied in C. JS keeps the
+        {TABLE}{who ? ` as ${who}` : ''}, seeded by libzb (Zig) through a native module: streamed, applied in C. JS keeps the
         clock only. Its own database, kept across launches.
       </Text>
       <View style={s.seed}>

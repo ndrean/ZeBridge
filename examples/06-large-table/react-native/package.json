@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "main": "index.js",
-  "description": "One big table, seeded from the chain on a phone \u2014 a progress bar and a timer (NOTES \u00a710ix)",
+  "description": "One big table, seeded from the chain on a phone by libzb — a timer and the three facts (NOTES §10ix)",
   "scripts": {
     "start": "expo start --dev-client",
     "prebuild": "expo prebuild --clean",
@@ -13,22 +13,11 @@
   },
   "dependencies": {
     "@babel/runtime": "^7.25.0",
-    "@msgpack/msgpack": "^3.0.0-beta.1",
-    "@nats-io/jetstream": "^3.4.0",
-    "@nats-io/kv": "^3.4.0",
-    "@nats-io/nats-core": "^3.4.0",
-    "@nats-io/obj": "3.4.0",
     "expo": "~52.0.0",
     "expo-dev-client": "~5.0.0",
     "expo-file-system": "~18.0.0",
-    "expo-sqlite": "~15.1.4",
-    "fzstd": "^0.1.1",
-    "js-sha256": "^0.11.1",
     "react": "18.3.1",
     "react-native": "0.76.9",
-    "react-native-get-random-values": "~1.11.0",
-    "uuid": "^14.0.1",
-    "zb-client-ts": "link:../../../zb-client-ts",
     "zb-react-native": "link:../../../zb-react-native"
   },
   "devDependencies": {

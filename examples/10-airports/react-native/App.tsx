@@ -1,15 +1,15 @@
-/// 10-airports on a phone through zb-client-ts (React Native): the same two things as the
-/// web page, without a map.
+/// 10-airports on a phone through libzb (React Native, the zb-react-native module): the
+/// same two things as the web page, without a map.
 ///   * the AIRPORTS around a city are a question — `request('query._default.airports_near')`
 ///     answered by the DuckDB service on the hub; nothing is replicated for it;
-///   * the FLIGHT is a row — `flights`, replicated into expo-sqlite and written with
+///   * the FLIGHT is a row — `flights`, replicated into libzb's SQLite and written with
 ///     `mutate`: two registers {v, t, w}, the departure and the arrival, merged with
 ///     `mergeRegisters` exactly as the web page and the Flutter app do.
 /// Built for zebridge.eu: EXPO_PUBLIC_ZB_INVITE on the first run, EXPO_PUBLIC_ZB_NATS_URL
-/// for a leaf node (wss://leaf.example.com:8443).
+/// for a leaf node (tls://leaf.example.com:4222).
 import { useEffect, useRef, useState } from 'react';
 import { FlatList, Pressable, SafeAreaView, StyleSheet, Text, View } from 'react-native';
-import { NotEnrolled, mergeRegisters } from 'zb-client-ts';
+import { mergeRegisters } from 'zb-react-native';
 import { makeClient, type AirportsClient } from './src/client';
 
 // Expo inlines EXPO_PUBLIC_* at bundle time; `process` exists only for that.
@@ -136,12 +136,12 @@ export default function App() {
       try {
         await zb.connect();
       } catch (e) {
-        setStatus(e instanceof NotEnrolled || /not enrolled/i.test(String((e as Error).message))
+        setStatus(/not enrolled/i.test(String((e as Error).message))
           ? 'Not enrolled: build with EXPO_PUBLIC_ZB_INVITE=<code> for the first run.'
           : `Could not connect: ${(e as Error).message}`);
         return;
       }
-      setStatus(`${zb.principal} · ${zb.tenant} · ${zb.engine}${NATS_URL ? ` · via ${host(NATS_URL)}` : ''}`);
+      setStatus(`${zb.principal} · ${zb.tenant}${NATS_URL ? ` · via ${host(NATS_URL)}` : ''}`);
       flight.current.id = `flight-${zb.tenant}`;
       await readFlight();
       await ask(CITIES[0]);
