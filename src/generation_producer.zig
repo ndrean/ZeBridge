@@ -1149,10 +1149,24 @@ pub const GenerationProducer = struct {
         const edge_writable = if (self.writable) |w| (w.get(table) orelse true) else true;
         const lower_bound: ?[]const u8 = if (last_cutoff) |cut| try deltaLowerBound(alloc, cut, last_floor, edge_writable) else null;
         if (lower_bound) |lb| {
-            const check = try utils.allocPrintZ(alloc, "SELECT EXISTS(SELECT 1 FROM \"{s}\" WHERE \"{s}\" >= {s})", .{ table, vcol, lb });
-            const res = try queryOne(pgc, check, &.{});
-            defer c.PQclear(res);
-            unchanged_by_version = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, 0, 0)), "f");
+            // Scoped like the pair's own reads: this tenant's rows and the open tenant's,
+            // the rows the read policy shows it (zebridge_scope_reads_by_tenant). This
+            // runs before the build's transaction sets zb.tenant, and unscoped it saw
+            // every tenant: one write in 'acme' cut an EMPTY delta, an upload each, for
+            // every other tenant of the table (measured 2026-10-07, site_survey).
+            if (tcol.len > 0) {
+                const check = try utils.allocPrintZ(alloc, "SELECT EXISTS(SELECT 1 FROM \"{s}\" WHERE \"{s}\" >= {s} AND (\"{s}\"::text = $1 OR \"{s}\"::text = $2))", .{ table, vcol, lb, tcol, tcol });
+                const open_z = try alloc.dupeSentinel(u8, self.topo.open_tenant, 0);
+                const params = [_]?[*:0]const u8{ tenant_z.ptr, open_z.ptr };
+                const res = try queryOne(pgc, check, &params);
+                defer c.PQclear(res);
+                unchanged_by_version = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, 0, 0)), "f");
+            } else {
+                const check = try utils.allocPrintZ(alloc, "SELECT EXISTS(SELECT 1 FROM \"{s}\" WHERE \"{s}\" >= {s})", .{ table, vcol, lb });
+                const res = try queryOne(pgc, check, &.{});
+                defer c.PQclear(res);
+                unchanged_by_version = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, 0, 0)), "f");
+            }
         }
 
         // The next number counts EVERY row, retired ones included: a retired row's
@@ -1754,10 +1768,10 @@ pub const GenerationProducer = struct {
         // the producer's single largest cost, and the producer is the side that races
         // the stream (§10ej). Level 3 here, like the deltas; the ratio is compared below.
         if (full_obj) |fo| {
-            log.info("🗜️ '{s}'/'{s}': g{d} full {d} -> {d} bytes ({d}%){s}", .{ tenant, table, gen, fo.raw_bytes, fo.z_bytes, fo.z_bytes * 100 / @max(fo.raw_bytes, 1), if (fo.streamed) " [streamed]" else "" });
+            log.debug("🗜️ '{s}'/'{s}': g{d} full {d} -> {d} bytes ({d}%){s}", .{ tenant, table, gen, fo.raw_bytes, fo.z_bytes, fo.z_bytes * 100 / @max(fo.raw_bytes, 1), if (fo.streamed) " [streamed]" else "" });
         }
         if (delta_obj) |d| {
-            log.info("🗜️ '{s}'/'{s}': g{d} delta {d} -> {d} bytes ({d}%){s}", .{ tenant, table, gen, d.raw_bytes, d.z_bytes, d.z_bytes * 100 / @max(d.raw_bytes, 1), if (d.streamed) " [streamed]" else "" });
+            log.debug("🗜️ '{s}'/'{s}': g{d} delta {d} -> {d} bytes ({d}%){s}", .{ tenant, table, gen, d.raw_bytes, d.z_bytes, d.z_bytes * 100 / @max(d.raw_bytes, 1), if (d.streamed) " [streamed]" else "" });
         }
 
         // ── 5. the chain manifest, swapped last ──────────────────────────────
@@ -1870,15 +1884,20 @@ pub const GenerationProducer = struct {
         // The duration is the number the retention contract needs (§10em): the CDC
         // window must cover two cadences AND this, since the cut is taken before the
         // build and must still be in the stream when the manifest is live.
-        log.info("🧬 g{d} for '{s}'/'{s}': {s}{s}{s} → {s} (cutoff {s} @ {s}) in {d} ms", .{
+        // ONE line per cut at info: what was built, how much, where, how long. The
+        // compression and the phases follow at debug — four lines a cut drowned a quiet
+        // log (one row written: ten lines, 2026-10-07).
+        const z_total = (if (delta_obj) |d| d.z_bytes else 0) + (if (full_obj) |fo| fo.z_bytes else 0);
+        log.info("🧬 g{d} for '{s}'/'{s}': {s}{s}{s}, {d} row(s), {d} B → {s} in {d} ms", .{
             gen,                                   tenant,                                      table,
             if (build_delta) "delta" else "",      if (build_delta and build_full) "+" else "", if (build_full) "full" else "",
-            bucket,                                cutoff_version,                              lsn,
+            delta_rows + full_rows,                z_total,                                     bucket,
             utils.unixMillis() - build_started_ms,
         });
+        log.debug("🧬   cutoff {s} @ {s}", .{ cutoff_version, lsn });
         // §10gx: both artifacts are one streamed phase now — COPY, encode, zstd and the
         // upload happen together, so there is nothing left to time apart.
-        log.info("🧬   phases: full (count+copy+encode+zstd+upload) {d} ms, delta (count+copy+encode+zstd+upload) {d} ms — {d} full row(s), {d} delta row(s)", .{ ph.full, ph.query, full_rows, delta_rows });
+        log.debug("🧬   phases: full (count+copy+encode+zstd+upload) {d} ms, delta (count+copy+encode+zstd+upload) {d} ms — {d} full row(s), {d} delta row(s)", .{ ph.full, ph.query, full_rows, delta_rows });
         if (delta_obj) |d| log.debug("🧬   delta: {d} row(s), {d} bytes", .{ delta_rows, d.raw_bytes });
         if (full_obj) |fo| log.debug("🧬   full:  {d} row(s), {d} bytes", .{ full_rows, fo.raw_bytes });
 
