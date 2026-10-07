@@ -1,8 +1,8 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index 9c196cd..afbd69d 100644
+index 1b283c3..ce231a4 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -905,7 +905,11 @@ pub const JetStream = struct {
+@@ -896,7 +896,11 @@ pub const JetStream = struct {
          }) catch return;
  
          const info = response.@"error";

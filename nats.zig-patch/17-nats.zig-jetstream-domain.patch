@@ -1,26 +1,26 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index 5d382c6..52dc083 100644
+index 72f67be..71cc2be 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -464,7 +464,7 @@ pub const PullSubscription = struct {
+@@ -468,7 +468,7 @@ pub const PullSubscription = struct {
  
      /// The pull API subject for this consumer, allocated from `a`.
      fn nextSubject(self: *PullSubscription, a: std.mem.Allocator) ![]u8 {
--        return std.fmt.allocPrint(a, "{s}CONSUMER.MSG.NEXT.{s}.{s}", .{ default_api_prefix, self.stream_name, self.consumer_name });
-+        return self.js.apiSubject(a, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.stream_name, self.consumer_name });
+-        return std.fmt.allocPrint(a, "{s}CONSUMER.MSG.NEXT.{s}.{s}", .{ default_api_prefix, self.consumer_info.value.stream_name, self.consumer_info.value.name });
++        return self.js.apiSubject(a, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.consumer_info.value.stream_name, self.consumer_info.value.name });
      }
  
      /// Fetch a batch of messages from the pull consumer
-@@ -524,7 +524,7 @@ pub const PullSubscription = struct {
+@@ -528,7 +528,7 @@ pub const PullSubscription = struct {
          defer self.js.nc.allocator.free(request_json);
  
          // Build the full API subject
--        const api_subject = try std.fmt.allocPrint(self.js.nc.allocator, "{s}CONSUMER.MSG.NEXT.{s}.{s}", .{ default_api_prefix, self.stream_name, self.consumer_name });
-+        const api_subject = try self.js.apiSubject(self.js.nc.allocator, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.stream_name, self.consumer_name });
+-        const api_subject = try std.fmt.allocPrint(self.js.nc.allocator, "{s}CONSUMER.MSG.NEXT.{s}.{s}", .{ default_api_prefix, self.consumer_info.value.stream_name, self.consumer_info.value.name });
++        const api_subject = try self.js.apiSubject(self.js.nc.allocator, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.consumer_info.value.stream_name, self.consumer_info.value.name });
          defer self.js.nc.allocator.free(api_subject);
  
          // Send the pull request with reply subject
-@@ -900,7 +900,10 @@ pub const PullSubscribeOptions = struct {
+@@ -891,7 +891,10 @@ pub const PullSubscribeOptions = struct {
  
  pub const JetStreamOptions = struct {
      request_timeout: Io.Timeout = default_request_timeout,
@@ -32,7 +32,7 @@ index 5d382c6..52dc083 100644
  };
  
  pub const JetStream = struct {
-@@ -914,8 +917,16 @@ pub const JetStream = struct {
+@@ -905,8 +908,16 @@ pub const JetStream = struct {
          };
      }
  
@@ -50,7 +50,7 @@ index 5d382c6..52dc083 100644
          defer self.nc.allocator.free(full_subject);
  
          return try self.nc.request(full_subject, payload, self.opts.request_timeout);
-@@ -2055,3 +2066,16 @@ pub const JetStream = struct {
+@@ -2235,3 +2246,16 @@ pub const JetStream = struct {
          return jetstream_objstore.ObjectStoreManager.init(self);
      }
  };

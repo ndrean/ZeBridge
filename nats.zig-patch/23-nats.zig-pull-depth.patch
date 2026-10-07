@@ -1,8 +1,8 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index eb44d2b..7f4de51 100644
+index 072870d..fe2e9f0 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -428,6 +428,16 @@ pub const MessageBatch = struct {
+@@ -441,6 +441,16 @@ pub const MessageBatch = struct {
  /// ZeBridge's libzb, 10 ms here made a 13 ms row, 1 ms makes it 3 ms.
  const fetch_idle_after_first: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } };
  
@@ -19,7 +19,7 @@ index eb44d2b..7f4de51 100644
  pub const PullSubscription = struct {
      /// How long `fetch` keeps collecting after its first message — `fetch_idle_after_first`
      /// (1 ms) unless the owner says otherwise. A CDC tail wants the 1 ms: one event, at
-@@ -455,10 +465,14 @@ pub const PullSubscription = struct {
+@@ -468,10 +478,14 @@ pub const PullSubscription = struct {
      /// server's 64 MB per-connection queue and was disconnected as a slow consumer every
      /// few seconds, losing every delivery in flight (ZeBridge §10jc). One outstanding
      /// request bounds the bytes in flight by `max_bytes`, whatever the link.
@@ -37,8 +37,8 @@ index eb44d2b..7f4de51 100644
 +    pull_depth: usize = 1,
      /// JetStream context
      js: JetStream,
-     /// Stream name
-@@ -525,33 +539,72 @@ pub const PullSubscription = struct {
+     /// Consumer information
+@@ -529,33 +543,72 @@ pub const PullSubscription = struct {
          }
      }
  
@@ -128,7 +128,7 @@ index eb44d2b..7f4de51 100644
      }
  
      pub fn fetch(self: *PullSubscription, batch: usize, timeout: Io.Timeout) !MessageBatch {
-@@ -563,10 +616,10 @@ pub const PullSubscription = struct {
+@@ -567,10 +620,10 @@ pub const PullSubscription = struct {
          try self.mutex.lock(self.js.nc.io);
          defer self.mutex.unlock(self.js.nc.io);
  
@@ -143,7 +143,7 @@ index eb44d2b..7f4de51 100644
              self.fetch_id_counter += 1;
              const new_reply = try std.fmt.allocPrint(self.js.nc.allocator, "{s}{d}", .{ self.inbox_prefix, self.fetch_id_counter });
              defer self.js.nc.allocator.free(new_reply);
-@@ -585,9 +638,6 @@ pub const PullSubscription = struct {
+@@ -589,9 +642,6 @@ pub const PullSubscription = struct {
              try self.js.nc.publishRequest(api_subject, new_reply, request_json);
              self.requestStart(new_reply, batch, timeout.toDeadline(self.js.nc.io));
          }
@@ -153,11 +153,32 @@ index eb44d2b..7f4de51 100644
          // Collect messages
          var messages = std.ArrayList(*JetStreamMessage).empty;
          defer messages.deinit(self.js.nc.allocator);
-@@ -633,12 +683,12 @@ pub const PullSubscription = struct {
-                 // e2e suite catches exactly that. Status frames are addressed to the inbox
-                 // (`HMSG _INBOX.<prefix>.<fetch_id>`), so they can be attributed, and they
-                 // are the only ones this loop treats as terminal.
+@@ -620,16 +670,29 @@ pub const PullSubscription = struct {
+             if (self.inbox_subscription.nextMsgTimeout(receive_deadline)) |raw_msg| {
+                 log.debug("Message: subject={s}, reply={s}, data='{s}'", .{ raw_msg.subject, raw_msg.reply orelse "none", raw_msg.data });
+ 
+-                // Status messages are addressed to the reply subject of the
+-                // request they answer. One for an earlier fetch that gave up
+-                // locally says nothing about this one. Data messages from
+-                // earlier requests are still the consumer's, so they are kept.
 -                if (raw_msg.status_code > 0 and !std.mem.eql(u8, raw_msg.subject, reply_subject)) {
++                // ⚠️ `inbox_subscription` is a WILDCARD (`<prefix>.*`), so it also receives
++                // replies addressed to *earlier* fetches. A fetch that returns before its
++                // `expires` leaves its request parked on the server until the server times
++                // it out, and that late 408 then lands here while a newer fetch is waiting.
++                //
++                // Accepting it ends the new fetch early, the caller re-fetches at once, and
++                // that leaves another parked request behind — self-sustaining, settling at
++                // `expires / period` parked pulls. Measured against an idle stream: 500 ms
++                // expiry, a new fetch every 48 ms, num_waiting=10, ~21 pull requests/sec
++                // with nothing to deliver.
++                //
++                // ⚠️ Applies to STATUS frames only. JetStream delivers a *data* message
++                // with its original subject (`test.foo`), routed to us by subscription id,
++                // so matching those against the inbox would drop every real message — the
++                // e2e suite catches exactly that. Status frames are addressed to the inbox
++                // (`HMSG _INBOX.<prefix>.<fetch_id>`), so they can be attributed, and they
++                // are the only ones this loop treats as terminal.
 +                if (raw_msg.status_code > 0 and !self.hasReply(raw_msg.subject)) {
                      raw_msg.deinit();
                      continue;
@@ -168,7 +189,7 @@ index eb44d2b..7f4de51 100644
                  if (raw_msg.status_code == STATUS_NOT_FOUND) {
                      // No messages available (404, a no_wait pull): "nothing before the
                      // deadline", the same answer as an expiry.
-@@ -799,23 +849,17 @@ pub const PullInbox = struct {
+@@ -790,23 +853,17 @@ pub const PullInbox = struct {
          self.fetch_id_counter += 1;
          const fetch_id = self.fetch_id_counter;
  
@@ -199,7 +220,7 @@ index eb44d2b..7f4de51 100644
                  defer a.free(new_reply);
                  const request_json = try jsonStringifyAlloc(a, FetchRequest{
                      .batch = batch,
-@@ -828,8 +872,6 @@ pub const PullInbox = struct {
+@@ -819,8 +876,6 @@ pub const PullInbox = struct {
                  try self.js.nc.publishRequest(api_subject, new_reply, request_json);
                  sub.requestStart(new_reply, batch, timeout.toDeadline(self.js.nc.io));
              }
@@ -208,7 +229,7 @@ index eb44d2b..7f4de51 100644
          }
  
          const gone = try a.alloc(bool, subs.len);
-@@ -852,15 +894,16 @@ pub const PullInbox = struct {
+@@ -843,15 +898,16 @@ pub const PullInbox = struct {
                  error.Canceled, error.ConnectionClosed, error.SlowConsumer => return err,
              };
              if (raw_msg.status_code > 0) {

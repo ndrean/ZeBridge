@@ -1,8 +1,8 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index 52dc083..f6dec11 100644
+index 71cc2be..f38b45e 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -429,6 +429,16 @@ pub const MessageBatch = struct {
+@@ -442,6 +442,16 @@ pub const MessageBatch = struct {
  const fetch_idle_after_first: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } };
  
  pub const PullSubscription = struct {
@@ -18,8 +18,8 @@ index 52dc083..f6dec11 100644
 +    idle_after_first: Io.Timeout = fetch_idle_after_first,
      /// JetStream context
      js: JetStream,
-     /// Stream name
-@@ -630,7 +640,7 @@ pub const PullSubscription = struct {
+     /// Consumer information
+@@ -621,7 +631,7 @@ pub const PullSubscription = struct {
                      try messages.append(self.js.nc.allocator, js_msg_ptr);
                      // Something arrived: from here on wait only for what is already in flight.
                      if (messages.items.len == 1) {

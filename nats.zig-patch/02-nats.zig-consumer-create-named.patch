@@ -1,8 +1,8 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index cdbff7d..32dc37d 100644
+index 5f1ecc5..555ea41 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -929,10 +929,19 @@ pub const JetStream = struct {
+@@ -1135,10 +1135,19 @@ pub const JetStream = struct {
          if (config.durable_name) |n| try validation.validateConsumerName(n);
  
          log.info("adding consumer", .{});

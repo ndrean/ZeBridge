@@ -1,8 +1,8 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index 5c08ad8..06e77c5 100644
+index c4293ec..a1b8fa0 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -449,18 +449,30 @@ pub const PullSubscription = struct {
+@@ -454,17 +454,29 @@ pub const PullSubscription = struct {
      fetch_id_counter: u64 = 0,
      /// Mutex for fiber safety
      mutex: xsync.Mutex = .init,
@@ -10,7 +10,6 @@ index 5c08ad8..06e77c5 100644
 +    owns_inbox: bool = true,
  
      pub fn deinit(self: *PullSubscription) void {
-         if (self.owns_stream_name) self.js.nc.allocator.free(self.stream_name);
          self.consumer_info.deinit();
 -        self.inbox_subscription.deinit(); // This will unsubscribe and release the user reference
 -        self.js.nc.allocator.free(self.inbox_prefix);
@@ -23,7 +22,7 @@ index 5c08ad8..06e77c5 100644
  
 +    /// The pull API subject for this consumer, allocated from `a`.
 +    fn nextSubject(self: *PullSubscription, a: std.mem.Allocator) ![]u8 {
-+        return std.fmt.allocPrint(a, "{s}CONSUMER.MSG.NEXT.{s}.{s}", .{ default_api_prefix, self.stream_name, self.consumer_name });
++        return std.fmt.allocPrint(a, "{s}CONSUMER.MSG.NEXT.{s}.{s}", .{ default_api_prefix, self.consumer_info.value.stream_name, self.consumer_info.value.name });
 +    }
 +
      /// Fetch a batch of messages from the pull consumer
@@ -35,7 +34,7 @@ index 5c08ad8..06e77c5 100644
  
          try self.mutex.lock(self.js.nc.io);
          defer self.mutex.unlock(self.js.nc.io);
-@@ -633,6 +645,163 @@ pub const PullSubscription = struct {
+@@ -624,6 +636,163 @@ pub const PullSubscription = struct {
      }
  };
  
@@ -199,7 +198,7 @@ index 5c08ad8..06e77c5 100644
  /// JetStream push subscription
  pub const JetStreamSubscription = struct {
      /// Underlying NATS subscription
-@@ -694,6 +863,12 @@ pub const PullSubscribeOptions = struct {
+@@ -685,6 +854,12 @@ pub const PullSubscribeOptions = struct {
  
      /// Full consumer configuration
      config: ?ConsumerConfig = null,
@@ -212,7 +211,7 @@ index 5c08ad8..06e77c5 100644
  };
  
  pub const JetStreamOptions = struct {
-@@ -1646,6 +1821,21 @@ pub const JetStream = struct {
+@@ -1843,6 +2018,21 @@ pub const JetStream = struct {
      }
  
      /// Create a pull subscription for the specified stream
@@ -225,7 +224,7 @@ index 5c08ad8..06e77c5 100644
 +        const wildcard_subject = try std.fmt.allocPrint(self.nc.allocator, "{s}*", .{inbox_prefix});
 +        defer self.nc.allocator.free(wildcard_subject);
 +        const inbox_subscription = try self.nc.subscribeSync(wildcard_subject);
-+        errdefer self.nc.unsubscribe(inbox_subscription);
++        errdefer inbox_subscription.deinit();
 +        const shared = try self.nc.allocator.create(PullInbox);
 +        shared.* = .{ .js = self, .inbox_subscription = inbox_subscription, .inbox_prefix = inbox_prefix };
 +        return shared;
@@ -234,21 +233,20 @@ index 5c08ad8..06e77c5 100644
      pub fn pullSubscribe(self: JetStream, subject: ?[]const u8, durable: []const u8, options: PullSubscribeOptions) !*PullSubscription {
          // Resolve stream name
          const stream_name = if (options.stream) |s|
-@@ -1675,6 +1865,25 @@ pub const JetStream = struct {
-             consumer_info.value.config.durable_name orelse
-             durable;
+@@ -1854,6 +2044,24 @@ pub const JetStream = struct {
+ 
+         defer if (options.stream == null and subject != null) self.nc.allocator.free(stream_name);
  
 +        // A shared inbox: borrow its subscription and prefix, own nothing of them.
 +        if (options.inbox) |shared| {
++            var consumer_info = try self.getOrCreateConsumer(stream_name, subject, durable, options.config, true, null);
++            errdefer consumer_info.deinit();
 +            // The limits only ever go up, so several consumers on one inbox get the
 +            // largest of their windows.
 +            applyPendingLimits(shared.inbox_subscription, &consumer_info.value.config);
 +            const pull_subscription = try self.nc.allocator.create(PullSubscription);
 +            pull_subscription.* = PullSubscription{
 +                .js = self,
-+                .stream_name = stream_name,
-+                .owns_stream_name = owns_stream_name,
-+                .consumer_name = consumer_name,
 +                .consumer_info = consumer_info,
 +                .inbox_subscription = shared.inbox_subscription,
 +                .inbox_prefix = shared.inbox_prefix,

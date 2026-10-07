@@ -1,8 +1,8 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index fa62ba1..5c08ad8 100644
+index afa502e..c4293ec 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -224,6 +224,12 @@ pub const ConsumerConfig = struct {
+@@ -235,6 +235,12 @@ pub const ConsumerConfig = struct {
      deliver_group: ?[]const u8 = null,
      /// Enable flow control protocol for push consumers
      flow_control: ?bool = null,

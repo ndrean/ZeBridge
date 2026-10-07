@@ -1,8 +1,8 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index 24a555c..cdbff7d 100644
+index 65ea251..5f1ecc5 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -1108,6 +1108,34 @@ pub const JetStream = struct {
+@@ -1314,6 +1314,34 @@ pub const JetStream = struct {
          if (options.next_by_subj) |subject| try validation.validateSubject(subject);
          log.debug("getMsgDirect: Stream name validation passed", .{});
  

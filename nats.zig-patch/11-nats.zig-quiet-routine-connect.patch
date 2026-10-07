@@ -25,10 +25,10 @@ index 0ebcd09..d4e4738 100644
          // Invoke reconnected callback last, so it observes a connection with
          // subscriptions restored and buffered publishes already queued ahead
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index 06e77c5..9c196cd 100644
+index a1b8fa0..1b283c3 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -1187,7 +1187,7 @@ pub const JetStream = struct {
+@@ -1369,7 +1369,7 @@ pub const JetStream = struct {
          if (config.name) |n| try validation.validateConsumerName(n);
          if (config.durable_name) |n| try validation.validateConsumerName(n);
  

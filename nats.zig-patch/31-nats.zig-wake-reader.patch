@@ -112,7 +112,7 @@ index a0096f8..e7520af 100644
 +    try std.testing.expect(queue.tryPop() == null);
 +}
 diff --git a/src/subscription.zig b/src/subscription.zig
-index 6811bca..170e3eb 100644
+index 987b3b0..250cf20 100644
 --- a/src/subscription.zig
 +++ b/src/subscription.zig
 @@ -65,6 +65,11 @@ pub const Subscription = struct {

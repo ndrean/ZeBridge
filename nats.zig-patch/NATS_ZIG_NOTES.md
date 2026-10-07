@@ -3,10 +3,11 @@
 Fixes made while migrating my app onto this library.
 Each entry: what broke, how it showed up, what changed. Upstream candidates unless noted.
 
-The submodule stays at the upstream commit the parent records (`d4cd40d`); the changes
-live in its working tree and, since 2026-09-23, as an **ordered series** of seventeen
-patches here, `01-…` to `17-…`, each the exact diff between two consecutive states. They
-apply in numeric order and only in that order. Two scripts keep it honest:
+The submodule sits on an upstream commit (`b8ffdd9` since 2026-10-07, §35; `d4cd40d`
+before); the changes live in its working tree and, since 2026-09-23, as an **ordered
+series** of patches here, `01-…` onwards, each the exact diff between two consecutive
+states. They apply in numeric order and only in that order; a number may be missing (03,
+dropped in §35). Two scripts keep it honest:
 
     nats.zig-patch/check-series.sh          upstream + series == working tree, or say where not
     nats.zig-patch/new-patch.sh <topic>     cut the next patch as diff(upstream + series, working tree)
@@ -1178,3 +1179,44 @@ head start plus a round trip) — cancelling the hanging IPv6 dial returns at on
 leaf's open port over IPv6 in 24–31 ms as before; the hub (IPv4 only) 48 ms. nats.zig unit
 140/140, e2e 185/185; libzb 38/40 (2 skipped), the bridge 342/342; a libzb client through
 the leaf 36 ms median, straight to the hub 33–41 ms. `check-series.sh` green over 34.
+
+## 35. The series rebased onto upstream `b8ffdd9` (2026-10-07)
+
+**How it appeared.** Before porting to Zig 0.17, a comparison of the 34 patches with
+upstream. Upstream had rewritten its history: `d4cd40d` is no longer an ancestor of
+`main`, and survives on GitHub only on the branch `fix/subscription-handler-self-join`.
+Its tree is identical to upstream's `6fadc18` (#157). Since then upstream has 11
+commits, in `jetstream.zig`, `jetstream_kv.zig`, `subscription.zig` and the tests:
+#181 (join a subscription's handler before releasing it), #178 (consumer create races,
+unset config fields left to the server), #183 `d9b7074` (a pull subscription reads its
+stream and consumer names from its consumer info), #184 `913455a` (ignore a status
+addressed to an earlier fetch), #185 `e59cdde` (KV entries removed by the server are
+deletes), #186 (nats-server 2.15 in CI).
+
+**Change.** The series re-cut on `b8ffdd9`, one commit per patch, with the same file names:
+
+- **03 (stale-408) is dropped.** #183 and #184 fix both of its halves, the freed stream
+  name and the late 408, with tests.
+- **05** keeps its contract, so upstream's new test "ignores a status left over from an
+  earlier request" expects `error.Timeout` from its empty first fetch instead of an empty
+  batch. The two test sets sit side by side.
+- **07** creates the consumer inside its shared-inbox branch, because #178 moved
+  `getOrCreateConsumer` after the inbox subscribe. It reads the names from
+  `consumer_info.value`, because #183 removed `stream_name`, `owns_stream_name` and
+  `consumer_name`. On error it calls `inbox_subscription.deinit()`, #181's idiom.
+- **17, 20, 22** build the `CONSUMER.MSG.NEXT` subject from `consumer_info.value.*`. 22
+  matches a delivered message to its consumer by `consumer_info.value.name`.
+- **23** keeps our `hasReply` over #184's single `reply_subject`: several requests stay
+  open across fetches, and a status for any of them is ours.
+- **Unchanged in content:** 04, 08, 09, 10, 14, 16, 19, 28, 29, 32, 34 are
+  byte-identical. The other 16 only moved: same lines, new line numbers and context.
+
+ZeBridge's libzb read `PullSubscription.consumer_name`; it reads
+`consumer_info.value.name` now.
+
+**Verified** (Zig 0.16.0): `check-series.sh` green over 33 on `b8ffdd9`. nats.zig unit
+141/141; e2e 191/191 against nats-server 2.15 (the suite's compose cluster through
+OrbStack). The bridge 352/352; libzb 39/41 (2 skipped, live). A second port, made
+separately, gave the same `src/`, apart from two comments and the error path of 07, which
+there still called `nc.unsubscribe`.
+

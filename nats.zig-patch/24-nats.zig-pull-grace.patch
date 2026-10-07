@@ -1,8 +1,8 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index 7f4de51..1ae1837 100644
+index fe2e9f0..56907da 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -428,6 +428,10 @@ pub const MessageBatch = struct {
+@@ -441,6 +441,10 @@ pub const MessageBatch = struct {
  /// ZeBridge's libzb, 10 ms here made a 13 ms row, 1 ms makes it 3 ms.
  const fetch_idle_after_first: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } };
  
@@ -13,7 +13,7 @@ index 7f4de51..1ae1837 100644
  /// One outstanding pull request of a `PullSubscription` (see `reqs`).
  const PullRequest = struct {
      reply: [160]u8 = undefined,
-@@ -585,7 +589,21 @@ pub const PullSubscription = struct {
+@@ -589,7 +593,21 @@ pub const PullSubscription = struct {
          }
          if (oldest) |o| {
              o.left -= 1;

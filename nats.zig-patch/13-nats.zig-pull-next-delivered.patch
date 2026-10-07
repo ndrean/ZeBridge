@@ -1,8 +1,8 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index afbd69d..3e92e01 100644
+index ce231a4..cb3c45b 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -468,6 +468,33 @@ pub const PullSubscription = struct {
+@@ -472,6 +472,33 @@ pub const PullSubscription = struct {
      }
  
      /// Fetch a batch of messages from the pull consumer

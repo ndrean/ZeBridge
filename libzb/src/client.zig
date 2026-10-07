@@ -2910,8 +2910,8 @@ pub const SyncClient = struct {
                         gap_reopens = 0;
                         reopen_pos = idle_pos;
                     }
-                    if (gap_reopens < 50 and self.unackedOn(stream, sub.consumer_name) > 0) {
-                        log.warn("{s}: drain idle with deliveries unacknowledged on {s} — lost in transit; recreating the consumer from position {d}", .{ stream, sub.consumer_name, try self.storedSeq(stream) });
+                    if (gap_reopens < 50 and self.unackedOn(stream, sub.consumer_info.value.name) > 0) {
+                        log.warn("{s}: drain idle with deliveries unacknowledged on {s} — lost in transit; recreating the consumer from position {d}", .{ stream, sub.consumer_info.value.name, try self.storedSeq(stream) });
                         gap_reopens += 1;
                         self.resetFlow(stream);
                         const fresh = try self.openConsumer(stream, 30 * std.time.ns_per_s, null);
@@ -2947,7 +2947,7 @@ pub const SyncClient = struct {
             defer ba.deinit();
             // §10jc: duplicates out, a lost delivery flagged — before the hole scan, which
             // must not read a redelivered old message as the batch's predecessor.
-            const keep = try self.admit(ba.allocator(), stream, sub.consumer_name, batch.messages);
+            const keep = try self.admit(ba.allocator(), stream, sub.consumer_info.value.name, batch.messages);
             const pos = try self.storedSeq(stream);
             if (self.firstHole(stream, pos, keep)) |j| {
                 var ms = pos;
@@ -2984,7 +2984,7 @@ pub const SyncClient = struct {
             }
         }
         const at = try self.storedSeq(stream);
-        const to = self.caughtUpTo(stream, sub.consumer_name, at);
+        const to = self.caughtUpTo(stream, sub.consumer_info.value.name, at);
         if (to > at) try self.persistSeq(stream, to);
         log.info("{s}: drained to seq {d}", .{ stream, @max(to, at) });
         return false;
@@ -3664,14 +3664,14 @@ pub const SyncClient = struct {
                 if (now - tl.watch_ms < tail_watch_ms) continue;
                 tl.watch_ms = now;
                 const pos = try self.storedSeq(stream);
-                switch (self.tailHealth(stream, tl.sub.consumer_name, pos, now - tl.delivered_ms)) {
+                switch (self.tailHealth(stream, tl.sub.consumer_info.value.name, pos, now - tl.delivered_ms)) {
                     .fine => |to| if (to > pos) try self.persistSeq(stream, to),
                     .deaf => |pending| {
-                        log.warn("{s}: tail deaf — {d} message(s) pending on the server for {s}, nothing delivered for {d} s (position {d}); reopening", .{ stream, pending, tl.sub.consumer_name, @divTrunc(now - tl.delivered_ms, 1000), pos });
+                        log.warn("{s}: tail deaf — {d} message(s) pending on the server for {s}, nothing delivered for {d} s (position {d}); reopening", .{ stream, pending, tl.sub.consumer_info.value.name, @divTrunc(now - tl.delivered_ms, 1000), pos });
                         self.reopenTail(tl) catch |e| self.markDark(stream, e);
                     },
                     .gone => {
-                        log.warn("{s}: tail consumer {s} gone from the server (position {d}) — reopening", .{ stream, tl.sub.consumer_name, pos });
+                        log.warn("{s}: tail consumer {s} gone from the server (position {d}) — reopening", .{ stream, tl.sub.consumer_info.value.name, pos });
                         self.reopenTail(tl) catch |e| self.markDark(stream, e);
                     },
                     .pruned => |first| {
@@ -3690,7 +3690,7 @@ pub const SyncClient = struct {
             if (self.tailFor(stream)) |tl| tl.delivered_ms = nowMillis() else |_| {}
             var last = try self.storedSeq(stream);
             // §10jc: duplicates out and a lost delivery flagged, before anything else.
-            const cons_name: []const u8 = if (self.tailFor(stream)) |t2| t2.sub.consumer_name else |_| "";
+            const cons_name: []const u8 = if (self.tailFor(stream)) |t2| t2.sub.consumer_info.value.name else |_| "";
             const admitted = try self.admit(a, stream, cons_name, mine.items);
             // §10ei: the gap rule, LIVE. The next message this tail is handed is `last + 1`
             // unless the stream pruned under the consumer while the host did not poll —

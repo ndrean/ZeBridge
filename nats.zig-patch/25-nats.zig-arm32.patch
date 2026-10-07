@@ -1,4 +1,4 @@
-diff --git asrc/atomic_u64.zig b/src/atomic_u64.zig
+diff --git a/src/atomic_u64.zig b/src/atomic_u64.zig
 new file mode 100644
 index 0000000..b97e1ce
 --- /dev/null
@@ -89,10 +89,10 @@ index 3ea3913..5736663 100644
      // Guards `subscriptions`. Acquired after `mutex` when both are held; see
      // the lock-order note on `mutex`.
 diff --git a/src/jetstream_kv.zig b/src/jetstream_kv.zig
-index 30ca218..7acde3d 100644
+index a6a6afc..5c4f045 100644
 --- a/src/jetstream_kv.zig
 +++ b/src/jetstream_kv.zig
-@@ -264,7 +264,7 @@ pub const KVWatcher = struct {
+@@ -263,7 +263,7 @@ pub const KVWatcher = struct {
                  self.received += 1;
                  // Set init_pending from first message if not set
                  if (self.init_pending == 0) {
@@ -141,7 +141,7 @@ index c6017f5..0e8d70d 100644
      // not provide; with TLS compiled out the whole file is skipped.
      if (@import("build_options").use_tls) {
 diff --git a/src/subscription.zig b/src/subscription.zig
-index ba3fd08..6811bca 100644
+index 5919333..987b3b0 100644
 --- a/src/subscription.zig
 +++ b/src/subscription.zig
 @@ -12,6 +12,7 @@

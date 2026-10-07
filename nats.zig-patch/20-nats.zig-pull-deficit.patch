@@ -1,8 +1,8 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index f6dec11..b1eb7f1 100644
+index f38b45e..23fcfcb 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -521,24 +521,36 @@ pub const PullSubscription = struct {
+@@ -525,24 +525,36 @@ pub const PullSubscription = struct {
          const reply_subject = try std.fmt.allocPrint(self.js.nc.allocator, "{s}{d}", .{ self.inbox_prefix, fetch_id });
          defer self.js.nc.allocator.free(reply_subject);
  
@@ -36,10 +36,10 @@ index f6dec11..b1eb7f1 100644
 +            defer self.js.nc.allocator.free(request_json);
  
 -        // Build the full API subject
--        const api_subject = try self.js.apiSubject(self.js.nc.allocator, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.stream_name, self.consumer_name });
+-        const api_subject = try self.js.apiSubject(self.js.nc.allocator, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.consumer_info.value.stream_name, self.consumer_info.value.name });
 -        defer self.js.nc.allocator.free(api_subject);
 +            // Build the full API subject
-+            const api_subject = try self.js.apiSubject(self.js.nc.allocator, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.stream_name, self.consumer_name });
++            const api_subject = try self.js.apiSubject(self.js.nc.allocator, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.consumer_info.value.stream_name, self.consumer_info.value.name });
 +            defer self.js.nc.allocator.free(api_subject);
  
 -        // Send the pull request with reply subject
@@ -50,7 +50,7 @@ index f6dec11..b1eb7f1 100644
  
          // Collect messages
          var messages = std.ArrayList(*JetStreamMessage).empty;
-@@ -562,8 +574,9 @@ pub const PullSubscription = struct {
+@@ -566,8 +578,9 @@ pub const PullSubscription = struct {
          // this reply subject and dropped by the guard below on a later fetch.
          var receive_deadline = timeout.toDeadline(self.js.nc.io);
  
@@ -62,7 +62,7 @@ index f6dec11..b1eb7f1 100644
              if (self.inbox_subscription.nextMsgTimeout(receive_deadline)) |raw_msg| {
                  log.debug("Message: subject={s}, reply={s}, data='{s}'", .{ raw_msg.subject, raw_msg.reply orelse "none", raw_msg.data });
  
-@@ -760,17 +773,26 @@ pub const PullInbox = struct {
+@@ -751,17 +764,26 @@ pub const PullInbox = struct {
              made += 1;
          }
  
@@ -99,7 +99,7 @@ index f6dec11..b1eb7f1 100644
          }
  
          const gone = try a.alloc(bool, subs.len);
-@@ -786,7 +808,6 @@ pub const PullInbox = struct {
+@@ -777,7 +799,6 @@ pub const PullInbox = struct {
          errdefer for (messages.items) |m| m.deinit();
  
          var receive_deadline = timeout.toDeadline(self.js.nc.io);

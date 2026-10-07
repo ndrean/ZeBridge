@@ -138,10 +138,10 @@ index e95d278..2de835e 100644
  
  test "inbox generation" {
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index 3e92e01..5d382c6 100644
+index cb3c45b..72f67be 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -1643,7 +1643,7 @@ pub const JetStream = struct {
+@@ -1824,7 +1824,7 @@ pub const JetStream = struct {
          // Prepare consumer config, generating deliver_subject if needed
          var config = options.config orelse ConsumerConfig{};
          const generated_deliver_subject = if (config.deliver_subject == null)
@@ -150,7 +150,7 @@ index 3e92e01..5d382c6 100644
          else
              null;
          errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
-@@ -1706,7 +1706,7 @@ pub const JetStream = struct {
+@@ -1891,7 +1891,7 @@ pub const JetStream = struct {
  
          // Generate deliver_subject if not provided in the config
          const generated_deliver_subject = if (config.deliver_subject == null)
@@ -159,7 +159,7 @@ index 3e92e01..5d382c6 100644
          else
              null;
          errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
-@@ -1760,7 +1760,7 @@ pub const JetStream = struct {
+@@ -1948,7 +1948,7 @@ pub const JetStream = struct {
  
          // Generate deliver_subject if not provided in the config
          const generated_deliver_subject = if (config.deliver_subject == null)
@@ -168,7 +168,7 @@ index 3e92e01..5d382c6 100644
          else
              null;
          errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
-@@ -1818,7 +1818,7 @@ pub const JetStream = struct {
+@@ -2011,7 +2011,7 @@ pub const JetStream = struct {
  
          // Generate deliver_subject if not provided in the config
          const generated_deliver_subject = if (config.deliver_subject == null)
@@ -177,7 +177,7 @@ index 3e92e01..5d382c6 100644
          else
              null;
          errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
-@@ -1854,7 +1854,7 @@ pub const JetStream = struct {
+@@ -2051,7 +2051,7 @@ pub const JetStream = struct {
      /// Create a pull subscription for the specified stream
      /// One inbox for several pull consumers — see `PullInbox`.
      pub fn pullInbox(self: JetStream) !*PullInbox {
@@ -186,7 +186,7 @@ index 3e92e01..5d382c6 100644
          defer self.nc.allocator.free(inbox_base);
          const inbox_prefix = try std.fmt.allocPrint(self.nc.allocator, "{s}.", .{inbox_base});
          errdefer self.nc.allocator.free(inbox_prefix);
-@@ -1916,7 +1916,7 @@ pub const JetStream = struct {
+@@ -2094,7 +2094,7 @@ pub const JetStream = struct {
          }
  
          // Generate unique inbox prefix for this pull subscription
@@ -196,10 +196,10 @@ index 3e92e01..5d382c6 100644
  
          const inbox_prefix = try std.fmt.allocPrint(self.nc.allocator, "{s}.", .{inbox_base});
 diff --git a/src/jetstream_kv.zig b/src/jetstream_kv.zig
-index 2902242..30ca218 100644
+index 04b60bf..a6a6afc 100644
 --- a/src/jetstream_kv.zig
 +++ b/src/jetstream_kv.zig
-@@ -203,7 +203,7 @@ pub const KVWatcher = struct {
+@@ -202,7 +202,7 @@ pub const KVWatcher = struct {
      pub fn init(kv: *KV, subjects: []const []const u8, options: WatchOptions) !Self {
          const allocator = kv.js.nc.allocator;
  

@@ -1,5 +1,5 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index c6445a8..fa62ba1 100644
+index 555ea41..afa502e 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
 @@ -21,6 +21,7 @@ const STATUS_CONTROL = message_mod.STATUS_CONTROL;
@@ -10,7 +10,7 @@ index c6445a8..fa62ba1 100644
  const Connection = @import("connection.zig").Connection;
  const Subscription = @import("subscription.zig").Subscription;
  const subscription_mod = @import("subscription.zig");
-@@ -396,6 +397,12 @@ pub const MessageBatch = struct {
+@@ -409,6 +410,12 @@ pub const MessageBatch = struct {
      /// Array of JetStream messages
      messages: []*JetStreamMessage,
      /// Any error that occurred during fetch
@@ -23,7 +23,7 @@ index c6445a8..fa62ba1 100644
      err: ?anyerror = null,
  
      pub fn deinit(self: *MessageBatch) void {
-@@ -409,6 +416,12 @@ pub const MessageBatch = struct {
+@@ -422,6 +429,12 @@ pub const MessageBatch = struct {
  };
  
  /// JetStream pull subscription
@@ -36,7 +36,7 @@ index c6445a8..fa62ba1 100644
  pub const PullSubscription = struct {
      /// JetStream context
      js: JetStream,
-@@ -482,7 +495,17 @@ pub const PullSubscription = struct {
+@@ -486,7 +499,17 @@ pub const PullSubscription = struct {
  
          // Convert the timeout to an absolute deadline so that receiving a
          // message (or a heartbeat) does not re-arm the full timeout.
@@ -55,7 +55,7 @@ index c6445a8..fa62ba1 100644
  
          // Collect messages until batch is complete or timeout
          while (!batch_complete and messages.items.len < request.batch) {
-@@ -512,8 +535,22 @@ pub const PullSubscription = struct {
+@@ -503,8 +526,22 @@ pub const PullSubscription = struct {
                  }
  
                  if (raw_msg.status_code == STATUS_NOT_FOUND) {
@@ -79,7 +79,7 @@ index c6445a8..fa62ba1 100644
                      batch_complete = true;
                      break;
                  } else if (raw_msg.status_code == STATUS_TIMEOUT) {
-@@ -546,10 +583,16 @@ pub const PullSubscription = struct {
+@@ -537,10 +574,16 @@ pub const PullSubscription = struct {
                      errdefer js_msg_ptr.deinit();
  
                      try messages.append(self.js.nc.allocator, js_msg_ptr);
@@ -97,7 +97,7 @@ index c6445a8..fa62ba1 100644
                      batch_complete = true;
                  },
                  error.Canceled, error.ConnectionClosed, error.SlowConsumer => {
-@@ -562,12 +605,23 @@ pub const PullSubscription = struct {
+@@ -553,12 +596,23 @@ pub const PullSubscription = struct {
              }
          }
  
@@ -123,7 +123,7 @@ index c6445a8..fa62ba1 100644
          };
      }
 diff --git a/tests/jetstream_pull_test.zig b/tests/jetstream_pull_test.zig
-index f6453fa..7a80f03 100644
+index ee5b3a8..5f64faf 100644
 --- a/tests/jetstream_pull_test.zig
 +++ b/tests/jetstream_pull_test.zig
 @@ -50,7 +50,7 @@ test "JetStream pull consumer basic fetch" {
@@ -135,9 +135,21 @@ index f6453fa..7a80f03 100644
      try testing.expectEqual(2, batch.messages.len);
  
      // Check message contents
-@@ -79,3 +79,165 @@ test "JetStream pull consumer basic fetch" {
-     // Acknowledge messages
-     try batch2.messages[0].ack();
+@@ -131,9 +131,8 @@ test "JetStream pull fetch ignores a status left over from an earlier request" {
+ 
+     // Nothing to fetch: this gives up locally, and the server's 408 for the
+     // expired request arrives afterwards.
+-    var empty = try subscription.fetch(1, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } });
+-    defer empty.deinit();
+-    try testing.expectEqual(0, empty.messages.len);
++    // (ZeBridge series, patch 05: an empty fetch is error.Timeout, not an empty batch.)
++    try testing.expectError(error.Timeout, subscription.fetch(1, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }));
+     try io.sleep(.fromMilliseconds(200), .awake);
+ 
+     try nc.publish("test.pull.stale.msg", "fresh");
+@@ -146,3 +145,165 @@ test "JetStream pull fetch ignores a status left over from an earlier request" {
+     try testing.expectEqual(1, batch.messages.len);
+     try testing.expectEqualStrings("fresh", batch.messages[0].msg.data);
  }
 +
 +// ── fetch contract (2026-08-29 patch, NOTES.md "fetch: return on the first message") ──

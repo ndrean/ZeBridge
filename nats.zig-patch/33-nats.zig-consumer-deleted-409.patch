@@ -1,5 +1,5 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index 983ad96..667add3 100644
+index c3539c1..76ae036 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
 @@ -22,6 +22,21 @@ const STATUS_NOT_FOUND = message_mod.STATUS_NOT_FOUND;
@@ -24,7 +24,7 @@ index 983ad96..667add3 100644
  const Connection = @import("connection.zig").Connection;
  const Subscription = @import("subscription.zig").Subscription;
  const subscription_mod = @import("subscription.zig");
-@@ -730,8 +745,9 @@ pub const PullSubscription = struct {
+@@ -734,8 +749,9 @@ pub const PullSubscription = struct {
                      if (messages.items.len == 0) fetch_error = error.Timeout;
                      batch_complete = true;
                      break;
@@ -36,7 +36,7 @@ index 983ad96..667add3 100644
                      // the consumer was deleted, reaped by its inactive threshold, or never
                      // created. Folding it into the unknown-status branch (as before) made
                      // a gone consumer look exactly like an idle one: the caller waited out
-@@ -964,12 +980,13 @@ pub const PullInbox = struct {
+@@ -968,12 +984,13 @@ pub const PullInbox = struct {
                      if (sub.hasReply(raw_msg.subject)) break i;
                  } else null;
                  const code = raw_msg.status_code;

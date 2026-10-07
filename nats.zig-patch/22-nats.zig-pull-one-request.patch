@@ -1,8 +1,8 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index 15849e2..eb44d2b 100644
+index 7819090..072870d 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -446,6 +446,19 @@ pub const PullSubscription = struct {
+@@ -459,6 +459,19 @@ pub const PullSubscription = struct {
      /// (measured: an iPhone on Wi-Fi, 100 × 250 KB messages per request, disconnected 66
      /// times as a slow consumer). A cap keeps the queue bounded.
      max_bytes: ?u64 = null,
@@ -21,8 +21,8 @@ index 15849e2..eb44d2b 100644
 +    req_deadline: Io.Timeout = .none,
      /// JetStream context
      js: JetStream,
-     /// Stream name
-@@ -512,6 +525,35 @@ pub const PullSubscription = struct {
+     /// Consumer information
+@@ -516,6 +529,35 @@ pub const PullSubscription = struct {
          }
      }
  
@@ -58,7 +58,7 @@ index 15849e2..eb44d2b 100644
      pub fn fetch(self: *PullSubscription, batch: usize, timeout: Io.Timeout) !MessageBatch {
          if (batch == 0) return error.InvalidBatchSize;
          // A shared inbox is read by `PullInbox.fetch` only: reading it here would
-@@ -521,44 +563,30 @@ pub const PullSubscription = struct {
+@@ -525,44 +567,30 @@ pub const PullSubscription = struct {
          try self.mutex.lock(self.js.nc.io);
          defer self.mutex.unlock(self.js.nc.io);
  
@@ -107,7 +107,7 @@ index 15849e2..eb44d2b 100644
              defer self.js.nc.allocator.free(request_json);
 -
 -            // Build the full API subject
-             const api_subject = try self.js.apiSubject(self.js.nc.allocator, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.stream_name, self.consumer_name });
+             const api_subject = try self.js.apiSubject(self.js.nc.allocator, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.consumer_info.value.stream_name, self.consumer_info.value.name });
              defer self.js.nc.allocator.free(api_subject);
 -
 -            // Send the pull request with reply subject
@@ -120,7 +120,7 @@ index 15849e2..eb44d2b 100644
  
          // Collect messages
          var messages = std.ArrayList(*JetStreamMessage).empty;
-@@ -610,6 +638,7 @@ pub const PullSubscription = struct {
+@@ -601,6 +629,7 @@ pub const PullSubscription = struct {
                      continue;
                  }
  
@@ -128,7 +128,7 @@ index 15849e2..eb44d2b 100644
                  if (raw_msg.status_code == STATUS_NOT_FOUND) {
                      // No messages available (404, a no_wait pull): "nothing before the
                      // deadline", the same answer as an expiry.
-@@ -659,6 +688,7 @@ pub const PullSubscription = struct {
+@@ -650,6 +679,7 @@ pub const PullSubscription = struct {
                      errdefer js_msg_ptr.deinit();
  
                      try messages.append(self.js.nc.allocator, js_msg_ptr);
@@ -136,7 +136,7 @@ index 15849e2..eb44d2b 100644
                      // Something arrived: from here on wait only for what is already in flight.
                      if (messages.items.len == 1) {
                          receive_deadline = self.idle_after_first.toDeadline(self.js.nc.io);
-@@ -777,33 +807,29 @@ pub const PullInbox = struct {
+@@ -768,33 +798,29 @@ pub const PullInbox = struct {
              for (replies[0..made]) |r| a.free(r);
              a.free(replies);
          }
@@ -188,7 +188,7 @@ index 15849e2..eb44d2b 100644
          }
  
          const gone = try a.alloc(bool, subs.len);
-@@ -834,6 +860,7 @@ pub const PullInbox = struct {
+@@ -825,6 +851,7 @@ pub const PullInbox = struct {
                  raw_msg.deinit();
                  const i = idx orelse continue;
                  if (code == STATUS_CONTROL) continue; // heartbeat
@@ -196,12 +196,12 @@ index 15849e2..eb44d2b 100644
                  if (done[i]) continue;
                  if (code == STATUS_NO_RESPONSE) gone[i] = true;
                  // 404, 408, 409, 503 — all terminal for this consumer's pull.
-@@ -847,6 +874,11 @@ pub const PullInbox = struct {
+@@ -838,6 +865,11 @@ pub const PullInbox = struct {
              };
              errdefer js_msg.deinit();
              try messages.append(a, js_msg);
 +            // Owed by whichever consumer delivered it (its ack metadata names it).
-+            for (subs) |sub| if (std.mem.eql(u8, sub.consumer_name, js_msg.metadata.consumer)) {
++            for (subs) |sub| if (std.mem.eql(u8, sub.consumer_info.value.name, js_msg.metadata.consumer)) {
 +                sub.requestDelivered();
 +                break;
 +            };

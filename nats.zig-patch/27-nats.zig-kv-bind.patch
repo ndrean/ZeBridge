@@ -1,8 +1,8 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index 51a8dee..53a8da9 100644
+index d11754d..ed3b8e5 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -2238,6 +2238,13 @@ pub const JetStream = struct {
+@@ -2431,6 +2431,13 @@ pub const JetStream = struct {
          return try manager.openBucket(bucket_name);
      }
  
@@ -17,10 +17,10 @@ index 51a8dee..53a8da9 100644
      pub fn objectStoreManager(self: JetStream) @import("jetstream_objstore.zig").ObjectStoreManager {
          const jetstream_objstore = @import("jetstream_objstore.zig");
 diff --git a/src/jetstream_kv.zig b/src/jetstream_kv.zig
-index 7acde3d..0b9a352 100644
+index 5c4f045..fc38c5a 100644
 --- a/src/jetstream_kv.zig
 +++ b/src/jetstream_kv.zig
-@@ -870,6 +870,15 @@ pub const KVManager = struct {
+@@ -844,6 +844,15 @@ pub const KVManager = struct {
          return try KV.init(self.js, bucket_name);
      }
  
