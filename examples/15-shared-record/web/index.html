@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Shared record</title>
+    <style>
+      :root { color-scheme: light dark; font: 15px/1.45 system-ui, sans-serif; }
+      body { margin: 0 auto; max-width: 720px; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+      h1 { font-size: 17px; margin: 0; }
+      form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+      select, input, button { font: inherit; padding: 6px 8px; border-radius: 6px; border: 1px solid #8886; }
+      input { flex: 1 1 180px; min-width: 0; }
+      button { cursor: pointer; }
+      #who, #status, #sent { font-size: 12px; opacity: .75; }
+      .bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      #chip { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: #1a7f3722; color: #1a7f37; }
+      #chip.off { background: #d1361f22; color: #d1361f; }
+      body.offline #row { opacity: .6; }
+      #row { padding: 10px 12px; border: 1px solid #8884; border-radius: 8px; overflow-wrap: anywhere; }
+      #row b { font-weight: 600; }
+      #row .part { margin-top: 6px; }
+      #row .reg { white-space: nowrap; }
+      #row .meta { font-size: 12px; opacity: .7; margin-top: 6px; }
+      h2 { font-size: 14px; margin: 0 0 6px; }
+      h2 small { font-weight: normal; opacity: .6; }
+      #activity { list-style: none; margin: 0; padding: 0; font-size: 13px; display: flex; flex-direction: column; gap: 3px; }
+      #activity li { padding: 3px 8px; border-left: 3px solid #8885; overflow-wrap: anywhere; }
+      #activity time { opacity: .6; margin-right: 6px; font-variant-numeric: tabular-nums; }
+      #activity .sent { border-color: #1f6feb; }
+      #activity .accepted, #activity .rebased { border-color: #1a7f37; }
+      #activity .rebased { background: #1a7f3714; }
+      #activity .stale, #activity .net { border-color: #d68910; }
+      #activity .lost, #activity .rejected { border-color: #d1361f; background: #d1361f14; }
+    </style>
+  </head>
+  <body>
+    <h1>Site survey</h1>
+    <div class="bar"><span id="who"></span> <button id="net" type="button" disabled>Go offline</button> <span id="chip"></span></div>
+    <form id="edit">
+      <select id="field" aria-label="field">
+        <option>access</option>
+        <option>hazard</option>
+        <option>contact</option>
+        <option>rating</option>
+        <option>notes</option>
+        <option>doc</option>
+      </select>
+      <select id="register" aria-label="register in doc" hidden>
+        <option>access</option>
+        <option>hazard</option>
+        <option>contact</option>
+        <option>rating</option>
+        <option>notes</option>
+      </select>
+      <input id="value" placeholder="a value" autocomplete="off" />
+      <button>Write</button>
+    </form>
+    <div id="sent"></div>
+    <div id="row">connecting…</div>
+    <section>
+      <h2>Activity <small>newest first</small></h2>
+      <ol id="activity"></ol>
+    </section>
+    <div id="status"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
