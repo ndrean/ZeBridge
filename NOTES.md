@@ -19217,3 +19217,24 @@ caught up ~0.5 s. ts_alice: no gap at all, connect 0.20 s (was 10.32 s, a false 
 wait for a cut). ts_bob: connect 0.24 s both legs; one REAL gap — offline 30 s, CDC_PUBLIC
 pruned past its position (116 → first 122) — the re-seed refused on CDC_acme (D2, the replica
 newer than the chain), handled in the background without holding connect.
+
+Step 4, measured before writing it (2026-10-08): the hot paths through WASM would not move
+zb-client-ts on Node. Firehose run B (1M preloaded, 5 s burst, 60 s load, zb-client-ts only)
+under `--cpu-prof`, on a quiet machine: 25k rows/s → 55k events/s, applied 29,907 rows/s;
+37.5k rows/s → 27,351 rows/s (PostgreSQL and the bridge fell behind there too); both exact.
+While behind, the worker is busy 99–100%; of that, `exec` (better-sqlite3 → SQLite) 74–79%,
+msgpack decode ~8%, planCdcBulk and the rest of core ~5%, GC ~2%. WASM could take at most the
+~12% of decode and planning. (A first run with the owner's Zig builds alongside showed 35%
+idle — contention, not a fetch stall; discarded.)
+On the firehose's shape (uuid keys, indexes on batch and updated_at, 2M rows), isolated:
+nodeStorage's exec per row 61k rows/s, a pre-bound synchronous loop 51k (the wrapper costs
+nothing measurable; the difference is run noise), segments sorted by key +3–8%. The Node
+ceiling is SQLite's own work on that table. libzb uses the same pragmas and does not sort its
+tail either. So: the WASM core stays the ONE SOURCE OF RULES; performance through WASM is a
+browser question (sqlite-wasm on OPFS behind a worker, where each call crosses a boundary),
+to be measured there before any hot path moves.
+Decided (owner, 2026-10-08): step 4 closed. Phones and desktops run libzb (React Native and
+Flutter through it); zb-client-ts is the browser and Node client, its rules from libzb's WASM
+core, its shell in JS. No browser-only hot path unless someone needs the browser faster.
+The live gap is ~1.5× (§10jb: libzb ~50k events/s, zb-client-ts ~33k); the large gap is the
+seed, and phones already take libzb's.
