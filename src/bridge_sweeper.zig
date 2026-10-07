@@ -424,6 +424,13 @@ pub fn main(init: std.process.Init) !void {
 
     // Run loop
     var first_pass = true;
+    // Said once after the first pass, then once an hour: a sweeper with nothing to reap is
+    // otherwise silent, and silence cannot be told from a hang. Each pass: debug.
+    var passes: u64 = 0;
+    var hour_passes: u64 = 0;
+    var hour_reaped: u64 = 0;
+    var hour_unpublished: u64 = 0;
+    var hour_start_ms = utils.getMilliTimestamp();
     while (!stop.load(.acquire)) {
         if (c.PQstatus(pg_conn) == c.CONNECTION_BAD) {
             log.warn("Connection lost. Reconnecting...", .{});
@@ -566,6 +573,7 @@ pub fn main(init: std.process.Init) !void {
         // A failure is logged and the loop continues: an unpublished watermark leaves
         // clients on the previous, *older* value, which is conservative. Stopping the
         // sweep over it would let tombstones accumulate instead, which is not.
+        var published = false;
         {
             const wm_secs = try utils.allocPrintZ(aa, "{d}", .{threshold_ms / 1000});
             const wm_ms = try utils.allocPrintZ(aa, "{d}", .{threshold_ms});
@@ -586,7 +594,36 @@ pub fn main(init: std.process.Init) !void {
                         " Clients cannot tell how far back tombstones survive. Re-run init.sql.",
                     .{},
                 );
+            } else {
+                published = true;
             }
+        }
+
+        passes += 1;
+        hour_passes += 1;
+        hour_reaped += reaped_this_pass;
+        if (!published) hour_unpublished += 1;
+        log.debug("pass {d}: {d} table(s), {d} tombstone(s) reaped, watermark {s}", .{
+            passes, sweeps.items.len, reaped_this_pass, if (published) "published" else "NOT published",
+        });
+        const now_ms = utils.getMilliTimestamp();
+        if (passes == 1) {
+            log.info("first pass done: {d} table(s) swept, {d} tombstone(s) reaped, watermark {s}; next every {d} s, summed up hourly", .{
+                sweeps.items.len, reaped_this_pass, if (published) "published" else "NOT published", interval_ms / 1000,
+            });
+            hour_passes = 0;
+            hour_reaped = 0;
+            hour_unpublished = 0;
+            hour_start_ms = now_ms;
+        } else if (now_ms - hour_start_ms >= 3_600_000) {
+            log.info("last hour: {d} pass(es) over {d} table(s), {d} tombstone(s) reaped, watermark published {d} time(s){s}", .{
+                hour_passes, sweeps.items.len, hour_reaped, hour_passes - hour_unpublished,
+                if (hour_unpublished > 0) " — some passes could not publish it (see the warnings)" else "",
+            });
+            hour_passes = 0;
+            hour_reaped = 0;
+            hour_unpublished = 0;
+            hour_start_ms = now_ms;
         }
 
         if (once) {
