@@ -81,6 +81,14 @@ pub const Reason = enum {
     /// probing: it lifts on restart (re-detected) or on a DDL event that fits.
     too_many_columns,
 
+    /// Its schema descriptor is wider than one event (`BASE_BUF`): the bridge cannot
+    /// publish what a client needs to build the table. Structural, like the column
+    /// count: it lifts on a restart with a larger BASE_BUF, or live on a DDL event whose
+    /// descriptor fits. It used to stop the bridge — at boot or on the DDL — with every
+    /// other table (measured 2026-10-07: a 2 KB probe and fuel_stations' 2,139-byte
+    /// descriptor).
+    schema_too_large,
+
     /// The string clients receive in a suspension payload.
     pub fn wireName(self: Reason) []const u8 {
         return @tagName(self);
@@ -116,6 +124,7 @@ pub const Reason = enum {
             .no_tenant_column => "add the column the catalogue names, or correct it with zebridge_enable",
             .tenant_not_in_replica_identity => "CREATE UNIQUE INDEX <t>_zb_ri ON <t> (<tenant>, <pk>); ALTER TABLE <t> REPLICA IDENTITY USING INDEX <t>_zb_ri",
             .too_many_columns => "restart the bridge — MAX_COLUMNS re-detects from the widest table (doubled) — or set MAX_COLUMNS higher; dropping columns lifts it live",
+            .schema_too_large => "restart with a larger BASE_BUF — the REFUSING line names the one that fits — or a DDL that narrows the table lifts it live",
             .no_cdc_subject => "declare the table in zebridge_catalogue (zebridge_enable with public_reason or tenant_col) — the bridge reloads on the catalogue row and lifts this itself, no restart",
         };
     }
@@ -461,7 +470,7 @@ pub const Registry = struct {
     /// Render as Prometheus exposition text. Reads only the atomics and the immortal
     /// names, so the HTTP thread may call it while the replication thread writes.
     pub fn writePrometheus(self: *const Registry, w: *std.Io.Writer) !void {
-        try w.print("# HELP bridge_refused_tables Tables refused (no primary key, undecodable column type, or a row too large for the event buffer)\n", .{});
+        try w.print("# HELP bridge_refused_tables Tables refused (no primary key, undecodable column type, a row or a schema descriptor too large for the event buffer, ...); bridge_refused_table names each with its reason\n", .{});
         try w.print("# TYPE bridge_refused_tables gauge\n", .{});
         try w.print("bridge_refused_tables {d}\n", .{self.refused_count.load(.acquire)});
 

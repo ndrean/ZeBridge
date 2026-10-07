@@ -453,6 +453,7 @@ Published when the bridge refuses a table. The reasons:
 | `unsupported_column_type` | a column's type cannot be decoded and is not an enum (§4) | change or drop that column |
 | `row_too_large` | a row exceeded the bridge's per-event buffer (`BASE_BUF`) | shrink the row: it lifts at the first write that fits after a 30 s cooldown; or restart with a larger buffer — a restart with the same buffer re-measures the widest row and keeps the suspension |
 | `too_many_columns` | a migration grew the table past the columns one event can carry (`MAX_COLUMNS`, sized at boot from the widest table, doubled) | restart the bridge (it re-detects), or set `MAX_COLUMNS`; dropping columns lifts it live. Rows written while suspended were dropped: a lift after drops, live or across the restart, bumps the table's `seed_epoch` so every replica re-seeds |
+| `schema_too_large` | the table's schema descriptor is wider than the bridge's per-event buffer (`BASE_BUF`), so it cannot be published | restart with a larger buffer (the bridge names the one that fits), or a DDL whose descriptor fits lifts it live |
 | `no_tenant_column` | the catalogue names a tenant column this table does not have | add the column, or correct the catalogue row |
 | `tenant_not_in_replica_identity` | the tenant column is outside the replica identity, so a DELETE could not be routed to a tenant at all | add a unique index covering `(tenant, pk)` and point `REPLICA IDENTITY` at it |
 

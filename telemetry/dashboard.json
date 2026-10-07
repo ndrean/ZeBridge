@@ -650,7 +650,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "A table is suspended when it has no primary key, a column the decoder cannot handle, or a row larger than BASE_BUF. Its CDC events are dropped and its clients are told to freeze. Any value > 0 needs the log: it names the table and the reason.",
+      "description": "A table is suspended when it has no primary key, a column the decoder cannot handle, or a row larger than BASE_BUF. Its CDC events are dropped and its clients are told to freeze. Any value > 0 needs the log: it names the table and the reason. One line per refused table, named with its reason (bridge_refused_table); the reasons are in the README's Suspended tables.",
       "targets": [
         {
           "datasource": {
@@ -671,6 +671,15 @@
           "expr": "rate(bridge_refused_events_dropped_total[1m])",
           "legendFormat": "events dropped/sec",
           "refId": "B"
+        },
+        {
+          "expr": "bridge_refused_table == 1",
+          "legendFormat": "{{table}}: {{reason}}",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
         }
       ],
       "fieldConfig": {

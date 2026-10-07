@@ -1290,6 +1290,7 @@ A table that breaks a rule is **suspended**, not the bridge: its events are drop
 | `tenant_not_in_replica_identity` | a DELETE could not be routed to its tenant | a unique index on `(tenant, pk)` and `REPLICA IDENTITY USING INDEX` on it; `zebridge_enable` does this |
 | `unsupported_column_type` | a column's type cannot be decoded | change or drop the column; the migration lifts it live. A PostGIS or pgvector column added to an already published table, on a bridge that started before the extension existed: restart the bridge |
 | `row_too_large` | a row exceeded the event buffer | lifts at the first write that fits after a 30 s cooldown; a restart re-measures the widest row and keeps the suspension while it still exceeds `BASE_BUF` |
+| `schema_too_large` | the table's schema descriptor is wider than the event buffer, so clients cannot be told its shape | restart with the `BASE_BUF` the bridge names (the boot lists every such table and the setting that fits them all), or a DDL that narrows the table lifts it live |
 | `too_many_columns` | a migration grew the table past `MAX_COLUMNS` | drop columns (lifts live), or restart: the boot re-detects |
 
 Rows written while a table was suspended never reached any replica. A lift after such drops, live or across a restart, bumps the table's seed epoch, so every replica re-seeds from a fresh full. Nothing to do by hand.

@@ -1946,6 +1946,11 @@ pub const EventProcessor = struct {
         const kv_subject = try Topology.render(arena, self.topology.kv_schemas_subject_pattern, &.{.{ .name = "table", .value = clean_table }}, null);
         const msg_id = try std.fmt.allocPrint(arena, "schema-{s}-{d}", .{ clean_table, wal_end });
 
+        if (!self.descriptorFits(json_str.items.len)) {
+            const suspend_id = try std.fmt.allocPrint(arena, "schema-suspend-size-{s}-{d}", .{ clean_table, wal_end });
+            return try self.refuseSchemaTooLarge(arena, clean_table, json_str.items.len, suspend_id, rel.relation_id, wal_end);
+        }
+
         var dummy_cols: std.ArrayList(pgoutput.Column) = .empty;
         try dummy_cols.append(arena, .{ .name = "schema", .value = .{ .text = json_str.items } });
 
@@ -1982,6 +1987,39 @@ pub const EventProcessor = struct {
     /// Withholding the schema silently was not enough: a client that already holds rows
     /// has no way to learn its table went stale, and a fresh client would read the last
     /// good schema, build the table, and wait forever for rows that are being dropped.
+    /// The smallest BASE_BUF whose event buffer holds a descriptor of `len` bytes behind
+    /// its column name (`schema`), which is what the packer requires.
+    fn baseBufFor(len: usize) u6 {
+        var n: u6 = 0;
+        while ((@as(usize, 1) << n) < len + "schema".len) n += 1;
+        return n;
+    }
+
+    /// Whether a descriptor of `len` bytes fits one event.
+    fn descriptorFits(self: *const EventProcessor, len: usize) bool {
+        return "schema".len + len <= self.batch_publisher.events[0].data_buffer.len;
+    }
+
+    /// A descriptor wider than one event: refuse THIS table, publish its suspension, and
+    /// let every other table carry on — the answer a too-wide row already gets.
+    fn refuseSchemaTooLarge(
+        self: *EventProcessor,
+        arena: std.mem.Allocator,
+        clean_table: []const u8,
+        descriptor_len: usize,
+        msg_id: []const u8,
+        relation_id: u32,
+        lsn: u64,
+    ) !u32 {
+        log.err("🔴 REFUSING '{s}': its schema descriptor is {d} bytes, the event buffer {d} — clients cannot build the table. Restart with BASE_BUF={d} or more; a DDL that narrows the table lifts it live. Every other table keeps replicating.", .{
+            clean_table, descriptor_len, self.batch_publisher.events[0].data_buffer.len, baseBufFor(descriptor_len),
+        });
+        self.refused.refuse(clean_table, .schema_too_large) catch |err| {
+            log.err("🔴 Could not record refusal for '{s}': {}", .{ clean_table, err });
+        };
+        return self.publishSuspension(arena, clean_table, RefusedTables.Reason.schema_too_large.wireName(), msg_id, relation_id, lsn);
+    }
+
     fn publishSuspension(
         self: *EventProcessor,
         arena: std.mem.Allocator,
@@ -2380,6 +2418,10 @@ pub const EventProcessor = struct {
             }
             break :blk parsePgLsnText(std.mem.span(c.PQgetvalue(lsn_res, 0, 0)));
         };
+
+        // Descriptors too wide for one event: refused one by one below, summed up once.
+        const TooWide = struct { table: []const u8, len: usize };
+        var too_wide: std.ArrayList(TooWide) = .empty;
 
         for (monitored_tables) |target_table| {
             var clean_table = target_table;
@@ -2852,6 +2894,14 @@ pub const EventProcessor = struct {
             const epoch_for_id: i64 = if (self.cat) |cat| (cat.epochs.get(clean_table) orelse 0) else 0;
             const msg_id = try std.fmt.allocPrint(arena, "schema-boot-{s}-{d}-e{d}", .{ clean_table, boot_lsn, epoch_for_id });
 
+            if (!self.descriptorFits(json_str.items.len)) {
+                const suspend_id = try std.fmt.allocPrint(arena, "schema-suspend-boot-size-{s}-{d}", .{ clean_table, boot_lsn });
+                const s_idx = try self.refuseSchemaTooLarge(arena, clean_table, json_str.items.len, suspend_id, 0, boot_lsn);
+                try self.releaseSlotToQueue(s_idx);
+                try too_wide.append(arena, .{ .table = clean_table, .len = json_str.items.len });
+                continue;
+            }
+
             var dummy_cols: std.ArrayList(pgoutput.Column) = .empty;
             try dummy_cols.append(arena, .{ .name = "schema", .value = .{ .text = json_str.items } });
 
@@ -2867,6 +2917,21 @@ pub const EventProcessor = struct {
 
             try self.releaseSlotToQueue(slot_idx);
             log.info("✅ Boot schema published to KV for '{s}'", .{clean_table});
+        }
+
+        // One line for the operator who reads only the end of the boot: every table,
+        // its size, and the one setting that fits them all.
+        if (too_wide.items.len > 0) {
+            var list: std.ArrayList(u8) = .empty;
+            var widest: usize = 0;
+            for (too_wide.items, 0..) |t, i| {
+                if (i > 0) try list.appendSlice(arena, ", ");
+                try list.appendSlice(arena, try std.fmt.allocPrint(arena, "{s} {d} B", .{ t.table, t.len }));
+                widest = @max(widest, t.len);
+            }
+            log.err("🔴 {d} table(s) refused at boot (schema_too_large): their descriptors are wider than the {d}-byte event buffer — {s}. BASE_BUF={d} fits them all; every other table replicates.", .{
+                too_wide.items.len, self.batch_publisher.events[0].data_buffer.len, list.items, baseBufFor(widest),
+            });
         }
     }
 };
@@ -2919,4 +2984,13 @@ test "isTenantIdentityIndex: the (tenant, pk) unique index and nothing else" {
     try std.testing.expect(!isTenantIdentityIndex(&other, "tenant_id", &pk));
     try std.testing.expect(!isTenantIdentityIndex(&wider, "tenant_id", &pk));
     try std.testing.expect(!isTenantIdentityIndex(&ri, null, &pk)); // a public table: mirror everything
+}
+
+test "baseBufFor: the smallest buffer that holds the descriptor behind its column name" {
+    // fuel_stations' descriptor, 2,139 bytes: 2,145 with "schema" — past 2 KB, inside 4 KB.
+    try std.testing.expectEqual(@as(u6, 12), EventProcessor.baseBufFor(2139));
+    try std.testing.expectEqual(@as(u6, 11), EventProcessor.baseBufFor(2048 - "schema".len));
+    try std.testing.expectEqual(@as(u6, 12), EventProcessor.baseBufFor(2048 - "schema".len + 1));
+    // charge_points' 4,221-byte DDL descriptor on Supabase: 8 KB.
+    try std.testing.expectEqual(@as(u6, 13), EventProcessor.baseBufFor(4221));
 }
