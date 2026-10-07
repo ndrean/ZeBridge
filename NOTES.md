@@ -19092,3 +19092,67 @@ stream to tail (the Python services never hit it, they follow a table). Now `pol
 tail inbox's queue, which the serve subscriptions wake (patch 31); a wake between two waits is
 counted, nothing is missed. Idle CPU 0%. `leaks` on the running process: none, and 250 more
 questions left the allocation count unchanged (3,999, 770 KB).
+
+## §10lw — the false gap on the shared route: a tenant table's client stuck on reconnect (2026-10-07)
+
+Example 15 (a shared record, three editors in `acme`): Alice, the editor online the longest,
+could not reconnect — `connect()` waited minutes. Her log: `Gap detected! CDC_PUBLIC: local 0,
+stream first 6276. Seeding [site_survey]`, then `chain g8 predates this replica (cutoff seq 39 <
+applied 42 on CDC_acme) — waiting for a newer build`.
+
+A tenant table's open-tenant rows ride CDC_PUBLIC (§10bq), so its client watches that stream
+too. In zb-client-ts:
+  * the heal after a seed moves the position only `if (stored0 > 0)`: a client that joins after
+    CDC_PUBLIC has pruned keeps position 0 there for good, and `core.caughtUpPosition` refuses
+    to move it (`firstSeq > pos + 1`). Every connect reads a gap and re-seeds — cheap, unnoticed
+    (Bob, Carol);
+  * when the replica is newer than the newest chain, the re-seed is refused (D2) and `connect()`
+    waits for the producer's next cut — minutes at a 300 s cadence (Alice, the most up to date);
+  * the coverage guard compares the table's `seedSeq` (its cut on CDC_<tenant>) with
+    CDC_PUBLIC's `first_seq`: two streams, so a tenant table is never "covered" on the shared
+    route even when the heal runs.
+libzb escapes it: it sets the position at its first seed and drains every poll; it counts the
+shared route covered when any chain of the table applies — looser than the guard zb-client-ts
+got after a measured loss (1,081,522 of 1,800,000 rows at 60k events/s), so not the one to copy.
+
+Measured with `scripts/scenarios/gen_follow.py` (manual; scratch database and nats-server; an
+emitter inserts counted ids into a tenant table while a public table prunes CDC_PUBLIC; the
+oracle is count = count(DISTINCT id) = max − min + 1 against PostgreSQL), producer cadence 20 s,
+CDC window 60 s, 40,000 ids:
+  * four libzb clients (fresh, offline 30 s, offline 120 s, longest-online): reconnect
+    0.01–0.06 s, caught up ~0.5 s; the 120 s one healed its 2 real gaps from chains;
+  * zb-client-ts joining after the prune: `ts_bob` a false gap and a re-seed at each reconnect
+    (0.31 s); `ts_alice` 10.32 s — the false gap, the refusal, the wait for a cut;
+  * all six equal PostgreSQL at the end: 40,000 ids, no hole, no double. Time, not data.
+
+The fix, approved: (1) the producer writes `shared_cutoff_seq` — CDC_PUBLIC's last sequence,
+read with `cutoff_seq` — in a tenant table's manifest; (2) the clients judge shared-route
+coverage with it and heal from position 0 too; (3) the §10ej repair re-cuts a tenant chain whose
+shared cut fell off CDC_PUBLIC. Done when gen_follow shows no false gap and every connect under
+a second. Diagrams: GENERATION.md.
+
+## §10lx — one source: libzb, its core in WASM for the browser (2026-10-07)
+
+§10lw is a rule written twice that drifted: what a client does with its position after a seed.
+The fixtures keep the two clients' pure functions identical (D2, §10hn); the state around them
+is not covered, and that is where the two differ. The direction: one source, libzb.
+
+All of libzb in the browser is not one step:
+  * the network — libzb speaks NATS over TCP (nats.zig); a browser has WebSockets only. Either
+    nats.zig gains a WebSocket transport over functions imported from JS, or JS keeps its NATS
+    connection and hands libzb the bytes. A new layer either way, under 33 local patches;
+  * threads — libzb has a reader thread and a poll; WASM threads need SharedArrayBuffer (the
+    pages already send COOP/COEP for OPFS) and Zig's are still rough. The host-driven poll
+    (2026-08-29) is the way: the host calls, libzb never waits on its own;
+  * storage — SQLite on OPFS goes through the official WASM build's JS VFS; libzb's own SQLite
+    would have to be wired to it, and seeds of a million rows are where the cost shows.
+Easy: the pure code (rules, merges, chain plans, msgpack, zstd) builds for wasm32; TLS is the
+browser's (`wss://`); a module of a few MB is in line with today's bundle.
+
+Decided: the CORE first. libzb's pure functions compiled to wasm32 (no I/O, no threads), called
+by zb-client-ts, which keeps the browser's own idioms — the NATS WebSocket, SQLite on OPFS
+through sqlocal, no threads. The rules are then written once, in Zig; decisions now spread in
+libzb.ts (where a position moves after a seed, which streams a table depends on) move into the
+core one by one, until zb-client-ts is a thin host; the whole of libzb in WASM is then a
+transport and storage question, not a rewrite. First: a spike — `caughtUpPosition` from the
+WASM core, the module's size and the cost of a call. §10lw's coverage rule goes in that way.
