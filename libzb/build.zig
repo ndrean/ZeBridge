@@ -375,6 +375,22 @@ pub fn build(b: *std.Build) void {
     const respond_step = b.step("respond", "Build ONLY zb-respond (the native responder)");
     respond_step.dependOn(&b.addInstallArtifact(respond_exe, .{}).step);
 
+    // `zig build wasm-core` — libzb's pure core for the browser (NOTES §10lx): wasm32, no
+    // I/O, no threads, whatever the host's target; zb-client-ts loads zig-out/wasm/zb_core.wasm.
+    // Not part of the default build.
+    const wasm_core = b.addExecutable(.{
+        .name = "zb_core",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm_core.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    wasm_core.entry = .disabled;
+    wasm_core.rdynamic = true;
+    const wasm_step = b.step("wasm-core", "Build ONLY the core for the browser (wasm32, zig-out/wasm/zb_core.wasm)");
+    wasm_step.dependOn(&b.addInstallArtifact(wasm_core, .{ .dest_dir = .{ .override = .{ .custom = "wasm" } } }).step);
+
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests (ZB_LIVE=1 adds the live transport test)");
