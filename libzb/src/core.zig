@@ -309,6 +309,60 @@ pub fn caughtUpPosition(pos: u64, first_seq: u64, last_seq: u64, num_pending: u6
     return last_seq;
 }
 
+/// §10lw: where a stream's position goes after a seed pass, from what the chains PROVED
+/// on it. `cuts` holds one entry per table that depends on the stream: the chain's own
+/// `cutoff_seq` when the stream is the table's route, its `shared_cutoff_seq` when it is
+/// the table's shared route (a tenant table's open-tenant rows ride CDC_PUBLIC, §10bq),
+/// null when no chain proved anything there (none applied, a failure, a manifest without
+/// the field). A cut proves the stream up to it: everything at or before it is in the
+/// snapshot.
+///
+///   * no gap (`stored` > 0 and the stream still holds `stored + 1`): stay;
+///   * nothing pruned (`first_seq` ≤ 1): every message is still there — resume at the
+///     lowest cut when all are known, else stay (at 0: the tail replays it all);
+///   * pruned: every cut must reach `first_seq - 1`, or the messages between are gone
+///     with no chain carrying them — stay and say BLOCKED (the producer re-cuts, §10ej).
+///     Otherwise resume at the lowest cut: the seed gate drops what the chains carried.
+///
+/// Never backwards. A stream no table depends on (`cuts` empty) stays where it is.
+/// zb-client-ts held its CDC_PUBLIC position at 0 for ever (only its own route's cut
+/// counted), and libzb trusted any chain of the table; this is the rule both follow now.
+pub const Resume = struct { to: i64, blocked: bool };
+
+pub fn streamResume(stored: i64, first_seq: i64, cuts: []const ?i64) Resume {
+    const stay: Resume = .{ .to = stored, .blocked = false };
+    if (cuts.len == 0) return stay;
+    const gap = stored <= 0 or (first_seq > 1 and stored < first_seq - 1);
+    if (!gap) return stay;
+    var low: i64 = std.math.maxInt(i64);
+    for (cuts) |c| {
+        const cut = c orelse return if (first_seq > 1) .{ .to = stored, .blocked = true } else stay;
+        if (first_seq > 1 and cut < first_seq - 1) return .{ .to = stored, .blocked = true };
+        low = @min(low, cut);
+    }
+    return .{ .to = @max(stored, low), .blocked = false };
+}
+
+/// streamResume over JSON: `{"stored", "firstSeq", "cuts": [n|null, …]}` → `{"to", "blocked"}`.
+pub fn streamResumeJson(a: std.mem.Allocator, args: Value) !Value {
+    if (args != .object) return error.BadArgs;
+    const int = struct {
+        fn of(v: ?Value) i64 {
+            const x = v orelse return 0;
+            return if (x == .integer) x.integer else 0;
+        }
+    };
+    const cv = args.object.get("cuts") orelse return error.BadArgs;
+    if (cv != .array) return error.BadArgs;
+    const cuts = try a.alloc(?i64, cv.array.items.len);
+    for (cv.array.items, 0..) |c, i| cuts[i] = if (c == .integer) c.integer else null;
+    const r = streamResume(int.of(args.object.get("stored")), int.of(args.object.get("firstSeq")), cuts);
+    var o: std.json.ObjectMap = .empty;
+    try o.put(a, "to", .{ .integer = r.to });
+    try o.put(a, "blocked", .{ .bool = r.blocked });
+    return .{ .object = o };
+}
+
 // ─── the apply SQL builders ─────────────────────────────────────────────────
 
 /// §10ex: the one object that is NOT JSON text — bytes, as `{"$bin": "<base64>"}`

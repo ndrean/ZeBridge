@@ -41,6 +41,11 @@ export type ChainManifest = {
   /// anchors only while the client reads that incarnation (a recreated stream
   /// restarts its numbering).
   cdc_stream_created?: string;
+  /// §10lw: a tenant table's cut on CDC_PUBLIC, where its open-tenant rows ride — read
+  /// with `cutoff_seq`, so the snapshot holds every message at or before it.
+  shared_cutoff_seq?: number;
+  shared_cdc_stream?: string;
+  shared_cdc_stream_created?: string;
   /// `zebridge_gc_watermark` as it stood at the cut: nothing soft-deleted before it is
   /// guaranteed to still exist. A replica older than this cannot catch up incrementally,
   /// because a row may have been deleted AND reaped while it was away and no artifact

@@ -1184,6 +1184,9 @@ pub const SyncClient = struct {
         // chain already carried in newer versions. (Existing replicas gain the columns.)
         execDdl(&self.st, "ALTER TABLE _zbz_generations ADD COLUMN anchor_stream TEXT") catch {};
         execDdl(&self.st, "ALTER TABLE _zbz_generations ADD COLUMN anchor_seq INTEGER") catch {};
+        // §10lw: the chain's cut on CDC_PUBLIC for a tenant table — what the seed proved on
+        // the shared route its open-tenant rows ride. NULL: nothing proved there.
+        execDdl(&self.st, "ALTER TABLE _zbz_generations ADD COLUMN shared_seq INTEGER") catch {};
         if (cols.len > 0 and !has_tenant) {
             const old = try self.st.query(a, "SELECT tbl, watermark, cutoff_lsn, seed_epoch FROM _zbz_generations_v1", &.{});
             for (old) |r| {
@@ -1609,18 +1612,14 @@ pub const SyncClient = struct {
         defer execSql(&self.st, a, "PRAGMA foreign_keys = ON;") catch {};
         // Still the CONFIGURED order (parents first — cheapest path to zero
         // residue), scoped to gapped routes plus never-seeded tables (§10n).
-        // §10fq: which gapped streams this pass may heal. A tenant's own stream heals
-        // only when that (table, tenant) pair seeded; the shared stream a tenant-scoped
-        // table's open rows ride heals when ANY of the table's pairs holds a chain past
-        // the gap — every chain carries the open rows. The heal used to wait for the
-        // whole pass (`reseed_pending`), so one tenant with no chain yet kept the shared
-        // stream "gapped" for ever, and every sibling re-seeded on every poll.
+        // §10fq: a stream whose seeding failed this pass is not healed by it (`blocked`);
+        // the others are judged by core.streamResume below, from what each chain PROVED
+        // on them (§10lw).
         var blocked: std.array_hash_map.String(void) = .empty;
         for (self.followed) |table| {
             if (self.isOnDemand(table)) continue; // §10hj: never seeded from a chain
             const st = self.states.get(table) orelse continue;
             const shared_gapped = if (st.shared_route) |sr| gapped.contains(sr) else false;
-            var covered = false;
             // §10fn: one chain per tenant of the table, each judged on its own stream.
             for (self.tenantsFor(st)) |tenant| {
                 const route = try self.routeFor(a, tenant);
@@ -1628,10 +1627,7 @@ pub const SyncClient = struct {
                 // ⚠️ `try`, not "treat a failed read as never seeded": that would answer a
                 // locked database with a full re-seed (the same trap as `storedSeq`).
                 const seeded = (try self.st.query(a, "SELECT tbl FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } })).len > 0;
-                if (!(gapped.contains(route) or shared_gapped or !seeded)) {
-                    covered = true;
-                    continue;
-                }
+                if (!(gapped.contains(route) or shared_gapped or !seeded)) continue;
                 // One table's failure is one table's failure (the TS rule): the rest
                 // still seed, and the next poll's gap check retries this one. A chain
                 // that is not there yet, or cannot splice, leaves `reseed_pending` set.
@@ -1646,7 +1642,6 @@ pub const SyncClient = struct {
                 const has_chain = (try self.st.query(a, "SELECT tbl FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } })).len > 0;
                 if (ok and has_chain) {
                     _ = self.unseeded.swapRemove(table);
-                    covered = true;
                     if (report_a) |ra_| if (seeded_map) |sm| {
                         if (!sm.contains(table)) sm.put(ra_, ra_.dupe(u8, table) catch table, {}) catch {};
                     };
@@ -1654,7 +1649,6 @@ pub const SyncClient = struct {
                     try blocked.put(a, route, {});
                 }
             }
-            if (!covered) if (st.shared_route) |sr| try blocked.put(a, sr, {});
         }
         // §10dg: whatever kept a table unseeded — no chain yet, a chain that predates
         // the replica or the re-seed, a shape the replica lacks, a failed step — the
@@ -1672,23 +1666,50 @@ pub const SyncClient = struct {
                 }
             }
         }
-        // §10ei: a gap healed by this pass resumes at the stream's OLDEST message.
-        // Every table routed to the gapped stream was just seeded to a cutoff at or
-        // past `first_seq - 1` (the predates-the-stream guard), so nothing between
-        // is owed and the seed gate drops what the chain carried. Left below
-        // `first_seq`, the tail would ask for a sequence the stream no longer holds,
-        // the server would continue from its oldest, and the live gap rule would read
-        // that as a fresh hole — a second seed at every poll after every gap.
+        // §10ei, §10lw: where a gapped stream resumes is core.streamResume — the rule
+        // zb-client-ts runs too — from the cut each dependent (table, tenant) chain proved
+        // on it: its own cut (`anchor_seq`) when the stream is its route, its shared cut
+        // when the stream is CDC_PUBLIC and the table is tenant-scoped. A cut below the
+        // oldest message proves nothing about what the stream dropped: blocked, the next
+        // poll asks again. Before §10lw the shared stream healed when ANY chain of the
+        // table applied — a tenant chain says nothing about CDC_PUBLIC's own numbers.
         {
             var git = gapped.iterator();
             while (git.next()) |ge| {
-                if (blocked.contains(ge.key_ptr.*)) continue;
+                const stream = ge.key_ptr.*;
+                if (blocked.contains(stream)) continue;
                 const first = ge.value_ptr.*;
-                const stored: i64 = @intCast(try self.storedSeq(ge.key_ptr.*));
-                if (first > 1 and stored < first - 1) {
+                const stored: i64 = @intCast(try self.storedSeq(stream));
+                var cuts: std.ArrayList(?i64) = .empty;
+                for (self.followed) |table| {
+                    if (self.isOnDemand(table)) continue;
+                    const st = self.states.get(table) orelse continue;
+                    for (self.tenantsFor(st)) |tenant| {
+                        const route = try self.routeFor(a, tenant);
+                        const own = std.mem.eql(u8, route, stream);
+                        const shared = !own and if (st.shared_route) |sr| std.mem.eql(u8, sr, stream) else false;
+                        if (!own and !shared) continue;
+                        const rows = try self.st.query(a, "SELECT anchor_stream, anchor_seq, shared_seq FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } });
+                        var cut: ?i64 = null;
+                        if (rows.len > 0) {
+                            const r = rows[0];
+                            if (own) {
+                                if (r[0].eqlText(stream) and r[1] == .integer and r[1].integer > 0) cut = r[1].integer;
+                            } else if (r[2] == .integer) cut = r[2].integer;
+                        }
+                        try cuts.append(a, cut);
+                    }
+                }
+                const res = core.streamResume(stored, first, cuts.items);
+                if (res.blocked) {
+                    log.warn("{s}: the gap stays open — no chain past the stream's oldest message ({d}) yet; waiting for the producer's next generation", .{ stream, first });
+                    self.reseed_pending = true;
+                    continue;
+                }
+                if (res.to > stored) {
                     // A first run (stored 0) resumes there too, silently: it is not a healed gap.
-                    if (stored > 0) log.info("{s}: gap healed — resuming at the stream's oldest message ({d}; was {d})", .{ ge.key_ptr.*, first - 1, stored });
-                    try self.persistSeq(ge.key_ptr.*, @intCast(first - 1));
+                    if (stored > 0) log.info("{s}: gap healed — resuming at {d} (was {d}, the stream holds from {d})", .{ stream, res.to, stored, first });
+                    try self.persistSeq(stream, @intCast(res.to));
                 }
             }
         }
@@ -2111,6 +2132,29 @@ pub const SyncClient = struct {
                 }
             } else |_| {}
         }
+        // §10lw: the same splice test on the SHARED route — a tenant table's open-tenant
+        // rows ride CDC_PUBLIC. A shared cut below its oldest message: the rows between are
+        // gone from the stream and not in the chain; wait for the next generation. A cut on
+        // a previous incarnation of the stream proves nothing there.
+        var shared_seq: ?i64 = null;
+        if (man.object.get("shared_cutoff_seq")) |sv| if (sv == .integer and sv.integer >= 0) {
+            const sstream = if (man.object.get("shared_cdc_stream")) |v| (if (v == .string) v.string else "") else "";
+            const screated = if (man.object.get("shared_cdc_stream_created")) |v| (if (v == .string) v.string else "") else "";
+            if (sstream.len > 0) if (self.t.js.getStreamInfo(sstream)) |info_c| {
+                var info = info_c;
+                defer info.deinit();
+                const same = screated.len == 0 or info.value.created.len == 0 or std.mem.eql(u8, screated, info.value.created);
+                if (same) {
+                    const first: i64 = @intCast(info.value.state.first_seq);
+                    if (sv.integer + 1 < first) {
+                        log.warn("{s}: chain g{d} predates {s} (shared cut {d} < first {d}) — its open-tenant rows between are gone; waiting for the producer's next generation", .{ table, if (man.object.get("gen")) |v| v.integer else 0, sstream, sv.integer, first });
+                        self.reseed_pending = true;
+                        return;
+                    }
+                    shared_seq = sv.integer;
+                }
+            } else |_| {};
+        };
 
         const st = self.states.getPtr(table).?;
         const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, tenant });
@@ -2231,7 +2275,7 @@ pub const SyncClient = struct {
             }
         }
         const anchor_seq: i64 = if (cdc_stream.len > 0 and gate_seq > 0) gate_seq else 0;
-        _ = try self.st.query(a, "INSERT INTO _zbz_generations (tbl, tenant, watermark, cutoff_lsn, seed_epoch, anchor_stream, anchor_seq) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tbl, tenant) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch, anchor_stream = excluded.anchor_stream, anchor_seq = excluded.anchor_seq", &.{ .{ .text = table }, .{ .text = tenant }, .{ .text = cv }, .{ .integer = seed_lsn }, .{ .integer = st.seed_epoch }, .{ .text = cdc_stream }, .{ .integer = anchor_seq } });
+        _ = try self.st.query(a, "INSERT INTO _zbz_generations (tbl, tenant, watermark, cutoff_lsn, seed_epoch, anchor_stream, anchor_seq, shared_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tbl, tenant) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch, anchor_stream = excluded.anchor_stream, anchor_seq = excluded.anchor_seq, shared_seq = excluded.shared_seq", &.{ .{ .text = table }, .{ .text = tenant }, .{ .text = cv }, .{ .integer = seed_lsn }, .{ .integer = st.seed_epoch }, .{ .text = cdc_stream }, .{ .integer = anchor_seq }, if (shared_seq) |q| .{ .integer = q } else .null });
         // A held event at or below the seed's LSN is inside the chain just applied:
         // superseded, not waiting (the TS client's pruneInboxSeeded).
         try pruneInboxSeeded(&self.st, a, table, seed_lsn);

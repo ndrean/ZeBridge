@@ -46,6 +46,13 @@ export fn zb_caught_up_position(pos: u64, first_seq: u64, last_seq: u64, num_pen
     return core.caughtUpPosition(pos, first_seq, last_seq, num_pending, num_ack_pending, delivered_count, delivered);
 }
 
+/// core.streamResume (§10lw): `{"stored", "firstSeq", "cuts": [n|null]}` → `{"to", "blocked"}`.
+export fn zb_stream_resume(ptr: [*]const u8, len: usize) u64 {
+    const args = parseArgs(ptr, len) orelse return 0;
+    const out = core.streamResumeJson(arena.allocator(), args) catch return 0;
+    return result(out);
+}
+
 /// core.scopeSeeding: `{"streams": {...}, "tables": {...}}` → `{"gapped": [...], "tablesToSeed": [...]}`.
 export fn zb_scope_seeding(ptr: [*]const u8, len: usize) u64 {
     const args = parseArgs(ptr, len) orelse return 0;

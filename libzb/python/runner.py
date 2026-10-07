@@ -53,6 +53,7 @@ SECTIONS = {
     "heartbeat":       (lambda c: {"principal": c["principal"], "tenant": c["tenant"], "ts": c["ts"], "seqs": c["seqs"], "pending": c.get("pending", {})}, lambda c: c["out"]),
     "tombstoned":      (lambda c: {"tombstoneColumn": c["tombstoneColumn"], "data": c["data"]}, lambda c: c["drops"]),
     "position":        (lambda c: {"stored": c["stored"], "batch": c["batch"]},    lambda c: c["next"]),
+    "streamResume":    (lambda c: {"stored": c["stored"], "firstSeq": c["firstSeq"], "cuts": c["cuts"]}, lambda c: {"to": c["to"], "blocked": c["blocked"]}),
     "caughtUp":        (lambda c: {k: c[k] for k in ("pos", "firstSeq", "lastSeq", "numPending", "numAckPending", "deliveredCount", "delivered") if k in c}, lambda c: c["next"]),
     "fkKind":          (lambda c: {"message": c["message"]},                       lambda c: c["kind"]),
     "pgTsToWire":      (lambda c: {"in": c["in"]},                                 lambda c: c["out"]),

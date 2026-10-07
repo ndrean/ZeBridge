@@ -692,9 +692,12 @@ pub const GenerationProducer = struct {
     fn holdCut(self: *GenerationProducer, tenant: []const u8, table: []const u8, for_ms: i64) void {
         var key_buf: [512]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ tenant, table }) catch return;
+        var shared_buf: [520]u8 = undefined;
+        const shared_key = std.fmt.bufPrint(&shared_buf, "{s}@shared", .{key}) catch return;
         self.cuts_lock.lock();
         defer self.cuts_lock.unlock();
         if (self.cuts.getPtr(key)) |cut| cut.hold_until_ms = utils.unixMillis() + for_ms;
+        if (self.cuts.getPtr(shared_key)) |cut| cut.hold_until_ms = utils.unixMillis() + for_ms;
     }
 
     fn queryOnePub(pgc: *c.PGconn, sql: [:0]const u8, params: []const ?[*:0]const u8) !*c.PGresult {
@@ -1349,6 +1352,24 @@ pub const GenerationProducer = struct {
                 break :blk .{ 0, name, 0, "" };
             }
         };
+        // §10lw: the SHARED cut. A tenant table's open-tenant rows ride CDC_PUBLIC (§10bq),
+        // and this snapshot reads them too, so it proves CDC_PUBLIC up to ITS last
+        // sequence, read here before the snapshot for the same reason as `cutoff_seq`.
+        // Without it a client could judge the shared route only with the tenant
+        // stream's cut — another stream's numbers — and either kept its CDC_PUBLIC
+        // position at 0 (a false gap at every connect) or trusted any chain (a loss when
+        // CDC_PUBLIC pruned past the snapshot). Empty `created`: not read, no field.
+        const shared_cut: u64, const shared_first: u64, const shared_created: []const u8 = blk: {
+            if (tcol.len == 0 or std.mem.eql(u8, tenant, self.topo.open_tenant)) break :blk .{ 0, 0, "" };
+            if (js.getStreamInfo(self.topo.cdc_stream_public)) |info_const| {
+                var info = info_const;
+                defer info.deinit();
+                break :blk .{ info.value.state.last_seq, info.value.state.first_seq, try alloc.dupe(u8, info.value.created) };
+            } else |err| {
+                log.warn("🧬 '{s}'/'{s}': stream info for {s} failed ({}) — manifest ships without shared_cutoff_seq; clients wait for a chain that has it", .{ tenant, table, self.topo.cdc_stream_public, err });
+                break :blk .{ 0, 0, "" };
+            }
+        };
         // §10ei: the chain must OVERLAP the stream. A client that fell off the stream
         // seeds from the newest manifest and resumes at its cutoff_seq; when the stream
         // no longer holds that sequence (a size valve, a purge, an age under the floor
@@ -1366,6 +1387,7 @@ pub const GenerationProducer = struct {
         // dropped. The recorded generations live in another server's object store, so a
         // delta on top of them would point at nothing: the next cut is a full.
         var chain_absent = false;
+        var prev_shared_cut: i64 = -1;
         const prev_cut: i64 = blk: {
             if (last_gen == 0) break :blk -1;
             var kvb = js.kvBucket(self.topo.kv_generations) catch |err| {
@@ -1385,14 +1407,24 @@ pub const GenerationProducer = struct {
                 chain_absent = true;
                 break :blk -1;
             };
+            if (man.object.get("shared_cutoff_seq")) |v| if (v == .integer) {
+                prev_shared_cut = v.integer;
+            };
             break :blk if (man.object.get("cutoff_seq")) |v| (if (v == .integer) v.integer else -1) else -1;
         };
         if (chain_absent) {
             log.info("🧬 '{s}'/'{s}': g{d} is recorded in PostgreSQL but this NATS holds no manifest for it (a new NATS on the same slot, an older one, or a dropped bucket) — forcing a full", .{ tenant, table, last_gen });
             build_full = true;
         }
-        const chain_fell_off: bool = prev_cut >= 0 and stream_first > 1 and prev_cut + 1 < @as(i64, @intCast(stream_first));
-        if (chain_fell_off) log.warn("🧬 '{s}'/'{s}': chain g{d} fell off {s} (its cutoff is below the stream's oldest message, seq {d}) — a returning client could not splice; cutting a delta with a fresh cut point", .{ tenant, table, last_gen, cdc_stream, stream_first });
+        // §10lw: the same on the shared route — a returning client of a tenant table must
+        // splice on CDC_PUBLIC too. A chain cut before the field existed (prev -1) on a
+        // tenant table is re-cut once, so every tenant manifest carries it.
+        const shared_fell_off: bool = shared_created.len > 0 and
+            (prev_shared_cut < 0 or (shared_first > 1 and prev_shared_cut + 1 < @as(i64, @intCast(shared_first))));
+        if (shared_fell_off and prev_cut >= 0) log.warn("🧬 '{s}'/'{s}': chain g{d}'s shared cut fell off {s} (or it has none; the stream's oldest message is {d}) — a returning client could not splice its open-tenant rows; cutting a delta with a fresh cut point", .{ tenant, table, last_gen, self.topo.cdc_stream_public, shared_first });
+        const chain_fell_off: bool = (prev_cut >= 0 and stream_first > 1 and prev_cut + 1 < @as(i64, @intCast(stream_first))) or
+            (prev_cut >= 0 and shared_fell_off);
+        if (chain_fell_off and !shared_fell_off) log.warn("🧬 '{s}'/'{s}': chain g{d} fell off {s} (its cutoff is below the stream's oldest message, seq {d}) — a returning client could not splice; cutting a delta with a fresh cut point", .{ tenant, table, last_gen, cdc_stream, stream_first });
 
         // ── §10gl: the next delta's floor, read JUST BEFORE the snapshot ────
         // A row this snapshot cannot see and a later commit makes visible comes from a
@@ -1843,13 +1875,17 @@ pub const GenerationProducer = struct {
             try std.fmt.allocPrint(alloc, "\"cutoff_seq\":{d},\"cdc_stream\":\"{s}\",\"cdc_stream_created\":\"{s}\",", .{ cutoff_seq, cdc_stream, stream_created })
         else
             "";
+        const shared_frag: []const u8 = if (shared_created.len > 0)
+            try std.fmt.allocPrint(alloc, "\"shared_cutoff_seq\":{d},\"shared_cdc_stream\":\"{s}\",\"shared_cdc_stream_created\":\"{s}\",", .{ shared_cut, self.topo.cdc_stream_public, shared_created })
+        else
+            "";
         const gc_frag: []const u8 = if (gc_watermark.len > 0)
             try std.fmt.allocPrint(alloc, "\"gc_watermark\":\"{s}\",", .{gc_watermark})
         else
             "";
-        const manifest = try std.fmt.allocPrint(alloc, "{{\"gen\":{d},\"seed_epoch\":{d},\"bucket\":\"{s}\",{s}{s}\"cutoff_version\":\"{s}\",\"cutoff_lsn\":\"{s}\"," ++
+        const manifest = try std.fmt.allocPrint(alloc, "{{\"gen\":{d},\"seed_epoch\":{d},\"bucket\":\"{s}\",{s}{s}{s}\"cutoff_version\":\"{s}\",\"cutoff_lsn\":\"{s}\"," ++
             "\"version_column\":\"{s}\"," ++
-            "\"full\":{{\"gen\":{d},\"object\":\"{s}-g{d}-full\",\"cutoff\":\"{s}\"{s}}},\"checkpoints\":{s},\"deltas\":[{s}]}}", .{ gen, cat_epoch, bucket, seq_frag, gc_frag, cutoff_version, lsn, vcol, full_gen_m, table, full_gen_m, full_cutoff_m, if (full_sorted_m) ",\"sorted\":true" else "", ckpts_json, deltas_json.items });
+            "\"full\":{{\"gen\":{d},\"object\":\"{s}-g{d}-full\",\"cutoff\":\"{s}\"{s}}},\"checkpoints\":{s},\"deltas\":[{s}]}}", .{ gen, cat_epoch, bucket, seq_frag, shared_frag, gc_frag, cutoff_version, lsn, vcol, full_gen_m, table, full_gen_m, full_cutoff_m, if (full_sorted_m) ",\"sorted\":true" else "", ckpts_json, deltas_json.items });
         _ = try kv.put(key, manifest, .{});
 
         // ── objects and manifest live: NOW the row becomes the producer's memory ──
@@ -1877,6 +1913,8 @@ pub const GenerationProducer = struct {
         // §10eq: the edge watch's memory of this pair.
         // The stream only when it was READ: a cut at seq 0 is a cut to watch (§10ja).
         self.recordCut(tenant, table, vcol, tcol, guarded, if (stream_created.len > 0) cdc_stream else "", cutoff_seq, utils.unixMillis() - build_started_ms, true) catch |err| log.debug("🧬 cut not recorded: {}", .{err});
+        // §10lw: watched like the own cut, under its own key; an urgent one re-cuts the pair.
+        if (shared_created.len > 0) self.recordCut(tenant, table, vcol, tcol, guarded, self.topo.cdc_stream_public, shared_cut, utils.unixMillis() - build_started_ms, true) catch |err| log.debug("🧬 shared cut not recorded: {}", .{err});
         if (build_full) self.recordFullBuild(tenant, table, utils.unixMillis() - build_started_ms);
 
         // ── 6. (pruning ran before the manifest was rendered — see pruneChain) ──
@@ -1917,6 +1955,17 @@ pub const GenerationProducer = struct {
                 }
             } else |_| {}
         }
+        if (shared_created.len > 0 and shared_cut > 0) {
+            if (js.getStreamInfo(self.topo.cdc_stream_public)) |info_c2| {
+                var info2 = info_c2;
+                defer info2.deinit();
+                const first_now = info2.value.state.first_seq;
+                if (shared_cut + 1 < first_now) {
+                    fell_off.* = true;
+                    log.warn("🧬 '{s}'/'{s}': g{d}'s shared cut (seq {d}) fell off {s} during the build — the stream's oldest message is {d} now; no client can splice its open-tenant rows on this generation", .{ tenant, table, gen, shared_cut, self.topo.cdc_stream_public, first_now });
+                }
+            } else |_| {}
+        }
     }
 
     /// `just_cut`: this build published the cut (the clock starts now, a hold is
@@ -1928,7 +1977,10 @@ pub const GenerationProducer = struct {
         // and under a firehose the boot chain predated the stream for ~50 s (5,609
         // messages at 50k events/s) until a cadence cut came. `stream` empty = not read.
         if (stream.len == 0) return;
-        const key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ tenant, table });
+        // §10lw: a tenant pair has two cuts — its own stream's, and CDC_PUBLIC's (the
+        // shared cut) — each watched on its stream; the shared one keys as `<key>@shared`.
+        const shared = tcol.len > 0 and !std.mem.eql(u8, tenant, self.topo.open_tenant) and std.mem.eql(u8, stream, self.topo.cdc_stream_public);
+        const key = try std.fmt.allocPrint(self.allocator, "{s}.{s}{s}", .{ tenant, table, if (shared) "@shared" else "" });
         self.cuts_lock.lock();
         defer self.cuts_lock.unlock();
         if (self.cuts.getPtr(key)) |cut| {

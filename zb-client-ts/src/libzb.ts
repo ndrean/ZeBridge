@@ -28,7 +28,7 @@ import { decode, encode, decodeMulti } from '@msgpack/msgpack';
 import type { Storage, StorageFactory, Exec as StorageExec } from './storage.ts';
 
 import { sqliteDialect, type Dialect } from './dialect.ts';
-import { loadCore, scopeSeeding, caughtUpPosition } from './wasm-core.ts';
+import { loadCore, scopeSeeding, caughtUpPosition, streamResume } from './wasm-core.ts';
 import { v7 as uuidv7 } from 'uuid';
 import { heartbeatPayload,
   seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica as coreFullPredates,
@@ -220,6 +220,9 @@ export type TableState = {
   /// LOWER lsn), so gating on lsn silently dropped in-flight transactions.
   seedSeq?: number;
   seedStream?: string;
+  /// §10lw: the chain's cut on CDC_PUBLIC for a tenant table (its open-tenant rows ride
+  /// there): what the seed proved on the shared route. Absent: nothing proved.
+  sharedSeedSeq?: number;
   /// FINDING 10: the lsn fallback gate must compare against a lsn that a SEED set —
   /// never `state.lsn`, which the boot schema-republish advances to the WAL head, so
   /// after any bridge restart every replayed data event carried an older lsn and was
@@ -1388,6 +1391,7 @@ export class ZeBridge {
     // carried in newer versions).
     try { await this.run(`ALTER TABLE _zebridge_generations ADD COLUMN seed_seq ${this.dialect.int64}`); } catch { /* present */ }
     try { await this.run(`ALTER TABLE _zebridge_generations ADD COLUMN seed_stream TEXT`); } catch { /* present */ }
+    try { await this.run(`ALTER TABLE _zebridge_generations ADD COLUMN shared_seed_seq ${this.dialect.int64}`); } catch { /* present */ }
 
     for (const r of await this.run(`SELECT stream, created FROM _zebridge_stream_seq WHERE created IS NOT NULL`)) this.streamCreated.set(String(r.stream), String(r.created));
     // §10dg: the shape this replica BUILT each table with (core.keyShape/typeShape) —
@@ -3002,6 +3006,25 @@ export class ZeBridge {
         }
       } catch { /* stream info unavailable — the gap rule at the next connect covers it */ }
     }
+    // §10lw: the same splice test on the SHARED route — the open-tenant rows of a tenant
+    // table ride CDC_PUBLIC. A shared cut below its oldest message means rows the chain
+    // does not carry are gone from the stream too: wait for the next generation. A cut on
+    // a previous incarnation of the stream proves nothing there.
+    let sharedSeq: number | null = null;
+    if (typeof manifest.shared_cutoff_seq === 'number' && manifest.shared_cutoff_seq >= 0 && manifest.shared_cdc_stream) {
+      try {
+        const jsm = await this.transport.jetstreamManager(this.nc!, this.jsOpts());
+        const info = await jsm.streams.info(manifest.shared_cdc_stream);
+        const nowCreated = String((info as { created?: unknown }).created ?? '');
+        if (!(manifest.shared_cdc_stream_created && nowCreated && manifest.shared_cdc_stream_created !== nowCreated)) {
+          if (manifest.shared_cutoff_seq + 1 < info.state.first_seq) {
+            this.appendLog('SYS', `${table}: chain g${manifest.gen} predates ${manifest.shared_cdc_stream} (shared cut ${manifest.shared_cutoff_seq} < first ${info.state.first_seq}) — its open-tenant rows between are gone; waiting for the producer's next generation`, 'WARNING');
+            return false;
+          }
+          sharedSeq = manifest.shared_cutoff_seq;
+        }
+      } catch { /* stream info unavailable — the shared route stays unproven */ }
+    }
 
     let os: any;
     try { os = await this.transport.objectStore(this.nc, manifest.bucket, this.jsOpts()); } catch (e) { this.appendLog('SYS', `${table}: chain bucket ${manifest.bucket} unreachable: ${e}`, 'ERROR'); return false; }
@@ -3242,6 +3265,7 @@ export class ZeBridge {
       state.seedSeq = gateSeq;
       state.seedStream = manifest.cdc_stream;
     }
+    state.sharedSeedSeq = sharedSeq ?? undefined;
     // The chain's cutoff_version is an observed version watermark: floor the HLC
     // with it so a freshly seeded slow-clock client stamps above its own seed.
     if (typeof manifest.cutoff_version === 'string') {
@@ -3249,10 +3273,10 @@ export class ZeBridge {
     }
     await this.pruneInboxSeeded(table, state.lsn);
     await this.run(
-      `INSERT INTO _zebridge_generations (tbl, watermark, cutoff_lsn, seed_epoch, seed_seq, seed_stream) VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO _zebridge_generations (tbl, watermark, cutoff_lsn, seed_epoch, seed_seq, seed_stream, shared_seed_seq) VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(tbl) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch,
-         seed_seq = excluded.seed_seq, seed_stream = excluded.seed_stream`,
-      table, manifest.cutoff_version, state.lsn, state.seedEpoch ?? 0, state.seedSeq ?? null, state.seedStream ?? null,
+         seed_seq = excluded.seed_seq, seed_stream = excluded.seed_stream, shared_seed_seq = excluded.shared_seed_seq`,
+      table, manifest.cutoff_version, state.lsn, state.seedEpoch ?? 0, state.seedSeq ?? null, state.seedStream ?? null, sharedSeq,
     );
     this.triggerChange(table);
     this.appendLog('SYS', `Seeded ${table} from generation chain g${manifest.gen} (${applied} row(s), watermark ${manifest.cutoff_version} @ ${manifest.cutoff_lsn})`, 'INFO');
@@ -3262,10 +3286,11 @@ export class ZeBridge {
   /// §10jc: the seed gate of the chain this replica last applied, back from the replica.
   private async restoreSeedGate(table: string) {
     const st = this.syncedTables.get(table);
-    if (!st || typeof st.seedSeq === 'number') return;
+    if (!st || typeof st.seedSeq === 'number' || typeof st.sharedSeedSeq === 'number') return;
     try {
-      const [r] = (await this.run(`SELECT seed_seq, seed_stream FROM _zebridge_generations WHERE tbl = ?`, table)) as any[];
+      const [r] = (await this.run(`SELECT seed_seq, seed_stream, shared_seed_seq FROM _zebridge_generations WHERE tbl = ?`, table)) as any[];
       if (r && r.seed_seq != null && r.seed_stream) { st.seedSeq = Number(r.seed_seq); st.seedStream = String(r.seed_stream); }
+      if (r && r.shared_seed_seq != null) st.sharedSeedSeq = Number(r.shared_seed_seq);
     } catch { /* a replica from before the columns: no gate to restore */ }
   }
 
@@ -3489,68 +3514,47 @@ export class ZeBridge {
             ? Math.min(...seedFloors)
             : (seeded.length ? 0 : ((await jsm.streams.info(streamName))?.state?.last_seq ?? 0));
           const stored0 = this.globalSyncState.seq[streamName] ?? 0;
-          // §10ei: a gap this pass healed — the position is below the stream's oldest
-          // message and every table routed here was re-seeded to a cutoff at or past
-          // it — takes the seeds' floor too. Left where it was, the tail asks for a
-          // sequence the stream no longer holds, the server continues from its
-          // oldest, and the live gap rule reads that as a fresh hole: re-seed,
-          // resume, hole, three gap passes in a minute on the wall.
-          let healedGap = false;
-          let firstSeq = 0;
-          if (stored0 > 0) {
-            try {
-              firstSeq = (await jsm.streams.info(streamName))?.state?.first_seq ?? 0;
-              healedGap = firstSeq > 0 && stored0 < firstSeq - 1;
-            } catch { /* keep the position */ }
+          // §10ei, §10go, §10lw: where the position goes is core.streamResume, from what
+          // each chain PROVED on this stream — a table's own cut when this is its route,
+          // its shared cut when this is CDC_PUBLIC and the table is tenant-scoped (its
+          // open-tenant rows ride here). Coverage, never "seeded at some point": a cut
+          // below the stream's oldest message certifies nothing about the messages it
+          // dropped, and moving past them loses rows for good — measured on the first
+          // heal, 1,081,522 of 1,800,000 rows at 60k events a second. Before §10lw only
+          // the own cut counted, so a tenant table's client kept CDC_PUBLIC at 0 and read
+          // a false gap at every connect.
+          const pub = this.config.grammar.cdc_streams?.public;
+          const cuts: (number | null)[] = [];
+          for (const table of this.syncedTables.keys()) {
+            if (this.ondemandSet.has(table)) continue;
+            const t = this.effectiveTenantFor(table);
+            if (t === null) continue;
+            const route = this.cdcStreamForTenant(t);
+            const st = this.syncedTables.get(table);
+            const failed = this.failed.has(table);
+            if (route === streamName) {
+              cuts.push(!failed && st?.seedStream === streamName && typeof st.seedSeq === 'number' ? st.seedSeq : null);
+            } else if (pub === streamName && route !== pub) {
+              cuts.push(!failed && typeof st?.sharedSeedSeq === 'number' ? st.sharedSeedSeq : null);
+            }
           }
-          // §10go: the seeds' floor can be BELOW the stream's oldest message. A chain cut
-          // while the stream was empty carries no cutoff_seq at all, so `floor` is 0 and
-          // the position never rises: the tail reopens under the hole, the live gap rule
-          // fires on the next message, and the client re-seeds again — measured at 40k
-          // events a second as 7,550 re-seeds in one 60 s run with the position frozen at
-          // 250, the replica standing still until the load stopped (libzb heals this in
-          // §10ei). `first_seq - 1` cannot skip a message the stream still holds, so a
-          // healed gap takes whichever is higher — but only when every table routed here
-          // is seeded, so a table still waiting for its chain keeps the stream blocked
-          // and the next pass retries it.
-          // ⚠️ The guard is COVERAGE, not "seeded at some point". A table seeded long ago
-          // from a chain whose cutoff is below the hole certifies nothing about the
-          // messages the stream dropped: moving the position past them then loses rows
-          // for good — measured, on the first version of this heal, as 1,081,522 of
-          // 1,800,000 rows at 60k events a second, 32 batches wrong. The chain just
-          // applied must reach at or past `first_seq - 1` (libzb's predates-the-stream
-          // guard). A chain with no cutoff_seq at all — cut while the stream was empty —
-          // proves nothing and blocks the stream until the producer cuts a newer one.
-          let blockedHere = false;
-          if (healedGap) {
-            for (const table of this.syncedTables.keys()) {
-              const t = this.effectiveTenantFor(table);
-              if (t === null) continue;
-              const route = this.cdcStreamForTenant(t);
-              const pub = this.config.grammar.cdc_streams?.public;
-              const here = route === streamName || (route !== pub && pub === streamName);
-              if (!here) continue;
-              const st = this.syncedTables.get(table);
-              const covered = typeof st?.seedSeq === 'number' && st.seedSeq >= firstSeq - 1;
-              if (this.failed.has(table) || !covered) blockedHere = true;
-            }
-            if (blockedHere) {
-              this.appendLog('SYS', `${streamName}: the gap stays open — no chain past the stream's oldest message (${firstSeq}) yet; waiting for the producer's next generation`, 'WARNING');
-            }
+          let firstSeq = 0;
+          try { firstSeq = (await jsm.streams.info(streamName))?.state?.first_seq ?? 0; } catch { /* keep the position */ }
+          // A stream no seeded table depends on takes the tail: the quiet-stream case.
+          const decided = cuts.length && seeded.length ? streamResume(stored0, firstSeq, cuts) : { to: stored0 > 0 ? stored0 : floor, blocked: false };
+          if (decided.blocked) {
+            this.appendLog('SYS', `${streamName}: the gap stays open — no chain past the stream's oldest message (${firstSeq}) yet; waiting for the producer's next generation`, 'WARNING');
           }
           // A blocked gap retries on the next pass, not in a tight loop: without a pause
           // the tail re-opens, meets the same hole and re-seeds immediately (§10go).
-          this.gapBackoffMs = blockedHere ? Math.min(5_000, (this.gapBackoffMs || 250) * 2) : 0;
-          const healTo = healedGap && !blockedHere ? Math.max(floor, firstSeq - 1) : floor;
-          if (healTo > stored0 && (stored0 === 0 || (healedGap && !blockedHere))) {
-            if (healedGap) this.appendLog('SYS', `${streamName}: gap healed — resuming at ${healTo} (was ${stored0}, stream holds from ${firstSeq})`, 'INFO');
-            // Only when we hold NO position, or a position the stream no longer
-            // holds: a live position must never jump forward past unconsumed messages.
-            this.globalSyncState.seq[streamName] = healTo;
+          this.gapBackoffMs = decided.blocked ? Math.min(5_000, (this.gapBackoffMs || 250) * 2) : 0;
+          if (decided.to > stored0) {
+            if (stored0 > 0) this.appendLog('SYS', `${streamName}: gap healed — resuming at ${decided.to} (was ${stored0}, stream holds from ${firstSeq})`, 'INFO');
+            this.globalSyncState.seq[streamName] = decided.to;
             await this.run(
               `INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?)
                ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
-              streamName, healTo,
+              streamName, decided.to,
             );
           }
         } catch { /* stream info unavailable — the per-batch persist still covers it */ }

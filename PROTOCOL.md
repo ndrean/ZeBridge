@@ -980,6 +980,9 @@ client can tell "empty" from "not built yet".
   "cutoff_seq": 9812774,
   "cdc_stream": "CDC_acme",
   "cdc_stream_created": "2026-09-17T05:12:40.118Z",
+  "shared_cutoff_seq": 4410387,
+  "shared_cdc_stream": "CDC_PUBLIC",
+  "shared_cdc_stream_created": "2026-09-17T05:12:39.902Z",
   "gc_watermark": "2026-09-17 06:31:02.114+00",
   "cutoff_version": "2026-09-17 07:44:51.201+00",
   "cutoff_lsn": "5/E018960",
@@ -1012,6 +1015,7 @@ client can tell "empty" from "not built yet".
 | `gc_watermark` | the sweeper's floor: nothing soft-deleted before this is still guaranteed to exist (§7.5). It travels in the manifest because a returning client's own copy of the watermark row is as old as the client — the first planning rule needs the current one. |
 | `cutoff_seq` + `cdc_stream` | the splice point: that stream's `last_seq`, captured *before* the build's REPEATABLE READ transaction begins |
 | `cdc_stream_created` | the `created` timestamp of the stream incarnation `cutoff_seq` was read on. A client gates CDC events on `cutoff_seq` only while it reads that incarnation: a stream deleted and recreated restarts its numbering, and a manifest cut before that must seed but gate nothing until a newer generation |
+| `shared_cutoff_seq` + `shared_cdc_stream` + `shared_cdc_stream_created` | a tenant table's second splice point. Its open-tenant rows ride `CDC_PUBLIC`, not `CDC_<tenant>`, and the chain carries them too: this is `CDC_PUBLIC`'s `last_seq`, read with `cutoff_seq`. Absent on public tables and on the open tenant's own chains |
 
 Everything at or below `cutoff_seq` on that stream is in the chain; everything above it is
 not. The direction is overlap-never-gap: a transaction still in flight when the chain was
@@ -1192,7 +1196,8 @@ stream's `first_seq`:
 * `stored_seq == 0` (first run) or `stored_seq < first_seq - 1` (the stream pruned past the stored position) → **gap** on that stream.
 * Otherwise resume that stream from `stored_seq + 1`.
 * **Live, too.** Stream sequences are contiguous and a tail reads the whole stream, so the next delivered sequence is `stored_seq + 1`. A delivered sequence beyond that means the stream pruned under the consumer (a host that did not poll, a tab throttled in the background): the server continues from the oldest message it holds and says nothing. The client treats it as the gap above, taken at once — the position stays below the hole until the re-seed lands.
-* **A chain older than the stream cannot splice.** If the newest manifest's `cutoff_seq + 1 < first_seq`, the events between the cutoff and the stream's oldest message are gone; the client says so and waits for the producer's next generation rather than seed and read past the hole.
+* **A chain older than the stream cannot splice.** If the newest manifest's `cutoff_seq + 1 < first_seq`, the events between the cutoff and the stream's oldest message are gone; the client says so and waits for the producer's next generation rather than seed and read past the hole. The same holds for a tenant table's `shared_cutoff_seq` against `CDC_PUBLIC`.
+* **Where a gapped stream resumes** comes from what the chains proved on it: each table that depends on the stream contributes its cut there — `cutoff_seq` when the stream is the table's own route, `shared_cutoff_seq` when it is `CDC_PUBLIC` and the table is tenant-scoped. If the stream pruned (`first_seq > 1`), every cut must reach `first_seq - 1`, else the stream stays blocked until the next generation. Otherwise resume at the lowest cut; the seed gate drops what the chains carried. A tenant table's client therefore holds a real position on `CDC_PUBLIC` from its first seed, and a later connect finds no gap there.
 
 The bridge keeps every CDC stream for at least two generation cadences (`CDC_MAX_AGE_SECONDS`, three by default): a gap re-seeds from the chain and resumes at the newest manifest's `cutoff_seq`, at most one cadence old, so the splice point is still in the stream. A stream that pruned harder than that (a size valve, a purge) leaves a chain that predates it; the client then waits for the next generation rather than resume past the hole.
 

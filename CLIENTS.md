@@ -4,7 +4,7 @@ Two client libraries speak the protocol.
 
 | | libzb | zb-client-ts |
 | --- | --- | --- |
-| language | Zig core + shell, C ABI | TypeScript shell; the core in TypeScript, moving to libzb's own core as WebAssembly (`scope`, `caughtUp` so far) |
+| language | Zig core + shell, C ABI | TypeScript shell; the core in TypeScript, moving to libzb's own core as WebAssembly (`scope`, `streamResume`, `caughtUp` so far) |
 | hosts | through its bindings: Python (`zb-python`), Kotlin/Java (`zb-android`), Dart/Flutter (`zb-dart`), React Native (`zb-react-native`); any other language through the C ABI directly | browser, Node |
 | local engine | SQLite (a file), PostgreSQL (`dbUrl`; seeds through COPY), or DuckDB (`engine: "duckdb"`; libduckdb opened at run time; seeds through the appender; the micro-VM worker's analytical replica, a file DuckDB itself opens once libzb closes it) | SQLite (sqlocal, better-sqlite3), PGlite |
 | SQLite version | 3.49.1, compiled in | 3.41 or later (`unhex`, in the seed of a table with a BLOB); every backend bundles its own, newer: sqlocal's SQLite WASM 3.51, better-sqlite3's 3.53 — never the device's |
@@ -188,8 +188,8 @@ in [DISTRIBUTION](DISTRIBUTION.md#building)).
 ## Pinned by fixtures — identical by construction
 
 One conformance suite, `zb-client-ts/fixtures/core-fixtures.json`, drives both cores (`core.ts` through `core.test.ts`, `core.zig` through `libzb/python/runner.py`). A rule in a fixture group cannot diverge without a test failing on one side.
-The rules zb-client-ts takes from libzb's WebAssembly core (`wasm/zb_core.wasm`: `scope`, `caughtUp`) are one implementation, so their groups check the module the package ships; `core.test.ts` also fails when that copy differs from libzb's build (`pnpm wasm` copies it).
-The groups, 39 today: seedGate, chainPlan, fullPredates, scope, position, caughtUp, fkKind, pgTsToWire, lsnToNumber, keyChange, upsert, delete, chainUpsert, chainRowParams, cdcBulk, columnDdl, fkClauses, createTable, rebuildSteps, diffColumns, fkDiffer, viewSteps, indexPlan, nextVersion, subjectSafe, envelope, normalizeVersion, hlcVersion, outboxWatermark, tombstoned, update, exists, pgArrayLiteral, heartbeat, shape, retyped, readOnlySql, tableSet, mergeRegisters.
+The rules zb-client-ts takes from libzb's WebAssembly core (`wasm/zb_core.wasm`: `scope`, `streamResume`, `caughtUp`) are one implementation, so their groups check the module the package ships; `core.test.ts` also fails when that copy differs from libzb's build (`pnpm wasm` copies it).
+The groups, 40 today: seedGate, chainPlan, fullPredates, scope, streamResume, position, caughtUp, fkKind, pgTsToWire, lsnToNumber, keyChange, upsert, delete, chainUpsert, chainRowParams, cdcBulk, columnDdl, fkClauses, createTable, rebuildSteps, diffColumns, fkDiffer, viewSteps, indexPlan, nextVersion, subjectSafe, envelope, normalizeVersion, hlcVersion, outboxWatermark, tombstoned, update, exists, pgArrayLiteral, heartbeat, shape, retyped, readOnlySql, tableSet, mergeRegisters.
 
 Everything below the core — the shells — is where parity is by hand, and where this document earns its place.
 

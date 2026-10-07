@@ -5139,5 +5139,108 @@
         }
       }
     }
+  ],
+  "streamResume": [
+    {
+      "name": "§10lw: a fresh client, the shared cut proves CDC_PUBLIC past its oldest message — resume at the cut",
+      "stored": 0,
+      "firstSeq": 6276,
+      "cuts": [
+        6300
+      ],
+      "to": 6300,
+      "blocked": false
+    },
+    {
+      "name": "a fresh client, the cut exactly one before the oldest message still splices",
+      "stored": 0,
+      "firstSeq": 6276,
+      "cuts": [
+        6275
+      ],
+      "to": 6275,
+      "blocked": false
+    },
+    {
+      "name": "a fresh client, the shared cut fell off the stream — blocked, the messages between are in no chain",
+      "stored": 0,
+      "firstSeq": 6276,
+      "cuts": [
+        6000
+      ],
+      "to": 0,
+      "blocked": true
+    },
+    {
+      "name": "a fresh client, a chain without the shared cut proves nothing on a pruned stream — blocked",
+      "stored": 0,
+      "firstSeq": 6276,
+      "cuts": [
+        null
+      ],
+      "to": 0,
+      "blocked": true
+    },
+    {
+      "name": "nothing pruned: a chain without a cut is harmless — stay at 0, the tail replays it all",
+      "stored": 0,
+      "firstSeq": 1,
+      "cuts": [
+        null
+      ],
+      "to": 0,
+      "blocked": false
+    },
+    {
+      "name": "nothing pruned: the lowest cut, the seed gate drops what the chains carried",
+      "stored": 0,
+      "firstSeq": 1,
+      "cuts": [
+        40,
+        25
+      ],
+      "to": 25,
+      "blocked": false
+    },
+    {
+      "name": "a live position the stream still holds: stay, whatever the cuts",
+      "stored": 7000,
+      "firstSeq": 6276,
+      "cuts": [
+        6300
+      ],
+      "to": 7000,
+      "blocked": false
+    },
+    {
+      "name": "a real gap, every table re-seeded past it: resume at the lowest cut",
+      "stored": 100,
+      "firstSeq": 6276,
+      "cuts": [
+        6400,
+        6300
+      ],
+      "to": 6300,
+      "blocked": false
+    },
+    {
+      "name": "a real gap, one table's chain still behind it: blocked, the position stays",
+      "stored": 100,
+      "firstSeq": 6276,
+      "cuts": [
+        6400,
+        6000
+      ],
+      "to": 100,
+      "blocked": true
+    },
+    {
+      "name": "no table depends on the stream: stay",
+      "stored": 0,
+      "firstSeq": 6276,
+      "cuts": [],
+      "to": 0,
+      "blocked": false
+    }
   ]
 }

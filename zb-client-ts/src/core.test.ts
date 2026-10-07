@@ -102,7 +102,7 @@ import {
   keyShape, typeShape, retypedColumns, isReadOnlySql,
 } from './core.ts';
 
-import { loadCore, scopeSeeding, caughtUpPosition } from './wasm-core.ts';
+import { loadCore, scopeSeeding, caughtUpPosition, streamResume } from './wasm-core.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 // The rules libzb owns run from the module this package ships (wasm-core.ts).
@@ -154,6 +154,9 @@ for (const c of fx.scope) {
 }
 for (const c of fx.position) {
   test(`position: ${c.name}`, () => assert.equal(advancePosition(c.stored, c.batch), c.next));
+}
+for (const c of fx.streamResume) {
+  test(`streamResume: ${c.name}`, () => assert.deepEqual(streamResume(c.stored, c.firstSeq, c.cuts), { to: c.to, blocked: c.blocked }));
 }
 for (const c of fx.caughtUp) {
   test(`caughtUp: ${c.name}`, () => assert.equal(caughtUpPosition(c.pos, c.lastSeq, c), c.next));

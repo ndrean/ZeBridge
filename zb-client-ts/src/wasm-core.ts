@@ -18,6 +18,7 @@ type Exports = {
   zb_reset(): void;
   zb_caught_up_position(pos: bigint, firstSeq: bigint, lastSeq: bigint, numPending: bigint, numAckPending: bigint, deliveredCount: bigint, delivered: bigint): bigint;
   zb_scope_seeding(ptr: number, len: number): bigint;
+  zb_stream_resume(ptr: number, len: number): bigint;
 };
 
 let ex: Exports | null = null;
@@ -76,6 +77,15 @@ export function scopeSeeding(
 ): { gapped: string[]; tablesToSeed: string[] } {
   const c = core();
   return call(c.zb_scope_seeding, 'scopeSeeding', { streams, tables });
+}
+
+/// §10lw: where a stream's position goes after a seed pass, from the cut each dependent
+/// table's chain proved on it (its own cut on its route, its shared cut on CDC_PUBLIC;
+/// null: none). `blocked`: a cut is below the stream's oldest message — wait for the
+/// producer. libzb core.streamResume.
+export function streamResume(stored: number, firstSeq: number, cuts: (number | null)[]): { to: number; blocked: boolean } {
+  const c = core();
+  return call(c.zb_stream_resume, 'streamResume', { stored, firstSeq, cuts });
 }
 
 /// Where an idle, caught-up consumer's position may move: to the stream's end when

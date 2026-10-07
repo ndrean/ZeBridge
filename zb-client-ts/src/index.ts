@@ -4,7 +4,7 @@
 /// Consumers: web-consumer (browser, #1), Node microservice (#2, forces the
 /// storage and transport seams).
 export * from './core.ts';
-export { loadCore, scopeSeeding, caughtUpPosition, type CoreSource, type StreamGap } from './wasm-core.ts';
+export { loadCore, scopeSeeding, caughtUpPosition, streamResume, type CoreSource, type StreamGap } from './wasm-core.ts';
 export * from './transport.ts';
 export * from './libzb.ts';
 export * from './dialect.ts';

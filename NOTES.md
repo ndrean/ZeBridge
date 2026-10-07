@@ -19198,3 +19198,22 @@ which Vite ships as an asset (66.6 kB, 35 kB gzipped; checked on 15-shared-recor
 run against the module, and core.test.ts fails when the shipped copy differs from libzb's
 build. Their reasoning lives in core.zig only (the read-order note and the two routes moved
 there). 249 tests, tsc clean.
+
+Step 3, 2026-10-08: §10lw's fix, one rule for both clients. The producer writes
+`shared_cutoff_seq` / `shared_cdc_stream` / `shared_cdc_stream_created` in a tenant table's
+manifest (CDC_PUBLIC's last sequence, read with `cutoff_seq`); the edge watch keeps the shared
+cut as a second cut of the pair (`<tenant>.<table>@shared`), so the §10ej triggers re-cut it,
+and a chain without the field, or whose shared cut fell off, is re-cut at the next tick.
+`core.streamResume(stored, firstSeq, cuts)` decides where a gapped stream resumes from what
+each dependent table's chain proved on it (own cut on its route, shared cut on CDC_PUBLIC;
+null = nothing): blocked when a cut is below `first_seq - 1` on a pruned stream, else the
+lowest cut. libzb calls it natively — its "any chain applied heals the shared stream" is gone
+— and zb-client-ts through WASM (`zb_stream_resume`); both refuse a chain whose shared cut
+fell off, and persist the shared cut (`_zbz_generations.shared_seq`,
+`_zebridge_generations.shared_seed_seq`). Fixtures `streamResume`, 10 cases, on both.
+
+gen_follow after (same settings, 40,000 ids): all six exact. libzb reconnects 0.01–0.05 s,
+caught up ~0.5 s. ts_alice: no gap at all, connect 0.20 s (was 10.32 s, a false gap and a
+wait for a cut). ts_bob: connect 0.24 s both legs; one REAL gap — offline 30 s, CDC_PUBLIC
+pruned past its position (116 → first 122) — the re-seed refused on CDC_acme (D2, the replica
+newer than the chain), handled in the background without holding connect.
