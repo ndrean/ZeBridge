@@ -19189,3 +19189,12 @@ not in the phone's roots): simulator 8.3 s, iPhone 12 28.4 s connect → usable 
 on the simulator against the hub, the flight's registers seen on the moto's Flutter app.
 08-map: chargers and fuel answer (poi_service.py on the Mac); the route tracing is awkward on
 a phone, not pursued.
+
+Step 2, 2026-10-08: zb-client-ts loads libzb's core. `src/wasm-core.ts` instantiates
+`wasm/zb_core.wasm` (copied by `pnpm wasm`) once per process in `connect()`, from the
+platform's `coreWasm()` — Node reads the file, the browser fetches `new URL(…, import.meta.url)`,
+which Vite ships as an asset (66.6 kB, 35 kB gzipped; checked on 15-shared-record's build).
+`scopeSeeding` and `caughtUpPosition` left core.ts: the fixtures `scope` and `caughtUp` now
+run against the module, and core.test.ts fails when the shipped copy differs from libzb's
+build. Their reasoning lives in core.zig only (the read-order note and the two routes moved
+there). 249 tests, tsc clean.

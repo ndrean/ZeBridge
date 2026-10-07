@@ -28,10 +28,11 @@ import { decode, encode, decodeMulti } from '@msgpack/msgpack';
 import type { Storage, StorageFactory, Exec as StorageExec } from './storage.ts';
 
 import { sqliteDialect, type Dialect } from './dialect.ts';
+import { loadCore, scopeSeeding, caughtUpPosition } from './wasm-core.ts';
 import { v7 as uuidv7 } from 'uuid';
 import { heartbeatPayload,
   seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica as coreFullPredates,
-  scopeSeeding, advancePosition, caughtUpPosition, foreignKeyFailureKind, lsnToNumber, pgTsToWire, tableSet,
+  advancePosition, foreignKeyFailureKind, lsnToNumber, pgTsToWire, tableSet,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgEngineValues, chainUpsertSql, chainRowParams,
   type SqlStep,
   fkClausesFor, createTableSteps, rebuildSteps, diffColumns, keyShape, typeShape, retypedColumns, isReadOnlySql,
@@ -1105,6 +1106,8 @@ export class ZeBridge {
   // ─── lifecycle ────────────────────────────────────────────────────────────
 
   public async connect(): Promise<void> {
+    // libzb's core (wasm-core.ts): once per process, before any rule is asked.
+    await loadCore(this.platform.coreWasm());
     await this.resolveIdentity();
     await this.initializeStorage();
     if (!this.config.grammarHash && this.config.bridgeUrl) {

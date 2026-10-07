@@ -167,55 +167,6 @@ export function fullPredatesReplica(
   return man.cutoff_seq < storedSeqForStream;
 }
 
-// ─── the gap rule and seeding scope (D2, §10n) ───────────────────────────────
-
-export type StreamGap = { firstSeq: number; stored: number; lastSeq?: number };
-
-/// Per-stream, never per-table (the abandoned-table paradox). `stored === 0` is
-/// the fresh-client case; `< firstSeq - 1` means the stream pruned past the
-/// stored position. `stored === firstSeq - 1` is NOT a gap: the very next
-/// message needed is the oldest one still held.
-/// Three shapes of "the stream no longer continues from where I stopped":
-///   never here (`stored === 0`); the tail I need was retained away
-///   (`stored < firstSeq - 1`); and the stream RESTARTED under me — my position is
-///   beyond its last sequence (`stored > lastSeq`). The third is what a lost
-///   replication slot looks like from a client: WAL the bridge never saw leaves no
-///   hole in the stream's numbering, so the bridge recreates the CDC streams on a new
-///   slot (NOTES §10bm) and this is the only trace a client can read.
-export function streamHasGap(g: StreamGap): boolean {
-  if (g.stored === 0) return true;
-  if (g.firstSeq > 0 && g.stored < g.firstSeq - 1) return true;
-  if (typeof g.lastSeq === 'number' && g.lastSeq >= 0 && g.stored > g.lastSeq) return true;
-  return false;
-}
-
-/// Seeding is SCOPED: a gap on one stream re-seeds only the tables ROUTED to
-/// that stream, plus tables never seeded at all (no generations watermark —
-/// a brand-new replica, or a table enabled between two connects). Everything
-/// else resumes untouched — a mobile client reconnecting with one stale
-/// stream must not rebuild its whole replica.
-export function scopeSeeding(
-  streams: Record<string, StreamGap>,
-  tables: Record<string, { route: string; sharedRoute?: string; seeded: boolean }>,
-): { gapped: string[]; tablesToSeed: string[] } {
-  const gapped = Object.entries(streams)
-    .filter(([, g]) => streamHasGap(g))
-    .map(([name]) => name);
-  const gappedSet = new Set(gapped);
-  // ⚠️ TWO routes, for a tenant-scoped table. Its own rows ride `CDC_<tenant>`, but its
-  // OPEN-TENANT rows — the shared ones every tenant may read (`zb_reader_all` admits
-  // `tenant_col = <open tenant>`, and the producer's chain carries them because it reads
-  // under that policy) — ride `CDC_PUBLIC`. Scoping such a table to its tenant stream
-  // alone meant a gap on CDC_PUBLIC re-seeded the public TABLES and left every
-  // tenant-scoped table's shared rows silently stale (NOTES §10bq).
-  const tablesToSeed = Object.entries(tables)
-    .filter(([, t]) => gappedSet.has(t.route) ||
-                       (t.sharedRoute != null && gappedSet.has(t.sharedRoute)) ||
-                       !t.seeded)
-    .map(([name]) => name);
-  return { gapped, tablesToSeed };
-}
-
 // ─── position accounting (D1, §10m) ──────────────────────────────────────────
 
 /// Delivery + accounting IS the position: an applied event is in the tables, a
@@ -224,27 +175,6 @@ export function scopeSeeding(
 /// backwards, and an empty batch leaves it alone.
 export function advancePosition(stored: number, batchSeqs: number[]): number {
   return batchSeqs.reduce((m, s) => Math.max(m, s ?? 0), stored);
-}
-
-/// §10ja: how far a CAUGHT-UP consumer has read. A consumer filtered to this client's
-/// tables never sees the other tables' messages, so its position stays at the last
-/// message it was handed (0 on a stream none of its tables writes to) and the next
-/// launch reads "position 0, stream first 9632" as a gap. With nothing pending it has
-/// seen every message for its subjects up to the stream's end: that is the position.
-/// ⚠️ `lastSeq` must be read BEFORE the consumer's info — then `numPending = 0` covers
-/// it — and nothing handed over past `pos`, nothing unacked, says all it was handed is
-/// applied. `deliveredCount` is the consumer's own sequence: a consumer that delivered
-/// nothing still reports `delivered` = its start - 1 (measured: 9631 on a fresh one,
-/// position 0), which is no message in flight. Any doubt keeps `pos`; never backwards.
-/// §10jh: never over a PRUNED range — `firstSeq` past `pos + 1` means the stream dropped
-/// messages after the position before this client saw them, and a filtered consumer then
-/// looks caught up. Stay; the gap rule heals it from the chain. `firstSeq` absent or 0:
-/// unknown, the old rule (libzb core.caughtUpPosition, the same fixtures).
-export function caughtUpPosition(pos: number, lastSeq: number, c: { numPending: number; numAckPending: number; deliveredCount: number; delivered: number; firstSeq?: number }): number {
-  if (lastSeq <= pos) return pos;
-  if ((c.firstSeq ?? 0) > pos + 1) return pos;
-  if (c.numPending !== 0 || c.numAckPending !== 0 || (c.deliveredCount > 0 && c.delivered > pos)) return pos;
-  return lastSeq;
 }
 
 // ─── FK failure classification (§10h) ────────────────────────────────────────

@@ -85,7 +85,7 @@ test('bytes stay bytes on every bind path (§10ex)', () => {
   assert.equal(pgEngineValues({ tile: b, tags: ['a'] }).tags, '{a}');
 });
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
@@ -95,14 +95,18 @@ import {
   fkTextDiffers, viewSteps, indexSyncPlan,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgArrayLiteral, chainUpsertSql, chainRowParams,
   planCdcBulk,
-  seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica, scopeSeeding, tableSet, mergeRegisters,
-  advancePosition, caughtUpPosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
+  seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica, tableSet, mergeRegisters,
+  advancePosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
   outboxWatermarkGate,
   heartbeatPayload,
   keyShape, typeShape, retypedColumns, isReadOnlySql,
 } from './core.ts';
 
+import { loadCore, scopeSeeding, caughtUpPosition } from './wasm-core.ts';
+
 const here = dirname(fileURLToPath(import.meta.url));
+// The rules libzb owns run from the module this package ships (wasm-core.ts).
+await loadCore(readFileSync(join(here, '..', 'wasm', 'zb_core.wasm')));
 const fx = JSON.parse(readFileSync(join(here, '..', 'fixtures', 'core-fixtures.json'), 'utf8'));
 
 // §10dq: the package's grammar is the bridge's, byte for byte. The bridge embeds
@@ -112,6 +116,13 @@ test('grammar: the packaged copy is byte-identical to src/grammar.json', () => {
   const packaged = readFileSync(join(here, 'grammar.json'), 'utf8');
   const source = readFileSync(join(here, '..', '..', 'src', 'grammar.json'), 'utf8');
   assert.equal(packaged, source);
+});
+
+// §10lx: the shipped core is libzb's current build. Rebuilt but not copied (`pnpm wasm`)
+// is a client running yesterday's rules; checked when the build output is there.
+const built = join(here, '..', '..', 'libzb', 'zig-out', 'wasm', 'zb_core.wasm');
+test('wasm: the packaged core is byte-identical to libzb\'s build', { skip: !existsSync(built) && 'libzb not built (zig build wasm-core)' }, () => {
+  assert.ok(readFileSync(join(here, '..', 'wasm', 'zb_core.wasm')).equals(readFileSync(built)));
 });
 
 for (const c of fx.heartbeat) {

@@ -6,6 +6,7 @@
 /// decoder (NOTES §10ja).
 import type { StorageFactory } from './storage.ts';
 import type { TransportConnection } from './transport.ts';
+import type { CoreSource } from './wasm-core.ts';
 
 export type PlatformName = 'node' | 'browser';
 
@@ -31,6 +32,9 @@ export interface Platform {
   /// Whether this platform dials NATS over TCP (Node) or only over WebSocket (the
   /// browser): picks `nats_url` or `nats_ws_url` from the identity.
   natsOverWebSocket?: boolean;
+  /// libzb's core as WebAssembly (wasm/zb_core.wasm in this package): its bytes, or the
+  /// fetch answering with them. Loaded once, by the first connect (wasm-core.ts).
+  coreWasm(): Promise<CoreSource>;
   /// Which zstd decoder runs — `zb.platformInfo`, for a log line.
   zstdName(): string;
 }

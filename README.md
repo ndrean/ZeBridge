@@ -262,7 +262,7 @@ The daemon `bridge` projects Postgres into NATS and back. It defines a protocol�
 
 There is a tiny daemon "sweeper". See [Sweeper](#sweeper).
 
-The client C-ABI `libzb` library - for FFI users - and the `zb-client-ts` library (no WASM) - for any JavaScript-based consumers - implement this protocol.
+The client C-ABI `libzb` library - for FFI users - and the `zb-client-ts` library - for any JavaScript-based consumers, with libzb's core as a 66 KB WASM module - implement this protocol.
 
 The client library abstracts away the complex choreography required to manage NATS streams, KV buckets, data decompression and deserialization, retries, holding queries with foreign keys...and sets up the local tables needed to hold the state of a client.
 
@@ -1386,7 +1386,7 @@ Start from what you see. Each row names the check and the rule behind it.
 
 The client library comes in two flavours: TypeScript (for any JavaScript engine) and a native dynamic Zig library with a C ABI, `libzb` (Flutter, React Native, Swift, Kotlin, Python services, and any language with an FFI).
 
-- **`zb-client-ts`** — a self-contained TypeScript package that runs **as-is** in browsers, Node, Electron, Deno and Bun. No wasm and no native library needed — a JavaScript host just uses this.
+- **`zb-client-ts`** — a self-contained TypeScript package that runs **as-is** in browsers, Node, Electron, Deno and Bun. No native library needed: the rules it shares with libzb come as a 66 KB WebAssembly build of libzb's core, shipped in the package and loaded by `connect()`.
 - **`libzb`** — a native library with a C ABI for mobile apps, desktop apps and microservices (FFI-compatible).
 
 > [!CAUTION]

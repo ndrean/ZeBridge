@@ -46,6 +46,7 @@ registerPlatform({
     },
   },
   zstdName: () => 'node:zlib',
+  coreWasm: () => readFile(new URL('../wasm/zb_core.wasm', import.meta.url)),
 });
 
 export * from './index.ts';

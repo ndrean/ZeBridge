@@ -14,11 +14,13 @@
     },
     "./node": "./src/entry-node.ts",
     "./browser": "./src/entry-browser.ts",
-    "./storage": "./src/storage.ts"
+    "./storage": "./src/storage.ts",
+    "./wasm/zb_core.wasm": "./wasm/zb_core.wasm"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test src/core.test.ts"
+    "test": "node --experimental-strip-types --test src/core.test.ts",
+    "wasm": "cd ../libzb && zig build wasm-core && cp zig-out/wasm/zb_core.wasm ../zb-client-ts/wasm/zb_core.wasm"
   },
   "dependencies": {
     "@electric-sql/pglite": "0.5.8",

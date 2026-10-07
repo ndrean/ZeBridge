@@ -20,6 +20,8 @@ registerPlatform({
     save: async (key, text) => { localStorage.setItem(`zebridge.identity:${key}`, text); },
   },
   natsOverWebSocket: true,
+  // `new URL(…, import.meta.url)`: the bundler sees the file and ships it as an asset.
+  coreWasm: () => fetch(new URL('../wasm/zb_core.wasm', import.meta.url)),
 });
 
 export * from './index.ts';

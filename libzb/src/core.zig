@@ -291,8 +291,8 @@ pub fn advancePosition(stored: i64, batch: std.json.Array) i64 {
     return m;
 }
 
-/// core.ts caughtUpPosition (§10ja): the position of a caught-up consumer — the
-/// stream's `last_seq`, read before the consumer's info, when nothing is pending,
+/// The position of a caught-up consumer (§10ja; zb-client-ts calls it through
+/// wasm_core.zig) — the stream's `last_seq`, when nothing is pending,
 /// nothing is unacked and nothing handed over is past `pos` (`delivered_count` 0: a
 /// fresh consumer's `delivered` is its start - 1, no message). Otherwise `pos`.
 /// §10jh: and never over a PRUNED range. `first_seq` past `pos + 1` means the stream
@@ -300,6 +300,8 @@ pub fn advancePosition(stored: i64, batch: std.json.Array) i64 {
 /// then has nothing pending and looks caught up, and jumping to `last_seq` erased the
 /// hole (a follower behind a slow link: 330,000 rows missing, the tail idle and "fine").
 /// Stay, and let the gap rule heal it from the chain. `first_seq` 0: unknown, the old rule.
+/// ⚠️ The caller reads `last_seq` BEFORE the consumer's info, so `num_pending == 0` covers
+/// it; read the other way round, a message landing between the two is skipped.
 pub fn caughtUpPosition(pos: u64, first_seq: u64, last_seq: u64, num_pending: u64, num_ack_pending: u64, delivered_count: u64, delivered: u64) u64 {
     if (last_seq <= pos) return pos;
     if (first_seq > pos + 1) return pos;
@@ -1107,7 +1109,10 @@ pub fn streamHasGap(first_seq: i64, stored: i64, last_seq: i64) bool {
     return false;
 }
 
-/// core.ts scopeSeeding: {gapped, tablesToSeed}.
+/// {gapped, tablesToSeed} (zb-client-ts calls it through wasm_core.zig). Scoped: a gap
+/// re-seeds the tables routed to that stream, plus tables never seeded. ⚠️ A tenant table
+/// has TWO routes: its own rows ride `CDC_<tenant>`, its open-tenant rows `CDC_PUBLIC`
+/// (`sharedRoute`); a gap on either re-seeds it (NOTES §10bq).
 pub fn scopeSeeding(a: std.mem.Allocator, streams: Value, tables: Value) !Value {
     var gapped = std.json.Array.init(a);
     if (streams == .object) {

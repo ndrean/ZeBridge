@@ -4,7 +4,7 @@ Two client libraries speak the protocol.
 
 | | libzb | zb-client-ts |
 | --- | --- | --- |
-| language | Zig core + shell, C ABI | TypeScript core + shell |
+| language | Zig core + shell, C ABI | TypeScript shell; the core in TypeScript, moving to libzb's own core as WebAssembly (`scope`, `caughtUp` so far) |
 | hosts | through its bindings: Python (`zb-python`), Kotlin/Java (`zb-android`), Dart/Flutter (`zb-dart`), React Native (`zb-react-native`); any other language through the C ABI directly | browser, Node |
 | local engine | SQLite (a file), PostgreSQL (`dbUrl`; seeds through COPY), or DuckDB (`engine: "duckdb"`; libduckdb opened at run time; seeds through the appender; the micro-VM worker's analytical replica, a file DuckDB itself opens once libzb closes it) | SQLite (sqlocal, better-sqlite3), PGlite |
 | SQLite version | 3.49.1, compiled in | 3.41 or later (`unhex`, in the seed of a table with a BLOB); every backend bundles its own, newer: sqlocal's SQLite WASM 3.51, better-sqlite3's 3.53 — never the device's |
@@ -188,6 +188,7 @@ in [DISTRIBUTION](DISTRIBUTION.md#building)).
 ## Pinned by fixtures — identical by construction
 
 One conformance suite, `zb-client-ts/fixtures/core-fixtures.json`, drives both cores (`core.ts` through `core.test.ts`, `core.zig` through `libzb/python/runner.py`). A rule in a fixture group cannot diverge without a test failing on one side.
+The rules zb-client-ts takes from libzb's WebAssembly core (`wasm/zb_core.wasm`: `scope`, `caughtUp`) are one implementation, so their groups check the module the package ships; `core.test.ts` also fails when that copy differs from libzb's build (`pnpm wasm` copies it).
 The groups, 39 today: seedGate, chainPlan, fullPredates, scope, position, caughtUp, fkKind, pgTsToWire, lsnToNumber, keyChange, upsert, delete, chainUpsert, chainRowParams, cdcBulk, columnDdl, fkClauses, createTable, rebuildSteps, diffColumns, fkDiffer, viewSteps, indexPlan, nextVersion, subjectSafe, envelope, normalizeVersion, hlcVersion, outboxWatermark, tombstoned, update, exists, pgArrayLiteral, heartbeat, shape, retyped, readOnlySql, tableSet, mergeRegisters.
 
 Everything below the core — the shells — is where parity is by hand, and where this document earns its place.
@@ -258,7 +259,7 @@ Everything below the core — the shells — is where parity is by hand, and whe
 | tenant revoked while connected | next connect | next connect |
 | inbox pruning | ✓ (`_zbz_inbox`, pruned at the seed's lsn) | ✓ |
 | zstd chain objects | built in | Node built in; browser needs `zstdDecompress` |
-| a chain step's apply | a msgpack cursor, rows sorted by key, transactions of `seedChunkRows` (50,000), bound straight from the payload, a 128 MB page cache while the seed lasts; 3 M rows in 11 s | the same sort, chunks and page cache over the decoded document; on SQLite a chunk is one statement through `json_each`, row by row for a table with a BLOB and on PGlite; 3 M rows in 26 s |
+| a chain step's apply | a msgpack cursor, rows sorted by key, transactions of `seedChunkRows` (50,000), bound straight from the payload, a 128 MB page cache while the seed lasts; 3 M rows in 11 s | the same sort, chunks and page cache over the decoded document; on SQLite a chunk is one statement through `json_each` (a BLOB as hex, back through `unhex`), row by row on PGlite; 3 M rows in 26 s |
 | a `rate_limited` verdict (`failed`, `retry_after_ms`) | kept in the outbox, flushes held until the time has passed; counted as `rate_limited` on the flush report | kept, flushes held the same way |
 | STRICT tables | every synced table is `CREATE TABLE … STRICT`; a replica from before is rebuilt once with the rows cast to the declared types | same, on the sqlite dialect (PGlite types its own columns) |
 | the streaming seed (`seedStreaming`) | opt-in: the object read through a pull consumer eight chunks at a time and inflated through a window; on SQLite the rows are staged in a temp table, one index build sorts them on disk, pages come back in key order; 3 M rows in 23 s at 329 MB peak (the whole-object path: 11 s, 1.1 GB); a step below `seedStreamingAboveBytes` compressed (8 MiB) takes the whole-object path, so a delta never streams | not built: the browser and Node hold the document (a phone runs libzb) |
