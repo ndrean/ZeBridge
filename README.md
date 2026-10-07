@@ -551,12 +551,11 @@ flowchart TD
     DQ -->|reads| B
 ```
 
-<img width="1614" height="859" alt="Screenshot 2026-10-06 at 22 27 00" src="https://github.com/user-attachments/assets/266f62af-9192-436f-8980-207a3b6654aa" />
-
+<img width="1614" height="559" alt="Screenshot 2026-10-06 at 22 27 00" src="https://github.com/user-attachments/assets/266f62af-9192-436f-8980-207a3b6654aa" />
 
 [examples/14-depot](examples/14-depot) runs the first two, with Supabase as the PostgreSQL and Valhalla on the hub: a plan, its places and its stops edited together on several screens, routes and the closest truck asked over NATS, positions computed by each screen from the plan. The live positions and their archive are the design for real trucks; they are not built yet.
 
-**Sizing, an estimate** for 20,000 trucks each reporting every 10 s (0.1 Hz: a dispatcher's map needs no more):
+**Sizing, an estimate** for 20,000 trucks each reporting every 10 s: a dispatcher's map needs no more):
 
 | | |
 | --- | --- |
@@ -1291,8 +1290,8 @@ A table that breaks a rule is **suspended**, not the bridge: its events are drop
 | `tenant_not_in_replica_identity` | a DELETE could not be routed to its tenant | a unique index on `(tenant, pk)` and `REPLICA IDENTITY USING INDEX` on it; `zebridge_enable` does this |
 | `unsupported_column_type` | a column's type cannot be decoded | change or drop the column; the migration lifts it live. A PostGIS or pgvector column added to an already published table, on a bridge that started before the extension existed: restart the bridge |
 | `row_too_large` | a row exceeded the event buffer | lifts at the first write that fits after a 30 s cooldown; a restart re-measures the widest row and keeps the suspension while it still exceeds `BASE_BUF` |
-| `schema_too_large` | the table's schema descriptor is wider than the event buffer, so clients cannot be told its shape | restart with the `BASE_BUF` the bridge names (the boot lists every such table and the setting that fits them all), or a DDL that narrows the table lifts it live |
 | `too_many_columns` | a migration grew the table past `MAX_COLUMNS` | drop columns (lifts live), or restart: the boot re-detects |
+| `schema_too_large` | the table's schema descriptor is wider than the event buffer, so clients cannot be told its shape | restart with the `BASE_BUF` the bridge names (the boot lists every such table and the setting that fits them all), or a DDL that narrows the table lifts it live |
 
 Rows written while a table was suspended never reached any replica. A lift after such drops, live or across a restart, bumps the table's seed epoch, so every replica re-seeds from a fresh full. Nothing to do by hand.
 
@@ -2871,7 +2870,7 @@ ZeBridge does both directions: changes out, by logical replication and per tenan
 
 - `PostgreSQL` 14+/16+ (for standby read replica). Uses `pgoutput` v1 binary mode.
 - `Nats/JetStream` 2.10+
-- `SQLite` 3.37.0+ (for STRICT)
+- `SQLite` 3.41+ (for STRICT, `unhex`)
 - `Zig v0.16`
 - `Python3` (installed by default with Debian and OSX).
 
