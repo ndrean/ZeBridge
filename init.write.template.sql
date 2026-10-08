@@ -677,14 +677,15 @@ CREATE TRIGGER zebridge_refuse_revoked_mapping_t
     FOR EACH ROW EXECUTE FUNCTION public.zebridge_refuse_revoked_mapping();
 
 -- Enrollment invites — the pump-starter (NOTES: the JWT mint flow). One row per
--- invitation: a high-entropy single-use code the operator hands out out-of-band;
+-- invitation: a high-entropy single-use code (122 random bits, generated here when the
+-- INSERT omits it) the operator hands out out-of-band;
 -- presenting it to the bridge's /enroll endpoint IS the authentication (a one-time
 -- password), and the row carries everything the mint needs: principal, tenant,
 -- role. The principal CHECK is the naming police — the narrow waist between the
 -- identity world and the routing world ([A-Za-z0-9_-] is the intersection of NATS
 -- subject-token, KV-key and template-expansion alphabets, measured).
 CREATE TABLE IF NOT EXISTS public.zebridge_invites (
-    code       text PRIMARY KEY,
+    code       text PRIMARY KEY DEFAULT replace(gen_random_uuid()::text, '-', ''),
     principal  text NOT NULL CHECK (principal ~ '^[A-Za-z0-9_-]+$'),
     tenant_id  text NOT NULL CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]'),
     role       text NOT NULL DEFAULT 'client',

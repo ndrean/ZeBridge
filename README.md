@@ -1931,7 +1931,7 @@ sequenceDiagram
 
     U->>BE: log in (OAuth, password…)
     BE->>BE: decide principal, tenant, role
-    BE->>PG: INSERT INTO zebridge_invites (code, principal, tenant, role)
+    BE->>PG: INSERT INTO zebridge_invites (principal, tenant_id, role) RETURNING code
     Note over BE,PG: today: a DBA does this by hand
     BE-->>A: the one-time code (in the login response)
 
@@ -2437,8 +2437,8 @@ bridge --diagnose
 A new user's app sends their `principal` (their ID) to the backend (today, the DBA). The backend (DBA here) assigns a `tenant_id` with a default role of "client".
 
 ```sql
-INSERT INTO zebridge_invites (code, principal, tenant_id)
-VALUES (replace(gen_random_uuid()::text, '-', ''), 'alice', 'acme')
+INSERT INTO zebridge_invites (principal, tenant_id)
+VALUES ('alice', 'acme')
 RETURNING code;
 ```
 

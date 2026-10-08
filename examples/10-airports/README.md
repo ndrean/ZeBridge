@@ -73,7 +73,7 @@ The first visit enrolls with an invite (any tenant: the service answers on the o
 and the browser keeps the identity, so later visits need no invite:
 
 ```sql
-INSERT INTO zebridge_invites (code, principal, tenant_id) VALUES ('<a random code>', 'alice', 'acme');
+INSERT INTO zebridge_invites (principal, tenant_id) VALUES ('alice', 'acme') RETURNING code;
 ```
 
 The dev server proxies NATS's WebSocket (`/nats`) and the bridge (`/bridge`, for `/enroll`

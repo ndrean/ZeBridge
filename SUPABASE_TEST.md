@@ -170,8 +170,9 @@ The last step of each `zebridge_enable` reads `T3 bridge=LIVE T4 nats=LIVE`.
 Your application's backend issues one per user, once it has signed them in. The code is 16 characters or more:
 
 ```sql
-INSERT INTO public.zebridge_invites (code, principal, tenant_id)
-VALUES ('<a random code>', 'alice', 'acme');
+INSERT INTO public.zebridge_invites (principal, tenant_id)
+VALUES ('alice', 'acme')
+RETURNING code;
 ```
 
 ## 8. A client

@@ -58,8 +58,8 @@ The settings, read at build time (clear Metro's cache after changing one):
 An invite is a row the backend writes:
 
 ```sql
-INSERT INTO zebridge_invites (code, principal, tenant_id)
-VALUES (replace(gen_random_uuid()::text, '-', ''), '<principal>', '<tenant>')
+INSERT INTO zebridge_invites (principal, tenant_id)
+VALUES ('<principal>', '<tenant>')
 RETURNING code;
 ```
 
