@@ -33,6 +33,9 @@ const zb = new ZeBridge({
   natsUrl: NATS_URL ?? (DEPLOYED_BRIDGE ? undefined : `${location.origin.replace(/^http/, 'ws')}/nats`),
   bridgeUrl: DEPLOYED_BRIDGE ?? `${location.origin}/bridge`,
   invite: qs.get('invite') ?? undefined,
+  // A dev stack (`bridge --init-nats dev`) has no enrollment: `?as=<name>` is then the
+  // principal itself. An identity this browser already holds wins over it.
+  principal: qs.get('invite') ? undefined : (qs.get('as') ?? undefined),
   dbPath: qs.get('as') ? `survey-${qs.get('as')}.sqlite3` : 'survey.sqlite3',
   tables: [TABLE],
 });

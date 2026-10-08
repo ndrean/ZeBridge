@@ -195,12 +195,17 @@ The parentheses keep each env file's values inside that one command.
 
 **1. NATS** — the whole stack, generated: operator, account, signing keys, `nats-server.conf`
 (client port 4222, WebSocket 8080 for the browser) and `zb-nats/.env.nats`. `operator` is the
-mode with enrollment, which the invites need (`dev` is an open server, enrollment off):
+mode with enrollment, which the invites need:
 
 ```sh
-./zig-out/bin/bridge --init-nats operator --dir ./zb-nats
+./zig-out/bin/bridge --init-nats operator --dir ./zb-nats   # add --js-domain <name> for clients behind a leaf node
 nats-server -c zb-nats/nats-server.conf
 ```
+
+For a quick try on a laptop, `--init-nats dev` instead: an open server, no authentication, no
+enrollment, so no invites. Map each editor to its tenant (`INSERT INTO zebridge_user_tenants
+(principal, tenant_id) VALUES ('alice', 'acme'), …`) and open the page with `?as=alice`: the
+name is the principal. Anyone can claim any name on such a server — never on a reachable host.
 
 **2. PostgreSQL** — the bridge's functions, grants and the publication, from `.env.bridge`
 (`DATABASE_READER_URL`, `DATABASE_WRITER_URL`, `BRIDGE_CDC_PUBLICATION`):
@@ -257,7 +262,9 @@ Each window has:
 
 `scripts/scenarios/shared_record.py` plays the timeline above with three zb-client-ts clients (alice, bob, carol) and an outsider, on part A and on part B, and checks the outcome mechanically: PostgreSQL holds access, notes and rating 5 by alice, hazard by bob, contact by carol; carol is told she lost rating; every replica equals PostgreSQL; the outsider changes nothing and sees nothing.
 
-    scripts/scenarios/run.py owns -k shared_record
+```txt
+scripts/scenarios/run.py owns -k shared_record
+```
 
 ### The TS client survival kit
 
@@ -345,49 +352,29 @@ zb.onVerdict(({ version, outcome, columns }) => show(version, outcome, columns))
 
 `onLog(cb)` says the same things in words, for people reading a console; an app does not need it.
 
-**The merge (part B).** Merge your register into the `doc` you see (`mergeRegisters`) and
-write it. PostgreSQL merges what it accepts into the stored `doc`, register by register, so a
-write built on an old `doc` cannot roll anyone back. A write refused as `stale` comes back to
-you: merge your registers into the newer row and write again; a register whose stamp lost to
-a newer one is LOST, and the page says so.
+**The merge (part B).** Merge your register into the `doc` you see (`mergeRegisters`) and write it. PostgreSQL merges what it accepts into the stored `doc`, register by register, so a write built on an old `doc` cannot roll anyone back. A write refused as `stale` comes back to you: merge your registers into the newer row and write again; a register whose stamp lost to a newer one is LOST, and the page says so.
 
-The page builds its client from the address it is served on:
-
-```js
-const zb = new ZeBridge({
-  natsUrl: NATS_URL ?? (DEPLOYED_BRIDGE ? undefined : `${location.origin.replace(/^http/, 'ws')}/nats`),
-  bridgeUrl: DEPLOYED_BRIDGE ?? `${location.origin}/bridge`,
-  invite: qs.get('invite') ?? undefined,
-  dbPath: qs.get('as') ? `survey-${qs.get('as')}.sqlite3` : 'survey.sqlite3',
-  tables: ['site_survey'],
-});
-```
-
-Serve it, from `examples/15-shared-record/web`. On a local stack, the dev server's proxy carries
-NATS's WebSocket and the bridge's `/enroll` on the page's own origin; tell it where they are:
+Serve it, from `examples/15-shared-record/web`. On a local stack, the dev server's proxy carries NATS's WebSocket and the bridge's `/enroll` on the page's own origin; tell it where they are:
 
 ```sh
-ZB_NATS_WS_ORIGIN=ws://127.0.0.1:8080 ZB_BRIDGE_ORIGIN=http://127.0.0.1:27434 pnpm dev   # http://localhost:5179
+ZB_NATS_WS_ORIGIN=ws://127.0.0.1:8080 \
+ZB_BRIDGE_ORIGIN=http://127.0.0.1:27434 \
+pnpm dev   # http://localhost:5179
 ```
 
 Against a deployed bridge, build the page for it instead: `VITE_ZB_BRIDGE_URL=https://bridge.example.com pnpm build`.
 
 ## What the demo deliberately does not do
 
-No CRDTs, no causal tracking, no ordered lists, no text collaboration. The register
-format is per-field, by design; notes is one register, and two editors who both edit
-it lose one. That is the same tradeoff as in COOPERATIVE_EDITING.md.
+No CRDTs, no causal tracking, no ordered lists, no text collaboration. The register format is per-field, by design; notes is one register, and two editors who both edit it lose one. That is the same tradeoff as in COOPERATIVE_EDITING.md.
 
 No multi-master. PostgreSQL judges every write.
 
-No map, no fleet, no routing. Those are examples 08, 13, 14. This one is about the
-merge.
+No map, no fleet, no routing. Those are examples 08, 13, 14. This one is about the merge.
 
-No offline seeding. All four editors seed at t = 0, online. The offline part is
-writes, which is the part the register model addresses.
+No offline seeding. All four editors seed at t = 0, online. The offline part is writes, which is the part the register model addresses.
 
-No server-side merge. The rebase is done by the library, following the rules the
-server stated. The server never sees a rebase as a new edit; it sees a fresh write.
+No server-side merge. The rebase is done by the library, following the rules the server stated. The server never sees a rebase as a new edit; it sees a fresh write.
 
 ## What it makes visible
 
