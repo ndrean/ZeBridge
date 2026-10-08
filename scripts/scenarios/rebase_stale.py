@@ -19,9 +19,15 @@ dropped that edit. Now it is kept aside until the winning row is here, and:
      on the queued write's key BEFORE the flush — which used to "confirm" the queued
      write as its own echo and drop it unsent (§10dt). The echo must carry our stamp.
 
+  E. Node OFFLINE again, the same column this time: the queued edit loses to libzb's
+     newer one.
+
 What must hold: PostgreSQL and both replicas equal, both outboxes empty, and each
-client's log names what it did (rebased / lost).
+client's log names what it did (rebased / lost). Node's `onVerdict` reports each of its
+writes once, by the version `mutate` returned: §A applied, §C and §D rebased (then the
+re-sent version applied), §E lost on `status`; `pending()` counts the queued write.
 """
+import json
 import os, sys, time, uuid
 from datetime import datetime, timedelta, timezone
 import zb
@@ -101,6 +107,17 @@ def main():
     err = open(PY_ERR, "w"); os.dup2(err.fileno(), 2)
     said = lambda path, s: s in open(path).read()
 
+    def verdict(version, timeout=30):
+        """Node's onVerdict line for the write `version`, waited for."""
+        end = time.time() + timeout
+        while time.time() < end:
+            for line in open(NODE_LOG):
+                if line.startswith("[VERDICT-API] "):
+                    v = json.loads(line[len("[VERDICT-API] "):])
+                    if v.get("version") == version: return v
+            time.sleep(0.2)
+        return None
+
     teardown()
     zb.psql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), title text, status text, {COMMON})")
     fresh_sqlite(PY_DB); fresh_sqlite(NODE_DB)
@@ -121,7 +138,7 @@ def main():
 
             # ── A. disjoint columns, libzb late, verdict before echo ──
             old = just_after(pg_version(uid))                                   # a slow clock: past the seed, below Node's
-            nd.mutate(T, "UPDATE", {"uid": uid}, {"status": "Done"})
+            a_ver = nd.mutate(T, "UPDATE", {"uid": uid}, {"status": "Done"})["version"]
             dt = wait_pg(uid, ("Old", "Done"))
             check(f"§A Node's edit landed: PostgreSQL {pg_row(uid)} ({dt} s)", dt is not None)
             py.mutate(T, "UPDATE", {"uid": uid}, {"title": "New"}, version=old)  # sent at once, stamped below Node's
@@ -161,10 +178,14 @@ def main():
             dt = both(py, nd, lambda c: local(c, uid) == ("New", "Again"), 60)
             check(f"§C both replicas hold it before Node writes ({dt} s)", dt is not None)
             old = (datetime.now(timezone.utc) - timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-            nd.mutate(T, "UPDATE", {"uid": uid}, {"title": "Newer"}, version=old)   # a clock 5 s slow
+            c_ver = nd.mutate(T, "UPDATE", {"uid": uid}, {"title": "Newer"}, version=old)["version"]   # a clock 5 s slow
             dt = wait_pg(uid, ("Newer", "Again"))
             check(f"§C Node's slow-clock edit judged stale, rebased at once, landed: PostgreSQL {pg_row(uid)} ({dt} s)", dt is not None)
             check("§C Node said so: 'rebased title onto the newer row'", said(NODE_LOG, "rebased title onto the newer row"))
+            v = verdict(c_ver)
+            check(f"§C onVerdict: {v}", v is not None and v["outcome"] == "rebased" and v["columns"] == ["title"] and v.get("rebasedAs"))
+            v2 = verdict(v["rebasedAs"]) if v and v.get("rebasedAs") else None
+            check(f"§C onVerdict for the re-sent write: {v2}", v2 is not None and v2["outcome"] == "applied")
             check(f"§C the resent stamp is above the winner, not the slow clock's: {pg_version(uid)} > {old}", pg_version(uid) > old)
             dt = both(py, nd, lambda c: local(c, uid) == ("Newer", "Again"), 60)
             check(f"§C both replicas at {{Newer, Again}} ({dt} s): py {local(py, uid)}, node {local(nd, uid)}", dt is not None)
@@ -174,8 +195,9 @@ def main():
 
             # ── D. Node offline: a queued edit meets the winner's row in the catch-up ──
             nd.disconnect()
-            nd.mutate(T, "UPDATE", {"uid": uid}, {"status": "Queued"})          # stamped now, sent on connect
+            d_ver = nd.mutate(T, "UPDATE", {"uid": uid}, {"status": "Queued"})["version"]          # stamped now, sent on connect
             check(f"§D Node hung up and queued an edit: outbox {outbox_left(nd, '_zebridge_outbox')}", outbox_left(nd, '_zebridge_outbox') == 1)
+            check(f"§D pending() says so: {nd.pending()}", nd.pending() == 1)
             time.sleep(0.5)
             py.mutate(T, "UPDATE", {"uid": uid}, {"title": "Meanwhile"}); py.flush(5000)
             dt = wait_pg(uid, ("Meanwhile", "Again"))
@@ -184,12 +206,30 @@ def main():
             dt = wait_pg(uid, ("Meanwhile", "Queued"))
             check(f"§D reconnected: the queued edit was judged stale, rebased and landed: PostgreSQL {pg_row(uid)} ({dt} s)", dt is not None)
             check("§D Node said so: 'rebased status onto the newer row'", said(NODE_LOG, "rebased status onto the newer row"))
+            v = verdict(d_ver)
+            check(f"§D onVerdict: {v}", v is not None and v["outcome"] == "rebased" and v["columns"] == ["status"])
             check("§D the winner's row was NOT taken for the queued write's echo", "confirmed by CDC echo" not in open(NODE_LOG).read().split("replaying 1 unconfirmed")[-1].split("rebased status")[0])
             dt = both(py, nd, lambda c: local(c, uid) == ("Meanwhile", "Queued"), 60)
             check(f"§D both replicas at {{Meanwhile, Queued}} ({dt} s): py {local(py, uid)}, node {local(nd, uid)}", dt is not None)
             turn(py, 2, lambda: False)
             check(f"§D outboxes empty: py {outbox_left(py, '%outbox%')}, node {outbox_left(nd, '_zebridge_outbox')}",
                   outbox_left(py, '%outbox%') == 0 and outbox_left(nd, '_zebridge_outbox') == 0)
+
+            # ── E. Node offline, the SAME column: the queued edit loses ──
+            nd.disconnect()
+            e_ver = nd.mutate(T, "UPDATE", {"uid": uid}, {"status": "Mine"})["version"]
+            time.sleep(0.5)
+            py.mutate(T, "UPDATE", {"uid": uid}, {"status": "Theirs"}); py.flush(5000)
+            dt = wait_pg(uid, ("Meanwhile", "Theirs"))
+            check(f"§E libzb's newer edit of status landed: PostgreSQL {pg_row(uid)} ({dt} s)", dt is not None)
+            nd.connect()
+            v = verdict(e_ver)
+            check(f"§E onVerdict: {v}", v is not None and v["outcome"] == "lost" and v.get("lostColumns") == ["status"])
+            dt = both(py, nd, lambda c: local(c, uid) == ("Meanwhile", "Theirs"), 60)
+            check(f"§E both replicas at the winner {{Meanwhile, Theirs}} ({dt} s): py {local(py, uid)}, node {local(nd, uid)}", dt is not None)
+            check(f"§E pending() back to 0: {nd.pending()}", nd.pending() == 0)
+            v = verdict(a_ver, timeout=1)
+            check(f"§A onVerdict (read at the end): {v}", v is not None and v["outcome"] == "applied" and v["columns"] == ["status"])
             py.close(); nd.close(); py = nd = None
             teardown()
     finally:

@@ -239,6 +239,28 @@ export type TableState = {
 /// 'snapshot' means "seeded" — the name predates the retirement of
 /// snapshot-on-demand and is kept for UI compatibility.
 export type Phase = 'connected' | 'migrated' | 'snapshot' | 'cdc';
+
+/// What became of ONE write, once and for good (`onVerdict`). `version` is the one
+/// `mutate()` returned. The library has already acted on it — dropped it from the outbox,
+/// re-sent it, or put the local row back — and only then says so:
+///   applied   PostgreSQL took it (`reason: 'version_clamped'` when this clock was ahead);
+///   rebased   a newer row won, but on other columns: re-sent as `rebasedAs`, which gets
+///             its own verdict;
+///   lost      a newer row won on the same columns (`lostColumns`), or a DELETE lost to a
+///             newer edit: the winning row stands, it arrives via CDC;
+///   deleted   the row was deleted elsewhere: the local copy is reverted;
+///   rejected  refused for good (`reason`, e.g. a policy): the local copy is reverted.
+/// A write kept for retry (`failed`, `rate_limited`) has no verdict yet.
+export type Verdict = {
+  version: string;
+  table: string;
+  key: Record<string, unknown>;
+  columns: string[];
+  outcome: 'applied' | 'rebased' | 'lost' | 'deleted' | 'rejected';
+  rebasedAs?: string;
+  lostColumns?: string[];
+  reason?: string;
+};
 /// §10ix: one table being seeded, a window at a time. `applied` counts the step's rows
 /// handled so far, `total` the step's row count, `kind` the chain step's (full, delta).
 /// `done` is true only on the event after the step is fully in the table: on the staged
@@ -576,7 +598,7 @@ export class ZeBridge {
   /// §10do: UPDATEs judged `stale` whose columns may still be rebased onto the
   /// winning row. Held until that row is here (it may already be), then either
   /// resubmitted with a fresh stamp or dropped and surfaced.
-  private rebase = new Map<string, { table: string; key: Record<string, unknown>; values: Record<string, unknown>; before: Record<string, unknown> | null; version: string; at: number }>();
+  private rebase = new Map<string, { table: string; key: Record<string, unknown>; values: Record<string, unknown>; before: Record<string, unknown> | null; version: string; sentVersion: string; at: number }>();
   private rebaseTimer: ReturnType<typeof setTimeout> | null = null;
   /// Streams the gap rule found RESTARTED (position beyond last_seq, §10bm's third
   /// shape) and no manifest has re-anchored on since. A manifest whose cutoff_seq is
@@ -612,6 +634,7 @@ export class ZeBridge {
   private eventListeners = new Set<(table: string, ev: any) => void>();
   private anyChangeListeners = new Set<() => void>();
   private logHandlers = new Set<(topic: string, data: any, level: string) => void>();
+  private verdictHandlers = new Set<(v: Verdict) => void>();
   private phaseHandlers = new Set<(p: Phase) => void>();
   private suspendedHandlers = new Set<(table: string, reason: string | null) => void>();
   private statusHandlers = new Set<(s: ConnStatus) => void>();
@@ -1018,6 +1041,42 @@ export class ZeBridge {
   public onLog(cb: (topic: string, data: any, level: string) => void): () => void {
     this.logHandlers.add(cb);
     return () => this.logHandlers.delete(cb);
+  }
+
+  /// The final outcome of each of this client's writes (`Verdict`), matched to `mutate()`
+  /// by `version`. `onLog` says the same things in words, for people; this is for code.
+  public onVerdict(cb: (v: Verdict) => void): () => void {
+    this.verdictHandlers.add(cb);
+    return () => this.verdictHandlers.delete(cb);
+  }
+
+  /// Writes still in the outbox: applied here, not yet judged by PostgreSQL (offline, in
+  /// flight, or kept for retry).
+  public async pending(): Promise<number> {
+    await this.outboxInitPromise;
+    try { return Number((await this.run(`SELECT count(*) AS n FROM _zebridge_outbox`))[0]?.n ?? 0); } catch { return 0; }
+  }
+
+  private emitVerdict(v: Verdict) {
+    for (const cb of this.verdictHandlers) { try { cb(v); } catch { /* a host's listener must not break the verdict path */ } }
+  }
+
+  /// What a verdict reports about its write, from the outbox row (read before the row goes).
+  private async outboxWrite(msgId: string, fallback: { table: string; version?: string | null } | undefined) {
+    await this.outboxInitPromise;
+    let row: any;
+    try { row = (await this.run(`SELECT tbl, payload FROM _zebridge_outbox WHERE msg_id = ?`, msgId))[0]; } catch { /* none */ }
+    let sent: any = {};
+    try { sent = row ? JSON.parse(row.payload) : {}; } catch { /* unreadable */ }
+    const table = String(row?.tbl ?? fallback?.table ?? '?');
+    const vcol = this.syncedTables.get(table)?.versionColumn;
+    const data = sent?.data && typeof sent.data === 'object' ? sent.data : {};
+    return {
+      version: String(sent?.version ?? fallback?.version ?? ''),
+      table,
+      key: sent?.key && typeof sent.key === 'object' ? sent.key : {},
+      columns: Object.keys(data).filter((c) => c !== vcol),
+    };
   }
 
   public onPhase(cb: (p: Phase) => void): () => void {
@@ -1506,6 +1565,7 @@ export class ZeBridge {
       table: entry.tbl, key, values,
       before: entry.before ? JSON.parse(entry.before) : null,
       version: normalizeVersion(String(sent.version ?? '')),
+      sentVersion: String(sent.version ?? ''),
       at: Date.now(),
     });
   }
@@ -1535,9 +1595,14 @@ export class ZeBridge {
     if (!state?.pkCols.length || !state.versionColumn) { this.rebase.delete(msgId); return; }
     const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
     const cur = (await this.run(`SELECT * FROM ${e.table} WHERE ${where}`, ...state.pkCols.map((c) => e.key[c])))[0];
+    const reported = (outcome: Verdict['outcome'], extra: Partial<Verdict> = {}) => this.emitVerdict({
+      version: e.sentVersion, table: e.table, key: e.key,
+      columns: Object.keys(e.values).filter((c) => c !== state.versionColumn), outcome, ...extra,
+    });
     if (!cur) {
       this.rebase.delete(msgId);
       this.appendLog(e.table, `rebase of ${msgId} abandoned: the row is gone`, 'ERROR');
+      reported('deleted');
       return;
     }
     // "The winner is here" — by the row's version now, OR by the version the row carried
@@ -1562,9 +1627,11 @@ export class ZeBridge {
     this.rebase.delete(msgId);
     if (overlap.length) {
       this.appendLog(e.table, `edit LOST to a newer version on the same column(s) ${overlap.join(', ')} — the winning row stands; surface this to the user`, 'ERROR');
+      reported('lost', { lostColumns: overlap });
       return;
     }
     const r = await this.mutate(e.table, 'UPDATE', e.key, e.values);
+    reported('rebased', { rebasedAs: r.version });
     this.appendLog(e.table, `rebased ${mine.join(', ')} onto the newer row (the winner changed ${winnerChanged.filter((c) => c !== 'last_writer').join(', ') || 'nothing else'}) as ${r.version}`, 'INFO');
   }
 
@@ -3988,6 +4055,8 @@ export class ZeBridge {
         // 'failed' is the ONE status that is not definitive (§7.1: keep and retry).
         const definitive = verdict.status !== 'failed';
         ok = definitive;
+        // What onVerdict reports, read while the outbox row is still there.
+        const write = definitive ? await this.outboxWrite(msgId, pending) : null;
         if (definitive) this.pendingWrites.delete(msgId);
         // §10do: a stale UPDATE is read BEFORE its outbox row goes — it may be rebased.
         // The verb lives on the outbox row (the verdict subject has none): read it now.
@@ -4008,6 +4077,7 @@ export class ZeBridge {
             } else {
               this.appendLog(m.subject, { ...verdict, write: where }, 'VERDICT');
             }
+            if (write) this.emitVerdict({ ...write, outcome: 'applied', ...(verdict.reason ? { reason: String(verdict.reason) } : {}) });
             break;
           case 'stale':
             // Pop and do NOT hand-revert: the winning row arrives via CDC. An UPDATE
@@ -4019,18 +4089,22 @@ export class ZeBridge {
               // §10dw: a delete that lost. Not rebased on purpose — a delete touches every
               // column, and re-issuing it would erase an edit its author saw accepted.
               this.appendLog(m.subject, `${where}: your DELETE lost to a newer edit of the same row — the row is back with that edit (surface this: delete again if it is still meant)`, 'WARNING');
+              if (write) this.emitVerdict({ ...write, outcome: 'lost', lostColumns: write.columns });
             } else {
               this.appendLog(m.subject, `${where}: a newer version won — dropping this edit, the winning row arrives via CDC`, 'INFO');
+              if (write) this.emitVerdict({ ...write, outcome: 'lost', lostColumns: write.columns });
             }
             break;
           case 'row_deleted':
             // Nothing is coming via CDC to correct this one — revert by hand (§1.6d).
             await this.revertOptimisticWrite(msgId, 'delete');
             this.appendLog(m.subject, `${where}: the row was deleted elsewhere, so this edit cannot be applied — reverting the local copy. Surface this to the user rather than dropping it silently.`, 'ERROR');
+            if (write) this.emitVerdict({ ...write, outcome: 'deleted' });
             break;
           case 'rejected':
             await this.revertOptimisticWrite(msgId, 'restore');
             this.appendLog(m.subject, `${where}: refused permanently (${verdict.reason}${verdict.sqlstate ? ` / SQLSTATE ${verdict.sqlstate}` : ''}) — ${verdict.detail || 'no detail'} — reverting the local copy`, 'ERROR');
+            if (write) this.emitVerdict({ ...write, outcome: 'rejected', ...(verdict.reason ? { reason: String(verdict.reason) } : {}) });
             break;
           case 'failed':
             if (verdict.reason === 'rate_limited') {

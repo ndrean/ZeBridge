@@ -36,6 +36,8 @@ zb.onLog((t: string, d: any, level: string) => {
   if (t === 'CDC' || t.startsWith('cdc.')) return;  // one line per event would dwarf the seed itself
   console.error(`[${t} ${level}] ${typeof d === 'string' ? d : JSON.stringify(d)}`.slice(0, 300));
 });
+// Each write's final outcome, one JSON line the scenario reads back (onVerdict).
+zb.onVerdict((v) => console.error(`[VERDICT-API] ${JSON.stringify(v)}`));
 
 // A refused connect (a revoked principal, §10dm) is reported, not fatal: the local
 // replica can still be queried and, explicitly, wiped.
@@ -58,6 +60,7 @@ for await (const line of rl) {
     // made in between queue in the outbox and go out on connect.
     if (req.disconnect) { await zb.close(); console.log(JSON.stringify({ rows: [{ disconnected: true }] })); continue; }
     if (req.connect) { await zb.connect(); console.log(JSON.stringify({ rows: [{ connected: true, tenant: zb.tenant }] })); continue; }
+    if (req.pending) { console.log(JSON.stringify({ rows: [{ pending: await zb.pending() }] })); continue; }
     if (req.mutate) {
       // {"mutate": {"table", "op", "key", "values"}} → the blessed write path
       const m = req.mutate;

@@ -131,6 +131,9 @@ class Node:
     def connect(self):
         """Reconnect: catch up on CDC, then flush the outbox."""
         return self._op({"connect": True})
+    def pending(self):
+        """zb.pending(): the writes still in the outbox."""
+        return self._op({"pending": True})["pending"]
     def wipe(self):
         """The explicit wipe (§10dl): the worker closes its client, deletes the files, exits."""
         self.p.stdin.write('{"wipe": true}\n'); self.p.stdin.flush()
