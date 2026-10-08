@@ -208,8 +208,15 @@ fn slotChecks(a: std.mem.Allocator, conn: *c.PGconn, own: []const u8, running: b
         const mine = std.mem.eql(u8, name, own);
         if (mine) own_seen = true;
         if (!std.mem.eql(u8, wal_status, "reserved") and !std.mem.eql(u8, wal_status, "extended")) {
-            findings += 1;
-            log.err("🔴 slot '{s}' is {s}: it cannot resume{s}", .{ name, wal_status, if (mine) " — this bridge must start once with ZB_FEED_RESTART=1, and its clients re-seed" else "" });
+            if (mine) {
+                findings += 1;
+                log.err("🔴 this bridge's slot '{s}' is {s}: it cannot resume — this bridge must start once with ZB_FEED_RESTART=1, and its clients re-seed", .{ name, wal_status });
+            } else {
+                // Another bridge's, a retired one's, a tool's: it holds no WAL any more, so
+                // it costs nothing and does not stop THIS bridge. A live owner's own
+                // diagnosis fails on it; here it is housekeeping.
+                log.warn("⚠️ slot '{s}' is {s} and holds no WAL: not this bridge's — drop it if nothing uses it (bridge --drop-slot {s})", .{ name, wal_status, name });
+            }
         } else if (mine) {
             if (active) {
                 log.info("✅ this bridge's slot '{s}' is active, holding {s} of WAL", .{ name, retained });
