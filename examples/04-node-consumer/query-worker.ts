@@ -9,7 +9,7 @@
 /// Env: NATS_URL ZB_PRINCIPAL ZB_DB ZB_ENGINE (sqlite|pglite) ZB_TABLES (comma list; default every table)
 import { createInterface } from 'node:readline';
 import { mkdirSync, readFileSync } from 'node:fs';
-import { ZeBridge } from 'zb-client-ts';
+import { ZeBridge, mergeRegisters } from 'zb-client-ts';
 
 // §10ex: a BLOB cell comes back as bytes; on this JSON line it is the same
 // `{"$bin": "<base64>"}` marker the C ABI uses, so a host reads both clients alike.
@@ -61,6 +61,9 @@ for await (const line of rl) {
     if (req.disconnect) { await zb.close(); console.log(JSON.stringify({ rows: [{ disconnected: true }] })); continue; }
     if (req.connect) { await zb.connect(); console.log(JSON.stringify({ rows: [{ connected: true, tenant: zb.tenant }] })); continue; }
     if (req.pending) { console.log(JSON.stringify({ rows: [{ pending: await zb.pending() }] })); continue; }
+    // the register kit: the library's own merge and clock
+    if (req.merge) { console.log(JSON.stringify({ rows: [mergeRegisters(req.merge.a ?? {}, req.merge.b ?? {})] })); continue; }
+    if (req.stamp) { console.log(JSON.stringify({ rows: [{ stamp: zb.stamp() }] })); continue; }
     if (req.mutate) {
       // {"mutate": {"table", "op", "key", "values"}} → the blessed write path
       const m = req.mutate;

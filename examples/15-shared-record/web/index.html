@@ -8,7 +8,9 @@
       :root { color-scheme: light dark; font: 15px/1.45 system-ui, sans-serif; }
       body { margin: 0 auto; max-width: 720px; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
       h1 { font-size: 17px; margin: 0; }
-      form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+      .forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
+      form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px; border: 1px solid #8884; border-radius: 8px; }
+      form h3 { flex: 1 0 100%; font-size: 13px; margin: 0; }
       select, input, button { font: inherit; padding: 6px 8px; border-radius: 6px; border: 1px solid #8886; }
       input { flex: 1 1 180px; min-width: 0; }
       button { cursor: pointer; }
@@ -28,34 +30,41 @@
       #activity li { padding: 3px 8px; border-left: 3px solid #8885; overflow-wrap: anywhere; }
       #activity time { opacity: .6; margin-right: 6px; font-variant-numeric: tabular-nums; }
       #activity .sent { border-color: #1f6feb; }
-      #activity .accepted, #activity .rebased { border-color: #1a7f37; }
+      #activity .applied, #activity .rebased { border-color: #1a7f37; }
       #activity .rebased { background: #1a7f3714; }
       #activity .stale, #activity .net { border-color: #d68910; }
-      #activity .lost, #activity .rejected { border-color: #d1361f; background: #d1361f14; }
+      #activity .lost, #activity .rejected, #activity .deleted { border-color: #d1361f; background: #d1361f14; }
     </style>
   </head>
   <body>
     <h1>Site survey</h1>
     <div class="bar"><span id="who"></span> <button id="net" type="button" disabled>Go offline</button> <span id="chip"></span></div>
-    <form id="edit">
-      <select id="field" aria-label="field">
-        <option>access</option>
-        <option>hazard</option>
-        <option>contact</option>
-        <option>rating</option>
-        <option>notes</option>
-        <option>doc</option>
-      </select>
-      <select id="register" aria-label="register in doc" hidden>
-        <option>access</option>
-        <option>hazard</option>
-        <option>contact</option>
-        <option>rating</option>
-        <option>notes</option>
-      </select>
-      <input id="value" placeholder="a value" autocomplete="off" />
-      <button>Write</button>
-    </form>
+    <div class="forms">
+      <form id="edit-a">
+        <h3>A · a column</h3>
+        <select id="col-a" aria-label="column">
+          <option>access</option>
+          <option>hazard</option>
+          <option>contact</option>
+          <option>rating</option>
+          <option>notes</option>
+        </select>
+        <input id="value-a" placeholder="a value" autocomplete="off" />
+        <button>Write the column</button>
+      </form>
+      <form id="edit-b">
+        <h3>B · a register in <code>doc</code></h3>
+        <select id="reg-b" aria-label="register in doc">
+          <option>access</option>
+          <option>hazard</option>
+          <option>contact</option>
+          <option>rating</option>
+          <option>notes</option>
+        </select>
+        <input id="value-b" placeholder="a value" autocomplete="off" />
+        <button>Write the register</button>
+      </form>
+    </div>
     <div id="sent"></div>
     <div id="row">connecting…</div>
     <section>

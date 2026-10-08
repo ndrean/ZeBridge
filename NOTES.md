@@ -19265,3 +19265,19 @@ Carol's write `applied`, Alice's 4 gone; §B with it — {access 4425 by carol, 
 in PostgreSQL and both replicas, `applied`, outbox empty. Applied to the dev database with
 `bridge --init-sql`; Supabase and the hub need the same, then `zebridge_enable` again with
 `register_cols` for their register tables.
+
+§10lz, continued (2026-10-08). Example 15's page split into two forms (A: a column, B: a register
+in `doc`) — the single form with a field picker had its owner writing columns while watching the
+registers — and moved onto the kit: `onVerdict` and `pending()` replace the four log regexes,
+`versionOf()` and the `_zebridge_outbox` query. `scripts/scenarios/shared_record.py` (owns) plays
+the README's timeline with three Node editors and an outsider, on columns and on registers.
+
+It found two bugs:
+* the BRIDGE: in a batch, the stale-vs-deleted probe (`classifyRound`) ran after the commit
+  without `zb.principal`, so on a tenant-scoped table RLS hid the row and every stale write was
+  answered `row_deleted` — the client put its local copy back instead of reporting the edit lost.
+  Any reconnect that flushes two or more queued writes takes that path (rebase_stale's reconnects
+  flush one). Fixed: a transaction-local set_config before each probe (the pipeline's statements
+  up to the sync share one implicit transaction).
+* zb-client-ts: `onVerdict` reported verdicts for other devices of the same principal (the ack
+  subject is the principal's). Now only a write in this client's outbox or sent this session.

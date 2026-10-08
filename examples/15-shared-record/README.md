@@ -188,6 +188,35 @@ Without `register_cols`, t = 30 is a silent loss: Bob's write is accepted whole,
 
 ## The app
 
+### Setup Postgres & NATS
+
+Three steps, from the repository's root, with the bridge built (`zig build -Doptimize=ReleaseFast`).
+The parentheses keep each env file's values inside that one command.
+
+**1. NATS** — the whole stack, generated: operator, account, signing keys, `nats-server.conf`
+(client port 4222, WebSocket 8080 for the browser) and `zb-nats/.env.nats`. `operator` is the
+mode with enrollment, which the invites need (`dev` is an open server, enrollment off):
+
+```sh
+./zig-out/bin/bridge --init-nats operator --dir ./zb-nats
+nats-server -c zb-nats/nats-server.conf
+```
+
+**2. PostgreSQL** — the bridge's functions, grants and the publication, from `.env.bridge`
+(`DATABASE_READER_URL`, `DATABASE_WRITER_URL`, `BRIDGE_CDC_PUBLICATION`):
+
+```sh
+( set -a; . ./.env.bridge; set +a; ./zig-out/bin/bridge --init-sql ) | psql "$ADMIN_URL"
+```
+
+Then the table, `zebridge_enable` and the seed row (above).
+
+**3. The bridge** — both env files; its first start creates the replication slot:
+
+```sh
+( set -a; . zb-nats/.env.nats; . ./.env.bridge; set +a; exec ./zig-out/bin/bridge )
+```
+
 ### Generate the invites
 
 The bridge is agnostic, so the DBA generates invites.
@@ -206,7 +235,7 @@ RETURNING code, principal, tenant_id, expires_at;
 Use the returned invite code per tab:
 
 ```txt
-http://localhost:5173/?invite=<code>&as=alice
+http://localhost:5179/?invite=<code>&as=alice
 ```
 
 ### The page
@@ -215,22 +244,20 @@ Two flows meet on the page:
 
 * Data, replicated into each browser: the site_survey table, one row per site, its editable fields kept as one register each in a jsonb column. Every editor's replica converges, offline or not.
 
-* Verdicts, coming back from PostgreSQL on each write: applied, stale, rebased, LOST, rejected. The demo turns them into a timeline, so the merge is watched, not inferred.
+* Verdicts, coming back from PostgreSQL on each write (`onVerdict`): applied, rebased, lost, deleted, rejected. The page lists them, so the merge is watched, not inferred.
 
 Each window has:
 
-* Record — the five registers, rendered from that editor’s replica. Labels are
-annotated with w and t. When the editor is offline, the panel is dimmed and a chip
-says offline — 1 queued write.
+* Two forms, side by side: **A · a column** writes one of the five plain columns; **B · a register in `doc`** writes one register, merged into the `doc` this replica holds.
+* The record, rendered from that editor's replica: the five columns (A), then the five registers of `doc` (B), each with its writer `w` and the time of its stamp `t`.
+* A chip, from `pending()`: online, or offline with the number of queued writes. Going offline dims the record.
+* Activity: each write sent, and what became of it (`onVerdict`) — applied, rebased, the row moved first and the page merged into it, or LOST with the value that stands.
 
-* Outbox — the pending writes: (register, value, stamp, state). States: queued,
-sent, settled, rebased, lost.
+### Played by a script
 
-* Verdicts — the last few verdicts from PostgreSQL: applied, stale (with the
-reason: rebased or edit LOST), row_deleted, rejected.
+`scripts/scenarios/shared_record.py` plays the timeline above with three zb-client-ts clients (alice, bob, carol) and an outsider, on part A and on part B, and checks the outcome mechanically: PostgreSQL holds access, notes and rating 5 by alice, hazard by bob, contact by carol; carol is told she lost rating; every replica equals PostgreSQL; the outsider changes nothing and sees nothing.
 
-* Timeline — a shared panel (one per browser) that lists
-(t, register, editor, verdict) so the merge is watched as it happens.
+    scripts/scenarios/run.py owns -k shared_record
 
 ### The TS client survival kit
 
@@ -336,11 +363,14 @@ const zb = new ZeBridge({
 });
 ```
 
-Serve it:
+Serve it, from `examples/15-shared-record/web`. On a local stack, the dev server's proxy carries
+NATS's WebSocket and the bridge's `/enroll` on the page's own origin; tell it where they are:
 
 ```sh
-VITE_ZB_BRIDGE_URL=https://localhost:5173 pnpm dev
+ZB_NATS_WS_ORIGIN=ws://127.0.0.1:8080 ZB_BRIDGE_ORIGIN=http://127.0.0.1:27434 pnpm dev   # http://localhost:5179
 ```
+
+Against a deployed bridge, build the page for it instead: `VITE_ZB_BRIDGE_URL=https://bridge.example.com pnpm build`.
 
 ## What the demo deliberately does not do
 

@@ -134,6 +134,12 @@ class Node:
     def pending(self):
         """zb.pending(): the writes still in the outbox."""
         return self._op({"pending": True})["pending"]
+    def merge(self, a, b):
+        """mergeRegisters, the library's (from its WASM core)."""
+        return self._op({"merge": {"a": a, "b": b}})
+    def stamp(self):
+        """zb.stamp(): a register's `t` on this client's clock."""
+        return self._op({"stamp": True})["stamp"]
     def wipe(self):
         """The explicit wipe (§10dl): the worker closes its client, deletes the files, exits."""
         self.p.stdin.write('{"wipe": true}\n'); self.p.stdin.flush()
