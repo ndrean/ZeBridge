@@ -1440,6 +1440,15 @@ pub const MutationListener = struct {
     /// The deferred stale-vs-deleted disambiguation, only for writes that touched
     /// zero rows. Reads run AFTER the batch's commit, which is exactly what the
     /// question means: what state did the row END in.
+    ///
+    /// ⚠️ Each probe runs as its write's principal: on a tenant-scoped table the row is
+    /// visible only under `zb.principal` (RLS, zb_tenant_write), and that setting is
+    /// transaction-local to the write, gone after its commit. Unscoped, the probe found no
+    /// row and every stale write of a batch was told `row_deleted` — the client then put
+    /// its local copy back instead of reporting the edit lost (§10lz, shared_record.py:
+    /// two queued writes sent on one reconnect). In pipeline mode the statements up to the
+    /// sync share one implicit transaction, so a local set_config before each probe holds
+    /// for it.
     fn classifyRound(self: *MutationListener, conn: ?*c.PGconn, bc: *BatchCtx) !void {
         _ = self;
         if (c.PQenterPipelineMode(conn) != 1) return error.MutationFailed;
@@ -1449,8 +1458,13 @@ pub const MutationListener = struct {
             c.PQreset(conn);
         };
         var expected: usize = 0;
+        const set_sql = "SELECT set_config('" ++ config.Sync.principal_setting ++ "', $1, true)";
         for (bc.pending.items) |*pnd| {
             if (!pnd.affected0) continue;
+            const principal_z = try bc.arena.allocator().dupeSentinel(u8, pnd.principal, 0);
+            const set_params = [_]?[*:0]const u8{principal_z.ptr};
+            if (c.PQsendQueryParams(conn, set_sql, 1, null, &set_params[0], null, null, 0) != 1) return error.MutationFailed;
+            expected += 1;
             if (c.PQsendQueryParams(
                 conn,
                 pnd.classify_sql.ptr,
@@ -1466,13 +1480,13 @@ pub const MutationListener = struct {
         if (c.PQpipelineSync(conn) != 1) return error.MutationFailed;
 
         var failed = false;
-        var idx: usize = 0; // walks the affected0 subset in order
+        var stmt: usize = 0; // statements finished: a set_config and a probe per affected0 pending
         var nulls: usize = 0;
         while (true) {
             const r = c.PQgetResult(conn);
             if (r == null) {
                 nulls += 1;
-                idx += 1;
+                stmt += 1;
                 if (nulls > expected + 3) {
                     failed = true;
                     exit_ok = false;
@@ -1499,7 +1513,8 @@ pub const MutationListener = struct {
                 failed = true;
                 continue;
             }
-            // idx-th zero-affected pending, in send order
+            if (stmt % 2 == 0) continue; // the set_config before a probe
+            const idx = stmt / 2; // the idx-th zero-affected pending, in send order
             var seen: usize = 0;
             for (bc.pending.items) |*pnd| {
                 if (!pnd.affected0) continue;
