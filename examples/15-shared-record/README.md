@@ -188,60 +188,88 @@ Without `register_cols`, t = 30 is a silent loss: Bob's write is accepted whole,
 
 ## The app
 
-### Setup Postgres & NATS
+### Run it
 
-Three steps, from the repository's root, with the bridge built (`zig build -Doptimize=ReleaseFast`).
-The parentheses keep each env file's values inside that one command.
+On a laptop, with no enrollment: a NATS server open to anyone, and each editor simply names
+itself. From the repository's root, with the bridge built (`zig build -Doptimize=ReleaseFast`);
+the parentheses keep each env file's values inside that one command.
 
-**1. NATS** — the whole stack, generated: operator, account, signing keys, `nats-server.conf`
-(client port 4222, WebSocket 8080 for the browser) and `zb-nats/.env.nats`. `operator` is the
-mode with enrollment, which the invites need:
+**1. NATS** — an open server (JetStream on, no authentication) and `zb-nats/.env.nats`:
 
 ```sh
-./zig-out/bin/bridge --init-nats operator --dir ./zb-nats   # add --js-domain <name> for clients behind a leaf node
-nats-server -c zb-nats/nats-server.conf
+./zig-out/bin/bridge --init-nats dev --dir ./zb-nats
+nats-server -c zb-nats/nats-server.conf      # client port 4222, WebSocket 8080 for the browser
 ```
 
-For a quick try on a laptop, `--init-nats dev` instead: an open server, no authentication, no
-enrollment, so no invites. Map each editor to its tenant (`INSERT INTO zebridge_user_tenants
-(principal, tenant_id) VALUES ('alice', 'acme'), …`) and open the page with `?as=alice`: the
-name is the principal. Anyone can claim any name on such a server — never on a reachable host.
-
 **2. PostgreSQL** — the bridge's functions, grants and the publication, from `.env.bridge`
-(`DATABASE_READER_URL`, `DATABASE_WRITER_URL`, `BRIDGE_CDC_PUBLICATION`):
+(`DATABASE_READER_URL`, `DATABASE_WRITER_URL`, `BRIDGE_CDC_PUBLICATION`), then the table,
+`zebridge_enable` and the seed row (above):
 
 ```sh
 ( set -a; . ./.env.bridge; set +a; ./zig-out/bin/bridge --init-sql ) | psql "$ADMIN_URL"
 ```
 
-Then the table, `zebridge_enable` and the seed row (above).
+**3. The editors' tenants** — what an invite would have written; the bridge scopes rows,
+writes and streams by it:
 
-**3. The bridge** — both env files; its first start creates the replication slot:
+```sql
+INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES
+  ('alice', 'acme'), ('bob', 'acme'), ('carol', 'acme'), ('omar', 'globex');
+```
+
+**4. The bridge** — both env files; its first start creates the replication slot:
 
 ```sh
 ( set -a; . zb-nats/.env.nats; . ./.env.bridge; set +a; exec ./zig-out/bin/bridge )
 ```
 
-### Generate the invites
+**5. The page** — from `examples/15-shared-record/web`; the dev server's proxy carries NATS's
+WebSocket and the bridge on the page's own origin:
 
-The bridge is agnostic, so the DBA generates invites.
+```sh
+ZB_NATS_WS_ORIGIN=ws://127.0.0.1:8080 ZB_BRIDGE_ORIGIN=http://127.0.0.1:27434 pnpm dev
+```
 
-> If you want to automate this, you need a backend that can receive a demand from a client, then connect to the PostgreSQL database (WRITER profile), and can send the OTP code back to the client (eg via email).
+Then one tab per editor — the name is the principal:
+
+```txt
+http://localhost:5179/?as=alice
+http://localhost:5179/?as=bob
+http://localhost:5179/?as=carol
+http://localhost:5179/?as=omar
+```
+
+⚠️ On an open server anyone can claim any name. Never on a host others can reach.
+
+### Deploying it: operator mode and invites
+
+On a real server, each device proves who it is. `--init-nats operator` generates the whole
+stack — operator, account, signing keys, the server's configuration — and the bridge then
+enrolls devices with one-time invites and mints their credentials:
+
+```sh
+./zig-out/bin/bridge --init-nats operator --dir ./zb-nats   # add --js-domain <name> for clients behind a leaf node
+```
+
+The bridge is agnostic, so the DBA generates the invites; each one also writes the principal's
+tenant, so step 3 above is not needed:
+
+> To automate this, a backend receives a request from a client, connects to PostgreSQL with
+> the WRITER profile, and sends the one-time code back to the client (by email, say).
 
 ```sql
 INSERT INTO public.zebridge_invites (principal, tenant_id) VALUES
-  ('alice', 'acme'),
-  ('bob', 'acme'),
-  ('carol', 'acme'),
-  ('omar', 'globex')
+  ('alice', 'acme'), ('bob', 'acme'), ('carol', 'acme'), ('omar', 'globex')
 RETURNING code, principal, tenant_id, expires_at;
 ```
 
-Use the returned invite code per tab:
+Each tab opens once with its code; the browser keeps the identity afterwards:
 
 ```txt
 http://localhost:5179/?invite=<code>&as=alice
 ```
+
+Against a deployed bridge, build the page for it: `VITE_ZB_BRIDGE_URL=https://bridge.example.com pnpm build`.
 
 ### The page
 
@@ -353,16 +381,6 @@ zb.onVerdict(({ version, outcome, columns }) => show(version, outcome, columns))
 `onLog(cb)` says the same things in words, for people reading a console; an app does not need it.
 
 **The merge (part B).** Merge your register into the `doc` you see (`mergeRegisters`) and write it. PostgreSQL merges what it accepts into the stored `doc`, register by register, so a write built on an old `doc` cannot roll anyone back. A write refused as `stale` comes back to you: merge your registers into the newer row and write again; a register whose stamp lost to a newer one is LOST, and the page says so.
-
-Serve it, from `examples/15-shared-record/web`. On a local stack, the dev server's proxy carries NATS's WebSocket and the bridge's `/enroll` on the page's own origin; tell it where they are:
-
-```sh
-ZB_NATS_WS_ORIGIN=ws://127.0.0.1:8080 \
-ZB_BRIDGE_ORIGIN=http://127.0.0.1:27434 \
-pnpm dev   # http://localhost:5179
-```
-
-Against a deployed bridge, build the page for it instead: `VITE_ZB_BRIDGE_URL=https://bridge.example.com pnpm build`.
 
 ## What the demo deliberately does not do
 
