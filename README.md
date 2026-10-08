@@ -1385,9 +1385,9 @@ Start from what you see. Each row names the check and the rule behind it.
 > - you do not talk to NATS: the library does all of it.
 > - you talk to the replica via the library primitives.
 
-The client library comes in two flavours: TypeScript (for any JavaScript engine) and a native dynamic Zig library with a C ABI, `libzb` (Flutter, React Native, Swift, Kotlin, Python services, and any language with an FFI).
+The client library comes in two flavours: TypeScript (for any JavaScript engine) and a native Zig library with a C ABI, `libzb` (Flutter, React Native, Swift, Kotlin, Python services, and any language with an FFI).
 
-- **`zb-client-ts`** — a self-contained TypeScript package that runs **as-is** in browsers, Node, Electron, Deno and Bun. No native library needed: the rules it shares with libzb come as a 66 KB WebAssembly build of libzb's core, shipped in the package and loaded by `connect()`.
+- **`zb-client-ts`** — a self-contained TypeScript package that runs **as-is** in browsers, Node, Electron, Deno and Bun. No native library needed: the rules it shares with libzb come as a WebAssembly build of libzb's core (about 70 KB), shipped in the package and loaded by `connect()`.
 - **`libzb`** — a native library with a C ABI for mobile apps, desktop apps and microservices (FFI-compatible).
 
 > [!CAUTION]
@@ -1410,11 +1410,11 @@ A host that manages identities itself passes `natsUrl`, `principal` and `creds` 
 
 ### The TypeScript API
 
-The app gets one connection to NATS (WebSocket in the browser, TCP on Node) and one local database (SQLite by default, or PGlite). It builds a `ZeBridge` object, calls `connect()`, reads with `query(sql)`, writes with `mutate(table, op, key, values)`, and gets reactivity from `onChange(table, cb)`.
+The app gets one connection to NATS (WebSocket in the browser, TCP on Node) and one local database (SQLite by default, or PGlite). It builds a `ZeBridge` object, calls `connect()`, reads with `query(sql)`, writes with `mutate(table, op, key, values)`, gets reactivity from `onChange(table, cb)`, and learns what became of each write from `onVerdict(cb)`.
 
 Once you call `connect()`, it subscribes, receives, applies and fires your callbacks on its own: you do nothing.
 
-Storage, zstd and the NATS dial come from the platform: better-sqlite3 and TCP on Node, sqlite-wasm on OPFS and WebSocket in the browser. The replica lives at `dbPath`, by default `zebridge_<principal>.sqlite3`, kept across reloads — which is what an outbox needs: a write queued while the socket was down must still be there after the page comes back. A fresh name per load (`dbPath: \`zebridge_${Date.now()}.sqlite3\``) is a clean room for a dev loop.`engine` defaults to SQLite; `'pglite'` (browser and Node) loads PostgreSQL-in-process on demand, and a SQLite consumer never downloads it. libzb takes the same options (CLIENTS.md).
+Storage, zstd and the NATS dial come from the platform: better-sqlite3 and TCP on Node, sqlite-wasm on OPFS and WebSocket in the browser. The replica lives at `dbPath`, by default `zebridge_<principal>.sqlite3`, kept across reloads — which is what an outbox needs: a write queued while the socket was down must still be there after the page comes back. A fresh name per load (`dbPath: \`zebridge_${Date.now()}.sqlite3\``) is a clean room for a dev loop. `engine` defaults to SQLite; `'pglite'` (browser and Node) loads PostgreSQL-in-process on demand, and a SQLite consumer never downloads it. libzb takes the same options (CLIENTS.md).
 
 **Query**: `query(sql, ...params)` — read your local database directly. Any single read: joins, aggregates, offline. The replica _is_ the API. It returns the rows as objects.
 
@@ -1504,7 +1504,17 @@ zb.onChange("counter_public", (ev) => {
 });
 ```
 
-That is the whole contract for an app author: one callback per table.
+That is the whole contract for an app author: one callback per table, and one for the verdicts.
+
+**What became of a write**: `onVerdict(cb)` reports each of this client's writes once, when its fate is final, matched to `mutate()` by the version it returned: `applied`; `rebased` (a newer row won on other columns, so the library re-sent it, as `rebasedAs`); `lost` (a newer row won on the same columns, `lostColumns`); `deleted`; `rejected` (with the reason). The library has already acted on it: dropped it from the outbox, re-sent it, or put the local row back. `pending()` counts the writes still waiting in the outbox: the "2 queued writes" of an offline indicator.
+
+```js
+zb.onVerdict(({ version, outcome, columns, lostColumns }) => {
+  if (outcome === 'lost') toast(`someone else changed ${lostColumns.join(', ')} first`);
+});
+```
+
+Two more for cooperative editing ([COOPERATIVE_EDITING](COOPERATIVE_EDITING.md)): `stamp()`, a register's time on the bridge's clock, and `mergeRegisters(a, b)`, imported. The whole set, used on one page: [example 15's survival kit](examples/15-shared-record/README.md#the-ts-client-survival-kit).
 
 ### The C ABI library
 
@@ -1513,8 +1523,8 @@ That is the whole contract for an app author: one callback per table.
 | verb | what it does | returns |
 | --- | --- | --- |
 | `zb_client_connect(opts_json)` | opens the replica and the socket | a handle, `0` on failure |
-| `zb_client_sync(h)` | the first step after open: resolves the tenant, applies the schemas, seeds the tables, drains the streams | `{"tenant": …, "first": bool, "unseeded": [{"table", "reason"}]}` — an empty `unseeded` is what "usable" means |
-| `zb_client_poll(h, wait_ms)` | waits up to `wait_ms` for CDC, applies what arrived, retries what was held, collects verdicts | `{"applied", "settled", "changed_tables", "seeded"}`, plus `"unseeded"` while any table is |
+| `zb_client_sync(h)` | the first step after open: resolves the tenant, applies the schemas, seeds the tables, drains the streams | `{"principal", "tenant", "tenants", "first": bool, "unseeded": [{"table", "reason"}]}` — an empty `unseeded` is what "usable" means |
+| `zb_client_poll(h, wait_ms)` | waits up to `wait_ms` for CDC, applies what arrived, retries what was held, collects verdicts | `{"applied", "settled", "changed_tables", "seeded", "outcomes": […], "pending"}`, plus `"unseeded"` while any table is, `"requests"` when it serves, `"unreadable"` for a tenant's stream it cannot read |
 | `zb_last_error()` | the words behind the last `0` or `NULL` this thread got (`errno`-style) | a C string, `NULL` after a success |
 | `zb_client_flush_outbox(h, wait_ms)` | sends the outbox and waits up to `wait_ms` for verdicts | `{"sent", "settled", "verdicts": {…}}` |
 | `zb_client_query(h, sql, params_json)` | a read against the replica | `{"columns": […], "rows": [[…], …]}` |
@@ -1533,6 +1543,8 @@ reason is the C ABI, not a choice:
 | read, write, ask, answer, absorb | `query` `mutate` `request` `serve` `ingest` | `zb_client_query` `zb_client_mutate` `zb_client_request` `zb_client_serve` + `zb_client_reply` `zb_client_ingest` — the questions come in `zb_client_poll`'s report, and the host answers each with `zb_client_reply` |
 | send the outbox | `flushOutbox()` | `zb_client_flush_outbox(h, wait_ms)` |
 | receive changes | `onChange(table, cb)` | `zb_client_poll(h, wait_ms)` — a C ABI cannot take a closure, so the host drives the loop |
+| what became of a write | `onVerdict(cb)`, matched by the `version` `mutate` returned | the poll report's `outcomes`, matched by the `msgId` `zb_client_mutate` returned |
+| writes still queued | `pending()` | the poll report's `pending` |
 | was I banned | `revoked` (a field) | `zb_client_revoked(h)` — `1` revoked, `0` live, `-1` unknown handle |
 | why did it fail | the `Error` thrown, the `SYS` log line | `zb_last_error()` after a `0`/`NULL`; `unseeded` in the sync and poll reports |
 | delete the local replica | `wipe()` | `zb_client_wipe(h)` |
@@ -1541,7 +1553,7 @@ reason is the C ABI, not a choice:
 C-only by necessity: `zb_free` (no GC), `zb_abi_version`, and `zb_client_live` (open
 handles in this process — a leak check for tests, and not to be confused with
 `zb_client_revoked`).
-Beside them: `zb_client_mutate_at` (a write with the caller's own version stamp; `mutate(…, { version })` in TypeScript), `zb_client_stamp` (a register stamp on the bridge's clock, for [cooperative editing](COOPERATIVE_EDITING.md); `stamp()` in TypeScript), `zb_client_wake` (see below), `zb_client_join` and `zb_client_leave` (follow one more tenant, or stop; libzb only), `zb_grammar_hash` and `zb_grammar_json` (what this build of the library speaks).
+Beside them: `zb_call(fn, args_json)` (a pure rule of the library's core, no handle: `mergeRegisters` for [cooperative editing](COOPERATIVE_EDITING.md), the one every binding uses), `zb_client_mutate_at` (a write with the caller's own version stamp; `mutate(…, { version })` in TypeScript), `zb_client_stamp` (a register stamp on the bridge's clock, for [cooperative editing](COOPERATIVE_EDITING.md); `stamp()` in TypeScript), `zb_client_wake` (see below), `zb_client_join` and `zb_client_leave` (follow one more tenant, or stop; libzb only), `zb_grammar_hash` and `zb_grammar_json` (what this build of the library speaks).
 
 **How data crosses.** Everything is a C string of JSON, in and out, so a binding is three declarations in any language with an FFI. One value is not JSON-shaped: a BLOB column (`bytea`, a PostGIS geometry) comes back from `zb_client_query` as `{"$bin": "<base64>"}` and is written the same way in a mutation's values. Two ownership rules make it safe:
 
@@ -1559,10 +1571,10 @@ The Flutter examples do exactly this, through the shared Dart package `zb-dart` 
 ```dart
 // UI side: the worker owns the handle; every call is a message with an answer.
 final zb = await ZeBridgeWorker.spawn({
-  "natsUrl": "nats://127.0.0.1:4222",       // plain NATS over TCP: libzb has no websocket
-  "credsPath": "/path/to/alice.creds",  // the operator-mode broker takes nothing else
+  "bridgeUrl": "https://bridge.mydom.com",  // the first run enrolls with the invite; the identity is kept beside dbPath
+  "invite": code,                           // later runs need neither: the identity names the principal and the NATS URL
+  // "natsUrl" + "creds" or "credsPath": a host that manages identities itself (plain NATS over TCP: libzb has no websocket)
   "dbPath": "/a/writable/place/zb.sqlite3",
-  "principal": "alice",
   "tables": ["counter_public", "counter_tenant", "app_users", "app_orders"],
   "clientId": "flutter-client",
   "seedChunkRows": 50000,               // rows per transaction when a chain seeds a table (0 = one); bounds memory and the lock
@@ -1606,7 +1618,7 @@ toUi.send({'type': 'ready', 'tenant': info['tenant']});
 while (!closing) {
   if (paused) { await Future.delayed(const Duration(milliseconds: 200)); continue; }
   final report = zb.poll(100);            // blocks up to 100 ms on the broker
-  if (report.changedTables.isNotEmpty || report.seeded.isNotEmpty) toUi.send(report);
+  if (report.changedTables.isNotEmpty || report.seeded.isNotEmpty || report.outcomes.isNotEmpty) toUi.send(report);
   zb.flush(0);                            // the outbox, every turn
   await Future.delayed(Duration.zero);    // the command port runs here: query, mutate…
 }
@@ -1643,7 +1655,8 @@ The one case it loses is when it arrives late with an older stamp than an edit t
 |                 what happened                 |                         result                          |
 |-----------------------------------------------|---------------------------------------------------------|
 | two edits on different columns, any older | both land, the later-arriving one rebased if it was stamped earlier |
-| two edits on the same column         | the later stamp wins, the loser logs edit LOST                   |
+| two edits on the same column         | the later stamp wins, the loser is told (`lost`)                  |
+| two edits of different registers of one `jsonb` column with `register_cols` | both kept: PostgreSQL merges the document register by register, whichever write was last ([COOPERATIVE_EDITING](COOPERATIVE_EDITING.md)) |
 | an edit changing a key column        | refused before it leaves the client, KeyChange; rename is delete + create |
 
 ### Local database writes are owned
@@ -1654,9 +1667,9 @@ The one case it loses is when it arrives late with an older stamp than an edit t
 
 **How** that is enforced depends on the local engine, and here is how we approach it:
 
-- **Browser SQLite (one OPFS connection)**: Enforced. the library owns the single connection and hands the app a **read-only** handle — a direct write is simply unreachable.
+- **Browser SQLite (one OPFS connection)**: Enforced. The library owns the single connection, and `query()` refuses any statement that is not a single read (by its shape) — the app has no other way to reach the database.
 - **Mobile and service SQLite (libzb)**: Enforced. `query()` runs on a second connection opened read-only, so a direct write fails.
-- **PGlite:** a supported engine (`?engine=pglite` in examples/05-tables/web-consumer; `engine: 'pglite'`, dialect seam in `zb-client-ts/src/dialect.ts`). The library owns PGlite's single connection (in memory, or persisted in IndexedDB) exactly as it owns the OPFS one, so the same handle-level lock applies.
+- **PGlite:** a supported engine (`?engine=pglite` in examples/05-tables/web-consumer; `engine: 'pglite'`, dialect seam in `zb-client-ts/src/dialect.ts`). The library owns PGlite's single connection (in memory, or persisted in IndexedDB) exactly as it owns the OPFS one, so the same statement-shape guard applies.
 - **PostgreSQL replica (libzb `dbUrl`)**: Enforced. `query()` runs on a second connection with `default_transaction_read_only` on.
 - **DuckDB (libzb)**: `query()` accepts a single read statement only, the same check the TypeScript client makes.
 
