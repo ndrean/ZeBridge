@@ -2167,6 +2167,15 @@ ADMIN_DATABASE_URL=xxx bridge --drop-slot my_slot     # an INACTIVE slot only; f
 
 The views read with the bridge's own `DATABASE_READER_URL`. The drop needs an admin URL passed for the invocation, refuses an active slot (stop that bridge first), and says how much WAL it freed. An inactive slot whose retained figure grows is an abandoned instance.
 
+**When the slot is lost.** A slot is lost when PostgreSQL discarded WAL the bridge had not read yet: the bridge was stopped too long, or fell too far behind, past `max_slot_wal_keep_size`; a failover to a standby that did not carry the slot; or a drop. The changes in that window are gone from the feed, and nothing in the CDC streams' numbering shows the hole, so the bridge refuses to resume on a lost slot. Recover once:
+
+```sh
+ADMIN_DATABASE_URL=xxx bridge --drop-slot my_slot   # if the lost slot is still listed
+ZB_FEED_RESTART=1 bridge                              # the first start only, then remove it
+```
+
+`ZB_FEED_RESTART=1` makes the bridge's start on its new slot a new feed: the CDC streams are recreated empty, the next tick builds a full for every table, and every client re-seeds from it, so the lost window is filled from the database. It is opt-in because a new slot can also be a second bridge next to a running one, whose streams it must not delete. `bridge --diagnose` says which case you are in.
+
 💡 how is my slot going?
 
 ```sql
