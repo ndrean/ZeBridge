@@ -188,6 +188,8 @@ Without `register_cols`, t = 30 is a silent loss: Bob's write is accepted whole,
 
 ## The app
 
+<img width="1330" height="669" alt="Screenshot 2026-10-08 at 18 12 21" src="https://github.com/user-attachments/assets/7cfd4382-fe34-4789-8864-e79cb143ab3e" />
+
 ### Run it
 
 On a laptop, with no enrollment: a NATS server open to anyone, and each editor simply names
