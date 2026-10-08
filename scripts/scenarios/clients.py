@@ -61,7 +61,13 @@ class Lib:
     def poll(self, wait_ms=300):
         """One poll; the report dict, or {"error": name} once the connection is gone."""
         self.last_poll = self.take(self.lib.zb_client_poll(self.h, wait_ms))
+        # Each write's outcome arrives once, in one report: keep them all for the scenario.
+        if isinstance(self.last_poll, dict):
+            self.outcomes = getattr(self, "outcomes", []) + self.last_poll.get("outcomes", [])
         return self.last_poll
+    def outcome(self, msg_id):
+        """The poll reports' outcome for the write `msg_id` (what mutate returned), or None."""
+        return next((o for o in getattr(self, "outcomes", []) if o.get("msgId") == msg_id), None)
     def q(self, sql, params=()):
         r = self.take(self.lib.zb_client_query(self.h, sql.encode(), json.dumps(list(params)).encode()))
         if "error" in r: raise RuntimeError(f"{r['error']}: {r['detail']}" if r.get("detail") else r["error"])

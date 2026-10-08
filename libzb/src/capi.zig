@@ -28,7 +28,9 @@
 //!                                                                    // §10hj: ask a service on `query.<tenant>.<name>`; its reply verbatim
 //!   char* zb_client_ingest(uint64_t h, const char* table, const char* answer_json, const char* scope_json);
 //!                                                                    // §10hj: keep an answer ({"columns","rows"}) in an on-demand table → {"applied":n}
-//!   char* zb_client_poll(uint64_t h, uint64_t wait_ms);            // {"applied":n,"settled":n,…,"requests":[…]?,"unreadable":[…]?,"unseeded":[…]?} — live tail, blocks ≤ wait_ms
+//!   char* zb_client_poll(uint64_t h, uint64_t wait_ms);            // {"applied":n,"settled":n,"outcomes":[…],"pending":n,…,"requests":[…]?,"unreadable":[…]?,"unseeded":[…]?} — live tail, blocks ≤ wait_ms
+//!       // outcomes: each of this client's writes once settled — {msgId, version, table, columns, outcome:
+//!       //   applied|rebased|lost|deleted|rejected, lostColumns?, rebasedAs? (the re-sent write's msgId), reason?}
 //!   const char* zb_last_error(void);                               // §10iz: the words behind the last 0 or NULL this thread got; NULL when the last call succeeded
 //!   char* zb_client_serve(uint64_t h, const char* opts_json);      // §10hp: answer query.<tenant>.<name> in a queue group → {"serving":n}
 //!   char* zb_client_reply(uint64_t h, uint64_t id, const char* answer_json);  // §10hp: answer one request from poll
@@ -1110,6 +1112,13 @@ fn pollJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
     const r = try b.c.poll(a, wait_ms);
     var out: std.json.ObjectMap = .empty;
     try out.put(a, "applied", .{ .integer = @intCast(r.applied) });
+    // What became of this client's writes since the last report, and what still waits.
+    var outcomes: std.json.Array = .init(a);
+    const taken = b.c.takeOutcomes();
+    defer b.c.freeOutcomes(taken);
+    for (taken) |text| try outcomes.append(try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}));
+    try out.put(a, "outcomes", .{ .array = outcomes });
+    try out.put(a, "pending", .{ .integer = @intCast(b.c.pendingCount(a)) });
     try out.put(a, "settled", .{ .integer = @intCast(r.settled) });
 
     var changed = std.json.Array.init(a);

@@ -323,17 +323,9 @@ Future<void> _workerMain(_Boot boot) async {
       final report = zb.poll(boot.pollWaitMs);
       if (report.changedTables.isNotEmpty ||
           report.seeded.isNotEmpty ||
-          report.unreadable.isNotEmpty) {
-        toUi.send({
-          'type': 'report',
-          'report': {
-            'applied': report.applied,
-            'settled': report.settled,
-            'changed_tables': report.changedTables,
-            'seeded': report.seeded,
-            'unreadable': report.unreadable,
-          },
-        });
+          report.unreadable.isNotEmpty ||
+          report.outcomes.isNotEmpty) {
+        toUi.send({'type': 'report', 'report': report.toJson()});
       }
       zb.flush(0);
     } catch (e) {

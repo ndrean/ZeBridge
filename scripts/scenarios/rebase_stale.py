@@ -141,7 +141,7 @@ def main():
             a_ver = nd.mutate(T, "UPDATE", {"uid": uid}, {"status": "Done"})["version"]
             dt = wait_pg(uid, ("Old", "Done"))
             check(f"§A Node's edit landed: PostgreSQL {pg_row(uid)} ({dt} s)", dt is not None)
-            py.mutate(T, "UPDATE", {"uid": uid}, {"title": "New"}, version=old)  # sent at once, stamped below Node's
+            a_mid = py.mutate(T, "UPDATE", {"uid": uid}, {"title": "New"}, version=old)["msgId"]  # sent at once, stamped below Node's
             f = py.flush(5000)
             check(f"§A libzb's slow-clock edit is judged on arrival: settled={f.get('settled')}, PostgreSQL still {pg_row(uid)}",
                   f.get("settled") >= 1 and pg_row(uid) == ("Old", "Done"))
@@ -150,6 +150,12 @@ def main():
             dt = turn(py, 30, lambda: pg_row(uid) == ("New", "Done"))
             check(f"§A polled the winner in, rebased and resent: PostgreSQL {pg_row(uid)} ({dt} s)", dt is not None)
             check("§A libzb said so: 'rebased title of mig_rb onto the newer row'", said(PY_ERR, f"libzb: rebased title of {T} onto the newer row"))
+            o = py.outcome(a_mid)
+            check(f"§A libzb's poll report: {o}", o is not None and o["outcome"] == "rebased" and o["columns"] == ["title"] and o.get("rebasedAs"))
+            turn(py, 5, lambda: py.outcome(o["rebasedAs"]) is not None if o else True)
+            o2 = py.outcome(o["rebasedAs"]) if o else None
+            check(f"§A ...and the re-sent write applied: {o2 and o2['outcome']}; pending {py.last_poll.get('pending')}",
+                  o2 is not None and o2["outcome"] == "applied" and py.last_poll.get("pending") == 0)
             dt = both(py, nd, lambda c: local(c, uid) == ("New", "Done"), 60)
             check(f"§A both replicas at {{New, Done}} ({dt} s): py {local(py, uid)}, node {local(nd, uid)}", dt is not None)
             check(f"§A outboxes empty: py {outbox_left(py, '%outbox%')}, node {outbox_left(nd, '_zebridge_outbox')}",
@@ -160,12 +166,14 @@ def main():
             nd.mutate(T, "UPDATE", {"uid": uid}, {"status": "Final"})
             dt = wait_pg(uid, ("New", "Final"))
             check(f"§B Node's edit landed: PostgreSQL {pg_row(uid)} ({dt} s)", dt is not None)
-            py.mutate(T, "UPDATE", {"uid": uid}, {"status": "Late"}, version=old)
+            b_mid = py.mutate(T, "UPDATE", {"uid": uid}, {"status": "Late"}, version=old)["msgId"]
             f = py.flush(5000)
             turn(py, 5, lambda: False)
             check(f"§B libzb's slow-clock edit judged stale (settled={f.get('settled')}), NOT resent: PostgreSQL {pg_row(uid)}", f.get("settled") >= 1 and pg_row(uid) == ("New", "Final"))
             check("§B libzb surfaced the loss: 'edit LOST to a newer version on the same column(s) status'",
                   said(PY_ERR, "edit LOST to a newer version on the same column(s) status"))
+            o = py.outcome(b_mid)
+            check(f"§B libzb's poll report: {o}", o is not None and o["outcome"] == "lost" and o.get("lostColumns") == ["status"])
             dt = both(py, nd, lambda c: local(c, uid) == ("New", "Final"), 60)
             check(f"§B both replicas at the winner {{New, Final}} ({dt} s): py {local(py, uid)}, node {local(nd, uid)}", dt is not None)
             check(f"§B outboxes empty: py {outbox_left(py, '%outbox%')}, node {outbox_left(nd, '_zebridge_outbox')}",

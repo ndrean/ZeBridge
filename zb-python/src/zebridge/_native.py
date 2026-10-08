@@ -38,6 +38,7 @@ for name, res, args in [
     ("zb_free", None, [_P]),
     ("zb_last_error", _S, []),
     ("zb_grammar_hash", _P, []),
+    ("zb_call", _P, [_S, _S]),
     ("zb_create_user", _P, []),
     ("zb_creds_file_text", _P, [_S, _S]),
     ("zb_client_connect", _H, [_S]),

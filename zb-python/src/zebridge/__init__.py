@@ -27,7 +27,7 @@ from typing import Any, Callable
 
 from . import _native as n
 
-__all__ = ["ZeBridge", "ZeBridgeError", "ZB_ABI", "create_user", "creds_file_text", "grammar_hash"]
+__all__ = ["ZeBridge", "ZeBridgeError", "ZB_ABI", "create_user", "creds_file_text", "grammar_hash", "merge_registers"]
 
 #: libzb's C ABI version this package was written for; libzb/python/abi_check.py checks it.
 ZB_ABI = 6
@@ -61,6 +61,13 @@ def creds_file_text(jwt: str, seed: str) -> str:
     if text.startswith("{"):
         _check(json.loads(text))
     return text
+
+
+def merge_registers(a: dict, b: dict) -> dict:
+    """Two documents of registers {v, t, w} merged (COOPERATIVE_EDITING.md): per key the
+    later `t` wins, then `w`. libzb's own rule (core.zig), the one every client and
+    PostgreSQL apply."""
+    return _check(n.take(n.lib.zb_call(b"mergeRegisters", n.enc({"a": a or {}, "b": b or {}}))))
 
 
 def grammar_hash() -> str:
@@ -145,7 +152,7 @@ class ZeBridge:
             try:
                 last_poll = time.monotonic()
                 r = _check(n.take(n.lib.zb_client_poll(h, busy_poll_ms if busy else self._poll_ms)))
-                if (r.get("applied") or r.get("settled") or r.get("requests")) and self._on_change:
+                if (r.get("applied") or r.get("settled") or r.get("requests") or r.get("outcomes")) and self._on_change:
                     self._on_change(r)
             except ZeBridgeError as e:
                 if self._on_error:

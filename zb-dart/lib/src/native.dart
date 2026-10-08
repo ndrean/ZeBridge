@@ -31,6 +31,8 @@ class PollReport {
     required this.seeded,
     this.unreadable = const [],
     this.requests = const [],
+    this.outcomes = const [],
+    this.pending = 0,
     this.error,
   });
 
@@ -45,6 +47,14 @@ class PollReport {
   /// §10hp: questions to answer when this client serves.
   final List<Map<String, dynamic>> requests;
 
+  /// What became of this client's writes since the last report, each once:
+  /// {msgId, version, table, columns, outcome: applied|rebased|lost|deleted|rejected,
+  /// lostColumns?, rebasedAs?, reason?} — `msgId` is what [mutate] returned.
+  final List<Map<String, dynamic>> outcomes;
+
+  /// The writes still in the outbox: applied here, not yet judged by PostgreSQL.
+  final int pending;
+
   /// Set by the worker when a poll itself failed (connection gone, principal revoked).
   final String? error;
 
@@ -55,6 +65,8 @@ class PollReport {
         seeded: List<String>.from(j['seeded'] ?? const []),
         unreadable: List<String>.from(j['unreadable'] ?? const []),
         requests: ((j['requests'] as List?) ?? const []).map((e) => Map<String, dynamic>.from(e as Map)).toList(),
+        outcomes: ((j['outcomes'] as List?) ?? const []).map((e) => Map<String, dynamic>.from(e as Map)).toList(),
+        pending: (j['pending'] as num?)?.toInt() ?? 0,
         error: j['error'] as String?,
       );
 
@@ -65,6 +77,8 @@ class PollReport {
         'seeded': seeded,
         'unreadable': unreadable,
         'requests': requests,
+        'outcomes': outcomes,
+        'pending': pending,
         if (error != null) 'error': error,
       };
 }

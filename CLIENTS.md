@@ -10,7 +10,8 @@ Two client libraries speak the protocol.
 | SQLite version | 3.49.1, compiled in | 3.41 or later (`unhex`, in the seed of a table with a BLOB); every backend bundles its own, newer: sqlocal's SQLite WASM 3.51, better-sqlite3's 3.53 — never the device's |
 | large answers | `reply` puts an answer past `results.inline_max_bytes` in `res-<tenant>` and sends an envelope; `request` resolves it | the same, in `serve`'s reply and in `request` |
 | being a service | `zb_client_serve` + the `requests` in `poll` + `zb_client_reply`: the host's loop answers | `serve({tenants, handlers, queue})`: async handlers, the library subscribes and replies |
-| cooperative documents | `mergeRegisters` through `zb_call` (COOPERATIVE_EDITING.md) | `mergeRegisters`, imported |
+| cooperative documents | `mergeRegisters` through `zb_call` (COOPERATIVE_EDITING.md); PostgreSQL merges what it accepts (`register_cols`) | `mergeRegisters`, imported (libzb's core, as WASM) |
+| each write's outcome | the poll report's `outcomes` — `{msgId, version, table, columns, outcome, lostColumns?, rebasedAs?, reason?}`, keyed by the `msgId` `mutate` returns — and `pending`, the outbox depth | `onVerdict(cb)`, keyed by the `version` `mutate` returns, and `pending()` |
 | on-demand answers | `zb_client_request` + `zb_client_ingest` | `request` + `ingest` |
 | reply inbox | `_INBOX.<principal>`, from the `inbox_prefix` connection option — replies, KV watchers, object reads and pull consumers all land there, inside the principal's `_INBOX.<principal>.>` grant | the same, through nats.js's `inboxPrefix` |
 | loop | host-driven: `sync`, `poll`, `flush` | self-driven: `connect()` runs it |
@@ -235,6 +236,7 @@ Everything below the core — the shells — is where parity is by hand, and whe
 | version stamped by the client (HLC) | ✓ | ✓ |
 | verdicts: accepted / stale / rejected / row_deleted, two revert targets | ✓ | ✓ |
 | a stale UPDATE rebased onto the winning row when the columns are disjoint, dropped and surfaced when they overlap; the winner before or after the verdict, a slow clock | ✓ `mutate_at` stamps a write explicitly | ✓ `mutate(…, { version })` |
+| each write's final outcome, once — applied, rebased, lost, deleted, rejected — and only for this client's own writes (another device of the same principal hears the verdict too) | ✓ poll report `outcomes` | ✓ `onVerdict` |
 | a write with no socket queues in the outbox and goes out on the next connect | ✓ (the host's flush) | ✓ (was a silent return) |
 | the CDC echo that confirms a write carries the write's own stamp — another client's row on the same key is not our echo | — (settles on verdicts only) | ✓ (was by key alone) |
 | an UPDATE that changes a key column is refused before it is queued (`KeyChange`); rename = delete + create | ✓ core | ✓ core |

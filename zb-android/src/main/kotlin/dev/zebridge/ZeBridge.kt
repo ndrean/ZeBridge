@@ -100,6 +100,14 @@ class ZeBridge @JvmOverloads constructor(
     }
 
     companion object {
+        /**
+         * Two documents of registers {v, t, w} merged (COOPERATIVE_EDITING.md): per key the
+         * later `t` wins, then `w` — libzb's own rule, the one every client and PostgreSQL apply.
+         */
+        @JvmStatic
+        fun mergeRegisters(a: JSONObject, b: JSONObject): JSONObject =
+            result(Native.call("mergeRegisters".toByteArray(), JSONObject().put("a", a).put("b", b).toString().toByteArray()))
+
         /** The grammar this library was built for; compare with the bridge's `X-Grammar-Hash`. */
         @JvmStatic
         fun grammarHash(): String = text(Native.grammarHash()) ?: ""
@@ -144,7 +152,8 @@ class ZeBridge @JvmOverloads constructor(
         if (!running) return
         try {
             val r = result(Native.poll(handle, pollMs))
-            if (r.optInt("applied") > 0 || r.optInt("settled") > 0 || (r.optJSONArray("requests")?.length() ?: 0) > 0) {
+            if (r.optInt("applied") > 0 || r.optInt("settled") > 0 || (r.optJSONArray("requests")?.length() ?: 0) > 0 ||
+                (r.optJSONArray("outcomes")?.length() ?: 0) > 0) {
                 listener?.onPoll(r)
             }
             if (running) worker.execute(::loopOnce)

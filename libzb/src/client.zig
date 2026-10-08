@@ -398,6 +398,11 @@ pub const SyncClient = struct {
     /// Cumulative verdict counts by status, for the host (the flush report carries
     /// them): a single-writer run with anything but `accepted` here has a finding.
     verdict_counts: VerdictCounts = .{},
+    /// What became of each of THIS client's writes since the last poll report, one JSON
+    /// object each — {msgId, version, table, columns, outcome, lostColumns?, rebasedAs?,
+    /// reason?}, zb-client-ts's onVerdict, keyed by the msg id `mutate` returns. Owned by
+    /// `a`; handed over and freed by `takeOutcomes`.
+    outcomes: std.ArrayList([]u8) = .empty,
     /// FK-held events (§10h) outlive the `drainStream` call that decoded them — they
     /// wait for `drainCdc`'s retry pass — but not the pass itself. So they get their
     /// own arena, reset after every pass: a third lifetime, between "this call" and
@@ -582,6 +587,8 @@ pub const SyncClient = struct {
         while (pit.next()) |e| self.a.free(e.key_ptr.*);
         self.last_pending.deinit(self.a);
         self.flows.deinit(self.a);
+        for (self.outcomes.items) |o| self.a.free(o);
+        self.outcomes.deinit(self.a);
         self.ro.close();
         self.st.close();
         self.arena.deinit();
@@ -4547,6 +4554,44 @@ pub const SyncClient = struct {
 
     /// One verdict, live or collected: true when definitive (the outbox entry is
     /// settled one way or another), false for `failed` (kept for retry).
+    /// One outcome for the next poll report. `columns` is the write's data minus the
+    /// version column, as a JSON array; `extra` adds lostColumns / rebasedAs / reason.
+    fn noteOutcome(self: *SyncClient, a: std.mem.Allocator, mid: []const u8, version: []const u8, table: []const u8, data: ?Value, outcome: []const u8, extra: []const struct { []const u8, Value }) void {
+        var o: std.json.ObjectMap = .empty;
+        var cols: std.json.Array = .init(a);
+        const vcol = if (self.states.get(table)) |st| st.version_col orelse "" else "";
+        if (data) |d| if (d == .object) for (d.object.keys()) |c| {
+            if (!std.mem.eql(u8, c, vcol)) cols.append(.{ .string = c }) catch return;
+        };
+        o.put(a, "msgId", .{ .string = mid }) catch return;
+        o.put(a, "version", .{ .string = version }) catch return;
+        o.put(a, "table", .{ .string = table }) catch return;
+        o.put(a, "columns", .{ .array = cols }) catch return;
+        o.put(a, "outcome", .{ .string = outcome }) catch return;
+        for (extra) |kv| o.put(a, kv[0], kv[1]) catch return;
+        const text = core.valueToString(a, .{ .object = o }) catch return;
+        const owned = self.a.dupe(u8, text) catch return;
+        self.outcomes.append(self.a, owned) catch self.a.free(owned);
+    }
+
+    /// The outcomes since the last call, for the poll report; the caller frees each
+    /// with `freeOutcomes`.
+    pub fn takeOutcomes(self: *SyncClient) [][]u8 {
+        return self.outcomes.toOwnedSlice(self.a) catch &.{};
+    }
+
+    pub fn freeOutcomes(self: *SyncClient, list: [][]u8) void {
+        for (list) |o| self.a.free(o);
+        self.a.free(list);
+    }
+
+    /// The writes still in the outbox: applied here, not yet judged.
+    pub fn pendingCount(self: *SyncClient, a: std.mem.Allocator) usize {
+        const r = self.st.query(a, "SELECT count(*) FROM _zebridge_outbox", &.{}) catch return 0;
+        if (r.len == 0 or r[0][0] != .integer) return 0;
+        return @intCast(r[0][0].integer);
+    }
+
     fn settleVerdict(self: *SyncClient, a: std.mem.Allocator, mid: []const u8, data: []const u8) !bool {
         // §10el: settled or not, this entry's send time has served; a `failed` verdict
         // keeps the entry queued and the next flush past the grace replays it.
@@ -4562,6 +4607,16 @@ pub const SyncClient = struct {
             return false;
         }
         self.verdict_counts.count(status);
+        // What the outcome reports, read while the outbox row is still there. No row: not
+        // this client's write — verdicts travel on the PRINCIPAL's subject, and another
+        // device of the same principal hears them too.
+        const ob = try self.st.query(a, "SELECT tbl, payload FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
+        const own: ?struct { table: []const u8, version: []const u8, data: ?Value } = if (ob.len == 1 and ob[0][0] == .text and ob[0][1] == .text) blk: {
+            const env = parseStoredJson(a, ob[0][1].text) catch break :blk null;
+            if (env != .object) break :blk null;
+            const ver = if (env.object.get("version")) |x| (if (x == .string) x.string else "") else "";
+            break :blk .{ .table = ob[0][0].text, .version = ver, .data = env.object.get("data") };
+        } else null;
         if (!std.mem.eql(u8, status, "accepted")) {
             // Say it: a refusal that only the counters knew about was found by a run
             // whose every INSERT was rejected in silence (§10dx).
@@ -4586,6 +4641,21 @@ pub const SyncClient = struct {
         // winner's, dropped and surfaced otherwise (see `tryRebase`).
         if (std.mem.eql(u8, status, "stale")) {
             self.holdForRebase(a, mid) catch |err| log.err("libzb: rebase hold for {s} failed: {any}", .{ mid, err });
+        }
+        if (own) |w| {
+            const reason: []const struct { []const u8, Value } = if (reason0.len > 0) &.{.{ "reason", .{ .string = reason0 } }} else &.{};
+            if (std.mem.eql(u8, status, "accepted")) {
+                self.noteOutcome(a, mid, w.version, w.table, w.data, "applied", reason);
+            } else if (std.mem.eql(u8, status, "rejected")) {
+                self.noteOutcome(a, mid, w.version, w.table, w.data, "rejected", reason);
+            } else if (std.mem.eql(u8, status, "row_deleted")) {
+                self.noteOutcome(a, mid, w.version, w.table, w.data, "deleted", &.{});
+            } else if (std.mem.eql(u8, status, "stale") and !self.rebase.contains(mid)) {
+                // Not held (not an UPDATE): it lost, whole. A held one is decided by tryRebase.
+                var lost: std.json.Array = .init(a);
+                if (w.data) |d| if (d == .object) for (d.object.keys()) |c| try lost.append(.{ .string = c });
+                self.noteOutcome(a, mid, w.version, w.table, w.data, "lost", &.{.{ "lostColumns", .{ .array = lost } }});
+            }
         }
         _ = try self.st.query(a, "DELETE FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
         return true;
@@ -4619,6 +4689,7 @@ pub const SyncClient = struct {
             .values = try la.dupe(u8, try core.valueToString(a, data)),
             .before = if (r[3] == .text) try la.dupe(u8, r[3].text) else null,
             .version = try la.dupe(u8, try core.normalizeVersion(a, ver.string)),
+            .sent_version = try la.dupe(u8, ver.string),
         });
         self.rebase_due = true;
     }
@@ -4652,6 +4723,7 @@ pub const SyncClient = struct {
         const key = try parseStoredJson(a, e.key);
         const cur = (try self.beforeImage(a, e.table, st, key)) orelse {
             log.warn("libzb: rebase of {s} abandoned: the row is gone", .{mid});
+            self.noteOutcome(a, mid, e.sent_version, e.table, parseStoredJson(a, e.values) catch null, "deleted", &.{});
             return true;
         };
         if (cur != .object) return true;
@@ -4661,6 +4733,7 @@ pub const SyncClient = struct {
         const before: ?Value = if (e.before) |b| try parseStoredJson(a, b) else null;
         var mine: std.ArrayList(u8) = .empty;
         var overlap: std.ArrayList(u8) = .empty;
+        var lost: std.json.Array = .init(a);
         for (values.object.keys()) |c| {
             if (std.mem.eql(u8, c, vcol)) continue;
             if (mine.items.len > 0) try mine.appendSlice(a, ", ");
@@ -4674,14 +4747,17 @@ pub const SyncClient = struct {
             if (winner_changed) {
                 if (overlap.items.len > 0) try overlap.appendSlice(a, ", ");
                 try overlap.appendSlice(a, c);
+                try lost.append(.{ .string = c });
             }
         }
         if (overlap.items.len > 0) {
             log.warn("libzb: {s} edit LOST to a newer version on the same column(s) {s} — the winning row stands; surface this to the user", .{ e.table, overlap.items });
+            self.noteOutcome(a, mid, e.sent_version, e.table, values, "lost", &.{.{ "lostColumns", .{ .array = lost } }});
             return true;
         }
         const ver = try self.mutate(a, e.table, "UPDATE", key, values);
         log.info("libzb: rebased {s} of {s} onto the newer row as {s}", .{ mine.items, e.table, ver });
+        self.noteOutcome(a, mid, e.sent_version, e.table, values, "rebased", &.{.{ "rebasedAs", .{ .string = ver } }});
         return true;
     }
 
@@ -5520,7 +5596,7 @@ fn maybeZstd(a: std.mem.Allocator, b: []const u8) ![]const u8 {
 /// §10do: a stale UPDATE kept aside for a rebase. `before` is the pre-write image
 /// the outbox stored; null when the row was not here at write time (then every
 /// column counts as changed by the winner, and the edit is dropped).
-const Rebase = struct { table: []const u8, key: []const u8, values: []const u8, before: ?[]const u8, version: []const u8 };
+const Rebase = struct { table: []const u8, key: []const u8, values: []const u8, before: ?[]const u8, version: []const u8, sent_version: []const u8 };
 
 fn sameJson(a: std.mem.Allocator, x: ?Value, y: ?Value) bool {
     const xs = core.valueToString(a, x orelse .null) catch return false;
