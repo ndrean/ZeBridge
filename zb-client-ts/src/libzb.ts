@@ -1065,10 +1065,14 @@ export class ZeBridge {
   }
 
   /// What a verdict reports about its write, from the outbox row (read before the row goes).
+  /// Null when the write is not this client's: verdicts travel on the PRINCIPAL's subject,
+  /// so another device of the same principal hears them too, and reports them as its own
+  /// only if its outbox holds the write (or this session sent it).
   private async outboxWrite(msgId: string, fallback: { table: string; version?: string | null } | undefined) {
     await this.outboxInitPromise;
     let row: any;
     try { row = (await this.run(`SELECT tbl, payload FROM _zebridge_outbox WHERE msg_id = ?`, msgId))[0]; } catch { /* none */ }
+    if (!row && !fallback) return null;
     let sent: any = {};
     try { sent = row ? JSON.parse(row.payload) : {}; } catch { /* unreadable */ }
     const table = String(row?.tbl ?? fallback?.table ?? '?');
