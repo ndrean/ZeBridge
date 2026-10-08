@@ -891,11 +891,13 @@ Writes are resolved, not merely accepted: the policy is last-writer-wins (LWW), 
 
 **How a write is judged.** It carries the version the client holds, and PostgreSQL applies it only if it is newer than the row's; an older one is refused as `stale`. The three verbs, `INSERT`, `UPDATE` and `DELETE`, follow the same rule.
 
-**A refused edit is not always lost.** The client looks at which columns the winner changed. If its own edit touched none of them, it resends it with a fresh stamp and it lands; if both touched the same column, the edit is dropped and the loss is reported (`edit LOST`). An edit is lost only on a column that was really contested.
+**A refused edit is not always lost.** The client looks at which columns the winner changed. If its own edit touched none of them, it resends it with a fresh stamp and it lands (`rebased`); if both touched the same column, the edit is dropped and the loss is reported (`lost`, through `onVerdict` in TypeScript and the poll report's `outcomes` in libzb). An edit is lost only on a column that was really contested.
 
 **Clock skew** is handled the same way. The client stamps its writes with a hybrid logical clock (HLC): an edit from a slow clock is judged stale, then rebased and stamped above what the client has seen.
 
 This is deliberate: ZeBridge arbitrates at ingest, so a slow or offline client cannot silently overwrite a newer edit, and a stale queued write cannot undo a delete. The cost is that LWW decides per **row**; for several editors on one row, see the next section. Worked cases: [Understanding the LWW rules](#understanding-the-lww-rules).
+
+**A live illustration**: [example 15, a shared record](examples/15-shared-record/README.md). Three editors of one tenant, two of them offline for a while, edit one row in four browser tabs; its part A is these rules on five plain columns — an offline edit rebased because the winner changed other columns, another reported LOST because the winner changed the same one — with each verdict shown on the page as it arrives. `scripts/scenarios/shared_record.py` plays the same timeline and checks every outcome.
 
 #### Cooperative editing: several editors on one row
 
@@ -918,9 +920,11 @@ The document itself must be a **flat map**: its keys are the fields your app edi
   "end":   { "v": { "lat": 47.20, "lng": -1.54 }, "t": "2026-09-20T06:20:29.781000Z", "w": "browser-alice" } }
 ```
 
-The same rule applies twice: LWW on the **row** decides who must merge, and LWW on each **register** decides which value survives. The merge is `mergeRegisters`, built into both client libraries. Your app runs a short loop: read the row, merge in its own registers, write, and repeat until nothing changes. Two editors moving different fields never lose a move. Two editors moving the same field end with one winner, by design.
+The same rule applies twice: LWW on the **row** decides whether a write is accepted, and LWW on each **register** decides which value survives. Declare the column with `zebridge_enable(…, register_cols => ARRAY['doc'])` and PostgreSQL merges every write it accepts into the stored document, register by register, so a late write built on an old copy of the document cannot roll back a field someone else edited meanwhile. It works like Cassandra's per-cell timestamps, or Figma's per-property last-writer-wins.
 
-Nothing changes on the server: the table is an ordinary writable table, and PostgreSQL still holds the truth, as a column anyone can query.
+Your app merges its register into the document it holds (`mergeRegisters`, the same rule from libzb's core in both client libraries) and writes it; a write refused as `stale` comes back, and the app merges once more into the newer row. Two editors moving different fields never lose a move. Two editors moving the same field end with one winner, by design, and the loser is told.
+
+The table stays an ordinary writable table, and PostgreSQL holds the truth, as a column anyone can query. A live illustration: [example 15](examples/15-shared-record/README.md), part B — the same timeline as part A on five registers of one `jsonb` column, including the late offline write that PostgreSQL's merge keeps from erasing the other editors' fields.
 
 See [COOPERATIVE_EDITING.md](COOPERATIVE_EDITING.md) for the table, the register format, the loop, and what this does not promise (no causal tracking, no ordered lists or text).
 
