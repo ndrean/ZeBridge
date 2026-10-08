@@ -754,6 +754,7 @@ Two choices decide how a table travels: whether clients write to it, and whether
 | Write  | updated_at | **timestamptz**  (3)| ✚ `zebridge_enable(version_col => 'updated_at')`, or your own column name |
 | Write  | deleted_at | **timestamptz** | soft-deleted ✚ `zebridge_enable(tombstone_col => 'deleted_at')`, or your own column name |
 | Write | last_writer | text | `zebridge_enable(tiebreak_col => 'last_writer')`, or your own column name |
+| Write | doc | **jsonb** of registers `{v, t, w}` | optional ✚ `zebridge_enable(register_cols => ARRAY['doc'])`: PostgreSQL merges each accepted write field by field ([COOPERATIVE_EDITING](COOPERATIVE_EDITING.md)) |
 
 (1) _in a writable table, a client mints its own keys offline, so a writable table's key must be **client-generable** — a `uuid-v7` (time-ordered), NOT a `bigserial` that the database hands out (an edge write to a sequence key would collide with the server's next insert, so the bridge refuses it)_.
 

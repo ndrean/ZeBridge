@@ -19238,3 +19238,30 @@ Flutter through it); zb-client-ts is the browser and Node client, its rules from
 core, its shell in JS. No browser-only hot path unless someone needs the browser faster.
 The live gap is ~1.5× (§10jb: libzb ~50k events/s, zb-client-ts ~33k); the large gap is the
 seed, and phones already take libzb's.
+
+## §10lz — register columns merged by PostgreSQL: `register_cols` (2026-10-08)
+
+Found with example 15 in the browser: Carol offline; Alice raises `doc.rating` 3 → 4; Carol,
+still offline, sets `doc.access`. Her write is built on the `doc` she saw before going offline
+and stamped after Alice's, so the row's last-writer-wins ACCEPTS it whole: rating back to 3,
+`applied`, no verdict says anything was lost. (Written before Alice's edit, the same write is
+refused as `stale` and the page re-merges correctly — the case §10lx's page handled.) The
+client-side loop could repair it only while the victim is online and only if every app keeps
+all its registers for ever.
+
+Fixed where the truth is: `zebridge_merge_registers(a, b)` (init.write) is mergeRegisters in
+SQL — later `t`, then `w`, keys on one side kept, no `t` = oldest, compared COLLATE "C" (byte
+order, as JS and Zig) — checked against the 8 `mergeRegisters` fixtures. A `BEFORE UPDATE OF
+<cols>` trigger merges OLD into NEW for the columns `zebridge_enable(register_cols => …)` names
+(`zebridge_install_register_merge`); a stale write is refused by the version guard's WHERE and
+never reaches it; the upsert path (ON CONFLICT DO UPDATE … WHERE) merges too. The row's rule
+decides WHETHER, the merge decides WHAT. `zebridge_enable` grew a parameter: the previous
+signature is dropped. Works like Cassandra's per-cell timestamps, Figma's per-property LWW,
+Riak's LWW maps — said in COOPERATIVE_EDITING.md, which no longer claims nothing below the
+application knows about registers.
+
+`scripts/scenarios/registers.py` (owns): §A the trigger dropped — {access 4425, rating 3},
+Carol's write `applied`, Alice's 4 gone; §B with it — {access 4425 by carol, rating 4 by alice}
+in PostgreSQL and both replicas, `applied`, outbox empty. Applied to the dev database with
+`bridge --init-sql`; Supabase and the hub need the same, then `zebridge_enable` again with
+`register_cols` for their register tables.

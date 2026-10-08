@@ -134,6 +134,7 @@ GROUPS = {
         "outbox_break":  ("bridge", "the application tries to damage the client's bookkeeping through query(): every write refused on both clients, the queued write survives and lands"),
         "write_stale":   ("bridge", "writes queued while the bridge is down, delivered after a DROP COLUMN, a new NOT NULL column and a re-key: verdicts, reverts, no ghost rows, both replicas equal PostgreSQL"),
         "rebase_stale":  ("bridge", "an UPDATE judged stale is rebased when its columns are disjoint from the winner's (both clients, verdict before and after the echo, a slow clock, a queued offline write), dropped and surfaced when they overlap"),
+        "registers":     ("bridge", "a jsonb register column merged by PostgreSQL: a late offline write built on an old doc keeps the other editor's newer register (control: without the merge it rolls it back)"),
     },
     "manual": {
         "firehose_topology": ("none", "the firehose with N TLS consumers attached, topology 2 (TLS on nats-server, bridge tls://) vs topology 1 (plain nats-server, HAProxy terminates the clients' TLS): chain margin, cuts, CPU per process (§10gb); ~10 min"),

@@ -1,20 +1,34 @@
 # Cooperative editing over LWW
 
-One row, several editors, no lost move — and nothing below the application knows about it. This is the contract: what the table must be, what the document must look like, what the client library does, and what this construction does **not** promise.
+One row, several editors, no lost move. This is the contract: what the table must be, what the document must look like, what PostgreSQL and the client library do, and what this construction does **not** promise.
 
-Proven by `scripts/scenarios/route_crdt.py` (two libzb clients of two tenants) and by the `mergeRegisters` fixtures (8 cases, both client libraries).
+Proven by `scripts/scenarios/route_crdt.py` (two libzb clients of two tenants), `scripts/scenarios/registers.py` (a late offline write against PostgreSQL's merge, with and without it) and the `mergeRegisters` fixtures (8 cases, run against both client libraries and the SQL function).
 
 ---
 
 ## The one sentence
 
-> Last-write-wins at the ROW decides who must merge.
+> Last-write-wins at the ROW decides whether a write is accepted.
 > Last-write-wins at the REGISTER decides which value survives.
-> The merge happens in the client.
+> PostgreSQL merges every write it accepts; the client merges before it writes.
 
-Two grain sizes of one rule. The row race is the protocol's, unchanged and firm. The
-register race is the application's, and it is what makes two editors converge instead
-of overwriting each other.
+Two grain sizes of one rule. The row race is the protocol's, unchanged and firm: a write
+older than the row is refused (`stale`). The register race decides what an accepted write
+changes: each field keeps its newest edit, whoever wrote the row last.
+
+## It works like
+
+* **Cassandra and ScyllaDB**: every cell (a column of a row) carries its own write
+  timestamp and the newest wins per cell, so two clients updating different columns of
+  one row never overwrite each other. Here a register is the cell, inside one `jsonb`.
+* **Figma's multiplayer**: each object's properties are separate last-writer-wins values,
+  ordered by the server. Two people moving one shape: one wins. One moving it while another
+  recolours it: both apply.
+* **Riak's maps of LWW registers**: the same construction, named as a CRDT.
+
+It is a CRDT, a map of last-writer-wins registers. It is not a text CRDT: two people typing
+in the same field at once end with one winner (Yjs, Automerge and Google Docs exist for
+that case).
 
 ---
 
@@ -24,8 +38,9 @@ of overwriting each other.
 | --- | --- | --- |
 | an ordinary writable table | PostgreSQL, via `zebridge_enable` | the row, its version, its tiebreak, its tombstone |
 | a `jsonb` column | that table | the cooperative document: a map of registers |
-| `mergeRegisters` | **both client cores** (`core.zig`, `core.ts`) | the merge, pinned by one fixture file |
-| the write-and-reconcile loop | the application | ships state, settles at a fixed point |
+| `zebridge_merge_registers` | PostgreSQL: a trigger `zebridge_enable(register_cols => …)` installs | merges each accepted write into the stored document, register by register |
+| `mergeRegisters` | **both client cores** (`core.zig`, `core.ts`) | the same merge, before a write; one fixture file pins all three |
+| the write-and-reconcile loop | the application | merges its registers into what it sees, re-merges after a `stale` |
 
 Nothing is added to the bridge, the producer, the chain, the grammar or the wire. A replica that has never heard of registers replicates this table correctly; it simply sees a `jsonb` value it does not interpret.
 
@@ -50,6 +65,7 @@ SELECT * FROM zebridge_enable('public.routes'::regclass,
     version_col   => 'updated_at',
     tombstone_col => 'deleted_at',
     tiebreak_col  => 'last_writer',
+    register_cols => ARRAY['doc'],                                     -- PostgreSQL merges it
     public_reason => 'a shared route, the cooperative-editing demo',   -- or tenant_col => 'tenant_id'
     publication   => 'my_pub', dry_run => false);
 ```
@@ -60,6 +76,7 @@ SELECT * FROM zebridge_enable('public.routes'::regclass,
 * **Public or tenant-scoped, as you wish.** The demo is public so a phone on tenant `kilo` and a browser on tenant `acme` can edit one row; give it a `tenant_col` instead and the same machinery works inside one tenant, invisible to the others. Tenancy is a property of the table, not of this construction.
 * **Writable is required**, since every editor writes through `mutate`.
 * **The version column is required** and does the work it always does. It is what makes a write `stale`, which is the signal to merge.
+* **`register_cols` names the register columns.** Without it, an accepted write replaces the whole document with what its writer last saw: a late write from an editor who was offline rolls back registers written meanwhile by others, accepted, and no verdict says so. With it, PostgreSQL merges the write register by register (`zebridge_merge_registers`, a `BEFORE UPDATE` trigger), so it can only add or advance registers. A refused (`stale`) write never reaches the trigger. Removing a register is writing it again with a newer `t` and an empty `v`.
 
 ## The document: what is NOT yours
 
@@ -139,6 +156,8 @@ Two rules earned by measurement, both of which look unnecessary until they are n
 1. **Ship state, not deltas.** Every write carries the union of ALL your own registers, not just the one you moved. Merging only "what I saw plus my newest change" loses your un-echoed keys to the other writer's accepted overwrites, and it does so without a single `stale` verdict, because the row version is fresh while the echo lags.
 1. **"Accepted" is not convergence.** The stopping condition is `observed ⊇ mine`. Stop at the verdict and, with fresh clocks, whoever writes last with a lagging echo erases the other silently. The loop terminates because merge is monotone: registers only gain, so a fixed point exists.
 
+With `register_cols`, PostgreSQL enforces both rules itself: every accepted write is merged into the stored document, so no accepted write can erase a register, whatever its writer shipped. The loop is then left with one job, the re-merge after a `stale`. Without `register_cols` (a table enabled before the option), both rules are the application's to keep.
+
 Bound the loop. The reference apps stop at ten rounds.
 
 ## Drawing it
@@ -157,7 +176,7 @@ It is **not**:
 * **causally tracked.** There are no vector clocks. Two concurrent edits of the SAME key end with one winner, by design. Different keys never conflict, which is the whole gain over replacing the document.
 * **clock-safe.** The order is a wall clock. A client whose clock steps backwards can write a register that the merge swallows, and the row's own version clamp (PROTOCOL §7.2) does not apply inside the `jsonb`. A hybrid logical clock in `t`, keeping `w` as the tiebreak, is the fix when this matters.
 * **a sequence type.** No list, no text, no fractional indices. A tour's ordered stops edited concurrently would want those; a list of registers with fractional positions inside the same document is the shape, still application-level.
-* **delivered by the algebra alone.** PostgreSQL can refuse a write as `stale`, which a textbook merge never does. Convergence here is the algebra plus the loop above.
+* **delivered by the algebra alone.** PostgreSQL can refuse a write as `stale`, which a textbook merge never does. Convergence here is the algebra, applied by PostgreSQL to every write it accepts, plus one re-merge by the client after a `stale`.
 
 A CRDT library (Yjs and its kind) was considered and refused: its state is an opaque binary document with its own update log and persistence, which duplicates the outbox and the echo, and contradicts the one thing this project insists on — PostgreSQL owns the truth and the table stays a table anyone can query.
 

@@ -1,36 +1,44 @@
 # 15 — a shared record: three editors, two offline, one merge
 
-A site survey is table with five independently editable fields — access, hazard, contact, rating, notes. Three people edit it, two of them are offline, all in the same tenant. One user is in another tenant, never sees these edits.
+A "site_survey" table with five independently editable fields — access, hazard, contact, rating, notes. Three people edit it, two of them are offline, all in the same tenant. One user is in another tenant, never sees these edits.
 
-The point is the merge: who wins each field, who loses, and why the loser is told, with two scenarios.
+For simplicity, four tabs in the browser:
 
-| editor | device | how offline is simulated |
-| -- | -- | -- |
-| Alice | laptop | online the whole time |
-| Bob | phone ( ) | the demo toggles the network off for 60 s at t = 10 s |
-| Carol | phone ( 🤖) | the demo toggles the network off for 120 s at t = 20 s |
-| Omar | laptop | tenant globex online, but sees nothing |
+| editor | how offline is simulated |
+| -- | -- |
+| Alice | online the whole time |
+| Bob | off then on |
+| Carol | off then on |
+| Omar | tenant globex online, but sees nothing |
 
-“Offline” in the browser is a network condition the page toggles. The library keeps working: writes go to the outbox, the replica keeps rendering, register stamps use the HLC, and nothing is sent.
+“Offline” in the browser is a network condition the page toggles:  `zb.close()` / `zb.connect()`. The library keeps working: writes go to the outbox, the replica keeps rendering, register stamps use the HLC, and nothing is sent.
 
-Alice edits from a laptop; Bob from a phone, offline for a minute at a plant; Carol from another phone, offline for two minutes on a train. A fourth editor, Omar,  is in a different tenant. He sees none of it and can write none of it.
+> **The point is to observe merge**: who wins each field, who loses, and why the loser is told, with two scenarios.
 
-|field|what it holds|who typically writes it|
-|--|--|--|
-|access|how to get on site: "gate code 4421"|Alice (office)|
-|hazard|a known hazard "asbestos roof"`|Bob (on site)|
-|contact|the site contact: "M. Dupont, 06…"`|Carol (phone)|
-|rating|a 1–5 condition score: 3|any of the three|
-|notes|free text: "..."`|any of the three|
+PostgreSQL judges every write. The register format `{v, t, w}` decides which field survives.
 
-PostgreSQL judges every write. The register format `{v, t, w}` decides which field survives. Nothing about the merge is decided by the browser.
+> PostgreSQL decides which write wins the row, and merges the registers of every write it accepts. It works like Cassandra's per-cell timestamps or Figma's per-property last-writer-wins: each field keeps its newest edit, whoever wrote the row last.
 
 ## One table, two flavours
 
 One table, two flavours, merged in one table for the demo: a real table picks one.
 
 * Part A: five plain columns, one per field — the library's rebase (column granularity) on `stale`. A write whose columns are disjoint from the winner’s is reapplied and lands; one whose columns overlap is dropped and the loser is told. No page-side logic.
-* Part B: one jsonb column holding the five registers, the format `{t,w,v}` as in [COOPERATIVE_EDITING.md](https://github.com/ndrean/zebridge/blob/main/COOPERATIVE_EDITING.md). format, merged by the page. Every field edit changes doc, so every stale write overlaps and the library drops it. The page does the field-level merge itself: a mine map of pending registers, merged into the winner’s doc on the echo, written again — the same pattern the depot page uses.
+* Part B: one jsonb column holding the five registers, the format `{t,w,v}` as in [COOPERATIVE_EDITING.md](https://github.com/ndrean/zebridge/blob/main/COOPERATIVE_EDITING.md), merged register by register. Every field edit changes `doc`, so for the row every write to it is a write to the same column: a stale one is refused, and a late one that wins the row carries whatever `doc` its writer last saw. PostgreSQL merges that `doc` into the stored one (`register_cols => ARRAY['doc']`), so each register keeps its newest stamp; the page merges its own registers into what it sees before writing, and again after a refusal.
+
+**The columns**:
+
+|field|what it holds|
+|--|--|
+|access|how to get on site: "gate code 4421"|
+|hazard|a known hazard "asbestos roof"`|
+|contact|the site contact: "M. Dupont, 06…"`|
+|rating|a 1–5 condition score: 3|
+|notes|free text: "a new warehouse..."`|
+|||
+|doc|the jsonb version|
+
+The DBA runs firstly:
 
 ```sql
 CREATE TABLE site_survey (
@@ -60,7 +68,7 @@ Three editors are in tenant "acme"; Omar is in "globex".
 
 RLS scopes the rows, the NATS JWT scopes the subjects, and neither is a claim in a payload.
 
-The schema declares the sync rules in one call, as every writable table does:
+The DBA then runs:
 
 ```sql
 SELECT * FROM zebridge_enable(
@@ -70,6 +78,7 @@ SELECT * FROM zebridge_enable(
   version_col   => 'updated_at',
   tombstone_col => 'deleted_at',
   tiebreak_col  => 'last_writer',
+  register_cols => ARRAY['doc'],   -- part B: PostgreSQL merges the registers of each accepted write
   publication   => 'my_pub',
   dry_run       => false
 );
@@ -77,7 +86,9 @@ SELECT * FROM zebridge_enable(
 
 `dry_run => true` first if you want to see every rule before anything is written.
 
-A seed creates one row for tenant_id = 'acme', with `doc = '{}'::jsonb`.
+The schema declares the sync rules in one call, as every writable table does.
+
+The DBA creates a seed, one row, for tenant_id = 'acme', with `doc = '{}'::jsonb`.
 
 ```sql
 INSERT INTO site_survey (id, tenant_id, access, hazard, contact, rating, notes, doc)
@@ -95,113 +106,116 @@ Every register is empty at t = 0, so the first write to any of them wins unconte
 
 ### Part A: five columns
 
-|field|what it holds|who typically writes it|
+|field|what it will do|who typically writes it|
 |--|--|--|
 |access|`INTO (access) VALUES "gate code 4421"`|Alice (office)|
 |hazard|`INTO (hazard) VALUES "asbestos roof"`|Bob (on site)|
-|contact|`INTO (contact) VALUES "M. Dupont, 06…"`|Carol (phone)|
+|contact|`INTO (contact) VALUES "M. Safety"`|Carol (phone)|
 |rating|`INTO (rating) VALUES 3`|any of the three|
-|notes|`INTO (notes) VALUES "..."`|any of the three|
+|notes|`INTO (notes) VALUES "the new warehouse..."`|any of the three|
 
 ### Part B: one column, five registers
 
-A site's editable fields are one jsonb column, doc, holding one register per field
-(see COOPERATIVE_EDITING.md): `{v, t, w}`, a value, a stamp, and its writer.
+A site's editable fields are one jsonb column, `doc`, holding one register per field - see [COOPERATIVE_EDITING](https://github.com/ndrean/zebridge/blob/main/COOPERATIVE_EDITING.md): `{v, t, w}`: a value, a stamp, and its writer.
 
-|register|what it holds|who typically writes it|
+```js
+doc = {access: {t,v,w}, hazard: {t,v,w},...}
+```
+
+|register|what it will do|who typically writes it|
 |--|--|--|
-|access|`SET doc = doc  \|\| "access": {v: "gate code 4421", t, w}::jsonb`|Alice (office)|
-|hazard|`SET doc = doc  \|\|  "hazard": {v: "asbestos roof", t, w}::jsonb`|Bob (on site)|
-|contact|`SET doc = doc  \|\|  "contact": {v: "M. Dupont, 06…", t, w}::jsonb`|Carol (phone)|
-|rating|`SET doc = doc  \|\| "rating": {v: 3, t, w}`|any of the three|
-|notes|`SET doc = doc  \|\|  "notes": {v: "...", t, w}::jsonb`|any of the three|
+|access|`SET doc = doc  \|\| "access": {v: "gate code 4421", t, w}::jsonb`|Alice|
+|hazard|`SET doc = doc  \|\|  "hazard": {v: "asbestos roof", t, w}::jsonb`|Bob|
+|contact|`SET doc = doc  \|\|  "contact": {v: "M. Dupont, 06…", t, w}::jsonb`|Carol|
+|rating|`SET doc = doc  \|\| "rating": {v: 3, t, w}::jsonb`|any of the three|
+|notes|`SET doc = doc  \|\|  "notes": {v: "the new...", t, w}::jsonb`|any of the three|
 
 * `t` is RFC 3339, UTC, ending in Z, with exactly six fractional digits (2026-09-20T06:20:26.474000Z).
 * `w` is stable per editor: laptop-alice, phone-bob, tablet-carol.
 * The library compares `t` as text, which is time order only at that fixed width, and breaks ties on `w`.
 
-The row itself carries the LWW machinery:
+The row itself carries the LWW machinery.
 
 ### Scenario
 
-The four editors share a scripted timeline, so the merge is reproducible:
+#### Part A
 
 | t(s) | Alice | Bob | Carol | what it shows |
 | -- | -- | -- | -- | -- |
 | 0 | opens, seeds | opens, seeds | opens, seeds | all three converge on the same record |
 | 5 | edits "access" | — | — | a plain write, echoed |
-| 10 | — | goes offline, edits "hazard" | — | a write queues; no one else sees it |
+| 10 | — | goes offline | — | Bob's replica stops at the row as it is now |
 | 15 | edits "notes" | — | — | a plain write |
-| 20 | edits "rating" to 4 | — | goes offline, edits "rating" to 2 | two writers on the same register, one offline |
+| 20 | edits "rating" to 2 | — | goes offline, edits "rating" to 1 | two writers on the same register, one offline |
 | 25 | edits "contact" | — | — | a plain write |
-| 30 | — | comes back, outbox flushes | — | hazard lands; rating loses to Alice (Carol is offline) |
+| 28 | — | edits "hazard" | — | a write queues, stamped after Alice's last write |
+| 30 | — | comes back, outbox flushes | — | hazard lands: the write is the newest, and it sets only `hazard` |
 | 35 | edits "rating" to 5 | - | - | the register moves again |
 | 40 | — | — | comes back, outbox flushes | rating loses again; UI shows “Carol’s edit LOST” |
 | 45 | — | — | edits "contact" | a plain write; contact changes |
 | 50 | — | — | — | everyone re-reads; the merge is stable |
 
-## The page
+#### Part B
+
+| t(s) | Alice | Bob | Carol | what it shows |
+| -- | -- | -- | -- | -- |
+| 0 | opens, seeds | opens, seeds | opens, seeds | all three converge on the same record |
+| 5 | edits "doc.access" | — | — | a plain write, echoed |
+| 10 | — | goes offline | — | Bob's replica stops at the row as it is now: `doc` holds access only |
+| 15 | edits "doc.notes" | — | — | a plain write |
+| 20 | edits "doc.rating" to 4 | — | goes offline, edits "doc.rating" to 2 | two writers on the same register, one offline |
+| 25 | edits "doc.contact" | — | — | a plain write |
+| 28 | — | edits "doc.hazard" | — | a write queues: Bob's `doc` is the one he saw at t = 10, plus hazard |
+| 30 | — | comes back, outbox flushes | — | Bob's write is the newest, so PostgreSQL accepts it — and merges it: hazard is added, Alice's notes, rating and contact keep their newer stamps |
+| 35 | edits "doc.rating" to 5 | - | - | the register moves again |
+| 40 | — | — | comes back, outbox flushes | rating loses again; UI shows “Carol’s edit LOST” |
+| 45 | — | — | edits "doc.contact" | a plain write; contact changes |
+| 50 | — | — | — | everyone re-reads; the merge is stable |
+
+Without `register_cols`, t = 30 is a silent loss: Bob's write is accepted whole, his `doc` from t = 10 replaces the row's, no verdict says anything went wrong, and Alice's three registers are gone. `scripts/scenarios/registers.py` plays this sequence with and without the merge. Part A has no such moment, because each write sets only its own column.
+
+#### Results
+
+| | A: five columns | B: one doc |
+| -- | -- | -- |
+| rebase unit | the column (library) | the register (page) |
+| hazard after Bob’s offline edit | lands | lands |
+| Alice's fields after Bob's late write | untouched | kept: PostgreSQL merges the registers |
+| rating after Carol’s offline edit | LOST, right outcome | page re-merges, loses, right outcome |
+| schema changes for a new field | one ADD COLUMN | nothing |
+| page-side merge logic | none | merge before writing, once more after a `stale` |
+| matches COOPERATIVE_EDITING.md | yes, one register per column | yes, registers inside one doc |
+
+## The app
+
+### Generate the invites
+
+The bridge is agnostic, so the DBA generates invites.
+
+> If you want to automate this, you need a backend that can receive a demand from a client, then connect to the PostgreSQL database (WRITER profile), and can send the OTP code back to the client (eg via email).
+
+```sql
+INSERT INTO public.zebridge_invites (principal, tenant_id) VALUES
+  ('alice', 'acme'),
+  ('bob', 'acme'),
+  ('carol', 'acme'),
+  ('omar', 'globex')
+RETURNING code, principal, tenant_id, expires_at;
+```
+
+Use the returned invite code per tab:
+
+```txt
+http://localhost:5173/?invite=<code>&as=alice
+```
+
+### The page
 
 Two flows meet on the page:
 
 * Data, replicated into each browser: the site_survey table, one row per site, its editable fields kept as one register each in a jsonb column. Every editor's replica converges, offline or not.
 
 * Verdicts, coming back from PostgreSQL on each write: applied, stale, rebased, LOST, rejected. The demo turns them into a timeline, so the merge is watched, not inferred.
-
-The JavaScript code uses `zb-client-ts`:
-
-```js
-import { ZeBridge, NotEnrolled, mergeRegisters } from 'zb-client-ts';
-
-const DEPLOYED_BRIDGE = import.meta.env.VITE_ZB_BRIDGE_URL as string | undefined;
-const NATS_URL = import.meta.env.VITE_ZB_NATS_URL as string | undefined;
-const qs = new URLSearchParams(location.search);
-
-const zb = new ZeBridge({
-  natsUrl: NATS_URL ?? (DEPLOYED_BRIDGE ? undefined : `${location.origin.replace(/^http/, 'ws')}/nats`),
-  bridgeUrl: DEPLOYED_BRIDGE ?? `${location.origin}/bridge`,
-  invite: qs.get('invite') ?? undefined,
-  dbPath: qs.get('as') ? `survey-${qs.get('as')}.sqlite3` : 'survey.sqlite3',
-  tables: ['site_survey'],
-});
-
-[...]
-
-// take an input from the UI and
-// 1) run optimistic local mutation
-// 2) send to Postgres via NATS
-await zb.mutate('site_survey', 'UPDATE', { id: row.id }, { [name]: value });
-
-// trigger on/offline
-if (online) { await zb.close(); online = false;  }
-else await zb.connect(); online = true;
-```
-
-Serve it:
-
-```sh
-VITE_ZB_BRIDGE_URL=https://localhost:5173 pnpm dev
-```
-
-Generate invites:
-
-```sh
-set -a; . ./.env.supabase; set +a; 
-psql "$SB_ADMIN_URL" -c "
-INSERT INTO public.zebridge_invites (code, principal, tenant_id)
-VALUES (gen_random_uuid()::text, 'alice', 'acme'),
-  (gen_random_uuid()::text, 'bob', 'acme'),
-  (gen_random_uuid()::text, 'carol', 'acme'),
-  (gen_random_uuid()::text, 'omar', 'globex')
-RETURNING code, principal, tenant_id, expires_at;
-"
-```
-
-Use the invit code:
-
-```txt
-http://localhost:5173/?invite=....
-```
 
 Each window has:
 
@@ -218,34 +232,115 @@ reason: rebased or edit LOST), row_deleted, rejected.
 * Timeline — a shared panel (one per browser) that lists
 (t, register, editor, verdict) so the merge is watched as it happens.
 
-Try, by hand:
+### The TS client survival kit
 
-Edit rating on Alice’s window; watch it echo on Bob’s and Carol’s.
+The page uses `zb-client-ts` and nothing else from ZeBridge. The whole client side of a cooperative app fits in these calls:
 
-Take Bob offline, edit hazard; watch Bob’s outbox hold the write and no other window
-move.
+```js
+import { ZeBridge, NotEnrolled, mergeRegisters } from 'zb-client-ts';
 
-Bring Bob back; watch hazard land and the verdict come back.
+// 1. who am I — the first visit enrolls with an invite; later visits need nothing
+const zb = new ZeBridge({ 
+  bridgeUrl: 'https://bridge.mydomain.org:27434',  // the bridge daemon
+  invite: <code>,                 // the invite code
+  tables: ['site_survey'] // the tables you follow  
+});
+// zb.natsUrl is populated by the identity when `zb.connect()`
 
-Take Carol offline, edit rating to 2. Meanwhile, on Alice, edit rating to 5.
-Bring Carol back: her edit is LOST, and the panel says so. The register holds Alice’s
+try { 
+  await zb.connect(); // the connection dance to get an auto-rotating JWT
+} catch (e) { 
+  if (e instanceof NotEnrolled) 
+    askForAnInvite(); // your own UI call
+}
 
-| | A: five columns | B: one doc |
-| -- | -- | -- |
-| rebase unit | the column (library) | the register (page) |
-hazard after Bob’s offline edit | rebased, lands | page re-merges, lands |
-| rating after Carol’s offline edit | LOST, right outcome | page re-merges, loses, right outcome |
-| schema changes for a new field | one ADD COLUMN | nothing |
-| page-side merge logic | none | a mine map and a re-write on the echo |
-| matches COOPERATIVE_EDITING.md | yes, one register per column | yes, registers inside one doc |
+console.log(zb.principal);   // eg 'alice': the writer of every register
 
-## On every window
+// 2. read — SQL on the local replica, offline too
+// example:
+const [row] = await zb.query('SELECT * FROM site_survey WHERE deleted_at IS NULL LIMIT 1');
+const row_id = row.id; 
 
-On Alice, edit access. On Bob, edit notes. Neither touches the other. Both land,
-neither loses.
+// or `const id = crypto.randomUUID()` minted locally
 
-On Omar’s window, call mutate on the same id. PostgreSQL refuses it (RLS); the
-library surfaces rejected. Omar’s record panel shows “not found”.
+// 3. write into a column — applied here at once, queued, sent, judged by PostgreSQL
+const { version } = await zb.mutate(
+  'site_survey',                // the table
+  'UPDATE',                     // the SQL verb, INSERT | UPDATE | DELETE
+  { id: row_id},                // the row_id
+  { hazard: 'asbestos roof' }   // the column:value
+);
+
+// 4. reactive primitive — the row moved, by me or by anyone
+// and trigger your UI change
+zb.onChange(
+  'site_survey',    // the table
+  redraw            // the callback
+);
+
+// 5. write by merge into the jsonb column 'doc': merge — one jsonb doc of registers {v, t, w}, edited by many
+mine.hazard = { 
+  v: 'asbestos roof',   // the value, any
+  // zb primitive to stamp with the right clock to be able to compare
+  t: zb.stamp(),        
+  w: zb.principal       // the writer id
+;
+
+await zb.mutate(
+  'site_survey',        // the table
+  'UPDATE',             // the SQL verb
+  { id: row_id },
+    doc: mergeRegisters(row.doc, mine) 
+    // the primitive takes 
+  }
+);
+
+// 6. offline and back — writes wait in the outbox, then go
+await zb.close();         // can be triggered by the UI
+await zb.pending();       // 1: one write waiting
+await zb.connect();       // can be triggered by the UI
+
+// 7. what became of each write — matched to mutate() by its version
+zb.onVerdict(({ version, outcome, columns }) => show(version, outcome, columns));
+```
+
+| call | what it gives |
+| -- | -- |
+| `new ZeBridge(opts)`, `connect()`, `NotEnrolled` | an identity on this device, enrolled once with an invite |
+| `principal` | who this editor is: the `w` of each register it writes |
+| `query(sql, ...params)` | the replica, read with SQL; it answers offline |
+| `mutate(table, op, key, values)` | a write, applied locally at once; returns its `version` |
+| `onChange(table, cb)` | a call each time the table's rows change, from any writer |
+| `stamp()` | a register's `t`, on the bridge's clock, never behind what this replica saw |
+| `mergeRegisters(a, b)` | the merge of two docs, register by register: the later `t` wins, then `w` |
+| `close()`, `connect()`, `pending()` | offline and back; the writes still waiting in the outbox |
+| `onVerdict(cb)` | each write's outcome, once: `applied`, `rebased`, `lost`, `deleted` or `rejected` |
+
+`onLog(cb)` says the same things in words, for people reading a console; an app does not need it.
+
+**The merge (part B).** Merge your register into the `doc` you see (`mergeRegisters`) and
+write it. PostgreSQL merges what it accepts into the stored `doc`, register by register, so a
+write built on an old `doc` cannot roll anyone back. A write refused as `stale` comes back to
+you: merge your registers into the newer row and write again; a register whose stamp lost to
+a newer one is LOST, and the page says so.
+
+The page builds its client from the address it is served on:
+
+```js
+const zb = new ZeBridge({
+  natsUrl: NATS_URL ?? (DEPLOYED_BRIDGE ? undefined : `${location.origin.replace(/^http/, 'ws')}/nats`),
+  bridgeUrl: DEPLOYED_BRIDGE ?? `${location.origin}/bridge`,
+  invite: qs.get('invite') ?? undefined,
+  dbPath: qs.get('as') ? `survey-${qs.get('as')}.sqlite3` : 'survey.sqlite3',
+  tables: ['site_survey'],
+});
+```
+
+Serve it:
+
+```sh
+VITE_ZB_BRIDGE_URL=https://localhost:5173 pnpm dev
+```
 
 ## What the demo deliberately does not do
 
@@ -263,31 +358,6 @@ writes, which is the part the register model addresses.
 
 No server-side merge. The rebase is done by the library, following the rules the
 server stated. The server never sees a rebase as a new edit; it sees a fresh write.
-
-## What it measured
-
-Scripted runs on 2026-10-XX: four windows on one laptop, the bridge and PostgreSQL on the same machine, the whole timeline replayed end to end. Every run ends with the merge table compared to golden.merge.txt, and every run matched.
-
-| what | measured |
-| -- | -- |
-| time from write to every online editor seeing it | ...
-| time from comes back to convergence | ... |
-| verdict round trip (write → verdict) | ... |
-| a rebased verdict | ... |
-| the scripted timeline, end to end | ... |
-
-**Final outcome**: (example)
-
-```txt
-t=50 register=access  winner=laptop-alice   verdict=applied
-t=50 register=hazard  winner=phone-bob      verdict=applied
-t=50 register=contact winner=tablet-carol   verdict=applied
-t=50 register=rating  winner=laptop-alice   verdict=applied
-t=50 register=notes   winner=laptop-alice   verdict=applied
-t=50 editor=phone-bob   register=rating      verdict=lost   (Alice's 5 stood)
-t=50 editor=tablet-carol register=rating     verdict=lost   (Alice's 5 stood)
-t=50 editor=globex-dan   register=*          verdict=rejected
-```
 
 ## What it makes visible
 

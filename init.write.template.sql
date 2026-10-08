@@ -453,6 +453,83 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- ── Registers (COOPERATIVE_EDITING.md) ───────────────────────────────────────
+-- A register column is one jsonb object of named registers, each {"v": value, "t": stamp,
+-- "w": writer}. The row's last-writer-wins decides whether a write is ACCEPTED; for a
+-- register column it would then replace the whole document with what its writer last saw
+-- — a late write from an editor who was offline rolled back registers written meanwhile
+-- by others, accepted, with no verdict saying so (measured in example 15). So on every
+-- accepted UPDATE the column is merged instead, register by register: the newest edit of
+-- each field survives, whoever wrote the row last — Cassandra's per-cell timestamps,
+-- Figma's per-property last-writer-wins, on a plain jsonb column.
+--
+-- zebridge_merge_registers is mergeRegisters (zb-client-ts core.ts, libzb core.zig), pinned
+-- by the same fixtures: per key the later `t` wins, an equal `t` breaks on `w`, a key on
+-- one side only is kept, a value without `t` counts as the oldest. Stamps and writers are
+-- compared byte by byte (COLLATE "C"), as JavaScript and Zig compare strings — a locale
+-- collation could order two stamps differently. Registers only gain: removing one is
+-- writing it again with a newer `t` and an empty `v`.
+CREATE OR REPLACE FUNCTION public.zebridge_merge_registers(a jsonb, b jsonb) RETURNS jsonb AS $$
+    SELECT COALESCE(jsonb_object_agg(k, CASE
+               WHEN rb IS NULL THEN ra
+               WHEN ra IS NULL THEN rb
+               WHEN COALESCE(rb ->> 't', '') COLLATE "C" > COALESCE(ra ->> 't', '') COLLATE "C" THEN rb
+               WHEN COALESCE(rb ->> 't', '') = COALESCE(ra ->> 't', '')
+                AND COALESCE(rb ->> 'w', '') COLLATE "C" > COALESCE(ra ->> 'w', '') COLLATE "C" THEN rb
+               ELSE ra END), '{}'::jsonb)
+    FROM (SELECT ea.key AS k, ea.value AS ra, NULL::jsonb AS rb
+            FROM jsonb_each(CASE WHEN jsonb_typeof(a) = 'object' THEN a ELSE '{}'::jsonb END) ea
+           WHERE NOT (CASE WHEN jsonb_typeof(b) = 'object' THEN b ELSE '{}'::jsonb END) ? ea.key
+          UNION ALL
+          SELECT eb.key, (CASE WHEN jsonb_typeof(a) = 'object' THEN a ELSE '{}'::jsonb END) -> eb.key, eb.value
+            FROM jsonb_each(CASE WHEN jsonb_typeof(b) = 'object' THEN b ELSE '{}'::jsonb END) eb) m
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
+-- The trigger: TG_ARGV names the register columns. BEFORE UPDATE OF those columns, so a
+-- write that does not set one (part A's plain columns) costs nothing; a write the version
+-- guard refuses (stale) never reaches it — the row's rule still decides WHETHER, this
+-- decides WHAT.
+CREATE OR REPLACE FUNCTION public.zebridge_merge_register_cols() RETURNS trigger AS $$
+DECLARE
+    col   text;
+    patch jsonb := '{}'::jsonb;
+BEGIN
+    FOREACH col IN ARRAY TG_ARGV LOOP
+        patch := patch || jsonb_build_object(col,
+            public.zebridge_merge_registers(to_jsonb(OLD) -> col, to_jsonb(NEW) -> col));
+    END LOOP;
+    NEW := jsonb_populate_record(NEW, patch);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Installs the merge on `cols` (each a jsonb column); idempotent, replaces the column list.
+CREATE OR REPLACE FUNCTION public.zebridge_install_register_merge(tbl regclass, cols name[]) RETURNS void AS $$
+DECLARE
+    c   name;
+    typ text;
+BEGIN
+    IF cols IS NULL OR cardinality(cols) = 0 THEN
+        EXECUTE format('DROP TRIGGER IF EXISTS zebridge_merge_registers_t ON %s', tbl);
+        RETURN;
+    END IF;
+    FOREACH c IN ARRAY cols LOOP
+        SELECT format_type(atttypid, atttypmod) INTO typ
+          FROM pg_attribute WHERE attrelid = tbl AND attname = c AND NOT attisdropped;
+        IF typ IS NULL THEN
+            RAISE EXCEPTION '%: no column %', tbl, c;
+        ELSIF typ <> 'jsonb' THEN
+            RAISE EXCEPTION '%.%: a register column is jsonb, not %', tbl, c, typ;
+        END IF;
+    END LOOP;
+    EXECUTE format('DROP TRIGGER IF EXISTS zebridge_merge_registers_t ON %s', tbl);
+    EXECUTE format('CREATE TRIGGER zebridge_merge_registers_t BEFORE UPDATE OF %s ON %s '
+                   'FOR EACH ROW EXECUTE FUNCTION public.zebridge_merge_register_cols(%s)',
+                   (SELECT string_agg(quote_ident(x), ', ') FROM unnest(cols) x), tbl,
+                   (SELECT string_agg(quote_literal(x), ', ') FROM unnest(cols) x));
+END;
+$$ LANGUAGE plpgsql;
+
 -- Take the guards off again — the counterpart, and needed more often than it looks
 --
 -- ⚠️ Once the delete guard is on, **nobody but the sweeper can physically delete from this

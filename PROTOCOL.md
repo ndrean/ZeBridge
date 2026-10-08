@@ -1977,6 +1977,8 @@ tiebreak_col  = 'last_writer'   -- tiebreak
 Without one, two writes carrying the *same* version are both **refused** — which is not a resolution: two replicas each holding the other's row refuse each other forever, silently.
 With one, the higher `client_id` wins, and the winner's id is stored so the comparison is `(version, client_id)` as §7.3 describes.
 
+**2c. Register columns, for a document several clients edit.** Optional: `register_cols` in `zebridge_enable`. A `jsonb` column of registers `{v, t, w}` (COOPERATIVE_EDITING.md) is merged by PostgreSQL on every accepted UPDATE (`zebridge_merge_registers`, a `BEFORE UPDATE` trigger): per key the later `t` wins, then `w`, and keys on one side only are kept. The version still decides whether a write is accepted; the merge decides what an accepted write changes inside the column. Without it, an accepted write replaces the whole document, including registers its writer never saw.
+
 ⚠️ Ties are the **normal** case for an integer version column — two clients that read the same value both send `stored + 1` — and happen with timestamps whenever two writes land in the same microsecond. A `timestamptz(6)` table with one writer may never need this; a counter-versioned table needs it immediately.
 
 Verified order-independent: the higher id wins whether it arrives first or second, which is the property that makes replicas converge rather than race.

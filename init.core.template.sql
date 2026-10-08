@@ -1818,6 +1818,7 @@ DROP FUNCTION IF EXISTS public.zebridge_enable(regclass, name, boolean, name[], 
 DROP FUNCTION IF EXISTS public.zebridge_enable(regclass, name, boolean, name[], name, name, name, boolean, text, name, boolean);
 DROP FUNCTION IF EXISTS public.zebridge_enable(regclass, name, boolean, name[], name, name, name, boolean, boolean, text, name, boolean);
 DROP FUNCTION IF EXISTS public.zebridge_enable(regclass, name, boolean, name[], name, name, name, boolean, boolean, text, name, boolean, boolean);
+DROP FUNCTION IF EXISTS public.zebridge_enable(regclass, name, boolean, name[], name, name, name, boolean, boolean, boolean, text, name, boolean, boolean);
 CREATE OR REPLACE FUNCTION public.zebridge_enable(
     tbl           regclass,
     tenant_col    name    DEFAULT NULL,
@@ -1826,6 +1827,10 @@ CREATE OR REPLACE FUNCTION public.zebridge_enable(
     version_col   name    DEFAULT NULL,
     tombstone_col name    DEFAULT NULL,
     tiebreak_col  name    DEFAULT NULL,  -- where the winning writer's id is stored; makes equal versions resolvable
+    -- jsonb columns of registers {v, t, w} (COOPERATIVE_EDITING.md): PostgreSQL merges each
+    -- accepted write into them register by register, so a late write never rolls back a
+    -- field someone else edited meanwhile. Needs writable => true.
+    register_cols name[]  DEFAULT NULL,
     -- ⚠️ The conscious opt-OUT of the tombstone requirement (see the gate below).
     -- Physical deletes are INEXPRESSIBLE in a generation delta (deltas are
     -- upsert-only), and generations are the only seed path — so a hard-deleted row
@@ -1939,6 +1944,12 @@ BEGIN
         RETURN QUERY SELECT 'preflight', 'ERROR', format('%s has no column %I', tbl, tenant_col);
         RETURN;
     END IF;
+    -- §10lz: register columns are merged on WRITE; a read-only table has no writes to merge.
+    IF register_cols IS NOT NULL AND cardinality(register_cols) > 0 AND NOT writable THEN
+        RETURN QUERY SELECT 'preflight', 'ERROR',
+            format('register_cols %s needs writable => true: the merge runs on the writes clients send', register_cols::text);
+        RETURN;
+    END IF;
     -- A nullable tenant column cannot route a row (NULL has no stream) and the scoping
     -- functions refuse it; said here, before anything is applied, rather than as an
     -- exception halfway through the activation.
@@ -2029,6 +2040,15 @@ BEGIN
             END IF;
             RETURN QUERY SELECT 'guards', verb,
                 format('zebridge_install_write_guards(%L, %L, %L, %L)', tbl::text, version_col, tombstone_col, tenant_col);
+        END IF;
+
+        IF register_cols IS NOT NULL AND cardinality(register_cols) > 0 THEN
+            IF NOT dry_run THEN
+                EXECUTE format('SELECT public.zebridge_install_register_merge(%L::regclass, %L::name[])', tbl, register_cols);
+            END IF;
+            RETURN QUERY SELECT 'registers', verb,
+                format('zebridge_install_register_merge(%L, %L) — each accepted write merged register by register',
+                       tbl::text, register_cols::text);
         END IF;
 
         IF tenant_col IS NOT NULL THEN
