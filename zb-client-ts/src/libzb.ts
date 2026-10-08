@@ -658,6 +658,9 @@ export class ZeBridge {
     this.config = config;
     config.grammar = GRAMMAR;
     this.platform = currentPlatform();
+    // The core's rules (mergeRegisters, …) are WASM: start loading now, so a page that
+    // edits before connect() has finished finds it ready; connect() awaits the same load.
+    void loadCore(this.platform.coreWasm()).catch(() => { /* connect() retries and says why */ });
     if (config.platform && config.platform !== this.platform.name) {
       throw new Error(`zb-client-ts: platform '${config.platform}' asked, but this build loaded the '${this.platform.name}' entry — import from 'zb-client-ts/${config.platform}'`);
     }

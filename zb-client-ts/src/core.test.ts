@@ -95,14 +95,14 @@ import {
   fkTextDiffers, viewSteps, indexSyncPlan,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgArrayLiteral, chainUpsertSql, chainRowParams,
   planCdcBulk,
-  seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica, tableSet, mergeRegisters,
+  seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica, tableSet,
   advancePosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
   outboxWatermarkGate,
   heartbeatPayload,
   keyShape, typeShape, retypedColumns, isReadOnlySql,
 } from './core.ts';
 
-import { loadCore, scopeSeeding, caughtUpPosition, streamResume } from './wasm-core.ts';
+import { loadCore, scopeSeeding, caughtUpPosition, streamResume, mergeRegisters } from './wasm-core.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 // The rules libzb owns run from the module this package ships (wasm-core.ts).

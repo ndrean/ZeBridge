@@ -46,6 +46,14 @@ export fn zb_caught_up_position(pos: u64, first_seq: u64, last_seq: u64, num_pen
     return core.caughtUpPosition(pos, first_seq, last_seq, num_pending, num_ack_pending, delivered_count, delivered);
 }
 
+/// core.mergeRegisters (COOPERATIVE_EDITING.md): `{"a": doc, "b": doc}` → the merged doc.
+export fn zb_merge_registers(ptr: [*]const u8, len: usize) u64 {
+    const args = parseArgs(ptr, len) orelse return 0;
+    if (args != .object) return 0;
+    const out = core.mergeRegisters(arena.allocator(), args.object.get("a") orelse .null, args.object.get("b") orelse .null) catch return 0;
+    return result(out);
+}
+
 /// core.streamResume (§10lw): `{"stored", "firstSeq", "cuts": [n|null]}` → `{"to", "blocked"}`.
 export fn zb_stream_resume(ptr: [*]const u8, len: usize) u64 {
     const args = parseArgs(ptr, len) orelse return 0;

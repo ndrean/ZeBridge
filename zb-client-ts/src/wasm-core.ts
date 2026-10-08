@@ -19,6 +19,7 @@ type Exports = {
   zb_caught_up_position(pos: bigint, firstSeq: bigint, lastSeq: bigint, numPending: bigint, numAckPending: bigint, deliveredCount: bigint, delivered: bigint): bigint;
   zb_scope_seeding(ptr: number, len: number): bigint;
   zb_stream_resume(ptr: number, len: number): bigint;
+  zb_merge_registers(ptr: number, len: number): bigint;
 };
 
 let ex: Exports | null = null;
@@ -63,6 +64,18 @@ function call(fn: (ptr: number, len: number) => bigint, name: string, args: unkn
   } finally {
     c.zb_reset();
   }
+}
+
+/// A register (COOPERATIVE_EDITING.md): a value, its stamp, its writer.
+export type Register = { v: unknown; t?: string; w?: string };
+
+/// Two documents of registers merged: per key the later `t` wins, an equal `t` breaks on
+/// `w`, a key on one side only is kept, a value without `t` is the oldest. Commutative,
+/// associative, idempotent. libzb core.mergeRegisters; PostgreSQL applies the same rule
+/// to each accepted write of a register column (zebridge_merge_registers).
+export function mergeRegisters(a: Record<string, Register>, b: Record<string, Register>): Record<string, Register> {
+  const c = core();
+  return call(c.zb_merge_registers, 'mergeRegisters', { a: a ?? {}, b: b ?? {} });
 }
 
 /// A stream's span against the position a client stored (the gap rule, D2, §10n).
