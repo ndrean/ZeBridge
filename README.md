@@ -897,7 +897,7 @@ Writes are resolved, not merely accepted: the policy is last-writer-wins (LWW), 
 
 This is deliberate: ZeBridge arbitrates at ingest, so a slow or offline client cannot silently overwrite a newer edit, and a stale queued write cannot undo a delete. The cost is that LWW decides per **row**; for several editors on one row, see the next section. Worked cases: [Understanding the LWW rules](#understanding-the-lww-rules).
 
-**A live illustration**: [example 15, a shared record](examples/15-shared-record/README.md). Three editors of one tenant, two of them offline for a while, edit one row in four browser tabs; its part A is these rules on five plain columns — an offline edit rebased because the winner changed other columns, another reported LOST because the winner changed the same one — with each verdict shown on the page as it arrives. `scripts/scenarios/shared_record.py` plays the same timeline and checks every outcome.
+Example 15 shows these rules live, on five plain columns: see [a live illustration](#a-live-illustration-a-shared-record) below.
 
 #### Cooperative editing: several editors on one row
 
@@ -924,7 +924,16 @@ The same rule applies twice: LWW on the **row** decides whether a write is accep
 
 Your app merges its register into the document it holds (`mergeRegisters`, the same rule from libzb's core in both client libraries) and writes it; a write refused as `stale` comes back, and the app merges once more into the newer row. Two editors moving different fields never lose a move. Two editors moving the same field end with one winner, by design, and the loser is told.
 
-The table stays an ordinary writable table, and PostgreSQL holds the truth, as a column anyone can query. A live illustration: [example 15](examples/15-shared-record/README.md), part B — the same timeline as part A on five registers of one `jsonb` column, including the late offline write that PostgreSQL's merge keeps from erasing the other editors' fields.
+The table stays an ordinary writable table, and PostgreSQL holds the truth, as a column anyone can query.
+
+##### A live illustration: a shared record
+
+[Example 15](examples/15-shared-record/README.md) edits one row two ways, side by side. Three editors of one tenant, two of them offline for a while, work in four browser tabs (the fourth is an editor of another tenant, who sees nothing):
+
+- **part A, five plain columns**: the rules of [conflict resolution](#conflict-resolution) per column — an offline edit rebased because the winner changed other columns, another reported LOST because the winner changed the same one;
+- **part B, five registers of one `jsonb` column**: merged per register by PostgreSQL — including the late offline write, built on an old copy of the document, that cannot erase the fields the others edited meanwhile.
+
+Each verdict appears on the page as it arrives, and `scripts/scenarios/shared_record.py` plays the same timeline and checks every outcome.
 
 See [COOPERATIVE_EDITING.md](COOPERATIVE_EDITING.md) for the table, the register format, the loop, and what this does not promise (no causal tracking, no ordered lists or text).
 
