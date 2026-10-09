@@ -86,6 +86,16 @@ async def main():
     while time.monotonic() < deadline and zb.psql(f"SELECT count(*) FROM {T} WHERE uid = '{u}'", quiet=True).strip() != "1": time.sleep(0.5)
     m = zb.psql(f"SELECT body, fts::text FROM {T} WHERE uid = '{u}'", quiet=True).strip()
     check(f"the client's write landed and the master computed its tsvector: {m} (verdicts {fl.get('verdicts')})", m == "jumps quickly|'jump':1 'quick':2")
+    # A column kept off the replicas is not the client's to write either: `secret` is in the
+    # stray publication's list, not in this bridge's, and the stray one must not widen it.
+    mid = em.mutate(T, "update", {"uid": u}, {"secret": "overwritten"})["msgId"]
+    deadline = time.monotonic() + 30
+    while em.outcome(mid) is None and time.monotonic() < deadline:
+        em.flush(500); em.poll(300)
+    o = em.outcome(mid) or {}
+    sec = zb.psql(f"SELECT coalesce(secret, '<null>') FROM {T} WHERE uid = '{u}'", quiet=True).strip()
+    check(f"a write to the unpublished column is refused: {(o.get('outcome'), o.get('reason'))}, secret in PostgreSQL {sec}",
+          o.get("outcome") == "rejected" and o.get("reason") == "UnknownColumn" and sec == "<null>")
     em.close()
 
     # The chain is cut within seconds of the enable (the catalogue reload kicks the

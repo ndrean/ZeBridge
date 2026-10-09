@@ -306,7 +306,8 @@ configuration that gets around them.
    table does not narrow them.
 3. **A bridge is all or nothing on a table's columns.** A column list hides a column
    from every tenant and every principal the bridge serves; there is no per-principal
-   projection. Views by the bridge were considered and rejected: a chain, a bucket, a
+   projection. The write path enforces the same list: a client write naming a column
+   left out is refused as `UnknownColumn`. Views by the bridge were considered and rejected: a chain, a bucket, a
    descriptor, a seed, a tombstone fan-out and a version per view and tenant, all
    imitating what a real table gets from PostgreSQL for free.
 4. **A column with a narrower audience is a migration, not a setting.** Move it into
@@ -674,8 +675,11 @@ credentials present, never a choice. The TTL remains the passive bound: size
 run where `operator.store` lives, with no database: their keys are in no table, and
 `--revoke <principal>` finds nothing to revoke. Each mint prints the identity's user key;
 file it with the creds. `OPERATOR_SEED=… ZB_ACCOUNT_PUB=… bridge --revoke --key U… --conf
-nats-server.conf` adds that key to the account JWT's revocations, with no database, and is
-also the answer to a creds file known to have leaked. A leaf node checks the devices
+nats-server.conf` adds that key to the account JWT's revocations, and is also the answer
+to a creds file known to have leaked. NATS refuses the JWTs issued up to the revocation,
+not after it: a minted identity never gets another, but an enrolled device would renew.
+For an enrolled device's key, pass `ADMIN_DATABASE_URL` as well: the key is then also
+marked in `zebridge_principal_keys`, and `/renew` refuses it. A leaf node checks the devices
 against its own copy of the account JWT: refresh its `trust.conf` after a revocation
 (`deploy/ansible/leaf.yml` does it on every run).
 

@@ -1613,6 +1613,7 @@ pub fn main(init: std.process.Init) !void {
                 // into an immediate, cheaper rejection with the same outcome.
                 @min(own_event_buf, effective_row_budget),
                 &rate_limiter,
+                parsed_args.publication_name,
             );
             try mut_listeners.append(allocator, lane_ptr);
             try lane_ptr.start();

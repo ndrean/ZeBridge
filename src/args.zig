@@ -39,10 +39,11 @@ const usage =
     \\  --init-sql      The init SQL for this database, on stdout (pipe it to psql). Reads
     \\                  DATABASE_READER_URL, DATABASE_WRITER_URL, BRIDGE_CDC_PUBLICATION
     \\
-    \\  --mint-responder --name NAME [--tenant T]... [--store PATH]
+    \\  --mint-responder --name NAME [--tenant T]... [--store PATH] [--ttl-days D]
     \\                  Creds for a responder service, on stdout, signed from operator.store
-    \\  --mint-leaf --name NAME [--store PATH]
+    \\  --mint-leaf --name NAME [--store PATH] [--ttl-days D]
     \\                  Creds for a leaf node's remote, on stdout: what its clients may carry
+    \\                  --ttl-days: both default to 3650 (ten years): replaced with a redeploy
     \\                  --store - reads the store from standard input (a password manager's pipe):
     \\                  the seeds never touch this host's disk
     \\  --revoke <principal>  Revoke: mapping + unused invites, three-clock narration.
@@ -54,9 +55,10 @@ const usage =
     \\                              and identity: at once if connected, when they renew
     \\                              otherwise. Best-effort: offline for good keeps its data
     \\
-    \\  --revoke --key U… --conf PATH  Revoke one user key, no database: a minted identity
-    \\                  (the `user key` a mint printed) or leaked creds. OPERATOR_SEED and
-    \\                  ZB_ACCOUNT_PUB; the account's revocations only grow
+    \\  --revoke --key U… --conf PATH  Revoke one user key: a minted identity (the `user key`
+    \\                  a mint printed) or leaked creds. OPERATOR_SEED and ZB_ACCOUNT_PUB; the
+    \\                  account's revocations only grow. With ADMIN_DATABASE_URL, an enrolled
+    \\                  device's key is also marked in PostgreSQL, so /renew refuses it
     \\  --view-slots    Every replication slot on the server: active, pid, LSNs, retained WAL
     \\  --view-slot <slot>  The same for one slot
     \\  --drop-slot <slot>  Drop an INACTIVE slot (frees its retained WAL). Needs

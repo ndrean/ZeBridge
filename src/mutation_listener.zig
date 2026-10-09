@@ -367,6 +367,11 @@ const TableMeta = struct {
     /// DDL has crossed the replication stream since, so they are re-read rather than
     /// trusted. See `catalog_epoch.zig`.
     epoch: u64 = 0,
+    /// The columns the publication carries, when that is fewer than the table's: a
+    /// `zebridge_enable(columns => …)` list. Null means every column travels. A client
+    /// may write only what it can see — a column kept off the replicas is the server's
+    /// alone, and the write path refuses it like an unknown one.
+    published: ?[][]const u8 = null,
 
     fn deinit(self: *TableMeta, allocator: std.mem.Allocator) void {
         for (self.pk_cols) |col| allocator.free(col);
@@ -377,6 +382,20 @@ const TableMeta = struct {
         allocator.free(self.version_col);
         if (self.client_col) |cc| allocator.free(cc);
         if (self.tombstone_col) |t| allocator.free(t);
+        if (self.published) |list| {
+            for (list) |col| allocator.free(col);
+            allocator.free(list);
+        }
+    }
+
+    /// A column a client may set: one of the table's, and one the publication carries.
+    fn clientWritable(self: *const TableMeta, name: []const u8) bool {
+        if (!self.hasColumn(name)) return false;
+        const list = self.published orelse return true;
+        for (list) |col| {
+            if (std.mem.eql(u8, col, name)) return true;
+        }
+        return false;
     }
 
     /// The kind of `name`, or `.scalar` when the column is unknown — an unknown column
@@ -463,6 +482,9 @@ pub const MutationListener = struct {
     /// tenant memory it keys the second bucket on (read from
     /// `zebridge_user_tenants` on first sight, "" when the principal has none).
     limiter: *rate_limit.Limiter,
+    /// This bridge's publication: a table's column list is read from it, not from any
+    /// other publication that happens to name the table.
+    publication: []const u8,
     tenant_cache: std.StringHashMap([]const u8),
     /// Throttle for the refusal log line: one per second at most, with the count.
     limit_log_ms: i64 = 0,
@@ -500,6 +522,7 @@ pub const MutationListener = struct {
         catalog_epoch: *const CatalogEpoch,
         event_buf_bytes: usize,
         limiter: *rate_limit.Limiter,
+        publication: []const u8,
     ) !*MutationListener {
         const self = try allocator.create(MutationListener);
 
@@ -514,6 +537,7 @@ pub const MutationListener = struct {
             .catalog_epoch = catalog_epoch,
             .event_buf_bytes = event_buf_bytes,
             .limiter = limiter,
+            .publication = publication,
             .tenant_cache = std.StringHashMap([]const u8).init(allocator),
         };
 
@@ -2000,6 +2024,49 @@ pub const MutationListener = struct {
             }
         }
 
+        // The publication's column list (PostgreSQL 15+; 14 has none): what the replicas
+        // see, and therefore all a client may write. THIS bridge's publication only: a
+        // stray one naming the table with another list must not widen it (collist.py).
+        // Read from the catalogs, matched by OID: `pg_publication_tables` casts every row's
+        // name to regclass, which the writer role is refused for tables it cannot see
+        // (measured: "permission denied for schema pg_toast"). `prattrs` is NULL when the
+        // table has no list, and the query then returns no row: every column travels.
+        var published: ?[][]const u8 = null;
+        errdefer if (published) |list| {
+            for (list) |col| alloc.free(col);
+            alloc.free(list);
+        };
+        if (conn) |cn| if (c.PQserverVersion(cn) >= 150000) {
+            const tbl_z = try alloc.dupeSentinel(u8, table, 0);
+            defer alloc.free(tbl_z);
+            const pub_z = try alloc.dupeSentinel(u8, self.publication, 0);
+            defer alloc.free(pub_z);
+            const pub_params = [_]?[*:0]const u8{ tbl_z.ptr, pub_z.ptr };
+            const pres = c.PQexecParams(cn,
+                \\SELECT a.attname::text FROM pg_publication_rel pr
+                \\  JOIN pg_publication p ON p.oid = pr.prpubid
+                \\  JOIN pg_attribute a ON a.attrelid = pr.prrelid AND a.attnum = ANY (pr.prattrs)
+                \\ WHERE p.pubname = $2 AND pr.prrelid = $1::regclass
+            , 2, null, &pub_params, null, null, 0);
+            defer if (pres) |pr| c.PQclear(pr);
+            if (pres == null or c.PQresultStatus(pres) != c.PGRES_TUPLES_OK) {
+                // Closed, not open: a guard that cannot read its list must not let every
+                // column through. The write is retried like any transient failure.
+                log.err("'{s}': could not read the publication's column list ({s}) — refusing writes to it until it can", .{ table, if (pres != null) std.mem.span(c.PQresultErrorMessage(pres)) else "no result" });
+                return error.ColumnListUnreadable;
+            }
+            const n: usize = @intCast(c.PQntuples(pres));
+            if (n > 0) {
+                var list: std.ArrayList([]const u8) = .empty;
+                errdefer {
+                    for (list.items) |col| alloc.free(col);
+                    list.deinit(alloc);
+                }
+                for (0..n) |i| try list.append(alloc, try alloc.dupe(u8, std.mem.span(c.PQgetvalue(pres, @intCast(i), 0))));
+                published = try list.toOwnedSlice(alloc);
+            }
+        };
+
         var version_type: VersionType = .other;
         for (columns.items, 0..) |col, i| {
             if (std.mem.eql(u8, col, version_name)) {
@@ -2016,7 +2083,9 @@ pub const MutationListener = struct {
             .version_type = version_type,
             .client_col = if (client_name) |cn| try alloc.dupe(u8, cn) else null,
             .tombstone_col = if (tombstone_name) |t| try alloc.dupe(u8, t) else null,
+            .published = published,
         };
+        published = null; // owned by `meta` now: its deinit frees it
         errdefer meta.deinit(alloc);
 
         // ⚠️ **Refused, not warned.** A client mints its own key (§7.2), and an explicit
@@ -2408,11 +2477,11 @@ pub const MutationListener = struct {
             if (entry.key_ptr.* != .str) continue;
             const name = entry.key_ptr.str.value();
             // The catalog is the allowlist. An unknown name never reaches SQL.
-            if (!meta.hasColumn(name)) {
+            if (!meta.clientWritable(name)) {
                 // The catalog is the allowlist and the client sent something outside it —
                 // a client fault, reported to them by the verdict, so traced here rather
-                // than raised.
-                log.info("⛔ '{s}' has no column '{s}' — refusing mutation from '{s}'", .{ mutation.table, name, mutation.principal });
+                // than raised. A column the publication leaves out is outside it too.
+                log.info("⛔ '{s}' has no column '{s}'{s} — refusing mutation from '{s}'", .{ mutation.table, name, if (meta.hasColumn(name)) " the replicas can see" else "", mutation.principal });
                 return error.UnknownColumn;
             }
             if (std.mem.eql(u8, name, meta.version_col)) continue; // set from `version`
@@ -2618,8 +2687,8 @@ pub const MutationListener = struct {
         while (it.next()) |entry| {
             if (entry.key_ptr.* != .str) continue;
             const name = entry.key_ptr.str.value();
-            if (!meta.hasColumn(name)) {
-                log.info("⛔ '{s}' has no column '{s}' — refusing mutation from '{s}'", .{ mutation.table, name, mutation.principal });
+            if (!meta.clientWritable(name)) {
+                log.info("⛔ '{s}' has no column '{s}'{s} — refusing mutation from '{s}'", .{ mutation.table, name, if (meta.hasColumn(name)) " the replicas can see" else "", mutation.principal });
                 return error.UnknownColumn;
             }
             if (meta.isPk(name)) {
@@ -3297,6 +3366,18 @@ test "§10km: versionMicros reads every timestamp shape a version arrives in" {
     try std.testing.expectEqual(@as(?i64, null), versionMicros("2026-09-20T06:20:26.474"));
     try std.testing.expectEqual(@as(?i64, null), versionMicros("2026-13-20T06:20:26Z"));
     try std.testing.expectEqual(@as(?i64, null), versionMicros("2026-09-20T06:20:26.Z"));
+}
+
+test "clientWritable: a column the publication leaves out is refused like an unknown one" {
+    var cols = [_][]const u8{ "uid", "body", "secret" };
+    var kinds = [_]ColKind{ .scalar, .scalar, .scalar };
+    var pubd = [_][]const u8{ "uid", "body" };
+    var meta = TableMeta{ .pk_cols = &.{}, .columns = &cols, .col_kinds = &kinds, .version_col = "updated_at", .tombstone_col = null, .published = &pubd };
+    try std.testing.expect(meta.clientWritable("body"));
+    try std.testing.expect(!meta.clientWritable("secret")); // the table's, but not published
+    try std.testing.expect(!meta.clientWritable("nope")); // not the table's at all
+    meta.published = null; // no column list: every column of the table
+    try std.testing.expect(meta.clientWritable("secret"));
 }
 
 test "hexText - bytea input form" {

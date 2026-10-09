@@ -179,7 +179,14 @@ pub fn run(init: *const std.process.Init) u8 {
     return amendRevocations(conn, init, op_seed.?, conf_path.?, null);
 }
 
-/// `--revoke --key U…`: one user key into the account JWT's revocations, no database.
+/// `--revoke --key U…`: one user key into the account JWT's revocations.
+///
+/// NATS refuses the JWTs issued up to the revocation, not after it. A key minted offline
+/// (`--mint-responder`, `--mint-leaf`) never gets another JWT, so the revocation holds. An
+/// ENROLLED device's key would: `/renew` answers any key on record that is not marked
+/// revoked, and its fresh JWT passes NATS. So with `ADMIN_DATABASE_URL` the key is also
+/// marked in `zebridge_principal_keys`, which `/renew` checks; without it, the command says
+/// that an enrolled device can still renew.
 fn revokeKey(init: *const std.process.Init, key: []const u8, conf_path: ?[]const u8) u8 {
     // A user key decodes (prefix U, checksum): the signature itself does not matter here.
     _ = nats.nkeys.verify(.user, key, "", [_]u8{0} ** 64) catch {
@@ -192,7 +199,39 @@ fn revokeKey(init: *const std.process.Init, key: []const u8, conf_path: ?[]const
             "     OPERATOR_SEED=SO… ZB_ACCOUNT_PUB=A… bridge --revoke --key {s} --conf /path/to/nats-server.conf\n", .{key});
         return 1;
     }
-    return amendRevocations(null, init, op_seed.?, conf_path.?, key);
+    const url = init.minimal.environ.getPosix("ADMIN_DATABASE_URL") orelse {
+        out("⚠️  ADMIN_DATABASE_URL is not set: {s} is revoked at NATS only. That holds for an identity\n" ++
+            "   minted offline (--mint-responder, --mint-leaf). If it is an ENROLLED device's key, /renew\n" ++
+            "   still gives it a fresh JWT that NATS accepts: run again with ADMIN_DATABASE_URL to mark it.\n", .{key});
+        return amendRevocations(null, init, op_seed.?, conf_path.?, key);
+    };
+    var url_buf: [1024]u8 = undefined;
+    const url_z = std.fmt.bufPrintSentinel(&url_buf, "{s}", .{url}, 0) catch {
+        out("🔴 ADMIN_DATABASE_URL too long\n", .{});
+        return 1;
+    };
+    const conn = c.PQconnectdb(url_z.ptr);
+    defer if (conn != null) c.PQfinish(conn);
+    if (conn == null or c.PQstatus(conn) != c.CONNECTION_OK) {
+        out("🔴 could not connect with ADMIN_DATABASE_URL{s}{s}\n", .{ if (conn != null) ": " else "", if (conn != null) std.mem.span(c.PQerrorMessage(conn)) else "" });
+        return 1;
+    }
+    var key_buf: [nats.nkeys.public_key_text_len + 1]u8 = undefined;
+    const key_z = std.fmt.bufPrintSentinel(&key_buf, "{s}", .{key}, 0) catch return 1;
+    const params = [_]?[*:0]const u8{key_z.ptr};
+    const res = c.PQexecParams(conn, "UPDATE public.zebridge_principal_keys SET revoked_at = now() WHERE user_pubkey = $1 AND revoked_at IS NULL RETURNING principal", 1, null, &params, null, null, 0);
+    defer c.PQclear(res);
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+        out("🔴 could not mark the key in zebridge_principal_keys: {s}\n", .{c.PQerrorMessage(conn)});
+        return 1;
+    }
+    if (c.PQntuples(res) == 1) {
+        out("✅ {s} is a key of principal '{s}': marked revoked in PostgreSQL, so /renew refuses it.\n" ++
+            "   Its other devices keep working; a NEW device for '{s}' needs a new principal, as after any revocation.\n", .{ key, std.mem.span(c.PQgetvalue(res, 0, 0)), std.mem.span(c.PQgetvalue(res, 0, 0)) });
+    } else {
+        out("   {s} is not an enrolled key (or was already marked): nothing to mark in PostgreSQL.\n", .{key});
+    }
+    return amendRevocations(conn, init, op_seed.?, conf_path.?, key);
 }
 
 /// The account JWT's revocations: the map it carries, PostgreSQL's revoked keys (when `conn`)

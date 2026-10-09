@@ -31,6 +31,7 @@ import zb  # noqa: E402
 BRIDGE = zb.ROOT / "zig-out" / "bin" / "bridge"
 PORT = 14223
 PRINCIPAL = "fullrev_probe"
+KEY_PRINCIPAL = "keyrev_probe"   # an enrolled device revoked by its key alone
 ADMIN_URL = "postgres://postgres@127.0.0.1:5432/postgres"
 
 
@@ -130,7 +131,30 @@ def main() -> int:
                 zb.bad(f"--update un-revoked the key (rc={again.returncode})"); failed += 1
         else:
             zb.bad(f"--update failed: {outp[-200:]}"); failed += 1
+
+        # --revoke --key on an ENROLLED device's key: NATS refuses the JWTs issued up to
+        # the revocation, not after, so the key must also be marked in PostgreSQL, or
+        # /renew hands the device a fresh JWT that NATS accepts.
+        gen = subprocess.run([str(BRIDGE), "--gen-nkey"], capture_output=True, text=True).stdout
+        dev_key = re.search(r"_PUB=(U[A-Z0-9]+)", gen).group(1)
+        zb.psql(f"INSERT INTO public.zebridge_principal_keys (user_pubkey, principal, tenant_id) VALUES ('{dev_key}', '{KEY_PRINCIPAL}', 'kilo')")
+        env_nodb = {k: v for k, v in env.items() if k != "ADMIN_DATABASE_URL"}
+        r = subprocess.run([str(BRIDGE), "--revoke", "--key", dev_key, "--conf", str(conf)], env=env_nodb, capture_output=True, text=True)
+        outp = r.stdout + r.stderr
+        marked = zb.psql(f"SELECT revoked_at IS NOT NULL FROM public.zebridge_principal_keys WHERE user_pubkey = '{dev_key}'").strip()
+        if r.returncode == 0 and "ADMIN_DATABASE_URL is not set" in outp and "ENROLLED" in outp and marked == "f":
+            zb.ok("--revoke --key without ADMIN_DATABASE_URL revokes at NATS and says an enrolled device can still renew")
+        else:
+            zb.bad(f"--key without a database: rc={r.returncode}, marked={marked}: {outp[-200:]}"); failed += 1
+        r = subprocess.run([str(BRIDGE), "--revoke", "--key", dev_key, "--conf", str(conf)], env=env, capture_output=True, text=True)
+        outp = r.stdout + r.stderr
+        marked = zb.psql(f"SELECT revoked_at IS NOT NULL FROM public.zebridge_principal_keys WHERE user_pubkey = '{dev_key}'").strip()
+        if r.returncode == 0 and f"principal '{KEY_PRINCIPAL}'" in outp and marked == "t":
+            zb.ok("--revoke --key with ADMIN_DATABASE_URL also marks the enrolled key in PostgreSQL, so /renew refuses it")
+        else:
+            zb.bad(f"--key with a database: rc={r.returncode}, marked={marked}: {outp[-200:]}"); failed += 1
     finally:
+        zb.psql(f"DELETE FROM public.zebridge_principal_keys WHERE principal = '{KEY_PRINCIPAL}'", quiet=True)
         for pr in (sub, ns):
             if pr and pr.poll() is None:
                 pr.terminate()
