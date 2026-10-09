@@ -101,13 +101,13 @@ The bridge generates the whole NATS setup (operator, account, signing keys, the 
 nats-server -c zb-nats/nats-server.conf
 ```
 
-`zb-nats/.env.nats` holds the NATS settings only: `NATS_URL` (with the port above), the bridge's credentials, and the enrollment keys.
+`zb-nats/.env.nats` holds the NATS settings only: `NATS_URL` (with the port above), the path to the bridge's credentials (`NATS_CREDS`), and the enrollment keys.
 
 `zb-nats/operator.store` holds every seed: keep it off the server.
 
 ## 5. The bridge
 
-The bridge loads two files: `zb-nats/.env.nats` (NATS, generated) and `.env.supabase` (the database, the slot, the publication). They share no setting, so the order does not matter:
+This script, saved as `zb-nats/run-bridge.sh` (`zb-nats/` is git-ignored), loads two files: `zb-nats/.env.nats` (NATS, generated) and `.env.supabase` (the database, the slot, the publication). They share no setting, so the order does not matter:
 
 ```sh
 #!/bin/sh
@@ -161,13 +161,13 @@ INSERT INTO public.counter_public (value) VALUES (0);
 INSERT INTO public.counter_tenant (value, tenant_id) VALUES (0, 'acme'), (0, 'globex');
 ```
 
-`allow_physical_deletes => true` says these counters are never deleted. A table whose rows are deleted gets a tombstone column instead (`deleted_at timestamptz`, `tombstone_col => 'deleted_at'`).
+`allow_physical_deletes => true` drops the tombstone rule: a deleted row can come back on a client that seeds before the next full. That is fine for counters nobody deletes. A table whose rows are deleted gets a tombstone column instead (`deleted_at timestamptz`, `tombstone_col => 'deleted_at'`).
 
-The last step of each `zebridge_enable` reads `T3 bridge=LIVE T4 nats=LIVE`.
+The last two rows of each `zebridge_enable` are `T3 bridge | LIVE` and `T4 nats | LIVE`.
 
 ## 7. An invite
 
-Your application's backend issues one per user, once it has signed them in. The code is 16 characters or more:
+Your application's backend issues one per user, once it has signed them in. `code` is 32 random hex characters by default (a code you set yourself must be 16 to 128 characters), and it expires after a day:
 
 ```sql
 INSERT INTO public.zebridge_invites (principal, tenant_id)
@@ -202,7 +202,7 @@ with ZeBridge(bridge_url="http://127.0.0.1:27434", invite="<the code>",
 | `ALTER TABLE … ADD COLUMN` reaching the client's table | about 1 s |
 | a new `psql` connection to Supabase, for scale | about 200 ms |
 
-The bridge was on a laptop in France; on a VPS in Supabase's region (London, UK), every number above shrinks with the distance.
+The bridge was on a laptop in France; on a VPS in Supabase's region (London, UK), every number above should shrink.
 
 ## 10. Tearing down
 

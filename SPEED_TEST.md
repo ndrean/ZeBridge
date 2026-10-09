@@ -11,7 +11,7 @@ The gap is the virtualization layer, not the bridge: the same binary, same code,
 
 ⚠️ Treat either figure as a reference point, not a spec — absolute throughput moves with machine, build mode, PostgreSQL version, and host load (a background process competing for CPU cores measurably drops it). A rerun that differs is not automatically a regression; see below for the number that _is_ comparable across machines.
 
-Full method, raw output, and how to read the <code>LOOP</code> line
+## Method and raw output
 
 **Method** (Docker environment):
 
@@ -60,9 +60,9 @@ End-to-end rate is `2000000 / (t_at_2M − t_at_start)`.
 PostgreSQL's own write time is the wall clock of the `psql` command above (`time docker exec …`).
 CPU is `bridge_cpu_seconds_total` sampled the same way — subtract the endpoints rather than reading the `cpu=%` field, which is a per-interval average.
 
-⚠️ **Detach every CDC consumer first.** The figures below were taken with none attached, and a browser client replaying 2M events into OPFS changes both the number and, usually, the browser. Check with `nats consumer ls CDC`.
+⚠️ **Detach every CDC consumer first.** The figures below were taken with none attached, and a browser client replaying 2M events into OPFS changes both the number and, usually, the browser. Check with `nats stream ls`, then `nats consumer ls CDC_PUBLIC` and each `CDC_<tenant>`.
 
-⚠️ **Host load matters more than you'd expect.** A CPU-bound process (the bridge) loses far more wall-clock time to a busy host than an I/O-bound one (PostgreSQL) — PostgreSQL mostly waits on disk either way, so background CPU contention barely touches its write time, while the bridge needs a core continuously and pays for every scheduling delay. A single unrelated process pinning even a few cores can cut measured throughput by half or more. Close anything CPU-heavy before trusting a number.
+⚠️ **Host load matters.** A CPU-bound process (the bridge) loses far more wall-clock time to a busy host than an I/O-bound one (PostgreSQL) — PostgreSQL mostly waits on disk either way, so background CPU contention barely touches its write time, while the bridge needs a core continuously and pays for every scheduling delay. A single unrelated process pinning even a few cores can cut measured throughput by half or more. Close CPU-heavy processes first.
 
 **Result:**
 
@@ -99,7 +99,7 @@ The number that _is_ comparable across machines is `iters` for a fixed event cou
 | `proc_ms` | milliseconds decoding tuples and packing them into the ring buffer |
 | `cpu` | process CPU over the interval, all threads — `100%` is one core saturated |
 
-`recv_ms` approaching the interval length with `idle=0` is the signature of a reader that cannot drain its socket — the exact shape of a bug this project has hit once already, in `wal_stream.zig`.
+`recv_ms` approaching the interval length with `idle=0` is the signature of a reader that cannot drain its socket.
 
 ## TLS or plain TCP between the bridge and NATS (2026-09-15)
 
@@ -116,8 +116,8 @@ publishing a figure for it. The TLS certificates are nats.zig's test certificate
 (`nats.zig/tests/configs/certs`), verified with their CA.
 
 Every run below was isolated: a scratch database rendered from the templates, its own
-publication and slot, scratch nats-servers with the buckets and MUTATIONS stream that
-`up.sh` creates, a bridge on its own port. ⚠️ Isolation does not cover WAL: a benchmark
+publication and slot, scratch nats-servers, a bridge on its own port (it creates its streams and buckets at
+boot). ⚠️ Isolation does not cover WAL: a benchmark
 writing millions of rows produces gigabytes of WAL for the whole cluster, and any INACTIVE
 logical slot retains it until `max_slot_wal_keep_size` invalidates the slot. Run these on a
 PostgreSQL of their own, or with every other bridge of the cluster running.
@@ -396,7 +396,7 @@ python scripts/scenarios/firehose_tls.py --seconds 120 --rate 1 --cap-mib 128 --
 | measure | value |
 | --- | --- |
 | full | 9,500,000 rows, 1,925,232,995 bytes raw, 312,178,857 compressed (16%) |
-| build | 9,929 ms (count, COPY, encode, zstd and upload 9,622 ms; dictionary 201 ms) |
+| build | 9,929 ms (count, COPY, encode, zstd and upload 9,622 ms; dictionary 201 ms, a step that no longer exists) |
 | bridge memory (RSS) | max 59 MiB, median 41 MiB |
 
 Before, the same full needed its raw bytes and its compressed bytes in memory at once:
@@ -427,7 +427,7 @@ scripts/native/down.sh && ZB_PG_BENCH=1 scripts/native/up.sh   # the sizing belo
 RING_BUFFER_COUNT=132000 python scripts/scenarios/firehose_tls.py --seconds 300 --rate 50000 --cap-mib 128 --preload 2000000 --runs tls:on:defer:async
 ```
 
-50,000 inserts + 50,000 updates a second on 2M static rows, TLS, streamed fulls.
+50,000 inserts + 50,000 updates a second on 2M static rows, TLS, streamed fulls. Today's `up.sh` always sets `checkpoint_timeout=15min` and `wal_compression=zstd`, so the first column cannot be reproduced as is.
 
 | | initdb defaults, ring 32,768 | `shared_buffers=4GB`, `max_wal_size=16GB`, `checkpoint_timeout=15min`, `wal_compression=zstd`; ring 132,000 |
 | --- | --- | --- |

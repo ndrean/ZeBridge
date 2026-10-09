@@ -1,6 +1,6 @@
 # Notes on PostgreSQL Binary Formats
 
-The binary layouts you have to decode when you receive CDC from Postgres in *binary mode* (e.g. via libpq/pg protocol).
+The binary layouts to decode when PostgreSQL sends logical replication through `pgoutput` with `binary 'true'`. PostgreSQL still sends some columns as text. The bridge decodes the types in `pgoutput.zig`; a column of another type (hstore, inet, a range…) suspends its table. The layouts below the JSON section are kept for reference.
 
 > [!NOTE] Postgres binary protocol uses **big‑endian** for integer and float wire formats.
 
@@ -69,7 +69,7 @@ Note: element bytes are themselves *binary representations* of the element type 
 ## JSON / JSONB
 
 * `json` in binary mode: plain UTF‑8 bytes of JSON text.
-* `jsonb` (binary) layout begins with `uint8 version` (1) then a binary tree/object encoding. For many use-cases, reading the version and passing the raw bytes to a JSONB parser (or falling back to text JSON) is easiest.
+* `jsonb` in binary mode: `uint8 version` (1), followed by the JSON text.
 
 ---
 
@@ -84,7 +84,7 @@ Note: element bytes are themselves *binary representations* of the element type 
 Binary representation:
 
 ```txt
-uint8 family (AF_INET=4/AF_INET6=6)
+uint8 family (PGSQL_AF_INET=2 / PGSQL_AF_INET6=3)
 uint8 masklen (prefix length)
 uint8 is_cidr (0/1)
 uint8 addrlen (4 or 16)

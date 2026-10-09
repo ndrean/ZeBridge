@@ -1,4 +1,4 @@
-# Monitoring & Telemetry
+# Observability and telemetry
 
 The bridge provides telemetry through multiple channels:
 
@@ -12,7 +12,7 @@ flowchart LR
 ```
 
 Scrape `/metrics` (Prometheus exposition) on `BRIDGE_PORT`.
-`/status` carries the same numbers as JSON.
+`/status` returns the core counters as JSON; the fleet, slot, PostgreSQL and verdict families are on `/metrics` only.
 
 Both are served by a thread that keeps answering through every outage below — that is deliberate, and `pg_restart.py` asserts it.
 
@@ -20,20 +20,20 @@ Both are served by a thread that keeps answering through every outage below — 
 | --- | --- | --- | --- |
 | `bridge_connected` | the WAL stream is attached | any PostgreSQL outage (0 while down, 1 after self-reconnect) | `pg_restart.py` |
 | `bridge_pg_reconnects_total` | PostgreSQL sessions re-established | backend kills, cluster restarts | `pg_restart.py`, `chaos.py` |
-| `bridge_nats_reconnects_total` | broker SESSIONS re-established, at the transport — nats.zig's `reconnected_cb` counts the library's silent self-heals, the publisher's fresh-connection fallback adds its disjoint share. NOT a broker-restart count: adjacent bounces merge into one down period, honestly | broker kill + return, even idle bounces | `churn.py` (metric == log ground truth), `nats_outage.py` |
-| `bridge_queue_usage_percent` | events held in the ring, right now | broker gone under load: climbs as the ring fills, 0 again after the drain. Three writers: post-flush, the halt loop, the periodic tick | `cascade.py` |
+| `bridge_nats_reconnects_total` | NATS sessions re-established, including the client library's own reconnects. Not a count of broker restarts: bounces close together count once | broker kill + return, even idle bounces | `churn.py` (metric == log ground truth), `nats_outage.py` |
+| `bridge_queue_usage_percent` | events held in the ring, right now | broker gone under load: climbs as the ring fills, 0 again after the drain | `cascade.py` |
 | `bridge_wal_confirmed_lag_bytes` | WAL PostgreSQL retains that this bridge has not confirmed — THE backlog number | any outage that stops acking; collapses on recovery. Samples on the monitor's 30 s cadence | `cascade.py` |
 | `bridge_wal_lag_bytes` | WAL retained from `restart_lsn` — a disk-pressure number that only moves at checkpoints. NOT a backlog gauge; a healthy bridge plateaus at a few MB | slot pressure | (definitional; see the field's comment) |
 | `bridge_slot_active` | PostgreSQL shows our slot streaming | bridge down or stepped aside → 0 | `downtime.py` |
-| `bridge_cdc_events_published_total` | ROW events acked by JetStream — trusted arithmetic, equals rows delivered | any write reaching CDC | `slot_contest.py` (flow-through), README burst method |
+| `bridge_cdc_events_published_total` | row events acked by JetStream: the rows delivered | any write reaching CDC | `slot_contest.py` (flow-through), [SPEED_TEST](SPEED_TEST.md) |
 | `bridge_schema_events_published_total` | KV/schema traffic, kept OUT of the row counter | DDL, suspensions, drops | `livebirth.py`, `legacybait.py` |
 | `bridge_refused_tables` | tables currently suspended or refused — the COUNT | `row_too_large` and structural refusals; falls on the live lift | `suspension_lift.py`, `legacybait.py` |
-| `bridge_refused_table{table,reason}` | the NAMED refusal series: 1 while refused, an explicit 0 after a lift in this process; the family vanishes on restart — which also cleared every ban, so absence and truth agree. psql twin: `SELECT tbl, suspended_reason FROM zebridge_catalogue WHERE suspended;` (a bridge dump, live while the bridge lives, pruned at boot) | every refusal transition | `suspension_lift.py` |
+| `bridge_refused_table{table,reason}` | the NAMED refusal series: 1 while refused, an explicit 0 after a lift in this process; the family vanishes on restart — which also cleared every ban, so absence and truth agree. psql twin: `SELECT tbl, reason, since FROM zebridge_suspensions;` (written by the running bridge, cleared at boot) | every refusal transition | `suspension_lift.py` |
 | `bridge_refused_events_dropped_total` | events dropped for refused tables | writes hitting a suspended table | `suspension_lift.py` |
-| `bridge_nats_publish_ack_seconds_total` / `bridge_nats_publishes_total` | summed publish→PubAck wall time / count (mean = quotient) | load; the drained fast-ack rides on these being honest | README burst method |
-| `bridge_gc_total_reaped_total` / `bridge_gc_last_sweep_timestamp_seconds` | sweeper activity, read off the watermark row's own CDC event — the sweeper stays a pure PG client | sweeper passes; survives a PostgreSQL restart under the daemon | `sweeper_restart.py`, `reaps.py` |
-| `bridge_last_ack_lsn` | the position THIS bridge confirmed — never the server's WAL head (the conflation that once silently skipped a downtime's changes) | every ack; jumps with the drained fast-ack | `txn_kill.py`, `pg_restart.py` |
-| `bridge_uptime_seconds`, `bridge_cpu_seconds_total`, `bridge_max_rss_bytes` | process vitals | always | (trivially live) |
+| `bridge_nats_publish_ack_seconds_total` / `bridge_nats_publishes_total` | summed publish→PubAck wall time / count (mean = quotient) | load | [SPEED_TEST](SPEED_TEST.md) |
+| `bridge_gc_total_reaped_total` / `bridge_gc_last_sweep_timestamp_seconds` | sweeper activity, read off the watermark row's own change event | sweeper passes; survives a PostgreSQL restart under the daemon | `sweeper_restart.py`, `reaps.py` |
+| `bridge_last_ack_lsn` | the position this bridge confirmed, never the server's WAL head | every ack; jumps with the drained fast-ack | `txn_kill.py`, `pg_restart.py` |
+| `bridge_uptime_seconds`, `bridge_cpu_seconds_total`, `bridge_max_rss_bytes`, `process_resident_memory_bytes` | process vitals (peak and current memory) | always | (trivially live) |
 | `/health` → 200 | the PROCESS is up **and will exit when replication dies** — a FATAL sets the global stop, so a lying 200 cannot outlive the failure | fatal paths | `stream_full.py` |
 
 > **Alert on `bridge_connected == 0` and on `bridge_wal_confirmed_lag_bytes` growth**, not on `/health` alone — health says "process alive", and a process can be alive and parked (that is its correct behaviour during a broker outage).
@@ -57,15 +57,22 @@ Data emitted by ZeBridge are self-reflection, or read from what ZeBridge owns an
 
 - its own tables in PostgreSQL — the chain (`zebridge_generations`), the catalogue, the tenant mappings, the invites — and the server's health as it bears on the bridge: connections per bridge role against their limits, the oldest open transaction, the size and dead rows of every published table. One pass every 60 s on the reader connection,
 - the consumer fleet signaling itself via NATS heartbeats, and the CDC streams' state, read by the fleet poll — so the dashboard needs no NATS exporter,
-- every replication slot on the server (for left-overs: Postgres will keep retaining all the WAL data generated beyond the possibly abandoned slot point). The same inventory from a shell: `bridge --view-slots`; the cure: `bridge --drop-slot <slot>` (README, [CLI](OPERATIONS.md#the-cli)).
+- every replication slot on the server (for left-overs: Postgres will keep retaining all the WAL data generated beyond the possibly abandoned slot point). The same inventory from a shell: `bridge --view-slots`; the cure: `ADMIN_DATABASE_URL=… bridge --drop-slot <slot>` (see [The CLI](OPERATIONS.md#the-cli)).
 
 ---
 
-### Metrics
+## Metrics
 
 ### Prometheus /metrics Endpoint
 
-**HTTP GET** `http://localhost:27434/metrics`, Prometheus text format, each metric with its own `# HELP`/`# TYPE` line.
+**HTTP GET** `http://localhost:27434/metrics`, Prometheus text format, each metric with its own `# HELP`/`# TYPE` line. Scrape it under the job name `zebridge`, which the dashboard filters on:
+
+```yaml
+scrape_configs:
+  - job_name: 'zebridge'
+    static_configs:
+      - targets: ['localhost:27434']
+```
 
 <details>
 <summary>Example output</summary>
@@ -116,6 +123,7 @@ bridge_cdc_stream_messages{stream="CDC_kilo"} 1236512
 bridge_mutation_verdicts_total{status="accepted"} 2500
 bridge_mutation_verdicts_total{status="stale"} 0
 bridge_mutation_verdicts_total{status="rejected"} 0
+bridge_mutation_verdicts_total{status="row_deleted"} 0
 bridge_mutation_verdicts_total{status="failed"} 0
 bridge_mutation_rate_limited_total 0
 bridge_pg_health_timestamp_seconds 1790587746
@@ -136,30 +144,31 @@ bridge_pg_max_connections 100
 bridge_pg_oldest_xact_age_seconds 0
 bridge_pg_table_bytes{table="sensor_events"} 1622016
 bridge_pg_table_dead_rows{table="sensor_events"} 0
+bridge_pg_table_live_rows{table="sensor_events"} 2500
 ```
 
 </details>
 <br>
 
-Six families come from the bridge's own schedules or from events it intercepts, not from the WAL loop:
+Six families come from the bridge's own polls, or from events it intercepts, not from its core counters:
 
 | family | source | cadence | what to read |
 | --- | --- | --- | --- |
-| `bridge_fleet_*` | the clients' heartbeats in the `live` KV bucket (PROTOCOL §11): each client writes `{principal, tenant, ts, streams: {stream: applied seq}}` every `heartbeatMs` | read every `FLEET_POLL_SECONDS` (60); a client silent for `FLEET_TTL_SECONDS` (90) drops out of the bucket by itself | `clients_live` per tenant, `last_seen_seconds` per client, `lag_events` per client and stream: stream head minus the sequence the client applied, in **messages** (a published batch counts one, not one per row) |
+| `bridge_fleet_*` | the clients' heartbeats in the `live` KV bucket ([PROTOCOL §11](PROTOCOL.md#11-liveness--kv-bucket-live-)): each client writes `{principal, tenant, ts, streams: {stream: applied seq}, pending}` every `heartbeatMs` | read every `FLEET_POLL_SECONDS` (60); a client silent for `FLEET_TTL_SECONDS` (90) drops out of the bucket by itself | `clients_live` per tenant, `last_seen_seconds` per client, `lag_events` per client and stream: the messages still pending for that client, as JetStream reported with its last delivery (stream head minus what it applied when the client stalls or reports nothing), in **messages** (a published batch counts one, not one per row) |
 | `bridge_replication_slot_*` | `pg_replication_slots` on the reader's server — every slot, this bridge's marked `self="true"` | every `SLOT_INVENTORY_SECONDS` (300); the first pass lands one interval after boot | an inactive slot whose retained WAL climbs is an abandoned instance holding the disk; `bridge_replication_slots` is the count |
-| `bridge_cdc_window_*`, `bridge_cdc_stream_*` | each CDC stream's state, read by the same fleet poll | every `FLEET_POLL_SECONDS` | the window a stream really holds (now minus its oldest event, `-1` when empty) against the two-cadence floor the chain needs; `short = 1` means the stream is pruning under that floor, so a size or message valve, not the age, is ending the window — see README, [Catching up](OPERATIONS.md#catching-up-the-chain-and-the-stream) |
+| `bridge_cdc_window_*`, `bridge_cdc_stream_*` | each CDC stream's state, read by the same fleet poll | every `FLEET_POLL_SECONDS` | the window a stream really holds (now minus its oldest event, `-1` when empty) against the two-cadence floor the chain needs; `short = 1` means the stream is pruning under that floor, so a size or message valve, not the age, is ending the window — see [OPERATIONS, Catching up](OPERATIONS.md#catching-up-the-chain-and-the-stream) |
 | `bridge_gc_*` | the sweeper's `zebridge_gc_watermark` writes, seen on the WAL | at every sweep | rows reaped and when, counted since this bridge started (`0` until the first sweep it sees) |
-| `bridge_chain_*`, `bridge_catalogue_tables`, `bridge_principals`, `bridge_tenants`, `bridge_invites`, `bridge_pg_*` | the bridge's own tables and the server's catalog views, read as the reader role: `zebridge_generations` (live generations per tenant and table), `zebridge_catalogue`, `zebridge_user_tenants`, `zebridge_invites`, `pg_stat_activity` with `pg_roles`, `zebridge_oldest_open_xact()`, `pg_publication_tables` with `pg_stat_user_tables` | every 60 s, one connection per pass; a query the reader may not run leaves its section out and the rest stand | the chain's age per table (`time() - bridge_chain_last_cut_timestamp_seconds`); the bridge roles' connections against their limits; the oldest open transaction; each published table's size and dead rows. `bridge_pg_client_connections` is a close estimate: other roles' session types are hidden from the reader |
+| `bridge_chain_*`, `bridge_catalogue_tables`, `bridge_principals`, `bridge_tenants`, `bridge_invites`, `bridge_pg_*` | the bridge's own tables and the server's catalog views, read as the reader role: `zebridge_generations` (live generations per tenant and table), `zebridge_catalogue`, `zebridge_user_tenants`, `zebridge_invites`, `pg_stat_activity` with `pg_roles`, `zebridge_oldest_open_xact()`, `pg_publication_tables` with `pg_stat_user_tables` | every 60 s, one connection per pass; a query the reader may not run leaves its section out and the rest stand | the chain's age per table (`time() - bridge_chain_last_cut_timestamp_seconds`); the bridge roles' connections against their limits; the oldest open transaction; each published table's size, live and dead rows. `bridge_pg_client_connections` is a close estimate: other roles' session types are hidden from the reader |
 | `bridge_mutation_verdicts_total{status}`, `bridge_mutation_rate_limited_total` | every verdict the mutation listener publishes, counted in process | at each verdict | `accepted`, `stale`, `row_deleted`, `rejected`, `failed` since this bridge started; the rate-limit refusals, also counted in `failed`, on their own |
 
-The four worth alerting on:
+Worth alerting on:
 
 | metric | fires when | what it means |
 | --- | --- | --- |
 | `bridge_refused_tables` | `> 0` | a table is **suspended** — no primary key, an undecodable column type, or a row larger than the event buffer. The log line names which and why. |
 | `bridge_refused_events_dropped_total` | `increase() > 0` | rows are being discarded right now for a suspended table |
-| `bridge_fleet_clients_live{tenant}` | drops | clients heartbeating inside the live bucket's TTL (PROTOCOL §11); a fleet going quiet is visible here before anyone complains |
-| `bridge_fleet_client_lag_events{tenant,principal,stream}` | `> N` for minutes | that client is falling behind on that stream — stream head minus what it applied, in messages |
+| `bridge_fleet_clients_live{tenant}` | drops | clients heartbeating inside the live bucket's TTL ([PROTOCOL §11](PROTOCOL.md#11-liveness--kv-bucket-live-)); a fleet going quiet is visible here before anyone complains |
+| `bridge_fleet_client_lag_events{tenant,principal,stream}` | `> N` for minutes | that client is falling behind on that stream: the messages still pending for it |
 | `bridge_replication_slot_active{slot,type,self}` | `== 0` with retained WAL climbing | a slot nobody reads — an abandoned instance: `bridge --view-slots` to see it from a shell, `ADMIN_DATABASE_URL=… bridge --drop-slot <slot>` once you are sure (it refuses an active slot); PostgreSQL frees the WAL at its next `CHECKPOINT` |
 | `bridge_replication_slot_retained_wal_bytes{slot,type,self}` | growing for an inactive slot | WAL PostgreSQL keeps for that slot; every slot on the server, not only this bridge's |
 | `bridge_cdc_window_short{stream}` | `== 1` | that stream holds less than two generation cadences and is pruning: a client that falls off it can find a chain that predates it and waits. Raise `CDC_MAX_BYTES` / `CDC_MAX_MSGS` if `bridge_cdc_stream_bytes` or `_messages` sits at a cap, `CDC_MAX_AGE_SECONDS` otherwise |
@@ -191,14 +200,15 @@ The same figure appears _in the log_ as `cpu=31%` on each `LOOP` line, which bea
 
 ### Dashboard
 
-`telemetry/dashboard.json` (Grafana) reads only the bridge's `/metrics`, so it works on the native stack without the NATS exporter. Its rows:
+`telemetry/dashboard.json` (Grafana) reads the bridge's `/metrics`, so it works on the native stack without the NATS exporter; only its Services row needs the container metrics of Grafana Alloy's cAdvisor exporter (`telemetry/vps/config.alloy`). Its rows:
 
 - the bridge and the WAL (status, lags, throughput, queue, CPU, memory, suspended tables);
 - the CDC streams (bytes and messages per stream, the window each holds);
 - the clients (live per tenant, lag per client and stream, last seen);
 - the write path (verdicts per second by status, rate-limit refusals);
 - the chain (age of the last cut and live generations per table);
-- PostgreSQL (connections per bridge role against its limit, the oldest open transaction, server connections against `max_connections`, the ten largest published tables and their dead rows, and a line of counts: tables, principals, tenants, pending invites).
+- PostgreSQL (connections per bridge role against its limit, the oldest open transaction, server connections against `max_connections`, the ten largest published tables and their dead rows, and a line of counts: tables, principals, tenants, pending invites);
+- Services (memory per hub service, from cAdvisor).
 
 ### The NATS dashboard
 
@@ -213,18 +223,10 @@ The same figure appears _in the log_ as `cpu=31%` on each `LOOP` line, which bea
 
 Every metric it queries was checked against a running exporter (`prometheus-nats-exporter`, nats-server 2.15.0).
 
-**Configure Prometheus to scrape this endpoint**:
-
-```yaml
-scrape_configs:
-  - job_name: 'cdc_bridge'
-    static_configs:
-      - targets: ['localhost:27434']
-```
 
 ### JSON /status Endpoint
 
-**HTTP GET** `http://localhost:27434/status` — the same data as `/metrics` above but shaped as JSON for a human or a shell script rather than a scraper.
+**HTTP GET** `http://localhost:27434/status` — the core counters as JSON, for a human or a shell script. The fleet, slot, PostgreSQL and verdict families are on `/metrics` only.
 
 <details>
 <summary>Example output</summary>
@@ -256,7 +258,7 @@ scrape_configs:
 }
 ```
 
-The three `ingress_*` fields describe the rate the bridge applies. Next to the MUTATIONS stream's own backlog cap (`MUTATION_BACKLOG_PER_PRINCIPAL`, set where NATS is set up), they say how long a full backlog takes to drain.
+The three `ingress_*` fields describe the rate the bridge applies. Next to the MUTATIONS stream's own backlog cap (`MUTATION_BACKLOG_PER_PRINCIPAL`, read when the bridge creates the MUTATIONS stream), they say how long a full backlog takes to drain.
 
 </details>
 
@@ -306,13 +308,7 @@ Under `systemd`, skip the redirect entirely: `journald` captures stderr, and `jo
 
 ### Structured Log Metrics (for Grafana Alloy/Loki)
 
-As said, ZeBridge writes **every log line to stderr**, including the periodic metric line below (every 15 seconds) and any panic with its stack trace.
-
-➡ Nothing is written to stdout — so redirect with `2>` or `2>&1`, not `>`:
-
-```bash
-bridge --slot my_slot --pub my_pub 2>> /var/log/bridge/bridge.log
-```
+The periodic metric line, every 15 seconds:
 
 ```log
 info(bridge): METRICS uptime=376 wal_messages=67 cdc_events=6 lsn=0/217e280 connected=1 pg_reconnects=0 nats_reconnects=0 lag_bytes=17816 slot_active=1
@@ -364,7 +360,7 @@ loki.process "bridge" {
 </details>
 <br>
 
-The queries that matter are `{job="zebridge", level="error"}` and `{job="zebridge", scope="refused"}` — every suspension the bridge has ever declared.
+The queries that matter are `{job="zebridge", level="error"}`, and `{job="zebridge", scope="refused"}` for the tables still refused (repeated every 15 s) and their lifts; the first `SUSPENDING` line of a table is in `scope="event_processor"`.
 
 ⚠️ Do **not** use Alloy's `stage.metrics` to re-derive counters from the `METRICS` line. Prometheus already scrapes those numbers from `/metrics`; a second, lossier copy that only updates every 15 seconds is worse in every respect.
 
@@ -381,6 +377,6 @@ Returns:
 {"status":"ok"}
 ```
 
-Status: `200 OK` when bridge HTTP server is running.
+Status: `200` while the process runs. A fatal replication error stops the process, so a `200` never outlives it. Alert on `bridge_connected`, not on this.
 
 ---
