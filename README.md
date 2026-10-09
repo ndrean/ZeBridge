@@ -125,6 +125,7 @@ To start again from scratch: `docker compose -f docker-compose.quickstart.yml do
       - [Scoped by tenant, authorized by grants](#scoped-by-tenant-authorized-by-grants)
       - [Conflict resolution](#conflict-resolution)
       - [Cooperative editing: several editors on one row](#cooperative-editing-several-editors-on-one-row)
+        - [A live illustration: a shared record](#a-live-illustration-a-shared-record)
       - [Cascade rules](#cascade-rules)
     - [Diagnose](#diagnose)
     - [Sweeper](#sweeper)
@@ -157,15 +158,17 @@ To start again from scratch: `docker compose -f docker-compose.quickstart.yml do
       - [Schema Consistency](#schema-consistency)
     - [Graceful Shutdown](#graceful-shutdown)
   - [Authentication](#authentication)
-    - [Authenticate ZeBridge with Postgres](#authenticate-zebridge-with-postgres)
-    - [Authenticate ZeBridge with NATS](#authenticate-zebridge-with-nats)
-    - [Identity and access](#identity-and-access)
+    - [The bridge and PostgreSQL](#the-bridge-and-postgresql)
+    - [Production: use `operator mode`](#production-use-operator-mode)
       - [1. Set up, once per deployment](#1-set-up-once-per-deployment)
       - [2. Onboard a device](#2-onboard-a-device)
       - [3. Connect and renew](#3-connect-and-renew)
       - [4. Revoke](#4-revoke)
       - [Who holds what](#who-holds-what)
-      - [Local development](#local-development)
+    - [Development](#development)
+      - [`dev` mode](#dev-mode)
+      - [Your own NATS server, without operator mode](#your-own-nats-server-without-operator-mode)
+      - [This repository's test stack](#this-repositorys-test-stack)
   - [Architecture \& Internals](#architecture--internals)
     - [The main loop PG/ZB/NATS](#the-main-loop-pgzbnats)
     - [The NATS/Consumer loop](#the-natsconsumer-loop)
@@ -263,7 +266,7 @@ The daemon `bridge` projects Postgres into NATS and back. It defines a protocol�
 
 There is a tiny daemon "sweeper". See [Sweeper](#sweeper).
 
-The client C-ABI `libzb` library - for FFI users - and the `zb-client-ts` library - for any JavaScript-based consumers, with libzb's core as a 66 KB WASM module - implement this protocol.
+The client C-ABI `libzb` library - for FFI users - and the `zb-client-ts` library - for any JavaScript-based consumers, with libzb's core as a WASM module of about 70 KB - implement this protocol.
 
 The client library abstracts away the complex choreography required to manage NATS streams, KV buckets, data decompression and deserialization, retries, holding queries with foreign keys...and sets up the local tables needed to hold the state of a client.
 
@@ -289,7 +292,7 @@ Two independent questions. **Which library** depends on whether the host can lin
 | Flutter desktop | libzb, vendored | `.dylib` / `.so` | nothing |
 | a service in Python, Go, Java, Elixir… | libzb, vendored | `.dylib` / `.so` | only its own engine, if it uses one |
 | React Native (iOS **and** Android) | libzb, in the zb-react-native Expo module | static on iOS, `.so` on Android | nothing |
-| browser, Node, Electron, Bun | zb-client-ts | — | nothing |
+| browser, Node, Electron, Bun | zb-client-ts | — | the browser nothing; Node `better-sqlite3` and `@nats-io/transport-node` (peer dependencies) |
 | native Swift on iOS | libzb, vendored | **static** `.a` | nothing |
 | native Kotlin on Android | libzb, vendored | **static** `.a`, linked into your JNI `.so` | nothing |
 
@@ -334,7 +337,7 @@ libraries).
    ```
 
 - **Run**: `bridge --diagnose` checks everything first; then start NATS, the bridge (`bridge --pub my_pub --slot my_slot`) and the `bridge_sweeper` daemon.
-- **Users**: since NATS is exposed to the internet, every user is authenticated. The bridge is OAuth agnostic: your backend writes a one-time invite naming the user (the principal) and their tenant in `zebridge_invites`. See [Identity and access](#identity-and-access).
+- **Users**: since NATS is exposed to the internet, every user is authenticated. The bridge is OAuth agnostic: your backend writes a one-time invite naming the user (the principal) and their tenant in `zebridge_invites`. See [Production: operator mode](#production-operator-mode).
 - **Frontend**: the developer builds on the library, `libzb` or `zb-client-ts`, and works only with the local database, never with NATS. They create a `ZeBridge` client with the bridge's URL, the invite, and the storage flavour (SQLite, PGlite, DuckDB).
 
 The full procedure is [Host setup on VPS or bare-metal](#host-setup-on-vps-or-bare-metal). On a Debian server behind Cloudflare, [deploy/ansible](deploy/ansible/README.md) does it for you: `site.yml` for the hub (HAProxy with Cloudflare's origin certificate, NATS with Let's Encrypt), `leaf.yml` for the [leaf nodes](#adding-a-leaf-node).
@@ -606,7 +609,7 @@ A seeded replica, then a 5 s burst at PostgreSQL's rate, then 90 s of sustained 
 | --- | --- | --- | --- | --- | --- |
 | iPhone 12 | libzb, React Native | 40k events/s | 153 of 153 exact | 0 | 170 s |
 | iPhone 12 | libzb, Flutter | 40k events/s | 183 of 183 exact | 0 | 172 s |
-| iPhone 12 | zb-client-ts, React Native | 2k events/s, after a 588k-row burst | exact (878,000 rows) | 0 | 300 s |
+| iPhone 12 | zb-client-ts, React Native (before React Native moved to libzb) | 2k events/s, after a 588k-row burst | exact (878,000 rows) | 0 | 300 s |
 | moto e20 | libzb, Flutter | 5k events/s | exact (4,552,000 rows) | 0 | 774 s |
 
 ### Snapshots: seeding a replica
@@ -620,14 +623,14 @@ A 3.1M-row table, about 1 GB in PostgreSQL, seeded on a Mac, an iPhone 12 (64-bi
 | libzb, from Flutter Desktop | Mac | 25 s | 125k row/s |
 | zb-client-ts, from Node service | Mac | 26 s | 120 k row/s |
 | libzb, from React Native or Flutter | iPhone 12 | 35 s | 90k row/s |
-| zb-client-ts, from React Native | iPhone 12 | 518 s | 6k row/s |
+| zb-client-ts, from React Native (before it moved to libzb) | iPhone 12 | 518 s | 6k row/s |
 | libzb, from Flutter (3.2M rows) | moto e20 (*) | 534 s, at ~250 MB of RAM | 6k row/s |
 
 (*) moto e20: Android Go, 32-bit ARM eMMC storage with 1.8 GB of RAM. It builds a 1.5 GB replica while the app stays at ~250 MB of RAM, because libzb streams the seed a window at a time.
 
 |client|device|time|rate|
 |--|--|--|--|
-|zb-client-ts, from React Native (200k rows)|moto e20 (*)|10 s|20k row/s<br>in one window|
+|zb-client-ts, from React Native (200k rows, before it moved to libzb)|moto e20 (*)|10 s|20k row/s<br>in one window|
 
 The gap between libzb and zb-client-ts on a phone is per-row JavaScript, not the phone: the host framework (React Native or Flutter) costs nothing.
 
@@ -748,12 +751,12 @@ Two choices decide how a table travels: whether clients write to it, and whether
 - Whatever the choice, the guards apply to every published table: `timestamptz` timestamps, rows that fit the change feed's buffer, a primary key. How deletes meet foreign keys: [Cascade rules](#cascade-rules).
 
 | Action | column | type | note |
-| --  |  --    | --   | --   |
-|  Read  | id    | **bigint** or **uuid** | composite pk possible (2)|
-|  Write  | id    | **uuid** (1)| composite pk possible (2)|
-|||||
-| Write  | updated_at | **timestamptz**  (3)| ✚ `zebridge_enable(version_col => 'updated_at')`, or your own column name |
-| Write  | deleted_at | **timestamptz** | soft-deleted ✚ `zebridge_enable(tombstone_col => 'deleted_at')`, or your own column name |
+| -- | -- | -- | -- |
+| Read | id | **bigint** or **uuid** | composite pk possible (2) |
+| Write | id | **uuid** (1) | composite pk possible (2) |
+| | | | |
+| Write | updated_at | **timestamptz**  (3) | ✚ `zebridge_enable(version_col => 'updated_at')`, or your own column name |
+| Write | deleted_at | **timestamptz** | soft-deleted ✚ `zebridge_enable(tombstone_col => 'deleted_at')`, or your own column name |
 | Write | last_writer | text | `zebridge_enable(tiebreak_col => 'last_writer')`, or your own column name |
 | Write | doc | **jsonb** of registers `{v, t, w}` | optional ✚ `zebridge_enable(register_cols => ARRAY['doc'])`: PostgreSQL merges each accepted write field by field ([COOPERATIVE_EDITING](COOPERATIVE_EDITING.md)) |
 
@@ -1070,7 +1073,7 @@ For the check before a start (`--diagnose`), see [Diagnose](#diagnose).
 
 For slot management, see [Replication slot management](#replication-slot-management)
 
-For identity management, see [Identity and access](#identity-and-access) and [4. Revoke](#4-revoke).
+For identity management, see [Production: operator mode](#production-operator-mode) and [4. Revoke](#4-revoke).
 
 [⬆️](#table-of-contents)
 
@@ -1138,7 +1141,7 @@ SELECT * FROM zebridge_enable(
 );
 ```
 
-**Client writable tables** need a **primary key** that the client creates, so a `uuid`: clients mint keys offline, and a key from a database sequence would collide with the rows PostgreSQL creates itself. A writable table also needs:
+**Client writable tables** need a **primary key** that the client creates, so a `uuid` (`zb.uuid()` mints a UUIDv7 in TypeScript): clients mint keys offline, and a key from a database sequence would collide with the rows PostgreSQL creates itself. A writable table also needs:
 
 - a tenant column, `tenant_id`, for scoping (or a `public_reason` for a table every client shares),
 - a version column (`updated_at`, `modified_at`, `last_modified`…) of type `timestamptz`,
@@ -1419,7 +1422,7 @@ await zb.connect();   // libzb: {"bridgeUrl": …, "invite": …, "tables": […
 
 The first connect generates the device's key pair (the seed never leaves it), redeems the invite at `GET /enroll`, and stores the identity (`identityPath`: a 0600 file, or the browser's localStorage — the same JSON in both libraries). Every later connect needs neither the invite nor `natsUrl`: the identity names the principal, the NATS URL the bridge handed out, the grammar hash and the JetStream domain. The JWT **renews itself** before it expires (`GET /renew`, signed with the device's key — no invite, no backend call), so a device enrolls once and stays enrolled until it is revoked.
 
-A host that manages identities itself passes `natsUrl`, `principal` and `creds` (the `.creds` text) instead, and has the low-level steps: `createUser()`/`zb_create_user()`, `enrollAt`, `credsFileText`/`zb_creds_file_text`.
+A host that manages identities itself passes `natsUrl` and `creds` (the `.creds` text; `credsPath` on Node) instead; the principal is read from the JWT inside them. The low-level steps are there for it: `createUser()`/`zb_create_user()`, `enrollAt`, `credsFileText`/`zb_creds_file_text`.
 
 ### The TypeScript API
 
@@ -1427,7 +1430,16 @@ The app gets one connection to NATS (WebSocket in the browser, TCP on Node) and 
 
 Once you call `connect()`, it subscribes, receives, applies and fires your callbacks on its own: you do nothing.
 
-Storage, zstd and the NATS dial come from the platform: better-sqlite3 and TCP on Node, sqlite-wasm on OPFS and WebSocket in the browser. The replica lives at `dbPath`, by default `zebridge_<principal>.sqlite3`, kept across reloads — which is what an outbox needs: a write queued while the socket was down must still be there after the page comes back. A fresh name per load (`dbPath: \`zebridge_${Date.now()}.sqlite3\``) is a clean room for a dev loop. `engine` defaults to SQLite; `'pglite'` (browser and Node) loads PostgreSQL-in-process on demand, and a SQLite consumer never downloads it. libzb takes the same options (CLIENTS.md).
+```ts
+import { ZeBridge, NotEnrolled, RevokedPurge } from 'zb-client-ts';   // the bundler picks the browser or the Node entry
+```
+
+- `connect()` throws `NotEnrolled` when this device has no stored identity and was given no invite (show the "open your invite link" screen), and `RevokedPurge` when the principal was revoked with `--purge` (its local data is gone).
+- `onStatus(cb)` reports `connected`, `connecting` or `disconnected`; with `pending()`, that is an offline indicator. Every `on…` returns a function that unsubscribes.
+- `zb.principal` and `zb.tenant` name who this client is and the tenant it writes to.
+- The WebAssembly core is loaded with `new URL('../wasm/zb_core.wasm', import.meta.url)`, so Vite and the other bundlers ship it as an asset with no configuration.
+
+Storage, zstd and the NATS dial come from the platform: better-sqlite3 and TCP on Node, sqlite-wasm on OPFS and WebSocket in the browser. The replica lives at `dbPath`, by default `zebridge_<principal>.sqlite3`, kept across reloads — which is what an outbox needs: a write queued while the socket was down must still be there after the page comes back. A fresh name per load (`` dbPath: `zebridge_${Date.now()}.sqlite3` ``) is a clean room for a dev loop. `engine` defaults to SQLite; `'pglite'` (browser and Node) loads PostgreSQL-in-process on demand, and a SQLite consumer never downloads it. libzb takes the same options, except `engine`: `'sqlite'` or `'duckdb'` there (CLIENTS.md).
 
 **Query**: `query(sql, ...params)` — read your local database directly. Any single read: joins, aggregates, offline. The replica _is_ the API. It returns the rows as objects.
 
@@ -1438,7 +1450,7 @@ const rows = await zb.query(
 );
 ```
 
-**Mutation**: `mutate(table, op, key, values)` — one write, three verbs (insert, update, delete), resolved last-writer-wins. This is the only way to change data. It returns the version it stamped on the write.
+**Mutation**: `mutate(table, op, key, values)` — one write, three verbs (insert, update, delete), resolved last-writer-wins. This is the only way to change data. It returns `{ version }` at once: the write's stamp, which `onVerdict` reports back with the outcome.
 
 <details><summary>An example of a mutation query</summary>
 
@@ -1538,11 +1550,11 @@ Two more for cooperative editing ([COOPERATIVE_EDITING](COOPERATIVE_EDITING.md))
 | `zb_client_connect(opts_json)` | opens the replica and the socket | a handle, `0` on failure |
 | `zb_client_sync(h)` | the first step after open: resolves the tenant, applies the schemas, seeds the tables, drains the streams | `{"principal", "tenant", "tenants", "first": bool, "unseeded": [{"table", "reason"}]}` — an empty `unseeded` is what "usable" means |
 | `zb_client_poll(h, wait_ms)` | waits up to `wait_ms` for CDC, applies what arrived, retries what was held, collects verdicts | `{"applied", "settled", "changed_tables", "seeded", "outcomes": […], "pending"}`, plus `"unseeded"` while any table is, `"requests"` when it serves, `"unreadable"` for a tenant's stream it cannot read |
-| `zb_last_error()` | the words behind the last `0` or `NULL` this thread got (`errno`-style) | a C string, `NULL` after a success |
+| `zb_last_error()` | why `zb_client_connect` returned `0`, for this thread (`errno`-style) | a C string; `NULL` once a connect succeeds |
 | `zb_client_flush_outbox(h, wait_ms)` | sends the outbox and waits up to `wait_ms` for verdicts | `{"sent", "settled", "verdicts": {…}}` |
 | `zb_client_query(h, sql, params_json)` | a read against the replica | `{"columns": […], "rows": [[…], …]}` |
 | `zb_client_mutate(h, table, op, key_json, values_json)` | one write: optimistic locally, sent at once | `{"msgId": …}` |
-| `zb_client_close(h)` | closes the socket and the replica | `0` |
+| `zb_client_close(h)` | closes the socket and the replica | `0`, `1` for an unknown handle |
 
 **One vocabulary, two libraries.** The names are zb-client-ts's, so an app author — or a
 model reading the code — learns one API and can write either. Where they differ, the
@@ -1559,7 +1571,7 @@ reason is the C ABI, not a choice:
 | what became of a write | `onVerdict(cb)`, matched by the `version` `mutate` returned | the poll report's `outcomes`, matched by the `msgId` `zb_client_mutate` returned |
 | writes still queued | `pending()` | the poll report's `pending` |
 | was I banned | `revoked` (a field) | `zb_client_revoked(h)` — `1` revoked, `0` live, `-1` unknown handle |
-| why did it fail | the `Error` thrown, the `SYS` log line | `zb_last_error()` after a `0`/`NULL`; `unseeded` in the sync and poll reports |
+| why did it fail | the `Error` thrown, the `SYS` log line | `zb_last_error()` after connect's `0`; `{"error": …}` from every other call; `unseeded` in the sync and poll reports |
 | delete the local replica | `wipe()` | `zb_client_wipe(h)` |
 | stop | `close()` | `zb_client_close(h)` |
 
@@ -1573,7 +1585,7 @@ Beside them: `zb_call(fn, args_json)` (a pure rule of the library's core, no han
 - Strings you pass in are read during the call and never kept: free your own copies as soon as the call returns.
 - Every string the card returns is allocated by the library and is yours until you hand it back with `zb_free(p)`. Read it, decode it, free it — in that order, every time. A binding that forgets `zb_free` leaks one JSON document per call; the Dart, Swift and C++ bindings in `examples/05-tables` free in the same line they decode.
 
-A failure comes back as `{"error": "<name>"}` on the same channel, and `zb_client_connect` returns `0`: check both before anything else. A query the replica refuses adds `"detail"` with SQLite's own words (`no such table: test_types`: a table this client does not follow).
+**Errors.** `zb_client_connect` returns a number, so its failure is `0` and the reason is in `zb_last_error()`. Every other call returns JSON, and its failure is in the JSON: `{"error": "<Name>"}` (`UnknownHandle`, `Revoked`, `BadJson`…), plus `"detail"` with SQLite's own words for a query the replica refuses (`no such table: test_types`: a table this client does not follow). A write that PostgreSQL refuses is not an error: `zb_client_mutate` succeeded, and the refusal arrives later as a verdict (the poll report's `outcomes`). `NULL` only means the binding passed a `NULL` argument, or memory ran out.
 
 **Who holds the handle.** The client is single-threaded by contract: the host owns the thread, and only one thread ever calls into a handle. `zb_client_poll` BLOCKS that thread for up to `wait_ms` when nothing arrives, so the loop cannot live on a UI thread. The honest shape is one worker that owns the handle and everything that touches it — poll, flush, query, mutate, close — while the UI talks to it over messages. In Flutter that is an isolate; on iOS a background queue; in React Native a native thread behind a promise.
 
@@ -1649,7 +1661,7 @@ The bound on a click is one poll's `wait_ms`: commands are served between two po
 - [DuckDB over a synced replica](/examples/07-duckdb/analyze.py): PostgreSQL → SQLite → DuckDB, an analytical job that never touches PostgreSQL,
 - a Node service on zb-client-ts (`examples/04-node-consumer`), and a Python service on libzb answering questions from a DuckDB replica (`examples/09-event`).
 
-A device gets its identity from an invite, once; the library does the rest. See [Identity and access](#identity-and-access).
+A device gets its identity from an invite, once; the library does the rest. See [Production: operator mode](#production-operator-mode).
 
 ### Understanding the LWW rules
 
@@ -1682,7 +1694,7 @@ The one case it loses is when it arrives late with an older stamp than an edit t
 
 - **Browser SQLite (one OPFS connection)**: Enforced. The library owns the single connection, and `query()` refuses any statement that is not a single read (by its shape) — the app has no other way to reach the database.
 - **Mobile and service SQLite (libzb)**: Enforced. `query()` runs on a second connection opened read-only, so a direct write fails.
-- **PGlite:** a supported engine (`?engine=pglite` in examples/05-tables/web-consumer; `engine: 'pglite'`, dialect seam in `zb-client-ts/src/dialect.ts`). The library owns PGlite's single connection (in memory, or persisted in IndexedDB) exactly as it owns the OPFS one, so the same statement-shape guard applies.
+- **PGlite:** a supported engine (`?engine=pglite` in examples/05-tables/web-consumer; `engine: 'pglite'`, dialect seam in `zb-client-ts/src/dialect.ts`). The library owns PGlite's single connection (persisted: IndexedDB in the browser, a directory at `dbPath` on Node) exactly as it owns the OPFS one, so the same statement-shape guard applies.
 - **PostgreSQL replica (libzb `dbUrl`)**: Enforced. `query()` runs on a second connection with `default_transaction_read_only` on.
 - **DuckDB (libzb)**: `query()` accepts a single read statement only, the same check the TypeScript client makes.
 
@@ -1778,16 +1790,26 @@ systemctl stop zebridge | pkill -x bridge | docker stop zebridge
 
 ## Authentication
 
-Four separate keys, four separate boundaries.
+ZeBridge does not log users in: your app does, however it likes (OAuth, passwords, biometrics). ZeBridge needs two things about each user:
 
-| boundary | credential | who holds it |
+- a name, the **principal**: your user id, an email, any name you choose (letters, digits, `_` and `-`);
+- the tenants this name may use.
+
+It runs in one of two modes:
+
+| | production (`operator` mode) | development (`dev` mode) |
 | --- | --- | --- |
-| create the roles (once) | PostgreSQL **superuser** | the DBA / the init step — never the bridge at runtime |
-| bridge → PG | two role URLs, `DATABASE_READER_URL` (`bridge_reader`) and `DATABASE_WRITER_URL` (`bridge_writer`) | the bridge, in `.env.bridge` |
-| bridge → NATS | operator mode: `creds/bridge.creds`, a service-role user from `bridge --init-nats operator`; otherwise an **nkey** | the bridge |
-| consumer → NATS | a **JWT** (scoped signing key) + nkey seed | every consumer, from enrollment |
+| set up with | `bridge --init-nats operator` | `bridge --init-nats dev` |
+| NATS | checks each user's token, and the subjects it may use | open: anyone who reaches the port can do anything |
+| add a user to a tenant | an invite: `INSERT INTO zebridge_invites (principal, tenant_id)` returns a one-time code | a direct insertion: `INSERT INTO zebridge_user_tenants (principal, tenant_id)` |
+| the device | redeems the code once, gets a token (a NATS JWT), and renews it on its own | passes its `principal` and the `natsUrl` |
+| can a client act as another user? | no | yes |
 
-### Authenticate ZeBridge with Postgres
+Use production mode for anything real, locally too. The Docker quick start, at the top of this README, runs it, with its invites written in advance. Development mode is a smoke test: it shows the data path without any keys.
+
+In both modes, the bridge reaches PostgreSQL the same way.
+
+### The bridge and PostgreSQL
 
 The bridge connects with two PostgreSQL roles, one URL each in `.env.bridge`:
 
@@ -1796,7 +1818,7 @@ The bridge connects with two PostgreSQL roles, one URL each in `.env.bridge`:
 | `DATABASE_READER_URL` | `bridge_reader` | read the published tables and the WAL (`SELECT` + `REPLICATION`); cannot write |
 | `DATABASE_WRITER_URL` | `bridge_writer` | apply client writes, only on tables enabled with `writable => true`. Unset: no writes from clients |
 
-These two URLs are the only place the role names and passwords are written. The DBA creates the roles with the init SQL, which takes them from the URLs, and uses the superuser from `.env.admin` (`ADMIN_DATABASE_URL`) only for this step and for admin commands such as `--revoke`; the bridge never runs as it.
+These two URLs are the only place the role names and passwords are written. The init SQL creates the roles from them. The DBA's superuser (`ADMIN_DATABASE_URL`, in `.env.admin`) is used only to install the SQL and for admin commands such as `--revoke`; the bridge never runs as it.
 
 ```sh
 set -a; . ./.env.admin; . ./.env.bridge; set +a
@@ -1806,54 +1828,24 @@ psql "$ADMIN_DATABASE_URL" -c "SELECT * FROM zebridge_create_publication('my_pub
 
 > Nb: A password with `@` or `:` must be percent-encoded in the URL, as libpq requires.
 
-### Authenticate ZeBridge with NATS
+### Production: use `operator mode`
 
-Under operator mode there is nothing to do here: `bridge --init-nats operator` writes the bridge's creds and sets `NATS_CREDS` (see [Identity and access](#identity-and-access)). The nkey below is for a server without operator mode.
+Your backend decides which tenants a user may use, and creates an OPT invite (see [Onboard a device](#2-onboard-a-device)). The device redeems the invite once, at the bridge, and gets a NATS JWT: a token that names the user and their tenants.
 
-**DBA mints the nkey pair for ZeBridge ↔ NATS**: mint the nkey pair a DBA installs between NATS and the bridge by using the bridge as a CLI:
+Two systems check every access, each on what it holds:
 
-```sh
-bridge --gen-nkey >> .env.bridge
-```
+- NATS checks which subjects (the message channels) a user may read or write;
+- PostgreSQL checks which rows a user may read or write: row-level security (RLS) and the tenant guard.
 
-appends to .env.bridge:
+So there are no sync rules to write, and no extra authorization service to run.
 
-```diff
-+ NATS_BRIDGE_NKEY_PUB=UDZXDNW7BZUWYV3Y3WVV2NRG5ERSXZOPNQDVMVNSSMUC4OBGXRO3UTJ4
-+ NATS_BRIDGE_NKEY_SEED=SUAPVJBFH7MWPQA4SJQTSP3QGXSZMWAWDOPKUIUAUALFS66X2DBIXQGVME
-```
+The user's name travels in the subject of each message, for example `mutation.alice.orders.UPDATE`.
 
-Set the public key `NATS_BRIDGE_NKEY_PUB=UD...` in the NATS config to start the NATS server.
+> NATS refuses a message whose subject does not match the sender's JWT, so the bridge can trust that name. It never trusts a name written inside the message itself.
 
-```json
-authorization {
-  users: [
-    { nkey: $NATS_BRIDGE_NKEY_PUB }
-  ]
-}
-```
+Note: NATS calls this setup [operator mode](https://docs.nats.io/learn/security/decentralized-auth#revoking-a-user). It is a chain of signatures: the **operator** signs the **account**, the account lists three **signing keys**, one per role (client, responder, service), and each signing key signs **users**. A signing key also holds the permissions of every user it signs, as a template: when the user connects, `{{name()}}` becomes the user's name and `{{tag(tenant)}}` each of their tenants. The JWT itself holds no permissions, only the user's name and one tag per tenant.
 
-After substitution, the DBA can start the server:
-
-```sh
-export NATS_BRIDGE_NKEY_PUB=UD...
-envsubst < nats-server.conf.template > nats-server.conf
-
-nats-server -js -m 8222 -c nats-server.conf
-```
-
-### Identity and access
-
-ZeBridge keeps your app's login apart from data access. Your backend signs users in however it likes (OAuth, passwords, biometrics). ZeBridge only turns one decision, _this principal, in this tenant, with this role_, into a NATS JWT for one device.
-
-Authorization lives where the data does:
-
-- NATS grants decide which subjects a principal may touch;
-- PostgreSQL RLS and the tenant guard decide which rows it may read and write.
-
-There is no sync-rules language to write and no separate authorization service to run. The principal is a subject token the broker vouches for, never a claim in a payload.
-
-NATS [operator mode](https://docs.nats.io/learn/security/decentralized-auth#revoking-a-user) is a chain of signatures: the **operator** signs the **account**, the account lists **scoped signing keys**, and each signing key signs **users**. A signing key carries a _role template_: the permissions of every user it signs, with `{{name()}}` (the principal) and `{{tag(tenant)}}` (each tenant) filled in at connect. The JWT itself holds no permissions, only the principal and one tenant tag per membership.
+The bridge's own NATS identity needs nothing from you: `bridge --init-nats operator` writes it (`creds/bridge.creds`, a service-role user) and points `NATS_CREDS` at it.
 
 #### 1. Set up, once per deployment
 
@@ -1899,7 +1891,7 @@ sequenceDiagram
 </details>
 <br>
 
-**What the bridge needs for enrollment.** `GET /enroll` and `GET /renew` are on only when `ZB_SIGNING_SEED`, `ZB_ACCOUNT_PUB` and `DATABASE_WRITER_URL` are all set; `--init-nats operator` writes the first two into `.env.nats`.
+**Enrollment settings.** The bridge reads them from its environment:
 
 | variable | default | what it sets |
 | --- | --- | --- |
@@ -1909,12 +1901,23 @@ sequenceDiagram
 | `ENROLL_NATS_URL` | — | the NATS URL handed to clients over TCP (native, Node) in their identity, e.g. `tls://nats.example.com:4222` |
 | `ENROLL_NATS_WS_URL` | — | the same for browsers, e.g. `wss://nats.example.com` |
 
+**If a client gets `enrollment not configured`**, the bridge is missing one of three settings: `ZB_SIGNING_SEED` or `ZB_ACCOUNT_PUB`, which `--init-nats operator` writes into `.env.nats`, or `DATABASE_WRITER_URL`, from `.env.bridge` (redeeming an invite is a write). Usually the bridge was started without `.env.nats` loaded, or the stack was set up with `--init-nats dev`. When all three are there, the boot log shows `🎟️ enrollment endpoint armed`.
+
+**`operator.store` is your root key.** Like the private key of a certificate authority, it signs everything else, and nothing running needs it: the bridge, nats-server and the devices work without it. Keep it offline (a password manager, an encrypted disk), and bring it to a trusted machine only to:
+
+- re-sign the account after a grammar change: `bridge --init-nats --update`;
+- mint the creds of a responder or a leaf: `--mint-responder`, `--mint-leaf`;
+- cut a revoked user off at NATS: `--revoke --conf` (it needs `OPERATOR_SEED`, from the store).
+
+A trusted machine is any machine you control, your laptop for example, with the `bridge` binary and the two libraries it needs (`libpq5` and `libzstd1` on Debian). Run the command there, with `--store` pointing at the file, then copy what it wrote to the server: the updated `nats-server.conf`, or the new `.creds`. `--revoke` also needs to reach PostgreSQL (`ADMIN_DATABASE_URL`).
+
 **Where the credentials live, and how to keep them safe.**
 
 | file | holds | keep it |
 | --- | --- | --- |
-| `operator.store` | every seed: the operator, the accounts, the three signing keys | **off the server**: a password manager or an encrypted offline disk. Needed only for `--init-nats --update` and `--revoke --conf` |
-| `.env.bridge` | the database passwords and `ZB_SIGNING_SEED`, which can mint a client for any principal | on the bridge host only, readable by the bridge's user only |
+| `operator.store` | every seed: the operator, the accounts, the three signing keys | **off the server**, offline (see above) |
+| `.env.bridge` | the database passwords | on the bridge host only, readable by the bridge's user only |
+| `.env.nats` | `ZB_SIGNING_SEED`, which can mint a client for any principal | on the bridge host only, readable by the bridge's user only |
 | `creds/bridge.creds` | the bridge's own NATS identity: publish and subscribe on every subject of the account | on the bridge host only, readable by the bridge's user only |
 | `nats-server.conf` | public JWTs, no secret | on the NATS host |
 
@@ -1943,7 +1946,33 @@ It re-signs the account with the same keys, with the templates re-derived and th
 
 #### 2. Onboard a device
 
-Your backend decides _who_ (the principal), _where_ (the tenant) and _how_ (the role), and writes it as a one-time invite; today a DBA writes it by hand. The app hands the invite to the library, and the library does the rest.
+Your backend decides _who_ (the principal) and _where_ (the tenant), and writes a one-time invite; today a DBA writes it by hand:
+
+```sql
+INSERT INTO zebridge_invites (principal, tenant_id) 
+VALUES ('alice', 'acme') 
+RETURNING code;
+```
+
+PostgreSQL generates the code; it expires after 1 day (set `expires_at` in the `INSERT` for another lifetime, e.g. `now() + interval '1 hour'`). Your backend then gets the code to the user's device, and the app passes it to the library as `invite`, on the first connect:
+
+| how the code reaches the device | where the app reads it |
+| --- | --- |
+| in your login response, when the user signs in to your app | the response |
+| a link in an email or an SMS: `https://app.example.com/?invite=<code>` | in the browser, the query string |
+| the same link on a phone, opened by your app (a universal link on iOS, an app link on Android) | the URL the system hands to the app |
+| the user types or pastes the code | a text field |
+
+The library never reads a URL itself. Whatever the source, the app passes the string:
+
+```ts
+const zb = new ZeBridge({ bridgeUrl, invite: code, tables });   // libzb: "invite": code in zb_client_connect's options
+await zb.connect();
+```
+
+Only the first connect needs it. The library then stores the device's identity, and every later start needs no code. The repository's phone examples take the code at build time (`--dart-define=ZB_INVITE=…`, `EXPO_PUBLIC_ZB_INVITE`): a shortcut for testing, not for a published app.
+
+Every device enrolled this way is a **client**: the table's `role` column is `client` by default, and the bridge mints client tokens only. A service that answers queries gets its own creds with `--mint-responder` (see [1. Set up](#1-set-up-once-per-deployment)).
 
 <details>
 
@@ -1958,8 +1987,8 @@ sequenceDiagram
     participant N as NATS
 
     U->>BE: log in (OAuth, password…)
-    BE->>BE: decide principal, tenant, role
-    BE->>PG: INSERT INTO zebridge_invites (principal, tenant_id, role) RETURNING code
+    BE->>BE: decide principal and tenant
+    BE->>PG: INSERT INTO zebridge_invites (principal, tenant_id) RETURNING code
     Note over BE,PG: today: a DBA does this by hand
     BE-->>A: the one-time code (in the login response)
 
@@ -2019,6 +2048,15 @@ sequenceDiagram
 
 No secret crosses the wire: NATS sends a nonce, the device signs it with its seed, and NATS checks the signature and the JWT's chain up to the operator. JWTs live `ENROLL_JWT_TTL_SECONDS` (24 h by default). The library renews with a quarter of that left, by proving it holds the device's key, so there is no invite and no backend call. The quarter is counted on the bridge's clock, not the device's: the identity keeps the difference, taken from each JWT's issue time, so a phone with a wrong clock still renews on time. libzb then counts on a clock the phone's settings cannot move, so changing the time while the app runs changes nothing. If its clock moved since, the bridge refuses the stamp and answers with its time, and the library tries once more with it; a JWT that NATS refuses is renewed at once. Only a revoked key, or a principal with no tenant left, needs a new invite.
 
+**Back after a long time offline.** An expired JWT is not a problem: `/renew` asks for proof of the device's key, not for the old JWT, so the library renews before it connects, whether the JWT expired an hour ago or a month ago. The limit that matters is the data's, not the identity's: within `GC_THRESHOLD_MS` (7 days by default), the device catches up through the chain and sends its queued writes; past it, it reloads the base, and the bridge refuses writes queued before the GC watermark (`PredatesGcWatermark`), so the app is told those edits are lost.
+
+| away for | identity | replica | queued writes |
+| --- | --- | --- | --- |
+| under 24 h | the JWT is still valid; renewed when due | resumes the stream if the stream still holds its position, otherwise catches up through the chain (deltas, checkpoints) | sent; verdicts as usual (`applied`, `rebased`, `lost`…) |
+| 24 h to 7 days | `/renew` first, then connect | catches up through the chain: the stream keeps events only `3 × cadence`, so it has rolled past its position | the same |
+| over 7 days (`GC_THRESHOLD_MS`) | `/renew` first, then connect | reloads the base: a delete it missed may have had its tombstone reaped, and only a base proves a row is gone | refused (`rejected`, `PredatesGcWatermark`); the local copy is put back and the edit reported lost |
+| revoked, or no tenant left | `/renew` refused: a new invite is needed (with `--purge`, the device deletes its replica and identity) | — | — |
+
 The same flow runs for every consumer (web app, phone, microservice) and in every language ([the first ten lines](CLIENTS.md#the-first-ten-lines)). Only the transport (WebSocket in the browser, TLS-TCP elsewhere) and the identity's storage differ.
 
 #### 4. Revoke
@@ -2063,13 +2101,65 @@ Without `--purge`, the rows already on a device stay there until the app calls `
 | the bridge | its own service creds + the **client** signing seed (`ZB_SIGNING_SEED`) | run the pipeline; mint client users only, never an admin |
 | a device | its own seed + its JWT | be itself, in its tenants |
 
-⚠️ **`/enroll` and `/renew` are off unless all three are set**: `ZB_SIGNING_SEED` (the client signing seed), `ZB_ACCOUNT_PUB` (the account, named in every JWT) and `DATABASE_WRITER_URL` (redeeming an invite is a write). Without them the bridge runs normally and answers `{"error":"enrollment not configured"}`; the boot log shows `🎟️ enrollment endpoint armed` when they are.
+### Development
 
-#### Local development
+#### `dev` mode
 
-`bridge --init-nats dev` writes an open server (no auth, enrollment off) for a first try. `bridge --init-nats operator` runs the real chain locally.
+`bridge --init-nats dev` writes an open NATS server: no authentication, and enrollment off. Map each user to a tenant directly:
 
-This repository's own test stack instead pre-mints fixed principals with `scripts/native/jwt-bootstrap.sh`:
+```sql
+INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('alice', 'acme');
+```
+
+A client then names itself:
+
+```ts
+const zb = new ZeBridge({ 
+  natsUrl: 'ws://localhost:8080', 
+  principal: 'alice', 
+  tables: ['orders'] 
+});
+```
+
+(`nats://localhost:4222` from Node or libzb). NATS checks nothing here, so any client can claim any principal: never expose a `dev` server.
+
+#### Your own NATS server, without operator mode
+
+If you run your own nats-server with nkey authentication, the bridge needs an nkey pair:
+
+```sh
+bridge --gen-nkey >> .env.bridge
+```
+
+It appends both keys to `.env.bridge`:
+
+```diff
++ NATS_BRIDGE_NKEY_PUB=UDZXDNW7BZUWYV3Y3WVV2NRG5ERSXZOPNQDVMVNSSMUC4OBGXRO3UTJ4
++ NATS_BRIDGE_NKEY_SEED=SUAPVJBFH7MWPQA4SJQTSP3QGXSZMWAWDOPKUIUAUALFS66X2DBIXQGVME
+```
+
+Put the public key in the server's config, then start it:
+
+```json
+authorization {
+  users: [
+    { nkey: $NATS_BRIDGE_NKEY_PUB }
+  ]
+}
+```
+
+```sh
+export NATS_BRIDGE_NKEY_PUB=UD...
+envsubst < nats-server.conf.template > nats-server.conf
+
+nats-server -js -m 8222 -c nats-server.conf
+```
+
+Invites and token renewal need operator mode, so on such a server the clients connect the way your server allows.
+
+#### This repository's test stack
+
+It pre-mints fixed principals with `scripts/native/jwt-bootstrap.sh`:
 
 ```sh
 scripts/native/creds/{alice,bob,mary,nina,omar,bridge,zbdoctor}.creds
@@ -2340,6 +2430,8 @@ On the server that will run NATS and the bridge, once:
 ```sh
 bridge --init-nats operator --dir /etc/zebridge
 ```
+
+`operator` is the mode for every real deployment; `dev` is only a local smoke test ([the two modes](#authentication)).
 
 It writes four files, `nats-server.conf`, `.env.nats`, `creds/bridge.creds` and `operator.store` into `/etc/zebridge` (what each file is: [Set up, once per deployment](#1-set-up-once-per-deployment)). The paths written inside them point into `--dir`; if NATS runs on another host, copy `nats-server.conf` there and change its `store_dir`. `--port`, `--http-port` and `--ws-port` choose the server's ports. `.env.nats` holds the NATS settings only: the URL, the bridge's credentials, the enrollment keys.
 
