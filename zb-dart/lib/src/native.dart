@@ -49,7 +49,8 @@ class PollReport {
 
   /// What became of this client's writes since the last report, each once:
   /// {msgId, version, table, columns, outcome: applied|rebased|lost|deleted|rejected,
-  /// lostColumns?, rebasedAs?, reason?} — `msgId` is what [mutate] returned.
+  /// lostColumns?, rebasedAs?, reason?, sqlstate?, detail?} — `msgId` is what [mutate]
+  /// returned; `sqlstate` and `detail` are PostgreSQL's code and message on a rejection.
   final List<Map<String, dynamic>> outcomes;
 
   /// The writes still in the outbox: applied here, not yet judged by PostgreSQL.

@@ -181,11 +181,21 @@ def main():
             before = pg_doc(uid_b)
             v = carol.mutate(T, "UPDATE", {"uid": uid_b}, {"doc": ["not", "registers"]})["version"]
             vd = verdict(v)
-            check(f"§C an array as doc is rejected (22023), not applied: {vd and (vd['outcome'], vd.get('reason'))}",
-                  vd is not None and vd["outcome"] == "rejected")
+            check(f"§C zb-client-ts: an array as doc is rejected, with PostgreSQL's code: {vd and (vd['outcome'], vd.get('sqlstate'))}",
+                  vd is not None and vd["outcome"] == "rejected" and vd.get("sqlstate") == "22023")
+            check(f"§C zb-client-ts: ...and its message in detail: {vd and vd.get('detail', '')[:70]}",
+                  vd is not None and "JSON object of registers" in vd.get("detail", ""))
             check(f"§C PostgreSQL's doc unchanged: {values(pg_doc(uid_b))}", pg_doc(uid_b) == before)
             dt = both(alice, carol, lambda c: safe(local_doc(c, uid_b) or {}) == want, 30)
             check(f"§C Carol's optimistic copy put back ({dt} s): {safe(local_doc(carol, uid_b) or {})}", dt is not None)
+            mid = alice.mutate(T, "UPDATE", {"uid": uid_b}, {"doc": "not registers"})["msgId"]
+            end = time.monotonic() + 30
+            while alice.outcome(mid) is None and time.monotonic() < end:
+                alice.flush(500); alice.poll(300)
+            o = alice.outcome(mid) or {}
+            check(f"§C libzb: a string as doc is rejected, sqlstate and detail in the poll report's outcome: {(o.get('outcome'), o.get('sqlstate'))}",
+                  o.get("outcome") == "rejected" and o.get("sqlstate") == "22023" and "JSON object of registers" in o.get("detail", ""))
+            check(f"§C PostgreSQL's doc still unchanged: {values(pg_doc(uid_b))}", pg_doc(uid_b) == before)
             ins = zb.psql(f"INSERT INTO {T} (uid, doc, tenant_id) VALUES ('{uuid.uuid4()}', '\"text\"'::jsonb, '{tenant}')", quiet=True)
             check("§C an INSERT with a non-object doc is refused too", "INSERT" not in ins)
             alice.close(); carol.close(); alice = carol = None

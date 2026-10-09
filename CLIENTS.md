@@ -11,7 +11,7 @@ Two client libraries speak the protocol.
 | large answers | `reply` puts an answer past `results.inline_max_bytes` in `res-<tenant>` and sends an envelope; `request` resolves it | the same, in `serve`'s reply and in `request` |
 | being a service | `zb_client_serve` + the `requests` in `poll` + `zb_client_reply`: the host's loop answers | `serve({tenants, handlers, queue})`: async handlers, the library subscribes and replies |
 | cooperative documents | `mergeRegisters` through `zb_call` (COOPERATIVE_EDITING.md); PostgreSQL merges what it accepts (`register_cols`) | `mergeRegisters`, imported (libzb's core, as WASM) |
-| each write's outcome | the poll report's `outcomes` — `{msgId, version, table, columns, outcome, lostColumns?, rebasedAs?, reason?}`, keyed by the `msgId` `mutate` returns — and `pending`, the outbox depth | `onVerdict(cb)`, keyed by the `version` `mutate` returns, and `pending()` |
+| each write's outcome | the poll report's `outcomes` — `{msgId, version, table, columns, outcome, lostColumns?, rebasedAs?, reason?, sqlstate?, detail?}`, keyed by the `msgId` `mutate` returns — and `pending`, the outbox depth | `onVerdict(cb)`, keyed by the `version` `mutate` returns, and `pending()` |
 | on-demand answers | `zb_client_request` + `zb_client_ingest` | `request` + `ingest` |
 | reply inbox | `_INBOX.<principal>`, from the `inbox_prefix` connection option — replies, KV watchers, object reads and pull consumers all land there, inside the principal's `_INBOX.<principal>.>` grant | the same, through nats.js's `inboxPrefix` |
 | loop | host-driven: `sync`, `poll`, `flush` | self-driven: `connect()` runs it |

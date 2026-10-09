@@ -250,6 +250,9 @@ export type Phase = 'connected' | 'migrated' | 'snapshot' | 'cdc';
 ///             newer edit: the winning row stands, it arrives via CDC;
 ///   deleted   the row was deleted elsewhere: the local copy is reverted;
 ///   rejected  refused for good (`reason`, e.g. a policy): the local copy is reverted.
+///             When PostgreSQL refused it, `sqlstate` and `detail` are its own code and
+///             message (22023 a malformed register document, 42501 row-level security):
+///             `reason` names the bridge's error, the same for both.
 /// A write kept for retry (`failed`, `rate_limited`) has no verdict yet.
 export type Verdict = {
   version: string;
@@ -260,6 +263,8 @@ export type Verdict = {
   rebasedAs?: string;
   lostColumns?: string[];
   reason?: string;
+  sqlstate?: string;
+  detail?: string;
 };
 /// §10ix: one table being seeded, a window at a time. `applied` counts the step's rows
 /// handled so far, `total` the step's row count, `kind` the chain step's (full, delta).
@@ -4111,7 +4116,12 @@ export class ZeBridge {
           case 'rejected':
             await this.revertOptimisticWrite(msgId, 'restore');
             this.appendLog(m.subject, `${where}: refused permanently (${verdict.reason}${verdict.sqlstate ? ` / SQLSTATE ${verdict.sqlstate}` : ''}) — ${verdict.detail || 'no detail'} — reverting the local copy`, 'ERROR');
-            if (write) this.emitVerdict({ ...write, outcome: 'rejected', ...(verdict.reason ? { reason: String(verdict.reason) } : {}) });
+            if (write) this.emitVerdict({
+              ...write, outcome: 'rejected',
+              ...(verdict.reason ? { reason: String(verdict.reason) } : {}),
+              ...(verdict.sqlstate ? { sqlstate: String(verdict.sqlstate) } : {}),
+              ...(verdict.detail ? { detail: String(verdict.detail) } : {}),
+            });
             break;
           case 'failed':
             if (verdict.reason === 'rate_limited') {

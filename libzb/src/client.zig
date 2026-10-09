@@ -4647,7 +4647,23 @@ pub const SyncClient = struct {
             if (std.mem.eql(u8, status, "accepted")) {
                 self.noteOutcome(a, mid, w.version, w.table, w.data, "applied", reason);
             } else if (std.mem.eql(u8, status, "rejected")) {
-                self.noteOutcome(a, mid, w.version, w.table, w.data, "rejected", reason);
+                // PostgreSQL's own word, when it refused the write: its SQLSTATE (22023 a
+                // malformed register document, 42501 row-level security) and its message.
+                // `reason` alone names the bridge's error, which is the same for both.
+                var extra: [3]struct { []const u8, Value } = undefined;
+                var n: usize = 0;
+                if (reason0.len > 0) {
+                    extra[n] = .{ "reason", .{ .string = reason0 } };
+                    n += 1;
+                }
+                for ([_][]const u8{ "sqlstate", "detail" }) |key| {
+                    const s = if (v == .object) (if (v.object.get(key)) |x| (if (x == .string) x.string else "") else "") else "";
+                    if (s.len > 0) {
+                        extra[n] = .{ key, .{ .string = s } };
+                        n += 1;
+                    }
+                }
+                self.noteOutcome(a, mid, w.version, w.table, w.data, "rejected", extra[0..n]);
             } else if (std.mem.eql(u8, status, "row_deleted")) {
                 self.noteOutcome(a, mid, w.version, w.table, w.data, "deleted", &.{});
             } else if (std.mem.eql(u8, status, "stale") and !self.rebase.contains(mid)) {
