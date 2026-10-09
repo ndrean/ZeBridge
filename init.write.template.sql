@@ -485,20 +485,34 @@ CREATE OR REPLACE FUNCTION public.zebridge_merge_registers(a jsonb, b jsonb) RET
             FROM jsonb_each(CASE WHEN jsonb_typeof(b) = 'object' THEN b ELSE '{}'::jsonb END) eb) m
 $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
 
--- The trigger: TG_ARGV names the register columns. BEFORE UPDATE OF those columns, so a
--- write that does not set one (part A's plain columns) costs nothing; a write the version
--- guard refuses (stale) never reaches it — the row's rule still decides WHETHER, this
--- decides WHAT.
+-- The trigger: TG_ARGV names the register columns. BEFORE INSERT, and BEFORE UPDATE OF
+-- those columns, so a write that does not set one (part A's plain columns) costs nothing;
+-- a write the version guard refuses (stale) never reaches it — the row's rule still
+-- decides WHETHER, this decides WHAT.
+--
+-- A register column holds a JSON object of registers, or NULL. Anything else (an array, a
+-- string, a number) is refused: merged, it would count as an empty document, so the write
+-- would change nothing and still be reported applied. SQLSTATE 22023 is permanent to the
+-- bridge, so the client gets `rejected` at once, with this message as the detail.
 CREATE OR REPLACE FUNCTION public.zebridge_merge_register_cols() RETURNS trigger AS $$
 DECLARE
     col   text;
+    val   jsonb;
     patch jsonb := '{}'::jsonb;
 BEGIN
     FOREACH col IN ARRAY TG_ARGV LOOP
-        patch := patch || jsonb_build_object(col,
-            public.zebridge_merge_registers(to_jsonb(OLD) -> col, to_jsonb(NEW) -> col));
+        val := to_jsonb(NEW) -> col;
+        IF jsonb_typeof(val) NOT IN ('object', 'null') THEN
+            RAISE EXCEPTION '%.%: a register column holds a JSON object of registers (got %)', TG_TABLE_NAME, col, jsonb_typeof(val)
+                USING ERRCODE = '22023';
+        END IF;
+        IF TG_OP = 'UPDATE' THEN
+            patch := patch || jsonb_build_object(col, public.zebridge_merge_registers(to_jsonb(OLD) -> col, val));
+        END IF;
     END LOOP;
-    NEW := jsonb_populate_record(NEW, patch);
+    IF TG_OP = 'UPDATE' THEN
+        NEW := jsonb_populate_record(NEW, patch);
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -523,7 +537,7 @@ BEGIN
         END IF;
     END LOOP;
     EXECUTE format('DROP TRIGGER IF EXISTS zebridge_merge_registers_t ON %s', tbl);
-    EXECUTE format('CREATE TRIGGER zebridge_merge_registers_t BEFORE UPDATE OF %s ON %s '
+    EXECUTE format('CREATE TRIGGER zebridge_merge_registers_t BEFORE INSERT OR UPDATE OF %s ON %s '
                    'FOR EACH ROW EXECUTE FUNCTION public.zebridge_merge_register_cols(%s)',
                    (SELECT string_agg(quote_ident(x), ', ') FROM unnest(cols) x), tbl,
                    (SELECT string_agg(quote_literal(x), ', ') FROM unnest(cols) x));
@@ -757,19 +771,22 @@ CREATE TRIGGER zebridge_refuse_revoked_mapping_t
 -- invitation: a high-entropy single-use code (122 random bits, generated here when the
 -- INSERT omits it) the operator hands out out-of-band;
 -- presenting it to the bridge's /enroll endpoint IS the authentication (a one-time
--- password), and the row carries everything the mint needs: principal, tenant,
--- role. The principal CHECK is the naming police — the narrow waist between the
+-- password), and the row carries everything the mint needs: principal and tenant.
+-- Every invite makes a CLIENT: the bridge holds the client signing key only, and
+-- services get their creds offline (--mint-responder). The principal CHECK is the naming police — the narrow waist between the
 -- identity world and the routing world ([A-Za-z0-9_-] is the intersection of NATS
 -- subject-token, KV-key and template-expansion alphabets, measured).
 CREATE TABLE IF NOT EXISTS public.zebridge_invites (
     code       text PRIMARY KEY DEFAULT replace(gen_random_uuid()::text, '-', ''),
     principal  text NOT NULL CHECK (principal ~ '^[A-Za-z0-9_-]+$'),
     tenant_id  text NOT NULL CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]'),
-    role       text NOT NULL DEFAULT 'client',
     created_at timestamptz NOT NULL DEFAULT now(),
     expires_at timestamptz NOT NULL DEFAULT now() + interval '1 days',
     used_at    timestamptz
 );
+-- The role column is gone: nothing read it, and a value other than 'client' was accepted
+-- and ignored. An existing table loses it here.
+ALTER TABLE public.zebridge_invites DROP COLUMN IF EXISTS role;
 ALTER TABLE public.zebridge_invites DROP CONSTRAINT IF EXISTS zebridge_invites_tenant_id_check;
 ALTER TABLE public.zebridge_invites ADD CONSTRAINT zebridge_invites_tenant_id_check CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]');
 -- The bridge redeems invites over its WRITER connection: read the row, stamp

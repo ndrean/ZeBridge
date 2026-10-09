@@ -441,7 +441,7 @@ pub const Server = struct {
             // its verdict channel would hang up a re-enrolled client anyway.
             "  WHERE code = $1 AND used_at IS NULL AND expires_at > now()" ++
             "    AND NOT EXISTS (SELECT 1 FROM public.zebridge_principal_keys k WHERE k.principal = zebridge_invites.principal AND k.revoked_at IS NOT NULL)" ++
-            "  RETURNING principal, tenant_id, role" ++
+            "  RETURNING principal, tenant_id" ++
             "), registered AS (" ++
             "  INSERT INTO public.zebridge_user_tenants (principal, tenant_id)" ++
             "  SELECT principal, tenant_id FROM redeemed" ++
@@ -456,7 +456,7 @@ pub const Server = struct {
             "  SELECT $2, principal, tenant_id FROM redeemed" ++
             "  ON CONFLICT (user_pubkey) DO UPDATE SET principal = EXCLUDED.principal," ++
             "    tenant_id = EXCLUDED.tenant_id, enrolled_at = now()" ++
-            ") SELECT principal, tenant_id, role FROM redeemed";
+            ") SELECT principal, tenant_id FROM redeemed";
         const res = c.PQexecParams(conn, redeem_sql, 2, null, &params[0], null, null, 0);
         defer c.PQclear(res);
         if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) {

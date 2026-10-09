@@ -71,8 +71,8 @@ SOFT, HARD = f"rv_soft_{RUN}", f"rv_hard_{RUN}"
 def enroll(principal):
     """An invite row, a fresh nkey, one GET /enroll → a creds file (the jwt_expiry recipe)."""
     code = os.urandom(16).hex()
-    zb.psql(f"INSERT INTO public.zebridge_invites (code, principal, tenant_id, role, expires_at) "
-            f"VALUES ('{code}', '{principal}', '{TENANT}', 'client', now() + interval '10 minutes')")
+    zb.psql(f"INSERT INTO public.zebridge_invites (code, principal, tenant_id, expires_at) "
+            f"VALUES ('{code}', '{principal}', '{TENANT}', now() + interval '10 minutes')")
     gen = subprocess.run([str(BRIDGE), "--gen-nkey"], capture_output=True, text=True)
     user_pub = re.search(r"NATS_BRIDGE_NKEY_PUB=(U[A-Z0-9]+)", gen.stdout).group(1)
     user_seed = re.search(r"NATS_BRIDGE_NKEY_SEED=(SU[A-Z0-9]+)", gen.stdout).group(1)
@@ -206,7 +206,7 @@ def main():
             check(f"§S6 the application's explicit wipe (zb_client_wipe / zb.wipe()) removed both replica files; left: {left}", not left)
             # a revoked principal is dead for good: the operator creates a NEW one
             code = os.urandom(16).hex()
-            zb.psql(f"INSERT INTO public.zebridge_invites (code, principal, tenant_id, role, expires_at) VALUES ('{code}', '{SOFT}', '{TENANT}', 'client', now() + interval '10 minutes')")
+            zb.psql(f"INSERT INTO public.zebridge_invites (code, principal, tenant_id, expires_at) VALUES ('{code}', '{SOFT}', '{TENANT}', now() + interval '10 minutes')")
             gen = subprocess.run([str(BRIDGE), "--gen-nkey"], capture_output=True, text=True)
             pub2 = re.search(r"NATS_BRIDGE_NKEY_PUB=(U[A-Z0-9]+)", gen.stdout).group(1)
             try:

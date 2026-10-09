@@ -174,6 +174,20 @@ def main():
             dt = both(alice, carol, lambda c: values(local_doc(c, uid_b) or {}) == want, 60)
             check(f"§B both replicas at {want} ({dt} s): alice {values(local_doc(alice, uid_b) or {})}, carol {values(local_doc(carol, uid_b) or {})}", dt is not None)
             check(f"§B Carol's outbox empty: pending() = {carol.pending()}", carol.pending() == 0)
+
+            # ── C. a document that is not an object: refused, not silently ignored ──
+            def safe(d):
+                return values(d) if isinstance(d, dict) else d
+            before = pg_doc(uid_b)
+            v = carol.mutate(T, "UPDATE", {"uid": uid_b}, {"doc": ["not", "registers"]})["version"]
+            vd = verdict(v)
+            check(f"§C an array as doc is rejected (22023), not applied: {vd and (vd['outcome'], vd.get('reason'))}",
+                  vd is not None and vd["outcome"] == "rejected")
+            check(f"§C PostgreSQL's doc unchanged: {values(pg_doc(uid_b))}", pg_doc(uid_b) == before)
+            dt = both(alice, carol, lambda c: safe(local_doc(c, uid_b) or {}) == want, 30)
+            check(f"§C Carol's optimistic copy put back ({dt} s): {safe(local_doc(carol, uid_b) or {})}", dt is not None)
+            ins = zb.psql(f"INSERT INTO {T} (uid, doc, tenant_id) VALUES ('{uuid.uuid4()}', '\"text\"'::jsonb, '{tenant}')", quiet=True)
+            check("§C an INSERT with a non-object doc is refused too", "INSERT" not in ins)
             alice.close(); carol.close(); alice = carol = None
             teardown()
     finally:

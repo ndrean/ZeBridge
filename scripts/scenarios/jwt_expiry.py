@@ -84,8 +84,8 @@ def main() -> int:
 
             # ── 2. invite → nkey → one GET = a working client ────────────────
             code = os.urandom(16).hex()
-            zb.psql(f"INSERT INTO public.zebridge_invites (code, principal, tenant_id, role, expires_at) "
-                    f"VALUES ('{code}', '{PRINCIPAL}', '{TENANT}', 'client', now() + interval '5 minutes')")
+            zb.psql(f"INSERT INTO public.zebridge_invites (code, principal, tenant_id, expires_at) "
+                    f"VALUES ('{code}', '{PRINCIPAL}', '{TENANT}', now() + interval '5 minutes')")
             gen = subprocess.run([str(BRIDGE), "--gen-nkey"], capture_output=True, text=True)
             user_pub = re.search(r"NATS_BRIDGE_NKEY_PUB=(U[A-Z0-9]+)", gen.stdout).group(1)
             user_seed = re.search(r"NATS_BRIDGE_NKEY_SEED=(SU[A-Z0-9]+)", gen.stdout).group(1)

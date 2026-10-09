@@ -66,8 +66,8 @@ def main():
 
     creds = ROOT / "scripts/native/creds" / f"{PRINCIPAL}.creds"
     code = os.urandom(16).hex()
-    psql(f"INSERT INTO public.zebridge_invites (code, principal, tenant_id, role, expires_at) "
-         f"VALUES ('{code}', '{PRINCIPAL}', '{tenants[0]}', 'client', now() + interval '10 minutes')")
+    psql(f"INSERT INTO public.zebridge_invites (code, principal, tenant_id, expires_at) "
+         f"VALUES ('{code}', '{PRINCIPAL}', '{tenants[0]}', now() + interval '10 minutes')")
     gen = subprocess.run([str(ROOT / "zig-out/bin/bridge"), "--gen-nkey"], capture_output=True, text=True)
     user_pub = re.search(r"NATS_BRIDGE_NKEY_PUB=(U[A-Z0-9]+)", gen.stdout).group(1)
     user_seed = re.search(r"NATS_BRIDGE_NKEY_SEED=(SU[A-Z0-9]+)", gen.stdout).group(1)

@@ -49,8 +49,8 @@ def main() -> int:
         zb.psql(f"DELETE FROM public.zebridge_invites WHERE principal = '{PRINCIPAL}'", quiet=True)
         zb.psql(f"INSERT INTO public.zebridge_user_tenants (principal, tenant_id) "
                 f"VALUES ('{PRINCIPAL}', '{TENANT}')")
-        zb.psql(f"INSERT INTO public.zebridge_invites (code, principal, tenant_id, role, expires_at) "
-                f"VALUES ('{os.urandom(16).hex()}', '{PRINCIPAL}', '{TENANT}', 'client', now() + interval '1 hour')")
+        zb.psql(f"INSERT INTO public.zebridge_invites (code, principal, tenant_id, expires_at) "
+                f"VALUES ('{os.urandom(16).hex()}', '{PRINCIPAL}', '{TENANT}', now() + interval '1 hour')")
         deadline = time.time() + 20
         while time.time() < deadline and kv_key() != TENANT:
             time.sleep(0.5)

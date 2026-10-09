@@ -40,8 +40,8 @@ def sql(text: str) -> str:
 def enrol(tenant: str, tag: str) -> tuple[pathlib.Path, list[str]]:
     """An invite, a fresh nkey, one GET /enroll → creds and the JWT's tenant tags."""
     code = os.urandom(16).hex()
-    sql(f"INSERT INTO public.zebridge_invites (code, principal, tenant_id, role, expires_at) "
-        f"VALUES ('{code}', '{PRINCIPAL}', '{tenant}', 'client', now() + interval '5 minutes')")
+    sql(f"INSERT INTO public.zebridge_invites (code, principal, tenant_id, expires_at) "
+        f"VALUES ('{code}', '{PRINCIPAL}', '{tenant}', now() + interval '5 minutes')")
     gen = subprocess.run([str(BRIDGE), "--gen-nkey"], capture_output=True, text=True)
     user_pub = re.search(r"NATS_BRIDGE_NKEY_PUB=(U[A-Z0-9]+)", gen.stdout).group(1)
     user_seed = re.search(r"NATS_BRIDGE_NKEY_SEED=(SU[A-Z0-9]+)", gen.stdout).group(1)
