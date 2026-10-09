@@ -24,7 +24,11 @@ PostgreSQL judges every write. The register format `{v, t, w}` decides which fie
 One table, two flavours, merged in one table for the demo: a real table picks one.
 
 * Part A: five plain columns, one per field — the library's rebase (column granularity) on `stale`. A write whose columns are disjoint from the winner’s is reapplied and lands; one whose columns overlap is dropped and the loser is told. No page-side logic.
-* Part B: one jsonb column holding the five registers, the format `{t,w,v}` as in [COOPERATIVE_EDITING.md](https://github.com/ndrean/zebridge/blob/main/COOPERATIVE_EDITING.md), merged register by register. Every field edit changes `doc`, so for the row every write to it is a write to the same column: a stale one is refused, and a late one that wins the row carries whatever `doc` its writer last saw. PostgreSQL merges that `doc` into the stored one (`register_cols => ARRAY['doc']`), so each register keeps its newest stamp; the page merges its own registers into what it sees before writing, and again after a refusal.
+* Part B: one jsonb column holding the five registers, the format `{t,w,v}` as in [COOPERATIVE_EDITING.md](https://github.com/ndrean/zebridge/blob/main/COOPERATIVE_EDITING.md), merged register by register. Every field edit changes `doc`, so for the row every write to it is a write to the same column: a stale one is refused, and a late one that wins the row carries whatever `doc` its writer last saw. The merge happens at two levels:
+  * **the page** merges its own registers into the `doc` it sees before writing, and again after a `stale`, into the newer row;
+  * **PostgreSQL**, when the table declares `register_cols => ARRAY['doc']`, merges each write it accepts into the stored `doc`, register by register, so each register keeps its newest stamp.
+
+  With `register_cols`, the page's second pass is a re-send more than a re-merge: a refused write never reached the trigger, but the re-sent one will, so the server does the merge that counts. The page's own job there is to tell its user which registers lost. Without `register_cols`, the page is the only merger, and a write built on an old `doc` can erase other registers (see [Part B without `register_cols`](#part-b-without-register_cols)).
 
 **The columns**:
 
@@ -104,6 +108,11 @@ The three editors (Alice, Bob, Carol) in the tenant "acme" share this id; Omar i
 
 Every register is empty at t = 0, so the first write to any of them wins uncontested.
 
+### Where the merge runs
+
+>[!IMPORTANT]
+> Without `register_cols`, only the page merges, and it merges against the copy of `doc` it last saw. A write queued offline carries that old copy, and PostgreSQL stores it whole. With `register_cols`, PostgreSQL merges each accepted write into the stored `doc`, so nothing someone else wrote meanwhile is lost. [Part B without `register_cols`](#part-b-without-register_cols) shows the difference.
+
 ### Part A: five columns
 
 |field|what it will do|who typically writes it|
@@ -174,17 +183,52 @@ The row itself carries the LWW machinery.
 
 Without `register_cols`, t = 30 is a silent loss: Bob's write is accepted whole, his `doc` from t = 10 replaces the row's, no verdict says anything went wrong, and Alice's three registers are gone. `scripts/scenarios/registers.py` plays this sequence with and without the merge. Part A has no such moment, because each write sets only its own column.
 
+#### Part B without `register_cols`
+
+To see that loss, run the part B timeline once without the merge. `register_cols` is declared on each call of `zebridge_enable`, so the DBA turns the merge off by running the same call without that line:
+
+```sql
+SELECT * FROM zebridge_enable(
+  'public.site_survey'::regclass,
+  writable      => true,
+  tenant_col    => 'tenant_id',
+  version_col   => 'updated_at',
+  tombstone_col => 'deleted_at',
+  tiebreak_col  => 'last_writer',
+  publication   => 'my_pub',
+  dry_run       => false
+);
+-- registers | done | register merge removed from site_survey: register_cols not given
+```
+
+No restart is needed: the tabs stay open. Empty the document, now that nothing merges it (with the merge on, this UPDATE would merge `{}` into the stored `doc` and change nothing):
+
+```sql
+UPDATE site_survey SET doc = '{}'::jsonb WHERE id = '11111111-1111-4111-8111-111111111111';
+```
+
+Play t = 0 to 30 again. At t = 30, Bob's outbox flushes and his `doc` from t = 10 replaces the row's: in every tab, `doc` holds access and hazard only. Alice's notes, rating and contact are gone, and Bob's write is reported `applied`, because for the row it was the newest.
+
+Then run the call with `register_cols => ARRAY['doc']` again to put the merge back.
+
 #### Results
 
-| | A: five columns | B: one doc |
-| -- | -- | -- |
-| rebase unit | the column (library) | the register (page) |
-| hazard after Bob’s offline edit | lands | lands |
-| Alice's fields after Bob's late write | untouched | kept: PostgreSQL merges the registers |
-| rating after Carol’s offline edit | LOST, right outcome | page re-merges, loses, right outcome |
-| schema changes for a new field | one ADD COLUMN | nothing |
-| page-side merge logic | none | merge before writing, once more after a `stale` |
-| matches COOPERATIVE_EDITING.md | yes, one register per column | yes, registers inside one doc |
+| | A: five columns | B: one column, with `register_cols` | B: one column, without `register_cols` |
+| -- | -- | -- | -- |
+| an accepted write is merged by | nothing needed: it sets only its own columns | PostgreSQL, register by register | nobody: it replaces the whole `doc` |
+| a refused (`stale`) write is rebased by | the library, per column | the page, per register | the page, per register |
+| the page merges | never | before each write, and after a `stale` | the same, and it is the only merge |
+| a late offline write can erase another editor's field | no | no | yes, silently |
+
+Our test sequence gives:
+
+| | A: five columns | B: one column, with `register_cols` | B: one column, without `register_cols` |
+| -- | -- | -- | -- |
+| "hazard" change after Bob’s offline edit | lands | lands | lands |
+| Alice's fields after Bob's late write | untouched | kept: PostgreSQL merges the registers | **erased, silently**: Bob's write is `applied` |
+| "rating" change after Carol’s offline edit | LOST, right outcome | the page re-merges, loses, right outcome | not played: the run stops at t = 30 |
+| a new field | one ADD COLUMN | nothing | nothing |
+| matches COOPERATIVE_EDITING.md | yes, one register per column | yes, registers inside one doc | no: an accepted write can erase registers |
 
 ## The app
 
@@ -327,7 +371,9 @@ const row_id = row.id;
 
 // or `const id = crypto.randomUUID()` minted locally
 
-// 3. write into a column — applied here at once, queued, sent, judged by PostgreSQL
+// 3. write into a column — applied here at once, queued, sent, judged by PostgreSQL.
+// It returns at once, before any verdict: `version` is the write's stamp, a time on the
+// bridge's clock (the row version it carries); its fate comes later, through onVerdict (7).
 const { version } = await zb.mutate(
   'site_survey',                // the table
   'UPDATE',                     // the SQL verb, INSERT | UPDATE | DELETE
@@ -348,15 +394,13 @@ mine.hazard = {
   // zb primitive to stamp with the right clock to be able to compare
   t: zb.stamp(),        
   w: zb.principal       // the writer id
-;
+};
 
 await zb.mutate(
   'site_survey',        // the table
   'UPDATE',             // the SQL verb
   { id: row_id },
-    doc: mergeRegisters(row.doc, mine) 
-    // the primitive takes 
-  }
+  { doc: mergeRegisters(row.doc, mine) }   // your registers merged into the doc you see
 );
 
 // 6. offline and back — writes wait in the outbox, then go
@@ -364,8 +408,9 @@ await zb.close();         // can be triggered by the UI
 await zb.pending();       // 1: one write waiting
 await zb.connect();       // can be triggered by the UI
 
-// 7. what became of each write — matched to mutate() by its version
-zb.onVerdict(({ version, outcome, columns }) => show(version, outcome, columns));
+// 7. what became of each write — matched to mutate() by its version.
+// onChange (4) says the row moved; onVerdict says what became of YOUR write.
+zb.onVerdict(({ version, outcome, columns }) => console.log(version, outcome, columns));
 ```
 
 | call | what it gives |
@@ -373,12 +418,12 @@ zb.onVerdict(({ version, outcome, columns }) => show(version, outcome, columns))
 | `new ZeBridge(opts)`, `connect()`, `NotEnrolled` | an identity on this device, enrolled once with an invite |
 | `principal` | who this editor is: the `w` of each register it writes |
 | `query(sql, ...params)` | the replica, read with SQL; it answers offline |
-| `mutate(table, op, key, values)` | a write, applied locally at once; returns its `version` |
+| `mutate(table, op, key, values)` | a write, applied locally at once; returns at once with its `version`, the write's stamp (a time on the bridge's clock); the verdict comes later, through `onVerdict` |
 | `onChange(table, cb)` | a call each time the table's rows change, from any writer |
 | `stamp()` | a register's `t`, on the bridge's clock, never behind what this replica saw |
 | `mergeRegisters(a, b)` | the merge of two docs, register by register: the later `t` wins, then `w` |
 | `close()`, `connect()`, `pending()` | offline and back; the writes still waiting in the outbox |
-| `onVerdict(cb)` | each write's outcome, once: `applied`, `rebased`, `lost`, `deleted` or `rejected` |
+| `onVerdict(cb)` | each write's outcome, once, matched by `version`: `applied`, `rebased`, `lost`, `deleted` or `rejected` |
 
 `onLog(cb)` says the same things in words, for people reading a console; an app does not need it.
 
@@ -386,15 +431,15 @@ zb.onVerdict(({ version, outcome, columns }) => show(version, outcome, columns))
 
 ## What the demo deliberately does not do
 
-No CRDTs, no causal tracking, no ordered lists, no text collaboration. The register format is per-field, by design; notes is one register, and two editors who both edit it lose one. That is the same tradeoff as in COOPERATIVE_EDITING.md.
+No CRDT library, no causal tracking, no ordered lists, no text collaboration. Part B's registers are a CRDT, but the simplest kind, a map of last-writer-wins registers, and the format is per-field by design; notes is one register, and two editors who both edit it lose one. That is the same tradeoff as in COOPERATIVE_EDITING.md.
 
 No multi-master. PostgreSQL judges every write.
 
 No map, no fleet, no routing. Those are examples 08, 13, 14. This one is about the merge.
 
-No offline seeding. All four editors seed at t = 0, online. The offline part is writes, which is the part the register model addresses.
+No offline seeding. All four editors seed at t = 0, online. The offline part is writes. With `register_cols`, a write queued offline is merged by PostgreSQL on arrival, so nothing another editor wrote meanwhile is lost; without it, the same write erases what it did not see (see Part B without `register_cols`).
 
-No server-side merge. The rebase is done by the library, following the rules the server stated. The server never sees a rebase as a new edit; it sees a fresh write.
+No server-side rebase. PostgreSQL refuses a write that lost on the row (`stale`), and the client rebases it: the library for part A's columns, the page for part B's registers. The rebase reaches the server as a fresh write. What PostgreSQL does do, in part B, is merge each write it accepts into the stored `doc` (`register_cols`).
 
 ## What it makes visible
 
