@@ -1038,6 +1038,11 @@ See [Replication slot management](#replication-slot-management) for details abou
       [--dir DIR]             …the directory holding nats-server.conf (default ./zb-nats)
       [--store PATH]          …the offline seeds (default DIR/operator.store; - reads standard input)
       [--js-domain NAME]      …add a domain to a running stack that has none (a first leaf); enrolled devices keep working
+
+  --init-nats --rotate-client-key  Replace the client signing key (ZB_SIGNING_SEED leaked):
+                              after a NATS reload, every client JWT the old key signed is
+                              refused, and devices renew on their own. Then restart the
+                              bridge. Takes --dir and --store like --update
   
   --init-sql      The init SQL for this database, on stdout (pipe it to psql). Reads
                   DATABASE_READER_URL, DATABASE_WRITER_URL, BRIDGE_CDC_PUBLICATION
@@ -1907,7 +1912,8 @@ sequenceDiagram
 
 - re-sign the account after a grammar change: `bridge --init-nats --update`;
 - mint the creds of a responder or a leaf: `--mint-responder`, `--mint-leaf`;
-- cut a revoked user off at NATS: `--revoke --conf` (it needs `OPERATOR_SEED`, from the store).
+- cut a revoked user off at NATS: `--revoke --conf` (it needs `OPERATOR_SEED`, from the store);
+- replace a leaked `ZB_SIGNING_SEED`: `--init-nats --rotate-client-key` (below).
 
 A trusted machine is any machine you control, your laptop for example, with the `bridge` binary and the two libraries it needs (`libpq5` and `libzstd1` on Debian). Run the command there, with `--store` pointing at the file, then copy what it wrote to the server: the updated `nats-server.conf`, or the new `.creds`. `--revoke` also needs to reach PostgreSQL (`ADMIN_DATABASE_URL`).
 
@@ -1923,7 +1929,16 @@ A trusted machine is any machine you control, your laptop for example, with the 
 
 - `--init-nats` writes the three secret files with mode `0600`. Keep it that way, and run the bridge under its own system user.
 - Never commit `zb-nats/`. This repository's `.gitignore` excludes it.
-- If `operator.store` leaks, anyone can sign an account: generate a new stack, and every device enrolls again. If `ZB_SIGNING_SEED` leaks, anyone can mint a client: the same today.
+- If `operator.store` leaks, anyone can sign an account: generate a new stack, and every device enrolls again.
+- If `ZB_SIGNING_SEED` leaks, anyone can make a client JWT for any user and any tenant. Replace the key, with `operator.store`:
+
+  ```sh
+  bridge --init-nats --rotate-client-key --dir /etc/zebridge --store /path/to/operator.store
+  nats-server --signal reload
+  systemctl restart zebridge   # the bridge must start with the new ZB_SIGNING_SEED
+  ```
+
+  It writes a new client signing key into the account, the store and `.env.nats`; the responder and service keys, the bridge's creds and the revocations stay. From the reload, NATS refuses every client JWT the old key signed, forged or genuine. A real device is refused once, renews on its own (`/renew` checks its device key, not its old JWT), and is back on a JWT from the new key: no new invite. Reload NATS and restart the bridge together: until the bridge has restarted, a device that renews gets a JWT from the old key and is refused again.
 
 **Services that answer queries (responders).** A responder is a service that keeps its own replica and answers the questions clients ask on `query.<tenant>.<name>` (for example, "points of interest near here"). **It reads like a client and never writes**. Give it its own creds, minted on the machine that holds `operator.store`, not on the bridge host. The command connects to nothing: a copy of the `bridge` binary runs it anywhere libpq and zstd are installed.
 

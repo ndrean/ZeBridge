@@ -31,6 +31,11 @@ const usage =
     \\      [--store PATH]          …the offline seeds (default DIR/operator.store; - reads standard input)
     \\      [--js-domain NAME]      …add a domain to a running stack that has none (a first leaf)
     \\
+    \\  --init-nats --rotate-client-key  Replace the client signing key (ZB_SIGNING_SEED leaked):
+    \\                              after a NATS reload, every client JWT the old key signed is
+    \\                              refused, and devices renew on their own. Then restart the
+    \\                              bridge. Takes --dir and --store like --update
+    \\
     \\  --init-sql      The init SQL for this database, on stdout (pipe it to psql). Reads
     \\                  DATABASE_READER_URL, DATABASE_WRITER_URL, BRIDGE_CDC_PUBLICATION
     \\

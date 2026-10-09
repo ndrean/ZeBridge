@@ -24,6 +24,11 @@
 //!   --update         after a grammar change: re-sign the account from operator.store
 //!                    with the same keys, templates re-derived, revocations kept. Only
 //!                    the account's preload line changes; issued creds stay valid.
+//!   --rotate-client-key  the same re-signing with a NEW client signing key, for a leaked
+//!                    ZB_SIGNING_SEED: after a reload NATS refuses every client JWT the old
+//!                    key signed, forged or genuine, and genuine devices renew at once
+//!                    (/renew proves the device key, not the old JWT). The responder and
+//!                    service keys, the bridge's creds and the revocations stay as they are.
 //!
 //! ⚠️ Never overwrites: an existing target file aborts the run (--force to override).
 //! Seeds are credentials; clobbering them silently would orphan a running system.
@@ -398,6 +403,8 @@ pub fn run(
     var js_domain: ?[]const u8 = null;
     // `--update [--store PATH]`: re-sign the account from the offline store (runUpdate).
     var update = false;
+    // `--rotate-client-key`: the same re-signing, with a new client signing key.
+    var rotate_client = false;
     var store_path: ?[]const u8 = null;
     // `--dir DIR` (§10kd): where the files live on THEIR host — written there, and the
     // absolute paths inside them (JetStream's store_dir, NATS_CREDS) point there. Run
@@ -418,7 +425,8 @@ pub fn run(
                 force = true;
             } else if (std.mem.eql(u8, arg, "--update")) {
                 update = true;
-
+            } else if (std.mem.eql(u8, arg, "--rotate-client-key")) {
+                rotate_client = true;
             } else if (std.mem.eql(u8, arg, "--store")) {
                 store_path = it.next() orelse return usageErr("--store needs a path");
             } else if (std.mem.eql(u8, arg, "--dir")) {
@@ -440,12 +448,17 @@ pub fn run(
             } else return usageErr("unknown argument");
         }
     }
+    if (rotate_client) {
+        if (update) return usageErr("--rotate-client-key and --update are two runs: update first");
+        if (js_domain != null) return usageErr("--rotate-client-key takes no --js-domain: add a domain with --update first");
+        return runUpdate(io, dir, store_path, null, true);
+    }
     if (update) {
         // `--js-domain` with `--update` ADDS a domain to a stack that has none (a leaf
         // joins a running deployment); changing one stays a new stack (runUpdate says so).
-        return runUpdate(io, dir, store_path, js_domain);
+        return runUpdate(io, dir, store_path, js_domain, false);
     }
-    if (store_path != null) return usageErr("--store goes with --update");
+    if (store_path != null) return usageErr("--store goes with --update or --rotate-client-key");
     if (nats_port == http_port or nats_port == ws_port or http_port == ws_port)
         return usageErr("--port, --http-port and --ws-port must differ");
 
@@ -868,7 +881,7 @@ fn readStore(io: std.Io, a: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 16));
 }
 
-fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[]const u8) u8 {
+fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[]const u8, rotate_client: bool) u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -896,7 +909,10 @@ fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[
             return 1;
         };
     }
-    const op_kp, const acct_kp, const sk_client, const sk_responder, const sk_service = keys;
+    const op_kp, const acct_kp, const old_client, const sk_responder, const sk_service = keys;
+    // A rotation swaps only the client key: the account drops the old one, so NATS refuses
+    // every user it signed once the server reloads.
+    const sk_client = if (rotate_client) genKey(io, .account) catch return 1 else old_client;
     var domain = storeValue(store, "JS_DOMAIN") orelse "";
     var env_line: ?[]const u8 = null; // NATS_JS_DOMAIN=… for .env.nats, when the domain is added
 
@@ -949,12 +965,13 @@ fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[
     const new_jwt = accountJwt(a, &topo, js_domain, now, &op_seed_kp, op_kp.public(), acct_kp.public(), sk_client.public(), sk_responder.public(), sk_service.public(), revocations) catch return 1;
 
     const new_claims = jwtClaims(a, new_jwt) orelse return 1;
-    if (std.mem.eql(u8, grantsOf(old_claims), grantsOf(new_claims))) {
+    if (!rotate_client and std.mem.eql(u8, grantsOf(old_claims), grantsOf(new_claims))) {
         out("✅ {s} already matches the grammar — nothing to update\n", .{conf_path});
         return 0;
     }
 
     const new_conf = std.mem.concat(a, u8, &.{ conf[0..jwt_start], new_jwt, conf[jwt_end..] }) catch return 1;
+    if (rotate_client) return finishRotation(io, a, dir, store_path, store, conf_path, new_conf, sk_client, revocations);
     writeFile(io, conf_path, new_conf, true) catch return 1;
     if (env_line != null) {
         // From standard input there is no file to write back: say the line to add.
@@ -987,6 +1004,61 @@ fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[
     } else {
         out("   Now reload the server:\n     nats-server --signal reload\n", .{});
     }
+    return 0;
+}
+
+/// The rotation's files, the store first: a conf naming a key that nobody kept would
+/// leave the bridge unable to mint, and the next rotation unable to find its own key.
+/// The new seed goes to the store and to .env.nats; when either is not a file here (the
+/// store read from standard input, .env.nats on another host), its line is printed on
+/// standard output for the operator to put in place, and the messages stay on stderr.
+fn finishRotation(
+    io: std.Io,
+    a: std.mem.Allocator,
+    dir: []const u8,
+    store_path: []const u8,
+    store: []const u8,
+    conf_path: []const u8,
+    new_conf: []const u8,
+    sk_client: KeyPair,
+    revocations: []const u8,
+) u8 {
+    var stdout_buf: [512]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
+    const from_stdin = std.mem.eql(u8, store_path, "-");
+    if (from_stdin) {
+        stdout.interface.print("SK_CLIENT_SEED={s}\n", .{sk_client.seed()}) catch return 1;
+    } else {
+        const new_store = setStoreValue(a, store, "SK_CLIENT_SEED", sk_client.seed()) catch return 1;
+        writeSecret(io, store_path, new_store, true) catch return 1;
+    }
+    writeFile(io, conf_path, new_conf, true) catch return 1;
+
+    const env_path = std.Io.Dir.path.join(a, &.{ dir, ".env.nats" }) catch return 1;
+    var env_written = false;
+    if (std.Io.Dir.cwd().readFileAlloc(io, env_path, a, .limited(1 << 16))) |env| {
+        const new_env = setStoreValue(a, env, "ZB_SIGNING_SEED", sk_client.seed()) catch return 1;
+        writeSecret(io, env_path, new_env, true) catch return 1;
+        env_written = true;
+    } else |_| {
+        stdout.interface.print("ZB_SIGNING_SEED={s}\n", .{sk_client.seed()}) catch return 1;
+    }
+    stdout.interface.flush() catch return 1;
+
+    out(
+        \\✅ client signing key replaced ({s})
+        \\   new key {s}; the responder and service keys, the bridge's creds and the revocations ({s}) are unchanged
+        \\
+    , .{ conf_path, sk_client.public(), if (revocations.len == 0) "none" else "kept" });
+    if (from_stdin) out("   ⚠️  put the SK_CLIENT_SEED line printed above in your copy of the store\n", .{});
+    if (env_written) {
+        out("   {s}: ZB_SIGNING_SEED replaced\n", .{env_path});
+    } else out("   ⚠️  {s} not found here: set the ZB_SIGNING_SEED line printed above in the bridge's environment\n", .{env_path});
+    out(
+        \\   Then, together: reload NATS (nats-server --signal reload) and restart the bridge.
+        \\   From the reload, NATS refuses every client JWT the old key signed; devices renew at once.
+        \\
+    , .{});
     return 0;
 }
 
@@ -1135,6 +1207,37 @@ test "an update keeps the store's keys and carries the revocations over" {
     const hub = try accountJwt(aa, &owned.topology, "hub", 3, &op_skp, op.public(), acct.public(), sk.public(), sk.public(), sk.public(), "");
     try std.testing.expect(!std.mem.eql(u8, grantsOf(first_claims), grantsOf(jwtClaims(aa, hub).?)));
     try std.testing.expectEqualStrings("", revocationsOf(jwtClaims(aa, hub).?));
+}
+
+test "a client-key rotation swaps that key only, and keeps the revocations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const owned = try topology_mod.loadEmbedded(aa);
+    const io = std.testing.io;
+    const op = try genKey(io, .operator);
+    const acct = try genKey(io, .account);
+    const old_client = try genKey(io, .account);
+    const new_client = try genKey(io, .account);
+    const responder = try genKey(io, .account);
+    const service = try genKey(io, .account);
+    var op_skp = try nats.nkeys.SeedKeyPair.fromSeed(op.seed());
+    defer op_skp.wipe();
+    const revoked = "\"revocations\":{\"UABC\":1700000000},";
+
+    const before = jwtClaims(aa, try accountJwt(aa, &owned.topology, null, 1, &op_skp, op.public(), acct.public(), old_client.public(), responder.public(), service.public(), revoked)).?;
+    const after = jwtClaims(aa, try accountJwt(aa, &owned.topology, null, 2, &op_skp, op.public(), acct.public(), new_client.public(), responder.public(), service.public(), revocationsOf(before))).?;
+
+    try std.testing.expect(std.mem.find(u8, after, old_client.public()) == null);
+    try std.testing.expect(std.mem.find(u8, after, new_client.public()) != null);
+    try std.testing.expect(std.mem.find(u8, after, responder.public()) != null);
+    try std.testing.expect(std.mem.find(u8, after, service.public()) != null);
+    try std.testing.expectEqualStrings(revoked, revocationsOf(after));
+    // The store's line moves to the new seed; the rest of the store is left alone.
+    const store = try std.fmt.allocPrint(aa, "OPERATOR_SEED={s}\nSK_CLIENT_SEED={s}\n", .{ op.seed(), old_client.seed() });
+    const rotated = try setStoreValue(aa, store, "SK_CLIENT_SEED", new_client.seed());
+    try std.testing.expectEqualStrings(new_client.seed(), storeValue(rotated, "SK_CLIENT_SEED").?);
+    try std.testing.expectEqualStrings(op.seed(), storeValue(rotated, "OPERATOR_SEED").?);
 }
 
 /// `bridge --mint-responder --name N [--tenant T]… [--store PATH] [--ttl-days D]`

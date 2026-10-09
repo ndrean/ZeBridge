@@ -13,6 +13,11 @@ libzb device and a zb-client-ts device (Node) enroll, then:
   C. both close; their offset is pushed 2 h BEHIND, and their JWT is left to expire.
      On reopen the device thinks nothing is due, NATS refuses the expired JWT, the
      device renews anyway (and corrects its stamp the same way), and connects.
+  D. the client signing key is rotated (`--init-nats --rotate-client-key`, as after a
+     leaked ZB_SIGNING_SEED), NATS reloads, the bridge restarts with the new seed. Both
+     devices reopen with a JWT that is still valid in time but signed by the old key:
+     NATS refuses it, the device renews, and its new JWT is signed by the new key. No
+     invite, nothing done on the device.
 
 The devices run on this machine, so their true offset is about 0: what B and C break is
 the device's stored estimate, the same state a real clock change leaves.
@@ -24,12 +29,14 @@ import ctypes
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
 import time
 import uuid
 
+import nkeys
 import zb
 from multi_bridge import BRIDGE, NATS_URL, lib, start_stack, take, wait_log
 
@@ -79,9 +86,13 @@ def jwt_of(db: str) -> str:
     return identity(db)["creds"].split("\n")[1]
 
 
-def exp_of(db: str) -> int:
+def claims_of(db: str) -> dict:
     payload = jwt_of(db).split(".")[1]
-    return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))["exp"]
+    return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+
+
+def exp_of(db: str) -> int:
+    return claims_of(db)["exp"]
 
 
 def shift_offset(db: str, by: int):
@@ -212,6 +223,38 @@ def main() -> int:
         r = node(ts_db, None, 1)
         check("C. zb-client-ts", r.get("connected") is True and jwt_of(ts_db) != before[1],
               f"the same, renewed and connected ({r.get('error') or 'ok'})")
+
+        # ── D. the client signing key rotated: the devices renew onto the new key ──
+        gen = os.path.join(tmp, "zb-nats")
+        r = subprocess.run([str(BRIDGE), "--init-nats", "--rotate-client-key", "--dir", gen],
+                           capture_output=True, text=True)
+        new_seed = next((l.split("=", 1)[1] for l in open(os.path.join(gen, "." + "env.nats")).read().splitlines()
+                         if l.startswith("ZB_SIGNING_SEED=")), "")
+        new_key = nkeys.from_seed(new_seed.encode()).public_key.decode() if new_seed else ""
+        old_key = claims_of(lib_db)["iss"]
+        check("D. rotation", r.returncode == 0 and new_seed != genv["ZB_SIGNING_SEED"] and new_key != old_key,
+              f"a new client signing key ({(r.stderr.strip().splitlines() or ['?'])[0]})")
+        ns.send_signal(signal.SIGHUP)
+        bridge.terminate()
+        bridge.wait(timeout=15)
+        blog2 = os.path.join(tmp, "bridge2.log")
+        env["ZB_SIGNING_SEED"] = new_seed
+        bridge = subprocess.Popen([str(BRIDGE), "--pub", PUB, "--slot", SLOT, "--port", str(PORT)],
+                                  env=env, stdout=subprocess.DEVNULL, stderr=open(blog2, "w"))
+        if not wait_log(blog2, "enrollment endpoint armed", 60):
+            zb.bad("the probe bridge did not restart")
+            return 1
+        before = (jwt_of(lib_db), jwt_of(ts_db))
+        h = lib_open(lib_db, None)
+        check("D. libzb", h != 0 and jwt_of(lib_db) != before[0] and claims_of(lib_db)["iss"] == new_key,
+              f"its JWT from the old key refused, renewed, connected on a JWT from the new key "
+              f"({(lib.zb_last_error() or b'').decode() or 'ok'})")
+        if h:
+            lib.zb_client_close(h)
+            h = 0
+        r = node(ts_db, None, 1)
+        check("D. zb-client-ts", r.get("connected") is True and jwt_of(ts_db) != before[1] and claims_of(ts_db)["iss"] == new_key,
+              f"the same, on the new key ({r.get('error') or 'ok'})")
     finally:
         if h:
             lib.zb_client_close(h)
