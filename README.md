@@ -1,5 +1,5 @@
 
-# ZeBridge - Sync PostgreSQL locally
+# ZeBridge - an offline-first PostgreSQL replica for the edge, over NATS
 
 <p align="center">
 <img width="400" height="400" alt="zebridge-logo" src="https://github.com/user-attachments/assets/3b0b7c42-a94b-45ff-a9d7-274fdf26132c" />
@@ -101,7 +101,7 @@ To start again from scratch: `docker compose -f docker-compose.quickstart.yml do
 
 ## Table of Contents
 
-- [ZeBridge - Sync PostgreSQL locally](#zebridge---sync-postgresql-locally)
+- [ZeBridge - an offline-first PostgreSQL replica for the edge, over NATS](#zebridge---an-offline-first-postgresql-replica-for-the-edge-over-nats)
   - [Table of Contents](#table-of-contents)
   - [Overview](#overview)
   - [Three pillars](#three-pillars)
@@ -208,6 +208,8 @@ To start again from scratch: `docker compose -f docker-compose.quickstart.yml do
 
 ## Overview
 
+**Naming**: the product is ZeBridge; its binary is `bridge` (and `bridge_sweeper`); its SQL objects are `zebridge_*`; its client libraries are `zb-client-ts` (TypeScript) and `libzb` (C ABI), with bindings named `zb-*`.
+
 **How does it work?**: three components, a daemon, a sweeper and a client library.
 
 - the daemon `ZeBridge` (ZB): a Zig executable with a bi-directional  connection to PostgreSQL (PG) and to NATS/JetStream (NATS). It publishes the schemas, cuts table snapshots that clients seed from, and streams PG changes onto NATS. It applies the writes coming back from consumers to the primary, within their tenants.
@@ -259,7 +261,7 @@ Bindings exist for Python, Kotlin (Android), Dart/Flutter and React Native. See 
 
 - **Schema translation**: replicas are built from PostgreSQL's schemas: as is for PGlite, translated for SQLite, with `STRICT` tables.
 - **PostGIS and pgvector ready**: support of `PostGIS` (binary EWKB as BLOB) and `pgvector` types out of the box.
-- **Anti-client flood**: writes per client are limited in backlog, on by default (`MUTATION_BACKLOG_PER_PRINCIPAL`, 5,000 queued writes: past it, that client's new writes are refused, and nothing already queued is evicted), and optionally in rate (`MUTATION_RATE_PER_PRINCIPAL`, off by default: over the rate, writes are delayed, not dropped).
+- **Anti-client flood**: writes per client are limited in backlog, on by default (`MUTATION_BACKLOG_PER_PRINCIPAL`, 5,000 queued writes: past it, that client's new writes are refused, and nothing already queued is evicted), and optionally in rate (`MUTATION_RATE_PER_PRINCIPAL`, off by default: over the rate, writes are delayed, not dropped). A delayed write changes nothing for `mutate()`, which returns at once: the write waits in the queue, `pending()` still counts it, and its verdict comes later. The backlog limit is set when the bridge first creates the MUTATIONS stream: change it on a fresh deployment, or edit the stream with `nats stream edit`.
 - **Observability**: Prometheus metrics on `/metrics` and log lines with a level and a scope that Loki can label, with ready-made Grafana dashboards. The bridge serves the PostgreSQL metrics too (slots, connections, table sizes), so no PostgreSQL exporter is needed.
 See [OBSERVABILITY_TELEMETRY](OBSERVABILITY_TELEMETRY.md).
   
@@ -765,7 +767,7 @@ Two choices decide how a table travels: whether clients write to it, and whether
 | Write | updated_at | **timestamptz**  (3) | ✚ `zebridge_enable(version_col => 'updated_at')`, or your own column name |
 | Write | deleted_at | **timestamptz** | soft-deleted ✚ `zebridge_enable(tombstone_col => 'deleted_at')`, or your own column name |
 | Write | last_writer | text | `zebridge_enable(tiebreak_col => 'last_writer')`, or your own column name |
-| Write | doc | **jsonb** of registers `{v, t, w}` | optional ✚ `zebridge_enable(register_cols => ARRAY['doc'])`: PostgreSQL merges each accepted write field by field ([COOPERATIVE_EDITING](COOPERATIVE_EDITING.md)) |
+| Write | doc | **jsonb** of registers `{v, t, w}` | optional ✚ `zebridge_enable(register_cols => ARRAY['doc'])`: PostgreSQL merges each accepted write register by register ([COOPERATIVE_EDITING](COOPERATIVE_EDITING.md)) |
 
 (1) _in a writable table, a client mints its own keys offline, so a writable table's key must be **client-generable** — a `uuid-v7` (time-ordered), NOT a `bigserial` that the database hands out (an edge write to a sequence key would collide with the server's next insert, so the bridge refuses it)_.
 
@@ -799,6 +801,8 @@ For example, two public tables and a tenant scoped one:
 #### Private Columns on Tables
 
 Publish only some columns with `zebridge_enable(..., columns => ARRAY['id', 'title', …])`: see _Columns that never travel_ above. The column list applies to **every tenant**.
+
+The column list also decides what a client may **write**: a write that names a column left out is refused like an unknown column (`rejected`, `UnknownColumn`), so a column the replicas cannot see is the server's alone. Only this bridge's publication counts, never another one naming the table. `register_cols` is independent of the list: a register column left out is merged when the server writes it, and clients cannot write it.
 
 #### Types
 
@@ -913,8 +917,8 @@ When several people edit the same row at the same time (a shared route, a form, 
 
 | key | required | what it must be |
 | --- | --- | --- |
-| `t` | **yes** | when the value was written: RFC 3339, UTC, ending in `Z`, with **exactly six fractional digits** (`2026-09-20T06:20:26.474000Z`). The library compares it **as text**, which matches time order only at this fixed width: `…26.474Z` sorts after `…26.474000Z`. A register with no `t` counts as the oldest and loses every race. |
-| `w` | **yes** | who wrote it: stable and unique per editor (`phone-omar`, `browser-alice`). It breaks a tie on equal `t`, so two editors sharing a `w` can disagree about the winner. The principal alone is not enough when one person has two editors open. |
+| `t` | **yes** | when the value was written: RFC 3339, UTC, ending in `Z`, with **exactly six fractional digits** (`2026-09-20T06:20:26.474000Z`). The library compares it **as text**, which matches time order only at this fixed width: `…26.474Z` sorts after `…26.474000Z`. A register with no `t` counts as the oldest and loses every race. `stamp()` gives it: a hybrid logical clock, the bridge's time as the device estimates it, and one microsecond more when that is not ahead of the newest stamp seen. Two devices can still produce the same `t`; `w` breaks the tie. |
+| `w` | **yes** | who wrote it: stable and unique per editor (`phone-omar`, `browser-alice`). It breaks a tie on equal `t` (the greater `w` wins); on equal `t` and `w`, `mergeRegisters(a, b)` keeps `a`, the document already held. Two editors sharing a `w` can therefore disagree about the winner. The principal alone is not enough when one person has two editors open. |
 | `v` | by convention | your value, any JSON. The library never looks inside it; it copies the winning register whole. |
 
 The document itself must be a **flat map**: its keys are the fields your app edits independently (`start`, `end`), and each value is one register. The column name (`doc` here) is yours to choose.
@@ -1061,6 +1065,7 @@ See [Replication slot management](#replication-slot-management) for details abou
                   Creds for a responder service, on stdout, signed from operator.store
   --mint-leaf --name NAME [--store PATH] [--ttl-days D]
                   Creds for a leaf node's remote, on stdout: what its clients may carry
+                  --ttl-days: both default to 3650 (ten years): replaced with a redeploy
                   --store - reads the store from standard input (a password manager's pipe):
                   the seeds never touch this host's disk
   --revoke <principal>  Revoke: mapping + unused invites, three-clock narration.
@@ -1072,9 +1077,10 @@ See [Replication slot management](#replication-slot-management) for details abou
                               and identity: at once if connected, when they renew
                               otherwise. Best-effort: offline for good keeps its data
 
-  --revoke --key U… --conf PATH  Revoke one user key, no database: a minted identity
-                  (the `user key` a mint printed) or leaked creds. OPERATOR_SEED and
-                  ZB_ACCOUNT_PUB; the account's revocations only grow
+  --revoke --key U… --conf PATH  Revoke one user key: a minted identity (the `user key`
+                  a mint printed) or leaked creds. OPERATOR_SEED and ZB_ACCOUNT_PUB; the
+                  account's revocations only grow. With ADMIN_DATABASE_URL, an enrolled
+                  device's key is also marked in PostgreSQL, so /renew refuses it
   --view-slots    Every replication slot on the server: active, pid, LSNs, retained WAL
   --view-slot <slot>  The same for one slot
   --drop-slot <slot>  Drop an INACTIVE slot (frees its retained WAL). Needs
@@ -1342,7 +1348,7 @@ One rule covers almost everything:
 | change | what's needed |
 | --- | --- |
 | ✚ new table <br> (public or tenant-scoped) | ❗️ `zebridge_enable(...)` migration, <br> **no restart** — the bridge sees the catalogue row in the WAL, reloads its rules, reconciles CDC_PUBLIC's subjects, lifts the table's refusal and publishes its schema; the sweeper reaps its tombstones from its next pass. No env edit, no stream edit by hand. |
-| changed _rule_ on an existing table (version / tombstone / tiebreak / tenant column) | ❗️re-run `zebridge_enable`, <br> **no restart** — same path (the write path re-reads the catalogue on the same signal; the sweeper reads it at the start of every pass) |
+| changed _rule_ on an existing table (version / tombstone / tiebreak / tenant column, `register_cols`) | ❗️re-run `zebridge_enable`, <br> **no restart** — same path (the write path re-reads the catalogue on the same signal; the sweeper reads it at the start of every pass) |
 | ✚ new tenant | **nothing** — a tenant is born with its first mapping (an invite redeemed, or an INSERT into `zebridge_user_tenants`): the bridge creates `CDC_<tenant>` on the spot, the producer its `gen-<tenant>` store on the first row, and the JWT's `tenant` tag carries the grants (the role's template, no server change) |
 | ✚ new user on an existing tenant | **nothing** — an invite (or an INSERT into `zebridge_user_tenants`); the JWT carries the tenant tag |
 | generations on/off, tenant growth, invites, enrollment | **nothing** — the producer and the mint read the database per tick/request |
@@ -1454,9 +1460,10 @@ Once you call `connect()`, it subscribes, receives, applies and fires your callb
 import { ZeBridge, NotEnrolled, RevokedPurge } from 'zb-client-ts';   // the bundler picks the browser or the Node entry
 ```
 
-- `connect()` throws `NotEnrolled` when this device has no stored identity and was given no invite (show the "open your invite link" screen), and `RevokedPurge` when the principal was revoked with `--purge` (its local data is gone).
+- `connect()` throws `NotEnrolled` when this device has no stored identity and was given no invite (show the "open your invite link" screen), and `RevokedPurge` when the principal was revoked with `--purge` (its local data is gone). A plain revoke has no class of its own: a connected client sets `zb.revoked` and hangs up, and a later `connect()` throws an `Error` ("renew: refused…"); the local rows stay until the app calls `wipe()`.
+- Without an invite, in `dev` mode, the client names itself: `new ZeBridge({ natsUrl, principal, tables })` ([Development](#development)).
 - `onStatus(cb)` reports `connected`, `connecting` or `disconnected`; with `pending()`, that is an offline indicator. Every `on…` returns a function that unsubscribes.
-- `zb.principal` and `zb.tenant` name who this client is and the tenant it writes to.
+- `zb.principal` is who this client is; `zb.tenant` the tenant it follows and writes to. A principal can belong to several tenants: zb-client-ts follows the first and logs the others, while libzb follows them all (`tenants` in `zb_client_sync`'s report, `zb_client_join` / `zb_client_leave`).
 - The WebAssembly core is loaded with `new URL('../wasm/zb_core.wasm', import.meta.url)`, so Vite and the other bundlers ship it as an asset with no configuration.
 
 Storage, zstd and the NATS dial come from the platform: better-sqlite3 and TCP on Node, sqlite-wasm on OPFS and WebSocket in the browser. The replica lives at `dbPath`, by default `zebridge_<principal>.sqlite3`, kept across reloads — which is what an outbox needs: a write queued while the socket was down must still be there after the page comes back. A fresh name per load (`` dbPath: `zebridge_${Date.now()}.sqlite3` ``) is a clean room for a dev loop. `engine` defaults to SQLite; `'pglite'` (browser and Node) loads PostgreSQL-in-process on demand, and a SQLite consumer never downloads it. libzb takes the same options, except `engine`: `'sqlite'` or `'duckdb'` there (CLIENTS.md).
@@ -1524,7 +1531,7 @@ An event looks like:
 }
 ```
 
-💡 Two things to know when writing a handler. The same row rings twice for your own writes: once for the optimistic apply (`optimistic: true`), once for the CDC echo, so an **INSERT handler must upsert**, never append blindly. And on a table that keeps tombstones, a delete arrives as an UPDATE whose tombstone column is set: treat that as the delete it is.
+💡 Two things to know when writing a handler. The same row rings twice for your own writes: once for the optimistic apply (`optimistic: true`), once for the CDC echo, so an **INSERT handler must upsert**, never append blindly. With `register_cols` there is no third event: the echo already carries the document PostgreSQL merged. And on a table that keeps tombstones, a delete arrives as an UPDATE whose tombstone column is set: treat that as the delete it is.
 
 Write one callback per table: patch your state from `ev.data`, or re-read the table when there is no event. The example in _App.tsx_ uses `SolidJS`:
 
@@ -1559,7 +1566,7 @@ zb.onVerdict(({ version, outcome, columns, lostColumns }) => {
 });
 ```
 
-`columns` are the columns this write changed. `lostColumns`, on a `lost` outcome, are the ones among them that a newer row had already changed. `reason`, on a `rejected` outcome, says why (`PredatesGcWatermark`, `KeyChange`…).
+`columns` are the columns this write changed. `lostColumns`, on a `lost` outcome, are the ones among them that a newer row had already changed. `reason`, on a `rejected` outcome, names the bridge's error (`PredatesGcWatermark`, `KeyChange`…). The full list of `reason`s is in [PROTOCOL](PROTOCOL.md#when-it-is-refused). When PostgreSQL itself refused the write, `sqlstate` and `detail` carry its code and message: `22023` is a malformed register document, `42501` a row-level-security refusal. Branch on `sqlstate`, not on `reason`, which reads the same for both (both libraries: `onVerdict` in TypeScript, the poll report's `outcomes` in libzb).
 
 Two more for cooperative editing ([COOPERATIVE_EDITING](COOPERATIVE_EDITING.md)): `stamp()`, a register's time on the bridge's clock, and `mergeRegisters(a, b)`, imported. The whole set, used on one page: [example 15's survival kit](examples/15-shared-record/README.md#the-ts-client-survival-kit).
 
@@ -1597,10 +1604,14 @@ reason is the C ABI, not a choice:
 | delete the local replica | `wipe()` | `zb_client_wipe(h)` |
 | stop | `close()` | `zb_client_close(h)` |
 
+`version` and `msgId` are two keys for the same write. The version is the stamp PostgreSQL compares (last-writer-wins). The `msgId` identifies the message: built from this client's id, the table, the key and that version, it is what NATS deduplicates on. Each library returns the one it matches outcomes on.
+
 C-only by necessity: `zb_free` (no GC), `zb_abi_version`, and `zb_client_live` (open
 handles in this process — a leak check for tests, and not to be confused with
 `zb_client_revoked`).
-Beside them: `zb_call(fn, args_json)` (a pure rule of the library's core, no handle: `mergeRegisters` for [cooperative editing](COOPERATIVE_EDITING.md), the one every binding uses), `zb_client_mutate_at` (a write with the caller's own version stamp; `mutate(…, { version })` in TypeScript), `zb_client_stamp` (a register stamp on the bridge's clock, for [cooperative editing](COOPERATIVE_EDITING.md); `stamp()` in TypeScript), `zb_client_wake` (see below), `zb_client_join` and `zb_client_leave` (follow one more tenant, or stop; libzb only), `zb_grammar_hash` and `zb_grammar_json` (what this build of the library speaks).
+Beside them: `zb_call(fn, args_json)` (a pure rule of the library's core, no handle: `mergeRegisters` for [cooperative editing](COOPERATIVE_EDITING.md), the one every binding uses), `zb_client_mutate_at` (a write with the caller's own version stamp; `mutate(…, { version })` in TypeScript), `zb_client_stamp` (a register stamp on the bridge's clock, for [cooperative editing](COOPERATIVE_EDITING.md); `stamp()` in TypeScript), `zb_client_wake` (see below), `zb_client_join` and `zb_client_leave` (follow one more tenant, or stop; libzb only), `zb_grammar_hash` and `zb_grammar_json` (what this build of the library speaks). A minimal binding needs the eight functions of the first table and `zb_free`; the rest are optional.
+
+**Responder mode**: a service that answers questions over NATS calls `zb_client_serve` once; the questions then arrive in the poll report's `requests`, and the host answers each with `zb_client_reply`. `zb_client_request` asks such a service, and `zb_client_ingest` absorbs rows the host already has. Details: [CLIENTS](CLIENTS.md).
 
 **How data crosses.** Everything is a C string of JSON, in and out, so a binding is three declarations in any language with an FFI. One value is not JSON-shaped: a BLOB column (`bytea`, a PostGIS geometry) comes back from `zb_client_query` as `{"$bin": "<base64>"}` and is written the same way in a mutation's values. Two ownership rules make it safe:
 
@@ -1743,6 +1754,8 @@ The decoder reads every type in the [Types](#types) table, and enums as their te
 #### At-Least-Once Delivery
 
 The full mechanism — bridge ACKs Postgres only after JetStream confirms, what happens if the bridge crashes, what happens if NATS crashes — is covered in [The main loop PG/ZB/NATS](#the-main-loop-pgzbnats). The guarantee: no data loss between Postgres and NATS, because the ACK to Postgres only happens after JetStream has durably persisted the message, and JetStream's Msg-ID deduplication absorbs any retry.
+
+The write path is the mirror image. The bridge ACKs a client's write on MUTATIONS only after PostgreSQL commits it. If the bridge stops between the two, JetStream delivers the write again; the bridge sees the row already carries that write's version and answers `accepted` again, so nothing applies twice. A client that publishes the same write twice is deduplicated by NATS on its `msgId` (the `Nats-Msg-Id`).
 
 #### Zero-Consumer Protection & Storage Bounds
 
@@ -1957,7 +1970,7 @@ A **trusted machine** is any machine you control, your laptop for example, with 
   systemctl restart zebridge   # the bridge must start with the new ZB_SIGNING_SEED
   ```
 
-  It writes a new client signing key into the account, the store and `.env.nats`; the responder and service keys, the bridge's creds and the revocations stay. From the reload, NATS refuses every client JWT the old key signed, forged or genuine. A real device is refused once, renews on its own (`/renew` checks its device key, not its old JWT), and is back on a JWT from the new key: no new invite. Reload NATS and restart the bridge together: until the bridge has restarted, a device that renews gets a JWT from the old key and is refused again.
+  It writes a new client signing key into the account, the store and `.env.nats`; the responder and service keys, the bridge's creds and the revocations stay. From the reload, NATS refuses every client JWT the old key signed, forged or genuine. The old client signing key is removed from the account. A real device is refused once, renews on its own, and is back on a JWT from the new key: no new invite. `/renew` still works because the device signs it with its own key, not with the client signing key, and the bridge checks it against the key on record. Reload NATS and restart the bridge together: until the bridge has restarted, a device that renews gets a JWT from the old key and is refused again.
 
 **Services that answer queries (responders).** A responder is a service that keeps its own replica and answers the questions clients ask on `query.<tenant>.<name>` (for example, "points of interest near here"). **It reads like a client and never writes**. Give it its own creds, minted on the machine that holds `operator.store`, not on the bridge host. The command connects to nothing: a copy of the `bridge` binary runs it anywhere libpq and zstd are installed.
 
@@ -1976,7 +1989,7 @@ bridge --init-nats --update --dir /etc/zebridge --store /path/to/operator.store
 nats-server --signal reload
 ```
 
-It re-signs the account with the same keys, with the templates re-derived and the revocations kept, and rewrites only the account's line in `nats-server.conf`. Every issued JWT stays valid, so no device needs a new invite. Use a reload, not a restart: a reload keeps every connection open, while a restart also applies the change but drops every client, and they all reconnect at once.
+It re-signs the account with the same keys, with the templates re-derived and the revocations kept, and rewrites only the account's line in `nats-server.conf`. Every issued JWT stays valid, so no device needs a new invite. The grants live in the account, not in the clients' JWTs, so a client gets a new subject at its next connection, without renewing. Use a reload, not a restart: a reload keeps every connection open, while a restart also applies the change but drops every client, and they all reconnect at once.
 
 #### 2. Onboard a device
 
@@ -2123,6 +2136,8 @@ ADMIN_DATABASE_URL=postgres://… \
 # if you have a hub, isolate the server PID
 nats-server --signal reload[=/var/run/nats-server.pid]
 ```
+
+⚠️ `bridge --revoke --key U…` adds one key to NATS's revocation list. NATS refuses the JWTs issued up to the revocation, not after it, and an enrolled device would renew. So for an enrolled device's key, pass `ADMIN_DATABASE_URL` too: the key is then also marked in PostgreSQL, and `/renew` refuses it. The principal's other devices keep working; a new device for it needs a new principal, as after any revocation. Identities minted offline (`--mint-responder`, `--mint-leaf`) never renew and need no database.
 
 Without `--purge`, the rows already on a device stay there until the app calls `wipe()` (`zb_client_wipe` in libzb). With `--purge`, the libraries delete them themselves. The promise holds only for a device that reconnects: one that never comes back keeps its data, and a modified client can ignore the instruction. It protects against lost or handed-on devices running the real app, not against someone who already copied the database file.
 
@@ -2396,6 +2411,8 @@ A **base** — the live rows only, since a client applies it as a wipe and a rel
 
 A client that was away applies the deltas cut after its watermark when the oldest of them begins at or before it, so the chain continues from where the replica stands; when no kept delta reaches that far back, it applies the checkpoints that cover the absence and then those deltas; and it reloads the base only when nothing covers the absence, or when its watermark is older than the sweeper's `gc_watermark` — past that, a delete it missed may have had its tombstone reaped, and only a base states absence. Either way it then resumes the stream at the sequence recorded in the manifest.
 
+The `gc_watermark` is the sweeper's marker (the one row of `zebridge_gc_watermark`): no tombstone older than it is guaranteed to still exist. The client reads it from the chain's manifest, since its own copy is as old as the client.
+
 #### The one rule
 
 That resume works only if the stream still holds the manifest's cut. The newest cut is at most one cadence old, so the stream must keep at least **two cadences** of events, plus the time a build takes and the time a client needs to apply it. `CDC_MAX_AGE_SECONDS` defaults to three cadences, and `bridge --diagnose` refuses less than two. The producer builds one table for one tenant at a time and walks every such pair in turn, so a tick costs the sum. Measured on a laptop over local TCP, one pair:
@@ -2615,7 +2632,7 @@ The app passes that code to the library once, with the bridge's URL: [Onboard a 
 
 A leaf node is a second `nats-server` close to a group of devices. It has no JetStream of its own: the devices' stream calls cross to the hub's JetStream through a **domain**, and their writes and questions cross like any other message. The hub keeps the only copy of the streams; the leaf shortens the devices' path to it.
 
-1. **Give the hub a domain.** A new stack: `bridge --init-nats operator --js-domain hub`. A running one: `bridge --init-nats --update --dir /etc/zebridge --js-domain hub`, then restart NATS and the bridge. The grants then allow both `$JS.API.` and `$JS.hub.API.`, and `/enroll` hands `js_domain` to every device. Devices enrolled before keep working on the hub.
+1. **Give the hub a domain.** A new stack: `bridge --init-nats operator --js-domain hub`. A running one: `bridge --init-nats --update --dir /etc/zebridge --js-domain hub`, then restart NATS and the bridge. The grants then allow both `$JS.API.` and `$JS.hub.API.`, and `/enroll` hands `js_domain` to every device. Devices enrolled before keep working on the hub, and receive the domain at their next renewal (within a quarter of the JWT's life), after which they can use a leaf too.
 
 2. **Open the hub to leaves.** In the hub's `nats-server.conf`, then restart NATS:
 
@@ -2660,7 +2677,7 @@ A leaf node is a second `nats-server` close to a group of devices. It has no Jet
    }
    ```
 
-   The creds file must be readable by the user `nats-server` runs as. Both servers log `Leafnode connection created`.
+   The creds file must be readable by the user `nats-server` runs as. Both servers log `Leafnode connection created`. The `tls` files are a certificate from a public authority, Let's Encrypt for example (`leaf.yml` gets one with certbot): a self-signed pair works only if every client is given its CA.
 
 5. **Point the devices at the leaf.** A device still enrolls at the hub's bridge; only its NATS address changes: `natsUrl` is `tls://leaf.example.com:4222`, or `wss://leaf.example.com:8443` in a browser. The `js_domain` from its enrollment carries its stream calls across the leaf.
 
