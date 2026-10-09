@@ -78,7 +78,7 @@ SELECT * FROM zebridge_enable('public.routes'::regclass,
 * **The version column is required** and does the work it always does. It is what makes a write `stale`, which is the signal to merge.
 * **`register_cols` names the register columns.** With it, PostgreSQL merges each accepted write into the stored document, register by register (`zebridge_merge_registers`, called by a `BEFORE INSERT OR UPDATE` trigger), so a write can only add or advance registers. A refused (`stale`) write never reaches the trigger. To remove a register, write it again with a newer `t` and `v` set to `null`.
 * **The column must hold a JSON object of registers, or `NULL`.** Anything else (an array, a string) is refused with SQLSTATE `22023`, and the write comes back `rejected`, with `sqlstate` and `detail`.
-* **Without `register_cols`**, an accepted write replaces the whole document with what its writer last saw: a late write from an editor who was offline rolls back what others wrote meanwhile, and no verdict says so. Like every option of `zebridge_enable`, it is declared on each call: a call without it removes the merge. Example 08's route runs this way, with the merge loop below in the app; example 15 shows [the difference](examples/15-shared-record/README.md#part-b-without-register_cols).
+* **Without `register_cols`**, an accepted write replaces the whole document with what its writer last saw: a late write from an editor who was offline rolls back what others wrote meanwhile, and no verdict says so. Like every option of `zebridge_enable`, it is declared on each call: a call without it removes the merge. [Example 15](examples/15-shared-record/README.md#part-b-without-register_cols) shows the difference live.
 
 ## The document: what is NOT yours
 

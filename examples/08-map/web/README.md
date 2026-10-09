@@ -27,14 +27,15 @@ holds the answer for as long as it draws it. Measured here: 25 stations within 6
 73 ms in the service, 80 ms round trip. Pick a fuel, then pan: it asks again.
 
 **The shared route is a ROW.** `routes.doc` is a jsonb map of registers — `start` and
-`end`, each carrying a value, its writer's stamp and its writer's name — replicated
+`end`, each carrying a value, its writer's stamp (`zb.stamp()`, the bridge's time as the device estimates it) and its writer's name — replicated
 into this browser's OPFS SQLite like any table and written with `mutate`. Turn the
 route on and click twice; the pins are drawn from the ROW as CDC delivers it, never
 from the click, so what is on screen is what the row holds, whoever moved it last. Two
 editors converge because each ships the union of its own registers merged into the
 document it last saw (`mergeRegisters`, the library's own rule, the same one libzb
 gives the phone), and reconciles until the row contains what it wrote. The row
-underneath is ordinary last-write-wins. [COOPERATIVE_EDITING.md](../../../COOPERATIVE_EDITING.md)
+underneath is ordinary last-write-wins, and PostgreSQL merges each accepted write into the
+stored document (`register_cols`), so a late write cannot erase the other end. [COOPERATIVE_EDITING.md](../../../COOPERATIVE_EDITING.md)
 explains the construction; `scripts/scenarios/route_crdt.py` asserts the same war between
 two libzb clients.
 

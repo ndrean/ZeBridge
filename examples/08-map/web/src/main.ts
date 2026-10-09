@@ -193,8 +193,9 @@ const routeMine: Record<string, any> = {};   // this browser's own registers, sh
 let routeSelected: 'start' | 'end' | null = null;
 let routeRounds = 0;
 
-/// The stamp every editor orders the same way: RFC 3339 UTC, six fractional digits.
-const stamp = () => new Date().toISOString().replace('Z', '000Z');
+/// A register's stamp: the bridge's time as this device estimates it, never behind what
+/// this replica has seen (RFC 3339 UTC, six fractional digits).
+const stamp = () => zb.stamp();
 const writer = `browser-${PRINCIPAL}`;
 
 async function readRoute() {

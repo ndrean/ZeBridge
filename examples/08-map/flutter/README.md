@@ -37,8 +37,10 @@ registers merged into the document it last saw (`mergeRegisters`, the library's 
 through `zb_call`), and reconciles until the row contains what it wrote. Open the web
 consumer (`examples/05-tables/web-consumer`, its "One route, two editors" panel) as another
 principal and move the end while the phone moves the start: both land. Move the same end
-on both: the later stamp wins on every replica, and the loser's pin jumps. The table comes
-from `examples/08-map/load_routes.py --create`; `scripts/scenarios/route_crdt.py` is the
+on both: the later stamp wins on every replica, and the loser's pin jumps. PostgreSQL merges each accepted write into the stored document (`register_cols`), so a
+late write cannot erase the other end. The table comes
+from `examples/08-map/load_routes.py --create` (run it again on an existing table to add
+the merge); `scripts/scenarios/route_crdt.py` is the
 same war between two libzb clients, asserted.
 
 `examples/08-map/poi_phone.py` is the same phone in Python — `--edit`, `--tour`, `--fuel`

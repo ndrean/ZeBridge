@@ -440,16 +440,6 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     }
   }
 
-  /// A stamp every editor orders the same way: RFC 3339 UTC with SIX fractional
-  /// digits — Dart prints three when the microseconds are zero, and "…123Z" would sort
-  /// AFTER "…123456Z".
-  static String _stampNow() {
-    final s = DateTime.now().toUtc().toIso8601String();
-    final dot = s.indexOf('.');
-    final frac = s.substring(dot + 1, s.length - 1);
-    return '${s.substring(0, dot + 1)}${frac.padRight(6, '0')}Z';
-  }
-
   /// The document as the local row holds it, and the pins from it.
   Future<void> _readRoute() async {
     final w = zb;
@@ -542,11 +532,15 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
 
   /// A tap moves one end as this phone's move. The pin appears when the row comes back.
   Future<void> _routeTap(LatLng at) async {
-    if (zb == null) return;
+    final w = zb;
+    if (w == null) return;
     final which = _routeTarget(at);
+    // The library's stamp: the bridge's time as this phone estimates it, never behind
+    // what this replica has seen.
+    final t = await w.stamp();
     routeMine[which] = {
       'v': {'lat': at.latitude, 'lng': at.longitude},
-      't': _stampNow(),
+      't': t,
       'w': _routeWriter,
     };
     // Whatever the tap moved is now the held end, so the next tap moves it too.

@@ -51,12 +51,13 @@ def main():
     psql(DDL)
     out = psql(f"SELECT step || ':' || status || ' ' || coalesce(detail, '') FROM zebridge_enable('public.routes'::regclass, "
                f"writable => true, version_col => 'updated_at', tombstone_col => 'deleted_at', tiebreak_col => 'last_writer', "
+               f"register_cols => ARRAY['doc']::name[], "
                f"public_reason => 'a shared route, the cooperative-editing demo', publication => '{PUB}', dry_run => false) "
                f"WHERE status = 'ERROR'")
     if out:
         sys.exit(f"enable refused: {out}")
     psql(f"INSERT INTO public.routes (id, name, doc) VALUES ('{ROUTE_ID}', 'demo', '{{}}'::jsonb) ON CONFLICT (id) DO NOTHING")
-    print(f"routes: table enabled (public, writable), demo row {ROUTE_ID}")
+    print(f"routes: table enabled (public, writable, doc merged by PostgreSQL), demo row {ROUTE_ID}")
     print(psql("SELECT tbl || ' seed_epoch=' || seed_epoch FROM zebridge_catalogue WHERE tbl = 'routes'"))
 
 
