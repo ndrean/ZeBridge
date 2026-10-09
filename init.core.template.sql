@@ -2073,6 +2073,18 @@ BEGIN
                    tbl::text, tenant_col);
     END IF;
 
+    -- §10lz: register_cols is declared on every call, like the other options: a call
+    -- without it turns the merge off, rather than leaving an earlier call's trigger behind.
+    IF (register_cols IS NULL OR cardinality(register_cols) = 0) AND EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgrelid = tbl AND tgname = 'zebridge_merge_registers_t'
+    ) THEN
+        IF NOT dry_run THEN
+            EXECUTE format('DROP TRIGGER zebridge_merge_registers_t ON %s', tbl);
+        END IF;
+        RETURN QUERY SELECT 'registers', verb,
+            format('register merge removed from %s: register_cols not given', tbl::text);
+    END IF;
+
     -- ── the sweeper's reach on a read-only table that keeps tombstones ─────────
     -- A loader's soft deletes (examples/08-map/load_fuel.py) are reaped like a client's;
     -- the sweeper runs as the writer role, which a read-only table never granted. A

@@ -767,7 +767,7 @@ CREATE TABLE IF NOT EXISTS public.zebridge_invites (
     tenant_id  text NOT NULL CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]'),
     role       text NOT NULL DEFAULT 'client',
     created_at timestamptz NOT NULL DEFAULT now(),
-    expires_at timestamptz NOT NULL DEFAULT now() + interval '7 days',
+    expires_at timestamptz NOT NULL DEFAULT now() + interval '1 days',
     used_at    timestamptz
 );
 ALTER TABLE public.zebridge_invites DROP CONSTRAINT IF EXISTS zebridge_invites_tenant_id_check;

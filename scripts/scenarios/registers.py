@@ -5,7 +5,7 @@ offline; Alice, online, raises `rating`; Carol, still offline, changes `access` 
 write is built on the doc she saw before going offline, and stamped AFTER Alice's. On
 reconnect her write is the newest, so the row's last-writer-wins accepts it whole.
 
-  A. without the merge (the trigger dropped): Carol's doc replaces the row's, and
+  A. without the merge (zebridge_enable re-run without register_cols): Carol's doc replaces the row's, and
      Alice's rating goes back to Carol's stale copy — accepted, no verdict says so;
   B. with `register_cols => ARRAY['doc']` (zebridge_enable): PostgreSQL merges the write
      register by register — Carol's access, Alice's rating, both kept.
@@ -25,8 +25,9 @@ T = "mig_reg"
 PUB = zb.publication()
 COMMON = ("tenant_id varchar(255) NOT NULL, last_writer varchar(255), inserted_at timestamptz NOT NULL DEFAULT now(), "
           "updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz")
+REGS = "register_cols => ARRAY['doc']::name[], "
 ENABLE = ("tenant_col => 'tenant_id', writable => true, version_col => 'updated_at', tombstone_col => 'deleted_at', "
-          f"tiebreak_col => 'last_writer', register_cols => ARRAY['doc']::name[], generations => true, "
+          f"tiebreak_col => 'last_writer', {REGS}generations => true, "
           f"publication => '{PUB}', dry_run => false")
 PY_DB, NODE_DB = "/tmp/zb-registers-py.sqlite3", "/tmp/zb-registers-node.sqlite3"
 
@@ -55,6 +56,11 @@ def teardown():
     for sql in (f"DROP TABLE IF EXISTS public.{T}", f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{T}'",
                 f"DELETE FROM public.zebridge_generations WHERE tbl = '{T}'"):
         zb.psql(sql, quiet=True)
+
+
+def merge_on():
+    return zb.psql(f"SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.{T}'::regclass "
+                   "AND tgname = 'zebridge_merge_registers_t'").strip() == "1"
 
 
 def values(doc):
@@ -143,7 +149,8 @@ def main():
                 return v
 
             # ── A. the control: no merge, the row's last-writer-wins alone ──
-            zb.psql(f"SELECT public.zebridge_install_register_merge('public.{T}', NULL)")
+            out = zb.psql(f"SELECT string_agg(step || ':' || status, ' ') FROM zebridge_enable('public.{T}', {ENABLE.replace(REGS, '')})")
+            check(f"zebridge_enable({T}) without register_cols turns the merge off: {out.strip()[:90]}…", "registers:done" in out and "error" not in out.lower() and not merge_on())
             uid_a = str(uuid.uuid4())
             v = run("§A", uid_a)
             dt = wait_pg(uid_a, {"access": "4425", "rating": 3})
@@ -152,7 +159,8 @@ def main():
             check(f"§A ...and Carol's write is reported applied, so nobody is told: {vd and vd['outcome']}", vd is not None and vd["outcome"] == "applied")
 
             # ── B. the merge, as zebridge_enable installs it ──
-            zb.psql(f"SELECT public.zebridge_install_register_merge('public.{T}', ARRAY['doc']::name[])")
+            out = zb.psql(f"SELECT string_agg(step || ':' || status, ' ') FROM zebridge_enable('public.{T}', {ENABLE})")
+            check(f"zebridge_enable({T}, register_cols => doc) turns it back on", "registers:done" in out and merge_on())
             uid_b = str(uuid.uuid4())
             v = run("§B", uid_b)
             want = {"access": "4425", "rating": 4}
