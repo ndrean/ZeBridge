@@ -261,7 +261,7 @@ Bindings exist for Python, Kotlin (Android), Dart/Flutter and React Native. See 
 
 - **Schema translation**: replicas are built from PostgreSQL's schemas: as is for PGlite, translated for SQLite, with `STRICT` tables.
 - **PostGIS and pgvector ready**: support of `PostGIS` (binary EWKB as BLOB) and `pgvector` types out of the box.
-- **Anti-client flood**: writes per client are limited in backlog, on by default (`MUTATION_BACKLOG_PER_PRINCIPAL`, 5,000 queued writes: past it, that client's new writes are refused, and nothing already queued is evicted), and optionally in rate (`MUTATION_RATE_PER_PRINCIPAL`, off by default: over the rate, writes are delayed, not dropped). A delayed write changes nothing for `mutate()`, which returns at once: the write waits in the queue, `pending()` still counts it, and its verdict comes later. The backlog limit is set when the bridge first creates the MUTATIONS stream: change it on a fresh deployment, or edit the stream with `nats stream edit`.
+- **Anti-client flood**: writes per client are limited in backlog, on by default (`MUTATION_BACKLOG_PER_PRINCIPAL`, 5,000 queued writes: past it, that client's new writes are refused, and nothing already queued is evicted), and optionally in rate (`MUTATION_RATE_PER_PRINCIPAL`, off by default: over the rate, writes are delayed, not dropped). A delayed write changes nothing for `mutate()`, which returns at once: the client has already sent it, it waits in JetStream, and `pending()` counts it until its verdict comes back. The backlog limit refuses at the NATS publish, before the bridge: there is no verdict, the write stays in the device's outbox, and the library sends it again until the backlog has room. The backlog limit is set when the bridge first creates the MUTATIONS stream: change it on a fresh deployment, or edit the stream with `nats stream edit`.
 - **Observability**: Prometheus metrics on `/metrics` and log lines with a level and a scope that Loki can label, with ready-made Grafana dashboards. The bridge serves the PostgreSQL metrics too (slots, connections, table sizes), so no PostgreSQL exporter is needed.
 See [OBSERVABILITY_TELEMETRY](OBSERVABILITY_TELEMETRY.md).
   
@@ -322,7 +322,7 @@ See `examples/08-map/native/README.md` for the exact commands.
 
 ⚠️ Do not compare an archive against a shared library — 22 MB of `.a` is 4 MB once linked, for identical code. Object files keep every symbol, nothing is dead-stripped, and the linker pulls only what an app references.
 
-Browser and Node hosts need no native build at all: zb-client-ts is plain TypeScript. React
+Browser and Node hosts need no native build at all: zb-client-ts bundles libzb's core as a WebAssembly module of about 70 KB, loaded at connect time, and keeps the database engine (SQLite, PGlite) and the socket on the TypeScript side. React
 Native runs libzb instead, through `zb-react-native` (its build scripts make both phones'
 libraries).
 
@@ -777,12 +777,18 @@ For example:
 
   ```txt
   postgres=# \d counter_tenant;
-                            Table "public.counter_tenant"
-
-    Column   |     Type   | Collation | Nullable |      Default
-  -----------+------------+-----------+----------+------------------
-   uid       | uuid       |           | not null | gen_random_uuid()
+                           Table "public.counter_tenant"
+     Column    |           Type           | Collation | Nullable |      Default
+  -------------+--------------------------+-----------+----------+-------------------
+   uid         | uuid                     |           | not null | gen_random_uuid()
+   value       | integer                  |           | not null | 0
+   tenant_id   | character varying(255)   |           | not null |
+   last_writer | character varying(255)   |           |          |
+   inserted_at | timestamp with time zone |           | not null |
+   updated_at  | timestamp with time zone |           | not null |
   ```
+
+  The key's default serves a row PostgreSQL creates itself; a client mints its own key (`zb.uuid()`, a UUIDv7) and sends it.
 
 For example, two public tables and a tenant scoped one:
 
@@ -942,6 +948,7 @@ The table stays an ordinary writable table, and PostgreSQL holds the truth, as a
 - Nobody checks `t` and `w` before merging, neither the bridge nor PostgreSQL. A register without `t` counts as the oldest: it is kept only where no other register has its name. A bare value in place of a register is kept the same way.
 - A document that is not a JSON object (an array, a string, a number) is refused, on `INSERT` and on `UPDATE`: the write comes back `rejected`, with PostgreSQL's message as its detail, and the local copy is put back. `NULL` is allowed and counts as an empty document.
 - The merge is shallow: for each name, the newer register is kept whole. Nothing inside `v` is merged.
+- A default PostgreSQL writes is not a merge: a register column filled by a DDL default (`ADD COLUMN … DEFAULT` with an expression) still needs `zebridge_reseed`, like any column.
 - `register_cols` merges per write: each accepted write is merged against the row as it stands at that moment. One `mutate()` carrying two registers is one merge; a batch of writes is a batch of merges, one after the other.
 
 ##### A live illustration: a shared record
@@ -997,7 +1004,7 @@ What it checks, in order:
 - **The catalogue**: `zebridge_check_all()`, every catalogued table against its own catalogue row; tenant-scoped tables whose writes nothing bounds; tenants the sweeper cannot reach; bridge instances with an empty publication, or disagreeing on the row budget.
 - **The slots**: an invalidated slot, an inactive one holding WAL, and this bridge's own.
 - **The bridge**: if it answers on its port, whether it is connected to NATS, its suspended tables, its reconnects. If not, the checks that need a running bridge are skipped, and said to be.
-- **NATS**: reachable with these credentials; every stream and bucket (with the bridge stopped, a missing one is a note: the bridge creates them at boot); the MUTATIONS backlog cap and the VERDICTS policy.
+- **NATS**: reachable with these credentials; every stream and bucket (with the bridge stopped, a missing one is a note: the bridge creates them at boot); the MUTATIONS backlog cap (discard new, per principal) and the VERDICTS policy (discard old). The bridge never edits those two streams, so a wrong one is a finding to fix by hand, not something it repairs.
 - **What a fresh client finds**, with the bridge running: a schema for every table, a tenant entry for every principal, and for every tenant and table a chain whose full object exists.
 
 It ends with `🩺 DIAGNOSE: all clear` (exit 0) or the number of findings (exit 1).
@@ -1052,7 +1059,7 @@ See [Replication slot management](#replication-slot-management) for details abou
   --init-nats --update        Re-sign the account after a grammar change, same keys
       [--dir DIR]             …the directory holding nats-server.conf (default ./zb-nats)
       [--store PATH]          …the offline seeds (default DIR/operator.store; - reads standard input)
-      [--js-domain NAME]      …add a domain to a running stack that has none (a first leaf); enrolled devices keep working
+      [--js-domain NAME]      …add a domain to a running stack that has none (a first leaf); enrolled devices keep working (see Adding a leaf node)
 
   --init-nats --rotate-client-key  Replace the client signing key (ZB_SIGNING_SEED leaked):
                               after a NATS reload, every client JWT the old key signed is
@@ -1310,7 +1317,7 @@ If the table is **empty**, one statement swaps the key, and `zebridge_enable` ru
 +   ADD COLUMN uid uuid PRIMARY KEY DEFAULT gen_random_uuid();
 ```
 
-If the table **has rows**, the other tables that reference the key must move with it, in one transaction, and `zebridge_enable` runs again at the end. Follow [the re-key recipe in MIGRATIONS.md](MIGRATIONS.md#the-re-key-recipe).
+If the table **has rows**, the other tables that reference the key must move with it, in one transaction, and `zebridge_enable` runs again at the end. Follow [the re-key recipe in MIGRATIONS.md](MIGRATIONS.md#the-re-key-recipe): it moves the key and every foreign key that references it in one transaction, so every replica sees one key change, never half of one.
 
 [⬆️](#table-of-contents)
 
@@ -1381,6 +1388,8 @@ SELECT * FROM zebridge_check_all() WHERE status = 'ERROR';   -- an empty result 
 Naming the columns makes it a pre-migration check: a declared name that disagrees with the catalogue is a finding, and a table with no row yet is checked against the names you gave.
 
 `zebridge_check_all()` checks every catalogued table against its own catalogue row: the intent you already wrote with `zebridge_enable(...)` in your migration, including an accepted `allow_physical_deletes` (a WARNING, not an ERROR). A catalogue row whose table is gone is an ERROR.
+
+Each row's `status` is `ok`, `NOTE`, `WARNING` or `ERROR`; only `ERROR` blocks the table.
 
 `bridge --diagnose` runs it too, along with the slots, NATS and, with the bridge running, what a fresh client finds.
 
@@ -1460,7 +1469,8 @@ Once you call `connect()`, it subscribes, receives, applies and fires your callb
 import { ZeBridge, NotEnrolled, RevokedPurge } from 'zb-client-ts';   // the bundler picks the browser or the Node entry
 ```
 
-- `connect()` throws `NotEnrolled` when this device has no stored identity and was given no invite (show the "open your invite link" screen), and `RevokedPurge` when the principal was revoked with `--purge` (its local data is gone). A plain revoke has no class of its own: a connected client sets `zb.revoked` and hangs up, and a later `connect()` throws an `Error` ("renew: refused…"); the local rows stay until the app calls `wipe()`.
+- `connect()` throws `NotEnrolled` when this device has no stored identity and was given no invite (show the "open your invite link" screen), and `RevokedPurge` when the principal was revoked with `--purge` (its local data is gone). A plain revoke has no class of its own: a connected client sets `zb.revoked` and hangs up, and a later `connect()` throws an `Error` ("renew: refused…"). It is a field, not a class, because the replica stays readable until the app calls `wipe()`; `RevokedPurge` is an error because the local data is already gone.
+- `zb.uuid()` mints a key for a new row (a UUIDv7, time-ordered), offline.
 - Without an invite, in `dev` mode, the client names itself: `new ZeBridge({ natsUrl, principal, tables })` ([Development](#development)).
 - `onStatus(cb)` reports `connected`, `connecting` or `disconnected`; with `pending()`, that is an offline indicator. Every `on…` returns a function that unsubscribes.
 - `zb.principal` is who this client is; `zb.tenant` the tenant it follows and writes to. A principal can belong to several tenants: zb-client-ts follows the first and logs the others, while libzb follows them all (`tenants` in `zb_client_sync`'s report, `zb_client_join` / `zb_client_leave`).
@@ -1561,12 +1571,12 @@ That is the whole contract for an app author: one callback per table, and one fo
 **What became of a write**: `onVerdict(cb)` reports each of this client's writes once, when its fate is final, matched to `mutate()` by the version it returned: `applied`; `rebased` (a newer row won on other columns, so the library re-sent it, as `rebasedAs`); `lost` (a newer row won on the same columns, `lostColumns`); `deleted`; `rejected` (with its `reason`). The library has already acted on it: dropped it from the outbox, re-sent it, or put the local row back. `pending()` counts the writes still waiting in the outbox: the "2 queued writes" of an offline indicator.
 
 ```js
-zb.onVerdict(({ version, outcome, columns, lostColumns }) => {
+zb.onVerdict(({ version, outcome, columns, lostColumns, rebasedAs }) => {
   if (outcome === 'lost') toast(`someone else changed ${lostColumns.join(', ')} first`);
 });
 ```
 
-`columns` are the columns this write changed. `lostColumns`, on a `lost` outcome, are the ones among them that a newer row had already changed. `reason`, on a `rejected` outcome, names the bridge's error (`PredatesGcWatermark`, `KeyChange`…). The full list of `reason`s is in [PROTOCOL](PROTOCOL.md#when-it-is-refused). When PostgreSQL itself refused the write, `sqlstate` and `detail` carry its code and message: `22023` is a malformed register document, `42501` a row-level-security refusal. Branch on `sqlstate`, not on `reason`, which reads the same for both (both libraries: `onVerdict` in TypeScript, the poll report's `outcomes` in libzb).
+`columns` are the columns this write changed. `rebasedAs`, on a `rebased` outcome, is the version the library re-sent it under. `lostColumns`, on a `lost` outcome, are the ones among them that a newer row had already changed. `reason`, on a `rejected` outcome, names the bridge's error (`PredatesGcWatermark`, `KeyChange`…). The full list of `reason`s is in [PROTOCOL](PROTOCOL.md#when-it-is-refused). When PostgreSQL itself refused the write, `sqlstate` and `detail` carry its code and message: `22023` is a malformed register document, `42501` a row-level-security refusal, `23514` a row wider than the width guard allows, `23505` a unique constraint. Branch on `sqlstate`, not on `reason`, which reads the same for both (both libraries: `onVerdict` in TypeScript, the poll report's `outcomes` in libzb).
 
 Two more for cooperative editing ([COOPERATIVE_EDITING](COOPERATIVE_EDITING.md)): `stamp()`, a register's time on the bridge's clock, and `mergeRegisters(a, b)`, imported. The whole set, used on one page: [example 15's survival kit](examples/15-shared-record/README.md#the-ts-client-survival-kit).
 
@@ -1584,6 +1594,13 @@ Two more for cooperative editing ([COOPERATIVE_EDITING](COOPERATIVE_EDITING.md))
 | `zb_client_query(h, sql, params_json)` | a read against the replica | `{"columns": […], "rows": [[…], …]}` |
 | `zb_client_mutate(h, table, op, key_json, values_json)` | one write: optimistic locally, sent at once | `{"msgId": …}` |
 | `zb_client_close(h)` | closes the socket and the replica | `0`, `1` for an unknown handle |
+
+| returns | functions | failure |
+| --- | --- | --- |
+| a handle (`u64`) | `zb_client_connect` | `0`; the words in `zb_last_error()` |
+| a JSON string | every other call | `{"error": "<Name>"}`, plus `"detail"` |
+| an `int` | `zb_client_close`, `zb_client_wipe`, `zb_client_wake` | `0` done, `1` not done (an unknown handle, most often) |
+| an `int` | `zb_client_revoked`, `zb_client_live` | a value: `1` revoked, `0` live, `-1` unknown handle; the count of open handles |
 
 **One vocabulary, two libraries.** The names are zb-client-ts's, so an app author — or a
 model reading the code — learns one API and can write either. Where they differ, the
@@ -1970,9 +1987,9 @@ A **trusted machine** is any machine you control, your laptop for example, with 
   systemctl restart zebridge   # the bridge must start with the new ZB_SIGNING_SEED
   ```
 
-  It writes a new client signing key into the account, the store and `.env.nats`; the responder and service keys, the bridge's creds and the revocations stay. From the reload, NATS refuses every client JWT the old key signed, forged or genuine. The old client signing key is removed from the account. A real device is refused once, renews on its own, and is back on a JWT from the new key: no new invite. `/renew` still works because the device signs it with its own key, not with the client signing key, and the bridge checks it against the key on record. Reload NATS and restart the bridge together: until the bridge has restarted, a device that renews gets a JWT from the old key and is refused again.
+  It writes a new client signing key into the account, the store and `.env.nats`; the responder and service keys, the bridge's creds and the revocations stay. From the reload, NATS refuses every client JWT the old key signed, forged or genuine. The old client signing key is removed from the account. A real device is refused once, renews on its own, and is back on a JWT from the new key: no new invite. `/renew` still works because the device signs it with its own key, not with the client signing key, and the bridge checks it against the key on record. Reload NATS and restart the bridge together: until the bridge has restarted, a device that renews gets a JWT from the old key and is refused again. A new device that enrolls in that window is in the same case: its first JWT comes from the old key and is refused, and it renews onto the new key once the bridge has restarted.
 
-**Services that answer queries (responders).** A responder is a service that keeps its own replica and answers the questions clients ask on `query.<tenant>.<name>` (for example, "points of interest near here"). **It reads like a client and never writes**. Give it its own creds, minted on the machine that holds `operator.store`, not on the bridge host. The command connects to nothing: a copy of the `bridge` binary runs it anywhere libpq and zstd are installed.
+**Services that answer queries (responders).** A responder is a service that keeps its own replica and answers the questions clients ask on `query.<tenant>.<name>` (for example, "points of interest near here"). **It reads like a client and never writes**, and the broker enforces it: the responder's signing key grants no `mutation.*` subject, so NATS refuses a write from its creds. Give it its own creds, minted on the machine that holds `operator.store`, not on the bridge host. The command connects to nothing: a copy of the `bridge` binary runs it anywhere libpq and zstd are installed.
 
 ```sh
 bridge --mint-responder --store operator.store --name pois --tenant globex > pois.creds
@@ -2112,7 +2129,7 @@ Three ways to take a user's access away, the strongest first:
 
 | you run | the user's devices | can the same name come back? |
 | --- | --- | --- |
-| `bridge --revoke <principal>` | writes refused at once; apps on the ZeBridge libraries disconnect at once; other code can read until the JWT expires (24 h) | no, invite a new principal |
+| `bridge --revoke <principal>` | writes refused at once; apps on the ZeBridge libraries disconnect at once; other code can read until its current JWT expires: its remaining life, at most `ENROLL_JWT_TTL_SECONDS` (24 h by default), since `/renew` refuses it | no, invite a new principal |
 | `bridge --revoke <principal> --conf …` <br> then reload nats-server | cut off at once: NATS refuses the token | no, invite a new principal |
 | add `--purge` to either | the same, and the devices delete their local replica and stored identity: a connected one at once, a returning one when it reconnects or renews its JWT | no, invite a new principal |
 | | | |
@@ -2526,7 +2543,7 @@ SELECT * FROM zebridge_enable('public.notes',
   dry_run     => false);            -- first run 'true', then set 'false'
 ```
 
-One call writes the table's catalogue row, installs its guards, scopes RLS and adds it to the publication, atomically.
+One call writes the table's catalogue row, installs its guards, scopes RLS and adds it to the publication, atomically. Its last two steps, `T3 bridge` and `T4 nats`, say what the bridge and NATS need: nothing, see [Restart rules](#restart-rules).
 
 Then check everything the bridge will meet at its start. It changes nothing:
 
@@ -2809,6 +2826,7 @@ At boot the bridge checks the writer role's connection limit, and PostgreSQL's `
 | `MUTATION_BACKLOG_PER_PRINCIPAL` | 5000 | the MUTATIONS stream's `max_msgs_per_subject`, with `discard new per subject` and workqueue retention, used when the bridge creates the stream. The subject carries the principal, so this is how many writes one principal may have queued before its publishes are refused at the door; nobody else notices. On an existing stream it changes nothing: the bridge never edits MUTATIONS (edit it with `nats stream edit`); `zbdoctor` checks the stream against the rate the bridge declares on `/status` |
 | `MUTATION_RATE_PER_PRINCIPAL` | 0 (off) | writes per second one principal, and one tenant, may send. Beyond it a write is NAK'd with the delay of its place in the queue and redelivered by JetStream when its turn comes: a flood is served at the rate, other tenants' writes are answered as if it were not there, nothing is dropped. `MUTATION_RATE_BURST` (default: one second's worth) is what a quiet client may send at once |
 | `ZB_INGRESS_LANES` | 1 (max 8) | parallel mutation listeners on the one ingress stream. Each lane pulls up to 64 writes and applies them in one transaction, on its own PostgreSQL writer connection and NATS connection; JetStream spreads the writes across lanes. Measured on one Mac: one lane ~8,500 writes/s, two ~14,000, four ~19,500 ([examples/09-event](examples/09-event/README.md#the-ramp-how-far-one-mac-goes)). Set at start, no rebuild |
+| `GC_BATCH_ROWS` | 1000 | how many tombstones the sweeper reaps per transaction |
 | `GC_THRESHOLD_MS` | 604800000 (7 days) | the sweeper's age: a tombstone older than this is reaped (floor 60000). It is the longest a client may stay offline and still catch up through the chain, with its pending edits |
 | `CDC_MAX_AGE_SECONDS` | 3 × cadence | how long a CDC stream keeps an event |
 | `CDC_MAX_BYTES` | 1 GiB | a CDC stream's size cap, a disk valve |
