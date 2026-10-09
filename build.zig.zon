@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zig_msgpack = .{
-            .url = "https://github.com/zigcc/zig-msgpack/archive/main.tar.gz",
-            .hash = "zig_msgpack-0.0.14-evvueL5SBQACmim6j6klQ9wWIIG_UxGlPvVYdiNy0KT8",
+            .url = "git+https://github.com/zigcc/zig-msgpack?ref=0.0.19#39c933f51dd9ee53fff119da877719f98aa174c2",
+            .hash = "zig_msgpack-0.0.19-evvueNR-BQBqKazGShn1eDXelQwAQz60su5SfPNB9lQk",
         },
         // lalinsky/nats.zig, cloned locally so a local fix can be applied and reviewed
         // before it goes upstream (see nats.zig/NOTES.md). std.Io transport, JetStream,

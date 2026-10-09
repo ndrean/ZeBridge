@@ -1220,3 +1220,19 @@ OrbStack). The bridge 352/352; libzb 39/41 (2 skipped, live). A second port, mad
 separately, gave the same `src/`, apart from two comments and the error path of 07, which
 there still called `nc.unsubscribe`.
 
+
+## 36. Patch 35: tls.zig pinned to a commit that builds on 0.16 and 0.17 (2026-10-09)
+
+**How it appeared.** The Zig 0.17 evaluation (2026-10-08, a scratch copy): the pinned tls.zig
+(`ef6780e`) does not build on 0.17. lalinsky/tls.zig `60d0ced` ("Build with both Zig 0.16 and
+0.17", 2026-10-04) does.
+
+**Change** (`35-nats.zig-tls-zig-017.patch`): `build.zig.zon` only — the `tls` dependency's URL
+and hash, still lazy. The first patch of the series outside `src/` and `tests/`: cut from
+`git -C nats.zig diff build.zig.zon` (new-patch.sh cuts those two directories only), and
+`check-series.sh` applies it with the rest but compares `src/` and `tests/` only.
+
+**Verified on 0.16.0:** nats.zig test-unit green, the bridge 354/354, libzb 39/41 (2 skipped);
+the same pin builds on 0.17.0 and on master 0.18.0-dev.120. Not verified live: a TLS
+connection through it (the dev stack was stopped) — the next start of the dev bridge, which
+speaks tls:// to nats-server, is that check.
