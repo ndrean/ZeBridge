@@ -6,17 +6,19 @@ One row per shape, both client libraries (`libzb`, `zb-client-ts`), no client re
 
 Proven by `scripts/scenarios/migrate_both.py` and the `libzb/python/migrate_*.py` proofs.
 
-The rule underneath: a migration whose values a replica can DERIVE is applied
-locally; one whose values only PostgreSQL knows is a re-seed. The re-seed is one
+The rule underneath: a migration whose values a replica can compute itself (a rename, a
+constant default) is applied locally; one whose values only PostgreSQL knows is a re-seed. The re-seed is one
 lever, `zebridge_reseed(table)`, pulled by hand or by the DDL trigger.
 
 | shape | descriptor carries | replica does | rows | re-seed |
 | --- | --- | --- | --- | --- |
 | `ADD COLUMN` (nullable) | the column | `ALTER TABLE ADD COLUMN` | kept, NULL in the new column | no |
+| `ADD COLUMN` on a table with a publication column list (`columns =>`) | nothing: the column is outside the list | nothing; clients can neither see nor write it | kept | run `zebridge_enable` again to add it to the list |
 | `ADD COLUMN … DEFAULT <constant>` | the column + `default` | `ALTER TABLE ADD COLUMN … DEFAULT` — the engine fills the old rows | kept, converge with PostgreSQL | no |
 | `ADD COLUMN … DEFAULT now()` (any expression) | the column, no `default` | `ADD COLUMN`; the old rows hold NULL where PostgreSQL holds a value | diverge silently | **`zebridge_reseed(t)` by hand** |
 | `RENAME COLUMN` | `renamed: {new: old}` (same attnum) | `ALTER TABLE RENAME COLUMN` | kept | no |
 | `DROP COLUMN` | without the column | indexes on it dropped first, then `DROP COLUMN` (a rebuild if refused) | kept | no |
+| `DROP COLUMN` or `ALTER COLUMN TYPE` on a register column (`register_cols`) | — | — | — | refused by PostgreSQL while the merge names the column: run `zebridge_enable` without it in `register_cols` first |
 | `ALTER COLUMN TYPE` on a non-key column | same name, new type | `ALTER COLUMN TYPE … USING` (PGlite) or a row-keeping rebuild (SQLite) | kept, then replaced | **automatic**: the trigger bumps the epoch |
 | primary key re-typed (bigserial → uuid) | `pk_columns` + the new type | rebuilt EMPTY, watermark dropped, held events and queued writes discarded | gone, then a fresh full | **automatic**, FK closure included |
 | primary key gains or loses a column | `pk_columns` | same as above | same | **automatic** |
@@ -25,7 +27,7 @@ lever, `zebridge_reseed(table)`, pulled by hand or by the DDL trigger.
 | `DROP TABLE` | tombstone (`dropped: true`) | local table dropped, queued writes discarded loudly | gone | — |
 | `DROP TABLE` then `CREATE TABLE` under the same name | a new descriptor | first sight | the producer sweeps the old chain; seeds from g1 | — |
 | table no longer meets the rules (no pk, a row too large) | suspension | table kept, CDC not followed | kept, stale | lifted live when the cause goes; a lift after dropped rows re-seeds |
-| a migration grows the table past `MAX_COLUMNS` | suspension (`too_many_columns`) | table kept, CDC not followed; the bridge stays up | kept, stale; rows written meanwhile are dropped by the bridge | restart the bridge (or set `MAX_COLUMNS`): the boot sees the inherited suspension, bumps the epoch, lifts; both replicas grow the columns and re-seed (`column_flood.py`) |
+| a migration grows the table past `MAX_COLUMNS` | suspension (`too_many_columns`) | table kept, CDC not followed; the bridge stays up | kept, stale; rows written meanwhile are dropped by the bridge | drop columns (lifts live), or restart the bridge, with a larger `MAX_COLUMNS` if needed: the boot sees the inherited suspension, bumps the epoch, lifts; both replicas grow the columns and re-seed (`column_flood.py`). See [Suspended tables](OPERATIONS.md#suspended-tables) and [Restart rules](OPERATIONS.md#restart-rules) |
 
 **A rebuild that cannot carry the rows** (a child whose parent stands empty, a NOT
 NULL the old rows cannot meet) degrades to the re-key path: emptied, watermark
@@ -44,8 +46,8 @@ dropped, seeded afresh. A table is never left stuck in its old shape.
   seeded at, refuse a manifest whose epoch is below the descriptor's, and refuse a
   chain object naming a column they lack — then wait for the producer's next full.
 
-**Where the epoch comes from.** The column is created with the catalogue itself, at
-`bridge-init`. A table's value is born the moment `zebridge_enable` first writes its
+**Where the epoch comes from.** The column is created with the catalogue itself, by
+the init SQL (`bridge --init-sql`). A table's value is born the moment `zebridge_enable` first writes its
 row: the insert does not name the column, so the table starts at 0. From there it only
 ever goes up — `zebridge_reseed` by hand, the DDL trigger, or the bridge lifting a
 suspension that dropped events.
@@ -99,9 +101,8 @@ re-key like a downtime, not like an ALTER.
 Retiring a replicated table and putting another in its place is the largest shape change
 there is, and the protocol has an answer for it that needs no downtime and no
 coordination: the new table is enabled, the old one is dropped, and each client learns
-both facts from the same schema bucket it already watches. This is that move as it was
-actually made (`osm_pois`, 2.1M OpenStreetMap points, replaced by
-`charge_points`, 16,173 OpenChargeMap points), the checks that prove each half, and what
+both facts from the same schema bucket it already watches. This is that move, on an example (`osm_pois`, 2.1M OpenStreetMap points, replaced by
+`charge_points`, 16,173 OpenChargeMap points): the checks that prove each half, and what
 it does to a client that already pulled the old schema.
 
 ## The move, in order
@@ -153,7 +154,7 @@ and it has one visible consequence, below.
 ## What to check in NATS
 
 ```bash
-N="nats --server nats://127.0.0.1:4222 --creds scripts/native/creds/bridge.creds"
+N="nats --server tls://<host>:4222 --creds <bridge.creds>"
 
 # the old table's key is not deleted: it holds a TOMBSTONE, and that is what clients read
 $N kv get schemas osm_pois --raw          # {"table":"osm_pois","dropped":true,"lsn":757938424736}
@@ -198,9 +199,7 @@ table. Measured on a throwaway table, one bridge process throughout:
 
 The third row is the one to remember, and it is the next section.
 
-## Three things the drop leaves behind
-
-All three were found by running the checks above rather than by reading the code.
+## Two things the drop leaves behind
 
 **A dead subject on `CDC_PUBLIC`.** The bridge sets that stream's subject list from the
 **catalogue's** public rows, not from the publication, and the catalogue row survives
@@ -208,18 +207,11 @@ the drop — so `cdc.osm_pois.>` stayed bound after the table was gone. Nothing 
 there, so it costs nothing but drift, and `DELETE FROM zebridge_catalogue WHERE tbl = …`
 clears it live, as the table above shows.
 
-**One chain object.** The prune took seven objects and the manifest key, and left
-`osm_pois-g3-dict`, the generation's zstd dictionary — 112 KiB, referenced by nothing
-(no `generations` key, no `zebridge_generations` row). Remove it with
-`nats object rm gen-<tenant> <name>-g<N>-dict`. Worth a look at `object ls` after any
-drop.
-
 **The schema tombstone, forever.** `kv get schemas <table>` still answers
 `{"dropped":true,…}` long after everything else is gone, and that is the one leftover
 that must NOT be swept on a schedule: it is how a client that was offline for the whole
 migration learns, on its next connect, that the table went away. The cost is that the
-bucket accumulates one dead key per retired table — this dev bucket holds 15, mostly
-test fixtures — and a client following `tables: "*"` follows every key, so it greets
+bucket accumulates one dead key per retired table, and a client following `tables: "*"` follows every key, so it greets
 each dead name once:
 
     osm_pois: schema unusable (no columns) — skipped
@@ -249,12 +241,6 @@ charge_points: created — watermark dropped, re-seeding from a fresh full
 charge_points: seeded 16173 row(s) from chain g3 (_default) — apply 63 ms
 local tables: ['charge_points', 'sqlite_sequence']
 ```
-
-⚠️ That queued-writes row was half true when this was written: the TypeScript client
-discarded the outbox on a drop, a re-key and an emptied rebuild; libzb discarded only
-the held events and left the outbox to retry forever against a table that no longer
-exists. Writing this playbook is what found it. libzb now has the same `discardOutbox`
-at the same sites, so the row above describes both clients.
 
 One consequence that is easy to miss: **the old table's rows are gone from every replica,
 including the edits a phone made to it.** A drop is not a migration — nothing is carried

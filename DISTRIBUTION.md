@@ -1,7 +1,9 @@
 # Distribution — which libzb for which host
 
 ZeBridge has two client libraries. **zb-client-ts** is TypeScript source: browsers
-and Node import it, and there is nothing to build. **libzb** is a native
+and Node import it, with nothing native to build. It ships libzb's core as a prebuilt
+WebAssembly file (`wasm/zb_core.wasm`); after a change to that core, `pnpm wasm` rebuilds
+it (it needs Zig). **libzb** is a native
 library with a C ABI. It has to be built per platform, and it can carry up to three
 local storage engines. This page says which build a host needs, and why.
 
@@ -34,10 +36,10 @@ library.
 | --- | --- | --- | --- | --- | --- | --- |
 | **libzb-ios** | iPhone arm64, simulator arm64 | compiled in | – | – | xcframework (static) | Swift, Flutter (dart:ffi), React Native (Expo module) |
 | **libzb-android** | arm64-v8a, armeabi-v7a, x86_64 | compiled in | – | – | AAR (`zb-android`), or a `.so` per CPU | Kotlin/Java (`dev.zebridge.ZeBridge`), Flutter (dart:ffi), React Native (Expo module) |
-| **libzb-desktop** | macOS, Linux, Windows | compiled in | if libpq is installed | if libduckdb is installed | shared library | apps and services: Python (ctypes), Node, Dart, JVM (JNA, FFM), .NET (P/Invoke) |
+| **libzb-desktop** | macOS, Linux, Windows | compiled in | if libpq is installed | if libduckdb is installed | shared library | apps and services: Python (ctypes), Dart, JVM (JNA, FFM), .NET (P/Invoke) |
 
 On top of these, one package per language gives libzb its idioms — `zb-python`,
-`zb-android` (the AAR), `zb-dart` — each a thin binding with no behavior of its own
+`zb-android` (the AAR), `zb-dart`, `zb-react-native` (an Expo module) — each a thin binding with no behavior of its own
 ([CLIENTS.md](CLIENTS.md#bindings-the-rule)); zb-client-ts covers JavaScript without libzb.
 
 A phone never has libpq or libduckdb, so on a phone those two engines answer with the
@@ -66,7 +68,7 @@ way: Android's own SQLite is not reachable from native code (the NDK does not ex
 Dart uses dart:ffi, a desktop JVM can use JNA or Java 22's FFM (no glue code needed),
 .NET uses P/Invoke.
 
-**Browsers, Node.** zb-client-ts, not libzb. It needs no native build at all.
+**Browsers, Node.** zb-client-ts, not libzb. It needs no native build: libzb's core comes with it as WebAssembly.
 
 ## DuckDB: why it is not compiled in
 
@@ -120,7 +122,7 @@ machine that runs the service.
 
 ## Building
 
-    # desktop, apps and services alike: nothing needed on the machine to build or load
+    # desktop, apps and services alike, in libzb/ with Zig 0.16.0: nothing needed on the machine to build or load
     zig build lib -Doptimize=ReleaseFast -Dvendor=true
 
     # phones
@@ -128,10 +130,10 @@ machine that runs the service.
     zb-react-native/scripts/build-android.sh
     examples/10-airports/flutter/tool/build-libzb-ios.sh
     examples/06-large-table/flutter/tool/build-libzb-android.sh
-
-    # Linux servers, from a Mac: bridge, bridge_sweeper and libzbcore.so
-    deploy/build-linux.sh              # x86_64; `aarch64` for an ARM server
     zb-android/scripts/build.sh        # the AAR
+
+    # Linux servers, from a Mac: bridge, bridge_sweeper, libzbcore.so and zb-respond
+    deploy/build-linux.sh              # x86_64; `aarch64` for an ARM server
 
 The engines' headers are in `libzb/include-engines/`, so building needs neither DuckDB
 nor PostgreSQL installed.

@@ -4,10 +4,10 @@ Two client libraries speak the protocol.
 
 | | libzb | zb-client-ts |
 | --- | --- | --- |
-| language | Zig core + shell, C ABI | TypeScript shell; the core in TypeScript, moving to libzb's own core as WebAssembly (`scope`, `streamResume`, `caughtUp` so far) |
+| language | Zig core + shell, C ABI | TypeScript shell and core; four rules (`scope`, `streamResume`, `caughtUp`, `mergeRegisters`) come from libzb's core compiled to WebAssembly (`wasm/zb_core.wasm`, about 70 KB) |
 | hosts | through its bindings: Python (`zb-python`), Kotlin/Java (`zb-android`), Dart/Flutter (`zb-dart`), React Native (`zb-react-native`); any other language through the C ABI directly | browser, Node |
-| local engine | SQLite (a file), PostgreSQL (`dbUrl`; seeds through COPY), or DuckDB (`engine: "duckdb"`; libduckdb opened at run time; seeds through the appender; the micro-VM worker's analytical replica, a file DuckDB itself opens once libzb closes it) | SQLite (sqlocal, better-sqlite3), PGlite |
-| SQLite version | 3.49.1, compiled in | 3.41 or later (`unhex`, in the seed of a table with a BLOB); every backend bundles its own, newer: sqlocal's SQLite WASM 3.51, better-sqlite3's 3.53 — never the device's |
+| local engine | SQLite (a file), PostgreSQL (`dbUrl`; seeds through COPY), or DuckDB (`engine: "duckdb"`; libduckdb opened at run time; seeds through the appender; an analytical replica that DuckDB can open directly once libzb closes it) | SQLite (sqlocal, better-sqlite3), PGlite |
+| SQLite version | 3.49.1 when compiled in (`-Dvendor=true`, every phone build); otherwise the machine's | 3.41 or later (`unhex`, in the seed of a table with a BLOB); every backend bundles its own, newer: sqlocal's SQLite WASM 3.51, better-sqlite3's 3.53 — never the device's |
 | large answers | `reply` puts an answer past `results.inline_max_bytes` in `res-<tenant>` and sends an envelope; `request` resolves it | the same, in `serve`'s reply and in `request` |
 | being a service | `zb_client_serve` + the `requests` in `poll` + `zb_client_reply`: the host's loop answers | `serve({tenants, handlers, queue})`: async handlers, the library subscribes and replies |
 | cooperative documents | `mergeRegisters` through `zb_call` (COOPERATIVE_EDITING.md); PostgreSQL merges what it accepts (`register_cols`) | `mergeRegisters`, imported (libzb's core, as WASM) |
@@ -16,7 +16,7 @@ Two client libraries speak the protocol.
 | reply inbox | `_INBOX.<principal>`, from the `inbox_prefix` connection option — replies, KV watchers, object reads and pull consumers all land there, inside the principal's `_INBOX.<principal>.>` grant | the same, through nats.js's `inboxPrefix` |
 | loop | host-driven: `sync`, `poll`, `flush` | self-driven: `connect()` runs it |
 | tables followed | **one rule, both clients (`core.tableSet`, fixtures `tableSet`)**: `tables` is a list, or `"*"` for every published table; `ondemandTables` are held for their schema only, never seeded or tailed, rows through `ingest`; a name in both is on-demand; absent both, nothing is followed — and the TS client says so in its log | the same |
-| tenants followed | every membership in `$KV.tenants.<principal>` (a set): one chain per tenant into one table, one CDC stream per tenant, watermarks per (table, tenant); `zb_client_join`/`zb_client_leave` at runtime; a join the credentials cannot read is refused, and a stream that becomes unreadable is set aside alone and named in the poll report (`unreadable`) | the FIRST membership only, with a warning when there are more (parity queued) |
+| tenants followed | every membership in `$KV.tenants.<principal>` (a set): one chain per tenant into one table, one CDC stream per tenant, watermarks per (table, tenant); `zb_client_join`/`zb_client_leave` at runtime; a join the credentials cannot read is refused, and a stream that becomes unreadable is set aside alone and named in the poll report (`unreadable`) | the FIRST membership only, with a warning when there are more |
 
 ## The first ten lines
 
@@ -68,17 +68,17 @@ React Native (iOS and Android), libzb through its Expo module — the host drive
 import { Libzb } from 'zb-react-native';
 const zb = await Libzb.connect({ bridgeUrl: 'https://zb.example.com', invite: code, tables: ['orders'], dbPath });
 await zb.sync();                                     // seed and catch up
-for (;;) { const r = await zb.poll(1000); if (r.changed_tables?.includes('orders')) refresh_ui_callback(); }
+for (;;) { const r = await zb.poll(1000); if (r.changed_tables?.includes('orders')) refresh_ui_callback(); }   // on its own task
 const open = await zb.query('SELECT * FROM orders WHERE status = ?', ['open']);
 await zb.mutate('orders', 'UPDATE', { id: 7 }, { status: 'done' });
 ```
 
-Any other language, through the C ABI — five calls, JSON in and out:
+Any other language, through the C ABI, with JSON in and out. `zb_client_connect` returns `0` on failure and `zb_last_error()` says why; every other call returns JSON, with `{"error": …}` on failure:
 
 ```c
 uint64_t h = zb_client_connect("{\"bridgeUrl\":\"https://zb.example.com\",\"invite\":\"…\",\"tables\":[\"orders\"]}");
 zb_free(zb_client_sync(h));                 // seed and catch up
-for (;;) zb_free(zb_client_poll(h, 1000));  // the loop: tail, verdicts, JWT renewal
+for (;;) zb_free(zb_client_poll(h, 1000));  // the loop, on its own thread: tail, verdicts, JWT renewal
 char *rows = zb_client_query(h, "SELECT * FROM orders", "[]");  /* … */ 
 zb_free(rows);
 zb_client_close(h);
@@ -135,11 +135,11 @@ A binding is the thin layer that gives one language libzb's C ABI. It may contai
 **Behavior never goes in a binding.** A retry, a default value, a parsing rule, a renewal policy: libzb, where every binding gets it at once. Enrollment and renewal were built that way, and they cost the Kotlin and Dart bindings almost nothing. A binding with logic is a second implementation, and a second implementation drifts — the three Flutter examples' copies had, before `zb-dart` replaced them.
 
 Each binding pins the ABI version it was written for (`ZB_ABI` / `zbAbi`), and `libzb/python/abi_check.py` fails when any pin disagrees with libzb.
-The bindings today: `zb-python` (~300 lines), `zb-dart` (~600, the isolate worker included), `zb-android` (~430, JNI included). A new one — Swift, Go, Rust, Ruby — starts from the closest of them.
+The bindings today: `zb-python` (~300 lines), `zb-dart` (~600, the isolate worker included), `zb-android` (~430, JNI included), `zb-react-native` (an Expo module: ~150 lines of TypeScript, ~100 of Swift, ~80 of Kotlin). A new one — Swift, Go, Rust, Ruby — starts from the closest of them.
 
 ## The configuration keys, side by side
 
-One vocabulary: the same key means the same thing in libzb's `opts_json` and in zb-client-ts's `new ZeBridge(opts)`, with the same default. An app passes what is about the app; what differs between platforms (storage, zstd, the NATS dial, crypto) the library decides — libzb by being native, zb-client-ts by its platform entry, which the bundler picks from package.json `exports` (`node`, `browser`, `react-native`).
+One vocabulary: the same key means the same thing in libzb's `opts_json` and in zb-client-ts's `new ZeBridge(opts)`, with the same default. An app passes what is about the app; what differs between platforms (storage, zstd, the NATS dial, crypto) the library decides — libzb by being native, zb-client-ts by its platform entry, which the bundler picks from package.json `exports` (`node`, `browser`).
 
 | key | libzb (`opts_json`) | zb-client-ts (`ZeBridgeConfig`) |
 | --- | --- | --- |
@@ -147,7 +147,7 @@ One vocabulary: the same key means the same thing in libzb's `opts_json` and in 
 | `invite` | ✅ first run only: with `bridgeUrl` and no stored identity, enrolls this device | ✅ the same |
 | `identityPath` | ✅ where the identity is kept (JSON, mode 0600); default `<dbPath>.identity`, else `zebridge.identity` | ✅ the same file on Node; a localStorage key in the browser |
 | `natsUrl` | ✅ optional once enrolled: the identity carries it | ✅ the same (the identity's `nats_ws_url` in the browser) |
-| `creds` | ✅ the .creds TEXT (nats.zig patch 19); wins over the identity | ✅ |
+| `creds` | ✅ the .creds TEXT; wins over the identity | ✅ |
 | `credsPath` | ✅ a .creds file | ✅ where there is a filesystem (Node) |
 | `principal` | ✅ optional: the creds or the identity name it | ✅ the same (also the inbox prefix on both) |
 | `password` | — (creds only) | ✅ dev shape, user/password |
@@ -162,7 +162,7 @@ One vocabulary: the same key means the same thing in libzb's `opts_json` and in 
 | `seedChunkRows` | ✅ | ✅ |
 | `seedStreaming`, `seedStreamingAboveBytes` | ✅ | ✅ |
 | `jsDomain` | ✅ | ✅ |
-| `caFile` | ✅ a PEM bundle of trusted roots for `https://` enrollment and renewal and a `tls://` NATS URL, in place of the system's. Unset on iOS and Android, where Zig reads no trust store, libzb uses its own copy of Mozilla's bundle (refreshed by `libzb/scripts/refresh-roots.sh`) | — (the platform's TLS: browser, Node, React Native) |
+| `caFile` | ✅ a PEM bundle of trusted roots for `https://` enrollment and renewal and a `tls://` NATS URL, in place of the system's. Unset on iOS and Android, where Zig reads no trust store, libzb uses its own copy of Mozilla's bundle (refreshed by `libzb/scripts/refresh-roots.sh`) | — (the platform's TLS: the browser's; on Node its built-in roots, `NODE_EXTRA_CA_CERTS` for a private CA) |
 | `bulkCdc`, `bulkStatement`, `cdcBatchEvents` | — (the DuckDB path is always bulk, SQLite per event) | ✅ tuning |
 | `platform` | — (one build per platform) | asserts the entry the bundler picked |
 | `storage`, `transport`, `connect`, `zstdDecompress`, `zstdDecompressStream`, `zstdCompress` | — | overrides, for a test or a storage of your own; an app never needs them |
@@ -175,8 +175,7 @@ Android it cannot: Zig, which libzb is written in, reads no trust store there. S
 carries its own: Mozilla's CA bundle, the one curl, Python's certifi, Debian's
 `ca-certificates` and Node.js use, compiled into the iOS and Android builds only. When the
 app passes no `caFile`, libzb writes the bundle once beside the replica (`zb-roots.pem`)
-and uses it. An app ships no certificates, and every binding (Flutter, React Native,
-Kotlin, Swift) gets this from libzb.
+and uses it. An app ships no certificates, and every host on iOS or Android gets this from libzb.
 
 Pass `caFile` yourself to trust something else: a private CA for a server of your own, or
 only the roots your servers chain to (stricter, but a certificate from another CA is then
@@ -189,20 +188,20 @@ in [DISTRIBUTION](DISTRIBUTION.md#building)).
 ## Pinned by fixtures — identical by construction
 
 One conformance suite, `zb-client-ts/fixtures/core-fixtures.json`, drives both cores (`core.ts` through `core.test.ts`, `core.zig` through `libzb/python/runner.py`). A rule in a fixture group cannot diverge without a test failing on one side.
-The rules zb-client-ts takes from libzb's WebAssembly core (`wasm/zb_core.wasm`: `scope`, `streamResume`, `caughtUp`) are one implementation, so their groups check the module the package ships; `core.test.ts` also fails when that copy differs from libzb's build (`pnpm wasm` copies it).
+The rules zb-client-ts takes from libzb's WebAssembly core (`wasm/zb_core.wasm`: `scope`, `streamResume`, `caughtUp`, `mergeRegisters`) are one implementation, so their groups check the module the package ships; `core.test.ts` also fails when that copy differs from libzb's build (`pnpm wasm` copies it).
 The groups, 40 today: seedGate, chainPlan, fullPredates, scope, streamResume, position, caughtUp, fkKind, pgTsToWire, lsnToNumber, keyChange, upsert, delete, chainUpsert, chainRowParams, cdcBulk, columnDdl, fkClauses, createTable, rebuildSteps, diffColumns, fkDiffer, viewSteps, indexPlan, nextVersion, subjectSafe, envelope, normalizeVersion, hlcVersion, outboxWatermark, tombstoned, update, exists, pgArrayLiteral, heartbeat, shape, retyped, readOnlySql, tableSet, mergeRegisters.
 
 Everything below the core — the shells — is where parity is by hand, and where this document earns its place.
 
 ## Parity matrix
 
-✓ same behaviour · ≠ different · — not applicable.
+✓ same behaviour · ≠ different · — not applicable · ✗ not built.
 
 | contract | libzb | zb-client-ts |
 | --- | --- | --- |
 | enrollment from an invite: the key pair made on the device, the seed never sent, `/enroll` redeemed, the identity stored | ✓ | ✓ |
 | one identity format: a file libzb writes, zb-client-ts on Node reads, and back | ✓ | ✓ |
-| https enrollment and renewal | ✓, except iOS: Zig cannot read the system trust store, so the app enrolls itself and passes `creds` | ✓ |
+| https enrollment and renewal | ✓ (on iOS and Android, against libzb's embedded roots, or `caFile`) | ✓ |
 | JWT renewal: checked every eighth of the JWT's life (at most every 60 s), renewed with a quarter left, by signing with the device's key (`/renew`); the next reconnect uses the new JWT. Timed and stamped on the bridge's clock (`clock_offset` in the identity, taken from each JWT's `iat`); a stamp the bridge refuses comes back with its time and is retried once; a JWT that NATS refuses is renewed at once, whatever the clock says. libzb counts from its last JWT on a clock that keeps running while the phone sleeps and that the phone's settings cannot move, and renews at open when the stored offset is over 60 s; zb-client-ts counts on the device's clock | ✓ in `poll` | ✓ on a timer |
 | purge on revocation (`bridge --revoke --purge`): the ban's `"purge": true`, or `/renew`'s 403 with it, deletes the replica and the stored identity | ✓ in the C layer after `poll` / `sync`; `zb_client_revoked` still answers 1, every other call `Revoked` | ✓ `purged` set, the replica deleted, the identity emptied |
 | seed gate by stream seq, never by LSN | ✓ | ✓ |
@@ -228,7 +227,7 @@ Everything below the core — the shells — is where parity is by hand, and whe
 | drop tombstone → local table dropped | ✓ | ✓ |
 | CDC batch in one transaction, position in it | ✓ | ✓ |
 | child before parent: held durably, retried, pruned by a seed past it or a drop | ✓ `_zbz_inbox` | ✓ `_zebridge_inbox` |
-| foreign keys deferred inside a batch, isolated replay with holds when COMMIT refuses | ✓ (2026-09-06) | ✓ `defer_foreign_keys` + `applyBatchIsolated` |
+| foreign keys deferred inside a batch, isolated replay with holds when COMMIT refuses | ✓ | ✓ `defer_foreign_keys` + `applyBatchIsolated` |
 | held events discarded when their row's DELETE goes by; multi-level holds released to a fixpoint | ✓ | ✓ |
 | cascaded deletes idempotent | ✓ | ✓ |
 | the duty outlives the instrument (tail, status watch) | reopen-then-swap; reopen from the stored position on a consumer death | tail loop with idle guard; status loop recreated until close |
@@ -237,8 +236,8 @@ Everything below the core — the shells — is where parity is by hand, and whe
 | verdicts: accepted / stale / rejected / row_deleted, two revert targets | ✓ | ✓ |
 | a stale UPDATE rebased onto the winning row when the columns are disjoint, dropped and surfaced when they overlap; the winner before or after the verdict, a slow clock | ✓ `mutate_at` stamps a write explicitly | ✓ `mutate(…, { version })` |
 | each write's final outcome, once — applied, rebased, lost, deleted, rejected — and only for this client's own writes (another device of the same principal hears the verdict too) | ✓ poll report `outcomes` | ✓ `onVerdict` |
-| a write with no socket queues in the outbox and goes out on the next connect | ✓ (the host's flush) | ✓ (was a silent return) |
-| the CDC echo that confirms a write carries the write's own stamp — another client's row on the same key is not our echo | — (settles on verdicts only) | ✓ (was by key alone) |
+| a write with no socket queues in the outbox and goes out on the next connect | ✓ (the host's flush) | ✓ |
+| the CDC echo that confirms a write carries the write's own stamp — another client's row on the same key is not our echo | — (settles on verdicts only) | ✓ |
 | an UPDATE that changes a key column is refused before it is queued (`KeyChange`); rename = delete + create | ✓ core | ✓ core |
 | the host can see refusals: cumulative verdict counts by status | ✓ `flush` report `verdicts{…}`; refusals printed with reason and detail | ✓ per-verdict log lines |
 | the optimistic row carries the write's own stamp in the version column | ✓ | ✓ |
@@ -246,25 +245,25 @@ Everything below the core — the shells — is where parity is by hand, and whe
 | the wire grammar compiled in; `grammarHash` at open refuses a fork; a bridge that cannot be reached does not block opening | ✓ `@embedFile`, `zb_grammar_hash()` | ✓ packaged copy, `grammarHashHex()`, pinned by test |
 | missed verdicts recovered by direct get | ✓ | ✓ |
 | a chain object past 2 MiB (a full with tombstones) | ✓ own chunk reader | ✓ pull-consumer reader with the object's SHA-256 checked (the object store's push reader stalls at 2 MiB, @nats-io/obj 3.4.0) |
-| one seed per table at a time — a second request joins the one in flight | — (one sync path) | ✓ (was twice at first sight) |
-| the gap rule LIVE: a delivered sequence beyond stored + 1 is a hole the stream pruned under the consumer — re-seed at once, never read past it | ✓ per poll (was connect-time only) | ✓ per delivery (was connect-time only) |
+| one seed per table at a time — a second request joins the one in flight | — (one sync path) | ✓ |
+| the gap rule LIVE: a delivered sequence beyond stored + 1 is a hole the stream pruned under the consumer — re-seed at once, never read past it | ✓ per poll | ✓ per delivery |
 | a chain whose cutoff fell off the stream is refused (`predates the stream`), the next generation awaited | ✓ | ✓ |
 | outbox watermark gate before a flush | ✓ | ✓ |
 | a failed optimistic echo still queues the write | ✓ | ✓ |
 | liveness of the NATS connection | host-driven (`NoResponders` → reopen tails) | RTT poll every 10 s, re-sync on recovery |
 | fleet heartbeat (PROTOCOL §11): a core publish, through `$JS.<domain>.API.` with a domain | on every poll and at sync end | from tenant resolution, before the seed |
 | a command from another thread ends the poll's wait | `zb_client_wake(h)`, made by the bindings with every command | — (self-driven) |
-| auth error named | ✓ `AuthorizationViolation` / `AuthExpired` from `poll` | ✓ the server's `error` status and `closed()`'s reason logged by name (2026-09-06) |
+| auth error named | ✓ `AuthorizationViolation` / `AuthExpired` from `poll` | ✓ the server's `error` status and `closed()`'s reason logged by name |
 | the ban (`mutation_ack.<p>.revoked`): hang up now, stay hung up on reconnect, every call answers Revoked | ✓ `error.Revoked` | ✓ `revoked`, logged, closed |
 | the wipe is explicit, never automatic | ✓ `zb_client_wipe` | ✓ `wipe()` |
 | a principal with no tenant mapping (revoked, never enrolled) | tenant-scoped tables skipped audibly, public followed | same; a purged mapping's DEL marker reads as none |
 | tenant revoked while connected | next connect | next connect |
 | inbox pruning | ✓ (`_zbz_inbox`, pruned at the seed's lsn) | ✓ |
-| zstd chain objects | built in | Node built in; browser needs `zstdDecompress` |
+| zstd chain objects | built in | built in (Node: `node:zlib`; the browser: fzstd) |
 | a chain step's apply | a msgpack cursor, rows sorted by key, transactions of `seedChunkRows` (50,000), bound straight from the payload, a 128 MB page cache while the seed lasts; 3 M rows in 11 s | the same sort, chunks and page cache over the decoded document; on SQLite a chunk is one statement through `json_each` (a BLOB as hex, back through `unhex`), row by row on PGlite; 3 M rows in 26 s |
 | a `rate_limited` verdict (`failed`, `retry_after_ms`) | kept in the outbox, flushes held until the time has passed; counted as `rate_limited` on the flush report | kept, flushes held the same way |
 | STRICT tables | every synced table is `CREATE TABLE … STRICT`; a replica from before is rebuilt once with the rows cast to the declared types | same, on the sqlite dialect (PGlite types its own columns) |
-| the streaming seed (`seedStreaming`) | opt-in: the object read through a pull consumer eight chunks at a time and inflated through a window; on SQLite the rows are staged in a temp table, one index build sorts them on disk, pages come back in key order; 3 M rows in 23 s at 329 MB peak (the whole-object path: 11 s, 1.1 GB); a step below `seedStreamingAboveBytes` compressed (8 MiB) takes the whole-object path, so a delta never streams | not built: the browser and Node hold the document (a phone runs libzb) |
+| the streaming seed (`seedStreaming`) | opt-in: the object read through a pull consumer eight chunks at a time and inflated through a window; on SQLite the rows are staged in a temp table, one index build sorts them on disk, pages come back in key order; 3 M rows in 23 s at 329 MB peak (the whole-object path: 11 s, 1.1 GB); a step below `seedStreamingAboveBytes` compressed (8 MiB) takes the whole-object path, so a delta never streams | ✓ opt-in, the same switches (`seedStreaming`, `seedStreamingAboveBytes`) |
 | arrays | JSON text as the wire carries it (`json_extract` reads it); a local write stores JSON text too | SQLite: same; PGlite: the JSON text becomes the array literal on apply (`pgArrayValues`), native arrays in the replica |
 | bytes (`bytea`, PostGIS) | BLOB; the host sees and sends `{"$bin": "<base64>"}` on the JSON card | BLOB; `Uint8Array` in and out (the Node example prints the same `$bin` marker) |
 | pgvector (`vector`, `halfvec`, `sparsevec`), `bit(n)` | BLOB in the wire's normalised shape (sqlite-vec reads it); on the PostgreSQL engine, pgvector's text form on every apply (`core.vecLiteral`); on DuckDB `vector`/`halfvec` are `FLOAT[n]` from the list text, `bit` is `BIT`, `sparsevec` stays the BLOB | BLOB (`Uint8Array`); on the postgres dialect, the text form on apply (`vecLiteral`) |
@@ -274,29 +273,15 @@ Everything below the core — the shells — is where parity is by hand, and whe
 
 ## Divergences that matter, ranked
 
-1. ~~libzb loses held events with its host~~ — closed 2026-09-06: `_zbz_inbox`,
-   written in the batch transaction, retried from the table, pruned by a seed past
-   it or a drop. Parity with the TS inbox.
-2. ~~Migrations reach libzb late~~ — closed 2026-09-06: libzb drains a watch on the
-   schemas bucket at the top of every poll; both clients now walk every
-   migration shape of `MIGRATIONS.md` side by side (`scripts/scenarios/migrate_both.py`).
-3. ~~The TypeScript client follows every schema key~~ — closed: both clients
-   follow `tables` (a list, or `"*"`) and nothing else.
-4. ~~Missing chain: retry or exclude~~ — closed 2026-09-11: the TypeScript client
-   keeps the table, holds its events (bounded) and asks for the chain without a deadline;
-   the late seed replays what was held. Measured live on a table enabled between two ticks.
-5. **Chain-orphan check** is built in neither. Retention ≥ cadence keeps it rare, not
+1. **Chain-orphan check** is built in neither. Retention ≥ cadence keeps it rare, not
    impossible.
-6. **The TypeScript client follows one tenant.** A principal in several tenants gets the
+2. **The TypeScript client follows one tenant.** A principal in several tenants gets the
    first one only, with a warning in the log; libzb follows every membership and can
    join or leave at runtime.
-7. **libzb cannot enroll over https on iOS.** Everywhere else the first ten lines are the
-   whole setup; on iOS with an https bridge, the app redeems the invite itself and passes
-   `creds`.
 
 ## What is tested, per client
 
-Both clients walk every migration shape together in `migrate_both` (owns).
+Both clients walk every migration shape together in `migrate_both` (in the `owns` group of `scripts/scenarios/run.py`).
 libzb carries the chaos program: `matrix`, `churn`, `cascade`, `client_gap`,
 `shared_gap`, `client_kill`, `chain_kill`, `jwt_expiry`, `clockskew`, `fleet`,
 `grammar_served`, `leaksoak`, and the swarm's Python workers. Enrollment is in the
@@ -307,5 +292,5 @@ iPhone 12 with 5-minute JWTs, the phone's clock moved by hand while the app ran 
 it was closed. The TypeScript client
 is exercised by `objstore_race`, the swarm's Node/PGlite workers, the
 Node consumer example, and the browser by hand. Nothing kills a TypeScript host
-mid-seed, nothing migrates a table under a TypeScript client in the battery, and the
+mid-seed, and the
 browser path has no automated run at all.

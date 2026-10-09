@@ -5,13 +5,13 @@
 A client receives its **whole tenant's** data for every table it follows, or none of it. There are no per-query "shapes" and no per-row read scoping: the subject ACL is `cdc.<tenant>.>`, so every client in a tenant holds every tenant row on its device.
 
 - `WHERE last_writer = 'me'` (or any filter) works as a **view** — the whole tenant is local, so the client can filter it with ordinary SQL. It is **not** a security boundary: a tenant-mate holds the same rows and can read them locally.
-- ZeBridge is therefore **B2B / departmental-shaped**. A tenant is a natural unit when it is an org, a department, or a project. For B2C the only mapping is one tenant per user, which means one stream per user — millions of streams, a wall. B2C-consumer scale needs per-user shapes, the axis this design does not cover.
+- ZeBridge therefore suits tenants that are organisations, departments or projects. One tenant per user means one stream per user, which does not scale to millions of users: that needs per-user shapes, which this design does not cover.
 
 ## The client holds the whole tenant
 
 There is no eviction, LRU, or partial retention: the replica is the tenant. Fine for thousands of rows, wrong for a tenant of millions on a phone. There is no client storage-limit story.
 
-Large-tenant mobile is out of scope: the client app designs a retention/shape mechanism.
+Large-tenant mobile is out of scope: an app that needs it must build its own retention.
 
 ## Consistency model
 
@@ -38,7 +38,7 @@ Two migration shapes need care:
 
 ## Write flooding is limited per principal, not prevented upstream
 
-A reverse proxy cannot see individual writes: they travel inside the NATS connection, one long-lived tunnel. NATS does not throttle per user either: a JWT's limits are caps (message size, subscriptions, bytes), not rates. So the limits sit where the writes arrive, in two layers:
+A reverse proxy cannot see individual writes: they travel inside the NATS connection, one long-lived connection. NATS does not throttle per user either: a JWT's limits are caps (message size, subscriptions, bytes), not rates. So the limits sit where the writes arrive, in two layers:
 
 - **A backlog per principal**, at the MUTATIONS stream: past `MUTATION_BACKLOG_PER_PRINCIPAL` queued writes (5,000 by default), that principal's next writes are refused at the door. Nobody else notices.
 - **A rate per principal and per tenant**, in the bridge (`MUTATION_RATE_PER_PRINCIPAL`, off by default): a write over the rate is delayed, not dropped. JetStream redelivers it when its turn comes, so a flood is served at the rate while other tenants' writes go through as if it were not there. Only a write still over the rate after its last redelivery is answered `rate_limited`, with a `retry_after_ms`.
@@ -47,4 +47,4 @@ What remains: a flooder still fills its own backlog, and it can cost a share of 
 
 ## Not yet battle-tested at scale
 
-Chaos-tested and stress-tested to about 20k client writes/s sustained on one machine, and a 3.2M-row table seeded on a low-end Android phone, but not run against a real fleet. Untested: whole-system disaster recovery (the claim that NATS state rebuilds from PostgreSQL at boot is sound but unproven as a runbook), and several bridges side by side on one database.
+Chaos-tested and stress-tested to about 20k client writes/s sustained on one machine, and a 3.2M-row table seeded on a low-end Android phone, but not run against a real fleet. Untested: whole-system disaster recovery (the claim that NATS state rebuilds from PostgreSQL at boot is sound but unproven as a runbook). Two bridges side by side on one database pass a scenario, but are not recommended yet.

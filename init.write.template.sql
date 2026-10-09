@@ -463,7 +463,7 @@ $$ LANGUAGE plpgsql;
 -- each field survives, whoever wrote the row last — Cassandra's per-cell timestamps,
 -- Figma's per-property last-writer-wins, on a plain jsonb column.
 --
--- zebridge_merge_registers is mergeRegisters (zb-client-ts core.ts, libzb core.zig), pinned
+-- zebridge_merge_registers is mergeRegisters (libzb core.zig, which zb-client-ts runs as WebAssembly), pinned
 -- by the same fixtures: per key the later `t` wins, an equal `t` breaks on `w`, a key on
 -- one side only is kept, a value without `t` counts as the oldest. Stamps and writers are
 -- compared byte by byte (COLLATE "C"), as JavaScript and Zig compare strings — a locale
