@@ -11,7 +11,8 @@ The reference for running ZeBridge: the CLI, the doctor (`--diagnose`), what nee
 - [Suspended tables](#suspended-tables)
 - [Troubleshooting](#troubleshooting)
 - [Configuration](#configuration)
-    - [Main Configuration](#main-configuration)
+  - [Main Configuration](#main-configuration)
+  - [Write limits, as a client sees them](#write-limits-as-a-client-sees-them)
 - [Sizing the ring](#sizing-the-ring)
   - [Two things checked at startup, before a byte is allocated](#two-things-checked-at-startup-before-a-byte-is-allocated)
   - [What happens when a row does not fit](#what-happens-when-a-row-does-not-fit)
@@ -232,7 +233,7 @@ Start from what you see. Each row names the check and the rule behind it.
 
 All configuration constants are centralized in `src/config.zig` and `grammar.json`. Per-table replication rules (tenant column, LWW columns, tombstone) live in `zebridge_catalogue`.
 
-#### Main Configuration
+### Main Configuration
 
 ZeBridge operates with a **fixed-size buffer** for the changes egress (PG-WAL →  bridge → NATS), and can parallelize mutations ingestion (client → NATS → bridge → PG).
 
@@ -247,6 +248,10 @@ Changing `BASE_BUF`, `RING_BUFFER_COUNT` or `MAX_COLUMNS` needs a restart: see [
 
 **2. Mutations**: On the other side, for inserting client mutations into Postgres via NATS, you may need to raise `ZB_INGRESS_LANES` (1 to 8, default 1) with the write rate: one lane applies about 8,500 writes/s, and each lane adds a writer connection.
 At boot the bridge checks the writer role's connection limit, and PostgreSQL's `max_connections`, against it.
+
+### Write limits, as a client sees them
+
+ writes per client are limited in backlog, on by default (`MUTATION_BACKLOG_PER_PRINCIPAL`, 5,000 queued writes: past it, that client's new writes are refused, and nothing already queued is evicted), and optionally in rate (`MUTATION_RATE_PER_PRINCIPAL`, off by default: over the rate, writes are delayed, not dropped). A delayed write changes nothing for `mutate()`, which returns at once: the client has already sent it, it waits in JetStream, and `pending()` counts it until its verdict comes back. The backlog limit refuses at the NATS publish, before the bridge: there is no verdict, the write stays in the device's outbox, and the library sends it again until the backlog has room. The backlog limit is set when the bridge first creates the MUTATIONS stream: change it on a fresh deployment, or edit the stream with `nats stream edit`.
 
 **3. Chain, sweeper and stream retention**:
 

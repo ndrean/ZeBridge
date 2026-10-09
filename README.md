@@ -118,7 +118,7 @@ To start again from scratch: `docker compose -f docker-compose.quickstart.yml do
   - [Code examples](#code-examples)
   - [Understanding the LWW rules](#understanding-the-lww-rules)
   - [Local database writes are owned](#local-database-writes-are-owned)
-- [The daemon](#the-daemon)
+- [Preparing your database](#preparing-your-database)
   - [Good practices](#good-practices)
     - [Schemas and zebridge\_enable](#schemas-and-zebridge_enable)
     - [Private Columns on Tables](#private-columns-on-tables)
@@ -137,7 +137,6 @@ To start again from scratch: `docker compose -f docker-compose.quickstart.yml do
     - [Fixing a "bad" writable table](#fixing-a-bad-writable-table)
     - [Changing a writable table's key from `bigint` to `uuid`](#changing-a-writable-tables-key-from-bigint-to-uuid)
 - [Authentication](#authentication)
-  - [The bridge and PostgreSQL](#the-bridge-and-postgresql)
   - [Production: use `operator mode`](#production-use-operator-mode)
     - [1. Set up, once per deployment](#1-set-up-once-per-deployment)
     - [2. Onboard a device](#2-onboard-a-device)
@@ -205,30 +204,18 @@ Bindings exist for Python, Kotlin (Android), Dart/Flutter and React Native. See 
   - **Changes**: the bridge streams over 100k rows/s from PostgreSQL into NATS, and a connected client applies 30k–50k of them a second (about 12k on an iPhone 12).
   - **Snapshots**: a new client seeds a table at 90k–125k rows/s, and still about 6k rows/s on a low-end Android phone (a Motorola E20), which the library feeds in chunks so the seed fits in its memory.
   - **Writes**: client writes reach PostgreSQL at about 8,500/s per ingress lane (`ZB_INGRESS_LANES`).
-- **Topology**: The preferred topology is the daemon colocated with the NATS server over TLS (as opposed to terminating TLS at a reverse-proxy). Since clients join NATS over TLS on the same port, the bridge talks to NATS over TLS too. Ideally PostgreSQL, NATS and ZeBridge are colocated; a cloud PostgreSQL works too, tested on Supabase (see [Using a cloud PostgreSQL](DEPLOYMENT.md#using-a-cloud-postgresql)).
-- **Standby Read Replica ready**: you can use a dedicated Postgres standby replica for all the reads as ZeBridge uses separate reader and writer roles. Point `DATABASE_READER_URL` at the standby and `DATABASE_WRITER_URL` at the primary: the slot and every read stay on the standby, and the bridge's few writes go to the primary. The standby needs PostgreSQL 16+, `wal_level=logical` and `hot_standby_feedback=on` (the bridge warns when it is off). Tested by `scripts/scenarios/standby.py`.
-- **CLI**: the same binary sets the system up (`--init-nats`, `--init-sql`, `--mint-responder`, `--mint-leaf`), checks it (`--diagnose`), revokes users (`--revoke` or `--revoke --purge` to prune the local replica on reconnection) and manages slots (`--view-slot(s)`, `--drop-slot`). See [The CLI](OPERATIONS.md#the-cli).
-- **Multiple instances**: possible, not recommended yet. Several instances of ZeBridge can run side by side, each with its own publication, slot and port, to follow large slow-moving tables apart from small tables with heavy changes, each instance with a buffer sized to its own tables. Two bridges on one database and one NATS pass `scripts/scenarios/multi_bridge.py`, but one bridge is the setup we run and recommend.
-- **Mobile-First Synchronization**: to optimize mobile bandwidth and reliability, we use a delta-chain process with aggressive compression for seeding and reseeding, and streaming when needed. A client that was away reloads from the snapshots instead of replaying the change feed event by event. PostgreSQL never sees a reconnection stampede: the bridge builds each snapshot once per table and tenant (when generations are on), and clients seed and catch up from NATS, never from PostgreSQL. A thousand phones coming back at once cost the database nothing: the work moves to NATS and the chain producer.
+- **Offline first, mobile first**: a client that was away reloads from snapshots the bridge builds once per table and tenant, compressed, read from NATS and never from PostgreSQL. A thousand phones coming back at once cost the database nothing.
 - **Division by tenant, or by place**: a tenant is a column in a table; a consumer brings their identity, and PostgreSQL resolves their tenants from it. Tenants divide the data, and the NATS grants with it. Replication is scoped by tenant. Since a tenant is a NATS stream, the number of tenants must stay small, so this design is not for one-user-per-tenant B2C. See [SCOPE, Replication is by TENANT, not by query](SCOPE.md).
   - **By business**: one tenant per customer company. Each one's rows travel on its own stream, and a user's JWT names the tenants they may read.
   - **By place**: a tenant can be a map cell (a geohash). A device enrolled for a few cells follows them, and moves between them as it travels (`zb_client_join`, `zb_client_leave`). This fits a city: the cells a device may follow are fixed when it enrolls.
   - **By place, at country scale**: the data stays whole, and a responder service per region, on a NATS leaf node close to its users, answers "what is around me?". The phone keeps the answers in a local table, so they stay available offline. The region's phones are served by their own leaf; the hub sees their questions only when that leaf has no responder ([examples/08-map](examples/08-map)).
 - **Strict authentication, JWT rotation**: because NATS is exposed to the internet and contains data, users are strictly tenant scoped and access grants are encoded in a JWT, immediately revokable by the DBA. Your app signs users in (OAuth or anything else) and its backend issues a one-time invite; the library enrolls the device with it and renews its JWT before it expires (`ENROLL_JWT_TTL_SECONDS`).
-- **Encryption**: in transit, TLS. At rest, the PostgreSQL disk can be encrypted, and so can NATS's store. The replicas are normally not encrypted (plain SQLite does not offer it).
+- **Schemas and types**: replicas are built from PostgreSQL's schemas, as is for PGlite and translated for SQLite (`STRICT` tables). PostGIS and pgvector work out of the box.
+- **For the operator**: the bridge sits next to NATS, over TLS ([topology](DEPLOYMENT.md#topology)); its reads can go to a standby ([standby](DEPLOYMENT.md#a-standby-for-the-reads)); one binary sets up, checks and revokes ([The CLI](OPERATIONS.md#the-cli)); writes are limited per client ([write limits](OPERATIONS.md#write-limits-as-a-client-sees-them)); Prometheus metrics, logs and Grafana dashboards come with it ([OBSERVABILITY](OBSERVABILITY_TELEMETRY.md)); data is encrypted in transit, and the [encryption](DEPLOYMENT.md#encryption) section says where that ends.
 
-> [!WARNING]
-> Encryption protects data between two points, not at the points themselves. Wherever TLS ends, the data is readable by whoever runs that point: a proxy that terminates TLS (in the demo, Cloudflare in front of the bridge and the browsers' WebSocket), a managed PostgreSQL (the database reads every row it judges), a hosted telemetry service. Each of these operators, and the rules they answer to, can see what passes through them. If you need full control over who may read your data, run the database yourself, and choose the services in the chain with care, or leave them out: clients can reach NATS and the bridge directly, without a proxy.
-
-- **Schema translation**: replicas are built from PostgreSQL's schemas: as is for PGlite, translated for SQLite, with `STRICT` tables.
-- **PostGIS and pgvector ready**: support of `PostGIS` (binary EWKB as BLOB) and `pgvector` types out of the box.
-- **Anti-client flood**: writes per client are limited in backlog, on by default (`MUTATION_BACKLOG_PER_PRINCIPAL`, 5,000 queued writes: past it, that client's new writes are refused, and nothing already queued is evicted), and optionally in rate (`MUTATION_RATE_PER_PRINCIPAL`, off by default: over the rate, writes are delayed, not dropped). A delayed write changes nothing for `mutate()`, which returns at once: the client has already sent it, it waits in JetStream, and `pending()` counts it until its verdict comes back. The backlog limit refuses at the NATS publish, before the bridge: there is no verdict, the write stays in the device's outbox, and the library sends it again until the backlog has room. The backlog limit is set when the bridge first creates the MUTATIONS stream: change it on a fresh deployment, or edit the stream with `nats stream edit`.
-- **Observability**: Prometheus metrics on `/metrics` and log lines with a level and a scope that Loki can label, with ready-made Grafana dashboards. The bridge serves the PostgreSQL metrics too (slots, connections, table sizes), so no PostgreSQL exporter is needed.
-See [OBSERVABILITY_TELEMETRY](OBSERVABILITY_TELEMETRY.md).
-  
 **Opinionated**: Because our goal is to sync Postgres databases locally with strict predictability by preventing unexpected concurrent writes, we have a few rules that we stamped 💡 _good practices_: strict memory boundaries, safety enforced by tenant, enrollment by tenant and JWT, enforced schemas, foreign key cascade mitigation, conflict resolution by last-writer-wins (LWW) with cooperative editing on top of it, table suspension, and local writes that go through the library only. See [Conflict resolution](#conflict-resolution) below.
 
-They may look strict, but they are mostly standard and well known, and applying them to a schema is almost mechanical. See [The daemon](#the-daemon) below for more details and [SCOPE ## Consistency model](SCOPE.md).
+They may look strict, but they are mostly standard and well known, and applying them to a schema is almost mechanical. See [Preparing your database](#preparing-your-database) below for more details and [SCOPE ## Consistency model](SCOPE.md).
 
 ## Three pillars
 
@@ -289,30 +276,13 @@ libraries).
 
 ### Setup steps at a glance
 
-- **NATS and the bridge's configuration**: `bridge --init-nats operator` writes the NATS server config, the bridge's credentials and `.env.nats`, which holds NATS settings only. The DBA's own `.env.bridge` names the database (the READER and WRITER URLs), the slot and the publication. The two files share no setting, so the order they are loaded in does not matter.
-- **PostgreSQL**:
-  - `bridge --init-sql | psql` creates the two roles, READER and WRITER, the functions and triggers ZeBridge needs, and the publication,
-  - the DBA migrates the database and fixes what does not follow the 💡 _good practice rules_,
-  - the DBA enables each table with `zebridge_enable`, where its sync rules are declared: this writes the catalogue row, installs the guards, scopes RLS and attaches the table to the publication, in one transaction.
+1. Generate the NATS configuration and the bridge's identity: `bridge --init-nats operator`.
+2. Prepare PostgreSQL: `bridge --init-sql | psql` creates the two roles, the functions, the triggers and the publication.
+3. Enable each table with `zebridge_enable`, which declares its sync rules (see [Preparing your database](#preparing-your-database)).
+4. Check with `bridge --diagnose`, then start NATS, the bridge and the `bridge_sweeper` daemon.
+5. Invite users: a row in `zebridge_invites` gives each device a one-time code (see [Authentication](#authentication)).
 
-   ```sql
-   SELECT * FROM zebridge_enable('public.orders', 
-    tenant_col => 'tenant_id',
-    writable => true,
-    version_col => 'updated_at',
-    tombstone_col => 'deleted_at',
-    publication => 'my_pub',
-    dry_run => false
-  );
-   ```
-
-- **Run**: `bridge --diagnose` checks everything first; then start NATS, the bridge (`bridge --pub my_pub --slot my_slot`) and the `bridge_sweeper` daemon.
-- **Users**: since NATS is exposed to the internet, every user is authenticated. The bridge is OAuth agnostic: your backend writes a one-time invite naming the user (the principal) and their tenant in `zebridge_invites`. See [Production: operator mode](#production-use-operator-mode).
-- **Frontend**: the developer builds on the library, `libzb` or `zb-client-ts`, and works only with the local database, never with NATS. They create a `ZeBridge` client with the bridge's URL, the invite, and the storage flavour (SQLite, PGlite, DuckDB).
-
-The full procedure is [Host setup on VPS or bare-metal](DEPLOYMENT.md#host-setup-on-vps-or-bare-metal). On a Debian server behind Cloudflare, [deploy/ansible](deploy/ansible/README.md) does it for you: `site.yml` for the hub (HAProxy with Cloudflare's origin certificate, NATS with Let's Encrypt), `leaf.yml` for the [leaf nodes](DEPLOYMENT.md#adding-a-leaf-node).
-
-See also [SUPABASE_TEST](https://github.com/ndrean/zebridge/blob/main/SUPABASE_TEST.md) for a cloud Postgres setup.
+The app then works on the library, `libzb` or `zb-client-ts`, and its local database, never on NATS. Step by step: [Host setup](DEPLOYMENT.md#host-setup-on-vps-or-bare-metal). On a Debian server behind Cloudflare, [deploy/ansible](deploy/ansible/README.md) does it all. A cloud PostgreSQL: [SUPABASE_TEST](SUPABASE_TEST.md).
 
 ### Use case: a fleet of trucks
 
@@ -724,7 +694,7 @@ The rule is the same everywhere; the _mechanism_ that guarantees it is engine-sp
 
 ---
 
-## The daemon
+## Preparing your database
 
 Once the DBA has installed the ZeBridge functions into PostgreSQL (`--init-sql`), checked the database's **compliance**, and generated the NATS configuration (`--init-nats`), ZeBridge, the first pillar of the architecture, is ready to run. It creates the streams and buckets it needs at its first start.
 
@@ -1257,26 +1227,7 @@ It runs in one of two modes:
 
 Use production mode for anything real, locally too. The Docker quick start, at the top of this README, runs it, with its invites written in advance. Development mode is a smoke test: it shows the data path without any keys.
 
-In both modes, the bridge reaches PostgreSQL the same way.
-
-### The bridge and PostgreSQL
-
-The bridge connects with two PostgreSQL roles, one URL each in `.env.bridge`:
-
-| variable | role | can |
-| --- | --- | --- |
-| `DATABASE_READER_URL` | `bridge_reader` | read the published tables and the WAL (`SELECT` + `REPLICATION`); cannot write |
-| `DATABASE_WRITER_URL` | `bridge_writer` | apply client writes, only on tables enabled with `writable => true`. Unset: no writes from clients |
-
-These two URLs are the only place the role names and passwords are written. The init SQL creates the roles from them. The DBA's superuser (`ADMIN_DATABASE_URL`, in `.env.admin`) is used only to install the SQL and for admin commands such as `--revoke`; the bridge never runs as it.
-
-```sh
-set -a; . ./.env.admin; . ./.env.bridge; set +a
-bridge --init-sql | psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1
-psql "$ADMIN_DATABASE_URL" -c "SELECT * FROM zebridge_create_publication('my_pub')"
-```
-
-> Nb: A password with `@` or `:` must be percent-encoded in the URL, as libpq requires.
+In both modes, the bridge reaches PostgreSQL the same way, with two roles: [The bridge and PostgreSQL](DEPLOYMENT.md#the-bridge-and-postgresql).
 
 ### Production: use `operator mode`
 

@@ -5,6 +5,10 @@ How to install ZeBridge on a server and open it to devices: the architecture and
 ## Table of Contents
 
 - [Architecture Example](#architecture-example)
+- [Topology](#topology)
+- [A standby for the reads](#a-standby-for-the-reads)
+- [Encryption](#encryption)
+- [The bridge and PostgreSQL](#the-bridge-and-postgresql)
 - [Setup \& Deployment](#setup--deployment)
   - [Host setup on VPS or bare-metal](#host-setup-on-vps-or-bare-metal)
     - [1. Prerequisites](#1-prerequisites)
@@ -167,6 +171,50 @@ This can serve the following clients:
 - browsers with a local `PGlite` (or `SQLite`) replica that connects over WSS to NATS,
 - mobiles with their native in-process `SQLite` replica that connects to NATS over TLS (React Native and Flutter through libzb),
 - a warm micro-VM with an in-process `DuckDB` replica for fast analytics, geo-computations... that connects to NATS over TLS.
+
+[⬆️](#table-of-contents)
+
+---
+
+## Topology
+
+The preferred topology is the daemon colocated with the NATS server over TLS (as opposed to terminating TLS at a reverse-proxy). Since clients join NATS over TLS on the same port, the bridge talks to NATS over TLS too. Ideally PostgreSQL, NATS and ZeBridge are colocated; a cloud PostgreSQL works too, tested on Supabase (see [Using a cloud PostgreSQL](DEPLOYMENT.md#using-a-cloud-postgresql)).
+
+**Multiple instances**: possible, not recommended yet; see [Running the Bridge](#running-the-bridge).
+
+## A standby for the reads
+
+You can use a dedicated Postgres standby replica for all the reads as ZeBridge uses separate reader and writer roles. Point `DATABASE_READER_URL` at the standby and `DATABASE_WRITER_URL` at the primary: the slot and every read stay on the standby, and the bridge's few writes go to the primary. The standby needs PostgreSQL 16+, `wal_level=logical` and `hot_standby_feedback=on` (the bridge warns when it is off). Tested by `scripts/scenarios/standby.py`.
+
+## Encryption
+
+In transit, TLS. At rest, the PostgreSQL disk can be encrypted, and so can NATS's store. The replicas are normally not encrypted (plain SQLite does not offer it).
+
+> [!WARNING]
+> Encryption protects data between two points, not at the points themselves. Wherever TLS ends, the data is readable by whoever runs that point: a proxy that terminates TLS (in the demo, Cloudflare in front of the bridge and the browsers' WebSocket), a managed PostgreSQL (the database reads every row it judges), a hosted telemetry service. Each of these operators, and the rules they answer to, can see what passes through them. If you need full control over who may read your data, run the database yourself, and choose the services in the chain with care, or leave them out: clients can reach NATS and the bridge directly, without a proxy.
+
+[⬆️](#table-of-contents)
+
+---
+
+## The bridge and PostgreSQL
+
+The bridge connects with two PostgreSQL roles, one URL each in `.env.bridge`:
+
+| variable | role | can |
+| --- | --- | --- |
+| `DATABASE_READER_URL` | `bridge_reader` | read the published tables and the WAL (`SELECT` + `REPLICATION`); cannot write |
+| `DATABASE_WRITER_URL` | `bridge_writer` | apply client writes, only on tables enabled with `writable => true`. Unset: no writes from clients |
+
+These two URLs are the only place the role names and passwords are written. The init SQL creates the roles from them. The DBA's superuser (`ADMIN_DATABASE_URL`, in `.env.admin`) is used only to install the SQL and for admin commands such as `--revoke`; the bridge never runs as it.
+
+```sh
+set -a; . ./.env.admin; . ./.env.bridge; set +a
+bridge --init-sql | psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1
+psql "$ADMIN_DATABASE_URL" -c "SELECT * FROM zebridge_create_publication('my_pub')"
+```
+
+> Nb: A password with `@` or `:` must be percent-encoded in the URL, as libpq requires.
 
 [⬆️](#table-of-contents)
 
