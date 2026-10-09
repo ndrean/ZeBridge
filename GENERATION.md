@@ -1,30 +1,21 @@
-# GENERATION
+# Shared rows and the gap check
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant A as Alice's client
-    participant P as CDC_PUBLIC<br/>(public tables + _default rows)
-    participant T as CDC_acme<br/>(acme's rows)
-    participant G as Producer<br/>(chains)
+A tenant table can hold rows of the open tenant (`_default`). Those rows travel on the
+public stream, `CDC_PUBLIC`, not on the tenant's own stream. So a client of tenant `acme`
+reads that table from two streams, and keeps a **position** on each: the last message it
+applied.
 
-    Note over A,P: Alice's position on CDC_PUBLIC = 0<br/>(no message there ever concerned her)
-    T-->>A: messages 40, 41, 42 applied<br/>(Alice is the most up to date)
-    G->>G: latest chain g8 cut at 39 on CDC_acme
-    P->>P: old messages expire<br/>first message now 6276
-    A--xA: Go offline
-    A->>P: reconnect: gap check
-    P-->>A: first = 6276 > position 0 + 1
-    Note over A: "Gap detected!" (false: nothing was missed)
-    A->>G: re-seed site_survey from the latest chain
-    G-->>A: g8, cut at 39
-    Note over A: 39 < 42 applied: reloading would erase<br/>the newest edits → refused, wait
-    A--xA: connect() blocked (90 s, then in the background)
-    T->>G: Bob writes → acme changed
-    G->>G: cuts g9 (edge watch ≤ 2 min, or tick 5 min)
-    G-->>A: g9, cut ≥ 42
-    A->>A: seeded, position healed, connected
-```
+Each stream drops old messages after a while. When a client comes back, it checks each
+position against the stream's first message: if messages it never applied were dropped,
+that is a **gap**, and the client must reload the table from a snapshot.
+
+A client that never had a reason to read `CDC_PUBLIC` keeps position 0 there. Once the
+stream has dropped its first messages, position 0 looks like a gap, although nothing was
+missed. Each snapshot therefore records two **cuts**, the stream sequences it covers:
+`cutoff_seq` on the tenant's stream, and `shared_cutoff_seq` on `CDC_PUBLIC`. A client
+seeded from that snapshot resumes `CDC_PUBLIC` at the shared cut (`streamResume`, a rule
+of libzb's core that zb-client-ts runs as WebAssembly), and reloads only when the shared
+cut itself has fallen off the stream.
 
 ```mermaid
 sequenceDiagram
@@ -39,8 +30,13 @@ sequenceDiagram
     A->>P: reconnect: gap check
     P-->>A: first = 6276
     Note over A: site_survey is covered: 6390 ≥ 6276 − 1<br/>nothing after its snapshot was dropped
-    A->>A: no re-seed: resume at once
-    P->>P: later, first passes 6391 (shared cut falls off)
-    G->>G: repair (§10ej): empty delta, fresh shared cut
+    A->>A: no reload: resume at once
+    P->>P: later, first passes 6391 (the shared cut falls off)
+    G->>G: next tick: an empty delta with a fresh shared cut
     Note over A,G: the coverage follows the stream's pruning
 ```
+
+How the chain and the stream fit together in general: [OPERATIONS, Catching up: the chain
+and the stream](OPERATIONS.md#catching-up-the-chain-and-the-stream). The rules a client
+follows: [PROTOCOL §6](PROTOCOL.md#6-seeding--generation-chains-). Tested by
+`scripts/scenarios/gen_follow.py` (by hand) and `shared_gap.py`.

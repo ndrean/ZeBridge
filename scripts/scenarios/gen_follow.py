@@ -17,7 +17,7 @@ to `acme`, on a schedule relative to the emitter's start:
   short   offline 30 s — inside the stream's window: resumes from the tail
   long    offline 120 s — past the window: a real gap, healed from a chain
   alice   online the longest, then reconnects 5 s after going away, once CDC_PUBLIC has
-          pruned past her position on it: the false gap (GENERATION.md)
+          pruned past her position on it (the shared cut covers it: GENERATION.md)
 
 Per client and per (re)connect: how long `connect`+`sync` took, how long until its max(id)
 reached PostgreSQL's (a catch-up over 10 s is flagged), and from libzb's own log the seeds,

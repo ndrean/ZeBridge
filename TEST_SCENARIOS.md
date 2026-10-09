@@ -1,6 +1,6 @@
 # Test scenarios
 
-What is tested, by which command, and what a pass proves. Current state only. This document is the evidence for the claims in the README. Every [test] link points to a file in scripts/scenarios/ unless named otherwise.
+What is tested, by which command, and what a pass proves. Current state only. This document is the evidence for the claims in the README. Every test named here is in `scripts/scenarios/` unless a path is given.
 
 ## The stack under test
 
@@ -72,7 +72,7 @@ for one of three reasons:
 
 ## What the tests prove, in plain words
 
-Each row: something that could go wrong, what the test shows instead, and the test that shows it (in `scripts/scenarios/` unless named otherwise). The tables after this section give the same ground in more detail.
+Each row: something that could go wrong, what the test shows instead, and the test that shows it. The tables after this section give the same ground in more detail.
 
 ### Nothing is lost
 
@@ -100,6 +100,11 @@ Each row: something that could go wrong, what the test shows instead, and the te
 | a write gets no answer, or blocks the ones behind it | every write gets an answer, and the write path never stalls | `replies.py`, `race.py` |
 | a value changes on the way from PostgreSQL to a device | every value arrives identical, field by field, wide rows included | `decode_integrity.py` |
 | two people edit the same row at once and one edit disappears | edits to different fields both survive; the same field ends with one winner | `crdt.py`, `route_crdt.py` |
+| a late offline write, built on an old copy of a `jsonb` document, erases what another editor wrote meanwhile | PostgreSQL merges it register by register (`register_cols`); without the merge the test shows the loss; a document that is not an object is refused (`rejected`, SQLSTATE 22023) in both libraries | `registers.py` |
+| three editors of one row, two of them offline, lose each other's changes | example 15's timeline, on five columns and on five registers: PostgreSQL and every replica end at the expected values, and the editor who lost is told | `shared_record.py` |
+| a refused update is dropped although it changed other columns than the winner | it is re-sent (`rebased`) when its columns differ from the winner's, and reported `lost` when they overlap, in both libraries | `rebase_stale.py` |
+| one write freezes a row with an integer version | a fresh row stores at most 1, an update at most the stored value + 1, and the answer says what was stored | `intclamp.py` |
+| the app damages the client's bookkeeping through `query()` | every such write is refused in both libraries, and a queued write survives and lands | `outbox_break.py` |
 
 ### Schema changes
 
@@ -107,12 +112,19 @@ Each row: something that could go wrong, what the test shows instead, and the te
 | --- | --- | --- |
 | a column is added, renamed or dropped while devices are connected | every replica follows, and the values are kept | `migrate_both.py` |
 | a device is offline during an `ADD` / `DROP COLUMN`, with a write queued | it comes back with the new columns, the queued write is settled, and it equals PostgreSQL | `offline_migrate.py` |
-| after a `DROP COLUMN`, writes to the table fail | writes keep working (this test found that they did not, and the fix) | `offline_migrate.py` |
+| after a `DROP COLUMN`, writes to the table fail | writes keep working | `offline_migrate.py` |
 | a device is offline while the table's key changes | it rebuilds the table, loads it again, and equals PostgreSQL | `rekey_offline.py` |
 | queued writes meet a new schema (a dropped column, a new required column, a new key) | each one gets a clear answer, and the replicas equal PostgreSQL | `write_stale.py` |
 | a column without a time zone makes "newer" ambiguous | the database refuses it when the table is created or altered | `tzguard.py` |
 | one oversized row blocks a table for everyone | the row is refused, in PostgreSQL and from a device; only its sender gets the refusal | `widthguard.py`, `rowsize.py` |
 | a table that breaks a rule stops everything | only that table is suspended, and it resumes by itself once fixed | `suspension_lift.py`, `legacybait.py` |
+| a suspended table says one thing to the operator and another to the clients | for every refusal reason, the registry and the published descriptor agree, live and at boot, and each lifts once fixed | `suspension_reasons.py` |
+| a migration grows a table past `MAX_COLUMNS` and crashes the bridge | the table is suspended, the bridge stays up, and a restart re-detects it and re-seeds both clients | `column_flood.py` |
+| two parent tables re-keyed in one transaction break a child that references both | one re-seed each, and both clients converge | `rekey_two_parents.py` |
+| a client killed in the middle of a local rebuild or a re-key is left broken | every leftover state converges when it reopens, in both clients | `rebuild_kill.py` |
+| a parent is deleted while live children still reference it | its tombstone is refused until the children go; a cascade into a tombstone table is refused at enable and at migration | `tombstone_children.py` |
+| a two-level cascade delete meets rows held in a client's inbox | no ghost row and no orphan: both replicas equal PostgreSQL | `cascade_held.py` |
+| `zebridge_enable` accepts a table it should not, or refuses one it should take | a read-only tenant table enables, a dry run changes nothing, a nullable tenant column and an unscoped table are refused | `enable_scoping.py` |
 
 ### Catching up after being away
 
@@ -122,6 +134,10 @@ Each row: something that could go wrong, what the test shows instead, and the te
 | the change stream is deleted under a connected device | the bridge recreates it, the device starts again from a snapshot, and converges | `stream_wipe.py` |
 | the replication slot is lost | the bridge refuses to start and says how to recover; after recovery every device reloads | `slot_loss.py` |
 | rows deleted since the last snapshot come back on a device that reloads | a full snapshot is cut instead, so they do not | `genproducer.py` |
+| a client reading one table sees another table's messages as a gap | it skips them: no gap, no reload | `filtered_gap.py` |
+| one unreadable stream stalls the others | another tenant's rows still arrive, no poll stalls, and the report names the unreadable tenant (by hand) | `darktail.py` |
+| a client returning after a short, a long, or a very long absence reloads more than it needs | it applies the deltas, then the checkpoints, and reloads the base only past the chain or past the sweeper's watermark, with no deleted row coming back (by hand) | `incremental.py` |
+| rows of a tenant table that travel on the public stream are missed, or reloaded for nothing | counted ids inserted while `CDC_PUBLIC` prunes: four clients that come and go each end with every id, and the one whose position fell behind resumes without a reload (by hand) | `gen_follow.py` |
 
 ### Who can see and change what
 
@@ -131,19 +147,25 @@ Each row: something that could go wrong, what the test shows instead, and the te
 | a device writes into another tenant | PostgreSQL refuses it; a user with no tenant can write nothing | `tenant_writes.py` |
 | a device writes under someone else's name, or the bridge falls back to admin rights | neither is possible | `credentials.py` |
 | hostile or malformed messages stall or crash the bridge | each one is refused; nothing stalls, nothing leaks | `adversarial.py` |
-| a revoked user keeps access | their writes are refused at once; a full revocation also cuts their reads and ends their open session at once | `revoke.py`, `revoke_full.py` |
+| a revoked user keeps access | their writes are refused at once; a full revocation also cuts their reads and ends their open session at once. `--revoke --key` revokes one device key at NATS, and with `ADMIN_DATABASE_URL` also marks it so `/renew` refuses it | `revoke.py`, `revoke_full.py` |
 | a revoked user's data stays on their device | with `--purge`, the device deletes its replica and identity when it reconnects or renews its JWT; a plain revocation leaves them | `revoke_purge.py` |
 | an expired JWT fails silently and the device retries forever | it fails with a clear, named error | `jwt_expiry.py` |
-| a device in use is cut off when its JWT runs out, or its wrong clock stops it renewing | both libraries hold 40 s JWTs across 100 s and keep receiving; with a clock estimate 2 h ahead or 2 h behind (the JWT expired meanwhile), each renews and connects | `jwt_renew.py` |
+| a device in use is cut off when its JWT runs out, or its wrong clock stops it renewing | both libraries hold 40 s JWTs across 100 s and keep receiving; with a clock estimate 2 h ahead or 2 h behind (the JWT expired meanwhile), each renews and connects; after a client signing key rotation, both renew onto the new key with no invite | `jwt_renew.py` |
+| a leaked client signing key keeps working | after `--rotate-client-key` and a reload, every client JWT the old key signed is refused, forged or genuine, and the bridge's own credentials keep working | `rotate_client_key.py` |
+| a column kept off the replicas still travels, or can be written | it never reaches the descriptor, a replica or the change feed, and a client write naming it is refused (`UnknownColumn`) | `collist.py` |
+| a user revoked while their device reloads a table keeps a partial copy | the reload finishes but writes stop; with a full revocation the session is cut mid-download and no partial table is left | `revoke_midseed.py` |
+| a principal in several tenants sees only one, or writes into the wrong one | a second invite joins a tenant, libzb reads one stream per tenant into one table, and each write lands in its own tenant (by hand) | `membership.py` |
 
 ### Under load
 
 | what could go wrong | what the test shows | test |
 | --- | --- | --- |
-| sustained writes slowly degrade | 4 million writes at a steady 21,500 per second for three minutes | `stamp.py` |
+| sustained writes slowly degrade | 4 million writes at a steady 21,500 per second for three minutes (by hand: a measurement) | `stamp.py` |
 | repeated disconnections leak memory or lose messages | memory, files and threads stay flat; no message lost or doubled | `churn.py` |
 | NATS dies under a steady stream of changes | the bridge holds back and stops cleanly, then delivers everything when NATS returns | `cascade.py` |
 | one client floods the write path and the others wait | its writes are served at the set rate, each answered once, none lost; a user of another tenant is answered within two seconds during the flood. Past the queue cap, its new writes are refused at the door (that phase runs only on a stack built with a small cap, `ZB_RATELIMIT_CAP_PHASE=1`) | `ratelimit.py` |
+| a long run drifts: replicas diverge, memory grows, tombstones pile up | a create, update and delete every 200 ms for hours, checked every minute: replicas equal PostgreSQL, outboxes empty, memory flat (by hand) | `drip.py` |
+| a large seed holds the whole table in memory | with `seedStreaming`, a 3 M-row seed holds one chunk at a time, with the same rows and checksum (by hand) | `seed_stream.py` |
 
 ### Types, extensions and setups
 
@@ -158,28 +180,33 @@ Each row: something that could go wrong, what the test shows instead, and the te
 | the link to NATS is encrypted in name only | a connect with the right CA does a JetStream round trip; the same connect without the CA fails on the certificate (by hand) | `tls.py` |
 | TLS between the bridge and NATS slows it down | measured: the same event rate as plain TCP (by hand: a measurement) | `burst_tls.py` |
 | reads moved to a standby break the bridge | with the reader on a hot standby and the writer on the primary, the slot lives on the standby, a client seeds and receives changes, and its writes land on the primary | `standby.py` |
-| two bridges on one database step on each other | each publishes and snapshots only its own tables, neither touches the other's snapshots, one client follows and writes the tables of both, and a schema change is published once (this test found that each bridge deleted the other's snapshots, and the fix) | `multi_bridge.py` |
-| a bridge moved to a new NATS (a new server, the same database and slot) leaves it without snapshots | on an empty NATS, the bridge builds a full snapshot of every table, and again when moved back to the old NATS, whose snapshots are out of date; restarted on the same NATS, it rebuilds nothing. Without the fix, the new NATS got no snapshot at all | `nats_move.py` |
+| two bridges on one database step on each other | each publishes and snapshots only its own tables, neither touches the other's snapshots, one client follows and writes the tables of both, and a schema change is published once | `multi_bridge.py` |
+| a bridge moved to a new NATS (a new server, the same database and slot) leaves it without snapshots | on an empty NATS, the bridge builds a full snapshot of every table, and again when moved back to the old NATS, whose snapshots are out of date; restarted on the same NATS, it rebuilds nothing | `nats_move.py` |
+| a service that answers questions works in one library only | a libzb responder and a zb-client-ts responder in one queue group both answer from their own replica, and share the questions | `serve.py` |
+| clients' lag is invisible to the operator | clients' heartbeats become per-client lag on `/metrics`, and every slot is inventoried | `fleet.py` |
+| a change to libzb's C ABI goes unnoticed by a binding | the exported functions and connect options are checked against `libzb/abi.json`: a change must bump the version the bindings check | `abi.py` |
 
-## The README's claims and their tests
+## The documentation's claims and their tests
 
-Each claim of the README's feature list, the tests behind it, and how far they go. "Partial" says what is not shown.
+Each claim of the README and its companions, the tests behind it, and how far they go. "Partial" says what is not shown.
 
-| the README says | tests | how far |
+| the claim (where) | tests | how far |
 | --- | --- | --- |
 | clients reconnect without a stampede: a client that was away reloads from snapshots | `client_gap`, `stream_wipe`, `slot_loss` | each device reloads from a snapshot, not from the change feed |
 | PostgreSQL never sees a reconnection storm | `client_gap`, `matrix`, `nats_outage` | partial: in these tests devices seed and catch up from NATS, and the bridge resumes from its slot; no test measures PostgreSQL's load while many devices reconnect at once |
 | no retry loop for the common case: the library queues, retries and reports verdicts | `race`, `replies`, `offline` | every write gets one verdict, queued writes are sent on reconnection |
 | PostgreSQL judges every write | `mutate`, `offline`, `tiebreak`, `clockskew`, `gc_resurrect` | stale writes refused, ties broken the same way everywhere, clocks bounded |
 | data travels three ways (changes, snapshots, writes) | `stamp`, `churn`; `speed`, `burst` by hand | the rates are measurements, read by a person; `stamp` and `churn` judge that they hold steady |
-| standby read replica | `standby` | the whole path: slot on the standby, seed, live change, write to the primary |
+| standby read replica (DEPLOYMENT) | `standby` | the whole path: slot on the standby, seed, live change, write to the primary |
 | `--revoke --purge` deletes the local replica | `revoke_purge` | both libraries, connected and on return, at reconnection and at renewal |
-| multiple instances (possible, not recommended yet) | `multi_bridge` | two bridges, one database, one NATS |
+| multiple instances, possible, not recommended yet (DEPLOYMENT) | `multi_bridge` | two bridges, one database, one NATS |
 | the JWT renews itself | `jwt_renew`, `revoke_purge` (F), `jwt_expiry`; real iPhone JWT renewal testing in `scripts/phone/renew` | both libraries keep working past two JWT lifetimes, and through a device clock 2 h off either way; a revoked device's renewal gets the purge answer; on an iPhone 12, libzb renews on the bridge's schedule with the clock moved by hand, open or closed |
-| TLS in transit | `tls`, `burst_tls` | the certificate is checked; the cost is measured |
+| TLS in transit (DEPLOYMENT) | `tls`, `burst_tls` | the certificate is checked; the cost is measured |
 | schema changes reach every replica live | `migrate_both`, `invalidate`, `offline_migrate` | online and offline, both libraries |
 | PostGIS and pgvector ready | `blobs`, `vectors`, `pgreplica`, `duckdb_replica` | byte-exact both ways, by hand |
-| anti-client flood | `ratelimit` | the rate, always; the backlog cap only on a stack built with a small cap |
+| write limits per client (OPERATIONS) | `ratelimit` | the rate, always; the backlog cap only on a stack built with a small cap |
+| cooperative editing: several editors on one row (README, COOPERATIVE_EDITING) | `crdt`, `route_crdt`, `registers`, `shared_record` | the merge in the app and in PostgreSQL, with and without `register_cols`; example 15's timeline end to end |
+| a leaked client signing key can be replaced (DEPLOYMENT) | `rotate_client_key`, `jwt_renew` (D) | the old key's JWTs refused, real devices renew onto the new key |
 
 ## In detail, by property
 
@@ -188,7 +215,7 @@ Each claim of the README's feature list, the tests behind it, and how far they g
 | property | asserted by |
 | --- | --- |
 | a `CREATE TABLE` + `zebridge_enable` while the bridge runs routes without a restart: rules reloaded, CDC_PUBLIC's filter reconciled, refusal lifted, schema published, `writable` reflects the grants | `livebirth.py`, `libzb/python/live_enable.py` |
-| a table taken out of the catalogue is refused live, its clients get a suspension | `live_enable.py` |
+| a table taken out of the catalogue is refused live, its clients get a suspension | `libzb/python/live_enable.py` |
 | ADD / DROP / RENAME COLUMN reach a running client as an ALTER, the value survives a rename hint, an FK change forces a rebuild that copies the rows | `libzb/python/migrate.py`, libzb unit test `migrateTable` |
 | the four caches notice DDL: KV schema, the write path's catalog cache, the relation map, the refusal registry; a dropped table's refusal does not linger | `invalidate.py` |
 | a naive `timestamp` column is refused at DDL time | `tzguard.py` |
@@ -199,39 +226,39 @@ Each claim of the README's feature list, the tests behind it, and how far they g
 
 | property | asserted by |
 | --- | --- |
-| a chain exists (full + deltas), continues across deltas, prunes, and a client walks it to the same row count as PostgreSQL | `genproducer.py`, `libzb/python/index_card.py` |
+| a chain exists (base, checkpoints, deltas), continues across deltas, prunes, and a client walks it to the same row count as PostgreSQL | `genproducer.py`, `incremental.py` (by hand), `libzb/python/index_card.py` |
 | the producer `kill -9`'d mid-build never leaves a manifest naming a missing object (objects first, manifest swapped last) | `chain_kill.py` |
 | a full is forced when rows were deleted since the cutoff (no resurrection) | `genproducer.py`, bridge unit tests |
 | writes committed while the bridge was down — and after a `kill -9` — replay from the slot | `downtime.py` |
-| a bridge `kill -9`'d MID-delivery of one large transaction: the unacked transaction replays whole, no row lost, the replayed half deduped at the broker | `txn_kill.py` |
+| a bridge `kill -9`'d in the middle of delivering one large transaction: the unacked transaction replays whole, no row lost, the replayed half deduped at the broker | `txn_kill.py` |
 | a stream at `max_bytes` refusing publishes: retry budget burns, the bridge stops itself, the slot retains, a restart after repair loses nothing | `stream_full.py` |
 | BASE_BUF lowered under stored data: the shrink-gated scan warns at boot, names the table, and stays silent on every non-shrinking boot | `shrink.py` |
 | `bridge --diagnose` says everything the boot would decide and changes nothing: exit 0/1, init presence the headline, minimum BASE_BUF computed, shrink a finding | `diagnose.py` |
 | two bridges on one slot: the loser refuses in its own words within seconds, no fight, no half-start — and `leaks` reads 0 bytes on the refusal path | `slot_contest.py` |
 | a CDC stream deleted wholesale under a live client: deliberate stop, boot recreates, slot replays, client resets to the fresh numbering and converges | `stream_wipe.py` |
 | PostgreSQL stopped and restarted under the bridge: refused connections waited out (connected=0 on /metrics), self-reconnect, durable slot, no loss — and `pg_ctl stop` completes in ~1 s, not wal_sender_timeout | `pg_restart.py` |
-| the permutation matrix: NATS and PostgreSQL down together in both orders, restored in both orders, plus both down with the bridge killed on top — one process survives four double outages, the 3 a.m. case reboots from the slot | `matrix.py` |
+| the permutation matrix: NATS and PostgreSQL down together in both orders, restored in both orders, plus both down with the bridge killed on top — the bridge survives three double outages, and in the fourth it is killed too and resumes from its slot | `matrix.py` |
 | PostgreSQL restarts under a running sweeper: it warns and retries, and the reconnect re-arms the whole session (prepared statements, principal, UTC pin) — fresh ripe tombstones reaped after | `sweeper_restart.py` |
 | the backpressure cascade, observable end to end: broker dies under a steady feed → queue climbs to ~86%, WAL dams behind the slot (~1 MB), bridge halts — then the broker returns and the same process drains it all, 1,199/1,199 rows | `cascade.py` |
 | the CLIENT's host SIGKILLed mid-seed, twice: the torn SQLite file reopens, the seed re-applies idempotently — 120k rows, all distinct, equal to PostgreSQL | `client_kill.py` |
-| `bridge --revoke` (ADMIN_DATABASE_URL, non-ambient): mapping + unused invites in one command, the three clocks narrated, KV purged by the live bridge, double-revoke distinguishable | `revoke.py` |
-| `bridge --init-nats` generates the whole NATS stack (dev: open, 10 s; operator: full JWT, no nsc) — proven by BOOTING the generated conf and round-tripping JetStream on the generated creds | `init_nats.py` |
+| `bridge --revoke` (with `ADMIN_DATABASE_URL`, passed for the call only): mapping + unused invites in one command, its output says when writes, reconnects and reads each stop, KV purged by the live bridge, double-revoke distinguishable | `revoke.py` |
+| `bridge --init-nats` generates the whole NATS stack (dev: open, 10 s; operator: full JWT, no nsc) — proven by booting the generated conf and round-tripping JetStream on the generated creds | `init_nats.py` |
 | the grammar is built in and served: /grammar byte-identical to src/grammar.json with its sha256 header, and a libzb client syncs from `grammarJson` alone — no file copied anywhere | `grammar_served.py` |
-| a JWT with a tiny TTL: full invite-code bootstrap (jwt + grammar in one GET), an ordinary client inside the window, then the read door closes AUDIBLY as a named auth error — not a silent forever-retry | `jwt_expiry.py` |
-| the HARD kill: `--revoke --conf` + OPERATOR_SEED rebuilds the revocations map from PG, re-signs the account JWT, splices the conf — on reload the live session is kicked and the dead token refused, in seconds | `revoke_full.py` |
-| reconnect churn: 50 shuffled NATS bounces + 15 PG fast stop/starts with wasp-swarm writes — RSS/fd/threads flat against a warmup baseline, no sting lost or doubled, one client converges, and `bridge_nats_reconnects_total` equals the log's ground truth (library self-heals + fallback connections — sessions, not bounces; adjacent bounces merge honestly) | `churn.py` |
-| clock skew under LWW: a 4 s-fast clock steals the row — audibly (`stale`) and only until the wall clock catches up; a 30 s-slow clock is starved writing from its wrist but writes through with §7.3's rule (libzb's `hlcVersion`); the feed's last word equals PostgreSQL's and no stale write leaves a trace | `clockskew.py` |
+| a JWT with a tiny TTL: full invite-code bootstrap (jwt + grammar in one GET), an ordinary client inside the window, then the read door closes with a named auth error — not a silent forever-retry | `jwt_expiry.py` |
+| the hard kill: `--revoke --conf` + OPERATOR_SEED rebuilds the revocations map from PG, re-signs the account JWT, splices the conf — on reload the live session is kicked and the dead token refused, in seconds | `revoke_full.py` |
+| reconnect churn: 50 shuffled NATS bounces + 15 PG fast stop/starts with wasp-swarm writes — RSS/fd/threads flat against a warmup baseline, no sting lost or doubled, one client converges, and the reconnect counter matches the log | `churn.py` |
+| clock skew under LWW: a 4 s-fast clock steals the row — audibly (`stale`) and only until the wall clock catches up; a 30 s-slow clock can still write, using [PROTOCOL §7.3](PROTOCOL.md#73-the-version-value)'s rule (libzb's `hlcVersion`); the feed's last word equals PostgreSQL's and no stale write leaves a trace | `clockskew.py` |
 | the CRDT ladder's top rung: a jsonb map-of-LWW-registers — blind replace demonstrably loses an accepted intent; state-based merge with reconcile-to-fixed-point loses none of 18 concurrent keys, settles the contested one by its register tiebreak, and terminates | `crdt.py` |
-| the capacity stamp: saturated and fault-free for 3 minutes — 4M mutations at a flat 21.5k/s (2 lanes), one consumer sustaining 10.4k rows/s downstream beside it; FAILs on a sagging bucket | `stamp.py` |
-| a row written outside the client is in its replica under 10 ms; a 300-row transaction lands in one poll | `libzb/python/tail.py`, `bench_poll.py` (benchmark) |
+| the capacity stamp: saturated and fault-free for 3 minutes — 4M mutations at a flat 21.5k/s (2 lanes), one consumer sustaining 10.4k rows/s downstream beside it; fails if any 10 s window drops | `stamp.py` |
+| a row written outside the client is in its replica under 10 ms; a 300-row transaction lands in one poll | `libzb/python/tail.py`, `libzb/python/bench_poll.py` (benchmark) |
 | a pre-guard oversized row quarantines the table, boot re-derives it, removing the row lifts it | `legacybait.py` |
-| a `row_too_large` suspension lifts LIVE once the table can be carried again — after a 30 s anti-flap cooldown — and the descriptor is republished; `zebridge_catalogue.suspended`/`suspended_reason` mirror both transitions for psql | `suspension_lift.py` |
+| a `row_too_large` suspension lifts live once the table can be carried again — after a 30 s anti-flap cooldown — and the descriptor is republished; `zebridge_catalogue.suspended`/`suspended_reason` mirror both transitions for psql | `suspension_lift.py` |
 | the broker gone for minutes: the bridge waits, ACKs nothing (`confirmed_flush_lsn` holds), the same process resumes, every row lands | `nats_outage.py` |
 | the slot invalidated: boot refuses with the recovery; `ZB_FEED_RESTART=1` restarts the feed (streams, chains, manifests); a client's position beyond `last_seq` is a gap and it re-seeds from a fresh full | `slot_loss.py` |
 | the client away past retention: the tail it needs is gone → gap → re-seed from the chain → converge | `client_gap.py` |
-| a tenant-scoped table's SHARED (open-tenant) rows ride `CDC_PUBLIC`: a gap there re-seeds that table too, not just the public ones | `shared_gap.py` |
+| a tenant-scoped table's shared (open-tenant) rows ride `CDC_PUBLIC`: a gap there re-seeds that table too, not just the public ones | `shared_gap.py` |
 
-### The write path (PROTOCOL §7)
+### The write path ([PROTOCOL §7](PROTOCOL.md#7-writing-from-the-edge--stream-mutations-))
 
 | property | asserted by |
 | --- | --- |
