@@ -53,6 +53,10 @@ pub fn main(init: std.process.Init) !u8 {
     defer argv.deinit(a);
     var ait = init.minimal.args.iterate();
     while (ait.next()) |arg| try argv.append(a, arg);
+    if (argv.items.len == 2 and std.mem.eql(u8, argv.items[1], "--version")) {
+        std.Io.File.stdout().writeStreamingAll(init.io, "zb-respond " ++ @import("build_options").version ++ "\n") catch {};
+        return 0;
+    }
     if (argv.items.len != 2) {
         std.debug.print("usage: zb-respond config.json\n", .{});
         return 2;

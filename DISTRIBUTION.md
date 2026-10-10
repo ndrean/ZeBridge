@@ -47,8 +47,9 @@ message above. The desktop library is the same file for an app and for a service
 differs is what is installed next to it.
 
 Built today: iOS (both slices), the Android AAR (all three CPUs), macOS, and Linux
-(`deploy/build-linux.sh`: x86_64 or aarch64, glibc 2.35). Not yet: Windows release builds
-(on Windows the two optional engines do not load yet), and packaging (see
+(x86_64 or aarch64, glibc 2.35), which also ships as release packages
+([Linux packages](#linux-packages)). Not yet: Windows release builds (on Windows the two
+optional engines do not load yet), and packages for the other platforms (see
 [What is missing](#what-is-missing)).
 
 ## How each host uses it
@@ -135,6 +136,9 @@ machine that runs the service.
     # Linux servers, from a Mac: bridge, bridge_sweeper, libzbcore.so and zb-respond
     deploy/build-linux.sh              # x86_64; `aarch64` for an ARM server
 
+    # the C header, after any change to the exported functions
+    python3 libzb/scripts/gen-header.py
+
 The engines' headers are in `libzb/include-engines/`, so building needs neither DuckDB
 nor PostgreSQL installed.
 
@@ -152,12 +156,36 @@ Every build embeds `grammar.json` and reports its hash (`zb_grammar_hash`). A cl
 whose hash differs from the bridge's (`X-Grammar-Hash` on `/grammar`) refuses to
 connect: rebuild every native client when `grammar.json` changes.
 
+## Linux packages
+
+For Debian and Ubuntu, x86_64 and aarch64. The version is the one in `build.zig.zon`.
+
+    deploy/package-linux.sh            # builds, then packages: x86_64; `aarch64` for ARM
+    deploy/test-linux.sh               # installs them on clean Debian 12, 13, Ubuntu 22.04, 24.04
+
+In `dist/<version>/`:
+
+| file | holds | needs |
+| --- | --- | --- |
+| `zebridge_<version>_<arch>.deb` | `bridge` and `bridge_sweeper` in `/usr/bin`; example systemd units in `/usr/share/doc/zebridge/examples` | `libpq5` (14 or later), `libzstd1`: apt installs them |
+| `libzb_<version>_<arch>.deb` | `libzbcore.so`, `/usr/include/zb.h`, `zb-respond` | glibc only; `libpq5` is suggested, for the PostgreSQL engine |
+| `zebridge-<version>-linux-<arch>.tar.gz`, `libzb-<version>-linux-<arch>.tar.gz` | the same files, to unpack anywhere | the same, installed by hand |
+| `SHA256SUMS` | the checksum of every file | |
+
+    sudo apt install ./zebridge_0.1.0_amd64.deb ./libzb_0.1.0_amd64.deb
+    bridge --version
+
+Every binary prints its version with `--version`. The binaries keep their debug
+information, so a crash prints the file and line it happened at.
+
+`libzb/include/zb.h` declares the C ABI. `libzb/scripts/gen-header.py` writes it from
+the exported functions in `src/capi.zig`, and `libzb/python/abi_check.py` fails when it is
+out of date. A C program builds with `cc app.c -lzbcore`.
+
 ## What is missing
 
 - **Windows loading** for the two optional engines (`LoadLibrary`); SQLite works there.
 - **Publishing the AAR** to a Maven repository; today it is built from source.
-- **A C header, `zb.h`.** The functions are listed in `libzb/abi.json` (checked against
-  the code by `libzb/python/abi_check.py`), but a C, Swift or C++ host still writes its
-  own declarations. The header should be generated from that file.
-- **Release packaging:** an xcframework zip, the AAR, a tarball per desktop platform
-  with the header, and checksums.
+- **Release packaging for the other platforms:** an xcframework zip, the AAR, and
+  tarballs for macOS and Windows. Linux has its packages
+  ([Linux packages](#linux-packages)).

@@ -19,6 +19,8 @@ const usage =
     \\
     \\  --diagnose      Doctor, bridge stopped or running: report what it meets, write nothing
     \\
+    \\  --version       Print the version and exit
+    \\
     \\  --init-nats [dev|operator]  Generate the whole NATS stack, no nsc (--force overwrites)
     \\      [--dir DIR]             …where the files live on their host (default ./zb-nats)
     \\      [--port N]              …the client port (default 4222), also in NATS_URL
@@ -180,7 +182,7 @@ pub const gen_nkey_flag = "--gen-nkey";
 
 /// Flags that REPLACE the program instead of configuring it: they read no environment,
 /// open nothing, and their whole output IS the answer.
-pub const EarlyExit = enum { help, gen_nkey, init_nats, init_sql, mint_responder, mint_leaf, revoke, view_slots, view_slot, drop_slot };
+pub const EarlyExit = enum { help, version, gen_nkey, init_nats, init_sql, mint_responder, mint_leaf, revoke, view_slots, view_slot, drop_slot };
 
 /// Answered from argv by `main` BEFORE the log level is resolved and before anything
 /// else prints — boot noise on stderr is noise in a command meant to be piped
@@ -196,6 +198,7 @@ pub fn earlyExit(init: *const std.process.Init) ?EarlyExit {
         for (help_flags) |flag| {
             if (std.mem.eql(u8, arg, flag)) return .help;
         }
+        if (std.mem.eql(u8, arg, "--version")) return .version;
         if (std.mem.eql(u8, arg, gen_nkey_flag)) return .gen_nkey;
         if (std.mem.eql(u8, arg, "--init-nats")) return .init_nats;
         if (std.mem.eql(u8, arg, "--mint-responder")) return .mint_responder;

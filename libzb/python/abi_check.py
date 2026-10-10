@@ -5,7 +5,7 @@
 says what to do: a host embedding a COPY of libzb (an xcframework, an .so) finds out it
 is stale by comparing versions, so a change that is not a bump is a stale copy nobody
 can detect (NOTES §10ja: an app's libzb, built before `creds`, sat in connect)."""
-import json, pathlib, re, sys
+import json, pathlib, re, subprocess, sys
 
 LIBZB = pathlib.Path(__file__).resolve().parents[1]
 REPO = LIBZB.parent
@@ -31,6 +31,11 @@ for pin in (REPO / "zb-react-native" / "src" / "abi.ts", REPO / "zb-android" / "
         pm = re.search(r"(?:ZB_ABI|zbAbi) = (\d+)", pin.read_text())
         if not pm or int(pm.group(1)) != abi["version"]:
             problems.append(f"{pin.relative_to(REPO)} pins {pm.group(1) if pm else '?'}, abi.json says {abi['version']}")
+
+# include/zb.h is generated from the same exports: a stale header is a broken ABI for C hosts.
+hdr = subprocess.run([sys.executable, str(REPO / "libzb" / "scripts" / "gen-header.py"), "--check"], capture_output=True, text=True)
+if hdr.returncode != 0:
+    problems.append((hdr.stderr or hdr.stdout).strip())
 
 if problems:
     for p in problems:

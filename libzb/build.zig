@@ -369,6 +369,10 @@ pub fn build(b: *std.Build) void {
     }
     respond_mod.link_libc = true;
     respond_mod.addImport("duckdb", duckdb_mod);
+    // The release version, from build.zig.zon: `zb-respond --version`.
+    const respond_options = b.addOptions();
+    respond_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    respond_mod.addOptions("build_options", respond_options);
     const respond_exe = b.addExecutable(.{ .name = "zb-respond", .root_module = respond_mod });
     b.installArtifact(respond_exe);
     // `zig build respond` — the responder alone (deploy/build-linux.sh, for a server).

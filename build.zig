@@ -73,6 +73,10 @@ pub fn build(b: *std.Build) void {
     pg_translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include", "postgresql" }) });
     const pg_c_mod = pg_translate_c.createModule();
 
+    // The release version, from build.zig.zon: `bridge --version` and the packages.
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+
     const mod = b.addModule("bridge", .{
         .root_source_file = b.path("src/bridge.zig"),
         .target = target,
@@ -102,6 +106,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("msgpack", msgpack.module("msgpack"));
     mod.addImport("nats", nats_mod);
     mod.addImport("c", c_mod);
+    mod.addOptions("build_options", build_options);
     // §10ke: `bridge --init-sql` prints the init SQL, so the templates travel inside
     // the binary. They live at the repository root, outside src/, where @embedFile
     // cannot reach: named imports can.
@@ -124,6 +129,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.root_module.addOptions("build_options", build_options);
 
     exe.root_module.addAnonymousImport("init_core_sql", .{ .root_source_file = b.path("init.core.template.sql") });
     exe.root_module.addAnonymousImport("init_write_sql", .{ .root_source_file = b.path("init.write.template.sql") });
@@ -144,6 +150,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    gc_exe.root_module.addOptions("build_options", build_options);
     gc_exe.root_module.link_libc = true;
     linkLibpq(gc_exe, b, prefix);
     // ⚠️ No linkZstd here: the sweeper references no zstd symbol (it only runs

@@ -149,6 +149,7 @@ const usage =
     \\
     \\  --once     one pass, then exit (a controlled run: check, sweep, check)
     \\  --help     this text
+    \\  --version  print the version and exit
     \\
     \\Environment: DATABASE_WRITER_URL (required), GC_THRESHOLD_MS (default 604800000, 7 days),
     \\  GC_INTERVAL_MS (default 60000), GC_BATCH_ROWS (default 1000), GC_DRY_RUN,
@@ -175,6 +176,9 @@ pub fn main(init: std.process.Init) !void {
         while (it.next()) |arg| {
             if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
                 try std.Io.File.stdout().writeStreamingAll(init.io, usage);
+                return;
+            } else if (std.mem.eql(u8, arg, "--version")) {
+                try std.Io.File.stdout().writeStreamingAll(init.io, "bridge_sweeper " ++ @import("build_options").version ++ "\n");
                 return;
             } else if (std.mem.eql(u8, arg, "--once")) {
                 once = true;

@@ -741,6 +741,7 @@ pub fn main(init: std.process.Init) !void {
     // KEY=value lines.
     if (args.earlyExit(&init)) |what| switch (what) {
         .help => return args.printUsage(init.io),
+        .version => return std.Io.File.stdout().writeStreamingAll(init.io, "bridge " ++ @import("build_options").version ++ "\n"),
         .gen_nkey => return nkey_gen.genNkey(init.io),
         .init_nats => return std.process.exit(nats_init.run(init.io, &init)),
         .mint_responder => return std.process.exit(nats_init.mintResponder(init.io, &init)),

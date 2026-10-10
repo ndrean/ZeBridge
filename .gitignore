@@ -107,3 +107,6 @@ zb.sqlite*
 
 # `bridge --init-nats` output: seeds, creds and .env.bridge (mode 0600). Never committed.
 /zb-nats/
+
+# release packages (deploy/package-linux.sh)
+dist/
