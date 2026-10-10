@@ -158,10 +158,29 @@ connect: rebuild every native client when `grammar.json` changes.
 
 ## Linux packages
 
-For Debian and Ubuntu, x86_64 and aarch64. The version is the one in `build.zig.zon`.
+For Debian 12+ and Ubuntu 22.04+, amd64 and arm64, from the APT repository at
+`packages.zebridge.eu`:
 
-    deploy/package-linux.sh            # builds, then packages: x86_64; `aarch64` for ARM
-    deploy/test-linux.sh               # installs them on clean Debian 12, 13, Ubuntu 22.04, 24.04
+    curl -fsSL https://packages.zebridge.eu/zebridge.gpg | sudo tee /usr/share/keyrings/zebridge.gpg >/dev/null
+    echo "deb [signed-by=/usr/share/keyrings/zebridge.gpg] https://packages.zebridge.eu stable main" \
+      | sudo tee /etc/apt/sources.list.d/zebridge.list
+    sudo apt update
+    sudo apt install zebridge libzb
+
+The repository is signed: apt refuses it without that key. The key's fingerprint is on
+the repository's page, `https://packages.zebridge.eu`. `sudo apt upgrade` installs later releases.
+
+**A release**, from a Mac. The version is the one in `build.zig.zon`:
+
+    deploy/package-linux.sh x86_64     # build and package, in dist/<version>/
+    deploy/package-linux.sh aarch64 --no-build  # or build both: run without --no-build
+    deploy/test-linux.sh               # install them on clean Debian 12, 13, Ubuntu 22.04, 24.04
+    deploy/apt-repo.sh                 # add them to dist/apt/, index and sign it
+
+then upload the whole `dist/apt/` folder to the static host (a Cloudflare Pages project).
+`dist/apt/` keeps every release, so it is uploaded whole each time. It is signed with the GPG key
+"ZeBridge packages" (Ed25519), which lives on the release machine only; keep a copy of it
+(`gpg --export-secret-keys --armor "ZeBridge packages"`) somewhere safe.
 
 In `dist/<version>/`:
 
@@ -172,8 +191,7 @@ In `dist/<version>/`:
 | `zebridge-<version>-linux-<arch>.tar.gz`, `libzb-<version>-linux-<arch>.tar.gz` | the same files, to unpack anywhere | the same, installed by hand |
 | `SHA256SUMS` | the checksum of every file | |
 
-    sudo apt install ./zebridge_0.1.0_amd64.deb ./libzb_0.1.0_amd64.deb
-    bridge --version
+A downloaded package installs the same way: `sudo apt install ./zebridge_0.1.0_amd64.deb`.
 
 Every binary prints its version with `--version`. The binaries keep their debug
 information, so a crash prints the file and line it happened at.

@@ -254,7 +254,7 @@ The whole procedure is also automated, for a Debian server behind Cloudflare: [d
   wal_sender_timeout = 300s
   ```
 
-- `nats-server`, and the `bridge` binary (`zig build -Doptimize=ReleaseFast`, then `zig-out/bin/bridge`), with `libpq` and `zstd` installed on the host. The DBA needs only this binary and `psql`: the init SQL is inside it. From a Mac, `deploy/build-linux.sh` builds the Linux `bridge`, `bridge_sweeper` and `libzbcore.so` in a Debian container (x86_64 by default, `aarch64` for an ARM server); they run on Debian 12+ and Ubuntu 22.04+.
+- `nats-server`, and the `bridge` binary. On Debian 12+ or Ubuntu 22.04+, `sudo apt install zebridge` from the project's APT repository installs it with what it needs ([DISTRIBUTION, Linux packages](DISTRIBUTION.md#linux-packages)). Otherwise build it (`zig build -Doptimize=ReleaseFast`, then `zig-out/bin/bridge`), with `libpq` and `zstd` installed on the host. The DBA needs only this binary and `psql`: the init SQL is inside it. From a Mac, `deploy/build-linux.sh` builds the Linux `bridge`, `bridge_sweeper` and `libzbcore.so` in a Debian container (x86_64 by default, `aarch64` for an ARM server); they run on Debian 12+ and Ubuntu 22.04+.
 
 #### 2. Generate the configuration
 
