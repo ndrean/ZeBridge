@@ -210,6 +210,11 @@ The same figure appears _in the log_ as `cpu=31%` on each `LOOP` line, which bea
 - PostgreSQL (connections per bridge role against its limit, the oldest open transaction, server connections against `max_connections`, the ten largest published tables and their dead rows, and a line of counts: tables, principals, tenants, pending invites);
 - Services (memory per hub service, from cAdvisor).
 
+See:
+
+- [Postgres-Bridge dashboard](https://github.com/ndrean/zebridge/telemetry/Postgres-CDC-to-NATS-1791617561819.png)
+- [NATS dashboard](https://github.com/ndrean/zebridge/telemetry/NATS-server-1791617602356.png>)
+
 ### The NATS dashboard
 
 `telemetry/dashboard-nats.json` ("ZeBridge — NATS server") shows what only the server knows, from [prometheus-nats-exporter](https://github.com/nats-io/prometheus-nats-exporter) scraping nats-server's monitoring port (`-varz -jsz all -leafz`; the `nats-exporter` service in `docker-compose.full.yml`, the `nats` job in `telemetry/prometheus.yml`). The bridge dashboard does not need it; this one is for operating the broker.
@@ -222,7 +227,6 @@ The same figure appears _in the log_ as `cpu=31%` on each `LOOP` line, which bea
 | Leaf nodes | leaf connections; slow leaf links | the regional links, once leaf nodes are deployed |
 
 Every metric it queries was checked against a running exporter (`prometheus-nats-exporter`, nats-server 2.15.0).
-
 
 ### JSON /status Endpoint
 
