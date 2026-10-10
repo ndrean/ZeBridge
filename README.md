@@ -96,6 +96,22 @@ Each link is a one-time invite: the tab makes its own key pair, enrolls at the b
 
 Then click a counter. `counter_public` is shared by every tenant, so all three tabs follow it; `counter_tenant` travels only on acme's stream, so the two alice tabs follow it and bob never sees it move. The rest of the page walks through foreign keys, rejected writes and cooperative editing.
 
+Now take the server side away. Keep the tabs open and stop everything else:
+
+```sh
+docker compose -f docker-compose.quickstart.yml down
+```
+
+Each tab keeps working on its own local replica: click the counters in every tab, and each one shows its own value, with its writes waiting in its outbox. Then start again:
+
+```sh
+docker compose -f docker-compose.quickstart.yml up
+```
+
+The tabs reconnect by themselves, send their waiting writes, and catch up on what the others did. PostgreSQL decides each conflict, and all three tabs end with the same values. A counter is last-writer-wins, so it shows the latest write, not the sum of every click.
+
+That is the other half of ZeBridge, next to the routing: each device works on its own, and comes back in line when the network returns.
+
 To start again from scratch: `docker compose -f docker-compose.quickstart.yml down -v`. The quickstart is for evaluation only (PostgreSQL trusts its local network, NATS has no TLS); a real setup follows [Host setup on VPS or bare-metal](DEPLOYMENT.md#host-setup-on-vps-or-bare-metal).
 
 **Where to go next**:
