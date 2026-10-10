@@ -36,5 +36,6 @@ with ZeBridge(bridge_url="https://zb.example.com", invite=code, tables=["orders"
 
 `ZB_LIB` names libzb's shared library; else a copy bundled in the package
 (`zebridge/lib/`), else the repository's own build (`cd libzb && zig build
--Doptimize=ReleaseFast`). `ZB_ABI` pins the C ABI this package speaks; libzb/python/abi_check.py
+-Doptimize=ReleaseFast`), else the system's: on Debian and Ubuntu, `sudo apt install
+./libzb_<version>_<arch>.deb` puts it where the loader finds it. `ZB_ABI` pins the C ABI this package speaks; libzb/python/abi_check.py
 checks it with the other bindings.

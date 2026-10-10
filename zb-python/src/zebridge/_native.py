@@ -8,6 +8,7 @@ that made the call.
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import json
 import os
 import pathlib
@@ -17,15 +18,22 @@ _EXT = {"darwin": ".dylib", "linux": ".so", "win32": ".dll"}
 
 
 def _find() -> str:
-    """ZB_LIB, else a copy bundled in the package, else the repository's own build."""
+    """ZB_LIB, else a copy bundled in the package, else the repository's own build, else
+    the system's (the libzb .deb puts it in /usr/lib/<triplet>)."""
     if os.environ.get("ZB_LIB"):
         return os.environ["ZB_LIB"]
     name = "libzbcore" + _EXT.get(sys.platform, ".so")
     here = pathlib.Path(__file__).resolve().parent
-    for candidate in (here / "lib" / name, here.parents[2] / "libzb" / "zig-out" / "lib" / name):
+    candidates = [here / "lib" / name]
+    if len(here.parents) > 2:  # in a checkout: zb-python/src/zebridge → the repository
+        candidates.append(here.parents[2] / "libzb" / "zig-out" / "lib" / name)
+    for candidate in candidates:
         if candidate.exists():
             return str(candidate)
-    raise OSError(f"zebridge: {name} not found — set ZB_LIB to its path, or build libzb (cd libzb && zig build -Doptimize=ReleaseFast)")
+    system = ctypes.util.find_library("zbcore")
+    if system:
+        return system
+    raise OSError(f"zebridge: {name} not found — install the libzb package, set ZB_LIB to its path, or build it (cd libzb && zig build -Doptimize=ReleaseFast)")
 
 
 lib = ctypes.CDLL(_find())
