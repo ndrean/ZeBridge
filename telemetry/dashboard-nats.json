@@ -174,7 +174,7 @@
         },
         "overrides": []
       },
-      "description": "A slow consumer is a connection the server cut because it did not read fast enough (its pending bytes passed max_pending, or a write missed write_deadline). Every disconnect loses the deliveries in flight: on phones over Wi-Fi this was the first sign of a link that could not keep up (NOTES §10jc). The server's log names the connection."
+      "description": "A slow consumer is a connection the server cut because it did not read fast enough (its pending bytes passed max_pending, or a write missed write_deadline). Every disconnect loses the deliveries in flight: on phones over Wi-Fi this is the first sign of a link that cannot keep up. The server's log names the connection."
     },
     {
       "gridPos": {
@@ -580,7 +580,7 @@
         },
         "overrides": []
       },
-      "description": "Client writes waiting for the bridge's ingress lanes. A write leaves the stream once applied (work-queue retention). With discard=new, a full stream refuses new writes at the door: the client's publish gets the error and keeps the write in its outbox. Verdicts are not here: they have their own stream, VERDICTS (NOTES §10jj)."
+      "description": "Client writes waiting for the bridge's ingress lanes. A write leaves the stream once applied (work-queue retention). With discard=new, a full stream refuses new writes at the door: the client's publish gets the error and keeps the write in its outbox. Verdicts are not here: they have their own stream, VERDICTS."
     },
     {
       "gridPos": {
@@ -815,7 +815,7 @@
         },
         "overrides": []
       },
-      "description": "Handed over but not acknowledged, and delivered more than once. Redeliveries climbing on a client's consumer mean deliveries lost in transit — the libzb/zb-client-ts strict-order rule recovers them (NOTES §10jc)."
+      "description": "Handed over but not acknowledged, and delivered more than once. Redeliveries climbing on a client's consumer mean deliveries lost in transit — the libzb/zb-client-ts strict-order rule recovers them."
     },
     {
       "gridPos": {
@@ -964,7 +964,7 @@
       }
     }
   ],
-  "refresh": "15s",
+  "refresh": "30s",
   "schemaVersion": 39,
   "tags": [
     "zebridge",
