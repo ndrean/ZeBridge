@@ -1,14 +1,50 @@
 {
   "name": "@zebridge/react-native",
   "version": "0.1.0",
-  "private": true,
-  "description": "libzb — the ZeBridge C client — for React Native: an Expo module with the library built in",
+  "description": "ZeBridge for React Native: an offline-first SQLite replica of PostgreSQL tables over NATS, as an Expo module with libzb built in (iOS and Android)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ndrean/zebridge.git",
+    "directory": "zb-react-native"
+  },
+  "homepage": "https://github.com/ndrean/zebridge/blob/main/CLIENTS.md",
+  "bugs": "https://github.com/ndrean/zebridge/issues",
+  "keywords": [
+    "react-native",
+    "expo",
+    "expo-module",
+    "postgresql",
+    "nats",
+    "offline-first",
+    "sqlite",
+    "sync"
+  ],
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "files": [
+    "src",
+    "expo-module.config.json",
+    "ios/ZbNative.podspec",
+    "ios/ZbNativeModule.swift",
+    "ios/zb.h",
+    "ios/ZbCore.xcframework",
+    "android/build.gradle",
+    "android/src",
+    "android/zb-android",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
-    "build:ios": "scripts/build-ios.sh"
+    "build:ios": "scripts/build-ios.sh",
+    "build:android": "scripts/build-android.sh",
+    "prepack": "scripts/prepack.sh",
+    "postpack": "scripts/postpack.sh"
   },
   "peerDependencies": {
-    "expo": ">=52"
+    "expo": ">=53"
   }
 }

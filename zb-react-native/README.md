@@ -13,7 +13,20 @@ await zb.sync();                                   // schema, seed, positions
 const { rows } = await zb.query('SELECT count(*) FROM orders');
 ```
 
-## Build
+## Install
+
+    npx expo install @zebridge/react-native
+
+The package carries libzb already built: an xcframework for iOS (device and simulator)
+and `libzb.so` for Android (arm64-v8a, armeabi-v7a, x86_64). It is native code, so the app
+runs in a [development build](https://docs.expo.dev/develop/development-builds/introduction/)
+(`npx expo run:ios`, `npx expo run:android`, or EAS Build), not in Expo Go. Expo SDK 53 or later.
+
+After upgrading the package, regenerate the native projects (`npx expo prebuild --clean`, or
+`pod install` in `ios/`): CocoaPods copies the library's slices by the names it saw at
+the last install, and a build against stale ones fails with `library 'zb' not found`.
+
+## Build (in this repository)
 
     scripts/build-ios.sh       # both iOS slices → ios/ZbCore.xcframework, ABI checked first
     scripts/build-android.sh   # zb-android's libzb.so per CPU, for the Android module

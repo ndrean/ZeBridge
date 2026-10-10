@@ -1,3 +1,6 @@
 # built by scripts/build-ios.sh
 ios/ZbCore.xcframework/
 android/build/
+ios/zb.h
+android/zb-android/
+LICENSE

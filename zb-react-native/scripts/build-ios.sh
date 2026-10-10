@@ -16,10 +16,14 @@ libzb=$(cd "$here/../libzb" && pwd)
 
 python3 "$libzb/python/abi_check.py"   # the ABI this copy will report is the one the code pins
 
-for slice in ios ios-sim; do
+# Three builds: the device (arm64), and the simulator on Apple silicon (arm64) and on Intel
+# (x86_64). A Release build for the simulator compiles both simulator architectures, so the
+# simulator slice must carry both: they are joined into one library below.
+for slice in ios ios-sim ios-sim-x64; do
   case $slice in
-    ios) target=aarch64-ios; sdk=iphoneos; platform=ios ;;
-    ios-sim) target=aarch64-ios-simulator; sdk=iphonesimulator; platform=ios-simulator ;;
+    ios) target=aarch64-ios; sdk=iphoneos; platform=ios; arch=arm64 ;;
+    ios-sim) target=aarch64-ios-simulator; sdk=iphonesimulator; platform=ios-simulator; arch=arm64 ;;
+    ios-sim-x64) target=x86_64-ios-simulator; sdk=iphonesimulator; platform=ios-simulator; arch=x86_64 ;;
   esac
   out="$libzb/zig-out/$slice"
   (cd "$libzb" && zig build lib -Dtarget=$target -Dvendor=true \
@@ -28,7 +32,7 @@ for slice in ios ios-sim; do
   rm -rf "$out/repack"; mkdir -p "$out/repack"
   (cd "$out/repack" && ar x ../lib/libzbcore.a && chmod 644 ./*.o)
   rm -rf "$out/prelink"; mkdir -p "$out/prelink"
-  ld -r -arch arm64 -platform_version $platform 15.1 18.0 -exported_symbol '_zb_*' \
+  ld -r -arch $arch -platform_version $platform 15.1 18.0 -exported_symbol '_zb_*' \
      "$out"/repack/*.o -o "$out/prelink/zb.o"
   libtool -static -o "$out/prelink/libzb.a" "$out/prelink/zb.o"
   if nm -gU "$out/prelink/zb.o" | grep -q ' _sqlite3_'; then
@@ -36,10 +40,18 @@ for slice in ios ios-sim; do
   fi
 done
 
+# The C declarations the Swift module calls: libzb's generated header, never a hand copy.
+cp "$libzb/include/zb.h" "$here/ios/zb.h"
+
+# The simulator slice: both simulator architectures in one library.
+mkdir -p "$libzb/zig-out/ios-sim-universal"
+lipo -create "$libzb/zig-out/ios-sim/prelink/libzb.a" "$libzb/zig-out/ios-sim-x64/prelink/libzb.a" \
+     -output "$libzb/zig-out/ios-sim-universal/libzb.a"
+
 dest="$here/ios/ZbCore.xcframework"
 rm -rf "$dest"
 xcodebuild -create-xcframework \
   -library "$libzb/zig-out/ios/prelink/libzb.a" \
-  -library "$libzb/zig-out/ios-sim/prelink/libzb.a" \
+  -library "$libzb/zig-out/ios-sim-universal/libzb.a" \
   -output "$dest"
 echo "ok: $dest (libzb ABI $(python3 -c "import json;print(json.load(open('$libzb/abi.json'))['version'])"))"
