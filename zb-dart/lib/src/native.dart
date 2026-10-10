@@ -4,11 +4,14 @@
 /// Every string crosses as UTF-8; every returned string is JSON the caller owns and
 /// frees with `zb_free` (`_take` does both). A NULL result means the call failed, and
 /// `zb_last_error` — per thread, like errno — says why.
+///
+/// libzb itself comes from the build hook (hook/build.dart): the build bundles the
+/// library made for its target, and every `@Native` below binds to it by this asset id.
+@ffi.DefaultAsset('package:zebridge/libzb')
 library;
 
 import 'dart:convert';
 import 'dart:ffi' as ffi;
-import 'dart:io';
 
 import 'package:ffi/ffi.dart';
 
@@ -113,28 +116,51 @@ typedef _PtrOfSS = ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf
 typedef _FreeC = ffi.Void Function(ffi.Pointer<Utf8>);
 typedef _Free = void Function(ffi.Pointer<Utf8>);
 
-/// Where libzb is. iOS links it into the app (its symbols are the process's own);
-/// Android loads `libzbcore.so` from jniLibs; a desktop host takes `ZB_LIB`, else the
-/// repository's own build found by walking up from the working directory — never a
-/// path written into the code.
-ffi.DynamicLibrary _open() {
-  if (Platform.isIOS) return ffi.DynamicLibrary.process();
-  if (Platform.isAndroid) return ffi.DynamicLibrary.open('libzbcore.so');
-  final name = Platform.isMacOS ? 'libzbcore.dylib' : (Platform.isWindows ? 'zbcore.dll' : 'libzbcore.so');
-  final env = Platform.environment['ZB_LIB'];
-  if (env != null && env.isNotEmpty) return ffi.DynamicLibrary.open(env);
-  var dir = Directory.current;
-  for (var i = 0; i < 8; i++) {
-    final f = File('${dir.path}/libzb/zig-out/lib/$name');
-    if (f.existsSync()) return ffi.DynamicLibrary.open(f.path);
-    if (dir.parent.path == dir.path) break;
-    dir = dir.parent;
-  }
-  return ffi.DynamicLibrary.open(name); // the loader's own search path
-}
+// libzb's C functions, one per symbol the client calls.
+@ffi.Native<_IntOf0C>(symbol: 'zb_abi_version')
+external int _zbAbiVersion();
+@ffi.Native<_PtrOf0C>(symbol: 'zb_last_error')
+external ffi.Pointer<Utf8> _zbLastError();
+@ffi.Native<_FreeC>(symbol: 'zb_free')
+external void _zbFree(ffi.Pointer<Utf8> p);
+@ffi.Native<_OpenC>(symbol: 'zb_client_connect')
+external int _zbConnect(ffi.Pointer<Utf8> opts);
+@ffi.Native<_IntOfHC>(symbol: 'zb_client_close')
+external int _zbClose(int h);
+@ffi.Native<_IntOfHC>(symbol: 'zb_client_wipe')
+external int _zbWipe(int h);
+@ffi.Native<_IntOfHC>(symbol: 'zb_client_revoked')
+external int _zbRevoked(int h);
+@ffi.Native<_IntOfHC>(symbol: 'zb_client_wake')
+external int _zbWake(int h);
+@ffi.Native<_PtrOfHC>(symbol: 'zb_client_sync')
+external ffi.Pointer<Utf8> _zbSync(int h);
+@ffi.Native<_PtrOfHC>(symbol: 'zb_client_stamp')
+external ffi.Pointer<Utf8> _zbStamp(int h);
+@ffi.Native<_PtrOfHNC>(symbol: 'zb_client_poll')
+external ffi.Pointer<Utf8> _zbPoll(int h, int ms);
+@ffi.Native<_PtrOfHNC>(symbol: 'zb_client_flush_outbox')
+external ffi.Pointer<Utf8> _zbFlush(int h, int ms);
+@ffi.Native<_PtrOfHSSC>(symbol: 'zb_client_query')
+external ffi.Pointer<Utf8> _zbQuery(int h, ffi.Pointer<Utf8> sql, ffi.Pointer<Utf8> params);
+@ffi.Native<_PtrOfHSSSSC>(symbol: 'zb_client_mutate')
+external ffi.Pointer<Utf8> _zbMutate(int h, ffi.Pointer<Utf8> table, ffi.Pointer<Utf8> op, ffi.Pointer<Utf8> key, ffi.Pointer<Utf8> values);
+@ffi.Native<_PtrOfHSC>(symbol: 'zb_client_join')
+external ffi.Pointer<Utf8> _zbJoin(int h, ffi.Pointer<Utf8> tenant);
+@ffi.Native<_PtrOfHSC>(symbol: 'zb_client_leave')
+external ffi.Pointer<Utf8> _zbLeave(int h, ffi.Pointer<Utf8> tenant);
+@ffi.Native<_PtrOfHSC>(symbol: 'zb_client_serve')
+external ffi.Pointer<Utf8> _zbServe(int h, ffi.Pointer<Utf8> opts);
+@ffi.Native<_PtrOfHSSNC>(symbol: 'zb_client_request')
+external ffi.Pointer<Utf8> _zbRequest(int h, ffi.Pointer<Utf8> subject, ffi.Pointer<Utf8> payload, int timeoutMs);
+@ffi.Native<_PtrOfHSSSC>(symbol: 'zb_client_ingest')
+external ffi.Pointer<Utf8> _zbIngest(int h, ffi.Pointer<Utf8> table, ffi.Pointer<Utf8> answer, ffi.Pointer<Utf8> scope);
+@ffi.Native<_PtrOfHNSC>(symbol: 'zb_client_reply')
+external ffi.Pointer<Utf8> _zbReply(int h, int id, ffi.Pointer<Utf8> answer);
+@ffi.Native<_PtrOfSSC>(symbol: 'zb_call')
+external ffi.Pointer<Utf8> _zbCall(ffi.Pointer<Utf8> fn, ffi.Pointer<Utf8> args);
 
 class ZeBridge {
-  static late ffi.DynamicLibrary _lib;
   static late _IntOf0 _abi;
   static late _PtrOf0 _lastError;
   static late _Free _free;
@@ -152,31 +178,30 @@ class ZeBridge {
   static late _PtrOfSS _call;
   static bool _ready = false;
 
-  /// Open libzb (once per isolate: FFI lookups are per isolate) and check its ABI.
+  /// Bind libzb (once per isolate) and check its ABI.
   static void init() {
     if (_ready) return;
-    _lib = _open();
-    _abi = _lib.lookupFunction<_IntOf0C, _IntOf0>('zb_abi_version');
-    _lastError = _lib.lookupFunction<_PtrOf0C, _PtrOf0>('zb_last_error');
-    _free = _lib.lookupFunction<_FreeC, _Free>('zb_free');
-    _connect = _lib.lookupFunction<_OpenC, _Open>('zb_client_connect');
-    _close = _lib.lookupFunction<_IntOfHC, _IntOfH>('zb_client_close');
-    _wipe = _lib.lookupFunction<_IntOfHC, _IntOfH>('zb_client_wipe');
-    _revoked = _lib.lookupFunction<_IntOfHC, _IntOfH>('zb_client_revoked');
-    _wake = _lib.lookupFunction<_IntOfHC, _IntOfH>('zb_client_wake');
-    _sync = _lib.lookupFunction<_PtrOfHC, _PtrOfH>('zb_client_sync');
-    _stamp = _lib.lookupFunction<_PtrOfHC, _PtrOfH>('zb_client_stamp');
-    _poll = _lib.lookupFunction<_PtrOfHNC, _PtrOfHN>('zb_client_poll');
-    _flush = _lib.lookupFunction<_PtrOfHNC, _PtrOfHN>('zb_client_flush_outbox');
-    _query = _lib.lookupFunction<_PtrOfHSSC, _PtrOfHSS>('zb_client_query');
-    _mutate = _lib.lookupFunction<_PtrOfHSSSSC, _PtrOfHSSSS>('zb_client_mutate');
-    _join = _lib.lookupFunction<_PtrOfHSC, _PtrOfHS>('zb_client_join');
-    _leave = _lib.lookupFunction<_PtrOfHSC, _PtrOfHS>('zb_client_leave');
-    _serve = _lib.lookupFunction<_PtrOfHSC, _PtrOfHS>('zb_client_serve');
-    _request = _lib.lookupFunction<_PtrOfHSSNC, _PtrOfHSSN>('zb_client_request');
-    _ingest = _lib.lookupFunction<_PtrOfHSSSC, _PtrOfHSSS>('zb_client_ingest');
-    _reply = _lib.lookupFunction<_PtrOfHNSC, _PtrOfHNS>('zb_client_reply');
-    _call = _lib.lookupFunction<_PtrOfSSC, _PtrOfSS>('zb_call');
+    _abi = () => _zbAbiVersion();
+    _lastError = () => _zbLastError();
+    _free = (p) => _zbFree(p);
+    _connect = (o) => _zbConnect(o);
+    _close = (h) => _zbClose(h);
+    _wipe = (h) => _zbWipe(h);
+    _revoked = (h) => _zbRevoked(h);
+    _wake = (h) => _zbWake(h);
+    _sync = (h) => _zbSync(h);
+    _stamp = (h) => _zbStamp(h);
+    _poll = (h, ms) => _zbPoll(h, ms);
+    _flush = (h, ms) => _zbFlush(h, ms);
+    _query = (h, a, b) => _zbQuery(h, a, b);
+    _mutate = (h, a, b, c, d) => _zbMutate(h, a, b, c, d);
+    _join = (h, t) => _zbJoin(h, t);
+    _leave = (h, t) => _zbLeave(h, t);
+    _serve = (h, o) => _zbServe(h, o);
+    _request = (h, a, b, n) => _zbRequest(h, a, b, n);
+    _ingest = (h, a, b, c) => _zbIngest(h, a, b, c);
+    _reply = (h, i, a) => _zbReply(h, i, a);
+    _call = (f, a) => _zbCall(f, a);
     final abi = _abi();
     if (abi != zbAbi) throw ZeBridgeException('libzb speaks ABI $abi, this package $zbAbi: rebuild one of them');
     _ready = true;

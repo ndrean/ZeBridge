@@ -1,5 +1,4 @@
 .dart_tool/
 pubspec.lock
 build/
-prebuilt/
-LICENSE
+scripts/

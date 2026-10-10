@@ -1,13 +1,3 @@
 #include "Generated.xcconfig"
-// libzb (06-large-table): the static library must be force-loaded — nothing in the
-// app references its symbols by name, Dart looks them up at run time through
-// DynamicLibrary.process(), and the linker would otherwise drop every zb_* object.
-OTHER_LDFLAGS[sdk=iphoneos*] = $(inherited) -force_load "$(SRCROOT)/libzb/libzb.xcframework/ios-arm64/libzbcore.a"
-OTHER_LDFLAGS[sdk=iphonesimulator*] = $(inherited) -force_load "$(SRCROOT)/libzb/libzb.xcframework/ios-arm64-simulator/libzbcore.a"
 // A personal team signs the device build (README).
 DEVELOPMENT_TEAM = 6UM77KAJ7Q
-// dlsym needs the zb_* symbols in the executable's export table: a release build
-// strips an app's globals (it exports nothing by default) — the simulator debug
-// build found them, the phone's release build did not (2026-09-24).
-STRIP_STYLE = non-global
-OTHER_LDFLAGS = $(inherited) -Xlinker -exported_symbol -Xlinker "_zb_*"

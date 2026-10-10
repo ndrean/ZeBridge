@@ -32,11 +32,9 @@ their failure reason through the C ABI is the other lesson.
 
 ## Build
 
-libzb for iOS is a static library, both slices in one xcframework:
-
-    tool/build-libzb-ios.sh      # zig build lib for aarch64-ios and -simulator, repacked
-
-Then, from this directory:
+libzb comes with the `zebridge` package: its build hook hands every build the library
+made for its target, so there is nothing to link here. In this repository, build those
+libraries once (`../../../zb-dart/scripts/build-prebuilt.sh`). Then, from this directory:
 
     cp ../../../scripts/native/creds/bob.creds assets/creds/     # dev only, git-ignored
     flutter pub get
@@ -44,30 +42,20 @@ Then, from this directory:
     flutter build ios --release --dart-define=ZB_NATS_URL=nats://192.168.1.11:4222   # a real phone: the Mac's LAN address
     xcrun devicectl device install app --device <udid> build/ios/iphoneos/Runner.app
 
-What `ios/Flutter/*.xcconfig` carries, and why (each was a failed link or launch):
-
-* `-force_load` on the slice: nothing references the `zb_*` symbols by name (Dart looks
-  them up at run time through `DynamicLibrary.process()`), so the linker would drop
-  every object;
-* `STRIP_STYLE = non-global` and `-exported_symbol "_zb_*"`, in `Release.xcconfig`
-  ONLY: a release build strips an app's globals — the simulator debug build found the
-  symbols, the phone's release build did not (`dlsym … symbol not found`). Not in
-  Debug: Xcode runs a debug app from a "debug dylib" whose entry point must stay
-  exported, and the list made the stub abort at launch;
-* `DEVELOPMENT_TEAM`: a personal Apple team signs the device build.
+`ios/Flutter/*.xcconfig` carries `DEVELOPMENT_TEAM`: a personal Apple team signs the
+device build.
 
 ## Android
 
-    tool/build-libzb-android.sh    # zig build lib for aarch64-linux-android, then the NDK's clang links the archive into libzbcore.so
     flutter build apk --release --target-platform android-arm64 --dart-define=ZB_NATS_URL=nats://192.168.1.11:4222
     adb install build/app/outputs/flutter-apk/app-release.apk
 
-Zig cannot synthesise Android's libc, so libzb is built as a static
-archive — position-independent on Android targets, `libzb/build.zig` — and the NDK's
-`clang --shared -Wl,--whole-archive` makes the `.so` dart:ffi loads from
-`android/app/src/main/jniLibs/<abi>/` (git-ignored). The manifest declares `INTERNET`.
+The `zebridge` package's build hook puts `libzbcore.so` for each ABI in the APK
+(`zb-dart/scripts/build-prebuilt.sh` builds them: Zig makes a static archive, and the
+NDK's `clang --shared -Wl,--whole-archive` turns it into the `.so`). The manifest
+declares `INTERNET`.
 
-Two slices: `arm64-v8a`, and `armeabi-v7a` for the 32-bit userspace of Android Go phones
+Among them: `arm64-v8a`, and `armeabi-v7a` for the 32-bit userspace of Android Go phones
 (`adb shell getprop ro.product.cpu.abilist` says which a phone runs). The 32-bit one needs
 nats.zig patch 25 (no 64-bit atomics on 32-bit ARM in Zig) and names its CPU
 (`-Dcpu=cortex_a7`: plain `arm` means pre-v7 to Zig).

@@ -47,6 +47,4 @@ app.*.map.json
 # Widget Preview related
 .widget_preview/
 assets/creds/
-ios/libzb/*.xcframework
-android/app/src/main/jniLibs/
 

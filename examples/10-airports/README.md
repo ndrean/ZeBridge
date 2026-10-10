@@ -143,8 +143,7 @@ The phone needs an invite in the same tenant as the browsers. From
 `examples/10-airports/flutter`:
 
 ```sh
-tool/build-libzb-ios.sh
-flutter pub get
+flutter pub get    # libzb comes with the zebridge package (zb-dart/scripts/build-prebuilt.sh, once)
 flutter build ios --release --dart-define=ZB_BRIDGE_URL=https://bridge.example.com --dart-define=ZB_INVITE=<code>
 xcrun devicectl device install app --device <udid> build/ios/iphoneos/Runner.app
 ```

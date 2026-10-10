@@ -54,15 +54,15 @@ optional engines do not load yet), and packages for the other platforms (see
 
 ## How each host uses it
 
-**iOS (Swift, Flutter, React Native).** A static library, packed as an xcframework:
-iOS apps link code in, they do not load it at run time. React Native wraps it in an
-Expo module (`zb-react-native/scripts/build-ios.sh`); Flutter looks the functions up in
-its own process (`examples/10-airports/flutter/tool/build-libzb-ios.sh`).
+**iOS (Swift, Flutter, React Native).** Swift and React Native link a static library,
+packed as an xcframework; React Native wraps it in an Expo module
+(`zb-react-native/scripts/build-ios.sh`). Flutter and Dart get a dynamic library from the
+`zebridge` package's build hook, which Flutter embeds as a framework.
 
 **Android.** A Kotlin or Java app adds the AAR ([zb-android](zb-android/README.md)): the
 JNI layer, a `ZeBridge` class that owns the client's thread, and `libzb.so` per CPU. React
 Native's Expo module calls the same JNI layer (`zb-react-native/scripts/build-android.sh`).
-Flutter loads its own `.so` with dart:ffi (`build-libzb-android.sh`). SQLite is compiled in either
+Flutter gets `libzbcore.so` from the `zebridge` package's build hook. SQLite is compiled in either
 way: Android's own SQLite is not reachable from native code (the NDK does not expose it).
 
 **Desktop.** A shared library that the host loads at run time. Python uses ctypes (`pip install zebridge`: the wheels for Linux and macOS carry the library, built by `zb-python/scripts/build-wheels.sh`),
@@ -129,8 +129,7 @@ machine that runs the service.
     # phones
     zb-react-native/scripts/build-ios.sh
     zb-react-native/scripts/build-android.sh
-    examples/10-airports/flutter/tool/build-libzb-ios.sh
-    examples/06-large-table/flutter/tool/build-libzb-android.sh
+    zb-dart/scripts/build-prebuilt.sh  # Dart and Flutter: every target, in zb-dart/prebuilt/
     zb-android/scripts/build.sh        # the AAR
 
     # Linux servers, from a Mac: bridge, bridge_sweeper, libzbcore.so and zb-respond

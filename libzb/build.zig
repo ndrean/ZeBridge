@@ -264,6 +264,9 @@ pub fn build(b: *std.Build) void {
     // Xcode's ld found `roundq` (f128, compiler-rt's) undefined in the force-loaded
     // archive on the first iOS link.
     lib.bundle_compiler_rt = true;
+    // Room for install-name rewrites: Dart's build hooks (and Xcode's embedding) rename a
+    // bundled dylib with install_name_tool, which fails on Zig's tight Mach-O headers.
+    if (target.result.os.tag.isDarwin()) lib.headerpad_max_install_names = true;
     b.installArtifact(lib);
 
     // §10iq: `zig build lib` — the LIBRARY on its own. The default step also builds

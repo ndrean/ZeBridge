@@ -13,9 +13,9 @@ An invite (16+ characters):
 
     INSERT INTO zebridge_invites (code, principal, tenant_id) VALUES ('phone-renew-…', 'phone_renew', 'acme');
 
-Build and install (libzb from `../../../libzb`, the same xcconfig as 06-large-table):
+Build and install (libzb comes with the zebridge package; in this repository, run
+`zb-dart/scripts/build-prebuilt.sh` once):
 
-    tool/build-libzb-ios.sh
     flutter pub get
     flutter build ios --release --dart-define=ZB_BRIDGE_URL=http://192.168.1.11:27434 \
       --dart-define=ZB_NATS_URL=nats://192.168.1.11:4222 --dart-define=ZB_INVITE=<code>
