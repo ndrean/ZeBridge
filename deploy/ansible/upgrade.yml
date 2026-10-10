@@ -49,11 +49,24 @@
         mode: "0644"
       loop: "{{ zb_debs }}"
 
+    # Under --check the copy above is only pretended: the files are not on the server,
+    # and apt cannot read a package that is not there. Say what would happen instead.
+    - name: What is installed now
+      ansible.builtin.package_facts:
+        manager: apt
+
+    - name: What --check would install
+      ansible.builtin.debug:
+        msg: "{{ item }} → {{ zb_release }} (installed now: {{ ansible_facts.packages[item][0].version if item in ansible_facts.packages else 'none, raw builds in /usr/local' }})"
+      loop: [zebridge, libzb]
+      when: ansible_check_mode
+
     - name: Installed (apt adds what they depend on)
       ansible.builtin.apt:
         deb: "/var/cache/zebridge/{{ item }}"
       loop: "{{ zb_debs }}"
       register: zb_installed
+      when: not ansible_check_mode
 
     - name: The installed packages, read again
       ansible.builtin.package_facts:
