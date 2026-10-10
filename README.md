@@ -156,6 +156,7 @@ To start again from scratch: `docker compose -f docker-compose.quickstart.yml do
     - [Durability](#durability)
     - [Schema Consistency](#schema-consistency)
   - [Graceful Shutdown](#graceful-shutdown)
+- [Telemetry](#telemetry)
 - [Performance measurements](#performance-measurements)
   - [Changes: PostgreSQL → clients](#changes-postgresql--clients)
     - [A live phone under load, killed four times](#a-live-phone-under-load-killed-four-times)
@@ -1567,6 +1568,27 @@ systemctl stop zebridge | pkill -x bridge | docker stop zebridge
 - No in-flight mutations lost
 - PostgreSQL knows exact resume point
 - Clean restart from last ACK'd LSN
+
+[⬆️](#table-of-contents)
+
+---
+
+## Telemetry
+
+You can see the whole pipeline at work, from PostgreSQL to each device.
+
+- **Metrics**: the bridge serves Prometheus metrics on `/metrics` (on `BRIDGE_PORT`), and a JSON summary on `/status`.
+- **Logs**: logfmt on stderr, ready for Loki.
+- **Clients**: each client sends a heartbeat with its position on every stream. The bridge turns it into a lag and a last-seen time per client, so you see which device is behind without asking it.
+
+Two Grafana dashboards come in `telemetry/`:
+
+- **The bridge** (`dashboard.json`): replication lag, throughput, suspended tables, each client's lag, write verdicts, the snapshot chains, PostgreSQL connections and table sizes. It reads only the bridge's `/metrics`.
+- **NATS** (`dashboard-nats.json`): connections, slow consumers, memory, streams, consumers and leaf nodes, from prometheus-nats-exporter.
+
+Screenshots: [the bridge dashboard](https://github.com/ndrean/zebridge/blob/main/telemetry/Postgres-CDC-to-NATS-1791617561819.png), [the NATS dashboard](https://github.com/ndrean/zebridge/blob/main/telemetry/NATS-server-1791617602356.png).
+
+The metrics, what to alert on, and the setup: [OBSERVABILITY](OBSERVABILITY_TELEMETRY.md).
 
 [⬆️](#table-of-contents)
 
