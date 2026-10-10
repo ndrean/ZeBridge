@@ -59,7 +59,7 @@ packed as an xcframework; React Native wraps it in an Expo module
 (`zb-react-native/scripts/build-ios.sh`). Flutter and Dart get a dynamic library from the
 `zebridge` package's build hook, which Flutter embeds as a framework.
 
-**Android.** A Kotlin or Java app adds the AAR ([zb-android](zb-android/README.md)): the
+**Android.** A Kotlin or Java app adds the AAR (`eu.zebridge:zebridge-android` on Maven Central, [zb-android](zb-android/README.md)): the
 JNI layer, a `ZeBridge` class that owns the client's thread, and `libzb.so` per CPU. React
 Native's Expo module calls the same JNI layer (`zb-react-native/scripts/build-android.sh`).
 Flutter gets `libzbcore.so` from the `zebridge` package's build hook. SQLite is compiled in either
@@ -202,7 +202,6 @@ out of date. A C program builds with `cc app.c -lzbcore`.
 ## What is missing
 
 - **Windows loading** for the two optional engines (`LoadLibrary`); SQLite works there.
-- **Publishing the AAR** to a Maven repository; today it is built from source.
 - **Release packaging for the other platforms:** an xcframework zip, the AAR, and
   tarballs for macOS and Windows. Linux has its packages
   ([Linux packages](#linux-packages)).

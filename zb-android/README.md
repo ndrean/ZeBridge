@@ -5,6 +5,12 @@ arm64-v8a, armeabi-v7a and x86_64 (the emulator), the JNI layer, and one class,
 `dev.zebridge.ZeBridge`. Android 10 (API 29) and newer. Which library for which host:
 [DISTRIBUTION.md](../DISTRIBUTION.md).
 
+```kotlin
+dependencies {
+    implementation("eu.zebridge:zebridge-android:0.1.0")   // Maven Central
+}
+```
+
 ## Use
 
 ```kotlin
@@ -50,6 +56,27 @@ Needs zig, the Android NDK and SDK, and a JDK (Android Studio's is used when `JA
 is not set). Per CPU, `zig build lib` makes libzb's static archive, and the NDK's clang
 links it with `src/main/cpp/zb_jni.c` into one `libzb.so` that exports only the JNI
 functions.
+
+## Publish to Maven Central
+
+The coordinates are `eu.zebridge:zebridge-android` (namespace `eu.zebridge`, verified on
+central.sonatype.com by a DNS record on zebridge.eu). Once, on the release machine:
+
+- a Central Portal user token in `~/.gradle/gradle.properties` (mode 0600), as
+  `mavenCentralUsername` and `mavenCentralPassword`;
+- the signing key: the GPG key "ZeBridge packages" signs every file through the `gpg`
+  command (`signing { useGpgCmd() }`), and its public half is on a keyserver
+  (`gpg --keyserver keyserver.ubuntu.com --send-keys <fingerprint>`).
+
+Then, per release (the version is in `build.gradle.kts`):
+
+```sh
+zb-android/scripts/build.sh                                   # libzb.so per CPU, then the AAR
+cd zb-android && gradle publishToMavenCentral                  # upload: the Portal validates it
+```
+
+The deployment then waits on central.sonatype.com (Deployments) until you press Publish.
+`gradle publishAndReleaseToMavenCentral` does both at once.
 
 ## Test on a device
 
