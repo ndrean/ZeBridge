@@ -212,8 +212,8 @@ The same figure appears _in the log_ as `cpu=31%` on each `LOOP` line, which bea
 
 See:
 
-- [Postgres-Bridge dashboard](https://github.com/ndrean/zebridge/telemetry/Postgres-CDC-to-NATS-1791617561819.png)
-- [NATS dashboard](https://github.com/ndrean/zebridge/telemetry/NATS-server-1791617602356.png>)
+- [Postgres-Bridge dashboard](https://github.com/ndrean/zebridge/blob/main/telemetry/Postgres-CDC-to-NATS-1791617561819.png)
+- [NATS dashboard](https://github.com/ndrean/zebridge/blob/main/telemetry/NATS-server-1791617602356.png>)
 
 ### The NATS dashboard
 
