@@ -69,7 +69,7 @@ way: Android's own SQLite is not reachable from native code (the NDK does not ex
 Dart uses dart:ffi, a desktop JVM can use JNA or Java 22's FFM (no glue code needed),
 .NET uses P/Invoke.
 
-**Browsers, Node.** zb-client-ts, not libzb. It needs no native build: libzb's core comes with it as WebAssembly.
+**Browsers, Node.** zb-client-ts (`npm install @zebridge/client`), not libzb. It needs no native build: libzb's core comes with it as WebAssembly.
 
 ## DuckDB: why it is not compiled in
 

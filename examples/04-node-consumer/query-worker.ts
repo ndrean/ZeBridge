@@ -9,7 +9,7 @@
 /// Env: NATS_URL ZB_PRINCIPAL ZB_DB ZB_ENGINE (sqlite|pglite) ZB_TABLES (comma list; default every table)
 import { createInterface } from 'node:readline';
 import { mkdirSync, readFileSync } from 'node:fs';
-import { ZeBridge, mergeRegisters } from 'zb-client-ts';
+import { ZeBridge, mergeRegisters } from '@zebridge/client';
 
 // §10ex: a BLOB cell comes back as bytes; on this JSON line it is the same
 // `{"$bin": "<base64>"}` marker the C ABI uses, so a host reads both clients alike.

@@ -12,7 +12,7 @@
 ///
 /// Env: NATS_URL, ZB_PRINCIPAL, ZB_CREDS, ZB_TABLE, ZB_DB, ZB_ENGINE (sqlite|pglite).
 import { readFileSync } from 'node:fs';
-import { ZeBridge } from 'zb-client-ts';
+import { ZeBridge } from '@zebridge/client';
 
 const REPO = new URL('../../', import.meta.url).pathname;
 const PRINCIPAL = process.env.ZB_PRINCIPAL ?? 'omar';

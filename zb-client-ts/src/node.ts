@@ -1,5 +1,5 @@
 /// Node adapter: better-sqlite3 storage + TCP transport (@nats-io/transport-node).
-/// Import from 'zb-client-ts/node'. The two deps are the HOST's to install
+/// Import from '@zebridge/client/node'. The two deps are the HOST's to install
 /// (optional peers) — a browser bundle never sees this file.
 import Database from 'better-sqlite3';
 import { connect as tcpConnect } from '@nats-io/transport-node';

@@ -16,7 +16,7 @@
 ///      ZB_DURATION_S ZB_SETTLE_S ZB_USER_IDS(csv) NATS_URL
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
-import { ZeBridge } from 'zb-client-ts';
+import { ZeBridge } from '@zebridge/client';
 
 const REPO = new URL('../../', import.meta.url).pathname;
 const SPEC: { wid: string; principal: string; tenant: string; db: string; engine: string; report: string }[] =

@@ -9,7 +9,7 @@
 ///   ?principal=bob   (its tenant, globex, by default)      ?principal=alice   (acme)
 ///
 /// A tenant's page can only ask about its own tenant: NATS refuses the publish otherwise.
-import { ZeBridge } from 'zb-client-ts';
+import { ZeBridge } from '@zebridge/client';
 
 const qs = new URLSearchParams(location.search);
 const PRINCIPAL = qs.get('principal') ?? 'bob';

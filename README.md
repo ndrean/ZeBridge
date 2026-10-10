@@ -185,7 +185,7 @@ To start again from scratch: `docker compose -f docker-compose.quickstart.yml do
 
 ## Overview
 
-**Naming**: the product is ZeBridge; its binary is `bridge` (and `bridge_sweeper`); its SQL objects are `zebridge_*`; its client libraries are `zb-client-ts` (TypeScript) and `libzb` (C ABI), with bindings named `zb-*`.
+**Naming**: the product is ZeBridge; its binary is `bridge` (and `bridge_sweeper`); its SQL objects are `zebridge_*`; its client libraries are `zb-client-ts` (TypeScript) and `libzb` (C ABI), with bindings named `zb-*`. What you install: `@zebridge/client` and `@zebridge/react-native` from npm, `zebridge` and `libzb` with apt.
 
 **How does it work?**: three components, a daemon, a sweeper and a client library.
 
@@ -391,7 +391,7 @@ A screen subscribes to its tenant or its region, not to the whole fleet: 2,000 m
 
 The client library comes in two flavours: TypeScript (for any JavaScript engine) and a native Zig library with a C ABI, `libzb` (Flutter, React Native, Swift, Kotlin, Python services, and any language with an FFI).
 
-- **`zb-client-ts`** — a self-contained TypeScript package that runs **as-is** in browsers, Node, Electron, Deno and Bun. No native library needed: the rules it shares with libzb come as a WebAssembly build of libzb's core (about 70 KB), shipped in the package and loaded by `connect()`.
+- **`zb-client-ts`** (`npm install @zebridge/client`) — a self-contained TypeScript package that runs **as-is** in browsers, Node, Electron, Deno and Bun. No native library needed: the rules it shares with libzb come as a WebAssembly build of libzb's core (about 70 KB), shipped in the package and loaded by `connect()`.
 - **`libzb`** — a native library with a C ABI for mobile apps, desktop apps and microservices (FFI-compatible).
 
 > [!CAUTION]
@@ -423,7 +423,7 @@ The app gets one connection to NATS (WebSocket in the browser, TCP on Node) and 
 Once you call `connect()`, it subscribes, receives, applies and fires your callbacks on its own: you do nothing.
 
 ```ts
-import { ZeBridge, NotEnrolled, RevokedPurge } from 'zb-client-ts';   // the bundler picks the browser or the Node entry
+import { ZeBridge, NotEnrolled, RevokedPurge } from '@zebridge/client';   // the bundler picks the browser or the Node entry
 ```
 
 - `connect()` throws `NotEnrolled` when this device has no stored identity and was given no invite (show the "open your invite link" screen), and `RevokedPurge` when the principal was revoked with `--purge` (its local data is gone). A plain revoke has no class of its own: a connected client sets `zb.revoked` and hangs up, and a later `connect()` throws an `Error` ("renew: refused…"). It is a field, not a class, because the replica stays readable until the app calls `wipe()`; `RevokedPurge` is an error because the local data is already gone.

@@ -8,7 +8,7 @@
 /// Nothing on this page teaches silently.
 
 import { ZeBridge, credsFileText, principalFromCreds, type SeedProgress } from '../../../../zb-client-ts';
-import { mergeRegisters } from 'zb-client-ts';
+import { mergeRegisters } from '@zebridge/client';
 import { nkeys } from '@nats-io/nats-core';
 import { createSignal, onCleanup, For, Show } from 'solid-js';
 

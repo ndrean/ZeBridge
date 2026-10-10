@@ -2,7 +2,7 @@
 /// enrolls with the invite flow, keeps the same registers as the web page and the Flutter
 /// app, and talks to the same bridge.
 import * as FileSystem from 'expo-file-system';
-import { Libzb } from 'zb-react-native';
+import { Libzb } from '@zebridge/react-native';
 
 export type Row = Record<string, any>;
 

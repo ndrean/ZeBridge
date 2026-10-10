@@ -1,7 +1,7 @@
 /// zb-client-ts in the browser: the replica in sqlite-wasm on OPFS (or PGlite with
 /// `engine: 'pglite'`), NATS over WebSocket, zstd by fzstd (pure JS, plain frames —
 /// every chain object since NOTES §10iy). The bundler's `browser` condition picks this
-/// file for `import … from 'zb-client-ts'`; it is also 'zb-client-ts/browser'.
+/// file for `import … from '@zebridge/client'`; it is also '@zebridge/client/browser'.
 import { decompress } from 'fzstd';
 import { fzstdStream } from './fzstd-stream.ts';
 import { registerPlatform } from './platform.ts';

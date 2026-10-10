@@ -4,7 +4,7 @@
 /// need neither. libzb moves only when called: a loop polls (CDC, verdicts, the JWT's
 /// renewal) and flushes the outbox; a command from the screen ends the poll's wait.
 import * as FileSystem from 'expo-file-system';
-import { Libzb } from 'zb-react-native';
+import { Libzb } from '@zebridge/react-native';
 
 // Expo inlines EXPO_PUBLIC_* at bundle time.
 export const BRIDGE_URL = process.env.EXPO_PUBLIC_ZB_BRIDGE_URL ?? 'https://bridge.zebridge.eu';

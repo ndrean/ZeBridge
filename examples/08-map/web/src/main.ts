@@ -18,7 +18,7 @@
 /// The basemap is OpenStreetMap raster, not the R2 vector tiles the phone renders —
 /// the vector stack in a browser needs a style sheet this demo does not need to own.
 import L from 'leaflet';
-import { ZeBridge, mergeRegisters } from 'zb-client-ts';
+import { ZeBridge, mergeRegisters } from '@zebridge/client';
 
 const qs = new URLSearchParams(location.search);
 const PRINCIPAL = qs.get('principal') ?? 'alice';

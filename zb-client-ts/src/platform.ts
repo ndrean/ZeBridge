@@ -1,6 +1,6 @@
 /// What differs between Node and the browser — and nothing else. The core
 /// (libzb.ts) never imports platform code: an entry file registers one `Platform`, and
-/// `import { ZeBridge } from 'zb-client-ts'` gets the right entry from the bundler's
+/// `import { ZeBridge } from '@zebridge/client'` gets the right entry from the bundler's
 /// conditions (package.json `exports`: browser, node). An app passes what
 /// is about the APP — natsUrl, creds, tables, dbPath — never a storage adapter or a
 /// decoder (NOTES §10ja).
@@ -47,7 +47,7 @@ export function registerPlatform(p: Platform): void {
 
 export function currentPlatform(): Platform {
   if (!current) {
-    throw new Error("zb-client-ts: no platform loaded — import from 'zb-client-ts' (the bundler picks node or browser) or from 'zb-client-ts/<platform>'");
+    throw new Error("zb-client-ts: no platform loaded — import from '@zebridge/client' (the bundler picks node or browser) or from '@zebridge/client/<platform>'");
   }
   return current;
 }

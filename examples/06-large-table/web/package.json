@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "One big table, seeded from the chain in a browser \u2014 a progress bar and a timer (NOTES \u00a710ix)",
+  "description": "One big table, seeded from the chain in a browser — a progress bar and a timer (NOTES §10ix)",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
@@ -19,7 +19,7 @@
     "solid-js": "^1.9.14",
     "sqlocal": "^0.18.0",
     "uuid": "^14.0.1",
-    "zb-client-ts": "link:../../../zb-client-ts"
+    "@zebridge/client": "link:../../../zb-client-ts"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

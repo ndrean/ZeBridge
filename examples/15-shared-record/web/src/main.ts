@@ -12,7 +12,7 @@
 ///
 /// The first load enrolls with `?invite=<code>`; the identity is kept in this browser.
 /// `?as=<name>` keeps a separate identity and replica: several editors in one browser.
-import { ZeBridge, NotEnrolled, mergeRegisters, type Register, type Verdict } from 'zb-client-ts';
+import { ZeBridge, NotEnrolled, mergeRegisters, type Register, type Verdict } from '@zebridge/client';
 
 const qs = new URLSearchParams(location.search);
 const el = (id: string) => document.getElementById(id)!;

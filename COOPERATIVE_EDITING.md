@@ -144,7 +144,7 @@ Order and repetition do not change the result (in algebra, the merge is commutat
 Replicas converge whatever the order or duplication of deliveries, and no key is ever removed by a merge.
 
 * **libzb**: `zb_call("mergeRegisters", {"a": …, "b": …})` — the handle-free core entry point, so a Dart, Python or Node host runs the library's own code rather than a copy.
-* **zb-client-ts**: `import { mergeRegisters } from 'zb-client-ts'`.
+* **zb-client-ts**: `import { mergeRegisters } from '@zebridge/client'`.
 * One implementation, libzb's core: zb-client-ts runs it as WebAssembly. `zb-client-ts/fixtures/core-fixtures.json` § `mergeRegisters` (8 cases) pins it, and `registers.py` runs the same cases against `zebridge_merge_registers` in SQL.
 
 ## The loop

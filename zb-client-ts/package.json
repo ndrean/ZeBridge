@@ -1,9 +1,29 @@
 {
-  "name": "zb-client-ts",
+  "name": "@zebridge/client",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "ZeBridge client library: local SQLite replica synchronized over NATS/JetStream",
+  "description": "ZeBridge client: an offline-first SQLite replica of PostgreSQL tables, kept in sync over NATS JetStream, for browsers and Node",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ndrean/zebridge.git",
+    "directory": "zb-client-ts"
+  },
+  "homepage": "https://github.com/ndrean/zebridge/blob/main/CLIENTS.md",
+  "bugs": "https://github.com/ndrean/zebridge/issues",
+  "keywords": [
+    "postgresql",
+    "nats",
+    "jetstream",
+    "offline-first",
+    "sqlite",
+    "replica",
+    "sync",
+    "cdc"
+  ],
+  "engines": {
+    "node": ">=22.15"
+  },
   "main": "src/entry-browser.ts",
   "types": "src/entry-browser.ts",
   "exports": {
@@ -17,10 +37,53 @@
     "./storage": "./src/storage.ts",
     "./wasm/zb_core.wasm": "./wasm/zb_core.wasm"
   },
+  "files": [
+    "dist",
+    "wasm/zb_core.wasm",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "main": "./dist/entry-browser.js",
+    "types": "./dist/entry-browser.d.ts",
+    "exports": {
+      ".": {
+        "browser": {
+          "types": "./dist/entry-browser.d.ts",
+          "default": "./dist/entry-browser.js"
+        },
+        "node": {
+          "types": "./dist/entry-node.d.ts",
+          "default": "./dist/entry-node.js"
+        },
+        "default": {
+          "types": "./dist/entry-browser.d.ts",
+          "default": "./dist/entry-browser.js"
+        }
+      },
+      "./node": {
+        "types": "./dist/entry-node.d.ts",
+        "default": "./dist/entry-node.js"
+      },
+      "./browser": {
+        "types": "./dist/entry-browser.d.ts",
+        "default": "./dist/entry-browser.js"
+      },
+      "./storage": {
+        "types": "./dist/storage.d.ts",
+        "default": "./dist/storage.js"
+      },
+      "./wasm/zb_core.wasm": "./wasm/zb_core.wasm"
+    }
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test src/core.test.ts",
-    "wasm": "cd ../libzb && zig build wasm-core && cp zig-out/wasm/zb_core.wasm ../zb-client-ts/wasm/zb_core.wasm"
+    "wasm": "cd ../libzb && zig build wasm-core && cp zig-out/wasm/zb_core.wasm ../zb-client-ts/wasm/zb_core.wasm",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "prepack": "cp ../LICENSE LICENSE && pnpm run build",
+    "prepublishOnly": "pnpm run typecheck && pnpm test"
   },
   "dependencies": {
     "@electric-sql/pglite": "0.5.8",

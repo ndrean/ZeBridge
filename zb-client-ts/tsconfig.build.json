@@ -1,0 +1,15 @@
+{
+  // The published package: src/ compiled to dist/ as JavaScript and declarations.
+  // The repository itself imports src/ directly (package.json "exports"); `pnpm publish`
+  // swaps in dist/ (package.json "publishConfig").
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": true,
+    "rewriteRelativeImportExtensions": true
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}

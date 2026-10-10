@@ -6,7 +6,7 @@
 /// Env: NATS_URL, ZB_DB, ZB_TABLES (comma list), ZB_PRINCIPAL, ZB_CREDS (optional: the
 /// scratch nats-server of a benchmark has no auth, and the creds file does not exist).
 import { existsSync, readFileSync } from 'node:fs';
-import { ZeBridge } from 'zb-client-ts';
+import { ZeBridge } from '@zebridge/client';
 
 const DB = process.env.ZB_DB ?? `/tmp/zb-follow-${process.pid}.sqlite3`;
 const credsPath = process.env.ZB_CREDS;

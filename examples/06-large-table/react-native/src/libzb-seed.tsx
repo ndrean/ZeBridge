@@ -7,7 +7,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as FileSystem from 'expo-file-system';
-import { Libzb, ZbNative, libzbAvailable } from 'zb-react-native';
+import { Libzb, ZbNative, libzbAvailable } from '@zebridge/react-native';
 import { fileLog } from './app-log';
 
 // Expo inlines EXPO_PUBLIC_* at bundle time. The first run enrolls with the invite; libzb

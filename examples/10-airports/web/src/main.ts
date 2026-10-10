@@ -13,7 +13,7 @@
 /// The first load enrolls with `?invite=<code>`; the identity is kept in this browser.
 /// `?as=<name>` keeps a separate identity and replica, so two people can share one browser.
 import L from 'leaflet';
-import { ZeBridge, NotEnrolled, mergeRegisters } from 'zb-client-ts';
+import { ZeBridge, NotEnrolled, mergeRegisters } from '@zebridge/client';
 
 const SAN_MATEO: L.LatLngTuple = [37.563, -122.326];
 /// A circle 200 km across, around the centre of the map.

@@ -26,7 +26,7 @@
 /// The first load enrolls with `?invite=<code>`; the identity is kept in this browser.
 /// `?as=<name>` keeps a separate identity and replica (two editors in one browser).
 import L from 'leaflet';
-import { ZeBridge, NotEnrolled, mergeRegisters } from 'zb-client-ts';
+import { ZeBridge, NotEnrolled, mergeRegisters } from '@zebridge/client';
 
 const T0 = performance.now();
 const NANTES: L.LatLngTuple = [47.2184, -1.5536];

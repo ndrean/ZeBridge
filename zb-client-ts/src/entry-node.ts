@@ -1,7 +1,7 @@
 /// zb-client-ts on Node: the replica in a better-sqlite3 file, NATS over TCP, zstd and
 /// SHA-256 from node:zlib and node:crypto, `credsPath` read from disk. The bundler's
-/// `node` condition picks this file for `import … from 'zb-client-ts'`; it is also
-/// 'zb-client-ts/node'. better-sqlite3 and @nats-io/transport-node are the host's to
+/// `node` condition picks this file for `import … from '@zebridge/client'`; it is also
+/// '@zebridge/client/node'. better-sqlite3 and @nats-io/transport-node are the host's to
 /// install (optional peers).
 import { readFileSync } from 'node:fs';
 import { readFile, rename, writeFile } from 'node:fs/promises';

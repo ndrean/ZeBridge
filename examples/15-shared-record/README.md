@@ -345,7 +345,7 @@ scripts/scenarios/run.py owns -k shared_record
 The page uses `zb-client-ts` and nothing else from ZeBridge. The whole client side of a cooperative app fits in these calls:
 
 ```js
-import { ZeBridge, NotEnrolled, mergeRegisters } from 'zb-client-ts';
+import { ZeBridge, NotEnrolled, mergeRegisters } from '@zebridge/client';
 
 // 1. who am I — the first visit enrolls with an invite; later visits need nothing
 const zb = new ZeBridge({ 

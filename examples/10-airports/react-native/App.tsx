@@ -9,7 +9,7 @@
 /// for a leaf node (tls://leaf.example.com:4222).
 import { useEffect, useRef, useState } from 'react';
 import { FlatList, Pressable, SafeAreaView, StyleSheet, Text, View } from 'react-native';
-import { mergeRegisters } from 'zb-react-native';
+import { mergeRegisters } from '@zebridge/react-native';
 import { makeClient, type AirportsClient } from './src/client';
 
 // Expo inlines EXPO_PUBLIC_* at bundle time; `process` exists only for that.

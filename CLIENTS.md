@@ -28,7 +28,7 @@ the NATS URL and JWT renewal are the library's.
 TypeScript (browser, Node):
 
 ```ts
-import { ZeBridge } from 'zb-client-ts';
+import { ZeBridge } from '@zebridge/client';
 const zb = new ZeBridge({ bridgeUrl: 'https://zb.example.com', invite: code, tables: ['orders'] });
 await zb.connect();
 zb.onChange('orders', refresh_ui_callback);
@@ -65,7 +65,7 @@ await zb.mutate('orders', 'UPDATE', {'id': 7}, {'status': 'done'});
 React Native (iOS and Android), libzb through its Expo module — the host drives the loop:
 
 ```ts
-import { Libzb } from 'zb-react-native';
+import { Libzb } from '@zebridge/react-native';
 const zb = await Libzb.connect({ bridgeUrl: 'https://zb.example.com', invite: code, tables: ['orders'], dbPath });
 await zb.sync();                                     // seed and catch up
 for (;;) { const r = await zb.poll(1000); if (r.changed_tables?.includes('orders')) refresh_ui_callback(); }   // on its own task

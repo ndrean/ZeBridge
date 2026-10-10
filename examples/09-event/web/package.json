@@ -16,7 +16,7 @@
     "fzstd": "0.1.1",
     "sqlocal": "^0.18.0",
     "uuid": "^14.0.1",
-    "zb-client-ts": "link:../../../zb-client-ts"
+    "@zebridge/client": "link:../../../zb-client-ts"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

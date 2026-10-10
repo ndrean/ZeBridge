@@ -667,7 +667,7 @@ export class ZeBridge {
     // edits before connect() has finished finds it ready; connect() awaits the same load.
     void loadCore(this.platform.coreWasm()).catch(() => { /* connect() retries and says why */ });
     if (config.platform && config.platform !== this.platform.name) {
-      throw new Error(`zb-client-ts: platform '${config.platform}' asked, but this build loaded the '${this.platform.name}' entry — import from 'zb-client-ts/${config.platform}'`);
+      throw new Error(`zb-client-ts: platform '${config.platform}' asked, but this build loaded the '${this.platform.name}' entry — import from '@zebridge/client/${config.platform}'`);
     }
     if (!config.creds && config.credsPath) {
       if (!this.platform.readText) throw new Error(`zb-client-ts: credsPath needs a filesystem; on ${this.platform.name} pass the creds text as \`creds\``);

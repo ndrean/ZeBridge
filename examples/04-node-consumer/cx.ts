@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { ZeBridge } from 'zb-client-ts';
+import { ZeBridge } from '@zebridge/client';
 const R = new URL('../../', import.meta.url).pathname;
 const zb = new ZeBridge({ natsUrl:'nats://127.0.0.1:4222', principal:'omar',
   creds: readFileSync(`${R}scripts/native/creds/omar.creds`,'utf8'),

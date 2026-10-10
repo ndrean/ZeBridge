@@ -9,7 +9,7 @@
 /// but may not subscribe there, which is the point of the role (§10hk).
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { ZeBridge } from 'zb-client-ts';
+import { ZeBridge } from '@zebridge/client';
 
 const REPO = new URL('../../', import.meta.url).pathname;
 const PRINCIPAL = process.env.ZB_PRINCIPAL ?? 'pois';

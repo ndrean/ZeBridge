@@ -6,7 +6,7 @@ native code; the options are the ones zb-client-ts takes (CLIENTS.md). `mergeReg
 is libzb's own register merge, the rule every client applies.
 
 ```ts
-import { Libzb } from 'zb-react-native';
+import { Libzb } from '@zebridge/react-native';
 
 const zb = await Libzb.connect({ natsUrl, creds, principal, tables: ['orders'], dbPath });
 await zb.sync();                                   // schema, seed, positions

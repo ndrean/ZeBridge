@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import MapLibreGL, { Camera, CircleLayer, LineLayer, MapView, MarkerView, PointAnnotation, ShapeSource } from '@maplibre/maplibre-react-native';
-import { mergeRegisters } from 'zb-react-native';
+import { mergeRegisters } from '@zebridge/react-native';
 import { MapClient, TENANT } from './src/client';
 
 MapLibreGL.setAccessToken(null);
