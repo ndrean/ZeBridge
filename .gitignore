@@ -16,12 +16,12 @@ nats-data/
 
 # Dependencies (vendored)
 libs/
-
+.ansible
 /consumer/.elixir_ls/
 # IDE
 .vscode/
 .idea/
-
+debian/
 # Docker
 postgres-data/
 postgres-standby/
