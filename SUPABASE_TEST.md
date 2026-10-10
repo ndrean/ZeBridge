@@ -23,9 +23,11 @@ What runs where:
 
 In Supabase: **Connect** → **Direct connection**: a URL of the form:
 
-`postgresql://postgres:<password>@db.<project>.supabase.co:5432/postgres`.
+```txt
+postgresql://postgres:<password>@db.<project>.supabase.co:5432/postgres
+```
 
-Create `.env.supabase` (git-ignored, mode 600). It holds the admin URL, and the two roles the init SQL will create for the bridge, with passwords you generate:
+Create `.env.supabase` (git-ignored, mode 600). It holds the admin URL, the two roles the init SQL will create for the bridge (with passwords you generate), the NATS addresses the bridge gives clients when they enroll (the ports of step 4), and the event buffer size:
 
 ```sh
 host=db.<project>.supabase.co
@@ -37,6 +39,9 @@ DATABASE_WRITER_URL=postgresql://zb_writer:$(openssl rand -hex 16)@$host:5432/po
 BRIDGE_CDC_PUBLICATION=my_pub
 BRIDGE_CDC_SLOT=zb_slot
 GENERATIONS_ENABLED=1
+ENROLL_NATS_URL=nats://127.0.0.1:4232
+ENROLL_NATS_WS_URL=ws://127.0.0.1:8082
+BASE_BUF=13
 EOF
 ```
 
@@ -45,16 +50,16 @@ EOF
 ```sh
 set -a; . ./.env.supabase; set +a
 psql "$SB_ADMIN_URL" -X <<'SQL'
-select version();
-show wal_level;                 -- logical
-show max_replication_slots;     -- 5 on the free tier
-show max_slot_wal_keep_size;    -- 512MB: a stopped bridge holds at most this much WAL
-select rolsuper, rolreplication, rolcreaterole from pg_roles where rolname = current_user;
+SELECT version();
+SHOW wal_level;                 -- logical
+SHOW max_replication_slots;     -- 5 on the free tier
+SHOW max_slot_wal_keep_size;    -- 512MB: a stopped bridge holds at most this much WAL
+SELECT rolsuper, rolreplication, rolcreaterole FROM pg_roles WHERE rolname = current_user;
 -- event triggers: created, then rolled back
-begin;
-create function zb_probe() returns event_trigger language plpgsql as $$ begin end $$;
-create event trigger zb_probe on ddl_command_end execute function zb_probe();
-rollback;
+BEGIN;
+CREATE function zb_probe() RETURNS event_trigger language plpgsql as $$ BEGIN END $$;
+CREATE event trigger zb_probe ON ddl_command_end EXECUTE function zb_probe();
+ROLLBACK;
 SQL
 ```
 
@@ -68,7 +73,7 @@ The bridge renders the init SQL from the connection file: the two roles, the `ze
 umask 077
 env -i PATH="$PATH" HOME="$HOME" sh -c 'set -a; . ./.env.supabase; set +a; ./zig-out/bin/bridge --init-sql' > zebridge_init.sql
 set -a; . ./.env.supabase; set +a
-psql "$SB_ADMIN_URL" -X -q -f zebridge_init.sql
+psql "$SB_ADMIN_URL" -X -q -f zebridge_init.sql -v ON_ERROR_STOP=1
 ```
 
 `zebridge_init.sql` contains the two roles' passwords: delete it afterwards.
@@ -76,10 +81,10 @@ psql "$SB_ADMIN_URL" -X -q -f zebridge_init.sql
 Check:
 
 ```sql
-select count(*) from pg_tables where schemaname = 'public' and tablename like 'zebridge%';   -- 10
-select evtname from pg_event_trigger where evtname like 'zebridge%';                        -- 4
-select tablename from pg_publication_tables where pubname = 'my_pub';                       -- the 4 internal tables
-select rolname, rolreplication, rolbypassrls from pg_roles where rolname in ('zb_reader', 'zb_writer');
+SELECT count(*) FROM c pg_tables WHERE schemaname = 'public' and tablename like 'zebridge%';   -- 10
+SELECT evtname FROM pg_event_trigger WHERE evtname like 'zebridge%';                        -- 4
+SELECT tablename FROM pg_publication_tables WHERE pubname = 'my_pub';                       -- the 4 internal tables
+SELECT rolname, rolreplication, rolbypassrls FROM pg_roles WHERE rolname in ('zb_reader', 'zb_writer');
 ```
 
 **Supabase's REST API.** Supabase serves the `public` schema over HTTP to its API roles, `anon` and `authenticated`, and grants them every new table and function there. The `anon` key is public by design: whatever `anon` may do, anyone with the project's URL may do. The init SQL takes ZeBridge's own tables and functions back from both roles and fixes every function's `search_path`, which settles Supabase's security advisor for ZeBridge's objects. Your own tables stay yours to decide: `zebridge_check_all()` warns when one is open to those roles without RLS.
@@ -87,7 +92,8 @@ select rolname, rolreplication, rolbypassrls from pg_roles where rolname in ('zb
 ZeBridge does not use the REST API. If your application does not either, turn it off: Project Settings → Data API, or remove `public` from the exposed schemas. Check that nothing of ZeBridge's is open:
 
 ```sql
-select tbl, check_name, detail from zebridge_check_all() where check_name in ('api roles', 'definer function');   -- no rows
+SELECT tbl, check_name, detail FROM zebridge_check_all()
+ WHERE check_name in ('api roles', 'definer function');   -- no rows
 ```
 
 ## 4. NATS
@@ -95,7 +101,8 @@ select tbl, check_name, detail from zebridge_check_all() where check_name in ('a
 The bridge generates the whole NATS setup (operator, account, signing keys, the bridge's credentials, and `.env.nats`) into `./zb-nats/` (git-ignored). The ports here are off the defaults (4222, 8222, 8080), so another NATS can run beside it:
 
 ```sh
-./zig-out/bin/bridge --init-nats operator --port 4232 --http-port 8232 --ws-port 8082
+./zig-out/bin/bridge --init-nats operator \
+--port 4232 --http-port 8232 --ws-port 8082
 # --dir zb-nats is the default
 
 nats-server -c zb-nats/nats-server.conf
@@ -107,7 +114,7 @@ nats-server -c zb-nats/nats-server.conf
 
 ## 5. The bridge
 
-This script, saved as `zb-nats/run-bridge.sh` (`zb-nats/` is git-ignored), loads two files: `zb-nats/.env.nats` (NATS, generated) and `.env.supabase` (the database, the slot, the publication). They share no setting, so the order does not matter:
+This script, saved as `zb-nats/run-bridge.sh` (`zb-nats/` is git-ignored), loads two files: `zb-nats/.env.nats` (NATS, generated) and `.env.supabase` (the database, the slot, the publication, the addresses clients are given). They share no setting, so the order does not matter:
 
 ```sh
 #!/bin/sh
@@ -146,17 +153,26 @@ CREATE TABLE public.counter_tenant (
 -- the same rows for every tenant
 SELECT step, status FROM zebridge_enable('public.counter_public',
   public_reason => 'demo counter — identical content for every tenant',
-  writable => true, version_col => 'updated_at', tiebreak_col => 'last_writer',
-  generations => true, allow_physical_deletes => true,
-  publication => 'my_pub', dry_run => false);
+  writable => true,
+  version_col => 'updated_at',
+  tiebreak_col => 'last_writer',
+  generations => true,
+  allow_physical_deletes => true,
+  publication => 'my_pub',
+  dry_run => false);
 
 -- rows divided by tenant_id
 SELECT step, status FROM zebridge_enable('public.counter_tenant',
   tenant_col => 'tenant_id',
-  writable => true, version_col => 'updated_at', tiebreak_col => 'last_writer',
-  generations => true, allow_physical_deletes => true,
-  publication => 'my_pub', dry_run => false);
+  writable => true,
+  version_col => 'updated_at',
+  tiebreak_col => 'last_writer',
+  generations => true,
+  allow_physical_deletes => true,
+  publication => 'my_pub',
+  dry_run => false);
 
+-- seed
 INSERT INTO public.counter_public (value) VALUES (0);
 INSERT INTO public.counter_tenant (value, tenant_id) VALUES (0, 'acme'), (0, 'globex');
 ```
@@ -177,13 +193,13 @@ RETURNING code;
 
 ## 8. A client
 
-The first run redeems the invite at the bridge, stores its identity next to the replica, seeds both tables and follows them. Later runs need neither the invite nor the NATS URL, and the JWT renews itself.
+The first run redeems the invite at the bridge, stores its identity next to the replica (with the NATS address from `ENROLL_NATS_URL`), seeds both tables and follows them. Later runs need no invite, and the JWT renews itself.
 
 ```python
 from zebridge import ZeBridge
 
 with ZeBridge(bridge_url="http://127.0.0.1:27434", invite="<the code>",
-              nats_url="nats://127.0.0.1:4232", db_path="demo.sqlite3",
+              db_path="demo.sqlite3",
               tables=["counter_public", "counter_tenant"]) as zb:
     print(zb.query("SELECT value FROM counter_public"))
     print(zb.query("SELECT tenant_id, value FROM counter_tenant"))   # acme only

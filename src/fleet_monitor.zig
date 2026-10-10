@@ -113,9 +113,11 @@ pub const Registry = struct {
             if (!gop.found_existing) gop.value_ptr.* = 0;
             gop.value_ptr.* += 1;
         }
+        try w.print("# HELP bridge_fleet_clients_live_all Clients whose heartbeat is inside the live bucket's TTL, all tenants (0 when none)\n", .{});
+        try w.print("# TYPE bridge_fleet_clients_live_all gauge\n", .{});
+        try w.print("bridge_fleet_clients_live_all {d}\n", .{self.clients.len});
         try w.print("# HELP bridge_fleet_clients_live Clients whose heartbeat is inside the live bucket's TTL, per tenant\n", .{});
         try w.print("# TYPE bridge_fleet_clients_live gauge\n", .{});
-        try w.print("bridge_fleet_clients_live_total {d}\n", .{self.clients.len});
         for (counts.keys(), counts.values()) |tenant, n| {
             try w.print("bridge_fleet_clients_live{{tenant=\"{s}\"}} {d}\n", .{ tenant, n });
         }

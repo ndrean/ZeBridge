@@ -102,7 +102,7 @@ bridge_ingress_rate_per_principal 20
 bridge_ingress_rate_burst 20
 bridge_ingress_rate_limited_total 180
 bridge_fleet_poll_timestamp_seconds 1757170200
-bridge_fleet_clients_live_total 3
+bridge_fleet_clients_live_all 3
 bridge_fleet_clients_live{tenant="kilo"} 2
 bridge_fleet_clients_live{tenant="acme"} 1
 bridge_fleet_client_last_seen_seconds{tenant="kilo",principal="omar"} 12
@@ -167,7 +167,7 @@ Worth alerting on:
 | --- | --- | --- |
 | `bridge_refused_tables` | `> 0` | a table is **suspended** — no primary key, an undecodable column type, or a row larger than the event buffer. The log line names which and why. |
 | `bridge_refused_events_dropped_total` | `increase() > 0` | rows are being discarded right now for a suspended table |
-| `bridge_fleet_clients_live{tenant}` | drops | clients heartbeating inside the live bucket's TTL ([PROTOCOL §11](PROTOCOL.md#11-liveness--kv-bucket-live-)); a fleet going quiet is visible here before anyone complains |
+| `bridge_fleet_clients_live{tenant}`, `bridge_fleet_clients_live_all` | drops | clients heartbeating inside the live bucket's TTL ([PROTOCOL §11](PROTOCOL.md#11-liveness--kv-bucket-live-)); a fleet going quiet is visible here before anyone complains |
 | `bridge_fleet_client_lag_events{tenant,principal,stream}` | `> N` for minutes | that client is falling behind on that stream: the messages still pending for it |
 | `bridge_replication_slot_active{slot,type,self}` | `== 0` with retained WAL climbing | a slot nobody reads — an abandoned instance: `bridge --view-slots` to see it from a shell, `ADMIN_DATABASE_URL=… bridge --drop-slot <slot>` once you are sure (it refuses an active slot); PostgreSQL frees the WAL at its next `CHECKPOINT` |
 | `bridge_replication_slot_retained_wal_bytes{slot,type,self}` | growing for an inactive slot | WAL PostgreSQL keeps for that slot; every slot on the server, not only this bridge's |
