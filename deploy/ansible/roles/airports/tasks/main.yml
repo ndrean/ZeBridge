@@ -14,11 +14,12 @@
         creates: /usr/local/lib/libduckdb.so
       notify: Restart airports
 
-    - name: The libzb library for Linux
+    - name: The libzb library for Linux (raw build, when the package is not installed)
       ansible.builtin.copy:
         src: "{{ zb_libzb }}"
         dest: /usr/local/lib/libzbcore.so
         mode: "0644"
+      when: not zb_pkg_libzb | bool
       notify: Restart airports
 
     - name: The library cache (ldconfig)
@@ -86,7 +87,7 @@
 
           [Service]
           User=zebridge
-          Environment=ZB_LIB=/usr/local/lib/libzbcore.so
+          Environment=ZB_LIB={{ zb_libzb_so }}
           Environment=PYTHONPATH=/opt/airports
           # A pipe, not a terminal: without this, Python holds each line in a buffer and
           # the questions reach the journal (and Grafana) late, in bursts.

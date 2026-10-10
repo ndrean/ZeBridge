@@ -90,11 +90,12 @@
       changed_when: "'Started' in routing_compose_up.stderr or 'Created' in routing_compose_up.stderr"
 
     # ── zb-respond ────────────────────────────────────────────────────────────
-    - name: The zb-respond binary
+    - name: The zb-respond binary (raw build, when the package is not installed)
       ansible.builtin.copy:
         src: "{{ zb_respond_bin }}"
         dest: /usr/local/bin/zb-respond
         mode: "0755"
+      when: not zb_pkg_libzb | bool
       notify: Restart routing
 
     - name: Its state directory (the client's own small database)
@@ -156,7 +157,7 @@
 
           [Service]
           User=zebridge
-          ExecStart=/usr/local/bin/zb-respond /etc/zebridge/routing.json
+          ExecStart={{ zb_respond }} /etc/zebridge/routing.json
           Restart=on-failure
           RestartSec=5
 

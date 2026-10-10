@@ -7,7 +7,7 @@
     argv:
       - sh
       - -c
-      - "set -a; . /etc/zebridge/.env.bridge; . /etc/zebridge/.env.nats; set +a; exec bridge --diagnose"
+      - "set -a; . /etc/zebridge/.env.bridge; . /etc/zebridge/.env.nats; set +a; exec {{ zb_bin }}/bridge --diagnose"
   become: true
   become_user: zebridge
   register: verify_diagnose

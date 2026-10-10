@@ -73,7 +73,7 @@
       User=zebridge
       EnvironmentFile=/etc/zebridge/.env.nats
       EnvironmentFile=/etc/zebridge/.env.bridge
-      ExecStart=/usr/local/bin/{{ item.bin }}
+      ExecStart={{ zb_bin }}/{{ item.bin }}
       Restart=on-failure
       RestartSec={{ item.restart_sec }}
 

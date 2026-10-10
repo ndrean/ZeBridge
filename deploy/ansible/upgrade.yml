@@ -1,0 +1,127 @@
+# Move the hub to a release: the .deb packages from deploy/package-linux.sh, installed
+# with apt, in place of the raw builds site.yml copies.
+#
+#   deploy/package-linux.sh                                   # dist/<version>/ on this machine
+#   ansible-playbook upgrade.yml --ask-vault-pass --check --diff
+#   ansible-playbook upgrade.yml --ask-vault-pass
+#   ansible-playbook upgrade.yml --ask-vault-pass -e zb_version=0.1.0   # another release
+#
+# The version is build.zig.zon's unless given. The packages are checked against
+# SHA256SUMS here, copied to the server, and installed (apt adds libpq5 and libzstd1).
+# The zebridge, airports and routing roles then rewrite their units for the packaged
+# paths (/usr/bin, /usr/lib/<triplet>), the services restart, the old /usr/local copies
+# go, and bridge --diagnose has the last word. site.yml stays usable afterwards: its roles
+# see the packages and stop copying raw builds.
+#
+# The first switch restarts each service twice, a few seconds apart: once for its new
+# unit, once for its new binary. Clients reconnect by themselves.
+- name: ZeBridge from the release packages
+  hosts: zebridge
+  become: true
+  vars:
+    zb_release: "{{ zb_version | default(lookup('file', zb_repo ~ '/build.zig.zon') | regex_search('\\.version = \"([^\"]+)\"', '\\1') | first) }}"
+    zb_dist: "{{ zb_repo }}/dist/{{ zb_release }}"
+    zb_debs:
+      - "zebridge_{{ zb_release }}_{{ zb_arch }}.deb"
+      - "libzb_{{ zb_release }}_{{ zb_arch }}.deb"
+    zb_services: "{{ ['zebridge', 'zebridge-sweeper'] + (['airports'] if zb_airports | bool else []) + (['routing'] if zb_routing | bool else []) }}"
+  tasks:
+    - name: The packages match SHA256SUMS (on this machine)
+      ansible.builtin.command: shasum -a 256 -c SHA256SUMS
+      args:
+        chdir: "{{ zb_dist }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      changed_when: false
+      check_mode: false
+
+    - name: A place for them on the server
+      ansible.builtin.file:
+        path: /var/cache/zebridge
+        state: directory
+        mode: "0755"
+
+    - name: The packages on the server
+      ansible.builtin.copy:
+        src: "{{ zb_dist }}/{{ item }}"
+        dest: "/var/cache/zebridge/{{ item }}"
+        mode: "0644"
+      loop: "{{ zb_debs }}"
+
+    - name: Installed (apt adds what they depend on)
+      ansible.builtin.apt:
+        deb: "/var/cache/zebridge/{{ item }}"
+      loop: "{{ zb_debs }}"
+      register: zb_installed
+
+    - name: The installed packages, read again
+      ansible.builtin.package_facts:
+        manager: apt
+
+    - name: The bridge's units, for the packaged binaries
+      ansible.builtin.include_role:
+        name: zebridge
+
+    - name: The airports responder's unit, for the packaged library
+      ansible.builtin.include_role:
+        name: airports
+      when: zb_airports | bool
+
+    - name: The routing responder's unit, for the packaged zb-respond
+      ansible.builtin.include_role:
+        name: routing
+      when: zb_routing | bool
+
+    - name: Units rewritten → restarted now
+      ansible.builtin.meta: flush_handlers
+
+    - name: A new package with the same units → restarted too
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: restarted
+        daemon_reload: true
+      loop: "{{ zb_services }}"
+      when: zb_installed is changed and not ansible_check_mode
+
+    - name: The old copies gone (/usr/local/bin comes first in PATH)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /usr/local/bin/bridge
+        - /usr/local/bin/bridge_sweeper
+        - /usr/local/bin/zb-respond
+        - /usr/local/lib/libzbcore.so
+      when: zb_pkg_bridge | bool and zb_pkg_libzb | bool
+
+    - name: The library cache (ldconfig)
+      ansible.builtin.command: ldconfig
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Each binary's version
+      ansible.builtin.command: "{{ item }} --version"
+      loop: ["{{ zb_bin }}/bridge", "{{ zb_bin }}/bridge_sweeper", "{{ zb_respond }}"]
+      register: zb_versions
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Each binary is the release
+      ansible.builtin.assert:
+        that: item.stdout is search(zb_release ~ '$')
+        fail_msg: "{{ item.item }} says '{{ item.stdout }}', expected {{ zb_release }}"
+        quiet: true
+      loop: "{{ zb_versions.results }}"
+      loop_control:
+        label: "{{ item.stdout | default(item.item) }}"
+      when: not ansible_check_mode
+
+    - name: Every service running
+      ansible.builtin.command: "systemctl is-active {{ zb_services | join(' ') }}"
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: The diagnosis
+      ansible.builtin.include_role:
+        name: verify

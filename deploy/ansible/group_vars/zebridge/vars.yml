@@ -14,6 +14,16 @@ zb_repo: "{{ playbook_dir }}/../.."
 zb_bin_dir: "{{ zb_repo }}/zig-out/linux-x86_64/bin"
 zb_libzb: "{{ zb_repo }}/libzb/zig-out/linux-x86_64/lib/libzbcore.so"
 
+# Where the server's binaries are. upgrade.yml installs the release packages, which put
+# them under /usr; site.yml on a server without them copies the raw builds above under
+# /usr/local. Read from the packages installed (the binaries role gathers them).
+zb_triplet: "{{ 'x86_64' if zb_arch == 'amd64' else 'aarch64' }}-linux-gnu"
+zb_pkg_bridge: "{{ 'zebridge' in (ansible_facts.packages | default({})) }}"
+zb_pkg_libzb: "{{ 'libzb' in (ansible_facts.packages | default({})) }}"
+zb_bin: "{{ '/usr/bin' if zb_pkg_bridge | bool else '/usr/local/bin' }}"
+zb_libzb_so: "{{ ('/usr/lib/' ~ zb_triplet) if zb_pkg_libzb | bool else '/usr/local/lib' }}/libzbcore.so"
+zb_respond: "{{ '/usr/bin' if zb_pkg_libzb | bool else '/usr/local/bin' }}/zb-respond"
+
 # Downloaded on the server. arch: amd64 or arm64.
 zb_arch: amd64
 nats_version: "2.15.0"   # what the VPS runs

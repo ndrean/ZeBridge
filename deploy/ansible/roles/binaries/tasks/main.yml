@@ -4,7 +4,13 @@
 - name: The nats-server release (nats.yml, shared with the leaves)
   ansible.builtin.include_tasks: nats.yml
 
-- name: The bridge and bridge_sweeper binaries
+# Which release packages are installed: once the zebridge package is (upgrade.yml), the
+# raw builds are not copied any more, and the units run the packaged binaries.
+- name: The installed packages
+  ansible.builtin.package_facts:
+    manager: apt
+
+- name: The bridge and bridge_sweeper binaries (raw builds, when the package is not installed)
   ansible.builtin.copy:
     src: "{{ zb_bin_dir }}/{{ item }}"
     dest: "/usr/local/bin/{{ item }}"
@@ -12,4 +18,5 @@
     owner: root
     group: root
   loop: [bridge, bridge_sweeper]
+  when: not zb_pkg_bridge | bool
   notify: Restart zebridge

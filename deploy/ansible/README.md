@@ -52,6 +52,21 @@ The NATS configuration is generated once, by `bridge --init-nats operator`: a la
 **Secrets.** Each secret from `vault.yml` is written only where its file is missing: a server keeps its own certificates, tokens and database URLs, and the vault matters for a new server. To replace them from the vault (a rotation), add `-e zb_rewrite_secrets=true`.
 A run that would write a placeholder from `vault.example.yml` stops before writing anything.
 
+## Upgrading to a release
+
+`upgrade.yml` installs the release packages (`deploy/package-linux.sh`, in `dist/<version>/`) in place of the raw builds:
+
+```sh
+deploy/package-linux.sh                       # from the repository root: build and package
+cd deploy/ansible
+ansible-playbook upgrade.yml --ask-vault-pass --check --diff
+ansible-playbook upgrade.yml --ask-vault-pass
+```
+
+It checks the packages against `SHA256SUMS`, installs them with apt (which adds `libpq5` and `libzstd1`), points the units at `/usr/bin` and `/usr/lib/<triplet>`, restarts the services, deletes the old copies in `/usr/local`, checks each binary's `--version`, and runs `bridge --diagnose`. The version is the one in `build.zig.zon`; `-e zb_version=…` picks another release in `dist/`.
+
+After it, `site.yml` still works: its roles see the packages installed and stop copying raw builds.
+
 ## Leaf nodes
 
 `leaf.yml` sets up the hosts of the inventory's `leaves` group (see `inventory.example.yml`: each one names its credentials, `leaf_name`, and its DNS name, `leaf_host`, with A and AAAA records, DNS only):
