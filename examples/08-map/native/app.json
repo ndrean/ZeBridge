@@ -15,8 +15,7 @@
       "package": "dev.zebridge.zemap"
     },
     "plugins": [
-      "@maplibre/maplibre-react-native",
-      "./plugins/with-fmt-consteval"
+      "@maplibre/maplibre-react-native"
     ]
   }
 }

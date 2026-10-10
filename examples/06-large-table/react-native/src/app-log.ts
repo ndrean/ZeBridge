@@ -4,7 +4,7 @@
 ///     --domain-identifier dev.zebridge.largetable --source Documents/app-log.txt --destination .
 /// The last 2,000 lines, rewritten at most every half second (no append in this
 /// expo-file-system), so logging never paces the seed.
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 
 const FILE = `${FileSystem.documentDirectory}app-log.txt`;
 const MAX = 2000;

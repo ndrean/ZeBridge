@@ -3,7 +3,7 @@
 /// enrolls with the invite; libzb keeps the identity beside the replica, and later runs
 /// need neither. libzb moves only when called: a loop polls (CDC, verdicts, the JWT's
 /// renewal) and flushes the outbox; a command from the screen ends the poll's wait.
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 import { Libzb } from '@zebridge/react-native';
 
 // Expo inlines EXPO_PUBLIC_* at bundle time.

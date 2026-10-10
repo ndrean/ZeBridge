@@ -10,8 +10,8 @@ The app id is `dev.zebridge.airports.rn`, so it installs beside the Flutter app.
 
 ## Android
 
-Needs JDK 17 (React Native 0.76's Gradle does not run on newer ones; Android Studio's
-bundled JDK is too new) and the Android SDK.
+Needs JDK 17 (the builds are tested with it, on React Native 0.86; Android Studio's
+bundled JDK is newer) and the Android SDK.
 
 ```sh
 ../../../zb-react-native/scripts/build-android.sh   # libzb for the module

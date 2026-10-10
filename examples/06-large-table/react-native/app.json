@@ -15,8 +15,6 @@
     "android": {
       "package": "dev.zebridge.largetable"
     },
-    "plugins": [
-      "./plugins/with-fmt-consteval"
-    ]
+    "plugins": []
   }
 }

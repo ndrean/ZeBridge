@@ -50,8 +50,8 @@ the command line, which is scriptable and shows its errors in the terminal.
 
 ⚠️ **It needs JDK 17, and Studio's bundled JDK is not it.** Gradle refuses anything newer
 with `Unsupported class file major version 69` — subtract 44 and that is Java 25, which
-is what Android Studio bundles and what Homebrew installs by default. React Native 0.76
-wants 17:
+is what Android Studio bundles and what Homebrew installs by default. The builds here
+(React Native 0.86) are tested with 17:
 
     brew install openjdk@17     # keg-only: it sits BESIDE your other JDKs
 
