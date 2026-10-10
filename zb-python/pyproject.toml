@@ -5,9 +5,23 @@ description = "ZeBridge client: a local replica of PostgreSQL through NATS, over
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["postgresql", "nats", "jetstream", "offline-first", "sqlite", "replica", "sync"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Topic :: Database",
+]
+
+[project.urls]
+Homepage = "https://github.com/ndrean/zebridge"
+Documentation = "https://github.com/ndrean/zebridge/blob/main/CLIENTS.md"
+Issues = "https://github.com/ndrean/zebridge/issues"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

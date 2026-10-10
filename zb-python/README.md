@@ -2,7 +2,14 @@
 
 A ZeBridge client for Python: a local replica that follows PostgreSQL through the
 bridge, and writes back through it. Pure Python over libzb's C ABI — no ctypes in your
-code. Which library for which host: [DISTRIBUTION.md](../DISTRIBUTION.md).
+code. Which library for which host: [DISTRIBUTION.md](https://github.com/ndrean/zebridge/blob/main/DISTRIBUTION.md).
+
+```sh
+pip install zebridge
+```
+
+The wheels carry libzb for Linux (x86_64, aarch64; glibc 2.35+) and macOS (Apple silicon,
+Intel; 13+). Python 3.10 or later.
 
 ## Use
 
@@ -15,7 +22,7 @@ with ZeBridge(bridge_url="https://zb.example.com", invite=code, tables=["orders"
     zb.mutate("orders", "UPDATE", {"id": 7}, {"status": "done"})
 ```
 
-- **The options** are the ones every ZeBridge client reads (CLIENTS.md), in camelCase or
+- **The options** are the ones every ZeBridge client reads ([CLIENTS.md](https://github.com/ndrean/zebridge/blob/main/CLIENTS.md)), in camelCase or
   snake_case (`bridge_url` is `bridgeUrl`). A dict works too: `ZeBridge({"bridgeUrl": …})`.
 - **Enrollment.** The first run redeems `invite` at the bridge and keeps the identity next
   to the replica (`identity_path`, default `<db_path>.identity`, mode 0600). Later runs need

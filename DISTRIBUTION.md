@@ -65,7 +65,7 @@ Native's Expo module calls the same JNI layer (`zb-react-native/scripts/build-an
 Flutter loads its own `.so` with dart:ffi (`build-libzb-android.sh`). SQLite is compiled in either
 way: Android's own SQLite is not reachable from native code (the NDK does not expose it).
 
-**Desktop.** A shared library that the host loads at run time. Python uses ctypes,
+**Desktop.** A shared library that the host loads at run time. Python uses ctypes (`pip install zebridge`: the wheels for Linux and macOS carry the library, built by `zb-python/scripts/build-wheels.sh`),
 Dart uses dart:ffi, a desktop JVM can use JNA or Java 22's FFM (no glue code needed),
 .NET uses P/Invoke.
 

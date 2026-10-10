@@ -1,0 +1,4 @@
+LICENSE
+src/zebridge/lib/
+build/
+*.egg-info/
