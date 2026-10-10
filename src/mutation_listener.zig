@@ -192,7 +192,7 @@ fn vectorText(alloc: std.mem.Allocator, bytes: []const u8, comptime F: type) ![:
     var i: usize = 0;
     while (i < bytes.len) : (i += size) {
         if (i > 0) try out.append(alloc, ',');
-        const bits = std.mem.readInt(std.meta.Int(.unsigned, size * 8), bytes[i..][0..size], .little);
+        const bits = std.mem.readInt(@Int(.unsigned, size * 8), bytes[i..][0..size], .little);
         try out.print(alloc, "{d}", .{@as(F, @bitCast(bits))});
     }
     try out.append(alloc, ']');

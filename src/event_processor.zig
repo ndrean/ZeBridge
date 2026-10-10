@@ -234,6 +234,17 @@ pub const EventProcessor = struct {
         };
     }
 
+    /// The roster's strings; everything else the processor points at is owned by `main`.
+    pub fn deinit(self: *EventProcessor) void {
+        var it = self.roster.iterator();
+        while (it.next()) |e| {
+            for (e.value_ptr.items) |t| self.allocator.free(t);
+            e.value_ptr.deinit(self.allocator);
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.roster.deinit(self.allocator);
+    }
+
     /// Run preflight's version-column report for one table, on its own connection.
     ///
     /// Short-lived by design: this fires on `CREATE TABLE`, which is rare, and holding an
@@ -598,7 +609,7 @@ pub const EventProcessor = struct {
         // Only applies to UPDATE operations on tables with configured transition rules:
         //   - If transition detected: .transition
         //   - Otherwise: .data
-        // For other operations or tables without rules: no suffix (backward compatible)
+        // Other operations, and tables without rules: no suffix
         const has_rules = self.transition_rules.contains(rel.name);
         const suffix = if (has_rules and operation[0] == 'U')
             if (is_transition) "transition" else "data"
@@ -2166,7 +2177,7 @@ pub const EventProcessor = struct {
     fn rosterRemove(self: *EventProcessor, principal: []const u8, tenant: []const u8) void {
         const list = self.roster.getPtr(principal) orelse return;
         for (list.items, 0..) |t, i| if (std.mem.eql(u8, t, tenant)) {
-            _ = list.orderedRemove(i);
+            self.allocator.free(list.orderedRemove(i));
             return;
         };
     }

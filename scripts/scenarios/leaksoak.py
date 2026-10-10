@@ -44,7 +44,9 @@ FIXTURES = ("memo", "note_t", "counter_public")
 
 
 def bridge_pid() -> str:
-    out = subprocess.run(["pgrep", "-f", "bridge --slot"], capture_output=True, text=True).stdout
+    # The bridge binary however it was started (`--slot`, `--pub`, or the env alone),
+    # never bridge_sweeper.
+    out = subprocess.run(["pgrep", "-f", "^[^ ]*bin/bridge( |$)"], capture_output=True, text=True).stdout
     return out.split()[0] if out.split() else ""
 
 

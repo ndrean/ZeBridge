@@ -1303,6 +1303,7 @@ pub fn main(init: std.process.Init) !void {
     var gen_producer: ?*generation_producer.GenerationProducer = null;
     defer if (gen_producer) |gp| {
         gp.join();
+        gp.deinit();
         allocator.destroy(gp);
     };
     if (runtime_config.generations_enabled or generation_rules.count() > 0) {
@@ -1520,6 +1521,7 @@ pub fn main(init: std.process.Init) !void {
         &writable,
         writer_role,
     );
+    defer event_proc.deinit();
     event_proc.cat = &cat; // §10df: the descriptor carries each table's seed_epoch
     event_proc.publication = pub_name_z; // §10ff: column lists are this publication's
 

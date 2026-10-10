@@ -222,6 +222,27 @@ pub const GenerationProducer = struct {
         self.full_thread = null;
     }
 
+    /// After `join`: the bookkeeping maps and the jobs still queued.
+    pub fn deinit(self: *GenerationProducer) void {
+        const a = self.allocator;
+        for (self.cuts.keys(), self.cuts.values()) |k, cut| {
+            for ([_][]const u8{ cut.tenant, cut.table, cut.vcol, cut.tcol, cut.stream }) |s| a.free(s);
+            a.free(k);
+        }
+        self.cuts.deinit(a);
+        for (self.pair_busy.keys()) |k| a.free(k);
+        self.pair_busy.deinit(a);
+        for (self.full_pending.keys()) |k| a.free(k);
+        self.full_pending.deinit(a);
+        for (self.full_queue.items) |j| for ([_][]const u8{ j.tenant, j.table, j.vcol, j.tcol }) |s| a.free(s);
+        self.full_queue.deinit(a);
+        for (self.edges.keys()) |k| a.free(k);
+        self.edges.deinit(a);
+        var it = self.streamless.keyIterator();
+        while (it.next()) |k| a.free(k.*);
+        self.streamless.deinit(a);
+    }
+
     /// §10du: a tick asked for out of cadence. Set by the catalogue reload when a
     /// table's seed epoch moves — every client of that table is waiting, empty, for
     /// the full under the new epoch, and the cadence is minutes. One producer per
