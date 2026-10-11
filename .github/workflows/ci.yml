@@ -68,9 +68,8 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: zb-client-ts/pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile
+      # No lockfile in the repository (.gitignore): versions resolve from package.json.
+      - run: pnpm install
       - run: pnpm run typecheck
       - run: pnpm test
 

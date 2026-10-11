@@ -398,7 +398,9 @@ pub fn build(b: *std.Build) void {
     const wasm_step = b.step("wasm-core", "Build ONLY the core for the browser (wasm32, zig-out/wasm/zb_core.wasm)");
     wasm_step.dependOn(&b.addInstallArtifact(wasm_core, .{ .dest_dir = .{ .override = .{ .custom = "wasm" } } }).step);
 
-    const tests = b.addTest(.{ .root_module = mod });
+    // LLVM, not Zig's own x86_64 backend: its Debug info references the libpq functions
+    // engines.zig only takes types from, and the test executable then fails to link.
+    const tests = b.addTest(.{ .root_module = mod, .use_llvm = true });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests (ZB_LIVE=1 adds the live transport test)");
     test_step.dependOn(&run_tests.step);
