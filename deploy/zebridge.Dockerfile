@@ -1,0 +1,20 @@
+# The release image: the bridge and the sweeper, installed from the release's own .deb, so
+# apt brings libpq5 and libzstd1 exactly as on a server. Built by .github/workflows/release.yml:
+#
+#   ghcr.io/ndrean/zebridge:<version>        linux/amd64 and linux/arm64
+#
+#   docker run --rm ghcr.io/ndrean/zebridge:<version> --version
+#   docker run ... --entrypoint bridge_sweeper ghcr.io/ndrean/zebridge:<version>
+#
+# The build context is a folder holding zebridge_<version>_<amd64|arm64>.deb.
+# postgresql-client is psql, for `bridge --init-sql | psql`.
+FROM debian:13-slim
+ARG VERSION
+ARG TARGETARCH
+COPY zebridge_${VERSION}_${TARGETARCH}.deb /tmp/
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates postgresql-client /tmp/zebridge_${VERSION}_${TARGETARCH}.deb \
+ && rm -rf /var/lib/apt/lists/* /tmp/*.deb \
+ && useradd --system --no-create-home --shell /usr/sbin/nologin zebridge
+USER zebridge
+ENTRYPOINT ["/usr/bin/bridge"]

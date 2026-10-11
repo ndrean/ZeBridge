@@ -41,5 +41,6 @@ EOF
 done
 rm -rf "$stage"
 
-(cd "$out" && shasum -a 256 ./*.tar.gz ./*.deb | sed 's| \./| |' > SHA256SUMS)
+# Over every file here: the Linux ones too when they were built on this machine.
+(cd "$out" && shasum -a 256 $(ls *.tar.gz *.deb 2>/dev/null) > SHA256SUMS)
 ls -la "$out"
