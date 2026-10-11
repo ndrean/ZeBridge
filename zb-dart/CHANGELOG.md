@@ -1,3 +1,8 @@
+## 0.1.2
+
+- pubspec.yaml declares the supported platforms: Android, iOS, Linux, macOS. There is
+  no Windows build of libzb yet.
+
 ## 0.1.1
 
 - The example is `example/zebridge_example.dart`, where pub.dev looks for it.
