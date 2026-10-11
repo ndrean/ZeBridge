@@ -1,0 +1,87 @@
+# Checks on every push and pull request. Nothing is published here.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bridge:
+    name: bridge (unit tests)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - name: Apply the nats.zig patches
+        run: for p in nats.zig-patch/[0-9][0-9]-nats.zig-*.patch; do git -C nats.zig apply "../$p"; done
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      # build.zig looks for libpq and zstd under /usr/lib; Ubuntu keeps them in the arch folder.
+      - name: Install libpq and zstd
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libpq-dev libzstd-dev
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libpq.so /usr/lib/libpq.so
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libzstd.so /usr/lib/libzstd.so
+      - run: zig build test
+
+  libzb:
+    name: libzb (unit tests, ABI)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - name: Apply the nats.zig patches
+        run: for p in nats.zig-patch/[0-9][0-9]-nats.zig-*.patch; do git -C nats.zig apply "../$p"; done
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: ABI and zb.h match the code
+        run: python3 libzb/python/abi_check.py
+      - name: Unit tests
+        working-directory: libzb
+        run: zig build test -Dvendor=true
+
+  client-ts:
+    name: zb-client-ts (typecheck, tests)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: zb-client-ts
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: zb-client-ts/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run typecheck
+      - run: pnpm test
+
+  dart:
+    name: zb-dart (analyze)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: zb-dart
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - run: dart pub get
+      - run: dart analyze
