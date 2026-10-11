@@ -307,6 +307,9 @@ pub const Publisher = struct {
     ) !void {
         if (self.js) |*js| {
             var res = js.publish(subject, data, .{ .msg_id = msg_id }) catch |err| {
+                // NATS answered: no stream takes this subject. The connection is fine, and
+                // a reconnect would only repeat the same answer.
+                if (err == error.NoStreamResponse) return err;
                 log.warn("NATS publish failed: {s} - attempting reconnection", .{@errorName(err)});
                 self.is_connected.store(false, .seq_cst);
 
@@ -361,6 +364,18 @@ pub const Publisher = struct {
             var res = js.getStreamInfo(stream_name) catch return false;
             res.deinit();
             return true;
+        }
+        return false;
+    }
+
+    /// True only when JetStream answers that the stream does not exist. Unlike
+    /// `!streamExists`, a request that failed (no connection, a timeout) is not an
+    /// answer and returns false: a caller that drops events on `true` must never do it
+    /// on a guess.
+    pub fn streamMissing(self: *Publisher, stream_name: []const u8) bool {
+        if (self.js) |*js| {
+            var res = js.getStreamInfo(stream_name) catch |err| return err == error.StreamNotFound;
+            res.deinit();
         }
         return false;
     }

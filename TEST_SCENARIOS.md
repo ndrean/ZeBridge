@@ -280,6 +280,7 @@ Each claim of the README and its companions, the tests behind it, and how far th
 | the bridge cannot fall back to admin credentials; the mutation principal is broker-enforced; an illegal principal token never lands | `credentials.py` |
 | cross-tenant reach by any primitive (core SUB, JS consumer, stream info, OBJ chain objects) — the file records the known hole deliberately | `crosstenant.py` |
 | `$KV.tenants` exact-key grants; live propagation from `zebridge_user_tenants`; the roster never appears on a CDC stream | `tenant_kv.py`, `dyntenant.py` |
+| a row for a tenant nobody is mapped to yet (no stream) is skipped: the bridge keeps running, the slot moves on, and the first mapping creates the stream | `unmapped_tenant.py` |
 | the two untrusted-byte entry points (mutation envelopes, `/enroll`) refuse, never wedge, never leak | `adversarial.py` |
 
 ### Operations

@@ -16,9 +16,8 @@ from every mapping the bridge has ever read:
   3. a row written with the new tenant lands in the new stream, on the subject the
      tenant value dictates — the bridge never knew this tenant existed.
 
-⚠️ The stream MUST exist before the write. A tenant-routed row whose subject matches
-no stream is the §2.19 failure shape: the publish gets no PubAck, retries, and enough
-of that kills the bridge. Step (1) is not setup convenience — it is the contract.
+The stream exists before the write here, as a backend provisioning it would arrange. A
+row for a tenant with no stream yet is skipped, not fatal: unmapped_tenant.py covers that.
 
 Usage:  python scripts/scenarios/dyntenant.py
 Needs a running bridge, a catalogue row for test_types with a tenant_col, NATS_CREDS

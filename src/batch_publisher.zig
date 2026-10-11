@@ -401,6 +401,40 @@ pub const CDCEvent = struct {
     }
 };
 
+/// Which CDC subjects may meet a missing stream without that being a fault.
+///
+/// A tenant's stream (`CDC_<tenant>`) exists once a principal is mapped to the tenant.
+/// A row written for a tenant before its first mapping has no stream to land in, and
+/// NATS answers 503. Nobody can read that tenant yet, and its first device seeds from a
+/// full generation built after its stream exists, which holds the row: the event is
+/// skipped, not retried until the bridge stops (the generation producer applies the same
+/// rule to its chains). Untenanted and open-tenant rows go to the public stream: a
+/// missing public stream stays a fault.
+pub const TenantRouting = struct {
+    cdc_prefix: []const u8, // "cdc"
+    stream_prefix: []const u8, // "CDC_"
+    open_tenant: []const u8, // "_default": its rows go to the public stream
+
+    /// The tenant of `<cdc_prefix>.<tenant>.<table>.<op>`. Null for an untenanted
+    /// subject (`<cdc_prefix>.<table>.<op>`), the open tenant, and anything else.
+    pub fn tenantOf(self: TenantRouting, subject: []const u8) ?[]const u8 {
+        var it = std.mem.splitScalar(u8, subject, '.');
+        if (!std.mem.eql(u8, it.next() orelse return null, self.cdc_prefix)) return null;
+        const tenant = it.next() orelse return null;
+        const table = it.next() orelse return null;
+        const op = it.next() orelse return null;
+        if (it.next() != null) return null;
+        if (tenant.len == 0 or table.len == 0 or op.len == 0) return null;
+        if (std.mem.eql(u8, tenant, self.open_tenant)) return null;
+        return tenant;
+    }
+
+    /// `<stream_prefix><tenant>` in `buf`; null when it does not fit.
+    pub fn streamName(self: TenantRouting, buf: []u8, tenant: []const u8) ?[]const u8 {
+        return std.fmt.bufPrint(buf, "{s}{s}", .{ self.stream_prefix, tenant }) catch null;
+    }
+};
+
 /// Batch publisher that runs a background flush thread
 /// Dequeues events from SPSC queue, batches, encodes, and publishes to NATS
 pub const BatchPublisher = struct {
@@ -410,6 +444,12 @@ pub const BatchPublisher = struct {
     metrics: ?*Metrics, // Optional metrics reference
     /// §10er: the burst mark per stream, fed on every publish.
     hot: ?*hot_streams.HotStreams = null,
+    /// Set by main from the topology: which subjects may meet a missing stream (a tenant
+    /// nobody is mapped to yet). Null: every missing stream is a fault.
+    tenant_routing: ?TenantRouting = null,
+    /// Tenants whose events were skipped for want of a stream, said once each (flush
+    /// thread only; forgotten when their stream accepts a publish again).
+    streamless: std.StringHashMapUnmanaged(void) = .empty,
 
     // Pre-allocated ring buffer of CDCEvent structs (zero malloc/free!)
     // Allocated once at startup, reused for entire lifetime
@@ -674,6 +714,9 @@ pub const BatchPublisher = struct {
 
         // The flush thread is joined above, so nothing can still be allocating from it.
         self.encode_arena.deinit();
+        var it = self.streamless.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        self.streamless.deinit(allocator);
 
         // 2. Unlock the data slab from RAM (symmetric with mlock in init)
         if (@hasDecl(std.posix, "munlock")) {
@@ -921,7 +964,11 @@ pub const BatchPublisher = struct {
 
         // Signal that flush thread has completed all work
         self.flush_complete.store(true, .seq_cst);
-        log.info("✅ Flush thread completed - all events published", .{});
+        if (self.fatal_error.load(.seq_cst) or batch.items.len > 0) {
+            log.warn("⚠️ Flush thread stopped with events unpublished: the replication slot replays them at the next start", .{});
+        } else {
+            log.info("✅ Flush thread completed - all events published", .{});
+        }
     }
 
     /// Update confirmed LSN and return slots to free queue after successful publish
@@ -967,7 +1014,11 @@ pub const BatchPublisher = struct {
         // stream is missing, a bucket was wiped, or one subject in a mixed batch is
         // unrouted (diagnosed the hard way 2026-09-17).
         self.publisher.publish(subject, msg_id, data) catch |err| {
-            log.err("❌ publish to '{s}' failed: {s}", .{ subject, @errorName(err) });
+            // A tenant subject with no stream: publishSubjectGroup decides (skip, or say
+            // it), so a tenant nobody is mapped to yet does not log once per event.
+            const tenant_503 = err == error.NoStreamResponse and
+                if (self.tenant_routing) |r| r.tenantOf(subject) != null else false;
+            if (!tenant_503) log.err("❌ publish to '{s}' failed: {s}", .{ subject, @errorName(err) });
             return err;
         };
         const elapsed_ns = utils.nanoTimestamp() - t0;
@@ -1098,7 +1149,16 @@ pub const BatchPublisher = struct {
             try win.publish(eg.subject, eg.msg_id, eg.payload);
             total += eg.count;
         }
-        try win.drain(Config.Nats.publish_ack_timeout_ms);
+        win.drain(Config.Nats.publish_ack_timeout_ms) catch |err| {
+            if (err != error.NoStreamResponse or self.tenant_routing == null) return err;
+            // Some lane has no stream (the window stops at the first such ack). Publish
+            // the groups one by one: each carries its msg id, so a group the window
+            // already stored is deduplicated, and each group succeeds, is skipped (a
+            // tenant nobody is mapped to yet), or fails on its own.
+            log.debug("📦 a lane of the window has no stream — publishing its {d} groups one by one", .{groups.items.len});
+            for (groups.items) |*g| try self.publishSubjectGroup(g.indices.items);
+            return;
+        };
         // Counted only after every ack landed — same "delivered, not produced"
         // invariant as timedPublish's call sites.
         if (self.metrics) |m| {
@@ -1194,11 +1254,47 @@ pub const BatchPublisher = struct {
     /// exposition comment).
     fn publishSubjectGroup(self: *BatchPublisher, indices: []usize) !void {
         const eg = try self.encodeGroup(indices);
-        try self.timedPublish(eg.subject, eg.msg_id, eg.payload);
+        self.timedPublish(eg.subject, eg.msg_id, eg.payload) catch |err| {
+            if (err == error.NoStreamResponse) {
+                if (self.skipIfStreamless(eg.subject, eg.count)) return;
+                log.err("❌ publish to '{s}' failed: no stream takes this subject", .{eg.subject});
+            }
+            return err;
+        };
+        if (self.streamless.count() > 0) self.noteStreamBack(eg.subject);
         if (self.metrics) |m| {
             for (0..eg.count) |_| m.incrementCdcEvents();
         }
         log.debug("📤 Published {d} event(s), {d} bytes to {s}", .{ eg.count, eg.payload.len, eg.subject });
+    }
+
+    /// A publish to `subject` met no stream. True (the events count as delivered, and
+    /// their LSN is confirmed) when it is a tenant's subject and JetStream says that
+    /// tenant's stream does not exist: see `TenantRouting`. Said once per tenant.
+    fn skipIfStreamless(self: *BatchPublisher, subject: []const u8, count: usize) bool {
+        const routing = self.tenant_routing orelse return false;
+        const tenant = routing.tenantOf(subject) orelse return false;
+        var buf: [256]u8 = undefined;
+        const stream = routing.streamName(&buf, tenant) orelse return false;
+        if (!self.publisher.streamMissing(stream)) return false;
+        if (!self.streamless.contains(tenant)) {
+            if (self.allocator.dupe(u8, tenant)) |key| {
+                self.streamless.put(self.allocator, key, {}) catch self.allocator.free(key);
+            } else |_| {}
+            log.warn("⏭️ tenant '{s}' has no stream ({s}): nobody is mapped to it yet, so its events are skipped — its first device seeds from a full snapshot, which holds them", .{ tenant, stream });
+        }
+        log.debug("⏭️ skipped {d} event(s) on '{s}': {s} does not exist", .{ count, subject, stream });
+        return true;
+    }
+
+    /// A tenant skipped before has a stream again (a principal was mapped): say it once.
+    fn noteStreamBack(self: *BatchPublisher, subject: []const u8) void {
+        const routing = self.tenant_routing orelse return;
+        const tenant = routing.tenantOf(subject) orelse return;
+        if (self.streamless.fetchRemove(tenant)) |kv| {
+            log.info("✅ tenant '{s}' has a stream now: its events publish", .{tenant});
+            self.allocator.free(kv.key);
+        }
     }
 
     /// Flush a batch to NATS with retry logic and exponential backoff
@@ -1434,4 +1530,34 @@ test "addColumn: the column ceiling is reported, not crashed into" {
     }
     try std.testing.expectEqual(@as(u16, test_max_columns), ev.column_count);
     try std.testing.expectError(error.TooManyColumns, ev.addColumn("one_too_many", .{ .int64 = 1 }));
+}
+
+test "TenantRouting.tenantOf: a tenant-routed subject names its tenant" {
+    const r: TenantRouting = .{ .cdc_prefix = "cdc", .stream_prefix = "CDC_", .open_tenant = "_default" };
+    try std.testing.expectEqualStrings("acme", r.tenantOf("cdc.acme.notes.insert").?);
+    try std.testing.expectEqualStrings("acme", r.tenantOf("cdc.acme.notes.batch").?);
+}
+
+test "TenantRouting.tenantOf: untenanted, open-tenant and foreign subjects are never skippable" {
+    const r: TenantRouting = .{ .cdc_prefix = "cdc", .stream_prefix = "CDC_", .open_tenant = "_default" };
+    // Untenanted rows go to the public stream: a missing CDC_PUBLIC is a fault, not a skip.
+    try std.testing.expect(r.tenantOf("cdc.notes.insert") == null);
+    // The open tenant's rows go to the public stream too.
+    try std.testing.expect(r.tenantOf("cdc._default.notes.insert") == null);
+    // Not a CDC subject: KV schema events, the bridge's own subjects.
+    try std.testing.expect(r.tenantOf("$KV.schemas.notes") == null);
+    try std.testing.expect(r.tenantOf("cdcx.acme.notes.insert") == null);
+    // Too short or too long: not the four-token tenant shape.
+    try std.testing.expect(r.tenantOf("cdc.acme.notes") == null);
+    try std.testing.expect(r.tenantOf("cdc.acme.notes.insert.extra") == null);
+    try std.testing.expect(r.tenantOf("cdc..notes.insert") == null);
+    try std.testing.expect(r.tenantOf("") == null);
+}
+
+test "TenantRouting.streamName: the stream a tenant's subjects belong to" {
+    const r: TenantRouting = .{ .cdc_prefix = "cdc", .stream_prefix = "CDC_", .open_tenant = "_default" };
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("CDC_acme", r.streamName(&buf, "acme").?);
+    var tiny: [4]u8 = undefined;
+    try std.testing.expect(r.streamName(&tiny, "acme") == null);
 }

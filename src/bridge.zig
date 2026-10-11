@@ -1499,6 +1499,12 @@ pub fn main(init: std.process.Init) !void {
         resolved_max_columns,
         &hot,
     );
+    // A row for a tenant nobody is mapped to yet has no stream: skipped, not fatal.
+    batch_pub.tenant_routing = .{
+        .cdc_prefix = runtime_config.topology.subject_cdc_prefix,
+        .stream_prefix = runtime_config.topology.cdc_stream_prefix,
+        .open_tenant = runtime_config.topology.open_tenant,
+    };
     // Start flush thread - batch_pub is now at stable heap address
     try batch_pub.start();
     defer batch_pub.join();
@@ -1877,9 +1883,9 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        // Check for fatal NATS errors (e.g., reconnection timeout exceeded)
+        // A batch failed every retry (NATS unreachable, a missing stream, a full one).
         if (batch_pub.hasFatalError()) {
-            log.err("🔴 FATAL ERROR: NATS reconnection failed - shutting down bridge to prevent WAL overflow", .{});
+            log.err("🔴 FATAL ERROR: a batch failed to publish after every retry (the error is above) - shutting down; the replication slot replays it at the next start", .{});
             // ⚠️ The global flag, not just the break. The break only leaves THIS loop;
             // wal_monitor and the HTTP server loop on `should_stop`, and the deferred
             // `wal_mon.join()` waits on it — without the store the process hung forever
@@ -2448,7 +2454,7 @@ pub fn main(init: std.process.Init) !void {
         utils.sleep(100 * std.time.ns_per_ms); // 100ms
     }
 
-    if (batch_pub.isFlushComplete()) {
+    if (batch_pub.isFlushComplete() and !batch_pub.hasFatalError()) {
         log.info("✅ Flush thread completed - all events published to NATS", .{});
     }
 
