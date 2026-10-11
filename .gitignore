@@ -100,7 +100,10 @@ examples/08-map/poi-ocm.json
 __pycache__/
 *.pyc
 
-# pnpm lockfiles are committed: CI installs zb-client-ts with --frozen-lockfile.
+# zb-client-ts commits its lockfile (CI installs it with --frozen-lockfile). The examples
+# link the local packages, so their lockfiles stay local; the root one only pins pnpm.
+/pnpm-lock.yaml
+examples/**/pnpm-lock.yaml
 examples/08-map/prix-des-carburants-en-france-flux-instantane-v2.csv
 zb.sqlite*
 
