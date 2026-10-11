@@ -18,7 +18,9 @@ version=$(sed -n 's/^ *\.version = "\(.*\)",/\1/p' "$root/build.zig.zon")
 dist="$root/dist/$version"
 apt="$root/dist/apt"
 
-[ -f "$dist/SHA256SUMS" ] || { echo "no $dist/SHA256SUMS: run deploy/package-linux.sh first" >&2; exit 1; }
+# The release's own files (built by .github/workflows/release.yml), so apt serves exactly
+# what the GitHub release and the image hold; package-linux.sh only for an unreleased build.
+[ -f "$dist/SHA256SUMS" ] || { echo "no $dist/SHA256SUMS: gh release download v$version --dir dist/$version (or deploy/package-linux.sh for a local build)" >&2; exit 1; }
 (cd "$dist" && shasum -a 256 -c SHA256SUMS >/dev/null) || { echo "checksums do not match" >&2; exit 1; }
 gpg --list-secret-keys "$key" >/dev/null 2>&1 || { echo "no secret key \"$key\": create it (see DISTRIBUTION.md)" >&2; exit 1; }
 
