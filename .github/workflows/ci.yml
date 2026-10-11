@@ -68,6 +68,7 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+          package-manager-cache: false
       # No lockfile in the repository (.gitignore): versions resolve from package.json.
       - run: pnpm install
       - run: pnpm run typecheck
