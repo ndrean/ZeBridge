@@ -3,7 +3,6 @@ zig-out/
 zig-cache/
 .zig-cache/
 .gitmodules
-chaos_test.sh
 
 
 
@@ -21,14 +20,12 @@ docs/
 
 emitter/
 examples/
-int-test/
 libzb/
 nats-data/
 notes/
 postgres-data/
 proxy/
 scripts/
-spike/
 telemetry/
 web-consumer/
 z-tests/
