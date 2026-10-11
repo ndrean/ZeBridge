@@ -1,0 +1,168 @@
+# ZeBridge on one server with Docker Compose: NATS, the bridge, the sweeper, HAProxy and
+# Let's Encrypt, and optionally PostgreSQL. README.md has the steps; .env.example the settings.
+#
+#   docker compose --profile postgres up -d     # with the PostgreSQL below
+#   docker compose up -d                        # with an external PostgreSQL (.env URLs)
+#
+# Published ports: 80 (Let's Encrypt, redirect), 443 (bridge + websocket), NATS_PUBLIC_PORT
+# (native clients, TLS). Nothing else leaves the server: PostgreSQL, NATS monitoring and
+# the bridge's /metrics stay on the compose network. Docker's published ports bypass ufw.
+
+x-zebridge: &zebridge
+  image: ghcr.io/ndrean/zebridge:${ZB_VERSION:-0.1.1}
+  restart: unless-stopped
+
+x-db: &db
+  DATABASE_READER_URL: ${DATABASE_READER_URL:-postgres://zb_reader:${ZB_READER_PASSWORD}@postgres:5432/zebridge}
+  DATABASE_WRITER_URL: ${DATABASE_WRITER_URL:-postgres://zb_writer:${ZB_WRITER_PASSWORD}@postgres:5432/zebridge}
+  BRIDGE_CDC_PUBLICATION: ${BRIDGE_CDC_PUBLICATION:-zb_pub}
+  BRIDGE_CDC_SLOT: ${BRIDGE_CDC_SLOT:-zb_slot}
+
+services:
+  # ── certificates ─────────────────────────────────────────────────────────────────
+  # One certificate for the three names. The first one is issued here, on port 80, before
+  # HAProxy takes that port; then `certbot` renews it behind HAProxy.
+  certs-init:
+    image: certbot/certbot:v5.8.0
+    entrypoint: ["/bin/sh", "/scripts/certs-init.sh"]
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+      DOMAINS: ${BRIDGE_HOST:?} ${WS_HOST:?} ${NATS_HOST:?}
+    ports: ["80:80"]
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certs:/certs
+      - ./scripts:/scripts:ro
+    restart: "no"
+
+  certbot:
+    image: certbot/certbot:v5.8.0
+    entrypoint: ["/bin/sh", "-c", "while :; do certbot renew --http-01-port 8888 --deploy-hook /scripts/cert-deploy.sh; sleep 12h & wait $$!; done"]
+    depends_on:
+      certs-init: { condition: service_completed_successfully }
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certs:/certs
+      - ./scripts:/scripts:ro
+    restart: unless-stopped
+
+  # ── NATS ─────────────────────────────────────────────────────────────────────────
+  # The operator, the accounts and the bridge's creds, generated ONCE into the zb-etc
+  # volume: running it again would make a new operator, and every enrolled device would be
+  # refused. operator.store (the root seeds) is in that volume too: copy it off the server.
+  nats-init:
+    <<: *zebridge
+    user: root
+    entrypoint: ["/bin/sh", "/scripts/nats-init.sh"]
+    environment:
+      NATS_HOST: ${NATS_HOST:?}
+    volumes:
+      - zb-etc:/etc/zebridge
+      - ./scripts:/scripts:ro
+    restart: "no"
+
+  nats:
+    image: nats:2.15.0-alpine
+    entrypoint: ["/bin/sh", "/scripts/nats-run.sh"]
+    depends_on:
+      nats-init: { condition: service_completed_successfully }
+      certs-init: { condition: service_completed_successfully }
+    ports: ["${NATS_PUBLIC_PORT:-4222}:4222"]
+    volumes:
+      - zb-etc:/etc/zebridge
+      - certs:/certs:ro
+      - ./scripts:/scripts:ro
+    networks:
+      default:
+        # The bridge dials tls://<NATS_HOST>:4222: the certificate's name, this container.
+        aliases: ["${NATS_HOST}"]
+    restart: unless-stopped
+
+  # ── the bridge ───────────────────────────────────────────────────────────────────
+  bridge:
+    <<: *zebridge
+    entrypoint: ["/bin/sh", "-c", "set -a; . /etc/zebridge/.env.nats; set +a; exec bridge"]
+    environment:
+      <<: *db
+      GENERATIONS_ENABLED: "1"
+      BRIDGE_BIND: 0.0.0.0          # the compose network only: 27434 is not published
+      BASE_BUF: ${BASE_BUF:-13}
+      ENROLL_NATS_URL: tls://${NATS_HOST}:${NATS_PUBLIC_PORT:-4222}
+      ENROLL_NATS_WS_URL: wss://${WS_HOST}:443
+    depends_on:
+      nats: { condition: service_started }
+      pg-init: { condition: service_completed_successfully, required: false }
+    volumes:
+      - zb-etc:/etc/zebridge
+
+  sweeper:
+    <<: *zebridge
+    entrypoint: ["bridge_sweeper"]
+    environment:
+      DATABASE_WRITER_URL: ${DATABASE_WRITER_URL:-postgres://zb_writer:${ZB_WRITER_PASSWORD}@postgres:5432/zebridge}
+    depends_on:
+      bridge: { condition: service_started }
+
+  # ── HAProxy: 80 and 443 ──────────────────────────────────────────────────────────
+  haproxy:
+    image: haproxy:3.4.6-alpine
+    entrypoint: ["/bin/sh", "/scripts/haproxy-run.sh"]
+    environment:
+      BRIDGE_HOST: ${BRIDGE_HOST}
+      WS_HOST: ${WS_HOST}
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"   # the image runs as the haproxy user
+    ports: ["80:80", "443:443"]
+    depends_on:
+      certs-init: { condition: service_completed_successfully }
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - certs:/certs:ro
+      - ./scripts:/scripts:ro
+    restart: unless-stopped
+
+  # ── PostgreSQL (profile "postgres") ──────────────────────────────────────────────
+  postgres:
+    profiles: [postgres]
+    image: postgres:18.6-trixie
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_slot_wal_keep_size=2GB   # a slot left behind cannot fill the disk
+    environment:
+      POSTGRES_DB: zebridge
+      POSTGRES_PASSWORD: ${PG_ADMIN_PASSWORD:?set PG_ADMIN_PASSWORD in .env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d zebridge"]
+      interval: 3s
+      retries: 20
+    volumes:
+      - pg-data:/var/lib/postgresql
+    restart: unless-stopped
+
+  # The roles, functions and publication, from the bridge's own `--init-sql`. Once: it
+  # skips a database that already has the publication.
+  pg-init:
+    <<: *zebridge
+    profiles: [postgres]
+    entrypoint: ["/bin/sh", "/scripts/pg-init.sh"]
+    environment:
+      <<: *db
+      ADMIN_DATABASE_URL: postgres://postgres:${PG_ADMIN_PASSWORD}@postgres:5432/zebridge
+    depends_on:
+      postgres: { condition: service_healthy }
+    volumes:
+      - ./scripts:/scripts:ro
+    restart: "no"
+
+volumes:
+  zb-etc:        # nats-server.conf, .env.nats, creds/, operator.store, nats-data/ (JetStream)
+  letsencrypt:   # certbot's account and certificates
+  certs:         # the copies NATS and HAProxy read (scripts/cert-deploy.sh)
+  pg-data:
