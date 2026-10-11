@@ -415,10 +415,14 @@ pub const TenantRouting = struct {
     stream_prefix: []const u8, // "CDC_"
     open_tenant: []const u8, // "_default": its rows go to the public stream
 
-    /// The tenant of `<cdc_prefix>.<tenant>.<table>.<op>`. Null for an untenanted
-    /// subject (`<cdc_prefix>.<table>.<op>`), the open tenant, and anything else.
+    /// The tenant of `<cdc_prefix>.<tenant>.<table>.<op>`, or of its batch form
+    /// `….<op>.batch` (several rows in one message, encodeGroup). Null for an untenanted
+    /// subject (`<cdc_prefix>.<table>.<op>[.batch]`), the open tenant, and anything else.
+    /// ⚠️ `.batch` is stripped FIRST: an untenanted batch also has four tokens, and read
+    /// as `<tenant>.<table>.<op>` it would name a tenant that does not exist.
     pub fn tenantOf(self: TenantRouting, subject: []const u8) ?[]const u8 {
-        var it = std.mem.splitScalar(u8, subject, '.');
+        const single = if (std.mem.endsWith(u8, subject, ".batch")) subject[0 .. subject.len - ".batch".len] else subject;
+        var it = std.mem.splitScalar(u8, single, '.');
         if (!std.mem.eql(u8, it.next() orelse return null, self.cdc_prefix)) return null;
         const tenant = it.next() orelse return null;
         const table = it.next() orelse return null;
@@ -1535,7 +1539,17 @@ test "addColumn: the column ceiling is reported, not crashed into" {
 test "TenantRouting.tenantOf: a tenant-routed subject names its tenant" {
     const r: TenantRouting = .{ .cdc_prefix = "cdc", .stream_prefix = "CDC_", .open_tenant = "_default" };
     try std.testing.expectEqualStrings("acme", r.tenantOf("cdc.acme.notes.insert").?);
-    try std.testing.expectEqualStrings("acme", r.tenantOf("cdc.acme.notes.batch").?);
+    // Several rows of one subject go out as one message on `<subject>.batch`
+    // (encodeGroup): the same tenant (found on leaf1, 2026-10-11: two rows at once).
+    try std.testing.expectEqualStrings("acme", r.tenantOf("cdc.acme.notes.insert.batch").?);
+}
+
+test "TenantRouting.tenantOf: an untenanted batch is not read as a tenant" {
+    const r: TenantRouting = .{ .cdc_prefix = "cdc", .stream_prefix = "CDC_", .open_tenant = "_default" };
+    // Four tokens like a tenant subject: read naively it is tenant 'notes', and a missing
+    // CDC_PUBLIC (a fault) would have dropped public rows as "CDC_notes does not exist".
+    try std.testing.expect(r.tenantOf("cdc.notes.insert.batch") == null);
+    try std.testing.expect(r.tenantOf("cdc._default.notes.insert.batch") == null);
 }
 
 test "TenantRouting.tenantOf: untenanted, open-tenant and foreign subjects are never skippable" {

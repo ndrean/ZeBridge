@@ -11,8 +11,9 @@ Now the event is skipped: nobody can read that tenant yet, and its first device 
 from a full snapshot built after its stream exists, which holds the row. Checked against
 a LIVE bridge:
 
-  1. a row for an unmapped, streamless tenant does not stop the bridge (same uptime, past
-     the whole retry budget), and the bridge does not create the stream for it;
+  1. rows for an unmapped, streamless tenant, one alone and two in one statement (a
+     `.batch` message), do not stop the bridge (same uptime, past the whole retry
+     budget), and the bridge does not create the stream for them;
   2. the slot is not stuck: a row for a mapped tenant still publishes;
   3. mapping a principal creates the tenant's stream, and its next row lands there.
 
@@ -47,9 +48,11 @@ def stream_msgs(name):
     return json.loads(r.stdout)["state"]["messages"] if r.returncode == 0 else -1
 
 
-def insert(uid, tenant, text):
+def insert(uids, tenant, text):
+    """One statement: several rows of a subject publish as ONE `<subject>.batch` message."""
+    values = ",".join(f"('{u}','{text}',now(),now(),'{tenant}')" for u in uids)
     zb.psql("INSERT INTO public.test_types (uid,some_text,inserted_at,updated_at,tenant_id) "
-            f"VALUES ('{uid}','{text}',now(),now(),'{tenant}')", quiet=True)
+            f"VALUES {values}", quiet=True)
 
 
 def main():
@@ -64,13 +67,16 @@ def main():
         sys.exit("no mapped tenant to check the slot with — map one first")
     other = mapped[0]
 
-    rows = [uuid.uuid4() for _ in range(3)]
+    rows = [uuid.uuid4() for _ in range(5)]
     try:
         before = status()
         if before is None:
             sys.exit(f"no bridge answers on {zb.http_base()} — start one first")
-        # ── 1. a row for the unmapped, streamless tenant ─────────────────────────
-        insert(rows[0], TENANT, "unmapped tenant probe")
+        # ── 1. rows for the unmapped, streamless tenant ──────────────────────────
+        # One row, then two in one statement: a single publish and a `.batch` one
+        # (leaf1, 2026-10-11: the batch form was not recognised as a tenant's).
+        insert([rows[0]], TENANT, "unmapped tenant probe")
+        insert([rows[3], rows[4]], TENANT, "unmapped tenant batch probe")
         # The retry budget is 6 tries with backoff 100..1600 ms (~3 s); a bridge that gives
         # up runs it again for its final flush while still answering /status: wait well
         # past both.
@@ -98,7 +104,7 @@ def main():
             return st["cdc_events_published"] if st else -1
 
         published = published_now()
-        insert(rows[1], other, "slot liveness probe")
+        insert([rows[1]], other, "slot liveness probe")
         deadline = time.time() + 15
         while time.time() < deadline and published_now() <= published:
             time.sleep(0.5)
@@ -119,7 +125,7 @@ def main():
             failed += 1
         else:
             n0 = stream_msgs(cdc_stream)
-            insert(rows[2], TENANT, "after the first mapping")
+            insert([rows[2]], TENANT, "after the first mapping")
             deadline = time.time() + 15
             while time.time() < deadline and stream_msgs(cdc_stream) <= n0:
                 time.sleep(0.5)
