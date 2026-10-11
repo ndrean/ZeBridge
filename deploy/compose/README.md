@@ -29,9 +29,12 @@ PostgreSQL, NATS monitoring and the bridge's `/metrics` are not published.
 3. Start:
 
    ```sh
-   docker compose --profile postgres up -d     # with PostgreSQL in the stack
-   docker compose up -d                        # with an external PostgreSQL (its URLs in .env)
+   docker compose up -d
    ```
+
+   `COMPOSE_PROFILES=postgres` in `.env` adds the PostgreSQL service, to this and every
+   other command (`down`, `logs`, `ps`). Without that line, the stack uses the external
+   PostgreSQL whose URLs are in `.env`.
 
    The first start issues the certificate, generates the NATS operator and accounts, and
    creates the database's roles, functions and publication. Each of these runs once.

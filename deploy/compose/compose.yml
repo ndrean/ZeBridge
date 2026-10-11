@@ -1,8 +1,7 @@
 # ZeBridge on one server with Docker Compose: NATS, the bridge, the sweeper, HAProxy and
 # Let's Encrypt, and optionally PostgreSQL. README.md has the steps; .env.example the settings.
 #
-#   docker compose --profile postgres up -d     # with the PostgreSQL below
-#   docker compose up -d                        # with an external PostgreSQL (.env URLs)
+#   docker compose up -d     # COMPOSE_PROFILES=postgres in .env adds the PostgreSQL below
 #
 # Published ports: 80 (Let's Encrypt, redirect), 443 (bridge + websocket), NATS_PUBLIC_PORT
 # (native clients, TLS). Nothing else leaves the server: PostgreSQL, NATS monitoring and
@@ -11,6 +10,7 @@
 x-zebridge: &zebridge
   image: ghcr.io/ndrean/zebridge:${ZB_VERSION:-0.1.1}
   restart: unless-stopped
+  init: true   # a small init as PID 1 passes SIGTERM on: a stop takes ms, not Docker's 10 s
 
 x-db: &db
   DATABASE_READER_URL: ${DATABASE_READER_URL:-postgres://zb_reader:${ZB_READER_PASSWORD}@postgres:5432/zebridge}
@@ -37,6 +37,7 @@ services:
 
   certbot:
     image: certbot/certbot:v5.8.0
+    init: true
     entrypoint: ["/bin/sh", "-c", "while :; do certbot renew --http-01-port 8888 --deploy-hook /scripts/cert-deploy.sh; sleep 12h & wait $$!; done"]
     depends_on:
       certs-init: { condition: service_completed_successfully }
@@ -63,6 +64,7 @@ services:
 
   nats:
     image: nats:2.15.0-alpine
+    init: true
     entrypoint: ["/bin/sh", "/scripts/nats-run.sh"]
     depends_on:
       nats-init: { condition: service_completed_successfully }
@@ -106,6 +108,7 @@ services:
   # ── HAProxy: 80 and 443 ──────────────────────────────────────────────────────────
   haproxy:
     image: haproxy:3.4.6-alpine
+    init: true
     entrypoint: ["/bin/sh", "/scripts/haproxy-run.sh"]
     environment:
       BRIDGE_HOST: ${BRIDGE_HOST}
@@ -137,7 +140,10 @@ services:
       - max_slot_wal_keep_size=2GB   # a slot left behind cannot fill the disk
     environment:
       POSTGRES_DB: zebridge
-      POSTGRES_PASSWORD: ${PG_ADMIN_PASSWORD:?set PG_ADMIN_PASSWORD in .env}
+      # No ${…:?} here: compose interpolates every service, profile or not, so a required
+      # variable would stop a stack that uses an external PostgreSQL. The image itself
+      # refuses to start without a password.
+      POSTGRES_PASSWORD: ${PG_ADMIN_PASSWORD:-}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d zebridge"]
       interval: 3s
