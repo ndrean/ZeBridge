@@ -47,6 +47,8 @@ PYTHONPATH=zb-python/src python3 examples/10-airports/airport_service.py \
 
 It seeds the 9,253 airports from the snapshot (about a second) and keeps them live from the change stream.
 
+As a container on a server or a leaf node's host: [INSTALL_AIRPORT_RESPONDER.md](INSTALL_AIRPORT_RESPONDER.md).
+
 Two questions:
 
 | question | parameters | answer |
