@@ -48,9 +48,12 @@ jobs:
           version: 0.16.0
       - name: ABI and zb.h match the code
         run: python3 libzb/python/abi_check.py
+      # Zig 0.16 downloads zip sources into <cache>/tmp without creating it first.
       - name: Unit tests
         working-directory: libzb
-        run: zig build test -Dvendor=true
+        run: |
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
+          zig build test -Dvendor=true
 
   client-ts:
     name: zb-client-ts (typecheck, tests)
@@ -60,9 +63,8 @@ jobs:
         working-directory: zb-client-ts
     steps:
       - uses: actions/checkout@v5
+      # The version comes from packageManager in the root package.json.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 12
       - uses: actions/setup-node@v5
         with:
           node-version: 22
