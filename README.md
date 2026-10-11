@@ -123,8 +123,8 @@ To start again from scratch: `docker compose -f docker-compose.quickstart.yml do
 ## Table of Contents
 
 - [Overview](#overview)
-- [Three pillars](#three-pillars)
-  - [Which library, and which artifact](#which-library-and-which-artifact)
+- [The components of the project](#the-components-of-the-project)
+  - [Packages: what to install](#packages-what-to-install)
   - [Setup steps at a glance](#setup-steps-at-a-glance)
   - [Use case: a fleet of trucks](#use-case-a-fleet-of-trucks)
 - [The consumer side](#the-consumer-side)
@@ -234,62 +234,71 @@ Bindings exist for Python, Kotlin (Android), Dart/Flutter and React Native. See 
 
 They may look strict, but they are mostly standard and well known, and applying them to a schema is almost mechanical. See [Preparing your database](#preparing-your-database) below for more details and [SCOPE ## Consistency model](SCOPE.md).
 
-## Three pillars
+## The components of the project
 
-The daemon `bridge` projects Postgres into NATS and back. It defines a protocol—a set of rules and workflows—for a consumer to connect to NATS and to the local replica.
-
-There is a tiny daemon "sweeper". See [Sweeper](OPERATIONS.md#sweeper).
-
-The client C-ABI `libzb` library - for FFI users - and the `zb-client-ts` library - for any JavaScript-based consumers, with libzb's core as a WASM module of about 70 KB - implement this protocol.
+1. The daemon `bridge` projects Postgres into NATS and back. It defines a protocol—a set of rules and workflows—for a consumer to connect to NATS and to the local replica.
+2. There is a tiny daemon "sweeper". See [Sweeper](OPERATIONS.md#sweeper).
+3. The client libraries that implement this protocol: `libzb`, a native library with a C ABI that every other language calls through its bindings, and `zb-client-ts`, a TypeScript client for JavaScript hosts, which reuses libzb's core rules as a WebAssembly module of about 70 KB.
 
 The client library abstracts away the complex choreography required to manage NATS streams, KV buckets, data decompression and deserialization, retries, holding queries with foreign keys...and sets up the local tables needed to hold the state of a client.
 
-A developer will build an app using the client library. We have bindings for specific idioms. See [CLIENTS](https://github.com/ndrean/zebridge/blob/main/CLIENTS.md)
+A developer will build an app using the client library. We have bindings for specific idioms. See [CLIENTS](CLIENTS.md). The client library shrinks this orchestration down to a few primitives: `connect()`, `close()`, `query()`, `mutate()`, `onChange()` and `onVerdict()`.
+
+### Packages: what to install
+
+Everything is published: nothing needs building. Each client package carries libzb, built for its platforms; the browser and Node package carries libzb's rules as a WebAssembly module of about 70 KB instead.
+
+**1. Two daemons running on a server communicating with PostgreSQL and NATS**:
 
 | artifact | what it is | who uses it |
 | -- | -- | -- |
 | bridge | POSIX based background executable <br>- Linux, FreeBSD, OSX | daemon running  next to PostgreSQL and  NATS |
 | bridge_sweeper | background executable | daemon running next to Postgres and to the bridge |
+
+The two APT packages come from the project's repository, added once:
+
+```sh
+curl -fsSL https://packages.zebridge.eu/zebridge.gpg | sudo tee /usr/share/keyrings/zebridge.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/zebridge.gpg] https://packages.zebridge.eu stable main" \
+  | sudo tee /etc/apt/sources.list.d/zebridge.list
+sudo apt update
+```
+
+| package | for | install | first call |
+| -- | -- | -- | -- |
+| `zebridge` (APT) | the bridge and the sweeper; Debian 12+, Ubuntu 22.04+ | `sudo apt install zebridge` | `bridge --version`, then a systemd service (example units in `/usr/share/doc/zebridge/examples`) |
+
+**2. Client libraries**:
+
+| artifact | what it is | who uses it |
+| -- | -- | -- |
 | libzb | native client library, C ABI | FFI Consumers: mobile apps, desktop apps, microservices |
 | zb-client-ts | client npm package <br>(self-contained TS) | JS Consumers: browsers, Node, Electron, Deno, Bun |
 
-The client library shrinks this orchestration down to a few primitives: `connect()`, `close()`, `query()`, `mutate()`, `onChange()` and `onVerdict()`.
-
-### Which library, and which artifact
-
-The client library uses four libraries: `libpq`, `sqlite`, `zstd` and `duckdb`.  
-Two independent questions. **Which library** depends on whether the host can link C.
-**Which artifact** depends on how that host expects to receive it.
-
-| host | library | artifact | needs installed |
+| package | for | install | first call |
 | -- | -- | -- | -- |
-| Flutter desktop | libzb, vendored | `.dylib` / `.so` | nothing |
-| a service in Python, Go, Java, Elixir… | libzb, vendored | `.dylib` / `.so` | only its own engine, if it uses one |
-| React Native (iOS **and** Android) | libzb, in the zb-react-native Expo module | static on iOS, `.so` on Android | nothing |
-| browser, Node, Electron, Bun | zb-client-ts | — | the browser nothing; Node `better-sqlite3` and `@nats-io/transport-node` (peer dependencies) |
-| native Swift on iOS | libzb, vendored | **static** `.a` | nothing |
-| native Kotlin on Android | libzb, vendored | **static** `.a`, linked into your JNI `.so` | nothing |
+| `libzb` <br>(APT) | C, C++, any language with an FFI | `sudo apt install libzb` | `#include <zb.h>`, link with `-lzbcore`: `zb_client_connect(opts_json)` |
+| `@zebridge/client` <br>(npm) | browsers, Node 22.15+ | `npm install @zebridge/client` | `const zb = new ZeBridge({ bridgeUrl, invite, tables }); await zb.connect();` |
+| `@zebridge/react-native` (npm) | React Native, Expo SDK 53+, iOS and Android | `npx expo install @zebridge/react-native` | `const zb = await Libzb.connect({ … }); await zb.sync();` |
+| `zebridge` <br>(PyPI) | Python 3.10+, Linux and macOS | `pip install zebridge` | `with ZeBridge(bridge_url=…, invite=…, tables=[…]) as zb:` |
+| `zebridge` <br>(pub.dev) | Dart 3.10+, Flutter 3.38+: Android, iOS, macOS, Linux | `dart pub add zebridge` | `final zb = await ZeBridgeWorker.spawn({ … });` |
+| `eu.zebridge:zebridge-android` <br>(Maven Central) | Kotlin and Java, Android 10+ | `implementation("eu.zebridge:zebridge-android:0.1.0")` | `val zb = ZeBridge(mapOf(…), context) { … }` |
 
-The dividing line is not phone versus server — it is **whether you control what is
-installed**. On your own server, linking the system sqlite and zstd is fine and keeps the
-binary smaller. On a phone nothing is installed, so everything travels inside the app:
+A client built upon `NodeJS` needs two more packages next to `@zebridge/client`: `better-sqlite3` and `@nats-io/transport-node`.
+
+React Native: the package contains native code, so the app must be built (`npx expo run:ios`, `npx expo run:android`, or EAS Build); it cannot run inside the Expo Go app.
+
+The API of each: [CLIENTS](CLIENTS.md). How each package is built and published: [DISTRIBUTION](DISTRIBUTION.md).
+
+**3. Another language** (Go, Elixir, .NET, the JVM outside Android…): download libzb for your platform from the [release](https://github.com/ndrean/zebridge/releases/latest) — Linux x86_64 and aarch64, macOS Apple silicon and Intel — or `sudo apt install libzb` on Debian and Ubuntu. Each holds `libzbcore` and its header, `zb.h`; call it through the language's C interface (cgo, a NIF, P/Invoke, JNA…). Every function takes and returns JSON.
+
+Another platform (Windows builds but is not tested yet) builds libzb from this repository:
 
 ```sh
-    zig build -Doptimize=ReleaseFast -Dvendor=true
-    # sqlite + zstd compiled IN
+cd libzb && zig build lib -Doptimize=ReleaseFast -Dvendor=true
 ```
 
-`-Dvendor` compiles both from sources pinned by hash in `build.zig.zon`, so a build does not depend on what a package manager happens to have installed, and cross-compiles for whatever target is asked for. It costs about 1.8 MB.
-
-Both phones take the **static** archive, for different reasons: iOS links archives or
-frameworks into the app, and on Android your own JNI shim is the `.so` with libzb linked into it.
-See `examples/08-map/native/README.md` for the exact commands.
-
-⚠️ Do not compare an archive against a shared library — 22 MB of `.a` is 4 MB once linked, for identical code. Object files keep every symbol, nothing is dead-stripped, and the linker pulls only what an app references.
-
-Browser and Node hosts need no native build at all: zb-client-ts bundles libzb's core as a WebAssembly module of about 70 KB, loaded at connect time, and keeps the database engine (SQLite, PGlite) and the socket on the TypeScript side. React
-Native runs libzb instead, through `zb-react-native` (its build scripts make both phones'
-libraries).
+`-Dvendor` compiles SQLite and zstd in, from sources pinned by hash in `build.zig.zon`, so the build does not depend on what a package manager has installed, and Zig cross-compiles for whatever target is asked for. It costs about 1.8 MB. The PostgreSQL and DuckDB replica engines are not compiled in: libzb loads `libpq` or `libduckdb` at run time if they are installed.
 
 ### Setup steps at a glance
 
