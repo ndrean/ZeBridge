@@ -135,6 +135,7 @@ Each row: something that could go wrong, what the test shows instead, and the te
 | the replication slot is lost | the bridge refuses to start and says how to recover; after recovery every device reloads | `slot_loss.py` |
 | rows deleted since the last snapshot come back on a device that reloads | a full snapshot is cut instead, so they do not | `genproducer.py` |
 | a client reading one table sees another table's messages as a gap | it skips them: no gap, no reload | `filtered_gap.py` |
+| a tenant table without a tombstone column gets no proof on the public stream, so its devices wait for ever once that stream prunes | every tenant snapshot of a tenant table carries its public-stream cut, and an update in one tenant's rows cuts a new snapshot for it | `shared_cut.py` |
 | one unreadable stream stalls the others | another tenant's rows still arrive, no poll stalls, and the report names the unreadable tenant (by hand) | `darktail.py` |
 | a client returning after a short, a long, or a very long absence reloads more than it needs | it applies the deltas, then the checkpoints, and reloads the base only past the chain or past the sweeper's watermark, with no deleted row coming back (by hand) | `incremental.py` |
 | rows of a tenant table that travel on the public stream are missed, or reloaded for nothing | counted ids inserted while `CDC_PUBLIC` prunes: four clients that come and go each end with every id, and the one whose position fell behind resumes without a reload (by hand) | `gen_follow.py` |

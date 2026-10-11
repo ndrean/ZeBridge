@@ -90,6 +90,7 @@ GROUPS = {
         "sweeper":       ("bridge", "tombstone GC boundary"),
         "client_gap":    ("bridge", "a client returns after the tail is gone: gap → re-seed → converge"),
         "filtered_gap":  ("bridge", "a filtered consumer jumps over another table's messages: no gap, no re-seed (§10ja)"),
+        "shared_cut":    ("bridge", "every tenant manifest of a tenant table carries its CDC_PUBLIC cut, with or without a tombstone column; an UPDATE in one tenant's rows cuts that pair"),
         "shared_gap":    ("bridge", "a CDC_PUBLIC gap re-seeds tenant-scoped tables too — their shared rows ride it"),
         "collist":       ("bridge", "publication column lists (§10ff): a STORED tsvector and a column the DBA leaves out never travel — publication, descriptor, a libzb replica, CDC, a client write and the audit agree; a stray second publication with a narrower list cannot shrink the descriptor; zebridge_enable refreshes the list after ADD COLUMN. SECURITY.md's column-list claim is proven HERE — it asserts, so it belongs in the battery, not in manual"),
     },

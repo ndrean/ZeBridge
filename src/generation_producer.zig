@@ -148,6 +148,8 @@ pub const GenerationProducer = struct {
         table: []const u8,
         vcol: []const u8,
         tcol: []const u8,
+        /// The tenant column ('' for an untenanted table). Not `tcol`, the tombstone.
+        tenant_col: []const u8,
         guarded: bool,
         stream: []const u8,
         cutoff_seq: u64,
@@ -226,7 +228,7 @@ pub const GenerationProducer = struct {
     pub fn deinit(self: *GenerationProducer) void {
         const a = self.allocator;
         for (self.cuts.keys(), self.cuts.values()) |k, cut| {
-            for ([_][]const u8{ cut.tenant, cut.table, cut.vcol, cut.tcol, cut.stream }) |s| a.free(s);
+            for ([_][]const u8{ cut.tenant, cut.table, cut.vcol, cut.tcol, cut.tenant_col, cut.stream }) |s| a.free(s);
             a.free(k);
         }
         self.cuts.deinit(a);
@@ -467,7 +469,7 @@ pub const GenerationProducer = struct {
         const pub_z = try alloc.dupeSentinel(u8, self.publication_name, 0);
         if (only) |pairs| {
             const jobs = try alloc.alloc(Job, pairs.len);
-            for (pairs, 0..) |cut, i| jobs[i] = .{ .table = cut.table, .tenant = cut.tenant, .vcol = cut.vcol, .tcol = cut.tcol, .guarded = cut.guarded, .force_cut = true };
+            for (pairs, 0..) |cut, i| jobs[i] = .{ .table = cut.table, .tenant = cut.tenant, .vcol = cut.vcol, .tcol = cut.tcol, .tenant_col = cut.tenant_col, .guarded = cut.guarded, .force_cut = true };
             self.runJobs(cs, jobs, true);
             return;
         }
@@ -569,7 +571,7 @@ pub const GenerationProducer = struct {
                         if (!ok) continue;
                     }
                     pairs += 1;
-                    try jobs.append(alloc, .{ .table = table, .tenant = tenant, .vcol = try alloc.dupe(u8, vcol), .tcol = tcol, .guarded = guarded, .force_cut = false });
+                    try jobs.append(alloc, .{ .table = table, .tenant = tenant, .vcol = try alloc.dupe(u8, vcol), .tcol = tcol, .tenant_col = try alloc.dupe(u8, tenant_col_eff), .guarded = guarded, .force_cut = false });
                 }
             } else {
                 const tenant = self.topo.open_tenant;
@@ -579,7 +581,7 @@ pub const GenerationProducer = struct {
                     if (!ok) continue;
                 }
                 pairs += 1;
-                try jobs.append(alloc, .{ .table = table, .tenant = tenant, .vcol = try alloc.dupe(u8, vcol), .tcol = tcol, .guarded = guarded, .force_cut = false });
+                try jobs.append(alloc, .{ .table = table, .tenant = tenant, .vcol = try alloc.dupe(u8, vcol), .tcol = tcol, .tenant_col = "", .guarded = guarded, .force_cut = false });
             }
         }
         self.runJobs(cs, jobs.items, false);
@@ -588,7 +590,7 @@ pub const GenerationProducer = struct {
 
     /// One (table, tenant) build for the pool: what `buildOne` needs, every string
     /// living in the tick's arena.
-    const Job = struct { table: []const u8, tenant: []const u8, vcol: []const u8, tcol: []const u8, guarded: bool, force_cut: bool };
+    const Job = struct { table: []const u8, tenant: []const u8, vcol: []const u8, tcol: []const u8, tenant_col: []const u8, guarded: bool, force_cut: bool };
 
     /// §10ev: the connections one builder holds — PostgreSQL for content and for
     /// bookkeeping, both rendering UTC, and NATS. On the heap: JetStream keeps a
@@ -705,7 +707,7 @@ pub const GenerationProducer = struct {
             const j = jobs[i];
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
-            const built = self.buildWithRetry(arena.allocator(), cs.pgc, cs.bkc, &js, j.table, j.tenant, j.vcol, j.tcol, j.guarded, j.force_cut);
+            const built = self.buildWithRetry(arena.allocator(), cs.pgc, cs.bkc, &js, j.table, j.tenant, j.vcol, j.tcol, j.tenant_col, j.guarded, j.force_cut);
             if (!built and j.force_cut) self.holdCut(j.tenant, j.table, 60_000);
         }
     }
@@ -1042,6 +1044,11 @@ pub const GenerationProducer = struct {
         /// The tombstone column ('' when the table keeps none): a full carries only live
         /// rows (§10ek), a delta carries the tombstoned ones — the delete signal.
         tcol: []const u8,
+        /// The tenant column ('' for an untenanted table): what scopes this pair's rows.
+        /// ⚠️ Not `tcol`: keying the delta check and the shared cut on the tombstone
+        /// column left a table without one with no shared cut (its clients blocked on
+        /// CDC_PUBLIC once it pruned), and a table with one cutting nothing on an UPDATE.
+        tenant_col: []const u8,
         /// The soft-delete guard is on the table: deletes are reaps, never a hole.
         guarded: bool,
         /// §10eq: the edge watch asks for a cut whatever the table did — a fresh cut
@@ -1178,8 +1185,8 @@ pub const GenerationProducer = struct {
             // runs before the build's transaction sets zb.tenant, and unscoped it saw
             // every tenant: one write in 'acme' cut an EMPTY delta, an upload each, for
             // every other tenant of the table (measured 2026-10-07, site_survey).
-            if (tcol.len > 0) {
-                const check = try utils.allocPrintZ(alloc, "SELECT EXISTS(SELECT 1 FROM \"{s}\" WHERE \"{s}\" >= {s} AND (\"{s}\"::text = $1 OR \"{s}\"::text = $2))", .{ table, vcol, lb, tcol, tcol });
+            if (tenant_col.len > 0) {
+                const check = try utils.allocPrintZ(alloc, "SELECT EXISTS(SELECT 1 FROM \"{s}\" WHERE \"{s}\" >= {s} AND (\"{s}\"::text = $1 OR \"{s}\"::text = $2))", .{ table, vcol, lb, tenant_col, tenant_col });
                 const open_z = try alloc.dupeSentinel(u8, self.topo.open_tenant, 0);
                 const params = [_]?[*:0]const u8{ tenant_z.ptr, open_z.ptr };
                 const res = try queryOne(pgc, check, &params);
@@ -1381,7 +1388,7 @@ pub const GenerationProducer = struct {
         // position at 0 (a false gap at every connect) or trusted any chain (a loss when
         // CDC_PUBLIC pruned past the snapshot). Empty `created`: not read, no field.
         const shared_cut: u64, const shared_first: u64, const shared_created: []const u8 = blk: {
-            if (tcol.len == 0 or std.mem.eql(u8, tenant, self.topo.open_tenant)) break :blk .{ 0, 0, "" };
+            if (tenant_col.len == 0 or std.mem.eql(u8, tenant, self.topo.open_tenant)) break :blk .{ 0, 0, "" };
             if (js.getStreamInfo(self.topo.cdc_stream_public)) |info_const| {
                 var info = info_const;
                 defer info.deinit();
@@ -1601,7 +1608,7 @@ pub const GenerationProducer = struct {
                     c.PQclear(rb);
                     // §10eq: a skipped pair still has a cut to watch — the previous
                     // one, with a conservative build time until this process builds it.
-                    if (prev_cut >= 0) self.recordCut(tenant, table, vcol, tcol, guarded, cdc_stream, @intCast(prev_cut), 100, false) catch {};
+                    if (prev_cut >= 0) self.recordCut(tenant, table, vcol, tcol, tenant_col, guarded, cdc_stream, @intCast(prev_cut), 100, false) catch {};
                     return;
                 }
                 // §10ej: nothing moved but the chain fell off the stream — the repair
@@ -1933,9 +1940,9 @@ pub const GenerationProducer = struct {
 
         // §10eq: the edge watch's memory of this pair.
         // The stream only when it was READ: a cut at seq 0 is a cut to watch (§10ja).
-        self.recordCut(tenant, table, vcol, tcol, guarded, if (stream_created.len > 0) cdc_stream else "", cutoff_seq, utils.unixMillis() - build_started_ms, true) catch |err| log.debug("🧬 cut not recorded: {}", .{err});
+        self.recordCut(tenant, table, vcol, tcol, tenant_col, guarded, if (stream_created.len > 0) cdc_stream else "", cutoff_seq, utils.unixMillis() - build_started_ms, true) catch |err| log.debug("🧬 cut not recorded: {}", .{err});
         // §10lw: watched like the own cut, under its own key; an urgent one re-cuts the pair.
-        if (shared_created.len > 0) self.recordCut(tenant, table, vcol, tcol, guarded, self.topo.cdc_stream_public, shared_cut, utils.unixMillis() - build_started_ms, true) catch |err| log.debug("🧬 shared cut not recorded: {}", .{err});
+        if (shared_created.len > 0) self.recordCut(tenant, table, vcol, tcol, tenant_col, guarded, self.topo.cdc_stream_public, shared_cut, utils.unixMillis() - build_started_ms, true) catch |err| log.debug("🧬 shared cut not recorded: {}", .{err});
         if (build_full) self.recordFullBuild(tenant, table, utils.unixMillis() - build_started_ms);
 
         // ── 6. (pruning ran before the manifest was rendered — see pruneChain) ──
@@ -1992,7 +1999,7 @@ pub const GenerationProducer = struct {
     /// `just_cut`: this build published the cut (the clock starts now, a hold is
     /// lifted); false for a cut only observed on a skipped pair (the clock keeps
     /// what it had, or starts now if this process never saw the pair).
-    fn recordCut(self: *GenerationProducer, tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8, guarded: bool, stream: []const u8, cutoff_seq: u64, build_ms: i64, just_cut: bool) !void {
+    fn recordCut(self: *GenerationProducer, tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8, tenant_col: []const u8, guarded: bool, stream: []const u8, cutoff_seq: u64, build_ms: i64, just_cut: bool) !void {
         // §10ja: a cut at seq 0 — the boot chain on an empty stream — is watched like any
         // other. Skipping it left the pair with no cut record: no edge trigger could fire,
         // and under a firehose the boot chain predated the stream for ~50 s (5,609
@@ -2000,7 +2007,7 @@ pub const GenerationProducer = struct {
         if (stream.len == 0) return;
         // §10lw: a tenant pair has two cuts — its own stream's, and CDC_PUBLIC's (the
         // shared cut) — each watched on its stream; the shared one keys as `<key>@shared`.
-        const shared = tcol.len > 0 and !std.mem.eql(u8, tenant, self.topo.open_tenant) and std.mem.eql(u8, stream, self.topo.cdc_stream_public);
+        const shared = tenant_col.len > 0 and !std.mem.eql(u8, tenant, self.topo.open_tenant) and std.mem.eql(u8, stream, self.topo.cdc_stream_public);
         const key = try std.fmt.allocPrint(self.allocator, "{s}.{s}{s}", .{ tenant, table, if (shared) "@shared" else "" });
         self.cuts_lock.lock();
         defer self.cuts_lock.unlock();
@@ -2017,6 +2024,7 @@ pub const GenerationProducer = struct {
             .table = try self.allocator.dupe(u8, table),
             .vcol = try self.allocator.dupe(u8, vcol),
             .tcol = try self.allocator.dupe(u8, tcol),
+            .tenant_col = try self.allocator.dupe(u8, tenant_col),
             .guarded = guarded,
             .stream = try self.allocator.dupe(u8, stream),
             .cutoff_seq = cutoff_seq,
@@ -2430,14 +2438,14 @@ pub const GenerationProducer = struct {
     /// (pause publishing for one build) is the next step, not this one.
     /// Returns false when the build itself failed (the pair is unchanged in NATS);
     /// true when a generation was published, spliceable or not.
-    fn buildWithRetry(self: *GenerationProducer, alloc: std.mem.Allocator, pgc: *c.PGconn, bkc: *c.PGconn, js: *nats.JetStream, table: []const u8, tenant: []const u8, vcol: []const u8, tcol: []const u8, guarded: bool, force_cut: bool) bool {
+    fn buildWithRetry(self: *GenerationProducer, alloc: std.mem.Allocator, pgc: *c.PGconn, bkc: *c.PGconn, js: *nats.JetStream, table: []const u8, tenant: []const u8, vcol: []const u8, tcol: []const u8, tenant_col: []const u8, guarded: bool, force_cut: bool) bool {
         // §10gf: one build of a pair at a time, the full lane's snapshot and attach included.
         self.pairAcquire(tenant, table);
         defer self.pairRelease(tenant, table);
         var attempt: u8 = 0;
         while (attempt < 3) : (attempt += 1) {
             var fell_off = false;
-            self.buildOne(alloc, pgc, bkc, js, table, tenant, vcol, tcol, guarded, force_cut, &fell_off) catch |err| {
+            self.buildOne(alloc, pgc, bkc, js, table, tenant, vcol, tcol, tenant_col, guarded, force_cut, &fell_off) catch |err| {
                 log.err("🧬 generation build failed for '{s}'/'{s}': {} — next cadence retries", .{ tenant, table, err });
                 return false;
             };
