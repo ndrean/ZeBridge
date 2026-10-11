@@ -125,10 +125,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      # By name: build-push-action adds its own build record artifact, which does not extract.
       - uses: actions/download-artifact@v4
         with:
+          name: linux
           path: files
-          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos
+          path: files
       - name: SHA256SUMS
         working-directory: files
         run: sha256sum *.tar.gz *.deb > SHA256SUMS && cat SHA256SUMS
