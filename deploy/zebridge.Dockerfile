@@ -11,6 +11,9 @@
 FROM debian:13-slim
 ARG VERSION
 ARG TARGETARCH
+# The build has no terminal: say so, so apt's debconf does not try three prompts first.
+# ARG, not ENV: it applies to this build only, not to the running container.
+ARG DEBIAN_FRONTEND=noninteractive
 COPY zebridge_${VERSION}_${TARGETARCH}.deb /tmp/
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates postgresql-client /tmp/zebridge_${VERSION}_${TARGETARCH}.deb \
