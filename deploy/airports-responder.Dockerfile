@@ -3,12 +3,13 @@
 # edge container platform, any Kubernetes — where a process lives on: one NATS connection,
 # a replica that follows CDC, native speed.
 #
-# Debian, not Alpine: libzbcore.so (deploy/build-linux.sh) and DuckDB's release are glibc
-# builds; musl would need both rebuilt. Build from the repository's root, after
-# deploy/build-linux.sh for the target CPU:
+# Debian, not Alpine: libzb's and DuckDB's releases are glibc builds; musl would need both
+# rebuilt. libzb comes from the ZeBridge release named by ZB_VERSION, checked against its
+# SHA256SUMS: the same libzbcore.so every other user of that release runs. Build from the
+# repository's root (the service and zb-python are copied from it):
 #
-#   deploy/build-linux.sh [aarch64]
-#   docker build -f deploy/airports-responder.Dockerfile --build-arg ARCH=x86_64 -t zb-airports .
+#   docker build -f deploy/airports-responder.Dockerfile --build-arg ARCH=x86_64 \
+#     --build-arg ZB_VERSION=0.1.3 -t zb-airports .
 #
 # Run it with a responder's creds (bridge --mint-responder) mounted, and the NATS server to
 # join; behind a leaf node, the hub's JetStream domain:
@@ -26,6 +27,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
  && curl -fsSL -o /tmp/duckdb.zip "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/libduckdb-linux-${d}.zip" \
  && unzip -j /tmp/duckdb.zip libduckdb.so -d /out
 
+FROM debian:13-slim AS libzb
+ARG ARCH
+ARG ZB_VERSION=0.1.3
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+ && cd /tmp && base="https://github.com/ndrean/ZeBridge/releases/download/v${ZB_VERSION}" \
+ && curl -fsSL -O "$base/libzb-${ZB_VERSION}-linux-${ARCH}.tar.gz" -O "$base/SHA256SUMS" \
+ && sha256sum -c SHA256SUMS --ignore-missing \
+ && tar -xzf "libzb-${ZB_VERSION}-linux-${ARCH}.tar.gz" \
+ && mkdir /out && cp "libzb-${ZB_VERSION}-linux-${ARCH}/lib/libzbcore.so" /out/
+
 FROM debian:13-slim
 ARG ARCH
 # python3: the service; ca-certificates: libzb on Linux reads the system's roots.
@@ -33,7 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-cert
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --home-dir /var/lib/airports --create-home airports
 COPY --from=duckdb /out/libduckdb.so /usr/local/lib/
-COPY libzb/zig-out/linux-${ARCH}/lib/libzbcore.so /usr/local/lib/
+COPY --from=libzb /out/libzbcore.so /usr/local/lib/
 RUN ldconfig
 COPY zb-python/src/zebridge/*.py /opt/airports/zebridge/
 COPY examples/10-airports/airport_service.py /opt/airports/
