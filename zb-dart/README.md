@@ -40,5 +40,5 @@ await zb.close();
 - **Errors** are `ZeBridgeException` with libzb's words; `unseeded` lists what the first
   sync could not seed.
 
-`dart run example/enroll.dart <bridgeUrl> <identityPath> <dbPath> [invite]` runs the whole
+`dart run example/zebridge_example.dart <bridgeUrl> <identityPath> <dbPath> [invite]` runs the whole
 app side: enroll, read, write, the verdict.

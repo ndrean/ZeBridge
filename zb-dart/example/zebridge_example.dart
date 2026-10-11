@@ -1,5 +1,5 @@
 // Enroll from an invite, read, write, and see the verdict — the whole app side.
-//   dart run example/enroll.dart <bridgeUrl> <identityPath> <dbPath> [invite]
+//   dart run example/zebridge_example.dart <bridgeUrl> <identityPath> <dbPath> [invite]
 import 'package:zebridge/zebridge.dart';
 
 Future<void> main(List<String> args) async {
