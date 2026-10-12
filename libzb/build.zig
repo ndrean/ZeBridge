@@ -267,6 +267,14 @@ pub fn build(b: *std.Build) void {
     // Room for install-name rewrites: Dart's build hooks (and Xcode's embedding) rename a
     // bundled dylib with install_name_tool, which fails on Zig's tight Mach-O headers.
     if (target.result.os.tag.isDarwin()) lib.headerpad_max_install_names = true;
+    // iOS: the identity is flagged out of backups through Core Foundation (enroll.zig). A
+    // dynamic library links it here; a static one leaves it to the app, which always links
+    // it. ⚠️ ABSOLUTE, inside the SDK: unlike a library path, Zig does not prepend the
+    // sysroot to a framework path (a relative one searched nothing).
+    if (target.result.os.tag == .ios and !static) {
+        if (b.sysroot) |sr| mod.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sr, "System", "Library", "Frameworks" }) });
+        mod.linkFramework("CoreFoundation", .{});
+    }
     b.installArtifact(lib);
 
     // §10iq: `zig build lib` — the LIBRARY on its own. The default step also builds

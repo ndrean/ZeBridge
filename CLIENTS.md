@@ -145,7 +145,7 @@ One vocabulary: the same key means the same thing in libzb's `opts_json` and in 
 | --- | --- | --- |
 | `bridgeUrl` | ✅ where `invite` is redeemed (`/enroll`) and the JWT renewed (`/renew`); kept in the identity | ✅ the same, and where the grammar hash is fetched when `grammarHash` is unset |
 | `invite` | ✅ first run only: with `bridgeUrl` and no stored identity, enrolls this device | ✅ the same |
-| `identityPath` | ✅ where the identity is kept (JSON, mode 0600); default `<dbPath>.identity`, else `zebridge.identity`. On Android, a replica in the app's private folder keeps it in the app's `no_backup/` (Android backs up everything else, the device's key with it); an identity found beside the replica moves there once. Apps read who they are from the client (`principal`), never from this file | ✅ the same file on Node; a localStorage key in the browser |
+| `identityPath` | ✅ where the identity is kept (JSON, mode 0600); default `<dbPath>.identity`, else `zebridge.identity`. On Android, a replica in the app's private folder keeps it in the app's `no_backup/` (Android backs up everything else, the device's key with it); an identity found beside the replica moves there once. On iOS it is flagged out of iCloud and computer backups (`kCFURLIsExcludedFromBackupKey`). Apps read who they are from the client (`principal`), never from this file | ✅ the same file on Node; a localStorage key in the browser |
 | `natsUrl` | ✅ optional once enrolled: the identity carries it | ✅ the same (the identity's `nats_ws_url` in the browser) |
 | `creds` | ✅ the .creds TEXT; wins over the identity | ✅ |
 | `credsPath` | ✅ a .creds file | ✅ where there is a filesystem (Node) |

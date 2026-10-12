@@ -644,6 +644,8 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
                 return error.EnrollFailed;
             }
         }
+        // iOS: the identity stays out of iCloud and computer backups (a no-op elsewhere).
+        if (kept_id_path) |p| enroll.excludeFromBackup(p);
     }
     const idv = struct {
         fn or_(opt: []const u8, from_id: ?[]const u8) []const u8 {

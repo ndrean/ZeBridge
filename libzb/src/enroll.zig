@@ -438,6 +438,26 @@ pub fn moveIdentity(old: [:0]const u8, new: [:0]const u8) void {
     }
 }
 
+/// iOS backs up an app's files to iCloud and to a computer, and restores them onto a new
+/// iPhone, the identity (the device's key) with them. Apple's flag for "not in backups" is
+/// the URL resource value kCFURLIsExcludedFromBackupKey. Set on every connect, so an
+/// identity saved before this existed gets it too. A no-op on every other system.
+pub fn excludeFromBackup(path: []const u8) void {
+    if (comptime builtin.os.tag != .ios) return;
+    const cf = struct {
+        extern fn CFURLCreateFromFileSystemRepresentation(alloc: ?*const anyopaque, buf: [*]const u8, len: isize, is_dir: u8) ?*anyopaque;
+        extern fn CFURLSetResourcePropertyForKey(url: *anyopaque, key: *const anyopaque, value: *const anyopaque, err: ?*?*anyopaque) u8;
+        extern fn CFRelease(obj: *anyopaque) void;
+        extern const kCFURLIsExcludedFromBackupKey: *const anyopaque;
+        extern const kCFBooleanTrue: *const anyopaque;
+    };
+    const log = std.log.scoped(.libzb);
+    const url = cf.CFURLCreateFromFileSystemRepresentation(null, path.ptr, @intCast(path.len), 0) orelse return;
+    defer cf.CFRelease(url);
+    if (cf.CFURLSetResourcePropertyForKey(url, cf.kCFURLIsExcludedFromBackupKey, cf.kCFBooleanTrue, null) == 0)
+        log.warn("identity: could not exclude {s} from iOS backups", .{path});
+}
+
 /// The identity at `path`, or null when there is none yet.
 pub fn load(a: std.mem.Allocator, path: []const u8) !?Identity {
     const pz = try a.dupeSentinel(u8, path, 0);
