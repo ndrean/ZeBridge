@@ -2887,6 +2887,10 @@ fn reconcileCdcStreams(
             });
             res.deinit();
             log.info("🆕 tenant '{s}' → created stream {s} ({s})", .{ tenant, stream_name, subj });
+            // Rows written before the tenant existed are on no stream: its first device
+            // gets them only from its first chain. Cut it now, not at the next tick (up to
+            // a cadence of an empty app). A no-op flag when generations are off.
+            generation_producer.GenerationProducer.kick();
         }
     }
 

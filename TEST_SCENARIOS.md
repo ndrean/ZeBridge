@@ -282,6 +282,7 @@ Each claim of the README and its companions, the tests behind it, and how far th
 | cross-tenant reach by any primitive (core SUB, JS consumer, stream info, OBJ chain objects) — the file records the known hole deliberately | `crosstenant.py` |
 | `$KV.tenants` exact-key grants; live propagation from `zebridge_user_tenants`; the roster never appears on a CDC stream | `tenant_kv.py`, `dyntenant.py` |
 | a row for a tenant nobody is mapped to yet (no stream) is skipped: the bridge keeps running, the slot moves on, and the first mapping creates the stream | `unmapped_tenant.py` |
+| those rows reach the tenant's first device only after the producer's next tick, an empty app for up to a cadence | the first mapping starts the tenant's chains: the chain exists within seconds, holding the rows | `new_tenant_chain.py` |
 | the two untrusted-byte entry points (mutation envelopes, `/enroll`) refuse, never wedge, never leak | `adversarial.py` |
 
 ### Operations
