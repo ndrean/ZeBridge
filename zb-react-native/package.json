@@ -1,6 +1,6 @@
 {
   "name": "@zebridge/react-native",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "ZeBridge for React Native: an offline-first SQLite replica of PostgreSQL tables over NATS, as an Expo module with libzb built in (iOS and Android)",
   "license": "Apache-2.0",
   "repository": {

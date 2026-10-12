@@ -1,3 +1,9 @@
+## 0.1.4
+
+- On iOS, the identity (the device's key) is flagged out of iCloud and computer backups,
+  so restoring a backup onto a new iPhone no longer copies it. An identity saved before
+  gets the flag on the next start.
+
 ## 0.1.3
 
 - On Android, the identity (the device's key) is kept in the app's `no_backup/` folder,
