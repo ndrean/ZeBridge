@@ -1,0 +1,4 @@
+exclude:
+  - examples
+  - nats.zig
+  - node_modules
