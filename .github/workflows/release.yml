@@ -95,6 +95,12 @@ jobs:
         with:
           name: linux
           path: ctx
+      # docker-compose.quickstart.yml's one-time setup rides in the image: the quickstart
+      # then needs no file of the repository.
+      - name: Quickstart files into the context
+        run: |
+          mkdir -p ctx/quickstart
+          cp quickstart/init.sh examples/05-tables/web-consumer/demo.sql ctx/quickstart/
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - if: github.ref_type == 'tag'
@@ -118,9 +124,40 @@ jobs:
             org.opencontainers.image.version=${{ needs.version.outputs.version }}
             org.opencontainers.image.licenses=Apache-2.0
 
+  web-demo:
+    name: quickstart web demo image
+    needs: version
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - if: github.ref_type == 'tag'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: quickstart/Dockerfile.web
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.ref_type == 'tag' }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/zebridge-web-demo:${{ needs.version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/zebridge-web-demo:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+
   release:
     name: draft GitHub release
-    needs: [version, linux, macos, image]
+    needs: [version, linux, macos, image, web-demo]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

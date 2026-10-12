@@ -78,13 +78,14 @@ If you put every client in one tenant, every client holds everything that tenant
 |generation / chain|a per-table, per-tenant snapshot lineage; base + checkpoints + deltas|
 |verdict|PostgreSQL's answer to a client write: accepted / stale / rejected / row_deleted / failed. A rejected one carries a `reason` (`PredatesGcWatermark`, `KeyChange`, `UnknownColumn`…, or PostgreSQL's own error with its `sqlstate`). The libraries report it to the app as an outcome: applied / rebased / lost / deleted / rejected|
 
-**Quick start**: With Docker (or OrbStack), from a clone of this repository:
+**Quick start**: With Docker (or OrbStack). No clone needed: one file, and published images.
 
 ```sh
-docker compose -f docker-compose.quickstart.yml up --build
+curl -O https://raw.githubusercontent.com/ndrean/ZeBridge/main/docker-compose.quickstart.yml
+docker compose -f docker-compose.quickstart.yml up
 ```
 
-The first run builds the bridge from source, which takes a few minutes. It starts PostgreSQL, NATS in operator mode, the bridge, the sweeper and a browser demo. When the `init` service prints its links, open each in its own tab:
+It starts PostgreSQL, NATS in operator mode, the bridge, the sweeper and a browser demo. When the `init` service prints its links, open each in its own tab:
 
 | link | who |
 | -- | -- |

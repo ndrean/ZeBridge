@@ -1,6 +1,8 @@
 # The browser demo (examples/05-tables/web-consumer), built with zb-client-ts and
 # served by nginx. Build context: the repository root.
-FROM node:22-alpine AS build
+# The static files are the same for every CPU: build them once, on the builder's own
+# platform, and only the nginx layer below is per-platform.
+FROM --platform=$BUILDPLATFORM node:22-alpine AS build
 RUN corepack enable
 WORKDIR /src
 COPY zb-client-ts/ zb-client-ts/

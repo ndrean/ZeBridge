@@ -1,17 +1,28 @@
-# ZeBridge in one command, for evaluation:
+# ZeBridge in one command, for evaluation. This file is all you need: every service runs a
+# published image, nothing is built and no other file is read.
 #
-#   docker compose -f docker-compose.quickstart.yml up --build
+#   curl -O https://raw.githubusercontent.com/ndrean/ZeBridge/main/docker-compose.quickstart.yml
+#   docker compose -f docker-compose.quickstart.yml up
 #
 # then open the links the `init` service prints (http://localhost:5173/?invite=…).
 # PostgreSQL, NATS in operator mode, the bridge, the sweeper and the browser demo.
-# Only the demo (5173) and the bridge's /status and /metrics (27434) are published.
-# Not a production layout: see the README's "Host setup on VPS or bare-metal".
+# Only the demo (5173) and the bridge's /status and /metrics (27434) are published, on
+# 127.0.0.1. Not a production layout: see deploy/compose/ for a server.
+#
+# Optional settings, in a .env next to this file or in the environment:
+#   ZB_VERSION=0.1.4      the release to run (ghcr.io/ndrean/zebridge, zebridge-web-demo)
+#   QS_WEB_PORT=5173      the demo's port on this machine
+#   QS_BRIDGE_PORT=27434  the bridge's /status and /metrics on this machine
 #
 # Start again from scratch: docker compose -f docker-compose.quickstart.yml down -v
 
+x-zebridge: &zebridge
+  image: ghcr.io/ndrean/zebridge:${ZB_VERSION:-0.1.4}
+  init: true   # an init as PID 1 passes SIGTERM on: a stop takes ms, not 10 s
+
 services:
   postgres:
-    image: postgres:18-alpine
+    image: postgres:18.6-alpine
     environment:
       POSTGRES_DB: app
       # The compose network only: no port is published, so trust stands in for a
@@ -25,21 +36,21 @@ services:
       interval: 2s
       retries: 30
 
+  # The one-time setup, carried by the image: NATS configuration, database, demo tables,
+  # invites. A second `up` finds everything in place.
   init:
-    build: { context: ., dockerfile: Dockerfile.bridge }
-    image: zebridge/bridge:quickstart
-    entrypoint: ["/bin/sh", "/quickstart/init.sh"]
+    <<: *zebridge
+    user: root
+    entrypoint: ["/bin/sh", "/usr/share/zebridge/quickstart/init.sh"]
     environment:
       QS_WEB_PORT: ${QS_WEB_PORT:-5173}
     volumes:
       - zb-nats:/zb-nats
-      - ./quickstart/init.sh:/quickstart/init.sh:ro
-      - ./examples/05-tables/web-consumer/demo.sql:/quickstart/demo.sql:ro
     depends_on:
       postgres: { condition: service_healthy }
 
   nats:
-    image: nats:alpine
+    image: nats:2.15.0-alpine
     command: ["-js", "-c", "/zb-nats/nats-server.conf"]
     volumes:
       - zb-nats:/zb-nats
@@ -47,7 +58,7 @@ services:
       init: { condition: service_completed_successfully }
 
   bridge:
-    image: zebridge/bridge:quickstart
+    <<: *zebridge
     entrypoint: ["/bin/sh", "-c", "set -a; . /zb-nats/.env.nats; . /zb-nats/.env.bridge; set +a; exec bridge"]
     environment:
       # Inside the container: the web service reaches /enroll over the compose
@@ -63,16 +74,18 @@ services:
     restart: on-failure
 
   sweeper:
-    build: { context: ., dockerfile: Dockerfile.sweeper }
-    entrypoint: ["/bin/sh", "-c", "set -a; . /zb-nats/.env.nats; . /zb-nats/.env.bridge; set +a; exec sweeper"]
+    <<: *zebridge
+    entrypoint: ["/bin/sh", "-c", "set -a; . /zb-nats/.env.nats; . /zb-nats/.env.bridge; set +a; exec bridge_sweeper"]
     volumes:
       - zb-nats:/zb-nats
     depends_on:
       init: { condition: service_completed_successfully }
     restart: on-failure
 
+  # The browser demo (examples/05-tables/web-consumer), served by nginx, which also proxies
+  # /bridge/ and /nats to the services above: the page only talks to its own origin.
   web:
-    build: { context: ., dockerfile: quickstart/Dockerfile.web }
+    image: ghcr.io/ndrean/zebridge-web-demo:${ZB_VERSION:-0.1.4}
     ports:
       - "127.0.0.1:${QS_WEB_PORT:-5173}:5173"
     depends_on:

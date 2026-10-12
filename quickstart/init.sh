@@ -1,5 +1,6 @@
 #!/bin/sh
-# The quickstart's one-shot setup, run in the bridge image (which carries psql):
+# The quickstart's one-shot setup, run as root in the zebridge image, which carries it in
+# /usr/share/zebridge/quickstart/ with demo.sql, and carries psql:
 # the NATS configuration, the database, the demo tables, and the invites the README
 # links to. Idempotent: a second `up` finds everything in place.
 #
@@ -9,6 +10,7 @@
 set -eu
 
 DIR=/zb-nats
+HERE=$(dirname "$0")
 ADMIN_URL="postgres://postgres@postgres:5432/app"
 
 # 1. NATS: an operator, an account, three scoped signing keys, the bridge's creds, and
@@ -44,7 +46,7 @@ set -a; . "$DIR/.env.nats"; . "$DIR/.env.bridge"; set +a
 if ! psql "$ADMIN_URL" -tAc "SELECT 1 FROM pg_publication WHERE pubname = 'quickstart'" | grep -q 1; then
   bridge --init-sql | psql "$ADMIN_URL" -q -v ON_ERROR_STOP=1 > /dev/null
 fi
-psql "$ADMIN_URL" -q -v ON_ERROR_STOP=1 -v pub=quickstart -f /quickstart/demo.sql > /dev/null
+psql "$ADMIN_URL" -q -v ON_ERROR_STOP=1 -v pub=quickstart -f "$HERE/demo.sql" > /dev/null
 
 # 4. One-time invites with fixed codes, so the README can print the links. A code
 #    has at least 16 characters: the bridge refuses shorter ones.
@@ -55,6 +57,9 @@ INSERT INTO public.zebridge_invites (code, principal, tenant_id, expires_at) VAL
   ('quickstart-bob-1',   'bob',   'globex', now() + interval '1 year')
 ON CONFLICT (code) DO NOTHING;
 SQL
+
+# The bridge and the sweeper run as the image's zebridge user: their files are theirs.
+chown zebridge:zebridge "$DIR/.env.nats" "$DIR/.env.bridge" "$DIR/creds/bridge.creds"
 
 PORT="${QS_WEB_PORT:-5173}"
 cat <<EOF

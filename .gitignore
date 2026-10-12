@@ -104,6 +104,8 @@ __pycache__/
 # link the local packages, so their lockfiles stay local; the root one only pins pnpm.
 /pnpm-lock.yaml
 examples/**/pnpm-lock.yaml
+# …except the quickstart web demo's: its image is published (quickstart/Dockerfile.web).
+!examples/05-tables/web-consumer/pnpm-lock.yaml
 examples/08-map/prix-des-carburants-en-france-flux-instantane-v2.csv
 zb.sqlite*
 
