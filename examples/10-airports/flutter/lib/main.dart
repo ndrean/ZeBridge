@@ -17,7 +17,6 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -88,21 +87,17 @@ class _AirportsScreenState extends State<AirportsScreen> {
     // an identity from another deployment (another operator, another address) is not this one's.
     final nats = natsUrl.isEmpty ? '' : '-${Uri.parse(natsUrl).host}';
     final dbPath = '${dir.path}/airports-${Uri.parse(bridgeUrl).host}$nats.sqlite3';
-    final identity = File('$dbPath.identity');
-    final enrolled = identity.existsSync();
-    if (!enrolled && invite.isEmpty) {
-      setState(() => count = 'no identity and no ZB_INVITE: rebuild with an invite');
-      return;
-    }
     try {
+      // The invite is spent once: libzb uses it only while this phone has no identity, and
+      // keeps that identity itself (on Android out of the backup). Never look for its file.
       final w = await ZeBridgeWorker.spawn({
         'bridgeUrl': bridgeUrl,
         if (natsUrl.isNotEmpty) 'natsUrl': natsUrl,
         'dbPath': dbPath,
         'tables': ['flights'],
-        if (!enrolled) 'invite': invite,
+        if (invite.isNotEmpty) 'invite': invite,
       });
-      principal = (jsonDecode(identity.readAsStringSync()) as Map)['principal'] as String? ?? '';
+      principal = w.principal;
       flightId = 'flight-${w.tenant}';
       zb = w;
       // The row moved, by me or by someone else: redraw from it, then reconcile.

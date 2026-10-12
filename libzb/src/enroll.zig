@@ -387,6 +387,57 @@ fn str(o: Value, k: []const u8) ?[]const u8 {
     return if (v == .string and v.string.len > 0) v.string else null;
 }
 
+/// Android keeps an app's private files under `/data/user/<user>/<package>/` (also reached
+/// as `/data/data/<package>/`, and `/data/user_de/<user>/<package>/` before unlock) and
+/// backs all of it up to the user's account, except `no_backup/`
+/// (Context.getNoBackupFilesDir). The identity holds the device's private key: restored
+/// onto another phone, two devices would share it; restored on a reinstall, the app
+/// reconnects as its old self and ignores a new invite. So a replica under an app's
+/// private folder keeps its identity in that app's `no_backup/`. Null for any other path:
+/// the default stays beside the replica.
+pub fn androidNoBackupPath(a: std.mem.Allocator, db_path: []const u8) !?[]u8 {
+    var it = std.mem.splitScalar(u8, db_path, '/');
+    if ((it.next() orelse return null).len != 0) return null; // absolute paths only
+    if (!std.mem.eql(u8, it.next() orelse return null, "data")) return null;
+    const kind = it.next() orelse return null;
+    if (std.mem.eql(u8, kind, "user") or std.mem.eql(u8, kind, "user_de")) {
+        const user = it.next() orelse return null;
+        if (user.len == 0) return null;
+        for (user) |ch| if (!std.ascii.isDigit(ch)) return null;
+    } else if (!std.mem.eql(u8, kind, "data")) return null;
+    const package = it.next() orelse return null;
+    if (package.len == 0) return null;
+    const rest = it.index orelse return null; // a file inside the app's folder, not the folder
+    if (rest >= db_path.len) return null;
+    const base = std.fs.path.basename(db_path);
+    return try std.fmt.allocPrint(a, "{s}/no_backup/{s}.identity", .{ db_path[0 .. rest - 1], base });
+}
+
+/// The identity used to sit beside the replica, where Android backs it up: moved into
+/// `no_backup/` once (the folder made if needed). When `new` already exists it wins, and the
+/// old copy is removed so no later backup carries it.
+pub fn moveIdentity(old: [:0]const u8, new: [:0]const u8) void {
+    const log = std.log.scoped(.libzb);
+    if (std.c.access(old, 0) != 0) return;
+    if (std.c.access(new, 0) == 0) {
+        _ = std.c.unlink(old);
+        log.info("identity: {s} is kept, the old copy beside the replica is removed", .{new});
+        return;
+    }
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = std.fs.path.dirname(new) orelse ".";
+    if (dir.len < buf.len) {
+        @memcpy(buf[0..dir.len], dir);
+        buf[dir.len] = 0;
+        _ = std.c.mkdir(@ptrCast(&buf), 0o700); // EEXIST is fine
+    }
+    if (std.c.rename(old, new) == 0) {
+        log.info("identity: moved to {s}, out of Android's backup", .{new});
+    } else {
+        log.warn("identity: could not move {s} to {s}; it stays where it is", .{ old, new });
+    }
+}
+
 /// The identity at `path`, or null when there is none yet.
 pub fn load(a: std.mem.Allocator, path: []const u8) !?Identity {
     const pz = try a.dupeSentinel(u8, path, 0);
@@ -548,4 +599,73 @@ test "principalFromCreds: the JWT's name claim, from text or a file" {
     defer a.free(f);
     try std.testing.expectEqualStrings("airports", f);
     try std.testing.expect(principalFromCredsFile(a, "zbz-no-such.creds") == null);
+}
+
+test "androidNoBackupPath: a replica in an app's private folder keeps its identity in no_backup/" {
+    const a = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "/data/user/0/dev.zebridge.airports/files/airports.sqlite3", "/data/user/0/dev.zebridge.airports/no_backup/airports.sqlite3.identity" },
+        .{ "/data/data/dev.zebridge.airports/databases/zebridge.sqlite3", "/data/data/dev.zebridge.airports/no_backup/zebridge.sqlite3.identity" },
+        .{ "/data/user_de/10/eu.zebridge.test/files/a.db", "/data/user_de/10/eu.zebridge.test/no_backup/a.db.identity" },
+        .{ "/data/user/0/dev.x/a.db", "/data/user/0/dev.x/no_backup/a.db.identity" },
+    };
+    for (cases) |c| {
+        const got = (try androidNoBackupPath(a, c[0])).?;
+        defer a.free(got);
+        try std.testing.expectEqualStrings(c[1], got);
+    }
+}
+
+test "androidNoBackupPath: any other path keeps the default beside the replica" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "/storage/emulated/0/Download/a.db", // shared storage: not the app's private folder
+        "airports.sqlite3", // relative
+        "/data/user/0/dev.x", // the app folder itself, no file in it
+        "/data/user/0/dev.x/", // idem
+        "/data/user/abc/dev.x/files/a.db", // a user that is not a number
+        "/data/local/tmp/a.db",
+        "/var/mobile/Containers/Data/Application/X/Documents/a.db", // iOS
+    }) |p| try std.testing.expect((try androidNoBackupPath(a, p)) == null);
+}
+
+test "moveIdentity: an identity beside the replica moves to no_backup/ once" {
+    const dir = "zbz-test-nb";
+    const old = "zbz-test-nb-old.identity";
+    const new = "zbz-test-nb/new.identity";
+    defer {
+        _ = std.c.unlink(old);
+        _ = std.c.unlink(new);
+        _ = std.c.rmdir(dir);
+    }
+    const write = struct {
+        fn f(path: [:0]const u8, text: []const u8) !void {
+            const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+            _ = std.c.write(fd, text.ptr, text.len);
+            _ = std.posix.system.close(fd);
+        }
+    }.f;
+    const exists = struct {
+        fn f(path: [:0]const u8) bool {
+            return std.c.access(path, 0) == 0;
+        }
+    }.f;
+    // Old only: moved, the folder made.
+    try write(old, "A");
+    moveIdentity(old, new);
+    try std.testing.expect(!exists(old));
+    try std.testing.expect(exists(new));
+    // Both: the one in no_backup/ wins, the old copy is removed (no backup carries it again).
+    try write(old, "B");
+    moveIdentity(old, new);
+    try std.testing.expect(!exists(old));
+    var buf: [4]u8 = undefined;
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, new, .{ .ACCMODE = .RDONLY }, 0);
+    const n = std.c.read(fd, &buf, buf.len);
+    _ = std.posix.system.close(fd);
+    try std.testing.expectEqualStrings("A", buf[0..@intCast(n)]);
+    // Neither: nothing happens.
+    _ = std.c.unlink(new);
+    moveIdentity(old, new);
+    try std.testing.expect(!exists(old) and !exists(new));
 }

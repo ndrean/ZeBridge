@@ -566,7 +566,23 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     if (str.get(o, "creds", "").len == 0 and str.get(o, "credsPath", "").len == 0) {
         const db_given = str.get(o, "dbPath", "");
         const id_path_opt = str.get(o, "identityPath", "");
-        const id_path = if (id_path_opt.len > 0) try a.dupe(u8, id_path_opt) else if (db_given.len > 0) try std.fmt.allocPrint(a, "{s}.identity", .{db_given}) else try a.dupe(u8, "zebridge.identity");
+        const id_path = if (id_path_opt.len > 0) try a.dupe(u8, id_path_opt) else if (db_given.len > 0) blk: {
+            const beside = try std.fmt.allocPrint(a, "{s}.identity", .{db_given});
+            // Android backs up an app's files, the identity (the device's key) with them:
+            // under an app's private folder it lives in no_backup/, moved there once.
+            if (comptime builtin.target.abi.isAndroid()) {
+                if (try enroll.androidNoBackupPath(a, db_given)) |nb| {
+                    defer a.free(beside);
+                    const old_z = try a.dupeZ(u8, beside);
+                    defer a.free(old_z);
+                    const new_z = try a.dupeZ(u8, nb);
+                    defer a.free(new_z);
+                    enroll.moveIdentity(old_z, new_z);
+                    break :blk nb;
+                }
+            }
+            break :blk beside;
+        } else try a.dupe(u8, "zebridge.identity");
         defer a.free(id_path);
         // A stored identity wins over an invite (a bookmarked invite must not spend a code
         // on every start) — when it can be used. One that cannot be read, or holds no
@@ -1406,4 +1422,5 @@ test {
     _ = @import("client.zig");
     _ = @import("handles.zig");
     _ = @import("zblog.zig");
+    _ = @import("enroll.zig");
 }

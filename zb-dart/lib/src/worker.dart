@@ -32,13 +32,17 @@ import 'dart:isolate';
 import 'native.dart';
 
 class ZeBridgeWorker {
-  ZeBridgeWorker._(this._toWorker, this._fromWorker, this._handle, this.tenant, this.tenants, this.unseeded);
+  ZeBridgeWorker._(this._toWorker, this._fromWorker, this._handle, this.principal, this.tenant, this.tenants, this.unseeded);
 
   final SendPort _toWorker;
 
   /// The worker's libzb handle: only ever passed to `ZeBridge.wake`, never used here.
   final int _handle;
   final ReceivePort _fromWorker;
+
+  /// Who this device is (its enrolled principal). Read it here, never from the identity
+  /// file: where libzb keeps that file is its own business (on Android, `no_backup/`).
+  final String principal;
 
   /// The first membership (sorted), or the open tenant.
   final String tenant;
@@ -104,6 +108,7 @@ class ZeBridgeWorker {
         toWorker!,
         fromWorker,
         info['handle'] as int,
+        (info['principal'] as String?) ?? '',
         (info['tenant'] as String?) ?? '—',
         List<String>.from((info['tenants'] as List?) ?? const []),
         ((info['unseeded'] as List?) ?? const []).map((e) => Map<String, dynamic>.from(e as Map)).toList());
@@ -220,6 +225,7 @@ Future<void> _workerMain(_Boot boot) async {
     toUi.send({
       'type': 'ready',
       'handle': zb.handle,
+      'principal': info['principal'],
       'tenant': info['tenant'],
       'tenants': info['tenants'],
       'unseeded': info['unseeded'],
