@@ -3,7 +3,7 @@
 This demo shows two things:
 
 1. **A write travels through PostgreSQL to the other browsers.** Users of one tenant edit the same flight. When one sets the departure or the arrival, PostgreSQL accepts the write and every other browser of that tenant draws the new route.
-2. **A browser asks a service over NATS and gets an answer.** A DuckDB service holds a copy of 9,253 airports and answers "which airports are near here?" for the map. PostgreSQL never sees these questions.
+2. **A browser asks a service over NATS and gets an answer.** A service holds a copy of 9,253 airports and answers "which airports are near here?" for the map. PostgreSQL never sees these questions.
 
 You need a running ZeBridge: PostgreSQL with the init SQL applied, NATS, and the bridge ([SUPABASE_TEST.md](../../SUPABASE_TEST.md) sets one up on a cloud database). The commands below run from the repository root, with the admin URL of your database in `$ADMIN_URL`.
 
@@ -32,9 +32,9 @@ psql "$ADMIN_URL" -c "\copy airports(code, icao, name, latitude, longitude, elev
 
 `COPY 9253`. The bridge streams the rows to NATS as they commit, and its next snapshot holds them all.
 
-## 4. The DuckDB service
+## 4. The airports service
 
-[airport_service.py](airport_service.py) follows `airports` into a local DuckDB file and answers on `query._default.<name>`: the open tenant, which every client may ask. It needs a responder's credentials, minted from the NATS setup's offline store, and libzb built:
+[airport_service.py](airport_service.py) follows `airports` into a local file (DuckDB by default, or SQLite with `--engine sqlite`) and answers on `query._default.<name>`: the open tenant, which every client may ask. It needs a responder's credentials, minted from the NATS setup's offline store, and libzb built:
 
 ```sh
 bridge --mint-responder --name airports --tenant _default --store zb-nats/operator.store > zb-nats/creds/airports.creds
@@ -47,6 +47,8 @@ PYTHONPATH=zb-python/src python3 examples/10-airports/airport_service.py \
 
 It seeds the 9,253 airports from the snapshot (about a second) and keeps them live from the change stream.
 
+`--engine sqlite` needs nothing but libzb: SQLite is built in. DuckDB needs `libduckdb` on the host. On the same questions, both give the same airports; at this size, SQLite answers `airports_near` faster (1 to 3 ms against 6 to 14 ms) and the two are even on `airports_in_view`.
+
 As a container on a server or a leaf node's host: [INSTALL_AIRPORT_RESPONDER.md](INSTALL_AIRPORT_RESPONDER.md).
 
 Two questions:
@@ -56,7 +58,7 @@ Two questions:
 | `airports_in_view` | `south`, `west`, `north`, `east`, `limit` (500) | the airports in the box. A box across the antimeridian wraps. When more than `limit` are inside, one per cell of a grid over the box, so a world view spreads over every continent (`complete: false`, `total`). |
 | `airports_near` | `lat`, `lng`, `radius_km` (100), `limit` (20) | the nearest airports, with `distance_km` |
 
-The service answers on libzb's own thread, inside the callback that hands it the question; a question wakes libzb's poll the moment it lands. Measured over NATS on the same host: 3 to 5 ms in DuckDB, about 6 ms round trip; idle, it uses 0.1% of a core.
+The service is two handlers given to `zb.serve`; libzb calls them on its own thread, between two polls, and replies; a question wakes libzb's poll the moment it lands. Measured over NATS on the same host: 3 to 5 ms in DuckDB, about 6 ms round trip; idle, it uses 0.1% of a core.
 
 ## 5. The map
 

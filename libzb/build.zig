@@ -178,6 +178,9 @@ pub fn build(b: *std.Build) void {
                     "-DSQLITE_DQS=0",
                     "-DSQLITE_OMIT_LOAD_EXTENSION=1",
                     "-DSQLITE_USE_ALLOCA=1",
+                    // sin, cos, asin, radians, pow, floor, mod…: a distance in plain SQL.
+                    // The host's SQLite has them by default; the bare amalgamation does not.
+                    "-DSQLITE_ENABLE_MATH_FUNCTIONS=1",
                 },
             });
             m.addIncludePath(zsd.path("lib"));

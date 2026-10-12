@@ -911,6 +911,24 @@ test "binding contract: bool binds as 0/1, roundtrips as integer" {
     try std.testing.expect(rows[0][1].eqlText("hi"));
 }
 
+test "math functions: a distance can be written in SQL (-DSQLITE_ENABLE_MATH_FUNCTIONS)" {
+    var st = try Storage.open(":memory:");
+    defer st.close();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Paris to London by haversine, about 344 km.
+    const rows = try st.query(a,
+        \\SELECT round(2 * 6371 * asin(sqrt(pow(sin(radians(51.5074 - 48.8566) / 2), 2) +
+        \\  cos(radians(48.8566)) * cos(radians(51.5074)) * pow(sin(radians(-0.1278 - 2.3522) / 2), 2)))),
+        \\  floor(2.5), mod(-200 + 540, 360) - 180
+    , &.{});
+    try std.testing.expectEqual(@as(f64, 344), rows[0][0].real);
+    try std.testing.expectEqual(@as(f64, 2), rows[0][1].real);
+    try std.testing.expectEqual(@as(f64, 160), rows[0][2].real);
+}
+
 test "foreign_keys is ON: an orphan child is refused" {
     var st = try Storage.open(":memory:");
     defer st.close();

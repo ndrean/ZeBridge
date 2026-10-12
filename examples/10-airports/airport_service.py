@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""The airports service: a DuckDB replica of `airports`, answering the map over NATS.
+"""The airports service: a replica of `airports`, answering the map over NATS.
 
-libzb follows `airports` into a local DuckDB file (seeded from the snapshot, kept live by
-the change stream) and answers named questions on `query._default.<name>`, the open
+libzb follows `airports` into a local file, DuckDB or SQLite (`--engine`), seeded from the
+snapshot and kept live by the change stream, and the service answers named questions on `query._default.<name>`, the open
 tenant every client may ask. PostgreSQL never sees a query.
 
     airports_in_view {"south", "west", "north", "east", "limit": 500}
@@ -99,22 +99,25 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default=os.environ.get("NATS_URL", "nats://127.0.0.1:4222"))
     ap.add_argument("--creds", required=True, help="a responder's creds (bridge --mint-responder)")
-    ap.add_argument("--db", default="/tmp/airports-service.duckdb")
+    ap.add_argument("--engine", choices=["duckdb", "sqlite"], default="duckdb",
+                    help="the replica: DuckDB (libduckdb at run time) or SQLite (built into libzb)")
+    ap.add_argument("--db", help="the replica's file (default /tmp/airports-service.<engine>)")
     ap.add_argument("--queue", default="airports", help="instances in one queue group share the questions")
     ap.add_argument("--js-domain", default=os.environ.get("NATS_JS_DOMAIN") or None,
                     help="the hub's JetStream domain, when this service runs behind a leaf node")
     ap.add_argument("--name", default=os.environ.get("ZB_SERVICE_NAME") or socket.gethostname(),
                     help="said in every answer (`by`): which instance of the queue group answered")
     a = ap.parse_args()
+    db = a.db or f"/tmp/airports-service.{'duckdb' if a.engine == 'duckdb' else 'sqlite3'}"
 
     t0 = time.time()
     opts = {"js_domain": a.js_domain} if a.js_domain else {}
-    with ZeBridge(nats_url=a.url, creds_path=a.creds, db_path=a.db, engine="duckdb",
+    with ZeBridge(nats_url=a.url, creds_path=a.creds, db_path=db, engine=a.engine,
                   tables=[TABLE], client_id="airport-service", heartbeat_ms=0,
                   on_change=lambda r: print(f"cdc: {r['applied']} row(s) applied", flush=True) if r.get("applied") else None,
                   **opts) as zb:
         held = zb.query(f"SELECT count(*) AS n FROM {TABLE}")[0]["n"]
-        print(f"replica: {held} airports in {a.db}, {time.time() - t0:.1f} s", flush=True)
+        print(f"replica: {held} airports in {db} ({a.engine}), {time.time() - t0:.1f} s", flush=True)
 
         def handler(fn):
             def answer(q: dict, tenant: str) -> dict:
