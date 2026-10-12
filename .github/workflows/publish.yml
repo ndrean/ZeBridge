@@ -4,8 +4,9 @@
 # Run by hand, everything is built and checked, and nothing is published.
 #
 # Once, on each registry (owner ndrean, repository ZeBridge, workflow publish.yml):
-#   npmjs.com, for @zebridge/client and @zebridge/react-native: a trusted publisher,
-#     with "npm publish" allowed (else each release waits for approval on npmjs.com)
+#   npmjs.com, for @zebridge/client and @zebridge/react-native: a trusted publisher. It
+#     stages (npm stage publish): each version goes live when a maintainer approves it,
+#     with 2FA, on npmjs.com or with `npm stage approve <id>`
 #   pypi.org, for zebridge: a trusted publisher, environment "pypi"
 name: Publish packages
 
@@ -33,8 +34,10 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22.14
-      - name: npm with trusted publishing (11.5.1 or later)
-        run: npm install -g npm@^11.5.1 >/dev/null && npm --version
+          cache: pnpm
+          cache-dependency-path: zb-client-ts/pnpm-lock.yaml
+      - name: npm with staged publishing (11.15.0 or later)
+        run: npm install -g npm@^11.15.0 >/dev/null && npm --version
       - id: v
         name: Is this version new?
         run: |
@@ -46,10 +49,11 @@ jobs:
           fi
       - run: pnpm install --frozen-lockfile
       - run: pnpm run typecheck && pnpm test
-      # pnpm pack applies publishConfig (the dist/ entry points); npm publish speaks OIDC.
+      # pnpm pack applies publishConfig (the dist/ entry points); npm stage publish speaks OIDC
+      # and adds provenance itself.
       - run: pnpm pack
       - if: steps.v.outputs.new == 'true' && github.event_name == 'release'
-        run: npm publish ./zebridge-client-*.tgz --provenance --access public
+        run: npm stage publish ./zebridge-client-*.tgz
       - if: github.event_name != 'release'
         run: tar -tzf ./zebridge-client-*.tgz | head -30
 
@@ -72,12 +76,13 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22.14
+          package-manager-cache: false   # pnpm pack needs no install here
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
-      - name: npm with trusted publishing (11.5.1 or later)
-        run: npm install -g npm@^11.5.1 >/dev/null && npm --version
+      - name: npm with staged publishing (11.15.0 or later)
+        run: npm install -g npm@^11.15.0 >/dev/null && npm --version
       - id: v
         name: Is this version new?
         working-directory: zb-react-native
@@ -102,7 +107,7 @@ jobs:
         run: pnpm pack && tar -tzf ./zebridge-react-native-*.tgz | grep -E "xcframework/Info.plist|libzb.so|zb.h" | head
       - if: steps.v.outputs.new == 'true' && github.event_name == 'release'
         working-directory: zb-react-native
-        run: npm publish ./zebridge-react-native-*.tgz --provenance --access public
+        run: npm stage publish ./zebridge-react-native-*.tgz
 
   pypi:
     name: PyPI zebridge
