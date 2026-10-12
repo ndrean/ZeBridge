@@ -789,6 +789,10 @@ CREATE TABLE IF NOT EXISTS public.zebridge_invites (
 ALTER TABLE public.zebridge_invites DROP COLUMN IF EXISTS role;
 ALTER TABLE public.zebridge_invites DROP CONSTRAINT IF EXISTS zebridge_invites_tenant_id_check;
 ALTER TABLE public.zebridge_invites ADD CONSTRAINT zebridge_invites_tenant_id_check CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]');
+-- The defaults too: CREATE TABLE IF NOT EXISTS leaves an older table as it was, and an
+-- invite inserted without a code then failed ("null value in column code").
+ALTER TABLE public.zebridge_invites ALTER COLUMN code SET DEFAULT replace(gen_random_uuid()::text, '-', '');
+ALTER TABLE public.zebridge_invites ALTER COLUMN expires_at SET DEFAULT now() + interval '1 days';
 -- The bridge redeems invites over its WRITER connection: read the row, stamp
 -- used_at, and register the principal→tenant mapping in the same transaction.
 GRANT SELECT, UPDATE ON public.zebridge_invites TO ${POSTGRES_WRITER_USER};
