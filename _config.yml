@@ -1,0 +1,5 @@
+exclude:
+  - examples
+  - scripts
+  - nats.zig
+  - node_modules
