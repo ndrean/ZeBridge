@@ -36,8 +36,37 @@ with ZeBridge(bridge_url="https://zb.example.com", invite=code, tables=["orders"
 - **Errors** raise `ZeBridgeError` with libzb's words. `on_error` hears the loop's.
 - **Revocation.** Once revoked, `zb.revoked` is true and the loop stops; `wipe()` removes the
   rows.
-- **Services.** `serve({...})`, then answer `on_change`'s `requests` with `reply(id, answer)`;
-  `request` and `ingest` for on-demand tables.
+- **Asking a service.** `request(subject, payload)`, and `ingest` to keep the answer's rows in
+  an on-demand table.
+
+## A service
+
+A service answers questions that clients ask with `request("query.<tenant>.<name>", …)`.
+It needs a responder's creds (`bridge --mint-responder`). Write one handler per question:
+
+```python
+from zebridge import ZeBridge
+
+with ZeBridge(nats_url="tls://nats.example.com:4222", creds_path="airports.creds",
+              db_path="airports.sqlite3", tables=["airports"]) as zb:
+
+    def by_code(q: dict, tenant: str):
+        return zb.query("SELECT * FROM airports WHERE code = ?", q["code"])
+
+    zb.serve(["_default"], {"airport_by_code": by_code}, queue="airports")
+    zb.wait()   # until SIGINT or SIGTERM
+```
+
+- A handler gets the asker's payload and the tenant from the subject (never from the
+  payload), and returns any JSON.
+- A handler that raises answers `{"error": "<Type>: <message>"}`, so the asker never waits
+  out a timeout.
+- Handlers run on the client's thread, between two polls. Instances with the same `queue`
+  share the questions.
+- An answer too large for one message goes through the tenant's object store; the asking
+  library fetches it.
+
+Example: [examples/10-airports/airport_service.py](https://github.com/ndrean/zebridge/blob/main/examples/10-airports/airport_service.py).
 
 ## The library
 

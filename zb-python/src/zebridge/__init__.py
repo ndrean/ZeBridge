@@ -15,7 +15,15 @@ later runs need only `bridge_url` (or nothing but `identity_path`); the JWT rene
 libzb drives a client from ONE thread; this class owns that thread. Every method may be
 called from any thread and blocks until the worker has run it (at most one poll, 250 ms
 by default). Between calls the worker polls, and `on_change` hears every poll that
-applied rows, settled writes or brought requests — on the worker thread.
+applied rows or settled writes — on the worker thread.
+
+A service is handlers; the library subscribes, calls them and replies:
+
+    def near(q, tenant):
+        return zb.query("SELECT * FROM airports WHERE latitude BETWEEN ? AND ?", q["south"], q["north"])
+
+    zb.serve(["_default"], {"airports_near": near}, queue="airports")
+    zb.wait()   # until SIGINT or SIGTERM
 """
 from __future__ import annotations
 
@@ -91,6 +99,7 @@ class ZeBridge:
         self._tasks: queue.SimpleQueue = queue.SimpleQueue()
         self._running = True
         self._handle = 0
+        self._handlers: dict[str, Callable[[Any, str], Any]] = {}
         ready: Future = Future()
         self._worker = threading.Thread(target=self._run, args=(opts, ready), name=f"zebridge-{opts.get('clientId', 'client')}", daemon=True)
         self._worker.start()
@@ -152,6 +161,8 @@ class ZeBridge:
             try:
                 last_poll = time.monotonic()
                 r = _check(n.take(n.lib.zb_client_poll(h, busy_poll_ms if busy else self._poll_ms)))
+                if r.get("requests"):
+                    r["requests"] = self._answer(r["requests"])
                 if (r.get("applied") or r.get("settled") or r.get("requests") or r.get("outcomes")) and self._on_change:
                     self._on_change(r)
             except ZeBridgeError as e:
@@ -161,6 +172,26 @@ class ZeBridge:
                     self._running = False  # for good: every later call answers Revoked
                 else:
                     threading.Event().wait(1.0)
+
+    def _answer(self, requests: list[dict]) -> list[dict]:
+        """Answer the questions a handler covers, here on the worker thread (from another
+        thread each reply would wait for the poll in flight); return the others."""
+        rest = []
+        for req in requests:
+            fn = self._handlers.get(req["name"])
+            if fn is None:
+                rest.append(req)
+                continue
+            try:
+                answer = fn(req.get("payload") or {}, req["tenant"])
+            except Exception as e:  # the asker hears it, rather than waiting out a timeout
+                answer = {"error": f"{type(e).__name__}: {e}"}
+            try:
+                _check(n.take(n.lib.zb_client_reply(self._handle, req["id"], n.enc(answer))))
+            except (ZeBridgeError, TypeError, ValueError) as e:  # TypeError/ValueError: not JSON
+                if self._on_error:
+                    self._on_error(e if isinstance(e, ZeBridgeError) else ZeBridgeError(f"{req['name']}: {e}"))
+        return rest
 
     def _call(self, fn: Callable[[], Any]) -> Any:
         if threading.current_thread() is self._worker:
@@ -216,9 +247,27 @@ class ZeBridge:
         """Store a request's answer rows in an on-demand table."""
         return self._call(lambda: _check(n.take(n.lib.zb_client_ingest(self._handle, table.encode(), n.enc(answer), n.enc(scope)))))
 
-    def serve(self, options: dict) -> dict:
-        """Answer requests as a service; they arrive in `on_change`'s `requests`."""
-        return self._call(lambda: _check(n.take(n.lib.zb_client_serve(self._handle, n.enc(options)))))
+    def serve(self, tenants: list[str], handlers: dict[str, Callable[[Any, str], Any]], queue: str = "zb") -> int:
+        """Be a service: answer `query.<tenant>.<name>` for each handler name, in one queue
+        group. A handler gets the asker's payload and the tenant the question arrived on,
+        and returns the answer (any JSON). A handler that raises answers {"error": …}.
+        Handlers run on the client's thread, between two polls. Returns how many subjects
+        this client now answers."""
+        def go():
+            r = _check(n.take(n.lib.zb_client_serve(self._handle, n.enc({"tenants": tenants, "queries": sorted(handlers), "queue": queue}))))
+            self._handlers.update(handlers)
+            return r["serving"]
+        return self._call(go)
+
+    def wait(self) -> None:
+        """Block until SIGINT or SIGTERM (from the main thread), or until the client stops."""
+        stop = threading.Event()
+        if threading.current_thread() is threading.main_thread():
+            import signal
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                signal.signal(sig, lambda *_: stop.set())
+        while not stop.is_set() and self._worker.is_alive():
+            stop.wait(0.5)
 
     def reply(self, request_id: int, answer: dict) -> dict:
         return self._call(lambda: _check(n.take(n.lib.zb_client_reply(self._handle, request_id, n.enc(answer)))))

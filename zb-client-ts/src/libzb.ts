@@ -852,13 +852,13 @@ export class ZeBridge {
   /// library's idiom: the handlers are yours, the subscribing, the dispatch, the reply
   /// and the error envelope are the library's.
   ///
-  /// A handler receives the asker's parsed payload and returns the answer, which is
-  /// sent as JSON. Throwing is allowed: the asker gets `{"error": …}` rather than a
+  /// A handler receives the asker's parsed payload and the tenant the question arrived
+  /// on (from the subject, never the payload), and returns the answer, sent as JSON. Throwing is allowed: the asker gets `{"error": …}` rather than a
   /// timeout, which is the difference between a service that says no and one that
   /// looks dead. Returns how many subjects this client now answers.
   public async serve(opts: {
     tenants: string[];
-    handlers: Record<string, (payload: any) => unknown | Promise<unknown>>;
+    handlers: Record<string, (payload: any, tenant: string) => unknown | Promise<unknown>>;
     queue?: string;
   }): Promise<number> {
     if (!this.nc) throw new Error('not connected');
@@ -876,7 +876,7 @@ export class ZeBridge {
             let answer: unknown;
             try {
               const raw = new TextDecoder().decode(m.data);
-              answer = await fn(raw ? JSON.parse(raw) : {});
+              answer = await fn(raw ? JSON.parse(raw) : {}, tenant);
             } catch (e) {
               answer = { error: `${(e as Error)?.name ?? 'Error'}: ${(e as Error)?.message ?? e}` };
             }

@@ -21,8 +21,6 @@ import argparse
 import socket
 import math
 import os
-import signal
-import threading
 import time
 
 from zebridge import ZeBridge
@@ -109,41 +107,25 @@ def main():
                     help="said in every answer (`by`): which instance of the queue group answered")
     a = ap.parse_args()
 
-    zb_ref: list = []
-
-    # Questions are answered HERE, on libzb's own thread, the moment a poll hands them
-    # over: query and reply run at once. Answered from another thread, each call would
-    # wait for the worker's current poll to end — measured, ~100 ms per question.
-    def on_change(r: dict) -> None:
-        if r.get("applied"):
-            print(f"cdc: {r['applied']} row(s) applied", flush=True)
-        for req in r.get("requests") or []:
-            zb = zb_ref[0]
-            fn = QUERIES.get(req["name"])
-            try:
-                ans = fn(zb, req.get("payload") or {}) if fn else {"error": f"unknown query {req['name']!r}", "known": sorted(QUERIES)}
-            except Exception as e:  # a bad parameter is the asker's problem
-                ans = {"error": f"{type(e).__name__}: {e}"}
-            ans["by"] = a.name
-            zb.reply(req["id"], ans)
-            print(f"{req['name']}: {ans.get('count', '?')} airport(s) in {ans.get('ms', '?')} ms", flush=True)
-
     t0 = time.time()
-    # A question wakes libzb's poll when it lands, so the default 250 ms poll answers
-    # at once and costs nothing when idle.
     opts = {"js_domain": a.js_domain} if a.js_domain else {}
     with ZeBridge(nats_url=a.url, creds_path=a.creds, db_path=a.db, engine="duckdb",
                   tables=[TABLE], client_id="airport-service", heartbeat_ms=0,
-                  on_change=on_change, **opts) as zb:
-        zb_ref.append(zb)
+                  on_change=lambda r: print(f"cdc: {r['applied']} row(s) applied", flush=True) if r.get("applied") else None,
+                  **opts) as zb:
         held = zb.query(f"SELECT count(*) AS n FROM {TABLE}")[0]["n"]
         print(f"replica: {held} airports in {a.db}, {time.time() - t0:.1f} s", flush=True)
-        r = zb.serve({"tenants": ["_default"], "queries": sorted(QUERIES), "queue": a.queue})
-        print(f"answering {sorted(QUERIES)} on query._default.<name>, queue group {a.queue!r} ({r.get('serving')} subject(s))", flush=True)
-        stop = threading.Event()
-        signal.signal(signal.SIGINT, lambda *_: stop.set())
-        signal.signal(signal.SIGTERM, lambda *_: stop.set())
-        stop.wait()
+
+        def handler(fn):
+            def answer(q: dict, tenant: str) -> dict:
+                ans = {**fn(zb, q), "by": a.name}
+                print(f"{fn.__name__}: {ans['count']} airport(s) in {ans['ms']} ms", flush=True)
+                return ans
+            return answer
+
+        n = zb.serve(["_default"], {name: handler(fn) for name, fn in QUERIES.items()}, queue=a.queue)
+        print(f"answering {sorted(QUERIES)} on query._default.<name>, queue group {a.queue!r} ({n} subject(s))", flush=True)
+        zb.wait()
 
 
 if __name__ == "__main__":
