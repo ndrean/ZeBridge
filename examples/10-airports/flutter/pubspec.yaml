@@ -7,8 +7,7 @@ environment:
   sdk: ^3.13.4
 
 dependencies:
-  zebridge:
-    path: ../../../zb-dart   # the shared Dart package: libzb over FFI + the isolate worker
+  zebridge: ^0.1.2   # pub.dev: libzb over FFI + the isolate worker, its native library included
   flutter:
     sdk: flutter
   ffi: ^2.2.0
