@@ -1,0 +1,141 @@
+# The client packages, published by their registries' trusted publishing (OIDC): no token
+# is stored here. On a published release, each job publishes its package only when the
+# version in its manifest is not on its registry yet: bump a package's version to ship it.
+# Run by hand, everything is built and checked, and nothing is published.
+#
+# Once, on each registry (owner ndrean, repository ZeBridge, workflow publish.yml):
+#   npmjs.com, for @zebridge/client and @zebridge/react-native: a trusted publisher,
+#     with "npm publish" allowed (else each release waits for approval on npmjs.com)
+#   pypi.org, for zebridge: a trusted publisher, environment "pypi"
+name: Publish packages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  npm-client:
+    name: npm @zebridge/client
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: zb-client-ts
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22.14
+      - name: npm with trusted publishing (11.5.1 or later)
+        run: npm install -g npm@^11.5.1 >/dev/null && npm --version
+      - id: v
+        name: Is this version new?
+        run: |
+          v=$(node -p "require('./package.json').version")
+          if npm view "@zebridge/client@$v" version 2>/dev/null | grep -q .; then
+            echo "new=false" >> "$GITHUB_OUTPUT"; echo "@zebridge/client $v is on npm already: skipped"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"; echo "@zebridge/client $v is new"
+          fi
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run typecheck && pnpm test
+      # pnpm pack applies publishConfig (the dist/ entry points); npm publish speaks OIDC.
+      - run: pnpm pack
+      - if: steps.v.outputs.new == 'true' && github.event_name == 'release'
+        run: npm publish ./zebridge-client-*.tgz --provenance --access public
+      - if: github.event_name != 'release'
+        run: tar -tzf ./zebridge-client-*.tgz | head -30
+
+  npm-react-native:
+    name: npm @zebridge/react-native
+    runs-on: macos-15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - name: Apply the nats.zig patches
+        run: for p in nats.zig-patch/[0-9][0-9]-nats.zig-*.patch; do git -C nats.zig apply "../$p"; done
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22.14
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: npm with trusted publishing (11.5.1 or later)
+        run: npm install -g npm@^11.5.1 >/dev/null && npm --version
+      - id: v
+        name: Is this version new?
+        working-directory: zb-react-native
+        run: |
+          v=$(node -p "require('./package.json').version")
+          if npm view "@zebridge/react-native@$v" version 2>/dev/null | grep -q .; then
+            echo "new=false" >> "$GITHUB_OUTPUT"; echo "@zebridge/react-native $v is on npm already: skipped"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"; echo "@zebridge/react-native $v is new"
+          fi
+      - uses: gradle/actions/setup-gradle@v4
+      - name: libzb for iOS and Android, built here
+        run: |
+          # The runner's own variable (not the workflow's env context): its newest NDK.
+          export ANDROID_NDK="$ANDROID_NDK_LATEST_HOME"
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
+          python3 libzb/python/abi_check.py
+          zb-react-native/scripts/build-ios.sh
+          zb-react-native/scripts/build-android.sh
+      - name: pack
+        working-directory: zb-react-native
+        run: pnpm pack && tar -tzf ./zebridge-react-native-*.tgz | grep -E "xcframework/Info.plist|libzb.so|zb.h" | head
+      - if: steps.v.outputs.new == 'true' && github.event_name == 'release'
+        working-directory: zb-react-native
+        run: npm publish ./zebridge-react-native-*.tgz --provenance --access public
+
+  pypi:
+    name: PyPI zebridge
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - name: Apply the nats.zig patches
+        run: for p in nats.zig-patch/[0-9][0-9]-nats.zig-*.patch; do git -C nats.zig apply "../$p"; done
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: astral-sh/setup-uv@v6
+      - id: v
+        name: Is this version new?
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' zb-python/pyproject.toml)
+          if curl -sf "https://pypi.org/pypi/zebridge/$v/json" >/dev/null; then
+            echo "new=false" >> "$GITHUB_OUTPUT"; echo "zebridge $v is on PyPI already: skipped"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"; echo "zebridge $v is new"
+          fi
+      - name: The four wheels (Linux and macOS, each with its libzb)
+        run: |
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
+          zb-python/scripts/build-wheels.sh
+          ls -la zb-python/dist
+      - if: steps.v.outputs.new == 'true' && github.event_name == 'release'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: zb-python/dist
