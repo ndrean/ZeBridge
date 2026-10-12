@@ -157,3 +157,32 @@ pass `http://` and `nats://` addresses instead (`ZB_NATS_URL`), with the bridge 
 the network (`BRIDGE_BIND=0.0.0.0`), and allow "Local Network" when iOS asks.
 
 The invite is used once; later launches open on the identity kept on the phone. Tap an airport to make it the departure or the arrival.
+
+## 8. Tenant isolation, on two phones
+
+Every tenant has its own flight (`flight-<tenant>`). Two phones show this without any code
+change: give them invites in the same tenant, then in two different ones.
+
+1. **Same tenant: one flight.** Create two invites with the same `tenant_id`, build one app
+   per phone with its invite (section 7), and open both. Set the departure on one phone and
+   the arrival on the other: each end appears on both.
+2. **Two tenants: two flights.** Give one phone a fresh start in another tenant: clear the
+   app's data, then rebuild it with an invite whose `tenant_id` differs. Now a route set on
+   one phone never reaches the other. Each phone edits its own tenant's flight, and the
+   browsers of each tenant follow their own.
+
+On Android, clear the data with
+`adb -s <serial> shell pm clear dev.zebridge.airports`. Reinstalling is not enough: Android
+can restore the app's old data, and with it the old identity, so the app reconnects in its
+old tenant and ignores the new invite.
+
+The app never filters by tenant; the layers below it do:
+
+| layer | what keeps the tenants apart |
+| -- | -- |
+| PostgreSQL | one flight row per tenant; a write lands only in the writer's tenant (the tenant guard and row-level security) |
+| NATS | each phone's JWT, from its enrollment, grants only its own tenant's stream (`CDC_<tenant>`); asking for another one is refused by the server |
+| snapshots | each tenant's chains live in its own object store (`gen-<tenant>`) |
+
+So the separation holds whatever the app does: a phone cannot read another tenant's flight
+even if its code asks for it.
