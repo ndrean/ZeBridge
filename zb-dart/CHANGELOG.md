@@ -1,3 +1,11 @@
+## 0.1.3
+
+- On Android, the identity (the device's key) is kept in the app's `no_backup/` folder,
+  which Android's backup skips: a reinstall or a new phone no longer brings back an old
+  identity. An identity beside the replica is moved there on the first start.
+- `ZeBridgeWorker.principal`: who this device is. Read it there, not from the identity
+  file.
+
 ## 0.1.2
 
 - pubspec.yaml declares the supported platforms: Android, iOS, Linux, macOS. There is
