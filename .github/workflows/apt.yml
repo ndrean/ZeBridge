@@ -1,0 +1,80 @@
+# The APT repository on GitHub Pages (packages.zebridge.eu), rebuilt when a release is
+# published: after the draft was reviewed, never before. Run by hand, it builds and signs
+# the repository; it deploys only with `deploy` ticked (gh workflow run apt.yml -f deploy=true).
+#
+# The pool is every published release's .deb, downloaded fresh each time: apt can still
+# install an older version, and nothing local can slip in.
+#
+# Once, in the repository's settings:
+#   Secrets: APT_GPG_KEY (the armored secret key "ZeBridge packages") and APT_GPG_PASSPHRASE
+#   Pages: source "GitHub Actions", custom domain packages.zebridge.eu
+#   Environments → github-pages: allow deployments from tags v*
+name: APT repository
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy to GitHub Pages (otherwise build and sign only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apt-pages
+  cancel-in-progress: false
+
+jobs:
+  apt:
+    name: build, sign, deploy
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Every published release's packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist/apt/pool/main
+          tags=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --exclude-drafts --json tagName --jq '.[].tagName' | grep '^v' || true)
+          for t in $tags; do
+            gh release download "$t" --repo "$GITHUB_REPOSITORY" --pattern '*.deb' --dir dist/apt/pool/main --skip-existing
+          done
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          echo "ZB_APT_VERSION=${latest#v}" >> "$GITHUB_ENV"
+          ls dist/apt/pool/main
+
+      - name: The signing key
+        env:
+          APT_GPG_KEY: ${{ secrets.APT_GPG_KEY }}
+        run: printf '%s\n' "$APT_GPG_KEY" | gpg --batch --import
+
+      - name: Indexes and signatures
+        env:
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          sudo apt-get install -y -qq apt-utils >/dev/null
+          pp="$RUNNER_TEMP/apt-passphrase"
+          (umask 077; printf '%s' "$APT_GPG_PASSPHRASE" > "$pp")
+          ZB_APT_POOL_READY=1 ZB_APT_GPG_OPTS="--pinentry-mode loopback --passphrase-file $pp" deploy/apt-repo.sh
+          rm -f "$pp"
+          echo packages.zebridge.eu > dist/apt/CNAME
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/apt
+
+      - if: github.event_name == 'release' || inputs.deploy
+        id: deploy
+        uses: actions/deploy-pages@v4
