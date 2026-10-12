@@ -1,7 +1,8 @@
 # The client packages, published by their registries' trusted publishing (OIDC): no token
 # is stored here. On a published release, each job publishes its package only when the
 # version in its manifest is not on its registry yet: bump a package's version to ship it.
-# Run by hand, everything is built and checked, and nothing is published.
+# Run by hand, everything is built and checked, and nothing is published unless asked
+# (gh workflow run publish.yml -f publish=true: the same rule, a version only once).
 #
 # Once, on each registry (owner ndrean, repository ZeBridge, workflow publish.yml):
 #   npmjs.com, for @zebridge/client and @zebridge/react-native: a trusted publisher. It
@@ -14,6 +15,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the versions the registries do not have (npm stages them)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -34,8 +40,9 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22.14
-          cache: pnpm
-          cache-dependency-path: zb-client-ts/pnpm-lock.yaml
+          # npm finds its OIDC login through the .npmrc this writes (npm's own examples).
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false   # no cache in a release build (npm's advice)
       - name: npm with staged publishing (11.15.0 or later)
         run: npm install -g npm@^11.15.0 >/dev/null && npm --version
       - id: v
@@ -52,7 +59,7 @@ jobs:
       # pnpm pack applies publishConfig (the dist/ entry points); npm stage publish speaks OIDC
       # and adds provenance itself.
       - run: pnpm pack
-      - if: steps.v.outputs.new == 'true' && github.event_name == 'release'
+      - if: steps.v.outputs.new == 'true' && (github.event_name == 'release' || inputs.publish)
         run: npm stage publish ./zebridge-client-*.tgz
       - if: github.event_name != 'release'
         run: tar -tzf ./zebridge-client-*.tgz | head -30
@@ -76,7 +83,8 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22.14
-          package-manager-cache: false   # pnpm pack needs no install here
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false   # no cache in a release build; pnpm pack installs nothing
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -105,7 +113,7 @@ jobs:
       - name: pack
         working-directory: zb-react-native
         run: pnpm pack && tar -tzf ./zebridge-react-native-*.tgz | grep -E "xcframework/Info.plist|libzb.so|zb.h" | head
-      - if: steps.v.outputs.new == 'true' && github.event_name == 'release'
+      - if: steps.v.outputs.new == 'true' && (github.event_name == 'release' || inputs.publish)
         working-directory: zb-react-native
         run: npm stage publish ./zebridge-react-native-*.tgz
 
@@ -140,7 +148,7 @@ jobs:
           mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
           zb-python/scripts/build-wheels.sh
           ls -la zb-python/dist
-      - if: steps.v.outputs.new == 'true' && github.event_name == 'release'
+      - if: steps.v.outputs.new == 'true' && (github.event_name == 'release' || inputs.publish)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: zb-python/dist
