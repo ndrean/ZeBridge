@@ -15,7 +15,7 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 libzb=$(cd "$here/../libzb" && pwd)
 python3 "$libzb/python/abi_check.py"   # the ABI the package pins is the one these carry
 
-ndk=$(ls -d "$HOME/Library/Android/sdk/ndk"/* | sort -V | tail -1)
+ndk=${ANDROID_NDK:-$(ls -d "$HOME/Library/Android/sdk/ndk"/* | sort -V | tail -1)}   # CI sets ANDROID_NDK
 tc="$ndk/toolchains/llvm/prebuilt/darwin-x86_64"
 api=29
 rm -rf "$here/prebuilt"

@@ -1,0 +1,50 @@
+# zb-dart to pub.dev, by OIDC (no token). pub.dev accepts only a run started by a tag
+# push that matches the package's tag pattern (zb-dart-v{{version}}), so this workflow
+# has its own tag, apart from the release's v* tags:
+#
+#   git tag zb-dart-v0.1.4 && git push origin zb-dart-v0.1.4
+#
+# A manual run is a dry run: it builds the libraries and runs `dart pub publish --dry-run`.
+name: Publish to pub.dev
+
+on:
+  push:
+    tags: ['zb-dart-v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+
+env:
+  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-global
+
+jobs:
+  publish:
+    name: pub.dev zebridge
+    runs-on: macos-15   # the iOS SDK; Zig cross-builds Android, macOS and Linux from here
+    permissions:
+      contents: read
+      id-token: write   # setup-dart turns it into a pub.dev token
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - name: The tag matches pubspec.yaml
+        if: github.event_name == 'push'
+        run: |
+          v=$(sed -n 's/^version: *//p' zb-dart/pubspec.yaml)
+          [ "zb-dart-v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME, pubspec $v"; exit 1; }
+      - name: Apply the nats.zig patches
+        run: for p in nats.zig-patch/[0-9][0-9]-nats.zig-*.patch; do git -C nats.zig apply "../$p"; done
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: dart-lang/setup-dart@v1
+      - name: libzb for the ten targets
+        run: |
+          export ANDROID_NDK="$ANDROID_NDK_LATEST_HOME"
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
+          zb-dart/scripts/build-prebuilt.sh
+      - working-directory: zb-dart
+        run: dart pub get
+      - name: Publish
+        working-directory: zb-dart
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then dart pub publish --force; else dart pub publish --dry-run; fi
