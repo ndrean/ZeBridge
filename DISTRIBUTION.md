@@ -169,17 +169,29 @@ For Debian 12+ and Ubuntu 22.04+, amd64 and arm64, from the APT repository at
 The repository is signed: apt refuses it without that key. The key's fingerprint is on
 the repository's page, `https://packages.zebridge.eu`. `sudo apt upgrade` installs later releases.
 
-**A release**, from a Mac. The version is the one in `build.zig.zon`:
+**A release** is built by GitHub Actions. A `v<version>` tag (the version in
+`build.zig.zon`) runs `.github/workflows/release.yml`: the packages and tarballs for both
+architectures, the images, and a draft release. Publishing that release runs
+`.github/workflows/apt.yml`, which rebuilds the repository from every published release's
+packages, signs it, and deploys it to GitHub Pages at `packages.zebridge.eu`. apt only ever
+sees releases that were reviewed and published.
+
+The repository is signed with the GPG key "ZeBridge packages" (Ed25519), held in the GitHub
+repository's secrets (`APT_GPG_KEY`, `APT_GPG_PASSPHRASE`) and on the release machine. Keep a
+copy of it somewhere safe (`gpg --export-secret-keys --armor "ZeBridge packages"`): a new key
+would make every server fetch `zebridge.gpg` again.
+
+By hand, on a machine with the key (the same script the workflow runs), for a release
+already published:
+
+    rm -rf dist/<version> && gh release download v<version> --dir dist/<version>
+    deploy/apt-repo.sh                 # add it to dist/apt/, index and sign it
+
+`dist/apt/` is then the whole repository, for any static host. Before a release, the
+packages can be built and tried locally:
 
     deploy/package-linux.sh x86_64     # build and package, in dist/<version>/
-    deploy/package-linux.sh aarch64 --no-build  # or build both: run without --no-build
     deploy/test-linux.sh               # install them on clean Debian 12, 13, Ubuntu 22.04, 24.04
-    deploy/apt-repo.sh                 # add them to dist/apt/, index and sign it
-
-then upload the whole `dist/apt/` folder to the static host (a Cloudflare Pages project).
-`dist/apt/` keeps every release, so it is uploaded whole each time. It is signed with the GPG key
-"ZeBridge packages" (Ed25519), which lives on the release machine only; keep a copy of it
-(`gpg --export-secret-keys --armor "ZeBridge packages"`) somewhere safe.
 
 In `dist/<version>/`:
 
