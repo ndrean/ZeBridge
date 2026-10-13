@@ -121,6 +121,22 @@ pub const Topology = struct {
     results_max_age_seconds: u64,
     query_pattern: []const u8,
 
+    // ─── sensor readings (examples/16-archive) ─────────────────────────────────
+    //
+    // NOT in grammar.json: clients never read readings (they ask a responder), and the
+    // grammar's hash is checked by every client at enrollment — a new block there would
+    // turn every published client away from this bridge. Fixed names, bridge-side only.
+    //
+    // One stream per tenant, like CDC: `READINGS_<tenant>` on `sensors.<tenant>.>`. A
+    // shared stream would leave the tenant only in a consumer's filter, which no grant
+    // can see (the request body), and STREAM.INFO could list every tenant's sensors.
+    readings_stream_prefix: []const u8 = "READINGS_",
+    /// `sensors.<tenant>.<sensor>.<kind>` — what an MQTT topic `sensors/<tenant>/…` becomes.
+    subject_readings_prefix: []const u8 = "sensors",
+    /// The archive's manifests, `$KV.time_manifests.<tenant>.<table>`: written by that
+    /// tenant's archiver, read by its responders.
+    kv_manifests: []const u8 = "time_manifests",
+
     // ─── KV buckets ─────────────────────────────────────────────────────────────
     kv_schemas: []const u8,
     kv_tenants: []const u8,
@@ -306,6 +322,10 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
     t.mutation_ack_pattern = try str(a, subjects, "subjects", "mutation_ack_pattern", diag);
     // Optional: a grammar from before §10hj has no query family and keeps the default.
     t.query_prefix = strOr(a, subjects, "query_prefix", "query") catch "query";
+    // Readings: fixed, never from the file (see the field's comment).
+    t.readings_stream_prefix = "READINGS_";
+    t.subject_readings_prefix = "sensors";
+    t.kv_manifests = "time_manifests";
     t.results_bucket_prefix = "res-";
     t.results_inline_max_bytes = 262_144;
     t.results_max_age_seconds = 600;

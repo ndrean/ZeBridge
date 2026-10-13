@@ -43,6 +43,11 @@ const usage =
     \\
     \\  --mint-responder --name NAME [--tenant T]... [--store PATH] [--ttl-days D]
     \\                  Creds for a responder service, on stdout, signed from operator.store
+    \\  --mint-archiver --name NAME [--tenant T] [--store PATH] [--ttl-days D]
+    \\                  Creds for one tenant's archiver: reads its readings, writes its manifests
+    \\  --mint-sensor --name NAME [--tenant T] [--store PATH] [--ttl-days D]
+    \\                  Creds for a sensor: publishes sensors.<T>.<NAME>.> only; its JWT is a
+    \\                  bearer token (over MQTT, the password). No --tenant: _default
     \\  --mint-leaf --name NAME [--store PATH] [--ttl-days D]
     \\                  Creds for a leaf node's remote, on stdout: what its clients may carry
     \\                  --ttl-days: both default to 3650 (ten years): replaced with a redeploy
@@ -182,7 +187,7 @@ pub const gen_nkey_flag = "--gen-nkey";
 
 /// Flags that REPLACE the program instead of configuring it: they read no environment,
 /// open nothing, and their whole output IS the answer.
-pub const EarlyExit = enum { help, version, gen_nkey, init_nats, init_sql, mint_responder, mint_leaf, revoke, view_slots, view_slot, drop_slot };
+pub const EarlyExit = enum { help, version, gen_nkey, init_nats, init_sql, mint_responder, mint_archiver, mint_sensor, mint_leaf, revoke, view_slots, view_slot, drop_slot };
 
 /// Answered from argv by `main` BEFORE the log level is resolved and before anything
 /// else prints — boot noise on stderr is noise in a command meant to be piped
@@ -202,6 +207,8 @@ pub fn earlyExit(init: *const std.process.Init) ?EarlyExit {
         if (std.mem.eql(u8, arg, gen_nkey_flag)) return .gen_nkey;
         if (std.mem.eql(u8, arg, "--init-nats")) return .init_nats;
         if (std.mem.eql(u8, arg, "--mint-responder")) return .mint_responder;
+        if (std.mem.eql(u8, arg, "--mint-archiver")) return .mint_archiver;
+        if (std.mem.eql(u8, arg, "--mint-sensor")) return .mint_sensor;
         if (std.mem.eql(u8, arg, "--mint-leaf")) return .mint_leaf;
         if (std.mem.eql(u8, arg, "--init-sql")) return .init_sql;
         if (std.mem.eql(u8, arg, "--revoke")) return .revoke;

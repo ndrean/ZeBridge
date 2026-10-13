@@ -115,7 +115,11 @@ fn writeFileMode(io: std.Io, path: []const u8, bytes: []const u8, force: bool, p
 /// services. A responder adds the answering side — subscribing `query.<tenant>.<name>`
 /// for its tenants and publishing replies to any inbox — and nothing of the write side:
 /// a service that answers from a replica cannot write to PostgreSQL through the bridge.
-const Role = enum { client, responder };
+const Role = enum { client, responder, archiver, sensor };
+
+/// The account's scoped signing keys, by role. `archiver` and `sensor` (readings,
+/// examples/16-archive) came later: `--update` adds them to an older store.
+const SigningKeys = struct { client: []const u8, responder: []const u8, service: []const u8, archiver: []const u8, sensor: []const u8 };
 
 /// The JetStream API prefix for a domain: none is the server's own `$JS.API.`; a name
 /// is `$JS.<name>.API.` — what a client on a leaf node dials to reach the hub's
@@ -140,6 +144,128 @@ test "roleAllows names the API under the domain's prefix, or the plain one" {
     try std.testing.expect(std.mem.find(u8, hub.pub_json, "$JS.API.") == null);
     // The ack subjects carry the domain too, and `$JS.ACK.>` still covers them.
     try std.testing.expect(std.mem.find(u8, hub.pub_json, "\"$JS.ACK.>\"") != null);
+}
+
+fn has(list: []const u8, item: []const u8) bool {
+    var buf: [256]u8 = undefined;
+    const quoted = std.fmt.bufPrint(&buf, "\"{s}\"", .{item}) catch return false;
+    return std.mem.find(u8, list, quoted) != null;
+}
+
+test "readings: a responder reads its tenant's readings and manifest, and writes neither" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const owned = try topology_mod.loadEmbedded(aa);
+    const r = try roleAllowsFor(aa, &owned.topology, .responder, null);
+    for ([_][]const u8{
+        "$JS.API.CONSUMER.CREATE.READINGS_{{tag(tenant)}}",
+        "$JS.API.CONSUMER.CREATE.READINGS_{{tag(tenant)}}.>",
+        "$JS.API.CONSUMER.MSG.NEXT.READINGS_{{tag(tenant)}}.>",
+        "$JS.API.STREAM.INFO.READINGS_{{tag(tenant)}}",
+        "$JS.API.DIRECT.GET.KV_time_manifests.$KV.time_manifests.{{tag(tenant)}}.>",
+        // the open tenant's readings, as for CDC_PUBLIC
+        "$JS.API.CONSUMER.CREATE.READINGS__default",
+        "$JS.API.DIRECT.GET.KV_time_manifests.$KV.time_manifests._default.>",
+        "$JS.FC.>",
+    }) |want| if (!has(r.pub_json, want)) {
+        std.debug.print("responder lacks {s}\n", .{want});
+        return error.TestExpectedEqual;
+    };
+    // No write to a manifest, and no way to list every tenant's keys (§10jr).
+    try std.testing.expect(std.mem.find(u8, r.pub_json, "\"$KV.time_manifests.") == null);
+    try std.testing.expect(std.mem.find(u8, r.pub_json, "STREAM.INFO.KV_time_manifests") == null);
+    try std.testing.expect(std.mem.find(u8, r.pub_json, "CONSUMER.CREATE.KV_time_manifests") == null);
+    try std.testing.expect(std.mem.find(u8, r.pub_json, "STREAM.MSG.GET.KV_time_manifests") == null);
+    // A client gets none of it: it asks a responder.
+    const cl = try roleAllowsFor(aa, &owned.topology, .client, null);
+    try std.testing.expect(std.mem.find(u8, cl.pub_json, "READINGS_") == null);
+    try std.testing.expect(std.mem.find(u8, cl.pub_json, "time_manifests") == null);
+}
+
+test "readings: an archiver reads its tenant's stream and writes its manifest, nothing else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const owned = try topology_mod.loadEmbedded(aa);
+    const r = try roleAllowsFor(aa, &owned.topology, .archiver, "hub");
+    for ([_][]const u8{
+        "$JS.API.CONSUMER.CREATE.READINGS_{{tag(tenant)}}",
+        "$JS.hub.API.CONSUMER.CREATE.READINGS_{{tag(tenant)}}",
+        "$JS.API.STREAM.INFO.READINGS_{{tag(tenant)}}",
+        "$JS.API.DIRECT.GET.KV_time_manifests.$KV.time_manifests.{{tag(tenant)}}.>",
+        "$KV.time_manifests.{{tag(tenant)}}.>",
+        "$JS.hub.API.$KV.time_manifests.{{tag(tenant)}}.>",
+        "$JS.ACK.>",
+        "$JS.FC.>",
+    }) |want| if (!has(r.pub_json, want)) {
+        std.debug.print("archiver lacks {s}\n", .{want});
+        return error.TestExpectedEqual;
+    };
+    // Its own tenant only: no open line, no CDC, no query, no write path, no stream admin.
+    for ([_][]const u8{ "READINGS__default", "CDC_", "query.", "mutation.", "STREAM.CREATE", "STREAM.DELETE", "STREAM.UPDATE", "_default.>" }) |never| {
+        if (std.mem.find(u8, r.pub_json, never) != null) {
+            std.debug.print("archiver may {s}\n", .{never});
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expectEqualStrings("\"_INBOX.{{name()}}.>\"", r.sub_json);
+}
+
+test "readings: a sensor publishes its own readings and nothing else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const owned = try topology_mod.loadEmbedded(aa);
+    const r = try roleAllowsFor(aa, &owned.topology, .sensor, "hub");
+    try std.testing.expectEqualStrings("\"sensors.{{tag(tenant)}}.{{name()}}.>\"", r.pub_json);
+    try std.testing.expectEqualStrings("", r.sub_json);
+}
+
+test "readings: the account carries the archiver and the sensor keys; the sensor's is a bearer, MQTT or NATS" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const owned = try topology_mod.loadEmbedded(aa);
+    const io = std.testing.io;
+    const op = try genKey(io, .operator);
+    const acct = try genKey(io, .account);
+    const sk = try genKey(io, .account);
+    var op_skp = try nats.nkeys.SeedKeyPair.fromSeed(op.seed());
+    defer op_skp.wipe();
+    const jwt = try accountJwt(aa, &owned.topology, null, 1, &op_skp, op.public(), acct.public(), .{ .client = sk.public(), .responder = sk.public(), .service = sk.public(), .archiver = sk.public(), .sensor = sk.public() }, "");
+    const claims = jwtClaims(aa, jwt).?;
+    try std.testing.expect(std.mem.find(u8, claims, "\"role\":\"archiver\"") != null);
+    const sensor = claims[std.mem.find(u8, claims, "\"role\":\"sensor\"").?..];
+    try std.testing.expect(std.mem.find(u8, sensor, "\"bearer_token\":true") != null);
+    // An EMPTY sub permission is no limit at all: measured, a sensor read every tenant's
+    // CDC, queries and inboxes. Subscribing must be denied outright.
+    try std.testing.expect(std.mem.startsWith(u8, sensor[std.mem.find(u8, sensor, "\"sub\":").?..], "\"sub\":{\"deny\":[\"\\u003e\"]}"));
+    try std.testing.expect(std.mem.find(u8, sensor, "\"allowed_connection_types\":[\"STANDARD\",\"MQTT\"]") != null);
+}
+
+test "readings: a leaf carries its sensors' readings to the hub" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const owned = try topology_mod.loadEmbedded(aa);
+    const l = try leafAllows(aa, &owned.topology, "hub");
+    try std.testing.expect(has(l.pub_json, "sensors.>"));
+}
+
+test "readings: --update gives an older store the archiver and sensor keys, and keeps the others" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const old = "OPERATOR_SEED=SOAAA\nSK_CLIENT_SEED=SAAAA\nSK_RESPONDER_SEED=SABBB\nSK_SERVICE_SEED=SACCC\n";
+    const r = try addMissingKeys(aa, std.testing.io, old);
+    try std.testing.expectEqual(@as(usize, 2), r.added);
+    try std.testing.expectEqualStrings("SABBB", storeValue(r.store, "SK_RESPONDER_SEED").?);
+    try std.testing.expect(std.mem.startsWith(u8, storeValue(r.store, "SK_ARCHIVER_SEED").?, "SA"));
+    try std.testing.expect(std.mem.startsWith(u8, storeValue(r.store, "SK_SENSOR_SEED").?, "SA"));
+    const again = try addMissingKeys(aa, std.testing.io, r.store);
+    try std.testing.expectEqual(@as(usize, 0), again.added);
+    try std.testing.expectEqualStrings(r.store, again.store);
 }
 
 /// `js_api` is the JetStream API prefix the grants name — `$JS.API.` or, with a
@@ -171,6 +297,10 @@ fn roleAllows(
 
     var pubs: std.ArrayList([]u8) = .empty;
     var subs: std.ArrayList([]u8) = .empty;
+    if (role == .archiver or role == .sensor) {
+        const r = try readingsRoleAllows(a, topo, role, js_api);
+        return .{ .pub_json = r.pub_json, .sub_json = r.sub_json };
+    }
     const P = struct {
         fn add(
             list: *std.ArrayList([]u8),
@@ -264,7 +394,15 @@ fn roleAllows(
             try P.add(&pubs, a, "$O.{s}{s}.>", .{ res_pre, open });
             try P.add(&subs, a, "{s}.{{{{tag(tenant)}}}}.>", .{subj_query});
             try P.add(&subs, a, "{s}.{s}.>", .{ subj_query, open });
+            // Readings (examples/16-archive): its tenants' streams and manifests, and the
+            // open tenant's, read only. The manifest by DIRECT GET of its exact key: no
+            // consumer and no STREAM.INFO on the bucket, which could list every tenant's
+            // keys (§10jr).
+            try readingsRead(a, &pubs, topo, js_api, "{{tag(tenant)}}");
+            try readingsRead(a, &pubs, topo, js_api, open);
+            try P.add(&pubs, a, "$JS.FC.>", .{});
         },
+        .archiver, .sensor => unreachable,
     }
     // Its own verdict subject, both roles: libzb subscribes it at connect, before it knows
     // whether it will ever write; a responder's never carries anything (§10hl).
@@ -282,6 +420,42 @@ fn roleAllows(
         .pub_json = try joinJson(a, pubs.items),
         .sub_json = try joinJson(a, subs.items),
     };
+}
+
+/// Read one tenant's readings: its stream (`READINGS_<tenant>`, only that tenant's
+/// subjects, so no grant needs a filter) and its manifests by exact key.
+fn readingsRead(a: std.mem.Allocator, pubs: *std.ArrayList([]u8), topo: *const topology_mod.Topology, js_api: []const u8, tenant: []const u8) !void {
+    const st = try std.fmt.allocPrint(a, "{s}{s}", .{ topo.readings_stream_prefix, tenant });
+    try pubs.append(a, try std.fmt.allocPrint(a, "{s}CONSUMER.CREATE.{s}", .{ js_api, st }));
+    inline for (.{ "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT", "CONSUMER.DELETE" }) |op|
+        try pubs.append(a, try std.fmt.allocPrint(a, "{s}{s}.{s}.>", .{ js_api, op, st }));
+    try pubs.append(a, try std.fmt.allocPrint(a, "{s}STREAM.INFO.{s}", .{ js_api, st }));
+    try pubs.append(a, try std.fmt.allocPrint(a, "{s}DIRECT.GET.KV_{s}.$KV.{s}.{s}.>", .{ js_api, topo.kv_manifests, topo.kv_manifests, tenant }));
+}
+
+/// The two readings roles. An ARCHIVER reads its tenant's stream and writes its tenant's
+/// manifests — no open tenant, no CDC, no queries, no stream admin. A SENSOR publishes
+/// its own readings and nothing else: `sensors.<tenant>.<itself>.>`, so a sensor cannot
+/// pose as another. (Its key is a bearer key: see accountJwt.)
+fn readingsRoleAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, role: Role, js_api: []const u8) !struct { pub_json: []u8, sub_json: []u8 } {
+    var pubs: std.ArrayList([]u8) = .empty;
+    var subs: std.ArrayList([]u8) = .empty;
+    switch (role) {
+        .sensor => try pubs.append(a, try std.fmt.allocPrint(a, "{s}.{{{{tag(tenant)}}}}.{{{{name()}}}}.>", .{topo.subject_readings_prefix})),
+        .archiver => {
+            try pubs.append(a, try std.fmt.allocPrint(a, "{s}INFO", .{js_api}));
+            try readingsRead(a, &pubs, topo, js_api, "{{tag(tenant)}}");
+            // The manifest write is a publish on the KV subject; with a domain it goes
+            // through `$JS.<domain>.API.$KV.` (as the client heartbeat, §10lk).
+            const kv_put: []const u8 = if (std.mem.eql(u8, js_api, "$JS.API.")) "" else js_api;
+            try pubs.append(a, try std.fmt.allocPrint(a, "{s}$KV.{s}.{{{{tag(tenant)}}}}.>", .{ kv_put, topo.kv_manifests }));
+            try pubs.append(a, try std.fmt.allocPrint(a, "$JS.ACK.>", .{}));
+            try pubs.append(a, try std.fmt.allocPrint(a, "$JS.FC.>", .{}));
+            try subs.append(a, try std.fmt.allocPrint(a, "_INBOX.{{{{name()}}}}.>", .{}));
+        },
+        else => unreachable,
+    }
+    return .{ .pub_json = try joinJson(a, pubs.items), .sub_json = try joinJson(a, subs.items) };
 }
 
 /// A role's grants: under `$JS.API.`, and with a domain under `$JS.<domain>.API.` too.
@@ -620,13 +794,13 @@ fn accountJwt(
     op_seed_kp: *nats.nkeys.SeedKeyPair,
     op_pub: []const u8,
     acct_pub: []const u8,
-    sk_client_pub: []const u8,
-    sk_responder_pub: []const u8,
-    sk_service_pub: []const u8,
+    keys: SigningKeys,
     revocations: []const u8,
 ) ![]const u8 {
     const allows = try roleAllowsFor(a, topo, .client, js_domain);
     const answers = try roleAllowsFor(a, topo, .responder, js_domain);
+    const archives = try roleAllowsFor(a, topo, .archiver, js_domain);
+    const senses = try roleAllowsFor(a, topo, .sensor, js_domain);
     const acct_claims = try std.fmt.allocPrint(
         a,
         "{{\"jti\":\"__JTI__\",\"iat\":{d},\"iss\":\"{s}\",\"name\":\"ZEBRIDGE\",\"sub\":\"{s}\",\"nats\":{{" ++
@@ -639,9 +813,17 @@ fn accountJwt(
             "{{\"kind\":\"user_scope\",\"key\":\"{s}\",\"role\":\"responder\",\"template\":{{" ++
             "\"pub\":{{\"allow\":[{s}]}},\"sub\":{{\"allow\":[{s}]}},\"subs\":-1,\"data\":-1,\"payload\":-1}},\"description\":\"\"}}," ++
             "{{\"kind\":\"user_scope\",\"key\":\"{s}\",\"role\":\"service\",\"template\":{{" ++
-            "\"pub\":{{\"allow\":[\"\\u003e\"]}},\"sub\":{{\"allow\":[\"\\u003e\"]}},\"subs\":-1,\"data\":-1,\"payload\":-1}},\"description\":\"\"}}]," ++
+            "\"pub\":{{\"allow\":[\"\\u003e\"]}},\"sub\":{{\"allow\":[\"\\u003e\"]}},\"subs\":-1,\"data\":-1,\"payload\":-1}},\"description\":\"\"}}," ++
+            "{{\"kind\":\"user_scope\",\"key\":\"{s}\",\"role\":\"archiver\",\"template\":{{" ++
+            "\"pub\":{{\"allow\":[{s}]}},\"sub\":{{\"allow\":[{s}]}},\"subs\":-1,\"data\":-1,\"payload\":-1}},\"description\":\"\"}}," ++
+            // A sensor cannot sign the server's nonce over MQTT: its JWT is its password,
+            // accepted as a bearer token — which is why this key's template holds so little.
+            "{{\"kind\":\"user_scope\",\"key\":\"{s}\",\"role\":\"sensor\",\"template\":{{" ++
+            // `sub` DENIES everything: an empty section is no limit at all in NATS.
+            "\"pub\":{{\"allow\":[{s}]}},\"sub\":{{\"deny\":[\"\\u003e\"]}},\"subs\":-1,\"data\":-1,\"payload\":-1," ++
+            "\"bearer_token\":true,\"allowed_connection_types\":[\"STANDARD\",\"MQTT\"]}},\"description\":\"\"}}]," ++
             "\"default_permissions\":{{\"pub\":{{}},\"sub\":{{}}}},\"authorization\":{{}},{s}\"type\":\"account\",\"version\":2}}}}",
-        .{ now, op_pub, acct_pub, sk_client_pub, allows.pub_json, allows.sub_json, sk_responder_pub, answers.pub_json, answers.sub_json, sk_service_pub, revocations },
+        .{ now, op_pub, acct_pub, keys.client, allows.pub_json, allows.sub_json, keys.responder, answers.pub_json, answers.sub_json, keys.service, keys.archiver, archives.pub_json, archives.sub_json, keys.sensor, senses.pub_json, revocations },
     );
     return jwt_mint.signClaims(a, op_seed_kp, acct_claims, "__JTI__");
 }
@@ -673,6 +855,8 @@ fn runOperator(
     const sk_client = genKey(io, .account) catch return 1; // signing keys are account-type
     const sk_service = genKey(io, .account) catch return 1;
     const sk_responder = genKey(io, .account) catch return 1; // §10hk: mints the services that answer
+    const sk_archiver = genKey(io, .account) catch return 1; // readings: one tenant's archive
+    const sk_sensor = genKey(io, .account) catch return 1; // readings: a device's bearer token
     const bridge_user = genKey(io, .user) catch return 1;
 
     var op_seed_kp = nats.nkeys.SeedKeyPair.fromSeed(op_kp.seed()) catch return 1;
@@ -713,7 +897,7 @@ fn runOperator(
     const sys_jwt = jwt_mint.signClaims(a, &op_seed_kp, sys_claims, "__JTI__") catch return 1;
 
     // ── account JWT: JetStream unlimited + the three SCOPED signing keys ────────
-    const acct_jwt = accountJwt(a, &topo, js_domain, now, &op_seed_kp, op_kp.public(), acct_kp.public(), sk_client.public(), sk_responder.public(), sk_service.public(), "") catch return 1;
+    const acct_jwt = accountJwt(a, &topo, js_domain, now, &op_seed_kp, op_kp.public(), acct_kp.public(), .{ .client = sk_client.public(), .responder = sk_responder.public(), .service = sk_service.public(), .archiver = sk_archiver.public(), .sensor = sk_sensor.public() }, "") catch return 1;
 
     // ── the bridge user: a scoped user under the SERVICE key ────────────────────
     // Ten years: the bridge's own credential rotates with a redeploy, not a TTL.
@@ -834,10 +1018,12 @@ fn runOperator(
         \\SK_CLIENT_SEED={s}
         \\SK_RESPONDER_SEED={s}
         \\SK_SERVICE_SEED={s}
+        \\SK_ARCHIVER_SEED={s}
+        \\SK_SENSOR_SEED={s}
         \\JS_DOMAIN={s}
         \\
     ,
-        .{ op_kp.seed(), sys_kp.seed(), acct_kp.seed(), sk_client.seed(), sk_responder.seed(), sk_service.seed(), js_domain orelse "" },
+        .{ op_kp.seed(), sys_kp.seed(), acct_kp.seed(), sk_client.seed(), sk_responder.seed(), sk_service.seed(), sk_archiver.seed(), sk_sensor.seed(), js_domain orelse "" },
     ) catch return 1;
     const store_path = std.Io.Dir.path.join(a, &.{ dir, "operator.store" }) catch return 1;
     writeSecret(io, store_path, store, force) catch return 1;
@@ -910,6 +1096,16 @@ fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[
         };
     }
     const op_kp, const acct_kp, const old_client, const sk_responder, const sk_service = keys;
+    // A store from before readings lacks the archiver and sensor keys: made here, once,
+    // and written back with the account below. Every other seed stays as it was.
+    const grown = addMissingKeys(a, io, store) catch return 1;
+    if (grown.added > 0 and std.mem.eql(u8, store_path, "-")) {
+        out("🔴 the store needs {d} new signing key(s) and was read from standard input: run --update on the store's file, so the new seeds are kept\n", .{grown.added});
+        return 1;
+    }
+    store = grown.store;
+    const sk_archiver = keyFromSeed(storeValue(store, "SK_ARCHIVER_SEED").?) catch return 1;
+    const sk_sensor = keyFromSeed(storeValue(store, "SK_SENSOR_SEED").?) catch return 1;
     // A rotation swaps only the client key: the account drops the old one, so NATS refuses
     // every user it signed once the server reloads.
     const sk_client = if (rotate_client) genKey(io, .account) catch return 1 else old_client;
@@ -962,18 +1158,24 @@ fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[
     var op_seed_kp = nats.nkeys.SeedKeyPair.fromSeed(op_kp.seed()) catch return 1;
     defer op_seed_kp.wipe();
     const now: i64 = @intCast(c.time(null));
-    const new_jwt = accountJwt(a, &topo, js_domain, now, &op_seed_kp, op_kp.public(), acct_kp.public(), sk_client.public(), sk_responder.public(), sk_service.public(), revocations) catch return 1;
+    const new_jwt = accountJwt(a, &topo, js_domain, now, &op_seed_kp, op_kp.public(), acct_kp.public(), .{ .client = sk_client.public(), .responder = sk_responder.public(), .service = sk_service.public(), .archiver = sk_archiver.public(), .sensor = sk_sensor.public() }, revocations) catch return 1;
 
     const new_claims = jwtClaims(a, new_jwt) orelse return 1;
-    if (!rotate_client and std.mem.eql(u8, grantsOf(old_claims), grantsOf(new_claims))) {
+    if (!rotate_client and grown.added == 0 and std.mem.eql(u8, grantsOf(old_claims), grantsOf(new_claims))) {
         out("✅ {s} already matches the grammar — nothing to update\n", .{conf_path});
         return 0;
     }
 
     const new_conf = std.mem.concat(a, u8, &.{ conf[0..jwt_start], new_jwt, conf[jwt_end..] }) catch return 1;
     if (rotate_client) return finishRotation(io, a, dir, store_path, store, conf_path, new_conf, sk_client, revocations);
+    // The store first, when it gained keys: a conf naming a key nobody kept would be
+    // an account no one can re-sign.
+    if (grown.added > 0) {
+        writeSecret(io, store_path, store, true) catch return 1;
+        out("   {s}: {d} new signing key(s) (archiver, sensor) — copy it back to where it is kept offline\n", .{ store_path, grown.added });
+    }
     writeFile(io, conf_path, new_conf, true) catch return 1;
-    if (env_line != null) {
+    if (env_line != null and grown.added == 0) {
         // From standard input there is no file to write back: say the line to add.
         if (std.mem.eql(u8, store_path, "-")) {
             out("⚠️  add `JS_DOMAIN={s}` to your copy of the store (it was read from standard input)\n", .{domain});
@@ -1060,6 +1262,20 @@ fn finishRotation(
         \\
     , .{});
     return 0;
+}
+
+/// The signing keys a store from before readings lacks, generated and appended. Existing
+/// lines are never touched: re-running finds nothing to add.
+fn addMissingKeys(a: std.mem.Allocator, io: std.Io, store: []const u8) !struct { store: []u8, added: usize } {
+    var s = try a.dupe(u8, store);
+    var added: usize = 0;
+    for ([_][]const u8{ "SK_ARCHIVER_SEED", "SK_SENSOR_SEED" }) |name| {
+        if (storeValue(s, name) != null) continue;
+        const k = try genKey(io, .account);
+        s = try setStoreValue(a, s, name, k.seed());
+        added += 1;
+    }
+    return .{ .store = s, .added = added };
 }
 
 /// `NAME=value` set in the store's text: the line replaced, or appended.
@@ -1195,16 +1411,16 @@ test "an update keeps the store's keys and carries the revocations over" {
     var op_skp = try nats.nkeys.SeedKeyPair.fromSeed(op.seed());
     defer op_skp.wipe();
     const revoked = "\"revocations\":{\"UABC\":1700000000,\"UDEF\":1700000001},";
-    const first = try accountJwt(aa, &owned.topology, null, 1, &op_skp, op.public(), acct.public(), sk.public(), sk.public(), sk.public(), revoked);
+    const first = try accountJwt(aa, &owned.topology, null, 1, &op_skp, op.public(), acct.public(), .{ .client = sk.public(), .responder = sk.public(), .service = sk.public(), .archiver = sk.public(), .sensor = sk.public() }, revoked);
     const first_claims = jwtClaims(aa, first).?;
     try std.testing.expectEqualStrings(revoked, revocationsOf(first_claims));
 
     // Re-signed later with what it carried: the same grants, the same revocations.
-    const again = try accountJwt(aa, &owned.topology, null, 2, &op_skp, op.public(), acct.public(), sk.public(), sk.public(), sk.public(), revocationsOf(first_claims));
+    const again = try accountJwt(aa, &owned.topology, null, 2, &op_skp, op.public(), acct.public(), .{ .client = sk.public(), .responder = sk.public(), .service = sk.public(), .archiver = sk.public(), .sensor = sk.public() }, revocationsOf(first_claims));
     const again_claims = jwtClaims(aa, again).?;
     try std.testing.expectEqualStrings(grantsOf(first_claims), grantsOf(again_claims));
     // A domain change is a grants change.
-    const hub = try accountJwt(aa, &owned.topology, "hub", 3, &op_skp, op.public(), acct.public(), sk.public(), sk.public(), sk.public(), "");
+    const hub = try accountJwt(aa, &owned.topology, "hub", 3, &op_skp, op.public(), acct.public(), .{ .client = sk.public(), .responder = sk.public(), .service = sk.public(), .archiver = sk.public(), .sensor = sk.public() }, "");
     try std.testing.expect(!std.mem.eql(u8, grantsOf(first_claims), grantsOf(jwtClaims(aa, hub).?)));
     try std.testing.expectEqualStrings("", revocationsOf(jwtClaims(aa, hub).?));
 }
@@ -1225,8 +1441,8 @@ test "a client-key rotation swaps that key only, and keeps the revocations" {
     defer op_skp.wipe();
     const revoked = "\"revocations\":{\"UABC\":1700000000},";
 
-    const before = jwtClaims(aa, try accountJwt(aa, &owned.topology, null, 1, &op_skp, op.public(), acct.public(), old_client.public(), responder.public(), service.public(), revoked)).?;
-    const after = jwtClaims(aa, try accountJwt(aa, &owned.topology, null, 2, &op_skp, op.public(), acct.public(), new_client.public(), responder.public(), service.public(), revocationsOf(before))).?;
+    const before = jwtClaims(aa, try accountJwt(aa, &owned.topology, null, 1, &op_skp, op.public(), acct.public(), .{ .client = old_client.public(), .responder = responder.public(), .service = service.public(), .archiver = service.public(), .sensor = service.public() }, revoked)).?;
+    const after = jwtClaims(aa, try accountJwt(aa, &owned.topology, null, 2, &op_skp, op.public(), acct.public(), .{ .client = new_client.public(), .responder = responder.public(), .service = service.public(), .archiver = service.public(), .sensor = service.public() }, revocationsOf(before))).?;
 
     try std.testing.expect(std.mem.find(u8, after, old_client.public()) == null);
     try std.testing.expect(std.mem.find(u8, after, new_client.public()) != null);
@@ -1249,6 +1465,44 @@ test "a client-key rotation swaps that key only, and keeps the revocations" {
 /// lives, never on the bridge host. One JWT implementation (`jwt_mint.mint`), and no
 /// Python package to install (it replaced scripts/native/mint_responder.py).
 pub fn mintResponder(io: std.Io, init: *const std.process.Init) u8 {
+    return mintScoped(io, init, .responder);
+}
+
+/// `bridge --mint-archiver --name N [--tenant T]`: one tenant's archiver (readings to
+/// Parquet, examples/16-archive). It reads that tenant's readings and writes its
+/// manifests, nothing else. One tenant: the template has no open-tenant line.
+pub fn mintArchiver(io: std.Io, init: *const std.process.Init) u8 {
+    return mintScoped(io, init, .archiver);
+}
+
+/// `bridge --mint-sensor --name N [--tenant T]`: a device that publishes readings on
+/// `sensors.<tenant>.<N>.>` and does nothing else. Its JWT is a bearer token: over MQTT
+/// it is the password (any user name), since a sensor cannot sign the server's nonce.
+pub fn mintSensor(io: std.Io, init: *const std.process.Init) u8 {
+    return mintScoped(io, init, .sensor);
+}
+
+const MintKind = enum {
+    responder,
+    archiver,
+    sensor,
+    fn flag(k: MintKind) []const u8 {
+        return switch (k) {
+            .responder => "--mint-responder",
+            .archiver => "--mint-archiver",
+            .sensor => "--mint-sensor",
+        };
+    }
+    fn storeKey(k: MintKind) []const u8 {
+        return switch (k) {
+            .responder => "SK_RESPONDER_SEED",
+            .archiver => "SK_ARCHIVER_SEED",
+            .sensor => "SK_SENSOR_SEED",
+        };
+    }
+};
+
+fn mintScoped(io: std.Io, init: *const std.process.Init, kind: MintKind) u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1261,33 +1515,40 @@ pub fn mintResponder(io: std.Io, init: *const std.process.Init) u8 {
         var it = init.minimal.args.iterate();
         _ = it.next();
         while (it.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--mint-responder")) continue;
+            if (std.mem.eql(u8, arg, kind.flag())) continue;
             if (std.mem.eql(u8, arg, "--store")) {
-                store_path = it.next() orelse return mintUsage("--store needs a path");
+                store_path = it.next() orelse return mintUsage(kind, "--store needs a path");
             } else if (std.mem.eql(u8, arg, "--name")) {
-                name = it.next() orelse return mintUsage("--name needs a value");
+                name = it.next() orelse return mintUsage(kind, "--name needs a value");
             } else if (std.mem.eql(u8, arg, "--tenant")) {
-                const t = it.next() orelse return mintUsage("--tenant needs a value");
-                if (t.len == 0 or std.mem.findAny(u8, t, ".*> ") != null) return mintUsage("a tenant is one subject token (no '.', '*', '>', ' ')");
+                const t = it.next() orelse return mintUsage(kind, "--tenant needs a value");
+                if (t.len == 0 or std.mem.findAny(u8, t, ".*> ") != null) return mintUsage(kind, "a tenant is one subject token (no '.', '*', '>', ' ')");
                 tenants.append(a, t) catch return 1;
             } else if (std.mem.eql(u8, arg, "--ttl-days")) {
-                const v = it.next() orelse return mintUsage("--ttl-days needs a number");
-                ttl_days = std.fmt.parseInt(i64, v, 10) catch return mintUsage("--ttl-days needs a number");
-                if (ttl_days < 1) return mintUsage("--ttl-days must be at least 1");
-            } else return mintUsage("unknown argument");
+                const v = it.next() orelse return mintUsage(kind, "--ttl-days needs a number");
+                ttl_days = std.fmt.parseInt(i64, v, 10) catch return mintUsage(kind, "--ttl-days needs a number");
+                if (ttl_days < 1) return mintUsage(kind, "--ttl-days must be at least 1");
+            } else return mintUsage(kind, "unknown argument");
         }
     }
-    const who = name orelse return mintUsage("--name is required");
+    const who = name orelse return mintUsage(kind, "--name is required");
     // The principal alphabet invites use: a NATS subject token, a KV key and a
     // template expansion all accept it.
-    for (who) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-')) return mintUsage("--name: letters, digits, '_' and '-' only");
+    for (who) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-')) return mintUsage(kind, "--name: letters, digits, '_' and '-' only");
+    // An archiver or a sensor belongs to ONE tenant, and always carries the tag: a
+    // template line whose tag is missing is dropped, not widened — a sensor minted
+    // without one could publish nothing, and say so nowhere.
+    if (kind != .responder) {
+        if (tenants.items.len > 1) return mintUsage(kind, "one --tenant only: an archiver or a sensor belongs to one tenant");
+        if (tenants.items.len == 0) tenants.append(a, "_default") catch return 1;
+    }
 
     const store = readStore(io, a, store_path) catch {
         out("🔴 cannot read the store {s} (--store PATH, - for standard input)\n", .{store_path});
         return 1;
     };
-    const sk_text = storeValue(store, "SK_RESPONDER_SEED") orelse {
-        out("🔴 {s} has no SK_RESPONDER_SEED — is it an operator.store?\n", .{store_path});
+    const sk_text = storeValue(store, kind.storeKey()) orelse {
+        out("🔴 {s} has no {s} — an operator.store from before this role? `bridge --init-nats --update` adds it\n", .{ store_path, kind.storeKey() });
         return 1;
     };
     const acct_text = storeValue(store, "ACCOUNT_SEED") orelse {
@@ -1295,7 +1556,7 @@ pub fn mintResponder(io: std.Io, init: *const std.process.Init) u8 {
         return 1;
     };
     const sk = keyFromSeed(sk_text) catch {
-        out("🔴 SK_RESPONDER_SEED in {s} is not a valid seed\n", .{store_path});
+        out("🔴 {s} in {s} is not a valid seed\n", .{ kind.storeKey(), store_path });
         return 1;
     };
     const acct = keyFromSeed(acct_text) catch {
@@ -1310,13 +1571,15 @@ pub fn mintResponder(io: std.Io, init: *const std.process.Init) u8 {
     };
     const creds = credsFile(a, jwt, user.seed()) catch return 1;
     std.Io.File.stdout().writeStreamingAll(io, creds) catch return 1;
-    out("✅ responder '{s}' minted ({d} tenant tag(s), {d} days) — keep the creds file like any secret\n", .{ who, tenants.items.len, ttl_days });
+    out("✅ {s} '{s}' minted ({d} tenant tag(s), {d} days) — keep the creds file like any secret\n", .{ @tagName(kind), who, tenants.items.len, ttl_days });
+    if (kind == .sensor) out("   over MQTT: the JWT (the creds file's first block) is the password, any user name\n", .{});
     out("   user key {s} — file it with the creds: `bridge --revoke --key` revokes this identity\n", .{user.public()});
     return 0;
 }
 
-fn mintUsage(msg: []const u8) u8 {
-    out("🔴 {s}\n  bridge --mint-responder --name NAME [--tenant T]... [--store PATH] [--ttl-days D] > NAME.creds\n", .{msg});
+fn mintUsage(kind: MintKind, msg: []const u8) u8 {
+    const tenant_arg: []const u8 = if (kind == .responder) "[--tenant T]..." else "[--tenant T]";
+    out("🔴 {s}\n  bridge {s} --name NAME {s} [--store PATH] [--ttl-days D] > NAME.creds\n", .{ msg, kind.flag(), tenant_arg });
     return 1;
 }
 
@@ -1409,7 +1672,9 @@ fn leafAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, js_domai
     // subject AS WRITTEN: the MUTATIONS stream listens on `mutation.>`, which
     // `mutation.*.>` does not cover, so without this line no write left the leaf (§10ll).
     // Each device's own JWT still holds it to `mutation.<itself>.>`.
-    const stream_subjects = try std.fmt.allocPrint(a, "\"{s}.>\"", .{topo.subject_mutations_prefix});
+    // Readings too: a sensor behind a leaf publishes `sensors.<tenant>.…`, stored by the
+    // hub's `READINGS_<tenant>` — the same "as written" rule as the MUTATIONS line.
+    const stream_subjects = try std.fmt.allocPrint(a, "\"{s}.>\",\"{s}.>\"", .{ topo.subject_mutations_prefix, topo.subject_readings_prefix });
     return .{
         .pub_json = try pruneCovered(a, try mergeJsonLists(a, try anyPrincipal(a, cl.pub_json), stream_subjects)),
         .sub_json = try pruneCovered(a, try anyPrincipal(a, cl.sub_json)),
