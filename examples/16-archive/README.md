@@ -27,6 +27,9 @@ flowchart LR
   when a tenant appears. A credential can then be held to one tenant by the stream's name.
 - **One archiver per tenant.** The manifest is written on the revision the archiver read, so a
   second archiver fails at its first flush and stops.
+- **Started early, it waits.** Before the tenant has a row in `zebridge_user_tenants`, its
+  stream does not exist: the archiver says so once, checks every 10 seconds, and starts the
+  moment the bridge makes the stream.
 - **No silent hole.** The archiver refuses to start when the stream no longer holds
   `covers_up_to + 1`, or when it keeps readings for less than two flushes plus the S3 outage
   to survive (`--outage-s`, one hour by default).

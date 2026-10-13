@@ -13,7 +13,9 @@ responder answers from the Parquet files the manifest names plus the stream afte
   D  the stream pruned past the archive: the archiver refuses to start, rather than leave a
      hole nobody sees;
   E  the responder counts every reading once while the boundary moves: new readings show in
-     the hot tail, and after the archiver's flush they are counted from Parquet instead.
+     the hot tail, and after the archiver's flush they are counted from Parquet instead;
+  F  started before its tenant's stream exists, the archiver says it waits (no traceback),
+     and archives as soon as the stream appears.
 
 Needs: the dev stack (NATS), local S3 (SeaweedFS on 127.0.0.1:8333, keys in
 ~/.config/zebridge/s3.json), boto3 and duckdb in the venv.
@@ -156,6 +158,25 @@ async def main() -> int:
     await js.purge_stream(stream, seq=info.state.last_seq)
     code, out = archiver()
     check(code == 4, f"D the stream pruned past the archive: archiver exit {code} — {out.strip().splitlines()[-1] if out.strip() else ''}")
+
+    # F
+    early = "zzwait"
+    try:
+        await js.delete_stream(common.stream_for(early))
+    except Exception:
+        pass
+    p = archiver("--tenant", early, "--exit-when-idle", "4", wait=False)   # the last --tenant wins
+    await asyncio.sleep(3)
+    await common.ensure_for_tests(js, early)
+    await common.reset_tenant(js, early)
+    await js.publish(f"sensors.{early}.s1.temperature", b"21.5")
+    out = p.communicate(timeout=60)[0]
+    check(p.returncode == 0 and "waiting for" in out and "Traceback" not in out and "flushed 1 reading" in out,
+          f"F started before its stream: waited, then archived (exit {p.returncode})")
+    if p.returncode != 0 or "Traceback" in out:
+        print(out[-1500:])
+    await common.reset_tenant(js, early)
+    await js.delete_stream(common.stream_for(early))
 
     await common.reset_tenant(js, TENANT)
     await nc.close()
