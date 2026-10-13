@@ -102,8 +102,10 @@ __pycache__/
 
 # zb-client-ts commits its lockfile (CI installs it with --frozen-lockfile). The examples
 # link the local packages, so their lockfiles stay local; the root one only pins pnpm.
+# zb-react-native's too: CI only packs it (pnpm pack installs nothing).
 /pnpm-lock.yaml
 examples/**/pnpm-lock.yaml
+zb-react-native/pnpm-lock.yaml
 # …except the quickstart web demo's: its image is published (quickstart/Dockerfile.web).
 !examples/05-tables/web-consumer/pnpm-lock.yaml
 examples/08-map/prix-des-carburants-en-france-flux-instantane-v2.csv
