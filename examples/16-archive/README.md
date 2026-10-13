@@ -53,7 +53,9 @@ docker run -d --name zb-s3 -p 127.0.0.1:8333:8333 -v zb-s3-data:/data \
 scripts read the keys from it (`S3_KEYS`) unless `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY` are set.
 
-With creds minted from `operator.store` (`--mint-archiver`, `--mint-responder`):
+As a container, one per tenant on the hub: `ghcr.io/ndrean/zebridge-archiver`
+([deploy/archiver.Dockerfile](../../deploy/archiver.Dockerfile) shows the `docker run`).
+From the repository, with creds minted from `operator.store` (`--mint-archiver`, `--mint-responder`):
 
 ```sh
 export NATS_URL=tls://nats.example.com:4222 PYTHONPATH=zb-python/src
@@ -92,7 +94,6 @@ made by `--init-nats operator`, and checks what each role may and may not do.
 
 ## Not yet
 
-- **An image** for the archiver, to run one container per tenant on the hub.
 - **The archive lag** on the bridge's `/metrics`: how far each tenant's archive is behind
   its stream.
 - **Compaction**: many small files merged into hourly or daily ones, the old ones deleted

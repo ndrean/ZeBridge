@@ -11,6 +11,8 @@ subject, with the revision expected in a header. Nothing binds the bucket: bindi
 for the bucket's stream info, which the archiver and responder grants refuse (it could
 list every tenant's keys).
 
+NATS: NATS_URL, NATS_CREDS, and NATS_TLS_CA for a server whose certificate a private CA signed.
+
 S3 is any S3 API: SeaweedFS locally, Cloudflare R2 on a server. Settings from the environment:
 S3_ENDPOINT (http://127.0.0.1:8333), S3_BUCKET (zb-events), S3_REGION (auto), and the keys from
 AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, or else the file S3_KEYS (~/.config/zebridge/s3.json:
@@ -58,6 +60,9 @@ async def connect(creds: str | None = None):
     kw = {"user_credentials": creds} if creds else {}
     if name:
         kw["inbox_prefix"] = f"_INBOX.{name}".encode()
+    if os.environ.get("NATS_TLS_CA"):   # a server whose certificate a private CA signed
+        import ssl
+        kw["tls"] = ssl.create_default_context(cafile=os.environ["NATS_TLS_CA"])
     return await nats.connect(os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), **kw)
 
 
