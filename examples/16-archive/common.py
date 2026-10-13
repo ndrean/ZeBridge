@@ -55,7 +55,12 @@ def principal_of(creds_path: str | None) -> str | None:
 async def connect(creds: str | None = None):
     """NATS with the given creds (or NATS_CREDS), and the principal's own inbox prefix."""
     import nats
+    url = os.environ.get("NATS_URL")
+    if url == "":   # the image sets it empty: a container must name its server
+        raise SystemExit("🔴 NATS_URL is not set: pass the NATS server, e.g. -e NATS_URL=tls://nats.example.com:4222")
     creds = creds or os.environ.get("NATS_CREDS")
+    if creds and not os.path.exists(creds):
+        raise SystemExit(f"🔴 no creds file at {creds}: mount the archiver's (bridge --mint-archiver), e.g. -v archiver-acme.creds:{creds}:ro")
     name = principal_of(creds)
     kw = {"user_credentials": creds} if creds else {}
     if name:
@@ -63,7 +68,7 @@ async def connect(creds: str | None = None):
     if os.environ.get("NATS_TLS_CA"):   # a server whose certificate a private CA signed
         import ssl
         kw["tls"] = ssl.create_default_context(cafile=os.environ["NATS_TLS_CA"])
-    return await nats.connect(os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), **kw)
+    return await nats.connect(url or "nats://127.0.0.1:4222", **kw)
 
 
 def s3():

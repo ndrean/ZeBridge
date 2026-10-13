@@ -6,11 +6,12 @@
 #
 #   docker build -f deploy/archiver.Dockerfile -t zb-archiver .
 #
-# Run it with an archiver's creds (bridge --mint-archiver --tenant acme) mounted, and the
-# S3 settings. It holds no state: its position is the manifest in NATS KV, so a restart, a
-# move or a rebuild loses nothing.
+# Run it with an archiver's creds (bridge --mint-archiver --tenant acme) mounted, the NATS
+# server and the S3 settings. It holds no state: its position is the manifest in NATS KV, so
+# a restart, a move or a rebuild loses nothing. With nats-server running natively on the
+# host, join it through the host's network, by the name its certificate carries:
 #
-#   docker run -d --name archiver-acme --restart on-failure \
+#   docker run -d --name archiver-acme --restart on-failure --network host \
 #     -v /etc/zebridge/creds/archiver-acme.creds:/creds:ro \
 #     -e NATS_URL=tls://nats.example.com:4222 \
 #     -e S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com -e S3_BUCKET=zb-events \
@@ -27,5 +28,7 @@ RUN pip install --no-cache-dir nats-py[nkeys]==2.15.0 nkeys==0.2.1 duckdb==1.5.5
 COPY examples/16-archive/archiver.py examples/16-archive/common.py /opt/zb-archiver/
 USER zbarchiver
 WORKDIR /tmp
-ENV NATS_CREDS=/creds PYTHONUNBUFFERED=1
+# NATS_URL empty, not absent: the archiver then stops and asks for it, rather than dial
+# 127.0.0.1, which in a container is the container itself.
+ENV NATS_URL="" NATS_CREDS=/creds PYTHONUNBUFFERED=1
 ENTRYPOINT ["python", "/opt/zb-archiver/archiver.py"]
