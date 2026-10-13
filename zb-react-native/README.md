@@ -15,7 +15,9 @@ const { rows } = await zb.query('SELECT count(*) FROM orders');
 
 ## Install
 
-    npx expo install @zebridge/react-native
+```sh
+npx expo install @zebridge/react-native
+```
 
 The package carries libzb already built: an xcframework for iOS (device and simulator)
 and `libzb.so` for Android (arm64-v8a, armeabi-v7a, x86_64). It is native code, so the app
@@ -28,8 +30,10 @@ the last install, and a build against stale ones fails with `library 'zb' not fo
 
 ## Build (in this repository)
 
-    scripts/build-ios.sh       # both iOS slices → ios/ZbCore.xcframework, ABI checked first
-    scripts/build-android.sh   # zb-android's libzb.so per CPU, for the Android module
+```sh
+scripts/build-ios.sh       # both iOS slices → ios/ZbCore.xcframework, ABI checked first
+scripts/build-android.sh   # zb-android's libzb.so per CPU, for the Android module
+```
 
 Each build is a **copy** of libzb. After any libzb change, run the script again and
 rebuild the app. The first call compares the copy's `zb_abi_version()` with `src/abi.ts`
