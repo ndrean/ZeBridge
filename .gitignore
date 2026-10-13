@@ -118,3 +118,6 @@ zb.sqlite*
 
 # release packages (deploy/package-linux.sh)
 dist/
+
+# a CLI tool's own settings (Cloudsmith), local only
+/config.ini
