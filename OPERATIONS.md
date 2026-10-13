@@ -169,7 +169,7 @@ SELECT * FROM zebridge_check_all() WHERE status = 'ERROR';   -- an empty result 
 `intent` is what you _mean_ the table to be; the check compares it with the grants (who holds INSERT+UPDATE) and with the catalogue row.
 Naming the columns makes it a pre-migration check: a declared name that disagrees with the catalogue is a finding, and a table with no row yet is checked against the names you gave.
 
-`zebridge_check_all()` checks every catalogued table against its own catalogue row: the intent you already wrote with `zebridge_enable(...)` in your migration, including an accepted `allow_physical_deletes` (a WARNING, not an ERROR). A catalogue row whose table is gone is an ERROR.
+`zebridge_check_all()` checks every catalogued table against its own catalogue row: the intent you already wrote with `zebridge_enable(...)` in your migration, including an accepted `allow_physical_deletes` (a WARNING, not an ERROR). A catalogue row whose table is gone is a NOTE: the row is kept on purpose, so a table re-created under the same name syncs again with the same rules. The doctor lists those tables once, and skips their schema and chain checks.
 
 Each row's `status` is `ok`, `NOTE`, `WARNING` or `ERROR`; only `ERROR` blocks the table.
 

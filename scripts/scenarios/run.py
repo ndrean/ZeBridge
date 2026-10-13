@@ -79,6 +79,7 @@ GROUPS = {
         "reaps":         ("bridge", "sweeper reaps never reach clients"),
         "tenant_kv":     ("bridge", "$KV.tenants exact-key grants"),
         "crosstenant":   ("client", "cross-tenant reach (expected to find the known hole)"),
+        "doctor_output": ("none",  "a dropped table in --diagnose: listed once in the info block 'Dropped, its sync rules kept', named by no warning or error, counted in the preflight's one info line; needs the dev database and .env.bridge"),
         "readings_roles": ("none",  "the readings roles on a scratch operator stack (its own nats-server, MQTT on): a sensor's bearer JWT publishes its own readings over NATS and MQTT and reads nothing, an archiver reads its tenant's stream and writes its manifest only, a responder reads both and writes neither, --update gives an older store the two keys and keeps every other line"),
         "archive":       ("bridge", "readings to Parquet (examples/16-archive): every reading archived once, a kill between upload and manifest, two archivers (the revision stops one), the stream pruned past the archive refused, the responder counting Parquet + hot tail once while the boundary moves; needs local S3 (SeaweedFS on :8333) and boto3 + duckdb in the venv"),
         "py_serve":      ("client", "zb-python's `serve(tenants, handlers, queue)`: a handler answers from the replica (= PostgreSQL), gets the tenant from the subject, a raising handler answers an error, any JSON goes, and on_change keeps the applied rows without the answered requests"),

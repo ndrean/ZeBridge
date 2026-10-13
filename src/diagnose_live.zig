@@ -87,6 +87,9 @@ fn catalogueChecks(a: std.mem.Allocator, conn: *c.PGconn) usize {
         log.err("🔴 zebridge_check_all() failed: {s} — re-apply the init SQL (bridge --init-sql)", .{std.mem.span(c.PQresultErrorMessage(res))});
         return 1;
     }
+    // One block per distinct finding, the tables it applies to on one line: the same
+    // explanation printed once per table buried the few findings that differ.
+    var groups: std.ArrayList(Group) = .empty;
     var errors: usize = 0;
     var warnings: usize = 0;
     var tables = std.StringHashMapUnmanaged(void).empty;
@@ -97,23 +100,69 @@ fn catalogueChecks(a: std.mem.Allocator, conn: *c.PGconn) usize {
         const check = std.mem.span(c.PQgetvalue(res, row, 1));
         const status = std.mem.span(c.PQgetvalue(res, row, 2));
         const detail = std.mem.span(c.PQgetvalue(res, row, 3));
-        tables.put(a, tbl, {}) catch {};
         if (std.mem.eql(u8, check, "summary")) continue;
-        if (std.mem.eql(u8, status, "ERROR")) {
-            errors += 1;
-            log.err("🔴 '{s}' {s}: {s}", .{ tbl, check, detail });
-        } else if (std.mem.eql(u8, status, "WARNING")) {
-            warnings += 1;
-            log.warn("⚠️ '{s}' {s}: {s}", .{ tbl, check, detail });
+        const level: Level = if (std.mem.eql(u8, status, "ERROR"))
+            .err
+        else if (std.mem.eql(u8, status, "WARNING"))
+            .warn
+        else if (std.mem.eql(u8, check, "dropped"))
+            .info
+        else
+            continue;
+        if (level != .info) tables.put(a, tbl, {}) catch {};
+        switch (level) {
+            .err => errors += 1,
+            .warn => warnings += 1,
+            .info => {},
         }
+        addToGroup(a, &groups, level, detail, tbl) catch {};
     }
-    if (errors == 0) log.info("✅ catalogue: {d} table(s) match their catalogue rows ({d} warning(s) above)", .{ tables.count(), warnings });
-    return errors + crossTableAudits(conn);
+    for (groups.items) |g| printGroup(a, g);
+    if (errors == 0) log.info("✅ catalogue: every table matches its catalogue row ({d} warning(s) above)", .{warnings});
+    return errors + crossTableAudits(a, conn);
+}
+
+const Level = enum { err, warn, info };
+const Group = struct { level: Level, text: []const u8, items: std.ArrayList([]const u8) = .empty };
+
+fn addToGroup(a: std.mem.Allocator, groups: *std.ArrayList(Group), level: Level, text: []const u8, item: []const u8) !void {
+    for (groups.items) |*g| if (g.level == level and std.mem.eql(u8, g.text, text)) {
+        try g.items.append(a, item);
+        return;
+    };
+    var g: Group = .{ .level = level, .text = text };
+    try g.items.append(a, item);
+    try groups.append(a, g);
+}
+
+/// The explanation once, then `N table(s): a, b, c` indented below it.
+fn printGroup(a: std.mem.Allocator, g: Group) void {
+    const names = std.mem.join(a, ", ", g.items.items) catch return;
+    const what: []const u8 = if (g.items.items.len == 1) "table" else "tables";
+    switch (g.level) {
+        .err => log.err("🔴 {s}\n    {d} {s}: {s}", .{ g.text, g.items.items.len, what, names }),
+        .warn => log.warn("⚠️  {s}\n    {d} {s}: {s}", .{ g.text, g.items.items.len, what, names }),
+        .info => log.info("ℹ️  {s}\n    {d} {s}: {s}", .{ g.text, g.items.items.len, what, names }),
+    }
+}
+
+test "findings group by text, tables listed once per group" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var groups: std.ArrayList(Group) = .empty;
+    try addToGroup(a, &groups, .err, "no deleted column", "memo");
+    try addToGroup(a, &groups, .info, "dropped", "arr_t");
+    try addToGroup(a, &groups, .err, "no deleted column", "orders");
+    try addToGroup(a, &groups, .warn, "no deleted column", "x");
+    try std.testing.expectEqual(@as(usize, 3), groups.items.len);
+    try std.testing.expectEqual(@as(usize, 2), groups.items[0].items.items.len);
+    try std.testing.expectEqualStrings("orders", groups.items[0].items.items[1]);
 }
 
 /// What no single table's check can see: writes nothing bounds, tenants the sweeper
 /// cannot reach, and the bridge instances registered in zebridge_limits.
-fn crossTableAudits(conn: *c.PGconn) usize {
+fn crossTableAudits(a: std.mem.Allocator, conn: *c.PGconn) usize {
     var findings: usize = 0;
 
     // A tenant-scoped table with nothing bounding WRITES lets a principal forge another
@@ -145,12 +194,25 @@ fn crossTableAudits(conn: *c.PGconn) usize {
             "WHERE lower(verdict) NOT LIKE 'ok%' AND lower(verdict) NOT LIKE 'reachable%' ORDER BY 1, 2");
         defer c.PQclear(res);
         if (c.PQresultStatus(res) == c.PGRES_TUPLES_OK) {
+            // One block: the tenants per table, on one line each.
             const n: usize = @intCast(c.PQntuples(res));
+            var per_table: std.ArrayList(Group) = .empty;
+            var tenants = std.StringHashMapUnmanaged(void).empty;
             for (0..n) |i| {
                 const row: c_int = @intCast(i);
-                log.warn("⚠️ the sweeper cannot reach '{s}' for tenant '{s}': {s}. Tombstones there are never reaped.", .{
-                    std.mem.span(c.PQgetvalue(res, row, 0)), std.mem.span(c.PQgetvalue(res, row, 1)), std.mem.span(c.PQgetvalue(res, row, 2)),
-                });
+                const tbl = std.mem.span(c.PQgetvalue(res, row, 0));
+                const tenant = std.mem.span(c.PQgetvalue(res, row, 1));
+                tenants.put(a, tenant, {}) catch {};
+                addToGroup(a, &per_table, .warn, tbl, tenant) catch {};
+            }
+            if (n > 0) {
+                var lines: std.ArrayList(u8) = .empty;
+                for (per_table.items) |g| {
+                    const names = std.mem.join(a, ", ", g.items.items) catch continue;
+                    lines.print(a, "\n    {s}: {s}", .{ g.text, names }) catch {};
+                }
+                log.warn("⚠️  The cleanup job (the sweeper) cannot see {d} tenant(s), so rows deleted there are never removed for good. " ++
+                    "Fix, per tenant: INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('zb_sweeper', '<tenant>');{s}", .{ tenants.count(), lines.items });
             }
         }
     }
@@ -343,7 +405,9 @@ fn topologyChecks(a: std.mem.Allocator, js: nats.JetStream, topo: *const topolog
 // listing would need consumer rights the auditor should not hold.
 fn clientContract(a: std.mem.Allocator, js: nats.JetStream, conn: *c.PGconn, topo: *const topology_mod.Topology, tenants: []const []const u8, write_ok: bool) usize {
     var findings: usize = 0;
-    const res = c.PQexec(conn, "SELECT tbl, coalesce(tenant_col::text, ''), generations::text FROM public.zebridge_catalogue ORDER BY tbl");
+    // Dropped tables keep their catalogue row on purpose: they have no schema or chain to check.
+    const res = c.PQexec(conn, "SELECT tbl, coalesce(tenant_col::text, ''), generations::text FROM public.zebridge_catalogue " ++
+        "WHERE to_regclass('public.' || quote_ident(tbl)) IS NOT NULL ORDER BY tbl");
     defer c.PQclear(res);
     if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) return 0;
     const n: usize = @intCast(c.PQntuples(res));

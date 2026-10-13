@@ -242,11 +242,21 @@ pub fn reportTenantColumns(
 
     var it = tenant_rules.iterator();
     var scoped: usize = 0;
+    var dropped: std.ArrayList([]const u8) = .empty;
+    defer dropped.deinit(allocator);
     while (it.next()) |entry| {
         const table = entry.key_ptr.*;
         const cols = entry.value_ptr.*;
         if (cols.len == 0) continue;
         const tenant_col = cols[0];
+
+        // A catalogue row outlives its table on purpose (MIGRATIONS.md: a table reborn
+        // under the name keeps its rules). Asked first, apart: a `'…'::regclass` constant
+        // in the check below is evaluated at plan time and fails the whole query.
+        if (!try tableExists(allocator, conn, table)) {
+            try dropped.append(allocator, table);
+            continue;
+        }
 
         // One query answers both halves: does the column exist, and is it inside whatever
         // this table uses as its replica identity (the PK for 'd', the marked index for
@@ -301,7 +311,47 @@ pub fn reportTenantColumns(
     }
 
     log.info("✅ Tenant scoping: {d} table(s) route reads by tenant", .{scoped});
+    if (dropped.items.len > 0) {
+        const line = try droppedSummary(allocator, dropped.items);
+        defer allocator.free(line);
+        log.info("🗂️  {s}", .{line});
+    }
     _ = publication_name;
+}
+
+fn tableExists(allocator: std.mem.Allocator, conn: *c.PGconn, table: []const u8) !bool {
+    const q = try utils.allocPrintZ(allocator, "SELECT to_regclass('\"public\".\"{s}\"') IS NOT NULL", .{table});
+    defer allocator.free(q);
+    const res = c.PQexec(conn, q.ptr);
+    defer c.PQclear(res);
+    // Unknown is "exists": the check below then runs and says what went wrong.
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) == 0) return true;
+    return c.PQgetvalue(res, 0, 0)[0] == 't';
+}
+
+/// One line for the catalogue rows whose table is gone: a normal state, so an info line,
+/// and a bounded one — a dev database collects dozens.
+fn droppedSummary(allocator: std.mem.Allocator, tables: []const []const u8) ![]u8 {
+    const shown = @min(tables.len, 8);
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.print(allocator, "{d} catalogue row(s) without a table (dropped; the rules stay for a table reborn under the name): ", .{tables.len});
+    for (tables[0..shown], 0..) |t, i| {
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try buf.appendSlice(allocator, t);
+    }
+    if (tables.len > shown) try buf.print(allocator, " and {d} more", .{tables.len - shown});
+    return buf.toOwnedSlice(allocator);
+}
+
+test "droppedSummary: one bounded line" {
+    const a = std.testing.allocator;
+    const one = try droppedSummary(a, &.{"arr_t"});
+    defer a.free(one);
+    try std.testing.expectEqualStrings("1 catalogue row(s) without a table (dropped; the rules stay for a table reborn under the name): arr_t", one);
+    const many = try droppedSummary(a, &.{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j" });
+    defer a.free(many);
+    try std.testing.expect(std.mem.endsWith(u8, many, ": a, b, c, d, e, f, g, h and 2 more"));
 }
 
 /// The role name out of a PostgreSQL connection URL.

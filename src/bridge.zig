@@ -3021,6 +3021,7 @@ test {
     _ = @import("batch_publisher.zig");
     _ = @import("catalog_epoch.zig");
     _ = @import("config.zig");
+    _ = @import("diagnose_live.zig");
     _ = @import("encoder.zig");
     _ = @import("event_processor.zig");
     _ = @import("fleet_monitor.zig");

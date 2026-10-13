@@ -2629,9 +2629,10 @@ BEGIN
     ELSIF want_writable THEN
         errors := errors + 1;
         RETURN QUERY SELECT 'tombstone', 'ERROR',
-            'writable without a tombstone_col: DELETEs are physical, inexpressible in a generation delta, '
-            'and hard-deleted rows resurrect on every fresh seed. Add deleted_at timestamptz and declare it '
-            '(or accept it explicitly: allow_physical_deletes => true, and say so in the intent)';
+            'Accepts writes from devices but has no "deleted" column: a row deleted in PostgreSQL '
+            'stays on devices that re-sync from scratch. Fix: add a deleted_at timestamptz column, then '
+            'zebridge_enable(''<table>'', tombstone_col => ''deleted_at''). Or allow it: '
+            'zebridge_enable(''<table>'', allow_physical_deletes => true)';
     ELSE
         RETURN QUERY SELECT 'tombstone', 'NOTE', 'none: read-only, physical deletes forwarded as deletes';
     END IF;
@@ -2735,8 +2736,11 @@ BEGIN
         WHERE c.rc IS NOT NULL
         ORDER BY c.tbl;
     RETURN QUERY
-        SELECT cat.tbl, 'exists'::text, 'ERROR'::text,
-               format('%s is in zebridge_catalogue but the table is gone: drop the row, or restore the table', cat.tbl)
+        -- A NOTE, not an error: the row outlives its table on purpose (MIGRATIONS.md), so
+        -- a table re-created under the name syncs again with the same rules.
+        SELECT cat.tbl, 'dropped'::text, 'NOTE'::text,
+               'Dropped, its sync rules kept: a table re-created under the same name syncs again with them. '
+               'To forget one: DELETE FROM zebridge_catalogue WHERE tbl = ''<table>'''::text
         FROM public.zebridge_catalogue cat
         WHERE NOT public.zebridge_is_internal_table(cat.tbl)
           AND to_regclass('public.' || quote_ident(cat.tbl)) IS NULL
