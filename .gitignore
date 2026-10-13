@@ -90,6 +90,8 @@ zb-client-ts/zebridge_*.sqlite3-*
 # The compose stack's settings and passwords, on the server only.
 deploy/compose/.env
 /node_modules/
+# every package and example installs its own: none is ever committed
+node_modules/
 
 examples/08-map/**/.env*
 examples/08-map/flutter/data/
