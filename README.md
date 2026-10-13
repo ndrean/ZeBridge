@@ -1272,13 +1272,13 @@ The user's name travels in the subject of each message, for example `mutation.al
 
 > NATS refuses a message whose subject does not match the sender's JWT, so the bridge can trust that name. It never trusts a name written inside the message itself.
 
-Note: NATS calls this setup [operator mode](https://docs.nats.io/learn/security/decentralized-auth#revoking-a-user). It is a chain of signatures: the **operator** signs the **account**, the account lists three **signing keys**, one per role (client, responder, service), and each signing key signs **users**. A signing key also holds the permissions of every user it signs, as a template: when the user connects, `{{name()}}` becomes the user's name and `{{tag(tenant)}}` each of their tenants. The JWT itself holds no permissions, only the user's name and one tag per tenant.
+Note: NATS calls this setup [operator mode](https://docs.nats.io/learn/security/decentralized-auth#revoking-a-user). It is a chain of signatures: the **operator** signs the **account**, the account lists five **signing keys**, one per role (client, responder, service, archiver, sensor), and each signing key signs **users**. A signing key also holds the permissions of every user it signs, as a template: when the user connects, `{{name()}}` becomes the user's name and `{{tag(tenant)}}` each of their tenants. The JWT itself holds no permissions, only the user's name and one tag per tenant.
 
 The bridge's own NATS identity needs nothing from you: `bridge --init-nats operator` writes it (`creds/bridge.creds`, a service-role user) and points `NATS_CREDS` at it.
 
 #### 1. Set up, once per deployment
 
-`bridge --init-nats operator` generates the whole chain, with no `nsc`: the operator, the account and its three signing keys, the bridge's own creds, and `.env.nats` with what enrollment needs. What each file holds and how to keep it safe (`operator.store` offline), minting a responder's creds, re-signing after a grammar change, and replacing a leaked `ZB_SIGNING_SEED`: [DEPLOYMENT, The NATS identity](DEPLOYMENT.md#the-nats-identity).
+`bridge --init-nats operator` generates the whole chain, with no `nsc`: the operator, the account and its five signing keys, the bridge's own creds, and `.env.nats` with what enrollment needs. What each file holds and how to keep it safe (`operator.store` offline), minting a responder's creds, re-signing after a grammar change, and replacing a leaked `ZB_SIGNING_SEED`: [DEPLOYMENT, The NATS identity](DEPLOYMENT.md#the-nats-identity).
 
 #### 2. Onboard a device
 

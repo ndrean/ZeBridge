@@ -1,12 +1,12 @@
 # 16 — sensor readings to Parquet, and questions over them
 
-Sensors send readings. They never touch PostgreSQL: a NATS stream keeps them for a day, an
+Sensors send readings. They never touch PostgreSQL: a NATS stream per tenant keeps them for a day, an
 **archiver** writes them to Parquet files in S3 (Cloudflare R2, or any S3), and a
 **responder** answers questions from those files plus the readings that came after.
 
 ```mermaid
 flowchart LR
-    S(sensors<br>MQTT or NATS) -->|"sensors.{tenant}.{sensor}.{kind}"| R[(stream READINGS)]
+    S(sensors<br>MQTT or NATS) -->|"sensors.{tenant}.{sensor}.{kind}"| R[(stream READINGS_tenant)]
     R --> A(archiver.py)
     A -->|Parquet| B[(S3 / R2)]
     A -->|"covers_up_to, files"| M[(KV time_manifests)]
@@ -23,11 +23,16 @@ flowchart LR
   next archiver covers the same readings again.
 - **The manifest is the archiver's position.** `covers_up_to` is the last stream sequence in
   a file. The archiver keeps no consumer of its own: it restarts from the next sequence.
+- **One stream per tenant.** The bridge makes `READINGS_<tenant>` for every tenant, at boot and
+  when a tenant appears. A credential can then be held to one tenant by the stream's name.
 - **One archiver per tenant.** The manifest is written on the revision the archiver read, so a
   second archiver fails at its first flush and stops.
 - **No silent hole.** The archiver refuses to start when the stream no longer holds
   `covers_up_to + 1`, or when it keeps readings for less than two flushes plus the S3 outage
   to survive (`--outage-s`, one hour by default).
+- **Each program has its own credential.** A sensor publishes its own readings and nothing
+  else; the archiver reads its tenant's stream and writes its tenant's manifest; the responder
+  reads both and writes neither ([DEPLOYMENT](../../DEPLOYMENT.md), "Sensors and their archive").
 - **Counted once.** The responder reads Parquet up to `covers_up_to` and the stream after it.
   When the manifest moves, the new files join and the hot rows they cover leave. A reading
   sent twice (same sensor, kind and sensor time) counts once.
@@ -48,23 +53,26 @@ docker run -d --name zb-s3 -p 127.0.0.1:8333:8333 -v zb-s3-data:/data \
 scripts read the keys from it (`S3_KEYS`) unless `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY` are set.
 
-```sh
-export NATS_URL=nats://127.0.0.1:4222 NATS_CREDS=scripts/native/creds/bridge.creds
-export PYTHONPATH=zb-python/src
-PY=scripts/scenarios/.venv/bin/python
+With creds minted from `operator.store` (`--mint-archiver`, `--mint-responder`):
 
-$PY examples/16-archive/archiver.py --tenant _default --flush-s 10 &
-$PY examples/16-archive/responder.py --tenant _default --creds scripts/native/creds/pois.creds --cache /tmp/zb-readings &
+```sh
+export NATS_URL=tls://nats.example.com:4222 PYTHONPATH=zb-python/src
+NATS_CREDS=archiver-acme.creds python3 examples/16-archive/archiver.py --tenant acme --flush-s 60 &
+python3 examples/16-archive/responder.py --tenant acme --creds readings-acme.creds --cache /var/cache/zb-readings &
 ```
 
-Readings come from anything that publishes on `sensors.<tenant>.<sensor>.<kind>`, for example
-09-event's `mqtt_sensors.py` over MQTT (its tenant is `globex`: run both scripts with
-`--tenant globex` and a responder credential for `globex`).
-
-The stream and the manifest bucket are created on first use (`common.provision`), the bucket
+The bridge has made the stream `READINGS_acme` and the bucket `time_manifests`; the S3 bucket
 must exist. Against R2: `S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com`,
 `S3_BUCKET=zb-events`, and an R2 API token's keys: read and write for the archiver, read only
 for the responder.
+
+Readings come from anything that publishes on `sensors.<tenant>.<sensor>.<kind>`: a sensor
+with `--mint-sensor` creds, over NATS or MQTT (its JWT as the password), or 09-event's
+`mqtt_sensors.py` for the tenant `globex`.
+
+On the dev stack, whose NATS accounts are made by `nsc` rather than `--init-nats`, the
+responder and archiver grants do not include readings: give both the bridge's creds with
+`NATS_CREDS=scripts/native/creds/bridge.creds` (the responder still answers with its own).
 
 ## Questions
 
@@ -79,12 +87,14 @@ for the responder.
 `scripts/scenarios/archive.py` runs the failure cases: every reading archived once, a kill
 between upload and manifest, two archivers at once, the stream pruned past the archive, and
 the responder counting each reading once while the boundary moves.
+`scripts/scenarios/readings_roles.py` runs both programs with their own credentials on a stack
+made by `--init-nats operator`, and checks what each role may and may not do.
 
 ## Not yet
 
-- **Its own NATS roles.** Here the archiver and the responder read the stream with the
-  bridge's credentials. A deployment needs an archiver role (the stream, the manifest) and
-  the stream added to the responder's grants, per tenant.
+- **An image** for the archiver, to run one container per tenant on the hub.
+- **The archive lag** on the bridge's `/metrics`: how far each tenant's archive is behind
+  its stream.
 - **Compaction**: many small files merged into hourly or daily ones, the old ones deleted
   after a grace period.
 - **The registry join**: business tables from PostgreSQL (sensors, zones, thresholds),

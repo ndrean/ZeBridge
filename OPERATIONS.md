@@ -64,6 +64,11 @@ The reference for running ZeBridge: the CLI, the doctor (`--diagnose`), what nee
                   DATABASE_READER_URL, DATABASE_WRITER_URL, BRIDGE_CDC_PUBLICATION
   --mint-responder --name NAME [--tenant T]... [--store PATH] [--ttl-days D]
                   Creds for a responder service, on stdout, signed from operator.store
+  --mint-archiver --name NAME [--tenant T] [--store PATH] [--ttl-days D]
+                  Creds for one tenant's archiver: reads its readings, writes its manifests
+  --mint-sensor --name NAME [--tenant T] [--store PATH] [--ttl-days D]
+                  Creds for a sensor: publishes sensors.<T>.<NAME>.> only; its JWT is a
+                  bearer token (over MQTT, the password). No --tenant: _default
   --mint-leaf --name NAME [--store PATH] [--ttl-days D]
                   Creds for a leaf node's remote, on stdout: what its clients may carry
                   --ttl-days: both default to 3650 (ten years): replaced with a redeploy
@@ -275,6 +280,8 @@ At boot the bridge checks the writer role's connection limit, and PostgreSQL's `
 | `CDC_MAX_AGE_SECONDS` | 3 × cadence | how long a CDC stream keeps an event |
 | `CDC_MAX_BYTES` | 1 GiB | a CDC stream's size cap, a disk valve |
 | `CDC_MAX_MSGS` | 10,000,000 | a CDC stream's message cap, a disk valve |
+| `READINGS_MAX_AGE_SECONDS` | 86400 (1 day) | how long a tenant's readings stream keeps a sensor reading |
+| `READINGS_MAX_BYTES` | 256 MiB | a readings stream's size cap, per tenant; full, it drops its oldest readings |
 
 Two inequalities hold them together, both checked by `bridge --diagnose` and at boot:
 
@@ -459,7 +466,7 @@ Raising `max_payload` in `nats-server.conf` (up to 8 MB is safe) is possible but
 ZeBridge uses two stream families and several KV buckets (schemas, tenants, generations, live) plus per-tenant object stores for the bidirectional flow ZeBridge ↔ NATS ↔ consumer.
 The naming is **shared** and declared in [grammar.json](src/grammar.json).
 
-A ZeBridge instance is started with one config. The DBA starts the NATS server with its own config. `grammar.json` is the static wire grammar shared between the two: stream names, subject prefixes, and KV bucket names, declared once (`streams`, `subjects`, `kv`, `cdc_streams`, `open_tenant`, `generations`). Which tables replicate, and how, lives in the database: one `zebridge_catalogue` row per table, written by `zebridge_enable(...)`. The bridge creates what is missing at boot: the MUTATIONS and VERDICTS streams, the `schemas`, `tenants`, `generations` and `live` buckets, and the CDC stream family, which it also reconciles to the catalogue. An existing MUTATIONS or VERDICTS stream keeps the limits it has.
+A ZeBridge instance is started with one config. The DBA starts the NATS server with its own config. `grammar.json` is the static wire grammar shared between the two: stream names, subject prefixes, and KV bucket names, declared once (`streams`, `subjects`, `kv`, `cdc_streams`, `open_tenant`, `generations`). Which tables replicate, and how, lives in the database: one `zebridge_catalogue` row per table, written by `zebridge_enable(...)`. The bridge creates what is missing at boot: the MUTATIONS and VERDICTS streams, the `schemas`, `tenants`, `generations`, `live` and `time_manifests` buckets, the CDC stream family, which it also reconciles to the catalogue, and one readings stream per tenant. An existing MUTATIONS or VERDICTS stream keeps the limits it has.
 
 The `live` bucket holds one heartbeat per connected client: its lag on each stream, sent every `heartbeatMs` (30 s by default) and dropped after `FLEET_TTL_SECONDS` of silence. The bridge's fleet monitor reads it for the `bridge_fleet_*` metrics: how many clients are live per tenant, and how far behind each one is.
 
@@ -474,6 +481,7 @@ The `live` bucket holds one heartbeat per connected client: its lag on each stre
 | **CDC** | Real-time egress changes | `CDC_MAX_AGE_SECONDS`, 3 × the generation cadence; `CDC_MAX_BYTES` 1 GiB and `CDC_MAX_MSGS` 10 M as disk valves | Continuous subscription | READ |
 | **MUTATIONS** | Real-time ingress changes | 2 h, 1 GB, discard new, `MUTATION_BACKLOG_PER_PRINCIPAL` queued writes per principal: past it, that principal's writes are refused | Continuous subscription | WRITE |
 | **VERDICTS** | Write verdicts and the revocation ban | 2 h, 1 GB, discard old: the window a missed verdict can be recovered in | Direct get by key | WRITE |
+| **READINGS_\<tenant\>** | Sensor readings, `sensors.<tenant>.>`, never through PostgreSQL ([examples/16-archive](examples/16-archive)) | `READINGS_MAX_AGE_SECONDS` 1 day, `READINGS_MAX_BYTES` 256 MiB, discard old | the tenant's archiver and responders | READ |
 
 Besides the streams, the bridge maintains the seeding buckets: the **`generations` KV** holds one chain manifest per `<tenant>.<table>`, and a per-tenant **`gen-<tenant>` object store** holds the full and delta objects the manifest points to. The producer provisions the object stores at runtime, the same way the bridge provisions per-tenant CDC streams.
 

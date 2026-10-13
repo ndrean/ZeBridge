@@ -371,14 +371,16 @@ in the server's default zone.
 
 ### 1.6 NATS: credentials and permissions
 
-Two credential shapes, on purpose:
+One credential per role, each with only what the role needs:
 
 | | credential | permissions |
 | --- | --- | --- |
 | the bridge | a creds file under the account's **service** signing key (`NATS_CREDS`, in `.env.nats`); `NATS_BRIDGE_NKEY_SEED` on a server without operator mode | `publish: >`, `subscribe: >` — it is the trusted writer and already holds replication rights |
 | a client | a JWT minted by `/enroll` under the **client** signing key (`ZB_SIGNING_SEED`, in `.env.nats`), and the device's own key | allow-listed to its own subtree, **its reply inbox included** (`_INBOX.<principal>.>`) |
-| a responder | JWT under the account's **responder** signing key, tagged with the tenants it serves | a client's read side, plus `subscribe: query.<tenant>.>` for its tenants, `publish: _INBOX.>` for the replies, and create/write on `OBJ_res-<tenant>` for answers too large to send inline — no mutations, no heartbeat key, no asking |
-| a leaf node's link | JWT signed by the account key, its permissions in the JWT | what any client may do, for any tenant and name, plus `publish: mutation.>` — no stream admin, no `cdc.*`, no generation writes |
+| a responder | JWT under the account's **responder** signing key, tagged with the tenants it serves | a client's read side, plus `subscribe: query.<tenant>.>` for its tenants, `publish: _INBOX.>` for the replies, and create/write on `OBJ_res-<tenant>` for answers too large to send inline; it also reads its tenants' sensor readings (`READINGS_<tenant>`) and their archive manifests, by exact key — no mutations, no heartbeat key, no asking |
+| an archiver | JWT under the account's **archiver** signing key, tagged with one tenant | reads that tenant's readings stream `READINGS_<tenant>` and writes that tenant's manifests `$KV.time_manifests.<tenant>.>` — nothing else: no other tenant, no CDC, no queries, no stream admin |
+| a sensor | bearer JWT under the account's **sensor** signing key, tagged with one tenant | publishes `sensors.<tenant>.<its own name>.>` and nothing else; subscribing is denied |
+| a leaf node's link | JWT signed by the account key, its permissions in the JWT | what any client may do, for any tenant and name, plus `publish: mutation.>` and `publish: sensors.>` — no stream admin, no `cdc.*`, no generation writes |
 
 **A responder answers, it never writes.** A service that answers `query.<tenant>.<name>`
 from a replica (PROTOCOL §2) holds a responder credential, not the bridge's: it follows
@@ -390,12 +392,37 @@ Minted by `scripts/native/jwt-bootstrap.sh` (nsc) or, in the stack the
 bridge generated, by `bridge --mint-responder --store operator.store`, offline: the
 responder signing seed is never on the bridge host.
 
+**A sensor publishes, it never reads.** A sensor cannot sign the server's nonce over MQTT,
+so its JWT is a **bearer** token: over MQTT it is the password, any user name. Whoever holds
+it is that sensor, which is why its template holds so little: publish to
+`sensors.<tenant>.<its name>.>`, so it cannot pose as another sensor or write for another
+tenant, and subscribe to nothing. A leaked sensor token can add false readings for one
+sensor; it cannot read anything or reach PostgreSQL. `bridge --revoke --key` cuts it off
+like any user. ⚠️ The template **denies** subscriptions outright: in NATS, an empty
+subscribe section is not "nothing", it is no limit at all. Measured: with an empty one, a
+sensor token received every tenant's CDC, queries and inboxes.
+
+**An archiver writes one thing.** It reads one tenant's readings and moves that tenant's
+archive manifest, nothing more. Readings live in one stream per tenant, `READINGS_<tenant>`,
+like CDC: the stream name is what a grant can check. A single shared stream would leave the
+tenant only in a consumer's filter, inside the request body where no grant looks, and its
+stream info could list every tenant's sensors. For the same reason the archiver and the
+responder read a manifest by direct get of its exact key, never by binding the bucket,
+which would ask for the bucket's stream info and could list every tenant's keys.
+
+✅ Verified on a stack made by `--init-nats operator` (`scripts/scenarios/readings_roles.py`):
+a sensor publishes its own readings over NATS and MQTT and receives nothing on five
+subscriptions from `sensors.>` to `>`; an archiver reads its tenant's stream, writes its
+manifest, and is refused another tenant's stream and manifest, and stream create and delete;
+a responder reads both and cannot write the manifest; the archiver and responder programs
+of examples/16-archive run with these credentials alone.
+
 **A leaf link carries its clients' traffic, nothing more.** A leaf node joins the hub
 with its own credential, minted by `bridge --mint-leaf --store operator.store`: the
 client template with every tenant and name widened to `*` (a NATS wildcard is a whole
 token, so `CDC_<tenant>` becomes any stream), plus `mutation.>`, the subject the hub's
 MUTATIONS stream listens on — the hub announces a subscription to a leaf only when the
-leaf may publish to it as written. Each device behind the leaf is still held to its own
+leaf may publish to it as written — and `sensors.>`, for the readings of sensors behind it. Each device behind the leaf is still held to its own
 JWT by the leaf. A compromised leaf host can read every stream, but cannot create,
 delete or reconfigure one, publish CDC events or write generations, which the bridge's
 own credential (`>`) would allow. Responders behind a leaf are not covered yet: their
@@ -576,8 +603,8 @@ confirm            the CDC echo carries your key — that is success. A verdict 
 
 ### 2.4 The NATS identity: scoped signing keys
 
-`bridge --init-nats operator` builds the account with three scoped signing keys, one per
-role: **client**, **responder** and **service**. Each holds a permission template derived
+`bridge --init-nats operator` builds the account with five scoped signing keys, one per
+role: **client**, **responder**, **service**, **archiver** and **sensor**. Each holds a permission template derived
 from the grammar. A device's JWT is minted by `/enroll` under the client key; its
 template grants, among other subjects:
 

@@ -590,7 +590,7 @@ sequenceDiagram
 🔔 **`operator.store` is your root key**: Like the private key of a certificate authority, it signs everything else, and nothing running needs it: the bridge, nats-server and the devices work without it. Keep it offline (a password manager, an encrypted disk), and bring it to a **trusted machine** only to:
 
 - re-sign the account after a grammar change: `bridge --init-nats --update`;
-- mint the creds of a responder or a leaf: `--mint-responder`, `--mint-leaf`;
+- mint the creds of a responder, an archiver, a sensor or a leaf: `--mint-responder`, `--mint-archiver`, `--mint-sensor`, `--mint-leaf`;
 - cut a revoked user off at NATS: `--revoke --conf` (it needs `OPERATOR_SEED`, from the store);
 - replace a leaked `ZB_SIGNING_SEED`: `--init-nats --rotate-client-key` (below).
 
@@ -600,7 +600,7 @@ A **trusted machine** is any machine you control, your laptop for example, with 
 
 | file | holds | keep it |
 | --- | --- | --- |
-| `operator.store` | every seed: the operator, the accounts, the three signing keys | **off the server**, offline (see above) |
+| `operator.store` | every seed: the operator, the accounts, the five signing keys | **off the server**, offline (see above) |
 | `.env.bridge` | the database passwords | on the bridge host only, readable by the bridge's user only |
 | `.env.nats` | `ZB_SIGNING_SEED`, which can mint a client for any principal | on the bridge host only, readable by the bridge's user only |
 | `creds/bridge.creds` | the bridge's own NATS identity: publish and subscribe on every subject of the account | on the bridge host only, readable by the bridge's user only |
@@ -628,6 +628,27 @@ bridge --mint-responder --store operator.store --name pois --tenant globex > poi
 🔔 The creds are valid ten years by default (`--ttl-days`): a service is replaced with a redeploy, not renewed.
 
 A new tenant needs none of this again: its grants are the template, filled with the tenant tag the JWT carries. A new _role_ (other permissions) is a new signing key in the account.
+
+**Sensors and their archive.** Sensors publish readings on `sensors.<tenant>.<sensor>.<kind>`, over NATS or MQTT. The bridge keeps them in one stream per tenant, `READINGS_<tenant>`, which it creates at boot and when a tenant appears, for every tenant, whether it has sensors or not. An archiver writes them to Parquet files in S3 (Cloudflare R2, or any S3), and a responder answers questions over them: [examples/16-archive](examples/16-archive). Each gets its own creds, minted like a responder's:
+
+```sh
+bridge --mint-sensor    --store operator.store --name boiler-12     --tenant acme > boiler-12.creds
+bridge --mint-archiver  --store operator.store --name archiver-acme --tenant acme > archiver-acme.creds
+bridge --mint-responder --store operator.store --name readings-acme --tenant acme > readings-acme.creds
+```
+
+- A **sensor** publishes its own readings, `sensors.acme.boiler-12.>`, and nothing else. Over MQTT, its JWT (the first block of the creds file) is the password, with any user name. Without `--tenant`, it belongs to the open tenant `_default`.
+- An **archiver** belongs to one tenant: it reads that tenant's readings and writes that tenant's archive manifest.
+- A **responder** reads the readings and manifests of the tenants it is minted for, and answers their questions.
+
+Two settings in `.env.bridge` bound each tenant's readings stream; a full stream drops its oldest readings:
+
+| setting | default | |
+| --- | --- | --- |
+| `READINGS_MAX_AGE_SECONDS` | 86400 (1 day) | how long a reading stays in the stream. The archiver refuses to start when this is shorter than two flushes plus the S3 outage it should survive |
+| `READINGS_MAX_BYTES` | 256 MiB | a disk valve per tenant: one flooding sensor drops its own tenant's oldest readings, never another tenant's |
+
+🔔 A store made before these two roles has no archiver or sensor key. `bridge --init-nats --update` adds them to the store and the account, and leaves every other key as it is: issued creds and device JWTs stay valid. Run it on the store's file, not from standard input, so the new keys are kept.
 
 **After a grammar change** (a new bridge version that adds a table or a subject), the templates must follow. Bring `operator.store` back and run:
 

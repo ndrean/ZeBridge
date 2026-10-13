@@ -1052,7 +1052,7 @@ fn runOperator(
 /// `bridge --init-nats --update`: the grammar changed (a table, a subject), so the role
 /// templates must follow. It reads the offline store, re-derives the templates, and
 /// re-signs the ZEBRIDGE account with the SAME keys — the operator, the account and the
-/// three signing keys keep their public keys, so every creds file and device JWT already
+/// signing keys keep their public keys, so every creds file and device JWT already
 /// issued stays valid. Only the account's line in the conf's resolver_preload changes;
 /// hand edits elsewhere in the conf survive. The revocations `bridge --revoke --full`
 /// wrote into the account are carried over: an update never un-revokes a key.
