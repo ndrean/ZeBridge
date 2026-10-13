@@ -169,12 +169,28 @@ For Debian 12+ and Ubuntu 22.04+, amd64 and arm64, from the APT repository at
 The repository is signed: apt refuses it without that key. The key's fingerprint is on
 the repository's page, `https://packages.zebridge.eu`. `sudo apt upgrade` installs later releases.
 
-**A release** is built by GitHub Actions. A `v<version>` tag (the version in
-`build.zig.zon`) runs `.github/workflows/release.yml`: the packages and tarballs for both
-architectures, the images, and a draft release. Publishing that release runs
-`.github/workflows/apt.yml`, which rebuilds the repository from every published release's
-packages, signs it, and deploys it to GitHub Pages at `packages.zebridge.eu`. apt only ever
-sees releases that were reviewed and published.
+**One version for everything.** The bridge, libzb and every client package carry the same
+version: `v0.2.0` is the same code, and the same libzb, in each of them. A release sets it
+everywhere with one command, then tags:
+
+    scripts/version.py set 0.2.0       # every package, the images' defaults, the install lines
+    scripts/version.py show            # what each file says
+
+**A release** is built by GitHub Actions. A `v<version>` tag runs
+`.github/workflows/release.yml`, which refuses a tag that some package does not carry, then
+builds the packages and tarballs for both architectures, the images, and a draft release.
+**Publishing** that release, after a review, runs the rest:
+
+- `.github/workflows/apt.yml`: rebuilds the APT repository from every published release's
+  packages, signs it, and deploys it to GitHub Pages at `packages.zebridge.eu`;
+- `.github/workflows/publish.yml`: npm (`@zebridge/client`, `@zebridge/react-native`, staged:
+  each version waits for a maintainer's approval with 2FA), PyPI (`zebridge`), and pub.dev
+  (`zebridge`, through `pubdev.yml` on the release's tag). Each skips a version its registry
+  already has, so a rerun is safe.
+
+Maven Central (`eu.zebridge:zebridge-android`) is still published by hand, with the release:
+`gradle publishAndReleaseToMavenCentral` in `zb-android/` ([zb-android/README.md](zb-android/README.md)). Nothing reaches apt or a
+registry before the release is published.
 
 The repository is signed with the GPG key "ZeBridge packages" (Ed25519), held in the GitHub
 repository's secrets (`APT_GPG_KEY`, `APT_GPG_PASSPHRASE`) and on the release machine. Keep a

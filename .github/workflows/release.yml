@@ -23,13 +23,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - id: v
+        # One version for every package (scripts/version.py): at a tag, every one must
+        # say the tag's; otherwise they must agree among themselves.
         run: |
           v=$(sed -n 's/^ *\.version = "\(.*\)",/\1/p' build.zig.zon)
-          l=$(sed -n 's/^ *\.version = "\(.*\)",/\1/p' libzb/build.zig.zon)
-          [ "$v" = "$l" ] || { echo "::error::build.zig.zon says $v, libzb/build.zig.zon $l"; exit 1; }
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$v" ]; then
             echo "::error::tag $GITHUB_REF_NAME, but build.zig.zon says $v"; exit 1
           fi
+          python3 scripts/version.py check "$v" || { echo "::error::the packages do not all say $v: scripts/version.py set $v"; exit 1; }
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
   linux:

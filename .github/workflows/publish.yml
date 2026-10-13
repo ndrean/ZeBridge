@@ -1,6 +1,8 @@
 # The client packages, published by their registries' trusted publishing (OIDC): no token
-# is stored here. On a published release, each job publishes its package only when the
-# version in its manifest is not on its registry yet: bump a package's version to ship it.
+# is stored here. Every package carries the release's version (scripts/version.py), so a
+# published release ships all of them; each job still skips a version its registry has,
+# which makes a rerun safe. pub.dev's job is its own workflow (pubdev.yml), started here on
+# the release's tag: pub.dev accepts only a run on a tag matching its pattern.
 # Run by hand, everything is built and checked, and nothing is published unless asked
 # (gh workflow run publish.yml -f publish=true: the same rule, a version only once).
 #
@@ -9,6 +11,8 @@
 #     stages (npm stage publish): each version goes live when a maintainer approves it,
 #     with 2FA, on npmjs.com or with `npm stage approve <id>`
 #   pypi.org, for zebridge: a trusted publisher, environment "pypi"
+#   pub.dev, for zebridge (Admin tab): automated publishing from ndrean/ZeBridge, tag pattern
+#     v{{version}}, workflow_dispatch events allowed
 name: Publish packages
 
 on:
@@ -25,6 +29,18 @@ permissions:
   contents: read
 
 jobs:
+  pubdev:
+    name: pub.dev zebridge (pubdev.yml, on the release's tag)
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh workflow run pubdev.yml -R "$GITHUB_REPOSITORY" --ref "$TAG" -f publish=true && echo "pubdev.yml started on $TAG"
+
   npm-client:
     name: npm @zebridge/client
     runs-on: ubuntu-24.04

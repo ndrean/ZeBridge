@@ -1,3 +1,10 @@
+## 0.2.0
+
+- Versions now follow ZeBridge's releases: every ZeBridge package carries the release's
+  version, so `zebridge 0.2.0` holds libzb 0.2.0.
+- libzb: SQLite's math functions (`sin`, `cos`, `asin`, `radians`, `pow`, `floor`, `mod`…)
+  are built in, so a distance can be computed in plain SQL on the local replica.
+
 ## 0.1.4
 
 - On iOS, the identity (the device's key) is flagged out of iCloud and computer backups,

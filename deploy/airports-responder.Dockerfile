@@ -9,7 +9,7 @@
 # repository's root (the service and zb-python are copied from it):
 #
 #   docker build -f deploy/airports-responder.Dockerfile --build-arg ARCH=x86_64 \
-#     --build-arg ZB_VERSION=0.1.7 -t zb-airports .
+#     --build-arg ZB_VERSION=0.2.0 -t zb-airports .
 #
 # Run it with a responder's creds (bridge --mint-responder) mounted, and the NATS server to
 # join; behind a leaf node, the hub's JetStream domain:
@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 FROM debian:13-slim AS libzb
 ARG ARCH
-ARG ZB_VERSION=0.1.7
+ARG ZB_VERSION=0.2.0
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
  && cd /tmp && base="https://github.com/ndrean/ZeBridge/releases/download/v${ZB_VERSION}" \
  && curl -fsSL -O "$base/libzb-${ZB_VERSION}-linux-${ARCH}.tar.gz" -O "$base/SHA256SUMS" \
