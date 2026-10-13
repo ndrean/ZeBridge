@@ -28,7 +28,7 @@ Copy the file to the host. The container runs as the image's `airports` user, so
 must belong to that user's **uid**, not to a name on the host:
 
 ```sh
-docker run --rm --entrypoint id zb-airports:0.1.3          # uid=999(airports): the number to use
+docker run --rm --entrypoint id zb-airports:0.1.7          # uid=999(airports): the number to use
 sudo install -m 0600 -o 999 -g 999 airports-leaf.creds /etc/zebridge/creds/airports-leaf.creds
 ```
 
@@ -39,7 +39,7 @@ host's CPU (`uname -m`), `ZB_VERSION` a ZeBridge release:
 
 ```sh
 docker build -f deploy/airports-responder.Dockerfile \
-  --build-arg ARCH=x86_64 --build-arg ZB_VERSION=0.1.3 -t zb-airports:0.1.3 .
+  --build-arg ARCH=x86_64 --build-arg ZB_VERSION=0.1.7 -t zb-airports:0.1.7 .
 ```
 
 The build needs only four paths of the repository: the Dockerfile and its
@@ -55,8 +55,12 @@ docker run -d --name airports --network host --restart unless-stopped \
   -e NATS_URL=tls://leaf.example.com:4222 \
   -e NATS_JS_DOMAIN=hub \
   -e ZB_SERVICE_NAME=airports-leaf \
-  zb-airports:0.1.3
+  zb-airports:0.1.7
 ```
+
+The replica is DuckDB by default (`airports.duckdb` in the volume). Add `--engine sqlite` after
+the image name for SQLite, built into libzb, with no DuckDB at all (`airports.sqlite3`); it
+needs libzb 0.1.7 or later, and says so at start otherwise.
 
 - `NATS_URL`: the NATS server this host reaches, with TLS when the port has it.
 - `NATS_JS_DOMAIN`: only behind a leaf node, the hub's domain. Leave it out on the hub.
@@ -92,13 +96,13 @@ Build the new release's image, then swap, keeping the old container for a rollba
 
 ```sh
 docker build -f deploy/airports-responder.Dockerfile \
-  --build-arg ARCH=x86_64 --build-arg ZB_VERSION=0.1.4 -t zb-airports:0.1.4 .
+  --build-arg ARCH=x86_64 --build-arg ZB_VERSION=0.1.7 -t zb-airports:0.1.7 .
 docker rename airports airports-old
 docker stop airports-old && docker update --restart=no airports-old
-docker run -d --name airports …same options as above… zb-airports:0.1.4
+docker run -d --name airports …same options as above… zb-airports:0.1.7
 ```
 
 Back to the old one: `docker rm -f airports && docker rename airports-old airports && docker
 start airports`. Once the new one has run cleanly, remove the old container and image
-(`docker rm airports-old`, `docker image rm zb-airports:0.1.3`). Never remove the
+(`docker rm airports-old`, `docker image rm zb-airports:<old version>`). Never remove the
 `airports-data` volume unless you want the service to seed again.

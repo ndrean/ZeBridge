@@ -9,7 +9,7 @@
 # repository's root (the service and zb-python are copied from it):
 #
 #   docker build -f deploy/airports-responder.Dockerfile --build-arg ARCH=x86_64 \
-#     --build-arg ZB_VERSION=0.1.3 -t zb-airports .
+#     --build-arg ZB_VERSION=0.1.7 -t zb-airports .
 #
 # Run it with a responder's creds (bridge --mint-responder) mounted, and the NATS server to
 # join; behind a leaf node, the hub's JetStream domain:
@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 FROM debian:13-slim AS libzb
 ARG ARCH
-ARG ZB_VERSION=0.1.3
+ARG ZB_VERSION=0.1.7
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
  && cd /tmp && base="https://github.com/ndrean/ZeBridge/releases/download/v${ZB_VERSION}" \
  && curl -fsSL -O "$base/libzb-${ZB_VERSION}-linux-${ARCH}.tar.gz" -O "$base/SHA256SUMS" \
@@ -52,9 +52,11 @@ COPY examples/10-airports/airport_service.py /opt/airports/
 USER airports
 WORKDIR /var/lib/airports
 ENV ZB_LIB=/usr/local/lib/libzbcore.so \
+    ZB_DB_DIR=/var/lib/airports \
     PYTHONPATH=/opt/airports \
     PYTHONUNBUFFERED=1
-# The replica lives in /var/lib/airports: a volume there keeps it across restarts, so a
-# restart resumes from its position instead of seeding again.
+# The replica lives in /var/lib/airports, named after the engine (airports.duckdb by default,
+# airports.sqlite3 with --engine sqlite, which needs libzb 0.1.7 or later): a volume there
+# keeps it across restarts, so a restart resumes from its position instead of seeding again.
 VOLUME /var/lib/airports
-ENTRYPOINT ["python3", "/opt/airports/airport_service.py", "--creds", "/creds", "--db", "/var/lib/airports/airports.duckdb"]
+ENTRYPOINT ["python3", "/opt/airports/airport_service.py", "--creds", "/creds"]

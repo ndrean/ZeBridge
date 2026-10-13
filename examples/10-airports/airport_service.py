@@ -23,7 +23,7 @@ import math
 import os
 import time
 
-from zebridge import ZeBridge
+from zebridge import ZeBridge, ZeBridgeError
 
 TABLE = "airports"
 COLUMNS = ["code", "icao", "name", "city", "country", "latitude", "longitude", "elevation", "time_zone"]
@@ -101,14 +101,16 @@ def main():
     ap.add_argument("--creds", required=True, help="a responder's creds (bridge --mint-responder)")
     ap.add_argument("--engine", choices=["duckdb", "sqlite"], default="duckdb",
                     help="the replica: DuckDB (libduckdb at run time) or SQLite (built into libzb)")
-    ap.add_argument("--db", help="the replica's file (default /tmp/airports-service.<engine>)")
+    ap.add_argument("--db", help="the replica's file (default <ZB_DB_DIR>/airports.<engine>, else /tmp/airports-service.<engine>)")
     ap.add_argument("--queue", default="airports", help="instances in one queue group share the questions")
     ap.add_argument("--js-domain", default=os.environ.get("NATS_JS_DOMAIN") or None,
                     help="the hub's JetStream domain, when this service runs behind a leaf node")
     ap.add_argument("--name", default=os.environ.get("ZB_SERVICE_NAME") or socket.gethostname(),
                     help="said in every answer (`by`): which instance of the queue group answered")
     a = ap.parse_args()
-    db = a.db or f"/tmp/airports-service.{'duckdb' if a.engine == 'duckdb' else 'sqlite3'}"
+    ext = "duckdb" if a.engine == "duckdb" else "sqlite3"
+    db = a.db or (os.path.join(os.environ["ZB_DB_DIR"], f"airports.{ext}") if os.environ.get("ZB_DB_DIR")
+                  else f"/tmp/airports-service.{ext}")
 
     t0 = time.time()
     opts = {"js_domain": a.js_domain} if a.js_domain else {}
@@ -116,6 +118,14 @@ def main():
                   tables=[TABLE], client_id="airport-service", heartbeat_ms=0,
                   on_change=lambda r: print(f"cdc: {r['applied']} row(s) applied", flush=True) if r.get("applied") else None,
                   **opts) as zb:
+        if a.engine == "sqlite":
+            # Asked once, here: without SQLite's math functions the first `airports_near`
+            # would fail with "no such function", long after a deploy looked fine.
+            try:
+                zb.query("SELECT radians(1) AS r")
+            except ZeBridgeError:
+                raise SystemExit("🔴 --engine sqlite needs SQLite's math functions (radians, sin, asin…), which this "
+                                 "libzb lacks: use libzb 0.1.7 or later, or --engine duckdb")
         held = zb.query(f"SELECT count(*) AS n FROM {TABLE}")[0]["n"]
         print(f"replica: {held} airports in {db} ({a.engine}), {time.time() - t0:.1f} s", flush=True)
 
