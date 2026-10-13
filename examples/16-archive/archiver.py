@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The archiver: one tenant's readings, from the stream into Parquet files in S3.
 
-    stream READINGS (sensors.<tenant>.>)  →  batch  →  Parquet  →  S3  →  manifest (NATS KV)
+    stream READINGS_<tenant>  →  batch  →  Parquet  →  S3  →  manifest (NATS KV)
 
 Its position is the manifest's `covers_up_to`: it keeps no consumer of its own. At start it
 reads the manifest and follows the stream from the next sequence. Each flush:
@@ -16,7 +16,10 @@ same readings again. It refuses to start when the stream no longer holds `covers
 (readings lost before any file held them), or when the stream keeps readings for less time
 than two flushes plus the S3 outage it should survive.
 
-    NATS_URL=… NATS_CREDS=… python3 examples/16-archive/archiver.py --tenant acme
+    NATS_URL=… NATS_CREDS=archiver-acme.creds python3 examples/16-archive/archiver.py --tenant acme
+
+Its credential: `bridge --mint-archiver --name archiver-acme --tenant acme` — it may read
+READINGS_acme and write acme's manifests, nothing else.
 
 Exit codes: 0 stopped, 2 retention too short, 3 another archiver moved the manifest,
 4 readings lost from the stream, 9 killed on purpose (--crash-after-upload, tests).
@@ -40,25 +43,26 @@ async def main() -> int:
     ap.add_argument("--crash-after-upload", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
 
-    nc = await nats.connect(os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), user_credentials=os.environ.get("NATS_CREDS"))
+    nc = await common.connect()
     js = nc.jetstream()
-    kv = await js.key_value(common.KV)
-    manifest, rev = await common.read_manifest(kv, a.tenant)
+    stream = common.stream_for(a.tenant)
+    manifest, rev = await common.read_manifest(nc, a.tenant)
+    archived = manifest is not None   # a tenant with no archive yet has nothing to lose
     manifest = manifest or {"covers_up_to": 0, "files": [], "schema": common.SCHEMA}
     covers = manifest["covers_up_to"]
 
     # The retention inequality: a reading must outlive two flushes and an S3 outage.
-    info = await js.stream_info(common.STREAM)
+    info = await js.stream_info(stream)
     max_age = info.config.max_age or 0
     need = 2 * a.flush_s + a.outage_s
     if max_age and max_age < need:
-        print(f"🔴 {common.STREAM} keeps readings {max_age:.0f} s; this archiver needs {need:.0f} s "
+        print(f"🔴 {stream} keeps readings {max_age:.0f} s; this archiver needs {need:.0f} s "
               f"(2 × flush {a.flush_s:.0f} s + outage {a.outage_s:.0f} s): raise the stream's max_age", flush=True)
         return 2
 
     # Nothing may be missing between the archive and the stream.
     first = info.state.first_seq
-    if rev is not None and info.state.messages > 0 and first > covers + 1 and not a.accept_loss:
+    if archived and info.state.messages > 0 and first > covers + 1 and not a.accept_loss:
         print(f"🔴 the stream starts at {first}, the archive covers up to {covers}: readings "
               f"{covers + 1}..{first - 1} are gone and no file holds them (--accept-loss to go on)", flush=True)
         return 4
@@ -66,7 +70,7 @@ async def main() -> int:
     print(f"archiver {a.tenant}: archive covers up to {covers} ({len(manifest['files'])} file(s)), "
           f"following {common.subject_filter(a.tenant)} from {start}", flush=True)
 
-    sub = await js.subscribe(common.subject_filter(a.tenant), stream=common.STREAM, ordered_consumer=True,
+    sub = await js.subscribe(common.subject_filter(a.tenant), stream=stream, ordered_consumer=True,
                              config=ConsumerConfig(deliver_policy=DeliverPolicy.BY_START_SEQUENCE, opt_start_seq=start))
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -91,11 +95,11 @@ async def main() -> int:
             pass
         now = time.monotonic()
         if rows and (len(rows) >= a.batch or now - first_at >= a.flush_s):
-            code, rev = flush(a, s3, kv, manifest, rev, list(rows.values()), last_seq)
+            code = flush(a, s3, manifest, list(rows.values()), last_seq)
             if code:
                 break
             # Awaited outside flush(): the manifest write is the one async step.
-            code, rev = await commit(kv, a.tenant, manifest, rev)
+            code, rev = await commit(js, a.tenant, manifest, rev)
             if code:
                 break
             rows.clear()
@@ -105,7 +109,7 @@ async def main() -> int:
     return code
 
 
-def flush(a, s3, kv, manifest, rev, rows, last_seq):
+def flush(a, s3, manifest, rows, last_seq):
     """Write and upload one file, and add it to `manifest` (not yet written)."""
     import duckdb
     first_seq = min(r["stream_seq"] for r in rows)
@@ -124,25 +128,20 @@ def flush(a, s3, kv, manifest, rev, rows, last_seq):
     head = s3.head_object(Bucket=common.BUCKET, Key=key)
     if head["ContentLength"] != size:
         print(f"🔴 {key}: {head['ContentLength']} bytes in S3, {size} written; the manifest stays", flush=True)
-        return 5, rev
+        return 5
     print(f"flushed {len(rows)} reading(s) to {key} ({size} bytes)", flush=True)
     if a.crash_after_upload:
         os._exit(9)
     manifest["files"].append({"key": key, "rows": len(rows), "bytes": size, "first_seq": first_seq, "last_seq": last_seq})
     manifest["covers_up_to"] = last_seq
-    return 0, rev
+    return 0
 
 
-async def commit(kv, tenant, manifest, rev):
+async def commit(js, tenant, manifest, rev):
     """Files first, manifest second, on the revision read: one writer per tenant."""
-    from nats.js.errors import KeyWrongLastSequenceError
-    value = json.dumps(manifest).encode()
     try:
-        if rev is None:
-            rev = await kv.create(common.manifest_key(tenant), value)
-        else:
-            rev = await kv.update(common.manifest_key(tenant), value, last=rev)
-    except (KeyWrongLastSequenceError, nats.js.errors.BadRequestError) as e:
+        rev = await common.write_manifest(js, tenant, manifest, rev)
+    except nats.js.errors.APIError as e:
         print(f"🔴 the manifest moved under this archiver (another one runs?): {e}", flush=True)
         return 3, rev
     print(f"manifest: covers up to {manifest['covers_up_to']}, {len(manifest['files'])} file(s)", flush=True)

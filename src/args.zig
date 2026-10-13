@@ -692,6 +692,8 @@ pub const Args = struct {
             config.Nats.max_cdc_max_age_seconds,
         );
         runtime_config.cdc_max_bytes = @intCast(envUint(u64, init, "CDC_MAX_BYTES", config.Nats.default_cdc_max_bytes, config.Nats.min_cdc_max_bytes, config.Nats.max_cdc_max_bytes));
+        runtime_config.readings_max_age_seconds = envUint(u64, init, "READINGS_MAX_AGE_SECONDS", config.Nats.default_readings_max_age_seconds, config.Nats.min_readings_max_age_seconds, config.Nats.max_cdc_max_age_seconds);
+        runtime_config.readings_max_bytes = @intCast(envUint(u64, init, "READINGS_MAX_BYTES", config.Nats.default_readings_max_bytes, config.Nats.min_readings_max_bytes, config.Nats.max_cdc_max_bytes));
         runtime_config.cdc_max_msgs = @intCast(envUint(u64, init, "CDC_MAX_MSGS", config.Nats.default_cdc_max_msgs, config.Nats.min_cdc_max_msgs, config.Nats.max_cdc_max_msgs));
 
         return .{

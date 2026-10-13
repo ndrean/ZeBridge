@@ -1,9 +1,15 @@
 """What the archiver and the responder share: the stream, the manifest, the files.
 
-    stream   READINGS on sensors.<tenant>.<sensor>.<kind>, payload {"value", "ts_ms"} or a bare number
+    stream   READINGS_<tenant> on sensors.<tenant>.<sensor>.<kind>, payload {"value", "ts_ms"}
+             or a bare number. The bridge makes one per tenant at boot.
     manifest NATS KV time_manifests, key <tenant>.readings:
              {"covers_up_to": <stream seq>, "files": [{"key", "rows", "bytes", "first_seq", "last_seq"}], "schema": 1}
     files    s3://<bucket>/<tenant>/readings/<yyyy-mm-dd>/<first_seq>-<last_seq>.parquet
+
+The manifest is read by DIRECT GET of its exact key and written as a publish on its KV
+subject, with the revision expected in a header. Nothing binds the bucket: binding asks
+for the bucket's stream info, which the archiver and responder grants refuse (it could
+list every tenant's keys).
 
 S3 is any S3 API: SeaweedFS locally, Cloudflare R2 on a server. Settings from the environment:
 S3_ENDPOINT (http://127.0.0.1:8333), S3_BUCKET (zb-events), S3_REGION (auto), and the keys from
@@ -12,14 +18,18 @@ SeaweedFS's identity file, or {"access_key_id", "secret_access_key"}).
 """
 from __future__ import annotations
 
-import json, os, pathlib
+import base64, json, os, pathlib
 
-STREAM = "READINGS"
+STREAM_PREFIX = "READINGS_"
 KV = "time_manifests"
 TABLE = "readings"
 SCHEMA = 1
 COLUMNS = "tenant VARCHAR, sensor_id VARCHAR, kind VARCHAR, value DOUBLE, sensor_ts TIMESTAMPTZ, received_at TIMESTAMPTZ, stream_seq BIGINT"
 BUCKET = os.environ.get("S3_BUCKET", "zb-events")
+
+
+def stream_for(tenant: str) -> str:
+    return f"{STREAM_PREFIX}{tenant}"
 
 
 def subject_filter(tenant: str) -> str:
@@ -28,6 +38,27 @@ def subject_filter(tenant: str) -> str:
 
 def manifest_key(tenant: str) -> str:
     return f"{tenant}.{TABLE}"
+
+
+def principal_of(creds_path: str | None) -> str | None:
+    """The user name in a creds file's JWT: its own inbox is `_INBOX.<name>.>`."""
+    if not creds_path:
+        return None
+    text = pathlib.Path(creds_path).read_text()
+    jwt = text.split("-----BEGIN NATS USER JWT-----", 1)[1].split("------END", 1)[0].strip()
+    body = jwt.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))).get("name")
+
+
+async def connect(creds: str | None = None):
+    """NATS with the given creds (or NATS_CREDS), and the principal's own inbox prefix."""
+    import nats
+    creds = creds or os.environ.get("NATS_CREDS")
+    name = principal_of(creds)
+    kw = {"user_credentials": creds} if creds else {}
+    if name:
+        kw["inbox_prefix"] = f"_INBOX.{name}".encode()
+    return await nats.connect(os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), **kw)
 
 
 def s3():
@@ -68,44 +99,25 @@ SELECT_ROWS = ("SELECT tenant, sensor_id, kind, value, make_timestamp(sensor_ms 
                "make_timestamp(received_ms * 1000)::TIMESTAMPTZ AS received_at, stream_seq")
 
 
-async def provision(js, max_age_s: int = 24 * 3600):
-    """The stream and the manifest bucket, created when missing (idempotent)."""
-    from nats.js.api import StreamConfig, KeyValueConfig
-    from nats.js.errors import NotFoundError
-    try:
-        await js.stream_info(STREAM)
-    except NotFoundError:
-        await js.add_stream(StreamConfig(name=STREAM, subjects=["sensors.>"], max_age=max_age_s))
-    try:
-        await js.key_value(KV)
-    except Exception:
-        await js.create_key_value(KeyValueConfig(bucket=KV, history=10))
-
-
-async def read_manifest(kv, tenant: str):
-    """(manifest, revision), or (None, None) when the tenant has none yet."""
-    from nats.js.errors import KeyNotFoundError
-    try:
-        e = await kv.get(manifest_key(tenant))
-    except KeyNotFoundError:
+async def read_manifest(nc, tenant: str):
+    """(manifest, revision): (None, None) when the key never existed, (None, rev) when it
+    was deleted or purged — the next write must name that revision."""
+    m = await nc.request(f"$JS.API.DIRECT.GET.KV_{KV}.$KV.{KV}.{manifest_key(tenant)}", b"", timeout=5)
+    h = m.headers or {}
+    if h.get("Status") == "404" or not h.get("Nats-Sequence"):
         return None, None
-    if e.value is None:   # deleted
-        return None, e.revision
-    return json.loads(e.value), e.revision
+    rev = int(h["Nats-Sequence"])
+    if h.get("KV-Operation") in ("DEL", "PURGE") or not m.data:
+        return None, rev
+    return json.loads(m.data), rev
 
 
-def manifest_sync(tenant: str) -> dict | None:
-    """The current manifest, from a script that is not async."""
-    import asyncio, nats
-
-    async def go():
-        nc = await nats.connect(os.environ.get("NATS_URL", "nats://127.0.0.1:4222"),
-                                user_credentials=os.environ.get("NATS_CREDS"))
-        try:
-            return (await read_manifest(await nc.jetstream().key_value(KV), tenant))[0]
-        finally:
-            await nc.close()
-    return asyncio.run(go())
+async def write_manifest(js, tenant: str, manifest: dict, rev: int | None) -> int:
+    """The manifest's next revision, written only if `rev` is still the latest: a second
+    writer's publish is refused (wrong last sequence) and raises."""
+    ack = await js.publish(f"$KV.{KV}.{manifest_key(tenant)}", json.dumps(manifest).encode(),
+                           headers={"Nats-Expected-Last-Subject-Sequence": str(rev or 0)})
+    return ack.seq
 
 
 def fetch_files(files: list[dict], cache: pathlib.Path) -> list[pathlib.Path]:
@@ -130,11 +142,29 @@ def decode_answer(data: bytes):
     return json.loads(data)
 
 
-async def reset_tenant(js, tenant: str):
-    """Tests only: forget a tenant's archive — manifest, files, and its readings in the stream."""
-    kv = await js.key_value(KV)
+async def ensure_for_tests(js, tenant: str):
+    """Tests only, with the bridge's creds: the stream and bucket the bridge makes at boot,
+    for a stack whose bridge predates them."""
+    from nats.js.api import StreamConfig, KeyValueConfig
+    from nats.js.errors import NotFoundError
     try:
-        await kv.purge(manifest_key(tenant))
+        await js.stream_info(stream_for(tenant))
+    except NotFoundError:
+        await js.add_stream(StreamConfig(name=stream_for(tenant), subjects=[subject_filter(tenant)],
+                                         max_age=24 * 3600, max_bytes=256 << 20, discard="old"))
+    try:
+        info = await js.stream_info(f"KV_{KV}")
+        if not info.config.allow_direct:   # a bucket made before the bridge made it: reads by direct get
+            info.config.allow_direct = True
+            await js.update_stream(info.config)
+    except NotFoundError:
+        await js.create_key_value(KeyValueConfig(bucket=KV, history=10, direct=True))
+
+
+async def reset_tenant(js, tenant: str):
+    """Tests only: forget a tenant's archive — manifest, files, and its readings."""
+    try:
+        await js.publish(f"$KV.{KV}.{manifest_key(tenant)}", b"", headers={"KV-Operation": "PURGE", "Nats-Rollup": "sub"})
     except Exception:
         pass
     client = s3()
@@ -145,4 +175,4 @@ async def reset_tenant(js, tenant: str):
     for page in client.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=f"{tenant}/{TABLE}/"):
         for o in page.get("Contents", []):
             client.delete_object(Bucket=BUCKET, Key=o["Key"])
-    await js.purge_stream(STREAM, subject=subject_filter(tenant))
+    await js.purge_stream(stream_for(tenant))

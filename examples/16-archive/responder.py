@@ -3,12 +3,13 @@
 
     manifest (NATS KV) ── files ──▶ local cache ──┐
                                                    ├─▶ DuckDB view `readings` ─▶ zb.serve handlers
-    stream READINGS after covers_up_to ─▶ hot tail ┘
+    stream READINGS_<tenant> after covers_up_to ─▶ hot tail ┘
 
 It holds nothing durable. At start it reads the manifest, fetches the Parquet files it names
 (once: they never change) and follows the stream from `covers_up_to + 1` into the hot tail.
-When the archiver moves the manifest, the new files join the view and the hot rows they
-cover leave it: a reading is counted once, from Parquet or from the tail, never both.
+When the archiver moves the manifest (read by exact key each second), the new files join
+the view and the hot rows they cover leave it: a reading is counted once, from Parquet or
+from the tail, never both.
 
 Questions, on query.<tenant>.<name>:
 
@@ -16,8 +17,11 @@ Questions, on query.<tenant>.<name>:
     per_minute {"kind", "minutes": 10}   {"columns", "rows"}: count and average per minute
     latest     {"kind"}           {"columns", "rows"}: each sensor's last reading
 
-    NATS_URL=… NATS_CREDS=<stream reader> python3 examples/16-archive/responder.py \
-        --tenant acme --creds acme-responder.creds
+    NATS_URL=… python3 examples/16-archive/responder.py --tenant acme --creds readings-acme.creds
+
+One credential, `bridge --mint-responder --name readings-acme --tenant acme`: it answers
+the questions and reads acme's readings and manifests. NATS_CREDS, when set, is used for
+the stream and the manifest instead (a stack whose responder grants predate readings).
 """
 import argparse, asyncio, os, pathlib, sys, threading
 
@@ -73,29 +77,37 @@ class Readings:
         return {"columns": cols, "rows": rows}
 
 
-async def follow(r: Readings, tenant: str, ready: threading.Event):
-    """Manifest first, then the stream after it; the manifest's watch moves the boundary."""
-    nc = await nats.connect(os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), user_credentials=os.environ.get("NATS_CREDS"))
+async def follow(r: Readings, tenant: str, creds: str, ready: threading.Event):
+    """Manifest first, then the stream after it; a new manifest revision moves the boundary."""
+    nc = await common.connect(os.environ.get("NATS_CREDS") or creds)
     js = nc.jetstream()
-    kv = await js.key_value(common.KV)
-    m, _ = await common.read_manifest(kv, tenant)
+    stream = common.stream_for(tenant)
+    m, rev = await common.read_manifest(nc, tenant)
     if m:
         await asyncio.to_thread(r.manifest, m)
-    info = await js.stream_info(common.STREAM)
+    info = await js.stream_info(stream)
     start = max(r.covers + 1, info.state.first_seq)
     if info.state.messages and info.state.first_seq > r.covers + 1 and m:
         print(f"⚠️ the stream starts at {info.state.first_seq}, the archive covers up to {r.covers}: a hole", flush=True)
-    sub = await js.subscribe(common.subject_filter(tenant), stream=common.STREAM, ordered_consumer=True,
+    sub = await js.subscribe(common.subject_filter(tenant), stream=stream, ordered_consumer=True,
                              config=ConsumerConfig(deliver_policy=DeliverPolicy.BY_START_SEQUENCE, opt_start_seq=start))
-    watch = await kv.watch(common.manifest_key(tenant), include_history=False)
     print(f"responder {tenant}: {len(r.files)} file(s) up to {r.covers}, the stream from {start}", flush=True)
     ready.set()
 
     async def manifests():
-        async for e in watch:
-            if e is not None and e.value:
-                import json
-                await asyncio.to_thread(r.manifest, json.loads(e.value))
+        # Polled, not watched: a watch is a consumer on the bucket, which could follow
+        # every tenant's keys; a direct get of one exact key is all the grant allows.
+        seen = rev
+        while True:
+            await asyncio.sleep(1)
+            try:
+                m, now = await common.read_manifest(nc, tenant)
+            except Exception as e:
+                print(f"manifest: {e}", flush=True)
+                continue
+            if m and now != seen:
+                seen = now
+                await asyncio.to_thread(r.manifest, m)
                 print(f"manifest: {len(r.files)} file(s), covers up to {r.covers}", flush=True)
 
     asyncio.create_task(manifests())
@@ -125,7 +137,7 @@ def main():
 
     r = Readings(pathlib.Path(a.cache))
     ready = threading.Event()
-    threading.Thread(target=lambda: asyncio.run(follow(r, a.tenant, ready)), daemon=True, name="follow").start()
+    threading.Thread(target=lambda: asyncio.run(follow(r, a.tenant, a.creds, ready)), daemon=True, name="follow").start()
     if not ready.wait(60):
         sys.exit("the manifest or the stream did not answer in 60 s")
 

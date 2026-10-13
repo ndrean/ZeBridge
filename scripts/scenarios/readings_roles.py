@@ -11,6 +11,9 @@ and a responder, and tries what each may and may not do:
   A  an ARCHIVER reads its tenant's stream and writes its tenant's manifest; another
      tenant's stream and manifest, and any stream admin, are refused;
   R  a RESPONDER reads its tenant's stream and manifest, and cannot write the manifest;
+  P  the real examples/16-archive programs inside those grants: archiver.py with an
+     archiver credential archives every reading to S3, and responder.py with a responder
+     credential answers the count from Parquet (needs local S3, boto3 and duckdb);
   U  an operator.store from before these roles: `--init-nats --update` adds the two keys,
      keeps every other line, and a sensor minted afterwards works.
 
@@ -202,7 +205,57 @@ async def main(tmp: pathlib.Path):
     check(await refused(rjs.publish("$KV.time_manifests.acme.readings", b'{"covers_up_to": 9}')),
           "R4 it cannot write the manifest")
     await nc.close()
+
+    # ── P: the programs themselves, each with its own credential ─────────────
+    await programs(tmp, js, arch, resp)
     await svc.close()
+
+
+async def programs(tmp, js, arch, resp):
+    import os
+    ex = zb.ROOT / "examples" / "16-archive"
+    sys.path.insert(0, str(ex))
+    import common
+    os.environ["NATS_URL"] = URL          # common.connect() reads it: the scratch server
+    os.environ.pop("NATS_CREDS", None)
+    # What the bridge makes at boot beside the streams: the buckets libzb reads at connect.
+    for b in ("schemas", "tenants", "generations"):
+        await js.create_key_value(KeyValueConfig(bucket=b, history=1, direct=True))
+    await js.add_stream(StreamConfig(name="VERDICTS", subjects=["mutation_ack.>"], allow_direct=True))
+    await common.reset_tenant(js, "acme")
+    for i in range(200):
+        await js.publish(f"sensors.acme.s{i % 4}.temperature", json.dumps({"value": i, "ts_ms": 1_700_000_000_000 + i}).encode())
+    env = dict(os.environ, NATS_URL=URL, PYTHONPATH=str(zb.ROOT / "zb-python" / "src"))
+    env.pop("NATS_CREDS", None)
+    r = subprocess.run([sys.executable, str(ex / "archiver.py"), "--tenant", "acme", "--flush-s", "1", "--exit-when-idle", "3",
+                        "--outage-s", "60"], env=dict(env, NATS_CREDS=str(arch)), capture_output=True, text=True, timeout=120)
+    m = (await common.read_manifest(await common.connect(str(arch)), "acme"))[0]
+    check(r.returncode == 0 and m and sum(f["rows"] for f in m["files"]) == 200,
+          f"P1 archiver.py with the archiver credential: exit {r.returncode}, {sum(f['rows'] for f in m['files']) if m else 0} rows archived for 200")
+    if r.returncode != 0:
+        print(r.stdout[-800:], r.stderr[-800:])
+    cache = tmp / "resp-cache"
+    p = subprocess.Popen([sys.executable, str(ex / "responder.py"), "--tenant", "acme", "--creds", str(resp), "--cache", str(cache),
+                          "--queue", "probe"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    answer = {}
+    try:
+        # The asker is not under test here (clients asking is the serve scenario's): the
+        # bridge's own credential asks, and the RESPONDER answers inside its grants.
+        cl = await common.connect(str(tmp / "zb-nats" / "creds" / "bridge.creds"))
+        for _ in range(40):
+            try:
+                answer = common.decode_answer((await cl.request("query.acme.count", b"{}", timeout=2)).data)
+                break
+            except Exception:
+                await asyncio.sleep(1)
+        await cl.close()
+    finally:
+        p.terminate()
+        out = p.communicate(timeout=10)[0]
+    check(answer.get("rows") == 200 and answer.get("hot") == 0,
+          f"P2 responder.py with the responder credential answers from Parquet: {answer}")
+    if answer.get("rows") != 200:
+        print(out[-1500:])
 
 
 def update_old_store(tmp: pathlib.Path):

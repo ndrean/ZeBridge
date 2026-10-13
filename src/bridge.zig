@@ -1099,6 +1099,7 @@ pub fn main(init: std.process.Init) !void {
         .refused = &refused,
         .publication_name = parsed_args.publication_name,
         .stream_limits = cdcLimits(&runtime_config),
+        .readings_limits = readingsLimits(&runtime_config),
     };
 
     // OID → typtype for types the CDC decoder's switch does not cover. Populated from
@@ -1277,6 +1278,11 @@ pub fn main(init: std.process.Init) !void {
         log.err("🔴 FATAL: stream reconciliation failed ({s}) — refusing to start rather than FATAL under load.", .{@errorName(err)});
         should_stop.store(true, .seq_cst);
         return err;
+    };
+    // Not fatal: readings are beside the bridge's job, and a deployment without sensors
+    // must not stop over them.
+    reconcileReadingsStreams(allocator, &publisher, &runtime_config.topology, readingsLimits(&runtime_config)) catch |err| {
+        log.err("📟 the readings streams could not be reconciled ({s}) — sensors' readings are not stored until the next boot", .{@errorName(err)});
     };
 
     // Make publisher available to HTTP server for stream management
@@ -2522,6 +2528,7 @@ const LiveCatalogue = struct {
     refused: *refused_tables.Registry,
     publication_name: []const u8,
     stream_limits: Config.StreamLimits,
+    readings_limits: Config.StreamLimits,
 
     fn reload(self: *LiveCatalogue, publisher: anytype, event_proc: anytype) void {
         var fresh = catalogue.loadRules(self.allocator, self.pg_config, self.tenant_rules, self.sync_rules);
@@ -2558,6 +2565,9 @@ const LiveCatalogue = struct {
 
         reconcileCdcStreams(self.allocator, publisher, self.topo, self.stream_limits) catch |err| {
             log.err("🗂️ catalogue reloaded but the streams could not be reconciled ({s}) — a new public table stays unrouted until the next row", .{@errorName(err)});
+        };
+        reconcileReadingsStreams(self.allocator, publisher, self.topo, self.readings_limits) catch |err| {
+            log.err("📟 a new tenant's readings stream could not be made ({s}) — its sensors' readings are not stored until the next reload", .{@errorName(err)});
         };
 
         // Symmetric, per table the read changed: routable now → lift a standing
@@ -2714,6 +2724,76 @@ fn restartFeed(
     });
 }
 
+fn readingsLimits(rc: anytype) Config.StreamLimits {
+    return .{ .max_age_seconds = rc.readings_max_age_seconds, .max_bytes = rc.readings_max_bytes, .max_msgs = -1 };
+}
+
+/// The tenants that get a readings stream: every tenant, and the open one exactly once
+/// (sensors minted without a tenant publish there). Unlike CDC there is no PUBLIC
+/// stream to fold it into: `READINGS_<open>` is a stream like the others.
+fn readingsTenants(a: std.mem.Allocator, topo: *const topology_mod.Topology) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    try list.append(a, topo.open_tenant);
+    for (topo.tenants) |t| {
+        if (std.mem.eql(u8, t, topo.open_tenant)) continue;
+        try list.append(a, t);
+    }
+    return list.toOwnedSlice(a);
+}
+
+test "readings: one stream per tenant, the open tenant once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var topo = topology_mod.Topology.for_tests;
+    topo.tenants = &.{ "acme", "_default", "beta" };
+    const got = try readingsTenants(arena.allocator(), &topo);
+    try std.testing.expectEqual(@as(usize, 3), got.len);
+    try std.testing.expectEqualStrings("_default", got[0]);
+    try std.testing.expectEqualStrings("acme", got[1]);
+    try std.testing.expectEqualStrings("beta", got[2]);
+    topo.tenants = &.{};
+    try std.testing.expectEqual(@as(usize, 1), (try readingsTenants(arena.allocator(), &topo)).len);
+}
+
+/// Readings (examples/16-archive): `READINGS_<tenant>` on `sensors.<tenant>.>`, made
+/// for every tenant whether or not it has sensors — like `query.>`, a deployment uses
+/// it or not, and an empty stream costs a few KB. Bounded by age and bytes, discard old.
+/// One stream per tenant, never a shared one: the stream name is what a grant can see.
+fn reconcileReadingsStreams(
+    allocator: std.mem.Allocator,
+    publisher: anytype,
+    topo: *const topology_mod.Topology,
+    limits: Config.StreamLimits,
+) !void {
+    const js = if (publisher.js) |*j| j else return error.NotConnected;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var made: usize = 0;
+    for (try readingsTenants(a, topo)) |tenant| {
+        const name = try std.fmt.allocPrint(a, "{s}{s}", .{ topo.readings_stream_prefix, tenant });
+        if (js.getStreamInfo(name)) |info_const| {
+            var info = info_const;
+            defer info.deinit();
+            _ = try reconcileLimits(js, &info.value, limits, null);
+        } else |_| {
+            const subj = try std.fmt.allocPrint(a, "{s}.{s}.>", .{ topo.subject_readings_prefix, tenant });
+            var res = try js.addStream(.{
+                .name = name,
+                .subjects = &.{subj},
+                .max_age = limits.max_age_seconds * std.time.ns_per_s,
+                .max_bytes = limits.max_bytes,
+                .discard = .old,
+                .duplicate_window = dupWindowFor(limits.max_age_seconds * std.time.ns_per_s, 0),
+                .compression = .s2,
+            });
+            res.deinit();
+            made += 1;
+        }
+    }
+    if (made > 0) log.info("📟 created {d} readings stream(s) ({s}<tenant> on {s}.<tenant>.>, {d}s, {d} bytes each)", .{ made, topo.readings_stream_prefix, topo.subject_readings_prefix, limits.max_age_seconds, limits.max_bytes });
+}
+
 fn cdcLimits(rc: anytype) Config.StreamLimits {
     return .{ .max_age_seconds = rc.cdc_max_age_seconds, .max_bytes = rc.cdc_max_bytes, .max_msgs = rc.cdc_max_msgs };
 }
@@ -2822,6 +2902,8 @@ fn ensureBaseTopology(
         .{ .name = topo.kv_schemas, .history = 10 },
         .{ .name = topo.kv_tenants, .history = 1 },
         .{ .name = topo.kv_generations, .history = 1 },
+        // Readings: each tenant's archive manifest, written by its archiver (§16-archive).
+        .{ .name = topo.kv_manifests, .history = 10 },
     };
     for (buckets) |b| {
         // Open first: creating over an existing bucket is refused (10058) and logged at

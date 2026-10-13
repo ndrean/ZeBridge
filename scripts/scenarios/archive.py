@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Readings to Parquet, and a responder over Parquet + the live stream (examples/16-archive).
 
-Sensors publish on `sensors.<tenant>.<sensor>.<kind>`; the stream READINGS keeps them. The
+Sensors publish on `sensors.<tenant>.<sensor>.<kind>`; the stream READINGS_<tenant> keeps them. The
 archiver writes them to Parquet in S3, then moves the manifest (NATS KV) forward. The
 responder answers from the Parquet files the manifest names plus the stream after it.
 
@@ -31,7 +31,7 @@ sys.path.insert(0, str(EX))
 import common  # noqa: E402
 
 TENANT = "_default"
-KV: list = []
+NC: list = []
 PY = sys.executable
 ENV = dict(os.environ, NATS_URL=zb.nats_server(), NATS_CREDS=zb.creds_for("bridge"),
            PYTHONPATH=str(REPO / "zb-python" / "src"))
@@ -57,7 +57,7 @@ async def publish(js, n: int, start_ts: int, resend: int = 0) -> int:
 
 
 async def manifest() -> dict | None:
-    return (await common.read_manifest(KV[0], TENANT))[0]
+    return (await common.read_manifest(NC[0], TENANT))[0]
 
 
 async def parquet_rows() -> int:
@@ -79,8 +79,8 @@ async def main() -> int:
 
     nc = await nats.connect(zb.nats_server(), user_credentials=zb.creds_for("bridge"))
     js = nc.jetstream()
-    await common.provision(js)
-    KV.append(await js.key_value(common.KV))
+    await common.ensure_for_tests(js, TENANT)   # what the bridge makes at boot
+    NC.append(nc)
     await common.reset_tenant(js, TENANT)   # a clean slate: manifest, files, stream subjects
     t0 = int(time.time() * 1000)
     sent = 0
@@ -151,8 +151,9 @@ async def main() -> int:
 
     # D
     await publish(js, 20, t0 + 6000)
-    info = await js.stream_info(common.STREAM)
-    await js.purge_stream(common.STREAM, subject=f"sensors.{TENANT}.>", seq=info.state.last_seq)
+    stream = common.stream_for(TENANT)
+    info = await js.stream_info(stream)
+    await js.purge_stream(stream, seq=info.state.last_seq)
     code, out = archiver()
     check(code == 4, f"D the stream pruned past the archive: archiver exit {code} — {out.strip().splitlines()[-1] if out.strip() else ''}")
 

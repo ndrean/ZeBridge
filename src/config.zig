@@ -194,6 +194,14 @@ pub const Nats = struct {
     pub const min_cdc_max_bytes: u64 = 1 << 20;
     pub const max_cdc_max_bytes: u64 = 1 << 40;
     pub const default_cdc_max_msgs: u64 = 10_000_000;
+    /// Readings (READINGS_<tenant>, examples/16-archive): per tenant, discard old. The
+    /// age must outlast the archiver's two flushes plus the S3 outage it should survive
+    /// (it checks at start); the bytes are a disk valve, so one flooding sensor drops
+    /// its own tenant's oldest readings and nothing else.
+    pub const default_readings_max_age_seconds: u64 = 24 * 60 * 60;
+    pub const min_readings_max_age_seconds: u64 = 60;
+    pub const default_readings_max_bytes: u64 = 256 << 20;
+    pub const min_readings_max_bytes: u64 = 1 << 20;
     pub const min_cdc_max_msgs: u64 = 1_000;
     pub const max_cdc_max_msgs: u64 = 1_000_000_000;
 
@@ -781,6 +789,9 @@ pub const RuntimeConfig = struct {
     /// CDC stream retention (StreamLimits, §10eg); the age defaults to three cadences.
     cdc_max_age_seconds: u64 = Nats.default_cdc_max_age_cadences * Generations.default_cadence_seconds,
     cdc_max_bytes: i64 = @intCast(Nats.default_cdc_max_bytes),
+    /// READINGS_MAX_AGE_SECONDS / READINGS_MAX_BYTES: each tenant's readings stream.
+    readings_max_age_seconds: u64 = Nats.default_readings_max_age_seconds,
+    readings_max_bytes: i64 = @intCast(Nats.default_readings_max_bytes),
     cdc_max_msgs: i64 = @intCast(Nats.default_cdc_max_msgs),
     fleet_poll_seconds: u64 = Fleet.default_poll_seconds,
     fleet_ttl_seconds: u64 = Fleet.default_ttl_seconds,
