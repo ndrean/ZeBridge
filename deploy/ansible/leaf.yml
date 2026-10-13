@@ -22,6 +22,12 @@
   become: true
   gather_facts: false
   tasks:
+    # zb_bin (group_vars) reads them: our bridge is /usr/bin/bridge from the package, or
+    # /usr/local/bin/bridge from a raw build. A bare `bridge` run as root finds iproute2's
+    # /usr/sbin/bridge first on Debian.
+    - name: The packages installed
+      ansible.builtin.package_facts:
+
     - name: The hub's NATS configuration
       ansible.builtin.slurp:
         src: /etc/zebridge/nats-server.conf
@@ -45,7 +51,7 @@
     # the leaf would restart for nothing.
     - name: A credential for each leaf that has none (bridge --mint-leaf)
       ansible.builtin.command: >-
-        bridge --mint-leaf --name {{ hostvars[item].leaf_name }} --store /etc/zebridge/operator.store
+        {{ zb_bin }}/bridge --mint-leaf --name {{ hostvars[item].leaf_name }} --store /etc/zebridge/operator.store
       loop: "{{ groups['leaves'] }}"
       when: zb_rewrite_secrets | bool or not hostvars[item].leaf_creds_file.stat.exists
       register: hub_leaf_mints

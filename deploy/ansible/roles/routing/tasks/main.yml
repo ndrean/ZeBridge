@@ -108,7 +108,7 @@
     - name: The responder's creds, minted once (needs operator.store on the server)
       ansible.builtin.shell: >-
         umask 077 &&
-        bridge --mint-responder --store /etc/zebridge/operator.store --name routing --tenant _default
+        {{ zb_bin }}/bridge --mint-responder --store /etc/zebridge/operator.store --name routing --tenant _default
         > /etc/zebridge/creds/routing.creds
       args:
         creates: /etc/zebridge/creds/routing.creds

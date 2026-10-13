@@ -657,6 +657,8 @@ bridge --init-nats --update --dir /etc/zebridge --store /path/to/operator.store
 nats-server --signal reload
 ```
 
+🔔 On a Debian server, run the bridge as root by its full path, `sudo /usr/bin/bridge …`: root's `PATH` finds iproute2's network tool `/usr/sbin/bridge` first, which answers `Option "-init-nats" is unknown`.
+
 It re-signs the account with the same keys, with the templates re-derived and the revocations kept, and rewrites only the account's line in `nats-server.conf`. Every issued JWT stays valid, so no device needs a new invite. The grants live in the account, not in the clients' JWTs, so a client gets a new subject at its next connection, without renewing. Use a reload, not a restart: a reload keeps every connection open, while a restart also applies the change but drops every client, and they all reconnect at once.
 
 [⬆️](#table-of-contents)
