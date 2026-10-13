@@ -51,12 +51,15 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - uses: dart-lang/setup-dart@v1
       - name: libzb for the ten targets
         run: |
           export ANDROID_NDK="$ANDROID_NDK_LATEST_HOME"
           mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
           zb-dart/scripts/build-prebuilt.sh
+      # AFTER the build: setup-dart fetches the OIDC token pub.dev accepts, and that token
+      # is short-lived. Fetched before the 25-minute build, it had expired at the upload
+      # ("Invalid JWT token: invalid timestamps", v0.2.0).
+      - uses: dart-lang/setup-dart@v1
       - working-directory: zb-dart
         run: dart pub get
       - name: Publish
