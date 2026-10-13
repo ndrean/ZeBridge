@@ -48,6 +48,18 @@ pub const StreamWindow = struct {
     short: bool,
 };
 
+/// One tenant's readings archive (examples/16-archive): what `READINGS_<tenant>` holds that
+/// no archive file does yet. `present` is whether an archiver ever wrote a manifest, so an
+/// alert can ask "behind AND archived", and a tenant without sensors or archiver is quiet.
+pub const ArchiveLag = struct { tenant: []const u8, messages: u64, lag: u64, present: bool };
+
+/// Readings in the stream after the archive: the stream's last sequence past the
+/// manifest's `covers_up_to`. With no manifest yet, every reading the stream holds.
+pub fn archiveLag(last_seq: u64, messages: u64, covers_up_to: ?u64) u64 {
+    const covers = covers_up_to orelse return messages;
+    return if (last_seq > covers) @min(last_seq - covers, messages) else 0;
+}
+
 pub const Client = struct {
     tenant: []const u8,
     principal: []const u8,
@@ -64,6 +76,7 @@ pub const Registry = struct {
     arena: ?*std.heap.ArenaAllocator = null,
     clients: []const Client = &.{},
     streams: []const StreamWindow = &.{},
+    archives: []const ArchiveLag = &.{},
     polled_at_unix: i64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Registry {
@@ -79,15 +92,17 @@ pub const Registry = struct {
             self.arena = null;
             self.clients = &.{};
             self.streams = &.{};
+            self.archives = &.{};
         }
     }
 
-    fn swap(self: *Registry, arena: *std.heap.ArenaAllocator, clients: []const Client, streams: []const StreamWindow, now_unix: i64) void {
+    fn swap(self: *Registry, arena: *std.heap.ArenaAllocator, clients: []const Client, streams: []const StreamWindow, archives: []const ArchiveLag, now_unix: i64) void {
         self.mutex.lock();
         const old = self.arena;
         self.arena = arena;
         self.clients = clients;
         self.streams = streams;
+        self.archives = archives;
         self.polled_at_unix = now_unix;
         self.mutex.unlock();
         if (old) |o| {
@@ -134,6 +149,17 @@ pub const Registry = struct {
             try w.print("# HELP bridge_cdc_stream_messages Messages the CDC stream holds\n", .{});
             try w.print("# TYPE bridge_cdc_stream_messages gauge\n", .{});
             for (self.streams) |sw| try w.print("bridge_cdc_stream_messages{{stream=\"{s}\"}} {d}\n", .{ sw.stream, sw.messages });
+        }
+        if (self.archives.len > 0) {
+            try w.print("# HELP bridge_readings_messages Sensor readings the tenant's READINGS stream holds\n", .{});
+            try w.print("# TYPE bridge_readings_messages gauge\n", .{});
+            for (self.archives) |ar| try w.print("bridge_readings_messages{{tenant=\"{s}\"}} {d}\n", .{ ar.tenant, ar.messages });
+            try w.print("# HELP bridge_archive_lag_messages Readings in the stream that no archive file holds yet. Growing while bridge_archive_present is 1: the archiver is stuck (often the S3 store refusing writes)\n", .{});
+            try w.print("# TYPE bridge_archive_lag_messages gauge\n", .{});
+            for (self.archives) |ar| try w.print("bridge_archive_lag_messages{{tenant=\"{s}\"}} {d}\n", .{ ar.tenant, ar.lag });
+            try w.print("# HELP bridge_archive_present 1 once an archiver has written the tenant's manifest\n", .{});
+            try w.print("# TYPE bridge_archive_present gauge\n", .{});
+            for (self.archives) |ar| try w.print("bridge_archive_present{{tenant=\"{s}\"}} {d}\n", .{ ar.tenant, @as(u8, if (ar.present) 1 else 0) });
         }
         if (self.clients.len == 0) return;
 
@@ -275,6 +301,11 @@ pub const FleetMonitor = struct {
             try self.windowOf(js, &heads, &windows, a, name, now_ms);
         }
 
+        const archives = self.archivesOf(js, a) catch |err| blk: {
+            log.debug("readings archive poll: {s}", .{@errorName(err)});
+            break :blk &.{};
+        };
+
         var seen: std.StringHashMapUnmanaged(u64) = .empty;
         if (keys) |k| for (k.value) |key| {
             var entry = kv.get(key) catch continue;
@@ -308,8 +339,42 @@ pub const FleetMonitor = struct {
         };
 
         self.rememberApplied(&seen);
-        self.registry.swap(arena, clients.items, windows.items, @divFloor(now_ms, 1000));
+        self.registry.swap(arena, clients.items, windows.items, archives, @divFloor(now_ms, 1000));
         log.debug("fleet poll: {d} live client(s), {d} stream window(s)", .{ clients.items.len, windows.items.len });
+    }
+
+    /// Each tenant's readings stream against its archive manifest: one STREAM.INFO and one
+    /// get of the exact manifest key per tenant. A tenant whose stream does not exist yet
+    /// is skipped; the open tenant is always there.
+    fn archivesOf(self: *FleetMonitor, js: nats.JetStream, a: std.mem.Allocator) ![]const ArchiveLag {
+        var out: std.ArrayList(ArchiveLag) = .empty;
+        var kv: ?nats.KV = js.kvBucket(self.topo.kv_manifests) catch null;
+        defer if (kv) |*k| k.deinit();
+        var tenants: std.ArrayList([]const u8) = .empty;
+        try tenants.append(a, self.topo.open_tenant);
+        for (self.topo.tenants) |t| if (!std.mem.eql(u8, t, self.topo.open_tenant)) try tenants.append(a, t);
+        for (tenants.items) |tenant| {
+            const stream = try std.fmt.allocPrint(a, "{s}{s}", .{ self.topo.readings_stream_prefix, tenant });
+            var info = js.getStreamInfo(stream) catch continue;
+            defer info.deinit();
+            const st = info.value.state;
+            var covers: ?u64 = null;
+            if (kv) |*k| {
+                const key = try std.fmt.allocPrint(a, "{s}.readings", .{tenant});
+                if (k.get(key)) |entry_const| {
+                    var entry = entry_const;
+                    defer entry.deinit();
+                    if (!entry.isDeleted()) {
+                        const m = std.json.parseFromSliceLeaky(std.json.Value, a, entry.value, .{}) catch null;
+                        if (m) |v| if (v == .object) if (v.object.get("covers_up_to")) |c| if (c == .integer and c.integer >= 0) {
+                            covers = @intCast(c.integer);
+                        };
+                    }
+                } else |_| {}
+            }
+            try out.append(a, .{ .tenant = try a.dupe(u8, tenant), .messages = st.messages, .lag = archiveLag(st.last_seq, st.messages, covers), .present = covers != null });
+        }
+        return out.items;
     }
 
     /// One STREAM.INFO: the head for the lag rows and the window the stream holds.
@@ -456,6 +521,14 @@ fn lagOf(head: u64, applied: u64, pending: ?u64, prev: ?u64, reports: bool) u64 
     // more than it took — its `pending` is from a delivery long past, the head is right.
     if (prev) |pv| if (pv == applied and head > applied + p) return head - applied;
     return p;
+}
+
+test "archiveLag: the stream past the manifest; everything without one" {
+    try std.testing.expectEqual(@as(u64, 0), archiveLag(100, 100, 100)); // all archived
+    try std.testing.expectEqual(@as(u64, 25), archiveLag(125, 125, 100)); // 25 since the flush
+    try std.testing.expectEqual(@as(u64, 40), archiveLag(500, 40, null)); // no archiver yet: all it holds
+    try std.testing.expectEqual(@as(u64, 10), archiveLag(500, 10, 100)); // pruned: never more than it holds
+    try std.testing.expectEqual(@as(u64, 0), archiveLag(0, 0, null)); // empty stream
 }
 
 test "lagOf: pending when progressing, head − applied when stalled or unknown" {
