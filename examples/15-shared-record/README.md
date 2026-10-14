@@ -230,6 +230,8 @@ Our test sequence gives:
 | a new field | one ADD COLUMN | nothing | nothing |
 | matches COOPERATIVE_EDITING.md | yes, one register per column | yes, registers inside one doc | no: an accepted write can erase registers |
 
+**Try it in one command**: the quickstart runs this page beside the first one, with the table, the seed row and the four invites in place: `docker compose -f docker-compose.quickstart.yml up`, then the four links on port 5174 that `init` prints ([README, Quick start](../../README.md)).
+
 ## The app
 
 <img width="1330" height="669" alt="Screenshot 2026-10-08 at 18 12 21" src="https://github.com/user-attachments/assets/7cfd4382-fe34-4789-8864-e79cb143ab3e" />

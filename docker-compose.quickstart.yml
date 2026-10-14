@@ -12,6 +12,7 @@
 # Optional settings, in a .env next to this file or in the environment:
 #   ZB_VERSION=0.2.0      the release to run (ghcr.io/ndrean/zebridge, zebridge-web-demo)
 #   QS_WEB_PORT=5173      the demo's port on this machine
+#   QS_SURVEY_PORT=5174   the shared record's port on this machine
 #   QS_BRIDGE_PORT=27434  the bridge's /status and /metrics on this machine
 #
 # Start again from scratch: docker compose -f docker-compose.quickstart.yml down -v
@@ -44,6 +45,7 @@ services:
     entrypoint: ["/bin/sh", "/usr/share/zebridge/quickstart/init.sh"]
     environment:
       QS_WEB_PORT: ${QS_WEB_PORT:-5173}
+      QS_SURVEY_PORT: ${QS_SURVEY_PORT:-5174}
     volumes:
       - zb-nats:/zb-nats
     depends_on:
@@ -88,6 +90,15 @@ services:
     image: ghcr.io/ndrean/zebridge-web-demo:${ZB_VERSION:-0.2.0}
     ports:
       - "127.0.0.1:${QS_WEB_PORT:-5173}:5173"
+    depends_on:
+      bridge: { condition: service_started }
+    restart: on-failure
+
+  # The second page (examples/15-shared-record): one record, several editors, a merge.
+  survey:
+    image: ghcr.io/ndrean/zebridge-survey-demo:${ZB_VERSION:-0.2.0}
+    ports:
+      - "127.0.0.1:${QS_SURVEY_PORT:-5174}:5173"
     depends_on:
       bridge: { condition: service_started }
     restart: on-failure

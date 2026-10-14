@@ -1,0 +1,13 @@
+# The quickstart's second page (examples/15-shared-record/web), built with zb-client-ts and
+# served by nginx with the same two routes as the first. Build context: the repository root.
+FROM --platform=$BUILDPLATFORM node:22-alpine AS build
+RUN corepack enable
+WORKDIR /src
+COPY zb-client-ts/ zb-client-ts/
+COPY examples/15-shared-record/web/ examples/15-shared-record/web/
+RUN cd zb-client-ts && pnpm install --frozen-lockfile --ignore-scripts
+RUN cd examples/15-shared-record/web && pnpm install --frozen-lockfile && pnpm build
+
+FROM nginx:alpine
+COPY quickstart/nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /src/examples/15-shared-record/web/dist /usr/share/nginx/html

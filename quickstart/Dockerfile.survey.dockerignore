@@ -1,0 +1,8 @@
+# Only what the survey image copies; nothing built locally.
+*
+!zb-client-ts/
+!examples/15-shared-record/web/
+!quickstart/nginx.conf
+**/node_modules
+**/dist
+**/*.sqlite3*

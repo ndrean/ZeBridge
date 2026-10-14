@@ -115,6 +115,8 @@ The tabs reconnect by themselves, send their waiting writes, and catch up on wha
 
 That is the other half of ZeBridge, next to the routing: each device works on its own, and comes back in line when the network returns.
 
+**A second page, the shared record**: `init` also prints four links on port 5174, one per editor of one survey record ([examples/15-shared-record](examples/15-shared-record)). Alice, Bob and Carol are in tenant acme, Omar in globex. Take Bob and Carol offline with their "Go offline" button, let each change a field, bring them back: every field keeps its latest edit, whoever saved the record last, and the editor who lost a field is told. Omar never sees the record.
+
 To start again from scratch: `docker compose -f docker-compose.quickstart.yml down -v`. The quickstart is for evaluation only (PostgreSQL trusts its local network, NATS has no TLS); a real setup follows [Host setup on VPS or bare-metal](DEPLOYMENT.md#host-setup-on-vps-or-bare-metal).
 
 **Where to go next**:

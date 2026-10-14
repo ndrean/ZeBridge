@@ -28,7 +28,7 @@ PLACES = [
     ("zb-android/README.md", rf'(eu\.zebridge:zebridge-android:)({V})()', 1),
     ("README.md", rf'(eu\.zebridge:zebridge-android:)({V})()', 1),
     # The images a deployment runs by default: the release's own.
-    ("docker-compose.quickstart.yml", rf"(ZB_VERSION(?::-|=))({V})()", 3),
+    ("docker-compose.quickstart.yml", rf"(ZB_VERSION(?::-|=))({V})()", 4),
     ("deploy/compose/compose.yml", rf"(ZB_VERSION:-)({V})()", 1),
     ("deploy/compose/.env.example", rf"^(ZB_VERSION=)({V})()$", 1),
     ("deploy/airports-responder.Dockerfile", rf"(ZB_VERSION=)({V})()", 2),

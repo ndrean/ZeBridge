@@ -1,6 +1,6 @@
 #!/bin/sh
 # The quickstart's one-shot setup, run as root in the zebridge image, which carries it in
-# /usr/share/zebridge/quickstart/ with demo.sql, and carries psql:
+# /usr/share/zebridge/quickstart/ with demo.sql and survey.sql, and carries psql:
 # the NATS configuration, the database, the demo tables, and the invites the README
 # links to. Idempotent: a second `up` finds everything in place.
 #
@@ -47,6 +47,7 @@ if ! psql "$ADMIN_URL" -tAc "SELECT 1 FROM pg_publication WHERE pubname = 'quick
   bridge --init-sql | psql "$ADMIN_URL" -q -v ON_ERROR_STOP=1 > /dev/null
 fi
 psql "$ADMIN_URL" -q -v ON_ERROR_STOP=1 -v pub=quickstart -f "$HERE/demo.sql" > /dev/null
+psql "$ADMIN_URL" -q -v ON_ERROR_STOP=1 -v pub=quickstart -f "$HERE/survey.sql" > /dev/null
 
 # 4. One-time invites with fixed codes, so the README can print the links. A code
 #    has at least 16 characters: the bridge refuses shorter ones.
@@ -54,7 +55,13 @@ psql "$ADMIN_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
 INSERT INTO public.zebridge_invites (code, principal, tenant_id, expires_at) VALUES
   ('quickstart-alice-1', 'alice', 'acme',   now() + interval '1 year'),
   ('quickstart-alice-2', 'alice', 'acme',   now() + interval '1 year'),
-  ('quickstart-bob-1',   'bob',   'globex', now() + interval '1 year')
+  ('quickstart-bob-1',   'bob',   'globex', now() + interval '1 year'),
+  -- the shared record (second page): their own principals, so the first page's bob stays
+  -- in globex alone
+  ('quickstart-survey-alice', 'survey-alice', 'acme',   now() + interval '1 year'),
+  ('quickstart-survey-bob',   'survey-bob',   'acme',   now() + interval '1 year'),
+  ('quickstart-survey-carol', 'survey-carol', 'acme',   now() + interval '1 year'),
+  ('quickstart-survey-omar',  'survey-omar',  'globex', now() + interval '1 year')
 ON CONFLICT (code) DO NOTHING;
 SQL
 
@@ -62,6 +69,7 @@ SQL
 chown zebridge:zebridge "$DIR/.env.nats" "$DIR/.env.bridge" "$DIR/creds/bridge.creds"
 
 PORT="${QS_WEB_PORT:-5173}"
+SURVEY="${QS_SURVEY_PORT:-5174}"
 cat <<EOF
 
   ZeBridge quickstart is ready. Open, each in its own tab:
@@ -69,6 +77,13 @@ cat <<EOF
     http://localhost:$PORT/?invite=quickstart-alice-1   alice, tenant acme
     http://localhost:$PORT/?invite=quickstart-alice-2   alice again, same tenant: edit the same rows
     http://localhost:$PORT/?invite=quickstart-bob-1     bob, tenant globex: shares only public tables
+
+  The shared record: one record, three editors in acme (two of them go offline), one in globex:
+
+    http://localhost:$SURVEY/?invite=quickstart-survey-alice&as=alice
+    http://localhost:$SURVEY/?invite=quickstart-survey-bob&as=bob
+    http://localhost:$SURVEY/?invite=quickstart-survey-carol&as=carol
+    http://localhost:$SURVEY/?invite=quickstart-survey-omar&as=omar
 
   Each link enrolls one tab once. Start again from scratch:
     docker compose -f docker-compose.quickstart.yml down -v
