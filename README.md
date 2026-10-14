@@ -322,10 +322,10 @@ A depot plans its trucks' trips; the people dispatching them work on browsers an
 
 - **Decisions go through PostgreSQL**: the trucks, their plans, the places they serve. A dispatcher's screen holds a replica and edits it locally; the write goes to PostgreSQL through the bridge, and every other screen receives it. Two dispatchers sending the same truck at once: the later stamp wins on every screen.
 - **Questions go to services over NATS**: a route, which truck is closest by road. `zb-respond` forwards each question to Valhalla and returns its answer; more pairs of them in one queue group share the load.
-- **What moves stays on NATS**: positions are published on `pos.<tenant>.<truck>` and shown by the screens that follow them. They never reach PostgreSQL, so their rate is NATS's, not the database's.
-- **History goes to Parquet**: an archiver packs the readings into Parquet files in one bucket, and a DuckDB responder answers questions on that archive (mileage, occupancy), taking the tenant from the subject, which the asker's JWT bounds ([examples/16-archive](examples/16-archive)). Today the readings stream and the archiver run on the hub, one of each per tenant, and a reading is one value per sensor and kind. Running them on each leaf, so a region keeps recording through a cut of its link, and positions (two coordinates) as readings, are the next steps.
+- **What moves stays on NATS**: a truck is a sensor and a position one of its readings, published on `sensors.<tenant>.<truck>.position` and shown by the screens that follow them. They never reach PostgreSQL, so their rate is NATS's, not the database's.
+- **History goes to Parquet**: on each leaf, an archiver packs the positions into Parquet files in one central bucket. On the hub, a DuckDB responder answers questions on that archive (mileage, occupancy), taking the tenant from the subject, which the asker's JWT bounds.
 
-10 services: a local replica (SQLite) per client, a NATS leaf node per region and its collector service (into Parquet compressor), the NATS server, the PostgreSQL server, the bridge daemon, a responder service, a Valhalla service, a DuckDB service (analytics on archives), and a bucket for the archives & vector tiles
+10 services: a local replica (SQLite) per client, a NATS leaf node per region and its archiver (into Parquet), the NATS server, the PostgreSQL server, the bridge daemon, a responder service, a Valhalla service, a DuckDB service (analytics on archives), and a bucket for the archives & vector tiles
 
 ```mermaid
 flowchart TD
@@ -344,7 +344,7 @@ flowchart TD
 
     subgraph Leaf ["Leaf node, per region"]
       LN[NATS leaf]:::internal
-      COL[collector<br>DuckDB → Parquet]:::daemon
+      COL[archiver<br>DuckDB → Parquet]:::daemon
     end
 
     subgraph Hub
@@ -369,7 +369,7 @@ flowchart TD
 
     %% Global connections
     S <==>|replica, writes,<br>questions, positions| LN
-    T -->|pos.tenant.truck| LN
+    T -->|sensors.tenant.truck.position| LN
     LN <==> HN
     LN --> COL
     COL -->|COPY … TO s3| B
@@ -378,7 +378,7 @@ flowchart TD
 
 <img width="1614" height="559" alt="Screenshot 2026-10-06 at 22 27 00" src="https://github.com/user-attachments/assets/266f62af-9192-436f-8980-207a3b6654aa" />
 
-[examples/14-depot](examples/14-depot) runs the first two, with Supabase as the PostgreSQL and Valhalla on the hub: a plan, its places and its stops edited together on several screens, routes and the closest truck asked over NATS, positions computed by each screen from the plan. The live positions and their archive are the design for real trucks; they are not built yet.
+[examples/14-depot](examples/14-depot) runs the first two, with Supabase as the PostgreSQL and Valhalla on the hub: a plan, its places and its stops edited together on several screens, routes and the closest truck asked over NATS, positions computed by each screen from the plan. The live positions and their archive are the design for real trucks. Built today ([examples/16-archive](examples/16-archive)): the readings archive, with the readings stream and its archiver on the hub, one of each per tenant, and one numeric value per reading. The archiver on each leaf, so a region keeps recording through a cut of its link, and a position as one reading of several fields are the next steps.
 
 **Sizing, an estimate** for 20,000 trucks each reporting every 10 s: a dispatcher's map needs no more):
 
@@ -386,7 +386,7 @@ flowchart TD
 | --- | --- |
 | one position (id, time, lat, lng, speed, heading, one sensor value) | ~50 B in MessagePack, ~120 B in JSON; ~115–185 B stored with its subject and JetStream's overhead |
 | messages into NATS | 2,000/s, 0.25–0.4 MB/s |
-| the leaf stream, kept 7 min | 100–150 MB: memory storage is enough. Longer than the collector's 5 min, so a slow write or a restart loses nothing |
+| the leaf stream, kept 7 min | 100–150 MB: memory storage is enough. Longer than the archiver's 5 min, so a slow write or a restart loses nothing |
 | Parquet, at 10–15 B per row (zstd, 32-bit coordinates) | a file every 5 min: 600,000 rows and 6–9 MB for the whole fleet, shared among the leaves, 288 a day · compacted once a night into one file per tenant and day: 170 million rows, 1.7–2.6 GB |
 | the archive | 50–80 GB a month |
 
