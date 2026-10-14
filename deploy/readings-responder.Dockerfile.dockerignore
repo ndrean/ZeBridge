@@ -1,0 +1,7 @@
+# The readings responder image sends only what it copies; the root .dockerignore is the
+# bridge image's.
+*
+!dist/*/libzb_*.deb
+!zb-python/src/zebridge/*.py
+!examples/16-archive/responder.py
+!examples/16-archive/common.py

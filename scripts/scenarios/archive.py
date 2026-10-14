@@ -15,7 +15,12 @@ responder answers from the Parquet files the manifest names plus the stream afte
   E  the responder counts every reading once while the boundary moves: new readings show in
      the hot tail, and after the archiver's flush they are counted from Parquet instead;
   F  started before its tenant's stream exists, the archiver says it waits (no traceback),
-     and archives as soon as the stream appears.
+     and archives as soon as the stream appears;
+  G  the responder too: started before its stream, it waits, then answers;
+  H  a remote S3_ENDPOINT without AWS_ACCESS_KEY_ID: a one-line refusal naming the variable,
+     never the local dev keys (a misspelled variable fell back to them, silently);
+  I  a responder whose files cannot be fetched stops with THAT error, not with "did not
+     answer in 60 s".
 
 Needs: the dev stack (NATS), local S3 (SeaweedFS on 127.0.0.1:8333, keys in
 ~/.config/zebridge/s3.json), boto3 and duckdb in the venv.
@@ -178,8 +183,57 @@ async def main() -> int:
     await common.reset_tenant(js, early)
     await js.delete_stream(common.stream_for(early))
 
+    # G
+    # zzwait is no dev principal's tenant: the bridge's creds stand in for its responder
+    # and its client (the grants themselves are readings_roles.py's).
+    resp = subprocess.Popen([PY, str(EX / "responder.py"), "--tenant", early, "--queue", "waitprobe",
+                             "--creds", zb.creds_for("bridge"), "--cache", "/private/tmp/claude-501/archive-wait"],
+                            env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    await asyncio.sleep(3)
+    await common.ensure_for_tests(js, early)
+    await js.publish(f"sensors.{early}.s1.temperature", b"7")
+    asker = await nats.connect(zb.nats_server(), user_credentials=zb.creds_for("bridge"))
+    a = {}
+    for _ in range(40):
+        try:
+            a = common.decode_answer((await asker.request(f"query.{early}.count", b"{}", timeout=2)).data)
+            break
+        except Exception:
+            await asyncio.sleep(1)
+    await asker.close()
+    resp.terminate()
+    out = resp.communicate(timeout=10)[0]
+    check(a.get("rows") == 1 and "waiting for" in out and "Traceback" not in out,
+          f"G a responder started before its stream: waited, then answered {a}")
+    if a.get("rows") != 1:
+        print(out[-1500:])
+    await common.reset_tenant(js, early)
+    await js.delete_stream(common.stream_for(early))
+
+    # H
+    env_h = {k: v for k, v in ENV.items() if not k.startswith("AWS_")}
+    env_h.update(S3_ENDPOINT="https://example.r2.cloudflarestorage.com", AWS_ACCESS_KEY_ID_TYPO="x")
+    r = subprocess.run([PY, "-c", "import common; common.s3()"], cwd=EX, env=env_h, capture_output=True, text=True, timeout=30)
+    said = (r.stdout + r.stderr).strip().splitlines()[-1:] or [""]
+    check(r.returncode != 0 and "AWS_ACCESS_KEY_ID" in said[0] and "Traceback" not in r.stderr,
+          f"H a remote endpoint without keys: {said[0][:120]}")
+
+    # I (the default tenant's manifest names files; this endpoint answers nothing)
+    await publish(js, 10, t0 + 9000)
+    archiver()
+    env_i = dict(ENV, S3_ENDPOINT="http://127.0.0.1:9", AWS_ACCESS_KEY_ID="x", AWS_SECRET_ACCESS_KEY="y")
+    t = time.time()
+    r = subprocess.run([PY, str(EX / "responder.py"), "--tenant", TENANT, "--queue", "failprobe", "--creds", zb.creds_for("pois"),
+                        "--cache", "/private/tmp/claude-501/archive-fail"], env=env_i, capture_output=True, text=True, timeout=120)
+    last = (r.stdout + r.stderr).strip().splitlines()[-1:] or [""]
+    check(r.returncode != 0 and "did not answer" not in last[0] and time.time() - t < 50,
+          f"I files unreachable: exit {r.returncode} in {time.time() - t:.0f} s — {last[0][:120]}")
+
     await common.reset_tenant(js, TENANT)
     await nc.close()
+    import shutil
+    for d in ("archive-check", "archive-resp", "archive-wait", "archive-fail"):
+        shutil.rmtree(f"/private/tmp/claude-501/{d}", ignore_errors=True)
     return 0 if ok else 1
 
 

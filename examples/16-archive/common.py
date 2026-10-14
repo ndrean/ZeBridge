@@ -52,12 +52,18 @@ def principal_of(creds_path: str | None) -> str | None:
     return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))).get("name")
 
 
+def nats_url() -> str:
+    """NATS_URL; unset, the dev server. The images set it EMPTY: a container must name its server."""
+    url = os.environ.get("NATS_URL")
+    if url == "":
+        raise SystemExit("🔴 NATS_URL is not set: pass the NATS server, e.g. -e NATS_URL=tls://nats.example.com:4222")
+    return url or "nats://127.0.0.1:4222"
+
+
 async def connect(creds: str | None = None):
     """NATS with the given creds (or NATS_CREDS), and the principal's own inbox prefix."""
     import nats
-    url = os.environ.get("NATS_URL")
-    if url == "":   # the image sets it empty: a container must name its server
-        raise SystemExit("🔴 NATS_URL is not set: pass the NATS server, e.g. -e NATS_URL=tls://nats.example.com:4222")
+    url = nats_url()
     creds = creds or os.environ.get("NATS_CREDS")
     if creds and not os.path.exists(creds):
         raise SystemExit(f"🔴 no creds file at {creds}: mount the archiver's (bridge --mint-archiver), e.g. -v archiver-acme.creds:{creds}:ro")
@@ -68,13 +74,20 @@ async def connect(creds: str | None = None):
     if os.environ.get("NATS_TLS_CA"):   # a server whose certificate a private CA signed
         import ssl
         kw["tls"] = ssl.create_default_context(cafile=os.environ["NATS_TLS_CA"])
-    return await nats.connect(url or "nats://127.0.0.1:4222", **kw)
+    return await nats.connect(url, **kw)
 
 
 def s3():
     import boto3
     from botocore.config import Config
+    endpoint = os.environ.get("S3_ENDPOINT", "http://127.0.0.1:8333")
+    local = any(h in endpoint for h in ("://127.0.0.1", "://localhost", "://[::1]"))
     kw = {}
+    if not os.environ.get("AWS_ACCESS_KEY_ID") and not local:
+        # The dev keys file is for the local S3 only: a misspelled variable once sent them to
+        # R2, which answered "400 Bad Request" with no word of why.
+        raise SystemExit(f"🔴 AWS_ACCESS_KEY_ID is not set for {endpoint}: set AWS_ACCESS_KEY_ID and "
+                         "AWS_SECRET_ACCESS_KEY (the S3 key pair; with R2, the API token's access key)")
     if not os.environ.get("AWS_ACCESS_KEY_ID"):
         path = pathlib.Path(os.environ.get("S3_KEYS", pathlib.Path.home() / ".config" / "zebridge" / "s3.json"))
         if path.exists():
@@ -82,9 +95,27 @@ def s3():
             c = d["identities"][0]["credentials"][0] if "identities" in d else d
             kw = {"aws_access_key_id": c.get("accessKey") or c["access_key_id"],
                   "aws_secret_access_key": c.get("secretKey") or c["secret_access_key"]}
-    return boto3.client("s3", endpoint_url=os.environ.get("S3_ENDPOINT", "http://127.0.0.1:8333"),
+    return boto3.client("s3", endpoint_url=endpoint,
                         region_name=os.environ.get("S3_REGION", "auto"),
                         config=Config(s3={"addressing_style": "path"}), **kw)
+
+
+async def stream_when_there(js, tenant: str, every_s: float = 10):
+    """The tenant's stream, waited for: the bridge makes it when the tenant has its first row
+    in zebridge_user_tenants. Said once, then checked every `every_s` seconds."""
+    from nats.js.errors import NotFoundError
+    stream, said = stream_for(tenant), False
+    while True:
+        try:
+            return await js.stream_info(stream)
+        except NotFoundError:
+            if not said:
+                print(f"⏳ waiting for the stream {stream}: the bridge makes it when the tenant has a row in "
+                      f"zebridge_user_tenants (INSERT INTO zebridge_user_tenants (principal, tenant_id) "
+                      f"VALUES ('<principal>', '{tenant}')). Checking every {every_s:g} s.", flush=True)
+                said = True
+            import asyncio
+            await asyncio.sleep(every_s)
 
 
 def reading(msg) -> dict | None:

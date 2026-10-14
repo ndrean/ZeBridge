@@ -82,10 +82,10 @@ async def follow(r: Readings, tenant: str, creds: str, ready: threading.Event):
     nc = await common.connect(os.environ.get("NATS_CREDS") or creds)
     js = nc.jetstream()
     stream = common.stream_for(tenant)
+    info = await common.stream_when_there(js, tenant)
     m, rev = await common.read_manifest(nc, tenant)
     if m:
         await asyncio.to_thread(r.manifest, m)
-    info = await js.stream_info(stream)
     start = max(r.covers + 1, info.state.first_seq)
     if info.state.messages and info.state.first_seq > r.covers + 1 and m:
         print(f"⚠️ the stream starts at {info.state.first_seq}, the archive covers up to {r.covers}: a hole", flush=True)
@@ -135,11 +135,28 @@ def main():
     ap.add_argument("--cache", default="/var/cache/zb-readings", help="the Parquet files, fetched once")
     a = ap.parse_args()
 
+    url = common.nats_url()   # before anything: a container must name its server
+    # The cache holds the fetched files and libzb's own small database: a tenant with no
+    # archive yet fetches nothing, and libzb could not open its file in a missing folder.
+    pathlib.Path(a.cache).mkdir(parents=True, exist_ok=True)
     r = Readings(pathlib.Path(a.cache))
     ready = threading.Event()
-    threading.Thread(target=lambda: asyncio.run(follow(r, a.tenant, a.creds, ready)), daemon=True, name="follow").start()
-    if not ready.wait(60):
-        sys.exit("the manifest or the stream did not answer in 60 s")
+    failed: list = []
+
+    def run_follow():
+        try:
+            asyncio.run(follow(r, a.tenant, a.creds, ready))
+        except BaseException as e:   # said by the main thread, which then stops
+            failed.append(e)
+            ready.set()
+
+    # A dead follower must stop the responder WITH its reason: answering from a replica that
+    # no longer moves would be wrong, and "did not answer in 60 s" hid an S3 refusal once.
+    threading.Thread(target=run_follow, daemon=True, name="follow").start()
+    ready.wait()
+    if failed:
+        e = failed[0]
+        sys.exit(e.code if isinstance(e, SystemExit) else f"🔴 the stream or the archive's files could not be read: {type(e).__name__}: {e}")
 
     def own(tenant: str):
         if tenant != a.tenant:   # one responder per tenant: never answer another's data
@@ -161,7 +178,7 @@ def main():
         return r.query("SELECT sensor_id, arg_max(value, sensor_ts) AS value, max(sensor_ts) AS sensor_ts "
                        "FROM readings WHERE kind = ? GROUP BY 1 ORDER BY 1", (q["kind"],))
 
-    with ZeBridge(nats_url=os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), creds_path=a.creds,
+    with ZeBridge(nats_url=url, creds_path=a.creds, ca_file=os.environ.get("NATS_TLS_CA"),
                   db_path=str(pathlib.Path(a.cache) / "zb.sqlite3"), client_id=f"readings-{a.tenant}", heartbeat_ms=0) as zb:
         n = zb.serve([a.tenant], {"count": count, "per_minute": per_minute, "latest": latest}, queue=a.queue)
         print(f"answering count, per_minute, latest on query.{a.tenant}.<name> ({n} subject(s))", flush=True)

@@ -56,8 +56,11 @@ docker run -d --name zb-s3 -p 127.0.0.1:8333:8333 -v zb-s3-data:/data \
 scripts read the keys from it (`S3_KEYS`) unless `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY` are set.
 
-As a container, one per tenant on the hub: `ghcr.io/ndrean/zebridge-archiver`
-([deploy/archiver.Dockerfile](../../deploy/archiver.Dockerfile) shows the `docker run`).
+As containers, one of each per tenant on the hub: `ghcr.io/ndrean/zebridge-archiver` and
+`ghcr.io/ndrean/zebridge-readings-responder` ([deploy/archiver.Dockerfile](../../deploy/archiver.Dockerfile)
+and [deploy/readings-responder.Dockerfile](../../deploy/readings-responder.Dockerfile) show the
+`docker run`). Both wait for a tenant's stream that does not exist yet, and stop with a one-line
+reason on a missing setting (`NATS_URL`, the S3 key pair, the creds file).
 From the repository, with creds minted from `operator.store` (`--mint-archiver`, `--mint-responder`):
 
 ```sh

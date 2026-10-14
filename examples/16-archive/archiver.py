@@ -50,7 +50,7 @@ async def main() -> int:
     # The stream may not exist yet: the bridge makes it when the tenant has its first row in
     # zebridge_user_tenants. Waiting, rather than exiting, starts the archive the moment it
     # does, under Docker or systemd alike, with one line said instead of a restart loop.
-    info = await stream_when_there(js, stream, a.tenant)
+    info = await common.stream_when_there(js, a.tenant)
 
     # The manifest AFTER the wait: its revision is what the first write must name, and a
     # revision read before a long wait may no longer be the latest.
@@ -114,21 +114,6 @@ async def main() -> int:
             break
     await nc.close()
     return code
-
-
-async def stream_when_there(js, stream, tenant, every_s=10):
-    from nats.js.errors import NotFoundError
-    said = False
-    while True:
-        try:
-            return await js.stream_info(stream)
-        except NotFoundError:
-            if not said:
-                print(f"⏳ waiting for the stream {stream}: the bridge makes it when the tenant has a row in "
-                      f"zebridge_user_tenants (INSERT INTO zebridge_user_tenants (principal, tenant_id) "
-                      f"VALUES ('<principal>', '{tenant}')). Checking every {every_s} s.", flush=True)
-                said = True
-            await asyncio.sleep(every_s)
 
 
 def flush(a, s3, manifest, rows, last_seq):

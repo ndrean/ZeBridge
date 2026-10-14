@@ -639,7 +639,7 @@ bridge --mint-responder --store operator.store --name readings-acme --tenant acm
 
 - A **sensor** publishes its own readings, `sensors.acme.boiler-12.>`, and nothing else. Over MQTT, its JWT (the first block of the creds file) is the password, with any user name. Without `--tenant`, it belongs to the open tenant `_default`.
 - An **archiver** belongs to one tenant: it reads that tenant's readings and writes that tenant's archive manifest. It runs as a container, one per tenant, next to the NATS server that holds the streams: `ghcr.io/ndrean/zebridge-archiver --tenant acme`, with its creds mounted at `/creds` and the S3 settings in its environment ([deploy/archiver.Dockerfile](deploy/archiver.Dockerfile)). It keeps no state: its position is the manifest, so a restart or a move loses nothing.
-- A **responder** reads the readings and manifests of the tenants it is minted for, and answers their questions.
+- A **responder** reads the readings and manifests of the tenants it is minted for, and answers their questions. It runs as a container too, one per tenant: `ghcr.io/ndrean/zebridge-readings-responder --tenant acme`, with its creds at `/creds` and a read-only S3 key in its environment ([deploy/readings-responder.Dockerfile](deploy/readings-responder.Dockerfile)).
 
 Two settings in `.env.bridge` bound each tenant's readings stream; a full stream drops its oldest readings:
 
