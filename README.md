@@ -75,6 +75,8 @@ If you put every client in one tenant, every client holds everything that tenant
 |principal|a stable, authenticated identity, belonging to ≥1 tenant|
 |publication|the PostgreSQL publication a bridge follows|
 |slot|the replication slot a bridge owns; one bridge = one slot|
+|hub|the central server: the NATS server with JetStream (every stream, bucket and snapshot), with the bridge beside it; PostgreSQL may run there or elsewhere (a managed database)|
+|leaf|a NATS leaf node joined to the hub, near a group of devices (a region): it routes their traffic to the hub and serves the responders placed on it; it stores no stream of its own|
 |generation / chain|a per-table, per-tenant snapshot lineage; base + checkpoints + deltas|
 |verdict|PostgreSQL's answer to a client write: accepted / stale / rejected / row_deleted / failed. A rejected one carries a `reason` (`PredatesGcWatermark`, `KeyChange`, `UnknownColumn`…, or PostgreSQL's own error with its `sqlstate`). The libraries report it to the app as an outcome: applied / rebased / lost / deleted / rejected|
 
