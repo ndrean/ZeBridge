@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name           = 'ZbNative'
-  s.version        = '0.2.0'
+  s.version        = '0.2.1'
   s.summary        = 'libzb, the ZeBridge C client, for this app'
   s.description    = 'The Expo module over libzb (scripts/build-ios.sh builds ZbCore.xcframework).'
   s.author         = ''
