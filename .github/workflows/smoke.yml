@@ -1,0 +1,28 @@
+# Post-release smoke test, on demand, once every registry has the version (npm approved):
+#
+#   gh workflow run smoke.yml -f version=0.2.1
+#
+# The bridge from APT, the Node, Python and Dart clients from their registries (Linux
+# x86_64 here; smoke/run.sh on a Mac covers arm64), and what the Maven and React Native
+# packages carry. Running on the phones stays by hand: smoke/README.md.
+name: Smoke test a release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The published version (X.Y.Z)
+        required: true
+
+jobs:
+  smoke:
+    name: smoke ${{ inputs.version }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - name: APT bridge, Node, Python, Dart; Maven and React Native packages
+        env:
+          VERSION: ${{ inputs.version }}
+        run: sh smoke/run.sh "$VERSION"

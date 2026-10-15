@@ -1,0 +1,72 @@
+# Post-release smoke test: the bridge from APT, the Node, Python and Dart clients from their
+# registries, and the Maven and React Native packages' contents, at one version.
+# Run it with ./run.sh <version>; nothing is published.
+name: zb-smoke
+
+x-bridge: &bridge
+  build: { context: ., dockerfile: bridge.Dockerfile, args: { ZB_VERSION: "${ZB_VERSION:?}" } }
+  image: zb-smoke-bridge:${ZB_VERSION:?}
+  volumes: [zb-nats:/zb-nats]
+
+x-client: &client
+  environment:
+    ZB_BRIDGE_URL: http://bridge:27434
+  depends_on:
+    bridge: { condition: service_healthy }
+  profiles: [clients]
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    environment: { POSTGRES_DB: app, POSTGRES_HOST_AUTH_METHOD: trust }
+    command: ["postgres", "-c", "wal_level=logical"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "app"]
+      interval: 2s
+      retries: 30
+
+  setup:
+    <<: *bridge
+    entrypoint: ["/bin/sh", "/smoke/setup.sh"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  nats:
+    image: nats:2.15.0-alpine
+    command: ["-js", "-c", "/zb-nats/nats-server.conf"]
+    volumes: [zb-nats:/zb-nats]
+    depends_on:
+      setup: { condition: service_completed_successfully }
+
+  bridge:
+    <<: *bridge
+    entrypoint: ["/bin/sh", "-c", "set -a; . /zb-nats/.env.nats; . /zb-nats/.env.bridge; set +a; exec /usr/bin/bridge"]
+    environment:
+      ENROLL_NATS_URL: nats://nats:4222
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:27434/status"]
+      interval: 2s
+      retries: 30
+    depends_on:
+      nats: { condition: service_started }
+
+  node:
+    <<: *client
+    build: { context: clients/node, args: { ZB_VERSION: "${ZB_VERSION:?}" } }
+    environment: { ZB_BRIDGE_URL: "http://bridge:27434", ZB_INVITE: smoke-invite-node }
+  python:
+    <<: *client
+    build: { context: clients/python, args: { ZB_VERSION: "${ZB_VERSION:?}" } }
+    environment: { ZB_BRIDGE_URL: "http://bridge:27434", ZB_INVITE: smoke-invite-python }
+  dart:
+    <<: *client
+    build: { context: clients/dart, args: { ZB_VERSION: "${ZB_VERSION:?}" } }
+    environment: { ZB_BRIDGE_URL: "http://bridge:27434", ZB_INVITE: smoke-invite-dart }
+  # Maven and npm phone packages: what they carry (nothing here can run them).
+  packages:
+    build: { context: clients/packages }
+    environment: { ZB_VERSION: "${ZB_VERSION:?}" }
+    profiles: [clients]
+
+volumes:
+  zb-nats:

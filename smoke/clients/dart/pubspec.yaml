@@ -1,0 +1,8 @@
+# For the editor (dart pub get here). The Dockerfile replaces the zebridge line with the
+# version under test.
+name: smoke
+publish_to: none
+environment:
+  sdk: ^3.10.0
+dependencies:
+  zebridge: ^0.2.1

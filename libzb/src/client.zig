@@ -2784,12 +2784,16 @@ pub const SyncClient = struct {
     fn openConsumer(self: *SyncClient, stream: []const u8, inactive_ns: u64, shared: ?*@import("nats").PullInbox) !*@import("nats").PullSubscription {
         const last = try self.storedSeq(stream);
         var name_buf: [48]u8 = undefined;
-        // Unique-enough per process: pid + a monotonic counter (std.crypto.random
-        // wants an Io in 0.16; libc is already linked).
+        // Unique across clients: random bytes + a counter. Not the pid: in a container
+        // every client is PID 1, and two clients on one stream then asked for the same
+        // durable name — refused when the configs differ, SHARED (each client getting
+        // part of the events) when they match. Found by smoke/ (2026-10-15).
         const Ctr = struct {
             var n = std.atomic.Value(u32).init(0);
         };
-        const cname = try std.fmt.bufPrint(&name_buf, "zbz{d}x{d}", .{ std.c.getpid(), Ctr.n.fetchAdd(1, .monotonic) });
+        var r: [6]u8 = undefined;
+        std.Io.Threaded.global_single_threaded.io().random(&r); // as nats.zig nuid.zig
+        const cname = try std.fmt.bufPrint(&name_buf, "zbz{x}x{d}", .{ r, Ctr.n.fetchAdd(1, .monotonic) });
 
         var cfg = transportConsumerConfig();
         cfg.name = cname;
