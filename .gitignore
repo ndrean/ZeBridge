@@ -121,3 +121,6 @@ dist/
 
 # a CLI tool's own settings (Cloudsmith), local only
 /config.ini
+
+# NATS credentials, wherever they land (an scp into the root, a test folder): never committed
+*.creds
