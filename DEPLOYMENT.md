@@ -650,6 +650,30 @@ Two settings in `.env.bridge` bound each tenant's readings stream; a full stream
 
 🔔 A store made before these two roles has no archiver or sensor key. `bridge --init-nats --update` adds them to the store and the account, and leaves every other key as it is: issued creds and device JWTs stay valid. Run it on the store's file, not from standard input, so the new keys are kept.
 
+**The credentials, process by process.** Each process holds one NATS identity, minted from `operator.store` and allowed only its own job; the two readings services also hold an S3 key, which comes from the bucket's provider (an R2 API token's key pair), not from ZeBridge.
+
+On the hub (`<t>` is a tenant):
+
+| process | NATS identity | minted by | file | may do | other keys |
+| --- | --- | --- | --- | --- | --- |
+| bridge and sweeper | the service key | `--init-nats`, once | `/etc/zebridge/creds/bridge.creds` | everything (`>`): the trusted writer | the database passwords, in `.env.bridge` |
+| `zb-respond` (routing) | responder `routing`, tenant `_default` | the Ansible `routing` role | `/etc/zebridge/creds/routing.creds` | answer `query._default.*`, read like a client; no writes | none |
+| archiver, one per tenant | archiver `archiver-<t>` | `--mint-archiver --name archiver-<t> --tenant <t>` | `/etc/zebridge/creds/archiver-<t>.creds` | read `READINGS_<t>`, write `<t>`'s manifest; nothing else | an S3 key that can **write** the bucket |
+| readings responder, one per tenant | responder `readings-<t>` | `--mint-responder --name readings-<t> --tenant <t>` | `/etc/zebridge/creds/readings-<t>.creds` | answer `query.<t>.*`, read `READINGS_<t>` and its manifest; no writes | an S3 key that can only **read** the bucket |
+
+Off the hub:
+
+| who | NATS identity | how it gets it | may do |
+| --- | --- | --- | --- |
+| a sensor | sensor `<name>`, one tenant (a bearer JWT) | `--mint-sensor`, copied to the device | publish `sensors.<t>.<name>.>`; read nothing |
+| a phone or a browser | a client, per device | `/enroll` with an invite; the device makes its own key | its tenants' data, its own writes, `query.<t>.*` |
+| a leaf node | the leaf link | `leaf.yml` (`--mint-leaf`) | carry its devices' traffic, `mutation.>` and `sensors.>` |
+
+- The archiver and the readings responder run as uid 10001 in their containers: their creds file must belong to that uid, mode 0600, or the container cannot read it: `sudo /usr/bin/bridge --mint-archiver … | sudo install -m 0600 -o 10001 -g 10001 /dev/stdin /etc/zebridge/creds/archiver-<t>.creds`.
+- Their S3 keys go in an env file read by `docker run --env-file` (mode 0600, root), never on a command line, where `ps` and the shell's history would show them.
+- Give the responder its own read-only S3 key: a compromised responder then cannot change the archive.
+- Every `--mint-…` reads `operator.store`. Kept offline, the commands run on the machine that holds it (`--store <path>`), and only the `.creds` files go to the hub.
+
 **After a grammar change** (a new bridge version that adds a table or a subject), the templates must follow. Bring `operator.store` back and run:
 
 ```sh
