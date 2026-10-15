@@ -115,7 +115,7 @@ The tabs reconnect by themselves, send their waiting writes, and catch up on wha
 
 That is the other half of ZeBridge, next to the routing: each device works on its own, and comes back in line when the network returns.
 
-**A second page, the shared record**: `init` also prints four links on port 5174, one per editor of one survey record ([examples/15-shared-record](examples/15-shared-record)). Alice, Bob and Carol are in tenant acme, Omar in globex. Take Bob and Carol offline with their "Go offline" button, let each change a field, bring them back: every field keeps its latest edit, whoever saved the record last, and the editor who lost a field is told. Omar never sees the record.
+`init` also prints four links on port 5174: a shared record with several editors, for [Understanding the LWW rules](#understanding-the-lww-rules).
 
 To start again from scratch: `docker compose -f docker-compose.quickstart.yml down -v`. The quickstart is for evaluation only (PostgreSQL trusts its local network, NATS has no TLS); a real setup follows [Host setup on VPS or bare-metal](DEPLOYMENT.md#host-setup-on-vps-or-bare-metal).
 
@@ -707,6 +707,26 @@ The one case it loses is when it arrives late with an older stamp than an edit t
 | two edits on the same column         | the later stamp wins, the loser is told (`lost`)                  |
 | two edits of different registers of one `jsonb` column with `register_cols` | both kept: PostgreSQL merges the document register by register, whichever write was last ([COOPERATIVE_EDITING](COOPERATIVE_EDITING.md)) |
 | an edit changing a key column        | refused before it leaves the client, KeyChange; rename is delete + create |
+
+**Try it**: the quickstart's second page is one survey record with three editors in tenant acme and one in globex ([examples/15-shared-record](examples/15-shared-record)).
+
+```sh
+curl -O https://raw.githubusercontent.com/ndrean/ZeBridge/main/docker-compose.quickstart.yml
+docker compose -f docker-compose.quickstart.yml up
+```
+
+Open each link in its own tab:
+
+| link | who |
+| -- | -- |
+| <http://localhost:5174/?invite=quickstart-survey-alice&as=alice> | Alice, acme, stays online |
+| <http://localhost:5174/?invite=quickstart-survey-bob&as=bob> | Bob, acme |
+| <http://localhost:5174/?invite=quickstart-survey-carol&as=carol> | Carol, acme |
+| <http://localhost:5174/?invite=quickstart-survey-omar&as=omar> | Omar, globex: never sees the record |
+
+1. Press **Go offline** in Bob's and Carol's tabs.
+2. Bob changes one field, Carol another, then both change the same field.
+3. Press **Go online** in both: the different fields both land; on the shared field the later stamp wins, and the loser's tab says it lost. With the registers (`doc`), every field keeps its latest edit whoever saved last.
 
 ### Local database writes are owned
 
