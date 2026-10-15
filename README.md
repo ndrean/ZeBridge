@@ -689,26 +689,15 @@ A device gets its identity from an invite, once; the library does the rest. See 
 
 ### Understanding the LWW rules
 
-We have two users in the same tenant. Mary went offline, and Bob is online and works on the **same row**.
+Every write carries a stamp, and PostgreSQL keeps the newest. The quickstart's second page shows it on one record, a site survey ([examples/15-shared-record](examples/15-shared-record)): Alice, Bob and Carol edit it in tenant acme, Bob and Carol go offline and come back, and Omar, in tenant globex, never sees it.
 
-|                 what happened             |                         result                          |
-|-----------------------------------------------|---------------------------------------------------------|
-| Mary is off, Bob edits online, then Mary deletes, then reconnects | delete wins: her stamp is newer than the row's |
-| Mary is off, Bob deletes online, then Mary edits, then reconnects | delete wins: the tombstone is terminal, her newer stamp does not revive it   |
-| Mary is off, deletes, then Bob edits online, she reconnects  | edit wins: her delete reaches the server with a stamp older |
+| on the page | result |
+| -- | -- |
+| Bob, offline, edits "hazard" while Alice edits other fields | when he comes back, his edit lands: it is the newest write, and it sets only `hazard` |
+| Carol, offline, sets "rating"; Alice sets it again later | Alice's later stamp wins; when Carol comes back, her tab shows her edit as lost |
+| the same fields kept as registers in one `doc` column (`register_cols`) | Bob's write does not erase Alice's newer fields: PostgreSQL merges the record field by field, and each field keeps its latest edit, whoever saved last ([COOPERATIVE_EDITING](COOPERATIVE_EDITING.md)) |
 
-So the delete is terminal once it has landed, and it wins against anything older than itself.
-
-The one case it loses is when it arrives late with an older stamp than an edit that already landed, which is last-writer-wins treating a delete like any other write. This is the only one where a deleted row comes back, with the loser told why.
-
-|                 what happened                 |                         result                          |
-|-----------------------------------------------|---------------------------------------------------------|
-| two edits on different columns, any older | both land, the later-arriving one rebased if it was stamped earlier |
-| two edits on the same column         | the later stamp wins, the loser is told (`lost`)                  |
-| two edits of different registers of one `jsonb` column with `register_cols` | both kept: PostgreSQL merges the document register by register, whichever write was last ([COOPERATIVE_EDITING](COOPERATIVE_EDITING.md)) |
-| an edit changing a key column        | refused before it leaves the client, KeyChange; rename is delete + create |
-
-**Try it**: the quickstart's second page is one survey record with three editors in tenant acme and one in globex ([examples/15-shared-record](examples/15-shared-record)).
+**Try it**:
 
 ```sh
 curl -O https://raw.githubusercontent.com/ndrean/ZeBridge/main/docker-compose.quickstart.yml
@@ -722,11 +711,23 @@ Open each link in its own tab:
 | <http://localhost:5174/?invite=quickstart-survey-alice&as=alice> | Alice, acme, stays online |
 | <http://localhost:5174/?invite=quickstart-survey-bob&as=bob> | Bob, acme |
 | <http://localhost:5174/?invite=quickstart-survey-carol&as=carol> | Carol, acme |
-| <http://localhost:5174/?invite=quickstart-survey-omar&as=omar> | Omar, globex: never sees the record |
+| <http://localhost:5174/?invite=quickstart-survey-omar&as=omar> | Omar, globex |
 
 1. Press **Go offline** in Bob's and Carol's tabs.
-2. Bob changes one field, Carol another, then both change the same field.
-3. Press **Go online** in both: the different fields both land; on the shared field the later stamp wins, and the loser's tab says it lost. With the registers (`doc`), every field keeps its latest edit whoever saved last.
+2. Alice edits a few fields and the rating; Bob edits "hazard"; Carol edits the rating.
+3. Press **Go online** in Bob's and Carol's tabs, and compare the four tabs.
+
+**What the page does not show**, with the same people:
+
+| what happened | result |
+| -- | -- |
+| Bob is offline; Alice edits the record; then Bob deletes it and comes back | the delete wins: his stamp is newer |
+| Bob is offline; Alice deletes the record; then Bob edits it and comes back | the delete wins: a delete is final, and a newer stamp does not bring the record back |
+| Bob is offline and deletes the record; then Alice edits it; he comes back | Alice's edit wins: his delete arrives with an older stamp; the record stays, and Bob is told why |
+| Bob's write is stamped before the record's last change, and sets other fields | it lands, rebased onto the newer record, and Bob is told |
+| a write changes the record's key | refused before it leaves the tab (`KeyChange`): a rename is a delete and a create |
+
+So a delete is final once it has landed, and it wins against anything older than itself. It loses only when it arrives late with an older stamp than an edit that already landed: last-writer-wins treats a delete like any other write.
 
 ### Local database writes are owned
 
