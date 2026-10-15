@@ -83,8 +83,7 @@ pnpm install
 VITE_ZB_BRIDGE_URL=https://bridge.example.com pnpm dev      # http://localhost:5177
 ```
 
-Open it with an invite: `http://localhost:5177/?invite=<code>`. The identity and the replica stay
-in the browser. Two editors in one browser: `?as=a` and `?as=b`, each with its own invite.
+Open it with an invite: `http://localhost:5177/?invite=<code>`. The identity and the replica stay in the browser. Two editors in one browser: `?as=a` and `?as=b`, each with its own invite.
 
 Then:
 
@@ -111,7 +110,7 @@ On 2026-10-06 and 07, the page on a laptop and two phones, the hub on a VPS (Sup
   16,173 chargers into the browser included, as the page's status line reports it.
 
   | device | page loaded | ready |
-  |---|---|---|
+  | --- | --- | --- |
   | laptop browser | 0.2 s | 3.0 s |
   | iPhone, Safari or Chrome | 0.1–0.3 s | 2.5 s |
   | moto e20 (an old Android), Chrome | 0.8 s | 11.5 s |
