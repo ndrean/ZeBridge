@@ -1,3 +1,10 @@
+## 0.2.2
+
+- libzb: two clients in containers no longer collide on a stream. A live-tail consumer was
+  named after the process id, which is 1 in every container: a second client was then
+  refused, or shared the first one's consumer and got only part of the changes. The name is
+  now random.
+
 ## 0.2.1
 
 - No change in the package: its version follows ZeBridge's releases. 0.2.1 adds the readings
