@@ -53,7 +53,7 @@ jobs:
           version: 0.16.0
       - name: libzb for the ten targets
         run: |
-          export ANDROID_NDK="$ANDROID_NDK_LATEST_HOME"
+          export ANDROID_NDK="$(scripts/android-ndk.sh)"   # pinned: the release machine's NDK
           mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
           zb-dart/scripts/build-prebuilt.sh
       # AFTER the build: setup-dart fetches the OIDC token pub.dev accepts, and that token

@@ -123,8 +123,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: libzb for iOS and Android, built here
         run: |
-          # The runner's own variable (not the workflow's env context): its newest NDK.
-          export ANDROID_NDK="$ANDROID_NDK_LATEST_HOME"
+          export ANDROID_NDK="$(scripts/android-ndk.sh)"   # pinned: the release machine's NDK
           mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
           python3 libzb/python/abi_check.py
           zb-react-native/scripts/build-ios.sh
@@ -205,7 +204,7 @@ jobs:
       - name: libzb for arm64-v8a, armeabi-v7a and x86_64, then the AAR
         run: |
           mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
-          export ANDROID_NDK="$ANDROID_NDK_LATEST_HOME"
+          export ANDROID_NDK="$(scripts/android-ndk.sh)"   # pinned: the release machine's NDK
           zb-android/scripts/build.sh
       # Signed with the APT repository's key, "ZeBridge packages", the one that signs the
       # Maven files from the release machine too. Without publishing, the signed files go to
