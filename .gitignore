@@ -84,6 +84,9 @@ libzb/zbz-*.sqlite3*
 zb-client-ts/zebridge_*.sqlite3
 zb-client-ts/zebridge_*.sqlite3-*
 
+# R2 bucket (tiles, sensors bucket)
+.env.bucket
+
 .env.grafana
 # A cloud PostgreSQL's connection strings (the Supabase demo project): never committed.
 .env.supabase
