@@ -168,9 +168,19 @@ connections. Kept in volume `letsencrypt`, copies in `certs`.
 
 ## Upgrading
 
-Set `ZB_VERSION` in `.env` to the new release, then `docker compose up -d --remove-orphans`:
-the images, the configuration and the database's functions follow, and a service a release
-retired is removed. With an external PostgreSQL, run
+`compose.yml` and the image go together: the image carries the scripts `compose.yml`
+names, so take both from the new release. `.env` stays (compare it with the release's
+`.env.example` for new settings):
+
+```sh
+V=<new release>
+curl -fsSLO https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/compose.yml
+sed -i "s|^ZB_VERSION=.*|ZB_VERSION=$V|" .env
+docker compose up -d --remove-orphans
+```
+
+The images, the configuration and the database's functions follow, and a service the
+release retired is removed. With `compose.readings.yml`, download the release's too. With an external PostgreSQL, run
 `pg-init` as above too.
 
 ## Firewall
