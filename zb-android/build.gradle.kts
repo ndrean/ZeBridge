@@ -76,8 +76,11 @@ mavenPublishing {
     }
 }
 
-// Signed by the gpg command: the key stays in gpg, and pinentry asks for its passphrase.
-// The key is named by the signing.gnupg.keyName Gradle property (~/.gradle/gradle.properties).
+// The key "ZeBridge packages". On the release machine, through the gpg command: the key
+// stays in gpg, pinentry asks for its passphrase, and the signing.gnupg.keyName Gradle
+// property (~/.gradle/gradle.properties) names it. In CI (publish.yml), the same key,
+// armored, from ZB_SIGNING_KEY and ZB_SIGNING_PASSPHRASE.
 signing {
-    useGpgCmd()
+    val key = System.getenv("ZB_SIGNING_KEY")
+    if (key.isNullOrBlank()) useGpgCmd() else useInMemoryPgpKeys(key, System.getenv("ZB_SIGNING_PASSPHRASE"))
 }

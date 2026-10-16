@@ -59,8 +59,9 @@ functions.
 
 ## Publish to Maven Central
 
-The coordinates are `eu.zebridge:zebridge-android` (namespace `eu.zebridge`, verified on
-central.sonatype.com by a DNS record on zebridge.eu). Once, on the release machine:
+The coordinates are `eu.zebridge:zebridge-android` (namespace `eu.zebridge`, verified on central.sonatype.com by a DNS record on zebridge.eu). A published release publishes it: the `maven` job of `.github/workflows/publish.yml` builds libzb for the three CPUs, signs with the key "ZeBridge packages" (the secrets `APT_GPG_KEY` and `APT_GPG_PASSPHRASE`), and uploads with a Central Portal user token (the secrets `MAVEN_CENTRAL_USERNAME` and `MAVEN_CENTRAL_PASSWORD`). Run by hand without `-f publish=true`, it builds and signs, and publishes nothing.
+
+By hand, from the release machine, once:
 
 - a Central Portal user token in `~/.gradle/gradle.properties` (mode 0600), as
   `mavenCentralUsername` and `mavenCentralPassword`;

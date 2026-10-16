@@ -183,14 +183,9 @@ builds the packages and tarballs for both architectures, the images, and a draft
 
 - `.github/workflows/apt.yml`: rebuilds the APT repository from every published release's
   packages, signs it, and deploys it to GitHub Pages at `packages.zebridge.eu`;
-- `.github/workflows/publish.yml`: npm (`@zebridge/client`, `@zebridge/react-native`, staged:
-  each version waits for a maintainer's approval with 2FA), PyPI (`zebridge`), and pub.dev
-  (`zebridge`, through `pubdev.yml` on the release's tag). Each skips a version its registry
-  already has, so a rerun is safe.
+- `.github/workflows/publish.yml`: npm (`@zebridge/client`, `@zebridge/react-native`, staged: each version waits for a maintainer's approval with 2FA), PyPI (`zebridge`), pub.dev (`zebridge`, through `pubdev.yml` on the release's tag), and Maven Central (`eu.zebridge:zebridge-android`, signed with the key below, uploaded with the Central Portal token in the secrets `MAVEN_CENTRAL_USERNAME` and `MAVEN_CENTRAL_PASSWORD`). Each skips a version its registry already has, so a rerun is safe.
 
-Maven Central (`eu.zebridge:zebridge-android`) is still published by hand, with the release:
-`gradle publishAndReleaseToMavenCentral` in `zb-android/` ([zb-android/README.md](zb-android/README.md)). Nothing reaches apt or a
-registry before the release is published.
+Nothing reaches apt or a registry before the release is published.
 
 The repository is signed with the GPG key "ZeBridge packages" (Ed25519), held in the GitHub
 repository's secrets (`APT_GPG_KEY`, `APT_GPG_PASSPHRASE`) and on the release machine. Keep a

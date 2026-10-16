@@ -24,7 +24,7 @@ PLACES = [
     ("zb-react-native/ios/ZbNative.podspec", rf"^(\s*s\.version\s*= ')({V})(')", 1),
     ("zb-dart/pubspec.yaml", rf"^(version: )({V})()$", 1),
     ("zb-android/build.gradle.kts", rf'(coordinates\("eu\.zebridge", "zebridge-android", ")({V})("\))', 1),
-    # The docs' install lines (Maven is published by hand: publish it with the release).
+    # The docs' install lines.
     ("zb-android/README.md", rf'(eu\.zebridge:zebridge-android:)({V})()', 1),
     ("README.md", rf'(eu\.zebridge:zebridge-android:)({V})()', 1),
     # The images a deployment runs by default: the release's own.

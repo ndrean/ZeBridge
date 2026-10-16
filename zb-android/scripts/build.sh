@@ -16,7 +16,8 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 libzb=$(cd "$here/../libzb" && pwd)
 sdk=${ANDROID_HOME:-$HOME/Library/Android/sdk}
 ndk=${ANDROID_NDK:-$(ls -d "$sdk/ndk"/* | tail -1)}
-tc="$ndk/toolchains/llvm/prebuilt/darwin-x86_64"
+# The NDK's compilers for this host: darwin-x86_64 on a Mac (Apple silicon too), linux-x86_64 in CI.
+tc="$ndk/toolchains/llvm/prebuilt/$(uname -s | tr '[:upper:]' '[:lower:]')-x86_64"
 api=29
 
 python3 "$libzb/python/abi_check.py"   # the ABI this copy reports is the one Kotlin pins
