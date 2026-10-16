@@ -448,7 +448,7 @@ BEGIN
             'CREATE TRIGGER zebridge_guard_tenant_t BEFORE INSERT OR UPDATE ON %s '
             'FOR EACH ROW EXECUTE FUNCTION public.zebridge_guard_tenant(%L)', t, tenant_col
         );
-        RAISE NOTICE 'tenant guard on %: %  filled from the writer''s tenant when omitted (fail-closed if unmapped), malformed refused', t, tenant_col;
+        RAISE NOTICE 'tenant guard on %: % filled from the writer''s tenant when omitted (fail-closed if unmapped), malformed refused', t, tenant_col;
     END IF;
 END;
 $$ LANGUAGE plpgsql;
@@ -623,7 +623,7 @@ BEGIN
     -- directly — defined once in core so it needs nothing from this file.
     PERFORM public.zebridge_scope_reads_by_tenant(tbl, tenant_col);
 
-    RAISE NOTICE 'writes and scoped reads on % are now scoped by %; CDC stays scoped by the subject, not RLS — zebridge_enable records %.% in zebridge_catalogue, and a running bridge reloads the catalogue row live (NOTES §10bj)',
+    RAISE NOTICE 'writes and scoped reads on % are now scoped by %; CDC stays scoped by the subject, not RLS — zebridge_enable records %.% in zebridge_catalogue, and a running bridge reloads the catalogue row live',
                  tbl, tenant_col, tbl, tenant_col;
 END;
 $$ LANGUAGE plpgsql;
