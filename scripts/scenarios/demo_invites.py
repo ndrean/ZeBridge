@@ -7,7 +7,9 @@
   C  20 visitors at once get 20 different invites (one shared connection, under a lock);
   D  a client that connects and sends nothing does not hold the others up;
   E  a login without zebridge_inviter: the visitor gets a 503 and a plain sentence, the
-     process keeps serving.
+     process keeps serving;
+  F  a POST that declares no body is answered 405 and the process keeps serving (std.http
+     asserted on it when keeping the connection alive).
 
 Needs the dev database with the init SQL applied (zebridge_invite) and the bridge built.
 
@@ -95,6 +97,16 @@ def main() -> int:
         s, _, _ = get("/demo")
         check(s == 302 and time.monotonic() - t0 < 2, f"D a silent client holds no one up ({s}, {time.monotonic() - t0:.2f} s)")
         silent.close()
+
+        # F — a POST that declares no body (curl -X POST sends exactly this): std.http's
+        # keep-alive path asserted on it, a Debug build panicked, a release one had
+        # undefined behaviour. Answered 405, and the process still serves.
+        raw = socket.create_connection(("127.0.0.1", PORT), 5)
+        raw.sendall(b"POST /demo HTTP/1.1\r\nHost: x\r\n\r\n")
+        head = raw.recv(64).decode(errors="replace").split("\r\n")[0]
+        raw.close()
+        s, _, _ = get("/health")
+        check("405" in head and s == 200 and p.poll() is None, f"F a POST with no body declared: '{head}', still serving (health {s})")
     finally:
         p.terminate()
         p.wait(5)

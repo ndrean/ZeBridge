@@ -47,6 +47,7 @@ const diagnose_live = @import("diagnose_live.zig");
 comptime {
     _ = @import("admin_invite.zig");
     _ = @import("demo_invites.zig");
+    _ = @import("http_respond.zig");
     _ = @import("admin_revoke.zig");
     _ = @import("array.zig");
     _ = @import("batch_publisher.zig");

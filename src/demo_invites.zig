@@ -13,6 +13,7 @@
 //! Separate from the bridge on purpose: its own credentials, its own unit, and a fault
 //! here never reaches replication. About 20 MB of memory.
 const std = @import("std");
+const http_respond = @import("http_respond.zig");
 const c = @import("c_imports.zig").c;
 const admin_invite = @import("admin_invite.zig");
 
@@ -108,7 +109,14 @@ pub fn run(init: *const std.process.Init) u8 {
         return 1;
     }
 
-    var demo: Demo = .{ .io = init.io, .conn = conn, .tenant = tenant, .expires = expires, .redirect = target, .prefix = prefix };
+    var demo: Demo = .{
+        .io = init.io,
+        .conn = conn,
+        .tenant = tenant,
+        .expires = expires,
+        .redirect = target,
+        .prefix = prefix,
+    };
 
     const addr = std.Io.net.IpAddress.parse(listen[0..colon], port) catch {
         out("🔴 --listen address is not an IP address: {s}\n", .{listen[0..colon]});
@@ -167,7 +175,12 @@ fn serve(d: *Demo, stream: std.Io.net.Stream) void {
 }
 
 fn cutSilent(d: *Demo, stream: std.Io.net.Stream, done: *std.atomic.Value(bool)) void {
-    std.Io.Timeout.sleep(.{ .duration = .{ .raw = .fromNanoseconds(receive_timeout_ns), .clock = .awake } }, d.io) catch return;
+    std.Io.Timeout.sleep(.{
+        .duration = .{
+            .raw = .fromNanoseconds(receive_timeout_ns),
+            .clock = .awake,
+        },
+    }, d.io) catch return;
     if (!done.load(.acquire)) stream.shutdown(d.io, .recv) catch {};
 }
 
@@ -175,16 +188,16 @@ const no_store: std.http.Header = .{ .name = "cache-control", .value = "no-store
 
 fn handle(d: *Demo, req: *std.http.Server.Request) !void {
     const target = req.head.target;
-    if (req.head.method != .GET) return req.respond("Method Not Allowed\n", .{ .status = .method_not_allowed });
-    if (std.mem.eql(u8, target, "/health")) return req.respond("ok\n", .{});
+    if (req.head.method != .GET) return http_respond.respond(req, "Method Not Allowed\n", .{ .status = .method_not_allowed });
+    if (std.mem.eql(u8, target, "/health")) return http_respond.respond(req, "ok\n", .{});
     const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-    if (!std.mem.eql(u8, path, "/demo")) return req.respond("Not Found\n", .{ .status = .not_found });
+    if (!std.mem.eql(u8, path, "/demo")) return http_respond.respond(req, "Not Found\n", .{ .status = .not_found });
 
     // A principal of its own per visitor: letters, digits and '-', as the invites table wants.
     var rnd: [6]u8 = undefined;
     d.io.random(&rnd);
     var p_buf: [80]u8 = undefined;
-    const principal = std.fmt.bufPrint(&p_buf, "{s}-{x}", .{ d.prefix, rnd }) catch return req.respond("Internal Server Error\n", .{ .status = .internal_server_error });
+    const principal = std.fmt.bufPrint(&p_buf, "{s}-{x}", .{ d.prefix, rnd }) catch return http_respond.respond(req, "Internal Server Error\n", .{ .status = .internal_server_error });
 
     var code_buf: [256]u8 = undefined;
     const result = blk: {
@@ -197,7 +210,7 @@ fn handle(d: *Demo, req: *std.http.Server.Request) !void {
     switch (result) {
         .refused => |why| {
             out("⚠️ no demo invite: {s}\n", .{why});
-            return req.respond("The demo cannot hand out an invite right now. Please try again in a minute.\n", .{
+            return http_respond.respond(req, "The demo cannot hand out an invite right now. Please try again in a minute.\n", .{
                 .status = .service_unavailable,
                 .extra_headers = &.{no_store},
             });
@@ -205,9 +218,9 @@ fn handle(d: *Demo, req: *std.http.Server.Request) !void {
         .code => |code| {
             var loc_buf: [1024]u8 = undefined;
             const sep: []const u8 = if (std.mem.indexOfScalar(u8, d.redirect, '?') != null) "&" else "?";
-            const location = std.fmt.bufPrint(&loc_buf, "{s}{s}invite={s}", .{ d.redirect, sep, code }) catch return req.respond("Internal Server Error\n", .{ .status = .internal_server_error });
+            const location = std.fmt.bufPrint(&loc_buf, "{s}{s}invite={s}", .{ d.redirect, sep, code }) catch return http_respond.respond(req, "Internal Server Error\n", .{ .status = .internal_server_error });
             out("🎟️ demo invite for {s}\n", .{principal});
-            return req.respond("", .{
+            return http_respond.respond(req, "", .{
                 .status = .found,
                 .extra_headers = &.{ .{ .name = "location", .value = location }, no_store },
             });

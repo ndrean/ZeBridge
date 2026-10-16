@@ -1,4 +1,5 @@
 const std = @import("std");
+const http_respond = @import("http_respond.zig");
 const metrics_mod = @import("metrics.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const jwt_mint = @import("jwt_mint.zig");
@@ -359,7 +360,7 @@ pub const Server = struct {
         } else if (method == .GET and std.mem.startsWith(u8, target, "/enroll?")) {
             try self.handleEnroll(req);
         } else {
-            try req.respond("Not Found\n", .{ .status = .not_found });
+            try http_respond.respond(req, "Not Found\n", .{ .status = .not_found });
         }
     }
 
@@ -391,14 +392,14 @@ pub const Server = struct {
             .{ .name = "access-control-allow-origin", .value = "*" },
         };
         const ctx = self.enroll orelse {
-            try req.respond("{\"error\":\"enrollment not configured\"}\n", .{ .status = .not_found, .extra_headers = cors });
+            try http_respond.respond(req, "{\"error\":\"enrollment not configured\"}\n", .{ .status = .not_found, .extra_headers = cors });
             return;
         };
         // The permit, before any work — and before the PG dial especially. The
         // slot is released on every exit path via the defer.
         if (self.enroll_in_flight.fetchAdd(1, .monotonic) >= max_concurrent_enrolls) {
             _ = self.enroll_in_flight.fetchSub(1, .monotonic);
-            try req.respond("{\"error\":\"busy — retry shortly\"}\n", .{ .status = .service_unavailable, .extra_headers = cors });
+            try http_respond.respond(req, "{\"error\":\"busy — retry shortly\"}\n", .{ .status = .service_unavailable, .extra_headers = cors });
             return;
         }
         defer _ = self.enroll_in_flight.fetchSub(1, .monotonic);
@@ -409,18 +410,18 @@ pub const Server = struct {
         if (code.len < Config.Http.enroll_code_min_len or code.len > Config.Http.enroll_code_max_len or
             user_pub.len != nats.nkeys.public_key_text_len or user_pub[0] != 'U')
         {
-            try req.respond("{\"error\":\"bad request\"}\n", .{ .status = .bad_request, .extra_headers = cors });
+            try http_respond.respond(req, "{\"error\":\"bad request\"}\n", .{ .status = .bad_request, .extra_headers = cors });
             return;
         }
 
         // One short-lived writer connection per enrollment — a rare, human-paced event.
         const conn = c.PQconnectdb(ctx.writer_conninfo.ptr) orelse {
-            try req.respond("{\"error\":\"backend unavailable\"}\n", .{ .status = .service_unavailable, .extra_headers = cors });
+            try http_respond.respond(req, "{\"error\":\"backend unavailable\"}\n", .{ .status = .service_unavailable, .extra_headers = cors });
             return;
         };
         defer c.PQfinish(conn);
         if (c.PQstatus(conn) != c.CONNECTION_OK) {
-            try req.respond("{\"error\":\"backend unavailable\"}\n", .{ .status = .service_unavailable, .extra_headers = cors });
+            try http_respond.respond(req, "{\"error\":\"backend unavailable\"}\n", .{ .status = .service_unavailable, .extra_headers = cors });
             return;
         }
 
@@ -461,7 +462,7 @@ pub const Server = struct {
         defer c.PQclear(res);
         if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) {
             log.warn("🎟️ enrollment refused (code invalid, used, or expired — or the principal was revoked, which is for good)", .{});
-            try req.respond("{\"error\":\"invalid or used code\"}\n", .{ .status = .forbidden, .extra_headers = cors });
+            try http_respond.respond(req, "{\"error\":\"invalid or used code\"}\n", .{ .status = .forbidden, .extra_headers = cors });
             return;
         }
         const principal = std.mem.span(c.PQgetvalue(res, 0, 0));
@@ -486,7 +487,7 @@ pub const Server = struct {
             ctx.ttl_seconds,
             @as(i64, @intCast(c.time(null))),
         ) catch {
-            try req.respond("{\"error\":\"mint failed\"}\n", .{ .status = .internal_server_error, .extra_headers = cors });
+            try http_respond.respond(req, "{\"error\":\"mint failed\"}\n", .{ .status = .internal_server_error, .extra_headers = cors });
             return;
         };
         defer self.allocator.free(jwt);
@@ -503,7 +504,7 @@ pub const Server = struct {
         const body = try self.identityPayload(ctx, jwt, principal);
         defer self.allocator.free(body);
         log.info("🎟️ enrolled '{s}' (tenant '{s}', {d} membership(s) tagged) — JWT minted, mapping registered", .{ principal, tenant, tenants.len });
-        try req.respond(body, .{ .status = .ok, .extra_headers = cors });
+        try http_respond.respond(req, body, .{ .status = .ok, .extra_headers = cors });
     }
 
     fn putTenantMapping(self: *Server, arena: std.mem.Allocator, ctx: EnrollCtx, principal: []const u8, tenants: []const []const u8) void {
@@ -549,12 +550,12 @@ pub const Server = struct {
             .{ .name = "access-control-allow-origin", .value = "*" },
         };
         const ctx = self.enroll orelse {
-            try req.respond("{\"error\":\"enrollment not configured\"}\n", .{ .status = .not_found, .extra_headers = cors });
+            try http_respond.respond(req, "{\"error\":\"enrollment not configured\"}\n", .{ .status = .not_found, .extra_headers = cors });
             return;
         };
         if (self.enroll_in_flight.fetchAdd(1, .monotonic) >= max_concurrent_enrolls) {
             _ = self.enroll_in_flight.fetchSub(1, .monotonic);
-            try req.respond("{\"error\":\"busy — retry shortly\"}\n", .{ .status = .service_unavailable, .extra_headers = cors });
+            try http_respond.respond(req, "{\"error\":\"busy — retry shortly\"}\n", .{ .status = .service_unavailable, .extra_headers = cors });
             return;
         }
         defer _ = self.enroll_in_flight.fetchSub(1, .monotonic);
@@ -565,7 +566,7 @@ pub const Server = struct {
         const sig_s = queryParam(target, "sig") orelse "";
         const bad = struct {
             fn respond(r: *std.http.Server.Request, h: []const std.http.Header, status: std.http.Status, msg: []const u8) !void {
-                try r.respond(msg, .{ .status = status, .extra_headers = h });
+                try http_respond.respond(r, msg, .{ .status = status, .extra_headers = h });
             }
         };
         if (user_pub.len != nats.nkeys.public_key_text_len or user_pub[0] != 'U') return bad.respond(req, cors, .bad_request, "{\"error\":\"bad request\"}\n");
@@ -629,7 +630,7 @@ pub const Server = struct {
         const body = try self.identityPayload(ctx, jwt, principal);
         defer self.allocator.free(body);
         log.info("🔁 renewed '{s}' ({d} membership(s)) — JWT minted for the same key", .{ principal, tenants.len });
-        try req.respond(body, .{ .status = .ok, .extra_headers = cors });
+        try http_respond.respond(req, body, .{ .status = .ok, .extra_headers = cors });
     }
 
     /// `std.http` writes the status line, headers and framing; this only picks the type.
@@ -637,7 +638,7 @@ pub const Server = struct {
     /// Replaces a hand-built response string over a 4096-byte buffer that silently
     /// truncated anything larger — `/metrics` was already close to it.
     fn respond(req: *std.http.Server.Request, status: std.http.Status, content_type: []const u8, body: []const u8) !void {
-        try req.respond(body, .{
+        try http_respond.respond(req, body, .{
             .status = status,
             .extra_headers = &.{.{ .name = "content-type", .value = content_type }},
         });
@@ -656,7 +657,7 @@ pub const Server = struct {
         std.crypto.hash.sha2.Sha256.hash(topology_mod.embedded_json, &digest, .{});
         var hex_buf: [64]u8 = undefined;
         const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{&digest}) catch unreachable;
-        try req.respond(topology_mod.embedded_json, .{
+        try http_respond.respond(req, topology_mod.embedded_json, .{
             .status = .ok,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json" },
