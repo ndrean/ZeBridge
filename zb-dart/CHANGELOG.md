@@ -1,3 +1,11 @@
+## 0.2.5
+
+- libzb's Android builds name their API level to the NDK's headers (`-Dandroid-api`, 29):
+  before, an older NDK assumed every Android API existed.
+- No other change in the package: its version follows ZeBridge's releases. 0.2.5 adds
+  `bridge --demo-invites` (a public demo's invite door), Maven Central publishing from CI,
+  and fixes the sweeper audit and the compose deployment's certificate e-mail check.
+
 ## 0.2.4
 
 - No change in the package: its version follows ZeBridge's releases. 0.2.4 fixes the Docker

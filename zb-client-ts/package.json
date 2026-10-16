@@ -1,6 +1,6 @@
 {
   "name": "@zebridge/client",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "type": "module",
   "description": "ZeBridge client: an offline-first SQLite replica of PostgreSQL tables, kept in sync over NATS JetStream, for browsers and Node",
   "license": "Apache-2.0",
