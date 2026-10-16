@@ -10,7 +10,9 @@ calmly, once, and not as a fault:
   B  no warning or error line names it (the old doctor printed an error per table, then a
      missing schema and a missing chain per tenant);
   C  the preflight counts it in its one "catalogue row(s) without a table" line, and
-     prints no "Tenant check skipped".
+     prints no "Tenant check skipped";
+  D  the open tenant (_default) is not reported out of the sweeper's reach: the write
+     policy admits it to every principal, the sweeper included.
 
 Needs the dev database and the bridge's environment (.env.bridge); the bridge itself may
 be running or not.
@@ -60,6 +62,20 @@ def main() -> int:
             if l.startswith("    ") and TABLE in l and i > 0 and re.match(r"^(warning|error)\(", lines[i - 1]):
                 loud.append(lines[i - 1] + " / " + l.strip())
         check(not loud, f"B no warning or error names it ({len(loud)} line(s)){': ' + loud[0][:160] if loud else ''}")
+
+        # D: the open tenant is never "out of the sweeper's reach": the write policy admits
+        # it to every principal, the sweeper included, with no mapping row. The audit used
+        # to count it, and the doctor warned about a tenant the sweeper does reap.
+        # The block: a warning header, then one indented "table: tenant, tenant" line per table.
+        open_named = []
+        for i, l in enumerate(lines):
+            if "sweeper" in l.lower() and re.match(r"^(warning|error)\(", l):
+                j = i + 1
+                while j < len(lines) and lines[j].startswith("    "):
+                    if re.search(r"[:,]\s*_default(,|$)", lines[j].strip()):
+                        open_named.append(lines[j].strip())
+                    j += 1
+        check(not open_named, f"D the open tenant is not reported out of the sweeper's reach{': ' + open_named[0][:120] if open_named else ''}")
 
         pre = [l for l in lines if "catalogue row(s) without a table" in l]
         skipped = [l for l in lines if "Tenant check skipped" in l]

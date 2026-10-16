@@ -1041,11 +1041,15 @@ BEGIN
         -- eaten by envsubst (it reads it as a variable) and truncates every definition
         -- after this point — caught by scripts/scenarios/render.py, which reported only
         -- 3 of 9 functions surviving the render.
+        -- The open tenant is never "unmapped": zb_tenant_write admits it to every principal,
+        -- the sweeper included, with no mapping row (and the auto-grant skips it on purpose).
+        -- Counting it reported a reachable tenant as never reaped.
         RETURN QUERY EXECUTE format(
             'SELECT %L::text, t.tenant_id::text, ''UNREAPED - tombstones for this tenant' || ' accumulate; %I is not mapped to it'' FROM (SELECT DISTINCT tenant_id FROM %s'
             || ' WHERE deleted_at IS NOT NULL) t WHERE NOT EXISTS (SELECT 1 FROM'
-            || ' public.zebridge_user_tenants m WHERE m.principal = %L AND m.tenant_id = t.tenant_id)',
-            r.relname, sweeper_principal, r.relname, sweeper_principal);
+            || ' public.zebridge_user_tenants m WHERE m.principal = %L AND m.tenant_id = t.tenant_id)'
+            || ' AND t.tenant_id <> %L',
+            r.relname, sweeper_principal, r.relname, sweeper_principal, '${OPEN_TENANT}');
     END LOOP;
 END $$;
 
