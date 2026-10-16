@@ -24,7 +24,7 @@ python3 "$libzb/python/abi_check.py"   # the ABI this copy reports is the one Ko
 
 build() { # <zig target> <clang target> <android abi> [zig cpu]
   out="$libzb/zig-out/android-$3"
-  (cd "$libzb" && zig build lib -Dtarget="$1.$api" ${4:+-Dcpu=$4} -Dvendor=true -Dandroid-api=$api \
+  (cd "$libzb" && zig build lib -Dtarget="$1" ${4:+-Dcpu=$4} -Dvendor=true -Dandroid-api=$api \
       --sysroot "$tc/sysroot" -Doptimize=ReleaseFast -p "zig-out/android-$3")
   mkdir -p "$here/src/main/jniLibs/$3"
   "$tc/bin/clang" --target="$2" -shared -fPIC -O2 -o "$here/src/main/jniLibs/$3/libzb.so" \
