@@ -70,10 +70,9 @@ pub fn build(b: *std.Build) void {
         break :blk b.allocator.dupe([]const u8, &.{base}) catch &.{};
     } else &.{};
     for (sysroot_includes) |p| translate_c.addSystemIncludePath(.{ .cwd_relative = p });
-    // ⚠️ The NDK's headers need the API level: since NDK 30, sys/cdefs.h stops on
-    // "Unversioned target triples are not supported!" when __ANDROID_API__ is unset, and
-    // older ones silently assume every API exists. The Zig target names no level, so it
-    // is given here (and to the C sources, addVendored), from -Dandroid-api.
+    // ⚠️ The NDK's headers need the API level in the target triple: since NDK 30,
+    // sys/cdefs.h stops on "Unversioned target triples are not supported!" for unversioned
+    // Android targets. Keep the explicit macro for translated headers and vendored C too.
     if (is_android) translate_c.defineCMacro("__ANDROID_API__", android_api);
     const c_mod = translate_c.createModule();
 
