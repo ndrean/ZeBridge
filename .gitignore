@@ -126,3 +126,6 @@ dist/
 
 # NATS credentials, wherever they land (an scp into the root, a test folder): never committed
 *.creds
+
+# Gradle caches (a module built inside an app, e.g. zb-react-native/android)
+.gradle/

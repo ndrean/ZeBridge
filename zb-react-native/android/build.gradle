@@ -13,7 +13,9 @@ plugins {
 }
 
 group = 'dev.zebridge'
-version = '0.1.0'
+// The package's own version (one version for every ZeBridge package): package.json sits
+// one level up both in this repository and in the published package.
+version = new groovy.json.JsonSlurper().parse(new File(projectDir, '../package.json')).version
 
 // The published package carries zb-android's files in android/zb-android
 // (scripts/prepack.sh). In this repository the package is linked into the app's
@@ -25,7 +27,7 @@ android {
   namespace "dev.zebridge.zbnative"
   defaultConfig {
     versionCode 1
-    versionName "0.1.0"
+    versionName project.version
   }
   sourceSets {
     main {
