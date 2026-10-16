@@ -3,7 +3,8 @@
 // run.sh inserts in PostgreSQL (it can only arrive by the live CDC tail). Exit 0 on both.
 import { ZeBridge } from '@zebridge/client';
 
-const NAME = 'node';
+const NAME = process.env.ZB_SMOKE_NAME ?? 'node'; // its rows: from-<NAME>, live-<NAME>
+const LIVE_WAIT = Number(process.env.ZB_SMOKE_LIVE_WAIT ?? 30); // seconds; longer when the row is inserted by hand
 const fail = (msg) => { console.log(`✗ ${NAME}: ${msg}`); process.exit(1); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -24,10 +25,10 @@ await zb.mutate('smoke_items', 'INSERT', { id },
 const v = await Promise.race([verdict, sleep(30_000).then(() => null)]);
 if (!v) fail('no verdict in 30 s');
 if (v.outcome !== 'applied') fail(`verdict ${JSON.stringify(v)}`);
-console.log('ready');
-const live = Date.now() + 30_000;
+console.log(`ready: insert live-${NAME} within ${LIVE_WAIT} s`);
+const live = Date.now() + LIVE_WAIT * 1000;
 while ((await zb.query('SELECT 1 AS one FROM smoke_items WHERE id = ?', `live-${NAME}`)).length === 0) {
-  if (Date.now() > live) fail("PostgreSQL's live row never arrived (the CDC tail)");
+  if (Date.now() > live) fail(`PostgreSQL's live row live-${NAME} did not arrive within ${LIVE_WAIT} s (the CDC tail)`);
   await sleep(500);
 }
 console.log(`✓ ${NAME}: enrolled, seeded, write applied, live change received (tenant ${zb.tenant})`);

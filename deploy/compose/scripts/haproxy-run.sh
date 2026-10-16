@@ -1,7 +1,7 @@
 #!/bin/sh
 # HAProxy in master-worker mode, reloaded (SIGUSR2: no connection dropped) when the
 # certificate changes.
-cfg=/usr/local/etc/haproxy/haproxy.cfg
+cfg=/conf/haproxy.cfg
 cert=/certs/haproxy.pem
 haproxy -W -db -f "$cfg" &
 pid=$!

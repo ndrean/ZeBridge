@@ -22,5 +22,6 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* /tmp/*.deb \
  && useradd --system --no-create-home --shell /usr/sbin/nologin zebridge
 COPY quickstart/ /usr/share/zebridge/quickstart/
+COPY compose/ /usr/share/zebridge/compose/
 USER zebridge
 ENTRYPOINT ["/usr/bin/bridge"]

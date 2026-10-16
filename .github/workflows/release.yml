@@ -96,12 +96,10 @@ jobs:
         with:
           name: linux
           path: ctx
-      # docker-compose.quickstart.yml's one-time setup rides in the image: the quickstart
-      # then needs no file of the repository.
-      - name: Quickstart files into the context
-        run: |
-          mkdir -p ctx/quickstart
-          cp quickstart/init.sh quickstart/survey.sql examples/05-tables/web-consumer/demo.sql ctx/quickstart/
+      # The quickstart's one-time setup and deploy/compose's configuration ride in the
+      # image: neither compose file then needs another file of the repository.
+      - name: Quickstart and compose files into the context
+        run: deploy/image-context.sh ctx
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - if: github.ref_type == 'tag'

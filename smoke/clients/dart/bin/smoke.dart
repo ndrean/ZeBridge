@@ -4,7 +4,9 @@
 import 'dart:io';
 import 'package:zebridge/zebridge.dart';
 
-const name = 'dart';
+final name = Platform.environment['ZB_SMOKE_NAME'] ?? 'dart'; // its rows: from-<name>, live-<name>
+// Seconds; longer when the row is inserted by hand.
+final liveWait = int.parse(Platform.environment['ZB_SMOKE_LIVE_WAIT'] ?? '30');
 
 Never fail(String msg) {
   print('✗ $name: $msg');
@@ -27,17 +29,17 @@ Future<void> main() async {
     await Future.delayed(const Duration(milliseconds: 500));
   }
   final verdict = zb.reports.where((r) => r.outcomes.isNotEmpty).first;
-  const id = 'from-$name';
+  final id = 'from-$name';
   await zb.mutate('smoke_items', 'insert', {'id': id},
       {'id': id, 'tenant_id': zb.tenants.first, 'note': 'written by $name',
        'updated_at': DateTime.now().toUtc().toIso8601String()});
   final r = await verdict.timeout(const Duration(seconds: 30), onTimeout: () => fail('no verdict in 30 s'));
   final outcome = r.outcomes.first['outcome'];
   if (outcome != 'applied') fail('verdict ${r.outcomes.first}');
-  print('ready');
-  final live = DateTime.now().add(const Duration(seconds: 30));
+  print('ready: insert live-$name within $liveWait s');
+  final live = DateTime.now().add(Duration(seconds: liveWait));
   while ((await zb.query('SELECT 1 AS one FROM smoke_items WHERE id = ?', ['live-$name'])).isEmpty) {
-    if (DateTime.now().isAfter(live)) fail("PostgreSQL's live row never arrived (the CDC tail)");
+    if (DateTime.now().isAfter(live)) fail("PostgreSQL's live row live-$name did not arrive within $liveWait s (the CDC tail)");
     await Future.delayed(const Duration(milliseconds: 500));
   }
   print('✓ $name: enrolled, seeded, write applied, live change received (tenant ${zb.tenants.first})');

@@ -1,0 +1,15 @@
+# Prometheus for the compose stack: the bridge's /metrics and the NATS exporter, on the
+# compose network. Nothing here is published; Grafana reads it.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: zebridge
+    static_configs:
+      - targets: ["bridge:27434"]
+        labels: { service: cdc-bridge, environment: production }
+  - job_name: nats
+    static_configs:
+      - targets: ["nats-exporter:7777"]
+        labels: { service: nats-server, environment: production }

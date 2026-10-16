@@ -5,7 +5,8 @@ import os, sys, threading, time
 from datetime import datetime, timezone
 from zebridge import ZeBridge
 
-NAME = "python"
+NAME = os.environ.get("ZB_SMOKE_NAME", "python")  # its rows: from-<NAME>, live-<NAME>
+LIVE_WAIT = int(os.environ.get("ZB_SMOKE_LIVE_WAIT", "30"))  # seconds; longer when the row is inserted by hand
 outcomes, got = [], threading.Event()
 
 
@@ -35,11 +36,11 @@ if not got.wait(30):
     fail("no verdict in 30 s")
 if outcomes[0].get("outcome") != "applied":
     fail(f"verdict {outcomes[0]}")
-print("ready", flush=True)
-deadline = time.monotonic() + 30
+print(f"ready: insert live-{NAME} within {LIVE_WAIT} s", flush=True)
+deadline = time.monotonic() + LIVE_WAIT
 while not zb.query("SELECT 1 FROM smoke_items WHERE id = ?", f"live-{NAME}"):
     if time.monotonic() > deadline:
-        fail("PostgreSQL's live row never arrived (the CDC tail)")
+        fail(f"PostgreSQL's live row live-{NAME} did not arrive within {LIVE_WAIT} s (the CDC tail)")
     time.sleep(0.5)
 zb.close()
 print(f"✓ {NAME}: enrolled, seeded, write applied, live change received (tenant {zb.tenants[0]})")

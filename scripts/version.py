@@ -32,6 +32,7 @@ PLACES = [
     ("deploy/compose/compose.yml", rf"(ZB_VERSION:-)({V})()", 1),
     ("deploy/compose/.env.example", rf"^(ZB_VERSION=)({V})()$", 1),
     ("deploy/airports-responder.Dockerfile", rf"(ZB_VERSION=)({V})()", 2),
+    ("deploy/compose/README.md", rf"^(   V=)({V})()$", 1),   # the tag its two files come from
     # Apps on the published packages: the phone check by hand (smoke/README.md) runs this
     # release, and the smoke client's editor view follows it.
     ("examples/10-airports/flutter/pubspec.yaml", rf"^(  zebridge: )({V})()(?=\s)", 1),

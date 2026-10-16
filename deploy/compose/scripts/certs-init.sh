@@ -10,4 +10,4 @@ args=""
 for d in $DOMAINS; do args="$args -d $d"; done
 # shellcheck disable=SC2086
 certbot certonly --standalone --non-interactive --agree-tos -m "$ACME_EMAIL" \
-  --cert-name zebridge --deploy-hook /scripts/cert-deploy.sh $args
+  --cert-name zebridge --deploy-hook /conf/scripts/cert-deploy.sh $args

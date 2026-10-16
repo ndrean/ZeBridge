@@ -1,0 +1,46 @@
+# Sensor readings and their archive (examples/16-archive), next to compose.yml: one archiver
+# and one readings responder per tenant. Copy the two services and the volume for each
+# tenant, renaming `acme`. Every docker compose command includes this file once .env says:
+#
+#   COMPOSE_FILE=compose.yml:compose.readings.yml
+#
+# Per tenant, next to compose.yml, all 0600:
+#   creds/archiver-acme.creds   bridge --mint-archiver  --name archiver-acme --tenant acme
+#   creds/readings-acme.creds   bridge --mint-responder --name readings-acme --tenant acme
+#                               (both owned by uid 10001: the containers read them)
+#   readings-acme-write.env     AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY: a key that can write the bucket
+#   readings-acme-read.env      the same names: a key that can only read it
+#                               (both read by compose itself, as whoever runs it)
+# The mints read operator.store, off the server: run them where it is, copy the .creds here.
+# The tenant's stream READINGS_acme comes from the bridge, with the tenant's first row in
+# zebridge_user_tenants; both services wait for it.
+
+x-readings: &readings
+  restart: unless-stopped
+  depends_on:
+    nats: { condition: service_started }
+  environment: &readings-env
+    NATS_URL: tls://${NATS_HOST}:4222     # NATS_HOST is the nats container's name on this network
+    S3_ENDPOINT: ${S3_ENDPOINT:?set S3_ENDPOINT in .env}
+    S3_BUCKET: ${S3_BUCKET:?set S3_BUCKET in .env}
+
+services:
+  archiver-acme:
+    <<: *readings
+    image: ghcr.io/ndrean/zebridge-archiver:${ZB_VERSION}
+    command: ["--tenant", "acme"]
+    env_file: readings-acme-write.env
+    volumes:
+      - ./creds/archiver-acme.creds:/creds:ro
+
+  readings-acme:
+    <<: *readings
+    image: ghcr.io/ndrean/zebridge-readings-responder:${ZB_VERSION}
+    command: ["--tenant", "acme"]
+    env_file: readings-acme-read.env
+    volumes:
+      - ./creds/readings-acme.creds:/creds:ro
+      - readings-cache-acme:/var/cache/zb-readings   # the Parquet files, fetched once
+
+volumes:
+  readings-cache-acme:

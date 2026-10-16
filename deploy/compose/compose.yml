@@ -1,11 +1,13 @@
 # ZeBridge on one server with Docker Compose: NATS, the bridge, the sweeper, HAProxy and
-# Let's Encrypt, and optionally PostgreSQL. README.md has the steps; .env.example the settings.
+# Let's Encrypt, Prometheus and Grafana, and optionally PostgreSQL. This file and a .env
+# are all a server needs: the configuration ships inside the release's image.
 #
 #   docker compose up -d     # COMPOSE_PROFILES=postgres in .env adds the PostgreSQL below
 #
 # Published ports: 80 (Let's Encrypt, redirect), 443 (bridge + websocket), NATS_PUBLIC_PORT
-# (native clients, TLS). Nothing else leaves the server: PostgreSQL, NATS monitoring and
-# the bridge's /metrics stay on the compose network. Docker's published ports bypass ufw.
+# (native clients, TLS), and Grafana on 127.0.0.1:3000 only (an SSH tunnel reaches it).
+# PostgreSQL, Prometheus, NATS monitoring and the bridge's /metrics stay on the compose
+# network. Docker's published ports bypass ufw. README.md has the steps.
 
 x-zebridge: &zebridge
   image: ghcr.io/ndrean/zebridge:${ZB_VERSION:-0.2.2}
@@ -19,32 +21,45 @@ x-db: &db
   BRIDGE_CDC_SLOT: ${BRIDGE_CDC_SLOT:-zb_slot}
 
 services:
+  # ── configuration ───────────────────────────────────────────────────────────────
+  # HAProxy's, Prometheus's and Grafana's files and the scripts, from the release's image
+  # into the zb-conf volume, at every start: they follow ZB_VERSION.
+  conf-init:
+    <<: *zebridge
+    user: root
+    entrypoint: ["/bin/sh", "/usr/share/zebridge/compose/scripts/conf-init.sh"]
+    volumes:
+      - zb-conf:/conf
+    restart: "no"
+
   # ── certificates ─────────────────────────────────────────────────────────────────
   # One certificate for the three names. The first one is issued here, on port 80, before
   # HAProxy takes that port; then `certbot` renews it behind HAProxy.
   certs-init:
     image: certbot/certbot:v5.8.0
-    entrypoint: ["/bin/sh", "/scripts/certs-init.sh"]
+    entrypoint: ["/bin/sh", "/conf/scripts/certs-init.sh"]
     environment:
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
       DOMAINS: ${BRIDGE_HOST:?} ${WS_HOST:?} ${NATS_HOST:?}
     ports: ["80:80"]
+    depends_on:
+      conf-init: { condition: service_completed_successfully }
     volumes:
       - letsencrypt:/etc/letsencrypt
       - certs:/certs
-      - ./scripts:/scripts:ro
+      - zb-conf:/conf:ro
     restart: "no"
 
   certbot:
     image: certbot/certbot:v5.8.0
     init: true
-    entrypoint: ["/bin/sh", "-c", "while :; do certbot renew --http-01-port 8888 --deploy-hook /scripts/cert-deploy.sh; sleep 12h & wait $$!; done"]
+    entrypoint: ["/bin/sh", "-c", "while :; do certbot renew --http-01-port 8888 --deploy-hook /conf/scripts/cert-deploy.sh; sleep 12h & wait $$!; done"]
     depends_on:
       certs-init: { condition: service_completed_successfully }
     volumes:
       - letsencrypt:/etc/letsencrypt
       - certs:/certs
-      - ./scripts:/scripts:ro
+      - zb-conf:/conf:ro
     restart: unless-stopped
 
   # ── NATS ─────────────────────────────────────────────────────────────────────────
@@ -54,18 +69,17 @@ services:
   nats-init:
     <<: *zebridge
     user: root
-    entrypoint: ["/bin/sh", "/scripts/nats-init.sh"]
+    entrypoint: ["/bin/sh", "/usr/share/zebridge/compose/scripts/nats-init.sh"]
     environment:
       NATS_HOST: ${NATS_HOST:?}
     volumes:
       - zb-etc:/etc/zebridge
-      - ./scripts:/scripts:ro
     restart: "no"
 
   nats:
     image: nats:2.15.0-alpine
     init: true
-    entrypoint: ["/bin/sh", "/scripts/nats-run.sh"]
+    entrypoint: ["/bin/sh", "/conf/scripts/nats-run.sh"]
     depends_on:
       nats-init: { condition: service_completed_successfully }
       certs-init: { condition: service_completed_successfully }
@@ -73,7 +87,7 @@ services:
     volumes:
       - zb-etc:/etc/zebridge
       - certs:/certs:ro
-      - ./scripts:/scripts:ro
+      - zb-conf:/conf:ro
     networks:
       default:
         # The bridge dials tls://<NATS_HOST>:4222: the certificate's name, this container.
@@ -109,7 +123,7 @@ services:
   haproxy:
     image: haproxy:3.4.6-alpine
     init: true
-    entrypoint: ["/bin/sh", "/scripts/haproxy-run.sh"]
+    entrypoint: ["/bin/sh", "/conf/scripts/haproxy-run.sh"]
     environment:
       BRIDGE_HOST: ${BRIDGE_HOST}
       WS_HOST: ${WS_HOST}
@@ -119,9 +133,47 @@ services:
     depends_on:
       certs-init: { condition: service_completed_successfully }
     volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - certs:/certs:ro
-      - ./scripts:/scripts:ro
+      - zb-conf:/conf:ro
+    restart: unless-stopped
+
+  # ── telemetry: the NATS exporter, Prometheus, Grafana ────────────────────────────
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:0.20.2
+    command: ["-port", "7777", "-jsz", "all", "-varz", "-connz", "-leafz", "http://nats:8222"]
+    depends_on:
+      nats: { condition: service_started }
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    command:
+      - --config.file=/conf/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-30d}
+      - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-2GB}   # whichever comes first
+    depends_on:
+      conf-init: { condition: service_completed_successfully }
+    volumes:
+      - prometheus-data:/prometheus
+      - zb-conf:/conf:ro
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.4
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_PATHS_PROVISIONING: /conf/grafana/provisioning
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    # The server's loopback only: open it through an SSH tunnel (README.md).
+    ports: ["127.0.0.1:3000:3000"]
+    depends_on:
+      prometheus: { condition: service_started }
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - zb-conf:/conf:ro
     restart: unless-stopped
 
   # ── PostgreSQL (profile "postgres") ──────────────────────────────────────────────
@@ -152,23 +204,26 @@ services:
       - pg-data:/var/lib/postgresql
     restart: unless-stopped
 
-  # The roles, functions and publication, from the bridge's own `--init-sql`. Once: it
-  # skips a database that already has the publication.
+  # The roles, functions and publication, from the bridge's own `--init-sql`, at every
+  # start (idempotent: an upgrade brings the new functions), then the invite login. For an
+  # external PostgreSQL, run it once by hand with the admin's URL (README.md).
   pg-init:
     <<: *zebridge
     profiles: [postgres]
-    entrypoint: ["/bin/sh", "/scripts/pg-init.sh"]
+    entrypoint: ["/bin/sh", "/usr/share/zebridge/compose/scripts/pg-init.sh"]
     environment:
       <<: *db
-      ADMIN_DATABASE_URL: postgres://postgres:${PG_ADMIN_PASSWORD}@postgres:5432/zebridge
+      ADMIN_DATABASE_URL: ${ADMIN_DATABASE_URL:-postgres://postgres:${PG_ADMIN_PASSWORD}@postgres:5432/zebridge}
+      ZB_INVITER_PASSWORD: ${ZB_INVITER_PASSWORD:-}
     depends_on:
       postgres: { condition: service_healthy }
-    volumes:
-      - ./scripts:/scripts:ro
     restart: "no"
 
 volumes:
-  zb-etc:        # nats-server.conf, .env.nats, creds/, operator.store, nats-data/ (JetStream)
-  letsencrypt:   # certbot's account and certificates
-  certs:         # the copies NATS and HAProxy read (scripts/cert-deploy.sh)
+  zb-conf:          # the release's configuration, rewritten at every start
+  zb-etc:           # nats-server.conf, .env.nats, creds/, operator.store, nats-data/ (JetStream)
+  letsencrypt:      # certbot's account and certificates
+  certs:            # the copies NATS and HAProxy read (scripts/cert-deploy.sh)
+  prometheus-data:
+  grafana-data:
   pg-data:
