@@ -158,16 +158,9 @@ To start again from scratch: `docker compose -f docker-compose.quickstart.yml do
     - [Fixing a "bad" writable table](#fixing-a-bad-writable-table)
     - [Changing a writable table's key from `bigint` to `uuid`](#changing-a-writable-tables-key-from-bigint-to-uuid)
 - [Authentication](#authentication)
-  - [Production: use `operator mode`](#production-use-operator-mode)
-    - [1. Set up, once per deployment](#1-set-up-once-per-deployment)
-    - [2. Onboard a device](#2-onboard-a-device)
-    - [3. Connect and renew](#3-connect-and-renew)
-    - [4. Revoke](#4-revoke)
-    - [Who holds what](#who-holds-what)
-  - [Development](#development)
-    - [`dev` mode](#dev-mode)
-    - [Your own NATS server, without operator mode](#your-own-nats-server-without-operator-mode)
-    - [This repository's test stack](#this-repositorys-test-stack)
+  - [The files](#the-files)
+  - [A) Users: invites](#a-users-invites)
+  - [B) Services and sensors](#b-services-and-sensors)
 - [Safety \& Guarantees](#safety--guarantees)
     - [Schemas Postgres -> SQLite](#schemas-postgres---sqlite)
     - [Internal WAL decoder and refused types](#internal-wal-decoder-and-refused-types)
@@ -445,7 +438,7 @@ import { ZeBridge, NotEnrolled, RevokedPurge } from '@zebridge/client';   // the
 
 - `connect()` throws `NotEnrolled` when this device has no stored identity and was given no invite (show the "open your invite link" screen), and `RevokedPurge` when the principal was revoked with `--purge` (its local data is gone). A plain revoke has no class of its own: a connected client sets `zb.revoked` and hangs up, and a later `connect()` throws an `Error` ("renew: refused…"). It is a field, not a class, because the replica stays readable until the app calls `wipe()`; `RevokedPurge` is an error because the local data is already gone.
 - `zb.uuid()` mints a key for a new row (a UUIDv7, time-ordered), offline.
-- Without an invite, in `dev` mode, the client names itself: `new ZeBridge({ natsUrl, principal, tables })` ([Development](#development)).
+- Without an invite, in `dev` mode, the client names itself: `new ZeBridge({ natsUrl, principal, tables })` ([Development](AUTHENTICATION.md#development)).
 - `onStatus(cb)` reports `connected`, `connecting` or `disconnected`; with `pending()`, that is an offline indicator. Every `on…` returns a function that unsubscribes.
 - `zb.principal` is who this client is; `zb.tenant` the tenant it follows and writes to. A principal can belong to several tenants: zb-client-ts follows the first and logs the others, while libzb follows them all (`tenants` in `zb_client_sync`'s report, `zb_client_join` / `zb_client_leave`).
 - The WebAssembly core is loaded with `new URL('../wasm/zb_core.wasm', import.meta.url)`, so Vite and the other bundlers ship it as an asset with no configuration.
@@ -685,7 +678,7 @@ The bound on a click is one poll's `wait_ms`: commands are served between two po
 - [DuckDB over a synced replica](/examples/07-duckdb/analyze.py): PostgreSQL → SQLite → DuckDB, an analytical job that never touches PostgreSQL,
 - a Node service on zb-client-ts (`examples/04-node-consumer`), and a Python service on libzb answering questions from a DuckDB replica (`examples/09-event`).
 
-A device gets its identity from an invite, once; the library does the rest. See [Production: operator mode](#production-use-operator-mode).
+A device gets its identity from an invite, once; the library does the rest. See [Users: invites](AUTHENTICATION.md#users-invites).
 
 ### Understanding the LWW rules
 
@@ -931,7 +924,7 @@ Can I check if my schemas will be accepted?
 
 **Every consumer is an identity in a tenant.** A consumer connects as a _principal_ — a stable, unique name — that belongs to one or more tenants (`zebridge_user_tenants`, a set; a second invite for a known principal is a join).
 
-PostgreSQL decides which rows a principal may read and write: row-level security (RLS) and the tenant guard. NATS decides which subjects it may use: the grants in its JWT, signed by a scoped signing key. Its name travels in the subject of each write, which NATS checks against the JWT, so the bridge never trusts a name written inside a message. See [Production: use `operator mode`](#production-use-operator-mode).
+PostgreSQL decides which rows a principal may read and write: row-level security (RLS) and the tenant guard. NATS decides which subjects it may use: the grants in its JWT, signed by a scoped signing key. Its name travels in the subject of each write, which NATS checks against the JWT, so the bridge never trusts a name written inside a message. See [AUTHENTICATION.md](AUTHENTICATION.md#the-picture).
 
 There is _no anonymous consumer_ and no cross-tenant read, so:
 
@@ -1263,283 +1256,36 @@ If the table **has rows**, the other tables that reference the key must move wit
 
 ## Authentication
 
-ZeBridge does not log users in: your app does, however it likes (OAuth, passwords, biometrics).
+ZeBridge does not log users in: your app does. Every device and every process then has its own identity: NATS checks which subjects it may use, PostgreSQL which rows. The how-to, every file's contents and the other modes: [AUTHENTICATION.md](AUTHENTICATION.md).
 
-ZeBridge needs two things about each user:
+### The files
 
-- a name, the **principal**: your user id, an email, any name you choose (letters, digits, `_` and `-`);
-- the tenants this name may use.
+1. **Filled in by the DBA**: `.env.bridge` on the bridge's host, with the bridge's two database URLs (`DATABASE_READER_URL`, `DATABASE_WRITER_URL`), its slot and its publication. The DBA's own `ADMIN_DATABASE_URL` is never stored on the server: it is given to one command at a time (`bridge --init-sql | psql`, `--revoke`).
+2. **Generated on the server** by `bridge --init-nats operator`: `nats-server.conf`, `.env.nats` (the bridge's NATS settings and the key that signs devices' tokens), `creds/bridge.creds` (the bridge's own NATS identity), and `operator.store`, the root key, which you move off the server.
 
-It runs in one of two modes:
+What each holds and how to keep it: [The files](AUTHENTICATION.md#the-files).
 
-| | production (`operator` mode) | development (`dev` mode) |
-| --- | --- | --- |
-| set up with | `bridge --init-nats operator` | `bridge --init-nats dev` |
-| NATS | checks each user's token, and the subjects it may use | open: anyone who reaches the port can do anything |
-| add a user to a tenant | an invite: `bridge --invite --principal alice --tenant acme` (or `SELECT zebridge_invite('alice', 'acme')`) returns a one-time code | a direct insertion: `INSERT INTO zebridge_user_tenants (principal, tenant_id)` |
-| the device | redeems the code once, gets a token (a NATS JWT), and renews it on its own | passes its `principal` and the `natsUrl` |
-| can a client act as another user? | no | yes |
+### A) Users: invites
 
-Use production mode for anything real, locally too. The Docker quick start, at the top of this README, runs it, with its invites written in advance. Development mode is a smoke test: it shows the data path without any keys.
+1. **Your app authenticates the user**: OAuth, a password, whatever it uses. ZeBridge is not involved.
+2. **Your backend creates a one-time invite** for that user, choosing the principal (the user's name in ZeBridge) and the tenant, with a command or one SQL call:
 
-In both modes, the bridge reaches PostgreSQL the same way, with two roles: [The bridge and PostgreSQL](DEPLOYMENT.md#the-bridge-and-postgresql).
+   ```sh
+   INVITER_DATABASE_URL=postgres://… bridge --invite --principal alice --tenant acme --expires '1 hour'
+   ```
 
-### Production: use `operator mode`
+   ```sql
+   SELECT zebridge_invite('alice', 'acme', interval '1 hour');
+   ```
 
-Your backend decides which tenants a user may use, and creates a one-time invite code (see [Onboard a device](#2-onboard-a-device)). The device redeems the invite once, at the bridge, and gets a NATS JWT: a token that names the user and their tenants.
+   Its database login is granted `zebridge_inviter`, and can create invites and nothing else. Meanwhile the DBA can create invites the same two ways.
+3. **The app passes the code to the library**, once: `new ZeBridge({ bridgeUrl, invite: code, tables })`. The library keeps the device's identity and renews it by itself.
 
-Two systems check every access, each on what it holds:
+Details, the enrollment's steps, renewal and revocation: [Users: invites](AUTHENTICATION.md#users-invites).
 
-- NATS checks which subjects (the message channels) a user may read or write;
-- PostgreSQL checks which rows a user may read or write: row-level security (RLS) and the tenant guard.
+### B) Services and sensors
 
-So there are no sync rules to write, and no extra authorization service to run.
-
-The user's name travels in the subject of each message, for example `mutation.alice.orders.UPDATE`.
-
-> NATS refuses a message whose subject does not match the sender's JWT, so the bridge can trust that name. It never trusts a name written inside the message itself.
-
-Note: NATS calls this setup [operator mode](https://docs.nats.io/learn/security/decentralized-auth#revoking-a-user). It is a chain of signatures: the **operator** signs the **account**, the account lists five **signing keys**, one per role (client, responder, service, archiver, sensor), and each signing key signs **users**. A signing key also holds the permissions of every user it signs, as a template: when the user connects, `{{name()}}` becomes the user's name and `{{tag(tenant)}}` each of their tenants. The JWT itself holds no permissions, only the user's name and one tag per tenant.
-
-The bridge's own NATS identity needs nothing from you: `bridge --init-nats operator` writes it (`creds/bridge.creds`, a service-role user) and points `NATS_CREDS` at it.
-
-#### 1. Set up, once per deployment
-
-`bridge --init-nats operator` generates the whole chain, with no `nsc`: the operator, the account and its five signing keys, the bridge's own creds, and `.env.nats` with what enrollment needs. What each file holds and how to keep it safe (`operator.store` offline), minting a responder's creds, re-signing after a grammar change, and replacing a leaked `ZB_SIGNING_SEED`: [DEPLOYMENT, The NATS identity](DEPLOYMENT.md#the-nats-identity).
-
-#### 2. Onboard a device
-
-Your backend signs the user in, however it does that (OAuth, a password…), then decides _who_ (the principal) and _where_ (the tenant), and asks for a one-time invite code. Either from a shell:
-
-```sh
-INVITER_DATABASE_URL=postgres://… bridge --invite --principal alice --tenant acme --expires '1 hour'
-```
-
-or with one SQL call over its own PostgreSQL connection:
-
-```sql
-SELECT zebridge_invite('alice', 'acme', interval '1 hour');
-```
-
-Both print the code, and both run the same function. Its login needs one right only, `GRANT zebridge_inviter TO <login>`: it can create invites, and it cannot read, spend or delete them, nor touch anything else. An invite lasts 1 day by default, at most 30 days, and a revoked principal gets none. Revoking stays with the DBA ([4. Revoke](#4-revoke)). Your backend then sends the code to the user's device, and the app passes it to the library as `invite`, on the first connect:
-
-| how the invite code reaches the device | where the app reads it |
-| --- | --- |
-| in your login response, when the user signs in to your app | the response |
-| a link in an email or an SMS: `https://app.example.com/?invite=<code>` | in the browser, the query string |
-| the same link on a phone, opened by your app (a universal link on iOS, an app link on Android) | the URL the system hands to the app |
-| the user types or pastes the code | a text field |
-
-The library never reads a URL itself. Whatever the source, the app passes the string:
-
-```ts
-const zb = new ZeBridge({ bridgeUrl, invite: code, tables });   // libzb: "invite": code in zb_client_connect's options
-await zb.connect();
-```
-
-Only the first connect needs it. The library then stores the device's identity, and every later start needs no code. The repository's phone examples take the code at build time (`--dart-define=ZB_INVITE=…`, `EXPO_PUBLIC_ZB_INVITE`): a shortcut for testing, not for a published app.
-
-Every device enrolled this way is a **client**: the bridge holds the client signing key only. A service that answers queries gets its own creds with `--mint-responder` (see [1. Set up](#1-set-up-once-per-deployment)).
-
-<details>
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor U as User
-    participant A as App + ZeBridge library
-    participant BE as Your backend
-    participant B as Bridge
-    participant PG@{ "type" : "database" }
-    participant N as NATS
-
-    U->>BE: log in (OAuth, password…)
-    BE->>BE: decide principal and tenant
-    BE->>PG: SELECT zebridge_invite(principal, tenant) (or bridge --invite)
-    Note over BE,PG: its login holds zebridge_inviter only
-    BE-->>A: the one-time code (in the login response)
-
-    A->>A: new ZeBridge({ bridgeUrl, invite, tables })
-    A->>A: generate the device key pair (seed stays here)
-    A->>B: GET /enroll?code=…&user_pubkey=U…
-    B->>PG: one transaction: mark the invite used,<br/>add the mapping principal ∈ tenant,<br/>record the device key
-    B->>B: mint a JWT for this key (tagged with the tenant)
-    B-->>A: JWT + principal + NATS URLs + grammar hash
-    A->>A: store the identity (0600 file, localStorage, app storage)
-
-    PG--)B: WAL: the new mapping
-    B->>N: $KV.tenants.principal = [tenant]
-    Note over B,N: a new tenant also gets its CDC stream here
-```
-
-</details>
-<br>
-
-The device's seed never leaves it. The client never sends its principal or its tenant: `/enroll` reads them from the invite row. An invite for a principal that already exists adds a device, or joins another tenant.
-
-#### 3. Connect and renew
-
-Every start is the same, with nothing to configure but the bridge URL.
-
-<details>
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant A as App + ZeBridge library
-    participant B as Bridge
-    participant PG@{ "type" : "database" }
-    participant N as NATS
-
-    A->>A: load the identity (JWT, seed, NATS URL, grammar hash)
-    opt less than a quarter of the JWT's life left (on the bridge's clock), or NATS refused it
-        A->>B: GET /renew?user_pubkey=U…&ts=bridge time&sig=Ed25519(seed)
-        B->>PG: key on record, not revoked? a tenant left?
-        B-->>A: a new JWT for the same key, current tenants
-        A->>A: rewrite the identity
-    end
-    A->>N: connect: JWT, and the server's nonce signed with the seed
-    N->>N: grants = the role's template × the JWT's tenant tags
-    A->>N: direct get $KV.tenants.principal → the tenants
-    A->>N: schemas, then each table's chain (generations KV, gen-tenant objects)
-    A->>A: seed the local database
-    loop while running
-        N--)A: CDC_tenant: live changes, applied last-writer-wins
-        A->>N: mutate → MUTATIONS, its verdict comes back on VERDICTS
-        A->>B: GET /renew when due (the next reconnect uses the new JWT)
-    end
-```
-
-</details>
-<br>
-
-No secret crosses the wire: NATS sends a nonce, the device signs it with its seed, and NATS checks the signature and the JWT's chain up to the operator. JWTs live `ENROLL_JWT_TTL_SECONDS` (24 h by default). The library renews with a quarter of that left, by proving it holds the device's key, so there is no invite and no backend call. The quarter is counted on the bridge's clock, not the device's: the identity keeps the difference, taken from each JWT's issue time, so a phone with a wrong clock still renews on time. libzb then counts on a clock the phone's settings cannot move, so changing the time while the app runs changes nothing. If its clock moved since, the bridge refuses the stamp and answers with its time, and the library tries once more with it; a JWT that NATS refuses is renewed at once. Only a revoked key, or a principal with no tenant left, needs a new invite.
-
-**Back after a long time offline.** An expired JWT is not a problem: `/renew` asks for proof of the device's key, not for the old JWT, so the library renews before it connects, whether the JWT expired an hour ago or a month ago. The limit that matters is the data's, not the identity's: within `GC_THRESHOLD_MS` (7 days by default), the device catches up through the chain and sends its queued writes; past it, it reloads the base, and the bridge refuses writes queued before the GC watermark (`PredatesGcWatermark`), so the app is told those edits are lost.
-
-| away for | identity | replica | queued writes |
-| --- | --- | --- | --- |
-| under 24 h | the JWT is still valid; renewed when due | resumes the stream if the stream still holds its position, otherwise catches up through the chain (deltas, checkpoints) | sent; verdicts as usual (`applied`, `rebased`, `lost`…) |
-| 24 h to 7 days | `/renew` first, then connect | catches up through the chain: the stream keeps events only `3 × cadence`, so it has rolled past its position | the same |
-| over 7 days (`GC_THRESHOLD_MS`) | `/renew` first, then connect | reloads the base: a delete it missed may have had its tombstone reaped, and only a base proves a row is gone | refused (`rejected`, `PredatesGcWatermark`); the local copy is put back and the edit reported lost |
-| revoked, or no tenant left | `/renew` refused: a new invite is needed (with `--purge`, the device deletes its replica and identity) | — | — |
-
-The same flow runs for every consumer (web app, phone, microservice) and in every language ([the first ten lines](CLIENTS.md#the-first-ten-lines)). Only the transport (WebSocket in the browser, TLS-TCP elsewhere) and the identity's storage differ.
-
-#### 4. Revoke
-
-Three ways to take a user's access away, the strongest first:
-
-| you run | the user's devices | can the same name come back? |
-| --- | --- | --- |
-| `bridge --revoke <principal>` | writes refused at once; apps on the ZeBridge libraries disconnect at once; other code can read until its current JWT expires: its remaining life, at most `ENROLL_JWT_TTL_SECONDS` (24 h by default), since `/renew` refuses it | no, invite a new principal |
-| `bridge --revoke <principal> --conf …` <br> then reload nats-server | cut off at once: NATS refuses the token | no, invite a new principal |
-| add `--purge` to either | the same, and the devices delete their local replica and stored identity: a connected one at once, a returning one when it reconnects or renews its JWT | no, invite a new principal |
-| | | |
-| `DELETE FROM zebridge_user_tenants WHERE principal = '…'` | the same as `--revoke` | yes: `INSERT` the mapping back and access returns at once |
-
-Nb: You must use env vars to run the previous commands as below.
-
-```sh
-ADMIN_DATABASE_URL=postgres://… \
-  bridge --revoke omar
-```
-
-```sh
-# also close the token at NATS 
-#(OPERATOR_SEED is in operator.store, ZB_ACCOUNT_PUB in .env.nats)
-OPERATOR_SEED=SO… \
-ZB_ACCOUNT_PUB=A… \
-ADMIN_DATABASE_URL=postgres://… \
-  bridge --revoke omar --conf zb-nats/nats-server.conf
-
-# if you have a hub, isolate the server PID
-nats-server --signal reload[=/var/run/nats-server.pid]
-```
-
-⚠️ `bridge --revoke --key U…` adds one key to NATS's revocation list. NATS refuses the JWTs issued up to the revocation, not after it, and an enrolled device would renew. So for an enrolled device's key, pass `ADMIN_DATABASE_URL` too: the key is then also marked in PostgreSQL, and `/renew` refuses it. The principal's other devices keep working; a new device for it needs a new principal, as after any revocation. Identities minted offline (`--mint-responder`, `--mint-leaf`) never renew and need no database.
-
-Without `--purge`, the rows already on a device stay there until the app calls `wipe()` (`zb_client_wipe` in libzb). With `--purge`, the libraries delete them themselves. The promise holds only for a device that reconnects: one that never comes back keeps its data, and a modified client can ignore the instruction. It protects against lost or handed-on devices running the real app, not against someone who already copied the database file.
-
-#### Who holds what
-
-| | holds | can |
-| --- | --- | --- |
-| you, offline | `operator.store`: every seed | re-sign the account: `bridge --init-nats --update` |
-| nats-server | the operator JWT and the account JWTs | check every user's chain of signatures, apply its role's template |
-| the bridge | its own service creds + the **client** signing seed (`ZB_SIGNING_SEED`) | run the pipeline; mint client users only, never an admin |
-| a device | its own seed + its JWT | be itself, in its tenants |
-
-### Development
-
-#### `dev` mode
-
-`bridge --init-nats dev` writes an open NATS server: no authentication, and enrollment off. Map each user to a tenant directly:
-
-```sql
-INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('alice', 'acme');
-```
-
-A client then names itself:
-
-```ts
-const zb = new ZeBridge({ 
-  natsUrl: 'ws://localhost:8080', 
-  principal: 'alice', 
-  tables: ['orders'] 
-});
-```
-
-(`nats://localhost:4222` from Node or libzb). NATS checks nothing here, so any client can claim any principal: never expose a `dev` server.
-
-#### Your own NATS server, without operator mode
-
-If you run your own nats-server with nkey authentication, the bridge needs an nkey pair:
-
-```sh
-bridge --gen-nkey >> .env.bridge
-```
-
-It appends both keys to `.env.bridge`:
-
-```diff
-+ NATS_BRIDGE_NKEY_PUB=UDZXDNW7BZUWYV3Y3WVV2NRG5ERSXZOPNQDVMVNSSMUC4OBGXRO3UTJ4
-+ NATS_BRIDGE_NKEY_SEED=SUAPVJBFH7MWPQA4SJQTSP3QGXSZMWAWDOPKUIUAUALFS66X2DBIXQGVME
-```
-
-Put the public key in the server's config, then start it:
-
-```json
-authorization {
-  users: [
-    { nkey: $NATS_BRIDGE_NKEY_PUB }
-  ]
-}
-```
-
-```sh
-export NATS_BRIDGE_NKEY_PUB=UD...
-envsubst < nats-server.conf.template > nats-server.conf
-
-nats-server -js -m 8222 -c nats-server.conf
-```
-
-Invites and token renewal need operator mode, so on such a server the clients connect the way your server allows.
-
-#### This repository's test stack
-
-It pre-mints fixed principals with `scripts/native/jwt-bootstrap.sh`:
-
-```sh
-scripts/native/creds/{alice,bob,mary,nina,omar,bridge,zbdoctor}.creds
-```
-
-Anything that reads `NATS_CREDS` points at one:
-
-```sh
-NATS_CREDS=scripts/native/creds/zbdoctor.creds bridge --diagnose
-NATS_CREDS=scripts/native/creds/omar.creds     python3 scripts/scenarios/mutate.py
-```
+A service that answers questions (a **responder**), the **archiver** of sensor readings, and a **sensor** each get their identity from `operator.store`, on the machine that holds it: `bridge --mint-responder`, `--mint-archiver`, `--mint-sensor`. Only the resulting `.creds` file goes to the server or the device. A sensor's identity is a single token: over MQTT, its password. What each may do: [Services and sensors](AUTHENTICATION.md#services-and-sensors).
 
 [⬆️](#table-of-contents)
 

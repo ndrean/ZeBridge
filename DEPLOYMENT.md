@@ -273,9 +273,9 @@ On the server that will run NATS and the bridge, once:
 bridge --init-nats operator --dir /etc/zebridge
 ```
 
-`operator` is the mode for every real deployment; `dev` is only a local smoke test ([the two modes](README.md#authentication)).
+`operator` is the mode for every real deployment; `dev` is only a local smoke test ([the modes](AUTHENTICATION.md#development)).
 
-It writes four files, `nats-server.conf`, `.env.nats`, `creds/bridge.creds` and `operator.store` into `/etc/zebridge` (what each file is: [Set up, once per deployment](README.md#1-set-up-once-per-deployment)). The paths written inside them point into `--dir`; if NATS runs on another host, copy `nats-server.conf` there and change its `store_dir`. `--port`, `--http-port` and `--ws-port` choose the server's ports. `.env.nats` holds the NATS settings only: the URL, the bridge's credentials, the enrollment keys.
+It writes four files, `nats-server.conf`, `.env.nats`, `creds/bridge.creds` and `operator.store` into `/etc/zebridge` (what each file holds: [The files](AUTHENTICATION.md#the-files)). The paths written inside them point into `--dir`; if NATS runs on another host, copy `nats-server.conf` there and change its `store_dir`. `--port`, `--http-port` and `--ws-port` choose the server's ports. `.env.nats` holds the NATS settings only: the URL, the bridge's credentials, the enrollment keys.
 
 Then create `/etc/zebridge/.env.bridge` (mode 0600), the bridge's database side:
 
@@ -390,7 +390,7 @@ At its first start the bridge creates the streams and buckets it needs in NATS: 
 
 #### 6. Secure the credentials
 
-Move `operator.store` off the server, and keep the other files readable by their service's user only. The full list: [where the credentials live](README.md#1-set-up-once-per-deployment).
+Move `operator.store` off the server, and keep the other files readable by their service's user only. The full list: [The files](AUTHENTICATION.md#the-files).
 
 ```sh
 mv /etc/zebridge/operator.store /your/offline/place/
@@ -415,7 +415,7 @@ INVITER_DATABASE_URL="$ADMIN_DATABASE_URL" bridge --invite --principal alice --t
 
 The code is printed alone, so a backend can capture it: `code=$(bridge --invite …)`. A backend uses its own login, granted `zebridge_inviter` ([The bridge and PostgreSQL](#the-bridge-and-postgresql)), never the admin's.
 
-The app passes that code to the library once, with the bridge's URL: [Onboard a device](README.md#2-onboard-a-device).
+The app passes that code to the library once, with the bridge's URL: [Users: invites](AUTHENTICATION.md#users-invites).
 
 ### Adding a leaf node
 
@@ -605,15 +605,7 @@ sequenceDiagram
 
 A **trusted machine** is any machine you control, your laptop for example, with the `bridge` binary and the two libraries it needs (`libpq5` and `libzstd1` on Debian). Run the command there, with `--store` pointing at the file, then copy what it wrote to the server: the updated `nats-server.conf`, or the new `.creds`. Passing the flag `--revoke` also needs to reach PostgreSQL (`ADMIN_DATABASE_URL`).
 
-**Where the credentials live, and how to keep them safe**:
-
-| file | holds | keep it |
-| --- | --- | --- |
-| `operator.store` | every seed: the operator, the accounts, the five signing keys | **off the server**, offline (see above) |
-| `.env.bridge` | the database passwords | on the bridge host only, readable by the bridge's user only |
-| `.env.nats` | `ZB_SIGNING_SEED`, which can mint a client for any principal | on the bridge host only, readable by the bridge's user only |
-| `creds/bridge.creds` | the bridge's own NATS identity: publish and subscribe on every subject of the account | on the bridge host only, readable by the bridge's user only |
-| `nats-server.conf` | public JWTs, no secret | on the NATS host |
+**Where the credentials live, and how to keep them safe**: [The files](AUTHENTICATION.md#the-files).
 
 - `--init-nats` writes the three secret files with mode `0600`. Keep it that way, and run the bridge under its own system user.
 - Never commit `zb-nats/`. This repository's `.gitignore` excludes it.
@@ -628,27 +620,9 @@ A **trusted machine** is any machine you control, your laptop for example, with 
 
   It writes a new client signing key into the account, the store and `.env.nats`; the responder and service keys, the bridge's creds and the revocations stay. From the reload, NATS refuses every client JWT the old key signed, forged or genuine. The old client signing key is removed from the account. A real device is refused once, renews on its own, and is back on a JWT from the new key: no new invite. `/renew` still works because the device signs it with its own key, not with the client signing key, and the bridge checks it against the key on record. Reload NATS and restart the bridge together: until the bridge has restarted, a device that renews gets a JWT from the old key and is refused again. A new device that enrolls in that window is in the same case: its first JWT comes from the old key and is refused, and it renews onto the new key once the bridge has restarted.
 
-**Services that answer queries (responders).** A responder is a service that keeps its own replica and answers the questions clients ask on `query.<tenant>.<name>` (for example, "points of interest near here"). **It reads like a client and never writes**, and the broker enforces it: the responder's signing key grants no `mutation.*` subject, so NATS refuses a write from its creds. Give it its own creds, minted on the machine that holds `operator.store`, not on the bridge host. The command connects to nothing: a copy of the `bridge` binary runs it anywhere libpq and zstd are installed.
+**Services and sensors.** A responder, an archiver and a sensor each get their creds from `operator.store` (`--mint-responder`, `--mint-archiver`, `--mint-sensor`), on the machine that holds it; what each may do and which process holds which file: [AUTHENTICATION.md, Services and sensors](AUTHENTICATION.md#services-and-sensors).
 
-```sh
-bridge --mint-responder --store operator.store --name pois --tenant globex > pois.creds
-```
-
-🔔 The creds are valid ten years by default (`--ttl-days`): a service is replaced with a redeploy, not renewed.
-
-A new tenant needs none of this again: its grants are the template, filled with the tenant tag the JWT carries. A new _role_ (other permissions) is a new signing key in the account.
-
-**Sensors and their archive.** Sensors publish readings on `sensors.<tenant>.<sensor>.<kind>`, over NATS or MQTT. The bridge keeps them in one stream per tenant, `READINGS_<tenant>`, which it creates at boot and when a tenant appears, for every tenant, whether it has sensors or not. An archiver writes them to Parquet files in S3 (Cloudflare R2, or any S3), and a responder answers questions over them: [examples/16-archive](examples/16-archive). Each gets its own creds, minted like a responder's:
-
-```sh
-bridge --mint-sensor    --store operator.store --name boiler-12     --tenant acme > boiler-12.creds
-bridge --mint-archiver  --store operator.store --name archiver-acme --tenant acme > archiver-acme.creds
-bridge --mint-responder --store operator.store --name readings-acme --tenant acme > readings-acme.creds
-```
-
-- A **sensor** publishes its own readings, `sensors.acme.boiler-12.>`, and nothing else. Over MQTT, its JWT (the first block of the creds file) is the password, with any user name. Without `--tenant`, it belongs to the open tenant `_default`.
-- An **archiver** belongs to one tenant: it reads that tenant's readings and writes that tenant's archive manifest. It runs as a container, one per tenant, next to the NATS server that holds the streams: `ghcr.io/ndrean/zebridge-archiver --tenant acme`, with its creds mounted at `/creds` and the S3 settings in its environment ([deploy/archiver.Dockerfile](deploy/archiver.Dockerfile)). It keeps no state: its position is the manifest, so a restart or a move loses nothing.
-- A **responder** reads the readings and manifests of the tenants it is minted for, and answers their questions. It runs as a container too, one per tenant: `ghcr.io/ndrean/zebridge-readings-responder --tenant acme`, with its creds at `/creds` and a read-only S3 key in its environment ([deploy/readings-responder.Dockerfile](deploy/readings-responder.Dockerfile)).
+**Sensors and their archive.** Sensors publish readings on `sensors.<tenant>.<sensor>.<kind>`, over NATS or MQTT. The bridge keeps them in one stream per tenant, `READINGS_<tenant>`, which it creates at boot and when a tenant appears, for every tenant, whether it has sensors or not. An archiver writes them to Parquet files in S3 (Cloudflare R2, or any S3), and a responder answers questions over them: [examples/16-archive](examples/16-archive). The archiver runs as a container, one per tenant (`ghcr.io/ndrean/zebridge-archiver --tenant acme`), next to the NATS server that holds the streams; it keeps no state, its position is the manifest. The readings responder too (`ghcr.io/ndrean/zebridge-readings-responder --tenant acme`).
 
 Two settings in `.env.bridge` bound each tenant's readings stream; a full stream drops its oldest readings:
 
@@ -659,31 +633,7 @@ Two settings in `.env.bridge` bound each tenant's readings stream; a full stream
 
 🔔 A store made before these two roles has no archiver or sensor key. `bridge --init-nats --update` adds them to the store and the account, and leaves every other key as it is: issued creds and device JWTs stay valid. Run it on the store's file, not from standard input, so the new keys are kept.
 
-**The credentials, process by process.** Each process holds one NATS identity, minted from `operator.store` and allowed only its own job; the two readings services also hold an S3 key, which comes from the bucket's provider (an R2 API token's key pair), not from ZeBridge.
-
-On the hub (`<t>` is a tenant):
-
-| process | NATS identity | minted by | file | may do | other keys |
-| --- | --- | --- | --- | --- | --- |
-| bridge and sweeper | the service key | `--init-nats`, once | `/etc/zebridge/creds/bridge.creds` | everything (`>`): the trusted writer | the database passwords, in `.env.bridge` |
-| `zb-respond` (routing) | responder `routing`, tenant `_default` | the Ansible `routing` role | `/etc/zebridge/creds/routing.creds` | answer `query._default.*`, read like a client; no writes | none |
-| archiver, one per tenant | archiver `archiver-<t>` | `--mint-archiver --name archiver-<t> --tenant <t>` | `/etc/zebridge/creds/archiver-<t>.creds` | read `READINGS_<t>`, write `<t>`'s manifest; nothing else | an S3 key that can **write** the bucket |
-| readings responder, one per tenant | responder `readings-<t>` | `--mint-responder --name readings-<t> --tenant <t>` | `/etc/zebridge/creds/readings-<t>.creds` | answer `query.<t>.*`, read `READINGS_<t>` and its manifest; no writes | an S3 key that can only **read** the bucket |
-
-Off the hub:
-
-| who | NATS identity | how it gets it | may do |
-| --- | --- | --- | --- |
-| a sensor | sensor `<name>`, one tenant (a bearer JWT) | `--mint-sensor`, copied to the device | publish `sensors.<t>.<name>.>`; read nothing |
-| a phone or a browser | a client, per device | `/enroll` with an invite; the device makes its own key | its tenants' data, its own writes, `query.<t>.*` |
-| a leaf node | the leaf link | `leaf.yml` (`--mint-leaf`) | carry its devices' traffic, `mutation.>` and `sensors.>` |
-| an app's backend | none: it reaches PostgreSQL only, as a login granted `zebridge_inviter` | the DBA (`GRANT zebridge_inviter TO <login>`) | create invites; nothing else |
-| the public demo's front door (`bridge --demo-invites`, on the hub) | none: the same, its own login granted `zebridge_inviter` | the DBA, then `vault_demo_inviter_url` (Ansible role `demo`) | create invites; nothing else |
-
-- The archiver and the readings responder run as uid 10001 in their containers: their creds file must belong to that uid, mode 0600, or the container cannot read it: `sudo /usr/bin/bridge --mint-archiver … | sudo install -m 0600 -o 10001 -g 10001 /dev/stdin /etc/zebridge/creds/archiver-<t>.creds`.
-- Their S3 keys go in an env file read by `docker run --env-file` (mode 0600, root), never on a command line, where `ps` and the shell's history would show them.
-- Give the responder its own read-only S3 key: a compromised responder then cannot change the archive.
-- Every `--mint-…` reads `operator.store`. Kept offline, the commands run on the machine that holds it (`--store <path>`), and only the `.creds` files go to the hub.
+**The credentials, process by process**: [AUTHENTICATION.md, Services and sensors](AUTHENTICATION.md#services-and-sensors).
 
 **After a grammar change** (a new bridge version that adds a table or a subject), the templates must follow. Bring `operator.store` back and run:
 

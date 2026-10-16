@@ -110,7 +110,7 @@ For the check before a start (`--diagnose`), see [Diagnose](#diagnose).
 
 For slot management, see [Replication slot management](#replication-slot-management)
 
-For identity management, see [Production: operator mode](README.md#production-use-operator-mode) and [4. Revoke](README.md#4-revoke).
+For identity management, see [AUTHENTICATION.md](AUTHENTICATION.md) and its [Revoke](AUTHENTICATION.md#revoke).
 
 [⬆️](#table-of-contents)
 
@@ -302,7 +302,7 @@ One more rule, for the write path: the writer role's `CONNECTION LIMIT` must hol
 
 The manifests live in the `generations` KV bucket, keyed `{tenant}.{table}`; the objects in per-tenant `gen-{tenant}` object stores. Why the rules are what they are: [Catching up: the chain and the stream](#catching-up-the-chain-and-the-stream).
 
-**4. Enrollment**: The enrollment variables are with the setup they belong to: [Set up, once per deployment](README.md#1-set-up-once-per-deployment). The main config is the JWT TTL: `ENROLL_JWT_TTL_SECONDS=86_400` (1 day).
+**4. Enrollment**: The enrollment variables are with the setup they belong to: [DEPLOYMENT, The NATS identity](DEPLOYMENT.md#the-nats-identity). The main config is the JWT TTL: `ENROLL_JWT_TTL_SECONDS=86_400` (1 day).
 
 **5. CDC configuration:**
 
