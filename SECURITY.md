@@ -18,13 +18,14 @@ buggy one (PROTOCOL.md §7.0).
 
 ## Part 1 — The DBA
 
-### 1.1 PostgreSQL: three roles, and why they are separate
+### 1.1 PostgreSQL: four roles, and why they are separate
 
 | role | holds | must never have |
 | --- | --- | --- |
 | **`postgres`** (admin) | creates roles, runs `bridge --init-sql | psql`, owns tables | to appear in `.env.bridge`. It is not a bridge credential |
 | **`bridge_reader`** | `SELECT` + `REPLICATION` — plus one deliberate exception: `INSERT`+`DELETE` on `zebridge_generations`, and `UPDATE` of only the columns that attach a full or a checkpoint to a generation and retire it (`has_full`, `has_checkpoint`, `ckpt_lower`, `obj_bytes`, `retired_at`, `full_sorted`, `ckpt_sorted`), the generation producer's own bookkeeping, because the content query must run as the reader (SELECT-everywhere + `zb.tenant` RLS), and the bookkeeping row is written by that same connection — after the objects and manifest are live, so it never vouches for artifacts that don't exist (append-only by privilege; `scripts/scenarios/generations.py` proves the boundary) | any write privilege on user data. It is *physically* unable to write anything a client reads |
 | **`bridge_writer`** | per-table `SELECT, INSERT, UPDATE, DELETE`, granted one table at a time | `BYPASSRLS`. That attribute is what makes RLS enforce writes |
+| **`zebridge_inviter`** | no login: `EXECUTE` on `zebridge_invite()` only, granted by the DBA to a backend's own login. The function (`SECURITY DEFINER`) writes the invite row, refuses a revoked principal and a lifetime over 30 days | any table privilege. It can create invites; it cannot read a code, spend or extend one, or delete one, so revoking stays with the admin |
 
 There is **no tenant role.** A tenant is a column value, not a login. One writer role serves every principal; who they are arrives as a session setting, and PostgreSQL resolves the tenant from it. Adding a tenant is a row in a mapping table, never a `CREATE ROLE`.
 
@@ -773,6 +774,7 @@ refactor, or a migration — and most of the defects found while building this w
 | claim | where |
 | --- | --- |
 | grant vs schema disagreement; refusal reports SQLSTATE 42501 | ✅ `scripts/scenarios/writable.py` |
+| a login granted `zebridge_inviter` creates invites and nothing else: no read, update or delete of `zebridge_invites`, no roster write; a revoked principal, a bad name or a lifetime over 30 days is refused and writes nothing | ✅ `scripts/scenarios/invite_cli.py` |
 | a column list is the bridge's own publication's: a stray second publication with a narrower list does not shrink the descriptor, the chain or the audit; the tsvector never travels; the list refreshes after ADD COLUMN; a client cannot write a column left out | ✅ `scripts/scenarios/collist.py`; the one-slot-two-lists refusal checked by hand |
 | a future-dated version is clamped to `now()` + tolerance, and the client is told what was stored | ✅ `scripts/scenarios/clamp.py` — asserts the cap, that the row unfreezes once the window passes, the verdict's wire format, and that a within-tolerance version is left untouched |
 | an integer version cannot freeze a row: a fresh row stores at most 1, an update or a delete at most stored + 1, the verdict names the value stored; the tombstone takes `now()`; the classify probe casts by the column's type | ✅ `scripts/scenarios/intclamp.py` — 9 assertions across insert, upsert, UPDATE, DELETE, `stale` and `row_deleted` |

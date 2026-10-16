@@ -314,7 +314,7 @@ cd libzb && zig build lib -Doptimize=ReleaseFast -Dvendor=true
 2. Prepare PostgreSQL: `bridge --init-sql | psql` creates the two roles, the functions, the triggers and the publication.
 3. Enable each table with `zebridge_enable`, which declares its sync rules (see [Preparing your database](#preparing-your-database)).
 4. Check with `bridge --diagnose`, then start NATS, the bridge and the `bridge_sweeper` daemon.
-5. Invite users: a row in `zebridge_invites` gives each device a one-time code (see [Authentication](#authentication)).
+5. Invite users: `bridge --invite` gives each device a one-time code (see [Authentication](#authentication)).
 
 The app then works on the library, `libzb` or `zb-client-ts`, and its local database, never on NATS. Step by step: [Host setup](DEPLOYMENT.md#host-setup-on-vps-or-bare-metal). On a Debian server behind Cloudflare, [deploy/ansible](deploy/ansible/README.md) does it all. A cloud PostgreSQL: [SUPABASE_TEST](SUPABASE_TEST.md).
 
@@ -1276,7 +1276,7 @@ It runs in one of two modes:
 | --- | --- | --- |
 | set up with | `bridge --init-nats operator` | `bridge --init-nats dev` |
 | NATS | checks each user's token, and the subjects it may use | open: anyone who reaches the port can do anything |
-| add a user to a tenant | an invite: `INSERT INTO zebridge_invites (principal, tenant_id)` returns a one-time code | a direct insertion: `INSERT INTO zebridge_user_tenants (principal, tenant_id)` |
+| add a user to a tenant | an invite: `bridge --invite --principal alice --tenant acme` (or `SELECT zebridge_invite('alice', 'acme')`) returns a one-time code | a direct insertion: `INSERT INTO zebridge_user_tenants (principal, tenant_id)` |
 | the device | redeems the code once, gets a token (a NATS JWT), and renews it on its own | passes its `principal` and the `natsUrl` |
 | can a client act as another user? | no | yes |
 
@@ -1309,15 +1309,19 @@ The bridge's own NATS identity needs nothing from you: `bridge --init-nats opera
 
 #### 2. Onboard a device
 
-Your backend decides _who_ (the principal) and _where_ (the tenant), and writes a one-time invite; today a DBA writes it by hand:
+Your backend signs the user in, however it does that (OAuth, a password…), then decides _who_ (the principal) and _where_ (the tenant), and asks for a one-time invite code. Either from a shell:
 
-```sql
-INSERT INTO zebridge_invites (principal, tenant_id) 
-VALUES ('alice', 'acme') 
-RETURNING code;
+```sh
+INVITER_DATABASE_URL=postgres://… bridge --invite --principal alice --tenant acme --expires '1 hour'
 ```
 
-PostgreSQL generates the OTP code; it expires after 1 day by default (set `expires_at` in the `INSERT` for another lifetime, e.g. `now() + interval '1 hour'`). Your backend (or DBA) then sends the code to the user's device, and the app passes it to the library as `invite`, on the first connect:
+or with one SQL call over its own PostgreSQL connection:
+
+```sql
+SELECT zebridge_invite('alice', 'acme', interval '1 hour');
+```
+
+Both print the code, and both run the same function. Its login needs one right only, `GRANT zebridge_inviter TO <login>`: it can create invites, and it cannot read, spend or delete them, nor touch anything else. An invite lasts 1 day by default, at most 30 days, and a revoked principal gets none. Revoking stays with the DBA ([4. Revoke](#4-revoke)). Your backend then sends the code to the user's device, and the app passes it to the library as `invite`, on the first connect:
 
 | how the invite code reaches the device | where the app reads it |
 | --- | --- |
@@ -1351,8 +1355,8 @@ sequenceDiagram
 
     U->>BE: log in (OAuth, password…)
     BE->>BE: decide principal and tenant
-    BE->>PG: INSERT INTO zebridge_invites (principal, tenant_id) RETURNING code
-    Note over BE,PG: today: a DBA does this by hand
+    BE->>PG: SELECT zebridge_invite(principal, tenant) (or bridge --invite)
+    Note over BE,PG: its login holds zebridge_inviter only
     BE-->>A: the one-time code (in the login response)
 
     A->>A: new ZeBridge({ bridgeUrl, invite, tables })

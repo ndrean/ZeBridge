@@ -208,6 +208,15 @@ The bridge connects with two PostgreSQL roles, one URL each in `.env.bridge`:
 
 These two URLs are the only place the role names and passwords are written. The init SQL creates the roles from them. The DBA's superuser (`ADMIN_DATABASE_URL`, in `.env.admin`) is used only to install the SQL and for admin commands such as `--revoke`; the bridge never runs as it.
 
+A third role, `zebridge_inviter`, is for whoever creates invites: an app's backend, or a script. It has no login and no password: the init SQL creates it and lets it call `zebridge_invite()`, nothing else. The DBA gives it to a login of their own:
+
+```sql
+CREATE ROLE app_backend LOGIN PASSWORD '…';
+GRANT zebridge_inviter TO app_backend;
+```
+
+That login can create invites (`bridge --invite`, or `SELECT zebridge_invite(…)`), and cannot read, spend or delete them. Its URL is the backend's `INVITER_DATABASE_URL`, passed to `bridge --invite` for the command only, never in `.env.bridge`.
+
 ```sh
 set -a; . ./.env.admin; . ./.env.bridge; set +a
 bridge --init-sql | psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1
@@ -398,13 +407,13 @@ bridge --diagnose
 
 #### 8. Invite the first user
 
-A new user's app sends their `principal` (their ID) to the backend (today, the DBA). The backend (DBA here) assigns them a `tenant_id`.
+A new user's app sends their `principal` (their ID) to the backend, which assigns them a `tenant_id` and asks for a code. By hand on the hub, with the admin's URL:
 
-```sql
-INSERT INTO zebridge_invites (principal, tenant_id)
-VALUES ('alice', 'acme')
-RETURNING code;
+```sh
+INVITER_DATABASE_URL="$ADMIN_DATABASE_URL" bridge --invite --principal alice --tenant acme --expires '1 hour'
 ```
+
+The code is printed alone, so a backend can capture it: `code=$(bridge --invite …)`. A backend uses its own login, granted `zebridge_inviter` ([The bridge and PostgreSQL](#the-bridge-and-postgresql)), never the admin's.
 
 The app passes that code to the library once, with the bridge's URL: [Onboard a device](README.md#2-onboard-a-device).
 
@@ -668,6 +677,7 @@ Off the hub:
 | a sensor | sensor `<name>`, one tenant (a bearer JWT) | `--mint-sensor`, copied to the device | publish `sensors.<t>.<name>.>`; read nothing |
 | a phone or a browser | a client, per device | `/enroll` with an invite; the device makes its own key | its tenants' data, its own writes, `query.<t>.*` |
 | a leaf node | the leaf link | `leaf.yml` (`--mint-leaf`) | carry its devices' traffic, `mutation.>` and `sensors.>` |
+| an app's backend | none: it reaches PostgreSQL only, as a login granted `zebridge_inviter` | the DBA (`GRANT zebridge_inviter TO <login>`) | create invites; nothing else |
 
 - The archiver and the readings responder run as uid 10001 in their containers: their creds file must belong to that uid, mode 0600, or the container cannot read it: `sudo /usr/bin/bridge --mint-archiver … | sudo install -m 0600 -o 10001 -g 10001 /dev/stdin /etc/zebridge/creds/archiver-<t>.creds`.
 - Their S3 keys go in an env file read by `docker run --env-file` (mode 0600, root), never on a command line, where `ps` and the shell's history would show them.

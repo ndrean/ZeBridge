@@ -798,6 +798,48 @@ ALTER TABLE public.zebridge_invites ALTER COLUMN expires_at SET DEFAULT now() + 
 GRANT SELECT, UPDATE ON public.zebridge_invites TO ${POSTGRES_WRITER_USER};
 GRANT INSERT ON public.zebridge_user_tenants TO ${POSTGRES_WRITER_USER};
 
+-- Creating an invite without the admin — see SECURITY.md §1.6. An app's backend, after its
+-- own sign-in, asks for an invite for the principal and tenant it chose; `bridge --invite`
+-- calls the same function. Its login is the DBA's to create, then
+-- `GRANT zebridge_inviter TO <login>`: the group role has no login and no password here.
+-- It may call this function and nothing else — no table, so it cannot read codes, spend
+-- one, or touch an invite it did not make. The function refuses a revoked principal
+-- (revocation is for good) and a lifetime over 30 days. Revoking stays an admin act.
+CREATE OR REPLACE FUNCTION public.zebridge_invite(p_principal text, p_tenant text, p_valid_for interval DEFAULT interval '1 day')
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    v_code text;
+BEGIN
+    IF p_valid_for IS NULL OR p_valid_for <= interval '0' OR p_valid_for > interval '30 days' THEN
+        RAISE EXCEPTION 'an invite lasts more than 0 and at most 30 days, not %', p_valid_for
+            USING ERRCODE = '22023';
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.zebridge_principal_keys k
+               WHERE k.principal = p_principal AND k.revoked_at IS NOT NULL) THEN
+        RAISE EXCEPTION 'principal % was revoked, which is for good: invite a new principal', p_principal
+            USING ERRCODE = '42501';
+    END IF;
+    INSERT INTO public.zebridge_invites (principal, tenant_id, expires_at)
+    VALUES (p_principal, p_tenant, now() + p_valid_for)
+    RETURNING code INTO v_code;
+    RETURN v_code;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.zebridge_invite(text, text, interval) FROM PUBLIC;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'zebridge_inviter') THEN
+        CREATE ROLE zebridge_inviter NOLOGIN;
+    END IF;
+END;
+$$;
+GRANT USAGE ON SCHEMA public TO zebridge_inviter;
+GRANT EXECUTE ON FUNCTION public.zebridge_invite(text, text, interval) TO zebridge_inviter;
+
 
 -- ⚠️ Never published as ordinary CDC — see the matching exemption in
 -- `zebridge_publication_guard()` (init.core.template.sql). The bridge special-cases this

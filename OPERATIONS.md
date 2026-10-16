@@ -74,6 +74,11 @@ The reference for running ZeBridge: the CLI, the doctor (`--diagnose`), what nee
                   --ttl-days: both default to 3650 (ten years): replaced with a redeploy
                   --store - reads the store from standard input (a password manager's pipe):
                   the seeds never touch this host's disk
+  --invite --principal NAME --tenant T [--expires '1 hour']
+                  An enrollment invite; the code alone on stdout. Needs
+                  INVITER_DATABASE_URL for the invocation: a login granted
+                  zebridge_inviter (an app's backend), or the admin. --expires: a
+                  PostgreSQL interval up to 30 days, default '1 day'
   --revoke <principal>  Revoke: mapping + unused invites, three-clock narration.
                   Needs ADMIN_DATABASE_URL for the invocation (never stored in env)
       [--conf PATH]           …and close the token now: with OPERATOR_SEED and

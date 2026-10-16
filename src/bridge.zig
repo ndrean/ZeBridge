@@ -20,6 +20,7 @@ const args = @import("args.zig");
 const nkey_gen = @import("nkey_gen.zig");
 const nats_init = @import("nats_init.zig");
 const init_sql = @import("init_sql.zig");
+const admin_invite = @import("admin_invite.zig");
 const admin_revoke = @import("admin_revoke.zig");
 const admin_slots = @import("admin_slots.zig");
 const hot_streams = @import("hot_streams.zig");
@@ -43,6 +44,7 @@ const diagnose_live = @import("diagnose_live.zig");
 // Zig only collects tests from files the root actually references, so every module
 // carrying `test` blocks must be listed here or its tests silently never run.
 comptime {
+    _ = @import("admin_invite.zig");
     _ = @import("admin_revoke.zig");
     _ = @import("array.zig");
     _ = @import("batch_publisher.zig");
@@ -749,6 +751,7 @@ pub fn main(init: std.process.Init) !void {
         .mint_sensor => return std.process.exit(nats_init.mintSensor(init.io, &init)),
         .mint_leaf => return std.process.exit(nats_init.mintLeaf(init.io, &init)),
         .init_sql => return std.process.exit(init_sql.run(init.io, &init)),
+        .invite => return std.process.exit(admin_invite.run(&init)),
         .revoke => return std.process.exit(admin_revoke.run(&init)),
         .view_slots => return std.process.exit(admin_slots.run(&init, .view_all)),
         .view_slot => return std.process.exit(admin_slots.run(&init, .view_one)),
