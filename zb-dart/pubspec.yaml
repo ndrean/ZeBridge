@@ -1,6 +1,6 @@
 name: zebridge
 description: "ZeBridge client for Dart and Flutter: an offline-first local replica of PostgreSQL tables, kept in sync over NATS, with libzb built in for Android, iOS, macOS and Linux."
-version: 0.2.3
+version: 0.2.4
 homepage: https://github.com/ndrean/zebridge
 repository: https://github.com/ndrean/zebridge/tree/main/zb-dart
 issue_tracker: https://github.com/ndrean/zebridge/issues

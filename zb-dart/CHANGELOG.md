@@ -1,3 +1,8 @@
+## 0.2.4
+
+- No change in the package: its version follows ZeBridge's releases. 0.2.4 fixes the Docker
+  Compose deployment (IPv6 for a cloud PostgreSQL, HAProxy alone on port 80, upgrades).
+
 ## 0.2.3
 
 - No change in the package: its version follows ZeBridge's releases. 0.2.3 adds
