@@ -27,6 +27,9 @@ pub fn build(b: *std.Build) void {
     // Opt-in for now, so nothing that works today changes: `-Dvendor=true`.
     const vendor = b.option(bool, "vendor", "Compile sqlite and zstd from pinned sources instead of linking the host's") orelse false;
 
+    const android_api = b.option([]const u8, "android-api", "Android API level whose libc a shared build links (NDK sysroot)") orelse "29";
+    const is_android = target.result.abi == .android or target.result.abi == .androideabi;
+
     const translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/sqlite_includes.h"),
         .target = target,
@@ -67,6 +70,11 @@ pub fn build(b: *std.Build) void {
         break :blk b.allocator.dupe([]const u8, &.{base}) catch &.{};
     } else &.{};
     for (sysroot_includes) |p| translate_c.addSystemIncludePath(.{ .cwd_relative = p });
+    // ⚠️ The NDK's headers need the API level: since NDK 30, sys/cdefs.h stops on
+    // "Unversioned target triples are not supported!" when __ANDROID_API__ is unset, and
+    // older ones silently assume every API exists. The Zig target names no level, so it
+    // is given here (and to the C sources, addVendored), from -Dandroid-api.
+    if (is_android) translate_c.defineCMacro("__ANDROID_API__", android_api);
     const c_mod = translate_c.createModule();
 
     // §10fl: DuckDB's header as its own module (`@import("duckdb")`), from the vendored
@@ -80,6 +88,7 @@ pub fn build(b: *std.Build) void {
         });
         tc.addIncludePath(b.path("include-engines"));
         for (sysroot_includes) |p| tc.addSystemIncludePath(.{ .cwd_relative = p });
+        if (is_android) tc.defineCMacro("__ANDROID_API__", android_api);
         break :blk tc.createModule();
     };
 
@@ -96,7 +105,6 @@ pub fn build(b: *std.Build) void {
     //
     // `dictBuilder` is deliberately absent: no dictionary is trained or loaded anywhere
     // since 2026-09-24 (§10iy).
-    const android_api = b.option([]const u8, "android-api", "Android API level whose libc a shared build links (NDK sysroot)") orelse "29";
     const arch_include: ?[]const u8 = if (target.result.abi == .android or target.result.abi == .androideabi)
         target.result.linuxTriple(b.allocator) catch null
     else
@@ -159,6 +167,8 @@ pub fn build(b: *std.Build) void {
                     // `-Dandroid-api` chooses the level (21 is the NDK's oldest).
                     // RELATIVE: Zig prepends the sysroot itself (the same trap as the iOS path).
                     m.addLibraryPath(.{ .cwd_relative = bb.pathJoin(&.{ "/usr", "lib", ai, api }) });
+                    // The API level for the NDK's headers, as for translate-c above.
+                    m.addCMacro("__ANDROID_API__", api);
                 }
                 // …and the libc to LINK against. Headers alone get as far as
                 // "unable to find libSystem system library".
