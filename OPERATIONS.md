@@ -79,6 +79,10 @@ The reference for running ZeBridge: the CLI, the doctor (`--diagnose`), what nee
                   INVITER_DATABASE_URL for the invocation: a login granted
                   zebridge_inviter (an app's backend), or the admin. --expires: a
                   PostgreSQL interval up to 30 days, default '1 day'
+  --demo-invites --redirect URL [--tenant demo] [--expires '1 hour'] [--listen 127.0.0.1:27435]
+                  A public demo's front door, its own process: GET /demo creates an
+                  invite for a new principal (demo-<random>) and redirects to
+                  URL?invite=<code>. INVITER_DATABASE_URL, a login granted zebridge_inviter
   --revoke <principal>  Revoke: mapping + unused invites, three-clock narration.
                   Needs ADMIN_DATABASE_URL for the invocation (never stored in env)
       [--conf PATH]           …and close the token now: with OPERATOR_SEED and

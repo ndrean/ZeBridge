@@ -58,6 +58,10 @@ const usage =
     \\                  INVITER_DATABASE_URL for the invocation: a login granted
     \\                  zebridge_inviter (an app's backend), or the admin. --expires: a
     \\                  PostgreSQL interval up to 30 days, default '1 day'
+    \\  --demo-invites --redirect URL [--tenant demo] [--expires '1 hour'] [--listen 127.0.0.1:27435]
+    \\                  A public demo's front door, its own process: GET /demo creates an
+    \\                  invite for a new principal (demo-<random>) and redirects to
+    \\                  URL?invite=<code>. INVITER_DATABASE_URL, a login granted zebridge_inviter
     \\  --revoke <principal>  Revoke: mapping + unused invites, three-clock narration.
     \\                  Needs ADMIN_DATABASE_URL for the invocation (never stored in env)
     \\      [--conf PATH]           …and close the token now: with OPERATOR_SEED and
@@ -192,7 +196,7 @@ pub const gen_nkey_flag = "--gen-nkey";
 
 /// Flags that REPLACE the program instead of configuring it: they read no environment,
 /// open nothing, and their whole output IS the answer.
-pub const EarlyExit = enum { help, version, gen_nkey, init_nats, init_sql, mint_responder, mint_archiver, mint_sensor, mint_leaf, invite, revoke, view_slots, view_slot, drop_slot };
+pub const EarlyExit = enum { help, version, gen_nkey, init_nats, init_sql, mint_responder, mint_archiver, mint_sensor, mint_leaf, invite, demo_invites, revoke, view_slots, view_slot, drop_slot };
 
 /// Answered from argv by `main` BEFORE the log level is resolved and before anything
 /// else prints — boot noise on stderr is noise in a command meant to be piped
@@ -217,6 +221,7 @@ pub fn earlyExit(init: *const std.process.Init) ?EarlyExit {
         if (std.mem.eql(u8, arg, "--mint-leaf")) return .mint_leaf;
         if (std.mem.eql(u8, arg, "--init-sql")) return .init_sql;
         if (std.mem.eql(u8, arg, "--invite")) return .invite;
+        if (std.mem.eql(u8, arg, "--demo-invites")) return .demo_invites;
         if (std.mem.eql(u8, arg, "--revoke")) return .revoke;
         if (std.mem.eql(u8, arg, "--view-slots")) return .view_slots;
         if (std.mem.eql(u8, arg, "--view-slot")) return .view_slot;

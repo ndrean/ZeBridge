@@ -70,33 +70,47 @@ pub fn run(init: *const std.process.Init) u8 {
         return 1;
     }
 
+    var buf: [512]u8 = undefined;
+    switch (create(conn.?, p, t, expires, &buf)) {
+        .refused => |why| {
+            out("🔴 no invite: {s}\n", .{why});
+            return 1;
+        },
+        .code => |code| {
+            var line_buf: [128]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buf, "{s}\n", .{code}) catch return 1;
+            std.Io.File.stdout().writeStreamingAll(init.io, line) catch return 1;
+            return 0;
+        },
+    }
+}
+
+/// One invite, or why there is none: the code, or PostgreSQL's reason said plainly, copied
+/// into `out`. Shared by `bridge --invite` and `bridge --demo-invites`, so the two cannot
+/// drift. `conn` logs in as a member of zebridge_inviter (or the admin).
+pub const Result = union(enum) { code: []const u8, refused: []const u8 };
+
+pub fn create(conn: *c.PGconn, principal: []const u8, tenant: []const u8, expires: []const u8, out_buf: []u8) Result {
     var p_buf: [300]u8 = undefined;
     var t_buf: [300]u8 = undefined;
     var e_buf: [100]u8 = undefined;
-    const p_z = std.fmt.bufPrintSentinel(&p_buf, "{s}", .{p}, 0) catch {
-        out("🔴 principal too long\n", .{});
-        return 1;
-    };
-    const t_z = std.fmt.bufPrintSentinel(&t_buf, "{s}", .{t}, 0) catch {
-        out("🔴 tenant too long\n", .{});
-        return 1;
-    };
-    const e_z = std.fmt.bufPrintSentinel(&e_buf, "{s}", .{expires}, 0) catch {
-        out("🔴 --expires too long\n", .{});
-        return 1;
-    };
+    const p_z = std.fmt.bufPrintSentinel(&p_buf, "{s}", .{principal}, 0) catch return .{ .refused = "principal too long" };
+    const t_z = std.fmt.bufPrintSentinel(&t_buf, "{s}", .{tenant}, 0) catch return .{ .refused = "tenant too long" };
+    const e_z = std.fmt.bufPrintSentinel(&e_buf, "{s}", .{expires}, 0) catch return .{ .refused = "--expires too long" };
     const params = [_]?[*:0]const u8{ p_z.ptr, t_z.ptr, e_z.ptr };
     const res = c.PQexecParams(conn, "SELECT public.zebridge_invite($1, $2, $3::interval)", 3, null, &params[0], null, null, 0);
     defer c.PQclear(res);
-    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) {
-        out("🔴 no invite: {s}\n", .{explain(c.PQresultErrorField(res, c.PG_DIAG_SQLSTATE), c.PQresultErrorField(res, c.PG_DIAG_MESSAGE_PRIMARY))});
-        return 1;
-    }
-
-    var line_buf: [128]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "{s}\n", .{std.mem.span(c.PQgetvalue(res, 0, 0))}) catch return 1;
-    std.Io.File.stdout().writeStreamingAll(init.io, line) catch return 1;
-    return 0;
+    const got: []const u8 = if (c.PQresultStatus(res) == c.PGRES_TUPLES_OK and c.PQntuples(res) == 1)
+        std.mem.span(c.PQgetvalue(res, 0, 0))
+    else
+        explain(c.PQresultErrorField(res, c.PG_DIAG_SQLSTATE), c.PQresultErrorField(res, c.PG_DIAG_MESSAGE_PRIMARY));
+    // Copied out: both strings live in `res`, cleared on return.
+    const n = @min(got.len, out_buf.len);
+    @memcpy(out_buf[0..n], got[0..n]);
+    return if (c.PQresultStatus(res) == c.PGRES_TUPLES_OK and c.PQntuples(res) == 1)
+        .{ .code = out_buf[0..n] }
+    else
+        .{ .refused = out_buf[0..n] };
 }
 
 /// PostgreSQL's words, with the two answers a caller can act on said plainly first.
