@@ -86,6 +86,8 @@ zb-client-ts/zebridge_*.sqlite3-*
 
 # R2 bucket (tiles, sensors bucket)
 .env.bucket
+# The Central Portal token for Maven (CI reads it from the repository's secrets)
+.env.maven
 
 .env.grafana
 # A cloud PostgreSQL's connection strings (the Supabase demo project): never committed.
