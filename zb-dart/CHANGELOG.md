@@ -1,3 +1,9 @@
+## 0.2.3
+
+- No change in the package: its version follows ZeBridge's releases. 0.2.3 adds
+  `bridge --invite` (invites from a backend, without the admin) and the all-in-one Docker
+  Compose deployment.
+
 ## 0.2.2
 
 - libzb: two clients in containers no longer collide on a stream. A live-tail consumer was

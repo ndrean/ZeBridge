@@ -290,7 +290,7 @@ sudo apt update
 | `@zebridge/react-native` (npm) | React Native, Expo SDK 53+, iOS and Android | `npx expo install @zebridge/react-native` | `const zb = await Libzb.connect({ … }); await zb.sync();` |
 | `zebridge` <br>(PyPI) | Python 3.10+, Linux and macOS | `pip install zebridge` | `with ZeBridge(bridge_url=…, invite=…, tables=[…]) as zb:` |
 | `zebridge` <br>(pub.dev) | Dart 3.10+, Flutter 3.38+: Android, iOS, macOS, Linux | `dart pub add zebridge` | `final zb = await ZeBridgeWorker.spawn({ … });` |
-| `eu.zebridge:zebridge-android` <br>(Maven Central) | Kotlin and Java, Android 10+ | `implementation("eu.zebridge:zebridge-android:0.2.2")` | `val zb = ZeBridge(mapOf(…), context) { … }` |
+| `eu.zebridge:zebridge-android` <br>(Maven Central) | Kotlin and Java, Android 10+ | `implementation("eu.zebridge:zebridge-android:0.2.3")` | `val zb = ZeBridge(mapOf(…), context) { … }` |
 
 A client built upon `NodeJS` needs two more packages next to `@zebridge/client`: `better-sqlite3` and `@nats-io/transport-node`.
 

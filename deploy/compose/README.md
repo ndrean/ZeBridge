@@ -27,7 +27,7 @@ clients' addresses, so HAProxy's per-address limits would count every client as 
 2. The two files, on the server:
 
    ```sh
-   V=0.2.2
+   V=0.2.3
    mkdir zebridge && cd zebridge
    curl -fsSLO https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/compose.yml
    curl -fsSL -o .env https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/.env.example

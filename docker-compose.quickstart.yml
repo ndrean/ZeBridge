@@ -10,7 +10,7 @@
 # 127.0.0.1. Not a production layout: see deploy/compose/ for a server.
 #
 # Optional settings, in a .env next to this file or in the environment:
-#   ZB_VERSION=0.2.2      the release to run (ghcr.io/ndrean/zebridge, zebridge-web-demo)
+#   ZB_VERSION=0.2.3      the release to run (ghcr.io/ndrean/zebridge, zebridge-web-demo)
 #   QS_WEB_PORT=5173      the demo's port on this machine
 #   QS_SURVEY_PORT=5174   the shared record's port on this machine
 #   QS_BRIDGE_PORT=27434  the bridge's /status and /metrics on this machine
@@ -18,7 +18,7 @@
 # Start again from scratch: docker compose -f docker-compose.quickstart.yml down -v
 
 x-zebridge: &zebridge
-  image: ghcr.io/ndrean/zebridge:${ZB_VERSION:-0.2.2}
+  image: ghcr.io/ndrean/zebridge:${ZB_VERSION:-0.2.3}
   init: true   # an init as PID 1 passes SIGTERM on: a stop takes ms, not 10 s
 
 services:
@@ -87,7 +87,7 @@ services:
   # The browser demo (examples/05-tables/web-consumer), served by nginx, which also proxies
   # /bridge/ and /nats to the services above: the page only talks to its own origin.
   web:
-    image: ghcr.io/ndrean/zebridge-web-demo:${ZB_VERSION:-0.2.2}
+    image: ghcr.io/ndrean/zebridge-web-demo:${ZB_VERSION:-0.2.3}
     ports:
       - "127.0.0.1:${QS_WEB_PORT:-5173}:5173"
     depends_on:
@@ -96,7 +96,7 @@ services:
 
   # The second page (examples/15-shared-record): one record, several editors, a merge.
   survey:
-    image: ghcr.io/ndrean/zebridge-survey-demo:${ZB_VERSION:-0.2.2}
+    image: ghcr.io/ndrean/zebridge-survey-demo:${ZB_VERSION:-0.2.3}
     ports:
       - "127.0.0.1:${QS_SURVEY_PORT:-5174}:5173"
     depends_on:
