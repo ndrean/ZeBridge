@@ -22,6 +22,25 @@ if [ ! -f /certs/haproxy.pem ]; then
   echo "temporary self-signed certificate in place, until Let's Encrypt's"
 fi
 
+# Let's Encrypt's expiry notices go to ACME_EMAIL. Empty, compose refuses to start; a
+# placeholder or a typo is refused here, with the temporary certificate already in place
+# so HAProxy and NATS run meanwhile, and certbot shows as Restarting in `docker compose ps`.
+email_ok() {
+  case "$1" in
+    *[!A-Za-z0-9._%+@-]* | *@*@*) return 1 ;;   # spaces, <, >, quotes; two @
+    ?*@?*.?*) ;;
+    *) return 1 ;;
+  esac
+  case "${1##*@}" in
+    example.com | example.org | example.net | *.example.com | *.test | *.invalid | *.localhost) return 1 ;;
+  esac
+}
+if ! email_ok "$ACME_EMAIL"; then
+  echo "ACME_EMAIL in .env is not an e-mail address: '$ACME_EMAIL'. Let's Encrypt needs a real one;"
+  echo "set it, then: docker compose up -d certbot"
+  exit 1
+fi
+
 # The challenge reaches us through HAProxy: wait until it listens.
 until python3 -c 'import socket; socket.create_connection(("haproxy", 80), 2)' 2>/dev/null; do sleep 2; done
 

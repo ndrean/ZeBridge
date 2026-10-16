@@ -66,7 +66,9 @@ clients' addresses, so HAProxy's per-address limits would count every client as 
 
    `ps -a`: `conf-init`, `nats-init` and `pg-init` exited with 0, the rest are up. Until
    Let's Encrypt's certificate arrives (seconds, once the names resolve), HAProxy and NATS
-   serve a temporary self-signed one; `docker compose logs certbot` says which. `--diagnose` needs the NATS settings that the bridge's own start loads. The
+   serve a temporary self-signed one; `docker compose logs certbot` says which. certbot
+   shown as `Restarting`: its log names the setting to fix (an `ACME_EMAIL` that is not an
+   address). `--diagnose` needs the NATS settings that the bridge's own start loads. The
    renewal dry run checks that Let's Encrypt reaches the certbot container through
    HAProxy; without `--no-random-sleep-on-renew` it first waits up to 8 minutes, silently.
 
@@ -102,7 +104,7 @@ them with two dashboards, the bridge's and NATS's. From your machine:
 ssh -L 3000:127.0.0.1:3000 <user>@<server>
 ```
 
-then http://localhost:3000, user `admin`, the password `GRAFANA_ADMIN_PASSWORD` from `.env`.
+then <http://localhost:3000>, user `admin`, the password `GRAFANA_ADMIN_PASSWORD` from `.env`.
 
 ## Sensor readings and their archive
 
@@ -179,9 +181,7 @@ sed -i "s|^ZB_VERSION=.*|ZB_VERSION=$V|" .env
 docker compose up -d --remove-orphans
 ```
 
-The images, the configuration and the database's functions follow, and a service the
-release retired is removed. With `compose.readings.yml`, download the release's too. With an external PostgreSQL, run
-`pg-init` as above too.
+The images, the configuration and the database's functions follow, and a service the release retired is removed. With `compose.readings.yml`, download the release's too. With an external PostgreSQL, run `pg-init` as above too.
 
 ## Firewall
 
