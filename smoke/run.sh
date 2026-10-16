@@ -12,6 +12,23 @@ cd "$(dirname "$0")"
 DC="docker compose -f compose.yml"
 trap '$DC --profile clients down -v --remove-orphans >/dev/null 2>&1' EXIT
 
+# Every registry serves the version, before minutes of image builds: a release half out
+# (npm staged and not yet approved, Maven still syncing) is named here, not as a failed
+# `npm install` deep in a Dockerfile.
+V=$ZB_VERSION
+missing=""
+serves() { curl -sf -o /dev/null --range 0-0 --max-time 15 "$2" || missing="$missing\n  $1"; }
+serves "APT zebridge $V" "https://packages.zebridge.eu/pool/main/zebridge_${V}_amd64.deb"
+serves "npm @zebridge/client $V (staged? approve it on npmjs.com)" "https://registry.npmjs.org/@zebridge%2fclient/$V"
+serves "npm @zebridge/react-native $V (staged? approve it on npmjs.com)" "https://registry.npmjs.org/@zebridge%2freact-native/$V"
+serves "PyPI zebridge $V" "https://pypi.org/pypi/zebridge/$V/json"
+serves "pub.dev zebridge $V" "https://pub.dev/api/packages/zebridge/versions/$V"
+serves "Maven Central eu.zebridge:zebridge-android $V" "https://repo1.maven.org/maven2/eu/zebridge/zebridge-android/$V/zebridge-android-$V.pom"
+if [ -n "$missing" ]; then
+  printf "✗ $V is not served everywhere yet:$missing\n"
+  exit 1
+fi
+
 echo "▶ zebridge $ZB_VERSION: building (APT, npm, PyPI, pub.dev, Maven)"
 $DC --profile clients build --pull -q || { echo "✗ build: an install failed (above)"; exit 1; }
 $DC up -d --wait bridge || { $DC logs setup bridge | tail -40; echo "✗ the APT bridge did not start"; exit 1; }
