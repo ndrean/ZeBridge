@@ -51,6 +51,7 @@ pub fn build(b: *std.Build) void {
         translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "include" }) });
         translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "include" }) });
     }
+
     // libpq for the PostgreSQL replica engine (§10fd): a client's storage may be a
     // PostgreSQL server instead of a SQLite file — the micro-VM case.
     //
@@ -70,10 +71,9 @@ pub fn build(b: *std.Build) void {
         break :blk b.allocator.dupe([]const u8, &.{base}) catch &.{};
     } else &.{};
     for (sysroot_includes) |p| translate_c.addSystemIncludePath(.{ .cwd_relative = p });
-    // ⚠️ The NDK's headers need the API level in the target triple: since NDK 30,
-    // sys/cdefs.h stops on "Unversioned target triples are not supported!" for unversioned
-    // Android targets. Keep the explicit macro for translated headers and vendored C too.
-    if (is_android) translate_c.defineCMacro("__ANDROID_API__", android_api);
+    // Zig's `.29` target spelling is not recognized as versioned by NDK 30's headers.
+    // android_api.h restores the configured API after the compiler's target builtins.
+    if (is_android) translate_c.defineCMacro("ZB_ANDROID_API", android_api);
     const c_mod = translate_c.createModule();
 
     // §10fl: DuckDB's header as its own module (`@import("duckdb")`), from the vendored
@@ -87,7 +87,7 @@ pub fn build(b: *std.Build) void {
         });
         tc.addIncludePath(b.path("include-engines"));
         for (sysroot_includes) |p| tc.addSystemIncludePath(.{ .cwd_relative = p });
-        if (is_android) tc.defineCMacro("__ANDROID_API__", android_api);
+        if (is_android) tc.defineCMacro("ZB_ANDROID_API", android_api);
         break :blk tc.createModule();
     };
 
@@ -167,7 +167,7 @@ pub fn build(b: *std.Build) void {
                     // RELATIVE: Zig prepends the sysroot itself (the same trap as the iOS path).
                     m.addLibraryPath(.{ .cwd_relative = bb.pathJoin(&.{ "/usr", "lib", ai, api }) });
                     // The API level for the NDK's headers, as for translate-c above.
-                    m.addCMacro("__ANDROID_API__", api);
+                    m.addCMacro("ZB_ANDROID_API", api);
                 }
                 // …and the libc to LINK against. Headers alone get as far as
                 // "unable to find libSystem system library".
@@ -176,12 +176,14 @@ pub fn build(b: *std.Build) void {
                 // absolute path produced `<sdk>/<sdk>/usr/lib` and found nothing.
                 m.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
             }
+            m.addIncludePath(bb.path("src"));
             m.addIncludePath(sqd.path("."));
             m.addCSourceFile(.{
                 .file = sqd.path("sqlite3.c"),
                 // The amalgamation compiles bare by default; these are what libzb's
                 // storage actually relies on.
                 .flags = &.{
+                    "-include", "android_api.h",
                     "-DSQLITE_ENABLE_COLUMN_METADATA=1",
                     "-DSQLITE_THREADSAFE=1",
                     "-DSQLITE_DQS=0",
@@ -199,7 +201,7 @@ pub fn build(b: *std.Build) void {
                     .file = zsd.path(src),
                     // ⚠️ No assembly: zstd's .S file is x86-64 only and would break
                     // every arm64 target, which is every target that matters here.
-                    .flags = &.{ "-DZSTD_DISABLE_ASM=1", "-DXXH_NAMESPACE=ZSTD_" },
+                    .flags = &.{ "-include", "android_api.h", "-DZSTD_DISABLE_ASM=1", "-DXXH_NAMESPACE=ZSTD_" },
                 });
             }
             m.link_libc = true;
