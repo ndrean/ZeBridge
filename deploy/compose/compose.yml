@@ -219,6 +219,13 @@ services:
       postgres: { condition: service_healthy }
     restart: "no"
 
+networks:
+  default:
+    # IPv6 inside the stack too (Docker 27+ allocates a private range and translates it to
+    # the server's address): Supabase's direct connection, the one replication needs, is
+    # IPv6-only, and so are some phone networks. Harmless on a server without IPv6.
+    enable_ipv6: true
+
 volumes:
   zb-conf:          # the release's configuration, rewritten at every start
   zb-etc:           # nats-server.conf, .env.nats, creds/, operator.store, nats-data/ (JetStream)
