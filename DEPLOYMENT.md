@@ -678,6 +678,7 @@ Off the hub:
 | a phone or a browser | a client, per device | `/enroll` with an invite; the device makes its own key | its tenants' data, its own writes, `query.<t>.*` |
 | a leaf node | the leaf link | `leaf.yml` (`--mint-leaf`) | carry its devices' traffic, `mutation.>` and `sensors.>` |
 | an app's backend | none: it reaches PostgreSQL only, as a login granted `zebridge_inviter` | the DBA (`GRANT zebridge_inviter TO <login>`) | create invites; nothing else |
+| the public demo's front door (`bridge --demo-invites`, on the hub) | none: the same, its own login granted `zebridge_inviter` | the DBA, then `vault_demo_inviter_url` (Ansible role `demo`) | create invites; nothing else |
 
 - The archiver and the readings responder run as uid 10001 in their containers: their creds file must belong to that uid, mode 0600, or the container cannot read it: `sudo /usr/bin/bridge --mint-archiver … | sudo install -m 0600 -o 10001 -g 10001 /dev/stdin /etc/zebridge/creds/archiver-<t>.creds`.
 - Their S3 keys go in an env file read by `docker run --env-file` (mode 0600, root), never on a command line, where `ps` and the shell's history would show them.

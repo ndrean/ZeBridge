@@ -7,6 +7,7 @@ One playbook sets up a Debian server running ZeBridge behind Cloudflare:
 * HAProxy for `bridge.<domain>`: Cloudflare only, `/enroll`, `/renew` and `/status`;
 * Alloy and the NATS exporter, sending metrics and logs to Grafana Cloud;
 * the airports responder of `examples/10-airports` (optional);
+* the public demo's front door (optional, `zb_demo`): `bridge --demo-invites` on loopback, behind HAProxy's `/demo`. Each visit creates a one-hour invite for a new principal in the tenant `demo` and redirects to the demo page with it (`zb_demo_redirect`, the depot by default), 3 per minute per visitor. Its database login, `vault_demo_inviter_url`, is granted `zebridge_inviter` only: once, on the database, `CREATE ROLE zb_demo LOGIN PASSWORD '…'; GRANT zebridge_inviter TO zb_demo;`, then the URL in the vault and `zb_demo: true`;
 * routing (`examples/13-routing`, optional): Valhalla in a container on loopback, and `zb-respond` as a systemd service answering `query._default.route`, `.matrix` and `.tour`. The tiles are built on your machine and copied as they are;
 * and, last, `bridge --diagnose` as the service user: the run fails unless it is clean.
 

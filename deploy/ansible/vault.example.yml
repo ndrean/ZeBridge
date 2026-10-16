@@ -17,3 +17,6 @@ vault_origin_key: "<its private key, PEM>"
 
 # Grafana Cloud: an access policy token that may write metrics and logs.
 vault_grafana_password: "<Grafana Cloud token>"
+
+# The public demo (zb_demo: true): a login granted zebridge_inviter only, on the same database.
+vault_demo_inviter_url: "<postgresql:// URL of that login, sslmode=require>"

@@ -16,4 +16,5 @@
     - telemetry   # Alloy + nats-exporter, to Grafana Cloud
     - airports    # the DuckDB responder (zb_airports: true)
     - routing     # Valhalla + zb-respond (zb_routing: true)
+    - demo        # bridge --demo-invites behind /demo (zb_demo: true)
     - verify      # bridge --diagnose, as the service user

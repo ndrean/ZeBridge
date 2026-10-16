@@ -24,7 +24,7 @@
     zb_debs:
       - "zebridge_{{ zb_release }}_{{ zb_arch }}.deb"
       - "libzb_{{ zb_release }}_{{ zb_arch }}.deb"
-    zb_services: "{{ ['zebridge', 'zebridge-sweeper'] + (['airports'] if zb_airports | bool else []) + (['routing'] if zb_routing | bool else []) }}"
+    zb_services: "{{ ['zebridge', 'zebridge-sweeper'] + (['airports'] if zb_airports | bool else []) + (['routing'] if zb_routing | bool else []) + (['zebridge-demo'] if zb_demo | bool else []) }}"
   tasks:
     - name: The packages match SHA256SUMS (on this machine)
       ansible.builtin.command: shasum -a 256 -c SHA256SUMS
@@ -85,6 +85,11 @@
       ansible.builtin.include_role:
         name: routing
       when: zb_routing | bool
+
+    - name: The demo's unit, for the packaged binary
+      ansible.builtin.include_role:
+        name: demo
+      when: zb_demo | bool
 
     - name: Units rewritten → restarted now
       ansible.builtin.meta: flush_handlers

@@ -1,0 +1,49 @@
+# The public demo's front door (zb_demo: true): `bridge --demo-invites` on loopback, behind
+# HAProxy's /demo route. GET https://bridge.<domain>/demo creates a one-hour invite for a
+# new principal in the demo tenant and redirects to zb_demo_redirect?invite=<code>.
+#
+# Its database login holds zebridge_inviter only (vault_demo_inviter_url): it can create
+# invites and nothing else. Created once by the DBA, on the database the bridge uses:
+#   CREATE ROLE zb_demo LOGIN PASSWORD '…';  GRANT zebridge_inviter TO zb_demo;
+
+- name: The demo's front door
+  when: zb_demo | bool
+  block:
+    - name: Its database login (a secret, written only where the file is missing)
+      ansible.builtin.copy:
+        dest: /etc/zebridge/.env.demo
+        owner: zebridge
+        group: zebridge
+        mode: "0600"
+        content: |
+          INVITER_DATABASE_URL={{ vault_demo_inviter_url }}
+        force: "{{ zb_rewrite_secrets | bool }}"   # an existing file stays (see vars.yml)
+      no_log: true
+      notify: Restart zebridge-demo
+
+    - name: Its service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/zebridge-demo.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=ZeBridge demo invites (GET /demo, behind HAProxy)
+          After=network-online.target
+
+          [Service]
+          User=zebridge
+          EnvironmentFile=/etc/zebridge/.env.demo
+          ExecStart={{ zb_bin }}/bridge --demo-invites --redirect {{ zb_demo_redirect }} --tenant {{ zb_demo_tenant }} --expires "{{ zb_demo_expires }}" --listen 127.0.0.1:27435
+          Restart=on-failure
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart zebridge-demo
+
+    - name: Running
+      ansible.builtin.systemd_service:
+        name: zebridge-demo
+        enabled: true
+        state: started
+        daemon_reload: true
