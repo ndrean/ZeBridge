@@ -40,7 +40,7 @@ services:
     entrypoint: ["/bin/sh", "/conf/scripts/certs-init.sh"]
     environment:
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
-      DOMAINS: ${BRIDGE_HOST:?} ${WS_HOST:?} ${NATS_HOST:?}
+      DOMAINS: ${BRIDGE_HOST:?set BRIDGE_HOST in .env} ${WS_HOST:?set WS_HOST in .env} ${NATS_HOST:?set NATS_HOST in .env}
     ports: ["80:80"]
     depends_on:
       conf-init: { condition: service_completed_successfully }
