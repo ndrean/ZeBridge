@@ -64,8 +64,9 @@ clients' addresses, so HAProxy's per-address limits would count every client as 
    docker compose exec certbot certbot renew --dry-run --http-01-port 8888 --no-random-sleep-on-renew
    ```
 
-   `ps -a`: `conf-init`, `certs-init`, `nats-init` and `pg-init` exited with 0, the rest
-   are up. `--diagnose` needs the NATS settings that the bridge's own start loads. The
+   `ps -a`: `conf-init`, `nats-init` and `pg-init` exited with 0, the rest are up. Until
+   Let's Encrypt's certificate arrives (seconds, once the names resolve), HAProxy and NATS
+   serve a temporary self-signed one; `docker compose logs certbot` says which. `--diagnose` needs the NATS settings that the bridge's own start loads. The
    renewal dry run checks that Let's Encrypt reaches the certbot container through
    HAProxy; without `--no-random-sleep-on-renew` it first waits up to 8 minutes, silently.
 
@@ -155,20 +156,21 @@ The database needs `wal_level = logical` (most managed services have a switch fo
 | service | does | when | kept in |
 | -- | -- | -- | -- |
 | `conf-init` | copies the configuration out of the image | every start | volume `zb-conf` |
-| `certs-init` | the first certificate | once | volume `letsencrypt`; copies in `certs` |
 | `nats-init` | `bridge --init-nats operator` | once | volume `zb-etc`: conf, `.env.nats`, creds, JetStream data |
 | `pg-init` | `bridge --init-sql`, then `zb_inviter` | every start: the SQL is idempotent, so an upgrade brings its new functions and stored data stays | the database |
 
 ⚠️ Never delete the `zb-etc` volume (`docker compose down -v` does): a new operator would
 refuse every enrolled device. Back it up with the database.
 
-Renewals: `certbot` checks twice a day; NATS and HAProxy reload the new certificate
-without dropping connections.
+Certificates: `certbot` gets the first one and renews it twice a day, both through HAProxy,
+which alone holds port 80; NATS and HAProxy reload a new certificate without dropping
+connections. Kept in volume `letsencrypt`, copies in `certs`.
 
 ## Upgrading
 
-Set `ZB_VERSION` in `.env` to the new release, then `docker compose up -d`: the images,
-the configuration and the database's functions follow. With an external PostgreSQL, run
+Set `ZB_VERSION` in `.env` to the new release, then `docker compose up -d --remove-orphans`:
+the images, the configuration and the database's functions follow, and a service a release
+retired is removed. With an external PostgreSQL, run
 `pg-init` as above too.
 
 ## Firewall

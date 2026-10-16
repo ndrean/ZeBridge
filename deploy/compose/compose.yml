@@ -33,29 +33,18 @@ services:
     restart: "no"
 
   # ── certificates ─────────────────────────────────────────────────────────────────
-  # One certificate for the three names. The first one is issued here, on port 80, before
-  # HAProxy takes that port; then `certbot` renews it behind HAProxy.
-  certs-init:
-    image: certbot/certbot:v5.8.0
-    entrypoint: ["/bin/sh", "/conf/scripts/certs-init.sh"]
-    environment:
-      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
-      DOMAINS: ${BRIDGE_HOST:?set BRIDGE_HOST in .env} ${WS_HOST:?set WS_HOST in .env} ${NATS_HOST:?set NATS_HOST in .env}
-    ports: ["80:80"]
-    depends_on:
-      conf-init: { condition: service_completed_successfully }
-    volumes:
-      - letsencrypt:/etc/letsencrypt
-      - certs:/certs
-      - zb-conf:/conf:ro
-    restart: "no"
-
+  # One certificate for the three names, issued and renewed through HAProxy, which alone
+  # holds port 80. Until Let's Encrypt's arrives, a temporary self-signed one lets HAProxy
+  # and NATS start (scripts/certbot-run.sh).
   certbot:
     image: certbot/certbot:v5.8.0
     init: true
-    entrypoint: ["/bin/sh", "-c", "while :; do certbot renew --http-01-port 8888 --deploy-hook /conf/scripts/cert-deploy.sh; sleep 12h & wait $$!; done"]
+    entrypoint: ["/bin/sh", "/conf/scripts/certbot-run.sh"]
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+      DOMAINS: ${BRIDGE_HOST:?set BRIDGE_HOST in .env} ${WS_HOST:?set WS_HOST in .env} ${NATS_HOST:?set NATS_HOST in .env}
     depends_on:
-      certs-init: { condition: service_completed_successfully }
+      conf-init: { condition: service_completed_successfully }
     volumes:
       - letsencrypt:/etc/letsencrypt
       - certs:/certs
@@ -82,7 +71,7 @@ services:
     entrypoint: ["/bin/sh", "/conf/scripts/nats-run.sh"]
     depends_on:
       nats-init: { condition: service_completed_successfully }
-      certs-init: { condition: service_completed_successfully }
+      certbot: { condition: service_started }   # it puts the certificate in place first
     ports: ["${NATS_PUBLIC_PORT:-4222}:4222"]
     volumes:
       - zb-etc:/etc/zebridge
@@ -131,7 +120,7 @@ services:
       net.ipv4.ip_unprivileged_port_start: "0"   # the image runs as the haproxy user
     ports: ["80:80", "443:443"]
     depends_on:
-      certs-init: { condition: service_completed_successfully }
+      certbot: { condition: service_started }   # it puts the certificate in place first
     volumes:
       - certs:/certs:ro
       - zb-conf:/conf:ro
