@@ -4,6 +4,9 @@
 # idempotent, so an upgrade brings the new release's functions, and stored data, grants and
 # guards stay as they are. Then the backend's invite login, granted zebridge_inviter only.
 set -eu
+# PostgreSQL's NOTICEs ("already exists, skipping") are the idempotent SQL talking: warnings
+# and errors only, or every start would fill the log with them.
+export PGOPTIONS="-c client_min_messages=warning"
 bridge --init-sql | psql "$ADMIN_DATABASE_URL" -X -q -v ON_ERROR_STOP=1 > /dev/null
 echo "database up to date: roles, functions, publication $BRIDGE_CDC_PUBLICATION"
 if [ -n "${ZB_INVITER_PASSWORD:-}" ]; then
