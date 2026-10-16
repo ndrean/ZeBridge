@@ -25,7 +25,7 @@ postgres-data/
 postgres-standby/
 *.tar.gz
 *.tar.xz
-
+.hub.*
 src/test_files/
 /docs/
 /demo/

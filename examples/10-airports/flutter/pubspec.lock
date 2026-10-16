@@ -447,10 +447,10 @@ packages:
     dependency: "direct main"
     description:
       name: zebridge
-      sha256: "965027efe3d57354c3c30f3627e807cc218d87779d977948ce2f4566ba3f6d9c"
+      sha256: "5b96766ec5363142a038bcfee172c44a92322839d4c86be9d3ce690e3fc15be3"
       url: "https://pub.dev"
     source: hosted
-    version: "0.2.3"
+    version: "0.2.5"
 sdks:
   dart: ">=3.13.4 <4.0.0"
   flutter: ">=3.38.4"

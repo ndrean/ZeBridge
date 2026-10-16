@@ -1,3 +1,9 @@
+## 0.2.6
+
+- No change in the package: its version follows ZeBridge's releases. 0.2.6 fixes the
+  bridge's HTTP servers (a POST that declared no body could crash a Debug build, and was
+  undefined behaviour in a release one).
+
 ## 0.2.5
 
 - libzb's Android builds name their API level to the NDK's headers (`-Dandroid-api`, 29):

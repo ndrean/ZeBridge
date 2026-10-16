@@ -10,7 +10,7 @@
 # network. Docker's published ports bypass ufw. README.md has the steps.
 
 x-zebridge: &zebridge
-  image: ghcr.io/ndrean/zebridge:${ZB_VERSION:-0.2.5}
+  image: ghcr.io/ndrean/zebridge:${ZB_VERSION:-0.2.6}
   restart: unless-stopped
   init: true   # a small init as PID 1 passes SIGTERM on: a stop takes ms, not Docker's 10 s
 

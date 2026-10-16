@@ -7,7 +7,7 @@ environment:
   sdk: ^3.13.4
 
 dependencies:
-  zebridge: 0.2.5   # pub.dev, exactly the release (scripts/version.py): libzb over FFI + the isolate worker, its native library included
+  zebridge: 0.2.6   # pub.dev, exactly the release (scripts/version.py): libzb over FFI + the isolate worker, its native library included
   flutter:
     sdk: flutter
   ffi: ^2.2.0

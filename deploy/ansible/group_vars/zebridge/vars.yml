@@ -58,7 +58,7 @@ zb_airports: true
 # The public demo's front door: GET https://bridge.<domain>/demo hands each visitor a
 # one-hour invite in the demo tenant and redirects to the demo page with it. Its database
 # login is vault_demo_inviter_url (granted zebridge_inviter only): true once it is in the vault.
-zb_demo: false
+zb_demo: true
 zb_demo_redirect: "https://depot.{{ zb_domain }}/"
 zb_demo_tenant: demo
 zb_demo_expires: "1 hour"
