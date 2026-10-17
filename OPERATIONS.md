@@ -499,6 +499,8 @@ The CDC stream family is owned by the bridge: at boot it creates any missing `CD
 
 ⚠️ **Retention is a correctness parameter.** A client offline past the stream's window re-seeds from the chain, and the chain's cut must still be in the stream: see [Catching up: the chain and the stream](#catching-up-the-chain-and-the-stream).
 
+**Consumers per stream.** Each client opens its own consumers on every stream it reads: one to catch up, reaped by the server 30 s after it goes idle, and one to follow, reaped after 120 s. Count about two per connected device per stream; `CDC_PUBLIC` holds them for the devices of every tenant, and a wave of reconnects adds new ones before the old ones are reaped. nats-server caps each stream at 1000 consumers unless the conf sets a limit, so the conf from `--init-nats` sets `default_max_consumers: 5000` in its `jetstream { limits {} }` block (enough for about 2,000 live devices). Past the cap, a client fails to open with `MaximumConsumersLimit`. Raise it as the fleet grows and restart nats-server; the cap stays as protection against a consumer leak. Memory is the other bound: about 1 MB of server memory per connected client.
+
 Consumers use these streams to interact with NATS; the exact names are declared in `grammar.json`.
 
 [⬆️](#table-of-contents)
