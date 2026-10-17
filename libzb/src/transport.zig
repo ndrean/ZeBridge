@@ -214,7 +214,7 @@ pub const Transport = struct {
         // Field-by-field assignment leaves every unassigned field undefined.
         self.* = .{
             .allocator = allocator,
-            .threaded = .init(allocator, .{}),
+            .threaded = android_io.threaded(allocator),
             .conn = undefined,
             .js = undefined,
         };

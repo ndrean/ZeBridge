@@ -12,6 +12,24 @@ const net = Io.net;
 
 pub const is_android = builtin.abi.isAndroid();
 
+/// Every `Io.Threaded` libzb makes: one per client's transport, and short-lived ones for
+/// enrollment, renewal and key generation.
+///
+/// ⚠️ Not `Io.Threaded.init` as it is. To wake a thread blocked in a system call, Threaded
+/// sends it SIGIO, so `init` installs a do-nothing handler for SIGIO (and SIGPIPE),
+/// process-wide, and `deinit` puts back the handler it found. Several clients in one
+/// process open and close in any order: a client closing could restore the DEFAULT
+/// handler while another still ran, and the next SIGIO sent to that one killed the whole
+/// process on Linux, where SIGIO's default action is to terminate ("I/O possible";
+/// reproduced: two clients, the first closed, the second's close died). So no libzb
+/// Threaded restores anything: the first one's do-nothing handlers stay for the life of
+/// the process, which is what every later one would install anyway.
+pub fn threaded(allocator: std.mem.Allocator) Io.Threaded {
+    var t: Io.Threaded = .init(allocator, .{});
+    t.have_signal_handler = false;
+    return t;
+}
+
 /// `t.io()`, with host names resolved by the platform on Android.
 pub fn io(t: *Io.Threaded) Io {
     const base = t.io();

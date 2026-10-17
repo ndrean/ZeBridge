@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const zblog = @import("zblog.zig");
+const android_io = @import("android_io.zig");
 
 pub const std_options: std.Options = .{ .log_level = .debug, .logFn = zblog.logFn };
 const log = std.log.scoped(.libzb);
@@ -140,7 +141,7 @@ pub fn main(init: std.process.Init) !u8 {
     const n = try c.serve(tenants.items, names.items, queue);
     log.info("{s}: answering {d} subject(s) in queue group {s}, as {s}", .{ name, n, queue, principal });
 
-    var threaded: std.Io.Threaded = .init(a, .{});
+    var threaded = android_io.threaded(a);
     defer threaded.deinit();
     var http: std.http.Client = .{ .allocator = a, .io = threaded.io() };
     defer http.deinit();

@@ -107,7 +107,7 @@ pub const UserKeys = struct {
 /// The public text is derived back FROM the seed text, so a seed that cannot be read
 /// back never escapes.
 pub fn newUserKeys(out: *UserKeys) !void {
-    var threaded: std.Io.Threaded = .init(std.heap.c_allocator, .{});
+    var threaded = android_io.threaded(std.heap.c_allocator);
     defer threaded.deinit();
     const kp = std.crypto.sign.Ed25519.KeyPair.generate(android_io.io(&threaded));
     out.seed = nats.nkeys.encodeSeed(.user, &kp.secret_key.seed(), &out.seed_buf);
@@ -131,7 +131,7 @@ pub fn enroll(a: std.mem.Allocator, bridge_url: []const u8, code: []const u8, ca
     const url = try std.fmt.allocPrint(a, "{s}/enroll?code={s}&user_pubkey={s}", .{ base, code, keys.public });
     defer a.free(url);
 
-    var threaded: std.Io.Threaded = .init(a, .{});
+    var threaded = android_io.threaded(a);
     defer threaded.deinit();
     var client: std.http.Client = .{ .allocator = a, .io = android_io.io(&threaded) };
     defer client.deinit();
@@ -309,7 +309,7 @@ pub fn renew(a: std.mem.Allocator, id: Identity, server_now: i64, ca_file: ?[]co
     defer skp.wipe();
     var pub_buf: [nats.nkeys.public_key_text_len]u8 = undefined;
     const public = skp.publicKeyText(&pub_buf);
-    var threaded: std.Io.Threaded = .init(a, .{});
+    var threaded = android_io.threaded(a);
     defer threaded.deinit();
     var client: std.http.Client = .{ .allocator = a, .io = android_io.io(&threaded) };
     defer client.deinit();
