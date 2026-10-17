@@ -2662,7 +2662,15 @@ pub const SyncClient = struct {
         while (it.next()) |e| for (e.value_ptr.routes) |r| try streams.put(a, r, {});
 
         var sit = streams.iterator();
-        while (sit.next()) |se| try self.drainStream(se.key_ptr.*);
+        // A stream that does not exist yet is set aside, as one that becomes unreadable is
+        // (§10fq), not a failed sync: a brand-new tenant's stream appears a moment after its
+        // first enrollment (the bridge makes it when the mapping reaches it), and its first
+        // devices sync in that moment (storm test: 8 of 8, StreamNotFound). The poll then
+        // retries it, and reseeds once it is there.
+        while (sit.next()) |se| self.drainStream(se.key_ptr.*) catch |err| switch (err) {
+            error.StreamNotFound => self.markDark(se.key_ptr.*, err),
+            else => return err,
+        };
         self.retryHeld(null, null);
     }
 

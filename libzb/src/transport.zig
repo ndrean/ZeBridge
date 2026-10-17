@@ -223,24 +223,65 @@ pub const Transport = struct {
 
         self.conn = try allocator.create(nats.Connection);
         errdefer allocator.destroy(self.conn);
-        self.conn.* = nats.Connection.init(allocator, io, .{
-            .user_creds = opts.creds_path,
-            .user_creds_content = opts.creds,
-            .user = opts.user,
-            .password = opts.password,
-            .inbox_prefix = opts.inbox_prefix,
-            // Never give up on the server: nats.zig's default stops after 60 tries (about
-            // two minutes), and a client whose NATS was down longer stayed dead after it
-            // came back. The host decides when to stop, by closing.
-            .reconnect = .{ .allow_reconnect = true, .max_reconnect = std.math.maxInt(u32) },
-            // Only on a tls:// URL: TLS options on a nats:// URL would force TLS on a
-            // server that does not speak it.
-            .tls = if (opts.ca_file != null and std.ascii.startsWithIgnoreCase(opts.url, "tls://")) .{ .ca_file = opts.ca_file } else null,
-        });
+
+        // The FIRST connection is retried, briefly, on a transient failure. nats.zig
+        // reconnects only a connection that has been up once, and a server busy with a
+        // crowd of clients connecting at once refuses some of them for a moment (storm
+        // test, 500 clients: one ConnectionFailed, never retried). A refused identity or
+        // a bad TLS setup is not retried: it would fail the same way. A failed
+        // nats.Connection cannot connect again (ConnectionClosed), so each attempt is a
+        // fresh one. The waits double from 250 ms, each with up to half of it again at
+        // random, so a crowd does not come back all at once: 8 to 12 s in all.
+        var attempt: u5 = 0;
+        while (true) : (attempt += 1) {
+            self.conn.* = nats.Connection.init(allocator, io, .{
+                .user_creds = opts.creds_path,
+                .user_creds_content = opts.creds,
+                .user = opts.user,
+                .password = opts.password,
+                .inbox_prefix = opts.inbox_prefix,
+                // Never give up on the server: nats.zig's default stops after 60 tries (about
+                // two minutes), and a client whose NATS was down longer stayed dead after it
+                // came back. The host decides when to stop, by closing.
+                .reconnect = .{ .allow_reconnect = true, .max_reconnect = std.math.maxInt(u32) },
+                // Only on a tls:// URL: TLS options on a nats:// URL would force TLS on a
+                // server that does not speak it.
+                .tls = if (opts.ca_file != null and std.ascii.startsWithIgnoreCase(opts.url, "tls://")) .{ .ca_file = opts.ca_file } else null,
+            });
+            if (self.conn.connect(opts.url)) |_| break else |err| {
+                self.conn.deinit();
+                if (attempt >= first_connect_attempts or !transientConnectError(err)) return err;
+                log.info("NATS refused the first connection ({s}): retry {d} of {d}", .{ @errorName(err), attempt + 1, first_connect_attempts });
+                backoff(io, attempt);
+            }
+        }
         errdefer self.conn.deinit();
-        try self.conn.connect(opts.url);
         self.js = self.conn.jetstream(.{ .domain = opts.js_domain });
         return self;
+    }
+
+    /// Retries of the first connection after the first attempt (see `connect`).
+    pub const first_connect_attempts: u5 = 5;
+
+    /// A failure that may pass by itself: the server busy, the network or the name lookup
+    /// failing for a moment. Everything else (an identity refused, TLS, a bad URL) is final.
+    pub fn transientConnectError(err: anyerror) bool {
+        const transient = [_][]const u8{
+            "ConnectionFailed",  "ConnectionRefused", "ConnectionTimedOut", "Timeout",
+            "NoServerAvailable", "NetworkUnreachable", "HostUnreachable",   "NameServerFailure",
+            "ConnectionResetByPeer", "BrokenPipe",
+        };
+        for (transient) |name| if (std.mem.eql(u8, @errorName(err), name)) return true;
+        return false;
+    }
+
+    /// 250 ms × 2^attempt, plus up to half of that at random.
+    pub fn backoff(io: std.Io, attempt: u5) void {
+        const base_ms: u64 = @as(u64, 250) << @min(attempt, 6);
+        var r: [2]u8 = undefined;
+        io.random(&r);
+        const jitter_ms = (@as(u64, std.mem.readInt(u16, &r, .little)) * (base_ms / 2)) / 65535;
+        std.Io.Timeout.sleep(.{ .duration = .{ .raw = .fromNanoseconds((base_ms + jitter_ms) * std.time.ns_per_ms), .clock = .awake } }, io) catch {};
     }
 
     pub fn deinit(self: *Transport) void {

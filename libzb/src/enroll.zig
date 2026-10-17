@@ -138,8 +138,34 @@ pub fn enroll(a: std.mem.Allocator, bridge_url: []const u8, code: []const u8, ca
     try trustFrom(&client, a, android_io.io(&threaded), ca_file);
     var body: std.Io.Writer.Allocating = .init(a);
     defer body.deinit();
-    const res = client.fetch(.{ .location = .{ .url = url }, .response_writer = &body.writer }) catch |err|
-        return fail("enroll: {s} unreachable ({s})", .{ base, @errorName(err) });
+    // Retried, briefly, while the bridge is busy or the network fails for a moment: the
+    // bridge redeems a few invites at a time and answers 503 "retry shortly" to the rest,
+    // and a lookup can fail once under load (storm test: both, at 8 enrollments at once).
+    // Neither spent the invite, so trying again is safe. The same waits as the first NATS
+    // connection (Transport.backoff); a refusal (403, 404) is final.
+    const T = @import("transport.zig").Transport;
+    const io = android_io.io(&threaded);
+    var attempt: u5 = 0;
+    const res = while (true) : (attempt += 1) {
+        body.clearRetainingCapacity();
+        const r = client.fetch(.{ .location = .{ .url = url }, .response_writer = &body.writer }) catch |err| {
+            // HttpConnectionClosing: closed before a single byte of reply, which is how the
+            // bridge refuses a connection over its cap (16); it never read the request.
+            const refused = err == error.HttpConnectionClosing;
+            if (attempt < T.first_connect_attempts and (refused or T.transientConnectError(err))) {
+                T.backoff(io, attempt);
+                continue;
+            }
+            return fail("enroll: {s} unreachable ({s})", .{ base, @errorName(err) });
+        };
+        const busy = r.status == .service_unavailable or r.status == .too_many_requests or
+            r.status == .bad_gateway or r.status == .gateway_timeout;
+        if (busy and attempt < T.first_connect_attempts) {
+            T.backoff(io, attempt);
+            continue;
+        }
+        break r;
+    };
     const text = body.written();
     if (res.status != .ok) {
         const why = std.mem.trim(u8, text, " \r\n");
