@@ -38,6 +38,18 @@
     group: nats
     mode: "0750"
 
+# nats-server 2.15 caps each stream at 1000 consumers unless the conf sets a limit; every
+# device holds consumers on each stream it reads. A conf from before the bridge wrote the
+# limit gains it here (a new one has it already).
+- name: Consumers per stream
+  ansible.builtin.replace:
+    path: /etc/zebridge/nats-server.conf
+    regexp: '^(  store_dir: .*)$'
+    replace: "\\1\n  limits {\n    default_max_consumers: 5000\n  }"
+    validate: nats-server -t -c %s
+  when: nats_conf is not search('default_max_consumers')
+  notify: Restart nats
+
 # Monitoring (/varz, /jsz) for the exporter on this host only: it lists connections and
 # subjects.
 - name: Monitoring on loopback

@@ -5,7 +5,14 @@
 set -eu
 d=/etc/zebridge
 if [ -f "$d/nats-server.conf" ]; then
-  echo "NATS configuration present: kept"
+  # Kept, but given the consumer cap of a newer release when it has none (nats-server
+  # 2.15 would cap each stream at 1000 consumers; restart the nats service to apply).
+  if ! grep -q default_max_consumers "$d/nats-server.conf"; then
+    sed -i 's|^\(  store_dir: .*\)$|\1\n  limits {\n    default_max_consumers: 5000\n  }|' "$d/nats-server.conf"
+    echo "NATS configuration present: kept, consumer cap 5000 added"
+  else
+    echo "NATS configuration present: kept"
+  fi
   exit 0
 fi
 bridge --init-nats operator --dir "$d" > /dev/null
