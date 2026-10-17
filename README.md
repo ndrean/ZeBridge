@@ -127,59 +127,67 @@ To start again from scratch: `docker compose -f docker-compose.quickstart.yml do
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [The components of the project](#the-components-of-the-project)
-  - [Packages: what to install](#packages-what-to-install)
-  - [Setup steps at a glance](#setup-steps-at-a-glance)
-  - [Use case: a fleet of trucks](#use-case-a-fleet-of-trucks)
-- [The consumer side](#the-consumer-side)
-  - [Enrolling a device](#enrolling-a-device)
-  - [The TypeScript API](#the-typescript-api)
-  - [The C ABI library](#the-c-abi-library)
-  - [Code examples](#code-examples)
-  - [Understanding the LWW rules](#understanding-the-lww-rules)
-  - [Local database writes are owned](#local-database-writes-are-owned)
-- [Preparing your database](#preparing-your-database)
-  - [Good practices](#good-practices)
-    - [Schemas and zebridge\_enable](#schemas-and-zebridge_enable)
-    - [Private Columns on Tables](#private-columns-on-tables)
-    - [Types](#types)
-    - [Schemas - guards and suspension](#schemas---guards-and-suspension)
-    - [Checks](#checks)
-    - [Scoped by tenant, authorized by grants](#scoped-by-tenant-authorized-by-grants)
-    - [Conflict resolution](#conflict-resolution)
-    - [Cooperative editing: several editors on one row](#cooperative-editing-several-editors-on-one-row)
-      - [A live illustration: a shared record](#a-live-illustration-a-shared-record)
-    - [Cascade rules](#cascade-rules)
-- [Migrations](#migrations)
-  - [What a migration does](#what-a-migration-does)
-  - [Examples](#examples)
-    - [Fixing a "bad" read-only table](#fixing-a-bad-read-only-table)
-    - [Fixing a "bad" writable table](#fixing-a-bad-writable-table)
-    - [Changing a writable table's key from `bigint` to `uuid`](#changing-a-writable-tables-key-from-bigint-to-uuid)
-- [Authentication](#authentication)
-  - [The files](#the-files)
-  - [A) Users: invites](#a-users-invites)
-  - [B) Services and sensors](#b-services-and-sensors)
-- [Safety \& Guarantees](#safety--guarantees)
-    - [Schemas Postgres -> SQLite](#schemas-postgres---sqlite)
-    - [Internal WAL decoder and refused types](#internal-wal-decoder-and-refused-types)
-    - [At-Least-Once Delivery](#at-least-once-delivery)
-    - [Zero-Consumer Protection \& Storage Bounds](#zero-consumer-protection--storage-bounds)
-    - [Idempotent Delivery](#idempotent-delivery)
-    - [Durability](#durability)
-    - [Schema Consistency](#schema-consistency)
-  - [Graceful Shutdown](#graceful-shutdown)
-- [Telemetry](#telemetry)
-- [Performance measurements](#performance-measurements)
-  - [Changes: PostgreSQL → clients](#changes-postgresql--clients)
-    - [A live phone under load, killed four times](#a-live-phone-under-load-killed-four-times)
-  - [Snapshots: seeding a replica](#snapshots-seeding-a-replica)
-  - [Writes: clients → PostgreSQL](#writes-clients--postgresql)
-  - [Example: Sensors to a DuckDB replica](#example-sensors-to-a-duckdb-replica)
-- [Limitations](#limitations)
-- [Alternatives](#alternatives)
-- [Requirements, Dependencies, Licenses \& Sources](#requirements-dependencies-licenses--sources)
+- [ZeBridge - an offline-first PostgreSQL replica for the edge, over NATS](#zebridge---an-offline-first-postgresql-replica-for-the-edge-over-nats)
+  - [Table of Contents](#table-of-contents)
+  - [Overview](#overview)
+  - [The components of the project](#the-components-of-the-project)
+    - [Packages: what to install](#packages-what-to-install)
+    - [Setup steps at a glance](#setup-steps-at-a-glance)
+    - [Use case: a fleet of trucks](#use-case-a-fleet-of-trucks)
+  - [The consumer side](#the-consumer-side)
+    - [Enrolling a device](#enrolling-a-device)
+    - [The TypeScript API](#the-typescript-api)
+    - [The C ABI library](#the-c-abi-library)
+    - [Code examples](#code-examples)
+    - [Understanding the LWW rules](#understanding-the-lww-rules)
+    - [Local database writes are owned](#local-database-writes-are-owned)
+  - [Preparing your database](#preparing-your-database)
+    - [Good practices](#good-practices)
+      - [Schemas and zebridge\_enable](#schemas-and-zebridge_enable)
+      - [Private Columns on Tables](#private-columns-on-tables)
+      - [Types](#types)
+      - [Schemas - guards and suspension](#schemas---guards-and-suspension)
+      - [Checks](#checks)
+      - [Scoped by tenant, authorized by grants](#scoped-by-tenant-authorized-by-grants)
+      - [Conflict resolution](#conflict-resolution)
+      - [Cooperative editing: several editors on one row](#cooperative-editing-several-editors-on-one-row)
+        - [A live illustration: a shared record](#a-live-illustration-a-shared-record)
+      - [Cascade rules](#cascade-rules)
+  - [Migrations](#migrations)
+    - [What a migration does](#what-a-migration-does)
+    - [Examples](#examples)
+      - [Fixing a "bad" read-only table](#fixing-a-bad-read-only-table)
+      - [Fixing a "bad" writable table](#fixing-a-bad-writable-table)
+      - [Changing a writable table's key from `bigint` to `uuid`](#changing-a-writable-tables-key-from-bigint-to-uuid)
+  - [Authentication](#authentication)
+    - [The files](#the-files)
+    - [A) Users: invites](#a-users-invites)
+    - [B) Services and sensors](#b-services-and-sensors)
+  - [Safety \& Guarantees](#safety--guarantees)
+      - [Schemas Postgres -\> SQLite](#schemas-postgres---sqlite)
+      - [Internal WAL decoder and refused types](#internal-wal-decoder-and-refused-types)
+      - [At-Least-Once Delivery](#at-least-once-delivery)
+      - [Zero-Consumer Protection \& Storage Bounds](#zero-consumer-protection--storage-bounds)
+      - [Idempotent Delivery](#idempotent-delivery)
+      - [Durability](#durability)
+      - [Schema Consistency](#schema-consistency)
+    - [Graceful Shutdown](#graceful-shutdown)
+  - [Telemetry](#telemetry)
+  - [Performance measurements](#performance-measurements)
+    - [Changes: PostgreSQL → clients](#changes-postgresql--clients)
+      - [A live phone under load, killed four times](#a-live-phone-under-load-killed-four-times)
+    - [Snapshots: seeding a replica](#snapshots-seeding-a-replica)
+    - [Writes: clients → PostgreSQL](#writes-clients--postgresql)
+    - [Example: Sensors to a DuckDB replica](#example-sensors-to-a-duckdb-replica)
+  - [Scaling](#scaling)
+    - [PostgreSQL: a primary for the writes, a standby for the reads](#postgresql-a-primary-for-the-writes-a-standby-for-the-reads)
+    - [The bridge: one per publication](#the-bridge-one-per-publication)
+    - [NATS: the clients' server](#nats-the-clients-server)
+    - [Tenants](#tenants)
+    - [Clients](#clients)
+  - [Limitations](#limitations)
+  - [Alternatives](#alternatives)
+  - [Requirements, Dependencies, Licenses \& Sources](#requirements-dependencies-licenses--sources)
 
 ## Overview
 
@@ -1512,11 +1520,59 @@ Past a lane count's ceiling the writes queue, and at 5,000 waiting writes per pr
 
 ---
 
+## Scaling
+
+Each part scales on its own, and the load does not spread evenly: NATS carries the clients, the bridge carries the changes and the writes, and PostgreSQL sees little of either. Below, layer by layer: what carries the load, how to scale it, and what is measured or not tested.
+
+### PostgreSQL: a primary for the writes, a standby for the reads
+
+Clients never read PostgreSQL. The bridge reads the WAL and builds each table's snapshot once per tenant, and clients seed from NATS. When 500 clients started at once (below), PostgreSQL stayed under 16% CPU.
+
+- **Reads**: point `DATABASE_READER_URL` at a standby. The slot and the snapshot reads move there, and the primary keeps only the client writes. PostgreSQL 16+, see [A standby for the reads](DEPLOYMENT.md#a-standby-for-the-reads).
+- **Writes**: they go to the primary, in batches of up to 64, on 1 to 8 lanes (`ZB_INGRESS_LANES`): about 8,500 writes/s on one lane, 20,000 on four ([measured](#writes-clients--postgresql)). Each principal may queue 5,000 writes; past that, its own writes are refused, not anyone else's ([write limits](OPERATIONS.md#write-limits-as-a-client-sees-them)).
+
+### The bridge: one per publication
+
+One bridge publishes over 100k rows/s. To split the work, give a second bridge its own publication, slot and tables: a table belongs to one publication, so the unit you split by is a set of tables, not a set of tenants. Two bridges on one database and one NATS pass `scripts/scenarios/multi_bridge.py` for correctness. What two bridges carry together has not been measured, and one bridge is the setup we recommend ([Running the Bridge](DEPLOYMENT.md#running-the-bridge)).
+
+The bridge's HTTP side (`/enroll`, `/renew`) serves 16 connections and 4 enrollments at once, and answers the rest "busy". The library retries a busy answer, so a wave of first starts is slower, not refused: 20 devices of a new tenant starting at once all got through.
+
+### NATS: the clients' server
+
+NATS carries every client: their connections, TLS, and their consumers on every stream they read. Measured with [storm/](storm/README.md) on the compose stack, on a 2-vCPU, 3.7 GB VPS, with the clients 100 ms away:
+
+| 500 clients | result |
+| --- | --- |
+| all starting at once, empty replicas | all synced, the slowest in 8.6 to 12 s across runs; NATS peaked at 140–165% CPU |
+| all starting at once, replicas already seeded | all synced in 5.0 s |
+| NATS restarted under them | none lost; half back within 6 s, the last at 23 s |
+| one write, reaching all 500 | median 288 ms, p95 491 ms (100 ms of it is the network) |
+
+The bridge stayed near idle throughout. NATS used about 1 MB of memory per client, so memory caps this server near 1,500 clients.
+
+- **Consumers**: count about two per connected device on each stream, `CDC_PUBLIC` holding them for every tenant. The conf caps a stream at 5,000 ([NATS streams and buckets](OPERATIONS.md#nats-streams-and-buckets)).
+- **A bigger server** first: one NATS server is the setup we run.
+- **Leaf nodes**: devices connect to a leaf near them, which takes their connections and TLS off the hub. JetStream stays on the hub ([Adding a leaf node](DEPLOYMENT.md#adding-a-leaf-node)). Running, but not load-tested.
+- **A NATS cluster**: not tested with ZeBridge.
+- **Mirrors of the streams on the leaves**: read-only copies with the same sequence numbers, which would put the consumers on the leaves. Not built.
+
+### Tenants
+
+A tenant is a stream on the hub, and each stream reserves its byte limit on JetStream's disk: dozens or a few hundred tenants, not one per user (_What a tenant costs_, in the [Overview](#overview)).
+
+### Clients
+
+A device applies 30k–50k changes a second, about 12k on an iPhone 12 ([Changes](#changes-postgresql--clients)). A service holding replicas in one process (a responder, a test harness) can open up to 64 clients in it.
+
+[⬆️](#table-of-contents)
+
+---
+
 ## Limitations
 
 **1. Types left out**: 🔔 xml, ranges, tsvector and tsquery never travel: zebridge_enable() leaves them out of the publication.
 
-🚦 A CDC event with an unsupported column suspends the table. See Suspended tables.
+🚦 A CDC event with an unsupported column suspends the table. See [Suspended tables](OPERATIONS.md#suspended-tables).
 
 **2. Size limitation**: ZeBridge is not designed for massive databases or tables storing large objects (BLOB) or an extra large number of columns. First, because NATS restricts payloads (< $2^{20}$=1 MB by default, safe up to 8 MB). This default limit of 1 MB is already very large for text - 200,000 words, 400 pages, or a huge JSON.
 Second, ZeBridge's fixed-size buffer must be sized for such rows.
