@@ -593,6 +593,12 @@ authorization {
 }
 
 jetstream {
+  # Consumers per stream: every device holds one on each stream it reads, and a reconnect
+  # leaves the old one for two minutes. nats-server 2.15+ would cap it at 1000. The cap
+  # stays, against a consumer leak; raise it as the fleet grows.
+  limits {
+    default_max_consumers: 5000
+  }
   store_dir: "/data"
 }
 

@@ -736,6 +736,13 @@ fn runDev(
         \\}}
         \\jetstream {{
         \\  store_dir: "{s}/nats-data"
+        \\  # Consumers per stream. Every device holds one on each stream it reads (the shared
+        \\  # CDC_PUBLIC: one per device of every tenant), and a reconnect leaves the old one
+        \\  # for two minutes. nats-server 2.15+ would cap it at 1000. The cap stays, against
+        \\  # a consumer leak; raise it as the fleet grows (about 1 MB of server memory each).
+        \\  limits {{
+        \\    default_max_consumers: 5000
+        \\  }}
         \\{s}}}
         \\
     ,
@@ -946,6 +953,13 @@ fn runOperator(
         \\}}
         \\jetstream {{
         \\  store_dir: "{s}/nats-data"
+        \\  # Consumers per stream. Every device holds one on each stream it reads (the shared
+        \\  # CDC_PUBLIC: one per device of every tenant), and a reconnect leaves the old one
+        \\  # for two minutes. nats-server 2.15+ would cap it at 1000. The cap stays, against
+        \\  # a consumer leak; raise it as the fleet grows (about 1 MB of server memory each).
+        \\  limits {{
+        \\    default_max_consumers: 5000
+        \\  }}
         \\{s}}}
         \\
     ,
