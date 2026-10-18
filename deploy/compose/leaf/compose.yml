@@ -49,6 +49,30 @@ services:
       - certs:/certs:ro
       - ./hub:/hub:ro
       - js-data:/data
+    networks:
+      default:
+        # The keeper dials tls://<LEAF_HOST>:4222: the certificate's name, this container.
+        aliases: ["${LEAF_HOST}"]
+    restart: unless-stopped
+
+  # A seeding leaf's mirrors (LEAF_JS_DOMAIN set): every 30 s, a mirror of each of the
+  # hub's snapshot streams this leaf serves, made from the hub stream's own settings, and
+  # none of a stream the hub no longer has. With the leaf's own credentials.
+  mirrors:
+    image: natsio/nats-box:0.20.0
+    init: true
+    entrypoint: ["/bin/sh", "/run/mirrors.sh"]
+    environment:
+      LEAF_HOST: ${LEAF_HOST:?set LEAF_HOST in .env}
+      LEAF_JS_DOMAIN: ${LEAF_JS_DOMAIN:-}
+      LEAF_TENANTS: ${LEAF_TENANTS:-}
+      HUB_JS_DOMAIN: ${HUB_JS_DOMAIN:-hub}
+    configs:
+      - { source: mirrors.sh, target: /run/mirrors.sh }
+    depends_on:
+      nats: { condition: service_started }
+    volumes:
+      - ./hub:/hub:ro
     restart: unless-stopped
 
 volumes:
@@ -57,6 +81,55 @@ volumes:
   js-data:
 
 configs:
+  mirrors.sh:
+    content: |
+      #!/bin/sh
+      set -u
+      if [ -z "$$LEAF_JS_DOMAIN" ]; then
+        echo "no LEAF_JS_DOMAIN: a forwarding leaf, nothing to mirror"
+        exec sleep 2147483647
+      fi
+      N="nats --inbox-prefix _INBOX.keeper -s tls://$$LEAF_HOST:4222 --creds /hub/leaf.creds"
+      # The hub's snapshot streams this leaf serves: the manifests, the public tables, and
+      # each tenant's chain objects (only LEAF_TENANTS', when set).
+      want() {
+        $$N --js-domain "$$HUB_JS_DOMAIN" stream ls --names 2>/dev/null | while read -r s; do
+          case "$$s" in
+            KV_generations | OBJ_gen-_default) echo "$$s" ;;
+            OBJ_gen-*)
+              t=$${s#OBJ_gen-}
+              if [ -z "$$LEAF_TENANTS" ] || echo " $$LEAF_TENANTS " | grep -q " $$t "; then echo "$$s"; fi ;;
+          esac
+        done
+      }
+      while :; do
+        hub=$$(want)
+        # A listing without the manifests is an unreachable hub or a partial answer:
+        # change nothing on it.
+        if echo "$$hub" | grep -qx KV_generations; then
+          have=$$($$N stream ls --names 2>/dev/null)
+          for s in $$hub; do
+            echo "$$have" | grep -qx "$$s" && continue
+            if $$N --js-domain "$$HUB_JS_DOMAIN" stream info "$$s" --json 2>/dev/null \
+                 | jq --arg s "$$s" --arg api "\$$JS.$$HUB_JS_DOMAIN.API" \
+                     '.config | del(.subjects, .sources, .mirror, .metadata, .consumer_limits)
+                      | .mirror = {name: $$s, external: {api: $$api, deliver: ""}}
+                      | .mirror_direct = true | .allow_direct = true' > /tmp/mirror.json \
+               && $$N stream add --config /tmp/mirror.json > /dev/null 2>&1; then
+              echo "mirror created: $$s"
+            else
+              echo "mirror not created: $$s (next pass)"
+            fi
+          done
+          for s in $$have; do
+            case "$$s" in KV_generations | OBJ_gen-*) ;; *) continue ;; esac
+            echo "$$hub" | grep -qx "$$s" && continue
+            $$N stream rm -f "$$s" > /dev/null 2>&1 && echo "mirror removed: $$s (not on the hub, or not this leaf's)"
+          done
+        fi
+        sleep 30
+      done
+
   certbot.sh:
     content: |
       #!/bin/sh
