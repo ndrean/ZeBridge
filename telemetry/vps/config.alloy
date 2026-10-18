@@ -14,7 +14,21 @@ prometheus.scrape "nats" {
   targets = [{__address__ = "127.0.0.1:7777", service = "nats-server", environment = "production"}]
   job_name        = "nats"
   scrape_interval = "15s"
-  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+  forward_to      = [prometheus.relabel.nats.receiver]
+}
+
+// Not the series of each JetStream consumer (`-jsz all` exports a set per consumer): every
+// device holds its own consumers, named anew at each connection, so 500 devices starting
+// at once made thousands of new series and went past Grafana Cloud's active-series limit
+// (15,000): every batch was refused and retried, and the dashboards went blank. No
+// dashboard reads them; the per-stream series stay.
+prometheus.relabel "nats" {
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+  rule {
+    source_labels = ["__name__"]
+    regex         = "jetstream_consumer_.*"
+    action        = "drop"
+  }
 }
 
 // The memory of the four services, as systemd counts it (`systemctl status` → Memory:),
