@@ -48,8 +48,9 @@ const usage =
     \\  --mint-sensor --name NAME [--tenant T] [--store PATH] [--ttl-days D]
     \\                  Creds for a sensor: publishes sensors.<T>.<NAME>.> only; its JWT is a
     \\                  bearer token (over MQTT, the password). No --tenant: _default
-    \\  --mint-leaf --name NAME [--store PATH] [--ttl-days D]
-    \\                  Creds for a leaf node's remote, on stdout: what its clients may carry
+    \\  --mint-leaf --name NAME [--mirror] [--store PATH] [--ttl-days D]
+    \\                  Creds for a leaf node's remote, on stdout: what its clients may carry;
+    \\                  --mirror: also keeps mirrors of the hub's snapshots in its own JetStream
     \\                  --ttl-days: both default to 3650 (ten years): replaced with a redeploy
     \\                  --store - reads the store from standard input (a password manager's pipe):
     \\                  the seeds never touch this host's disk

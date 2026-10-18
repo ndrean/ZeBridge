@@ -249,7 +249,7 @@ test "readings: a leaf carries its sensors' readings to the hub" {
     defer arena.deinit();
     const aa = arena.allocator();
     const owned = try topology_mod.loadEmbedded(aa);
-    const l = try leafAllows(aa, &owned.topology, "hub");
+    const l = try leafAllows(aa, &owned.topology, "hub", false);
     try std.testing.expect(has(l.pub_json, "sensors.>"));
 }
 
@@ -473,10 +473,62 @@ fn roleAllowsFor(
     const own = try roleAllows(a, topo, role, try jsApiPrefix(a, js_domain));
     if (js_domain == null) return .{ .pub_json = own.pub_json, .sub_json = own.sub_json };
     const plain = try roleAllows(a, topo, role, try jsApiPrefix(a, null));
+    var pubs = try mergeJsonLists(a, own.pub_json, plain.pub_json);
+    if (role == .client or role == .responder) pubs = try mergeJsonLists(a, pubs, try seedAllows(a, topo));
     return .{
-        .pub_json = try mergeJsonLists(a, own.pub_json, plain.pub_json),
+        .pub_json = pubs,
         .sub_json = try mergeJsonLists(a, own.sub_json, plain.sub_json),
     };
+}
+
+/// A seeding leaf: the reads of a seed — the tenant's manifests by direct get, its chain
+/// objects through a pull consumer — in ANY JetStream domain (`$JS.*.API.`), so a device
+/// seeds from the mirrors of the leaf it dials. Read-only and tenant-scoped like the
+/// hub's; a leaf's JetStream holds only mirrors. Only with a domain: without one, no
+/// leaf has a JetStream of its own.
+fn seedAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology) ![]u8 {
+    const any = "$JS.*.API.";
+    const kv_gens = topo.kv_generations;
+    const obj_pre = topo.generation_bucket_prefix;
+    const open = topo.open_tenant;
+    var buf: std.ArrayList(u8) = .empty;
+    const W = struct {
+        fn add(b: *std.ArrayList(u8), alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+            if (b.items.len > 0) try b.append(alloc, ',');
+            try b.print(alloc, "\"" ++ fmt ++ "\"", args);
+        }
+    };
+    try W.add(&buf, a, "{s}DIRECT.GET.KV_{s}.$KV.{s}.{{{{tag(tenant)}}}}.>", .{ any, kv_gens, kv_gens });
+    try W.add(&buf, a, "{s}DIRECT.GET.KV_{s}.$KV.{s}.{s}.>", .{ any, kv_gens, kv_gens, open });
+    try W.add(&buf, a, "{s}DIRECT.GET.OBJ_{s}{{{{tag(tenant)}}}}.>", .{ any, obj_pre });
+    try W.add(&buf, a, "{s}DIRECT.GET.OBJ_{s}{s}.>", .{ any, obj_pre, open });
+    inline for (.{ "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT" }) |op| {
+        try W.add(&buf, a, "{s}{s}.OBJ_{s}{{{{tag(tenant)}}}}.>", .{ any, op, obj_pre });
+        try W.add(&buf, a, "{s}{s}.OBJ_{s}{s}.>", .{ any, op, obj_pre, open });
+    }
+    try W.add(&buf, a, "{s}CONSUMER.CREATE.OBJ_{s}{{{{tag(tenant)}}}}", .{ any, obj_pre });
+    try W.add(&buf, a, "{s}CONSUMER.CREATE.OBJ_{s}{s}", .{ any, obj_pre, open });
+    return buf.toOwnedSlice(a);
+}
+
+test "a seeding leaf: a device may read its seed in any domain, and only its seed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const owned = try topology_mod.loadEmbedded(aa);
+    const cl = try roleAllowsFor(aa, &owned.topology, .client, "hub");
+    try std.testing.expect(has(cl.pub_json, "$JS.*.API.DIRECT.GET.KV_generations.$KV.generations.{{tag(tenant)}}.>"));
+    try std.testing.expect(has(cl.pub_json, "$JS.*.API.CONSUMER.CREATE.OBJ_gen-{{tag(tenant)}}.>"));
+    try std.testing.expect(has(cl.pub_json, "$JS.*.API.DIRECT.GET.OBJ_gen-_default.>"));
+    // nothing else with the any-domain prefix: no CDC, no schemas, no writes, no admin
+    var it = std.mem.splitScalar(u8, cl.pub_json, ',');
+    while (it.next()) |item| if (std.mem.find(u8, item, "$JS.*.API.") != null) {
+        try std.testing.expect(std.mem.find(u8, item, "OBJ_gen-") != null or std.mem.find(u8, item, "KV_generations.$KV.generations.") != null);
+        try std.testing.expect(std.mem.find(u8, item, "STREAM.") == null);
+    };
+    // without a domain there is no leaf JetStream, and no any-domain grant
+    const plain = try roleAllowsFor(aa, &owned.topology, .client, null);
+    try std.testing.expect(std.mem.find(u8, plain.pub_json, "$JS.*.") == null);
 }
 
 /// Two `"a","b"` lists as one, first-seen order, no duplicates (subjects hold no comma).
@@ -1597,13 +1649,19 @@ fn mintUsage(kind: MintKind, msg: []const u8) u8 {
     return 1;
 }
 
-/// `bridge --mint-leaf --name N [--store PATH] [--ttl-days D]` (§10ll): the creds a leaf
+/// `bridge --mint-leaf --name N [--mirror] [--store PATH] [--ttl-days D]` (§10ll): the creds a leaf
 /// node's remote presents to the hub. Not a scoped user: signed by the account key, its
 /// permissions in its own JWT — what a client or a responder may do, for any tenant and
 /// any name (each template becomes `*`). The leaf carries its devices' traffic and
 /// nothing else: no stream admin, no `cdc.*` or generation writes, which the bridge's
 /// own creds (`>`) handed to a second machine. Runs where the store lives; a grammar
 /// change means minting again, like a responder's.
+///
+/// `--mirror`: a leaf with its own JetStream holding mirrors of the hub's snapshots, so the
+/// devices behind it seed from the leaf. It may also receive its mirrors' deliveries, list
+/// the hub's streams, and create or delete streams in ITS OWN JetStream (`$JS.API.`, which a
+/// domain keeps on the leaf). Needs the hub's JetStream domain: without one, `$JS.API.`
+/// crosses the link and "create a stream" would reach the hub.
 pub fn mintLeaf(io: std.Io, init: *const std.process.Init) u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
@@ -1612,12 +1670,15 @@ pub fn mintLeaf(io: std.Io, init: *const std.process.Init) u8 {
     var store_path: []const u8 = "zb-nats/operator.store";
     var name: ?[]const u8 = null;
     var ttl_days: i64 = 3650; // a leaf rotates with a redeploy, not a TTL
+    var mirror = false;
     {
         var it = init.minimal.args.iterate();
         _ = it.next();
         while (it.next()) |arg| {
             if (std.mem.eql(u8, arg, "--mint-leaf")) continue;
-            if (std.mem.eql(u8, arg, "--store")) {
+            if (std.mem.eql(u8, arg, "--mirror")) {
+                mirror = true;
+            } else if (std.mem.eql(u8, arg, "--store")) {
                 store_path = it.next() orelse return mintLeafUsage("--store needs a path");
             } else if (std.mem.eql(u8, arg, "--name")) {
                 name = it.next() orelse return mintLeafUsage("--name needs a value");
@@ -1645,9 +1706,13 @@ pub fn mintLeaf(io: std.Io, init: *const std.process.Init) u8 {
     };
     const domain = storeValue(store, "JS_DOMAIN") orelse "";
     const js_domain: ?[]const u8 = if (domain.len == 0) null else domain;
+    if (mirror and js_domain == null) {
+        out("🔴 --mirror needs the hub's JetStream domain, and {s} has none (--init-nats --update --js-domain NAME first)\n", .{store_path});
+        return 1;
+    }
 
     const owned = topology_mod.loadEmbedded(a) catch return 1;
-    const allows = leafAllows(a, &owned.topology, js_domain) catch return 1;
+    const allows = leafAllows(a, &owned.topology, js_domain, mirror) catch return 1;
     const user = genKey(io, .user) catch return 1;
     const now: i64 = @intCast(c.time(null));
     const claims = std.fmt.allocPrint(
@@ -1665,13 +1730,13 @@ pub fn mintLeaf(io: std.Io, init: *const std.process.Init) u8 {
     };
     const creds = credsFile(a, jwt, user.seed()) catch return 1;
     std.Io.File.stdout().writeStreamingAll(io, creds) catch return 1;
-    out("✅ leaf '{s}' minted ({s}, {d} days) — keep the creds file like any secret\n", .{ who, if (js_domain) |d| d else "no JetStream domain", ttl_days });
+    out("✅ leaf '{s}' minted ({s}{s}, {d} days) — keep the creds file like any secret\n", .{ who, if (js_domain) |d| d else "no JetStream domain", if (mirror) ", mirrors" else "", ttl_days });
     out("   user key {s} — file it with the creds: `bridge --revoke --key` revokes this identity\n", .{user.public()});
     return 0;
 }
 
 fn mintLeafUsage(msg: []const u8) u8 {
-    out("🔴 {s}\n  bridge --mint-leaf --name NAME [--store PATH] [--ttl-days D] > NAME.creds\n", .{msg});
+    out("🔴 {s}\n  bridge --mint-leaf --name NAME [--mirror] [--store PATH] [--ttl-days D] > NAME.creds\n", .{msg});
     return 1;
 }
 
@@ -1680,7 +1745,7 @@ fn mintLeafUsage(msg: []const u8) u8 {
 /// (consumers, info, direct gets) open to every stream, while writes, admin and CDC stay
 /// shut. Clients only: a responder's `STREAM.CREATE.OBJ_res-…` would become "create any
 /// stream", and no responder runs behind a leaf yet.
-fn leafAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, js_domain: ?[]const u8) !struct { pub_json: []u8, sub_json: []u8 } {
+fn leafAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, js_domain: ?[]const u8, mirror: bool) !struct { pub_json: []u8, sub_json: []u8 } {
     const cl = try roleAllowsFor(a, topo, .client, js_domain);
     // The hub announces a subscription to the leaf only when the leaf may publish to its
     // subject AS WRITTEN: the MUTATIONS stream listens on `mutation.>`, which
@@ -1689,9 +1754,23 @@ fn leafAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, js_domai
     // Readings too: a sensor behind a leaf publishes `sensors.<tenant>.…`, stored by the
     // hub's `READINGS_<tenant>` — the same "as written" rule as the MUTATIONS line.
     const stream_subjects = try std.fmt.allocPrint(a, "\"{s}.>\",\"{s}.>\"", .{ topo.subject_mutations_prefix, topo.subject_readings_prefix });
+    var pubs = try mergeJsonLists(a, try anyPrincipal(a, cl.pub_json), stream_subjects);
+    var subs = try anyPrincipal(a, cl.sub_json);
+    if (mirror) {
+        // A mirror's consumer on the hub is created with CONSUMER.CREATE (already above),
+        // answered on `$JSC.R.…` (not an inbox: without it the mirror waits forever, and the
+        // link drops the answer without a word), delivers on `$JS.M.…` and is paced by
+        // flow-control replies on `$JS.FC.…` (nats-server stream.go, setupMirrorConsumer). Its
+        // keeper lists the hub's streams and creates or deletes the mirrors locally:
+        // `$JS.API.` stays on the leaf because both sides have a domain (mintLeaf checks).
+        const hub_api = try std.fmt.allocPrint(a, "$JS.{s}.API.", .{js_domain.?});
+        pubs = try mergeJsonLists(a, pubs, try std.fmt.allocPrint(a,
+            "\"$JS.FC.>\",\"{s}STREAM.NAMES\",\"$JS.API.STREAM.NAMES\",\"$JS.API.STREAM.CREATE.*\",\"$JS.API.STREAM.DELETE.*\"", .{hub_api}));
+        subs = try mergeJsonLists(a, subs, "\"$JS.M.>\",\"$JSC.R.>\"");
+    }
     return .{
-        .pub_json = try pruneCovered(a, try mergeJsonLists(a, try anyPrincipal(a, cl.pub_json), stream_subjects)),
-        .sub_json = try pruneCovered(a, try anyPrincipal(a, cl.sub_json)),
+        .pub_json = try pruneCovered(a, pubs),
+        .sub_json = try pruneCovered(a, subs),
     };
 }
 
@@ -1711,6 +1790,14 @@ fn pruneCovered(a: std.mem.Allocator, list: []const u8) ![]u8 {
         try buf.print(a, "\"{s}\"", .{x});
     }
     return buf.toOwnedSlice(a);
+}
+
+/// Whether some pattern of a `"a","b"` list covers `subject` (listed as written, or pruned
+/// under a broader one by `pruneCovered`).
+fn allowedBy(list: []const u8, subject: []const u8) bool {
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |item| if (item.len >= 2 and covers(item[1 .. item.len - 1], subject)) return true;
+    return false;
 }
 
 /// Whether the pattern `y` matches every subject the pattern `x` matches (NATS tokens).
@@ -1762,7 +1849,7 @@ test "a leaf link carries what its clients and responders may, for anyone, and n
     defer arena.deinit();
     const aa = arena.allocator();
     const owned = try topology_mod.loadEmbedded(aa);
-    const l = try leafAllows(aa, &owned.topology, "hub");
+    const l = try leafAllows(aa, &owned.topology, "hub", false);
     // pruned: what `*` covers is not listed again, and the token stays small
     try std.testing.expect(std.mem.find(u8, l.pub_json, "CONSUMER.CREATE.CDC_PUBLIC") == null);
     try std.testing.expect(l.pub_json.len + l.sub_json.len < 2000);
@@ -1777,9 +1864,32 @@ test "a leaf link carries what its clients and responders may, for anyone, and n
     try std.testing.expect(std.mem.find(u8, l.pub_json, "\"mutation.>\"") != null);
     // a template inside a token widens the whole token: no `CDC_*` (a literal name to NATS)
     try std.testing.expect(std.mem.find(u8, l.pub_json, "_*") == null);
-    try std.testing.expect(std.mem.find(u8, l.pub_json, "\"$JS.hub.API.CONSUMER.MSG.NEXT.*.>\"") != null);
+    try std.testing.expect(allowedBy(l.pub_json, "$JS.hub.API.CONSUMER.MSG.NEXT.*.>"));
     // nobody on a leaf writes CDC, creates or deletes a stream
     try std.testing.expect(std.mem.find(u8, l.pub_json, "STREAM.CREATE") == null);
     try std.testing.expect(std.mem.find(u8, l.pub_json, "\"cdc.") == null);
     try std.testing.expect(std.mem.find(u8, l.pub_json, "STREAM.DELETE") == null);
+    try std.testing.expect(std.mem.find(u8, l.sub_json, "$JS.M.") == null);
+}
+
+test "a mirroring leaf: its mirrors' traffic, and stream admin in its own JetStream only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const owned = try topology_mod.loadEmbedded(aa);
+    const m = try leafAllows(aa, &owned.topology, "hub", true);
+    // the mirror's consumer: created on the hub (as for any leaf), delivered, paced
+    try std.testing.expect(allowedBy(m.pub_json, "$JS.hub.API.CONSUMER.CREATE.*"));
+    try std.testing.expect(has(m.sub_json, "$JS.M.>"));
+    try std.testing.expect(has(m.sub_json, "$JSC.R.>"));
+    try std.testing.expect(has(m.pub_json, "$JS.FC.>"));
+    // the keeper: lists the hub's streams, manages its own
+    try std.testing.expect(has(m.pub_json, "$JS.hub.API.STREAM.NAMES"));
+    try std.testing.expect(has(m.pub_json, "$JS.API.STREAM.CREATE.*"));
+    try std.testing.expect(has(m.pub_json, "$JS.API.STREAM.DELETE.*"));
+    // never the hub's streams: no admin with the hub's prefix, no CDC writes
+    try std.testing.expect(std.mem.find(u8, m.pub_json, "$JS.hub.API.STREAM.CREATE") == null);
+    try std.testing.expect(std.mem.find(u8, m.pub_json, "$JS.hub.API.STREAM.DELETE") == null);
+    try std.testing.expect(std.mem.find(u8, m.pub_json, "\"cdc.") == null);
+    try std.testing.expect(std.mem.find(u8, m.pub_json, "\">\"") == null);
 }
