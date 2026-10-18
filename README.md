@@ -1552,9 +1552,9 @@ The bridge stayed near idle throughout. NATS used about 1 MB of memory per clien
 
 - **Consumers**: count about two per connected device on each stream, `CDC_PUBLIC` holding them for every tenant. The conf caps a stream at 5,000 ([NATS streams and buckets](OPERATIONS.md#nats-streams-and-buckets)).
 - **A bigger server** first: one NATS server is the setup we run.
-- **Leaf nodes**: devices connect to a leaf near them, which takes their connections and TLS off the hub. JetStream stays on the hub ([Adding a leaf node](DEPLOYMENT.md#adding-a-leaf-node)). Running, but not load-tested.
+- **Leaf nodes**: devices connect to a leaf near them, which takes their connections and TLS off the hub; a seeding leaf also serves their seeds from mirrors of the hub's snapshots. The streams stay on the hub. With 500 devices starting at once, the hub's NATS used 53 CPU-seconds alone, 16 behind two forwarding leaves, 10 behind two seeding leaves ([LEAF_NODES](LEAF_NODES.md)).
 - **A NATS cluster**: not tested with ZeBridge.
-- **Mirrors of the streams on the leaves**: read-only copies with the same sequence numbers, which would put the consumers on the leaves. Not built.
+- **Mirrors of the live-change streams on the leaves**, which would move their consumers off the hub: not built.
 
 ### Tenants
 
