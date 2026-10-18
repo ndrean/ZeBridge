@@ -229,7 +229,10 @@ configs:
       # hub's snapshots. The domain keeps it apart from the hub's (devices still reach the
       # hub's with the domain they enrolled with).
       if [ -n "$$LEAF_JS_DOMAIN" ]; then
-        printf 'jetstream {\n  domain: %s\n  store_dir: "/data"\n}\n' "$$LEAF_JS_DOMAIN" >> /tmp/nats-server.conf
+        # Consumers per stream: each seed opens one on its tenant's mirror (reaped 5 min after
+        # it goes idle). nats-server 2.15 would cap a stream at 1000, which a storm of one
+        # tenant's devices passes; the hub's conf says 5000 too.
+        printf 'jetstream {\n  domain: %s\n  store_dir: "/data"\n  limits {\n    default_max_consumers: 5000\n  }\n}\n' "$$LEAF_JS_DOMAIN" >> /tmp/nats-server.conf
       fi
       until [ -f /certs/fullchain.pem ]; do sleep 2; done
       nats-server -c /tmp/nats-server.conf &
