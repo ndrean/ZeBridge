@@ -37,6 +37,7 @@ services:
     environment:
       HUB_NATS_HOST: ${HUB_NATS_HOST:?set HUB_NATS_HOST in .env}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set ALLOWED_ORIGINS in .env}
+      LEAF_JS_DOMAIN: ${LEAF_JS_DOMAIN:-}
     configs:
       - { source: nats.sh, target: /run/nats.sh }
     depends_on:
@@ -47,11 +48,13 @@ services:
     volumes:
       - certs:/certs:ro
       - ./hub:/hub:ro
+      - js-data:/data
     restart: unless-stopped
 
 volumes:
   letsencrypt:
   certs:
+  js-data:
 
 configs:
   certbot.sh:
@@ -149,6 +152,12 @@ configs:
         }]
       }
       EOF
+      # A seeding leaf: its own JetStream, under its own domain, for the mirrors of the
+      # hub's snapshots. The domain keeps it apart from the hub's (devices still reach the
+      # hub's with the domain they enrolled with).
+      if [ -n "$$LEAF_JS_DOMAIN" ]; then
+        printf 'jetstream {\n  domain: %s\n  store_dir: "/data"\n}\n' "$$LEAF_JS_DOMAIN" >> /tmp/nats-server.conf
+      fi
       until [ -f /certs/fullchain.pem ]; do sleep 2; done
       nats-server -c /tmp/nats-server.conf &
       pid=$$!

@@ -99,7 +99,8 @@ def worker(args):
         t = time.time()
         try:
             clients[i] = ZeBridge(bridge_url=args.bridge, tables=[TABLE], identity_path=str(idents[i]),
-                                  db_path=str(dbs / f"{args.offset + i:04d}.db"), on_change=on_change)
+                                  db_path=str(dbs / f"{args.offset + i:04d}.db"), on_change=on_change,
+                                  nats_url=args.nats or None, seed_domain=args.seed_domain or None)
             connect_s[i] = time.time() - t
         except Exception as e:
             errors.append(f"client {args.offset + i}: {e}")
@@ -149,25 +150,27 @@ def run(args):
     """The storm: N clients over ceil(N / 60) worker processes, started together."""
     import subprocess, tempfile
     idents = sorted(pathlib.Path(args.ids).glob("*.identity"))
-    if len(idents) < args.n:
-        sys.exit(f"only {len(idents)} identities in {args.ids}, {args.n} asked")
+    if len(idents) < args.first + args.n:
+        sys.exit(f"only {len(idents)} identities in {args.ids}, {args.first + args.n} needed")
     dbs = pathlib.Path(args.dbs)
     dbs.mkdir(parents=True, exist_ok=True)
     if not args.warm:
         for f in dbs.glob("*"):
             f.unlink()
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="storm-"))
-    start_at = time.time() + 3 + args.n / 100        # time for the workers to load
+    start_at = args.start_at or time.time() + 3 + args.n / 100   # time for the workers to load
     markers_at = start_at + args.settle
     procs, outs = [], []
-    for k, off in enumerate(range(0, args.n, PER_PROCESS)):
+    for k, off in enumerate(range(args.first, args.first + args.n, PER_PROCESS)):
         out = tmp / f"w{k}.json"
         outs.append(out)
         cmd = [sys.executable, __file__, "worker", args.ids, "--offset", str(off),
-               "--count", str(min(PER_PROCESS, args.n - off)), "--bridge", args.bridge, "--dbs", str(dbs),
+               "--count", str(min(PER_PROCESS, args.first + args.n - off)), "--bridge", args.bridge, "--nats", args.nats,
+               "--seed-domain", args.seed_domain, "--dbs", str(dbs),
                "--start-at", str(start_at), "--markers", str(args.markers), "--markers-at", str(markers_at),
-               "--out", str(out)] + (["--writer"] if k == 0 else [])
-        procs.append(subprocess.Popen(cmd, stderr=subprocess.DEVNULL))
+               "--out", str(out)] + (["--writer"] if k == 0 and args.first == 0 else [])
+        log = open(pathlib.Path(args.worker_logs) / f"w{off:04d}.log", "w") if args.worker_logs else subprocess.DEVNULL
+        procs.append(subprocess.Popen(cmd, stderr=log))
     if args.markers:
         print(f"  markers from {datetime.fromtimestamp(markers_at).strftime('%H:%M:%S')} for {args.markers} s "
               f"(restart NATS during that time to time a reconnect)", flush=True)
@@ -218,6 +221,11 @@ def main():
     r = sub.add_parser("run")
     r.add_argument("ids"); r.add_argument("n", type=int)
     r.add_argument("--bridge", required=True)
+    r.add_argument("--nats", default="", help="dial this NATS (a leaf) instead of the one enrollment named")
+    r.add_argument("--seed-domain", default="", help="the leaf's JetStream domain, to seed from its mirrors")
+    r.add_argument("--worker-logs", default="", help="keep each worker's library log in this directory")
+    r.add_argument("--first", type=int, default=0, help="start at this identity (two halves side by side)")
+    r.add_argument("--start-at", type=float, default=0, help="the shared start, epoch seconds (two halves side by side)")
     r.add_argument("--warm", action="store_true")
     r.add_argument("--markers", type=int, default=0)
     r.add_argument("--settle", type=float, default=20, help="seconds from the start to the first marker")
@@ -225,7 +233,7 @@ def main():
     r.add_argument("--json")
     w = sub.add_parser("worker")
     w.add_argument("ids"); w.add_argument("--offset", type=int, required=True); w.add_argument("--count", type=int, required=True)
-    w.add_argument("--bridge", required=True); w.add_argument("--dbs", required=True)
+    w.add_argument("--bridge", required=True); w.add_argument("--dbs", required=True); w.add_argument("--nats", default=""); w.add_argument("--seed-domain", default="")
     w.add_argument("--start-at", type=float, required=True); w.add_argument("--markers", type=int, default=0)
     w.add_argument("--markers-at", type=float, default=0); w.add_argument("--writer", action="store_true")
     w.add_argument("--out", required=True)
