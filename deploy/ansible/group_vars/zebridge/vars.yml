@@ -35,7 +35,7 @@ letsencrypt_email: "you@example.com"
 # answers to, and the leaves' addresses, one per family — the hub opens 7422 to them
 # only. An empty list: no leafnodes listener.
 zb_js_domain: hub
-zb_leaf_addresses: ["54.37.13.184", "2001:41d0:404:200::5858"]
+zb_leaf_addresses: ["54.37.13.184", "2001:41d0:404:200::5858", "51.222.37.223", "2607:5300:205:200::dbf5"]   # leaf1, scratch
 
 # The secrets (vault.yml) are written only where their file is missing: a server keeps
 # its own certificates, tokens and database URLs, and the vault matters for a new server.

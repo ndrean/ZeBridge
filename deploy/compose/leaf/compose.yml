@@ -1,0 +1,165 @@
+# A ZeBridge leaf with Docker Compose: a nats-server near a group of devices, joined to the
+# hub, with no JetStream of its own (the devices' stream calls cross to the hub's through
+# the domain they enrolled with). No PostgreSQL, no bridge, no ZeBridge image: nats-server
+# and certbot only, their scripts below.
+#
+#   docker compose up -d
+#
+# Next to this file: .env, and hub/ with the two files the hub's operator gives
+# (README.md, "A leaf node"): trust.conf and leaf.creds.
+# Published ports: 80 (Let's Encrypt), NATS_PUBLIC_PORT (native clients, TLS) and
+# LEAF_WS_PORT (browsers, TLS). Docker's published ports bypass ufw.
+
+services:
+  # One certificate for LEAF_HOST, from Let's Encrypt on port 80, renewed twice a day.
+  # Until it arrives, a temporary self-signed one lets NATS start.
+  certbot:
+    image: certbot/certbot:v5.8.0
+    init: true
+    entrypoint: ["/bin/sh", "/run/certbot.sh"]
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+      LEAF_HOST: ${LEAF_HOST:?set LEAF_HOST in .env}
+    configs:
+      # Executable: certbot refuses a deploy hook that is not (configs mount 0444).
+      - { source: certbot.sh, target: /run/certbot.sh, mode: 0555 }
+      - { source: cert-deploy.sh, target: /run/cert-deploy.sh, mode: 0555 }
+    ports: ["80:80"]
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certs:/certs
+    restart: unless-stopped
+
+  nats:
+    image: nats:2.15.0-alpine
+    init: true
+    entrypoint: ["/bin/sh", "/run/nats.sh"]
+    environment:
+      HUB_NATS_HOST: ${HUB_NATS_HOST:?set HUB_NATS_HOST in .env}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set ALLOWED_ORIGINS in .env}
+    configs:
+      - { source: nats.sh, target: /run/nats.sh }
+    depends_on:
+      certbot: { condition: service_started }   # it puts the certificate in place first
+    ports:
+      - "${NATS_PUBLIC_PORT:-4222}:4222"
+      - "${LEAF_WS_PORT:-443}:8443"
+    volumes:
+      - certs:/certs:ro
+      - ./hub:/hub:ro
+    restart: unless-stopped
+
+volumes:
+  letsencrypt:
+  certs:
+
+configs:
+  certbot.sh:
+    content: |
+      #!/bin/sh
+      set -u
+      if [ ! -f /certs/fullchain.pem ]; then
+        t=$$(mktemp -d)
+        openssl req -x509 -newkey rsa:2048 -nodes -days 7 -subj "/CN=temporary" \
+          -keyout "$$t/key" -out "$$t/crt" 2>/dev/null
+        cp "$$t/crt" /certs/fullchain.pem
+        cp "$$t/key" /certs/privkey.pem
+        chmod 644 /certs/fullchain.pem /certs/privkey.pem   # this volume only
+        rm -rf "$$t"
+        echo "temporary self-signed certificate in place, until Let's Encrypt's"
+      fi
+      case "$$ACME_EMAIL" in
+        *[!A-Za-z0-9._%+@-]* | *@*@* | *@example.* | *@*.example.*) ok=no ;;
+        ?*@?*.?*) ok=yes ;;
+        *) ok=no ;;
+      esac
+      if [ "$$ok" = no ]; then
+        echo "ACME_EMAIL in .env is not an e-mail address: '$$ACME_EMAIL'. Set it, then: docker compose up -d certbot"
+        exit 1
+      fi
+      while :; do
+        if [ -d /etc/letsencrypt/live/leaf ]; then
+          # The copy NATS reads, again if it differs: a hook that failed once is not rerun.
+          cmp -s /etc/letsencrypt/live/leaf/fullchain.pem /certs/fullchain.pem || /run/cert-deploy.sh
+          certbot renew --deploy-hook /run/cert-deploy.sh
+          sleep 12h & wait $$!
+        else
+          if certbot certonly --standalone --non-interactive --agree-tos -m "$$ACME_EMAIL" \
+               --cert-name leaf --deploy-hook /run/cert-deploy.sh -d "$$LEAF_HOST"; then
+            continue
+          fi
+          echo "no certificate yet: does $$LEAF_HOST point at this server, and is port 80 open? Next try in 10 minutes"
+          sleep 600 & wait $$!
+        fi
+      done
+
+  cert-deploy.sh:
+    content: |
+      #!/bin/sh
+      # After each issue or renewal: the copies NATS reads; nats.sh notices and reloads.
+      set -eu
+      live=$${RENEWED_LINEAGE:-/etc/letsencrypt/live/leaf}
+      cp "$$live/fullchain.pem" /certs/fullchain.pem.new
+      cp "$$live/privkey.pem" /certs/privkey.pem.new
+      chmod 644 /certs/*.new
+      mv /certs/fullchain.pem.new /certs/fullchain.pem
+      mv /certs/privkey.pem.new /certs/privkey.pem
+      echo "certificate installed"
+
+  nats.sh:
+    content: |
+      #!/bin/sh
+      # The leaf's conf, written at each start from the hub's two files, then nats-server,
+      # reloaded (SIGHUP: no connection dropped) when the certificate changes.
+      set -eu
+      for f in trust.conf leaf.creds; do
+        [ -s "/hub/$$f" ] || { echo "hub/$$f is missing next to compose.yml: the hub's operator gives it (README.md)"; exit 1; }
+      done
+      # The account the remote binds to: the key on the line after `// Account "ZEBRIDGE"`.
+      account=$$(awk '/Account "ZEBRIDGE"/ { getline; sub(/^[ \t]*/, ""); sub(/:.*/, ""); print; exit }' /hub/trust.conf)
+      case "$$account" in
+        A???????????????????????????????????????????????????????) ;;
+        *) echo "hub/trust.conf has no ZEBRIDGE account: copy the hub's operator and resolver_preload lines again"; exit 1 ;;
+      esac
+      # Beside the conf: nats-server reads an include relative to the conf's directory,
+      # even an absolute path.
+      cp /hub/trust.conf /tmp/trust.conf
+      cat > /tmp/nats-server.conf <<EOF
+      include ./trust.conf
+      port: 4222
+      http: "127.0.0.1:8222"
+      ping_interval: "1m"
+      tls {
+        cert_file: "/certs/fullchain.pem"
+        key_file: "/certs/privkey.pem"
+      }
+      websocket {
+        port: 8443
+        tls {
+          cert_file: "/certs/fullchain.pem"
+          key_file: "/certs/privkey.pem"
+        }
+        allowed_origins: $$ALLOWED_ORIGINS
+      }
+      leafnodes {
+        remotes: [{
+          url: "tls://$$HUB_NATS_HOST:7422"
+          credentials: "/hub/leaf.creds"
+          account: "$$account"
+        }]
+      }
+      EOF
+      until [ -f /certs/fullchain.pem ]; do sleep 2; done
+      nats-server -c /tmp/nats-server.conf &
+      pid=$$!
+      trap 'kill -TERM $$pid; wait $$pid; exit 0' TERM INT
+      seen=$$(stat -c %Y /certs/fullchain.pem)
+      while kill -0 "$$pid" 2>/dev/null; do
+        sleep 60 & wait $$!
+        now=$$(stat -c %Y /certs/fullchain.pem 2>/dev/null || echo "$$seen")
+        if [ "$$now" != "$$seen" ]; then
+          seen=$$now
+          kill -HUP "$$pid" && echo "certificate changed: nats-server reloaded"
+        fi
+      done
+      wait "$$pid"

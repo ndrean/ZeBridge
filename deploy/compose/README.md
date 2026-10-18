@@ -27,7 +27,30 @@ Docker Engine, the standard (rootful) daemon, with the compose plugin. Rootless 
    chmod 600 .env
    ```
 
-   In `.env`: the three names, the e-mail, and `ZB_VERSION`. The passwords (letters and digits only), made on the server and written straight into `.env`, never shown:
+   In `.env`: the three domain names, the ACME e-mail, and `ZB_VERSION`, and COMPOSE_PROFILES set to 'postgres' for a local server, commented otherwise (compose will not run PostgreSQL)
+
+   ```txt
+   # .env
+   COMPOSE_PROFILES=postgres  # <-- local Postgres server on
+   ZB_VERSION=0.2.6
+   BRIDGE_HOST=               #<-- bridge.example.com
+   WS_HOST=                   #<-- ws.example.com
+   NATS_HOST=                 #<-- nats.example.com
+   NATS_PUBLIC_PORT=4222
+
+   ACME_EMAIL=                #<-- your@email
+
+   PG_ADMIN_PASSWORD=
+   ZB_READER_PASSWORD=
+   ZB_WRITER_PASSWORD=
+   ZB_INVITER_PASSWORD=
+   GRAFANA_ADMIN_PASSWORD=
+
+   BRIDGE_CDC_PUBLICATION=zb_pub
+   BRIDGE_CDC_SLOT=zb_slot
+   ```
+
+   The passwords (letters and digits only), made on the server and written straight into `.env`, never shown:
 
    ```sh
    for v in PG_ADMIN_PASSWORD ZB_READER_PASSWORD ZB_WRITER_PASSWORD ZB_INVITER_PASSWORD GRAFANA_ADMIN_PASSWORD; do
@@ -147,3 +170,47 @@ The images, the configuration and the database's functions follow, and a service
 ## Firewall
 
 Docker's published ports bypass ufw: 80, 443 and `NATS_PUBLIC_PORT` are open to the internet whatever ufw says, and nothing else is published (Grafana listens on the server's loopback). A firewall in front of the server (the provider's network firewall) does apply: allow 22, 80, 443 and `NATS_PUBLIC_PORT`.
+
+## A leaf node
+
+A leaf is a nats-server close to a group of devices, joined to the hub ([DEPLOYMENT, Adding a leaf node](../../DEPLOYMENT.md#adding-a-leaf-node)). It has no JetStream, no PostgreSQL and no bridge: devices still enroll at the hub's bridge, then dial the leaf, and their stream calls cross to the hub's JetStream through the domain they enrolled with. `leaf/compose.yml` runs nats-server and certbot, nothing else.
+
+The hub needs a JetStream domain and a leafnodes listener on 7422, open to the leaf's addresses. A hub set up with Ansible has both (`zb_js_domain`, `zb_leaf_addresses`); this compose stack has neither yet.
+
+1. **On the hub's side**, two files for the leaf. Its credentials, minted where `operator.store` is kept:
+
+   ```sh
+   bridge --mint-leaf --name leaf2 --store operator.store > leaf.creds
+   ```
+
+   And the hub's trust lines (the operator and the accounts), from its `nats-server.conf`:
+
+   ```sh
+   sudo awk '/^operator: /{p=1} p; p && /^}/{exit}' /etc/zebridge/nats-server.conf > trust.conf
+   ```
+
+2. **On the leaf's server**, one DNS record (A, and AAAA if it has IPv6) for its name, then:
+
+   ```sh
+   V=0.2.6
+   mkdir -p zebridge-leaf/hub && cd zebridge-leaf
+   curl -fsSLO https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/leaf/compose.yml
+   curl -fsSL -o .env https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/leaf/.env.example
+   chmod 600 .env
+   ```
+
+   Put `trust.conf` and `leaf.creds` in `hub/` (`chmod 600 hub/leaf.creds`). In `.env`: the leaf's name, the hub's NATS name, the e-mail, and the web apps allowed to open the websocket.
+
+3. **Start and check**:
+
+   ```sh
+   docker compose up -d
+   docker compose logs nats | grep -i leafnode
+   docker compose exec nats wget -qO- http://127.0.0.1:8222/leafz
+   ```
+
+   `Leafnode connection created`, and `/leafz` lists one link. Devices dial `tls://<LEAF_HOST>:4222`, or `wss://<LEAF_HOST>` in a browser: the client's `natsUrl` setting.
+
+4. **After every `--update` on the hub** (a grammar change, a new domain), copy its trust lines again into `hub/trust.conf` and restart the leaf: `docker compose restart nats`. The leaf checks the devices' JWTs against its own copy of the account.
+
+Published ports: 80 (Let's Encrypt), `NATS_PUBLIC_PORT` and `LEAF_WS_PORT`. To upgrade, download the release's `compose.yml` again, then `docker compose up -d --force-recreate`: the scripts live inside `compose.yml`, and a plain `up -d` keeps running containers on the old ones.
