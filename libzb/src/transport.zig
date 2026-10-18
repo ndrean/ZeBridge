@@ -28,6 +28,9 @@ pub const ConnectOptions = struct {
     /// when JetStream is reached across a leaf link. The /enroll payload's `js_domain`
     /// says whether the deployment has one; null is the server's own JetStream.
     js_domain: ?[]const u8 = null,
+    /// A seeding leaf's JetStream domain: manifests and chain objects are read from its
+    /// mirrors first (`seed_js`), everything else from `js_domain`. Null: no seeding leaf.
+    seed_domain: ?[]const u8 = null,
     /// A PEM bundle of trusted root certificates for a `tls://` URL, in place of the
     /// system's: Zig reads no trust store on iOS, so a phone host ships its own.
     ca_file: ?[]const u8 = null,
@@ -44,6 +47,8 @@ pub const ConnectOptions = struct {
 /// store's reader does.
 pub const ObjectPull = struct {
     a: std.mem.Allocator,
+    /// The JetStream the object is read from: the hub's, or a seeding leaf's (`seed_js`).
+    js: nats.JetStream,
     sub: *nats.PullSubscription,
     /// To reopen the reader where it stopped (see `read`): the transport, the object's
     /// stream and chunk subject, and the stream sequence of the next chunk (0: from the start).
@@ -68,11 +73,15 @@ pub const ObjectPull = struct {
     };
 
     pub fn open(t: *Transport, a: std.mem.Allocator, bucket: []const u8, name: []const u8) !ObjectPull {
+        return openIn(t, t.js, a, bucket, name);
+    }
+
+    pub fn openIn(t: *Transport, js: nats.JetStream, a: std.mem.Allocator, bucket: []const u8, name: []const u8) !ObjectPull {
         const stream = try std.fmt.allocPrint(a, "OBJ_{s}", .{bucket});
         const enc = try a.alloc(u8, std.base64.url_safe.Encoder.calcSize(name.len));
         _ = std.base64.url_safe.Encoder.encode(enc, name);
         const meta_subject = try std.fmt.allocPrint(a, "$O.{s}.M.{s}", .{ bucket, enc });
-        const msg = t.js.getMsg(stream, .{ .last_by_subj = meta_subject, .direct = true }) catch |err| switch (err) {
+        const msg = js.getMsg(stream, .{ .last_by_subj = meta_subject, .direct = true }) catch |err| switch (err) {
             error.MessageNotFound => return error.ObjectNotFound,
             else => return err,
         };
@@ -81,8 +90,8 @@ pub const ObjectPull = struct {
         const info = (try std.json.parseFromSliceLeaky(Info, a, msg.data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }));
         if (info.deleted) return error.ObjectNotFound;
         const chunk_subject = try std.fmt.allocPrint(a, "$O.{s}.C.{s}", .{ bucket, info.nuid });
-        const sub = try openChunks(t, a, stream, chunk_subject, 0);
-        return .{ .a = a, .sub = sub, .t = t, .stream = stream, .chunk_subject = chunk_subject, .chunks = info.chunks, .size = info.size, .digest = info.digest };
+        const sub = try openChunks(js, a, stream, chunk_subject, 0);
+        return .{ .a = a, .js = js, .sub = sub, .t = t, .stream = stream, .chunk_subject = chunk_subject, .chunks = info.chunks, .size = info.size, .digest = info.digest };
     }
 
     /// The chunk reader's pull consumer, from `start_seq` (0: the first chunk). Named like
@@ -91,7 +100,7 @@ pub const ObjectPull = struct {
     /// window, then sorts and applies it before reading on, and on a slow phone (a moto e20,
     /// eMMC) that took longer than 30 s — the consumer was reaped and the next read failed
     /// with NoResponders, the seed with it. `read` also reopens here if it happens anyway.
-    fn openChunks(t: *Transport, a: std.mem.Allocator, stream: []const u8, chunk_subject: []const u8, start_seq: u64) !*nats.PullSubscription {
+    fn openChunks(js: nats.JetStream, a: std.mem.Allocator, stream: []const u8, chunk_subject: []const u8, start_seq: u64) !*nats.PullSubscription {
         const cname = try std.fmt.allocPrint(a, "zbo{d}x{d}", .{ std.c.getpid(), Ctr.n.fetchAdd(1, .monotonic) });
         var cfg: nats.ConsumerConfig = .{ .ack_policy = .none, .deliver_policy = .all };
         if (start_seq > 0) {
@@ -101,7 +110,7 @@ pub const ObjectPull = struct {
         cfg.name = cname;
         cfg.durable_name = cname;
         cfg.inactive_threshold = 5 * 60 * std.time.ns_per_s;
-        const sub = try t.js.pullSubscribe(chunk_subject, cname, .{ .stream = stream, .config = cfg });
+        const sub = try js.pullSubscribe(chunk_subject, cname, .{ .stream = stream, .config = cfg });
         // §10iy: wait for the WHOLE batch. nats.zig's fetch returns 1 ms after its first
         // message (right for a CDC tail); over Wi-Fi the 8 chunks of a batch do not land
         // within a millisecond, so `read` got one, asked for eight more, and the server
@@ -154,7 +163,7 @@ pub const ObjectPull = struct {
                         if (reopened >= 5) return err;
                         reopened += 1;
                         log.warn("object reader: consumer gone at chunk {d} of {d} ({s}) — reopening from stream seq {d}", .{ self.chunk_index, self.chunks, @errorName(err), self.next_seq });
-                        const fresh = try openChunks(self.t, self.a, self.stream, self.chunk_subject, self.next_seq);
+                        const fresh = try openChunks(self.js, self.a, self.stream, self.chunk_subject, self.next_seq);
                         self.sub.deinit();
                         self.sub = fresh;
                         continue;
@@ -201,6 +210,8 @@ pub const Transport = struct {
     threaded: std.Io.Threaded,
     conn: *nats.Connection,
     js: nats.JetStream,
+    /// A seeding leaf's JetStream, on the same connection (ConnectOptions.seed_domain).
+    seed_js: ?nats.JetStream = null,
     /// The object store handle for the bucket last read (a chain is one bucket, many
     /// objects). `ObjectStore.init` is four small string dupes, so this is a tidiness
     /// cache, not a hot-path one; what matters is that it is released in `deinit`.
@@ -257,6 +268,7 @@ pub const Transport = struct {
         }
         errdefer self.conn.deinit();
         self.js = self.conn.jetstream(.{ .domain = opts.js_domain });
+        if (opts.seed_domain) |d| self.seed_js = self.conn.jetstream(.{ .domain = d });
         return self;
     }
 
@@ -292,6 +304,11 @@ pub const Transport = struct {
         self.allocator.destroy(self);
     }
 
+    fn sameDomain(x: ?[]const u8, y: ?[]const u8) bool {
+        if (x == null or y == null) return x == null and y == null;
+        return std.mem.eql(u8, x.?, y.?);
+    }
+
     fn dropObjectStore(self: *Transport) void {
         if (self.os) |*o| o.deinit();
         self.os = null;
@@ -322,7 +339,12 @@ pub const Transport = struct {
     /// client templates no longer carry it for the key-scoped buckets (tenants,
     /// generations). A missing bucket now reads as a missing key.
     pub fn kvGet(self: *Transport, a: std.mem.Allocator, bucket: []const u8, key: []const u8) !?[]u8 {
-        var kv = try self.js.kvBind(bucket);
+        return kvGetIn(self.js, a, bucket, key);
+    }
+
+    /// `kvGet` in a given JetStream: the hub's, or a seeding leaf's (`seed_js`).
+    pub fn kvGetIn(js: nats.JetStream, a: std.mem.Allocator, bucket: []const u8, key: []const u8) !?[]u8 {
+        var kv = try js.kvBind(bucket);
         defer kv.deinit();
         var entry = kv.get(key) catch return null;
         defer entry.deinit();
@@ -345,6 +367,19 @@ pub const Transport = struct {
     /// Object store get: the whole object, `a`-owned. The store chunks at
     /// 128 KiB — no NATS max_payload limit applies to a seed (§10n).
     pub fn objectGetBytes(self: *Transport, a: std.mem.Allocator, bucket: []const u8, name: []const u8) ![]u8 {
+        return self.objectGetBytesIn(self.js, a, bucket, name);
+    }
+
+    /// `objectGetBytes` in a given JetStream. The hub's store handle is cached; a seeding
+    /// leaf's is made for the read (four string dupes).
+    pub fn objectGetBytesIn(self: *Transport, js: nats.JetStream, a: std.mem.Allocator, bucket: []const u8, name: []const u8) ![]u8 {
+        if (!sameDomain(js.opts.domain, self.js.opts.domain)) {
+            var store = try nats.ObjectStore.init(self.allocator, js, bucket, 128 * 1024);
+            defer store.deinit();
+            var res = try store.getBytes(name);
+            defer res.deinit();
+            return try a.dupe(u8, res.value);
+        }
         const os = try self.objectStore(bucket);
         var res = try os.getBytes(name);
         defer res.deinit();

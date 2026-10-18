@@ -50,6 +50,11 @@ pub const Options = struct {
     /// hub's. The wrong value is not a mismatch the library can detect: every API call
     /// simply gets no responder, so it fails at the first request, not at connect.
     js_domain: ?[]const u8 = null,
+    /// A seeding leaf's JetStream domain (`seedDomain`): the leaf this client dials holds
+    /// mirrors of the hub's manifests and chain objects, and a seed reads them there
+    /// first, falling back to the hub's (`js_domain`) when the leaf cannot serve it.
+    /// Everything else — CDC, schemas, writes — stays on `js_domain`. Null: no such leaf.
+    seed_domain: ?[]const u8 = null,
     /// A PEM bundle of trusted roots for a `tls://` URL (`caFile`), in place of the
     /// system's — which Zig cannot read on iOS.
     ca_file: ?[]const u8 = null,
@@ -559,7 +564,7 @@ pub const SyncClient = struct {
             try std.fmt.allocPrint(self.aa(), "_INBOX.{s}", .{opts.principal})
         else
             "_INBOX";
-        self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = if (opts.creds_path.len > 0) opts.creds_path else null, .creds = if (opts.creds.len > 0) opts.creds else null, .inbox_prefix = inbox_prefix, .js_domain = opts.js_domain, .ca_file = opts.ca_file });
+        self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = if (opts.creds_path.len > 0) opts.creds_path else null, .creds = if (opts.creds.len > 0) opts.creds else null, .inbox_prefix = inbox_prefix, .js_domain = opts.js_domain, .seed_domain = opts.seed_domain, .ca_file = opts.ca_file });
         errdefer self.t.deinit();
         self.startup.mark("dial");
 
@@ -2055,7 +2060,25 @@ pub const SyncClient = struct {
         return order;
     }
 
+    /// A seed from the seeding leaf's mirrors when there is one, else (or when the leaf
+    /// cannot serve it) from the hub. The leaf "cannot serve it" when anything about its
+    /// copy would make the client wait or fail: no manifest yet, a manifest older than the
+    /// stream or the replica, an object not mirrored yet, the leaf unreachable. Retrying
+    /// from the hub replays the chain from the stored watermark, as any failed seed does
+    /// on its next turn; a failure of the replica itself fails again there and is returned.
     fn applyChain(self: *SyncClient, table: []const u8, tenant: []const u8) !void {
+        if (self.t.seed_js) |seed| {
+            if (self.applyChainFrom(table, tenant, seed, true)) |_| return else |err| {
+                if (err == error.SeedStale)
+                    log.info("{s}: the seeding leaf's copy is behind ({s}) — seeding from the hub", .{ table, tenant })
+                else
+                    log.warn("{s}: seeding from the leaf failed ({s}) — seeding from the hub", .{ table, @errorName(err) });
+            }
+        }
+        return self.applyChainFrom(table, tenant, self.t.js, false);
+    }
+
+    fn applyChainFrom(self: *SyncClient, table: []const u8, tenant: []const u8, src: @import("nats").JetStream, from_seed: bool) !void {
         // Per-call: a seed can be megabytes, and it is dead the moment it is applied.
         // Only `seed_stream` leaves this arena, duped into the client arena explicitly
         // below.
@@ -2063,7 +2086,8 @@ pub const SyncClient = struct {
         defer ca.deinit();
         const a = ca.allocator();
         const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ tenant, table });
-        const man_bytes = (try self.t.kvGet(a, self.kv_generations, key)) orelse {
+        const man_bytes = (try transport.Transport.kvGetIn(src, a, self.kv_generations, key)) orelse {
+            if (from_seed) return error.SeedStale;
             log.info("{s}: no chain yet ({s})", .{ table, tenant });
             return;
         };
@@ -2076,6 +2100,7 @@ pub const SyncClient = struct {
         const man_epoch: i64 = if (man.object.get("seed_epoch")) |v| (if (v == .integer) v.integer else 0) else 0;
         const want_epoch: i64 = if (self.states.get(table)) |s0| s0.seed_epoch else 0;
         if (man_epoch < want_epoch) {
+            if (from_seed) return error.SeedStale;
             log.warn("{s}: chain g{d} predates the re-seed (epoch {d} < {d}) — waiting for the producer's full", .{ table, if (man.object.get("gen")) |v| v.integer else 0, man_epoch, want_epoch });
             self.reseed_pending = true;
             return;
@@ -2090,6 +2115,7 @@ pub const SyncClient = struct {
         const cdc_stream = if (man.object.get("cdc_stream")) |v| (if (v == .string) v.string else "") else "";
         const pos: i64 = if (cdc_stream.len > 0) @intCast(try self.storedSeq(cdc_stream)) else 0;
         if (core.fullPredatesReplica(man, plan.array, pos)) {
+            if (from_seed) return error.SeedStale;
             log.warn("{s}: chain predates replica — refusing the full (D2)", .{table});
             return;
         }
@@ -2133,6 +2159,7 @@ pub const SyncClient = struct {
                     }
                 }
                 if (cutoff_seq + 1 < first) {
+                    if (from_seed) return error.SeedStale;
                     log.warn("{s}: chain g{d} predates the stream (cutoff seq {d} < first {d} on {s}) — the events between are gone; waiting for the producer's next generation", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, first, cdc_stream });
                     self.reseed_pending = true;
                     return;
@@ -2154,6 +2181,7 @@ pub const SyncClient = struct {
                 if (same) {
                     const first: i64 = @intCast(info.value.state.first_seq);
                     if (sv.integer + 1 < first) {
+                        if (from_seed) return error.SeedStale;
                         log.warn("{s}: chain g{d} predates {s} (shared cut {d} < first {d}) — its open-tenant rows between are gone; waiting for the producer's next generation", .{ table, if (man.object.get("gen")) |v| v.integer else 0, sstream, sv.integer, first });
                         self.reseed_pending = true;
                         return;
@@ -2185,7 +2213,7 @@ pub const SyncClient = struct {
             const raw: []const u8 = if (self.opts.seed_streaming) blk: {
                 // The object's size is in its meta, read before any chunk: a small
                 // step takes the whole-object path through the same pull reader.
-                var pull = try transport.ObjectPull.open(self.t, step_a, bucket, step.object.get("name").?.string);
+                var pull = try transport.ObjectPull.openIn(self.t, src, step_a, bucket, step.object.get("name").?.string);
                 if (pull.size >= self.opts.seed_streaming_above) {
                     defer pull.deinit();
                     applied += try self.applyStepStreaming(step_a, table, tenant, st, man, step, &pull, is_full, &ph);
@@ -2194,7 +2222,7 @@ pub const SyncClient = struct {
                 }
                 defer pull.deinit();
                 break :blk try pull.readAll(step_a);
-            } else try self.t.objectGetBytes(step_a, bucket, step.object.get("name").?.string);
+            } else try self.t.objectGetBytesIn(src, step_a, bucket, step.object.get("name").?.string);
             ph[0] += msNow() - t_ph;
             t_ph = msNow();
             const blob = try maybeZstd(step_a, raw); // §10w: magic-sniffed, mixed chains fine
@@ -2217,6 +2245,7 @@ pub const SyncClient = struct {
                     const v = cur.readValue(step_a) catch return error.ChainObjectMalformed;
                     cols = try jsonStrList(step_a, try mpToJson(step_a, v));
                     for (cols) |col| if (!contains(st.cols, col)) {
+                        if (from_seed) return error.SeedStale;
                         log.warn("{s}: chain object {s} names column {s}, which the replica lacks — predates the schema, waiting for the producer's full", .{ table, step.object.get("name").?.string, col });
                         return;
                     };

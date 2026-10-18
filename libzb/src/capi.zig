@@ -46,6 +46,8 @@
 //! (optional: the hash the host received from /enroll or GET /grammar; a mismatch
 //! refuses to open), jsDomain (optional: the /enroll payload's `js_domain` — the
 //! JetStream domain the grants name, when JetStream is reached across a leaf link),
+//! seedDomain (optional: a seeding leaf's JetStream domain — seeds read its mirrors
+//! first, the hub's when it cannot serve them),
 //! caFile (optional: a PEM bundle of trusted roots for https:// enrollment and renewal
 //! and a tls:// NATS URL, in place of the system's; unset on iOS and Android, where Zig
 //! reads no trust store, libzb uses its own copy of Mozilla's bundle, roots.zig).
@@ -401,6 +403,7 @@ const ClientBox = struct {
     creds_text: []u8,
     grammar_hash: ?[]u8,
     js_domain: ?[]u8,
+    seed_domain: ?[]u8,
     ca_file: ?[]u8,
     db: [:0]u8,
     principal: [:0]u8,
@@ -436,6 +439,7 @@ const ClientBox = struct {
         a.free(self.creds_text);
         if (self.grammar_hash) |g| a.free(g);
         if (self.js_domain) |d| a.free(d);
+        if (self.seed_domain) |d| a.free(d);
         if (self.ca_file) |p| a.free(p);
         a.free(self.db);
         a.free(self.principal);
@@ -674,6 +678,11 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     const jd_raw = idv.or_(str.get(o, "jsDomain", ""), if (ident) |i| i.js_domain else null);
     const js_domain: ?[]u8 = if (jd_raw.len > 0) try a.dupe(u8, jd_raw) else null;
     errdefer if (js_domain) |d| a.free(d);
+    // "seedDomain": a seeding leaf's JetStream domain — the leaf this client dials holds
+    // mirrors of the hub's manifests and chain objects. Empty = seed from the hub.
+    const sd_raw = str.get(o, "seedDomain", "");
+    const seed_domain: ?[]u8 = if (sd_raw.len > 0) try a.dupe(u8, sd_raw) else null;
+    errdefer if (seed_domain) |d| a.free(d);
     // dbUrl (§10fd): a PostgreSQL replica instead of the SQLite file.
     const db_url_raw = str.get(o, "dbUrl", "");
     const db_url: ?[:0]u8 = if (db_url_raw.len > 0) try a.dupeSentinel(u8, db_url_raw, 0) else null;
@@ -777,6 +786,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             .creds = creds_text,
             .grammar_hash = grammar_hash,
             .js_domain = js_domain,
+            .seed_domain = seed_domain,
             .ca_file = ca_file,
             .heartbeat_ms = heartbeat_ms,
             .seed_chunk_rows = seed_chunk_rows,
@@ -796,6 +806,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         .creds_text = creds_text,
         .grammar_hash = grammar_hash,
         .js_domain = js_domain,
+        .seed_domain = seed_domain,
         .ca_file = ca_file,
         .db = db,
         .principal = principal,
