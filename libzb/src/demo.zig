@@ -61,6 +61,7 @@ pub fn main() !void {
     // that will not decode — stale objects in a long-lived dev store, say — does not
     // block testing writes.
     if (std.c.getenv("ZB_SKIP_SEED") == null) {
+        c.beginPass();
         try c.gapAndSeed(null, null);
         try c.drainCdc();
         std.debug.print("=> users={d} salaries={d}\n", .{ c.count("users"), c.count("salaries") });

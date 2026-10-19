@@ -383,6 +383,13 @@ pub const SyncClient = struct {
     /// old anchor (163), and every event of the recreated stream (seq 3–14) was dropped
     /// as "in the chain" — replica 1 row, PostgreSQL 13.
     restarted: std.StringHashMapUnmanaged(void) = .empty,
+    /// The streams' first/last sequence and incarnation, asked once per pass (a sync or a
+    /// poll) and shared by every check of that pass: the open asked STREAM.INFO up to six
+    /// times per stream (measured on the hub, 2026-10-19). Reset at each pass's start, so
+    /// a pass sees the server as of that pass — as when each check asked. Errors are not
+    /// kept: a failing stream is asked again, and handled where it is asked.
+    pass_streams: std.StringHashMapUnmanaged(StreamFacts) = .empty,
+    pass_arena: ?std.heap.ArenaAllocator = null,
     states: std.array_hash_map.String(TableState) = .empty,
     /// §10hp: this client SERVES — the queue subscriptions it drains in `poll`, and the
     /// requests it has handed the host but not yet answered. A responder is a client
@@ -585,6 +592,7 @@ pub const SyncClient = struct {
     /// forgotten the same way — it is the one list, and both this and the test read it.
     pub fn deinit(self: *SyncClient) void {
         self.releaseHandles();
+        if (self.pass_arena) |*ar| ar.deinit();
         var sit = self.sent_at.iterator();
         while (sit.next()) |e| self.a.free(e.key_ptr.*);
         self.sent_at.deinit(self.a);
@@ -1572,20 +1580,19 @@ pub const SyncClient = struct {
             if (self.isDark(stream)) continue;
             // §10fq: an unreadable stream costs a request timeout on every pass; set
             // it aside instead, so an unseeded tenant behind it does not slow each poll.
-            var info = self.t.js.getStreamInfo(stream) catch |err| {
+            const info = self.streamFacts(stream) catch |err| {
                 self.markDark(stream, err);
                 continue;
             };
-            defer info.deinit();
-            const first: i64 = @intCast(info.value.state.first_seq);
-            const last: i64 = @intCast(info.value.state.last_seq);
+            const first: i64 = @intCast(info.first_seq);
+            const last: i64 = @intCast(info.last_seq);
             const stored: i64 = @intCast(try self.storedSeq(stream));
             // The stream's identity: a different `created` under the same name is a
             // stream recreated (a wipe, a lost slot) — a restart whatever the numbers say.
             // Measured (stream_wipe.py, 2026-09-17): position 1, the recreated stream
             // already at last_seq 2, `stored > last_seq` never fired, and the client read
             // on from 2 — one row of the new numbering skipped for ever.
-            const created: []const u8 = info.value.created;
+            const created: []const u8 = info.created;
             const known_created = try self.storedCreated(a, stream);
             const recreated = if (known_created) |kc| (created.len > 0 and !std.mem.eql(u8, kc, created)) else false;
             if (core.streamHasGap(first, stored, last) or recreated) {
@@ -2138,14 +2145,12 @@ pub const SyncClient = struct {
         // chain cut on an empty stream predates a stream that now starts past 1.
         const has_cutoff_seq = man.object.get("cutoff_seq") != null;
         if (cdc_stream.len > 0 and has_cutoff_seq) {
-            if (self.t.js.getStreamInfo(cdc_stream)) |info_c| {
-                var info = info_c;
-                defer info.deinit();
-                const first: i64 = @intCast(info.value.state.first_seq);
-                const last: i64 = @intCast(info.value.state.last_seq);
-                if (man_created.len > 0 and info.value.created.len > 0) {
-                    if (!std.mem.eql(u8, man_created, info.value.created)) {
-                        log.info("{s}: chain g{d} was cut on a previous incarnation of {s} (created {s}, now {s}) — seeding it, gating nothing until a newer generation", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cdc_stream, man_created, info.value.created });
+            if (self.streamFacts(cdc_stream)) |info| {
+                const first: i64 = @intCast(info.first_seq);
+                const last: i64 = @intCast(info.last_seq);
+                if (man_created.len > 0 and info.created.len > 0) {
+                    if (!std.mem.eql(u8, man_created, info.created)) {
+                        log.info("{s}: chain g{d} was cut on a previous incarnation of {s} (created {s}, now {s}) — seeding it, gating nothing until a newer generation", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cdc_stream, man_created, info.created });
                         gate_seq = 0;
                     } else {
                         _ = self.restarted.remove(cdc_stream);
@@ -2174,12 +2179,10 @@ pub const SyncClient = struct {
         if (man.object.get("shared_cutoff_seq")) |sv| if (sv == .integer and sv.integer >= 0) {
             const sstream = if (man.object.get("shared_cdc_stream")) |v| (if (v == .string) v.string else "") else "";
             const screated = if (man.object.get("shared_cdc_stream_created")) |v| (if (v == .string) v.string else "") else "";
-            if (sstream.len > 0) if (self.t.js.getStreamInfo(sstream)) |info_c| {
-                var info = info_c;
-                defer info.deinit();
-                const same = screated.len == 0 or info.value.created.len == 0 or std.mem.eql(u8, screated, info.value.created);
+            if (sstream.len > 0) if (self.streamFacts(sstream)) |info| {
+                const same = screated.len == 0 or info.created.len == 0 or std.mem.eql(u8, screated, info.created);
                 if (same) {
-                    const first: i64 = @intCast(info.value.state.first_seq);
+                    const first: i64 = @intCast(info.first_seq);
                     if (sv.integer + 1 < first) {
                         if (from_seed) return error.SeedStale;
                         log.warn("{s}: chain g{d} predates {s} (shared cut {d} < first {d}) — its open-tenant rows between are gone; waiting for the producer's next generation", .{ table, if (man.object.get("gen")) |v| v.integer else 0, sstream, sv.integer, first });
@@ -2915,10 +2918,35 @@ pub const SyncClient = struct {
         return null;
     }
 
-    fn streamFirst(self: *SyncClient, stream: []const u8) ?u64 {
-        var info = self.t.js.getStreamInfo(stream) catch return null;
+    const StreamFacts = struct { first_seq: u64, last_seq: u64, created: []const u8 };
+
+    /// A new pass: what the last one learnt of the streams is forgotten. `poll`, `syncOnce`
+    /// and `join` start one; a caller driving the steps itself (`gapAndSeed`, `drainCdc`)
+    /// starts one first, or reads what an earlier pass learnt.
+    pub fn beginPass(self: *SyncClient) void {
+        if (self.pass_arena) |*ar| _ = ar.reset(.retain_capacity) else self.pass_arena = std.heap.ArenaAllocator.init(self.a);
+        self.pass_streams = .empty; // its memory was the arena's
+    }
+
+    /// The stream's facts for this pass: asked of the server once, then shared.
+    fn streamFacts(self: *SyncClient, stream: []const u8) !StreamFacts {
+        if (self.pass_streams.get(stream)) |f| return f;
+        var info = try self.t.js.getStreamInfo(stream);
         defer info.deinit();
-        return info.value.state.first_seq;
+        if (self.pass_arena == null) self.beginPass();
+        const pa = self.pass_arena.?.allocator();
+        const f: StreamFacts = .{
+            .first_seq = info.value.state.first_seq,
+            .last_seq = info.value.state.last_seq,
+            .created = try pa.dupe(u8, info.value.created),
+        };
+        try self.pass_streams.put(pa, try pa.dupe(u8, stream), f);
+        return f;
+    }
+
+    fn streamFirst(self: *SyncClient, stream: []const u8) ?u64 {
+        const f = self.streamFacts(stream) catch return null;
+        return f.first_seq;
     }
 
     /// §10jc: deliveries the server counts as outstanding on `consumer`. Everything this
@@ -2931,9 +2959,8 @@ pub const SyncClient = struct {
     }
 
     fn prunedAfter(self: *SyncClient, stream: []const u8, pos: u64) bool {
-        var info = self.t.js.getStreamInfo(stream) catch return true;
-        defer info.deinit();
-        return info.value.state.first_seq > pos + 1;
+        const f = self.streamFacts(stream) catch return true;
+        return f.first_seq > pos + 1;
     }
 
     /// §10gm: the drain, with the gap rule the live tail already had. A stream that
@@ -3472,19 +3499,18 @@ pub const SyncClient = struct {
     };
 
     fn tailHealth(self: *SyncClient, stream: []const u8, consumer: []const u8, pos: u64, idle_ms: i64) TailHealth {
-        var si = self.t.js.getStreamInfo(stream) catch |e| {
+        const si = self.streamFacts(stream) catch |e| {
             tr("{s}: idle check — stream info failed ({s})", .{ stream, @errorName(e) });
             return .{ .fine = pos };
         };
-        defer si.deinit();
-        const last = si.value.state.last_seq;
+        const last = si.last_seq;
         var ci = self.t.js.getConsumerInfo(stream, consumer) catch |e| {
             tr("{s}: idle check — consumer {s} info failed ({s}): gone", .{ stream, consumer, @errorName(e) });
             return .gone;
         };
         defer ci.deinit();
         const c = ci.value;
-        tr("{s}: idle {d} s, position {d}; server: first {d} last {d}; consumer {s}: pending {d}, ack_pending {d}, delivered {d} (stream seq {d})", .{ stream, @divTrunc(idle_ms, 1000), pos, si.value.state.first_seq, last, consumer, c.num_pending, c.num_ack_pending, c.delivered.consumer_seq, c.delivered.stream_seq });
+        tr("{s}: idle {d} s, position {d}; server: first {d} last {d}; consumer {s}: pending {d}, ack_pending {d}, delivered {d} (stream seq {d})", .{ stream, @divTrunc(idle_ms, 1000), pos, si.first_seq, last, consumer, c.num_pending, c.num_ack_pending, c.delivered.consumer_seq, c.delivered.stream_seq });
         if (c.num_pending > 0 and idle_ms >= tail_watch_ms) return .{ .deaf = c.num_pending };
         // §10jc: nothing in hand, yet deliveries unacknowledged — lost in transit, and the
         // server re-sends them only after ack_wait, out of order. Reopen from the position.
@@ -3492,9 +3518,9 @@ pub const SyncClient = struct {
         if (last <= pos) return .{ .fine = pos };
         // §10jh: the stream dropped what follows the position before it was delivered —
         // a filtered consumer created there has nothing pending and would look caught up.
-        if (c.num_pending == 0 and c.num_ack_pending == 0 and si.value.state.first_seq > pos + 1)
-            return .{ .pruned = si.value.state.first_seq };
-        return .{ .fine = core.caughtUpPosition(pos, si.value.state.first_seq, last, c.num_pending, c.num_ack_pending, c.delivered.consumer_seq, c.delivered.stream_seq) };
+        if (c.num_pending == 0 and c.num_ack_pending == 0 and si.first_seq > pos + 1)
+            return .{ .pruned = si.first_seq };
+        return .{ .fine = core.caughtUpPosition(pos, si.first_seq, last, c.num_pending, c.num_ack_pending, c.delivered.consumer_seq, c.delivered.stream_seq) };
     }
 
     /// A request taken off a queue subscription and handed to the host: the id the host
@@ -3642,6 +3668,7 @@ pub const SyncClient = struct {
     /// BEFORE the CDC wait and again after it, so `wait_ms` bounds how long a question
     /// can sit unseen: a responder polls with a short wait.
     pub fn poll(self: *SyncClient, report_a: std.mem.Allocator, wait_ms: u64) !PollReport {
+        self.beginPass();
         var requests: std.ArrayList(Request) = .empty;
         if (self.serve_subs.len > 0) try self.drainServe(report_a, &requests);
         var r = try self.pollInner(report_a, wait_ms);
@@ -5137,6 +5164,7 @@ pub const SyncClient = struct {
     /// the verdict channel) the first time, then seed-if-gapped and drain-to-tail every
     /// time. Idempotent by construction — a host calls it at boot and on a timer.
     pub fn syncOnce(self: *SyncClient) !SyncReport {
+        self.beginPass();
         try self.refuseIfRevoked();
         const first = !self.schemas_synced;
         if (first) {
@@ -5174,6 +5202,7 @@ pub const SyncClient = struct {
     /// consumer, loudly, and is retried at the next poll like any unseeded table.
     pub fn join(self: *SyncClient, tenant: []const u8) !void {
         if (tenant.len == 0 or std.mem.findAny(u8, tenant, ".*> ") != null) return error.TenantMalformed;
+        self.beginPass();
         for (self.tenants) |t| if (std.mem.eql(u8, t, tenant)) return;
         // Ask the broker FIRST (§10fo): a tenant outside the JWT's tags, or one whose
         // stream does not exist yet, answers here and the membership is never taken.
