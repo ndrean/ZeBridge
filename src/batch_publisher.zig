@@ -410,10 +410,18 @@ pub const CDCEvent = struct {
 /// skipped, not retried until the bridge stops (the generation producer applies the same
 /// rule to its chains). Untenanted and open-tenant rows go to the public stream: a
 /// missing public stream stays a fault.
+/// The subject of a roster note from the event processor: a principal whose last tenant
+/// mapping went (its `$KV.tenants` key is purged directly, not through this queue). Read
+/// into `members`, never published.
+pub const roster_note_prefix = "$ZB.roster.";
+
 pub const TenantRouting = struct {
     cdc_prefix: []const u8, // "cdc"
     stream_prefix: []const u8, // "CDC_"
     open_tenant: []const u8, // "_default": its rows go to the public stream
+    /// "$KV.tenants.": a principal's tenant set, published by this publisher in WAL order
+    /// (`members`). Empty: membership unknown, every missing stream is skipped as before.
+    tenants_kv_prefix: []const u8 = "",
 
     /// The tenant of `<cdc_prefix>.<tenant>.<table>.<op>`, or of its batch form
     /// `….<op>.batch` (several rows in one message, encodeGroup). Null for an untenanted
@@ -454,14 +462,15 @@ pub const BatchPublisher = struct {
     /// Tenants whose events were skipped for want of a stream, said once each (flush
     /// thread only; forgotten when their stream accepts a publish again).
     streamless: std.StringHashMapUnmanaged(void) = .empty,
-    /// The tenants whose stream this process knows to exist: the boot topology's (the
-    /// bridge made or reconciled them before publishing) and every tenant a publish has
-    /// reached since. A missing stream is "nobody mapped yet" only for a tenant NOT here;
-    /// for one here, its stream was deleted under the bridge (an operator, a recreate),
-    /// and skipping would confirm its rows' LSN with nobody holding them — the fault
-    /// §10bu stops on, the slot keeping every row. Touched by the flush thread alone,
-    /// after `knowStream` filled it before `start`.
-    stream_known: std.StringHashMapUnmanaged(void) = .empty,
+    /// The roster as this publisher has published it: principal → its tenants, from each
+    /// `$KV.tenants.<principal>` value (boot publishes them all before any row). In WAL
+    /// order with the rows, so it is the roster AS OF each row. A missing stream is
+    /// "nobody mapped yet" only for a tenant nobody holds here; for a tenant with a
+    /// member, its stream was deleted under the bridge, and skipping would confirm rows
+    /// its members follow with nobody holding them — the fault §10bu stops on, the slot
+    /// keeping every row. Touched by the flush thread alone.
+    members: std.StringHashMapUnmanaged([]const []const u8) = .empty,
+    members_arena: ?std.heap.ArenaAllocator = null,
 
     // Pre-allocated ring buffer of CDCEvent structs (zero malloc/free!)
     // Allocated once at startup, reused for entire lifetime
@@ -729,9 +738,8 @@ pub const BatchPublisher = struct {
         var it = self.streamless.keyIterator();
         while (it.next()) |k| allocator.free(k.*);
         self.streamless.deinit(allocator);
-        var kit = self.stream_known.keyIterator();
-        while (kit.next()) |k| allocator.free(k.*);
-        self.stream_known.deinit(allocator);
+        self.members.deinit(allocator);
+        if (self.members_arena) |*ar| ar.deinit();
 
         // 2. Unlock the data slab from RAM (symmetric with mlock in init)
         if (@hasDecl(std.posix, "munlock")) {
@@ -1062,6 +1070,15 @@ pub const BatchPublisher = struct {
 
         for (indices) |slot_idx| {
             const event = &self.events[slot_idx];
+            if (std.mem.startsWith(u8, event.getSubject(), roster_note_prefix)) {
+                // In order with the rows around it: what precedes it publishes first.
+                if (cdc_indices.items.len > 0) {
+                    try self.publishCDCSubBatch(cdc_indices.items);
+                    cdc_indices.clearRetainingCapacity();
+                }
+                _ = self.members.remove(event.getSubject()[roster_note_prefix.len..]);
+                continue;
+            }
             if (std.mem.startsWith(u8, event.getSubject(), Config.Nats.kv_subject_prefix)) {
                 // If there are pending CDC events, flush them first to preserve order
                 if (cdc_indices.items.len > 0) {
@@ -1077,6 +1094,7 @@ pub const BatchPublisher = struct {
                     const msg_id = event.getMsgId();
 
                     try self.timedPublish(event.getSubject(), msg_id, raw_json);
+                    self.noteMembers(event.getSubject(), raw_json);
                     // §1.7's undercount, resolved sideways: SCHEMA events get their own
                     // counter rather than joining `cdc_events_published`, whose value is
                     // trusted to equal row events (README burst method, speed.py).
@@ -1277,7 +1295,6 @@ pub const BatchPublisher = struct {
             return err;
         };
         if (self.streamless.count() > 0) self.noteStreamBack(eg.subject);
-        self.noteStreamKnown(eg.subject);
         if (self.metrics) |m| {
             for (0..eg.count) |_| m.incrementCdcEvents();
         }
@@ -1293,8 +1310,8 @@ pub const BatchPublisher = struct {
         var buf: [256]u8 = undefined;
         const stream = routing.streamName(&buf, tenant) orelse return false;
         if (!self.publisher.streamMissing(stream)) return false;
-        if (self.stream_known.contains(tenant)) {
-            log.err("❌ the stream of tenant '{s}' ({s}) is gone while the bridge held it: deleted under it — not skipping; the retries stop the bridge and the slot keeps every row (the next start recreates it)", .{ tenant, stream });
+        if (self.tenantHasMembers(tenant)) {
+            log.err("❌ the stream of tenant '{s}' ({s}) is gone while principals are mapped to it: deleted under the bridge — not skipping; the retries stop the bridge and the slot keeps every row (the next start recreates it)", .{ tenant, stream });
             return false;
         }
         if (!self.streamless.contains(tenant)) {
@@ -1307,20 +1324,27 @@ pub const BatchPublisher = struct {
         return true;
     }
 
-    /// A tenant whose stream exists: from the boot topology, before `start`.
-    pub fn knowStream(self: *BatchPublisher, tenant: []const u8) !void {
-        if (self.stream_known.contains(tenant)) return;
-        const key = try self.allocator.dupe(u8, tenant);
-        errdefer self.allocator.free(key);
-        try self.stream_known.put(self.allocator, key, {});
+    /// A principal's tenant set was published (`$KV.tenants.<principal>`, a JSON array):
+    /// remember it. A value that does not parse is ignored (the roster it replaces stays).
+    fn noteMembers(self: *BatchPublisher, subject: []const u8, value: []const u8) void {
+        const routing = self.tenant_routing orelse return;
+        if (routing.tenants_kv_prefix.len == 0 or !std.mem.startsWith(u8, subject, routing.tenants_kv_prefix)) return;
+        const principal = subject[routing.tenants_kv_prefix.len..];
+        if (principal.len == 0) return;
+        if (self.members_arena == null) self.members_arena = std.heap.ArenaAllocator.init(self.allocator);
+        const ma = self.members_arena.?.allocator();
+        const parsed = std.json.parseFromSliceLeaky([]const []const u8, ma, value, .{ .allocate = .alloc_always }) catch return;
+        // The arena grows with every change; the roster is small and changes are rare.
+        const gop = self.members.getOrPut(self.allocator, principal) catch return;
+        if (!gop.found_existing) gop.key_ptr.* = ma.dupe(u8, principal) catch return;
+        gop.value_ptr.* = parsed;
     }
 
-    /// A publish to a tenant's subject succeeded: its stream exists (a tenant mapped
-    /// since the boot included).
-    fn noteStreamKnown(self: *BatchPublisher, subject: []const u8) void {
-        const routing = self.tenant_routing orelse return;
-        const tenant = routing.tenantOf(subject) orelse return;
-        self.knowStream(tenant) catch {};
+    /// Whether some principal is mapped to `tenant`, as of the rows published so far.
+    fn tenantHasMembers(self: *BatchPublisher, tenant: []const u8) bool {
+        var it = self.members.valueIterator();
+        while (it.next()) |ts| for (ts.*) |t| if (std.mem.eql(u8, t, tenant)) return true;
+        return false;
     }
 
     /// A tenant skipped before has a stream again (a principal was mapped): say it once.

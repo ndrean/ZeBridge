@@ -2109,6 +2109,14 @@ pub const EventProcessor = struct {
             if (!known) {
                 self.new_tenant_seen = true;
                 log.info("🆕 tenant '{s}' is new (first mapping: '{s}') — reconciling its stream", .{ row.tenant, row.principal });
+            } else if (self.tenantMembers(row.tenant) == 0) {
+                // Known, but nobody was mapped to it: its stream may have gone while it
+                // stood empty (deleted by hand, a cleanup). Reconcile as for a new tenant:
+                // create-when-missing makes it again, a stream still there is unchanged.
+                // Without this its first member again found no stream, and its rows
+                // stopped the bridge until a restart recreated it.
+                self.new_tenant_seen = true;
+                log.info("🆕 tenant '{s}' has a member again ('{s}') after none — reconciling its stream", .{ row.tenant, row.principal });
             }
         }
         const first = self.rosterLen(row.principal) == 0;
@@ -2143,7 +2151,19 @@ pub const EventProcessor = struct {
             self.purgeTenantKey(row.principal);
             self.publishRevoked(row.principal);
         }
-        return null;
+        // The key is purged directly, not through the ring: tell the publisher, in WAL
+        // order, that this principal holds no tenant any more (`BatchPublisher.members`
+        // decides whether a missing stream is a fault). Never published.
+        return try self.packRosterNote(arena, row.principal, rel.relation_id, wal_end);
+    }
+
+    /// The publisher's own roster note: `<roster_note_prefix><principal>`, no tenants.
+    fn packRosterNote(self: *EventProcessor, arena: std.mem.Allocator, principal: []const u8, relation_id: u32, wal_end: u64) !u32 {
+        const subject = try std.fmt.allocPrint(arena, "{s}{s}", .{ @import("batch_publisher.zig").roster_note_prefix, principal });
+        const msg_id = try std.fmt.allocPrint(arena, "roster-{s}-{d}", .{ principal, wal_end });
+        var cols: std.ArrayList(pgoutput.Column) = .empty;
+        try cols.append(arena, .{ .name = "tenants", .value = .{ .text = "[]" } });
+        return try self.acquireAndFillSlot(subject, principal, "TENANT", msg_id, relation_id, cols, wal_end);
     }
 
     const RosterRow = struct { principal: []const u8, tenant: []const u8 };
@@ -2180,6 +2200,19 @@ pub const EventProcessor = struct {
             self.allocator.free(list.orderedRemove(i));
             return;
         };
+    }
+
+    /// How many principals are mapped to `tenant` (the roster is small: a scan).
+    fn tenantMembers(self: *EventProcessor, tenant: []const u8) usize {
+        var n: usize = 0;
+        var it = self.roster.valueIterator();
+        while (it.next()) |list| {
+            for (list.items) |t| if (std.mem.eql(u8, t, tenant)) {
+                n += 1;
+                break;
+            };
+        }
+        return n;
     }
 
     fn rosterLen(self: *EventProcessor, principal: []const u8) usize {

@@ -1519,10 +1519,9 @@ pub fn main(init: std.process.Init) !void {
         .cdc_prefix = runtime_config.topology.subject_cdc_prefix,
         .stream_prefix = runtime_config.topology.cdc_stream_prefix,
         .open_tenant = runtime_config.topology.open_tenant,
+        // A missing stream of a tenant someone is mapped to is a fault (see `members`).
+        .tenants_kv_prefix = try std.fmt.allocPrint(allocator, "$KV.{s}.", .{runtime_config.topology.kv_tenants}),
     };
-    // The tenants whose stream boot reconciled: a missing one is a deleted stream, not a
-    // tenant nobody is mapped to (see `stream_known`).
-    for (runtime_config.topology.tenants) |t| try batch_pub.knowStream(t);
     // Start flush thread - batch_pub is now at stable heap address
     try batch_pub.start();
     defer batch_pub.join();
