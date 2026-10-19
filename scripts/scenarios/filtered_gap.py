@@ -55,7 +55,7 @@ def main() -> int:
         return int(rows[0][0]) if rows else 0
 
     db = f"/tmp/zb-filtered-gap-{os.getpid()}.sqlite3"
-    h = lib.zb_client_connect(json.dumps({"natsUrl": zb.nats_server(), "credsPath": zb.creds_for(who), "dbPath": db, "principal": who, "clientId": "py-filtered-gap", "tables": [FOLLOWED]}).encode())
+    h = lib.zb_client_connect(json.dumps({"natsUrl": zb.nats_server(), **zb.tls_opts(), "credsPath": zb.creds_for(who), "dbPath": db, "principal": who, "clientId": "py-filtered-gap", "tables": [FOLLOWED]}).encode())
     if not h:
         sys.exit("libzb client could not open (cd libzb && zig build; is the stack up?)")
     failed = 0

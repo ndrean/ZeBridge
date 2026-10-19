@@ -59,6 +59,16 @@ def nats_server() -> str:
     return f"{scheme}://{address}" if scheme else address
 
 
+def tls_opts() -> dict:
+    """A libzb client's `caFile` on a `tls://` stack: the CA the bridge uses
+    (`NATS_TLS_CA`, relative to the repo root), so a test CA verifies; nothing otherwise."""
+    ca = os.environ.get("NATS_TLS_CA")
+    if not ca or not NATS_URL.startswith("tls://"):
+        return {}
+    path = pathlib.Path(ca)
+    return {"caFile": str(path if path.is_absolute() else pathlib.Path(__file__).resolve().parents[2] / path)}
+
+
 def principal() -> str | None:
     """Who a scenario acts as: `ZB_PRINCIPAL`, else the creds file's name
     (`scripts/native/creds/<principal>.creds`), else the URL's userinfo (legacy),
@@ -432,8 +442,10 @@ def nats_cli(*args, seed_file=None) -> subprocess.CompletedProcess:
         auth = ["--nkey", str(seed_file)]
     # ⚠️ The server address only: userinfo in NATS_URL would win over the credential
     # and every administrative command would be denied with an opaque timeout.
+    # On a tls:// stack the CLI must trust its test CA too (see tls_opts).
+    tls = ["--tlsca", tls_opts()["caFile"]] if tls_opts() else []
     return subprocess.run(
-        ["nats", "--server", nats_server(), *auth, *args],
+        ["nats", "--server", nats_server(), *tls, *auth, *args],
         capture_output=True,
         text=True,
     )

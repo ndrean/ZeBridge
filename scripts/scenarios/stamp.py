@@ -91,7 +91,7 @@ async def main():
             except FileNotFoundError:
                 pass
         h = lib.zb_client_connect(json.dumps({
-            "natsUrl": zb.nats_server(), "credsPath": zb.creds_for(who),
+            "natsUrl": zb.nats_server(), **zb.tls_opts(), "credsPath": zb.creds_for(who),
             "dbPath": cdb,
             "principal": who, "clientId": "stamp-consumer",
             "tables": ["zb_stamp"]}).encode())

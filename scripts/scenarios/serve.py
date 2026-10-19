@@ -53,7 +53,7 @@ class ZigResponder:
                      ("serve", [ctypes.c_char_p]), ("reply", [ctypes.c_uint64, ctypes.c_char_p])):
             f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
         self.h = lib.zb_client_connect(json.dumps({
-            "natsUrl": zb.nats_server(), "credsPath": zb.creds_for("pois"), "principal": "pois",
+            "natsUrl": zb.nats_server(), **zb.tls_opts(), "credsPath": zb.creds_for("pois"), "principal": "pois",
             "dbPath": db, "tables": [TABLE], "clientId": f"serve-{label}", "heartbeatMs": 0}).encode())
         if not self.h:
             sys.exit("libzb open failed")

@@ -246,7 +246,7 @@ async def run() -> int:
         db = f"/tmp/zb-chain-kill-{os.getpid()}.sqlite3"
         _env.rm_sqlite(db)
         h = lib.zb_client_connect(json.dumps({
-            "natsUrl": zb.nats_server(), "credsPath": zb.creds_for("alice"),   # alice → acme
+            "natsUrl": zb.nats_server(), **zb.tls_opts(), "credsPath": zb.creds_for("alice"),   # alice → acme
             "dbPath": db,
             "principal": "alice", "clientId": "py-chain-kill", "tables": [TABLE]}).encode())
         if not h:
