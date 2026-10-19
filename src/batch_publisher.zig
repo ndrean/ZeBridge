@@ -454,6 +454,14 @@ pub const BatchPublisher = struct {
     /// Tenants whose events were skipped for want of a stream, said once each (flush
     /// thread only; forgotten when their stream accepts a publish again).
     streamless: std.StringHashMapUnmanaged(void) = .empty,
+    /// The tenants whose stream this process knows to exist: the boot topology's (the
+    /// bridge made or reconciled them before publishing) and every tenant a publish has
+    /// reached since. A missing stream is "nobody mapped yet" only for a tenant NOT here;
+    /// for one here, its stream was deleted under the bridge (an operator, a recreate),
+    /// and skipping would confirm its rows' LSN with nobody holding them — the fault
+    /// §10bu stops on, the slot keeping every row. Touched by the flush thread alone,
+    /// after `knowStream` filled it before `start`.
+    stream_known: std.StringHashMapUnmanaged(void) = .empty,
 
     // Pre-allocated ring buffer of CDCEvent structs (zero malloc/free!)
     // Allocated once at startup, reused for entire lifetime
@@ -721,6 +729,9 @@ pub const BatchPublisher = struct {
         var it = self.streamless.keyIterator();
         while (it.next()) |k| allocator.free(k.*);
         self.streamless.deinit(allocator);
+        var kit = self.stream_known.keyIterator();
+        while (kit.next()) |k| allocator.free(k.*);
+        self.stream_known.deinit(allocator);
 
         // 2. Unlock the data slab from RAM (symmetric with mlock in init)
         if (@hasDecl(std.posix, "munlock")) {
@@ -1266,6 +1277,7 @@ pub const BatchPublisher = struct {
             return err;
         };
         if (self.streamless.count() > 0) self.noteStreamBack(eg.subject);
+        self.noteStreamKnown(eg.subject);
         if (self.metrics) |m| {
             for (0..eg.count) |_| m.incrementCdcEvents();
         }
@@ -1281,6 +1293,10 @@ pub const BatchPublisher = struct {
         var buf: [256]u8 = undefined;
         const stream = routing.streamName(&buf, tenant) orelse return false;
         if (!self.publisher.streamMissing(stream)) return false;
+        if (self.stream_known.contains(tenant)) {
+            log.err("❌ the stream of tenant '{s}' ({s}) is gone while the bridge held it: deleted under it — not skipping; the retries stop the bridge and the slot keeps every row (the next start recreates it)", .{ tenant, stream });
+            return false;
+        }
         if (!self.streamless.contains(tenant)) {
             if (self.allocator.dupe(u8, tenant)) |key| {
                 self.streamless.put(self.allocator, key, {}) catch self.allocator.free(key);
@@ -1289,6 +1305,22 @@ pub const BatchPublisher = struct {
         }
         log.debug("⏭️ skipped {d} event(s) on '{s}': {s} does not exist", .{ count, subject, stream });
         return true;
+    }
+
+    /// A tenant whose stream exists: from the boot topology, before `start`.
+    pub fn knowStream(self: *BatchPublisher, tenant: []const u8) !void {
+        if (self.stream_known.contains(tenant)) return;
+        const key = try self.allocator.dupe(u8, tenant);
+        errdefer self.allocator.free(key);
+        try self.stream_known.put(self.allocator, key, {});
+    }
+
+    /// A publish to a tenant's subject succeeded: its stream exists (a tenant mapped
+    /// since the boot included).
+    fn noteStreamKnown(self: *BatchPublisher, subject: []const u8) void {
+        const routing = self.tenant_routing orelse return;
+        const tenant = routing.tenantOf(subject) orelse return;
+        self.knowStream(tenant) catch {};
     }
 
     /// A tenant skipped before has a stream again (a principal was mapped): say it once.
