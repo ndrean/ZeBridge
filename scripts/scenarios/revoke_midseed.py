@@ -263,7 +263,7 @@ def main():
             dt = both(wit, wit, lambda c: wm_epoch(c, "_zbz_generations") == e2 and count(c) == base + 5000, 90)
             check(f"§H5 the witness on omar re-seeded to completion on the same server, untouched ({dt} s; {count(wit)} rows, epoch {wm_epoch(wit, '_zbz_generations')})", dt is not None)
             py.close(); nd.close(); clients = [wit]
-            r = subprocess.run(["nats", "--server", zb.nats_server(), "--creds", str(hard), "pub", "x", "y"], capture_output=True, text=True, timeout=10)
+            r = subprocess.run(["nats", "--server", zb.nats_server(), *zb.nats_tls_args(), "--creds", str(hard), "pub", "x", "y"], capture_output=True, text=True, timeout=10)
             check(f"§H6 the revoked token cannot come back: {(r.stderr + r.stdout).strip()[:80]!r}", r.returncode != 0 and "Authorization" in r.stderr + r.stdout)
             wit.close(); clients = []
     finally:

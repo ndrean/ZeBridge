@@ -91,7 +91,7 @@ class Lib:
 class Node:
     """The zb-client-ts client, event-driven, behind query-worker.ts."""
     def __init__(self, db, log="/tmp/zb_node_worker.log", principal="omar", creds=None):
-        env = dict(os.environ, ZB_DB=db, ZB_PRINCIPAL=principal, NATS_URL=zb.nats_server())
+        env = dict(os.environ, ZB_DB=db, ZB_PRINCIPAL=principal, NATS_URL=zb.nats_server(), **zb.node_tls_env())
         if creds: env["ZB_CREDS"] = str(creds)
         self.log = open(log, "w")
         self.p = subprocess.Popen(["node", "--experimental-strip-types", "query-worker.ts"], cwd=NODE_DIR, env=env,

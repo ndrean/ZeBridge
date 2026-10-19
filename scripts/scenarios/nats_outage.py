@@ -95,7 +95,7 @@ async def main() -> int:
         with open(natslog, "ab") as lf:
             subprocess.Popen(argv, stdout=lf, stderr=subprocess.STDOUT, cwd=zb.ROOT, start_new_session=True)
         for _ in range(50):
-            if subprocess.run(["nats", "--server", zb.nats_server(), "--creds", zb.creds_for("bridge"), "server", "check", "connection"],
+            if subprocess.run(["nats", "--server", zb.nats_server(), *zb.nats_tls_args(), "--creds", zb.creds_for("bridge"), "server", "check", "connection"],
                               capture_output=True).returncode == 0: break
             time.sleep(0.2)
         nc = await zb.connect()

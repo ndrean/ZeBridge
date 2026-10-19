@@ -69,6 +69,12 @@ def tls_opts() -> dict:
     return {"caFile": str(path if path.is_absolute() else pathlib.Path(__file__).resolve().parents[2] / path)}
 
 
+def nats_tls_args() -> list:
+    """For the `nats` CLI on a `tls://` stack: `--tlsca` with the bridge's CA; none otherwise."""
+    opts = tls_opts()
+    return ["--tlsca", opts["caFile"]] if opts else []
+
+
 def node_tls_env() -> dict:
     """For a Node process (zb-client-ts) on a `tls://` stack: Node trusts the extra CA in
     NODE_EXTRA_CA_CERTS, process-wide; nothing otherwise."""
@@ -450,7 +456,7 @@ def nats_cli(*args, seed_file=None) -> subprocess.CompletedProcess:
     # ⚠️ The server address only: userinfo in NATS_URL would win over the credential
     # and every administrative command would be denied with an opaque timeout.
     # On a tls:// stack the CLI must trust its test CA too (see tls_opts).
-    tls = ["--tlsca", tls_opts()["caFile"]] if tls_opts() else []
+    tls = nats_tls_args()
     return subprocess.run(
         ["nats", "--server", nats_server(), *tls, *auth, *args],
         capture_output=True,
