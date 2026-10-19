@@ -2691,16 +2691,26 @@ pub const SyncClient = struct {
         while (it.next()) |e| for (e.value_ptr.routes) |r| try streams.put(a, r, {});
 
         var sit = streams.iterator();
-        // A stream that does not exist yet is set aside, as one that becomes unreadable is
-        // (§10fq), not a failed sync: a brand-new tenant's stream appears a moment after its
-        // first enrollment (the bridge makes it when the mapping reaches it), and its first
-        // devices sync in that moment (storm test: 8 of 8, StreamNotFound). The poll then
-        // retries it, and reseeds once it is there.
-        while (sit.next()) |se| self.drainStream(se.key_ptr.*) catch |err| switch (err) {
-            error.StreamNotFound => self.markDark(se.key_ptr.*, err),
-            else => return err,
+        // A stream that cannot be read right now is set aside, as one that becomes
+        // unreadable while polling is (§10fq), not a failed sync: the poll retries it with
+        // backoff and reseeds once it is readable. A brand-new tenant's stream appears a
+        // moment after its first enrollment (storm test: 8 of 8, StreamNotFound); a
+        // JetStream busy with a crowd answers late (storm through a far leaf: 9 of 250
+        // opens failed on Timeout). A failure that waiting cannot cure still fails the sync.
+        while (sit.next()) |se| self.drainStream(se.key_ptr.*) catch |err| {
+            if (!transientStreamError(err)) return err;
+            self.markDark(se.key_ptr.*, err);
         };
         self.retryHeld(null, null);
+    }
+
+    /// A stream read that may succeed later by itself: the stream not created yet, the
+    /// server busy or briefly unreachable, the stream at its consumer cap.
+    fn transientStreamError(err: anyerror) bool {
+        return switch (err) {
+            error.StreamNotFound, error.Timeout, error.NoResponders, error.MaximumConsumersLimit => true,
+            else => false,
+        };
     }
 
     /// The streams this client reads, public first: parents (users) ride
