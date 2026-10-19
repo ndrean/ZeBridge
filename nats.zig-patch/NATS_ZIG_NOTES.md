@@ -1271,3 +1271,30 @@ frees the slot by itself — hence the kill). libzb sets `request_expires_ms = 2
 tail inbox (its `tail_watch_ms`); the same capture on the hub: `CONSUMER.MSG.NEXT` from one
 idle device over 40 s went from 162 + 176 to 2 + 2. libzb 43/45 (2 skipped).
 `check-series.sh` green over 36.
+
+## 38. A consumer is created before it is looked up (2026-10-19)
+
+**How it appeared.** The same request count as §37: every `pullSubscribe` sent
+`CONSUMER.INFO` then `CONSUMER.CREATE`. `getOrCreateConsumer` looked the consumer up first
+— the pattern Synadia's "JetStream Anti-Patterns" names: INFO answers a missing consumer
+only after the meta-leader has looked, and a fleet creating consumers by the thousand pays
+it each time. A ZeBridge device names every consumer anew, so the INFO always answered "not
+found": 8 of its ~37 open requests, plus one per seed object and per reopened tail.
+
+**Change** (`37-nats.zig-create-before-info.patch`):
+- `jetstream.zig`: `createConsumerAs(stream, config, action)` — `addConsumer` with the
+  request's `action`; `addConsumer` sends none, as before. `getOrCreateConsumer` for a
+  named consumer creates first with `action: "create"` (server ≥ 2.10): an identical
+  consumer is a success, one with other settings is refused (`ConsumerAlreadyExists`) and
+  left untouched, and only then is it looked up and checked (`checkExistingConsumer`) as
+  before. Not `action` null: that is create-OR-UPDATE, and would have rewritten another
+  application's consumer instead of refusing to bind to it.
+- `tests/jetstream_pull_test.zig`: a second connection hears the API: two `pullSubscribe`
+  to one durable send 2 `CONSUMER.CREATE` and 0 `CONSUMER.INFO`.
+
+**Verified:** `test-e2e` 194/194, the mismatch tests of `jetstream_sync_test.zig` (filter,
+queue group, pull against push) still refused — they take the fallback path. Negative
+control: with the lookup put back first, the new test fails (1 create, 2 info). On the hub,
+one device's open: `CONSUMER.INFO` 8 → 4 (the 4 left are libzb's own health checks); the
+device's open plus 34 s idle is 38 requests, against 375 before §37. `check-series.sh`
+green over 37.
