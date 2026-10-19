@@ -3344,6 +3344,12 @@ pub const SyncClient = struct {
         // server closes the connection (an iPhone on Wi-Fi: 66 disconnects, every
         // delivery in flight lost each time).
         self.tail_inbox.?.max_bytes = pull_max_bytes;
+        // Each tail's pull request stays parked on the server for `tail_watch_ms` and
+        // delivers as events are stored; a poll only reads what arrived. With the request
+        // living one poll (250 ms from the Python host), an idle device sent ~6.5 pull
+        // requests a second per stream — about 6,500 a second for 500 devices doing
+        // nothing (measured on the hub, 2026-10-19). nats.zig re-asks after a reconnect.
+        self.tail_inbox.?.request_expires_ms = tail_watch_ms;
         self.wireServeWakes();
         return self.tail_inbox.?;
     }

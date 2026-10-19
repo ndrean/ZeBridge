@@ -1236,3 +1236,38 @@ and hash, still lazy. The first patch of the series outside `src/` and `tests/`:
 the same pin builds on 0.17.0 and on master 0.18.0-dev.120. Not verified live: a TLS
 connection through it (the dev stack was stopped) — the next start of the dev bridge, which
 speaks tls:// to nats-server, is that check.
+
+## 37. A shared pull inbox can park its requests on the server (2026-10-19)
+
+**How it appeared.** A count of the JetStream API requests one ZeBridge device sends to the
+hub (every `$JS.API.>` subject for 40 s, against a baseline without the device): idle, it
+sent ~6.5 `CONSUMER.MSG.NEXT` a second on each of its two streams — about 13 a second per
+connected device, 6,500 a second for 500 devices doing nothing. `PullInbox.fetch` sent each
+request with `expires` = the fetch's own timeout, and libzb's host polls every 250 ms: each
+request lived one poll, and every poll asked again (two per stream, `pull_depth` 2). The
+slots of patches 22–24 already stop a fetch from asking while a request is open; only the
+request's lifetime was tied to the caller's wait.
+
+**Change** (`36-nats.zig-long-pull-requests.patch`):
+- `jetstream.zig`: `PullInbox.request_expires_ms` — when set, a request asks the server to
+  keep it that long and its slot's deadline follows; each `fetch` still waits only its own
+  timeout locally and reads what the parked request delivered. Null: as before.
+- `jetstream.zig`: `PullRequest.epoch`, set at `requestStart`; `slotOpen` drops a request
+  sent before the last reconnect. A server that crashed, or a client whose network vanished,
+  never answers the parked request: without this the slot stays "open" until its deadline
+  and the consumer has no request — live changes would wait up to `request_expires_ms`.
+- `connection.zig`: `Connection.reconnect_epoch`, bumped when a reconnect completes (after
+  subscriptions are restored, before the reconnected callback).
+- `tests/jetstream_pull_test.zig`: a 10 s expiry, ten 100 ms fetches on an idle stream —
+  `num_waiting` is 1, and a message published after is delivered through it.
+- `tests/reconnection_test.zig`: a 30 s request parked, the three-node cluster KILLED
+  (SIGKILL: no status frame to the request) and started; after the reconnect, ONE 200 ms
+  fetch must park a new request (`num_waiting` ≥ 1) and the stored message arrives.
+
+**Verified:** `test-e2e` 193/193. Negative control: with the epoch check disabled the
+reconnect test fails — 0 requests waiting after the crash (with a `restart` instead of a
+kill it passed either way: a clean shutdown sends the parked request a status frame, which
+frees the slot by itself — hence the kill). libzb sets `request_expires_ms = 25_000` on its
+tail inbox (its `tail_watch_ms`); the same capture on the hub: `CONSUMER.MSG.NEXT` from one
+idle device over 40 s went from 162 + 176 to 2 + 2. libzb 43/45 (2 skipped).
+`check-series.sh` green over 36.
