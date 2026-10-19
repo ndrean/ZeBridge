@@ -69,6 +69,15 @@ def tls_opts() -> dict:
     return {"caFile": str(path if path.is_absolute() else pathlib.Path(__file__).resolve().parents[2] / path)}
 
 
+def purge_tombstones(table: str, tenant: str) -> None:
+    """A scenario tenant's tombstones, removed for good as the sweeper would: the delete
+    guard lets `zb.principal = zb_sweeper` through. A tenant the sweeper is not mapped to
+    (one a scenario keeps unmapped on purpose) otherwise keeps them for ever, and
+    `--diagnose` reports it."""
+    psql(f"BEGIN; SET LOCAL zb.principal = 'zb_sweeper'; "
+         f"DELETE FROM public.{table} WHERE tenant_id = '{tenant}' AND deleted_at IS NOT NULL; COMMIT;", quiet=True)
+
+
 def nats_tls_args() -> list:
     """For the `nats` CLI on a `tls://` stack: `--tlsca` with the bridge's CA; none otherwise."""
     opts = tls_opts()

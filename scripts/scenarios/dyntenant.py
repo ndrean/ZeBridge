@@ -129,6 +129,7 @@ def main():
             failed += 1
     finally:
         zb.psql(f"DELETE FROM public.test_types WHERE uid='{uid}'", quiet=True)
+        zb.purge_tombstones("test_types", TENANT)
         # Both mappings: ours, and the one the autogrant trigger created from it.
         zb.psql(f"DELETE FROM public.zebridge_user_tenants WHERE principal='{PRINCIPAL}' "
                 f"OR (principal = 'zb_sweeper' AND tenant_id = '{TENANT}')", quiet=True)

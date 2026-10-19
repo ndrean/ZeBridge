@@ -136,6 +136,7 @@ def main():
                 failed += 1
     finally:
         zb.psql("DELETE FROM public.test_types WHERE uid IN (" + ",".join(f"'{u}'" for u in rows) + ")", quiet=True)
+        zb.purge_tombstones("test_types", TENANT)
         zb.psql(f"DELETE FROM public.zebridge_user_tenants WHERE tenant_id = '{TENANT}'", quiet=True)
         time.sleep(1.5)  # let the deletes publish before the stream goes
         zb.nats_cli("stream", "rm", cdc_stream, "-f")
