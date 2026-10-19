@@ -55,7 +55,7 @@ async def main() -> int:
     }
     ok = True
     with tempfile.TemporaryDirectory() as d, \
-            ZeBridge(nats_url=zb.nats_server(), creds_path=zb.creds_for("pois"), principal="pois",
+            ZeBridge(nats_url=zb.nats_server(), **zb.tls_opts(), creds_path=zb.creds_for("pois"), principal="pois",
                      db_path=f"{d}/r.sqlite3", tables=[TABLE], client_id="py-serve", heartbeat_ms=0,
                      on_change=polls.append) as z:
         zbc.append(z)

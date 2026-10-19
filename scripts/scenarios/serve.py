@@ -112,7 +112,7 @@ async def main() -> int:
 
     # The zb-client-ts responder, as a separate process — the other library, same group.
     env_ts = dict(os.environ, ZB_LABEL="ts", ZB_TABLES=TABLE, ZB_QUEUE=QUEUE, ZB_TENANTS=TENANT,
-                  ZB_DB=str(tmp / "ts.sqlite3"), NATS_URL=zb.nats_server())
+                  ZB_DB=str(tmp / "ts.sqlite3"), NATS_URL=zb.nats_server(), **zb.node_tls_env())
     ts = subprocess.Popen(["pnpm", "serve"], cwd=REPO / "examples" / "04-node-consumer",
                           env=env_ts, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:

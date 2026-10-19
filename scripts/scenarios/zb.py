@@ -69,6 +69,13 @@ def tls_opts() -> dict:
     return {"caFile": str(path if path.is_absolute() else pathlib.Path(__file__).resolve().parents[2] / path)}
 
 
+def node_tls_env() -> dict:
+    """For a Node process (zb-client-ts) on a `tls://` stack: Node trusts the extra CA in
+    NODE_EXTRA_CA_CERTS, process-wide; nothing otherwise."""
+    opts = tls_opts()
+    return {"NODE_EXTRA_CA_CERTS": opts["caFile"]} if opts else {}
+
+
 def principal() -> str | None:
     """Who a scenario acts as: `ZB_PRINCIPAL`, else the creds file's name
     (`scripts/native/creds/<principal>.creds`), else the URL's userinfo (legacy),
