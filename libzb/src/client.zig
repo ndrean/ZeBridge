@@ -243,8 +243,9 @@ const ApplyStats = struct {
         const b: i64 = @intCast(@max(self.batches, 1));
         const inside = self.decode + self.plan + self.shape + self.append + self.upsert + self.single;
         log.info("apply stats: {d} batches, {d} msgs, {d} events ({d}/s), {d} avg / {d} max events per batch — per batch, ms: total {d:.2} = decode {d:.2} + plan {d:.2} + shape {d:.2} + append {d:.2} + upsert {d:.2} + single {d:.2} + commit/rest {d:.2}; acks {d:.2}; {d} segment(s) appended direct ({d} split with an upsert), {d} batch(es) fell back", .{
-            self.batches, self.msgs, self.events, @divTrunc(self.events * 1_000_000, @as(u64, @intCast(now - self.window_us))), self.events / @as(u64, @intCast(b)), self.max_events,
-            ms(self.batch, b), ms(self.decode, b), ms(self.plan, b), ms(self.shape, b), ms(self.append, b), ms(self.upsert, b), ms(self.single, b), ms(self.batch - inside, b), ms(self.ack, b), self.direct, self.split, self.fallbacks,
+            self.batches,       self.msgs,                  self.events,      @divTrunc(self.events * 1_000_000, @as(u64, @intCast(now - self.window_us))), self.events / @as(u64, @intCast(b)), self.max_events,
+            ms(self.batch, b),  ms(self.decode, b),         ms(self.plan, b), ms(self.shape, b),                                                            ms(self.append, b),                  ms(self.upsert, b),
+            ms(self.single, b), ms(self.batch - inside, b), ms(self.ack, b),  self.direct,                                                                  self.split,                          self.fallbacks,
         });
         self.* = .{ .window_us = now };
     }
@@ -5651,7 +5652,7 @@ fn compressAnswer(a: std.mem.Allocator, b: []const u8) ![]const u8 {
     const buf = try a.alloc(u8, bound);
     const n = C.ZSTD_compress(buf.ptr, buf.len, b.ptr, b.len, 3);
     if (C.ZSTD_isError(n) != 0) return b; // never fail an answer over compression
-    if (n >= b.len) return b;             // incompressible: send it as it is
+    if (n >= b.len) return b; // incompressible: send it as it is
     return buf[0..n];
 }
 

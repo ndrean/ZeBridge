@@ -279,8 +279,8 @@ pub const Transport = struct {
     /// failing for a moment. Everything else (an identity refused, TLS, a bad URL) is final.
     pub fn transientConnectError(err: anyerror) bool {
         const transient = [_][]const u8{
-            "ConnectionFailed",  "ConnectionRefused", "ConnectionTimedOut", "Timeout",
-            "NoServerAvailable", "NetworkUnreachable", "HostUnreachable",   "NameServerFailure",
+            "ConnectionFailed",      "ConnectionRefused",  "ConnectionTimedOut", "Timeout",
+            "NoServerAvailable",     "NetworkUnreachable", "HostUnreachable",    "NameServerFailure",
             "ConnectionResetByPeer", "BrokenPipe",
         };
         for (transient) |name| if (std.mem.eql(u8, @errorName(err), name)) return true;
