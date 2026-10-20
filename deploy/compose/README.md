@@ -173,58 +173,17 @@ Docker's published ports bypass ufw: 80, 443 and `NATS_PUBLIC_PORT` are open to 
 
 ## A leaf node
 
-A leaf is a nats-server close to a group of devices, joined to the hub ([DEPLOYMENT, Adding a leaf node](../../DEPLOYMENT.md#adding-a-leaf-node)). It has no PostgreSQL and no bridge: devices still enroll at the hub's bridge, then dial the leaf, and their stream calls cross to the hub's JetStream through the domain they enrolled with. It takes the devices' connections and TLS off the hub. A leaf can also seed them, from its own copies of the hub's snapshots: see [A seeding leaf](#a-seeding-leaf). `leaf/compose.yml` runs nats-server and certbot, and for a seeding leaf the keeper of its copies.
+See [Leaf nodes](../../LEAF_NODES.md) for the enforced tenant and identity model. Build the hub bridge image from these sources first; the published `0.2.6` image does not contain mutation admission or signed trust refresh. The admission health check and bridge startup check deliberately refuse an incompatible image or legacy queue. Run the [queue cutover](../../OPERATIONS.md#mutation-admission-cutover) before starting the updated workers against an existing deployment.
 
-The hub needs a JetStream domain and a leafnodes listener on 7422, open to the leaf's addresses. A hub set up with Ansible has both (`zb_js_domain`, `zb_leaf_addresses`); this compose stack has neither yet.
+1. Apply current init SQL and register the leaf's explicit tenant list and URLs in `zebridge_leaf_scopes`. Stage the updated libzb/TS clients. Leaf devices and responders use `<leaf>.<device>` identities; existing root identities continue on the hub.
+2. Mint `leaf.creds` with `--mint-leaf --name lf-leaf2 --tenant demo` and `--mirror` if seeding. Mint a separate `--keeper` with **the same name and tenants** for seeding. Keep both files 0600. Extract the public operator/resolver trust block from the hub configuration into `trust.conf`; keep `operator.store` offline.
+3. Copy the **whole** `deploy/compose/leaf/` directory from this checkout to the leaf, including `.dockerignore`, `Dockerfile`, `leaf_trust.py` and `mirrors.sh`. Copy `.env.example` to `.env` and install trust/credentials under `hub/`. Do not download only an older release's compose file.
+4. Configure `LEAF_NAME`, `LEAF_TENANTS` (required space-separated list), `LEAF_HOST`, `HUB_NATS_HOST`, `TRUST_FEED_URL=https://bridge.<domain>/nats-account`, email and allowed web origins. The list must match the PostgreSQL registry and minted credentials. Set a distinct `LEAF_JS_DOMAIN` for seeding, or leave the domain empty for forwarding. Leave the confirmed `TRUST_MAX_STALE_SECONDS=300` default.
+5. On the hub, enable `NATS_ACCOUNT_CONF` and expose `/nats-account` through the provided HAProxy rule. Verify HTTPS returns only `account` and `jwt`. Keep the hub leaf listener restricted to the leaf IPs. The hub must have a JetStream domain and a TLS leaf listener; the root Compose stack does not create that listener automatically.
+6. Run `docker compose build nats`, then `docker compose up -d --force-recreate`. Check `docker compose logs nats mirrors` and `docker compose exec nats wget -qO- http://127.0.0.1:8222/leafz`. Clients dial the regional TLS/WSS URL, with `jsDomain: "hub"` and the seeding domain in `seedDomain`.
 
-1. **On the hub's side**, two files for the leaf. Its credentials, minted where `operator.store` is kept:
+The custom NATS image adds Python and PyNaCl for signed account refresh. Its persistent `trust-state` volume preserves revocations and the verified lease. A missing or invalid feed pauses NATS after five minutes and recovers automatically after verification. Certbot and the keeper remain separate services. A seeding leaf mirrors only allowed object snapshots and combines tenant-filtered manifest projections; the keeper never deletes a cache because the origin is missing.
 
-   ```sh
-   bridge --mint-leaf --name leaf2 --store operator.store > leaf.creds
-   ```
+When upgrading existing leaves, retain and later revoke the old public keys, and explicitly retire broad legacy caches before the restricted deployment is considered complete. Copy all leaf files when upgrading and rebuild/recreate NATS. No production upgrade or key revocation is performed by these local instructions.
 
-   And the hub's trust lines (the operator and the accounts), from its `nats-server.conf`:
-
-   ```sh
-   sudo awk '/^operator: /{p=1} p; p && /^}/{exit}' /etc/zebridge/nats-server.conf > trust.conf
-   ```
-
-2. **On the leaf's server**, one DNS record (A, and AAAA if it has IPv6) for its name, then:
-
-   ```sh
-   V=0.2.6
-   mkdir -p zebridge-leaf/hub && cd zebridge-leaf
-   curl -fsSLO https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/leaf/compose.yml
-   curl -fsSL -o .env https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/leaf/.env.example
-   chmod 600 .env
-   ```
-
-   Put `trust.conf` and `leaf.creds` in `hub/` (`chmod 600 hub/leaf.creds`). In `.env`: the leaf's name, the hub's NATS name, the e-mail, and the web apps allowed to open the websocket.
-
-3. **Start and check**:
-
-   ```sh
-   docker compose up -d
-   docker compose logs nats | grep -i leafnode
-   docker compose exec nats wget -qO- http://127.0.0.1:8222/leafz
-   ```
-
-   `Leafnode connection created`, and `/leafz` lists one link. Devices dial `tls://<LEAF_HOST>:4222`, or `wss://<LEAF_HOST>` in a browser: the client's `natsUrl` setting.
-
-4. **After every `--update` on the hub** (a grammar change, a new domain), copy its trust lines again into `hub/trust.conf` and restart the leaf: `docker compose restart nats`. The leaf checks the devices' JWTs against its own copy of the account.
-
-### A seeding leaf
-
-A seeding leaf has its own JetStream, under its own domain, holding mirrors of the hub's snapshots: the manifests (`KV_generations`) and each tenant's chain objects (`OBJ_gen-<tenant>`, the public tables' `OBJ_gen-_default` included). A device dialling it seeds from the leaf instead of the hub; live changes, schemas and writes still go to the hub. When the leaf cannot serve a seed (it is down, or behind), the device seeds from the hub.
-
-1. **The hub's account** must carry the seed grants: run `bridge --init-nats --update` with a bridge of this release on the hub's conf, then reload its nats-server, and copy the trust lines to every leaf again (step 4 above).
-2. **The leaf's credentials** are minted with `--mirror`: they may also receive its mirrors' traffic and manage the streams of its own JetStream.
-
-   ```sh
-   bridge --mint-leaf --name leaf2 --mirror --store operator.store > leaf.creds
-   ```
-
-3. **In `.env`**: `LEAF_JS_DOMAIN`, a name for this leaf's JetStream, unlike the hub's (`hub`) and the other leaves'. `LEAF_TENANTS`, the tenants it serves, space-separated; empty mirrors every tenant. Then `docker compose up -d`. The `mirrors` service checks every 30 s: a mirror for each of these streams the leaf lacks, made from the hub stream's own settings, and none for a stream the hub no longer has. `docker compose logs mirrors` names each change.
-4. **The devices** pass the leaf's domain as `seedDomain`, beside its address in `natsUrl`.
-
-Published ports: 80 (Let's Encrypt), `NATS_PUBLIC_PORT` and `LEAF_WS_PORT`. To upgrade, download the release's `compose.yml` again, then `docker compose up -d --force-recreate`: the scripts live inside `compose.yml`, and a plain `up -d` keeps running containers on the old ones.
+Published leaf ports: 80 (Let's Encrypt), `NATS_PUBLIC_PORT`, and `LEAF_WS_PORT`. Native NATS DNS must be DNS-only in Cloudflare. Follow [checkpoint and recovery](../../OPERATIONS.md#hub-checkpoints-and-recovery) for the authoritative hub; leaf caches are replaceable.

@@ -1,88 +1,73 @@
 # Leaf nodes
 
-A leaf node is a nats-server near a group of devices, joined to the hub's NATS. It runs no PostgreSQL and no bridge. Devices enroll at the hub's bridge as usual, then dial their leaf instead of the hub. A leaf is the unit you add per region: one server and one DNS name each.
+A leaf is a regional NATS server. PostgreSQL, the bridge, authoritative CDC streams, mutations and verdicts remain on the hub. A forwarding leaf relays client traffic. A seeding leaf also runs JetStream under a distinct domain and caches the snapshots needed by its explicitly authorized tenants.
 
-There are two kinds. A **forwarding leaf** relays devices to the hub. A **seeding leaf** also serves their seeds from its own copies of the hub's snapshots.
-
-## What each kind takes off the hub
-
-| work | no leaf | forwarding leaf | seeding leaf |
-| --- | --- | --- | --- |
-| connections and TLS handshakes | hub | leaf | leaf |
-| seeds: manifests and snapshot objects | hub | hub, through the leaf | **leaf** (hub as fallback) |
-| live changes (`CDC_*` consumers) | hub | hub, through the leaf | hub, through the leaf |
-| schemas, writes, verdicts, heartbeats | hub | hub, through the leaf | hub, through the leaf |
-| enrollment and renewal | hub's bridge | hub's bridge | hub's bridge |
-
-The streams stay on the hub in both cases: a leaf is a gateway to them, not a second copy. Live changes would arrive no sooner from a copy, since a copy receives them over the same link.
-
-## A forwarding leaf
-
-The leaf holds every device connection and its TLS session, and passes the devices' requests to the hub. It has no JetStream: a device reaches the hub's JetStream through the domain it enrolled with (`js_domain`, `hub` by default).
-
-What it gives: the hub holds a handful of leaf links instead of thousands of device connections, and a reconnect storm hits the leaves first and reaches the hub spread over time. A device's first contact (DNS, TCP, TLS) is with a nearby server.
-
-## A seeding leaf
-
-The leaf also has its own JetStream, under its own domain (for example `strasbourg`). It holds mirrors of the hub's snapshots: the manifests (`KV_generations`) and the chain objects of each tenant it serves (`OBJ_gen-<tenant>`, the public tables' `OBJ_gen-_default` included). A mirror is a read-only copy with the hub's own sequence numbers, kept up to date by the leaf's nats-server.
-
-A device on the leaf seeds from these copies: the manifest, then the objects it names. Everything else still goes to the hub. When the leaf cannot serve a seed (it is down, its copy is behind the hub's stream, or an object has not arrived yet), the device seeds from the hub instead. A seed never waits on the leaf.
-
-What it gives, beyond a forwarding leaf: the seed's bytes leave the hub, and the round trips with them. libzb reads an object 1 MB per request, so a far hub costs one long round trip per megabyte; a near leaf makes a large seed much faster. This is the leaf that lets a fleet grow by region: each new region adds its own seeding capacity, and the hub's share per device shrinks to the live changes.
-
-### Three containers
-
-| container | image | does |
+| Work | Forwarding leaf | Seeding leaf |
 | --- | --- | --- |
-| `nats` | `nats` | the leaf's nats-server: devices' connections with TLS (4222 for native clients, a websocket for browsers), the link to the hub, and the leaf's JetStream with the mirrors |
-| `certbot` | `certbot/certbot` | the leaf's certificate from Let's Encrypt on port 80, renewed twice a day; nats-server reloads it without dropping a device |
-| `mirrors` | `natsio/nats-box` | the keeper of the mirrors (below); idle on a forwarding leaf |
+| Connections and TLS | leaf | leaf |
+| Manifest and snapshot reads | hub through the link | local cache, with hub fallback |
+| CDC, schemas, mutations and verdicts | hub through the link | hub through the link |
+| Enrollment, renewal and signed account feed | hub HTTPS | hub HTTPS |
 
-There is no ZeBridge image on a leaf: the scripts are written inside `compose.yml`. The leaf's state is two volumes, the certificate and the JetStream store; both rebuild themselves if lost (a new certificate, mirrors copied again from the hub).
+A leaf's JetStream is a cache, not an authority for client writes. Clients use `jsDomain: "hub"` and, on a seeding leaf, `seedDomain: "<leaf-domain>"`. When a cache read fails, the client can request the hub through its existing connection. If the entire leaf connection is unavailable, the application needs a reachable hub connection or another authorized leaf; cache fallback alone does not supply connection failover.
 
-### Two files from the hub
+## Tenant and identity boundaries
 
-A leaf trusts what the hub trusts, and presents its own identity to it. Both come from the hub's operator, put in `hub/` next to `compose.yml`:
+An administrator registers each leaf in PostgreSQL, after applying the current `bridge --init-sql` output:
 
-- **`trust.conf`**: the hub's operator and its accounts, the lines of the hub's `nats-server.conf` from `operator:` to the end of `resolver_preload`. The leaf checks each device's JWT against them, as the hub would. They change when the hub's account is signed again (`--init-nats --update`); copy them to every leaf then, and restart its nats-server.
-- **`leaf.creds`**: the leaf's own credential, minted where `operator.store` is kept: `bridge --mint-leaf --name <leaf> --mirror`. It is a secret, like a device's identity, kept 0600.
+```sql
+INSERT INTO public.zebridge_leaf_scopes(leaf_id, tenant_ids, nats_url, nats_ws_url)
+VALUES ('lf-leaf1', ARRAY['demo','storm'],
+        'tls://leaf1.example.com:4222', 'wss://leaf1.example.com');
+```
 
-What the credential allows on the link to the hub:
+Use the **same explicit tenant list** in this row, credential minting and deployment configuration. Empty configuration fails closed; it never means all tenants. Public `_default` data remains available. A leaf id starts with `lf-` (`leaf_prefix` in the grammar) and no other principal may, so a plain name can never shadow a leaf's namespace: clients and responders behind `lf-leaf1` use names such as `lf-leaf1.alice` and `lf-leaf1.routing`. PostgreSQL, the mint commands and the mutation subject parser all enforce it. A leaf cannot relay a mutation as a root identity or another leaf's identity. PostgreSQL guards reject memberships and invitations outside the registered list, including direct edits through privileged application roles. They also reject reusing a historical root principal as a leaf namespace and shrinking a policy while incompatible memberships remain.
 
-| it may | so that |
-| --- | --- |
-| carry what any device or responder may (each tenant read as "any") | the devices behind the leaf reach the hub |
-| create a consumer on any hub stream, receive its deliveries (`$JS.M.…`), receive the answer to its creation (`$JSC.R.…`), and pace it (`$JS.FC.…`) | a mirror copies its stream from the hub |
-| list the hub's streams | the keeper finds the snapshot streams |
-| create, list and delete streams in its own JetStream (`$JS.API.…`) | the keeper manages the mirrors |
+The registry is the canonical enrollment policy. JWT grants are fixed when minted: editing a registry row does not revoke existing credentials. Retire memberships and keys and clear obsolete cached data as part of any tenant removal. A compromised leaf remains trusted for its configured tenants and principal namespace. Do not install unrestricted hub client or service credentials on a leaf; their bearer authority can be delegated by anyone possessing them.
 
-It never may write a CDC event, or create or delete a stream on the hub: with a JetStream domain on both sides, `$JS.API.…` stays on the leaf, and `--mirror` refuses a hub without a domain. The devices' own JWTs allow the seed reads in any domain (`$JS.*.API.…`), read-only and for their own tenants: the hub's account carries them once it is signed (`--init-nats --update`) by a bridge that has them.
+For a scoped principal, enrollment returns the registry's regional NATS URLs when configured. The app still supplies `seedDomain`. Existing root identities remain usable on the hub; moving them behind a restricted leaf requires new scoped identities and replicas. Drain or deliberately export pending local outboxes before changing an identity; do not discard an offline replica with unsubmitted writes.
 
-### The keeper
+## Credentials and trust from the hub
 
-The `mirrors` container checks every 30 s, with the leaf's credential:
+Keep the offline `operator.store` off every leaf. Mint two different keys with the **same leaf name and tenant list**:
 
-1. **It lists the hub's snapshot streams**: `KV_generations`, `OBJ_gen-_default`, and each `OBJ_gen-<tenant>` (only those of `LEAF_TENANTS`, when set).
-2. **It creates the mirrors the leaf lacks.** A mirror's settings are copied from the hub stream's own (one message per key for the manifests, rollups, direct reads), without its subjects, with the hub stream as source. A mirror with other settings would not read as a KV bucket or an object store.
-3. **It removes the mirrors the hub no longer has**, or that are not this leaf's tenants.
+```sh
+bridge --mint-leaf --name lf-leaf1 --tenant demo --tenant storm --mirror --store operator.store > leaf.creds
+bridge --mint-leaf --name lf-leaf1 --tenant demo --tenant storm --keeper --store operator.store > keeper.creds
+chmod 600 leaf.creds keeper.creds
+```
 
-If the hub's list does not include `KV_generations` (the hub unreachable, a partial answer), it changes nothing: a network failure never empties a leaf. A new tenant is mirrored within 30 s of its first snapshot; until then its devices seed from the hub. `docker compose logs mirrors` names every change.
+Omit `--mirror` for a forwarding link; it needs no keeper. `leaf.creds` is restricted to LEAFNODE connections. It cannot authenticate on a client port or create/delete hub snapshot streams. Its hub API, CDC, readings, inbox and verdict grants are limited to its tenants and principal namespace. Literal `OBJ_res-<allowed-tenant>` creation remains permitted for responders' large results. It cannot create consumers on the shared `KV_generations` stream, because a consumer's body filter is not a subject permission boundary.
 
-### Sizing a leaf
+`keeper.creds` accepts ordinary connections from loopback only and manages known local cache streams. It cannot administer hub-domain streams or authenticate as a leaf link. Its private reply prefix is `$ZB.KEEPER.<leaf>`. Docker shares the NATS network namespace; Ansible runs the keeper beside NATS. Both dial the leaf's certificate name mapped to loopback, preserving TLS verification.
 
-| limit | where | what sets it |
-| --- | --- | --- |
-| devices connected | the leaf's memory | about 1 MB per device in nats-server: a 2 vCPU, 4 GB leaf holds a few thousand |
-| live-change consumers | the **hub's** streams, shared by all leaves | about two per device on each stream it follows, `CDC_PUBLIC` holding every tenant's; the hub caps a stream at 5,000 |
-| seed consumers | the leaf's mirrors | one per seed in progress, reaped 5 min after it goes idle; the leaf caps a stream at 5,000 |
-| disk | the leaf's JetStream store | the size of the mirrored snapshots: the tenants it serves, plus the public tables |
-| CPU | the leaf | TLS handshakes and seed reads during a storm: 130% of 2 vCPU for 250 devices at once |
+The offline `trust.conf` pins the operator and account. The hub serves only its public current account claim at `GET /nats-account` when `NATS_ACCOUNT_CONF` is set. Both deployments use the same `leaf_trust.py` supervisor: HTTPS verification, operator signature verification, account identity, increasing claim revisions and monotonic revocations are checked before NATS validates and reloads a candidate. Operator/SYS trust stays pinned. Persisted state retains revocations and the verified lease across restarts. Credential tags must match the configured leaf and tenants.
 
-The hub's limits do not grow with the leaves: the live-change consumers of every region land on the hub's streams. Raise the hub's `default_max_consumers` as the whole fleet grows.
+The supervisor pauses NATS after **300 seconds without a verified refresh**, then restarts it automatically when trust refresh succeeds. Devices retain their local replicas during that outage. This bounds stale account authentication after feed loss; it is not a substitute for protecting the hub and its HTTPS feed. Treat operator/account replacement as a separate manual trust migration. A normal, nonrenewable device JWT stops working at its signed expiry, but `ENROLL_JWT_TTL_SECONDS` is a bridge issuance setting, not a server-enforced maximum for an attacker holding a signing seed. A stale leaf may accept freshly forged or much longer-lived JWTs. Losing the HTTPS feed also does not imply losing the NATS data link: a stale leaf can still forward an authenticated client's allowed mutation traffic to a live hub, which authenticates the leaf link rather than the downstream JWT. The `leaf_trust` scenario reproduces that delivery path; it does not assert a PostgreSQL commit. Keeping leaves online indefinitely with stale trust would therefore be an explicit availability tradeoff, not a general revocation bound equal to normal client lifetime.
 
-## Measured
+## How seeding caches are maintained
 
-On 2026-10-18: a hub in Frankfurt (6 vCPU), a leaf in Strasbourg and one in Canada (2 vCPU each), 500 devices starting at once with empty replicas, from a Mac in France, each seeding 10,000 rows. CPU-seconds are the hub's nats-server CPU summed over the run.
+The hub creates one filtered **source projection** per tenant, `KV_generations_leaf_<tenant>`, from the shared manifest bucket. The local `KV_generations` combines only the leaf's allowed projections and `_default`. It never mirrors the complete shared bucket. Object caches mirror `OBJ_gen-<allowed-tenant>` and `OBJ_gen-_default`, receiving data on `$ZB.MIRROR.<leaf>.>`.
+
+NATS 2.15 requires `feature_flags { js_api_reply_v2: true }` on the leaf so mirror control replies include the stream name and can be authorized narrowly. The deployment templates enable it. The shared `mirrors.sh` keeper checks the known origin names every 30 seconds, validates configurations, and creates missing local caches. It never deletes caches based on a missing origin, a listing, or a network error. Legacy/unexpected configurations are refused for explicit migration. Monitor disk usage and replication lag; cache retirement and out-of-policy data removal are deliberate operator actions.
+
+Query replies use `_INBOX.<principal>.query.<tenant>.<nonce>`. libzb's C ABI and TS transport generate that internally, without changing public request APIs or mutation messages. Update native/shim and TS clients **before** installing restricted leaf keys: older query clients use generic inboxes that the restricted link cannot authorize safely.
+
+## Deployment and migration
+
+Docker uses all files in `deploy/compose/leaf/`, including its Dockerfile, trust supervisor and keeper. Ansible's `leaf.yml` supports both forwarding and seeding leaves. See the [Compose guide](deploy/compose/README.md#a-leaf-node) and [Ansible guide](deploy/ansible/README.md). Build bridge/client binaries and images from these sources before deploying; old published images do not implement the new commands.
+
+For an existing installation: stage updated clients, apply PostgreSQL guards and register explicit scopes, prepare hub manifest projections, migrate the mutation queue as described in [Operations](OPERATIONS.md#mutation-admission-cutover), then install scoped identities and both new leaf keys. Preserve old public user keys before replacing files. Ansible records retired keys in `/etc/zebridge/retired-leaf-keys`; revoke them on the hub after verified cutover, reload NATS and verify every leaf has refreshed trust. Replacing a file alone does not invalidate a stolen credential. Existing broad caches must be retired/rebuilt explicitly after preserving any needed diagnostics; the keeper intentionally does not erase them automatically.
+
+The hub requires a JetStream domain and a leaf listener on 7422 restricted to the leaf IPs. Native NATS DNS records must bypass Cloudflare's HTTP proxy; HTTPS/WSS use the configured proxy and strict origin TLS.
+
+## Capacity and recovery limits
+
+Leaves offload connection/TLS and snapshot bytes. CDC consumer work, PostgreSQL mutation work and global queue/storage limits remain on the hub. Choose disk and consumer budgets from measured tenant sizes and reconnect loads. Neither two leaves nor mirrored seeds makes the single hub highly available. [Operations](OPERATIONS.md#hub-checkpoints-and-recovery) describes coordinated checkpoints and rebuilding a fresh feed; the recovery point is the last completed checkpoint, not every later acknowledged write.
+
+## Historical measurements
+
+These measurements predate the restricted leaf credentials, filtered manifest projections and trust supervisor. They have not been rerun with this hardening. On 2026-10-18: a hub in Frankfurt (6 vCPU), a leaf in Strasbourg and one in Canada (2 vCPU each), 500 devices starting at once with empty replicas, from a Mac in France, each seeding 10,000 rows. CPU-seconds are the hub's nats-server CPU summed over the run.
 
 | run | hub CPU, busiest second | hub CPU-seconds | synced |
 | --- | --- | --- | --- |
@@ -92,11 +77,3 @@ On 2026-10-18: a hub in Frankfurt (6 vCPU), a leaf in Strasbourg and one in Cana
 | two seeding leaves, 250 each | 160% | 10 | 500 of 500 |
 
 One device starting through Strasbourg was synced in 1.3 s, against 7.5 s through Canada. The forwarding leaves took the largest share (connections and TLS); the mirrors took a third of what was left (the seeds), and removed the timeouts of long-distance seed requests. What remains on the hub is mostly JetStream work: the consumers of live changes, schemas and reads.
-
-## Setting one up
-
-Both kinds run from `deploy/compose/leaf`: see the compose [README](deploy/compose/README.md#a-leaf-node), sections "A leaf node" and "A seeding leaf". The Ansible playbook `deploy/ansible/leaf.yml` sets up a forwarding leaf.
-
-The hub needs a JetStream domain and a leafnodes listener on port 7422, open to each leaf's addresses. A hub set up with Ansible has both; the compose stack of `deploy/compose` has neither yet.
-
-A device on a leaf is given the leaf's address (`natsUrl`) and, for a seeding leaf, its domain (`seedDomain`). Enrollment does not hand these out yet: the app passes them.

@@ -419,62 +419,11 @@ The app passes that code to the library once, with the bridge's URL: [Users: inv
 
 ### Adding a leaf node
 
-A leaf node is a second `nats-server` close to a group of devices. It has no JetStream of its own: the devices' stream calls cross to the hub's JetStream through a **domain**, and their writes and questions cross like any other message. The hub keeps the only copy of the streams; the leaf shortens the devices' path to it. The steps below set up this forwarding leaf by hand; a leaf can also seed its devices from mirrors of the hub's snapshots, and both kinds run from `deploy/compose/leaf`: see [LEAF_NODES](LEAF_NODES.md).
+A leaf is a regional NATS server. A forwarding leaf relays to the hub; a seeding leaf also caches allowed snapshots under its own JetStream domain. PostgreSQL, CDC and mutation processing remain authoritative on the hub.
 
-1. **Give the hub a domain.** A new stack: `bridge --init-nats operator --js-domain hub`. A running one: `bridge --init-nats --update --dir /etc/zebridge --js-domain hub`, then restart NATS and the bridge. The grants then allow both `$JS.API.` and `$JS.hub.API.`, and `/enroll` hands `js_domain` to every device. Devices enrolled before keep working on the hub, and receive the domain at their next renewal (within a quarter of the JWT's life), after which they can use a leaf too.
+Use the current [leaf guide](LEAF_NODES.md) and the [Ansible](deploy/ansible/README.md) or [Docker](deploy/compose/README.md#a-leaf-node) procedure. They enforce explicit tenant lists, `<leaf>.<device>` identities, LEAFNODE-only link keys, separate loopback keeper keys, filtered manifest projections and signed account refresh. The supervisor pauses NATS after five minutes without verified trust and restarts it after recovery. Manually copying an account once is insufficient for revocation propagation.
 
-2. **Open the hub to leaves.** In the hub's `nats-server.conf`, then restart NATS:
-
-   ```
-   leafnodes {
-     port: 7422
-     no_advertise: true
-     tls { cert_file: "/etc/zebridge/tls/nats.crt", key_file: "/etc/zebridge/tls/nats.key" }
-   }
-   ```
-
-   Open 7422 in the firewall to the leaf's addresses: one rule per address family, IPv4 and IPv6.
-
-3. **Mint the leaf's credentials**, where `operator.store` lives:
-
-   ```sh
-   bridge --mint-leaf --name leaf1 --store operator.store > leaf1.creds
-   ```
-
-   They allow what the devices may do, and nothing more (see [SECURITY](SECURITY.md)). Mint them again after a grammar change.
-
-4. **Configure the leaf.** Copy the trust lines of the hub's `nats-server.conf` into the leaf's `trust.conf`: `operator`, `system_account`, `resolver: MEMORY` and the `resolver_preload` block. The leaf's own `nats-server.conf`, with no `jetstream` block:
-
-   ```
-   include ./trust.conf
-   port: 4222
-   http: "127.0.0.1:8222"
-   tls { cert_file: "/etc/zebridge/tls/leaf.crt", key_file: "/etc/zebridge/tls/leaf.key" }
-
-   websocket {                                   # for browsers
-     port: 8443
-     tls { cert_file: "/etc/zebridge/tls/leaf.crt", key_file: "/etc/zebridge/tls/leaf.key" }
-     allowed_origins: ["https://app.example.com"]
-   }
-
-   leafnodes {
-     remotes: [{
-       url: "tls://nats.example.com:7422"
-       credentials: "/etc/zebridge/creds/leaf1.creds"
-       account: "<ZB_ACCOUNT_PUB from the hub's .env.nats>"
-     }]
-   }
-   ```
-
-   The creds file must be readable by the user `nats-server` runs as. Both servers log `Leafnode connection created`. The `tls` files are a certificate from a public authority, Let's Encrypt for example (`leaf.yml` gets one with certbot): a self-signed pair works only if every client is given its CA.
-
-5. **Point the devices at the leaf.** A device still enrolls at the hub's bridge; only its NATS address changes: `natsUrl` is `tls://leaf.example.com:4222`, or `wss://leaf.example.com:8443` in a browser. The `js_domain` from its enrollment carries its stream calls across the leaf.
-
-6. **After every `--update` on the hub**, copy the new ZEBRIDGE account JWT into the leaf's `trust.conf` and reload the leaf: the leaf checks the devices' JWTs against its own copy.
-
-[⬆️](#table-of-contents)
-
----
+Before upgrading existing servers, build these changes, stage client query routing, apply the PostgreSQL scope guards and complete the [mutation queue cutover](OPERATIONS.md#mutation-admission-cutover). Retire broad legacy cache data and revoke replaced public keys after verified cutover. An empty tenant list never authorizes all tenants. The hub listener must be restricted to the leaf IPs; regional native NATS DNS must bypass the Cloudflare HTTP proxy.
 
 ## Using a cloud PostgreSQL
 

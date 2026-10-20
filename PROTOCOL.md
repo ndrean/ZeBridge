@@ -183,7 +183,8 @@ flowchart TD
 | `tenants` | **KV bucket** | bridge → client | `$KV.tenants.<principal>` → the principal's memberships, a JSON array, kept current from `zebridge_user_tenants` (§6, Step 0). One key per principal, granted per principal. |
 | `CDC_PUBLIC`, `CDC_<tenant>` | **streams** | bridge → client | Ordered, replayable, time-bounded. Changes are *events*: public tables on `CDC_PUBLIC`, a tenant's tables on its own stream (§4). |
 | `generations` + `gen-<tenant>` | **KV + object store** | bridge → client | The seed source (§6): one chain manifest per `<tenant>.<table>`, objects chunked by the store itself — a seed is *state*, built on a cadence, never served per request. |
-| `MUTATIONS` | **stream** | client → bridge | Edge writes (§7), and the dead-letter copies of refused writes (`mutation_error.<table>`) for the operator. Discard new: when full, a write is refused at the door. |
+| `MUTATIONS` | **stream** | admission → bridge | Private `$ZB.mutation.<principal>` capture in production, aggregate principal count/byte limits, discard new, no age expiry. Legacy mode captures public routes and only caps each route. |
+| `MUTATIONS_ERRORS` | **stream** | bridge → operator | Admission mode dead letters on `mutation_error.<table>`, separate 64 MiB/2 h discard-old diagnostics. |
 | `live` | **KV bucket** | client → bridge | Each client's heartbeat, `$KV.live.<tenant>.<principal>`, expiring after `FLEET_TTL_SECONDS`; the bridge reads it for the fleet metrics (§11). |
 | `VERDICTS` | **stream** | bridge → client | The verdicts answering writes (`mutation_ack.<principal>.<msg_id>`) and the ban (`mutation_ack.<principal>.revoked`), kept 2 h for a client that was offline. One message per subject, discard old: verdicts never take the space writes need, and a verdict pushed out early costs one idempotent replay. |
 
@@ -198,8 +199,8 @@ own and nobody sweeps them.
 
 A client may publish to `query.<tenant>.<name>` for its own tenant and the open one; a
 service holding a **responder** credential (SECURITY §1.6) — tagged with the tenants it
-serves, granted the query subjects of those tenants and the open one, and replies to any
-inbox — answers on the client's inbox. Nothing is stored: no stream, no consumer, no
+serves, granted the query subjects of those tenants and the open one — answers on the client's inbox. Root responder credentials allow inbox replies; a restricted leaf link permits only
+`_INBOX.<principal>.query.<authorized-tenant>.<nonce>` replies. Nothing is stored: no stream, no consumer, no
 position. The bridge is not involved beyond rendering the grant and serving the name in
 the grammar. What a service answers is its own contract — the reference service
 (`examples/08-map/poi_service.py`) takes named queries with parameters, never SQL, and
@@ -2517,3 +2518,14 @@ counted by the server at the delivery, so it needs no clock and no timing.
 
 The bridge never writes the bucket. It creates it if missing (with the TTL) and
 reads it. A client that never beats never appears.
+
+
+## Restricted leaf and admission transport
+
+A root principal is one ASCII alphanumeric/underscore/hyphen token. A scoped principal has exactly two such tokens, `<leaf>.<device>`, at most 128 bytes total; the leaf namespace is at most 64 bytes. Route parsing takes the last two mutation tokens as table and operation, leaving the complete principal intact. Public mutation subjects and JSON bodies remain unchanged. PostgreSQL's `zebridge_leaf_scopes` defines namespace/tenant registration and optional regional enrollment URLs; membership/invite triggers enforce it. It is administrator-owned and cannot be enabled as an edge-writable application table.
+
+Under `MUTATION_ADMISSION=1`, a separate service validates routes, rebuilds headers and publishes on `$ZB.mutation.<principal>`. `ZB-Original-Subject` retains the original route, `ZB-Client-Msg-Id` retains the client's verdict ID, and the durable deduplication ID is namespaced by principal. These headers are trusted only on the private route, which client JWTs cannot publish. The gateway forwards the original authorized reply inbox unchanged so JetStream produces the durable PubAck. A write is accepted only after persistence. The worker restores the route and original verdict ID; all of a principal's table/operation routes share one durable quota.
+
+Query transport replies use `_INBOX.<principal>.query.<tenant>.<nonce>`; libzb and TS construct it internally. Leaf response publishing is restricted by that tenant token, and reply subscriptions by principal namespace. This is a client transport update without a public C ABI or request API change. Deploy it before restricted leaf keys. Other API replies keep the principal inbox prefix.
+
+A seeding leaf combines `KV_generations_leaf_<tenant>` hub source projections, including `_default`, instead of consuming shared manifests. Object snapshots retain their normal names; mirror delivery uses `$ZB.MIRROR.<leaf>.>`, while the local keeper uses `$ZB.KEEPER.<leaf>.>` replies. `/nats-account` exposes only the public account JWT; pinned-operator trust refresh and the five-minute stale limit are described in [Leaf nodes](LEAF_NODES.md).

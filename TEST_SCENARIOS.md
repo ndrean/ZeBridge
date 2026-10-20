@@ -310,3 +310,19 @@ run beside another bridge; `chaos.py` restarts the broker; `sweeper.py` scopes t
 sweeper to its fixture (`SWEEP_ONLY_TABLES`). Run `owns` alone and sequentially —
 `run.py owns` does. `speed.py` truncates `users`; it is a benchmark, run it by hand on a
 disposable database.
+
+
+## Restricted leaf security and hub recovery
+
+Run with `scripts/scenarios/.venv/bin/python scripts/scenarios/<name>.py`. The new fixtures create private NATS instances, and the PostgreSQL fixtures create/drop scratch databases and unique roles. They do not connect to the VPS. `ZB_BRIDGE_BIN` selects a Debug/ReleaseSafe bridge for these new fixtures; `ZB_LIBZB` selects the native library for `leaf_security`, `hub_recovery` and renewal (through `multi_bridge`).
+
+| Scenario | What a pass proves |
+| --- | --- |
+| `mutation_admission` | Aggregate quota across table routes, principal-isolated deduplication, real durable PubAcks, forged headers/private publishes refused, restart behavior, nonempty migration refusal and backup failure preserving/resuming capture. No PostgreSQL. |
+| `leaf_tenants` | Idempotent SQL bootstrap, reserved-prefix leaf IDs, bare reserved principals and unprefixed dotted invitations refused, allowed memberships/invites, cross-policy changes refused, legacy namespace collisions and no writer policy escalation. Disposable PostgreSQL. |
+| `leaf_trust` | Native supervised NATS refreshes signed account trust, applies live revocation and client-key rotation, rejects rollback/tampering and stops/restarts after a shortened test lease. A trust-feed-only outage proves a removed signer can still mint a long-lived JWT accepted by the stale leaf and relay a mutation to the live hub before cutoff, although direct hub authentication is refused. |
+| `leaf_security` | Docker NATS 2.15 hub/leaf and the packaged trust supervisor: CLI refusal of unprefixed leaf IDs and invalid responder principals without credential output, connection-type/source limits, tenant and inbox/verdict isolation, filtered manifest copies, local mirror management, no deletion on missing origins, real native and TS query replies, stale-feed pause/recovery. Build `docker build -t zebridge-leaf-nats:2.15.0-security deploy/compose/leaf` first. `ZB_CHECK_LEAKS=1` adds a macOS live native-query allocation check. |
+| `hub_recovery` | A real scoped C ABI client writes through admission into PostgreSQL; coordinated pg_dump/pg_restore plus fresh NATS feed rebuilding recovers the write, resets a returning replica's post-checkpoint state, and seeds a fresh device under the preserved identity. |
+| `jwt_renew` | In addition to renewal/hostile timestamps/rotation, validates the current public account feed. `MUTATION_ADMISSION=1` exercises the native write through admission. |
+
+Run bridge builds/tests in Debug and ReleaseSafe, libzb unit tests in both modes, TS tests/type checking, shell/Ansible/Compose configuration checks and the relevant Python fixtures. Unit builds list the bridge's catalogue twice (Debug plus the chosen mode); 402 executions represent 201 tests per module. The two skipped libzb tests require its separate live configuration. These fixtures establish functional/security boundaries, not post-hardening fleet throughput or production backup availability.

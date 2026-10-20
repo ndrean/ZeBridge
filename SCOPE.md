@@ -40,8 +40,8 @@ Two migration shapes need care:
 
 A reverse proxy cannot see individual writes: they travel inside the NATS connection, one long-lived connection. NATS does not throttle per user either: a JWT's limits are caps (message size, subscriptions, bytes), not rates. So the limits sit where the writes arrive, in two layers:
 
-- **A backlog per principal**, at the MUTATIONS stream: past `MUTATION_BACKLOG_PER_PRINCIPAL` queued writes (5,000 by default), that principal's next writes are refused at the door. Nobody else notices.
-- **A rate per principal and per tenant**, in the bridge (`MUTATION_RATE_PER_PRINCIPAL`, off by default): a write over the rate is delayed, not dropped. JetStream redelivers it when its turn comes, so a flood is served at the rate while other tenants' writes go through as if it were not there. Only a write still over the rate after its last redelivery is answered `rate_limited`, with a `retry_after_ms`.
+- **Aggregate principal admission**, when `MUTATION_ADMISSION=1` and the dedicated ingress service is running: all tables/operations for one principal share `$ZB.mutation.<principal>`. Count and byte budgets bound that principal; the default effective count is 1,016, the minimum of the configured 5,000 and the 64 MiB principal budget divided by the 64 KiB message ceiling plus overhead. The stream has a shared 1 GiB ceiling, so enough principals can still fill it. Accepted writes have no age expiry. Legacy direct capture caps each complete route separately and does not provide this aggregate guarantee.
+- **A service rate per principal and tenant**, when `MUTATION_RATE_PER_PRINCIPAL` is enabled: delayed redelivery schedules excess work. Deployment defaults enable it; development defaults leave it off. This reduces unfair processing, but does not promise unchanged latency under server/network saturation. Revocation remains the response to a persistent abusive credential.
 
 What remains: a flooder still fills its own backlog, and it can cost a share of the bridge's ingress time until the limits catch it. Set `MUTATION_RATE_PER_PRINCIPAL` in production; it is off by default.
 

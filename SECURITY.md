@@ -381,7 +381,7 @@ One credential per role, each with only what the role needs:
 | a responder | JWT under the account's **responder** signing key, tagged with the tenants it serves | a client's read side, plus `subscribe: query.<tenant>.>` for its tenants, `publish: _INBOX.>` for the replies, and create/write on `OBJ_res-<tenant>` for answers too large to send inline; it also reads its tenants' sensor readings (`READINGS_<tenant>`) and their archive manifests, by exact key — no mutations, no heartbeat key, no asking |
 | an archiver | JWT under the account's **archiver** signing key, tagged with one tenant | reads that tenant's readings stream `READINGS_<tenant>` and writes that tenant's manifests `$KV.time_manifests.<tenant>.>` — nothing else: no other tenant, no CDC, no queries, no stream admin |
 | a sensor | bearer JWT under the account's **sensor** signing key, tagged with one tenant | publishes `sensors.<tenant>.<its own name>.>` and nothing else; subscribing is denied |
-| a leaf node's link | JWT signed by the account key, its permissions in the JWT | what any client may do, for any tenant and name, plus `publish: mutation.>` and `publish: sensors.>` — no stream admin, no `cdc.*`, no generation writes |
+| a leaf node's link | account-signed JWT, LEAFNODE-only | explicit tenant list plus public data, reserved `<leaf>.<device>` namespace, scoped query replies and permitted seed replication; separate loopback keeper administers local caches |
 
 **A responder answers, it never writes.** A service that answers `query.<tenant>.<name>`
 from a replica (PROTOCOL §2) holds a responder credential, not the bridge's: it follows
@@ -418,16 +418,7 @@ manifest, and is refused another tenant's stream and manifest, and stream create
 a responder reads both and cannot write the manifest; the archiver and responder programs
 of examples/16-archive run with these credentials alone.
 
-**A leaf link carries its clients' traffic, nothing more.** A leaf node joins the hub
-with its own credential, minted by `bridge --mint-leaf --store operator.store`: the
-client template with every tenant and name widened to `*` (a NATS wildcard is a whole
-token, so `CDC_<tenant>` becomes any stream), plus `mutation.>`, the subject the hub's
-MUTATIONS stream listens on — the hub announces a subscription to a leaf only when the
-leaf may publish to it as written — and `sensors.>`, for the readings of sensors behind it. Each device behind the leaf is still held to its own
-JWT by the leaf. A compromised leaf host can read every stream, but cannot create,
-delete or reconfigure one, publish CDC events or write generations, which the bridge's
-own credential (`>`) would allow. Responders behind a leaf are not covered yet: their
-`STREAM.CREATE` would widen to any stream.
+**A leaf link is an explicit trust boundary.** Mint it with `bridge --mint-leaf --name lf-leaf1 --tenant acme [--mirror] --store operator.store`. It accepts LEAFNODE connections only and carries the configured tenants plus public data, with principals reserved under `lf-leaf1.<device>`. Leaf ids carry the grammar's `lf-` prefix and no other principal may, so no plain principal's wildcard grants cover a leaf's devices. It cannot administer hub snapshot streams or consume shared manifests without tenant filtering. Literal result-object creation remains available for authorized responders. A distinct loopback-only `--keeper` identity (same leaf name/tenants) administers local caches. PostgreSQL registration guards enforce namespace memberships and invitations. A compromised leaf can act within that authorized scope; do not place unrestricted hub client/service credentials on it. [Leaf nodes](LEAF_NODES.md) describes the full grants, query transport staging and migration.
 
 **The reply inbox is a read boundary.** JetStream does not deliver a pulled message, a
 KV answer or an object chunk on the subject the reader filtered on: it delivers to the
@@ -683,8 +674,7 @@ to a creds file known to have leaked. NATS refuses the JWTs issued up to the rev
 not after it: a minted identity never gets another, but an enrolled device would renew.
 For an enrolled device's key, pass `ADMIN_DATABASE_URL` as well: the key is then also
 marked in `zebridge_principal_keys`, and `/renew` refuses it. A leaf node checks the devices
-against its own copy of the account JWT: refresh its `trust.conf` after a revocation
-(`deploy/ansible/leaf.yml` does it on every run).
+against its own verified account JWT. Both deployment paths automatically refresh it from the hub's public HTTPS `/nats-account` feed under a pinned operator, and pause NATS after five minutes without verified refresh. Preserve the persistent trust state so restarting cannot discard revocations.
 
 Two corollaries reviewers keep re-deriving, pinned here:
 - **restarting nats-server is not a revocation event — it is the opposite.** The
@@ -706,7 +696,9 @@ Stated plainly, because half of what was found while building this was assumed r
 written down.
 
 * **A stolen credential** — full access to that identity. No subject grammar helps.
-What it cannot do is crowd the others out: with `MUTATION_RATE_PER_PRINCIPAL` set, its writes are served at the rate (NAK'd with the delay of their place in the queue, redelivered by JetStream once each), its tenant's budget is a second bucket, and another tenant's verdict latency does not move. Off by default; set it in production. What bounds the pile itself is the stream's own policy, which the bridge sets when it creates MUTATIONS: `discard new`, workqueue retention and a per-subject cap (`MUTATION_BACKLOG_PER_PRINCIPAL`, 5000) — the subject carries the principal, so a flooder's publishes are refused at the door past its backlog while everyone else's go through. `bridge --diagnose` reports a stream without it. What remains is the floor: a refused publish still costs the server one small reply, because an honest client must be told whether its write landed and the door cannot tell the two apart. It is not amplification (the reply is smaller than the request, nothing is stored, one credential is one socket), and a flood that persists is ended by revoking the credential, not by anything in the protocol.
+Production deployments enable a separate admission service (`MUTATION_ADMISSION=1`). It forwards the unchanged public mutation message onto one private durable subject per validated principal, rebuilds trusted routing headers and namespaces deduplication IDs. The original client receives JetStream's own durable PubAck. All tables and operations share that principal's count/byte budget; the default effective count is 1,016 (configured 5,000, capped by 64 MiB divided by message ceiling plus overhead). The stream has a 1 GiB total ceiling and no age expiry for accepted writes. A full global budget still affects everyone; this is bounded storage and fairer service, not denial-of-service immunity. Legacy direct capture limits each route separately. Production rate buckets delay excess work; development defaults leave them off. Refused requests still consume network/server work, and persistent abuse requires credential revocation. Existing streams require the explicit empty-queue migration in [Operations](OPERATIONS.md#mutation-admission-cutover).
+
+Restricted leaf links are LEAFNODE-only and allow explicit tenants, public data and a reserved `<leaf>.<device>` principal namespace. Separate loopback-only keepers manage local seed caches. PostgreSQL registration guards prevent assigning that namespace to other tenants. Both deployment paths verify a pinned-operator public account feed and pause leaf NATS after five minutes without verified refresh. A leaf remains trusted within its authorized namespace; shared-account bearer credentials are not end-to-end device signatures. See [Leaf nodes](LEAF_NODES.md) for client staging, key retirement and cache migration.
 * **A publisher bug** 🚧 — NATS enforces who may *subscribe*; nothing verifies the bridge tagged a row with the right tenant. That is the cost of one bridge serving many tenants.
 A publication and slot per tenant moves that guarantee back into PostgreSQL.
 * **Reads** — public tables are read by every principal; a tenant's tables only by that tenant's principals. Tenant routing is ✅ built for CDC and for the per-tenant generation buckets.

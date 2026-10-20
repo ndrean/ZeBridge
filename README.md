@@ -9,6 +9,8 @@
 
 **What is it?**: ZeBridge keeps many local replicas (SQLite, PGlite, PostgreSQL, DuckDB) in sync with one authoritative PostgreSQL database. It uses NATS JetStream to solve the distribution problem for offline-first applications. Clients read locally and optimistically mutate; every write is a request to PostgreSQL, which resolves it last-writer-wins and returns a verdict. Change distribution runs over NATS JetStream, so clients reconnect without a stampede on the database.
 
+Production leaf deployments use explicit tenant scopes, separate link/keeper credentials and a signed account-trust feed with a five-minute stale cutoff. A separate hub admission service bounds queued mutations across each principal's tables. Existing installations need the staged [leaf migration](LEAF_NODES.md#deployment-and-migration) and [empty-queue cutover](OPERATIONS.md#mutation-admission-cutover); build current binaries/images before using the updated deployment files.
+
 ZeBridge has a three-pillar architecture with a projection daemon between your PostgreSQL primary and a NATS server, and a library where consumers build upon their apps, plus a small housekeeping "sweeper" sidecar daemon.
 
 ```mermaid

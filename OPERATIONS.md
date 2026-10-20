@@ -69,8 +69,9 @@ The reference for running ZeBridge: the CLI, the doctor (`--diagnose`), what nee
   --mint-sensor --name NAME [--tenant T] [--store PATH] [--ttl-days D]
                   Creds for a sensor: publishes sensors.<T>.<NAME>.> only; its JWT is a
                   bearer token (over MQTT, the password). No --tenant: _default
-  --mint-leaf --name NAME [--store PATH] [--ttl-days D]
+  --mint-leaf --name NAME --tenant T [--tenant T]... [--mirror | --keeper] [--store PATH] [--ttl-days D]
                   Creds for a leaf node's remote, on stdout: what its clients may carry
+                  NAME is the leaf id: it starts with lf- (grammar.json leaf_prefix), no other principal may
                   --ttl-days: both default to 3650 (ten years): replaced with a redeploy
                   --store - reads the store from standard input (a password manager's pipe):
                   the seeds never touch this host's disk
@@ -131,7 +132,7 @@ What it checks, in order:
 - **The catalogue**: `zebridge_check_all()`, every catalogued table against its own catalogue row; tenant-scoped tables whose writes nothing bounds; tenants the sweeper cannot reach; bridge instances with an empty publication, or disagreeing on the row budget.
 - **The slots**: an invalidated slot, an inactive one holding WAL, and this bridge's own.
 - **The bridge**: if it answers on its port, whether it is connected to NATS, its suspended tables, its reconnects. If not, the checks that need a running bridge are skipped, and said to be.
-- **NATS**: reachable with these credentials; every stream and bucket (with the bridge stopped, a missing one is a note: the bridge creates them at boot); the MUTATIONS backlog cap (discard new, per principal) and the VERDICTS policy (discard old). The bridge never edits those two streams, so a wrong one is a finding to fix by hand, not something it repairs.
+- **NATS**: reachable with these credentials; every stream and bucket (with the bridge stopped, a missing one is a note: the bridge creates them at boot); the MUTATIONS backlog cap (aggregate per principal under admission; per route in legacy mode) and the VERDICTS policy (discard old). The bridge never edits those two streams, so a wrong one is a finding to fix by hand, not something it repairs.
 - **What a fresh client finds**, with the bridge running: a schema for every table, a tenant entry for every principal, and for every tenant and table a chain whose full object exists.
 
 It ends with `🩺 DIAGNOSE: all clear` (exit 0) or the number of findings (exit 1).
@@ -282,7 +283,7 @@ At boot the bridge checks the writer role's connection limit, and PostgreSQL's `
 | `GENERATION_ASYNC_FULLS` | true | the routine full (every depth) is built in the background while deltas keep being cut, then attached behind them; fulls a correctness rule asks for stay with their delta |
 | `GENERATION_DEFER_FULLS` | true | while a stream has less time left than three builds of a table's full, that full waits and deltas continue; at 4 × depth generations it is built anyway |
 | `GENERATION_WORKERS` | 1 | builders for the early cuts of bursting streams; more re-cut those pairs in parallel, each on its own connections, so a round lasts as long as its longest build. The cadence tick builds in turn whatever this says. Memory: workers × the biggest full's MessagePack size |
-| `MUTATION_BACKLOG_PER_PRINCIPAL` | 5000 | the MUTATIONS stream's `max_msgs_per_subject`, with `discard new per subject` and workqueue retention, used when the bridge creates the stream. The subject carries the principal, so this is how many writes one principal may have queued before its publishes are refused at the door; nobody else notices. On an existing stream it changes nothing: the bridge never edits MUTATIONS (edit it with `nats stream edit`); `zbdoctor` checks the stream against the rate the bridge declares on `/status` |
+| `MUTATION_BACKLOG_PER_PRINCIPAL` | 5000 | configured count limit; admission reduces it to fit the principal byte budget (1,016 with defaults). All tables/operations share one private subject per principal. Legacy direct capture only caps each route. Existing streams require explicit migration; the shared stream ceiling still limits the whole fleet. |
 | `MUTATION_RATE_PER_PRINCIPAL` | 0 (off) | writes per second one principal, and one tenant, may send. Beyond it a write is NAK'd with the delay of its place in the queue and redelivered by JetStream when its turn comes: a flood is served at the rate, other tenants' writes are answered as if it were not there, nothing is dropped. `MUTATION_RATE_BURST` (default: one second's worth) is what a quiet client may send at once |
 | `ZB_INGRESS_LANES` | 1 (max 8) | parallel mutation listeners on the one ingress stream. Each lane pulls up to 64 writes and applies them in one transaction, on its own PostgreSQL writer connection and NATS connection; JetStream spreads the writes across lanes. Measured on one Mac: one lane ~8,500 writes/s, two ~14,000, four ~19,500 ([examples/09-event](examples/09-event/README.md#the-ramp-how-far-one-mac-goes)). Set at start, no rebuild |
 | `GC_BATCH_ROWS` | 1000 | how many tombstones the sweeper reaps per transaction |
@@ -489,7 +490,8 @@ The `live` bucket holds one heartbeat per connected client: its lag on each stre
 | Stream | Purpose | Retention (default) | Consumer Pattern | Role |
 | -------- | ------------------- | ------------- | ----------------------- | -- |
 | **CDC** | Real-time egress changes | `CDC_MAX_AGE_SECONDS`, 3 × the generation cadence; `CDC_MAX_BYTES` 1 GiB and `CDC_MAX_MSGS` 10 M as disk valves | Continuous subscription | READ |
-| **MUTATIONS** | Real-time ingress changes | 2 h, 1 GB, discard new, `MUTATION_BACKLOG_PER_PRINCIPAL` queued writes per principal: past it, that principal's writes are refused | Continuous subscription | WRITE |
+| **MUTATIONS** | Private admitted writes | No age expiry, 1 GiB, discard new, bounded aggregate backlog per principal; shared fleet ceiling | Continuous subscription | WRITE |
+| **MUTATIONS_ERRORS** | Refused-write diagnostics under admission | 2 h, 64 MiB, discard old | Operator inspection | Service |
 | **VERDICTS** | Write verdicts and the revocation ban | 2 h, 1 GB, discard old: the window a missed verdict can be recovered in | Direct get by key | WRITE |
 | **READINGS_\<tenant\>** | Sensor readings, `sensors.<tenant>.>`, never through PostgreSQL ([examples/16-archive](examples/16-archive)) | `READINGS_MAX_AGE_SECONDS` 1 day, `READINGS_MAX_BYTES` 256 MiB, discard old | the tenant's archiver and responders | READ |
 
@@ -750,3 +752,42 @@ The sweeper's clock is coupled to the same chain: what the chain promises must s
 [⬆️](#table-of-contents)
 
 ---
+
+
+## Mutation admission cutover
+
+Build the bridge and client transports from this checkout using Zig 0.16; old packaged binaries/images do not contain the new commands. Admission is a separate NATS-only process, `bridge --mutation-ingress`. Set the worker's `MUTATION_ADMISSION=1` and the same limits on both. Deployment defaults use 64 MiB per principal, a 64 KiB message ceiling, 1 GiB total, and rate 100/burst 200. The effective default count is 1,016. Set `ZB_LEAF_NAMES` to the registered, space-separated leaf namespaces so their two-token principals are subscribed. Root principals continue to work without changing client mutation messages.
+
+For an existing public `MUTATIONS` stream, keep its old worker running until all accepted writes are applied. Stop competing stream/configuration changes and admission during the cutover. Review/archive legacy dead letters; the migration refuses a nonempty stream. With current bridge binaries and the hub service credential in `NATS_URL`, `NATS_CREDS` and `NATS_JS_DOMAIN`:
+
+```sh
+scripts/scenarios/.venv/bin/python deploy/migrate-mutations.py           # read-only plan
+scripts/scenarios/.venv/bin/python deploy/migrate-mutations.py --apply   # explicit cutover
+bridge --mutation-ingress --check
+```
+
+The script changes capture subjects only after observing an empty queue, rechecks in-flight writes before changing limits, and restores public capture if one arrived. It preserves stream identity and sequence history and removes only idle old-filter consumers. It never purges queued writes. During the brief capture gap clients receive no successful durable PubAck and retain their outbox for retry. Start admission, then restart workers with `MUTATION_ADMISSION=1`; verify an actual client write reaches PostgreSQL, echoes and clears its outbox. A published message's original PubAck comes from JetStream after private persistence. Refused-write diagnostics use a separate bounded stream; accepted writes do not expire by age.
+
+Apply the current init SQL and register `zebridge_leaf_scopes` before inviting scoped devices. Update libzb/TS query routing before tightening leaf grants. Before re-enrolling a device under a scoped identity, drain or explicitly preserve its pending local outbox; keep its old replica until that is verified. Use matching tenant lists in PostgreSQL, minted credentials and deployment settings. Prepare hub manifest projections with a running updated bridge, or `ZB_LEAF_TENANTS="demo storm" bridge --mutation-ingress --prepare-projections`. See [Leaf nodes](LEAF_NODES.md) for scoped identities, both credential replacements, legacy cache retirement and old-key revocation.
+
+## Hub checkpoints and recovery
+
+Leaf caches do not replace a hub backup. `deploy/backup-hub.py` produces a coordinated PostgreSQL recovery point for the private admission queue. It temporarily pauses durable capture, drains already accepted writes, runs `pg_dump -Fc`, and saves current public NATS configuration, bridge service credentials, rendered SQL bootstrap, checksums and the exact resume configuration. It resumes capture even on ordinary failure. Directory mode is 0700 and files 0600; the bundle contains application data and online credentials. Encrypt it and copy it to a separately managed offsite destination. Keep `operator.store`, deployment vault, TLS material and any other service credentials backed up separately, offline where appropriate.
+
+Set `ADMIN_DATABASE_URL` for pg_dump, both runtime database URLs for the bootstrap, and the hub NATS environment. Review the read-only plan first:
+
+```sh
+scripts/scenarios/.venv/bin/python deploy/backup-hub.py /secure/checkpoints/point-001 --config /etc/zebridge/nats-server.conf
+scripts/scenarios/.venv/bin/python deploy/backup-hub.py /secure/checkpoints/point-001 --config /etc/zebridge/nats-server.conf --apply
+```
+
+Use a new destination each time. Only a successful run with `manifest.json` is complete; verify its file SHA256 checksums. A timeout leaves accepted queue data intact. If the backup process or host is killed while capture is paused, use its saved `resume-mutations.json` to restore the exact original stream configuration before resuming service. The script does not provision offsite storage, encryption, backup scheduling or high availability.
+
+To recover onto an isolated replacement hub:
+
+1. Verify the bundle and preserve the same operator/account identity, current revocations and required service credentials. Recreate the database/roles and apply the saved bootstrap (with deliberate new role passwords/URLs if necessary), then restore `database.dump` using `pg_restore --clean --if-exists --no-owner`. Recheck grants, role ownership, extensions and publication settings for that environment.
+2. Start **fresh** NATS storage under that identity and domain, with the recovered trust block adapted to the new server's TLS/listener/storage paths. Do not reuse an unrelated operator. Start admission with the registered leaf namespaces and matching limits.
+3. Start one bridge with a **new logical slot** and `ZB_FEED_RESTART=1`. This clears restored generation bookkeeping and rebuilds the authoritative feed/snapshots from PostgreSQL. Do this before other bridges or clients use the replacement. Remove the restart flag for normal starts; never point it at a surviving active feed.
+4. Verify a returning replica notices the new stream identity and converges to restored rows, a fresh device seeds correctly, and a new mutation commits/echoes/clears its outbox. Rebuild regional caches against the replacement before reopening access. An old local snapshot may contain post-checkpoint data and must not be mistaken for the restored authority.
+
+The recovery point is the database snapshot in the last completed bundle. Later writes, even previously acknowledged ones, may be lost after total hub loss. The disposable `hub_recovery.py` scenario proves restore and native returning/fresh-client convergence with a scoped principal; it does not establish a production RPO/RTO or verify a particular offsite copy. Run a restore drill on the actual backup destination and monitor WAL, queue, disk and backup age.

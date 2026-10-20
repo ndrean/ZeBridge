@@ -55,6 +55,12 @@ A run that would write a placeholder from `vault.example.yml` stops before writi
 
 ## Upgrading to a release
 
+Firstly dowload the release from GitHub:
+
+```sh
+gh release download v0.2.6 -D dist/0.2.6
+```
+
 `upgrade.yml` installs the release packages (`deploy/package-linux.sh`, in `dist/<version>/`) in place of the raw builds:
 
 ```sh
@@ -76,7 +82,11 @@ After it, `site.yml` still works: its roles see the packages installed and stop 
 ansible-playbook leaf.yml --ask-vault-pass
 ```
 
-It reads the trust block (operator, accounts) of the hub's `nats-server.conf` on every run, so a leaf follows each `--init-nats --update` on the hub. It mints a leaf's credentials on the hub (`bridge --mint-leaf`) only when the leaf has none; `-e zb_rewrite_secrets=true` mints new ones. Then the Let's Encrypt certificate for `leaf_host`, the server with TLS on 4222 and a websocket (`leaf_ws_port`, `leaf_allowed_origins` in `group_vars/leaves/vars.yml`), the firewall, and a last check that the link is up (`/leafz`). The hub's side (its domain, `leafnodes` on 7422, the firewall for the leaves' addresses) is in `site.yml`: `zb_js_domain` and `zb_leaf_addresses` in `group_vars/zebridge/vars.yml`.
+Each inventory leaf must set `leaf_name`, `leaf_host` and a nonempty `leaf_tenants` list matching its PostgreSQL `zebridge_leaf_scopes` registration. Set `leaf_js_domain` to enable seeding caches; an empty domain is forwarding only. Build current Linux binaries before running these playbooks. Existing hubs require the [explicit mutation queue cutover](../../OPERATIONS.md#mutation-admission-cutover) before admission-enabled worker startup. The playbook does not perform administrative PostgreSQL initialization: apply current init SQL and register scopes separately.
+
+`leaf.yml` pins the public hub trust block, mints tenant-restricted LEAFNODE link credentials and a separate loopback-only keeper (same leaf name), installs the shared trust supervisor and mirror keeper, and enables stream-scoped NATS 2.15 API replies. Old unrestricted credentials are replaced; their public keys are retained in `/etc/zebridge/retired-leaf-keys` for deliberate revocation after verified cutover. Do not consider replacement complete until those old keys are revoked and obsolete broad caches retired. Stage updated client query transports and `<leaf>.<device>` identities first.
+
+The hub service reads public `NATS_ACCOUNT_CONF` through a read ACL, and HAProxy exposes `/nats-account`. Leaves verify this HTTPS feed against the pinned operator, enforce monotonic claims/revocations, pause NATS after `leaf_trust_max_stale: 300` seconds without a verified refresh, and recover automatically. `leaf_trust_feed` defaults to the hub's HTTPS endpoint. Verify reachability before deployment; `/leafz` checks the link afterward. See [Leaf nodes](../../LEAF_NODES.md) for cache projections and migration.
 
 ## After the first run
 
