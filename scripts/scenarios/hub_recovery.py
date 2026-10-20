@@ -190,6 +190,17 @@ async def main():
                 await asyncio.sleep(.05)
             check(rows(h) == [[10], [20]] and pending(h) == 0,
                   "a write crosses admission, commits, echoes and clears its original client outbox")
+            # A decided receipt in monthly partitions, as a running bridge leaves them.
+            receipt_id = f"zb1-t{int(time.time() * 1000)}-recovery-1"
+            receipt_args = (f"'lf-edge1.recovery_device', ARRAY['{receipt_id}']::text[], "
+                            "ARRAY[convert_to('mutation.lf-edge1.recovery_device.recovery_row.insert','UTF8')]::bytea[], "
+                            "ARRAY[convert_to('{}','UTF8')]::bytea[]")
+            sql("SELECT count(*) FROM zebridge_private.maintain_receipts(); BEGIN; "
+                f"SELECT count(*) FROM zebridge_private.claim_receipts({receipt_args}); "
+                f"SELECT zebridge_private.finish_receipts('lf-edge1.recovery_device', ARRAY['{receipt_id}']::text[], "
+                "ARRAY['{\"committed\":true}'::jsonb]); COMMIT;")
+            policy_sql = "SELECT retention_days || '|' || min_accepted_ms FROM zebridge_private.receipt_policy"
+            source_policy = sql(policy_sql)
             checkpoint = tmp / "checkpoint"
             def dump(path):
                 dump_env = backup.postgres_environment(f"postgres://postgres@127.0.0.1:5432/{source}")
@@ -220,6 +231,16 @@ async def main():
             assert restore.returncode == 0, restore.stderr[-1800:]
             check(sql("SELECT string_agg(v::text,',' ORDER BY v) FROM recovery_row", restored) == "10,20",
                   "pg_restore recovers the checkpoint, including the acknowledged client mutation")
+            check(sql(f"SELECT status || '|' || outcome::text FROM zebridge_private.claim_receipts({receipt_args})", restored)
+                  == 'duplicate|{"committed": true}'
+                  and int(sql("SELECT count(*) FROM pg_inherits WHERE inhparent = 'zebridge_private.receipts'::regclass", restored)) >= 7,
+                  "restored receipts and partitions answer a replayed ID with its recorded outcome")
+            restored_policy = sql(policy_sql, restored)
+            check(restored_policy == source_policy and int(source_policy.split("|")[1]) > 0,
+                  f"the receipt policy is restored exactly: retention and minimum accepted time ({restored_policy})")
+            sql("SELECT count(*) FROM zebridge_private.maintain_receipts()", restored)  # what the replacement bridge runs at startup
+            check(int(sql(policy_sql, restored).split("|")[1]) >= int(source_policy.split("|")[1]),
+                  "startup maintenance on the restored database keeps or advances the minimum, never lowers it")
             recovered_conf = (checkpoint / "nats-server.conf").read_text()
             recovered_trust = recovered_conf[:recovered_conf.index('\nhost:')]
             new_url, _, _, _, _ = await start_hub(restored, 1, recovered_trust, checkpoint / "bridge.creds")

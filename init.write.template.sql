@@ -129,6 +129,12 @@ BEGIN
         RAISE EXCEPTION 'refusing to grant edge writes on %: this is a bridge-owned '
                         'table — a forged row here reaches every client', tbl_name;
     END IF;
+    -- Mutation receipts, by schema: the parent, every monthly partition (present or
+    -- future) and the policy row. A forged receipt silences a write that never ran.
+    IF (SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = tbl) = 'zebridge_private' THEN
+        RAISE EXCEPTION 'refusing to grant edge writes on %: zebridge_private holds the bridge''s '
+                        'mutation receipts', tbl_name;
+    END IF;
 
     -- DELETE as well as SELECT/INSERT/UPDATE, for two paths that both need it:
     --
@@ -1142,6 +1148,286 @@ BEGIN
 END $$;
 
 GRANT SELECT, INSERT, UPDATE ON public.zebridge_gc_watermark TO ${POSTGRES_WRITER_USER};
+
+
+-- ─── Mutation receipts: one durable outcome per (principal, original message ID) ─────
+-- A retried write must never execute twice, however long its device stayed offline.
+-- JetStream deduplicates for two minutes; a receipt is the database's own record,
+-- committed in the same transaction as the write it describes.
+--
+-- Everything lives in zebridge_private, not public: the public DDL triggers never
+-- announce its monthly partitions, the reader's public grants never reach it, no edge
+-- mutation can name it, and the writer only EXECUTEs the three functions granted below.
+-- The functions are SECURITY DEFINER with search_path = pg_catalog: every name in
+-- them is schema-qualified.
+CREATE SCHEMA IF NOT EXISTS zebridge_private;
+REVOKE ALL ON SCHEMA zebridge_private FROM PUBLIC;
+GRANT USAGE ON SCHEMA zebridge_private TO ${POSTGRES_WRITER_USER};
+
+-- The first day of the UTC month holding epoch milliseconds `ms`. Date arithmetic
+-- only, so it is IMMUTABLE (a timestamptz detour would depend on TimeZone).
+CREATE OR REPLACE FUNCTION zebridge_private.month_of_ms(ms bigint)
+RETURNS date LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+    SELECT make_date(extract(year FROM d)::int, extract(month FROM d)::int, 1)
+    FROM (SELECT DATE '1970-01-01' + (ms / 86400000)::int AS d) s
+$$;
+
+-- A new-format ID's creation time: zb1-t<epoch-ms>-<rest>. NULL for anything else.
+CREATE OR REPLACE FUNCTION zebridge_private.receipt_created_ms(message_id text)
+RETURNS bigint LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+    SELECT (pg_catalog.regexp_match(message_id, '^zb1-t([0-9]{1,15})-.'))[1]::bigint
+$$;
+
+-- The partition month of a message ID, from the ID alone: a retry of the same ID always
+-- addresses the same partition, so the primary key below is unique across months.
+-- No zb1- prefix: a legacy ID, all in the 1900-01 sentinel month (no new-format ID can
+-- fall there). zb1- but malformed: NULL, which the CHECK below refuses.
+CREATE OR REPLACE FUNCTION zebridge_private.receipt_month(message_id text)
+RETURNS date LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+    SELECT CASE WHEN message_id !~ '^zb1-' THEN DATE '1900-01-01'
+                ELSE zebridge_private.month_of_ms(zebridge_private.receipt_created_ms(message_id)) END
+$$;
+
+-- outcome is NULL only between the claim and the end of its transaction; the deferred
+-- trigger below refuses a commit that leaves it NULL. There is no default partition:
+-- a month without one is an operational error, never a silently accepted write.
+CREATE TABLE IF NOT EXISTS zebridge_private.receipts (
+    principal   text        NOT NULL,
+    message_id  text        NOT NULL,
+    id_month    date        NOT NULL,
+    fingerprint bytea       NOT NULL CHECK (length(fingerprint) = 32),
+    outcome     jsonb,
+    claimed_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (principal, message_id, id_month),
+    CONSTRAINT receipts_month_from_id CHECK (id_month IS NOT DISTINCT FROM zebridge_private.receipt_month(message_id))
+) PARTITION BY RANGE (id_month);
+
+-- SECURITY DEFINER: a deferred trigger fires at COMMIT as the committing role (the
+-- writer), which has no privilege on this table.
+CREATE OR REPLACE FUNCTION zebridge_private.receipt_finished()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+BEGIN
+    -- Re-read: the same transaction may have finished the row after inserting it.
+    IF EXISTS (SELECT 1 FROM zebridge_private.receipts r
+               WHERE r.principal = NEW.principal AND r.message_id = NEW.message_id
+                 AND r.id_month = NEW.id_month AND r.outcome IS NULL) THEN
+        RAISE EXCEPTION 'receipt % of % would commit without an outcome', NEW.message_id, NEW.principal
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+DROP TRIGGER IF EXISTS receipts_finished ON zebridge_private.receipts;
+CREATE CONSTRAINT TRIGGER receipts_finished AFTER INSERT ON zebridge_private.receipts
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION zebridge_private.receipt_finished();
+
+-- One row: the retention and the minimum accepted creation time. The minimum only ever
+-- rises, so a dropped month can never become admissible again through a config change.
+-- An operator changes retention_days directly; the next maintenance applies it.
+CREATE TABLE IF NOT EXISTS zebridge_private.receipt_policy (
+    singleton       boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    retention_days  integer NOT NULL DEFAULT 180 CHECK (retention_days BETWEEN 1 AND 3650),
+    min_accepted_ms bigint  NOT NULL DEFAULT 0 CHECK (min_accepted_ms >= 0)
+);
+INSERT INTO zebridge_private.receipt_policy DEFAULT VALUES ON CONFLICT DO NOTHING;
+
+CREATE OR REPLACE FUNCTION zebridge_private.receipt_policy_guard()
+RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'the receipt policy row cannot be deleted' USING ERRCODE = '23514';
+    END IF;
+    IF NEW.min_accepted_ms < OLD.min_accepted_ms THEN
+        RAISE EXCEPTION 'min_accepted_ms only rises (% -> %)', OLD.min_accepted_ms, NEW.min_accepted_ms
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS receipt_policy_guard ON zebridge_private.receipt_policy;
+CREATE TRIGGER receipt_policy_guard BEFORE UPDATE OR DELETE ON zebridge_private.receipt_policy
+    FOR EACH ROW EXECUTE FUNCTION zebridge_private.receipt_policy_guard();
+
+-- Raise the minimum to now - retention, then make sure a partition exists for every month
+-- from the minimum through next month, plus the legacy month. Returns what it created.
+-- The bridge runs it at startup and daily; the policy row lock serializes two bridges.
+-- It never drops anything: see prune_receipts.
+CREATE OR REPLACE FUNCTION zebridge_private.maintain_receipts()
+RETURNS SETOF text LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+    now_ms   bigint := (extract(epoch FROM clock_timestamp()) * 1000)::bigint;
+    pol      record;
+    floor_ms bigint;
+    m        date;
+    last_m   date;
+    part     text;
+BEGIN
+    SELECT * INTO pol FROM zebridge_private.receipt_policy FOR UPDATE;
+    floor_ms := greatest(pol.min_accepted_ms, now_ms - pol.retention_days::bigint * 86400000);
+    IF floor_ms > pol.min_accepted_ms THEN
+        UPDATE zebridge_private.receipt_policy SET min_accepted_ms = floor_ms;
+    END IF;
+    IF to_regclass('zebridge_private.receipts_legacy') IS NULL THEN
+        CREATE TABLE zebridge_private.receipts_legacy PARTITION OF zebridge_private.receipts
+            FOR VALUES FROM ('1900-01-01') TO ('1900-02-01');
+        RETURN NEXT 'receipts_legacy';
+    END IF;
+    m := zebridge_private.month_of_ms(floor_ms);
+    last_m := (zebridge_private.month_of_ms(now_ms) + interval '1 month')::date;
+    WHILE m <= last_m LOOP
+        part := 'receipts_' || to_char(m, 'YYYY_MM');
+        IF to_regclass('zebridge_private.' || part) IS NULL THEN
+            EXECUTE format('CREATE TABLE zebridge_private.%I PARTITION OF zebridge_private.receipts FOR VALUES FROM (%L) TO (%L)',
+                           part, m, (m + interval '1 month')::date);
+            RETURN NEXT part;
+        END IF;
+        m := (m + interval '1 month')::date;
+    END LOOP;
+END;
+$$;
+
+-- Drop whole months that ended before the minimum accepted month. Explicit, operator-run:
+-- nothing calls it automatically. The legacy partition is never dropped here.
+CREATE OR REPLACE FUNCTION zebridge_private.prune_receipts()
+RETURNS SETOF text LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+    floor_m date;
+    p       record;
+BEGIN
+    SELECT zebridge_private.month_of_ms(min_accepted_ms) INTO floor_m FROM zebridge_private.receipt_policy;
+    FOR p IN SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+              WHERE i.inhparent = 'zebridge_private.receipts'::regclass
+                AND c.relname ~ '^receipts_[0-9]{4}_[0-9]{2}$'
+                AND to_date(substr(c.relname, 10), 'YYYY_MM') < floor_m
+              ORDER BY c.relname
+    LOOP
+        EXECUTE format('DROP TABLE zebridge_private.%I', p.relname);
+        RETURN NEXT p.relname;
+    END LOOP;
+END;
+$$;
+
+-- Claim a batch's receipts before its writes execute. One row per input position:
+--   claimed   new: execute it, then finish_receipts with its outcome, same transaction
+--   duplicate already decided: do NOT execute; `outcome` is the recorded one
+--   repeat    the same ID earlier in this batch, same content: answer as that one
+--   conflict  the same ID with different content (here or recorded): refuse it
+--   expired   created before the minimum accepted time: not executed by this attempt
+--   future    created more than 60 s ahead of this database's clock: refuse it
+--   invalid   empty, too long, not one subject token, or a malformed zb1- ID
+-- The fingerprint is sha256 of the route's length (4 bytes), the route, then the payload:
+-- the exact bytes received, never re-serialized JSON. Keys are inserted sorted, so
+-- concurrent batches take index locks in one order. Under READ COMMITTED each statement
+-- below takes a fresh snapshot: the lookup after the insert sees a concurrent winner.
+CREATE OR REPLACE FUNCTION zebridge_private.claim_receipts(p_principal text, p_ids text[], p_routes bytea[], p_payloads bytea[])
+RETURNS TABLE(ord integer, status text, outcome jsonb)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+    now_ms   bigint := (extract(epoch FROM clock_timestamp()) * 1000)::bigint;
+    floor_ms bigint;
+    fps      bytea[];
+    months   date[];
+    verdicts text[];
+    claimed  text[];
+BEGIN
+    IF p_principal IS NULL OR p_principal = '' THEN
+        RAISE EXCEPTION 'a receipt needs an authenticated principal' USING ERRCODE = '22023';
+    END IF;
+    IF cardinality(p_ids) IS DISTINCT FROM cardinality(p_routes)
+       OR cardinality(p_ids) IS DISTINCT FROM cardinality(p_payloads) THEN
+        RAISE EXCEPTION 'claim_receipts: ids, routes and payloads differ in length' USING ERRCODE = '22023';
+    END IF;
+    SELECT min_accepted_ms INTO floor_ms FROM zebridge_private.receipt_policy;
+
+    -- 1. Fingerprint and classify every position (positions keep the input order).
+    SELECT array_agg(i.fp ORDER BY i.n), array_agg(i.m ORDER BY i.n), array_agg(i.v ORDER BY i.n)
+      INTO fps, months, verdicts
+      FROM (SELECT x.n,
+                   sha256(int4send(length(x.r)) || x.r || x.p) AS fp,
+                   zebridge_private.receipt_month(x.id) AS m,
+                   CASE WHEN x.id IS NULL OR x.r IS NULL OR x.p IS NULL
+                             -- (PostgreSQL caps a regex repetition at 255: length apart)
+                             OR length(x.id) NOT BETWEEN 1 AND 512 OR x.id ~ '[.*>[:space:][:cntrl:]]'
+                             OR zebridge_private.receipt_month(x.id) IS NULL THEN 'invalid'
+                        WHEN zebridge_private.receipt_created_ms(x.id) < floor_ms THEN 'expired'
+                        WHEN zebridge_private.receipt_created_ms(x.id) > now_ms + 60000 THEN 'future'
+                        ELSE 'candidate' END AS v
+              FROM unnest(p_ids, p_routes, p_payloads) WITH ORDINALITY AS x(id, r, p, n)) i;
+
+    -- 2. Claim the first occurrence of each candidate ID, keys sorted.
+    WITH firsts AS (
+        SELECT DISTINCT ON (p_ids[n]) p_ids[n] AS id, months[n] AS m, fps[n] AS fp
+          FROM generate_subscripts(p_ids, 1) AS n
+         WHERE verdicts[n] = 'candidate'
+         ORDER BY p_ids[n], n
+    ), ins AS (
+        INSERT INTO zebridge_private.receipts (principal, message_id, id_month, fingerprint)
+        SELECT p_principal, f.id, f.m, f.fp FROM firsts f ORDER BY f.id
+        ON CONFLICT (principal, message_id, id_month) DO NOTHING
+        RETURNING message_id
+    )
+    SELECT coalesce(array_agg(message_id), '{}') INTO claimed FROM ins;
+
+    -- 3. Answer every position. A new statement, so a fresh snapshot.
+    RETURN QUERY
+    SELECT n::integer,
+           CASE WHEN verdicts[n] <> 'candidate' THEN verdicts[n]
+                WHEN EXISTS (SELECT 1 FROM generate_subscripts(p_ids, 1) e
+                             WHERE e < n AND p_ids[e] = p_ids[n] AND verdicts[e] = 'candidate')
+                     THEN CASE WHEN fps[n] = fps[(SELECT min(e) FROM generate_subscripts(p_ids, 1) e
+                                                  WHERE p_ids[e] = p_ids[n] AND verdicts[e] = 'candidate')]
+                               THEN 'repeat' ELSE 'conflict' END
+                WHEN p_ids[n] = ANY (claimed) THEN 'claimed'
+                WHEN rec.fingerprint = fps[n] THEN 'duplicate'
+                ELSE 'conflict' END,
+           CASE WHEN verdicts[n] = 'candidate' AND NOT (p_ids[n] = ANY (claimed)) AND rec.fingerprint = fps[n]
+                THEN rec.outcome END
+      FROM generate_subscripts(p_ids, 1) AS n
+      LEFT JOIN zebridge_private.receipts rec
+             ON verdicts[n] = 'candidate' AND rec.principal = p_principal
+            AND rec.message_id = p_ids[n] AND rec.id_month = months[n]
+     ORDER BY n;
+END;
+$$;
+
+-- Record the outcome of every receipt this transaction claimed. Refuses an ID that is not
+-- an unfinished claim visible to this transaction, and a NULL outcome.
+CREATE OR REPLACE FUNCTION zebridge_private.finish_receipts(p_principal text, p_ids text[], p_outcomes jsonb[])
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+    done integer;
+BEGIN
+    IF cardinality(p_ids) IS DISTINCT FROM cardinality(p_outcomes) OR array_position(p_outcomes, NULL) IS NOT NULL THEN
+        RAISE EXCEPTION 'finish_receipts: one non-null outcome per ID' USING ERRCODE = '22023';
+    END IF;
+    UPDATE zebridge_private.receipts r SET outcome = o.outcome
+      FROM unnest(p_ids, p_outcomes) AS o(id, outcome)
+     WHERE r.principal = p_principal AND r.message_id = o.id
+       AND r.id_month = zebridge_private.receipt_month(o.id) AND r.outcome IS NULL;
+    GET DIAGNOSTICS done = ROW_COUNT;
+    IF done <> cardinality(p_ids) THEN
+        RAISE EXCEPTION 'finish_receipts: % of % IDs were unfinished claims of %', done, cardinality(p_ids), p_principal
+            USING ERRCODE = '23514';
+    END IF;
+END;
+$$;
+
+DO $$
+DECLARE
+    f regprocedure;
+BEGIN
+    FOR f IN SELECT p.oid::regprocedure FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'zebridge_private'
+    LOOP
+        EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', f);
+    END LOOP;
+END $$;
+GRANT EXECUTE ON FUNCTION zebridge_private.maintain_receipts() TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.claim_receipts(text, text[], bytea[], bytea[]) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.finish_receipts(text, text[], jsonb[]) TO ${POSTGRES_WRITER_USER};
+-- No partition is created here: the bridge runs maintain_receipts at startup. A recovery
+-- applies this file before `pg_restore --clean`, which cannot drop a partition's
+-- inherited primary key; with no partitions present it restores the dumped ones intact.
 
 
 -- ─── The writer's EXECUTE, and the same rules for this file's functions ───────────────
