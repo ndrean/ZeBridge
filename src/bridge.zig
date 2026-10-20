@@ -1506,6 +1506,9 @@ pub fn main(init: std.process.Init) !void {
     // Use c_allocator (thread-safe) for cross-thread allocations:
     // Main thread allocates CDC event data, flush thread deallocates it
     // Returns *BatchPublisher to ensure memory stability for flush thread
+    // Routing borrows this prefix until the publisher has stopped and been destroyed.
+    const tenants_kv_prefix = try std.fmt.allocPrint(allocator, "$KV.{s}.", .{runtime_config.topology.kv_tenants});
+    defer allocator.free(tenants_kv_prefix);
     const batch_pub = try initBatchPublisher(
         event_alloc,
         &publisher,
@@ -1514,19 +1517,18 @@ pub fn main(init: std.process.Init) !void {
         resolved_max_columns,
         &hot,
     );
+    defer batch_pub.deinit(); // Joins the flush thread and frees the publisher itself.
     // A row for a tenant nobody is mapped to yet has no stream: skipped, not fatal.
     batch_pub.tenant_routing = .{
         .cdc_prefix = runtime_config.topology.subject_cdc_prefix,
         .stream_prefix = runtime_config.topology.cdc_stream_prefix,
         .open_tenant = runtime_config.topology.open_tenant,
         // A missing stream of a tenant someone is mapped to is a fault (see `members`).
-        .tenants_kv_prefix = try std.fmt.allocPrint(allocator, "$KV.{s}.", .{runtime_config.topology.kv_tenants}),
+        .tenants_kv_prefix = tenants_kv_prefix,
     };
     // Start flush thread - batch_pub is now at stable heap address
     try batch_pub.start();
-    defer batch_pub.join();
     errdefer should_stop.store(true, .seq_cst);
-    defer batch_pub.deinit(); // Will free the heap-allocated BatchPublisher itself
 
     // === Initialize EventProcessor (in this main thread, the CDC processing)
     // EventProcessor enqueues to the SPSC queue that BatchPublisher consumes
