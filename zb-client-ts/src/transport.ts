@@ -78,13 +78,15 @@ export const natsTransport: Transport = {
   connect: (opts) => wsconnect(opts as any),
   credsAuthenticator: (creds) => credsAuthenticator(creds),
   headers: () => headers(),
-  jetstream: (nc, js) => jetstream(nc, js),
-  jetstreamManager: (nc, js) => jetstreamManager(nc, js),
+  // NATS normalizes options in place (domain becomes apiPrefix). Keep the
+  // caller's domain intact when a seed attempt reuses it across factories.
+  jetstream: (nc, js) => jetstream(nc, js && { ...js }),
+  jetstreamManager: (nc, js) => jetstreamManager(nc, js && { ...js }),
   // Kvm and Objm take a connection OR a JetStream client; handing them the client
   // built with the domain is how the domain reaches the bucket's own API calls.
-  kv: (nc, bucket, opts, js) => new Kvm(jetstream(nc, js)).open(bucket, opts as any),
-  objectStore: (nc, bucket, js) => new Objm(jetstream(nc, js)).open(bucket),
-  objectStoreCreate: (nc, bucket, opts, js) => new Objm(jetstream(nc, js)).create(bucket, { max_age: opts.max_age_ns, description: 'ZeBridge answers (§10hq)' } as any),
+  kv: (nc, bucket, opts, js) => new Kvm(jetstream(nc, js && { ...js })).open(bucket, opts as any),
+  objectStore: (nc, bucket, js) => new Objm(jetstream(nc, js && { ...js })).open(bucket),
+  objectStoreCreate: (nc, bucket, opts, js) => new Objm(jetstream(nc, js && { ...js })).create(bucket, { max_age: opts.max_age_ns, description: 'ZeBridge answers (§10hq)' } as any),
   nkeySign: (seed, data) => {
     const kp = nkeysFromSeed(new TextEncoder().encode(seed));
     try { return { publicKey: kp.getPublicKey(), signature: kp.sign(data) }; } finally { kp.clear(); }

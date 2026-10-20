@@ -126,6 +126,10 @@ export interface ZeBridgeConfig {
   /// hub's. The wrong value is not detectable at connect: every API call simply gets
   /// no responder, so it fails at the first request.
   jsDomain?: string;
+  /// Optional JetStream domain of the connected leaf's seed mirrors. Generation
+  /// manifests and objects are read there first; a missing, stale or incomplete
+  /// copy falls back to jsDomain. Schemas, membership, CDC and writes use jsDomain.
+  seedDomain?: string;
   /// The bridge's HTTP url: where `invite` is redeemed (`/enroll`) and the JWT renewed
   /// (`/renew`), kept in the identity; and where the grammar hash is fetched when
   /// `grammarHash` is unset. libzb: same name.
@@ -2744,11 +2748,11 @@ export class ZeBridge {
   /// `OBJ_<bucket>`, so they are fetched the way CDC is — a pull consumer, nothing
   /// to answer — 16 MB in 78 ms, and the object's own SHA-256 is checked before
   /// the blob is trusted.
-  private async objectBlob(os: any, bucket: string, name: string): Promise<Uint8Array | null> {
+  private async objectBlob(os: any, bucket: string, name: string, jsOpts: JetStreamOpts | undefined = this.jsOpts()): Promise<Uint8Array | null> {
     const info = await os.info(name);
     if (!info || info.deleted) return null;
     if (!info.chunks || !info.size) return new Uint8Array(0);
-    const js = this.transport.jetstream(this.nc!, this.jsOpts());
+    const js = this.transport.jetstream(this.nc!, jsOpts);
     const c = await js.consumers.get(`OBJ_${bucket}`, { filter_subjects: [`$O.${bucket}.C.${info.nuid}`] });
     const parts: Uint8Array[] = [];
     let got = 0;
@@ -2791,11 +2795,11 @@ export class ZeBridge {
 
   /// §10ix: the streaming read of one plan step, or null for the buffered path —
   /// streaming off, or an object under `seedStreamingAboveBytes`.
-  private async chainStepStream(os: any, bucket: string, step: PlanStep, table: string):
+  private async chainStepStream(os: any, bucket: string, step: PlanStep, table: string, jsOpts: JetStreamOpts | undefined):
     Promise<{ columns: string[]; nrows: number; batches: AsyncIterable<any[][]>; tail: () => Promise<Record<string, any>> } | null> {
     if (!this.config.seedStreaming) return null;
     let src: { info: any; chunks: AsyncIterable<Uint8Array> } | null;
-    try { src = await this.objectChunkStream(os, bucket, step.name); }
+    try { src = await this.objectChunkStream(os, bucket, step.name, jsOpts); }
     catch (e) { this.appendLog('SYS', `${table}: chain object ${step.name} unreadable: ${e}`, 'ERROR'); return null; }
     if (!src || src.info.size < (this.config.seedStreamingAboveBytes ?? 8 * 1024 * 1024)) return null;
     const doc = await this.chainDocStream(await this.zstdChunkStream(src.chunks));
@@ -2808,14 +2812,14 @@ export class ZeBridge {
   /// folded in as they pass and checked after the last one: a truncated or corrupt
   /// object still fails, only after the rows it did deliver, and before the watermark
   /// that would have made them count.
-  private async objectChunkStream(os: any, bucket: string, name: string): Promise<{ info: any; chunks: AsyncIterable<Uint8Array> } | null> {
+  private async objectChunkStream(os: any, bucket: string, name: string, jsOpts: JetStreamOpts | undefined): Promise<{ info: any; chunks: AsyncIterable<Uint8Array> } | null> {
     const info = await os.info(name);
     if (!info || info.deleted) return null;
     const self = this;
     async function* chunks(): AsyncGenerator<Uint8Array> {
       if (!info.chunks || !info.size) return;
       const hash = await self.streamingSha256();
-      const js = self.transport.jetstream(self.nc!, self.jsOpts());
+      const js = self.transport.jetstream(self.nc!, jsOpts);
       const c = await js.consumers.get(`OBJ_${bucket}`, { filter_subjects: [`$O.${bucket}.C.${info.nuid}`] });
       let n = 0, got = 0;
       while (n < info.chunks) {
@@ -3010,6 +3014,18 @@ export class ZeBridge {
   }
 
   private async applyGenerationsOnce(table: string): Promise<boolean> {
+    if (this.config.seedDomain && this.config.seedDomain !== this.config.jsDomain) {
+      try {
+        if (await this.applyGenerationsFrom(table, { domain: this.config.seedDomain })) return true;
+      } catch (e) {
+        this.appendLog('SYS', `${table}: leaf seed failed: ${e}`, 'WARNING');
+      }
+      this.appendLog('SYS', `${table}: leaf chain unavailable or behind — seeding from the hub`, 'INFO');
+    }
+    return this.applyGenerationsFrom(table, this.jsOpts());
+  }
+
+  private async applyGenerationsFrom(table: string, seedOpts: JetStreamOpts | undefined): Promise<boolean> {
     const GEN = this.config.grammar.generations;
     if (!GEN || !this.nc) return false;
     const state = this.syncedTables.get(table);
@@ -3032,7 +3048,7 @@ export class ZeBridge {
     const key = `${tenantForTable}.${table}`;
     const readManifest = async (): Promise<any | null> => {
       try {
-        const kv = await this.transport.kv(this.nc!, GEN.kv, { allow_direct: true }, this.jsOpts());
+        const kv = await this.transport.kv(this.nc!, GEN.kv, { allow_direct: true }, seedOpts);
         const entry = await kv.get(key);
         // A swept chain (§10dg) leaves a DEL marker with an empty value: no manifest.
         if (!entry || entry.operation !== 'PUT' || !entry.value?.length) return null;
@@ -3112,10 +3128,10 @@ export class ZeBridge {
     }
 
     let os: any;
-    try { os = await this.transport.objectStore(this.nc, manifest.bucket, this.jsOpts()); } catch (e) { this.appendLog('SYS', `${table}: chain bucket ${manifest.bucket} unreachable: ${e}`, 'ERROR'); return false; }
+    try { os = await this.transport.objectStore(this.nc, manifest.bucket, seedOpts); } catch (e) { this.appendLog('SYS', `${table}: chain bucket ${manifest.bucket} unreachable: ${e}`, 'ERROR'); return false; }
     const fetchDoc = async (name: string): Promise<any | null> => {
       try {
-        let blob = await this.objectBlob(os, manifest.bucket, name);
+        let blob = await this.objectBlob(os, manifest.bucket, name, seedOpts);
         if (!blob) return null;
         blob = await this.maybeZstd(blob); // §10w: sniffed by magic, mixed chains fine
         return decode(blob) as any; // objects are msgpack
@@ -3137,7 +3153,7 @@ export class ZeBridge {
       for (const step of plan) {
         // §10ix: a large step streams; anything else, or any host that cannot stream,
         // takes the buffered path. Both apply through the same `applyWindow` below.
-        const stream = await this.chainStepStream(os, manifest.bucket, step, table);
+        const stream = await this.chainStepStream(os, manifest.bucket, step, table, seedOpts);
         const doc = stream ? null : await fetchDoc(step.name);
         if (!stream && !doc) return null; // pruned under us — caller re-reads
         const cols: string[] = (stream ? stream.columns : doc.columns) ?? [];

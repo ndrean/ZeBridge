@@ -6,6 +6,30 @@ import { encode, decode, decodeMulti } from '@msgpack/msgpack';
 import { parseChainHead, chainStageSql, msgpackScan, msgpackDecodeScanned } from './core.ts';
 import { sha256 } from 'js-sha256';
 import { cdcValue, pgEngineValues, isBytes, pgArrayValues, sortRowsByKey, chainBulkSql, chainChunkJson, vecColsOf, vecLiteral, pgVectorValues } from './core.ts';
+import { natsTransport } from './transport.ts';
+
+test('transport factories preserve reusable seed-domain options', async () => {
+  const requests: string[] = [];
+  const nc = {
+    options: { inboxPrefix: '_INBOX.test' },
+    info: { version: '2.15.0' },
+    features: { get: () => ({ ok: true, min: '2.10.0' }) },
+    request: async (subject: string) => {
+      requests.push(subject);
+      return { data: new TextEncoder().encode(JSON.stringify({ config: { name: 'OBJ_seed', subjects: ['$O.seed.>'] }, state: {} })) };
+    },
+  };
+  const opts = Object.freeze({ domain: 'leaf' });
+  const js = natsTransport.jetstream(nc, opts);
+  assert.equal(js.apiPrefix, '$JS.leaf.API');
+  await natsTransport.jetstreamManager(nc, opts);
+  await natsTransport.kv(nc, 'generations', { allow_direct: true }, opts);
+  await natsTransport.objectStore(nc, 'seed', opts);
+  await natsTransport.objectStoreCreate(nc, 'seed', { max_age_ns: 1_000_000 }, opts);
+  assert.deepEqual(opts, { domain: 'leaf' });
+  assert.ok(requests.length > 0);
+  assert.ok(requests.every((subject) => subject.startsWith('$JS.leaf.API.')));
+});
 
 test('a chunk in one statement through json_each, version-guarded (§10fc)', () => {
   const sql = chainBulkSql('t', ['uid', 'n', 'updated_at'], ['uid'], 'updated_at');

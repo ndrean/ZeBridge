@@ -162,6 +162,7 @@ One vocabulary: the same key means the same thing in libzb's `opts_json` and in 
 | `seedChunkRows` | ✅ | ✅ |
 | `seedStreaming`, `seedStreamingAboveBytes` | ✅ | ✅ |
 | `jsDomain` | ✅ | ✅ |
+| `seedDomain` | ✅ optional leaf domain for generation manifests and objects; falls back to `jsDomain` | ✅ the same, for buffered and streaming seeds; schemas, membership, CDC and writes still use `jsDomain` |
 | `caFile` | ✅ a PEM bundle of trusted roots for `https://` enrollment and renewal and a `tls://` NATS URL, in place of the system's. Unset on iOS and Android, where Zig reads no trust store, libzb uses its own copy of Mozilla's bundle (refreshed by `libzb/scripts/refresh-roots.sh`) | — (the platform's TLS: the browser's; on Node its built-in roots, `NODE_EXTRA_CA_CERTS` for a private CA) |
 | `bulkCdc`, `bulkStatement`, `cdcBatchEvents` | — (the DuckDB path is always bulk, SQLite per event) | ✅ tuning |
 | `platform` | — (one build per platform) | asserts the entry the bundler picked |
