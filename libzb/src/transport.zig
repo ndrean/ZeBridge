@@ -418,6 +418,30 @@ pub const Transport = struct {
         };
     }
 
+    /// Query replies name the tenant in the inbox, allowing a restricted leaf to
+    /// answer that tenant's requests without permission to publish all inboxes.
+    pub fn requestQuery(self: *Transport, a: std.mem.Allocator, principal: []const u8, prefix: []const u8, subject: []const u8, payload: []const u8, timeout: std.Io.Timeout) !*nats.Message {
+        var parts = std.mem.splitScalar(u8, subject, '.');
+        if (!std.mem.eql(u8, parts.next() orelse "", prefix)) return self.conn.request(subject, payload, timeout);
+        const tenant = parts.next() orelse return error.MalformedQuerySubject;
+        if (tenant.len == 0 or std.mem.findAny(u8, tenant, "*> \t\r\n") != null or parts.next() == null) return error.MalformedQuerySubject;
+        const fresh = try self.conn.newInbox(a);
+        defer a.free(fresh);
+        const nonce = fresh[(std.mem.findScalarLast(u8, fresh, '.') orelse return error.MalformedInbox) + 1 ..];
+        const reply = try std.fmt.allocPrint(a, "_INBOX.{s}.query.{s}.{s}", .{ principal, tenant, nonce });
+        defer a.free(reply);
+        const sub = try self.conn.subscribeSync(reply);
+        defer sub.deinit();
+        sub.setPendingLimits(1, 2 << 20);
+        try self.conn.publishRequest(subject, reply, payload);
+        const msg = try sub.nextMsgTimeout(timeout);
+        if (msg.isNoResponders()) {
+            msg.deinit();
+            return error.NoResponders;
+        }
+        return msg;
+    }
+
     /// Core subscription (the verdict channel `mutation_ack.<principal>.>`).
     /// §10hp: a QUEUE subscription the caller drains itself. The async form would
     /// deliver on the reader's thread, which a host-driven client does not own; this

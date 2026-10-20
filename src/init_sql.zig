@@ -8,7 +8,7 @@
 //! that will run on it. The values come from where they already live:
 //!   role names and passwords  ← DATABASE_READER_URL / DATABASE_WRITER_URL
 //!   TARGET_DB                 ← the reader URL's database (TARGET_DB overrides)
-//!   OPEN_TENANT               ← the embedded grammar
+//!   OPEN_TENANT, LEAF_PREFIX  ← the embedded grammar
 //! No DATABASE_WRITER_URL: the read-only profile (init.core only), as the bridge itself
 //! runs without ingress. BRIDGE_CDC_PUBLICATION set: `zebridge_create_publication` is
 //! appended, so one pipe does the whole of step 3.
@@ -67,6 +67,7 @@ pub fn run(io: std.Io, init: *const std.process.Init) u8 {
         .{ .name = "POSTGRES_WRITER_PASSWORD", .value = if (writer) |w| (quoteDoubled(a, w.password) catch return 1) else "" },
         .{ .name = "TARGET_DB", .value = target_db },
         .{ .name = "OPEN_TENANT", .value = open_tenant },
+        .{ .name = "LEAF_PREFIX", .value = owned.topology.leaf_prefix },
     };
 
     var sql: std.ArrayList(u8) = .empty;
@@ -229,7 +230,7 @@ test "render substitutes, quotes passwords, and refuses a leftover" {
 }
 
 test "both embedded templates name only the six known variables" {
-    const known = [_][]const u8{ "POSTGRES_READER_USER", "POSTGRES_READER_PASSWORD", "POSTGRES_WRITER_USER", "POSTGRES_WRITER_PASSWORD", "TARGET_DB", "OPEN_TENANT" };
+    const known = [_][]const u8{ "POSTGRES_READER_USER", "POSTGRES_READER_PASSWORD", "POSTGRES_WRITER_USER", "POSTGRES_WRITER_PASSWORD", "TARGET_DB", "OPEN_TENANT", "LEAF_PREFIX" };
     for ([_][]const u8{ core_template, write_template }) |t| {
         var i: usize = 0;
         while (std.mem.findPos(u8, t, i, "${")) |start| {

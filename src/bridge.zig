@@ -2952,6 +2952,10 @@ fn reconcileCdcStreams(
 ) !void {
     const js = if (publisher.js) |*j| j else return error.NotConnected;
 
+    // Restricted leaves consume filtered manifest projections, never the shared KV.
+    if (publisher.config.endpoint.js_domain) |domain|
+        try @import("leaf_scope.zig").ensureProjections(allocator, publisher.conn.?, topo, domain);
+
     // ── per-tenant streams: ensure, create when missing ─────────────────────────
     for (topo.tenants) |tenant| {
         // ⚠️ The OPEN tenant's rows ride CDC_PUBLIC — `cdc.<open>.>` is already in its

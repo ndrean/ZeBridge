@@ -1831,7 +1831,8 @@ pub const MutationListener = struct {
     /// the catalogue, which is the whole difference between the three, and it is the
     /// one that was actually exploited (§10aq).
     fn isForbiddenTable(table: []const u8) bool {
-        return std.mem.eql(u8, table, "zebridge_ddl_events") or
+        return std.mem.eql(u8, table, "zebridge_leaf_scopes") or
+            std.mem.eql(u8, table, "zebridge_ddl_events") or
             std.mem.eql(u8, table, "zebridge_gc_watermark") or
             std.mem.eql(u8, table, "zebridge_user_tenants") or
             std.mem.eql(u8, table, "zebridge_invites") or

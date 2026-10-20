@@ -121,7 +121,8 @@ BEGIN
     -- This does not revoke what the BRIDGE itself needs (the sweeper writes the
     -- watermark as bridge_writer, and must keep that grant). It refuses to hand those
     -- tables to the EDGE, which is a different question and the one that was wrong.
-    IF tbl_name IN ('zebridge_ddl_events',   'public.zebridge_ddl_events',
+    IF tbl_name IN ('zebridge_leaf_scopes', 'public.zebridge_leaf_scopes',
+                    'zebridge_ddl_events',   'public.zebridge_ddl_events',
                     'zebridge_gc_watermark', 'public.zebridge_gc_watermark',
                     'zebridge_user_tenants', 'public.zebridge_user_tenants',
                     'zebridge_invites',      'public.zebridge_invites') THEN
@@ -710,6 +711,58 @@ ALTER TABLE public.zebridge_user_tenants DROP CONSTRAINT IF EXISTS zebridge_user
 ALTER TABLE public.zebridge_user_tenants ADD CONSTRAINT zebridge_user_tenants_tenant_id_check CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]');
 GRANT SELECT ON public.zebridge_user_tenants TO ${POSTGRES_READER_USER}, ${POSTGRES_WRITER_USER};
 
+-- A restricted leaf owns a principal namespace <leaf_id>.<device>. Register
+-- its explicit tenant list before issuing leaf-scoped invites or link credentials.
+-- This table is admin-owned; the bridge can only read it. A leaf id starts with
+-- ${LEAF_PREFIX} (grammar.json leaf_prefix) and no plain principal may: a principal
+-- named like a leaf would sit above <leaf_id>.<device> in every wildcard grant.
+-- A leaf id must also never have been used as a hub principal.
+CREATE TABLE IF NOT EXISTS public.zebridge_leaf_scopes (
+    leaf_id text PRIMARY KEY,
+    tenant_ids text[] NOT NULL CHECK (cardinality(tenant_ids) > 0
+        AND array_position(tenant_ids, NULL) IS NULL
+        AND array_position(tenant_ids, '') IS NULL
+        AND array_to_string(tenant_ids, '') ~ '^[A-Za-z0-9_-]+$'),
+    nats_url text,
+    nats_ws_url text
+);
+ALTER TABLE public.zebridge_leaf_scopes DROP CONSTRAINT IF EXISTS zebridge_leaf_scopes_leaf_id_check;
+ALTER TABLE public.zebridge_leaf_scopes ADD CONSTRAINT zebridge_leaf_scopes_leaf_id_check
+    CHECK (leaf_id ~ '^${LEAF_PREFIX}[A-Za-z0-9_-]+$' AND length(leaf_id) <= 64);
+GRANT SELECT ON public.zebridge_leaf_scopes TO ${POSTGRES_READER_USER}, ${POSTGRES_WRITER_USER};
+
+CREATE OR REPLACE FUNCTION public.zebridge_check_leaf_membership(p_principal text, p_tenant text)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE scope text;
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtextextended(split_part(p_principal, '.', 1), 0));
+    IF p_principal ~ '^${LEAF_PREFIX}[A-Za-z0-9_-]+[.][A-Za-z0-9_-]+$' THEN
+        scope := split_part(p_principal, '.', 1);
+        PERFORM 1 FROM public.zebridge_leaf_scopes
+            WHERE leaf_id = scope AND p_tenant = ANY(tenant_ids) FOR SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'principal % is outside its registered leaf tenant list', p_principal
+                USING ERRCODE = '23514';
+        END IF;
+    ELSIF p_principal !~ '^[A-Za-z0-9_-]+$' OR p_principal ~ '^${LEAF_PREFIX}' THEN
+        RAISE EXCEPTION 'invalid or reserved principal namespace %', p_principal USING ERRCODE = '23514';
+    END IF;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.zebridge_check_leaf_membership(text, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.zebridge_check_leaf_membership(text, text) TO ${POSTGRES_WRITER_USER};
+
+CREATE OR REPLACE FUNCTION public.zebridge_guard_leaf_membership()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+    PERFORM public.zebridge_check_leaf_membership(NEW.principal, NEW.tenant_id);
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS zebridge_guard_leaf_membership_t ON public.zebridge_user_tenants;
+CREATE TRIGGER zebridge_guard_leaf_membership_t BEFORE INSERT OR UPDATE ON public.zebridge_user_tenants
+    FOR EACH ROW EXECUTE FUNCTION public.zebridge_guard_leaf_membership();
+
 -- The keys a principal enrolled with (§10cl). /enroll used to mint from the pubkey
 -- and FORGET it — which made any future hard kill (the NATS account revocation list,
 -- keyed by user pubkey) impossible to retrofit: you cannot revoke a key you never
@@ -786,6 +839,13 @@ CREATE TABLE IF NOT EXISTS public.zebridge_invites (
 );
 -- The role column is gone: nothing read it, and a value other than 'client' was accepted
 -- and ignored. An existing table loses it here.
+ALTER TABLE public.zebridge_invites DROP CONSTRAINT IF EXISTS zebridge_invites_principal_check;
+ALTER TABLE public.zebridge_invites ADD CONSTRAINT zebridge_invites_principal_check
+    CHECK ((principal ~ '^[A-Za-z0-9_-]+$' AND principal !~ '^${LEAF_PREFIX}')
+        OR principal ~ '^${LEAF_PREFIX}[A-Za-z0-9_-]+[.][A-Za-z0-9_-]+$');
+DROP TRIGGER IF EXISTS zebridge_guard_leaf_membership_t ON public.zebridge_invites;
+CREATE TRIGGER zebridge_guard_leaf_membership_t BEFORE INSERT OR UPDATE OF principal, tenant_id ON public.zebridge_invites
+    FOR EACH ROW EXECUTE FUNCTION public.zebridge_guard_leaf_membership();
 ALTER TABLE public.zebridge_invites DROP COLUMN IF EXISTS role;
 ALTER TABLE public.zebridge_invites DROP CONSTRAINT IF EXISTS zebridge_invites_tenant_id_check;
 ALTER TABLE public.zebridge_invites ADD CONSTRAINT zebridge_invites_tenant_id_check CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]');
@@ -801,6 +861,34 @@ GRANT INSERT ON public.zebridge_user_tenants TO ${POSTGRES_WRITER_USER};
 -- Creating an invite without the admin — see SECURITY.md §1.6. An app's backend, after its
 -- own sign-in, asks for an invite for the principal and tenant it chose; `bridge --invite`
 -- calls the same function. Its login is the DBA's to create, then
+-- Changing a scope cannot strand existing memberships or reuse a principal
+-- namespace whose old credentials may still be valid. Retire/revoke devices first.
+CREATE OR REPLACE FUNCTION public.zebridge_guard_leaf_scope()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE lid text;
+BEGIN
+    lid := CASE WHEN TG_OP = 'DELETE' THEN OLD.leaf_id ELSE NEW.leaf_id END;
+    PERFORM pg_advisory_xact_lock(hashtextextended(lid, 0));
+    IF TG_OP <> 'DELETE' AND (
+        EXISTS (SELECT 1 FROM public.zebridge_principal_keys WHERE principal = NEW.leaf_id) OR
+        EXISTS (SELECT 1 FROM public.zebridge_invites WHERE principal = NEW.leaf_id) OR
+        EXISTS (SELECT 1 FROM public.zebridge_user_tenants WHERE principal = NEW.leaf_id)) THEN
+        RAISE EXCEPTION 'leaf id % has a hub-principal history; choose a fresh id', NEW.leaf_id USING ERRCODE = '23514';
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.zebridge_user_tenants
+        WHERE split_part(principal, '.', 1) = lid AND strpos(principal, '.') > 0
+          AND (TG_OP = 'DELETE' OR NOT tenant_id = ANY(NEW.tenant_ids))) OR
+        (TG_OP = 'UPDATE' AND NEW.leaf_id <> OLD.leaf_id) THEN
+        RAISE EXCEPTION 'leaf scope % still has incompatible memberships; revoke them before changing it', lid USING ERRCODE = '23514';
+    END IF;
+    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS zebridge_guard_leaf_scope_t ON public.zebridge_leaf_scopes;
+CREATE TRIGGER zebridge_guard_leaf_scope_t BEFORE INSERT OR UPDATE OR DELETE ON public.zebridge_leaf_scopes
+    FOR EACH ROW EXECUTE FUNCTION public.zebridge_guard_leaf_scope();
+
 -- `GRANT zebridge_inviter TO <login>`: the group role has no login and no password here.
 -- It may call this function and nothing else — no table, so it cannot read codes, spend
 -- one, or touch an invite it did not make. The function refuses a revoked principal

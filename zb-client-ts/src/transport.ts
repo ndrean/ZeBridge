@@ -31,7 +31,7 @@ export interface TransportConnection {
   /// gets each message, which is how a responder scales and fails over (§10hp).
   subscribe(subject: string, opts?: { queue?: string }): AsyncIterable<any>;
   /// §10hn: request/reply — the on-demand `request` (a `query.<tenant>.<name>` ask).
-  request(subject: string, data: Uint8Array, opts?: { timeout?: number }): Promise<{ data: Uint8Array }>;
+  request(subject: string, data: Uint8Array, opts?: { timeout?: number; noMux?: boolean; reply?: string }): Promise<{ data: Uint8Array }>;
   /// A core publish, nothing awaited: the fleet heartbeat (PROTOCOL §11).
   publish(subject: string, data: Uint8Array): void;
   rtt(): Promise<number>;

@@ -533,7 +533,7 @@ pub const Server = struct {
         // only brings back the race: answer anyway.
         self.putTenantMapping(tenants_arena.allocator(), ctx, principal, if (tenants.len > 0) tenants else &.{tenant});
 
-        const body = try self.identityPayload(ctx, jwt, principal);
+        const body = try self.identityPayload(ctx, conn, jwt, principal);
         defer self.allocator.free(body);
         log.info("🎟️ enrolled '{s}' (tenant '{s}', {d} membership(s) tagged) — JWT minted, mapping registered", .{ principal, tenant, tenants.len });
         try http_respond.respond(req, body, .{ .status = .ok, .extra_headers = cors });
@@ -555,14 +555,33 @@ pub const Server = struct {
     /// identity and wire contract are one artifact — the grants inside the JWT were
     /// minted from these very names), and, when set, the JetStream domain and the NATS
     /// URLs. A renewal hands out the CURRENT values, so a moved NATS reaches devices.
-    fn identityPayload(self: *Server, ctx: EnrollCtx, jwt: []const u8, principal: []const u8) ![]u8 {
+    fn identityUrl(a: std.mem.Allocator, name: []const u8, url: []const u8) ![]u8 {
+        const encoded = try std.json.Stringify.valueAlloc(a, url, .{});
+        defer a.free(encoded);
+        return std.fmt.allocPrint(a, ",\"{s}\":{s}", .{ name, encoded });
+    }
+
+    fn identityPayload(self: *Server, base_ctx: EnrollCtx, conn: *c.PGconn, jwt: []const u8, principal: []const u8) ![]u8 {
+        var ctx = base_ctx;
+        var scoped_result: ?*c.PGresult = null;
+        defer if (scoped_result) |r| c.PQclear(r);
+        if (std.mem.findScalar(u8, principal, '.')) |dot| {
+            var scope_buf: [129]u8 = undefined;
+            const scope = try std.fmt.bufPrintSentinel(&scope_buf, "{s}", .{principal[0..dot]}, 0);
+            const params = [_]?[*:0]const u8{scope.ptr};
+            const result = c.PQexecParams(conn, "SELECT nats_url, nats_ws_url FROM public.zebridge_leaf_scopes WHERE leaf_id = $1", 1, null, &params, null, null, 0);
+            scoped_result = result;
+            if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK or c.PQntuples(result) != 1) return error.MissingLeafScope;
+            ctx.nats_url = if (c.PQgetisnull(result, 0, 0) == 0) std.mem.span(c.PQgetvalue(result, 0, 0)) else null;
+            ctx.nats_ws_url = if (c.PQgetisnull(result, 0, 1) == 0) std.mem.span(c.PQgetvalue(result, 0, 1)) else null;
+        }
         var ghash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(topology_mod.embedded_json, &ghash, .{});
         const dom_part = if (ctx.js_domain) |d| try std.fmt.allocPrint(self.allocator, ",\"js_domain\":\"{s}\"", .{d}) else "";
         defer if (ctx.js_domain != null) self.allocator.free(dom_part);
-        const url_part = if (ctx.nats_url) |u| try std.fmt.allocPrint(self.allocator, ",\"nats_url\":\"{s}\"", .{u}) else "";
+        const url_part = if (ctx.nats_url) |u| try identityUrl(self.allocator, "nats_url", u) else "";
         defer if (ctx.nats_url != null) self.allocator.free(url_part);
-        const ws_part = if (ctx.nats_ws_url) |u| try std.fmt.allocPrint(self.allocator, ",\"nats_ws_url\":\"{s}\"", .{u}) else "";
+        const ws_part = if (ctx.nats_ws_url) |u| try identityUrl(self.allocator, "nats_ws_url", u) else "";
         defer if (ctx.nats_ws_url != null) self.allocator.free(ws_part);
         return std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\",\"grammar_hash\":\"{x}\"{s}{s}{s},\"grammar\":{s}}}\n", .{ jwt, principal, &ghash, dom_part, url_part, ws_part, topology_mod.embedded_json });
     }
@@ -660,7 +679,7 @@ pub const Server = struct {
         const jwt = jwt_mint.mint(self.allocator, ctx.signing_seed, ctx.account_pub, principal, tenants, user_pub, ctx.ttl_seconds, now) catch
             return bad.respond(req, cors, .internal_server_error, "{\"error\":\"mint failed\"}\n");
         defer self.allocator.free(jwt);
-        const body = try self.identityPayload(ctx, jwt, principal);
+        const body = try self.identityPayload(ctx, conn, jwt, principal);
         defer self.allocator.free(body);
         log.info("🔁 renewed '{s}' ({d} membership(s)) — JWT minted for the same key", .{ principal, tenants.len });
         try http_respond.respond(req, body, .{ .status = .ok, .extra_headers = cors });

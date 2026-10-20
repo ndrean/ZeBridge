@@ -953,7 +953,13 @@ export class ZeBridge {
   public async request(subject: string, payload: unknown, timeoutMs = 5_000): Promise<any> {
     if (!this.nc) throw new Error('not connected');
     const t0 = Date.now();
-    const m = await this.nc.request(subject, new TextEncoder().encode(JSON.stringify(payload ?? {})), { timeout: timeoutMs });
+    const parts = subject.split('.');
+    const isQuery = parts[0] === (this.config.grammar?.subjects?.query_prefix ?? 'query');
+    if (isQuery && (parts.length < 3 || !parts[1] || /[* >\s]/.test(parts[1]))) throw new Error('malformed query subject');
+    const reply = isQuery ? `_INBOX.${this.config.principal}.query.${parts[1]}.${crypto.randomUUID()}` : undefined;
+    const m = await this.nc.request(subject, new TextEncoder().encode(JSON.stringify(payload ?? {})), {
+      timeout: timeoutMs, ...(reply ? { noMux: true, reply } : {}),
+    });
     const wire_ms = Date.now() - t0;
     // §10hq: an answer too large for one message arrives as an envelope naming an object.
     const t1 = Date.now();

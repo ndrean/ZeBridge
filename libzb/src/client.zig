@@ -4261,7 +4261,7 @@ pub const SyncClient = struct {
     pub fn request(self: *SyncClient, a: std.mem.Allocator, subject: []const u8, payload: []const u8, timeout_ms: u64) ![]u8 {
         const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(@intCast(@max(1, timeout_ms))), .clock = .awake } };
         const t0 = msNow();
-        const msg = try self.t.conn.request(subject, payload, t);
+        const msg = try self.t.requestQuery(a, self.opts.principal, self.subject_query_prefix, subject, payload, t);
         defer msg.deinit();
         const wire_ms = msNow() - t0;
         // §10hq: an answer too large for one message arrives as a small envelope naming
