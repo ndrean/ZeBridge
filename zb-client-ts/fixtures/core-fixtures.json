@@ -3533,13 +3533,6 @@
       "out": "2026-08-27T10:00:00.123457Z"
     }
   ],
-  "subjectSafe": [
-    {
-      "name": "dots, wildcards and spaces become dashes",
-      "in": "c-1.users.*>x y",
-      "out": "c-1-users---x-y"
-    }
-  ],
   "envelope": [
     {
       "name": "UPDATE: full envelope",
@@ -3557,11 +3550,12 @@
         "pkCols": [
           "uid"
         ],
-        "version": "2026-08-27T10:00:00.123000Z"
+        "version": "2026-08-27T10:00:00.123000Z",
+        "createdMs": 1787824800123
       },
       "out": {
         "subject": "mutation.omar.test_types.update",
-        "msgId": "c-40acde74-test_types-u-1-2026-08-27T10:00:00-123000Z",
+        "msgId": "zb1-t1787824800123-UPDATE-c~2D40acde74-test_types-k1-u~2D1-2026~2D08~2D27T10:00:00~2E123000Z",
         "id": "u-1",
         "payload": {
           "key": {
@@ -3600,11 +3594,12 @@
           "a",
           "b"
         ],
-        "version": "2026-08-27T10:00:00.000000Z"
+        "version": "2026-08-27T10:00:00.000000Z",
+        "createdMs": 1787824800123
       },
       "out": {
         "subject": "mutation.omar.t.delete",
-        "msgId": "c-1-t-1|2-2026-08-27T10:00:00-000000Z",
+        "msgId": "zb1-t1787824800123-DELETE-c~2D1-t-k2-1+2-2026~2D08~2D27T10:00:00~2E000000Z",
         "id": "1|2",
         "payload": {
           "key": {
@@ -3639,11 +3634,12 @@
         "pkCols": [
           "id"
         ],
-        "version": "2026-08-27T10:00:00.000000Z"
+        "version": "2026-08-27T10:00:00.000000Z",
+        "createdMs": 1787824800123
       },
       "out": {
         "subject": "mutation.p.t.insert",
-        "msgId": "c-t-5-2026-08-27T10:00:00-000000Z",
+        "msgId": "zb1-t1787824800123-INSERT-c-t-k1-5-2026~2D08~2D27T10:00:00~2E000000Z",
         "id": "5",
         "payload": {
           "key": {
@@ -3681,7 +3677,8 @@
         "pkCols": [
           "uid"
         ],
-        "version": "2026-08-27T10:00:00.123000Z"
+        "version": "2026-08-27T10:00:00.123000Z",
+        "createdMs": 1787824800123
       },
       "throws": "KeyChange"
     },
@@ -3702,11 +3699,12 @@
         "pkCols": [
           "uid"
         ],
-        "version": "2026-08-27T10:00:00.123000Z"
+        "version": "2026-08-27T10:00:00.123000Z",
+        "createdMs": 1787824800123
       },
       "out": {
         "subject": "mutation.omar.test_types.update",
-        "msgId": "c-40acde74-test_types-u-1-2026-08-27T10:00:00-123000Z",
+        "msgId": "zb1-t1787824800123-UPDATE-c~2D40acde74-test_types-k1-u~2D1-2026~2D08~2D27T10:00:00~2E123000Z",
         "id": "u-1",
         "payload": {
           "key": {
@@ -3746,11 +3744,12 @@
           "a",
           "b"
         ],
-        "version": "2026-08-27T10:00:00.000000Z"
+        "version": "2026-08-27T10:00:00.000000Z",
+        "createdMs": 1787824800123
       },
       "out": {
         "subject": "mutation.omar.t.delete",
-        "msgId": "c-1-t-1|2-2026-08-27T10:00:00-000000Z",
+        "msgId": "zb1-t1787824800123-DELETE-c~2D1-t-k2-1+2-2026~2D08~2D27T10:00:00~2E000000Z",
         "id": "1|2",
         "payload": {
           "key": {
@@ -3788,11 +3787,12 @@
         "pkCols": [
           "uid"
         ],
-        "version": "2026-08-27T10:00:00.123000Z"
+        "version": "2026-08-27T10:00:00.123000Z",
+        "createdMs": 1787824800123
       },
       "out": {
         "subject": "mutation.omar.test_types.update",
-        "msgId": "c-40acde74-test_types-u-1-2026-08-27T10:00:00-123000Z",
+        "msgId": "zb1-t1787824800123-UPDATE-c~2D40acde74-test_types-k1-u~2D1-2026~2D08~2D27T10:00:00~2E123000Z",
         "id": "u-1",
         "payload": {
           "key": {
@@ -3832,9 +3832,117 @@
         "pkCols": [
           "uid"
         ],
-        "version": "2026-08-27T10:00:00.123000Z"
+        "version": "2026-08-27T10:00:00.123000Z",
+        "createdMs": 1787824800123
       },
       "throws": "UnknownOperation"
+    },
+    {
+      "name": "zb1: a write without its creation time is refused before it is queued",
+      "args": {
+        "principal": "omar",
+        "clientId": "c-40acde74",
+        "table": "test_types",
+        "op": "UPDATE",
+        "key": {
+          "uid": "u-1"
+        },
+        "values": {
+          "note": "hi"
+        },
+        "pkCols": [
+          "uid"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "throws": "MissingCreatedMs"
+    },
+    {
+      "name": "zb1: a negative creation time is refused",
+      "args": {
+        "principal": "omar",
+        "clientId": "c-40acde74",
+        "table": "test_types",
+        "op": "UPDATE",
+        "key": {
+          "uid": "u-1"
+        },
+        "values": {
+          "note": "hi"
+        },
+        "pkCols": [
+          "uid"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z",
+        "createdMs": -1
+      },
+      "throws": "InvalidCreatedMs"
+    },
+    {
+      "name": "zb1: an ID over 512 bytes is refused before it is queued (the bridge would refuse it)",
+      "args": {
+        "principal": "omar",
+        "clientId": "c-40acde74",
+        "table": "test_types",
+        "op": "UPDATE",
+        "key": {
+          "uid": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
+        },
+        "values": {
+          "note": "hi"
+        },
+        "pkCols": [
+          "uid"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z",
+        "createdMs": 1787824800123
+      },
+      "throws": "MessageIdTooLong"
+    },
+    {
+      "name": "zb1: a text key with a Unicode space keeps it in the ID, in both cores",
+      "args": {
+        "principal": "omar",
+        "clientId": "c-40acde74",
+        "table": "test_types",
+        "op": "UPDATE",
+        "key": {
+          "uid": "a b"
+        },
+        "values": {
+          "note": "hi"
+        },
+        "pkCols": [
+          "uid"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z",
+        "createdMs": 1787824800123
+      },
+      "out": {
+        "subject": "mutation.omar.test_types.update",
+        "msgId": "zb1-t1787824800123-UPDATE-c~2D40acde74-test_types-k1-a~E2~80~83b-2026~2D08~2D27T10:00:00~2E123000Z",
+        "id": "a b",
+        "payload": {
+          "key": {
+            "uid": "a b"
+          },
+          "version": "2026-08-27T10:00:00.123000Z",
+          "client_id": "c-40acde74",
+          "data": {
+            "note": "hi"
+          }
+        },
+        "optimistic": {
+          "table": "test_types",
+          "operation": "UPDATE",
+          "data": {
+            "uid": "a b",
+            "note": "hi"
+          },
+          "lsn": 9007199254740991,
+          "optimistic": true
+        }
+      }
     }
   ],
   "normalizeVersion": [
@@ -5241,6 +5349,234 @@
       "cuts": [],
       "to": 0,
       "blocked": false
+    }
+  ],
+  "messageId": [
+    {
+      "name": "lossy sanitizing: a.b ...",
+      "args": {
+        "createdMs": 1787824800123,
+        "clientId": "c-1",
+        "table": "t",
+        "op": "INSERT",
+        "keyParts": [
+          "a.b"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "out": "zb1-t1787824800123-INSERT-c~2D1-t-k1-a~2Eb-2026~2D08~2D27T10:00:00~2E123000Z"
+    },
+    {
+      "name": "... and a-b are different writes",
+      "args": {
+        "createdMs": 1787824800123,
+        "clientId": "c-1",
+        "table": "t",
+        "op": "INSERT",
+        "keyParts": [
+          "a-b"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "out": "zb1-t1787824800123-INSERT-c~2D1-t-k1-a~2Db-2026~2D08~2D27T10:00:00~2E123000Z"
+    },
+    {
+      "name": "field boundaries: client c-1, key x ...",
+      "args": {
+        "createdMs": 1787824800123,
+        "clientId": "c-1",
+        "table": "t",
+        "op": "INSERT",
+        "keyParts": [
+          "x"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "out": "zb1-t1787824800123-INSERT-c~2D1-t-k1-x-2026~2D08~2D27T10:00:00~2E123000Z"
+    },
+    {
+      "name": "... and client c, key 1-x are different writes",
+      "args": {
+        "createdMs": 1787824800123,
+        "clientId": "c",
+        "table": "t",
+        "op": "INSERT",
+        "keyParts": [
+          "1-x"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "out": "zb1-t1787824800123-INSERT-c-t-k1-1~2Dx-2026~2D08~2D27T10:00:00~2E123000Z"
+    },
+    {
+      "name": "composite keys: [a|b, c] ...",
+      "args": {
+        "createdMs": 1787824800123,
+        "clientId": "c-1",
+        "table": "t",
+        "op": "INSERT",
+        "keyParts": [
+          "a|b",
+          "c"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "out": "zb1-t1787824800123-INSERT-c~2D1-t-k2-a~7Cb+c-2026~2D08~2D27T10:00:00~2E123000Z"
+    },
+    {
+      "name": "... and [a, b|c] are different writes",
+      "args": {
+        "createdMs": 1787824800123,
+        "clientId": "c-1",
+        "table": "t",
+        "op": "INSERT",
+        "keyParts": [
+          "a",
+          "b|c"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "out": "zb1-t1787824800123-INSERT-c~2D1-t-k2-a+b~7Cc-2026~2D08~2D27T10:00:00~2E123000Z"
+    },
+    {
+      "name": "the operation: INSERT of a key ...",
+      "args": {
+        "createdMs": 1787824800123,
+        "clientId": "c-1",
+        "table": "t",
+        "op": "INSERT",
+        "keyParts": [
+          "k"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "out": "zb1-t1787824800123-INSERT-c~2D1-t-k1-k-2026~2D08~2D27T10:00:00~2E123000Z"
+    },
+    {
+      "name": "... and DELETE of the same key are different writes",
+      "args": {
+        "createdMs": 1787824800123,
+        "clientId": "c-1",
+        "table": "t",
+        "op": "DELETE",
+        "keyParts": [
+          "k"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "out": "zb1-t1787824800123-DELETE-c~2D1-t-k1-k-2026~2D08~2D27T10:00:00~2E123000Z"
+    },
+    {
+      "name": "a literal escape sequence is escaped itself: ~2E is not '.'",
+      "args": {
+        "createdMs": 1787824800123,
+        "clientId": "c-1",
+        "table": "t",
+        "op": "INSERT",
+        "keyParts": [
+          "~2E"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "out": "zb1-t1787824800123-INSERT-c~2D1-t-k1-~7E2E-2026~2D08~2D27T10:00:00~2E123000Z"
+    },
+    {
+      "name": "UTF-8 is escaped byte by byte, uppercase: é and an EM SPACE",
+      "args": {
+        "createdMs": 1787824800123,
+        "clientId": "c-1",
+        "table": "t",
+        "op": "INSERT",
+        "keyParts": [
+          "é x"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "out": "zb1-t1787824800123-INSERT-c~2D1-t-k1-~C3~A9~E2~80~83x-2026~2D08~2D27T10:00:00~2E123000Z"
+    },
+    {
+      "name": "an operation in any case is its normalized form",
+      "args": {
+        "createdMs": 1787824800123,
+        "clientId": "c-1",
+        "table": "t",
+        "op": "delete",
+        "keyParts": [
+          "k"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "out": "zb1-t1787824800123-DELETE-c~2D1-t-k1-k-2026~2D08~2D27T10:00:00~2E123000Z"
+    },
+    {
+      "name": "exactly 512 bytes is accepted",
+      "args": {
+        "createdMs": 1787824800123,
+        "clientId": "c",
+        "table": "t",
+        "op": "INSERT",
+        "keyParts": [
+          "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        ],
+        "version": ""
+      },
+      "out": "zb1-t1787824800123-INSERT-c-t-k1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-"
+    },
+    {
+      "name": "513 bytes is refused",
+      "args": {
+        "createdMs": 1787824800123,
+        "clientId": "c",
+        "table": "t",
+        "op": "INSERT",
+        "keyParts": [
+          "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        ],
+        "version": ""
+      },
+      "throws": "MessageIdTooLong"
+    },
+    {
+      "name": "the limit counts bytes after escaping: 180 raw bytes that escape past 512",
+      "args": {
+        "createdMs": 1787824800123,
+        "clientId": "c-1",
+        "table": "t",
+        "op": "INSERT",
+        "keyParts": [
+          "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "throws": "MessageIdTooLong"
+    },
+    {
+      "name": "a negative creation time is refused",
+      "args": {
+        "createdMs": -1,
+        "clientId": "c-1",
+        "table": "t",
+        "op": "INSERT",
+        "keyParts": [
+          "k"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "throws": "InvalidCreatedMs"
+    },
+    {
+      "name": "anything but INSERT, UPDATE or DELETE is refused",
+      "args": {
+        "createdMs": 1787824800123,
+        "clientId": "c-1",
+        "table": "t",
+        "op": "TRUNCATE",
+        "keyParts": [
+          "k"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "throws": "UnknownOperation"
     }
   ]
 }

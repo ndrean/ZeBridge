@@ -36,7 +36,7 @@ import { heartbeatPayload,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgEngineValues, chainUpsertSql, chainRowParams,
   type SqlStep,
   fkClausesFor, createTableSteps, rebuildSteps, diffColumns, keyShape, typeShape, retypedColumns, isReadOnlySql,
-  mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent, normalizeOp,
+  mutationSubject, mutationMsgId, idKeyPart, mutationKeyId, mutationPayload, optimisticEvent, normalizeOp,
   normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate,
   isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, chainChunkJson, parseChainHead, msgpackScan, msgpackDecodeScanned, chainStageSql, vecColsOf, pgVectorValues, vecLiteral, strictMissing,
@@ -4196,7 +4196,13 @@ export class ZeBridge {
     // IN the id — a second edit to the same row is a different write; a retry
     // of the same edit is not.
     const subject = mutationSubject(this.config.principal!, table, op, this.config.grammar.subjects?.mutations_prefix);
-    const msgId = mutationMsgId(this.clientIdValue, table, id, version);
+    // createdMs: the bridge's clock as this device estimates it, taken once here; the
+    // outbox keeps the resulting ID, so a retry never regenerates it.
+    // The key parts in declared primary-key order, each kept apart in the ID.
+    const pkCols = this.syncedTables.get(table)?.pkCols ?? [];
+    const keyObj = (payload as { key?: Record<string, unknown> }).key;
+    const keyParts = pkCols.length && keyObj ? pkCols.map((c) => idKeyPart(keyObj[c])) : [String(id)];
+    const msgId = mutationMsgId(Math.floor(Date.now() + this.clockOffsetMs()), this.clientIdValue, table, op, keyParts, version);
     const h = this.transport.headers();
     h.set('Nats-Msg-Id', msgId);
     this.pendingWrites.set(msgId, { table, id, at: Date.now(), version });

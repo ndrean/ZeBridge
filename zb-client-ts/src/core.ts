@@ -1075,11 +1075,6 @@ export function nextVersion(nowIso: string, lastVersion: string): string {
   return candidate;
 }
 
-/// NATS-subject-safe token: dots, wildcards and whitespace become dashes. The
-/// msg_id rides as subject tokens on mutation_ack, and the version carries
-/// fractional seconds — unescaped, one write's ack would fan out as a wildcard.
-export const subjectSafeToken = (v: string): string => v.replace(/[.*>\s]/g, '-');
-
 /// `prefix` is grammar.json's `subjects.mutations_prefix`; the shell passes it, the
 /// fixtures rely on the protocol default.
 /// PROTOCOL §11: the fleet heartbeat a client writes to `$KV.live.<tenant>.<principal>`.
@@ -1102,10 +1097,39 @@ export function mutationSubject(principal: string, table: string, op: string, pr
   return `${prefix}.${principal}.${table}.${op.toLowerCase()}`;
 }
 
-/// The idempotency id. The version stays IN the id: a second edit to the same
-/// row is a different write; a retry of the same edit is not.
-export function mutationMsgId(clientId: string, table: string, id: string | number, version: string): string {
-  return subjectSafeToken(`${clientId}-${table}-${id}-${version}`);
+/// A write's message ID, the key of its receipt on the bridge (libzb: core.messageId):
+///
+///     zb1-t<createdMs>-<OP>-<clientId>-<table>-k<n>-<part1>+…+<partN>-<version>
+///
+/// Every component is escaped on its own: `A-Z a-z 0-9 _ :` pass, any other byte (`-`,
+/// `+` and `~` included, and every UTF-8 byte) becomes `~HH`, uppercase. A component
+/// therefore never contains the `-` and `+` that frame it, so two different writes never
+/// share an ID: not `a.b` and `a-b`, not `["a|b","c"]` and `["a","b|c"]`, not an INSERT
+/// and a DELETE of one key. The version stays in: a second edit of a row is a different
+/// write, a retry of the same edit is not. `createdMs` is the shell's estimate of the
+/// bridge's clock when the write is made, taken once and never the version; the bridge
+/// reads only that prefix. At most 512 bytes, counted after escaping.
+export function mutationMsgId(createdMs: number, clientId: string, table: string, op: string, keyParts: string[], version: string): string {
+  if (typeof createdMs !== 'number') throw new Error('MissingCreatedMs');
+  if (!Number.isInteger(createdMs) || createdMs < 0 || createdMs > 999_999_999_999_999) throw new Error(`InvalidCreatedMs: ${createdMs}`);
+  const msgId = `zb1-t${createdMs}-${normalizeOp(op)}-${idComponent(clientId)}-${idComponent(table)}`
+    + `-k${keyParts.length}-${keyParts.map(idComponent).join('+')}-${idComponent(version)}`;
+  if (msgId.length > 512) throw new Error('MessageIdTooLong'); // pure ASCII after escaping: length = bytes
+  return msgId;
+}
+
+/// One key column's value as a message-ID part: its text, `null` for a null (libzb:
+/// scalarToString). Not the row id's `join('|')`, which renders null as ''.
+export const idKeyPart = (v: unknown): string => (v === null || v === undefined ? 'null' : String(v));
+
+const ID_SAFE = /^[A-Za-z0-9_:]$/;
+function idComponent(s: string): string {
+  let out = '';
+  for (const b of new TextEncoder().encode(s)) {
+    const ch = String.fromCharCode(b);
+    out += b < 0x80 && ID_SAFE.test(ch) ? ch : `~${b.toString(16).toUpperCase().padStart(2, '0')}`;
+  }
+  return out;
 }
 
 /// The row id mutate() reports and the outbox tracks: the PK values joined with
@@ -1176,7 +1200,7 @@ export function buildMutation(args: {
   principal: string; clientId: string; table: string;
   op: string;
   key: Record<string, unknown>; values?: Record<string, unknown>;
-  pkCols: string[]; version: string;
+  pkCols: string[]; version: string; createdMs: number;
   mutationsPrefix?: string;
 }): { subject: string; msgId: string; id: string; payload: Record<string, unknown>; optimistic: Record<string, unknown> } {
   const op = normalizeOp(args.op);
@@ -1184,7 +1208,7 @@ export function buildMutation(args: {
   const payload = mutationPayload(op, args.key, args.values, args.version, args.clientId);
   return {
     subject: mutationSubject(args.principal, args.table, op, args.mutationsPrefix),
-    msgId: mutationMsgId(args.clientId, args.table, id, args.version),
+    msgId: mutationMsgId(args.createdMs, args.clientId, args.table, op, args.pkCols.map((c) => idKeyPart(args.key[c])), args.version),
     id,
     payload,
     optimistic: optimisticEvent(args.table, op, payload),

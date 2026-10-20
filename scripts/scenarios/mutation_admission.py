@@ -142,6 +142,23 @@ async def main():
             await asyncio.sleep(.2)
             check((await js.stream_info("MUTATIONS")).state.messages == 3,
                   "malformed public subjects never occupy durable queue capacity")
+            # Every admitted write has a valid original ID (its receipt key); none is made up.
+            for headers, reason, label in (
+                (None, "MissingMessageId", "no Nats-Msg-Id"),
+                ({"Nats-Msg-Id": "zb1-t12-"}, "InvalidMessageId", "a malformed zb1 ID (never read as legacy)"),
+                ({"Nats-Msg-Id": "has.dot"}, "InvalidMessageId", "an ID that is not one subject token"),
+            ):
+                try:
+                    await bob.publish("mutation.bob.one.insert", b"{}", headers=headers)
+                    refused = ""
+                except nats.js.errors.APIError as e:
+                    refused = e.description or ""
+                check(reason in refused and (await js.stream_info("MUTATIONS")).state.messages == 3,
+                      f"admission refuses {label} with a reasoned error PubAck, before storing it")
+            good = await bob.publish("mutation.bob.one.insert", b"{}", headers={"Nats-Msg-Id": f"zb1-t{int(time.time() * 1000)}-c-1-one-1-v"})
+            stored = await js.get_msg("MUTATIONS", seq=good.seq)
+            check(stored.headers.get("ZB-Client-Msg-Id", "").startswith("zb1-t") and (await js.stream_info("MUTATIONS")).state.messages == 4,
+                  "a well-formed zb1 ID is admitted, with its original ID kept for the receipt")
             if os.environ.get("ZB_CHECK_LEAKS") == "1":
                 report = subprocess.run(["leaks", "--nocontext", str(gateway.pid)], capture_output=True, text=True, timeout=45)
                 clean = re.search(r'\b0 leaks for 0 total leaked bytes', report.stdout)

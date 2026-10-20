@@ -114,7 +114,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
   normalizeVersion, hlcVersion,
-  nextVersion, subjectSafeToken, buildMutation,
+  nextVersion, mutationMsgId, buildMutation,
   columnDdl, fkClausesFor, createTableSteps, rebuildSteps, diffColumns,
   fkTextDiffers, viewSteps, indexSyncPlan,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgArrayLiteral, chainUpsertSql, chainRowParams,
@@ -279,8 +279,12 @@ for (const c of fx.indexPlan) {
 for (const c of fx.nextVersion) {
   test(`nextVersion: ${c.name}`, () => assert.equal(nextVersion(c.now, c.last), c.out));
 }
-for (const c of fx.subjectSafe) {
-  test(`subjectSafe: ${c.name}`, () => assert.equal(subjectSafeToken(c.in), c.out));
+for (const c of fx.messageId) {
+  test(`messageId: ${c.name}`, () => {
+    const call = () => mutationMsgId(c.args.createdMs, c.args.clientId, c.args.table, c.args.op, c.args.keyParts, c.args.version);
+    if (c.throws) assert.throws(call, new RegExp(c.throws));
+    else assert.equal(call(), c.out);
+  });
 }
 for (const c of fx.envelope) {
   test(`envelope: ${c.name}`, () => {

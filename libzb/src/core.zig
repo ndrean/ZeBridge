@@ -238,14 +238,41 @@ pub fn lsnToNumber(lsn: []const u8) i64 {
     return hi * 0x1_0000_0000 + lo;
 }
 
-/// core.ts subjectSafeToken: [.*>\s] -> '-'.
-pub fn subjectSafeToken(a: std.mem.Allocator, v: []const u8) ![]const u8 {
-    const out = try a.dupe(u8, v);
-    for (out) |*c| switch (c.*) {
-        '.', '*', '>', ' ', '\t', '\n', '\r', 0x0b, 0x0c => c.* = '-',
-        else => {},
+/// core.ts mutationMsgId. A write's message ID, the key of its receipt on the bridge:
+///
+///     zb1-t<createdMs>-<OP>-<clientId>-<table>-k<n>-<part1>+…+<partN>-<version>
+///
+/// Every component is escaped on its own: `A-Z a-z 0-9 _ :` pass, any other byte (`-`,
+/// `+` and `~` included, and every UTF-8 byte) becomes `~HH`, uppercase. A component
+/// therefore never contains the `-` and `+` that frame it, so two different writes never
+/// share an ID: not `a.b` and `a-b`, not `["a|b","c"]` and `["a","b|c"]`, not an INSERT
+/// and a DELETE of one key. The bridge reads only the `zb1-t<ms>-` prefix; the rest is
+/// opaque to it. At most 512 bytes, counted after escaping.
+pub fn messageId(a: std.mem.Allocator, created_ms: i64, client_id: []const u8, table: []const u8, op_in: []const u8, key_parts: []const []const u8, version: []const u8) ![]const u8 {
+    if (created_ms < 0 or created_ms > 999_999_999_999_999) return error.InvalidCreatedMs;
+    const op = normalizeOp(op_in) orelse return error.UnknownOperation;
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(a, "zb1-t{d}-{s}-", .{ created_ms, op });
+    try appendIdComponent(a, &out, client_id);
+    try out.append(a, '-');
+    try appendIdComponent(a, &out, table);
+    try out.print(a, "-k{d}-", .{key_parts.len});
+    for (key_parts, 0..) |part, i| {
+        if (i > 0) try out.append(a, '+');
+        try appendIdComponent(a, &out, part);
+    }
+    try out.append(a, '-');
+    try appendIdComponent(a, &out, version);
+    if (out.items.len > 512) return error.MessageIdTooLong;
+    return out.items;
+}
+
+fn appendIdComponent(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    const hex = "0123456789ABCDEF";
+    for (s) |b| switch (b) {
+        'A'...'Z', 'a'...'z', '0'...'9', '_', ':' => try out.append(a, b),
+        else => try out.appendSlice(a, &.{ '~', hex[b >> 4], hex[b & 15] }),
     };
-    return out;
 }
 
 // ─── classifiers and gates ──────────────────────────────────────────────────
@@ -963,16 +990,25 @@ pub fn buildMutation(a: std.mem.Allocator, args: Value) !Value {
     const table = getStr(args, "table") orelse "";
     const op = normalizeOp(getStr(args, "op") orelse "") orelse return error.UnknownOperation;
     const version = getStr(args, "version") orelse "";
+    // The message ID's creation time, `zb1-t<createdMs>-`: the shell's estimate of the
+    // bridge's clock when the write is made, taken once. Never the version, which a caller
+    // can set and the HLC floor can lift. The bridge files the write's receipt under its
+    // month and refuses it once it is older than the retry horizon.
+    const created_ms = getInt(args, "createdMs") orelse return error.MissingCreatedMs;
     const key = if (args == .object) args.object.get("key") orelse .null else Value.null;
     const values = if (args == .object) args.object.get("values") else null;
     const pk = try strArr(a, getArr(args, "pkCols") orelse std.json.Array.init(a));
 
-    // id: pk values joined with '|', JS String() semantics
+    // id: pk values joined with '|', JS String() semantics. The message ID keeps the parts
+    // apart instead (`["a|b","c"]` and `["a","b|c"]` share this id, never a message ID).
     var id: std.ArrayList(u8) = .empty;
+    var key_parts: std.ArrayList([]const u8) = .empty;
     for (pk, 0..) |c, i| {
         if (i > 0) try id.append(a, '|');
         const v = if (key == .object) key.object.get(c) orelse .null else Value.null;
-        try id.appendSlice(a, try scalarToString(a, v));
+        const part = try scalarToString(a, v);
+        try key_parts.append(a, part);
+        try id.appendSlice(a, part);
     }
 
     // op lowercased for the subject
@@ -1030,7 +1066,7 @@ pub fn buildMutation(a: std.mem.Allocator, args: Value) !Value {
     // it as `mutationsPrefix`. Absent (the fixtures) → the protocol default.
     const prefix = getStr(args, "mutationsPrefix") orelse "mutation";
     try out.put(a, "subject", .{ .string = try std.fmt.allocPrint(a, "{s}.{s}.{s}.{s}", .{ prefix, principal, table, op_lower }) });
-    try out.put(a, "msgId", .{ .string = try subjectSafeToken(a, try std.fmt.allocPrint(a, "{s}-{s}-{s}-{s}", .{ client_id, table, id.items, version })) });
+    try out.put(a, "msgId", .{ .string = try messageId(a, created_ms, client_id, table, op, key_parts.items, version) });
     try out.put(a, "id", .{ .string = id.items });
     try out.put(a, "payload", .{ .object = payload });
     try out.put(a, "optimistic", .{ .object = optimistic });

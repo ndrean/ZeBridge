@@ -161,6 +161,30 @@ fn ensureErrors(js: nats.JetStream, a: std.mem.Allocator, topo: *const topology.
     created.deinit();
 }
 
+/// A client's original message ID: one subject token, since it ends the verdict subject
+/// `mutation_ack.<principal>.<id>`, of 1 to 512 bytes. An ID starting with `zb1-` must be
+/// exactly `zb1-t<epoch-ms>-<rest>`: never treated as legacy, because its receipt month
+/// comes from that time. Any other ID is a legacy one, accepted from deployed clients.
+pub fn validMessageId(id: []const u8) bool {
+    if (id.len == 0 or id.len > 512) return false;
+    for (id) |ch| switch (ch) {
+        0...32, 127, '.', '*', '>' => return false,
+        else => {},
+    };
+    return !std.mem.startsWith(u8, id, "zb1-") or createdMs(id) != null;
+}
+
+/// The creation time of a `zb1-t<epoch-ms>-<rest>` ID (1 to 15 digits, a non-empty rest).
+pub fn createdMs(id: []const u8) ?i64 {
+    const head = "zb1-t";
+    if (!std.mem.startsWith(u8, id, head)) return null;
+    const dash = std.mem.findScalarPos(u8, id, head.len, '-') orelse return null;
+    const digits = id[head.len..dash];
+    if (digits.len == 0 or digits.len > 15 or dash + 1 >= id.len) return null;
+    for (digits) |d| if (!std.ascii.isDigit(d)) return null;
+    return std.fmt.parseInt(i64, digits, 10) catch null;
+}
+
 pub fn replyBelongsTo(reply: []const u8, principal: []const u8) bool {
     const prefix = "_INBOX.";
     if (!std.mem.startsWith(u8, reply, prefix)) return false;
@@ -174,6 +198,11 @@ fn relay(conn: *nats.Connection, incoming: *nats.Message, prefix: []const u8, le
     if (incoming.reply) |reply| {
         if (!replyBelongsTo(reply, parsed.principal)) return error.InvalidReplyInbox;
     }
+    // Every admitted write carries a valid original ID: its receipt is keyed by it, and
+    // a write that cannot have one is refused here, while the publisher still waits for
+    // the PubAck. No ID is ever made up on its behalf.
+    const id = incoming.headerGet("Nats-Msg-Id") orelse return error.MissingMessageId;
+    if (!validMessageId(id)) return error.InvalidMessageId;
     const outgoing = try conn.newMsg();
     defer outgoing.deinit();
     const subject = try std.fmt.allocPrint(outgoing.arena.allocator(), "$ZB.{s}.{s}", .{ prefix, parsed.principal });
@@ -181,13 +210,9 @@ fn relay(conn: *nats.Connection, incoming: *nats.Message, prefix: []const u8, le
     try outgoing.setPayload(incoming.data, false);
     // Rebuild headers: a public caller cannot inject an original route or leaf scope.
     try outgoing.headerSet(original_subject_header, incoming.subject);
-    if (incoming.headerGet("Nats-Msg-Id")) |id| {
-        if (id.len > 512) return error.MessageIdTooLong;
-        for (id) |ch| if (ch < 32 or ch == 127) return error.InvalidMessageId;
-        const scoped_id = try std.fmt.allocPrint(outgoing.arena.allocator(), "{s}:{s}", .{ parsed.principal, id });
-        try outgoing.headerSet("Nats-Msg-Id", scoped_id);
-        try outgoing.headerSet(original_id_header, id);
-    }
+    const scoped_id = try std.fmt.allocPrint(outgoing.arena.allocator(), "{s}:{s}", .{ parsed.principal, id });
+    try outgoing.headerSet("Nats-Msg-Id", scoped_id);
+    try outgoing.headerSet(original_id_header, id);
     if (incoming.reply) |reply| try conn.publishRequestMsg(outgoing, reply) else try conn.publishMsg(outgoing);
 }
 
@@ -282,7 +307,11 @@ fn runImpl(init: *const std.process.Init, a: std.mem.Allocator) !void {
                     // Never emit an error to an arbitrary caller-chosen subject.
                     const parsed = route(incoming.subject, owned.topology.subject_mutations_prefix, owned.topology.leaf_prefix) catch continue;
                     if (replyBelongsTo(reply, parsed.principal)) {
-                        conn.publish(reply, "{\"error\":{\"code\":400,\"err_code\":10003,\"description\":\"mutation admission refused\"}}") catch {};
+                        // The reason is an error name: an identifier, safe inside the JSON.
+                        var buf: [192]u8 = undefined;
+                        const body = std.fmt.bufPrint(&buf, "{{\"error\":{{\"code\":400,\"err_code\":10003,\"description\":\"mutation admission refused: {s}\"}}}}", .{@errorName(err)}) catch
+                            "{\"error\":{\"code\":400,\"err_code\":10003,\"description\":\"mutation admission refused\"}}";
+                        conn.publish(reply, body) catch {};
                     }
                 }
             };
@@ -341,4 +370,21 @@ test "private mutation headers must agree with the stored principal" {
     // A public caller's forged header never replaces its broker-authorized subject.
     try msg.setSubject("mutation.alice.orders.update", false);
     try std.testing.expectEqualStrings(msg.subject, try originalSubject(&msg, "mutation", "lf-"));
+}
+
+test "message IDs: zb1 IDs are strict, legacy IDs pass, nothing else does" {
+    try std.testing.expect(validMessageId("zb1-t1787824800123-c-40acde74-test_types-u-1-2026-08-27T10:00:00-123000Z"));
+    try std.testing.expectEqual(@as(?i64, 1787824800123), createdMs("zb1-t1787824800123-x"));
+    try std.testing.expect(validMessageId("c-40acde74-test_types-u-1-2026-08-27T10:00:00-123000Z")); // legacy
+    // zb1- but not the strict shape: refused, never read as a legacy ID.
+    for ([_][]const u8{ "zb1-", "zb1-t-x", "zb1-t12", "zb1-t12-", "zb1-tx1-x", "zb1-t1234567890123456-x", "zb1-1787824800123-x" }) |id|
+        try std.testing.expect(!validMessageId(id));
+    // Not one subject token, empty, or too long.
+    for ([_][]const u8{ "", "a.b", "a*", "a>", "a b", "a\tb", "a\x01b", "a\x7fb" }) |id|
+        try std.testing.expect(!validMessageId(id));
+    try std.testing.expect(validMessageId("x" ** 512) and !validMessageId("x" ** 513));
+    // Bytes, not characters, and ASCII only: Unicode spaces are ordinary UTF-8 (the same
+    // policy as both builders and PostgreSQL's receipt check).
+    try std.testing.expect(validMessageId("a\u{2003}b") and validMessageId("a\u{85}b") and validMessageId("a\u{a0}b"));
+    try std.testing.expect(!validMessageId("\u{2003}" ** 171)); // 513 bytes, 171 characters
 }

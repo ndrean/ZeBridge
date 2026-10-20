@@ -919,7 +919,10 @@ pub const MutationListener = struct {
         //
         // No verdict rather than a sanitised one: the client matches on the id it chose,
         // so a rewritten id would arrive unmatchable. Its own id, its own problem.
-        if (!utils.isSubjectToken(msg_id)) {
+        // The same rule as admission and the receipt check (up to 512 bytes), not the
+        // 128-byte bound for tenant tokens: an escaped zb1 ID is often longer than 128,
+        // and a shorter bound here committed the write but never answered it.
+        if (!admission.validMessageId(msg_id)) {
             log.warn(
                 "⚠️  Nats-Msg-Id is not a valid subject token ('{s}'): no verdict can be addressed for this write",
                 .{msg_id},
@@ -1069,6 +1072,10 @@ pub const MutationListener = struct {
             );
             self.deadLetter(conn_nats, msg, payload, error.ForbiddenTable);
             msg.ack() catch {};
+            return;
+        }
+        if (!hasValidMessageId(msg)) {
+            refuseUnidentified(self, conn_nats, msg, payload, mutation);
             return;
         }
         if (self.rateLimited(conn, conn_nats, msg, mutation)) return;
@@ -1251,6 +1258,10 @@ pub const MutationListener = struct {
                 );
                 self.deadLetter(conn_nats, msg, payload, error.ForbiddenTable);
                 msg.ack() catch {};
+                continue;
+            }
+            if (!hasValidMessageId(msg)) {
+                refuseUnidentified(self, conn_nats, msg, payload, mutation);
                 continue;
             }
             if (self.rateLimited(conn, conn_nats, msg, mutation)) continue;
@@ -1764,6 +1775,24 @@ pub const MutationListener = struct {
     fn msgIdOf(msg: *nats.JetStreamMessage) ?[]const u8 {
         if (std.mem.startsWith(u8, msg.msg.subject, "$ZB.")) return msg.msg.headerGet(admission.original_id_header);
         return msg.msg.headerGet("Nats-Msg-Id");
+    }
+
+    /// Every write the database accepts has a receipt, keyed by its original ID. Admission
+    /// refuses a missing or invalid ID before storing the write; in direct mode
+    /// (MUTATION_ADMISSION=0) JetStream has already acknowledged it, so the refusal lands
+    /// here, before any SQL. Under admission, the same check catches a missing original-ID
+    /// header. No ID is ever made up on the write's behalf.
+    fn hasValidMessageId(msg: *nats.JetStreamMessage) bool {
+        const id = msgIdOf(msg) orelse return false;
+        return admission.validMessageId(id);
+    }
+
+    /// No verdict can reach the client: verdicts are addressed by the very ID that is
+    /// missing or unusable. The write is dead-lettered and the operator sees why.
+    fn refuseUnidentified(self: *MutationListener, conn_nats: *nats.Connection, msg: *nats.JetStreamMessage, payload: []const u8, mutation: Mutation) void {
+        log.warn("⚠️  '{s}' wrote to '{s}' without a valid message ID: not executed, dead-lettered, and no verdict is addressable", .{ mutation.principal, mutation.table });
+        self.deadLetter(conn_nats, msg, payload, error.InvalidMessageId);
+        msg.ack() catch {};
     }
 
     // `headerValue` lived here: a hand-rolled parse of the raw header block, written

@@ -4474,6 +4474,9 @@ pub const SyncClient = struct {
         try args.put(a, "table", .{ .string = table });
         try args.put(a, "op", .{ .string = op });
         try args.put(a, "version", .{ .string = version });
+        // The ID's creation time: the bridge's clock as this device estimates it, taken
+        // once here; the outbox keeps the resulting ID, so a retry never regenerates it.
+        try args.put(a, "createdMs", .{ .integer = nowMillis() + self.clock_offset_ms });
         try args.put(a, "key", key);
         if (values) |v| try args.put(a, "values", v);
         var pk_arr = std.json.Array.init(a);

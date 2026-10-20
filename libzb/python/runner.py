@@ -61,7 +61,7 @@ SECTIONS = {
     "normalizeVersion":(lambda c: {"in": c["in"]},                                 lambda c: c["out"]),
     "nextVersion":     (lambda c: {"now": c["now"], "last": c["last"]},            lambda c: c["out"]),
     "hlcVersion":      (lambda c: {"now": c["now"], "last": c["last"], "floor": c["floor"]}, lambda c: c["out"]),
-    "subjectSafe":     (lambda c: {"in": c["in"]},                                 lambda c: c["out"]),
+    "messageId":       (lambda c: c["args"],                                       lambda c: {"error": "dispatch failed: " + c["throws"]} if "throws" in c else c["out"]),
     # a `throws` case: the C card reports a refused build as {"error": "dispatch failed: <name>"}
     "envelope":        (lambda c: c["args"],                                       lambda c: {"error": "dispatch failed: " + c["throws"]} if "throws" in c else c["out"]),
     "keyChange":       (lambda c: {"table": c["table"], "pkCols": c["pkCols"], "data": c["data"]}, lambda c: c["step"]),

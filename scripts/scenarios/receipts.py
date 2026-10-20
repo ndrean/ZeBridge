@@ -107,6 +107,13 @@ def main():
         r = claim([f"zb1-t{ms(now - datetime.timedelta(days=400))}-c1-t-4", f"zb1-t{ms(now + datetime.timedelta(minutes=10))}-c1-t-5",
                    "has.dot", "zb1-tbad-x", "x" * 513])
         check(statuses(r) == ["expired", "future", "invalid", "invalid", "invalid"], "expired, future and invalid IDs are refused before any claim")
+        # One byte policy with admission and both builders: Unicode spaces are ordinary UTF-8,
+        # ASCII space/control bytes are not, and the limit counts bytes, not characters.
+        uni = [f"zb1-t{ms(now)}-c1-t-a b", f"zb1-t{ms(now)}-c1-t-a\u0085b"]
+        r = claim(uni, extra=finish(uni))
+        check(statuses(r) == ["claimed", "claimed"], "IDs with U+2003 or U+0085, which admission accepts, are claimed, not invalid")
+        r = claim([f"zb1-t{ms(now)}-c1-t-a\tb", " " * 171])
+        check(statuses(r) == ["invalid", "invalid"], "an ASCII tab is invalid; so is a 513-byte ID of 171 characters")
 
         unfinished = f"zb1-t{ms(now)}-c1-t-6"
         r = claim([unfinished])

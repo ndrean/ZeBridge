@@ -183,13 +183,17 @@ async def main():
             mutation = take(lib.zb_client_mutate(h, b"recovery_row", b"INSERT",
                 b'{"id":"00000000-0000-0000-0000-000000000002"}', b'{"v":20}'))
             assert "error" not in mutation, mutation
+            # Longer than the 128-byte tenant-token bound the verdict check once used, within
+            # the 512-byte ID rule: clearing the outbox below proves such an ID gets its verdict.
+            id_bytes = len(mutation["msgId"].encode("utf-8"))
+            check(128 < id_bytes <= 512, f"the native write's escaped zb1 ID is longer than 128 bytes ({id_bytes})")
             for _ in range(100):
                 await asyncio.to_thread(lambda: take(lib.zb_client_poll(h, 20)))
                 if rows(h) == [[10], [20]] and pending(h) == 0:
                     break
                 await asyncio.sleep(.05)
             check(rows(h) == [[10], [20]] and pending(h) == 0,
-                  "a write crosses admission, commits, echoes and clears its original client outbox")
+                  f"a write crosses admission, commits, echoes and clears its original client outbox (rows {rows(h)}, pending {pending(h)})")
             # A decided receipt in monthly partitions, as a running bridge leaves them.
             receipt_id = f"zb1-t{int(time.time() * 1000)}-recovery-1"
             receipt_args = (f"'lf-edge1.recovery_device', ARRAY['{receipt_id}']::text[], "

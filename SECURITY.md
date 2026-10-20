@@ -565,8 +565,7 @@ but nothing runs is prose, and the untested cells were found exactly that way.
    wire format of every value in it, and PostgreSQL parses both, so nothing fails while
    your comparisons quietly stop agreeing with the feed.
 5. **Treat a reply as a verdict, not as data.** State always arrives through CDC.
-6. **Keep `Nats-Msg-Id` stable across retries**, and subject-safe (no `.`, `*`, `>`,
-   whitespace) — it becomes a subject token.
+6. **Always set `Nats-Msg-Id`, and keep it stable across retries.** A write without a valid one is never executed: admission refuses it before queueing; in direct mode, JetStream may already have acknowledged storing it, and the bridge refuses execution instead. It must be 1 to 512 bytes with no `.`, `*`, `>` and no ASCII control or space byte; an ID starting with `zb1-` must be `zb1-t<epoch-ms>-<rest>` (PROTOCOL.md §7.2).
 
 ### 2.2 The workflow
 

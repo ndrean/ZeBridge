@@ -1346,8 +1346,11 @@ BEGIN
                    sha256(int4send(length(x.r)) || x.r || x.p) AS fp,
                    zebridge_private.receipt_month(x.id) AS m,
                    CASE WHEN x.id IS NULL OR x.r IS NULL OR x.p IS NULL
-                             -- (PostgreSQL caps a regex repetition at 255: length apart)
-                             OR length(x.id) NOT BETWEEN 1 AND 512 OR x.id ~ '[.*>[:space:][:cntrl:]]'
+                             -- One byte policy with admission and both builders: 1-512 BYTES, no
+                             -- '.', '*', '>' and no ASCII control or space byte; UTF-8 is allowed.
+                             -- Explicit bytes, not [:space:]: those classes are Unicode-aware here
+                             -- and would refuse U+2003 or U+0085 that admission accepted.
+                             OR octet_length(x.id) NOT BETWEEN 1 AND 512 OR x.id ~ '[.*>\x01-\x20\x7f]'
                              OR zebridge_private.receipt_month(x.id) IS NULL THEN 'invalid'
                         WHEN zebridge_private.receipt_created_ms(x.id) < floor_ms THEN 'expired'
                         WHEN zebridge_private.receipt_created_ms(x.id) > now_ms + 60000 THEN 'future'

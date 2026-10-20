@@ -183,8 +183,13 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
         try core.writeJsonString(a, &out, try core.hlcVersion(a, args.object.get("now").?.string, args.object.get("last").?.string, args.object.get("floor").?.string));
         return out.items;
     }
-    if (eq(u8, name, "subjectSafe")) {
-        try core.writeJsonString(a, &out, try core.subjectSafeToken(a, args.object.get("in").?.string));
+    if (eq(u8, name, "messageId")) {
+        const parts = try strArrField(a, args, "keyParts");
+        const created: i64 = switch (args.object.get("createdMs") orelse return error.MissingCreatedMs) {
+            .integer => |x| x,
+            else => return error.InvalidCreatedMs,
+        };
+        try core.writeJsonString(a, &out, try core.messageId(a, created, args.object.get("clientId").?.string, args.object.get("table").?.string, args.object.get("op").?.string, parts, args.object.get("version").?.string));
         return out.items;
     }
     if (eq(u8, name, "envelope")) {
