@@ -94,7 +94,7 @@ var clients: handles.Table(ClientBox, 64) = .{};
 
 /// The ABI version — libzb/abi.json's `version`, which python/abi_check.py keeps in
 /// step with what this file exports and what `openBox` reads.
-pub const abi_version: c_int = 6;
+pub const abi_version: c_int = 7;
 
 export fn zb_abi_version() c_int {
     return abi_version;

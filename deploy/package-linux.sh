@@ -87,7 +87,7 @@ cp "$root/libzb/include/zb.h" "$l/include/"
 cp "$lib/bin/zb-respond" "$l/bin/"
 cp "$root/LICENSE" "$l/"
 cat > "$l/README.txt" <<EOF
-libzb $version for Linux ($arch): the ZeBridge client as a C library (ABI 6).
+libzb $version for Linux ($arch): the ZeBridge client as a C library (ABI 7).
 
     lib/libzbcore.so    SQLite and zstd compiled in; needs only glibc 2.35+
     include/zb.h        the C declarations; every call takes and returns JSON

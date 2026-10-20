@@ -38,7 +38,7 @@ from . import _native as n
 __all__ = ["ZeBridge", "ZeBridgeError", "ZB_ABI", "create_user", "creds_file_text", "grammar_hash", "merge_registers"]
 
 #: libzb's C ABI version this package was written for; libzb/python/abi_check.py checks it.
-ZB_ABI = 6
+ZB_ABI = 7
 
 
 class ZeBridgeError(RuntimeError):

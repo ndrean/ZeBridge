@@ -37,7 +37,7 @@ for a in $archs; do
       python3 -c '
 import ctypes, json
 z = ctypes.CDLL(\"libzbcore.so\")
-assert z.zb_abi_version() == 6, z.zb_abi_version()
+assert z.zb_abi_version() == 7, z.zb_abi_version()
 z.zb_call.restype = ctypes.c_void_p
 z.zb_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
 z.zb_free.argtypes = [ctypes.c_void_p]

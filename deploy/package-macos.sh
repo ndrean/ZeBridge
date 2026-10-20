@@ -25,7 +25,7 @@ for spec in "aarch64 arm64" "x86_64 x86_64"; do
   cp "$root/libzb/include/zb.h" "$l/include/"
   cp "$root/LICENSE" "$l/"
   cat > "$l/README.txt" <<EOF
-libzb $version for macOS ($arch, macOS 13+): the ZeBridge client as a C library (ABI 6).
+libzb $version for macOS ($arch, macOS 13+): the ZeBridge client as a C library (ABI 7).
 
     lib/libzbcore.dylib  SQLite and zstd compiled in; needs nothing else
     include/zb.h         the C declarations; every call takes and returns JSON
