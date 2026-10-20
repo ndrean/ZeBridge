@@ -29,6 +29,38 @@ const topology_mod = @import("topology.zig");
 
 pub const log = std.log.scoped(.http_server);
 
+/// The timestamp is untrusted and may be any i64, including minInt. Widen both
+/// operands before subtracting, including for the refusal log below.
+fn renewalClockSkew(now: i64, timestamp: i64) i128 {
+    return @as(i128, now) - @as(i128, timestamp);
+}
+
+test "renewal clock skew handles the entire signed timestamp range" {
+    const min = std.math.minInt(i64);
+    const max = std.math.maxInt(i64);
+    const span: i128 = std.math.maxInt(u64);
+    try std.testing.expectEqual(span, renewalClockSkew(max, min));
+    try std.testing.expectEqual(-span, renewalClockSkew(min, max));
+    try std.testing.expectEqual(@as(i128, 0), renewalClockSkew(min, min));
+    try std.testing.expectEqual(@as(i128, 0), renewalClockSkew(max, max));
+
+    const now: i64 = 1_792_400_000;
+    for ([_]i64{ min, max }) |timestamp| {
+        try std.testing.expect(@abs(renewalClockSkew(now, timestamp)) > Config.Http.renew_clock_skew_seconds);
+    }
+}
+
+test "renewal clock window includes both boundaries and refuses the next second" {
+    const now: i64 = 1_792_400_000;
+    const window = Config.Http.renew_clock_skew_seconds;
+    for ([_]i64{ -window, 0, window }) |offset| {
+        try std.testing.expect(@abs(renewalClockSkew(now, now + offset)) <= window);
+    }
+    for ([_]i64{ -window - 1, window + 1 }) |offset| {
+        try std.testing.expect(@abs(renewalClockSkew(now, now + offset)) > window);
+    }
+}
+
 // `parseIp4` and its two tests lived here. `std.Io.net.IpAddress.parse` does it, and does
 // not offer the byte-order mistake the hand-rolled version made: `readInt(u32, .big)`
 // returns the numeric value, which lays down reversed on a little-endian host, so
@@ -577,8 +609,9 @@ pub const Server = struct {
         dec.decode(&sig, sig_s) catch return bad.respond(req, cors, .bad_request, "{\"error\":\"bad request\"}\n");
 
         const now = @as(i64, @intCast(c.time(null)));
-        if (@abs(now - ts) > Config.Http.renew_clock_skew_seconds) {
-            log.warn("🔁 renewal refused: timestamp {d} s off the bridge's clock — the answer carries the bridge's time", .{now - ts});
+        const skew = renewalClockSkew(now, ts);
+        if (@abs(skew) > Config.Http.renew_clock_skew_seconds) {
+            log.warn("🔁 renewal refused: timestamp {d} s off the bridge's clock — the answer carries the bridge's time", .{skew});
             // The bridge's time goes back with the refusal: the device re-stamps with it
             // and tries once more, so a wrong device clock never locks a device out.
             // The signature still binds the stamp, so a replay stays bounded by the window.

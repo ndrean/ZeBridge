@@ -3036,6 +3036,7 @@ test {
     _ = @import("fleet_monitor.zig");
     _ = @import("generation_producer.zig");
     _ = @import("init_sql.zig");
+    _ = @import("http_server.zig");
     _ = @import("mutation_listener.zig");
     _ = @import("nats_init.zig");
     _ = @import("numeric.zig");
