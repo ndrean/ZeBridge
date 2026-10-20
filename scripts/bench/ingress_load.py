@@ -9,6 +9,8 @@ The rows are 09-event's (examples/09-event/sensors.py); what varies is the write
              resends the very same messages, which only the bridge itself can recognise
     reject   a --reject-share of the writes carries an unknown column: refused, and in a
              batch it fails the whole transaction, so the bridge replays that batch one by one
+    single   one zb1 write at a time, each waiting for its own verdict: every write takes
+             the listener's single-message path, so its latency is that path's alone
 
 One JSON line on stdout at the end: sent, publish errors, verdicts by status, and verdict
 latency percentiles (phase 2 apart for `dup`).
@@ -54,7 +56,7 @@ async def main():
     ap.add_argument("--creds", required=True)
     ap.add_argument("--principal", default="bob")
     ap.add_argument("--tenant", default="globex")
-    ap.add_argument("--variant", choices=("legacy", "zb1", "dup", "reject"), required=True)
+    ap.add_argument("--variant", choices=("legacy", "zb1", "dup", "reject", "single"), required=True)
     ap.add_argument("--rate", type=float, required=True, help="writes per second offered by this process")
     ap.add_argument("--seconds", type=float, required=True)
     ap.add_argument("--first-id", type=int, default=0)
@@ -66,11 +68,13 @@ async def main():
     nc = await nats.connect(a.url, user_credentials=a.creds, inbox_prefix=f"_INBOX.{a.principal}".encode())
     js = nc.jetstream()
     phases = [Phase(), Phase()]
-    current = {"phase": 0}
-    sent_at = {}
+    sent_at, answered = {}, {}
 
     async def on_verdict(m):
-        entry = sent_at.pop(m.subject.rsplit(".", 1)[-1], None)  # an ID never holds a dot
+        mid = m.subject.rsplit(".", 1)[-1]  # an ID never holds a dot
+        if mid in answered:
+            answered[mid].set()
+        entry = sent_at.pop(mid, None)
         if entry is None:
             return  # another process's write
         t, ph = entry
@@ -121,8 +125,27 @@ async def main():
         while time.monotonic() < end and sum(phases[ph].verdicts.values()) < phases[ph].sent:
             await asyncio.sleep(.1)
 
+    async def single(until):
+        while time.monotonic() < until:
+            eid, now = uuid.uuid7(), time.time()
+            row = {"event_id": str(eid), "tenant_id": a.tenant, "sensor_id": a.first_id, "kind": "temperature",
+                   "value": round(21 + 2 * math.cos(now), 3), "updated_at": iso(now)}
+            client = f"sensor-{a.first_id}"
+            body = msgpack.packb({"key": {"event_id": row["event_id"]}, "data": row, "version": row["updated_at"], "client_id": client})
+            mid = zb1_id(int(now * 1000), client, row["event_id"], row["updated_at"])
+            answered[mid] = asyncio.Event()
+            await publish(0, mid, body)
+            try:
+                await asyncio.wait_for(answered[mid].wait(), 10)
+            except asyncio.TimeoutError:
+                pass
+            answered.pop(mid, None)
+
     start = time.monotonic()
-    await asyncio.gather(*(worker(w, start + a.seconds) for w in range(a.workers)))
+    if a.variant == "single":
+        await single(start + a.seconds)
+    else:
+        await asyncio.gather(*(worker(w, start + a.seconds) for w in range(a.workers)))
     await settle(0)
     result = {"variant": a.variant, "offered_per_s": a.rate, "seconds": a.seconds, "phase1": phases[0].summary()}
     if a.variant == "dup":

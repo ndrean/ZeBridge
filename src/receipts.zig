@@ -42,18 +42,72 @@ pub fn parseOutcome(a: std.mem.Allocator, text: []const u8) !Outcome {
 const claim_sql = "SELECT status, outcome::text FROM zebridge_private.claim_receipts($1, ARRAY[$2::text], ARRAY[$3::bytea], ARRAY[$4::bytea])";
 const finish_sql = "SELECT zebridge_private.finish_receipts($1, ARRAY[$2::text], ARRAY[$3::jsonb])";
 
-/// The claim for one write, pipelined: the route and payload go as binary parameters, the
-/// exact bytes received, which is what the fingerprint is taken over.
-pub fn sendClaim(conn: ?*c.PGconn, principal: [:0]const u8, id: [:0]const u8, route: []const u8, payload: []const u8) bool {
-    const values = [_]?[*]const u8{ principal.ptr, id.ptr, route.ptr, payload.ptr };
-    const lengths = [_]c_int{ 0, 0, @intCast(route.len), @intCast(payload.len) };
-    const formats = [_]c_int{ 0, 0, 1, 1 };
-    return c.PQsendQueryParams(conn, claim_sql, 4, null, @ptrCast(&values), &lengths, &formats, 0) == 1;
+/// `$first`, `$first+1`, … as `ARRAY[$i::cast, …]`: every element its own parameter, so
+/// bytes travel as bytes (binary) and nothing hand-encodes an array literal.
+fn placeholders(a: std.mem.Allocator, sql: *std.ArrayList(u8), first: usize, n: usize, cast: []const u8) !void {
+    try sql.appendSlice(a, "ARRAY[");
+    for (0..n) |i| {
+        if (i > 0) try sql.append(a, ',');
+        try sql.print(a, "${d}::{s}", .{ first + i, cast });
+    }
+    try sql.append(a, ']');
 }
 
-pub fn sendFinish(conn: ?*c.PGconn, principal: [:0]const u8, id: [:0]const u8, outcome: [:0]const u8) bool {
-    const values = [_]?[*:0]const u8{ principal.ptr, id.ptr, outcome.ptr };
-    return c.PQsendQueryParams(conn, finish_sql, 3, null, &values, null, null, 0) == 1;
+/// One principal's claims in one call, pipelined; the rows come back in `ids` order. The
+/// routes and payloads go as binary parameters: the exact bytes received, which is what
+/// the fingerprint is taken over. (Per call, a function costs about 60 µs over its rows:
+/// one call per principal, not per write.)
+pub fn sendClaims(a: std.mem.Allocator, conn: ?*c.PGconn, principal: [:0]const u8, ids: []const [:0]const u8, routes: []const []const u8, payloads: []const []const u8) !bool {
+    const n = ids.len;
+    var sql: std.ArrayList(u8) = .empty;
+    try sql.appendSlice(a, "SELECT status, outcome::text FROM zebridge_private.claim_receipts($1, ");
+    try placeholders(a, &sql, 2, n, "text");
+    try sql.appendSlice(a, ", ");
+    try placeholders(a, &sql, 2 + n, n, "bytea");
+    try sql.appendSlice(a, ", ");
+    try placeholders(a, &sql, 2 + 2 * n, n, "bytea");
+    try sql.appendSlice(a, ") ORDER BY ord");
+    const sql_z = try a.dupeZ(u8, sql.items);
+    const values = try a.alloc(?[*]const u8, 1 + 3 * n);
+    const lengths = try a.alloc(c_int, 1 + 3 * n);
+    const formats = try a.alloc(c_int, 1 + 3 * n);
+    values[0], lengths[0], formats[0] = .{ principal.ptr, 0, 0 };
+    for (0..n) |i| {
+        values[1 + i], lengths[1 + i], formats[1 + i] = .{ ids[i].ptr, 0, 0 };
+        values[1 + n + i], lengths[1 + n + i], formats[1 + n + i] = .{ routes[i].ptr, @intCast(routes[i].len), 1 };
+        values[1 + 2 * n + i], lengths[1 + 2 * n + i], formats[1 + 2 * n + i] = .{ payloads[i].ptr, @intCast(payloads[i].len), 1 };
+    }
+    return c.PQsendQueryParams(conn, sql_z.ptr, @intCast(1 + 3 * n), null, values.ptr, lengths.ptr, formats.ptr, 0) == 1;
+}
+
+/// One principal's outcomes in one call, pipelined (a set-based keyed UPDATE).
+pub fn sendFinishes(a: std.mem.Allocator, conn: ?*c.PGconn, principal: [:0]const u8, ids: []const [:0]const u8, outcomes: []const [:0]const u8) !bool {
+    const n = ids.len;
+    var sql: std.ArrayList(u8) = .empty;
+    try sql.appendSlice(a, "SELECT zebridge_private.finish_receipts($1, ");
+    try placeholders(a, &sql, 2, n, "text");
+    try sql.appendSlice(a, ", ");
+    try placeholders(a, &sql, 2 + n, n, "jsonb");
+    try sql.append(a, ')');
+    const sql_z = try a.dupeZ(u8, sql.items);
+    const values = try a.alloc(?[*:0]const u8, 1 + 2 * n);
+    values[0] = principal.ptr;
+    for (0..n) |i| {
+        values[1 + i] = ids[i].ptr;
+        values[1 + n + i] = outcomes[i].ptr;
+    }
+    return c.PQsendQueryParams(conn, sql_z.ptr, @intCast(1 + 2 * n), null, values.ptr, null, null, 0) == 1;
+}
+
+/// A grouped claim's rows, one per ID in send order.
+pub fn readClaims(a: std.mem.Allocator, r: ?*c.PGresult, out: []Claim) !void {
+    if (c.PQntuples(r) != @as(c_int, @intCast(out.len))) return error.ReceiptInfrastructure;
+    for (out, 0..) |*claim, i| {
+        const row: c_int = @intCast(i);
+        const status = std.meta.stringToEnum(Status, std.mem.span(c.PQgetvalue(r, row, 0))) orelse return error.ReceiptInfrastructure;
+        const outcome: ?[]const u8 = if (c.PQgetisnull(r, row, 1) == 0) try a.dupe(u8, std.mem.span(c.PQgetvalue(r, row, 1))) else null;
+        claim.* = .{ .status = status, .outcome = outcome };
+    }
 }
 
 /// A claim's row: (status, outcome).

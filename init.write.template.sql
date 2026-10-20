@@ -1166,25 +1166,35 @@ GRANT USAGE ON SCHEMA zebridge_private TO ${POSTGRES_WRITER_USER};
 
 -- The first day of the UTC month holding epoch milliseconds `ms`. Date arithmetic
 -- only, so it is IMMUTABLE (a timestamptz detour would depend on TimeZone).
+-- One expression, no FROM: PostgreSQL inlines it (measured: per-row receipt work fell
+-- from about 150 to 60 µs once these helpers lost their regex and subqueries).
 CREATE OR REPLACE FUNCTION zebridge_private.month_of_ms(ms bigint)
-RETURNS date LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
-    SELECT make_date(extract(year FROM d)::int, extract(month FROM d)::int, 1)
-    FROM (SELECT DATE '1970-01-01' + (ms / 86400000)::int AS d) s
+RETURNS date LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+    SELECT (DATE '1970-01-01' + (ms / 86400000)::int) - (extract(day FROM DATE '1970-01-01' + (ms / 86400000)::int)::int - 1)
 $$;
 
 -- A new-format ID's creation time: zb1-t<epoch-ms>-<rest>. NULL for anything else.
+-- String functions, not a regex: it runs in the CHECK on every insert and update.
 CREATE OR REPLACE FUNCTION zebridge_private.receipt_created_ms(message_id text)
-RETURNS bigint LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
-    SELECT (pg_catalog.regexp_match(message_id, '^zb1-t([0-9]{1,15})-.'))[1]::bigint
+RETURNS bigint LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+    SELECT CASE WHEN left(message_id, 5) = 'zb1-t'
+                 AND split_part(substr(message_id, 6), '-', 1) <> ''
+                 AND length(split_part(substr(message_id, 6), '-', 1)) <= 15
+                 AND translate(split_part(substr(message_id, 6), '-', 1), '0123456789', '') = ''
+                 AND length(message_id) > 6 + length(split_part(substr(message_id, 6), '-', 1))
+            THEN split_part(substr(message_id, 6), '-', 1)::bigint END
 $$;
 
 -- The partition month of a message ID, from the ID alone: a retry of the same ID always
 -- addresses the same partition, so the primary key below is unique across months.
 -- No zb1- prefix: a legacy ID, all in the 1900-01 sentinel month (no new-format ID can
 -- fall there). zb1- but malformed: NULL, which the CHECK below refuses.
+-- Not STRICT, like the two helpers it calls: PostgreSQL inlines a SQL function only when
+-- its body is as strict as its declaration, and these are CASE expressions. A NULL ID
+-- still yields NULL.
 CREATE OR REPLACE FUNCTION zebridge_private.receipt_month(message_id text)
-RETURNS date LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
-    SELECT CASE WHEN message_id !~ '^zb1-' THEN DATE '1900-01-01'
+RETURNS date LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+    SELECT CASE WHEN left(message_id, 4) <> 'zb1-' THEN DATE '1900-01-01'
                 ELSE zebridge_private.month_of_ms(zebridge_private.receipt_created_ms(message_id)) END
 $$;
 
@@ -1269,7 +1279,7 @@ BEGIN
     END IF;
     IF to_regclass('zebridge_private.receipts_legacy') IS NULL THEN
         CREATE TABLE zebridge_private.receipts_legacy PARTITION OF zebridge_private.receipts
-            FOR VALUES FROM ('1900-01-01') TO ('1900-02-01');
+            FOR VALUES FROM ('1900-01-01') TO ('1900-02-01') WITH (fillfactor = 70);
         RETURN NEXT 'receipts_legacy';
     END IF;
     m := zebridge_private.month_of_ms(floor_ms);
@@ -1277,7 +1287,9 @@ BEGIN
     WHILE m <= last_m LOOP
         part := 'receipts_' || to_char(m, 'YYYY_MM');
         IF to_regclass('zebridge_private.' || part) IS NULL THEN
-            EXECUTE format('CREATE TABLE zebridge_private.%I PARTITION OF zebridge_private.receipts FOR VALUES FROM (%L) TO (%L)',
+            -- fillfactor 70: room on the page for finish_receipts' update, which touches no
+            -- indexed column, to be a HOT update (no new index entry).
+            EXECUTE format('CREATE TABLE zebridge_private.%I PARTITION OF zebridge_private.receipts FOR VALUES FROM (%L) TO (%L) WITH (fillfactor = 70)',
                            part, m, (m + interval '1 month')::date);
             RETURN NEXT part;
         END IF;
@@ -1325,7 +1337,8 @@ $$;
 -- below takes a fresh snapshot: the lookup after the insert sees a concurrent winner.
 CREATE OR REPLACE FUNCTION zebridge_private.claim_receipts(p_principal text, p_ids text[], p_routes bytea[], p_payloads bytea[])
 RETURNS TABLE(ord integer, status text, outcome jsonb)
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog
+SET enable_hashjoin = off SET enable_mergejoin = off SET enable_seqscan = off AS $$
 DECLARE
     now_ms   bigint := (extract(epoch FROM clock_timestamp()) * 1000)::bigint;
     floor_ms bigint;
@@ -1334,6 +1347,9 @@ DECLARE
     verdicts text[];
     timing   text[];
     claimed  text[];
+    first    integer;
+    rec_fp   bytea;
+    rec_outcome jsonb;
 BEGIN
     IF p_principal IS NULL OR p_principal = '' THEN
         RAISE EXCEPTION 'a receipt needs an authenticated principal' USING ERRCODE = '22023';
@@ -1379,34 +1395,58 @@ BEGIN
     )
     SELECT coalesce(array_agg(message_id), '{}') INTO claimed FROM ins;
 
-    -- 3. Answer every position. A new statement, so a fresh snapshot.
-    RETURN QUERY
-    SELECT n::integer,
-           CASE WHEN verdicts[n] <> 'candidate' THEN verdicts[n]
-                WHEN EXISTS (SELECT 1 FROM generate_subscripts(p_ids, 1) e
-                             WHERE e < n AND p_ids[e] = p_ids[n] AND verdicts[e] = 'candidate')
-                     THEN CASE WHEN fps[n] = fps[(SELECT min(e) FROM generate_subscripts(p_ids, 1) e
-                                                  WHERE p_ids[e] = p_ids[n] AND verdicts[e] = 'candidate')]
-                               THEN 'repeat' ELSE 'conflict' END
-                WHEN p_ids[n] = ANY (claimed) THEN 'claimed'
-                WHEN rec.fingerprint = fps[n] THEN 'duplicate'
-                WHEN rec.fingerprint IS NOT NULL THEN 'conflict'
-                WHEN timing[n] <> 'ok' THEN timing[n]  -- no receipt: now the time checks
-                ELSE 'conflict' END,
-           CASE WHEN verdicts[n] = 'candidate' AND NOT (p_ids[n] = ANY (claimed)) AND rec.fingerprint = fps[n]
-                THEN rec.outcome END
-      FROM generate_subscripts(p_ids, 1) AS n
-      LEFT JOIN zebridge_private.receipts rec
-             ON verdicts[n] = 'candidate' AND rec.principal = p_principal
-            AND rec.message_id = p_ids[n] AND rec.id_month = months[n]
-     ORDER BY n;
+    -- 3. Answer every position. Each lookup is its own statement, so a fresh snapshot sees
+    --    a concurrent winner; and each is a full-key equality, so it is an index probe in one
+    --    partition whatever plan this session cached. (A join on generate_subscripts, plain or
+    --    LATERAL, was planned while the table was still empty, kept its scan as the table
+    --    grew, and slowed each claim down batch after batch: 19 → 141 ms per 64 writes.)
+    FOR n IN 1 .. coalesce(cardinality(p_ids), 0) LOOP
+        ord := n;
+        outcome := NULL;
+        IF verdicts[n] <> 'candidate' THEN
+            status := verdicts[n];
+        ELSE
+            first := n;
+            FOR e IN 1 .. n - 1 LOOP
+                IF p_ids[e] = p_ids[n] AND verdicts[e] = 'candidate' THEN
+                    first := e;
+                    EXIT;
+                END IF;
+            END LOOP;
+            IF first < n THEN
+                status := CASE WHEN fps[n] = fps[first] THEN 'repeat' ELSE 'conflict' END;
+            ELSIF p_ids[n] = ANY (claimed) THEN
+                status := 'claimed';
+            ELSE
+                SELECT r.fingerprint, r.outcome INTO rec_fp, rec_outcome
+                  FROM zebridge_private.receipts r
+                 WHERE r.principal = p_principal AND r.message_id = p_ids[n] AND r.id_month = months[n];
+                IF FOUND AND rec_fp = fps[n] THEN
+                    status := 'duplicate';
+                    outcome := rec_outcome;
+                ELSIF FOUND THEN
+                    status := 'conflict';
+                ELSIF timing[n] <> 'ok' THEN
+                    status := timing[n]; -- no receipt: now the time checks
+                ELSE
+                    status := 'conflict';
+                END IF;
+            END IF;
+        END IF;
+        RETURN NEXT;
+    END LOOP;
 END;
 $$;
 
 -- Record the outcome of every receipt this transaction claimed. Refuses an ID that is not
 -- an unfinished claim visible to this transaction, and a NULL outcome.
 CREATE OR REPLACE FUNCTION zebridge_private.finish_receipts(p_principal text, p_ids text[], p_outcomes jsonb[])
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog
+-- Index probes only, whatever the statistics say: a plan made while the table was empty,
+-- and cached for the session, must not become a scan of every partition as it grows. The
+-- UPDATE is set-based on purpose: starting an UPDATE on a partitioned table costs about
+-- 100 µs, so one per ID (a loop) cost more than the rows themselves.
+SET enable_hashjoin = off SET enable_mergejoin = off SET enable_seqscan = off AS $$
 DECLARE
     done integer;
 BEGIN

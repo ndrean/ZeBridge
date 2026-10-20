@@ -293,20 +293,24 @@ async def main():
                   "its retry is answered from the rejection receipt, without running")
 
             # ── concurrent duplicates: both copies stored before the bridge looks ──
+            # Two principals interleaved, so each batch holds one claim group per principal.
+            bob = Writer(hub, "bob")
+            await bob.open()
             keys = [str(uuid.uuid4()) for _ in range(50)]
-            dups = [write("s2_row", k, {"v": n}) for n, k in enumerate(keys)]
+            dups = [((alice, bob)[n % 2], write("s2_row", k, {"v": n})) for n, k in enumerate(keys)]
             hub.procs["bridge"].send_signal(signal.SIGSTOP)
-            for d in dups:
-                await alice.send("s2_row", *d)
+            for who, d in dups:
+                await who.send("s2_row", *d)
             await asyncio.sleep(0.8)  # past the shortened window: the second copies are stored too
-            for d in dups:
-                await alice.send("s2_row", *d)
+            for who, d in dups:
+                await who.send("s2_row", *d)
             hub.procs["bridge"].send_signal(signal.SIGCONT)
-            answers = [await alice.answered(d[0], 2) for d in dups]
+            answers = [await who.answered(d[0], 2) for who, d in dups]
             runs = sum(hub.executions("s2_row", k) for k in keys)
             check(all(len(a) == 2 and a[0]["status"] == a[1]["status"] == "accepted" and a[0]["version"] == a[1]["version"] for a in answers)
                   and runs == len(keys),
-                  f"{len(keys)} writes stored twice, judged by two lanes: {runs} executions, both copies answered alike")
+                  f"{len(keys)} writes from two principals stored twice, judged by two lanes: {runs} executions, both copies answered alike")
+            await bob.nc.close()
             await alice.nc.close()
         except Exception:
             for label in hub.logs:

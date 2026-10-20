@@ -512,6 +512,9 @@ pub const MutationListener = struct {
     last_outcome: WriteOutcome = .applied,
     /// When the receipt partitions are next maintained (epoch seconds; 0: at once).
     receipts_due_at: i64 = 0,
+    /// Batches replayed message by message since the last warning, and when it was.
+    replayed_batches: u64 = 0,
+    replay_logged_at: i64 = 0,
     /// Non-null while `applyBatched` has a pipeline open: routes `exec()` into
     /// send-only mode. Always null on the per-message path.
     batch_ctx: ?*BatchCtx = null,
@@ -711,11 +714,22 @@ pub const MutationListener = struct {
             defer batch.deinit();
 
             if (batch.messages.len > 1) {
-                self.applyBatched(conn, conn_nats, batch.messages) catch {
+                self.applyBatched(conn, conn_nats, batch.messages) catch |err| {
                     // The transaction rolled back whole; every message replays
                     // through the per-message path — the full retry, dead-letter
                     // and verdict machinery decides there. No delivery budget was
                     // spent in the failed attempt (nothing was acked or NAK'd).
+                    //
+                    // Said, at most once a second with a count: a replay is correct but
+                    // one write at a time, so batches that keep failing look like a
+                    // slow bridge and nothing else.
+                    self.replayed_batches +|= 1;
+                    const now = std.Io.Clock.real.now(self.io).toSeconds();
+                    if (now != self.replay_logged_at) {
+                        log.warn("⚠️  {d} batch(es) replayed one write at a time, latest because: {s}", .{ self.replayed_batches, @errorName(err) });
+                        self.replay_logged_at = now;
+                        self.replayed_batches = 0;
+                    }
                     for (batch.messages) |msg| self.processOne(conn, conn_nats, msg);
                 };
             } else for (batch.messages) |msg| self.processOne(conn, conn_nats, msg);
@@ -1342,22 +1356,38 @@ pub const MutationListener = struct {
         // From here on, ANY error return (allocation failures included) leaves the
         // connection idle and outside any transaction, ready for the per-message replay.
         errdefer self.abandonTransaction(conn);
+        // One claim call per principal (a function call costs about 60 µs beyond its rows):
+        // `order` is sorted by (principal, ID), so a group is a run of one principal, its IDs
+        // in key order, which is the lock order.
+        const groups = try principalRuns(a, items.items, order.items);
         if (c.PQenterPipelineMode(conn) != 1) return error.MutationFailed;
         var sent_ok = c.PQsendQueryParams(conn, "BEGIN", 0, null, null, null, null, 0) == 1;
-        for (order.items) |k| {
-            const it = items.items[k];
-            sent_ok = sent_ok and receipts.sendClaim(conn, it.principal_z, it.id_z, it.route, it.msg.msg.data);
+        for (groups) |g| {
+            const span = order.items[g[0]..g[1]];
+            const ids = try a.alloc([:0]const u8, span.len);
+            const routes = try a.alloc([]const u8, span.len);
+            const payloads = try a.alloc([]const u8, span.len);
+            for (span, 0..) |k, n| {
+                ids[n] = items.items[k].id_z;
+                routes[n] = items.items[k].route;
+                payloads[n] = items.items[k].msg.msg.data;
+            }
+            sent_ok = sent_ok and try receipts.sendClaims(a, conn, items.items[span[0]].principal_z, ids, routes, payloads);
         }
         var failed_at: usize = 0;
         if (!sent_ok or c.PQpipelineSync(conn) != 1) return error.MutationFailed;
-        const r1 = try receipts.collect(a, conn, order.items.len + 1, &failed_at);
+        const r1 = try receipts.collect(a, conn, groups.len + 1, &failed_at);
         defer receipts.clearAll(r1);
         try self.leavePipeline(conn);
         if (failed_at != r1.len) return error.ReceiptInfrastructure;
         if (faultAt(.oom_in_claims)) return error.OutOfMemory;
         if (faultAt(.reset_after_claims)) c.PQreset(conn); // the transaction and its claims are gone
         try requireTransaction(conn);
-        for (order.items, 0..) |k, n| items.items[k].claim = try receipts.readClaim(a, r1[n + 1]);
+        for (groups, 0..) |g, gi| {
+            const claims = try a.alloc(receipts.Claim, g[1] - g[0]);
+            try receipts.readClaims(a, r1[gi + 1], claims);
+            for (order.items[g[0]..g[1]], claims) |k, claim| items.items[k].claim = claim;
+        }
         for (items.items, 0..) |*it, k| {
             if (it.first == k) continue;
             const f = items.items[it.first];
@@ -1405,27 +1435,35 @@ pub const MutationListener = struct {
         }
 
         // ── R4: the outcomes and COMMIT ──
-        const finishes = bc.pending.items.len;
-        if (finishes == 0) {
+        if (bc.pending.items.len == 0) {
             receipts.rollback(conn); // nothing was claimed: nothing to keep
         } else {
             // The transaction must still hold the claims and the writes: a COMMIT sent
             // outside one answers only a warning, with the very tag COMMIT.
             try requireTransaction(conn);
+            // One finish call per principal, over the claimed writes in `order`.
+            var done: std.ArrayList(usize) = .empty;
+            for (order.items) |k| if (items.items[k].pending != null) try done.append(a, k);
+            const fgroups = try principalRuns(a, items.items, done.items);
             if (c.PQenterPipelineMode(conn) != 1) return error.MutationFailed;
             sent_ok = true;
-            var sent: usize = 0;
-            for (items.items) |it| if (it.pending) |k| {
-                const pnd = bc.pending.items[k];
-                if (sent == 1 and faultAt(.oom_in_finishes)) return error.OutOfMemory;
-                const json = try receipts.outcomeJson(a, .{
-                    .status = pnd.outcome.wireName(),
-                    .reason = if (pnd.clamped) "version_clamped" else "",
-                    .version = pnd.version_buf[0..pnd.version_len],
-                });
-                sent_ok = sent_ok and receipts.sendFinish(conn, it.principal_z, it.id_z, json);
-                sent += 1;
-            };
+            for (fgroups) |g| {
+                const span = done.items[g[0]..g[1]];
+                const ids = try a.alloc([:0]const u8, span.len);
+                const outcomes = try a.alloc([:0]const u8, span.len);
+                for (span, 0..) |k, n| {
+                    const pnd = bc.pending.items[items.items[k].pending.?];
+                    ids[n] = items.items[k].id_z;
+                    outcomes[n] = try receipts.outcomeJson(a, .{
+                        .status = pnd.outcome.wireName(),
+                        .reason = if (pnd.clamped) "version_clamped" else "",
+                        .version = pnd.version_buf[0..pnd.version_len],
+                    });
+                }
+                sent_ok = sent_ok and try receipts.sendFinishes(a, conn, items.items[span[0]].principal_z, ids, outcomes);
+                if (faultAt(.oom_in_finishes)) return error.OutOfMemory; // a finish queued, the pipeline open
+            }
+            const finishes = fgroups.len;
             sent_ok = sent_ok and c.PQsendQueryParams(conn, "COMMIT", 0, null, null, null, null, 0) == 1;
             if (!sent_ok or c.PQpipelineSync(conn) != 1) return error.MutationFailed;
             // Lost before the COMMIT's answer: ambiguous. The replay claims again, and a
@@ -1458,6 +1496,21 @@ pub const MutationListener = struct {
             }
             it.msg.ack() catch {};
         }
+    }
+
+    /// Runs of one principal in `keys` (indexes into `items`, sorted by principal): one
+    /// [start, end) per run.
+    fn principalRuns(a: std.mem.Allocator, items: []const BatchItem, keys: []const usize) ![]const [2]usize {
+        var runs: std.ArrayList([2]usize) = .empty;
+        var from: usize = 0;
+        for (keys, 0..) |k, n| {
+            if (n > from and !std.mem.eql(u8, items[k].principal_z, items[keys[from]].principal_z)) {
+                try runs.append(a, .{ from, n });
+                from = n;
+            }
+        }
+        if (keys.len > from) try runs.append(a, .{ from, keys.len });
+        return runs.items;
     }
 
     /// Leave pipeline mode after a round. A connection that cannot is reset, which ends
