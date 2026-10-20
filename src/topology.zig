@@ -148,6 +148,10 @@ pub const Topology = struct {
     /// The tenant token tenant-agnostic tables live under (`"_default"` unless
     /// grammar.json says otherwise) — generation manifests.
     open_tenant: []const u8,
+    /// Every restricted leaf's id starts with it, and no other principal may
+    /// (`leaf_scope.principalIn`): `lf-canada.alice` cannot be shadowed by a principal
+    /// named `lf-canada`, whose `<prefix>.<principal>.>` grants would cover it.
+    leaf_prefix: []const u8,
 
     // ─── generations (NOTES.md §1.13) ───────────────────────────────────────────
     /// KV bucket holding the chain manifests, keyed `<tenant>.<table>` — tenant first,
@@ -222,6 +226,7 @@ pub const Topology = struct {
         .kv_tenants = "tenants",
         .kv_live = "live",
         .open_tenant = "_default",
+        .leaf_prefix = "lf-",
         .kv_generations = "generations",
         .generation_bucket_prefix = "gen-",
         .mutations_subject_wildcard = "mutation.>",
@@ -353,6 +358,13 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
         .string => |x| try a.dupe(u8, x),
         else => "_default",
     }) else "_default";
+    // Rendered into SQL regexes (init SQL) and matched in subjects: the principal
+    // alphabet only, never empty.
+    t.leaf_prefix = if (root.get("leaf_prefix")) |v| (switch (v) {
+        .string => |x| try a.dupe(u8, x),
+        else => "lf-",
+    }) else "lf-";
+    if (!@import("leaf_scope.zig").token(t.leaf_prefix)) return error.InvalidLeafPrefix;
 
     // Optional, like cdc_streams: a deployment that never sets GENERATION_RULES has no
     // reason to name these, and absent means the defaults the feature was built against.

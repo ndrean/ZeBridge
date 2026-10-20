@@ -3039,6 +3039,7 @@ test {
     _ = @import("generation_producer.zig");
     _ = @import("init_sql.zig");
     _ = @import("http_server.zig");
+    _ = @import("leaf_scope.zig");
     _ = @import("mutation_listener.zig");
     _ = @import("nats_init.zig");
     _ = @import("numeric.zig");

@@ -5,6 +5,7 @@
     "verdicts": "VERDICTS"
   },
   "open_tenant": "_default",
+  "leaf_prefix": "lf-",
   "cdc_streams": {
     "tenant_prefix": "CDC_",
     "public": "CDC_PUBLIC"

@@ -63,6 +63,9 @@ jobs:
         working-directory: zb-client-ts
     steps:
       - uses: actions/checkout@v5
+      # The bridge hashes its grammar into every enrollment reply: the copy must be byte-identical.
+      - name: grammar.json matches the bridge's
+        run: cmp ../src/grammar.json src/grammar.json
       # The version comes from packageManager in the root package.json.
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v5
