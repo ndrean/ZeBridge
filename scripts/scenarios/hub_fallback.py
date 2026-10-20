@@ -262,4 +262,11 @@ async def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    # ZB_HUB_FALLBACK_STAGES picks stages ("1 2" by default); stage 2 lives in its own
+    # module because its fixtures (PostgreSQL, a bridge, libzb) differ from stage 1's.
+    stages = os.environ.get("ZB_HUB_FALLBACK_STAGES", "1 2").split()
+    code = asyncio.run(main()) if "1" in stages else 0
+    if "2" in stages:
+        import hub_fallback_stage2
+        code |= asyncio.run(hub_fallback_stage2.main())
+    raise SystemExit(code)
