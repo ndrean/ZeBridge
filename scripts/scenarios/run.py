@@ -59,6 +59,7 @@ GROUPS = {
         "leaf_security": ("none",   "disposable Docker hub and leaf: link credentials cannot connect as clients or administer streams; loopback keeper cannot connect directly to the hub; local mirror creation, replication and deletion work"),
         "hub_recovery": ("none", "disposable PostgreSQL and NATS: scoped native mutation, real checkpoint/pg_restore, returning replica reset and fresh-device seed"),
         "hub_fallback": ("none", "disposable hub and scoped leaf: real TS buffered/streaming mirror seeds, stale or missing cache fallback, hub-domain isolation and live CDC"),
+        "receipt_faults": ("none", "disposable stack, ZB_TEST_FAULT per run: a reset after the claims, or a failed allocation in the claims or the finishes, never runs a write twice or commits it without its receipt; the connection serves the next batch"),
         "receipts": ("none", "disposable PostgreSQL: zebridge_private mutation receipts — month derived from the ID, claim/duplicate/conflict/expired/future/invalid, no unfinished commit, concurrent duplicate, legacy sentinel, monotonic minimum, privileges, silent DDL, pruning and pg_dump"),
         "mutation_admission": ("none","a private durable mutation queue: aggregate principal quotas across tables, scoped deduplication, forged headers refused, durable PubAcks and restart recovery; own local NATS, no PostgreSQL"),
         "revoke_full":   ("none",   "the hard kill: --revoke --conf amends the account JWT; reload kicks the live session"),

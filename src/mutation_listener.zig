@@ -10,6 +10,7 @@ const config = @import("config.zig");
 const pg_conn = @import("pg_conn.zig");
 const utils = @import("utils.zig");
 const rate_limit = @import("rate_limit.zig");
+const receipts = @import("receipts.zig");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 
@@ -509,6 +510,8 @@ pub const MutationListener = struct {
     /// What actually became of the last successfully-executed write — the three outcomes
     /// PROTOCOL.md §7.1 tells clients to key their outbox on.
     last_outcome: WriteOutcome = .applied,
+    /// When the receipt partitions are next maintained (epoch seconds; 0: at once).
+    receipts_due_at: i64 = 0,
     /// Non-null while `applyBatched` has a pipeline open: routes `exec()` into
     /// send-only mode. Always null on the per-message path.
     batch_ctx: ?*BatchCtx = null,
@@ -691,6 +694,8 @@ pub const MutationListener = struct {
                 }
                 log.info("Mutation listener: Reconnected to PostgreSQL.", .{});
             }
+            // Before the first write and daily after: every claim needs its month's partition.
+            self.maintainReceiptsIfDue(conn);
 
             // One pull for a whole batch: at depth >= 2 the batched apply amortizes
             // the WAL flush and the round trips (§10cr measured the one-at-a-time
@@ -1084,11 +1089,34 @@ pub const MutationListener = struct {
         // ever quote a failure from *this* message.
         self.clearFailure();
         self.refreshGcWatermark(conn);
+
+        // The receipt first, before the table's metadata, grants or the GC watermark are
+        // consulted: a write that already committed is answered from its receipt even if
+        // its table changed or went since. One explicit transaction holds the claim, the
+        // write and its outcome, so all three commit together or not at all.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const principal_z = a.dupeZ(u8, mutation.principal) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        const id_z = a.dupeZ(u8, msgIdOf(msg).?) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        receipts.exec(conn, "BEGIN", null) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        const claim = receipts.claimOne(a, conn, principal_z, id_z, subject, payload) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        if (claim.status != .claimed) {
+            receipts.rollback(conn); // the claim inserted nothing
+            self.answerUnclaimed(a, conn_nats, msg, mutation, claim);
+            msg.ack() catch {};
+            return;
+        }
+        receipts.exec(conn, "SAVEPOINT zb_write", null) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+
         self.handleMutation(mutation, payload, conn) catch |err| {
+            // A SQLSTATE the server returned and we recognise as permanent ends the
+            // retries now: waiting cannot change a privilege or a constraint.
+            const hopeless = sqlstateIsPermanent(self.lastSqlstate());
             // Retrying a malformed payload cannot help: the bytes will not
             // improve. Before this split, one bad message NAK'd forever at one
             // attempt per second and the queue never advanced past it.
-            if (isPermanent(err)) {
+            if (isPermanent(err) or hopeless) {
                 if (isOperatorFault(err)) {
                     // One line for every operator fault: the specific reason was
                     // already logged where it was detected (`tableMeta`), and
@@ -1098,11 +1126,19 @@ pub const MutationListener = struct {
                         "🔴 '{s}' cannot accept writes ({}): only a migration or a zebridge_enable change can fix this. Preflight reports it at boot; see the line above for the reason.",
                         .{ mutation.table, err },
                     );
+                } else if (hopeless) {
+                    // `info`: PostgreSQL evaluated the statement and refused it, which is
+                    // the boundary doing its job; if the *grant* were the mistake,
+                    // preflight would already have said so at boot.
+                    log.info("⛔ Mutation refused [{s}] on '{s}': SQLSTATE {s} (not retrying)", .{ mutation.principal, mutation.table, self.lastSqlstate() });
                 } else {
                     // Traced, not raised: the client is the only one who can fix a
                     // payload, and the verdict below is how they are told.
                     log.info("⛔ Mutation refused [{s}] on '{s}': {} (not retrying)", .{ mutation.principal, mutation.table, err });
                 }
+                // The refusal is this write's outcome: its receipt records it, so a retry
+                // is answered `rejected` without running again.
+                if (!self.recordRejection(a, conn, principal_z, id_z, @errorName(err))) return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
                 self.deadLetter(conn_nats, msg, payload, err);
                 self.publishVerdict(conn_nats, msg, mutation.principal, "rejected", @errorName(err));
                 // ACK, not NACK: the message is handled — badly, but finally.
@@ -1110,67 +1146,66 @@ pub const MutationListener = struct {
                 return;
             }
 
-            // Every SQL error lands here, because the bridge cannot tell a
-            // dropped connection from `permission denied` — so both get the full
-            // retry budget. That is the right default and it is also why a client
-            // used to learn nothing: after the last attempt the server stops
-            // redelivering and **nobody is told anything at all**.
-            //
-            // The delivery count is in the message's own ack subject, so the
-            // bridge can tell when it is out of attempts. On that last one, stop
-            // pretending it is transient: say why, and ACK. A genuinely transient
-            // failure still gets all five tries first.
-            // The library parses this off the ack subject for us, including the
-            // JetStream-domain form where every token shifts by two — the case
-            // the bridge's own parser had to special-case.
-            const out_of_attempts = msg.metadata.num_delivered >= config.Nats.mutation_max_deliver;
-            // A SQLSTATE the server returned and we recognise as permanent ends
-            // the retries now: waiting cannot change a privilege or a constraint.
-            const hopeless = sqlstateIsPermanent(self.lastSqlstate());
-            const final = out_of_attempts or hopeless;
-
-            if (final) {
-                if (hopeless) {
-                    // `info`: PostgreSQL evaluated the statement and refused it,
-                    // which is the boundary doing its job. Nothing here is the
-                    // operator's to fix — if the *grant* were the mistake,
-                    // preflight would already have said so at boot, because
-                    // a catalogue row on an ungrantable table is checked there.
-                    log.info(
-                        "⛔ Mutation refused [{s}] on '{s}': SQLSTATE {s} (not retrying)",
-                        .{ mutation.principal, mutation.table, self.lastSqlstate() },
-                    );
-                } else {
-                    log.err(
-                        "🔴 Mutation failed on the last of {d} attempts [{s}] on '{s}': {} ({s})",
-                        .{ config.Nats.mutation_max_deliver, mutation.principal, mutation.table, err, self.lastSqlstate() },
-                    );
-                }
+            // Transient: nothing is recorded, so the next attempt claims afresh.
+            receipts.rollback(conn);
+            // Every other SQL error lands here, and gets the full retry budget. On the
+            // last attempt the bridge stops pretending it is transient: it says why and
+            // ACKs. The delivery count is parsed off the ack subject by the library.
+            if (msg.metadata.num_delivered >= config.Nats.mutation_max_deliver) {
+                log.err(
+                    "🔴 Mutation failed on the last of {d} attempts [{s}] on '{s}': {} ({s})",
+                    .{ config.Nats.mutation_max_deliver, mutation.principal, mutation.table, err, self.lastSqlstate() },
+                );
                 self.deadLetter(conn_nats, msg, payload, err);
-                self.publishVerdict(conn_nats, msg, mutation.principal, if (hopeless) "rejected" else "failed", @errorName(err));
+                // `failed` is not definitive, so it has no receipt: the client may retry.
+                self.publishVerdict(conn_nats, msg, mutation.principal, "failed", @errorName(err));
                 msg.ack() catch {};
                 return;
             }
-
             log.err("Failed to handle mutation, will retry: {}", .{err});
             msg.nak() catch {};
             utils.sleep(1 * std.time.ns_per_s);
             return;
         };
 
+        const outcome = receipts.outcomeJson(a, .{
+            .status = self.last_outcome.wireName(),
+            .reason = if (self.last_clamped) "version_clamped" else "",
+            .version = self.lastVersion(),
+        }) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        receipts.finishOne(conn, principal_z, id_z, outcome) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+
+        // The application's deferred constraints are checked now, while this write can
+        // still be rolled back alone: at COMMIT their failure would take the receipt with
+        // it. The receipt's own deferred check passes, since its outcome is set above.
+        var failure: receipts.Failure = .{};
+        receipts.exec(conn, "SET CONSTRAINTS ALL IMMEDIATE", &failure) catch {
+            const sqlstate = std.mem.sliceTo(&failure.sqlstate, 0);
+            self.rememberFailure(sqlstate, failure.message[0..failure.message_len]);
+            if (!sqlstateIsPermanent(sqlstate)) {
+                receipts.rollback(conn);
+                log.err("Deferred constraint check failed ({s}), will retry", .{sqlstate});
+                return self.retryOrFail(conn_nats, msg, mutation.principal, "MutationFailed");
+            }
+            log.info("⛔ Mutation refused at its deferred constraints [{s}] on '{s}': SQLSTATE {s}", .{ mutation.principal, mutation.table, sqlstate });
+            if (!self.recordRejection(a, conn, principal_z, id_z, "MutationFailed")) return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+            self.deadLetter(conn_nats, msg, payload, error.MutationFailed);
+            self.publishVerdict(conn_nats, msg, mutation.principal, "rejected", "MutationFailed");
+            msg.ack() catch {};
+            return;
+        };
+        receipts.commit(conn, null) catch {
+            // Refused or lost at COMMIT: nothing is answered. The redelivery claims again
+            // and finds the receipt if the commit did happen.
+            receipts.rollback(conn);
+            log.warn("⚠️  COMMIT failed for [{s}] on '{s}': retried, and answered from its receipt if it committed", .{ mutation.principal, mutation.table });
+            return self.retryOrFail(conn_nats, msg, mutation.principal, "CommitFailed");
+        };
+
         // ⚠️ A verdict on **every** write that PostgreSQL accepted, not only the
         // ones that changed something. PROTOCOL.md §7.1 makes a client's outbox
         // rule "pop only on a definitive reply", and the three definitive replies
         // are all successes at the SQL level — `accepted`, `stale`, `row_deleted`.
-        // Publishing only on failure, which is what this did before, left a
-        // correct client unable to ever pop a successful write: it would retry
-        // forever, idempotently and invisibly.
-        //
-        // This is the one place the bridge speaks per-message rather than
-        // per-table, so it doubles ingress message count by construction. That is
-        // the cost of the outbox protocol, not an accident of this
-        // implementation — the alternative is a client that cannot distinguish
-        // "applied" from "lost in transit".
         if (self.last_clamped) {
             log.info(
                 "🕒 clamped a version too far ahead [{s}] on '{s}' → {s}",
@@ -1207,35 +1242,57 @@ pub const MutationListener = struct {
         };
     };
 
-    /// The whole fetched batch behind ONE pipeline sync — one implicit
-    /// transaction, ONE WAL flush, one round trip for N mutations (§10cs rungs
-    /// 2+3; rung 1's explicit BEGIN/COMMIT still paid a pipeline sync per
-    /// mutation and measured ~1,200/s). The classify probe is DEFERRED: it only
-    /// disambiguates stale-from-deleted, which only matters when the write
-    /// touched zero rows — the rare case gets a small second round, the common
-    /// case never pays for it.
+    /// One fetched message of a batch, from validation to its verdict.
+    const BatchItem = struct {
+        msg: *nats.JetStreamMessage,
+        mutation: Mutation,
+        route: []const u8,
+        principal_z: [:0]const u8,
+        id_z: [:0]const u8,
+        /// The batch's first message with this (principal, ID): itself, or the one a
+        /// repeat is answered like.
+        first: usize,
+        claim: receipts.Claim = .{ .status = .claimed },
+        /// Its index in the batch's pending writes, once sent.
+        pending: ?usize = null,
+
+        fn keyLess(items: []const BatchItem, x: usize, y: usize) bool {
+            return switch (std.mem.order(u8, items[x].principal_z, items[y].principal_z)) {
+                .lt => true,
+                .gt => false,
+                .eq => std.mem.order(u8, items[x].id_z, items[y].id_z) == .lt,
+            };
+        }
+    };
+
+    /// A fetched batch, in ONE explicit transaction across four pipeline rounds:
     ///
-    /// Identities cannot bleed: every mutation's pair still begins with its own
-    /// `set_config(zb.principal, is_local)`, re-scoping RLS inside the shared
-    /// implicit transaction. Verdicts and acks come only after the sync — which
-    /// is also the COMMIT, so nothing ever vouches for a rolled-back write. Any
-    /// failure before or at the sync aborts the implicit transaction whole
-    /// (nothing persisted) and the caller replays per-message. A failure in the
-    /// classify round is different — the writes ARE committed by then — so its
-    /// messages are NAK'd to retry (a re-applied same-version write lands on the
-    /// same zero-affected question) while the rest get their verdicts.
+    ///   R1  BEGIN and the receipt claims, one per distinct (principal, ID), sent sorted so
+    ///       concurrent batches take index locks in one order
+    ///   R2  the claimed writes, in fetch order, each after its own set_config
+    ///   R3  only when a write touched zero rows: the classify probes (stale or deleted)
+    ///   R4  every finish_receipts, then COMMIT, whose tag must say COMMIT
     ///
-    /// ⚠️ Metas are PRE-WARMED before the pipeline opens: a `tableMeta` cache
-    /// miss issues its own synchronous catalog query, which is illegal inside
-    /// pipeline mode.
+    /// A message that is not claimed (a duplicate, an expired or reused ID) never reaches
+    /// R2: it is answered from its claim, and its table need not even exist any more. The
+    /// table metadata is pre-warmed only for claimed writes, after R1 and outside pipeline
+    /// mode (a cache miss issues its own synchronous query).
+    ///
+    /// Verdicts and acks come only after COMMIT is confirmed. Any failure rolls the whole
+    /// transaction back, receipts included, and returns an error: the caller replays every
+    /// message through `processOne`, which claims again. After an ambiguous COMMIT the
+    /// replay is safe for the same reason: a committed write is found as a duplicate.
+    ///
+    /// Identities cannot bleed: every write and every classify probe begins with its own
+    /// `set_config(zb.principal, is_local)`, re-scoping RLS inside the shared transaction.
     fn applyBatched(self: *MutationListener, conn: ?*c.PGconn, conn_nats: *nats.Connection, msgs: []const *nats.JetStreamMessage) !void {
         var bc = BatchCtx{ .arena = std.heap.ArenaAllocator.init(self.allocator) };
         defer bc.arena.deinit();
         defer bc.pending.deinit(self.allocator);
+        const a = bc.arena.allocator();
 
-        const Parsed = struct { msg: *nats.JetStreamMessage, mutation: Mutation };
-        var parsed: std.ArrayList(Parsed) = .empty;
-        defer parsed.deinit(self.allocator);
+        var items: std.ArrayList(BatchItem) = .empty;
+        defer items.deinit(self.allocator);
         // Outside pipeline mode, once for the whole batch (§10km).
         self.refreshGcWatermark(conn);
 
@@ -1265,64 +1322,199 @@ pub const MutationListener = struct {
                 continue;
             }
             if (self.rateLimited(conn, conn_nats, msg, mutation)) continue;
-            // Pre-warm the meta OUTSIDE pipeline mode; an error here fails the
-            // batch before anything was sent — the per-message replay owns the
-            // dead-letter/verdict semantics for it.
-            _ = try self.tableMeta(conn, mutation.table);
-            try parsed.append(self.allocator, .{ .msg = msg, .mutation = mutation });
+            const principal_z = try a.dupeZ(u8, mutation.principal);
+            const id_z = try a.dupeZ(u8, msgIdOf(msg).?);
+            var first = items.items.len;
+            for (items.items, 0..) |it, k| {
+                if (std.mem.eql(u8, it.principal_z, principal_z) and std.mem.eql(u8, it.id_z, id_z)) {
+                    first = k;
+                    break;
+                }
+            }
+            try items.append(self.allocator, .{ .msg = msg, .mutation = mutation, .route = subject, .principal_z = principal_z, .id_z = id_z, .first = first });
         }
-        if (parsed.items.len == 0) return;
+        if (items.items.len == 0) return;
 
+        // ── R1: BEGIN and the claims ──
+        var order: std.ArrayList(usize) = .empty;
+        for (items.items, 0..) |it, k| if (it.first == k) try order.append(a, k);
+        std.mem.sort(usize, order.items, @as([]const BatchItem, items.items), BatchItem.keyLess);
+        // From here on, ANY error return (allocation failures included) leaves the
+        // connection idle and outside any transaction, ready for the per-message replay.
+        errdefer self.abandonTransaction(conn);
+        if (c.PQenterPipelineMode(conn) != 1) return error.MutationFailed;
+        var sent_ok = c.PQsendQueryParams(conn, "BEGIN", 0, null, null, null, null, 0) == 1;
+        for (order.items) |k| {
+            const it = items.items[k];
+            sent_ok = sent_ok and receipts.sendClaim(conn, it.principal_z, it.id_z, it.route, it.msg.msg.data);
+        }
+        var failed_at: usize = 0;
+        if (!sent_ok or c.PQpipelineSync(conn) != 1) return error.MutationFailed;
+        const r1 = try receipts.collect(a, conn, order.items.len + 1, &failed_at);
+        defer receipts.clearAll(r1);
+        try self.leavePipeline(conn);
+        if (failed_at != r1.len) return error.ReceiptInfrastructure;
+        if (faultAt(.oom_in_claims)) return error.OutOfMemory;
+        if (faultAt(.reset_after_claims)) c.PQreset(conn); // the transaction and its claims are gone
+        try requireTransaction(conn);
+        for (order.items, 0..) |k, n| items.items[k].claim = try receipts.readClaim(a, r1[n + 1]);
+        for (items.items, 0..) |*it, k| {
+            if (it.first == k) continue;
+            const f = items.items[it.first];
+            const same = std.mem.eql(u8, f.route, it.route) and std.mem.eql(u8, f.msg.msg.data, it.msg.msg.data);
+            it.claim = .{ .status = if (same) .repeat else .conflict };
+        }
+
+        // Pre-warm the metas of the claimed writes only, outside pipeline mode.
+        for (items.items) |it| {
+            if (it.claim.status != .claimed) continue;
+            _ = try self.tableMeta(conn, it.mutation.table);
+        }
+
+        // ── R2: the claimed writes, in fetch order ──
+        // Only inside the transaction that holds the claims: sent after a lost one, they
+        // would run in an implicit transaction of their own and commit with no receipt.
+        try requireTransaction(conn);
         self.batch_ctx = &bc;
         {
             defer self.batch_ctx = null;
-            for (parsed.items) |pm| {
+            for (items.items) |*it| {
+                if (it.claim.status != .claimed) continue;
                 self.clearFailure();
-                self.handleMutation(pm.mutation, pm.msg.msg.data, conn) catch |err| {
+                self.handleMutation(it.mutation, it.msg.msg.data, conn) catch |err| {
+                    // A write refused before it was sent (an unknown column, a bad
+                    // payload): end the open pipeline cleanly rather than by a reset.
+                    // What it ran is undone by the ROLLBACK that follows.
                     self.abortOpenPipeline(conn, &bc);
-                    return err; // nothing committed — replay per-message
+                    return err;
                 };
-                bc.pending.items[bc.pending.items.len - 1].msg = pm.msg;
+                bc.pending.items[bc.pending.items.len - 1].msg = it.msg;
+                it.pending = bc.pending.items.len - 1;
             }
         }
-        if (!bc.entered or bc.pending.items.len == 0) {
-            self.abortOpenPipeline(conn, &bc);
+        if (bc.entered) {
+            try self.drainBatch(conn, &bc);
+            try requireTransaction(conn);
+            // ── R3: the zero-affected, classified INSIDE the transaction ──
+            var need = false;
+            for (bc.pending.items) |pnd| need = need or pnd.affected0;
+            if (need) {
+                try self.classifyRound(conn, &bc);
+                try requireTransaction(conn);
+            }
+        }
+
+        // ── R4: the outcomes and COMMIT ──
+        const finishes = bc.pending.items.len;
+        if (finishes == 0) {
+            receipts.rollback(conn); // nothing was claimed: nothing to keep
+        } else {
+            // The transaction must still hold the claims and the writes: a COMMIT sent
+            // outside one answers only a warning, with the very tag COMMIT.
+            try requireTransaction(conn);
+            if (c.PQenterPipelineMode(conn) != 1) return error.MutationFailed;
+            sent_ok = true;
+            var sent: usize = 0;
+            for (items.items) |it| if (it.pending) |k| {
+                const pnd = bc.pending.items[k];
+                if (sent == 1 and faultAt(.oom_in_finishes)) return error.OutOfMemory;
+                const json = try receipts.outcomeJson(a, .{
+                    .status = pnd.outcome.wireName(),
+                    .reason = if (pnd.clamped) "version_clamped" else "",
+                    .version = pnd.version_buf[0..pnd.version_len],
+                });
+                sent_ok = sent_ok and receipts.sendFinish(conn, it.principal_z, it.id_z, json);
+                sent += 1;
+            };
+            sent_ok = sent_ok and c.PQsendQueryParams(conn, "COMMIT", 0, null, null, null, null, 0) == 1;
+            if (!sent_ok or c.PQpipelineSync(conn) != 1) return error.MutationFailed;
+            // Lost before the COMMIT's answer: ambiguous. The replay claims again, and a
+            // write that did commit is found as a duplicate.
+            const r4 = try receipts.collect(a, conn, finishes + 1, &failed_at);
+            defer receipts.clearAll(r4);
+            try self.leavePipeline(conn);
+            // A finish refused (receipt trouble) or the COMMIT refused (a deferred
+            // constraint): nothing committed. The replay judges each write alone.
+            if (failed_at < finishes) return error.ReceiptInfrastructure;
+            if (failed_at != r4.len or !receipts.committed(r4[finishes])) return error.MutationFailed;
+        }
+
+        // ── Verdicts and acks, now that the outcomes are durable ──
+        for (items.items) |it| {
+            const src = if (it.claim.status == .repeat) items.items[it.first] else it;
+            if (src.claim.status == .claimed) {
+                const pnd = bc.pending.items[src.pending.?];
+                self.last_sqlstate_len = 0;
+                self.last_error_len = 0;
+                self.last_clamped = pnd.clamped;
+                self.last_version_len = pnd.version_len;
+                @memcpy(self.last_version_buf[0..pnd.version_len], pnd.version_buf[0..pnd.version_len]);
+                if (pnd.clamped and it.claim.status == .claimed) {
+                    log.info("🕒 clamped a future version [{s}] → {s}", .{ pnd.principal, self.lastVersion() });
+                }
+                self.publishVerdict(conn_nats, it.msg, it.mutation.principal, pnd.outcome.wireName(), if (pnd.clamped) "version_clamped" else "");
+            } else {
+                self.answerUnclaimed(a, conn_nats, it.msg, it.mutation, src.claim);
+            }
+            it.msg.ack() catch {};
+        }
+    }
+
+    /// Leave pipeline mode after a round. A connection that cannot is reset, which ends
+    /// the transaction: that is an error, never a quiet continuation.
+    fn leavePipeline(self: *MutationListener, conn: ?*c.PGconn) !void {
+        _ = self;
+        if (c.PQpipelineStatus(conn) == c.PQ_PIPELINE_OFF) return;
+        while (c.PQgetResult(conn)) |r| c.PQclear(r);
+        if (c.PQexitPipelineMode(conn) != 1) {
+            log.err("🔴 Could not leave pipeline mode ({s}) — the connection will be reset", .{c.PQerrorMessage(conn)});
+            c.PQreset(conn);
+            return error.TransactionLost;
+        }
+    }
+
+    /// The batch's transaction must still be open, between rounds: a reset or a lost
+    /// connection ends it, and with it the claims.
+    fn requireTransaction(conn: ?*c.PGconn) !void {
+        if (c.PQtransactionStatus(conn) != c.PQTRANS_INTRANS) return error.TransactionLost;
+    }
+
+    /// Every error after BEGIN ends here. A pipeline still open is ended by a reset (the
+    /// session ends, so does its transaction); otherwise ROLLBACK. Either way the
+    /// connection is left idle and outside any transaction, or reset, before the replay.
+    fn abandonTransaction(self: *MutationListener, conn: ?*c.PGconn) void {
+        _ = self;
+        if (c.PQpipelineStatus(conn) != c.PQ_PIPELINE_OFF) {
+            log.warn("⚠️  batch abandoned with a pipeline open: resetting the writer connection", .{});
+            c.PQreset(conn);
             return;
         }
-
-        try self.drainBatch(conn, &bc); // errors: implicit tx aborted at the sync — replay
-
-        // ── rung 3's second act: only the zero-affected need the classify ──
-        var need: usize = 0;
-        for (bc.pending.items) |*pnd| {
-            if (pnd.affected0) need += 1;
+        if (c.PQstatus(conn) != c.CONNECTION_OK) {
+            c.PQreset(conn);
+            return;
         }
-        var classified = true;
-        if (need > 0) {
-            self.classifyRound(conn, &bc) catch {
-                // The writes are COMMITTED; replay would re-apply. The undecided
-                // messages retry instead — a same-version re-apply reaches the
-                // same zero-affected question with a healthy connection.
-                classified = false;
-            };
-        }
+        receipts.rollback(conn);
+        if (c.PQtransactionStatus(conn) != c.PQTRANS_IDLE) c.PQreset(conn);
+    }
 
-        for (bc.pending.items) |*pnd| {
-            if (pnd.affected0 and !classified) {
-                pnd.msg.nak() catch {};
-                continue;
-            }
-            self.last_sqlstate_len = 0;
-            self.last_error_len = 0;
-            self.last_clamped = pnd.clamped;
-            self.last_version_len = pnd.version_len;
-            @memcpy(self.last_version_buf[0..pnd.version_len], pnd.version_buf[0..pnd.version_len]);
-            if (pnd.clamped) {
-                log.info("🕒 clamped a future version [{s}] → {s}", .{ pnd.principal, self.lastVersion() });
-            }
-            self.publishVerdict(conn_nats, pnd.msg, pnd.principal, pnd.outcome.wireName(), if (pnd.clamped) "version_clamped" else "");
-            pnd.msg.ack() catch {};
-        }
+    /// Test-only fault injection: compiled in only with `-Dtest-faults=true` (the fault-test
+    /// binary of scripts/scenarios/receipt_faults.py); every other build has none, and no
+    /// environment variable can turn it on. ZB_TEST_FAULT picks the point; each fault that
+    /// actually fires logs `ZB_TEST_FAULT <point> fired`, which the scenario asserts.
+    const TestFault = enum { none, reset_after_claims, oom_in_claims, oom_in_finishes };
+    var test_fault: ?TestFault = null;
+    fn faultAt(point: TestFault) bool {
+        if (comptime !@import("build_options").test_faults) return false;
+        if (testFault() != point) return false;
+        log.warn("ZB_TEST_FAULT {s} fired", .{@tagName(point)});
+        return true;
+    }
+    fn testFault() TestFault {
+        if (test_fault) |f| return f;
+        const v: []const u8 = if (std.c.getenv("ZB_TEST_FAULT")) |p| std.mem.span(p) else "";
+        test_fault = std.meta.stringToEnum(TestFault, v) orelse .none;
+        if (test_fault.? != .none) log.warn("⚠️  ZB_TEST_FAULT={s}: fault injection is ON (tests only)", .{v});
+        return test_fault.?;
     }
 
     /// exec()'s send-only half: the principal + the write, queued into the open
@@ -1785,6 +1977,105 @@ pub const MutationListener = struct {
     fn hasValidMessageId(msg: *nats.JetStreamMessage) bool {
         const id = msgIdOf(msg) orelse return false;
         return admission.validMessageId(id);
+    }
+
+    /// A receipt operation failed: a missing partition or schema, a refused claim or
+    /// finish. Never the client's fault and never a rejection: roll back, log, retry. On the
+    /// last delivery it ends like any transient failure: `failed` (no receipt, so the client
+    /// keeps the write and retries) and an ACK. A NAK there would leave the write in the
+    /// queue with nobody ever told.
+    fn receiptTrouble(self: *MutationListener, conn: ?*c.PGconn, conn_nats: *nats.Connection, msg: *nats.JetStreamMessage, principal: []const u8) void {
+        receipts.rollback(conn);
+        log.err("🔴 a mutation receipt could not be claimed or recorded: the write is retried (check zebridge_private and its partitions)", .{});
+        self.clearFailure();
+        self.retryOrFail(conn_nats, msg, principal, "ReceiptUnavailable");
+    }
+
+    /// Every retryable failure ends here. While deliveries remain: NAK, and a pause. On
+    /// the last one JetStream stops redelivering, so the client is told: `failed` (never a
+    /// receipt, so the write stays in its outbox and is sent again) and an ACK.
+    fn retryOrFail(self: *MutationListener, conn_nats: *nats.Connection, msg: *nats.JetStreamMessage, principal: []const u8, reason: []const u8) void {
+        if (msg.metadata.num_delivered >= config.Nats.mutation_max_deliver) {
+            log.err("🔴 a write from '{s}' failed on its last delivery ({s}): answered `failed`, the client retries it", .{ principal, reason });
+            self.publishVerdict(conn_nats, msg, principal, "failed", reason);
+            msg.ack() catch {};
+            return;
+        }
+        msg.nak() catch {};
+        utils.sleep(1 * std.time.ns_per_s);
+    }
+
+    /// The write failed permanently after its claim: undo the write (the savepoint), keep
+    /// the claim, record `rejected` with this failure, and commit. False: roll back.
+    fn recordRejection(self: *MutationListener, a: std.mem.Allocator, conn: ?*c.PGconn, principal_z: [:0]const u8, id_z: [:0]const u8, reason: []const u8) bool {
+        receipts.exec(conn, "ROLLBACK TO SAVEPOINT zb_write", null) catch {
+            receipts.rollback(conn);
+            return false;
+        };
+        const outcome = receipts.outcomeJson(a, .{ .status = "rejected", .reason = reason, .sqlstate = self.lastSqlstate(), .detail = self.lastError() }) catch {
+            receipts.rollback(conn);
+            return false;
+        };
+        receipts.finishOne(conn, principal_z, id_z, outcome) catch {
+            receipts.rollback(conn);
+            return false;
+        };
+        receipts.commit(conn, null) catch {
+            receipts.rollback(conn);
+            return false;
+        };
+        return true;
+    }
+
+    /// A write that was not claimed is answered without running it:
+    ///   duplicate  its recorded verdict (the current message's `seq`)
+    ///   conflict   `indeterminate` MessageIdReused: this ID already names another write
+    ///   expired    `indeterminate` MessageIdExpired: this attempt did not execute; whether
+    ///              an earlier one committed is unknown (its receipt is gone)
+    ///   future     `failed` MessageIdFromFuture: retryable, a clock may have stepped back
+    ///   invalid    `rejected` InvalidMessageId
+    /// `indeterminate` settles the outbox without a revert: the client reconciles the row.
+    fn answerUnclaimed(self: *MutationListener, a: std.mem.Allocator, conn_nats: *nats.Connection, msg: *nats.JetStreamMessage, mutation: Mutation, claim: receipts.Claim) void {
+        self.clearFailure();
+        switch (claim.status) {
+            .duplicate => {
+                const o = receipts.parseOutcome(a, claim.outcome orelse "") catch {
+                    log.err("🔴 the receipt of a duplicate from '{s}' is unreadable: answered indeterminate", .{mutation.principal});
+                    return self.publishVerdict(conn_nats, msg, mutation.principal, "indeterminate", "ReceiptUnreadable");
+                };
+                self.rememberFailure(o.sqlstate, o.detail);
+                self.last_version_len = @min(o.version.len, self.last_version_buf.len);
+                @memcpy(self.last_version_buf[0..self.last_version_len], o.version[0..self.last_version_len]);
+                log.debug("🧾 duplicate from '{s}' on '{s}': answered from its receipt ({s})", .{ mutation.principal, mutation.table, o.status });
+                self.publishVerdict(conn_nats, msg, mutation.principal, o.status, o.reason);
+            },
+            .conflict => {
+                log.warn("⚠️  '{s}' reused a message ID for a different write on '{s}': not executed, answered indeterminate", .{ mutation.principal, mutation.table });
+                self.publishVerdict(conn_nats, msg, mutation.principal, "indeterminate", "MessageIdReused");
+            },
+            .expired => {
+                log.info("⌛ '{s}' retried a write older than the retry horizon on '{s}': not executed, answered indeterminate", .{ mutation.principal, mutation.table });
+                self.publishVerdict(conn_nats, msg, mutation.principal, "indeterminate", "MessageIdExpired");
+            },
+            .future => {
+                log.warn("⚠️  '{s}' sent a write dated ahead of this database's clock on '{s}': retryable", .{ mutation.principal, mutation.table });
+                self.publishVerdict(conn_nats, msg, mutation.principal, "failed", "MessageIdFromFuture");
+            },
+            .invalid => self.publishVerdict(conn_nats, msg, mutation.principal, "rejected", "InvalidMessageId"),
+            .claimed, .repeat => unreachable,
+        }
+    }
+
+    /// The receipt partitions: at the first pull and then daily, outside any transaction.
+    /// A failure is retried a minute later; claims fail (and writes retry) meanwhile.
+    fn maintainReceiptsIfDue(self: *MutationListener, conn: ?*c.PGconn) void {
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
+        if (now < self.receipts_due_at) return;
+        receipts.maintain(conn) catch {
+            self.receipts_due_at = now + 60;
+            return;
+        };
+        self.receipts_due_at = now + 24 * 3600;
     }
 
     /// No verdict can reach the client: verdicts are addressed by the very ID that is

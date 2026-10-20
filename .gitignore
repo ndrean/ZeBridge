@@ -1,5 +1,6 @@
 # Zig build artifacts
 zig-out/
+zig-out-faults/
 zig-cache/
 .zig-cache/
 .lexical/

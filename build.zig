@@ -76,6 +76,9 @@ pub fn build(b: *std.Build) void {
     // The release version, from build.zig.zon: `bridge --version` and the packages.
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    // Off in every mode: only scripts/scenarios/receipt_faults.py's own binary turns it on
+    // (-Dtest-faults=true). Off, the fault path is not compiled in at all.
+    build_options.addOption(bool, "test_faults", b.option(bool, "test-faults", "Compile in ZB_TEST_FAULT fault injection (receipt_faults.py only)") orelse false);
 
     const mod = b.addModule("bridge", .{
         .root_source_file = b.path("src/bridge.zig"),

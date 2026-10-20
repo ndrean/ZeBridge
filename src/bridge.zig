@@ -30,6 +30,7 @@ const catalogue = @import("catalogue.zig");
 const generation_producer = @import("generation_producer.zig");
 const mutation_listener = @import("mutation_listener.zig");
 const mutation_admission = @import("mutation_admission.zig");
+const receipts = @import("receipts.zig");
 
 const rate_limit = @import("rate_limit.zig");
 const catalog_epoch_mod = @import("catalog_epoch.zig");
@@ -1634,6 +1635,16 @@ pub fn main(init: std.process.Init) !void {
     var mut_listeners: std.ArrayList(*mutation_listener.MutationListener) = .empty;
     defer mut_listeners.deinit(allocator);
     if (writer_config) |*wc| {
+        // Every write claims a receipt first: without the schema, or the writer's right to
+        // use it, ingress could only wait and retry. Refuse to start instead, and say why.
+        {
+            const rconn = pg_conn.connect(allocator, wc.*) catch |err| {
+                log.err("🔴 FATAL: could not connect as the writer to check the mutation receipts ({}) — refusing to start.", .{err});
+                return err;
+            };
+            defer c.PQfinish(rconn);
+            receipts.bootCheck(rconn) catch |err| return err;
+        }
         log.info("Starting {d} mutation listener lane(s) (role: {s})...", .{ ingress_lanes, wc.role });
         for (0..ingress_lanes) |lane_i| {
             _ = lane_i;
@@ -3059,6 +3070,7 @@ test {
     _ = @import("http_server.zig");
     _ = @import("leaf_scope.zig");
     _ = @import("mutation_admission.zig");
+    _ = @import("receipts.zig");
     _ = @import("mutation_listener.zig");
     _ = @import("nats_init.zig");
     _ = @import("numeric.zig");

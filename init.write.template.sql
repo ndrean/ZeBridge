@@ -1312,9 +1312,13 @@ $$;
 --   duplicate already decided: do NOT execute; `outcome` is the recorded one
 --   repeat    the same ID earlier in this batch, same content: answer as that one
 --   conflict  the same ID with different content (here or recorded): refuse it
---   expired   created before the minimum accepted time: not executed by this attempt
---   future    created more than 60 s ahead of this database's clock: refuse it
+--   expired   created before the minimum accepted time, and no receipt: not executed by
+--             this attempt (an earlier one may have committed; the receipt is gone)
+--   future    created more than 60 s ahead of this database's wall clock, and no receipt:
+--             retryable, since a clock stepped back can make an accepted ID look future
 --   invalid   empty, too long, not one subject token, or a malformed zb1- ID
+-- A receipt is looked up BEFORE the time checks: an ID that has one gets its recorded
+-- outcome however old or (by today's clock) future it looks.
 -- The fingerprint is sha256 of the route's length (4 bytes), the route, then the payload:
 -- the exact bytes received, never re-serialized JSON. Keys are inserted sorted, so
 -- concurrent batches take index locks in one order. Under READ COMMITTED each statement
@@ -1328,6 +1332,7 @@ DECLARE
     fps      bytea[];
     months   date[];
     verdicts text[];
+    timing   text[];
     claimed  text[];
 BEGIN
     IF p_principal IS NULL OR p_principal = '' THEN
@@ -1339,9 +1344,10 @@ BEGIN
     END IF;
     SELECT min_accepted_ms INTO floor_ms FROM zebridge_private.receipt_policy;
 
-    -- 1. Fingerprint and classify every position (positions keep the input order).
-    SELECT array_agg(i.fp ORDER BY i.n), array_agg(i.m ORDER BY i.n), array_agg(i.v ORDER BY i.n)
-      INTO fps, months, verdicts
+    -- 1. Fingerprint every position and check its shape; the time checks are kept apart
+    --    (`timing`), to be applied only when no receipt exists.
+    SELECT array_agg(i.fp ORDER BY i.n), array_agg(i.m ORDER BY i.n), array_agg(i.v ORDER BY i.n), array_agg(i.t ORDER BY i.n)
+      INTO fps, months, verdicts, timing
       FROM (SELECT x.n,
                    sha256(int4send(length(x.r)) || x.r || x.p) AS fp,
                    zebridge_private.receipt_month(x.id) AS m,
@@ -1352,16 +1358,18 @@ BEGIN
                              -- and would refuse U+2003 or U+0085 that admission accepted.
                              OR octet_length(x.id) NOT BETWEEN 1 AND 512 OR x.id ~ '[.*>\x01-\x20\x7f]'
                              OR zebridge_private.receipt_month(x.id) IS NULL THEN 'invalid'
-                        WHEN zebridge_private.receipt_created_ms(x.id) < floor_ms THEN 'expired'
+                        ELSE 'candidate' END AS v,
+                   CASE WHEN zebridge_private.receipt_created_ms(x.id) < floor_ms THEN 'expired'
                         WHEN zebridge_private.receipt_created_ms(x.id) > now_ms + 60000 THEN 'future'
-                        ELSE 'candidate' END AS v
+                        ELSE 'ok' END AS t
               FROM unnest(p_ids, p_routes, p_payloads) WITH ORDINALITY AS x(id, r, p, n)) i;
 
-    -- 2. Claim the first occurrence of each candidate ID, keys sorted.
+    -- 2. Claim the first occurrence of each candidate ID that passes the time checks, keys
+    --    sorted. An expired or future one is never claimed: it can only match a receipt.
     WITH firsts AS (
         SELECT DISTINCT ON (p_ids[n]) p_ids[n] AS id, months[n] AS m, fps[n] AS fp
           FROM generate_subscripts(p_ids, 1) AS n
-         WHERE verdicts[n] = 'candidate'
+         WHERE verdicts[n] = 'candidate' AND timing[n] = 'ok'
          ORDER BY p_ids[n], n
     ), ins AS (
         INSERT INTO zebridge_private.receipts (principal, message_id, id_month, fingerprint)
@@ -1382,6 +1390,8 @@ BEGIN
                                THEN 'repeat' ELSE 'conflict' END
                 WHEN p_ids[n] = ANY (claimed) THEN 'claimed'
                 WHEN rec.fingerprint = fps[n] THEN 'duplicate'
+                WHEN rec.fingerprint IS NOT NULL THEN 'conflict'
+                WHEN timing[n] <> 'ok' THEN timing[n]  -- no receipt: now the time checks
                 ELSE 'conflict' END,
            CASE WHEN verdicts[n] = 'candidate' AND NOT (p_ids[n] = ANY (claimed)) AND rec.fingerprint = fps[n]
                 THEN rec.outcome END

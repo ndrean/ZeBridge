@@ -198,6 +198,21 @@ def main():
         check(pruned and all(p < "receipts_" + this_month.strftime("%Y_%m") for p in pruned)
               and "receipts_legacy" in left and "receipts_" + this_month.strftime("%Y_%m") in left,
               f"pruning drops only whole months before the minimum, never legacy ({len(pruned)} dropped)")
+
+        # The receipt is looked up before the time checks (last: the minimum only rises).
+        kept, late = f"zb1-t{ms(now)}-c1-t-k", f"zb1-t{ms(now)}-c1-t-late"
+        claim([kept], extra=finish([kept]))
+        sql(f"UPDATE zebridge_private.receipt_policy SET min_accepted_ms = {ms(now) + 1000}")
+        r = claim([kept, late])
+        check(statuses(r) == ["duplicate", "expired"] and '{"ok": 1}' in r.stdout,
+              "past the minimum, an ID with a receipt still gets its recorded outcome; one without is expired")
+        ahead = f"zb1-t{ms(now + datetime.timedelta(minutes=10))}-c1-t-ahead"
+        sql(f"INSERT INTO zebridge_private.receipts VALUES ('alice', '{ahead}', zebridge_private.receipt_month('{ahead}'), "
+            "sha256(int4send(length(convert_to('mutation.alice.t.insert','UTF8'))) || convert_to('mutation.alice.t.insert','UTF8') "
+            "|| convert_to('p','UTF8')), '{\"ok\": 2}')")
+        r = claim([ahead, f"zb1-t{ms(now + datetime.timedelta(minutes=10))}-c1-t-ahead2"])
+        check(statuses(r) == ["duplicate", "future"],
+              "a future-dated ID with a receipt (a clock stepped back) gets its outcome; one without is future")
     finally:
         sql(f'DROP DATABASE "{name}" WITH (FORCE)', "postgres")
         for role in (reader, writer):
