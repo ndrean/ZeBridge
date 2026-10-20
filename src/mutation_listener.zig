@@ -1,4 +1,5 @@
 const std = @import("std");
+const admission = @import("mutation_admission.zig");
 const nats = @import("nats");
 const nats_endpoint = @import("nats_endpoint.zig");
 const Topology = @import("topology.zig");
@@ -517,7 +518,7 @@ pub const MutationListener = struct {
         pg_config: *const pg_conn.PgConf,
         endpoint: config.Nats.Endpoint,
         topology: *const Topology.Topology,
-            io: std.Io,
+        io: std.Io,
         should_stop: *std.atomic.Value(bool),
         catalog_epoch: *const CatalogEpoch,
         event_buf_bytes: usize,
@@ -823,21 +824,9 @@ pub const MutationListener = struct {
         //
         // So the token count is checked first, and an unparseable subject is routed to
         // `unknown` — honest, and at least a subject an operator can subscribe to.
-        const subject = msg.msg.subject;
-        var table: []const u8 = "unknown";
-        var count: usize = 0;
-        var counter = std.mem.splitScalar(u8, subject, '.');
-        while (counter.next()) |_| count += 1;
-        if (count == config.Nats.mutation_token_count) {
-            var it = std.mem.splitScalar(u8, subject, '.');
-            var token: usize = 0;
-            while (it.next()) |tok| : (token += 1) {
-                if (token == config.Nats.mutation_token_table) {
-                    table = tok;
-                    break;
-                }
-            }
-        }
+        const subject = admission.originalSubject(msg.msg, self.endpoint_topology.subject_mutations_prefix, self.endpoint_topology.leaf_prefix) catch msg.msg.subject;
+        const parsed_route = admission.route(subject, self.endpoint_topology.subject_mutations_prefix, self.endpoint_topology.leaf_prefix) catch null;
+        const table: []const u8 = if (parsed_route) |route| route.table else "unknown";
 
         // Named field, like the snapshot subject patterns: topology writes
         // "{[table]s}", so the argument is a struct, not a tuple.
@@ -1053,8 +1042,11 @@ pub const MutationListener = struct {
 
         // Subject first: it carries the identity, the table and the verb, and
         // all three are refused before a byte of the payload is decoded.
-        const subject = msg.msg.subject;
-        const mutation = parseSubject(subject, self.endpoint_topology.subject_mutations_prefix) catch |err| {
+        const subject = admission.originalSubject(msg.msg, self.endpoint_topology.subject_mutations_prefix, self.endpoint_topology.leaf_prefix) catch {
+            msg.ack() catch {};
+            return;
+        };
+        const mutation = parseSubject(subject, self.endpoint_topology.subject_mutations_prefix, self.endpoint_topology.leaf_prefix) catch |err| {
             // `warn`, not `err` — and not `info` either. Client-caused like the
             // refusals below, so it is not the operator's to fix. But it is the
             // one client fault where **nobody is told**: the principal lives in
@@ -1242,8 +1234,11 @@ pub const MutationListener = struct {
 
         for (msgs) |msg| {
             const payload = msg.msg.data;
-            const subject = msg.msg.subject;
-            const mutation = parseSubject(subject, self.endpoint_topology.subject_mutations_prefix) catch |err| {
+            const subject = admission.originalSubject(msg.msg, self.endpoint_topology.subject_mutations_prefix, self.endpoint_topology.leaf_prefix) catch {
+                msg.ack() catch {};
+                continue;
+            };
+            const mutation = parseSubject(subject, self.endpoint_topology.subject_mutations_prefix, self.endpoint_topology.leaf_prefix) catch |err| {
                 log.warn("⚠️  Malformed mutation subject '{s}' ({}): dead-lettering, and no verdict is addressable", .{ subject, err });
                 self.deadLetter(conn_nats, msg, payload, err);
                 msg.ack() catch {};
@@ -1767,6 +1762,7 @@ pub const MutationListener = struct {
     /// JetStream consumes this header for deduplication; nothing surfaced it to the
     /// bridge before, so a verdict had no way to name the write it was about.
     fn msgIdOf(msg: *nats.JetStreamMessage) ?[]const u8 {
+        if (std.mem.startsWith(u8, msg.msg.subject, "$ZB.")) return msg.msg.headerGet(admission.original_id_header);
         return msg.msg.headerGet("Nats-Msg-Id");
     }
 
@@ -1785,24 +1781,11 @@ pub const MutationListener = struct {
     /// `mutations_prefix` is passed rather than read from a constant: the prefix is a
     /// topology name now, and a parser that hardcoded "mutation" would accept subjects a
     /// renamed deployment never issues — and reject the ones it does.
-    fn parseSubject(subject: []const u8, mutations_prefix: []const u8) !Mutation {
-        var tokens: [config.Nats.mutation_token_count][]const u8 = undefined;
-        var n: usize = 0;
-        var it = std.mem.splitScalar(u8, subject, '.');
-        while (it.next()) |tok| {
-            // Counted before indexing: a longer subject must be rejected, not truncated
-            // to something that looks valid.
-            if (n >= tokens.len) return error.MalformedSubject;
-            tokens[n] = tok;
-            n += 1;
-        }
-        if (n != config.Nats.mutation_token_count) return error.MalformedSubject;
-        if (!std.mem.eql(u8, tokens[0], mutations_prefix)) return error.MalformedSubject;
-
-        const principal = tokens[config.Nats.mutation_token_principal];
-        const table = tokens[config.Nats.mutation_token_table];
-        const op_text = tokens[config.Nats.mutation_token_operation];
-        if (principal.len == 0 or table.len == 0) return error.MalformedSubject;
+    fn parseSubject(subject: []const u8, mutations_prefix: []const u8, leaf_prefix: []const u8) !Mutation {
+        const parsed = try admission.route(subject, mutations_prefix, leaf_prefix);
+        const principal = parsed.principal;
+        const table = parsed.table;
+        const op_text = parsed.operation;
 
         const operation: Mutation.Operation =
             if (std.mem.eql(u8, op_text, "insert")) .insert else if (std.mem.eql(u8, op_text, "update")) .update else if (std.mem.eql(u8, op_text, "delete")) .delete else return error.UnknownOperation;
@@ -3390,7 +3373,7 @@ test "hexText - bytea input form" {
 const testing = std.testing;
 
 test "subject - the grammar is the authorization surface" {
-    const m = try MutationListener.parseSubject("mutation.a3f9c1.users.insert", "mutation");
+    const m = try MutationListener.parseSubject("mutation.a3f9c1.users.insert", "mutation", "lf-");
     try testing.expectEqualStrings("a3f9c1", m.principal);
     try testing.expectEqualStrings("users", m.table);
     try testing.expect(m.operation == .insert);
@@ -3399,11 +3382,13 @@ test "subject - the grammar is the authorization surface" {
 test "subject - wrong token count is refused, never truncated" {
     // Truncating a longer subject to the first four tokens would let
     // `mutation.alice.users.insert.extra` be read as a valid write.
-    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("mutation.alice.users", "mutation"));
-    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("mutation.alice.users.insert.extra", "mutation"));
-    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("cmd.alice.users.insert", "mutation"));
-    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("mutation..users.insert", "mutation"));
-    try testing.expectError(error.UnknownOperation, MutationListener.parseSubject("mutation.alice.users.truncate", "mutation"));
+    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("mutation.alice.users", "mutation", "lf-"));
+    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("mutation.alice.users.insert.extra", "mutation", "lf-"));
+    const scoped = try MutationListener.parseSubject("mutation.lf-leaf1.alice.users.insert", "mutation", "lf-");
+    try testing.expectEqualStrings("lf-leaf1.alice", scoped.principal);
+    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("cmd.alice.users.insert", "mutation", "lf-"));
+    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("mutation..users.insert", "mutation", "lf-"));
+    try testing.expectError(error.UnknownOperation, MutationListener.parseSubject("mutation.alice.users.truncate", "mutation", "lf-"));
 }
 
 test "the bridge's own tables are never writable from the edge" {

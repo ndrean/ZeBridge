@@ -1,0 +1,344 @@
+//! Hub-side admission, preserving the public mutation subject and JetStream PubAck.
+//! Only this service publishes the private, one-subject-per-principal queue. The
+//! storage server replies directly to the client's original inbox: no synthetic ack.
+const std = @import("std");
+const builtin = @import("builtin");
+const nats = @import("nats");
+const Conf = @import("config.zig");
+const topology = @import("topology.zig");
+const leaf_scope = @import("leaf_scope.zig");
+const publisher_mod = @import("nats_publisher.zig");
+
+const log = std.log.scoped(.mutation_admission);
+pub const original_subject_header = "ZB-Original-Subject";
+pub const original_id_header = "ZB-Client-Msg-Id";
+pub const leaf_tenants_header = "ZB-Leaf-Tenants";
+var stopping: std.atomic.Value(bool) = .init(false);
+const SignalHandler = @typeInfo(@TypeOf(@as(std.posix.Sigaction, undefined).handler.handler)).optional.child;
+const Signal = @typeInfo(@typeInfo(SignalHandler).pointer.child).@"fn".params[0].type.?;
+
+fn stop(_: Signal) callconv(.c) void {
+    stopping.store(true, .release);
+}
+
+pub fn enabled(init: *const std.process.Init) bool {
+    const value = init.minimal.environ.getPosix("MUTATION_ADMISSION") orelse return false;
+    return std.mem.eql(u8, value, "1");
+}
+
+pub fn privatePrefix(a: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "$ZB.{s}", .{prefix});
+}
+
+pub const Limits = struct {
+    stream_bytes: i64 = 1 << 30,
+    principal_bytes: i64 = 64 << 20,
+    message_bytes: i32 = 64 << 10,
+    principal_messages: i64 = 5000,
+
+    pub fn count(self: Limits) !i64 {
+        // Include a conservative per-record allowance for subject and store metadata.
+        if (self.message_bytes < 4096 or self.message_bytes > 1 << 20 or
+            self.principal_messages < 1 or self.principal_bytes < self.message_bytes + 512 or
+            self.stream_bytes < 1 or self.principal_bytes > @divFloor(self.stream_bytes, 2)) return error.InvalidAdmissionLimits;
+        return @min(self.principal_messages, @divFloor(self.principal_bytes, @as(i64, self.message_bytes) + 512));
+    }
+
+    pub fn fromEnv(init: *const std.process.Init) !Limits {
+        var limits: Limits = .{};
+        inline for (.{
+            .{ "stream_bytes", "MUTATION_STREAM_MAX_BYTES" },
+            .{ "principal_bytes", "MUTATION_BACKLOG_BYTES_PER_PRINCIPAL" },
+            .{ "message_bytes", "MUTATION_MAX_MESSAGE_BYTES" },
+            .{ "principal_messages", "MUTATION_BACKLOG_PER_PRINCIPAL" },
+        }) |setting| {
+            if (init.minimal.environ.getPosix(setting[1])) |value| {
+                @field(limits, setting[0]) = try std.fmt.parseInt(@TypeOf(@field(limits, setting[0])), value, 10);
+            }
+        }
+        _ = try limits.count();
+        return limits;
+    }
+};
+
+pub const Route = struct { principal: []const u8, table: []const u8, operation: []const u8 };
+
+pub fn route(subject: []const u8, prefix: []const u8, leaf_prefix: []const u8) !Route {
+    if (subject.len > 512) return error.MalformedSubject;
+    const first_dot = std.mem.findScalar(u8, subject, '.') orelse return error.MalformedSubject;
+    if (!std.mem.eql(u8, subject[0..first_dot], prefix)) return error.MalformedSubject;
+    const last_dot = std.mem.findScalarLast(u8, subject, '.') orelse return error.MalformedSubject;
+    if (last_dot <= first_dot) return error.MalformedSubject;
+    const table_dot = std.mem.findScalarLast(u8, subject[0..last_dot], '.') orelse return error.MalformedSubject;
+    if (table_dot <= first_dot) return error.MalformedSubject;
+    const principal = subject[first_dot + 1 .. table_dot];
+    const table = subject[table_dot + 1 .. last_dot];
+    const op = subject[last_dot + 1 ..];
+    if (!leaf_scope.principalIn(leaf_prefix, principal) or table.len == 0 or table.len > 128) return error.MalformedSubject;
+    if (!std.mem.eql(u8, op, "insert") and !std.mem.eql(u8, op, "update") and !std.mem.eql(u8, op, "delete")) return error.UnknownOperation;
+    return .{ .principal = principal, .table = table, .operation = op };
+}
+
+/// Internal headers are trusted only on the private subject, and must agree with it.
+pub fn originalSubject(msg: *nats.Message, prefix: []const u8, leaf_prefix: []const u8) ![]const u8 {
+    var expected: [256]u8 = undefined;
+    const start = try std.fmt.bufPrint(&expected, "$ZB.{s}.", .{prefix});
+    if (!std.mem.startsWith(u8, msg.subject, start)) return msg.subject;
+    const original = msg.headerGet(original_subject_header) orelse return error.MalformedSubject;
+    const parsed = try route(original, prefix, leaf_prefix);
+    if (!std.mem.eql(u8, msg.subject[start.len..], parsed.principal)) return error.MalformedSubject;
+    return original;
+}
+
+pub fn ensureStream(js: nats.JetStream, a: std.mem.Allocator, topo: *const topology.Topology, limits: Limits) !void {
+    const prefix = try privatePrefix(a, topo.subject_mutations_prefix);
+    defer a.free(prefix);
+    const subject = try std.fmt.allocPrint(a, "{s}.>", .{prefix});
+    defer a.free(subject);
+    if (js.getStreamInfo(topo.stream_mutations)) |info_value| {
+        var info = info_value;
+        defer info.deinit();
+        // Never race a public JetStream responder with the admission service. A
+        // legacy queue must be drained and migrated during a reviewed cutover.
+        var canonical = false;
+        for (info.value.config.subjects) |item| {
+            if (std.mem.eql(u8, item, subject)) canonical = true;
+            if (std.mem.startsWith(u8, item, topo.subject_mutations_prefix)) return error.LegacyMutationStreamNeedsMigration;
+        }
+        if (!canonical or info.value.config.max_age != 0 or info.value.config.no_ack or info.value.config.subjects.len != 1 or info.value.config.max_msgs_per_subject > try limits.count() or
+            info.value.config.max_msgs_per_subject < 1 or info.value.config.max_msg_size > limits.message_bytes or
+            info.value.config.max_msg_size < 1 or info.value.config.max_bytes > limits.stream_bytes or
+            info.value.config.max_bytes < 1 or info.value.config.discard != .new or
+            info.value.config.discard_new_per_subject != true or info.value.config.retention != .workqueue)
+            return error.UnsafeMutationStreamLimits;
+        try ensureErrors(js, a, topo);
+        return;
+    } else |err| {
+        if (err != error.StreamNotFound) return err;
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var created = try js.addStream(try desiredStream(arena.allocator(), topo, limits));
+    created.deinit();
+    try ensureErrors(js, a, topo);
+}
+
+fn desiredStream(a: std.mem.Allocator, topo: *const topology.Topology, limits: Limits) !nats.StreamConfig {
+    const subjects = try a.alloc([]const u8, 1);
+    subjects[0] = try std.fmt.allocPrint(a, "$ZB.{s}.>", .{topo.subject_mutations_prefix});
+    return .{
+        .name = topo.stream_mutations,
+        .subjects = subjects,
+        .retention = .workqueue,
+        .max_age = 0, // Accepted writes remain until processed; capacity is bounded separately.
+        .max_bytes = limits.stream_bytes,
+        .max_msg_size = limits.message_bytes,
+        .max_msgs_per_subject = try limits.count(),
+        .discard = .new,
+        .discard_new_per_subject = true,
+    };
+}
+
+fn ensureErrors(js: nats.JetStream, a: std.mem.Allocator, topo: *const topology.Topology) !void {
+    const name = try std.fmt.allocPrint(a, "{s}_ERRORS", .{topo.stream_mutations});
+    defer a.free(name);
+    if (js.getStreamInfo(name)) |info_value| {
+        var info = info_value;
+        defer info.deinit();
+        if (info.value.config.max_bytes <= 0 or info.value.config.max_bytes > 64 << 20 or
+            info.value.config.discard != .old) return error.UnsafeMutationErrorStreamLimits;
+        return;
+    } else |err| if (err != error.StreamNotFound) return err;
+    const subject = try std.fmt.allocPrint(a, "{s}.>", .{topo.mutation_error_prefix});
+    defer a.free(subject);
+    var created = try js.addStream(.{
+        .name = name,
+        .subjects = &.{subject},
+        .max_bytes = 64 << 20,
+        .max_age = 2 * 3600 * std.time.ns_per_s,
+        .discard = .old,
+    });
+    created.deinit();
+}
+
+pub fn replyBelongsTo(reply: []const u8, principal: []const u8) bool {
+    const prefix = "_INBOX.";
+    if (!std.mem.startsWith(u8, reply, prefix)) return false;
+    const rest = reply[prefix.len..];
+    return rest.len > principal.len + 1 and std.mem.startsWith(u8, rest, principal) and rest[principal.len] == '.';
+}
+
+fn relay(conn: *nats.Connection, incoming: *nats.Message, prefix: []const u8, leaf_prefix: []const u8, limits: Limits) !void {
+    const parsed = try route(incoming.subject, prefix, leaf_prefix);
+    if (incoming.data.len > @as(usize, @intCast(limits.message_bytes - 2048))) return error.MessageTooLarge;
+    if (incoming.reply) |reply| {
+        if (!replyBelongsTo(reply, parsed.principal)) return error.InvalidReplyInbox;
+    }
+    const outgoing = try conn.newMsg();
+    defer outgoing.deinit();
+    const subject = try std.fmt.allocPrint(outgoing.arena.allocator(), "$ZB.{s}.{s}", .{ prefix, parsed.principal });
+    try outgoing.setSubject(subject, false);
+    try outgoing.setPayload(incoming.data, false);
+    // Rebuild headers: a public caller cannot inject an original route or leaf scope.
+    try outgoing.headerSet(original_subject_header, incoming.subject);
+    if (incoming.headerGet("Nats-Msg-Id")) |id| {
+        if (id.len > 512) return error.MessageIdTooLong;
+        for (id) |ch| if (ch < 32 or ch == 127) return error.InvalidMessageId;
+        const scoped_id = try std.fmt.allocPrint(outgoing.arena.allocator(), "{s}:{s}", .{ parsed.principal, id });
+        try outgoing.headerSet("Nats-Msg-Id", scoped_id);
+        try outgoing.headerSet(original_id_header, id);
+    }
+    if (incoming.reply) |reply| try conn.publishRequestMsg(outgoing, reply) else try conn.publishMsg(outgoing);
+}
+
+fn runImpl(init: *const std.process.Init, a: std.mem.Allocator) !void {
+    var ep = try Conf.Nats.Endpoint.parseUrl(optionalEnv(init, "NATS_URL") orelse Conf.Nats.default_url);
+    ep.creds = optionalEnv(init, "NATS_CREDS");
+    ep.tls_ca = optionalEnv(init, "NATS_TLS_CA");
+    ep.tls_server_name = optionalEnv(init, "NATS_TLS_SERVER_NAME");
+    ep.js_domain = optionalEnv(init, "NATS_JS_DOMAIN");
+    var owned = try topology.loadEmbedded(a);
+    defer owned.deinit();
+    const limits = try Limits.fromEnv(init);
+    var prepare_projections = false;
+    var check_only = false;
+    var args = init.minimal.args.iterate();
+    while (args.next()) |arg| if (std.mem.eql(u8, arg, "--print-config")) {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const config = try desiredStream(arena.allocator(), &owned.topology, limits);
+        const json = try std.json.Stringify.valueAlloc(arena.allocator(), config, .{ .emit_null_optional_fields = false });
+        try std.Io.File.stdout().writeStreamingAll(init.io, json);
+        return;
+    } else if (std.mem.eql(u8, arg, "--prepare-projections")) {
+        prepare_projections = true;
+    } else if (std.mem.eql(u8, arg, "--check")) {
+        check_only = true;
+    };
+    var publisher = try publisher_mod.Publisher.init(a, .{ .endpoint = ep }, init.io);
+    defer publisher.deinit();
+    try publisher.connect();
+    if (prepare_projections) {
+        var tenants: std.ArrayList([]const u8) = .empty;
+        defer tenants.deinit(a);
+        var values = std.mem.tokenizeAny(u8, optionalEnv(init, "ZB_LEAF_TENANTS") orelse return error.MissingLeafTenants, " \t\r\n");
+        while (values.next()) |t| {
+            if (!leaf_scope.token(t) or tenants.items.len >= 64) return error.InvalidLeafTenants;
+            try tenants.append(a, t);
+        }
+        if (tenants.items.len == 0) return error.MissingLeafTenants;
+        var topo = owned.topology;
+        topo.tenants = tenants.items;
+        try leaf_scope.ensureProjections(a, publisher.conn.?, &topo, ep.js_domain orelse return error.MissingHubDomain);
+        return;
+    }
+    try ensureStream(publisher.js.?, a, &owned.topology, limits);
+    if (check_only) return;
+    const conn = publisher.conn.?;
+    var subscriptions: std.ArrayList(*nats.Subscription) = .empty;
+    defer {
+        for (subscriptions.items) |sub| sub.deinit();
+        subscriptions.deinit(a);
+    }
+    const root_subject = try std.fmt.allocPrint(a, "{s}.*.*.*", .{owned.topology.subject_mutations_prefix});
+    defer a.free(root_subject);
+    try subscriptions.append(a, try conn.queueSubscribeSync(root_subject, "zebridge_mutation_admission"));
+    var leaves = std.mem.tokenizeAny(u8, optionalEnv(init, "ZB_LEAF_NAMES") orelse "", " \t\r\n");
+    var names: std.StringHashMap(void) = .init(a);
+    defer names.deinit();
+    while (leaves.next()) |leaf| {
+        if (!leaf_scope.leafId(owned.topology.leaf_prefix, leaf) or names.count() >= 64) return error.InvalidLeafNames;
+        if ((try names.getOrPut(leaf)).found_existing) continue;
+        const scoped_subject = try std.fmt.allocPrint(a, "{s}.{s}.*.*.*", .{ owned.topology.subject_mutations_prefix, leaf });
+        defer a.free(scoped_subject);
+        try subscriptions.append(a, try conn.queueSubscribeSync(scoped_subject, "zebridge_mutation_admission"));
+    }
+    for (subscriptions.items) |sub| sub.setPendingLimits(1024, 8 << 20);
+    try conn.flush();
+    const action = std.posix.Sigaction{ .handler = .{ .handler = stop }, .mask = std.mem.zeroes(std.posix.sigset_t), .flags = 0 };
+    std.posix.sigaction(std.posix.SIG.TERM, &action, null);
+    std.posix.sigaction(std.posix.SIG.INT, &action, null);
+    log.info("mutation admission ready: {d} queued messages per principal, {d} byte budget", .{ try limits.count(), limits.principal_bytes });
+    var refused: u64 = 0;
+    var last_warning: i64 = 0;
+    while (!stopping.load(.acquire)) {
+        var activity = false;
+        for (subscriptions.items) |subscription| {
+            const incoming = subscription.nextMsgTimeout(.{ .duration = .{ .raw = .fromMilliseconds(0), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout, error.SlowConsumer => continue,
+                else => return err,
+            };
+            activity = true;
+            defer incoming.deinit();
+            relay(conn, incoming, owned.topology.subject_mutations_prefix, owned.topology.leaf_prefix, limits) catch |err| {
+                refused +|= 1;
+                const now = std.Io.Clock.real.now(init.io).toSeconds();
+                if (now != last_warning) {
+                    log.warn("mutation admission refused {d} request(s), latest: {s}", .{ refused, @errorName(err) });
+                    last_warning = now;
+                    refused = 0;
+                }
+                if (incoming.reply) |reply| {
+                    // Never emit an error to an arbitrary caller-chosen subject.
+                    const parsed = route(incoming.subject, owned.topology.subject_mutations_prefix, owned.topology.leaf_prefix) catch continue;
+                    if (replyBelongsTo(reply, parsed.principal)) {
+                        conn.publish(reply, "{\"error\":{\"code\":400,\"err_code\":10003,\"description\":\"mutation admission refused\"}}") catch {};
+                    }
+                }
+            };
+        }
+        if (!activity) try std.Io.sleep(init.io, .fromMilliseconds(1), .awake);
+    }
+}
+
+fn optionalEnv(init: *const std.process.Init, key: []const u8) ?[]const u8 {
+    const value = init.minimal.environ.getPosix(key) orelse return null;
+    return if (value.len == 0) null else value;
+}
+
+pub fn run(init: *const std.process.Init) u8 {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer if (builtin.mode == .Debug) {
+        _ = gpa.deinit();
+    };
+    const a = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
+    runImpl(init, a) catch |err| {
+        log.err("mutation admission stopped: {s}", .{@errorName(err)});
+        return 1;
+    };
+    return 0;
+}
+
+test "admission caps all of a principal's routes within a byte budget" {
+    const limits: Limits = .{};
+    try std.testing.expect((try limits.count()) * (@as(i64, limits.message_bytes) + 512) <= limits.principal_bytes);
+    try std.testing.expectError(error.InvalidAdmissionLimits, (Limits{ .principal_messages = -1 }).count());
+    try std.testing.expectError(error.InvalidAdmissionLimits, (Limits{ .principal_bytes = 1 << 30 }).count());
+    try std.testing.expectError(error.InvalidAdmissionLimits, (Limits{ .principal_bytes = std.math.maxInt(i64) }).count());
+    try std.testing.expectEqualStrings("alice", (try route("mutation.alice.table_a.insert", "mutation", "lf-")).principal);
+    try std.testing.expectEqualStrings("alice", (try route("mutation.alice.table_b.delete", "mutation", "lf-")).principal);
+    // `alice.t` is no principal (a two-token one starts with the leaf prefix): one token too many is malformed.
+    try std.testing.expectError(error.MalformedSubject, route("mutation.alice.t.insert.extra", "mutation", "lf-"));
+    try std.testing.expectError(error.UnknownOperation, route("mutation.alice.t.truncate", "mutation", "lf-"));
+    try std.testing.expectEqualStrings("lf-leaf1.alice", (try route("mutation.lf-leaf1.alice.t.insert", "mutation", "lf-")).principal);
+    try std.testing.expectError(error.MalformedSubject, route("mutation.lf-leaf1.alice.extra.t.insert", "mutation", "lf-"));
+    // A plain principal in the leaf namespace, and a two-token one outside it: both refused.
+    try std.testing.expectError(error.MalformedSubject, route("mutation.lf-leaf1.t.insert", "mutation", "lf-"));
+    try std.testing.expectError(error.MalformedSubject, route("mutation.canada.alice.t.insert", "mutation", "lf-"));
+    try std.testing.expect(replyBelongsTo("_INBOX.alice.123", "alice"));
+    try std.testing.expect(!replyBelongsTo("_INBOX.alice-other.123", "alice"));
+    try std.testing.expect(!replyBelongsTo("_INBOX.bob.123", "alice"));
+}
+
+test "private mutation headers must agree with the stored principal" {
+    var msg = nats.Message.init(std.testing.allocator);
+    defer msg.deinit();
+    try msg.setSubject("$ZB.mutation.alice", false);
+    try msg.headerSet(original_subject_header, "mutation.alice.orders.update");
+    try std.testing.expectEqualStrings("mutation.alice.orders.update", try originalSubject(&msg, "mutation", "lf-"));
+    try msg.headerSet(original_subject_header, "mutation.bob.orders.delete");
+    try std.testing.expectError(error.MalformedSubject, originalSubject(&msg, "mutation", "lf-"));
+    // A public caller's forged header never replaces its broker-authorized subject.
+    try msg.setSubject("mutation.alice.orders.update", false);
+    try std.testing.expectEqualStrings(msg.subject, try originalSubject(&msg, "mutation", "lf-"));
+}

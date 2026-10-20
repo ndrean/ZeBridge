@@ -54,6 +54,7 @@ GROUPS = {
         "diagnose":      ("none",   "bridge --diagnose: the pre-run doctor says everything, changes nothing"),
         "revoke":        ("bridge", "deleting a principal's mapping purges its $KV.tenants key live"),
         "init_nats":     ("none",   "bridge --init-nats: the whole NATS stack generated, then BOOTED and proven"),
+        "mutation_admission": ("none", "a private durable mutation queue: aggregate principal quotas across tables, scoped deduplication, forged headers refused, durable PubAcks and restart recovery; own local NATS, no PostgreSQL"),
         "revoke_full":   ("none",   "the hard kill: --revoke --conf amends the account JWT; reload kicks the live session"),
         "rotate_client_key": ("none", "--init-nats --rotate-client-key: a new client signing key; on reload the old key's JWTs (live, stored or forged) are refused, the new key's connect, the service creds stay (own NATS stack)"),
         "revoke_purge":  ("none",   "--revoke --purge: libzb and zb-client-ts delete their replica and identity, live and on return; /renew says purge; a plain revoke leaves them (own NATS stack and probe bridge, §10kn)"),

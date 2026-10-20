@@ -54,6 +54,12 @@ const usage =
     \\                  --ttl-days: both default to 3650 (ten years): replaced with a redeploy
     \\                  --store - reads the store from standard input (a password manager's pipe):
     \\                  the seeds never touch this host's disk
+    \\  --mutation-ingress
+    \\                  Hub-side admission service (NATS only). Preserves client PubAcks;
+    \\                  stores all of a principal's writes on one private subject
+    \\                  --check: verify/prepare bounded queue, then exit
+    \\                  --print-config: print desired private queue configuration, no connection
+    \\                  --prepare-projections: prepare ZB_LEAF_TENANTS manifest sources, then exit
     \\  --invite --principal NAME --tenant T [--expires '1 hour']
     \\                  An enrollment invite; the code alone on stdout. Needs
     \\                  INVITER_DATABASE_URL for the invocation: a login granted
@@ -104,6 +110,8 @@ const usage =
     \\                        it differs from the dialed host (a public name, dialed on 127.0.0.1)
     \\  NATS_JS_DOMAIN        the JetStream domain to address, when JetStream is reached across
     \\                        a leaf link (API subjects, grants and /enroll all carry it)
+    \\  ZB_LEAF_NAMES         admission's registered leaf namespaces, space-separated
+    \\  ZB_LEAF_TENANTS       explicit tenant list for --prepare-projections
     \\  ZB_FEED_RESTART       1: this new slot replaces a lost one — restart the feed
     \\                        once, so clients re-seed instead of resuming past the hole
     \\  ZB_INGRESS_LANES      parallel mutation listeners, each with its own PG writer and
@@ -169,8 +177,13 @@ const usage =
     \\                        JetStream when their turn comes (default: 0 = off)
     \\  MUTATION_RATE_BURST   how many writes a quiet client may send at once
     \\                        (default: one second's worth)
-    \\  MUTATION_BACKLOG_PER_PRINCIPAL  writes one principal may have queued, used
-    \\                        only when the bridge creates MUTATIONS (default: 5000)
+    \\  MUTATION_ADMISSION  1: consume the private admission queue (production); 0:
+    \\                        legacy direct queue, with per-route limits only (default)
+    \\  MUTATION_BACKLOG_PER_PRINCIPAL  queued writes per principal under admission
+    \\                        (default: 5000, also capped by the byte budget)
+    \\  MUTATION_BACKLOG_BYTES_PER_PRINCIPAL  admission payload budget (default: 64 MiB)
+    \\  MUTATION_MAX_MESSAGE_BYTES  admission message size, headers included (default: 64 KiB)
+    \\  MUTATION_STREAM_MAX_BYTES  shared admission stream ceiling (default: 1 GiB)
     \\  CDC_MAX_AGE_SECONDS   how long a CDC stream keeps an event (default:
     \\                        3 × cadence). The contract with the chain: a
     \\                        client further behind re-seeds and resumes at
@@ -197,7 +210,7 @@ pub const gen_nkey_flag = "--gen-nkey";
 
 /// Flags that REPLACE the program instead of configuring it: they read no environment,
 /// open nothing, and their whole output IS the answer.
-pub const EarlyExit = enum { help, version, gen_nkey, init_nats, init_sql, mint_responder, mint_archiver, mint_sensor, mint_leaf, invite, demo_invites, revoke, view_slots, view_slot, drop_slot };
+pub const EarlyExit = enum { help, version, gen_nkey, init_nats, init_sql, mint_responder, mint_archiver, mint_sensor, mint_leaf, mutation_ingress, invite, demo_invites, revoke, view_slots, view_slot, drop_slot };
 
 /// Answered from argv by `main` BEFORE the log level is resolved and before anything
 /// else prints — boot noise on stderr is noise in a command meant to be piped
@@ -220,6 +233,7 @@ pub fn earlyExit(init: *const std.process.Init) ?EarlyExit {
         if (std.mem.eql(u8, arg, "--mint-archiver")) return .mint_archiver;
         if (std.mem.eql(u8, arg, "--mint-sensor")) return .mint_sensor;
         if (std.mem.eql(u8, arg, "--mint-leaf")) return .mint_leaf;
+        if (std.mem.eql(u8, arg, "--mutation-ingress")) return .mutation_ingress;
         if (std.mem.eql(u8, arg, "--init-sql")) return .init_sql;
         if (std.mem.eql(u8, arg, "--invite")) return .invite;
         if (std.mem.eql(u8, arg, "--demo-invites")) return .demo_invites;

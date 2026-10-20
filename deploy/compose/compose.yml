@@ -20,6 +20,14 @@ x-db: &db
   BRIDGE_CDC_PUBLICATION: ${BRIDGE_CDC_PUBLICATION:-zb_pub}
   BRIDGE_CDC_SLOT: ${BRIDGE_CDC_SLOT:-zb_slot}
 
+x-admission: &admission
+  MUTATION_ADMISSION: "1"
+  ZB_LEAF_NAMES: ${ZB_LEAF_NAMES:-}
+  MUTATION_BACKLOG_PER_PRINCIPAL: ${MUTATION_BACKLOG_PER_PRINCIPAL:-5000}
+  MUTATION_BACKLOG_BYTES_PER_PRINCIPAL: ${MUTATION_BACKLOG_BYTES_PER_PRINCIPAL:-67108864}
+  MUTATION_MAX_MESSAGE_BYTES: ${MUTATION_MAX_MESSAGE_BYTES:-65536}
+  MUTATION_STREAM_MAX_BYTES: ${MUTATION_STREAM_MAX_BYTES:-1073741824}
+
 services:
   # ── configuration ───────────────────────────────────────────────────────────────
   # HAProxy's, Prometheus's and Grafana's files and the scripts, from the release's image
@@ -84,18 +92,37 @@ services:
     restart: unless-stopped
 
   # ── the bridge ───────────────────────────────────────────────────────────────────
+  admission:
+    <<: *zebridge
+    entrypoint: ["/bin/sh", "-c", "set -a; . /etc/zebridge/.env.nats; set +a; exec bridge --mutation-ingress"]
+    healthcheck:
+      test: ["CMD-SHELL", "set -a; . /etc/zebridge/.env.nats; set +a; bridge --mutation-ingress --check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    environment:
+      <<: *admission
+    depends_on:
+      nats: { condition: service_started }
+    volumes:
+      - zb-etc:/etc/zebridge:ro
+
   bridge:
     <<: *zebridge
     entrypoint: ["/bin/sh", "-c", "set -a; . /etc/zebridge/.env.nats; set +a; exec bridge"]
     environment:
-      <<: *db
+      <<: [*db, *admission]
       GENERATIONS_ENABLED: "1"
       BRIDGE_BIND: 0.0.0.0          # the compose network only: 27434 is not published
       BASE_BUF: ${BASE_BUF:-13}
       ENROLL_NATS_URL: tls://${NATS_HOST}:${NATS_PUBLIC_PORT:-4222}
       ENROLL_NATS_WS_URL: wss://${WS_HOST}:443
+      MUTATION_RATE_PER_PRINCIPAL: ${MUTATION_RATE_PER_PRINCIPAL:-100}
+      MUTATION_RATE_BURST: ${MUTATION_RATE_BURST:-200}
     depends_on:
       nats: { condition: service_started }
+      admission: { condition: service_healthy }
       pg-init: { condition: service_completed_successfully, required: false }
     volumes:
       - zb-etc:/etc/zebridge

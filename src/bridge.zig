@@ -29,6 +29,8 @@ const publication_mod = @import("publication.zig");
 const catalogue = @import("catalogue.zig");
 const generation_producer = @import("generation_producer.zig");
 const mutation_listener = @import("mutation_listener.zig");
+const mutation_admission = @import("mutation_admission.zig");
+
 const rate_limit = @import("rate_limit.zig");
 const catalog_epoch_mod = @import("catalog_epoch.zig");
 const c_imports = @import("c_imports.zig");
@@ -56,6 +58,7 @@ comptime {
     _ = @import("event_processor.zig");
     _ = @import("numeric.zig");
     _ = @import("mutation_listener.zig");
+    _ = @import("mutation_admission.zig");
     _ = @import("nats_init.zig");
     _ = @import("rate_limit.zig");
     _ = @import("pg_conn.zig");
@@ -753,6 +756,7 @@ pub fn main(init: std.process.Init) !void {
         .mint_archiver => return std.process.exit(nats_init.mintArchiver(init.io, &init)),
         .mint_sensor => return std.process.exit(nats_init.mintSensor(init.io, &init)),
         .mint_leaf => return std.process.exit(nats_init.mintLeaf(init.io, &init)),
+        .mutation_ingress => return std.process.exit(mutation_admission.run(&init)),
         .init_sql => return std.process.exit(init_sql.run(init.io, &init)),
         .invite => return std.process.exit(admin_invite.run(&init)),
         .demo_invites => return std.process.exit(demo_invites.run(&init)),
@@ -809,6 +813,12 @@ pub fn main(init: std.process.Init) !void {
     var topology_owned = try topology_mod.loadEmbedded(allocator);
     defer topology_owned.deinit();
     runtime_config.topology = topology_owned.topology;
+    const admission_filter: ?[]u8 = if (mutation_admission.enabled(&init))
+        try std.fmt.allocPrint(allocator, "$ZB.{s}.>", .{runtime_config.topology.subject_mutations_prefix})
+    else
+        null;
+    defer if (admission_filter) |filter| allocator.free(filter);
+    if (admission_filter) |filter| runtime_config.topology.mutations_subject_wildcard = filter;
     log.info("Topology: built in (grammar.json embedded at compile time, §10ci)", .{});
 
     // Create null-terminated versions for C APIs (kept alive for entire program)
@@ -1276,7 +1286,7 @@ pub fn main(init: std.process.Init) !void {
         std.fmt.parseInt(i64, v, 10) catch 5000
     else
         5000;
-    ensureBaseTopology(allocator, &publisher, &runtime_config.topology, backlog_per_principal) catch |err| {
+    ensureBaseTopology(allocator, &publisher, &runtime_config.topology, backlog_per_principal, if (admission_filter != null) try mutation_admission.Limits.fromEnv(&init) else null) catch |err| {
         log.err("🔴 FATAL: could not ensure the MUTATIONS / VERDICTS streams and the KV buckets ({s}) — refusing to start.", .{@errorName(err)});
         should_stop.store(true, .seq_cst);
         return err;
@@ -2856,12 +2866,15 @@ fn ensureBaseTopology(
     publisher: anytype,
     topo: *const topology_mod.Topology,
     backlog_per_principal: i64,
+    admission_limits: ?mutation_admission.Limits,
 ) !void {
     const js = if (publisher.js) |*j| j else return error.NotConnected;
     const two_hours: u64 = 2 * 3600 * std.time.ns_per_s;
     const one_gib: i64 = 1 << 30;
 
-    if (js.getStreamInfo(topo.stream_mutations)) |info_const| {
+    if (admission_limits) |limits| {
+        try mutation_admission.ensureStream(js.*, allocator, topo, limits);
+    } else if (js.getStreamInfo(topo.stream_mutations)) |info_const| {
         var info = info_const;
         info.deinit();
     } else |_| {
@@ -2869,10 +2882,8 @@ fn ensureBaseTopology(
         defer allocator.free(writes);
         const dead = try std.fmt.allocPrint(allocator, "{s}.>", .{topo.mutation_error_prefix});
         defer allocator.free(dead);
-        // Workqueue: a write leaves once the bridge acks it, so the per-subject cap
-        // counts what is QUEUED per principal (the subject carries it), and `discard
-        // new` per subject refuses that principal's next write at the door — nobody
-        // else notices (§10fk).
+        // Compatibility mode: this is a full-subject cap, hence per table/operation,
+        // not an aggregate principal quota. Production uses admission_limits above.
         var res = try js.addStream(.{
             .name = topo.stream_mutations,
             .subjects = &.{ writes, dead },
@@ -2884,7 +2895,7 @@ fn ensureBaseTopology(
             .discard_new_per_subject = true,
         });
         res.deinit();
-        log.info("🆕 created stream {s} ({s}, {s}; {d} queued writes per principal)", .{ topo.stream_mutations, writes, dead, backlog_per_principal });
+        log.info("🆕 created legacy stream {s} ({s}, {s}; {d} queued writes per route; enable MUTATION_ADMISSION for aggregate quotas)", .{ topo.stream_mutations, writes, dead, backlog_per_principal });
     }
 
     if (js.getStreamInfo(topo.stream_verdicts)) |info_const| {
@@ -3040,6 +3051,7 @@ test {
     _ = @import("init_sql.zig");
     _ = @import("http_server.zig");
     _ = @import("leaf_scope.zig");
+    _ = @import("mutation_admission.zig");
     _ = @import("mutation_listener.zig");
     _ = @import("nats_init.zig");
     _ = @import("numeric.zig");

@@ -34,6 +34,13 @@
       BASE_BUF: "{{ zb_base_buf }}"
       ENROLL_NATS_URL: "tls://{{ zb_host_nats }}:4222"
       ENROLL_NATS_WS_URL: "wss://{{ zb_host_ws }}:443"
+      MUTATION_ADMISSION: "{{ zb_mutation_admission | bool | ternary('1', '0') }}"
+      MUTATION_BACKLOG_PER_PRINCIPAL: "{{ zb_mutation_backlog }}"
+      MUTATION_BACKLOG_BYTES_PER_PRINCIPAL: "{{ zb_mutation_backlog_bytes }}"
+      MUTATION_MAX_MESSAGE_BYTES: "{{ zb_mutation_message_bytes }}"
+      MUTATION_STREAM_MAX_BYTES: "{{ zb_mutation_stream_bytes }}"
+      MUTATION_RATE_PER_PRINCIPAL: "{{ zb_mutation_rate }}"
+      MUTATION_RATE_BURST: "{{ zb_mutation_burst }}"
   notify: Restart zebridge
 
 # 4222 speaks TLS only: the bridge dials it by name (the certificate's), which /etc/hosts
@@ -44,6 +51,44 @@
     regexp: '^NATS_URL='
     line: "NATS_URL=tls://{{ zb_host_nats }}:4222"
   notify: Restart zebridge
+
+- name: Admission policy and NATS address (no PostgreSQL credentials)
+  ansible.builtin.copy:
+    dest: /etc/zebridge/.env.admission
+    owner: root
+    group: zebridge
+    mode: "0640"
+    content: |
+      NATS_URL=tls://{{ zb_host_nats }}:4222
+      NATS_CREDS=/etc/zebridge/creds/bridge.creds
+      NATS_JS_DOMAIN={{ zb_js_domain }}
+      ZB_LEAF_NAMES="{{ groups['leaves'] | default([]) | map('extract', hostvars, 'leaf_name') | join(' ') }}"
+      MUTATION_BACKLOG_PER_PRINCIPAL={{ zb_mutation_backlog }}
+      MUTATION_BACKLOG_BYTES_PER_PRINCIPAL={{ zb_mutation_backlog_bytes }}
+      MUTATION_MAX_MESSAGE_BYTES={{ zb_mutation_message_bytes }}
+      MUTATION_STREAM_MAX_BYTES={{ zb_mutation_stream_bytes }}
+  notify: Restart admission
+
+- name: The mutation admission service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/zebridge-admission.service
+    mode: "0644"
+    content: |
+      [Unit]
+      After=nats.service network-online.target
+      Wants=nats.service
+      [Service]
+      User=zebridge
+      EnvironmentFile=/etc/zebridge/.env.admission
+      ExecStart={{ zb_bin }}/bridge --mutation-ingress
+      Restart=on-failure
+      RestartSec=5
+      NoNewPrivileges=true
+      PrivateTmp=true
+      ProtectHome=true
+      [Install]
+      WantedBy=multi-user.target
+  notify: Restart admission
 
 - name: .env.nats — the JWT lifetime handed to clients
   ansible.builtin.lineinfile:
@@ -59,6 +104,13 @@
     mode: "0600"
   loop: [/etc/zebridge/.env.nats, /etc/zebridge/creds/bridge.creds]
 
+- name: Admission running when enabled
+  ansible.builtin.systemd_service:
+    name: zebridge-admission
+    enabled: "{{ zb_mutation_admission | bool }}"
+    state: "{{ zb_mutation_admission | bool | ternary('started', 'stopped') }}"
+    daemon_reload: true
+
 - name: The bridge and the sweeper as services
   ansible.builtin.copy:
     dest: "/etc/systemd/system/{{ item.unit }}.service"
@@ -73,6 +125,9 @@
       User=zebridge
       EnvironmentFile=/etc/zebridge/.env.nats
       EnvironmentFile=/etc/zebridge/.env.bridge
+      {% if item.unit == 'zebridge' and zb_mutation_admission | bool %}
+      ExecStartPre={{ zb_bin }}/bridge --mutation-ingress --check
+      {% endif %}
       ExecStart={{ zb_bin }}/{{ item.bin }}
       Restart=on-failure
       RestartSec={{ item.restart_sec }}
