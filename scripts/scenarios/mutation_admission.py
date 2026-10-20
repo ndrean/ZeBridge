@@ -198,6 +198,36 @@ async def main():
             await migration.migrate(admin, wanted, apply=True)
             check((await js.stream_info("MUTATIONS")).config.max_age == 0,
                   "accepted writes have no age expiry; bounded capacity refuses new writes instead")
+            backup_spec = importlib.util.spec_from_file_location("hub_backup", zb.ROOT / "deploy/backup-hub.py")
+            backup = importlib.util.module_from_spec(backup_spec)
+            backup_spec.loader.exec_module(backup)
+            original_capture = (await js.stream_info("MUTATIONS")).config.as_dict()
+            never_dump = lambda _path: (_ for _ in ()).throw(AssertionError("dump should not run"))
+            await backup.checkpoint(admin, tmp / "plan", config, env["NATS_CREDS"], never_dump, never_dump)
+            check(not (tmp / "plan").exists() and (await js.stream_info("MUTATIONS")).config.as_dict() == original_capture,
+                  "the recovery-checkpoint plan changes neither storage nor files")
+            await js.publish("$ZB.mutation.alice", b"accepted-before-checkpoint")
+            worker = await js.pull_subscribe("$ZB.mutation.>", durable="backup_guard", stream="MUTATIONS")
+            try:
+                await backup.checkpoint(admin, tmp / "not-drained", config, env["NATS_CREDS"], never_dump, never_dump, apply=True, timeout=.2)
+                drain_refused = False
+            except RuntimeError:
+                drain_refused = True
+            check(drain_refused and (await js.stream_info("MUTATIONS")).state.messages == 1 and
+                  (await js.stream_info("MUTATIONS")).config.as_dict() == original_capture,
+                  "an undrained recovery checkpoint preserves accepted writes and resumes capture")
+            for message in await worker.fetch(1, timeout=2):
+                await message.ack_sync()
+            def failed_dump(_path):
+                raise RuntimeError("injected dump failure")
+            try:
+                await backup.checkpoint(admin, tmp / "failed-dump", config, env["NATS_CREDS"], failed_dump, never_dump, apply=True)
+                dump_failed = False
+            except RuntimeError:
+                dump_failed = True
+            check(dump_failed and (await js.stream_info("MUTATIONS")).config.as_dict() == original_capture and
+                  not (tmp / "failed-dump/manifest.json").exists(),
+                  "a failed PostgreSQL dump resumes capture without labelling a checkpoint complete")
         except Exception:
             print((tmp / "nats.log").read_text(errors="replace")[-1500:])
             raise

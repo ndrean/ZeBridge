@@ -57,6 +57,7 @@ GROUPS = {
         "leaf_tenants": ("none", "disposable PostgreSQL: leaf namespaces and explicit tenant lists, refused cross-scope invites, membership changes and policy escalation"),
         "leaf_trust": ("none", "disposable hub and supervised leaf: signed trust refresh, revocation, signing-key rotation, rollback rejection and stale-feed recovery"),
         "leaf_security": ("none",   "disposable Docker hub and leaf: link credentials cannot connect as clients or administer streams; loopback keeper cannot connect directly to the hub; local mirror creation, replication and deletion work"),
+        "hub_recovery": ("none", "disposable PostgreSQL and NATS: scoped native mutation, real checkpoint/pg_restore, returning replica reset and fresh-device seed"),
         "mutation_admission": ("none", "a private durable mutation queue: aggregate principal quotas across tables, scoped deduplication, forged headers refused, durable PubAcks and restart recovery; own local NATS, no PostgreSQL"),
         "revoke_full":   ("none",   "the hard kill: --revoke --conf amends the account JWT; reload kicks the live session"),
         "rotate_client_key": ("none", "--init-nats --rotate-client-key: a new client signing key; on reload the old key's JWTs (live, stored or forged) are refused, the new key's connect, the service creds stay (own NATS stack)"),
