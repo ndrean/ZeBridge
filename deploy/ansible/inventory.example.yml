@@ -12,5 +12,7 @@ all:
         leaf1:
           ansible_host: 54.37.13.184
           ansible_user: debian
-          leaf_name: leaf1
+          leaf_name: lf-leaf1
+          leaf_tenants: [demo, storm]
+          leaf_js_domain: strasbourg
           leaf_host: leaf1.zebridge.eu

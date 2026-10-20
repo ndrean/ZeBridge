@@ -1,14 +1,7 @@
-# A ZeBridge leaf with Docker Compose: a nats-server near a group of devices, joined to the
-# hub, with no JetStream of its own (the devices' stream calls cross to the hub's through
-# the domain they enrolled with). No PostgreSQL, no bridge, no ZeBridge image: nats-server
-# and certbot only, their scripts below.
-#
-#   docker compose up -d
-#
-# Next to this file: .env, and hub/ with the two files the hub's operator gives
-# (README.md, "A leaf node"): trust.conf and leaf.creds.
-# Published ports: 80 (Let's Encrypt), NATS_PUBLIC_PORT (native clients, TLS) and
-# LEAF_WS_PORT (browsers, TLS). Docker's published ports bypass ufw.
+# Regional NATS with a pinned-operator signed trust supervisor, certbot, and
+# the shared mirror keeper. Copy this whole directory and build the NATS image.
+# A distinct LEAF_JS_DOMAIN enables seeding caches. Explicit tenants are required
+# for both modes. See ../README.md and ../../../LEAF_NODES.md for migration.
 
 services:
   # One certificate for LEAF_HOST, from Let's Encrypt on port 80, renewed twice a day.
@@ -31,13 +24,22 @@ services:
     restart: unless-stopped
 
   nats:
-    image: nats:2.15.0-alpine
+    image: zebridge-leaf-nats:2.15.0-security
+    build: .
+    stop_grace_period: 20s
     init: true
     entrypoint: ["/bin/sh", "/run/nats.sh"]
+    # Containers sharing this network namespace inherit its hosts file too.
+    extra_hosts:
+      - "${LEAF_HOST}:127.0.0.1"
     environment:
+      LEAF_NAME: ${LEAF_NAME:?set the reserved leaf namespace}
+      LEAF_TENANTS: ${LEAF_TENANTS:?set an explicit tenant list}
       HUB_NATS_HOST: ${HUB_NATS_HOST:?set HUB_NATS_HOST in .env}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set ALLOWED_ORIGINS in .env}
       LEAF_JS_DOMAIN: ${LEAF_JS_DOMAIN:-}
+      TRUST_FEED_URL: ${TRUST_FEED_URL:?set the hub HTTPS account feed}
+      TRUST_MAX_STALE_SECONDS: ${TRUST_MAX_STALE_SECONDS:-300}
     configs:
       - { source: nats.sh, target: /run/nats.sh }
     depends_on:
@@ -49,6 +51,7 @@ services:
       - certs:/certs:ro
       - ./hub:/hub:ro
       - js-data:/data
+      - trust-state:/state
     networks:
       default:
         # The keeper dials tls://<LEAF_HOST>:4222: the certificate's name, this container.
@@ -57,15 +60,19 @@ services:
 
   # A seeding leaf's mirrors (LEAF_JS_DOMAIN set): every 30 s, a mirror of each of the
   # hub's snapshot streams this leaf serves, made from the hub stream's own settings, and
-  # none of a stream the hub no longer has. With the leaf's own credentials.
+  # missing origins never delete a local cache. A separate loopback-only keeper identity.
   mirrors:
     image: natsio/nats-box:0.20.0
     init: true
     entrypoint: ["/bin/sh", "/run/mirrors.sh"]
+    # The keeper JWT accepts loopback sources only. Share NATS's network namespace;
+    # resolving its TLS name to loopback preserves certificate verification.
+    network_mode: "service:nats"
     environment:
+      LEAF_NAME: ${LEAF_NAME:?set the reserved leaf namespace in .env}
       LEAF_HOST: ${LEAF_HOST:?set LEAF_HOST in .env}
       LEAF_JS_DOMAIN: ${LEAF_JS_DOMAIN:-}
-      LEAF_TENANTS: ${LEAF_TENANTS:-}
+      LEAF_TENANTS: ${LEAF_TENANTS:?set an explicit tenant list in .env}
       HUB_JS_DOMAIN: ${HUB_JS_DOMAIN:-hub}
     configs:
       - { source: mirrors.sh, target: /run/mirrors.sh }
@@ -79,56 +86,11 @@ volumes:
   letsencrypt:
   certs:
   js-data:
+  trust-state:
 
 configs:
   mirrors.sh:
-    content: |
-      #!/bin/sh
-      set -u
-      if [ -z "$$LEAF_JS_DOMAIN" ]; then
-        echo "no LEAF_JS_DOMAIN: a forwarding leaf, nothing to mirror"
-        exec sleep 2147483647
-      fi
-      N="nats --inbox-prefix _INBOX.keeper -s tls://$$LEAF_HOST:4222 --creds /hub/leaf.creds"
-      # The hub's snapshot streams this leaf serves: the manifests, the public tables, and
-      # each tenant's chain objects (only LEAF_TENANTS', when set).
-      want() {
-        $$N --js-domain "$$HUB_JS_DOMAIN" stream ls --names 2>/dev/null | while read -r s; do
-          case "$$s" in
-            KV_generations | OBJ_gen-_default) echo "$$s" ;;
-            OBJ_gen-*)
-              t=$${s#OBJ_gen-}
-              if [ -z "$$LEAF_TENANTS" ] || echo " $$LEAF_TENANTS " | grep -q " $$t "; then echo "$$s"; fi ;;
-          esac
-        done
-      }
-      while :; do
-        hub=$$(want)
-        # A listing without the manifests is an unreachable hub or a partial answer:
-        # change nothing on it.
-        if echo "$$hub" | grep -qx KV_generations; then
-          have=$$($$N stream ls --names 2>/dev/null)
-          for s in $$hub; do
-            echo "$$have" | grep -qx "$$s" && continue
-            if $$N --js-domain "$$HUB_JS_DOMAIN" stream info "$$s" --json 2>/dev/null \
-                 | jq --arg s "$$s" --arg api "\$$JS.$$HUB_JS_DOMAIN.API" \
-                     '.config | del(.subjects, .sources, .mirror, .metadata, .consumer_limits)
-                      | .mirror = {name: $$s, external: {api: $$api, deliver: ""}}
-                      | .mirror_direct = true | .allow_direct = true' > /tmp/mirror.json \
-               && $$N stream add --config /tmp/mirror.json > /dev/null 2>&1; then
-              echo "mirror created: $$s"
-            else
-              echo "mirror not created: $$s (next pass)"
-            fi
-          done
-          for s in $$have; do
-            case "$$s" in KV_generations | OBJ_gen-*) ;; *) continue ;; esac
-            echo "$$hub" | grep -qx "$$s" && continue
-            $$N stream rm -f "$$s" > /dev/null 2>&1 && echo "mirror removed: $$s (not on the hub, or not this leaf's)"
-          done
-        fi
-        sleep 30
-      done
+    file: ./mirrors.sh
 
   certbot.sh:
     content: |
@@ -205,6 +167,7 @@ configs:
       port: 4222
       http: "127.0.0.1:8222"
       ping_interval: "1m"
+      feature_flags { js_api_reply_v2: true }
       tls {
         cert_file: "/certs/fullchain.pem"
         key_file: "/certs/privkey.pem"
@@ -235,7 +198,8 @@ configs:
         printf 'jetstream {\n  domain: %s\n  store_dir: "/data"\n  limits {\n    default_max_consumers: 5000\n  }\n}\n' "$$LEAF_JS_DOMAIN" >> /tmp/nats-server.conf
       fi
       until [ -f /certs/fullchain.pem ]; do sleep 2; done
-      nats-server -c /tmp/nats-server.conf &
+      python3 /usr/local/bin/zebridge-leaf-trust.py --config /tmp/nats-server.conf \
+        --pinned /hub/trust.conf --state-dir /state/trust --link-creds /hub/leaf.creds &
       pid=$$!
       trap 'kill -TERM $$pid; wait $$pid; exit 0' TERM INT
       seen=$$(stat -c %Y /certs/fullchain.pem)

@@ -1,5 +1,5 @@
 # Every leaf. Per leaf, in the inventory: leaf_name (its credentials' name, as
-# `bridge --mint-leaf --name`) and leaf_host (its DNS name, A and AAAA, DNS only: the
+# `bridge --mint-leaf --name`, starting with lf-) and leaf_host (its DNS name, A and AAAA, DNS only: the
 # certificate names it, and phones and browsers dial it).
 
 # The hub the leaves join: the inventory name of the zebridge host whose trust and
@@ -10,3 +10,15 @@ leaf_hub: "{{ groups['zebridge'][0] }}"
 # to open it: the published app, and a local preview while testing.
 leaf_ws_port: 8443
 leaf_allowed_origins: ["https://airports.zebridge.eu", "http://localhost:5176"]
+
+# Required per leaf: an explicit tenant list. Empty never means all tenants.
+leaf_tenants: []
+# A distinct domain enables local seeding caches; empty is forwarding only.
+leaf_js_domain: ""
+nats_cli_version: "0.5.0"
+nats_cli_checksums:
+  amd64: d9fc93e9e9ab0310deff7e719a8a0da6f9d66f26d473f039aaee70155507aecc
+  arm64: 39496b0e332ba8d1b7dcbac2019c7d1e7a7f0d0ccefef9da547e9d6eeed408c8
+
+leaf_trust_feed: "https://bridge.{{ hostvars[leaf_hub].zb_domain }}/nats-account"
+leaf_trust_max_stale: 300

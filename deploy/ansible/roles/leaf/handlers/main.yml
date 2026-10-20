@@ -9,3 +9,10 @@
   ansible.builtin.systemd_service:
     name: nats
     state: reloaded
+
+- name: Restart mirrors
+  ansible.builtin.systemd_service:
+    name: zebridge-mirrors
+    state: restarted
+    daemon_reload: true
+  when: leaf_js_domain | length > 0

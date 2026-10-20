@@ -5,7 +5,7 @@
 
 - name: Packages
   ansible.builtin.apt:
-    name: [ca-certificates, curl, unzip, ufw, acl, certbot, python3-certbot-dns-cloudflare]
+    name: [ca-certificates, curl, unzip, jq, python3-nacl, ufw, acl, certbot, python3-certbot-dns-cloudflare]
     update_cache: true
 
 - name: The nats user
@@ -82,6 +82,16 @@
     mode: "0640"
   notify: Reload nats
 
+- name: Retain the retired link's public key for revocation after verified cutover
+  ansible.builtin.lineinfile:
+    path: /etc/zebridge/retired-leaf-keys
+    create: true
+    mode: "0600"
+    line: "{{ leaf_creds_restricted.stdout | default('') }}"
+  vars:
+    leaf_minted: "{{ hostvars[leaf_hub].hub_leaf_mints.results | selectattr('item', 'equalto', inventory_hostname) | first }}"
+  when: leaf_minted.stdout is defined and leaf_creds_restricted.stdout | default('') is match('^U[A-Z2-7]{55}$')
+
 - name: This leaf's credentials, when the hub just minted them
   ansible.builtin.copy:
     dest: "/etc/zebridge/creds/{{ leaf_name }}.creds"
@@ -95,6 +105,134 @@
   no_log: true
   notify: Restart nats
 
+- name: Retain the retired keeper's public key for revocation after verified cutover
+  ansible.builtin.lineinfile:
+    path: /etc/zebridge/retired-leaf-keys
+    create: true
+    mode: "0600"
+    line: "{{ leaf_keeper_restricted.stdout | default('') }}"
+  vars:
+    keeper_minted: "{{ hostvars[leaf_hub].hub_keeper_mints.results | selectattr('item', 'equalto', inventory_hostname) | first }}"
+  when: leaf_js_domain | length > 0 and keeper_minted.stdout is defined and leaf_keeper_restricted.stdout | default('') is match('^U[A-Z2-7]{55}$')
+
+- name: This seeding leaf's loopback keeper credentials
+  ansible.builtin.copy:
+    dest: "/etc/zebridge/creds/{{ leaf_name }}-keeper.creds"
+    content: "{{ keeper_minted.stdout }}"
+    owner: root
+    group: nats
+    mode: "0640"
+  vars:
+    keeper_minted: "{{ hostvars[leaf_hub].hub_keeper_mints.results | selectattr('item', 'equalto', inventory_hostname) | first }}"
+  when: leaf_js_domain | length > 0 and keeper_minted.stdout is defined
+  no_log: true
+  notify: Restart mirrors
+
+- name: The seeding store
+  ansible.builtin.file:
+    path: /var/lib/zebridge-leaf
+    state: directory
+    owner: nats
+    group: nats
+    mode: "0750"
+  when: leaf_js_domain | length > 0
+
+- name: The local TLS hostname resolves to loopback
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^127\.0\.0\.1[ \t]+{{ leaf_host | regex_escape }}$'
+    line: "127.0.0.1 {{ leaf_host }}"
+  when: leaf_js_domain | length > 0
+
+- name: The pinned native NATS CLI for the keeper
+  when: leaf_js_domain | length > 0
+  block:
+    - name: Download the CLI release with its verified release checksum
+      ansible.builtin.get_url:
+        url: "https://github.com/nats-io/natscli/releases/download/v{{ nats_cli_version }}/nats-{{ nats_cli_version }}-linux-{{ zb_arch }}.zip"
+        dest: "/tmp/nats-cli-{{ nats_cli_version }}.zip"
+        checksum: "sha256:{{ nats_cli_checksums[zb_arch] }}"
+        mode: "0644"
+    - name: Unpack the CLI
+      ansible.builtin.unarchive:
+        src: "/tmp/nats-cli-{{ nats_cli_version }}.zip"
+        dest: /tmp
+        remote_src: true
+    - name: Install the CLI
+      ansible.builtin.copy:
+        src: "/tmp/nats-{{ nats_cli_version }}-linux-{{ zb_arch }}/nats"
+        dest: /usr/local/bin/nats
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      when: not ansible_check_mode
+
+- name: The shared Docker and Ansible mirror keeper
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../compose/leaf/mirrors.sh"
+    dest: /usr/local/bin/zebridge-mirrors
+    owner: root
+    group: root
+    mode: "0755"
+  when: leaf_js_domain | length > 0
+  notify: Restart mirrors
+
+- name: The mirror keeper's settings
+  ansible.builtin.copy:
+    dest: /etc/zebridge/.env.mirrors
+    owner: root
+    group: nats
+    mode: "0640"
+    content: |
+      LEAF_NAME={{ leaf_name }}
+      LEAF_HOST={{ leaf_host }}
+      LEAF_JS_DOMAIN={{ leaf_js_domain }}
+      LEAF_TENANTS="{{ leaf_tenants | join(' ') }}"
+      HUB_JS_DOMAIN={{ zb_js_domain }}
+      KEEPER_CREDS=/etc/zebridge/creds/{{ leaf_name }}-keeper.creds
+  when: leaf_js_domain | length > 0
+  notify: Restart mirrors
+
+- name: The mirror keeper service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/zebridge-mirrors.service
+    mode: "0644"
+    content: |
+      [Unit]
+      After=nats.service network-online.target
+      Requires=nats.service
+      [Service]
+      User=nats
+      EnvironmentFile=/etc/zebridge/.env.mirrors
+      ExecStart=/usr/local/bin/zebridge-mirrors
+      Restart=on-failure
+      RestartSec=5
+      NoNewPrivileges=true
+      PrivateTmp=true
+      ProtectHome=true
+      [Install]
+      WantedBy=multi-user.target
+  when: leaf_js_domain | length > 0
+  notify: Restart mirrors
+
+- name: The signed account trust supervisor (shared with Docker)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../compose/leaf/leaf_trust.py"
+    dest: /usr/local/bin/zebridge-leaf-trust.py
+    mode: "0755"
+    owner: root
+    group: root
+  notify: Restart nats
+
+- name: Persistent public trust state
+  ansible.builtin.file:
+    path: /var/lib/zebridge-trust
+    state: directory
+    owner: nats
+    group: nats
+    mode: "0750"
+
 # ── the server ─────────────────────────────────────────────────────────────────────────
 
 - name: The leaf's nats-server.conf
@@ -104,11 +242,19 @@
     group: nats
     mode: "0640"
     content: |
-      # Managed by deploy/ansible (leaf.yml). A leaf: no jetstream block.
+      # Managed by deploy/ansible (leaf.yml). Explicit tenant-scoped credentials.
       include ./trust.conf
       port: 4222
       http: "127.0.0.1:8222"
       ping_interval: "1m"
+      feature_flags { js_api_reply_v2: true }
+      {% if leaf_js_domain | length %}
+      jetstream {
+        domain: {{ leaf_js_domain }}
+        store_dir: "/var/lib/zebridge-leaf"
+        limits { default_max_consumers: 5000 }
+      }
+      {% endif %}
       tls {
         cert_file: "/etc/zebridge/tls/leaf.crt"
         key_file:  "/etc/zebridge/tls/leaf.key"
@@ -152,7 +298,8 @@
 
       [Service]
       User=nats
-      ExecStart=/usr/local/bin/nats-server -c /etc/zebridge/nats-server.conf
+      ExecStart=/usr/bin/python3 /usr/local/bin/zebridge-leaf-trust.py --config /etc/zebridge/nats-server.conf --pinned /etc/zebridge/trust.conf --state-dir /var/lib/zebridge-trust --link-creds /etc/zebridge/creds/{{ leaf_name }}.creds --leaf-name {{ leaf_name }} --tenants "{{ leaf_tenants | join(' ') }}" --feed {{ leaf_trust_feed }} --max-stale {{ leaf_trust_max_stale }}
+      TimeoutStopSec=20
       ExecReload=/bin/kill -s HUP $MAINPID
       Restart=on-failure
       LimitNOFILE=65536
@@ -167,6 +314,14 @@
     enabled: true
     state: started
     daemon_reload: true
+
+- name: Mirror keeper running on seeding leaves
+  ansible.builtin.systemd_service:
+    name: zebridge-mirrors
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: leaf_js_domain | length > 0
 
 # ── the firewall: SSH, phones, browsers; nothing else ─────────────────────────────────
 
