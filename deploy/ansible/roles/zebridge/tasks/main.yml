@@ -32,6 +32,7 @@
       BRIDGE_CDC_SLOT: "{{ zb_slot }}"
       GENERATIONS_ENABLED: "1"
       BASE_BUF: "{{ zb_base_buf }}"
+      NATS_ACCOUNT_CONF: /etc/zebridge/nats-server.conf
       ENROLL_NATS_URL: "tls://{{ zb_host_nats }}:4222"
       ENROLL_NATS_WS_URL: "wss://{{ zb_host_ws }}:443"
       MUTATION_ADMISSION: "{{ zb_mutation_admission | bool | ternary('1', '0') }}"
@@ -42,6 +43,14 @@
       MUTATION_RATE_PER_PRINCIPAL: "{{ zb_mutation_rate }}"
       MUTATION_RATE_BURST: "{{ zb_mutation_burst }}"
   notify: Restart zebridge
+
+- name: The bridge may read public account claims for leaf trust refresh
+  ansible.posix.acl:
+    path: /etc/zebridge/nats-server.conf
+    entity: zebridge
+    etype: user
+    permissions: r
+    state: present
 
 # 4222 speaks TLS only: the bridge dials it by name (the certificate's), which /etc/hosts
 # keeps on this machine.

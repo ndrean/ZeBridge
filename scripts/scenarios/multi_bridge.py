@@ -29,6 +29,7 @@ import asyncio
 import ctypes
 import json
 import os
+import pathlib
 import subprocess
 import tempfile
 import time
@@ -39,8 +40,8 @@ import nats
 import zb
 
 ADMIN_URL = "postgres://postgres@127.0.0.1:5432/postgres"
-BRIDGE = zb.ROOT / "zig-out" / "bin" / "bridge"
-LIBZB = zb.ROOT / "libzb" / "zig-out" / "lib" / ("libzbcore.dylib" if os.uname().sysname == "Darwin" else "libzbcore.so")
+BRIDGE = pathlib.Path(os.environ.get("ZB_BRIDGE_BIN", zb.ROOT / "zig-out/bin/bridge"))
+LIBZB = pathlib.Path(os.environ.get("ZB_LIBZB", zb.ROOT / "libzb/zig-out/lib" / ("libzbcore.dylib" if os.uname().sysname == "Darwin" else "libzbcore.so")))
 NATS_PORT = 14225
 NATS_URL = f"nats://127.0.0.1:{NATS_PORT}"
 SIDES = {"a": 9097, "b": 9098}

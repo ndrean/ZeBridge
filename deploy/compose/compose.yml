@@ -113,6 +113,7 @@ services:
     entrypoint: ["/bin/sh", "-c", "set -a; . /etc/zebridge/.env.nats; set +a; exec bridge"]
     environment:
       <<: [*db, *admission]
+      NATS_ACCOUNT_CONF: /etc/zebridge/nats-server.conf
       GENERATIONS_ENABLED: "1"
       BRIDGE_BIND: 0.0.0.0          # the compose network only: 27434 is not published
       BASE_BUF: ${BASE_BUF:-13}

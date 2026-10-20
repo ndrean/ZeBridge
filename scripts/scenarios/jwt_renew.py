@@ -4,6 +4,8 @@
 A probe bridge mints 40 s JWTs, on its own NATS (port 14225), publication and slot. A
 libzb device and a zb-client-ts device (Node) enroll, then:
 
+  0. extreme and malformed renewal timestamps are refused before authentication,
+     without killing the bridge; a signed renewal then succeeds on the same process;
   A. both stay connected for 100 s, two and a half JWT lifetimes: their identity carries
      at least three JWTs (two renewals), and a row inserted at the end reaches both;
   B. both close; their stored `clock_offset` is pushed 2 h AHEAD (a device clock that
@@ -28,12 +30,16 @@ import base64
 import ctypes
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 
 import nkeys
@@ -53,7 +59,8 @@ def setup_db():
     zb.psql(f"CREATE TABLE IF NOT EXISTS public.{T} (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), v int, "
             "updated_at timestamptz NOT NULL DEFAULT now())")
     out = zb.psql(f"SELECT string_agg(step || ':' || status, ' ') FROM zebridge_enable('public.{T}', "
-                  f"public_reason => 'jwt_renew test', publication => '{PUB}', dry_run => false)")
+                  f"public_reason => 'jwt_renew test', writable => true, version_col => 'updated_at', "
+                  f"allow_physical_deletes => true, publication => '{PUB}', dry_run => false)")
     if "ERROR" in out:
         raise SystemExit(f"zebridge_enable {T}: {out}")
     zb.psql(f"INSERT INTO public.{T} (v) VALUES (1)")
@@ -76,6 +83,16 @@ def invite(principal: str) -> str:
     code = f"renew-{uuid.uuid4().hex}"
     zb.psql(f"INSERT INTO public.zebridge_invites (code, principal, tenant_id) VALUES ('{code}', '{principal}', 'acme')")
     return code
+
+
+def http_json(path: str, params: dict) -> tuple[int, dict]:
+    url = f"{BRIDGE_URL}{path}?{urllib.parse.urlencode(params)}"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        with e:
+            return e.code, json.loads(e.read())
 
 
 def identity(db: str) -> dict:
@@ -131,11 +148,11 @@ def main() -> int:
         (zb.ok if cond else zb.bad)(f"{label}: {detail}")
         failed += 0 if cond else 1
 
-    principals = [f"jr_lib_{RUN}", f"jr_ts_{RUN}"]
+    principals = [f"jr_lib_{RUN}", f"jr_ts_{RUN}", f"jr_http_{RUN}"]
     tmp = tempfile.mkdtemp(prefix="zb-renew-")
     blog = os.path.join(tmp, "bridge.log")
     lib_db, ts_db = os.path.join(tmp, "lib.sqlite3"), os.path.join(tmp, "ts.sqlite3")
-    ns = bridge = None
+    ns = bridge = admission = None
     h = 0
     try:
         teardown_db(principals)
@@ -144,13 +161,59 @@ def main() -> int:
         env = dict(os.environ, NATS_URL=NATS_URL, NATS_CREDS=genv["NATS_CREDS"], NATS_TLS_CA="", NATS_JS_DOMAIN="",
                    ZB_SIGNING_SEED=genv["ZB_SIGNING_SEED"], ZB_ACCOUNT_PUB=genv["ZB_ACCOUNT_PUB"],
                    ENROLL_JWT_TTL_SECONDS=str(TTL), GENERATIONS_ENABLED="1", GENERATION_CADENCE_SECONDS="10",
-                   LOG_LEVEL="info")
+                   LOG_LEVEL="info", NATS_ACCOUNT_CONF=os.path.join(tmp, "zb-nats/nats-server.conf"))
+        if os.environ.get("MUTATION_ADMISSION") == "1":
+            admission_log = os.path.join(tmp, "admission.log")
+            with open(admission_log, "w") as output:
+                admission = subprocess.Popen([str(BRIDGE), "--mutation-ingress"], env=env,
+                                             stdout=subprocess.DEVNULL, stderr=output)
+            if not wait_log(admission_log, "mutation admission ready", 30):
+                zb.bad("the admission service did not start")
+                return 1
         bridge = subprocess.Popen([str(BRIDGE), "--pub", PUB, "--slot", SLOT, "--port", str(PORT)],
                                   env=env, stdout=subprocess.DEVNULL, stderr=open(blog, "w"))
         if not wait_log(blog, f"deriving from publication '{PUB}'", 60):
             zb.bad("the probe bridge did not start")
             return 1
         wait_log(blog, "enrollment endpoint armed", 30)
+
+        def check_feed(label):
+            with urllib.request.urlopen(f"{BRIDGE_URL}/nats-account?fresh={uuid.uuid4().hex}", timeout=10) as response:
+                payload = json.loads(response.read())
+                expected = re.search(r"(?m)^\s*" + re.escape(genv["ZB_ACCOUNT_PUB"]) + r':\s*"?([A-Za-z0-9_.-]+)',
+                                     open(env["NATS_ACCOUNT_CONF"]).read()).group(1)
+                check(label, set(payload) == {"account", "jwt"} and payload["account"] == genv["ZB_ACCOUNT_PUB"]
+                      and payload["jwt"] == expected and response.headers.get("Cache-Control") == "no-store",
+                      "only the current public account JWT is served, without secrets or caching")
+        check_feed("0. public trust feed")
+
+        # ── 0. hostile timestamps must not terminate the renewal server ─────────
+        kp = nkeys.from_seed(nkeys.encode_seed(os.urandom(32), nkeys.PREFIX_BYTE_USER))
+        pub = kp.public_key.decode()
+        status, enrolled = http_json("/enroll", {"code": invite(principals[2]), "user_pubkey": pub})
+        check("0. HTTP enrolled", status == 200 and bool(enrolled.get("jwt")), f"HTTP {status}")
+        if status != 200:
+            return 1
+        # A correctly sized but invalid signature reaches the timestamp check, which
+        # runs before signature verification. These require no authenticated caller.
+        dummy_sig = base64.urlsafe_b64encode(bytes(64)).decode().rstrip("=")
+        for stamp, expected in ((str(-(1 << 63)), 401), (str((1 << 63) - 1), 401),
+                                (str(-(1 << 63) - 1), 400), (str(1 << 63), 400),
+                                ("not-a-timestamp", 400), ("", 400)):
+            status, body = http_json("/renew", {"user_pubkey": pub, "ts": stamp, "sig": dummy_sig})
+            skew_response = (body.get("error") == "stale or future timestamp"
+                             and isinstance(body.get("server_time"), int))
+            check(f"0. timestamp {stamp!r}", status == expected and (expected != 401 or skew_response),
+                  f"HTTP {status}, {body.get('error')}")
+        with urllib.request.urlopen(f"{BRIDGE_URL}/health", timeout=10) as r:
+            check("0. bridge survived", bridge.poll() is None and r.status == 200,
+                  "the original process still serves /health")
+        stamp = int(time.time())
+        sig = base64.urlsafe_b64encode(kp.sign(f"zebridge-renew:{pub}:{stamp}".encode())).decode().rstrip("=")
+        status, renewed = http_json("/renew", {"user_pubkey": pub, "ts": stamp, "sig": sig})
+        check("0. valid renewal after hostile requests", status == 200 and bool(renewed.get("jwt"))
+              and renewed.get("principal") == principals[2] and bridge.poll() is None,
+              f"HTTP {status}, the same process renews the enrolled identity")
 
         # ── A. two and a half lifetimes, connected ──────────────────────────────
         stay = int(TTL * 2.5)
@@ -160,6 +223,17 @@ def main() -> int:
         h = lib_open(lib_db, invite(principals[0]))
         check("A. libzb enrolled", h != 0 and not take(lib.zb_client_sync(h)).get("error"),
               f"a {TTL} s JWT, synced ({(lib.zb_last_error() or b'').decode() or 'ok'})")
+        row_id = str(uuid.uuid4())
+        mutation = take(lib.zb_client_mutate(h, T.encode(), b"INSERT", json.dumps({"id": row_id}).encode(), b'{"v":3}'))
+        deadline = time.monotonic() + 15
+        landed = False
+        while h and time.monotonic() < deadline:
+            take(lib.zb_client_poll(h, 200))
+            landed = zb.psql(f"SELECT count(*) FROM public.{T} WHERE id = '{row_id}'") == "1"
+            if landed:
+                break
+        check("A. client mutation reaches PostgreSQL", "error" not in mutation and landed,
+              "the existing libzb API writes through the configured admission path")
         jwts, reconnects = {jwt_of(lib_db)}, 0
         t0 = time.monotonic()
         inserted = False
@@ -237,6 +311,7 @@ def main() -> int:
         ns.send_signal(signal.SIGHUP)
         bridge.terminate()
         bridge.wait(timeout=15)
+        check("D. bridge shutdown", bridge.returncode == 0, f"exit {bridge.returncode}")
         blog2 = os.path.join(tmp, "bridge2.log")
         env["ZB_SIGNING_SEED"] = new_seed
         bridge = subprocess.Popen([str(BRIDGE), "--pub", PUB, "--slot", SLOT, "--port", str(PORT)],
@@ -244,6 +319,7 @@ def main() -> int:
         if not wait_log(blog2, "enrollment endpoint armed", 60):
             zb.bad("the probe bridge did not restart")
             return 1
+        check_feed("D. refreshed public trust feed")
         before = (jwt_of(lib_db), jwt_of(ts_db))
         h = lib_open(lib_db, None)
         check("D. libzb", h != 0 and jwt_of(lib_db) != before[0] and claims_of(lib_db)["iss"] == new_key,
@@ -264,10 +340,21 @@ def main() -> int:
                 bridge.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 bridge.kill()
+                bridge.wait(timeout=5)
+            check("final bridge shutdown", bridge.returncode == 0, f"exit {bridge.returncode}")
+        if admission:
+            admission.terminate()
+            admission.wait(timeout=15)
+            check("admission shutdown", admission.returncode == 0, f"exit {admission.returncode}")
         if ns:
             ns.terminate()
             ns.wait(timeout=10)
         teardown_db(principals)
+        for path in (blog, os.path.join(tmp, "bridge2.log"), os.path.join(tmp, "admission.log")):
+            if os.path.exists(path):
+                shutdown_log = open(path, errors="replace").read()
+                check(f"shutdown {os.path.basename(path)}", "error(DebugAllocator)" not in shutdown_log
+                      and "panic:" not in shutdown_log, "no allocator leaks or panics")
         if os.path.exists(blog):
             shutil.copy(blog, "/tmp/zb_jwt_renew_bridge.log")
         shutil.rmtree(tmp, ignore_errors=True)

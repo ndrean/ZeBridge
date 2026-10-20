@@ -1224,7 +1224,10 @@ fn runUpdate(io: std.Io, dir: []const u8, store_arg: ?[]const u8, add_domain: ?[
     const topo: topology_mod.Topology = owned.topology;
     var op_seed_kp = nats.nkeys.SeedKeyPair.fromSeed(op_kp.seed()) catch return 1;
     defer op_seed_kp.wipe();
-    const now: i64 = @intCast(c.time(null));
+    const now = @import("account_trust.zig").freshIssuedAt(a, io, old_claims) catch |err| {
+        out("🔴 cannot advance account revision: {}\n", .{err});
+        return 1;
+    };
     const new_jwt = accountJwt(a, &topo, js_domain, now, &op_seed_kp, op_kp.public(), acct_kp.public(), .{ .client = sk_client.public(), .responder = sk_responder.public(), .service = sk_service.public(), .archiver = sk_archiver.public(), .sensor = sk_sensor.public() }, revocations) catch return 1;
 
     const new_claims = jwtClaims(a, new_jwt) orelse return 1;

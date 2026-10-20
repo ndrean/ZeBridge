@@ -861,6 +861,7 @@ pub fn main(init: std.process.Init) !void {
         &metrics,
         null,
     );
+    http_srv.account_jwt_path = init.minimal.environ.getPosix("NATS_ACCOUNT_CONF");
     // Enrollment/mint (NOTES: the JWT mint flow): armed only when the operator
     // handed over the scoped client signing seed — the bridge is a signer, not a
     // key store: no file I/O, the seed arrives like NATS_BRIDGE_NKEY_SEED always did.
@@ -3043,6 +3044,8 @@ fn reconcileCdcStreams(
 // to collect its tests. Without it, generation_producer.zig's never ran (§10ge); every
 // file with tests is listed so none is left out again.
 test {
+    _ = @import("account_trust.zig");
+    _ = @import("admin_revoke.zig");
     _ = @import("array.zig");
     _ = @import("batch_publisher.zig");
     _ = @import("catalog_epoch.zig");

@@ -96,6 +96,8 @@ pub const Server = struct {
     /// like nats_publisher; null leaves /enroll answering 404 — the bridge is only
     /// a signer when the operator handed it the scoped seed.
     enroll: ?EnrollCtx = null,
+    /// Public account JWT source for leaf trust refresh; no seed is served.
+    account_jwt_path: ?[]const u8 = null,
     /// Concurrent enrollments in flight. Bounded separately from `open_conns`
     /// because each one dials a PG writer connection — the resource a flood
     /// actually starves (the bridge's own writer shares that Postgres). Refuse
@@ -385,6 +387,8 @@ pub const Server = struct {
             try self.handleStatus(req);
         } else if (method == .GET and std.mem.eql(u8, target, "/metrics")) {
             try self.handleMetrics(req);
+        } else if (method == .GET and (std.mem.eql(u8, target, "/nats-account") or std.mem.startsWith(u8, target, "/nats-account?"))) {
+            try self.handleAccountJwt(req);
         } else if (method == .GET and std.mem.eql(u8, target, "/grammar")) {
             try handleGrammar(req);
         } else if (method == .GET and std.mem.startsWith(u8, target, "/renew?")) {
@@ -699,6 +703,22 @@ pub const Server = struct {
     // -------------------------------------------------------------------------
     // Handlers
     // -------------------------------------------------------------------------
+
+    fn handleAccountJwt(self: *Server, req: *std.http.Server.Request) !void {
+        const path = self.account_jwt_path orelse return http_respond.respond(req, "Not Found\n", .{ .status = .not_found });
+        const ctx = self.enroll orelse return http_respond.respond(req, "Not Found\n", .{ .status = .not_found });
+        const conf = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(1 << 20)) catch
+            return http_respond.respond(req, "Account claims unavailable\n", .{ .status = .service_unavailable });
+        defer self.allocator.free(conf);
+        const jwt = @import("account_trust.zig").accountJwt(conf, ctx.account_pub) catch
+            return http_respond.respond(req, "Account claims unavailable\n", .{ .status = .service_unavailable });
+        const body = try std.json.Stringify.valueAlloc(self.allocator, .{ .account = ctx.account_pub, .jwt = jwt }, .{});
+        defer self.allocator.free(body);
+        try http_respond.respond(req, body, .{ .status = .ok, .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "cache-control", .value = "no-store" },
+        } });
+    }
 
     /// GET /grammar — the wire grammar, served from the binary (§10ci). Clients never
     /// copy grammar.json: they receive it here (or in the /enroll payload) and pin the

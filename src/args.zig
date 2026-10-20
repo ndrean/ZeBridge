@@ -112,6 +112,7 @@ const usage =
     \\                        it differs from the dialed host (a public name, dialed on 127.0.0.1)
     \\  NATS_JS_DOMAIN        the JetStream domain to address, when JetStream is reached across
     \\                        a leaf link (API subjects, grants and /enroll all carry it)
+    \\  NATS_ACCOUNT_CONF     current hub NATS config for the public /nats-account JWT feed
     \\  ZB_LEAF_NAMES         admission's registered leaf namespaces, space-separated
     \\  ZB_LEAF_TENANTS       explicit tenant list for --prepare-projections
     \\  ZB_FEED_RESTART       1: this new slot replaces a lost one — restart the feed

@@ -315,6 +315,10 @@ fn amendRevocations(conn: ?*c.PGconn, init: *const std.process.Init, op_seed: []
         };
         amended = std.mem.concat(a, u8, &.{ claims[0..t], rev_json, claims[t..] }) catch return 1;
     }
+    amended = @import("account_trust.zig").refreshIssuedAt(a, init.io, amended) catch |err| {
+        out("🔴 cannot advance account revision: {}\n", .{err});
+        return 1;
+    };
     // fresh jti: swap the existing value for the signer's token
     const jstart = (std.mem.find(u8, amended, "\"jti\":\"") orelse return 1) + "\"jti\":\"".len;
     const jend = std.mem.findScalarPos(u8, amended, jstart, '"') orelse return 1;
