@@ -30,7 +30,9 @@
 //!                                                                    // §10hj: keep an answer ({"columns","rows"}) in an on-demand table → {"applied":n}
 //!   char* zb_client_poll(uint64_t h, uint64_t wait_ms);            // {"applied":n,"settled":n,"outcomes":[…],"pending":n,…,"requests":[…]?,"unreadable":[…]?,"unseeded":[…]?} — live tail, blocks ≤ wait_ms
 //!       // outcomes: each of this client's writes once settled — {msgId, version, table, columns, outcome:
-//!       //   applied|rebased|lost|deleted|rejected, lostColumns?, rebasedAs? (the re-sent write's msgId), reason?}
+//!       //   applied|rebased|lost|deleted|rejected|indeterminate|reconciled, lostColumns?, rebasedAs? (the re-sent write's msgId), reason?}
+//!       // indeterminate: settled, outcome unknown; the write's (table, tenant) reseeds from the hub, then `reconciled`
+//!       // reconciling: writes answered indeterminate whose reseed has not finished
 //!   const char* zb_last_error(void);                               // §10iz: the words behind the last 0 or NULL this thread got; NULL when the last call succeeded
 //!   char* zb_client_serve(uint64_t h, const char* opts_json);      // §10hp: answer query.<tenant>.<name> in a queue group → {"serving":n}
 //!   char* zb_client_reply(uint64_t h, uint64_t id, const char* answer_json);  // §10hp: answer one request from poll
@@ -1135,7 +1137,7 @@ fn flushJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
     // parsing stderr (§10dx).
     var vc: std.json.ObjectMap = .empty;
     const c = b.c.verdict_counts;
-    inline for (.{ "accepted", "stale", "rejected", "row_deleted", "failed", "rate_limited", "other" }) |name| {
+    inline for (.{ "accepted", "stale", "rejected", "row_deleted", "failed", "rate_limited", "indeterminate", "other" }) |name| {
         try vc.put(a, name, .{ .integer = @intCast(@field(c, name)) });
     }
     try out.put(a, "verdicts", .{ .object = vc });
@@ -1153,6 +1155,8 @@ fn pollJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
     for (taken) |text| try outcomes.append(try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}));
     try out.put(a, "outcomes", .{ .array = outcomes });
     try out.put(a, "pending", .{ .integer = @intCast(b.c.pendingCount(a)) });
+    // Writes answered `indeterminate` whose reconciliation has not finished (§7.4c).
+    try out.put(a, "reconciling", .{ .integer = @intCast(b.c.reconcilingCount(a)) });
     try out.put(a, "settled", .{ .integer = @intCast(r.settled) });
 
     var changed = std.json.Array.init(a);

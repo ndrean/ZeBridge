@@ -440,6 +440,14 @@ pub const SyncClient = struct {
     schema_kv: ?@import("nats").KV = null,
     /// §10df: a descriptor arrived with a higher seed_epoch — seed on the next poll.
     reseed_pending: bool = false,
+    /// Reconciliation of `indeterminate` writes (PROTOCOL §7.4c): the CDC routes rewound
+    /// for an authoritative reseed from the hub. Not tailed until a gap heal resumes them.
+    /// Rebuilt from `_zbz_reconcile` on the first pass. Keys live in the client arena.
+    reconciling: std.array_hash_map.String(void) = .empty,
+    /// The `reconciling` routes the last `gapAndSeed` healed (resumed, not blocked).
+    healed_routes: std.array_hash_map.String(void) = .empty,
+    reconcile_loaded: bool = false,
+    outbox_ready: bool = false,
     /// Events the seed gate dropped, for the trace.
     gated: usize = 0,
     /// §10iz: what kept each table unseeded — the error name of its last failed seed,
@@ -1560,6 +1568,7 @@ pub const SyncClient = struct {
     // ─── step 2: the gap rule (per stream) + scoped seeding (§10n) ──────────
 
     pub fn gapAndSeed(self: *SyncClient, report_a: ?std.mem.Allocator, seeded_map: ?*std.array_hash_map.String(void)) !void {
+        self.healed_routes.clearRetainingCapacity();
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const a = ca.allocator();
@@ -1726,6 +1735,7 @@ pub const SyncClient = struct {
                     self.reseed_pending = true;
                     continue;
                 }
+                if (self.reconciling.getKey(stream)) |k| try self.healed_routes.put(self.aa(), k, {});
                 if (res.to > stored) {
                     // A first run (stored 0) resumes there too, silently: it is not a healed gap.
                     if (stored > 0) log.info("{s}: gap healed — resuming at {d} (was {d}, the stream holds from {d})", .{ stream, res.to, stored, first });
@@ -2075,14 +2085,21 @@ pub const SyncClient = struct {
     /// from the hub replays the chain from the stored watermark, as any failed seed does
     /// on its next turn; a failure of the replica itself fails again there and is returned.
     fn applyChain(self: *SyncClient, table: []const u8, tenant: []const u8) !void {
-        if (self.t.seed_js) |seed| {
+        // A route under reconciliation seeds from the hub only: a leaf's copy may be
+        // behind the very commit the reconciliation is about.
+        const hub_only = blk: {
+            var qa = std.heap.ArenaAllocator.init(self.a);
+            defer qa.deinit();
+            break :blk self.reconciling.contains(try self.routeFor(qa.allocator(), tenant));
+        };
+        if (!hub_only) if (self.t.seed_js) |seed| {
             if (self.applyChainFrom(table, tenant, seed, true)) |_| return else |err| {
                 if (err == error.SeedStale)
                     log.info("{s}: the seeding leaf's copy is behind ({s}) — seeding from the hub", .{ table, tenant })
                 else
                     log.warn("{s}: seeding from the leaf failed ({s}) — seeding from the hub", .{ table, @errorName(err) });
             }
-        }
+        };
         return self.applyChainFrom(table, tenant, self.t.js, false);
     }
 
@@ -2319,6 +2336,13 @@ pub const SyncClient = struct {
         // A held event at or below the seed's LSN is inside the chain just applied:
         // superseded, not waiting (the TS client's pruneInboxSeeded).
         try pruneInboxSeeded(&self.st, a, table, seed_lsn);
+        // A full replaced the rows: this client's writes still queued lost their optimistic
+        // copies with them, so they go back on top (PROTOCOL §7.4c).
+        const had_full = for (plan.array.items) |step| {
+            const kind = if (step == .object) step.object.get("kind") else null;
+            if (kind != null and kind.? == .string and std.mem.eql(u8, kind.?.string, "full")) break true;
+        } else false;
+        if (had_full) self.reapplyPending(a, table, tenant, !self.multiTenant(st.*)) catch |err| log.err("{s}: re-applying pending writes over the seed failed: {s}", .{ table, @errorName(err) });
         if (streamed > 0) {
             log.info("{s}: seeded {d} row(s) from chain g{d} — fetch {d} ms, inflate {d} ms, decode {d} ms, apply {d} ms ({d} of {d} step(s) streamed: fetch+inflate as read, decode = the stage's sort)", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0, ph[0], ph[1], ph[2], ph[3], streamed, plan.array.items.len });
         } else {
@@ -2728,6 +2752,9 @@ pub const SyncClient = struct {
         }
         it = self.states.iterator();
         while (it.next()) |e| for (e.value_ptr.routes) |r| try streams.put(a, r, {});
+        // A route rewound for reconciliation sits at position 0 until its heal: tailed
+        // now, it would replay the stream from its first message.
+        for (self.reconciling.keys()) |r| _ = streams.swapRemove(r);
         return try a.dupe([]const u8, streams.keys());
     }
 
@@ -3694,6 +3721,8 @@ pub const SyncClient = struct {
 
         // Schema first: a row in a new shape must find its table already moved.
         self.drainSchemaWatch(report_a, &changed_map, &seeded_map) catch |err| log.info("schema watch: {s}", .{@errorName(err)});
+        // Then the writes answered `indeterminate`, before any route is tailed.
+        self.reconcile(report_a, &seeded_map) catch |err| log.warn("reconcile: {s} — retried at the next pass", .{@errorName(err)});
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const streams = try self.cdcStreams(ca.allocator());
@@ -4398,7 +4427,15 @@ pub const SyncClient = struct {
     /// The outbox: what makes this a queue rather than a log. An entry leaves only on
     /// a definitive verdict — never on a send failure, which is why a flush is safe to
     /// repeat and why the original msg_id must survive a restart.
+    ///
+    /// `published` is set, durably, before the first send: a write never published cannot
+    /// have committed, so the GC gate may revert it here; a published one goes to the
+    /// bridge, whose receipt knows (an outbox from before the column counts as published).
+    /// `tenant` is the row's tenant (the open tenant for a public table; NULL when the
+    /// write did not name it), `optimistic` the local apply, kept for re-applying after a
+    /// full seed replaced the rows.
     pub fn ensureOutbox(self: *SyncClient) !void {
+        if (self.outbox_ready) return;
         try execDdl(&self.st,
             \\CREATE TABLE IF NOT EXISTS _zebridge_outbox (
             \\  msg_id     TEXT PRIMARY KEY,
@@ -4408,9 +4445,34 @@ pub const SyncClient = struct {
             \\  row_id     TEXT NOT NULL,
             \\  before     TEXT,
             \\  created_at INTEGER NOT NULL,
-            \\  attempts   INTEGER NOT NULL DEFAULT 0
+            \\  attempts   INTEGER NOT NULL DEFAULT 0,
+            \\  published  INTEGER NOT NULL DEFAULT 1,
+            \\  tenant     TEXT,
+            \\  optimistic TEXT
             \\)
         );
+        execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN published INTEGER NOT NULL DEFAULT 1") catch {};
+        execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN tenant TEXT") catch {};
+        execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN optimistic TEXT") catch {};
+        // A write answered `indeterminate`: settled for retransmission, its outcome
+        // unknown until an authoritative reseed of its route (PROTOCOL §7.4c). `state`:
+        // pending (not rewound yet), rewound (its routes wait for the heal), healed (the
+        // tail catches up to `targets`, `route:seq,…`: each stream's end at the heal).
+        try execDdl(&self.st,
+            \\CREATE TABLE IF NOT EXISTS _zbz_reconcile (
+            \\  msg_id  TEXT PRIMARY KEY,
+            \\  tbl     TEXT NOT NULL,
+            \\  tenant  TEXT,
+            \\  reason  TEXT NOT NULL,
+            \\  version TEXT NOT NULL DEFAULT '',
+            \\  data    TEXT,
+            \\  routes  TEXT NOT NULL DEFAULT '',
+            \\  targets TEXT NOT NULL DEFAULT '',
+            \\  since   INTEGER NOT NULL,
+            \\  state   TEXT NOT NULL DEFAULT 'pending'
+            \\)
+        );
+        self.outbox_ready = true;
     }
 
     /// The GC watermark as THIS replica sees it — the one row of
@@ -4520,14 +4582,26 @@ pub const SyncClient = struct {
 
         const payload_json = try core.valueToString(a, payload);
         const before_json: storage.Value = if (before) |b| .{ .text = try core.valueToString(a, b) } else .null;
+        // The row's tenant: a public table's is the open tenant; a tenant-scoped one's is
+        // its tenant column, from the write or the row it replaces.
+        const row_tenant: storage.Value = blk: {
+            const tc = st.tenant_col orelse break :blk .{ .text = self.open_tenants[0] };
+            for ([_]?Value{ values, key, before }) |src| {
+                const o = src orelse continue;
+                if (o != .object) continue;
+                const tv = o.object.get(tc) orelse continue;
+                if (tv == .string) break :blk .{ .text = tv.string };
+            }
+            break :blk .null;
+        };
         _ = try self.st.query(a,
-            \\INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at, attempts)
-            \\VALUES (?,?,?,?,?,?,?,0)
+            \\INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at, attempts, published, tenant, optimistic)
+            \\VALUES (?,?,?,?,?,?,?,0,0,?,?)
             \\ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1
         , &.{
             .{ .text = msg_id },         .{ .text = subject }, .{ .text = payload_json },
             .{ .text = table },          .{ .text = row_id },  before_json,
-            .{ .integer = nowMillis() },
+            .{ .integer = nowMillis() }, row_tenant,           .{ .text = try core.valueToString(a, opt) },
         });
 
         // ⚠️ Sent through flushOutbox, NOT published directly from here.
@@ -4558,7 +4632,7 @@ pub const SyncClient = struct {
         defer ca.deinit();
         const a = ca.allocator();
         try self.ensureOutbox();
-        const rows = try self.st.query(a, "SELECT msg_id, subject, payload, tbl, row_id, before FROM _zebridge_outbox ORDER BY created_at", &.{});
+        const rows = try self.st.query(a, "SELECT msg_id, subject, payload, tbl, row_id, before, published FROM _zebridge_outbox ORDER BY created_at", &.{});
         if (rows.len == 0) return 0;
         if (nowMillis() < self.hold_until_ms) return 0; // §10fk: rate limited — not yet
 
@@ -4572,7 +4646,11 @@ pub const SyncClient = struct {
             try e.put(a, "msgId", .{ .string = if (r[0] == .text) r[0].text else "" });
             const env = if (r[2] == .text) parseStoredJson(a, r[2].text) catch Value.null else Value.null;
             const ver = if (env == .object) env.object.get("version") else null;
-            try e.put(a, "version", if (ver) |v| v else .null);
+            // Only a write never published is judged here. A published one may have
+            // committed: the bridge answers it from its receipt, or refuses it itself
+            // (PredatesGcWatermark) when no attempt did.
+            const published = !(r[6] == .integer and r[6].integer == 0);
+            try e.put(a, "version", if (published) .null else if (ver) |v| v else .null);
             try entries.append(.{ .object = e });
         }
         const gate = try core.outboxWatermarkGate(a, entries, watermark);
@@ -4609,8 +4687,8 @@ pub const SyncClient = struct {
             }
             if (refused.contains(msg_id)) {
                 // Exactly a `rejected` verdict's handling, because that is what it is:
-                // this write will never be sent, so the optimistic copy is a
-                // divergence. Restore and SAY SO — the user's edit is being dropped.
+                // this write was never published, so it never committed, and it will
+                // never be sent. Restore and SAY SO — the user's edit is being dropped.
                 try self.revertOptimistic(a, r);
                 _ = try self.st.query(a, "DELETE FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = msg_id }});
                 log.warn(
@@ -4619,7 +4697,15 @@ pub const SyncClient = struct {
                         "(PROTOCOL MUST 6). Local copy reverted; this edit is lost.",
                     .{ if (r[3] == .text) r[3].text else "?", if (r[4] == .text) r[4].text else "?", msg_id, watermark orelse "?" },
                 );
+                const genv = if (r[2] == .text) parseStoredJson(a, r[2].text) catch Value.null else Value.null;
+                const gver = if (genv == .object) (if (genv.object.get("version")) |x| (if (x == .string) x.string else "") else "") else "";
+                self.noteOutcome(a, msg_id, gver, if (r[3] == .text) r[3].text else "", if (genv == .object) genv.object.get("data") else null, "rejected", &.{.{ "reason", .{ .string = "PredatesGcWatermark" } }});
                 continue;
+            }
+            // Published from here on: recorded BEFORE the publish, so a crash after it can
+            // never leave a sent write that this client believes unsent.
+            if (r[6] == .integer and r[6].integer == 0) {
+                _ = try self.st.query(a, "UPDATE _zebridge_outbox SET published = 1 WHERE msg_id = ?", &.{.{ .text = msg_id }});
             }
             const env = if (r[2] == .text) try parseStoredJson(a, r[2].text) else Value.null;
             self.publishEnvelope(a, r[1].text, env, msg_id) catch |err| {
@@ -4713,6 +4799,16 @@ pub const SyncClient = struct {
             log.info("libzb: verdict {s} for {s}{s}{s}{s}{s}", .{ status, mid, if (reason.len > 0) " — " else "", reason, if (detail.len > 0) ": " else "", detail });
         }
         if (std.mem.eql(u8, status, "failed")) return false;
+        // `indeterminate`, or a status this client does not know: settled for
+        // retransmission, outcome unknown. Never reverted, never re-sent under a new ID.
+        const known = for ([_][]const u8{ "accepted", "stale", "rejected", "row_deleted" }) |k| {
+            if (std.mem.eql(u8, status, k)) break true;
+        } else false;
+        if (!known) {
+            const why = if (std.mem.eql(u8, status, "indeterminate")) reason0 else try std.fmt.allocPrint(a, "UnknownStatus:{s}", .{status});
+            try self.settleIndeterminate(a, mid, why, if (own) |w| .{ .table = w.table, .version = w.version, .data = w.data } else null);
+            return true;
+        }
         if (std.mem.eql(u8, status, "rejected") or std.mem.eql(u8, status, "row_deleted")) {
             const rows = try self.st.query(a, "SELECT msg_id, subject, payload, tbl, row_id, before FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
             // §10dy: `rejected` restores the before-image (nothing changed server-side);
@@ -4763,6 +4859,223 @@ pub const SyncClient = struct {
         }
         _ = try self.st.query(a, "DELETE FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
         return true;
+    }
+
+    // ─── reconciliation of `indeterminate` writes (PROTOCOL §7.4c) ───────────
+
+    const OwnWrite = struct { table: []const u8, version: []const u8, data: ?Value };
+
+    /// Settle an `indeterminate` write: in ONE local transaction its outbox entry goes
+    /// and its reconciliation marker comes, so a crash leaves either the queued write
+    /// (re-sent, answered again) or the marker (reconciled at the next pass). The
+    /// optimistic row stays as it is, and the write stays visibly unresolved (the poll's
+    /// `reconciling`), until the reseed decides it.
+    fn settleIndeterminate(self: *SyncClient, a: std.mem.Allocator, mid: []const u8, reason: []const u8, own: ?OwnWrite) !void {
+        const ob = try self.st.query(a, "SELECT tbl, tenant FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
+        if (ob.len == 0) return; // another device's write: nothing of it is here
+        const data_text: storage.Value = if (own) |w| (if (w.data) |d| .{ .text = try core.valueToString(a, d) } else .null) else .null;
+        const Ctx = struct {
+            a: std.mem.Allocator,
+            mid: []const u8,
+            row: storage.Row,
+            reason: []const u8,
+            version: []const u8,
+            data: storage.Value,
+            fn apply(cx: @This(), s: *storage.Storage) !void {
+                _ = try s.query(cx.a, "DELETE FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = cx.mid }});
+                _ = try s.query(cx.a, "INSERT INTO _zbz_reconcile (msg_id, tbl, tenant, reason, version, data, since, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending') ON CONFLICT(msg_id) DO NOTHING", &.{
+                    .{ .text = cx.mid }, cx.row[0], cx.row[1], .{ .text = cx.reason }, .{ .text = cx.version }, cx.data, .{ .integer = nowMillis() },
+                });
+            }
+        };
+        try self.st.transaction(Ctx{ .a = a, .mid = mid, .row = ob[0], .reason = reason, .version = if (own) |w| w.version else "", .data = data_text }, Ctx.apply);
+        log.warn("libzb: {s} on '{s}' is indeterminate ({s}) — its outcome is unknown; reconciling from the hub", .{ mid, if (ob[0][0] == .text) ob[0][0].text else "?", reason });
+        if (own) |w| self.noteOutcome(a, mid, w.version, w.table, w.data, "indeterminate", &.{.{ "reason", .{ .string = reason } }});
+    }
+
+    /// The writes still waiting for reconciliation.
+    pub fn reconcilingCount(self: *SyncClient, a: std.mem.Allocator) usize {
+        const r = self.st.query(a, "SELECT count(*) FROM _zbz_reconcile", &.{}) catch return 0;
+        if (r.len == 0 or r[0][0] != .integer) return 0;
+        return @intCast(r[0][0].integer);
+    }
+
+    /// Reconcile the `indeterminate` writes: whether an earlier attempt committed is
+    /// something only the authoritative state can say. For each marked write, its
+    /// (table, tenant) watermark is dropped (the reseed must be a FULL, which replaces
+    /// the optimistic row) and its CDC route rewound to 0 — the gap path then seeds from
+    /// the HUB's chain (never a seeding leaf, which may be behind) and resumes the tail at
+    /// the chain's cut. Rewinding the whole route, rather than waiting for a chain newer
+    /// than the replica's position, cannot starve under continuing load; the other tables
+    /// on the route heal like any gap (deltas from their watermarks, then the tail).
+    /// Repeated markers coalesce on their routes. A marker clears once its routes healed
+    /// AND the tail reached each stream's end as it was at the heal — a commit after the
+    /// chain's cut arrives by the tail, not the seed. A crash or a lost connection leaves
+    /// the marker for the next pass.
+    fn reconcile(self: *SyncClient, report_a: ?std.mem.Allocator, seeded_map: ?*std.array_hash_map.String(void)) !void {
+        var ca = std.heap.ArenaAllocator.init(self.a);
+        defer ca.deinit();
+        const a = ca.allocator();
+        try self.ensureOutbox();
+        const select = "SELECT msg_id, tbl, tenant, state, routes, version, data, targets FROM _zbz_reconcile ORDER BY since";
+        var rows = try self.st.query(a, select, &.{});
+        if (!self.reconcile_loaded) {
+            // After a restart: a rewound route still at 0 waits for its heal; one past 0
+            // healed before the marker moved on, and its tail catches up to now.
+            self.reconcile_loaded = true;
+            for (rows) |r| {
+                if (!(r[3] == .text and std.mem.eql(u8, r[3].text, "rewound")) or r[4] != .text) continue;
+                var it = std.mem.splitScalar(u8, r[4].text, ',');
+                while (it.next()) |route| {
+                    if (route.len == 0 or self.reconciling.contains(route)) continue;
+                    if ((try self.storedSeq(route)) == 0) try self.reconciling.put(self.aa(), try self.aa().dupe(u8, route), {});
+                }
+            }
+        }
+        if (rows.len == 0 and self.reconciling.count() == 0) return;
+
+        // 1. Rewind what the new markers need, in one transaction with their state.
+        var rewind: std.array_hash_map.String(void) = .empty;
+        const Mark = struct { mid: storage.Value, routes: []const u8, tbl: []const u8, tenant: ?[]const u8 };
+        var marks: std.ArrayList(Mark) = .empty;
+        for (rows) |r| {
+            if (!(r[3] == .text and std.mem.eql(u8, r[3].text, "pending"))) continue;
+            const tbl = if (r[1] == .text) r[1].text else continue;
+            const tenant: ?[]const u8 = if (r[2] == .text) r[2].text else null;
+            var routes: std.ArrayList(u8) = .empty;
+            if (self.states.get(tbl)) |st| {
+                if (!self.isOnDemand(tbl)) {
+                    if (tenant) |t| {
+                        try routes.appendSlice(a, try self.routeFor(a, t));
+                    } else for (st.routes, 0..) |rt, i| {
+                        if (i > 0) try routes.append(a, ',');
+                        try routes.appendSlice(a, rt);
+                    }
+                }
+            }
+            var it = std.mem.splitScalar(u8, routes.items, ',');
+            while (it.next()) |route| if (route.len > 0 and !self.reconciling.contains(route)) try rewind.put(a, route, {});
+            try marks.append(a, .{ .mid = r[0], .routes = routes.items, .tbl = tbl, .tenant = tenant });
+        }
+        if (marks.items.len > 0) {
+            const Ctx = struct {
+                client: *SyncClient,
+                a: std.mem.Allocator,
+                marks: []const Mark,
+                rewind: []const []const u8,
+                fn apply(cx: @This(), s: *storage.Storage) !void {
+                    for (cx.rewind) |route| try cx.client.persistSeq(route, 0);
+                    for (cx.marks) |m| {
+                        if (m.tenant) |t| {
+                            _ = try s.query(cx.a, "DELETE FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = m.tbl }, .{ .text = t } });
+                        } else {
+                            _ = try s.query(cx.a, "DELETE FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = m.tbl }});
+                        }
+                        _ = try s.query(cx.a, "UPDATE _zbz_reconcile SET state = 'rewound', routes = ? WHERE msg_id = ?", &.{ .{ .text = m.routes }, m.mid });
+                    }
+                }
+            };
+            try self.st.transaction(Ctx{ .client = self, .a = a, .marks = marks.items, .rewind = rewind.keys() }, Ctx.apply);
+            for (rewind.keys()) |route| {
+                self.dropTail(route);
+                try self.reconciling.put(self.aa(), try self.aa().dupe(u8, route), {});
+                log.info("{s}: rewound for reconciliation — reseeding from the hub", .{route});
+            }
+        }
+
+        // 2. Heal: the gap path, hub-only for these routes.
+        if (self.reconciling.count() > 0) {
+            self.gapAndSeed(report_a, seeded_map) catch |err| log.info("reconcile: reseed not finished ({s}) — retried at the next pass", .{@errorName(err)});
+            for (self.healed_routes.keys()) |route| _ = self.reconciling.swapRemove(route);
+            // A route no followed table rides any more has nothing left to heal.
+            const live = try self.allRoutes(a);
+            var i: usize = 0;
+            while (i < self.reconciling.count()) {
+                const route = self.reconciling.keys()[i];
+                if (!live.contains(route)) _ = self.reconciling.swapRemove(route) else i += 1;
+            }
+        }
+
+        // 3. A rewound marker whose routes all healed waits for the tail to reach each
+        // stream's end as it is now; a healed one clears once it did.
+        rows = try self.st.query(a, select, &.{});
+        for (rows) |r| {
+            const state = if (r[3] == .text) r[3].text else "";
+            const routes = if (r[4] == .text) r[4].text else "";
+            if (std.mem.eql(u8, state, "rewound")) {
+                var it = std.mem.splitScalar(u8, routes, ',');
+                const waiting = while (it.next()) |route| {
+                    if (route.len > 0 and self.reconciling.contains(route)) break true;
+                } else false;
+                if (waiting) continue;
+                var targets: std.ArrayList(u8) = .empty;
+                var it2 = std.mem.splitScalar(u8, routes, ',');
+                while (it2.next()) |route| {
+                    if (route.len == 0) continue;
+                    const last: u64 = if (self.streamFacts(route)) |f| f.last_seq else |_| continue;
+                    if (targets.items.len > 0) try targets.append(a, ',');
+                    try targets.appendSlice(a, try std.fmt.allocPrint(a, "{s}:{d}", .{ route, last }));
+                }
+                _ = try self.st.query(a, "UPDATE _zbz_reconcile SET state = 'healed', targets = ? WHERE msg_id = ?", &.{ .{ .text = targets.items }, r[0] });
+                continue;
+            }
+            if (!std.mem.eql(u8, state, "healed")) continue;
+            var it = std.mem.splitScalar(u8, if (r[7] == .text) r[7].text else "", ',');
+            const behind = while (it.next()) |pair| {
+                const colon = std.mem.lastIndexOfScalar(u8, pair, ':') orelse continue;
+                const want = std.fmt.parseInt(u64, pair[colon + 1 ..], 10) catch continue;
+                if ((try self.storedSeq(pair[0..colon])) < want) break true;
+            } else false;
+            if (behind) continue;
+            _ = try self.st.query(a, "DELETE FROM _zbz_reconcile WHERE msg_id = ?", &.{r[0]});
+            const mid = if (r[0] == .text) r[0].text else "";
+            const data: ?Value = if (r[6] == .text) parseStoredJson(a, r[6].text) catch null else null;
+            log.info("libzb: {s} reconciled — the local copy is the authoritative state", .{mid});
+            self.noteOutcome(a, mid, if (r[5] == .text) r[5].text else "", if (r[1] == .text) r[1].text else "", data, "reconciled", &.{});
+        }
+    }
+
+    /// Every CDC route any followed table rides, own or shared.
+    fn allRoutes(self: *SyncClient, a: std.mem.Allocator) !std.array_hash_map.String(void) {
+        var out: std.array_hash_map.String(void) = .empty;
+        var it = self.states.iterator();
+        while (it.next()) |e| {
+            for (e.value_ptr.routes) |r| try out.put(a, r, {});
+            if (e.value_ptr.shared_route) |sr| try out.put(a, sr, {});
+        }
+        return out;
+    }
+
+    /// A full step replaced the rows of (table, tenant) with the chain's, which knows
+    /// nothing of this client's writes still in the outbox: their optimistic copies are
+    /// gone. Re-apply them, oldest first, each over a fresh before-image (the seeded row,
+    /// or the previous pending write's), so a later rejection restores the authoritative
+    /// state plus the writes before it. `whole`: the full replaced every tenant's rows.
+    /// A write queued before the `optimistic` column cannot be re-applied (logged).
+    fn reapplyPending(self: *SyncClient, a: std.mem.Allocator, table: []const u8, tenant: []const u8, whole: bool) !void {
+        const st = self.states.get(table) orelse return;
+        const rows = if (whole)
+            try self.st.query(a, "SELECT msg_id, payload, optimistic FROM _zebridge_outbox WHERE tbl = ? ORDER BY created_at", &.{.{ .text = table }})
+        else
+            try self.st.query(a, "SELECT msg_id, payload, optimistic FROM _zebridge_outbox WHERE tbl = ? AND tenant = ? ORDER BY created_at", &.{ .{ .text = table }, .{ .text = tenant } });
+        var applied: usize = 0;
+        var skipped: usize = 0;
+        for (rows) |r| {
+            if (r[1] != .text or r[2] != .text) {
+                skipped += 1;
+                continue;
+            }
+            const env = parseStoredJson(a, r[1].text) catch continue;
+            const key = if (env == .object) env.object.get("key") orelse continue else continue;
+            const before = try self.beforeImage(a, table, st, key);
+            const before_v: storage.Value = if (before) |b| .{ .text = try core.valueToString(a, b) } else .null;
+            _ = try self.st.query(a, "UPDATE _zebridge_outbox SET before = ? WHERE msg_id = ?", &.{ before_v, r[0] });
+            const opt = parseStoredJson(a, r[2].text) catch continue;
+            self.applyOptimistic(table, st, opt) catch {};
+            applied += 1;
+        }
+        if (applied > 0) log.info("{s}: {d} pending write(s) re-applied over the seed", .{ table, applied });
+        if (skipped > 0) log.warn("{s}: {d} pending write(s) queued before this version cannot be re-applied over the seed — their verdicts or echoes restore them", .{ table, skipped });
     }
 
     // ─── §10do: rebase on stale ───────────────────────────────────────────────
@@ -5187,6 +5500,7 @@ pub const SyncClient = struct {
         // this client runs lands on its next sync (§10v's alter/rebuild path).
         try self.syncSchemas();
         self.startup.mark("schemas");
+        self.reconcile(null, null) catch |err| log.warn("reconcile: {s} — retried at the next pass", .{@errorName(err)});
         try self.gapAndSeed(null, null);
         self.startup.mark("seed");
         try self.drainCdc();
@@ -5306,9 +5620,10 @@ pub const SyncClient = struct {
         failed: usize = 0,
         /// §10fk: `failed` with reason `rate_limited` — counted here, not as failed.
         rate_limited: usize = 0,
+        indeterminate: usize = 0,
         other: usize = 0,
         fn count(self: *VerdictCounts, status: []const u8) void {
-            if (std.mem.eql(u8, status, "accepted")) self.accepted += 1 else if (std.mem.eql(u8, status, "stale")) self.stale += 1 else if (std.mem.eql(u8, status, "rejected")) self.rejected += 1 else if (std.mem.eql(u8, status, "row_deleted")) self.row_deleted += 1 else if (std.mem.eql(u8, status, "failed")) self.failed += 1 else self.other += 1;
+            if (std.mem.eql(u8, status, "accepted")) self.accepted += 1 else if (std.mem.eql(u8, status, "stale")) self.stale += 1 else if (std.mem.eql(u8, status, "rejected")) self.rejected += 1 else if (std.mem.eql(u8, status, "row_deleted")) self.row_deleted += 1 else if (std.mem.eql(u8, status, "failed")) self.failed += 1 else if (std.mem.eql(u8, status, "indeterminate")) self.indeterminate += 1 else self.other += 1;
         }
     };
 

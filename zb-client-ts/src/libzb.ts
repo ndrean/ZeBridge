@@ -258,12 +258,16 @@ export type Phase = 'connected' | 'migrated' | 'snapshot' | 'cdc';
 ///             message (22023 a malformed register document, 42501 row-level security):
 ///             `reason` names the bridge's error, the same for both.
 /// A write kept for retry (`failed`, `rate_limited`) has no verdict yet.
+///   indeterminate  settled, but whether it committed is unknown (`reason`: MessageIdReused,
+///             MessageIdExpired, ReceiptUnreadable). Never re-sent under a new ID: its table
+///             reseeds from the hub (`reconciling()` counts it until then), then
+///   reconciled  the local copy is the authoritative state, whichever way it went.
 export type Verdict = {
   version: string;
   table: string;
   key: Record<string, unknown>;
   columns: string[];
-  outcome: 'applied' | 'rebased' | 'lost' | 'deleted' | 'rejected';
+  outcome: 'applied' | 'rebased' | 'lost' | 'deleted' | 'rejected' | 'indeterminate' | 'reconciled';
   rebasedAs?: string;
   lostColumns?: string[];
   reason?: string;
@@ -637,6 +641,12 @@ export class ZeBridge {
   private outboxInitPromise: Promise<void>;
   private resolveOutboxInit!: () => void;
   private resyncing = false;
+  /// Reconciliation of `indeterminate` writes (PROTOCOL §7.4c): routes rewound for an
+  /// authoritative reseed, seeded from the hub only until healed.
+  private hubOnly = new Set<string>();
+  private healedRoutes = new Set<string>();
+  private reconcileLoaded = false;
+  private reconcileBusy = false;
   private naturallyConnected = true;
 
   private tableListeners: Record<string, Set<(ev?: any) => void>> = {};
@@ -1265,11 +1275,17 @@ export class ZeBridge {
         this.hbIntervalId = setInterval(() => void this.sendHeartbeat(), hb);
         void this.sendHeartbeat();
       }
+      // Writes answered `indeterminate` before a restart: their routes rewind before any
+      // tail opens, and the subscribe below is their heal.
+      try { await this.reconcileRewind(); } catch (e) { this.appendLog('SYS', `reconcile: ${e}`, 'WARNING'); }
       await this.subscribeStreams();
       if (this.nc !== nc) {
         this.appendLog('SYS', 'closed while connecting — this connect() stops here', 'INFO');
         return;
       }
+      try {
+        if (await this.reconcileClear()) setTimeout(() => void this.reconcile(), 2_000);
+      } catch (e) { this.appendLog('SYS', `reconcile: ${e}`, 'WARNING'); }
       this.reach('cdc');
 
       // Anything queued while disconnected goes out now — including writes made in a
@@ -1514,23 +1530,50 @@ export class ZeBridge {
         row_id     TEXT NOT NULL,
         before     TEXT,
         created_at ${this.dialect.int64} NOT NULL,
-        attempts   INTEGER NOT NULL DEFAULT 0
+        attempts   INTEGER NOT NULL DEFAULT 0,
+        published  INTEGER NOT NULL DEFAULT 1,
+        optimistic TEXT
+      )
+    `);
+    // `published` is set before the first send: a write never published cannot have
+    // committed, so the GC gate may revert it here; a published one goes to the bridge,
+    // whose receipt knows (an outbox from before the column counts as published).
+    // `optimistic`: the local apply, re-applied after a full seed replaced the rows.
+    try { await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN published INTEGER NOT NULL DEFAULT 1`); } catch { /* present */ }
+    try { await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN optimistic TEXT`); } catch { /* present */ }
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS _zebridge_reconcile (
+        msg_id  TEXT PRIMARY KEY,
+        tbl     TEXT NOT NULL,
+        reason  TEXT NOT NULL,
+        version TEXT NOT NULL DEFAULT '',
+        data    TEXT,
+        routes  TEXT NOT NULL DEFAULT '',
+        targets TEXT NOT NULL DEFAULT '',
+        since   ${this.dialect.int64} NOT NULL,
+        state   TEXT NOT NULL DEFAULT 'pending'
       )
     `);
   }
 
   private async outboxPut(
-    r: { msgId: string; subject: string; payload: unknown; table: string; id: string | number; before: unknown },
+    r: { msgId: string; subject: string; payload: unknown; table: string; id: string | number; before: unknown; optimistic: unknown },
     exec: Exec = this.run,
   ) {
     await this.outboxInitPromise;
     await exec(
-      `INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at, attempts)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+      `INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at, attempts, published, optimistic)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
        ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1`,
       r.msgId, r.subject, JSON.stringify(r.payload), r.table, String(r.id),
-      r.before == null ? null : JSON.stringify(r.before), Date.now(),
+      r.before == null ? null : JSON.stringify(r.before), Date.now(), JSON.stringify(r.optimistic),
     );
+  }
+
+  /// Recorded BEFORE the publish, so a crash after it can never leave a sent write that
+  /// this client believes unsent.
+  private async outboxMarkPublished(msgId: string) {
+    await this.run(`UPDATE _zebridge_outbox SET published = 1 WHERE msg_id = ? AND published = 0`, msgId);
   }
 
   private async outboxDrop(msgId: string) {
@@ -3014,7 +3057,11 @@ export class ZeBridge {
   }
 
   private async applyGenerationsOnce(table: string): Promise<boolean> {
-    if (this.config.seedDomain && this.config.seedDomain !== this.config.jsDomain) {
+    // A route under reconciliation seeds from the hub only: a leaf's copy may be behind
+    // the very commit the reconciliation is about.
+    const tenant = this.effectiveTenantFor(table);
+    const hubOnly = tenant !== null && this.hubOnly.has(this.cdcStreamForTenant(tenant));
+    if (!hubOnly && this.config.seedDomain && this.config.seedDomain !== this.config.jsDomain) {
       try {
         if (await this.applyGenerationsFrom(table, { domain: this.config.seedDomain })) return true;
       } catch (e) {
@@ -3379,6 +3426,9 @@ export class ZeBridge {
          seed_seq = excluded.seed_seq, seed_stream = excluded.seed_stream, shared_seed_seq = excluded.shared_seed_seq`,
       table, manifest.cutoff_version, state.lsn, state.seedEpoch ?? 0, state.seedSeq ?? null, state.seedStream ?? null, sharedSeq,
     );
+    // A full replaced the rows: this client's writes still queued lost their optimistic
+    // copies with them, so they go back on top (PROTOCOL §7.4c).
+    if (plan.some((stp: PlanStep) => stp.kind === 'full')) await this.reapplyPending(table);
     this.triggerChange(table);
     this.appendLog('SYS', `Seeded ${table} from generation chain g${manifest.gen} (${applied} row(s), watermark ${manifest.cutoff_version} @ ${manifest.cutoff_lsn})`, 'INFO');
     return true;
@@ -3649,6 +3699,17 @@ export class ZeBridge {
           // A blocked gap retries on the next pass, not in a tight loop: without a pause
           // the tail re-opens, meets the same hole and re-seeds immediately (§10go).
           this.gapBackoffMs = decided.blocked ? Math.min(5_000, (this.gapBackoffMs || 250) * 2) : 0;
+          // A route under reconciliation healed when its position is decided and every
+          // table riding it has a chain applied again (an empty stream's chain has no cut).
+          if (this.hubOnly.has(streamName) && !decided.blocked) {
+            const have = new Set(((await this.run(`SELECT tbl FROM _zebridge_generations`)) ?? []).map((r: any) => String(r.tbl)));
+            const riding = [...this.syncedTables.keys()].filter((t) => {
+              if (this.ondemandSet.has(t)) return false;
+              const tn = this.effectiveTenantFor(t);
+              return tn !== null && this.cdcStreamForTenant(tn) === streamName;
+            });
+            if (riding.every((t) => have.has(t) && !this.failed.has(t))) this.healedRoutes.add(streamName);
+          }
           if (decided.to > stored0) {
             if (stored0 > 0) this.appendLog('SYS', `${streamName}: gap healed — resuming at ${decided.to} (was ${stored0}, stream holds from ${firstSeq})`, 'INFO');
             this.globalSyncState.seq[streamName] = decided.to;
@@ -4086,6 +4147,21 @@ export class ZeBridge {
         const pending = this.pendingWrites.get(msgId);
         const where = pending ? `${pending.table}#${pending.id}` : '(not from this session)';
 
+        // `indeterminate`, or a status this client does not know: settled for
+        // retransmission, outcome unknown (PROTOCOL §7.4c). Never reverted, never
+        // re-sent under a new ID: the table reseeds from the hub, then `reconciled`.
+        if (!['accepted', 'stale', 'rejected', 'row_deleted', 'failed'].includes(verdict.status)) {
+          const reason = verdict.status === 'indeterminate' ? String(verdict.reason ?? '') : `UnknownStatus:${verdict.status}`;
+          const write = await this.outboxWrite(msgId, pending);
+          this.pendingWrites.delete(msgId);
+          if (await this.settleIndeterminate(msgId, reason, write)) {
+            this.appendLog(m.subject, `${where}: indeterminate (${reason}) — whether it committed is unknown; reconciling from the hub`, 'WARNING');
+            if (write) this.emitVerdict({ ...write, outcome: 'indeterminate', reason });
+            void this.reconcile();
+          }
+          return true;
+        }
+
         // 'failed' is the ONE status that is not definitive (§7.1: keep and retry).
         const definitive = verdict.status !== 'failed';
         ok = definitive;
@@ -4156,13 +4232,176 @@ export class ZeBridge {
             }
             break;
           default:
-            ok = false;
-            this.pendingWrites.set(msgId, pending ?? { table: '?', id: '?', at: Date.now() });
-            this.appendLog(m.subject, { ...verdict, write: where, note: 'unknown status — kept pending' }, 'ERROR');
+            // Unreachable: every other status settles as indeterminate above.
+            break;
         }
       }
     }
     return ok;
+  }
+
+  // ── reconciliation of `indeterminate` writes (PROTOCOL §7.4c) ─────────────
+
+  /// In ONE local transaction the outbox entry goes and the marker comes, so a crash
+  /// leaves either the queued write (re-sent, answered again) or the marker (reconciled
+  /// at the next connect). False when the write is not this client's.
+  private async settleIndeterminate(msgId: string, reason: string, write: Record<string, unknown> | null): Promise<boolean> {
+    await this.outboxInitPromise;
+    const row = (await this.run(`SELECT tbl FROM _zebridge_outbox WHERE msg_id = ?`, msgId))[0];
+    if (!row) return false;
+    await this.transaction(async (txExec) => {
+      await txExec(`DELETE FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
+      await txExec(
+        `INSERT INTO _zebridge_reconcile (msg_id, tbl, reason, version, data, since, state) VALUES (?, ?, ?, ?, ?, ?, 'pending')
+         ON CONFLICT(msg_id) DO NOTHING`,
+        msgId, String(row.tbl), reason, write?.version ?? '', write ? JSON.stringify(write) : null, Date.now(),
+      );
+    });
+    return true;
+  }
+
+  /// Writes answered `indeterminate` whose reconciliation has not finished.
+  public async reconciling(): Promise<number> {
+    await this.outboxInitPromise;
+    try { return Number((await this.run(`SELECT count(*) AS n FROM _zebridge_reconcile`))[0]?.n ?? 0); } catch { return 0; }
+  }
+
+  /// Rewind what the markers need: the table's watermark goes (the reseed must be a FULL,
+  /// which replaces the optimistic row) and its route's position returns to 0, so the gap
+  /// path seeds from the HUB's chain and resumes the tail at the chain's cut — every
+  /// commit after the cut arrives too. Rewinding the route, rather than waiting for a
+  /// chain newer than the replica's position, cannot starve under continuing load.
+  private async reconcileRewind() {
+    await this.outboxInitPromise;
+    const rows: any[] = await this.run(`SELECT msg_id, tbl, state, routes FROM _zebridge_reconcile ORDER BY since`);
+    if (!this.reconcileLoaded) {
+      // After a restart: a rewound route still at 0 waits for its heal; one past 0 healed
+      // before the marker could be cleared.
+      this.reconcileLoaded = true;
+      for (const r of rows) {
+        if (r.state !== 'rewound') continue;
+        for (const route of String(r.routes ?? '').split(',')) {
+          if (route && (this.globalSyncState.seq[route] ?? 0) === 0) this.hubOnly.add(route);
+        }
+      }
+    }
+    const pending = rows.filter((r) => r.state === 'pending');
+    if (!pending.length) return;
+    const rewind = new Set<string>();
+    const marks = pending.map((r) => {
+      const tenant = this.syncedTables.has(r.tbl) && !this.ondemandSet.has(r.tbl) ? this.effectiveTenantFor(r.tbl) : null;
+      const route = tenant === null ? '' : this.cdcStreamForTenant(tenant);
+      if (route && !this.hubOnly.has(route)) rewind.add(route);
+      return { msgId: String(r.msg_id), tbl: String(r.tbl), route };
+    });
+    await this.transaction(async (txExec) => {
+      for (const route of rewind) {
+        await txExec(`INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, 0) ON CONFLICT(stream) DO UPDATE SET last_seq = 0`, route);
+      }
+      for (const m of marks) {
+        await txExec(`DELETE FROM _zebridge_generations WHERE tbl = ?`, m.tbl);
+        await txExec(`UPDATE _zebridge_reconcile SET state = 'rewound', routes = ? WHERE msg_id = ?`, m.route, m.msgId);
+      }
+    });
+    for (const route of rewind) {
+      // The live tail stops at its next message without applying it: its position must
+      // stay at 0 until the heal.
+      this.tailGen.set(route, (this.tailGen.get(route) ?? 0) + 1);
+      this.globalSyncState.seq[route] = 0;
+      this.hubOnly.add(route);
+      this.appendLog('SYS', `${route}: rewound for reconciliation — reseeding from the hub`, 'WARNING');
+    }
+  }
+
+  /// A rewound marker whose route healed waits for the tail to reach the stream's end as
+  /// it is now — a commit after the chain's cut arrives by the tail, not the seed; a
+  /// healed one clears once it did. True while any marker remains.
+  private async reconcileClear(): Promise<boolean> {
+    for (const route of this.healedRoutes) this.hubOnly.delete(route);
+    this.healedRoutes.clear();
+    const live = new Set(this.cdcStreams());
+    for (const route of [...this.hubOnly]) if (!live.has(route)) this.hubOnly.delete(route);
+    const rows: any[] = await this.run(`SELECT msg_id, state, routes, targets, data FROM _zebridge_reconcile ORDER BY since`);
+    let left = 0;
+    for (const r of rows) {
+      const routes = String(r.routes ?? '').split(',').filter(Boolean);
+      if (r.state === 'rewound') {
+        left++;
+        if (routes.some((route) => this.hubOnly.has(route)) || !this.nc) continue;
+        const jsm = await this.transport.jetstreamManager(this.nc, this.jsOpts());
+        const targets: string[] = [];
+        for (const route of routes) {
+          try { targets.push(`${route}:${(await jsm.streams.info(route))?.state?.last_seq ?? 0}`); } catch { /* gone: nothing to wait for */ }
+        }
+        await this.run(`UPDATE _zebridge_reconcile SET state = 'healed', targets = ? WHERE msg_id = ?`, targets.join(','), r.msg_id);
+        continue;
+      }
+      if (r.state !== 'healed') { left++; continue; }
+      const behind = String(r.targets ?? '').split(',').filter(Boolean).some((pair) => {
+        const at = pair.lastIndexOf(':');
+        return (this.globalSyncState.seq[pair.slice(0, at)] ?? 0) < Number(pair.slice(at + 1));
+      });
+      if (behind) { left++; continue; }
+      await this.run(`DELETE FROM _zebridge_reconcile WHERE msg_id = ?`, r.msg_id);
+      this.appendLog('SYS', `${r.msg_id} reconciled — the local copy is the authoritative state`, 'INFO');
+      let write: any = null;
+      try { write = r.data ? JSON.parse(r.data) : null; } catch { /* unreadable */ }
+      if (write) this.emitVerdict({ ...write, outcome: 'reconciled' });
+    }
+    return left > 0;
+  }
+
+  /// Rewind, heal through `subscribeStreams` (the gap path), clear. Retried every few
+  /// seconds while markers remain, and at every connect.
+  private async reconcile(): Promise<void> {
+    if (this.reconcileBusy || !this.nc) return;
+    this.reconcileBusy = true;
+    let again = false;
+    try {
+      await this.reconcileRewind();
+      if (this.hubOnly.size) {
+        if (this.resyncing) {
+          again = true;
+          return;
+        }
+        this.resyncing = true;
+        try { await this.subscribeStreams(); } finally { this.resyncing = false; }
+      }
+      again = await this.reconcileClear();
+    } catch (e) {
+      this.appendLog('SYS', `reconcile: ${e} — retried shortly`, 'WARNING');
+      again = true;
+    } finally {
+      this.reconcileBusy = false;
+      if (again) setTimeout(() => void this.reconcile(), 2_000);
+    }
+  }
+
+  /// A full seed replaced the table's rows with the chain's, which knows nothing of this
+  /// client's writes still in the outbox: their optimistic copies are gone. Re-apply them,
+  /// oldest first, each over a fresh before-image (the seeded row, or the previous pending
+  /// write's). A write queued before the `optimistic` column cannot be (logged).
+  private async reapplyPending(table: string) {
+    await this.outboxInitPromise;
+    const state = this.syncedTables.get(table);
+    const rows: any[] = await this.run(`SELECT msg_id, payload, optimistic FROM _zebridge_outbox WHERE tbl = ? ORDER BY created_at`, table);
+    let applied = 0, skipped = 0;
+    for (const r of rows) {
+      if (!r.optimistic || !state?.pkCols.length) { skipped++; continue; }
+      let sent: any, ev: any;
+      try { sent = JSON.parse(r.payload); ev = JSON.parse(r.optimistic); } catch { skipped++; continue; }
+      const keyObj = sent?.key as Record<string, unknown> | undefined;
+      if (!keyObj) { skipped++; continue; }
+      await this.transaction(async (txExec) => {
+        const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
+        const before = (await txExec(`SELECT * FROM ${table} WHERE ${where}`, ...state.pkCols.map((c) => keyObj[c])))[0] ?? null;
+        await txExec(`UPDATE _zebridge_outbox SET before = ? WHERE msg_id = ?`, before == null ? null : JSON.stringify(before), r.msg_id);
+        await this.applyEvent(table, ev, txExec);
+      });
+      applied++;
+    }
+    if (applied) this.appendLog('SYS', `${table}: ${applied} pending write(s) re-applied over the seed`, 'INFO');
+    if (skipped) this.appendLog('SYS', `${table}: ${skipped} pending write(s) queued before this version cannot be re-applied over the seed — their verdicts or echoes restore them`, 'WARNING');
   }
 
   private sweepPendingWrites() {
@@ -4223,7 +4462,6 @@ export class ZeBridge {
             before = existing[0] ?? null;
           }
         }
-        await this.outboxPut({ msgId, subject, payload, table, id, before }, txExec);
         // §10dx: the optimistic row carries the write's own stamp in the version column
         // — the ingress sets it from `version` server-side, and locally a NOT NULL
         // version column without it refused every optimistic INSERT.
@@ -4231,6 +4469,7 @@ export class ZeBridge {
         if (op !== 'DELETE' && state?.versionColumn && applied.data && typeof applied.data === 'object' && !(state.versionColumn in (applied.data as any))) {
           (applied.data as any)[state.versionColumn] = version;
         }
+        await this.outboxPut({ msgId, subject, payload, table, id, before, optimistic: applied }, txExec);
         await this.applyEvent(table, applied, txExec);
       });
       // Fire the change event AFTER the local replica is successfully updated — with
@@ -4255,8 +4494,12 @@ export class ZeBridge {
     // whose queued write is being sent for the first time long after it was made.
     const wm = await this.gcWatermark();
     if (outboxWatermarkGate([{ msgId, version: (payload as any)?.version ?? null }], wm).refuse.length) {
+      // Never published, so it never committed: the revert is exact.
+      const write = await this.outboxWrite(msgId, { table, version });
+      this.pendingWrites.delete(msgId);
       await this.revertOptimisticWrite(msgId, 'restore');
       await this.outboxDrop(msgId);
+      if (write) this.emitVerdict({ ...write, outcome: 'rejected', reason: 'PredatesGcWatermark' });
       this.appendLog(
         subject,
         `${table}[${id}] predates the GC watermark (${wm}) and CANNOT be sent: its tombstone ` +
@@ -4277,6 +4520,7 @@ export class ZeBridge {
     // JetStream publish, not core: the PubAck proves durability (not application —
     // the verdict/echo decide that), and `duplicate: true` is a success.
     try {
+      await this.outboxMarkPublished(msgId);
       const ack = await this.transport.jetstream(this.nc, this.jsOpts()).publish(subject, encode(payload), { headers: h });
       this.appendLog(subject, { ...payload, _ack: { seq: ack.seq, duplicate: ack.duplicate } }, 'MUTATION OUT');
     } catch (err) {
@@ -4311,8 +4555,11 @@ export class ZeBridge {
     // watermark for the whole flush, and an entry that must not be sent is never
     // sent even if a later one fails.
     const watermark = await this.gcWatermark();
+    // Only a write never published is judged here. A published one may have committed:
+    // the bridge answers it from its receipt, or refuses it itself (PredatesGcWatermark)
+    // when no attempt did.
     const gate = outboxWatermarkGate(
-      rows.map((r: any) => ({ msgId: r.msg_id, version: outboxVersionOf(r) })),
+      rows.map((r: any) => ({ msgId: r.msg_id, version: Number(r.published ?? 1) === 0 ? outboxVersionOf(r) : null })),
       watermark,
     );
     if (gate.refuse.length) {
@@ -4322,8 +4569,10 @@ export class ZeBridge {
         // will never be sent, so the optimistic copy is a divergence. Restore the
         // before-image and say so — the user's edit is being dropped, and PROTOCOL
         // §SHOULD 2's rule (surface it, never silently discard) is exactly this case.
+        const write = await this.outboxWrite(r.msg_id, undefined);
         await this.revertOptimisticWrite(r.msg_id, 'restore');
         await this.outboxDrop(r.msg_id);
+        if (write) this.emitVerdict({ ...write, outcome: 'rejected', reason: 'PredatesGcWatermark' });
         this.appendLog(
           'OUTBOX',
           `${r.tbl}[${r.row_id}] ${r.msg_id} was queued before the GC watermark ` +
@@ -4344,6 +4593,7 @@ export class ZeBridge {
         const h = this.transport.headers();
         h.set('Nats-Msg-Id', r.msg_id);
         this.pendingWrites.set(r.msg_id, { table: r.tbl, id: r.row_id, at: Date.now(), version: outboxVersionOf(r) });
+        await this.outboxMarkPublished(r.msg_id);
         const ack = await this.transport.jetstream(this.nc, this.jsOpts()).publish(r.subject, encode(JSON.parse(r.payload)), { headers: h });
         this.appendLog('OUTBOX', `replayed ${r.msg_id} (seq ${ack.seq}${ack.duplicate ? ', duplicate — already landed' : ''})`, 'INFO');
       } catch (err) {

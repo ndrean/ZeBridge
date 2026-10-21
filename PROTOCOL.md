@@ -2068,7 +2068,7 @@ reply published under it would be read back by the bridge as if it were a write.
 
 ```json
 {
-  "status":   "accepted" | "stale" | "row_deleted" | "rejected" | "failed",
+  "status":   "accepted" | "stale" | "row_deleted" | "rejected" | "failed" | "indeterminate",
   "reason":   "",
   "sqlstate": "",
   "detail":   "",
@@ -2090,7 +2090,7 @@ reply published under it would be read back by the bridge as if it were a write.
 | `version` | the version **actually stored**, in the wire format of §7.3. Authoritative: after a clamp it is not what you sent |
 | `write` | `<table>#<key>` — the row the verdict is about, for a log line that has nothing else to name it by |
 
-**The five statuses**:
+**The six statuses**:
 
 | status | it means | client |
 | --- | --- | --- |
@@ -2099,10 +2099,11 @@ reply published under it would be read back by the bridge as if it were a write.
 | `row_deleted` | zero rows; the row is gone or tombstoned | pop, and surface it |
 | `rejected` | PostgreSQL refused, and will refuse the same bytes again — constraint, privilege, bad type | pop; retrying cannot help |
 | `failed` | the attempt failed for a reason that may not recur, after the delivery limit | keep, or resend under the same `msg_id` |
+| `indeterminate` | this attempt did not run, and whether an earlier attempt committed is unknown: `MessageIdExpired` (the ID is older than the receipt minimum and has no receipt), `MessageIdReused` (the ID already names a different write), `ReceiptUnreadable` | pop, never resend under a new ID, and reconcile (§7.4c) |
 
 The bridge acks a write on `MUTATIONS` only after PostgreSQL commits it. If it stops between the two, JetStream delivers the write again; a redelivery whose row already carries this write's version is answered `accepted`, not `stale` or `row_deleted`.
 
-**What the libraries report.** Both client libraries turn these statuses into one outcome per write, reported once when final (`onVerdict` in zb-client-ts, the poll report's `outcomes` in libzb): `applied` (`accepted`); `rebased` (`stale`, and the library re-sent the edit because the winner changed other columns: `rebasedAs`); `lost` (`stale` on the same columns: `lostColumns`); `deleted` (`row_deleted`); `rejected`, with `reason`, and PostgreSQL's `sqlstate` and `detail` when it refused. A `failed` or `rate_limited` write has no outcome yet: it stays in the outbox.
+**What the libraries report.** Both client libraries turn these statuses into one outcome per write, reported once when final (`onVerdict` in zb-client-ts, the poll report's `outcomes` in libzb): `applied` (`accepted`); `rebased` (`stale`, and the library re-sent the edit because the winner changed other columns: `rebasedAs`); `lost` (`stale` on the same columns: `lostColumns`); `deleted` (`row_deleted`); `rejected`, with `reason`, and PostgreSQL's `sqlstate` and `detail` when it refused; `indeterminate` (`indeterminate`, or a status the library does not know), with `reason`, then `reconciled` once its reconciliation finished (§7.4c). A `failed` or `rate_limited` write has no outcome yet: it stays in the outbox.
 
 ⚠️ **`accepted`, `stale` and `row_deleted` are all successes at the SQL level**, and two of
 them are *zero rows affected*. The bridge tells them apart by reading the row's state in
@@ -2125,6 +2126,19 @@ and retries forever, idempotently and silently.
 
 Tested by `scripts/scenarios/replies.py` (all three success outcomes) and
 `scripts/scenarios/clamp.py` (the `version` field and `version_clamped`).
+
+### 7.4c Reconciling an `indeterminate` write
+
+`indeterminate` settles a write for retransmission but not for its outcome: an earlier attempt may have committed, or none did. Only the authoritative state can say which, so both client libraries reconcile.
+
+1. **Settle durably.** In one local transaction the outbox entry is removed and a reconciliation marker is stored. A crash leaves one or the other: the queued write, which is resent and answered again, or the marker, which is reconciled at the next pass. The optimistic row stays as it is for now. The library never resends the write under a new ID: re-enqueuing it is the application's decision.
+2. **Rewind.** The write's table loses its generations watermark, so its next seed is a full that replaces its optimistic row, and the write's CDC route returns to position 0. A route under reconciliation is not tailed. Several markers on one route share one rewind.
+3. **Heal from the hub.** The gap path reseeds every table on the route, from the hub's chain only, never a seeding leaf, which may be behind the commit in question. The tail resumes at the chain's cut, so every commit after the cut arrives too. Rewinding the route, rather than waiting for a chain newer than the replica's position, cannot starve under continuing load.
+4. **Clear.** The marker is removed only once its route healed; the outcome `reconciled` follows. Until then the write stays visibly unresolved: `reconciling` in libzb's poll report, `reconciling()` in zb-client-ts. A lost connection or a restart leaves the marker for the next pass.
+
+After any full seed, the writes still in the outbox are applied again over the seeded rows, oldest first, each with a fresh before-image: a full replaces the rows and would otherwise drop their optimistic copies. This applies to every full, not only to reconciliation.
+
+Tested by `scripts/scenarios/reconcile.py`, for both libraries: a write that never committed, one that committed while its client was away, a pending write kept through the reseed, and the GC gate below.
 
 ### 7.5 Deletes, tombstones, and the GC watermark
 
@@ -2192,6 +2206,8 @@ oldest queued version < watermark  →  that write cannot be judged safely
 
 What to do then is a product decision — discard, ask the user, or send with an explicit
 intent to resurrect — but the client must not send it blindly.
+
+Both client libraries apply this gate only to a write they never published. Each outbox entry records, before its first send, that it was published. A write never published cannot have committed, so reverting it locally is exact, and the library reports it `rejected` with reason `PredatesGcWatermark`. A published write is sent again: the bridge reads its receipt first and returns the recorded verdict if it committed, and refuses it with `PredatesGcWatermark` against the current watermark if no attempt did.
 
 ⚠️ **Check `swept_at`, not just `watermark`.** A stopped sweeper leaves a watermark that
 looks perfectly valid and is frozen: `swept_at` far in the past means the line has not

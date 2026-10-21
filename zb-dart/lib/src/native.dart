@@ -36,6 +36,7 @@ class PollReport {
     this.requests = const [],
     this.outcomes = const [],
     this.pending = 0,
+    this.reconciling = 0,
     this.error,
   });
 
@@ -51,13 +52,18 @@ class PollReport {
   final List<Map<String, dynamic>> requests;
 
   /// What became of this client's writes since the last report, each once:
-  /// {msgId, version, table, columns, outcome: applied|rebased|lost|deleted|rejected,
-  /// lostColumns?, rebasedAs?, reason?, sqlstate?, detail?} — `msgId` is what [mutate]
-  /// returned; `sqlstate` and `detail` are PostgreSQL's code and message on a rejection.
+  /// {msgId, version, table, columns, outcome: applied|rebased|lost|deleted|rejected|
+  /// indeterminate|reconciled, lostColumns?, rebasedAs?, reason?, sqlstate?, detail?} —
+  /// `msgId` is what [mutate] returned; `sqlstate` and `detail` are PostgreSQL's code and
+  /// message on a rejection. `indeterminate`: settled, outcome unknown; the write's table
+  /// reseeds from the hub, then `reconciled` (the local copy is the authoritative state).
   final List<Map<String, dynamic>> outcomes;
 
   /// The writes still in the outbox: applied here, not yet judged by PostgreSQL.
   final int pending;
+
+  /// Writes answered `indeterminate` whose reconciliation has not finished.
+  final int reconciling;
 
   /// Set by the worker when a poll itself failed (connection gone, principal revoked).
   final String? error;
@@ -71,6 +77,7 @@ class PollReport {
         requests: ((j['requests'] as List?) ?? const []).map((e) => Map<String, dynamic>.from(e as Map)).toList(),
         outcomes: ((j['outcomes'] as List?) ?? const []).map((e) => Map<String, dynamic>.from(e as Map)).toList(),
         pending: (j['pending'] as num?)?.toInt() ?? 0,
+        reconciling: (j['reconciling'] as num?)?.toInt() ?? 0,
         error: j['error'] as String?,
       );
 
@@ -83,6 +90,7 @@ class PollReport {
         'requests': requests,
         'outcomes': outcomes,
         'pending': pending,
+        'reconciling': reconciling,
         if (error != null) 'error': error,
       };
 }
