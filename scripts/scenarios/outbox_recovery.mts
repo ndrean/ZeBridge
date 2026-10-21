@@ -23,7 +23,11 @@ try {
       };
     }
     c.onLog((topic, data, level) => {
-      if (level === 'ERROR') console.error(JSON.stringify({ principal: o.principal, topic, data }));
+      // Errors, and every tail lifecycle event: what creates consumers on the server.
+      const text = typeof data === 'string' ? data : '';
+      if (level === 'ERROR' || /CDC consumer on|recreat|deaf|superseded|Gap detected|reconnected|status loop|rtt check recovered|rewound/.test(text)) {
+        console.error(JSON.stringify({ principal: o.principal, topic, level, data: text || data }));
+      }
     });
     try { await c.connect(); } catch (e) { errors.push(String(e)); }
   }));

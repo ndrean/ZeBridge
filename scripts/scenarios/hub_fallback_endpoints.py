@@ -114,6 +114,29 @@ class Fixture(Stack):
     def monitor(self, leaf=False, endpoint="connz"):
         return json.load(urllib.request.urlopen(f"http://127.0.0.1:{self.leaf_http if leaf else self.hub_http}/{endpoint}", timeout=3))
 
+    async def cdc_consumers_since(self, since):
+        """Tail consumers created on each CDC stream at or after `since`: what one client
+        session opened. Replaced consumers are reaped by the server, not deleted (clients
+        have no CONSUMER.DELETE grant), so a count over all consumers would include them.
+        Tails are reaped after 120 s idle; libzb's catch-up drain at sync opens its own
+        consumer reaped after 30 s, which is not a tail and is not counted."""
+        import nats, ssl
+        ctx = ssl.create_default_context(cafile=str(self.ca))
+        ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT  # the fixture's test CA has no Authority Key Identifier
+        nc = await nats.connect(self.url, user_credentials=self.bridge_creds, tls=ctx)
+        try:
+            js = nc.jetstream(domain="hub")
+            out = {}
+            for info in await js.streams_info():
+                name = info.config.name
+                if not name.startswith("CDC_"): continue
+                n = sum(1 for c in await js.consumers_info(name)
+                        if c.created and c.created >= since and (c.config.inactive_threshold or 0) >= 60)
+                if n: out[name] = n
+            return out
+        finally:
+            await nc.close()
+
     def devices_at_leaf(self):
         # Pending TCP/TLS handshakes are connections too; only count authenticated
         # clients, never a failed handshake still being closed by the server.
@@ -396,6 +419,8 @@ async def main():
                 await hub.broker("nats", hub.hub_conf)
                 if getattr(hub, "proxy", None): await asyncio.to_thread(hub.close_http)
                 requests = len(hub.requests)
+                import datetime
+                opened_at = datetime.datetime.now(datetime.timezone.utc)
                 await client.open()
                 deadline = time.monotonic() + 30
                 while time.monotonic() < deadline:
@@ -410,6 +435,10 @@ async def main():
                 await hub.linked()
                 await asyncio.sleep(.3)
                 check(hub.devices_at_leaf() == 0, f"{label}: leaf recovery does not move a healthy hub connection")
+                # s2_row is public, the principal's tenant is acme: one tail, on CDC_PUBLIC,
+                # and none on CDC_acme (no followed table rides it).
+                tails = await hub.cdc_consumers_since(opened_at)
+                check(tails == {"CDC_PUBLIC": 1}, f"{label}: one tail consumer per followed stream through failover and leaf recovery ({tails})")
                 await client.close()
                 override_opts = dict(opts, natsUrl=hub.ws_url if mode == "ws" else hub.url)
                 override = Native(lib, override_opts) if mode is None else Typescript(hub, label + "-override", override_opts, mode)

@@ -33,7 +33,7 @@ function fixture(path = ':memory:') {
   Object.assign(c, {
     outboxInitPromise: Promise.resolve(), reconcileLoaded: false, streamWork: Promise.resolve(),
     globalSyncState: { seq }, hubOnly: new Set(), healedRoutes: new Set(),
-    tailGen: new Map(), tailStops: new Map(), syncedTables: new Map([['item', {}]]), ondemandSet: new Set(),
+    tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), streamsSubscribed: false, syncedTables: new Map([['item', {}]]), ondemandSet: new Set(),
     streamCreated: new Map([['CDC_acme', 'same']]), restarted: new Set(), failed: new Set(), nc: {},
     transport: {
       jetstreamManager: async () => ({ streams: { info: async () => ({ state: { last_seq: 12 } }) } }),
@@ -239,4 +239,26 @@ test('rewind fences buffered timers and waits for active flushes and idle checks
       if (!inFlight && !idle) assert.equal(applying, false);
     } finally { c.nc = null; db.close(); }
   }
+});
+
+test('a stream with no followed table gets no tail consumer', async () => {
+  await loadCore(readFileSync(new URL('../wasm/zb_core.wasm', import.meta.url)));
+  const { db, c } = fixture();
+  try {
+    // On-demand only: the table is known but nothing on the stream is followed. The
+    // real filter function decides (the fixture's stub always names a subject).
+    c.cdcFilters = ZeBridge.prototype['cdcFilters' as keyof ZeBridge];
+    c.ondemandSet.add('item');
+    c.globalSyncState.seq.CDC_acme = 10;
+    db.exec("INSERT INTO _zebridge_stream_seq VALUES ('CDC_acme', 10, 'same')");
+    let added = 0;
+    c.transport.jetstreamManager = async () => ({
+      streams: { info: async () => ({ created: 'same', state: { first_seq: 1, last_seq: 11 } }) },
+      consumers: { add: async () => { added++; return { name: 'x', num_pending: 0 }; } },
+    });
+    c.transport.jetstream = () => ({ consumers: { get: async () => ({ consume: async () => ({ [Symbol.asyncIterator]() { return this; }, next: () => new Promise(() => {}), stop() {} }) }) } });
+    await c.subscribeStreams();
+    assert.equal(added, 0);
+    assert.equal(c.tailFilters.has('CDC_acme'), false);
+  } finally { c.nc = null; db.close(); }
 });

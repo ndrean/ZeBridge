@@ -605,6 +605,10 @@ export class ZeBridge {
   private tailGen = new Map<string, number>();
   /// Stop buffered work and wait for active flush/idle work before rewinding a route.
   private tailStops = new Map<string, () => Promise<void>>();
+  /// The subject filters each live tail was opened with. A consumer's filters are fixed
+  /// at creation, so a change in what a stream should carry needs a new tail.
+  private tailFilters = new Map<string, string>();
+  private streamsSubscribed = false;
   private streamWork: Promise<void> = Promise.resolve();
 
   /// Consumer setup and reconciliation rewinds must not race each other's positions.
@@ -2151,6 +2155,7 @@ export class ZeBridge {
       // check has nothing to compare, so the seed is kicked here.
       if (emptied) this.kickReseed(table);
       await this.drainPending(table);
+      this.ensureTails();
     } catch (err) {
       this.appendLog('SCHEMA', `Applying schema for ${table} failed: ${err}`, 'ERROR');
     }
@@ -3761,8 +3766,14 @@ export class ZeBridge {
         } catch { /* stream info unavailable — the per-batch persist still covers it */ }
         // A reconciliation whose seed could not splice must not replay from zero.
         if (this.hubOnly.has(streamName) && !this.healedRoutes.has(streamName)) continue;
-        const last = this.globalSyncState.seq[streamName] ?? 0;
         const filters = this.cdcFilters(streamName);
+        // No followed table rides this stream (on-demand only, or none yet): no tail. An
+        // unfiltered consumer would hand this client every event of the stream, for
+        // nothing — measured: 250 such clients × 32,000 events overran their event
+        // loops into reconnect storms. libzb opens none either.
+        if (!filters.length) { this.tailFilters.delete(streamName); continue; }
+        const last = this.globalSyncState.seq[streamName] ?? 0;
+        this.tailFilters.set(streamName, filters.join('|'));
         const ci = await jsm.consumers.add(streamName, {
           deliver_policy: last > 0 ? this.transport.deliverPolicy.byStartSequence : this.transport.deliverPolicy.all,
           opt_start_seq: last > 0 ? last + 1 : undefined,
@@ -4132,6 +4143,20 @@ export class ZeBridge {
     } catch (e) {
       this.appendLog('SYS', `Failed to start CDC consumer: ${e}`, 'ERROR');
     }
+    this.streamsSubscribed = true;
+  }
+
+  /// A table followed after connect (a schema arriving later): a stream whose tail
+  /// lacks it, or has no tail at all, is subscribed again with the right filters.
+  private ensureTails() {
+    if (!this.nc || !this.streamsSubscribed || this.resyncing) return;
+    const stale = this.cdcStreams().some((stream) => {
+      const want = this.cdcFilters(stream).join('|');
+      return want !== (this.tailFilters.get(stream) ?? '');
+    });
+    if (!stale) return;
+    this.resyncing = true;
+    void this.subscribeStreams().catch(() => {}).finally(() => { this.resyncing = false; });
   }
 
   // ── the write path (PROTOCOL.md §7) ───────────────────────────────────────

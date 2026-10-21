@@ -217,7 +217,11 @@ async def main():
                         info = await js.stream_info(stream)
                         consumer_peak[stream] = max(consumer_peak.get(stream,0),info.state.consumer_count)
                         snapshot[stream] = {'count':info.state.consumer_count,'limit':info.config.max_consumers}
-                    print(json.dumps({'consumer_snapshot':label,'account_limit':account_info.limits.max_consumers,'account_consumers':account_info.consumers,'server_default_max_consumers':5000,'streams':snapshot}))
+                    # Who holds them: libzb names its tails `zbz…`; TS consumers get server names.
+                    kinds = {'native': 0, 'ts': 0}
+                    for ci in await js.consumers_info('CDC_PUBLIC'):
+                        kinds['native' if ci.name.startswith('zbz') else 'ts'] += 1
+                    print(json.dumps({'consumer_snapshot':label,'account_limit':account_info.limits.max_consumers,'account_consumers':account_info.consumers,'server_default_max_consumers':5000,'streams':snapshot,'cdc_public_by_kind':kinds}))
                 except Exception as e: print(json.dumps({'consumer_snapshot':label,'unavailable':str(e)}))
             await consumers('before clients')
             for i,p in enumerate(who):
@@ -241,6 +245,8 @@ async def main():
             await asyncio.sleep(13)
             max_get = max((max_window(e['get']) for e in events.values()), default=0)
             max_pub = max((max_window(e['pub']) for e in events.values()), default=0)
+            short = {p: len(set(mid for _,mid in events[p]['pub'])) for p in who if len(set(mid for _,mid in events[p]['pub'])) != min(window,pending)}
+            if short: print(json.dumps({'window_short': dict(list(short.items())[:10]), 'clients_short': len(short), 'observed_clients': len(events)}))
             if check_window: check(len(events)==count and all(len(set(mid for _,mid in events[p]['pub'])) == min(window,pending) for p in who),
                   f'every client reserves {min(window,pending)} of at most {window} slots, then admits no new ID without a verdict (gets/4s {max_get}, publishes/4s {max_pub})')
             reservations = {}
