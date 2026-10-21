@@ -1449,6 +1449,7 @@ pub const MutationListener = struct {
                         }
                         self.invalidate(it.mutation.table);
                         _ = try self.tableMeta(conn, it.mutation.table);
+                        log.info("Mutation listener: '{s}' re-read from the catalog inside a batch after {s}; retrying that write once", .{ it.mutation.table, @errorName(err) });
                         try requireTransaction(conn);
                         it.rechecked = true;
                         n -%= 1; // the same write again (wrapping: the loop's +%= 1 lands back on it)
@@ -1469,16 +1470,20 @@ pub const MutationListener = struct {
                 it.pending = bc.pending.items.len - 1;
             }
         }
+        // The last segment, if one is still open. A layout re-read may have closed it
+        // already, so classification below does not depend on it.
         if (bc.entered) {
             try self.drainBatch(conn, &bc);
             try requireTransaction(conn);
-            // ── R3: the zero-affected, classified INSIDE the transaction ──
-            var need = false;
-            for (bc.pending.items) |pnd| need = need or pnd.affected0;
-            if (need) {
-                try self.classifyRound(conn, &bc);
-                try requireTransaction(conn);
-            }
+        }
+        // ── R3: every zero-affected write, of any segment, classified INSIDE the
+        //    transaction. Skipping it would record such a write's default `accepted`
+        //    when it was stale or its row deleted. ──
+        var need = false;
+        for (bc.pending.items) |pnd| need = need or pnd.affected0;
+        if (need) {
+            try self.classifyRound(conn, &bc);
+            try requireTransaction(conn);
         }
 
         // ── R4: the outcomes and COMMIT ──

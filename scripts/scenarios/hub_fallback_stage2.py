@@ -41,9 +41,9 @@ def stamp():
     return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-def write(table, key, data, client="c1", op="INSERT"):
+def write(table, key, data, client="c1", op="INSERT", version=None):
     """A write as a client sends it: its zb1 ID and its exact bytes."""
-    version = stamp()
+    version = version or stamp()
     mid = f"zb1-t{int(time.time() * 1000)}-{op}-{comp(client)}-{comp(table)}-k1-{comp(key)}-{comp(version)}"
     body = msgpack.packb({"key": {"id": key}, "data": {**data, "id": key, "updated_at": version}, "version": version, "client_id": client})
     return mid, body
@@ -313,17 +313,56 @@ async def main():
             check(len(again) == 2 and again[1]["status"] == "rejected" and again[1]["reason"] == again[0]["reason"],
                   "a refused write's retry is answered from its receipt")
 
-            # ── a column added just now: the batch re-reads the layout, never a false refusal ──
+            # ── zero-affected writes before a refusal that closes the last segment ──
+            # One batch (the bridge paused while it is stored): a stale UPDATE, an UPDATE of a
+            # row that does not exist, then a write naming no column the table has, whose
+            # re-read closes the segment and which stays refused. The first two must still
+            # be classified, answered and recorded as what they are.
+            old = stamp()
+            await asyncio.sleep(.01)
+            kr = str(uuid.uuid4())
+            current = write("s2_row", kr, {"v": 1})
+            await alice.send("s2_row", *current)
+            await alice.answered(current[0])
+            stale_w = write("s2_row", kr, {"v": 2}, op="UPDATE", version=old)
+            gone_w = write("s2_row", str(uuid.uuid4()), {"v": 3}, op="UPDATE")
+            bad_w = write("s2_row", str(uuid.uuid4()), {"v": 4, "no_such_column": 1})
+            hub.procs["bridge"].send_signal(signal.SIGSTOP)
+            await alice.send("s2_row", *stale_w, op="update")
+            await alice.send("s2_row", *gone_w, op="update")
+            await alice.send("s2_row", *bad_w)
+            hub.procs["bridge"].send_signal(signal.SIGCONT)
+            firsts = [(await alice.answered(w[0]))[:1] for w in (stale_w, gone_w, bad_w)]
+            recorded = [hub.sql(f"SELECT outcome->>'status' FROM zebridge_private.receipts WHERE message_id = '{w[0]}'") for w in (stale_w, gone_w, bad_w)]
+            got = [f[0]["status"] if f else None for f in firsts]
+            check(got == ["stale", "row_deleted", "rejected"] and recorded == got,
+                  f"a batch ending in a refusal that closes its segment still classifies its zero-affected writes ({got}, receipts {recorded})")
+            await asyncio.sleep(1)  # past the shortened window: only the receipts can answer
+            await alice.send("s2_row", *stale_w, op="update")
+            await alice.send("s2_row", *gone_w, op="update")
+            await alice.send("s2_row", *bad_w)
+            replays = [(await alice.answered(w[0], 2))[1:] for w in (stale_w, gone_w, bad_w)]
+            check([r[0]["status"] if r else None for r in replays] == got, "their retries replay the recorded stale / row_deleted / rejected")
+
+            # ── a column added with no DDL event: only the batch's re-read can see it ──
+            # The DDL capture trigger is off around the ALTER, so no catalog epoch bump can
+            # refresh the cached layout first; the batch must close its segment and re-read.
             warm = write("s2_row", str(uuid.uuid4()), {"v": 1})
             await alice.send("s2_row", *warm)
             await alice.answered(warm[0])  # the layout is cached without `extra`
-            hub.sql("ALTER TABLE s2_row ADD COLUMN extra int")
+            hub.sql("ALTER EVENT TRIGGER zebridge_ddl_trigger DISABLE; ALTER TABLE s2_row ADD COLUMN extra int; "
+                    "ALTER EVENT TRIGGER zebridge_ddl_trigger ENABLE;")
+            rereads_before = hub.log("bridge").count("re-read from the catalog inside a batch")
             fresh = [write("s2_row", str(uuid.uuid4()), {"v": n, "extra": n}) for n in range(20)]
-            await asyncio.gather(*(alice.send("s2_row", *w) for w in fresh))
+            hub.procs["bridge"].send_signal(signal.SIGSTOP)
+            for w in fresh:
+                await alice.send("s2_row", *w)
+            hub.procs["bridge"].send_signal(signal.SIGCONT)
             fresh_answers = [await alice.answered(w[0]) for w in fresh]
             stored = hub.sql("SELECT count(*) FROM s2_row WHERE extra IS NOT NULL")
-            check(all(a and a[0]["status"] == "accepted" for a in fresh_answers) and stored == "20",
-                  "writes naming a column added after the layout was cached are accepted inside their batch (re-read, not refused)")
+            rereads = hub.log("bridge").count("re-read from the catalog inside a batch") - rereads_before
+            check(all(a and a[0]["status"] == "accepted" for a in fresh_answers) and stored == "20" and rereads >= 1,
+                  f"writes naming a column the cached layout lacks are accepted after the batch's own re-read ({rereads}), never falsely refused")
 
             # ── concurrent duplicates: both copies stored before the bridge looks ──
             # Two principals interleaved, so each batch holds one claim group per principal.
