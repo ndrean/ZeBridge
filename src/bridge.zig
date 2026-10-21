@@ -390,6 +390,7 @@ fn runDiagnose(
     io: std.Io,
     bridge_port: u16,
     nats_endpoint: ?Config.Nats.Endpoint,
+    enrollment: ?http_server.Server.EnrollCtx,
 ) u8 {
     var findings: usize = 0;
     log.info("🩺 DIAGNOSE: BASE_BUF gives a {d}-byte event buffer; slot '{s}', publication '{s}'. Read-only: PostgreSQL, NATS and the bridge's port are read; nothing is created or changed.", .{ event_buf, slot_name, pub_name });
@@ -581,6 +582,7 @@ fn runDiagnose(
         .bridge_port = bridge_port,
         .endpoint = nats_endpoint,
         .topo = topo,
+        .enroll = enrollment,
     });
 
     if (findings == 0) {
@@ -1007,6 +1009,7 @@ pub fn main(init: std.process.Init) !void {
             io,
             parsed_args.http_port,
             Config.Nats.Endpoint.resolve(&runtime_config) catch null,
+            http_srv.enroll,
         );
         std.process.exit(code);
     }

@@ -278,6 +278,24 @@ async def main():
         enrolled_options = None
         try:
             await hub.start()
+            def diagnose(env=None):
+                result = subprocess.run([str(BRIDGE), '--diagnose', '--pub', 'hf2_pub', '--slot', hub.name+'_slot', '--port', str(hub.bridge_port)],
+                                        env=env or hub.env, capture_output=True, text=True, timeout=45)
+                return result.returncode, result.stdout + result.stderr
+            _, report = diagnose()
+            check('enrollment endpoint policies: hub and 1 leaf' in report, 'diagnose checks the enrolled hub and leaf policies before devices use them')
+            try:
+                hub.sql("UPDATE zebridge_leaf_scopes SET nats_url='nats://leaf.invalid:4222', nats_ws_url='ws://leaf.invalid' WHERE leaf_id='lf-edge1'")
+                code, report = diagnose()
+                check(code != 0 and 'lf-edge1 (native): MixedEnrollmentEndpointSecurity' in report and 'lf-edge1 (WebSocket): MixedEnrollmentEndpointSecurity' in report,
+                      'diagnose refuses mixed leaf/hub security for native and WebSocket lists')
+            finally:
+                hub.sql(f"UPDATE zebridge_leaf_scopes SET nats_url='{hub.leaf_url}', nats_ws_url='{hub.leaf_ws_url}' WHERE leaf_id='lf-edge1'")
+            code, report = diagnose(dict(hub.env, ENROLL_NATS_URL=hub.url+',nats://hub.invalid:4222'))
+            check(code != 0 and 'hub (native): MixedEnrollmentEndpointSecurity' in report, 'diagnose catches a mixed hub list too')
+            _, report = diagnose()
+            check('enrollment endpoint policies: hub and 1 leaf' in report and 'MixedEnrollmentEndpointSecurity' not in report,
+                  'correcting the policy clears the endpoint finding; diagnosis did not change the registry')
             # The pool is read from the same native Transport used by the C ABI.
             # A refused first endpoint must not move the last ahead of the second.
             refused = f"tls://127.0.0.1:{port()}"

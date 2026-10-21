@@ -16,6 +16,7 @@ const c = c_imports.c;
 const Conf = @import("config.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const topology_mod = @import("topology.zig");
+const Http = @import("http_server.zig").Server;
 
 const log = std.log.scoped(.diagnose);
 
@@ -29,6 +30,7 @@ pub const Inputs = struct {
     /// Null when NATS_URL could not be read: reported, and the NATS checks skipped.
     endpoint: ?Conf.Nats.Endpoint,
     topo: *const topology_mod.Topology,
+    enroll: ?Http.EnrollCtx = null,
 };
 
 /// Returns the number of findings. Warnings are printed and not counted.
@@ -37,6 +39,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, in: Inputs) usize {
     defer arena.deinit();
     const a = arena.allocator();
     var findings: usize = 0;
+
+    if (in.enroll) |ctx| findings += enrollmentChecks(in.conn, ctx, in.write_ok);
 
     if (in.core_ok) findings += catalogueChecks(a, in.conn);
     const running = bridgeStatus(a, io, in.bridge_port, &findings);
@@ -73,6 +77,38 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, in: Inputs) usize {
         return findings;
     }
     if (in.core_ok) findings += clientContract(a, js, in.conn, in.topo, tenants, in.write_ok);
+    return findings;
+}
+
+fn endpointPairCheck(scope: []const u8, native: ?[]const u8, ws: ?[]const u8, ctx: Http.EnrollCtx) usize {
+    var findings: usize = 0;
+    for ([_]bool{ false, true }) |websocket| {
+        Http.validateEndpointPair(if (websocket) ws else native, if (websocket) ctx.nats_ws_url else ctx.nats_url, websocket) catch |err| {
+            findings += 1;
+            log.err("🔴 enrollment endpoints for {s} ({s}): {s}. Fix the leaf registry URLs and ENROLL_NATS_URL / ENROLL_NATS_WS_URL; use nats:// or tls:// for native, ws:// or wss:// for WebSocket, with one security mode per list.", .{ scope, if (websocket) "WebSocket" else "native", @errorName(err) });
+        };
+    }
+    return findings;
+}
+
+fn enrollmentChecks(conn: *c.PGconn, ctx: Http.EnrollCtx, write_ok: bool) usize {
+    var findings = endpointPairCheck("hub", null, null, ctx);
+    if (!write_ok) return findings;
+    const result = c.PQexec(conn, "SELECT leaf_id, nats_url, nats_ws_url FROM public.zebridge_leaf_scopes ORDER BY leaf_id");
+    defer c.PQclear(result);
+    if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
+        log.err("🔴 enrollment endpoint policies could not be read; check the init SQL and reader's SELECT grant on zebridge_leaf_scopes", .{});
+        return findings + 1;
+    }
+    const count: usize = @intCast(c.PQntuples(result));
+    for (0..count) |i| {
+        const row: c_int = @intCast(i);
+        const scope = std.mem.span(c.PQgetvalue(result, row, 0));
+        const native = if (c.PQgetisnull(result, row, 1) == 0) std.mem.span(c.PQgetvalue(result, row, 1)) else null;
+        const ws = if (c.PQgetisnull(result, row, 2) == 0) std.mem.span(c.PQgetvalue(result, row, 2)) else null;
+        findings += endpointPairCheck(scope, native, ws, ctx);
+    }
+    if (findings == 0) log.info("✅ enrollment endpoint policies: hub and {d} leaf list(s) have valid, consistent transport security", .{count});
     return findings;
 }
 

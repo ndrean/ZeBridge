@@ -234,24 +234,36 @@ async def main():
             hub.procs["admission"].wait(timeout=15)
             kz = str(uuid.uuid4())
             take(lib.zb_client_mutate(h, b"s2_row", b"INSERT", json.dumps({"id": kz}).encode(), b'{"v": 3}'))
-            outbox = lambda handle: take(lib.zb_client_query(handle, b"SELECT msg_id FROM _zebridge_outbox", b"[]")).get("rows", [])
+            monitor = await nats.connect(hub.url, user_credentials=hub.bridge_creds)
+            seen = []
+            async def published(msg): seen.append(msg.headers.get('Nats-Msg-Id') if msg.headers else None)
+            try:
+                await monitor.subscribe('mutation.bob.s2_row.insert', cb=published)
+                await monitor.flush()
+                kz2 = str(uuid.uuid4())
+                second = await asyncio.to_thread(lambda: take(lib.zb_client_mutate(h, b"s2_row", b"INSERT", json.dumps({"id": kz2}).encode(), b'{"v": 4}')))
+                await asyncio.sleep(.15)
+                check(seen == [second.get('msgId')], 'a new mutation sends its own ID only, without replaying unrelated pending writes')
+            finally:
+                await monitor.close()
+            outbox = lambda handle: take(lib.zb_client_query(handle, b"SELECT msg_id FROM _zebridge_outbox ORDER BY msg_id", b"[]")).get("rows", [])
             before = outbox(h)
             lib.zb_client_close(h)
             h = await asyncio.to_thread(lib.zb_client_connect, opts)
             after = outbox(h) if h else []
-            check(len(before) == 1 and before == after and before[0][0].startswith("zb1-t"),
-                  "a write queued while admission is down keeps its zb1 ID when the client reopens")
+            check(len(before) == 2 and before == after and all(r[0].startswith('zb1-t') for r in before),
+                  "writes queued while admission is down keep their zb1 IDs when the client reopens")
             hub.start_admission()
             await hub.wait_log("admission", "mutation admission ready")
-            # The host's write pump, as an application drives it: libzb resends its outbox
-            # on a new write or on zb_client_flush_outbox, never on its own.
+            # Exercise the explicit full-pass API. Automatic bounded passes are covered
+            # separately by outbox_recovery and endpoint-failover's normal poll loop.
             for _ in range(100):
                 await asyncio.to_thread(lambda: take(lib.zb_client_flush_outbox(h, 200)))
                 if not outbox(h):
                     break
             receipt = hub.sql(f"SELECT outcome->>'status' FROM zebridge_private.receipts WHERE principal = 'bob' AND message_id = '{before[0][0] if before else ''}'")
-            left, runs = len(outbox(h)), hub.executions("s2_row", kz)
-            check(left == 0 and receipt == "accepted" and runs == 1,
+            left, runs = len(outbox(h)), hub.executions("s2_row", kz) + hub.executions("s2_row", kz2)
+            check(left == 0 and receipt == "accepted" and runs == 2 and hub.executions('s2_row', kz) == 1 and hub.executions('s2_row', kz2) == 1,
                   f"after restart it is sent under that ID, commits once and clears the outbox (left {left}, receipt {receipt or 'none'}, executions {runs})")
             lib.zb_client_close(h)
 

@@ -14,15 +14,22 @@ export function bindEndpointTls(options: any): any {
   // A TLS options object makes nats.js require TLS. Preserve plain dev connections.
   if (!secure && options.tls === undefined) return options;
   let hostname: string | undefined;
+  let selection = 0;
+  let tlsSelection = -1;
   const customCheck = options.tls?.checkServerIdentity;
   return {
     ...options,
     tls: {
       ...options.tls,
       // IP addresses have no SNI name; verification below still uses the exact IP.
-      get servername() { return hostname && !isIP(hostname) ? hostname : undefined; },
+      get servername() {
+        if (!hostname) throw new Error('TLS options read before endpoint selection; unsupported NATS transport');
+        tlsSelection = selection;
+        return !isIP(hostname) ? hostname : undefined;
+      },
       checkServerIdentity: (_fallback: string, cert: any) => {
-        if (!hostname) return new Error('Endpoint TLS name missing: @nats-io/transport-node 3.4.0 or later is required');
+        if (!hostname) return new Error('Endpoint TLS name missing: the pinned @nats-io/transport-node 3.4.0 is required');
+        if (tlsSelection !== selection) return new Error('TLS options were copied before this endpoint selection; unsupported NATS transport');
         const expected = hostname;
         return checkServerIdentity(expected, cert) ?? customCheck?.(expected, cert);
       },
@@ -31,6 +38,7 @@ export function bindEndpointTls(options: any): any {
       const choice = options.reconnectToServer?.(pool, info) ?? null;
       const selected = choice && 'server' in choice ? choice.server : choice ?? pool[0];
       hostname = selected?.hostname;
+      selection++;
       return choice;
     },
   };

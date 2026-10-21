@@ -21,7 +21,7 @@ importers:
         specifier: ^3.4.0
         version: 3.4.0
       '@nats-io/nats-core':
-        specifier: ^3.4.0
+        specifier: 3.4.0
         version: 3.4.0
       '@nats-io/nkeys':
         specifier: ^2.0.3
@@ -43,7 +43,7 @@ importers:
         version: 14.0.2
     devDependencies:
       '@nats-io/transport-node':
-        specifier: ^3.4.0
+        specifier: 3.4.0
         version: 3.4.0
       '@types/better-sqlite3':
         specifier: ^7.6.11

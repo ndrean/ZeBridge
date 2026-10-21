@@ -3707,11 +3707,11 @@ pub const SyncClient = struct {
             const epoch = self.t.conn.reconnect_epoch.load(.acquire);
             if (epoch != self.outbox_reconnect_epoch) {
                 self.outbox_reconnect_epoch = epoch;
-                self.next_outbox_retry_ms = now + self.outboxRetryJitter();
+                self.next_outbox_retry_ms = @max(self.next_outbox_retry_ms, now + self.outboxRetryJitter());
             }
             if (now >= self.next_outbox_retry_ms) {
                 self.next_outbox_retry_ms = now + 5_000 + self.outboxRetryJitter();
-                _ = self.flushOutbox() catch |err| {
+                _ = self.flushOutboxPass(true, null) catch |err| {
                     log.info("outbox recovery: {s} — pending writes retained for a later poll", .{@errorName(err)});
                 };
             }
@@ -4479,6 +4479,7 @@ pub const SyncClient = struct {
         execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN published INTEGER NOT NULL DEFAULT 1") catch {};
         execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN tenant TEXT") catch {};
         execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN optimistic TEXT") catch {};
+        try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_recovery ON _zebridge_outbox (attempts, created_at, msg_id)");
         // A write answered `indeterminate`: settled for retransmission, its outcome
         // unknown until an authoritative reseed of its route (PROTOCOL §7.4c). `state`:
         // pending (not rewound yet), rewound (its routes wait for the heal), healed (the
@@ -4636,10 +4637,9 @@ pub const SyncClient = struct {
         // only replays were checked. Measured — a write the gate then refused was
         // already in PostgreSQL, printed as "flushed: 0" next to a row that existed.
         //
-        // One path for every send closes it. The cost is that a flush republishes any
-        // stragglers too, which is what an outbox is for, and the msg_id makes it
-        // idempotent.
-        _ = self.flushOutbox() catch |err| {
+        // Use the same gate, for this edit only. A mutation (including an automatic
+        // rebase) must not bypass the recovery budget by flushing unrelated backlog.
+        _ = self.flushOutboxPass(false, msg_id) catch |err| {
             // Kept, not lost: the entry is durable and the next flush retries.
             log.err("mutate: send failed ({any}) — queued as {s}", .{ err, msg_id });
         };
@@ -4653,11 +4653,24 @@ pub const SyncClient = struct {
     /// one bad send does not starve the rest. If NOTHING could be sent the last error
     /// is returned — "flushed: 0" next to a broker that is down should say why.
     pub fn flushOutbox(self: *SyncClient) !usize {
+        return self.flushOutboxPass(false, null);
+    }
+
+    /// Automatic recovery budgets both the selected rows and their network work.
+    /// Persisted attempts rotate the oldest tried entries behind untried ones, even
+    /// across a restart. Explicit host flushes retain their full-pass contract.
+    fn flushOutboxPass(self: *SyncClient, automatic: bool, only_id: ?[]const u8) !usize {
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const a = ca.allocator();
         try self.ensureOutbox();
-        const rows = try self.st.query(a, "SELECT msg_id, subject, payload, tbl, row_id, before, published FROM _zebridge_outbox ORDER BY created_at", &.{});
+        const params: []const storage.Value = if (only_id) |mid| &.{.{ .text = mid }} else &.{};
+        const rows = try self.st.query(a, if (only_id != null)
+            "SELECT msg_id, subject, payload, tbl, row_id, before, published FROM _zebridge_outbox WHERE msg_id = ?"
+        else if (automatic)
+            "SELECT msg_id, subject, payload, tbl, row_id, before, published FROM _zebridge_outbox ORDER BY attempts, created_at, msg_id LIMIT 8"
+        else
+            "SELECT msg_id, subject, payload, tbl, row_id, before, published FROM _zebridge_outbox ORDER BY created_at", params);
         if (rows.len == 0) return 0;
         if (nowMillis() < self.hold_until_ms) return 0; // §10fk: rate limited — not yet
 
@@ -4695,12 +4708,14 @@ pub const SyncClient = struct {
         for (rows) |r| {
             const msg_id = if (r[0] == .text) r[0].text else continue;
             if (self.sent_at.get(msg_id)) |t| if (now_ms - t < grace_ms) continue;
+            if (automatic) _ = try self.st.query(a, "UPDATE _zebridge_outbox SET attempts = CASE WHEN attempts < 2147483647 THEN attempts + 1 ELSE attempts END WHERE msg_id = ?", &.{.{ .text = msg_id }});
             // The verdicts this client MISSED (PROTOCOL §7.4b): one per-key direct get per
             // pending entry, settled through the same handler `drainVerdicts` uses. Until
             // 2026-08-29 nothing read a stored verdict — the replay earned a fresh one,
             // at the cost of a second PostgreSQL attempt and, past the duplicate window,
             // a `stale` for a write that had been accepted.
-            if (!refused.contains(msg_id)) {
+            const published = !(r[6] == .integer and r[6].integer == 0);
+            if (published and !refused.contains(msg_id)) {
                 const ack_subject = try std.fmt.allocPrint(a, "{s}.{s}.{s}", .{ self.subject_mutation_ack_prefix, self.opts.principal, msg_id });
                 if (self.t.lastBySubject(self.stream_verdicts, ack_subject) catch null) |vm| {
                     defer vm.deinit();
@@ -4737,6 +4752,7 @@ pub const SyncClient = struct {
                 failed += 1;
                 last_err = err;
                 log.info("outbox: {s} not sent ({any}) — still queued", .{ msg_id, err });
+                if (automatic) break;
                 continue;
             };
             sent += 1;

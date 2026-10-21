@@ -1314,7 +1314,7 @@ export class ZeBridge {
 
       // Anything queued while disconnected goes out now — including writes made in a
       // previous page load, which is the whole point of persisting them.
-      void this.flushOutbox();
+      void this.recoverOutbox();
 
       // `reconnect: true` restores the connection without coming back through this
       // function — the status loop is what re-syncs after a blip. Safe to re-run
@@ -1334,7 +1334,7 @@ export class ZeBridge {
               if (t === 'reconnect') {
                 this.naturallyConnected = true;
                 this.emitStatus('connected');
-                this.nextOutboxRetry = performance.now() + Math.floor(Math.random() * 1000);
+                this.nextOutboxRetry = Math.max(this.nextOutboxRetry, performance.now() + Math.floor(Math.random() * 1000));
                 if (this.resyncing) continue;
                 this.resyncing = true;
                 this.appendLog('SYS', 'NATS reconnected — scheduling outbox recovery and re-syncing streams', 'INFO');
@@ -1569,6 +1569,7 @@ export class ZeBridge {
     // `optimistic`: the local apply, re-applied after a full seed replaced the rows.
     try { await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN published INTEGER NOT NULL DEFAULT 1`); } catch { /* present */ }
     try { await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN optimistic TEXT`); } catch { /* present */ }
+    await this.run(`CREATE INDEX IF NOT EXISTS _zbz_outbox_recovery ON _zebridge_outbox (attempts, created_at, msg_id)`);
     await this.run(`
       CREATE TABLE IF NOT EXISTS _zebridge_reconcile (
         msg_id  TEXT PRIMARY KEY,
@@ -4143,12 +4144,12 @@ export class ZeBridge {
   /// attempt per entry and, past the duplicate window, a `stale` for a write that had
   /// in fact been accepted. The grant is per key —
   /// `$JS.API.DIRECT.GET.VERDICTS.mutation_ack.<principal>.>` — scoped like `$KV.tenants`.
-  private async collectMissedVerdicts(rows: any[]): Promise<Set<string>> {
+  private async collectMissedVerdicts(rows: any[], manager?: Promise<any>): Promise<Set<string>> {
     const settled = new Set<string>();
     if (!this.nc || !rows.length) return settled;
     const stream = this.config.grammar.streams?.verdicts ?? 'VERDICTS';
     let jsm: any;
-    try { jsm = await this.transport.jetstreamManager(this.nc, this.jsOpts()); } catch { return settled; }
+    try { jsm = await (manager ?? this.transport.jetstreamManager(this.nc, this.jsOpts())); } catch { return settled; }
     // ⚠️ The DIRECT form only. `jsm.streams.getMessage` is the legacy
     // `$JS.API.STREAM.MSG.GET.<stream>` request, which the client JWT does not grant
     // (and must not: it is not scopable per key). Without `jsm.direct` there is
@@ -4503,8 +4504,7 @@ export class ZeBridge {
     // bounded even when the first publish after reconnect has no responder.
     const retryNow = performance.now();
     if (this.nc && this.naturallyConnected && retryNow >= this.nextOutboxRetry) {
-      this.nextOutboxRetry = retryNow + 5000 + Math.floor(Math.random() * 1000);
-      void this.flushOutbox().catch((e) => this.appendLog('OUTBOX', `recovery failed, pending writes retained: ${e}`, 'WARNING'));
+      void this.recoverOutbox().catch((e) => this.appendLog('OUTBOX', `recovery failed, pending writes retained: ${e}`, 'WARNING'));
     }
     for (const [msgId, w] of this.pendingWrites) {
       if (now - w.at < WRITE_TIMEOUT_MS) continue;
@@ -4632,19 +4632,33 @@ export class ZeBridge {
   /// log. Safe to run repeatedly: original msg ids make replays idempotent. Entries
   /// are only popped by a verdict or a CDC echo (§7.1), never on send failure.
   public async flushOutbox() {
+    return this.flushOutboxPass(false);
+  }
+
+  private async recoverOutbox() {
+    const now = performance.now();
+    if (now < this.nextOutboxRetry) return;
+    this.nextOutboxRetry = now + 5000 + Math.floor(Math.random() * 1000);
+    return this.flushOutboxPass(true);
+  }
+
+  private async flushOutboxPass(automatic: boolean) {
     if (this.outboxWork) return this.outboxWork;
-    const work = this.flushOutboxOnce();
+    const work = this.flushOutboxOnce(automatic);
     this.outboxWork = work;
     try { await work; }
     finally { if (this.outboxWork === work) this.outboxWork = null; }
   }
 
-  private async flushOutboxOnce() {
+  private async flushOutboxOnce(automatic: boolean) {
     const nc = this.nc;
     if (!nc) return;
     let rows: any[] = [];
     try {
-      rows = await this.outboxAll();
+      await this.outboxInitPromise;
+      rows = automatic
+        ? await this.run(`SELECT * FROM _zebridge_outbox ORDER BY attempts, created_at, msg_id LIMIT 8`)
+        : await this.outboxAll();
     } catch (err) {
       this.appendLog('OUTBOX', `could not be read: ${err}`, 'ERROR');
       return;
@@ -4653,7 +4667,7 @@ export class ZeBridge {
     if (Date.now() < this.holdUntil) return; // §10fk: rate limited — not yet
 
     // ── first, the verdicts already waiting for us (PROTOCOL §7.4b) ──────────
-    const settled = await this.collectMissedVerdicts(rows);
+    const settled = automatic ? new Set<string>() : await this.collectMissedVerdicts(rows.filter((r) => Number(r.published ?? 1) !== 0));
     if (settled.size) {
       rows = rows.filter((r: any) => !settled.has(r.msg_id));
       if (!rows.length) return;
@@ -4697,9 +4711,19 @@ export class ZeBridge {
     }
 
     this.appendLog('OUTBOX', `replaying ${rows.length} unconfirmed write(s)`, 'INFO');
+    // Reuse the manager's account/API check for this pass. Per-entry verdict
+    // collection must not turn eight direct gets into eight extra INFO requests.
+    let verdictManager: Promise<any> | undefined;
     for (const r of rows) {
       if (this.nc !== nc) return;
       try {
+        if (automatic) {
+          await this.run(`UPDATE _zebridge_outbox SET attempts = CASE WHEN attempts < 2147483647 THEN attempts + 1 ELSE attempts END WHERE msg_id = ?`, r.msg_id);
+          if (Number(r.published ?? 1) !== 0) {
+            verdictManager ??= this.transport.jetstreamManager(nc, this.jsOpts());
+            if ((await this.collectMissedVerdicts([r], verdictManager)).has(r.msg_id)) continue;
+          }
+        }
         const h = this.transport.headers();
         h.set('Nats-Msg-Id', r.msg_id);
         this.pendingWrites.set(r.msg_id, { table: r.tbl, id: r.row_id, at: Date.now(), version: outboxVersionOf(r) });
@@ -4708,6 +4732,7 @@ export class ZeBridge {
         this.appendLog('OUTBOX', `replayed ${r.msg_id} (seq ${ack.seq}${ack.duplicate ? ', duplicate — already landed' : ''})`, 'INFO');
       } catch (err) {
         this.appendLog('OUTBOX', `replay of ${r.msg_id} failed, kept for next connection: ${err}`, 'ERROR');
+        if (automatic) break;
       }
     }
   }
@@ -4751,7 +4776,7 @@ export class ZeBridge {
         this.appendLog('SYS', 'NATS rtt check recovered — re-syncing (nc.status() never reported this)', 'INFO');
         if (!this.resyncing) {
           this.resyncing = true;
-          void this.flushOutbox();
+          void this.recoverOutbox();
           void this.subscribeStreams().catch(() => {}).finally(() => { this.resyncing = false; });
         }
       }

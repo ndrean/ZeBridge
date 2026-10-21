@@ -588,6 +588,28 @@ pub const Server = struct {
         return std.fmt.allocPrint(a, "{s},\"{s}\":{s}", .{ legacy, plural, list });
     }
 
+    /// Diagnose the complete enrolled list, rather than discovering a mixed policy
+    /// independently on every device. Native and WebSocket are separate lists.
+    pub fn validateEndpointPair(primary: ?[]const u8, hub: ?[]const u8, websocket: bool) !void {
+        var secure: ?bool = null;
+        for ([_]?[]const u8{ primary, hub }) |value| {
+            const text = std.mem.trim(u8, value orelse continue, " \t");
+            if (text.len == 0) continue;
+            var parts = std.mem.splitScalar(u8, text, ',');
+            while (parts.next()) |part| {
+                const url = std.mem.trim(u8, part, " \t");
+                if (url.len == 0) return error.InvalidEnrollmentEndpoint;
+                for (url) |ch| if (ch <= 0x20 or ch == 0x7f) return error.InvalidEnrollmentEndpoint;
+                const uri = std.Uri.parse(url) catch return error.InvalidEnrollmentEndpoint;
+                const host = uri.host orelse return error.InvalidEnrollmentEndpoint;
+                if (host.isEmpty()) return error.InvalidEnrollmentEndpoint;
+                const encrypted = if (std.ascii.eqlIgnoreCase(uri.scheme, if (websocket) "wss" else "tls")) true else if (std.ascii.eqlIgnoreCase(uri.scheme, if (websocket) "ws" else "nats")) false else return error.InvalidEnrollmentEndpoint;
+                if (secure) |previous| if (previous != encrypted) return error.MixedEnrollmentEndpointSecurity;
+                secure = encrypted;
+            }
+        }
+    }
+
     fn identityPayload(self: *Server, base_ctx: EnrollCtx, conn: *c.PGconn, jwt: []const u8, principal: []const u8) ![]u8 {
         var ctx = base_ctx;
         var scoped_result: ?*c.PGresult = null;
@@ -1078,4 +1100,16 @@ test "identity endpoints keep the assigned leaf before the hub and the legacy pr
     const absent = try Server.identityEndpoints(a, "nats_url", "nats_urls", null, null);
     defer a.free(absent);
     try std.testing.expectEqualStrings("", absent);
+}
+
+test "enrollment policy diagnosis refuses mixed security and wrong transports" {
+    try Server.validateEndpointPair("tls://leaf:4222", "tls://hub:4222", false);
+    try Server.validateEndpointPair("ws://leaf", "ws://hub", true);
+    try Server.validateEndpointPair(null, null, false);
+    try std.testing.expectError(error.MixedEnrollmentEndpointSecurity, Server.validateEndpointPair("tls://leaf", "nats://hub", false));
+    try std.testing.expectError(error.MixedEnrollmentEndpointSecurity, Server.validateEndpointPair("wss://leaf", "ws://hub", true));
+    try std.testing.expectError(error.MixedEnrollmentEndpointSecurity, Server.validateEndpointPair(null, "tls://one,nats://two", false));
+    try std.testing.expectError(error.InvalidEnrollmentEndpoint, Server.validateEndpointPair("wss://leaf", "tls://hub", false));
+    try std.testing.expectError(error.InvalidEnrollmentEndpoint, Server.validateEndpointPair("tls://", null, false));
+    try std.testing.expectError(error.InvalidEnrollmentEndpoint, Server.validateEndpointPair("tls://leaf,,tls://hub", null, false));
 }

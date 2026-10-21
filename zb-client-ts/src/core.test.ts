@@ -442,13 +442,16 @@ test('Node TLS verifies the selected URL on initial connect and reconnect', asyn
   const { bindEndpointTls } = await import('./node-tls.ts');
   const leaf = { hostname: '127.0.0.1' }, hub = { hostname: 'hub.example' };
   const opts = bindEndpointTls({ servers: ['tls://127.0.0.1', 'tls://hub.example'], tls: { caFile: '/roots.pem' } });
+  assert.throws(() => ({ ...opts.tls }), /before endpoint selection/, 'early options cloning fails clearly');
   assert.ok(opts.tls.checkServerIdentity('localhost', { subjectaltname: 'DNS:localhost' }), 'a missing endpoint selection fails closed');
   assert.equal(opts.reconnectToServer([leaf, hub], null), null);
   assert.equal(opts.tls.servername, undefined);
   // The fallback name passed by Node must not authorize the wrong endpoint.
   assert.ok(opts.tls.checkServerIdentity('localhost', { subjectaltname: 'DNS:localhost' }));
   assert.equal(opts.tls.checkServerIdentity('localhost', { subjectaltname: 'IP Address:127.0.0.1' }), undefined);
+  const copied = { ...opts.tls };
   opts.reconnectToServer([hub, leaf], null);
+  assert.match(copied.checkServerIdentity('127.0.0.1', { subjectaltname: 'DNS:hub.example' }).message, /copied before this endpoint/, 'a one-time clone cannot silently reuse the first name');
   assert.equal(opts.tls.servername, 'hub.example');
   assert.ok(opts.tls.checkServerIdentity('127.0.0.1', { subjectaltname: 'IP Address:127.0.0.1' }));
   assert.equal(opts.tls.checkServerIdentity('127.0.0.1', { subjectaltname: 'DNS:hub.example' }), undefined);
@@ -460,4 +463,36 @@ test('Node TLS verifies the selected URL on initial connect and reconnect', asyn
   assert.throws(() => bindEndpointTls({ servers: [' TLS://hub.example '], tls: null }));
   const plain = { servers: ['nats://localhost:4222'] };
   assert.equal(bindEndpointTls(plain), plain, 'plain development connections do not acquire required TLS');
+});
+
+test('the pinned NATS parser and TLS transport read endpoint options for every attempt', async (t) => {
+  const { bindEndpointTls } = await import('./node-tls.ts');
+  const { parseOptions } = await import('@nats-io/nats-core/internal');
+  const { EventEmitter } = await import('node:events');
+  const tls = (await import('node:tls')).default;
+  // Use the installed implementation, not a reimplementation of its options copy.
+  const { NodeTransport } = await import(new URL('./lib/node_transport.js', import.meta.resolve('@nats-io/transport-node')).href);
+  const bound = bindEndpointTls({ servers: ['tls://leaf.example', 'tls://hub.example'] });
+  const parsed = parseOptions(bound); // must not eagerly read tls.servername
+  const transport = new NodeTransport();
+  transport.options = parsed;
+  transport.socket = {};
+  transport.tlsName = 'stale.example';
+  transport.loadClientCerts = async () => ({});
+  let expected = '';
+  const reads: string[] = [];
+  t.mock.method(tls, 'connect', (opts: any, done: () => void) => {
+    reads.push(opts.servername);
+    assert.equal(opts.servername, expected);
+    assert.equal(opts.checkServerIdentity('stale.example', { subjectaltname: `DNS:${expected}` }), undefined);
+    const socket = Object.assign(new EventEmitter(), { authorized: true });
+    queueMicrotask(done);
+    return socket;
+  });
+  for (const name of ['leaf.example', 'hub.example', 'leaf.example']) {
+    expected = name;
+    bound.reconnectToServer([{ hostname: name }], null);
+    await transport.startTLS();
+  }
+  assert.deepEqual(reads, ['leaf.example', 'hub.example', 'leaf.example']);
 });
