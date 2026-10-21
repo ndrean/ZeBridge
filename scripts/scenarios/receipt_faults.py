@@ -12,12 +12,12 @@ writes, so the listener forms batches; the fault fires in every batch, which the
 message by message. A BEFORE trigger counts executions in the same transaction: unlike row
 counts or an AFTER trigger, it also sees a repeated upsert that changed nothing.
 
-receipts-locks prototype: ZB_RECEIPT_GUARD=1 says the binary is variant B (built with
--Dreceipt-guard=true); the database's completion guard is switched on to match. The mode
+Normal builds and fresh installs enable the guard. Disabling it requires
+-Dreceipt-guard=false and ZB_RECEIPT_GUARD=0; the installed policy must match. The mode
 commit_before_receipts (fires once) sends COMMIT after the writes and before any receipt:
-B's guard must refuse it and the replay must run each write exactly once; A commits the
-writes without receipts, which is A's accepted limitation and is reported as such, never as
-a pass.
+the enabled guard must refuse it and the replay must run each write exactly once. A disabled
+guard permits committing writes without receipts; that result is reported, never counted
+as a safety pass.
 """
 import asyncio, datetime, json, os, pathlib, socket, subprocess, tempfile, time, uuid
 
@@ -29,8 +29,8 @@ from rotate_client_key import client_creds as mint_client
 
 BRIDGE = pathlib.Path(os.environ.get("ZB_FAULT_BRIDGE_BIN", zb.ROOT / "zig-out-faults/bin/bridge"))
 MODES = tuple(os.environ.get("ZB_RF_MODES", "reset_after_claims oom_in_claims oom_in_finishes commit_before_receipts").split())
-GUARD = os.environ.get("ZB_RECEIPT_GUARD") == "1"
-VARIANT = "B" if GUARD else "A"
+GUARD = os.environ.get("ZB_RECEIPT_GUARD", "1") == "1"
+GUARD_STATE = "enabled" if GUARD else "disabled"
 
 
 def port():
@@ -74,8 +74,7 @@ async def main():
                            DATABASE_WRITER_URL=f"postgres://{writer}:x@127.0.0.1:5432/{name}", TARGET_DB=name,
                            BRIDGE_CDC_PUBLICATION="rf_pub")
                 sql(subprocess.run([str(BRIDGE), "--init-sql"], env=env, capture_output=True, text=True, check=True).stdout)
-                if GUARD:
-                    sql("UPDATE zebridge_private.receipt_policy SET completion_guard = true")
+                assert (sql("SELECT completion_guard FROM zebridge_private.receipt_policy") == "t") == GUARD, "installed receipt policy must match the fault-test build"
                 sql("CREATE TABLE fault_audit (n bigserial PRIMARY KEY, id uuid NOT NULL); "
                     "CREATE TABLE fault_row (id uuid PRIMARY KEY, v int NOT NULL, updated_at timestamptz NOT NULL DEFAULT now()); "
                     "CREATE FUNCTION fault_count() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS "
@@ -117,7 +116,7 @@ async def main():
                 await wait_log("admission", "mutation admission ready")
                 spawn([str(BRIDGE), "--pub", "rf_pub", "--slot", name + "_slot", "--port", str(port())], dict(env, ZB_TEST_FAULT=mode), "bridge")
                 await wait_log("bridge", "Ready! Pulling mutations", timeout=90)
-                await wait_log("bridge", f"variant {VARIANT}")
+                await wait_log("bridge", f"completion guard {GUARD_STATE}")
 
                 nc = await nats.connect(url, user_credentials=str(tmp / "alice.creds"), inbox_prefix=b"_INBOX.alice")
                 js = nc.jetstream()
@@ -161,12 +160,12 @@ async def main():
                 guards = int(sql("SELECT count(*) FROM zebridge_private.receipt_guards"))
                 check(guards == 0, f"{mode}: no completion guard outlives its transaction ({guards} left)")
                 if mode == "commit_before_receipts" and not GUARD:
-                    # Variant A: nothing in the database ties a write to its receipt. The facts
+                    # Without the guard, nothing in the database ties a write to its receipt. The facts
                     # must match the limitation exactly; this is NOT the safety check passing.
                     missing = len(ids) - receipts
                     as_expected = (missing >= 1 and rows == len(ids) and executions == [str(len(ids)), str(len(ids))]
                                    and statuses.count("accepted") == len(ids))
-                    print(f"  ◇ variant A LIMITATION reproduced{'' if as_expected else ' (NOT as expected)'}: "
+                    print(f"  ◇ guard disabled: missing-receipt commit reproduced{'' if as_expected else ' (NOT as expected)'}: "
                           f"{missing} write(s) committed WITHOUT a receipt — a late retry of those would run again; "
                           f"the exactly-once safety check does not hold under this fault (rows {rows}, receipts {receipts})")
                     failed += not as_expected
@@ -174,7 +173,7 @@ async def main():
                     continue
                 if mode == "commit_before_receipts":
                     refused = "undecided writes would commit without their receipts" in logs["bridge"].read_text(errors="replace")
-                    check(refused, f"{mode}: variant B's completion guard refused the receipt-less COMMIT")
+                    check(refused, f"{mode}: the completion guard refused the receipt-less COMMIT")
                 check(statuses.count("accepted") == len(ids) and rows == len(ids)
                       and executions == [str(len(ids)), str(len(ids))] and receipts == len(ids) and once == len(ids),
                       f"{mode}: every write ran exactly once, has its receipt and got one verdict delivery; "

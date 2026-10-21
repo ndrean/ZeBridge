@@ -1198,7 +1198,7 @@ RETURNS date LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
                 ELSE zebridge_private.month_of_ms(zebridge_private.receipt_created_ms(message_id)) END
 $$;
 
--- (receipts-locks prototype) A receipt is inserted once, complete, after its write ran:
+-- A receipt is inserted once, complete, after its write ran:
 -- outcome is NOT NULL. Concurrent duplicates are kept apart by transaction-scoped advisory
 -- locks taken before the receipt is read (lock_receipts), not by a placeholder row.
 -- There is no default partition: a month without one is an operational error.
@@ -1216,11 +1216,11 @@ ALTER TABLE zebridge_private.receipts ALTER COLUMN outcome SET NOT NULL;
 DROP TRIGGER IF EXISTS receipts_finished ON zebridge_private.receipts;
 DROP FUNCTION IF EXISTS zebridge_private.receipt_finished();
 
--- Variant B's completion guard (receipt_policy.completion_guard): one row per transaction that has undecided writes, holding
+-- The completion guard (receipt_policy.completion_guard): one row per transaction that has undecided writes, holding
 -- the exact (principal, ID, fingerprint) set lookup_receipts left undecided (expected) and
 -- the set record_receipts inserted (actual). close_guard deletes it only when the two sets
--- are identical; a deferred check refuses any COMMIT that still has its guard. Unused by
--- variant A (completion_guard false); the caller cannot choose. Every guard error is SQLSTATE ZBG01: the
+-- are identical; a deferred check refuses any COMMIT that still has its guard. Unused when
+-- completion_guard is false; the caller cannot choose. Every guard error is SQLSTATE ZBG01: the
 -- bridge's, never read as a refusal of the client's write.
 CREATE TABLE IF NOT EXISTS zebridge_private.receipt_guards (
     txid          xid8    PRIMARY KEY,
@@ -1249,11 +1249,14 @@ CREATE CONSTRAINT TRIGGER receipt_guard_closed AFTER INSERT ON zebridge_private.
 CREATE TABLE IF NOT EXISTS zebridge_private.receipt_policy (
     singleton       boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     retention_days  integer NOT NULL DEFAULT 180 CHECK (retention_days BETWEEN 1 AND 3650),
-    min_accepted_ms bigint  NOT NULL DEFAULT 0 CHECK (min_accepted_ms >= 0)
+    min_accepted_ms bigint  NOT NULL DEFAULT 0 CHECK (min_accepted_ms >= 0),
+    completion_guard boolean NOT NULL DEFAULT ${RECEIPT_COMPLETION_GUARD}
 );
--- receipts-locks prototype: variant B's completion guard, on for every transaction once
--- set (the bridge refuses to start if its build disagrees). One-way: never switched off.
+-- Upgrade a pre-guard database without silently changing its policy. Existing rows
+-- acquire false; the administrator explicitly enables the guard after stopping the old workers.
+-- Fresh installs use this binary's completion-guard default above (enabled by default).
 ALTER TABLE zebridge_private.receipt_policy ADD COLUMN IF NOT EXISTS completion_guard boolean NOT NULL DEFAULT false;
+ALTER TABLE zebridge_private.receipt_policy ALTER COLUMN completion_guard SET DEFAULT ${RECEIPT_COMPLETION_GUARD};
 INSERT INTO zebridge_private.receipt_policy DEFAULT VALUES ON CONFLICT DO NOTHING;
 
 CREATE OR REPLACE FUNCTION zebridge_private.receipt_policy_guard()
@@ -1305,7 +1308,7 @@ BEGIN
     WHILE m <= last_m LOOP
         part := 'receipts_' || to_char(m, 'YYYY_MM');
         IF to_regclass('zebridge_private.' || part) IS NULL THEN
-            -- Insert-only (receipts-locks): full pages, no room kept for updates.
+            -- Insert-only receipts: full pages, no room kept for updates.
             EXECUTE format('CREATE TABLE zebridge_private.%I PARTITION OF zebridge_private.receipts FOR VALUES FROM (%L) TO (%L)',
                            part, m, (m + interval '1 month')::date);
             RETURN NEXT part;
@@ -1359,7 +1362,7 @@ $$;
 --   claimed   undecided: execute it, then record_receipts with its outcome
 --   duplicate / repeat / conflict / expired / future / invalid: as claim_receipts did
 -- `fingerprint` is returned for record_receipts. With the completion guard on, the
--- undecided entries become this transaction's guard (variant B).
+-- undecided entries become this transaction's guard when enabled.
 CREATE OR REPLACE FUNCTION zebridge_private.lookup_receipts(p_principal text, p_ids text[], p_routes bytea[], p_payloads bytea[])
 RETURNS TABLE(ord integer, status text, outcome jsonb, fingerprint bytea)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog
@@ -1480,7 +1483,7 @@ RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalo
     SELECT completion_guard FROM zebridge_private.receipt_policy
 $$;
 
--- Variant B's finalizer: the receipts this transaction inserted must be exactly the
+-- The completion-guard finalizer: the receipts this transaction inserted must be exactly the
 -- undecided set lookup_receipts recorded, entry for entry (key and fingerprint, as
 -- multisets: both sides sorted by key, then fingerprint, whatever order they arrived in;
 -- an aggregate's ORDER BY 1 would sort by the constant 1, keeping arrival order). Then

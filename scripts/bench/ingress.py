@@ -54,7 +54,7 @@ def main():
     ap.add_argument("--dup-window-s", type=float, default=5)
     ap.add_argument("--per-process", type=float, default=5000, help="writes/s per load process")
     ap.add_argument("--out", type=pathlib.Path, required=True)
-    ap.add_argument("--receipt-guard", action="store_true", help="switch receipt_policy.completion_guard on (receipts-locks variant B)")
+    ap.add_argument("--receipt-guard", action="store_true", help="enable the completion guard when testing a binary whose init SQL defaults to disabled")
     a = ap.parse_args()
     pgbin = pathlib.Path(zb._psql_binary()).parent
     procs, made = [], {}
@@ -99,9 +99,12 @@ def main():
         init_sql = subprocess.run([str(a.bridge), "--init-sql"], env=env, capture_output=True, text=True, check=True).stdout
         sql(init_sql)
         # The schema version each result ran on: the rendered init SQL's hash.
-        schema = {"schema_sha256": hashlib.sha256(init_sql.encode()).hexdigest()[:16], "receipt_guard": a.receipt_guard}
         if a.receipt_guard:
             sql("UPDATE zebridge_private.receipt_policy SET completion_guard = true")
+        # Record the database's actual policy, including guard defaults and pre-receipt baselines.
+        has_policy = sql("SELECT to_regclass('zebridge_private.receipt_policy') IS NOT NULL") == "t"
+        actual_guard = has_policy and sql("SELECT coalesce((to_jsonb(p)->>'completion_guard')::boolean,false) FROM zebridge_private.receipt_policy p") == "t"
+        schema = {"schema_sha256": hashlib.sha256(init_sql.encode()).hexdigest()[:16], "receipt_guard": actual_guard}
         sql(DDL)
         refused = sql("SELECT step || ': ' || detail FROM zebridge_enable('public.sensor_events'::regclass, tenant_col => 'tenant_id', "
                       "writable => true, version_col => 'updated_at', tombstone_col => 'deleted_at', publication => 'bench_pub', "

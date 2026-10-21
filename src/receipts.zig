@@ -2,15 +2,14 @@
 //!
 //! One durable outcome per (principal, original message ID). The listener locks a write's
 //! receipt key (a transaction-scoped advisory lock), looks the receipt up, runs the write
-//! and inserts its complete receipt in the same transaction, so a retry, however late, is
-//! answered from the receipt instead of running again.
+//! and inserts its complete receipt in the same transaction, so a retry with a retained
+//! receipt is answered from it instead of running again. An expired ID without a receipt
+//! is refused as indeterminate; it never starts a new execution.
 //!
-//! receipts-locks prototype, two variants (build option -Dreceipt-guard):
-//!   A (false)  locks + final receipts: nothing in the database checks that a committed
-//!              write has its receipt; a COMMIT sent before the receipts commits without them.
-//!   B (true)   A + one completion guard per transaction: the lookup records the undecided
-//!              (principal, ID, fingerprint) set, close_guard verifies the inserted set is
-//!              exactly that one, and a deferred check refuses a COMMIT whose guard is open.
+//! The completion guard is enabled by default (-Dreceipt-guard=true). One guard per
+//! transaction records the undecided (principal, ID, fingerprint) set; close_guard verifies
+//! the completed receipts match it, and a deferred check refuses a COMMIT with an open guard.
+//! With the guard disabled, a premature COMMIT can persist writes without their receipts.
 //!
 //! A receipt failure (a missing partition, a refused claim or finish) is never the
 //! client's: the transaction is rolled back and the write retried. It is never answered
@@ -30,7 +29,7 @@ pub const Claim = struct {
     fingerprint: ?[:0]const u8 = null,
 };
 
-/// Variant B: the completion guard is on. The database decides (receipt_policy.
+/// Whether the completion guard is on. The database decides (receipt_policy.
 /// completion_guard); this build only knows whether to close it, and bootCheck refuses a
 /// database that disagrees.
 pub const guard = @import("build_options").receipt_guard;
@@ -253,7 +252,7 @@ fn resetIfPipelined(conn: ?*c.PGconn) void {
 }
 
 /// The single path's first exchange: BEGIN, the lock, the lookup (which opens the guard
-/// in variant B) and SAVEPOINT zb_write in one pipeline round. The lock and the guard come
+/// when enabled) and SAVEPOINT zb_write in one pipeline round. The lock and the guard come
 /// before the savepoint, so rolling back to it keeps both. An unclaimed write rolls it all
 /// back. On success the transaction is open, out of pipeline mode. Any failure is the
 /// receipts' (the caller rolls back and retries).
@@ -278,10 +277,10 @@ pub fn beginClaim(a: std.mem.Allocator, conn: ?*c.PGconn, principal: [:0]const u
     return readClaim(a, rs[2]);
 }
 
-/// The single path's last exchange: the receipt (and, in variant B, close_guard), the
+/// The single path's last exchange: the receipt (and close_guard when enabled), the
 /// application's deferred constraints checked now (SET CONSTRAINTS ALL IMMEDIATE) and
 /// COMMIT, in one pipeline round. `skip_receipt` is the commit_before_receipts test fault:
-/// COMMIT with no receipt and no close; B's guard refuses it at SET CONSTRAINTS (ZBG01).
+/// COMMIT with no receipt and no close; the guard refuses it at SET CONSTRAINTS (ZBG01).
 ///   error.ReceiptInfrastructure  the receipt or the guard was refused
 ///   error.DeferredRefused        a deferred constraint refused the write; `failure` holds
 ///                                why, and the transaction is aborted but open (the caller
@@ -315,7 +314,7 @@ pub fn finishCommit(a: std.mem.Allocator, conn: ?*c.PGconn, principal: [:0]const
     if (failed_at == n - 1 or !committed(rs[n - 1])) return error.CommitFailed;
 }
 
-/// One receipt outside pipeline mode (and, in variant B, close_guard).
+/// One receipt outside pipeline mode (and close_guard when enabled).
 pub fn finishOne(conn: ?*c.PGconn, principal: [:0]const u8, id: [:0]const u8, fp: [:0]const u8, outcome: [:0]const u8) !void {
     const values = [_]?[*:0]const u8{ principal.ptr, id.ptr, fp.ptr, outcome.ptr };
     const r = c.PQexecParams(conn, finish_sql, 4, null, &values, null, null, 0);
@@ -395,15 +394,17 @@ pub fn bootCheck(conn: ?*c.PGconn) !void {
     const g = c.PQexec(conn, "SELECT zebridge_private.completion_guard_on()");
     defer c.PQclear(g);
     if (c.PQresultStatus(g) != c.PGRES_TUPLES_OK or c.PQntuples(g) != 1) {
-        log.err("🔴 FATAL: the receipt policy has no completion_guard — apply this branch's `bridge --init-sql`", .{});
+        log.err("🔴 FATAL: the receipt policy has no completion_guard — apply the current `bridge --init-sql`", .{});
         return error.ReceiptsNotInstalled;
     }
     const on = std.mem.eql(u8, std.mem.span(c.PQgetvalue(g, 0, 0)), "t");
     if (on != guard) {
-        log.err("🔴 FATAL: receipt_policy.completion_guard is {} but this bridge is built for variant {s}", .{ on, if (guard) "B" else "A" });
+        log.err("🔴 FATAL: receipt_policy.completion_guard is {} but this bridge requires {}", .{ on, guard });
+        if (guard and !on) log.err("After draining and stopping old workers, enable the completion guard as administrator: UPDATE zebridge_private.receipt_policy SET completion_guard = true WHERE singleton;", .{});
         return error.ReceiptsNotInstalled;
     }
-    log.info("🧾 receipts: advisory locks, variant {s}", .{if (guard) "B (completion guard)" else "A (final receipts only)"});
+    if (!guard) log.warn("Receipt completion guard disabled: a premature COMMIT can persist writes without receipts", .{});
+    log.info("🧾 receipts: advisory locks, completion guard {s}", .{if (guard) "enabled" else "disabled"});
     try maintain(conn);
 }
 

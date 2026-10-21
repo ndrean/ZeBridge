@@ -1303,7 +1303,7 @@ Reading this protocol, the asymmetry is the first thing to explain. §3–§6 as
 | --- | --- |
 | a transaction that serialises concurrent writers | a version column and last-write-wins (§7.3) |
 | a sequence you can reach to allocate a key | a key the client mints alone (§7.2) |
-| exactly-once execution | `Nats-Msg-Id` dedup **plus** an idempotent upsert, because the dedup window is finite (§2) |
+| retries without repeating committed transactional effects | durable PostgreSQL receipts keyed by principal and original message ID (§7.4b); JetStream deduplication alone has a finite window |
 | a return value | the verdict channel (§7.4b) |
 | seeing a row deleted while you were away | tombstones and the GC watermark (§7.5) |
 | a session identity the server already knows | the principal as a subject token the broker vouched for (§7.1) |
@@ -2050,8 +2050,7 @@ longer exists.
 
 ### 7.4b The reply channel — `mutation_ack.<principal>.<msg_id>` ✅
 
-Every mutation the bridge reaches a conclusion about gets exactly one reply, on a subject
-built from the principal that wrote it and the `Nats-Msg-Id` the client chose:
+Every delivery the bridge reaches a conclusion about gets a verdict on the subject below. A retry replays the recorded outcome, using the principal that wrote it and the original message ID the client chose:
 
 ```
 mutation_ack.<principal>.<msg_id>
@@ -2101,7 +2100,13 @@ reply published under it would be read back by the bridge as if it were a write.
 | `failed` | the attempt failed for a reason that may not recur, after the delivery limit | keep, or resend under the same `msg_id` |
 | `indeterminate` | this attempt did not run, and whether an earlier attempt committed is unknown: `MessageIdExpired` (the ID is older than the receipt minimum and has no receipt), `MessageIdReused` (the ID already names a different write), `ReceiptUnreadable` | pop, never resend under a new ID, and reconcile (§7.4c) |
 
-The bridge acks a write on `MUTATIONS` only after PostgreSQL commits it. If it stops between the two, JetStream delivers the write again; a redelivery whose row already carries this write's version is answered `accepted`, not `stale` or `row_deleted`.
+Newly adjudicated writes commit their SQL effects and definitive outcomes together before acknowledgement on `MUTATIONS`; permanent SQL refusals commit their rejection receipts. A duplicate is acknowledged after reading its existing receipt. If the bridge stops between commit and acknowledgement, JetStream delivers the write again and the receipt supplies the original semantic outcome, including the stored version. Delivery fields such as `seq` are rebuilt for the current message. ID-policy refusals (expired, reused, future or invalid) execute no mutation SQL and create no new receipt. Temporary database or receipt failures are retried; exhausting the delivery budget returns `failed` without storing a definitive receipt. An ambiguous commit is never classified as a permanent rejection.
+
+**Durable receipts.** Receipts live in the bridge-owned `zebridge_private` schema, outside public replication, reader grants and client write routes. The key is the principal and original message ID, with the ID's derived UTC month as the partition key. On admission-queue messages the original ID must come from `ZB-Client-Msg-Id`; direct mode uses `Nats-Msg-Id`. A SHA-256 fingerprint covers a length-framed route and the payload's exact received bytes. A matching retry gets the recorded outcome before current table metadata, grants or GC watermark checks; the same ID with different content gets `indeterminate` with `MessageIdReused`.
+
+The listener takes transaction-scoped advisory locks in one global order, then reads receipts in a fresh Read Committed statement. It runs only undecided writes and inserts completed receipts in the same transaction. The exact text key remains protected by a unique constraint; a collision of advisory lock hashes only serializes unrelated work. One database completion guard per transaction records the undecided identities and fingerprints, verifies the completed multiset, and refuses an early COMMIT that skipped recording receipts or closing the guard. Receipt locks do not prevent deadlocks involving application rows or triggers, so retry handling remains necessary. Only transactional effects are covered; external side effects or PostgreSQL sequence consumption do not become transactional.
+
+New IDs carry their creation time once, and outbox retries preserve the ID and bytes. The default retry horizon is 180 days, also bounding how long a device can remain offline with pending writes. Maintenance monotonically raises the minimum accepted creation time and creates partitions through next month; it never prunes automatically. Administrator pruning can drop whole expired monthly partitions, while the legacy sentinel partition is never pruned. A retained receipt still answers an old ID; an older ID without one returns `indeterminate` with `MessageIdExpired` and never executes. Future or malformed IDs without a receipt are refused. Normal builds and fresh installs enable the completion guard; an existing disabled policy requires explicit administrator enablement after draining old workers. See [Operations](OPERATIONS.md#upgrading-mutation-receipts).
 
 **What the libraries report.** Both client libraries turn these statuses into one outcome per write, reported once when final (`onVerdict` in zb-client-ts, the poll report's `outcomes` in libzb): `applied` (`accepted`); `rebased` (`stale`, and the library re-sent the edit because the winner changed other columns: `rebasedAs`); `lost` (`stale` on the same columns: `lostColumns`); `deleted` (`row_deleted`); `rejected`, with `reason`, and PostgreSQL's `sqlstate` and `detail` when it refused; `indeterminate` (`indeterminate`, or a status the library does not know), with `reason`, then `reconciled` once its reconciliation finished (§7.4c). A `failed` or `rate_limited` write has no outcome yet: it stays in the outbox.
 
@@ -2131,7 +2136,7 @@ Tested by `scripts/scenarios/replies.py` (all three success outcomes) and
 
 `indeterminate` settles a write for retransmission but not for its outcome: an earlier attempt may have committed, or none did. Only the authoritative state can say which, so both client libraries reconcile.
 
-**Release compatibility:** libzb before durable reconciliation settles this unfamiliar verdict without an authoritative refresh; older TS may additionally publish the original write once more during outbox replay. These clients do not provide the recovery guarantee below. Entries already settled by an old client have no durable reconciliation marker, so a later client upgrade alone cannot recover them. See the [upgrade order and older-client release note](OPERATIONS.md#release-note-older-clients-and-indeterminate-verdicts).
+Clients that predate this section do not provide the guarantee below; see [OPERATIONS](OPERATIONS.md#client-requirements-for-indeterminate-recovery).
 
 1. **Settle durably.** In one local transaction the outbox entry is removed and a reconciliation marker is stored. A crash leaves one or the other: the queued write, which is resent and answered again, or the marker, which is reconciled at the next pass. The optimistic row stays as it is for now. The library never resends the write under a new ID: re-enqueuing it is the application's decision.
 2. **Rewind.** The write's table loses its generations watermark, so its next seed is a full that replaces its optimistic row, and the write's CDC route returns to position 0. A route under reconciliation is not tailed. The TS client stops buffered tail work and waits for active flushes and idle checks before persisting the rewind; consumer setup cannot race that transition. Several markers on one route share one rewind.

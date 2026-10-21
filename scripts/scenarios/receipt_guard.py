@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Variant B's completion guard, driven in SQL as the writer role (receipts-locks prototype).
+"""The receipt completion guard, driven in SQL as the writer role.
 
-A disposable database gets `bridge --init-sql` and the guard switched on. Each case is one
+A disposable database gets `bridge --init-sql`, which must enable the guard by default. Each case is one
 transaction through psql, run as the writer: the guard must hold the exact set of undecided
 (principal, ID, fingerprint) entries from the lookup, refuse a COMMIT that skipped the
 receipts or close_guard, refuse a recorded set that differs in identity (not only in count),
@@ -68,7 +68,9 @@ def main():
                    DATABASE_WRITER_URL=f"postgres://{writer}:x@127.0.0.1:5432/{name}", TARGET_DB=name, BRIDGE_CDC_PUBLICATION="rg_pub")
         r = run(subprocess.run([str(BRIDGE), "--init-sql"], env=env, capture_output=True, text=True, check=True).stdout)
         assert r.returncode == 0, r.stderr
-        r = run("UPDATE zebridge_private.receipt_policy SET completion_guard = true; SELECT string_agg(p, ',') FROM zebridge_private.maintain_receipts() p;")
+        r = run("SELECT completion_guard FROM zebridge_private.receipt_policy")
+        assert r.returncode == 0 and r.stdout.strip() == "t", "installation must enable the completion guard"
+        r = run("SELECT string_agg(p, ',') FROM zebridge_private.maintain_receipts() p;")
         assert r.returncode == 0, r.stderr
 
         x, y, z = ident("X"), ident("Y"), ident("Z")

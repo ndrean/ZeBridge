@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Mutation receipts in a disposable local PostgreSQL database (hub fallback, stage 2a).
 
-Exercises the zebridge_private receipt storage through the writer's functions (receipts-locks
-prototype: lock_receipts, lookup_receipts, record_receipts, close_guard): month derivation
+Exercises the zebridge_private receipt storage through the writer's functions
+(lock_receipts, lookup_receipts, record_receipts, close_guard): month derivation
 from the ID, claimed/duplicate/conflict/expired/future/invalid verdicts, one receipt per
 write, a concurrent duplicate waiting on the lock, the legacy sentinel, the monotonic
 minimum, privileges, DDL silence, pruning and pg_dump.
 
-ZB_RECEIPT_GUARD=1 runs variant B: the database's completion guard is switched on, every
-finish closes it, and a lookup committed without its receipt must be refused.
+The guard is enabled by default: every finish closes it, and a lookup
+committed without its receipt must be refused. ZB_RECEIPT_GUARD=0 requires a
+binary built with -Dreceipt-guard=false.
 """
 import datetime
 import os
@@ -20,7 +21,7 @@ import uuid
 import zb
 
 BRIDGE = pathlib.Path(os.environ.get("ZB_BRIDGE_BIN", zb.ROOT / "zig-out/bin/bridge"))
-GUARD = os.environ.get("ZB_RECEIPT_GUARD") == "1"
+GUARD = os.environ.get("ZB_RECEIPT_GUARD", "1") == "1"
 
 
 def ms(dt):
@@ -79,11 +80,8 @@ def main():
         rendered = subprocess.run([str(BRIDGE), "--init-sql"], env=env, capture_output=True, text=True, check=True).stdout
         first = sql(rendered)
         sql(rendered)  # idempotent re-apply
-        if GUARD:
-            sql("UPDATE zebridge_private.receipt_policy SET completion_guard = true")
-            sql(rendered)  # a re-apply keeps the guard on
-            check(sql("SELECT completion_guard FROM zebridge_private.receipt_policy").stdout.strip() == "t",
-                  "variant B: the completion guard is on and survives a re-apply of --init-sql")
+        check((sql("SELECT completion_guard FROM zebridge_private.receipt_policy").stdout.strip() == "t") == GUARD,
+              "the installed receipt default matches the build and survives a re-apply of --init-sql")
         check(first.stdout.strip() == "", "installing receipts prints nothing into --init-sql's output")
         count_parts = "SELECT count(*) FROM pg_inherits WHERE inhparent = 'zebridge_private.receipts'::regclass"
         check(sql(count_parts).stdout.strip() == "0", "installation creates no partition (pg_restore --clean must not meet one)")
@@ -134,10 +132,10 @@ def main():
         r = claim([unfinished])
         if GUARD:
             check(r.returncode != 0 and "would commit without their receipts" in r.stderr,
-                  "variant B: a lookup that found the ID undecided cannot commit without its receipt")
+                  "guard enabled: a lookup that found the ID undecided cannot commit without its receipt")
         else:
             check(r.returncode == 0 and statuses(r) == ["claimed"],
-                  "variant A: a lookup inserts nothing, so committing without a receipt is not refused (A's limitation)")
+                  "guard disabled: a lookup inserts nothing, so committing without a receipt is not refused")
         r = claim([unfinished], extra=finish([unfinished]))
         check(statuses(r) == ["claimed"], "nothing was left behind: the ID is still undecided, then recorded")
         r = sql(f"SET ROLE {writer}; BEGIN; {finish([new_id])} COMMIT;", check=False)

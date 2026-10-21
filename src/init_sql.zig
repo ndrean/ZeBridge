@@ -9,6 +9,7 @@
 //!   role names and passwords  ← DATABASE_READER_URL / DATABASE_WRITER_URL
 //!   TARGET_DB                 ← the reader URL's database (TARGET_DB overrides)
 //!   OPEN_TENANT, LEAF_PREFIX  ← the embedded grammar
+//!   RECEIPT_COMPLETION_GUARD  ← this binary's build option (enabled by default)
 //! No DATABASE_WRITER_URL: the read-only profile (init.core only), as the bridge itself
 //! runs without ingress. BRIDGE_CDC_PUBLICATION set: `zebridge_create_publication` is
 //! appended, so one pipe does the whole of step 3.
@@ -68,6 +69,7 @@ pub fn run(io: std.Io, init: *const std.process.Init) u8 {
         .{ .name = "TARGET_DB", .value = target_db },
         .{ .name = "OPEN_TENANT", .value = open_tenant },
         .{ .name = "LEAF_PREFIX", .value = owned.topology.leaf_prefix },
+        .{ .name = "RECEIPT_COMPLETION_GUARD", .value = if (@import("build_options").receipt_guard) "true" else "false" },
     };
 
     var sql: std.ArrayList(u8) = .empty;
@@ -140,7 +142,7 @@ fn quoteDoubled(a: std.mem.Allocator, s: []const u8) ![]const u8 {
     return std.mem.replaceOwned(u8, a, s, "'", "''");
 }
 
-/// `${NAME}` → its value, for the six names the templates use. Anything else in that
+/// `${NAME}` → its value, for the known names the templates use. Anything else in that
 /// shape is an error: the templates have exactly these, and a new one must be added here.
 fn render(a: std.mem.Allocator, sql: *std.ArrayList(u8), template: []const u8, vars: []const Var) !void {
     var i: usize = 0;
@@ -229,8 +231,8 @@ test "render substitutes, quotes passwords, and refuses a leftover" {
     try std.testing.expectError(error.EmptyVariable, render(aa, &d, "GRANT x TO ${POSTGRES_WRITER_USER};", &empty));
 }
 
-test "both embedded templates name only the six known variables" {
-    const known = [_][]const u8{ "POSTGRES_READER_USER", "POSTGRES_READER_PASSWORD", "POSTGRES_WRITER_USER", "POSTGRES_WRITER_PASSWORD", "TARGET_DB", "OPEN_TENANT", "LEAF_PREFIX" };
+test "both embedded templates name only known variables" {
+    const known = [_][]const u8{ "POSTGRES_READER_USER", "POSTGRES_READER_PASSWORD", "POSTGRES_WRITER_USER", "POSTGRES_WRITER_PASSWORD", "TARGET_DB", "OPEN_TENANT", "LEAF_PREFIX", "RECEIPT_COMPLETION_GUARD" };
     for ([_][]const u8{ core_template, write_template }) |t| {
         var i: usize = 0;
         while (std.mem.findPos(u8, t, i, "${")) |start| {

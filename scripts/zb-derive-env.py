@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Derive what init.sql needs from the values that already exist elsewhere.
 
-One value, one home. `init.{core,write}.template.sql` interpolates seven
+One value, one home. `init.{core,write}.template.sql` interpolates the template
 variables, and four of them are the bridge's own role credentials — the same
 secret `.env.bridge` already carries inside `DATABASE_READER_URL` /
 `DATABASE_WRITER_URL`, only in parts instead of as a URL. Storing them twice is
@@ -63,6 +63,17 @@ def derive_into(env) -> dict:
                 out["OPEN_TENANT"] = grammar["open_tenant"]
         except (OSError, json.JSONDecodeError):
             pass
+    if not env.get("LEAF_PREFIX"):
+        grammar = json.loads((ROOT / "src" / "grammar.json").read_text())
+        env["LEAF_PREFIX"] = grammar.get("leaf_prefix", "lf-")
+        out["LEAF_PREFIX"] = env["LEAF_PREFIX"]
+    # Legacy envsubst installs enable the guard by default. An explicit override
+    # can set false; bridge --init-sql uses its own build option instead.
+    if not env.get("RECEIPT_COMPLETION_GUARD"):
+        env["RECEIPT_COMPLETION_GUARD"] = "true"
+        out["RECEIPT_COMPLETION_GUARD"] = "true"
+    if env["RECEIPT_COMPLETION_GUARD"] not in ("true", "false"):
+        raise ValueError("RECEIPT_COMPLETION_GUARD must be true or false")
     return out
 
 

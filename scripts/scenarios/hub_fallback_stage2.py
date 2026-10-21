@@ -14,8 +14,8 @@ rows or an AFTER trigger, it also sees a repeated upsert that changed nothing.
   concurrent duplicates        both copies stored before the bridge looks: one execution
   direct mode                  without admission, a write with no ID is never executed
 
-ZB_RECEIPT_GUARD=1 (receipts-locks variant B; ZB_BRIDGE_BIN built with -Dreceipt-guard=true)
-switches the database's completion guard on, and the bridge must report variant B.
+The completion guard is enabled by default. ZB_RECEIPT_GUARD=0 requires a binary built with
+-Dreceipt-guard=false; installation and startup must agree without a fixture override.
 """
 import asyncio, ctypes, datetime, json, os, pathlib, signal, socket, subprocess, tempfile, time, uuid
 
@@ -27,7 +27,7 @@ from rotate_client_key import client_creds as mint_client
 
 BRIDGE = pathlib.Path(os.environ.get("ZB_BRIDGE_BIN", zb.ROOT / "zig-out/bin/bridge"))
 LIBRARY = pathlib.Path(os.environ.get("ZB_LIBZB", zb.ROOT / "libzb/zig-out/lib" / ("libzbcore.dylib" if os.uname().sysname == "Darwin" else "libzbcore.so")))
-GUARD = os.environ.get("ZB_RECEIPT_GUARD") == "1"
+GUARD = os.environ.get("ZB_RECEIPT_GUARD", "1") == "1"
 WINDOW_S = 125  # past JetStream's default two-minute duplicate window
 
 
@@ -90,8 +90,9 @@ class Stack:
                         DATABASE_WRITER_URL=f"postgres://{w}:x@127.0.0.1:5432/{self.name}", TARGET_DB=self.name,
                         BRIDGE_CDC_PUBLICATION="hf2_pub")
         self.sql(subprocess.run([str(BRIDGE), "--init-sql"], env=self.env, capture_output=True, text=True, check=True).stdout)
-        if GUARD:
-            self.sql("UPDATE zebridge_private.receipt_policy SET completion_guard = true")
+        installed = self.sql("SELECT completion_guard FROM zebridge_private.receipt_policy") == "t"
+        if installed != GUARD:
+            raise RuntimeError("installed receipt default disagrees with ZB_RECEIPT_GUARD (enabled by default; disabling requires -Dreceipt-guard=false)")
         enable = ("SELECT * FROM zebridge_enable('public.{t}', public_reason => 'stage 2 fixture', writable => true, version_col => 'updated_at', "
                   "allow_physical_deletes => true, publication => 'hf2_pub', dry_run => false); ")
         self.sql("CREATE TABLE audit (n bigserial PRIMARY KEY, tbl text NOT NULL, id uuid NOT NULL); "
@@ -124,7 +125,7 @@ class Stack:
             await self.wait_log("admission", "mutation admission ready")
         self.spawn("bridge", [str(BRIDGE), "--pub", "hf2_pub", "--slot", self.name + "_slot", "--port", str(port())], self.env)
         await self.wait_log("bridge", "Ready! Pulling mutations")
-        await self.wait_log("bridge", "variant B" if GUARD else "variant A")
+        await self.wait_log("bridge", "completion guard enabled" if GUARD else "completion guard disabled")
         await asyncio.sleep(2)  # clear of the GC watermark the bridge sets at start
 
     def start_admission(self):

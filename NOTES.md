@@ -19281,3 +19281,13 @@ It found two bugs:
   up to the sync share one implicit transaction).
 * zb-client-ts: `onVerdict` reported verdicts for other devices of the same principal (the ack
   subject is the principal's). Now only a write in this client's outbox or sent this session.
+
+## Durable indeterminate reconciliation — compatibility history (2026-10-21)
+
+Durable client reconciliation was introduced in `6dc66ff`; `251ad46` added tail fencing, verification of every recovery target and parking of markers without an automatic recovery route. These changes are required together for the recovery guarantee in PROTOCOL §7.4c.
+
+Before these changes, libzb settled an unfamiliar `indeterminate` verdict silently: it removed the outbox entry without reverting or scheduling an authoritative refresh. Older TS could also publish the original write once more during outbox replay after collecting that unfamiliar verdict. Receipt checks still protected a retained receipt from executing twice, but neither client guaranteed reconciliation of its local optimistic value. If no earlier attempt committed, the replica could retain a value the hub never stored.
+
+Upgrading does not reconstruct reconciliation markers for entries already settled by those clients; affected replicas need an authoritative full resync. The new clients report `indeterminate`, persist recovery atomically with removing the outbox entry, and report `reconciled` only after verified hub recovery. On-demand and unfollowed tables stay unresolved until a recovery path exists. Legacy message IDs remain accepted, and the public C ABI remains version 7.
+
+The minimum compatible release has not been numbered. The `v0.2.6` tag predates these changes, while the candidate's libzb and zb-client-ts manifests still say `0.2.6`; that version string cannot distinguish the implementations. Set the minimum client release in OPERATIONS when the compatible release is assigned, rather than using a commit hash as an operator requirement.

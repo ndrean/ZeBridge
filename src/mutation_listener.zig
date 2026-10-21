@@ -1192,7 +1192,7 @@ pub const MutationListener = struct {
 
         // The application's deferred constraints are checked before COMMIT, while this
         // write can still be rolled back alone: at COMMIT their failure would take the
-        // receipt with it. In variant B the guard is closed first, so its check passes.
+        // receipt with it. When enabled, the guard is closed first, so its check passes.
         var failure: receipts.Failure = .{};
         const fp = claim.fingerprint orelse return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
         receipts.finishCommit(a, conn, principal_z, id_z, fp, outcome, faultAt(.commit_before_receipts), &failure) catch |err| switch (err) {
@@ -1535,7 +1535,7 @@ pub const MutationListener = struct {
                 sent_ok = sent_ok and try receipts.sendFinishes(a, conn, items.items[span[0]].principal_z, ids, fps, outcomes);
                 if (faultAt(.oom_in_finishes)) return error.OutOfMemory; // a finish queued, the pipeline open
             }
-            // Variant B: close_guard verifies the receipts are exactly the undecided set.
+            // close_guard verifies the receipts are exactly the undecided set.
             const close = receipts.guard and !skip_receipts;
             if (close) sent_ok = sent_ok and c.PQsendQueryParams(conn, receipts.close_sql, 0, null, null, null, null, 0) == 1;
             const finishes = (if (skip_receipts) 0 else fgroups.len) + @intFromBool(close);
@@ -2155,7 +2155,7 @@ pub const MutationListener = struct {
 
     /// The write failed permanently after its claim: undo the write (the savepoint), keep
     /// the claim, record `rejected` with this failure, and commit. False: roll back.
-    /// The lock and (variant B) the guard were taken before the savepoint: both survive.
+    /// The lock and (when enabled) the guard were taken before the savepoint: both survive.
     fn recordRejection(self: *MutationListener, a: std.mem.Allocator, conn: ?*c.PGconn, principal_z: [:0]const u8, id_z: [:0]const u8, fingerprint: ?[:0]const u8, reason: []const u8) bool {
         const fp = fingerprint orelse {
             receipts.rollback(conn);

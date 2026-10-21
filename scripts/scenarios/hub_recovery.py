@@ -5,9 +5,9 @@ Creates two scratch databases and private NATS servers. A native client writes
 through admission, a checkpoint drains it, and a replacement hub rebuilds from
 pg_restore under the same NATS identity. The old replica must converge too.
 
-ZB_RECEIPT_GUARD=1 (receipts-locks variant B; ZB_BRIDGE_BIN built with -Dreceipt-guard=true)
-switches the source's completion guard on: the restore must carry it, or the replacement
-bridge refuses to start.
+The guard is enabled by default; ZB_RECEIPT_GUARD=0 selects a binary built with
+-Dreceipt-guard=false. The installed policy must match without an override, and the
+restore must carry it, or the replacement bridge refuses to start.
 """
 import asyncio
 import ctypes
@@ -31,7 +31,7 @@ from rotate_client_key import client_creds as mint_client
 
 ROOT = zb.ROOT
 BRIDGE = pathlib.Path(os.environ.get("ZB_BRIDGE_BIN", ROOT / "zig-out/bin/bridge"))
-GUARD = os.environ.get("ZB_RECEIPT_GUARD") == "1"
+GUARD = os.environ.get("ZB_RECEIPT_GUARD", "1") == "1"
 LIBRARY = pathlib.Path(os.environ.get("ZB_LIBZB", ROOT / "libzb/zig-out/lib" / ("libzbcore.dylib" if os.uname().sysname == "Darwin" else "libzbcore.so")))
 spec = importlib.util.spec_from_file_location("checkpoint", ROOT / "deploy/backup-hub.py")
 backup = importlib.util.module_from_spec(spec)
@@ -109,8 +109,7 @@ async def main():
             sql(f'CREATE DATABASE "{source}"', "postgres")
             made.append(source)
             sql(render(source))
-            if GUARD:
-                sql("UPDATE zebridge_private.receipt_policy SET completion_guard = true")
+            assert (sql("SELECT completion_guard FROM zebridge_private.receipt_policy") == "t") == GUARD, "installed receipt policy must match the selected build"
             sql("CREATE TABLE recovery_row (id uuid PRIMARY KEY, v int NOT NULL, updated_at timestamptz NOT NULL DEFAULT now()); "
                 "SELECT * FROM zebridge_enable('public.recovery_row', public_reason => 'recovery fixture', writable => true, "
                 "version_col => 'updated_at', allow_physical_deletes => true, publication => 'recovery_pub', dry_run => false); "

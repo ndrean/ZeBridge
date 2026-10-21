@@ -7,7 +7,7 @@ The reference for running ZeBridge: the CLI, the doctor (`--diagnose`), what nee
 - [The CLI](#the-cli)
 - [Diagnose](#diagnose)
 - [Upgrading mutation receipts](#upgrading-mutation-receipts)
-  - [Release note: older clients and indeterminate verdicts](#release-note-older-clients-and-indeterminate-verdicts)
+  - [Client requirements for indeterminate recovery](#client-requirements-for-indeterminate-recovery)
 - [Restart rules](#restart-rules)
   - [Checking a table / database against the bridge's rules](#checking-a-table--database-against-the-bridges-rules)
 - [Suspended tables](#suspended-tables)
@@ -159,15 +159,15 @@ umask 077
 psql "$ADMIN_DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f zebridge-upgrade.sql
 ```
 
-3. On the `receipts-locks` candidate, select the same variant in the binary and database. Variant B requires a bridge built with `-Dreceipt-guard=true` and the administrator setting `UPDATE zebridge_private.receipt_policy SET completion_guard = true WHERE singleton;` after the init SQL succeeds. The installer does not enable B automatically. Enabling the guard is one-way: the database refuses to turn it off, and a mismatched bridge refuses to start. Variant A remains experimental; its early-commit fault can commit writes without receipts.
+3. Ensure the receipt completion guard is enabled. Normal builds and fresh SQL installs enable it by default. Reapplying init SQL preserves the existing guard setting, retention and minimum accepted timestamp. If the guard is disabled or the policy predates the guard column, enable it as administrator after the init SQL succeeds and the old workers have been drained and stopped: `UPDATE zebridge_private.receipt_policy SET completion_guard = true WHERE singleton;`. Enablement is one-way: the database refuses to turn the guard off, and a bridge whose build disagrees with the policy refuses to start.
 4. Upgrade and start the bridge workers, then resume mutation admission after startup succeeds. Startup maintenance creates the required monthly partitions and the legacy partition before the first receipt lookup; installation itself creates no partitions. Existing receipts and the monotonic minimum accepted timestamp must survive the upgrade. Do not clear them or recreate the policy to make a startup check pass.
 5. Verify an actual client write commits, echoes and clears its outbox, and check receipt maintenance and worker logs. A binary rollback alone is not a database rollback: retain a compatible schema/build combination and use the checkpoint recovery procedure if restoration is required.
 
-### Release note: older clients and indeterminate verdicts
+### Client requirements for indeterminate recovery
 
-Deploy client builds with durable `indeterminate` reconciliation, including the fixes in `251ad46`, before relying on automatic recovery from expired or reused message IDs. Older libzb settles an unfamiliar `indeterminate` verdict silently: it removes the outbox entry without reverting or scheduling an authoritative refresh. Older TS can also publish the original write once more during outbox replay after collecting that unfamiliar verdict. Receipt checks still protect a retained receipt from executing twice, but neither old client guarantees that its local optimistic value is reconciled.
+**Minimum compatible client release: not yet assigned.** Clients from the `v0.2.6` tag do not provide durable `indeterminate` recovery. Until a compatible release is numbered, use a validated candidate build of libzb or zb-client-ts implementing [PROTOCOL §7.4c](PROTOCOL.md#74c-reconciling-an-indeterminate-write) before relying on automatic recovery from expired or reused message IDs. The package version and C ABI alone do not certify this capability.
 
-When no earlier attempt committed, an old client can therefore keep a local value that the hub never stored. Upgrading the client does not reconstruct reconciliation markers for entries already settled by old code; affected replicas need an authoritative full resync. Current clients report `indeterminate`, persist recovery atomically with removing the outbox entry, and report `reconciled` only after verified hub recovery. On-demand and unfollowed tables remain visibly unresolved until a recovery path exists. See [PROTOCOL §7.4c](PROTOCOL.md#74c-reconciling-an-indeterminate-write). Legacy message IDs remain accepted, and the public C ABI remains version 7.
+If a replica settled an uncertain write without a durable reconciliation marker, perform an authoritative full resync; upgrading the client cannot reconstruct that marker. On-demand and unfollowed tables remain unresolved until configured with an authoritative recovery path.
 
 [⬆️](#table-of-contents)
 

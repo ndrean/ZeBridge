@@ -64,6 +64,8 @@ REQUIRED_VARS = [
     # The tenant guard's default. Empty renders `hstore(col, '')` — a row routed to
     # `cdc..<table>.<op>`, an illegal subject no stream captures.
     "OPEN_TENANT",
+    "LEAF_PREFIX",
+    "RECEIPT_COMPLETION_GUARD",
 ]
 
 ADMIN_URL = os.environ.get(
@@ -163,13 +165,20 @@ async def main():
         else:
             zb.ok("the rendered SQL applies cleanly to a fresh database")
 
+        guard = admin("SELECT completion_guard FROM zebridge_private.receipt_policy", db=SCRATCH_DB)
+        if guard.returncode == 0 and guard.stdout.strip() == ("t" if os.environ["RECEIPT_COMPLETION_GUARD"] == "true" else "f"):
+            zb.ok("the envsubst install selects the requested receipt policy (enabled by default)")
+        else:
+            zb.bad("the envsubst install lost the receipt completion-guard default")
+            failed += 1
+
         # The decisive count. psql exiting 0 is not evidence: the truncation bug produced a
         # clean exit with six of seven functions missing.
         counts = admin(
             "SELECT (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace"
-            "        WHERE n.nspname='public' AND p.proname LIKE 'zebridge%')::text"
+            "        WHERE (n.nspname='public' AND p.proname LIKE 'zebridge%') OR n.nspname='zebridge_private')::text"
             " || '|' || (SELECT count(*) FROM pg_event_trigger WHERE evtname LIKE 'zebridge%')::text"
-            " || '|' || (SELECT count(*) FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'zebridge%')::text",
+            " || '|' || (SELECT count(*) FROM pg_tables WHERE (schemaname='public' AND tablename LIKE 'zebridge%') OR schemaname='zebridge_private')::text",
             db=SCRATCH_DB,
         ).stdout.strip()
         fns, trgs, tbls = (int(x) for x in counts.split("|"))
