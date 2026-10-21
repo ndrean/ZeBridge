@@ -298,6 +298,8 @@ const Startup = struct {
     }
 };
 
+pub const outbox_window: usize = 128;
+
 pub const SyncClient = struct {
     a: std.mem.Allocator,
     arena: std.heap.ArenaAllocator, // client-lifetime allocations (states, grammar)
@@ -364,23 +366,17 @@ pub const SyncClient = struct {
     /// `join`/`leave` at runtime. Tenant-scoped tables seed one chain per entry and
     /// read one `CDC_<tenant>` stream per entry. Client arena.
     tenants: []const []const u8 = &.{},
-    /// §10el: when each pending write was last sent by THIS process (unix ms). A
-    /// `flush` used to run the reconnect pass — one direct get for the verdict, then
-    /// a replay — over every pending entry, including a write sent a millisecond
-    /// earlier: the direct get beat the verdict subscription and the log said the
-    /// client had been "away", and every entry cost a request per flush. An entry
-    /// sent within the grace window is left to the subscription. Empty at start, so a
-    /// fresh process (and a real outage, longer than the grace) still runs the full
-    /// pass, which is what PROTOCOL §7.4b asks. Keys owned here, freed on settle.
-    sent_at: std.StringHashMapUnmanaged(i64) = .empty,
     /// §10fk: a `rate_limited` verdict names `retry_after_ms`; the outbox is not
     /// flushed before then. The write stays queued, exactly as after `failed`.
     hold_until_ms: i64 = 0,
-    /// The host's normal poll loop also pumps pending writes after an outage. Bound
-    /// the work and spread reconnecting devices; flushOutbox retains its send grace,
-    /// rate-limit gate and original durable IDs/bytes.
+    /// Reconnect jitter only. Steady-state refill is verdict-clocked; positive
+    /// outbox retry_at reservations survive restart and back off per entry.
     next_outbox_retry_ms: i64 = 0,
     outbox_reconnect_epoch: u64 = 0,
+    outbox_retry_on_reconnect: bool = false,
+    outbox_next_check_ms: i64 = 0,
+    outbox_clock_ms: i64 = 0,
+    outbox_first_pump: bool = true,
     /// Streams the gap rule found RESTARTED (position beyond last_seq, NOTES §10bm's
     /// third shape) and no manifest has re-anchored on since. While a stream is here, a
     /// manifest whose `cutoff_seq` is beyond the stream's last_seq was cut on the previous
@@ -607,9 +603,6 @@ pub const SyncClient = struct {
     pub fn deinit(self: *SyncClient) void {
         self.releaseHandles();
         if (self.pass_arena) |*ar| ar.deinit();
-        var sit = self.sent_at.iterator();
-        while (sit.next()) |e| self.a.free(e.key_ptr.*);
-        self.sent_at.deinit(self.a);
         var pit = self.last_pending.iterator();
         while (pit.next()) |e| self.a.free(e.key_ptr.*);
         self.last_pending.deinit(self.a);
@@ -3410,7 +3403,7 @@ pub const SyncClient = struct {
         // requests a second per stream — about 6,500 a second for 500 devices doing
         // nothing (measured on the hub, 2026-10-19). nats.zig re-asks after a reconnect.
         self.tail_inbox.?.request_expires_ms = tail_watch_ms;
-        self.wireServeWakes();
+        self.wirePollWakes();
         return self.tail_inbox.?;
     }
 
@@ -3431,9 +3424,12 @@ pub const SyncClient = struct {
         ib.inbox_subscription.messages.wake();
     }
 
-    fn wireServeWakes(self: *SyncClient) void {
+    fn wirePollWakes(self: *SyncClient) void {
         const ib = self.tail_inbox orelse return;
         for (self.serve_subs) |sub| sub.wake_on_message = ib.inbox_subscription;
+        // A verdict must clock the write window even when the followed CDC
+        // stream is idle. Both borrowers are released before this inbox.
+        if (self.verdicts) |sub| sub.wake_on_message = ib.inbox_subscription;
     }
 
     /// Set aside and not yet due for a retry.
@@ -3620,7 +3616,7 @@ pub const SyncClient = struct {
         }
         self.serve_queue = try ca.dupe(u8, queue);
         self.serve_subs = try subs.toOwnedSlice(ca);
-        self.wireServeWakes();
+        self.wirePollWakes();
         return self.serve_subs.len;
     }
 
@@ -3702,28 +3698,47 @@ pub const SyncClient = struct {
     /// can sit unseen: a responder polls with a short wait.
     pub fn poll(self: *SyncClient, report_a: std.mem.Allocator, wait_ms: u64) !PollReport {
         self.beginPass();
-        if (self.t.conn.getStatus() == .connected and !self.revoked) {
-            const now = @divTrunc(usMono(), 1000);
-            const epoch = self.t.conn.reconnect_epoch.load(.acquire);
-            if (epoch != self.outbox_reconnect_epoch) {
-                self.outbox_reconnect_epoch = epoch;
-                self.next_outbox_retry_ms = @max(self.next_outbox_retry_ms, now + self.outboxRetryJitter());
-            }
-            if (now >= self.next_outbox_retry_ms) {
-                self.next_outbox_retry_ms = now + 5_000 + self.outboxRetryJitter();
-                _ = self.flushOutboxPass(true, null) catch |err| {
-                    log.info("outbox recovery: {s} — pending writes retained for a later poll", .{@errorName(err)});
-                };
-            }
-        }
+        const early = if (self.t.conn.getStatus() == .connected and !self.revoked)
+            try self.drainVerdictsWith(0, 1)
+        else
+            0;
+        self.pumpOutbox();
         var requests: std.ArrayList(Request) = .empty;
         if (self.serve_subs.len > 0) try self.drainServe(report_a, &requests);
         var r = try self.pollInner(report_a, wait_ms);
+        r.settled += early;
         if (self.serve_subs.len > 0) {
             try self.drainServe(report_a, &requests);
             r.requests = requests.items;
         }
+        // Verdicts drained by pollInner free slots immediately, without a timer.
+        self.pumpOutbox();
         return r;
+    }
+
+    fn pumpOutbox(self: *SyncClient) void {
+        if (self.t.conn.getStatus() != .connected or self.revoked) return;
+        const now = @divTrunc(usMono(), 1000);
+        const epoch = self.t.conn.reconnect_epoch.load(.acquire);
+        if (self.outbox_first_pump) {
+            self.outbox_first_pump = false;
+            self.next_outbox_retry_ms = now + 5 * self.outboxRetryJitter();
+        }
+        if (epoch != self.outbox_reconnect_epoch) {
+            self.outbox_reconnect_epoch = epoch;
+            self.outbox_retry_on_reconnect = true;
+            self.outbox_next_check_ms = 0;
+            // Leave the reconnect control plane room before replaying a fleet's
+            // windows; this is a start delay, never steady-state write pacing.
+            self.next_outbox_retry_ms = @max(self.next_outbox_retry_ms, now + 5 * self.outboxRetryJitter());
+        }
+        const wall = nowMillis();
+        if (wall < self.outbox_clock_ms) self.outbox_next_check_ms = 0;
+        self.outbox_clock_ms = wall;
+        if (now < self.next_outbox_retry_ms or wall < self.outbox_next_check_ms or wall < self.hold_until_ms) return;
+        _ = self.flushOutbox() catch |err| {
+            log.info("outbox recovery: {s} — pending writes retained", .{@errorName(err)});
+        };
     }
 
     fn outboxRetryJitter(self: *SyncClient) i64 {
@@ -3762,7 +3777,10 @@ pub const SyncClient = struct {
                 const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(@intCast(wait_ms)), .clock = .awake } };
                 if (ib.inbox_subscription.nextMsgTimeout(t)) |stray| stray.deinit() else |_| {}
             }
-            return .{ .applied = 0, .settled = 0, .changed_tables = changed_map.keys(), .seeded = seeded_map.keys() };
+            // An on-demand-only client still has writes to settle. Omitting this
+            // drain makes its window advance only through timed direct-get retries.
+            const settled = try self.drainVerdictsWith(if (self.serve_subs.len > 0) 0 else wait_ms, 1);
+            return .{ .applied = 0, .settled = settled, .changed_tables = changed_map.keys(), .seeded = seeded_map.keys() };
         }
 
         // ONE wait over every stream (nats.zig `PullInbox`, §10bh): one pull per
@@ -4472,6 +4490,7 @@ pub const SyncClient = struct {
             \\  created_at INTEGER NOT NULL,
             \\  attempts   INTEGER NOT NULL DEFAULT 0,
             \\  published  INTEGER NOT NULL DEFAULT 1,
+            \\  retry_at   INTEGER NOT NULL DEFAULT 0,
             \\  tenant     TEXT,
             \\  optimistic TEXT
             \\)
@@ -4479,6 +4498,8 @@ pub const SyncClient = struct {
         execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN published INTEGER NOT NULL DEFAULT 1") catch {};
         execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN tenant TEXT") catch {};
         execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN optimistic TEXT") catch {};
+        execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN retry_at INTEGER DEFAULT 0") catch {};
+        try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_retry ON _zebridge_outbox (retry_at, attempts, created_at, msg_id)");
         try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_recovery ON _zebridge_outbox (attempts, created_at, msg_id)");
         // A write answered `indeterminate`: settled for retransmission, its outcome
         // unknown until an authoritative reseed of its route (PROTOCOL §7.4c). `state`:
@@ -4637,42 +4658,46 @@ pub const SyncClient = struct {
         // only replays were checked. Measured — a write the gate then refused was
         // already in PostgreSQL, printed as "flushed: 0" next to a row that existed.
         //
-        // Use the same gate, for this edit only. A mutation (including an automatic
-        // rebase) must not bypass the recovery budget by flushing unrelated backlog.
-        _ = self.flushOutboxPass(false, msg_id) catch |err| {
-            // Kept, not lost: the entry is durable and the next flush retries.
-            log.err("mutate: send failed ({any}) — queued as {s}", .{ err, msg_id });
-        };
+        self.outbox_next_check_ms = 0;
+        // Mutations share the same window as recovery; a full window leaves this
+        // edit queued, and each subsequent verdict lets the poll refill it.
+        if (self.t.conn.getStatus() == .connected) {
+            _ = self.flushOutbox() catch |err| log.info("mutate: {s} — queued as {s}", .{ @errorName(err), msg_id });
+        }
         return try result_a.dupe(u8, msg_id);
     }
 
-    /// Republish everything still queued — and refuse what the GC watermark has
-    /// outlived (§10at). Returns the number actually sent.
+    /// Fill free window slots and retry due reservations; refuse writes the GC
+    /// watermark outlived (§10at). Returns the number actually sent.
     ///
-    /// A publish failure is logged and the entry stays queued; the pass continues so
-    /// one bad send does not starve the rest. If NOTHING could be sent the last error
+    /// A publish failure keeps its slot and ends this pump. Other reserved entries
+    /// remain eligible on the next pump. If NOTHING could be sent the last error
     /// is returned — "flushed: 0" next to a broker that is down should say why.
     pub fn flushOutbox(self: *SyncClient) !usize {
-        return self.flushOutboxPass(false, null);
+        return self.flushOutboxPass();
     }
 
-    /// Automatic recovery budgets both the selected rows and their network work.
-    /// Persisted attempts rotate the oldest tried entries behind untried ones, even
-    /// across a restart. Explicit host flushes retain their full-pass contract.
-    fn flushOutboxPass(self: *SyncClient, automatic: bool, only_id: ?[]const u8) !usize {
+    /// A self-clocking window, not a rate limit. New slots are filled on every
+    /// pump; only already-reserved entries wait for their own retry deadline.
+    fn flushOutboxPass(self: *SyncClient) !usize {
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const a = ca.allocator();
         try self.ensureOutbox();
-        const params: []const storage.Value = if (only_id) |mid| &.{.{ .text = mid }} else &.{};
-        const rows = try self.st.query(a, if (only_id != null)
-            "SELECT msg_id, subject, payload, tbl, row_id, before, published FROM _zebridge_outbox WHERE msg_id = ?"
-        else if (automatic)
-            "SELECT msg_id, subject, payload, tbl, row_id, before, published FROM _zebridge_outbox ORDER BY attempts, created_at, msg_id LIMIT 8"
-        else
-            "SELECT msg_id, subject, payload, tbl, row_id, before, published FROM _zebridge_outbox ORDER BY created_at", params);
+        // A full quiet window sleeps until its nearest per-entry deadline. A
+        // verdict or newly queued edit invalidates this cache immediately.
+        defer {
+            if (self.st.query(a, "SELECT CASE WHEN (SELECT count(*) FROM _zebridge_outbox WHERE retry_at>0)<128 AND EXISTS(SELECT 1 FROM _zebridge_outbox WHERE retry_at=0) THEN 0 ELSE COALESCE((SELECT min(retry_at) FROM _zebridge_outbox WHERE retry_at>0),9223372036854775807) END", &.{})) |next| {
+                self.outbox_next_check_ms = next[0][0].integer;
+            } else |_| self.outbox_next_check_ms = nowMillis() + 1000;
+        }
+        if (nowMillis() < self.hold_until_ms) return 0;
+        if (self.outbox_retry_on_reconnect) {
+            _ = try self.st.query(a, "UPDATE _zebridge_outbox SET retry_at = 1 WHERE retry_at > 0", &.{});
+            self.outbox_retry_on_reconnect = false;
+        }
+        const rows = try reserveOutbox(&self.st, a, nowMillis());
         if (rows.len == 0) return 0;
-        if (nowMillis() < self.hold_until_ms) return 0; // §10fk: rate limited — not yet
 
         // ⚠️ Gated ONCE, before the first publish — one read of the watermark for the
         // whole pass, and an entry that must not be sent is not sent even if an
@@ -4695,20 +4720,18 @@ pub const SyncClient = struct {
 
         var refused: std.array_hash_map.String(void) = .empty;
         for (gate.object.get("refuse").?.array.items) |v| try refused.put(a, v.string, {});
-        // §10el: the grace — the bridge answers in milliseconds and its ack wait is ten
-        // seconds; five leaves the subscription its turn and still replays a straggler
-        // well inside one poll of a slow host.
-        const grace_ms: i64 = 5_000;
-        const now_ms = nowMillis();
-
         var sent: usize = 0;
         var failed: usize = 0;
         var last_err: ?anyerror = null;
         var collected: usize = 0;
         for (rows) |r| {
             const msg_id = if (r[0] == .text) r[0].text else continue;
-            if (self.sent_at.get(msg_id)) |t| if (now_ms - t < grace_ms) continue;
-            if (automatic) _ = try self.st.query(a, "UPDATE _zebridge_outbox SET attempts = CASE WHEN attempts < 2147483647 THEN attempts + 1 ELSE attempts END WHERE msg_id = ?", &.{.{ .text = msg_id }});
+            if (nowMillis() < self.hold_until_ms) break;
+            const attempts: u6 = @intCast(@min(4, @max(0, r[7].integer)));
+            const delay = @min(@as(i64, 60_000), @as(i64, 5_000) << attempts) + self.outboxRetryJitter();
+            // Claim the slot BEFORE the get/send; an ambiguous PubAck must not
+            // release it or let a restart admit another window of unknown writes.
+            _ = try self.st.query(a, "UPDATE _zebridge_outbox SET retry_at = ?, attempts = CASE WHEN attempts < 2147483647 THEN attempts + 1 ELSE attempts END WHERE msg_id = ?", &.{ .{ .integer = nowMillis() + delay }, .{ .text = msg_id } });
             // The verdicts this client MISSED (PROTOCOL §7.4b): one per-key direct get per
             // pending entry, settled through the same handler `drainVerdicts` uses. Until
             // 2026-08-29 nothing read a stored verdict — the replay earned a fresh one,
@@ -4719,12 +4742,17 @@ pub const SyncClient = struct {
                 const ack_subject = try std.fmt.allocPrint(a, "{s}.{s}.{s}", .{ self.subject_mutation_ack_prefix, self.opts.principal, msg_id });
                 if (self.t.lastBySubject(self.stream_verdicts, ack_subject) catch null) |vm| {
                     defer vm.deinit();
-                    if (try self.settleVerdict(a, msg_id, vm.data)) {
+                    // A retained `failed` verdict is not a new rate-limit signal.
+                    // Only the live subscription applies its relative retry_after_ms.
+                    const stored = parseStoredJson(a, vm.data) catch Value.null;
+                    const old_failed = stored == .object and (if (stored.object.get("status")) |v| v == .string and std.mem.eql(u8, v.string, "failed") else false);
+                    if (!old_failed and try self.settleVerdict(a, msg_id, vm.data)) {
                         collected += 1;
                         continue;
                     }
                 }
             }
+            if (nowMillis() < self.hold_until_ms) break;
             if (refused.contains(msg_id)) {
                 // Exactly a `rejected` verdict's handling, because that is what it is:
                 // this write was never published, so it never committed, and it will
@@ -4752,15 +4780,9 @@ pub const SyncClient = struct {
                 failed += 1;
                 last_err = err;
                 log.info("outbox: {s} not sent ({any}) — still queued", .{ msg_id, err });
-                if (automatic) break;
-                continue;
+                break;
             };
             sent += 1;
-            if (self.sent_at.getPtr(msg_id)) |slot| {
-                slot.* = now_ms;
-            } else if (self.a.dupe(u8, msg_id)) |key| {
-                self.sent_at.put(self.a, key, now_ms) catch self.a.free(key);
-            } else |_| {}
         }
         if (collected > 0) log.info("outbox: collected {d} verdict(s) published while this client was away — settled without replay", .{collected});
         if (sent == 0 and failed > 0) return last_err.?;
@@ -4808,9 +4830,6 @@ pub const SyncClient = struct {
     }
 
     fn settleVerdict(self: *SyncClient, a: std.mem.Allocator, mid: []const u8, data: []const u8) !bool {
-        // §10el: settled or not, this entry's send time has served; a `failed` verdict
-        // keeps the entry queued and the next flush past the grace replays it.
-        if (self.sent_at.fetchRemove(mid)) |kv| self.a.free(kv.key);
         const v = parseStoredJson(a, data) catch return false;
         const status = if (v == .object) (if (v.object.get("status")) |x| (if (x == .string) x.string else "") else "") else "";
         const reason0 = if (v == .object) (if (v.object.get("reason")) |x| (if (x == .string) x.string else "") else "") else "";
@@ -4899,6 +4918,7 @@ pub const SyncClient = struct {
             }
         }
         _ = try self.st.query(a, "DELETE FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
+        if (ob.len > 0) self.outbox_next_check_ms = 0;
         return true;
     }
 
@@ -4930,6 +4950,7 @@ pub const SyncClient = struct {
             }
         };
         try self.st.transaction(Ctx{ .a = a, .mid = mid, .row = ob[0], .reason = reason, .version = if (own) |w| w.version else "", .data = data_text }, Ctx.apply);
+        self.outbox_next_check_ms = 0;
         log.warn("libzb: {s} on '{s}' is indeterminate ({s}) — its outcome is unknown; reconciling from the hub", .{ mid, if (ob[0][0] == .text) ob[0][0].text else "?", reason });
         if (own) |w| self.noteOutcome(a, mid, w.version, w.table, w.data, "indeterminate", &.{.{ "reason", .{ .string = reason } }});
     }
@@ -5253,6 +5274,7 @@ pub const SyncClient = struct {
         if (self.verdicts != null) return;
         const subject = try std.fmt.allocPrint(self.aa(), "{s}.{s}.>", .{ self.subject_mutation_ack_prefix, self.opts.principal });
         self.verdicts = try self.t.subscribeSync(subject);
+        self.wirePollWakes();
     }
 
     /// `wait_ms` is a BUDGET for the first verdict, not a per-message timeout. A
@@ -5278,13 +5300,16 @@ pub const SyncClient = struct {
         const sub = self.verdicts.?;
         var settled: usize = 0;
         const started = nowMillis();
+        var first = true;
         while (true) {
-            if (settled == 0 and @as(u64, @intCast(nowMillis() - started)) > wait_ms) break;
+            if (!first and settled == 0 and @as(u64, @intCast(nowMillis() - started)) > wait_ms) break;
+            const pause_ms = if (first) @max(1, wait_ms) else per_msg_ms;
+            first = false;
             // The bridge's own idiom (nats_publisher.zig): a bounded wait, so a
             // drain with nothing pending returns instead of blocking forever.
             // Only a timeout ends the drain quietly; a closed connection is an error.
             const msg = sub.nextMsgTimeout(
-                .{ .duration = .{ .raw = .fromMilliseconds(@intCast(per_msg_ms)), .clock = .awake } },
+                .{ .duration = .{ .raw = .fromMilliseconds(@intCast(pause_ms)), .clock = .awake } },
             ) catch |err| switch (err) {
                 error.Timeout => break,
                 else => return err,
@@ -5705,6 +5730,34 @@ pub const SyncClient = struct {
         return rows[0][0].integer;
     }
 };
+
+/// One handle serializes its calls. Reservations precede every network operation;
+/// their positive retry_at survives errors and reopening until the row is settled.
+fn reserveOutbox(st: *storage.Storage, a: std.mem.Allocator, now_ms: i64) ![]storage.Row {
+    var rows: []storage.Row = &.{};
+    const Ctx = struct {
+        a: std.mem.Allocator,
+        now: i64,
+        rows: *[]storage.Row,
+        fn apply(cx: @This(), db: *storage.Storage) !void {
+            cx.rows.* = try reserveOutboxLocked(db, cx.a, cx.now);
+        }
+    };
+    try st.transaction(Ctx{ .a = a, .now = now_ms, .rows = &rows }, Ctx.apply);
+    return rows;
+}
+
+fn reserveOutboxLocked(st: *storage.Storage, a: std.mem.Allocator, now_ms: i64) ![]storage.Row {
+    const active = try st.query(a, "SELECT count(*) FROM _zebridge_outbox WHERE retry_at > 0", &.{});
+    const used: usize = @intCast(active[0][0].integer);
+    const slots = outbox_window - @min(outbox_window, used);
+    if (slots > 0) {
+        _ = try st.query(a, "UPDATE _zebridge_outbox SET retry_at = 1 WHERE msg_id IN (SELECT msg_id FROM _zebridge_outbox WHERE retry_at = 0 ORDER BY attempts, created_at, msg_id LIMIT ?)", &.{.{ .integer = @intCast(slots) }});
+    }
+    // A backwards wall-clock adjustment cannot park a reservation indefinitely.
+    _ = try st.query(a, "UPDATE _zebridge_outbox SET retry_at = ? WHERE retry_at > ?", &.{ .{ .integer = now_ms + 61_000 }, .{ .integer = now_ms + 61_000 } });
+    return try st.query(a, "SELECT msg_id, subject, payload, tbl, row_id, before, published, attempts FROM _zebridge_outbox WHERE retry_at > 0 AND retry_at <= ? ORDER BY retry_at, attempts, created_at, msg_id LIMIT 128", &.{.{ .integer = now_ms }});
+}
 
 /// One required string from grammar.json, by path. The error names the key, because
 /// "which name did the file forget" is the whole diagnostic.
@@ -6912,4 +6965,29 @@ test "maybeZstd: a frame without its content size inflates (§10gi)" {
         // Truncated: an error, never a short document.
         try std.testing.expectError(error.ZstdDecompressFailed, maybeZstd(aa, z.items[0 .. z.items.len - 9]));
     }
+}
+
+test "outbox window: reservations survive reopening and only definitive removal frees a slot" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/tmp/zb-outbox-window.sqlite3";
+    for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+    var st = try storage.Storage.open(path);
+    defer st.close();
+    try execDdl(&st, "CREATE TABLE _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT, payload TEXT, tbl TEXT, row_id TEXT, before TEXT, published INTEGER DEFAULT 1, attempts INTEGER DEFAULT 0, created_at INTEGER, retry_at INTEGER DEFAULT 0)");
+    _ = try st.query(a, "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<299) INSERT INTO _zebridge_outbox(msg_id,subject,payload,tbl,row_id,created_at) SELECT 'id'||i,'s','{}','t',i,i FROM n", &.{});
+    try std.testing.expectEqual(@as(usize, 128), (try reserveOutbox(&st, a, 1000)).len);
+    _ = try st.query(a, "UPDATE _zebridge_outbox SET retry_at=9000 WHERE retry_at>0", &.{});
+    st.close();
+    st = try storage.Storage.open(path);
+    try std.testing.expectEqual(@as(usize, 0), (try reserveOutbox(&st, a, 1001)).len);
+    _ = try st.query(a, "DELETE FROM _zebridge_outbox WHERE msg_id='id0'", &.{});
+    const next = try reserveOutbox(&st, a, 1002);
+    try std.testing.expectEqual(@as(usize, 1), next.len);
+    try std.testing.expectEqualStrings("id128", next[0][0].text);
+    _ = try st.query(a, "UPDATE _zebridge_outbox SET retry_at=1 WHERE msg_id='id7'", &.{});
+    const retry = try reserveOutbox(&st, a, 1003);
+    try std.testing.expectEqual(@as(usize, 2), retry.len); // id128 is still reserved, unsent
+    try std.testing.expectEqualStrings("id7", retry[0][0].text);
 }

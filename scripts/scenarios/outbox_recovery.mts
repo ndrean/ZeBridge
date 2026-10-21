@@ -13,7 +13,8 @@ try {
     const active = new Map<number, {op: string; since: number}>();
     inflight.set(c, active);
     let serial = 0;
-    for (const op of ['collectMissedVerdicts', 'outboxMarkPublished', 'flushOutboxOnce', 'handleVerdict']) {
+    for (const op of ['collectMissedVerdicts', 'flushOutbox', 'flushOutboxOnce', 'handleVerdict']) {
+      if (typeof (c as any)[op] !== 'function') continue;
       const original = (c as any)[op].bind(c);
       (c as any)[op] = async (...args: any[]) => {
         const id = ++serial;
@@ -27,9 +28,14 @@ try {
     try { await c.connect(); } catch (e) { errors.push(String(e)); }
   }));
   console.log(JSON.stringify({ ready: clients.length - errors.length, errors }));
+  let nextFlush = performance.now()+5000;
   for await (const line of createInterface({ input: process.stdin })) {
     const cmd = JSON.parse(line);
     if (cmd === 'close') break;
+    if (process.env.ZB_OUTBOX_LEGACY_PUMP === '1' && performance.now() >= nextFlush) {
+      nextFlush = performance.now()+5000;
+      for (const c of clients) if (![...inflight.get(c)!.values()].some(x => x.op === 'flushOutbox')) void c.flushOutbox();
+    }
     const pending = await Promise.all(clients.map(async (c) => Number((await c.sql('SELECT count(*) AS n FROM _zebridge_outbox'))[0].n)));
     console.log(JSON.stringify({ pending, active: clients.map(c => ({
       principal: (c as any).config.principal, connected: (c as any).naturallyConnected,
