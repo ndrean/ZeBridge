@@ -1113,15 +1113,16 @@ pub const MutationListener = struct {
         const a = arena.allocator();
         const principal_z = a.dupeZ(u8, mutation.principal) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
         const id_z = a.dupeZ(u8, msgIdOf(msg).?) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
-        receipts.exec(conn, "BEGIN", null) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
-        const claim = receipts.claimOne(a, conn, principal_z, id_z, subject, payload) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        // Three exchanges when it succeeds: (1) BEGIN, the claim, SAVEPOINT; (2) the write
+        // and its classify; (3) the outcome, the deferred constraints, COMMIT.
+        const claim = receipts.beginClaim(a, conn, principal_z, id_z, subject, payload) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
         if (claim.status != .claimed) {
             receipts.rollback(conn); // the claim inserted nothing
             self.answerUnclaimed(a, conn_nats, msg, mutation, claim);
             msg.ack() catch {};
             return;
         }
-        receipts.exec(conn, "SAVEPOINT zb_write", null) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        requireTransaction(conn) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
 
         self.handleMutation(mutation, payload, conn) catch |err| {
             // A SQLSTATE the server returned and we recognise as permanent ends the
@@ -1187,33 +1188,36 @@ pub const MutationListener = struct {
             .reason = if (self.last_clamped) "version_clamped" else "",
             .version = self.lastVersion(),
         }) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
-        receipts.finishOne(conn, principal_z, id_z, outcome) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        requireTransaction(conn) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
 
-        // The application's deferred constraints are checked now, while this write can
-        // still be rolled back alone: at COMMIT their failure would take the receipt with
-        // it. The receipt's own deferred check passes, since its outcome is set above.
+        // The application's deferred constraints are checked before COMMIT, while this
+        // write can still be rolled back alone: at COMMIT their failure would take the
+        // receipt with it. The receipt's own deferred check passes, its outcome set first.
         var failure: receipts.Failure = .{};
-        receipts.exec(conn, "SET CONSTRAINTS ALL IMMEDIATE", &failure) catch {
-            const sqlstate = std.mem.sliceTo(&failure.sqlstate, 0);
-            self.rememberFailure(sqlstate, failure.message[0..failure.message_len]);
-            if (!sqlstateIsPermanent(sqlstate)) {
+        receipts.finishCommit(a, conn, principal_z, id_z, outcome, &failure) catch |err| switch (err) {
+            error.DeferredRefused => {
+                const sqlstate = std.mem.sliceTo(&failure.sqlstate, 0);
+                self.rememberFailure(sqlstate, failure.message[0..failure.message_len]);
+                if (!sqlstateIsPermanent(sqlstate)) {
+                    receipts.rollback(conn);
+                    log.err("Deferred constraint check failed ({s}), will retry", .{sqlstate});
+                    return self.retryOrFail(conn_nats, msg, mutation.principal, "MutationFailed");
+                }
+                log.info("⛔ Mutation refused at its deferred constraints [{s}] on '{s}': SQLSTATE {s}", .{ mutation.principal, mutation.table, sqlstate });
+                if (!self.recordRejection(a, conn, principal_z, id_z, "MutationFailed")) return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+                self.deadLetter(conn_nats, msg, payload, error.MutationFailed);
+                self.publishVerdict(conn_nats, msg, mutation.principal, "rejected", "MutationFailed");
+                msg.ack() catch {};
+                return;
+            },
+            error.ReceiptInfrastructure => return self.receiptTrouble(conn, conn_nats, msg, mutation.principal),
+            else => {
+                // Refused or lost at COMMIT: nothing is answered. The redelivery claims
+                // again and finds the receipt if the commit did happen.
                 receipts.rollback(conn);
-                log.err("Deferred constraint check failed ({s}), will retry", .{sqlstate});
-                return self.retryOrFail(conn_nats, msg, mutation.principal, "MutationFailed");
-            }
-            log.info("⛔ Mutation refused at its deferred constraints [{s}] on '{s}': SQLSTATE {s}", .{ mutation.principal, mutation.table, sqlstate });
-            if (!self.recordRejection(a, conn, principal_z, id_z, "MutationFailed")) return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
-            self.deadLetter(conn_nats, msg, payload, error.MutationFailed);
-            self.publishVerdict(conn_nats, msg, mutation.principal, "rejected", "MutationFailed");
-            msg.ack() catch {};
-            return;
-        };
-        receipts.commit(conn, null) catch {
-            // Refused or lost at COMMIT: nothing is answered. The redelivery claims again
-            // and finds the receipt if the commit did happen.
-            receipts.rollback(conn);
-            log.warn("⚠️  COMMIT failed for [{s}] on '{s}': retried, and answered from its receipt if it committed", .{ mutation.principal, mutation.table });
-            return self.retryOrFail(conn_nats, msg, mutation.principal, "CommitFailed");
+                log.warn("⚠️  COMMIT failed for [{s}] on '{s}': retried, and answered from its receipt if it committed", .{ mutation.principal, mutation.table });
+                return self.retryOrFail(conn_nats, msg, mutation.principal, "CommitFailed");
+            },
         };
 
         // ⚠️ A verdict on **every** write that PostgreSQL accepted, not only the
@@ -1241,6 +1245,9 @@ pub const MutationListener = struct {
         arena: std.heap.ArenaAllocator,
         pending: std.ArrayList(Pending) = .empty,
         entered: bool = false,
+        /// The first pending write of the open pipeline segment: a batch closes a segment
+        /// to re-read a table's layout (no synchronous query in pipeline mode) and goes on.
+        drain_from: usize = 0,
 
         const Pending = struct {
             msg: *nats.JetStreamMessage,
@@ -1269,6 +1276,12 @@ pub const MutationListener = struct {
         claim: receipts.Claim = .{ .status = .claimed },
         /// Its index in the batch's pending writes, once sent.
         pending: ?usize = null,
+        /// Refused before any of its SQL was sent (a payload the bridge cannot apply, a
+        /// table that cannot take writes): its outcome is `rejected`, recorded with the
+        /// batch, and the batch goes on.
+        refused: ?anyerror = null,
+        /// Its table's layout was re-read once for it already (a stale-cache candidate).
+        rechecked: bool = false,
 
         fn keyLess(items: []const BatchItem, x: usize, y: usize) bool {
             return switch (std.mem.order(u8, items[x].principal_z, items[y].principal_z)) {
@@ -1395,10 +1408,18 @@ pub const MutationListener = struct {
             it.claim = .{ .status = if (same) .repeat else .conflict };
         }
 
-        // Pre-warm the metas of the claimed writes only, outside pipeline mode.
-        for (items.items) |it| {
+        // Pre-warm the metas of the claimed writes only, outside pipeline mode. A table
+        // that cannot take writes refuses its write here, deterministically, as long as
+        // the transaction is intact; any other failure fails the batch.
+        for (items.items) |*it| {
             if (it.claim.status != .claimed) continue;
-            _ = try self.tableMeta(conn, it.mutation.table);
+            _ = self.tableMeta(conn, it.mutation.table) catch |err| {
+                if ((isPermanent(err) or isOperatorFault(err)) and c.PQtransactionStatus(conn) == c.PQTRANS_INTRANS) {
+                    it.refused = err;
+                    continue;
+                }
+                return err;
+            };
         }
 
         // ── R2: the claimed writes, in fetch order ──
@@ -1408,13 +1429,39 @@ pub const MutationListener = struct {
         self.batch_ctx = &bc;
         {
             defer self.batch_ctx = null;
-            for (items.items) |*it| {
-                if (it.claim.status != .claimed) continue;
+            var n: usize = 0;
+            while (n < items.items.len) : (n +%= 1) {
+                const it = &items.items[n];
+                if (it.claim.status != .claimed or it.refused != null) continue;
                 self.clearFailure();
+                const sent_before = bc.pending.items.len;
                 self.handleMutation(it.mutation, it.msg.msg.data, conn) catch |err| {
-                    // A write refused before it was sent (an unknown column, a bad
-                    // payload): end the open pipeline cleanly rather than by a reset.
-                    // What it ran is undone by the ROLLBACK that follows.
+                    const unsent = bc.pending.items.len == sent_before;
+                    // A schema-shaped refusal may be a stale cached layout (a column added
+                    // since it was read): close this segment, re-read the layout outside
+                    // pipeline mode, still in the transaction, and retry this write once.
+                    if (unsent and !it.rechecked and (err == error.UnknownColumn or err == error.MissingPrimaryKey)) {
+                        if (bc.entered) {
+                            try self.drainBatch(conn, &bc);
+                            bc.entered = false;
+                            bc.drain_from = bc.pending.items.len;
+                            try requireTransaction(conn);
+                        }
+                        self.invalidate(it.mutation.table);
+                        _ = try self.tableMeta(conn, it.mutation.table);
+                        try requireTransaction(conn);
+                        it.rechecked = true;
+                        n -%= 1; // the same write again (wrapping: the loop's +%= 1 lands back on it)
+                        continue;
+                    }
+                    // Refused before any of its SQL was sent (nothing joined the batch's
+                    // pending writes): a deterministic refusal is this write's outcome, and
+                    // the others go on in order. Anything else ends the open pipeline
+                    // cleanly, and the ROLLBACK that follows undoes what it ran.
+                    if (unsent and (isPermanent(err) or isOperatorFault(err))) {
+                        it.refused = err;
+                        continue;
+                    }
                     self.abortOpenPipeline(conn, &bc);
                     return err;
                 };
@@ -1435,15 +1482,15 @@ pub const MutationListener = struct {
         }
 
         // ── R4: the outcomes and COMMIT ──
-        if (bc.pending.items.len == 0) {
+        var done: std.ArrayList(usize) = .empty;
+        for (order.items) |k| if (items.items[k].pending != null or items.items[k].refused != null) try done.append(a, k);
+        if (done.items.len == 0) {
             receipts.rollback(conn); // nothing was claimed: nothing to keep
         } else {
             // The transaction must still hold the claims and the writes: a COMMIT sent
             // outside one answers only a warning, with the very tag COMMIT.
             try requireTransaction(conn);
-            // One finish call per principal, over the claimed writes in `order`.
-            var done: std.ArrayList(usize) = .empty;
-            for (order.items) |k| if (items.items[k].pending != null) try done.append(a, k);
+            // One finish call per principal, over the decided writes in `order`.
             const fgroups = try principalRuns(a, items.items, done.items);
             if (c.PQenterPipelineMode(conn) != 1) return error.MutationFailed;
             sent_ok = true;
@@ -1452,8 +1499,12 @@ pub const MutationListener = struct {
                 const ids = try a.alloc([:0]const u8, span.len);
                 const outcomes = try a.alloc([:0]const u8, span.len);
                 for (span, 0..) |k, n| {
-                    const pnd = bc.pending.items[items.items[k].pending.?];
                     ids[n] = items.items[k].id_z;
+                    if (items.items[k].refused) |err| {
+                        outcomes[n] = try receipts.outcomeJson(a, .{ .status = "rejected", .reason = @errorName(err) });
+                        continue;
+                    }
+                    const pnd = bc.pending.items[items.items[k].pending.?];
                     outcomes[n] = try receipts.outcomeJson(a, .{
                         .status = pnd.outcome.wireName(),
                         .reason = if (pnd.clamped) "version_clamped" else "",
@@ -1480,7 +1531,19 @@ pub const MutationListener = struct {
         // ── Verdicts and acks, now that the outcomes are durable ──
         for (items.items) |it| {
             const src = if (it.claim.status == .repeat) items.items[it.first] else it;
-            if (src.claim.status == .claimed) {
+            if (src.claim.status == .claimed and src.refused != null) {
+                const err = src.refused.?;
+                self.clearFailure();
+                if (it.claim.status == .claimed) {
+                    if (isOperatorFault(err)) {
+                        log.err("🔴 '{s}' cannot accept writes ({}): only a migration or a zebridge_enable change can fix this. Preflight reports it at boot; see the line above for the reason.", .{ it.mutation.table, err });
+                    } else {
+                        log.info("⛔ Mutation refused [{s}] on '{s}': {} (not retrying)", .{ it.mutation.principal, it.mutation.table, err });
+                    }
+                }
+                self.deadLetter(conn_nats, it.msg, it.msg.msg.data, err);
+                self.publishVerdict(conn_nats, it.msg, it.mutation.principal, "rejected", @errorName(err));
+            } else if (src.claim.status == .claimed) {
                 const pnd = bc.pending.items[src.pending.?];
                 self.last_sqlstate_len = 0;
                 self.last_error_len = 0;
@@ -1644,10 +1707,10 @@ pub const MutationListener = struct {
         }
 
         var failed = false;
-        var pi: usize = 0; // which pending
+        var pi: usize = bc.drain_from; // which pending
         var stmt: usize = 0; // 0 = set_config, 1 = the write
         var nulls: usize = 0;
-        const expect_stmts = bc.pending.items.len * 2;
+        const expect_stmts = (bc.pending.items.len - bc.drain_from) * 2;
         while (true) {
             const r = c.PQgetResult(conn);
             if (r == null) {
@@ -2622,6 +2685,9 @@ pub const MutationListener = struct {
             // cached list, so the statement is built, PostgreSQL answers 42703, and the
             // existing invalidation fires.
             if (!meta_was_cached) return err;
+            // Inside a batch the pipeline is open and the catalog cannot be read now: the
+            // batch closes its segment, re-reads the layout and retries this write itself.
+            if (self.batch_ctx != null) return err;
             if (err != error.UnknownColumn and err != error.MissingPrimaryKey) return err;
 
             self.invalidate(mutation.table);

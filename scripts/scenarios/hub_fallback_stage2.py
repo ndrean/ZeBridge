@@ -292,6 +292,39 @@ async def main():
                   and hub.executions("s2_child", kbad) == 0,
                   "its retry is answered from the rejection receipt, without running")
 
+            # ── refusals that need no SQL stay inside their batch ──
+            replays_before = hub.log("bridge").count("replayed one write at a time")
+            good = [write("s2_row", str(uuid.uuid4()), {"v": n}) for n in range(20)]
+            bad_keys = [str(uuid.uuid4()) for _ in range(3)]
+            refused_writes = [write("s2_row", k, {"v": 0, "no_such_column": 1}) for k in bad_keys]
+            mixed = good[:7] + refused_writes[:1] + good[7:14] + refused_writes[1:2] + good[14:] + refused_writes[2:]
+            await asyncio.gather(*(alice.send("s2_row", *w) for w in mixed))
+            good_answers = [await alice.answered(w[0]) for w in good]
+            bad_answers = [await alice.answered(w[0]) for w in refused_writes]
+            bad_receipts = [hub.sql(f"SELECT outcome->>'status' FROM zebridge_private.receipts WHERE message_id = '{w[0]}'") for w in refused_writes]
+            replays = hub.log("bridge").count("replayed one write at a time") - replays_before
+            check(all(a and a[0]["status"] == "accepted" for a in good_answers)
+                  and all(a and a[0]["status"] == "rejected" for a in bad_answers) and bad_receipts == ["rejected"] * 3
+                  and sum(hub.executions("s2_row", k) for k in bad_keys) == 0 and replays == 0,
+                  f"writes refused before any SQL are rejected with a receipt inside their batch; the rest accepted; no batch replayed ({replays})")
+            await asyncio.sleep(1)  # past the shortened window: only the receipt can answer it
+            await alice.send("s2_row", *refused_writes[0])
+            again = await alice.answered(refused_writes[0][0], 2)
+            check(len(again) == 2 and again[1]["status"] == "rejected" and again[1]["reason"] == again[0]["reason"],
+                  "a refused write's retry is answered from its receipt")
+
+            # ── a column added just now: the batch re-reads the layout, never a false refusal ──
+            warm = write("s2_row", str(uuid.uuid4()), {"v": 1})
+            await alice.send("s2_row", *warm)
+            await alice.answered(warm[0])  # the layout is cached without `extra`
+            hub.sql("ALTER TABLE s2_row ADD COLUMN extra int")
+            fresh = [write("s2_row", str(uuid.uuid4()), {"v": n, "extra": n}) for n in range(20)]
+            await asyncio.gather(*(alice.send("s2_row", *w) for w in fresh))
+            fresh_answers = [await alice.answered(w[0]) for w in fresh]
+            stored = hub.sql("SELECT count(*) FROM s2_row WHERE extra IS NOT NULL")
+            check(all(a and a[0]["status"] == "accepted" for a in fresh_answers) and stored == "20",
+                  "writes naming a column added after the layout was cached are accepted inside their batch (re-read, not refused)")
+
             # ── concurrent duplicates: both copies stored before the bridge looks ──
             # Two principals interleaved, so each batch holds one claim group per principal.
             bob = Writer(hub, "bob")

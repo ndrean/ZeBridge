@@ -191,18 +191,72 @@ fn note(f: *Failure, r: ?*c.PGresult) void {
     @memcpy(f.message[0..f.message_len], line[0..f.message_len]);
 }
 
-pub fn claimOne(a: std.mem.Allocator, conn: ?*c.PGconn, principal: [:0]const u8, id: [:0]const u8, route: []const u8, payload: []const u8) !Claim {
+/// Leave pipeline mode after a round; a connection that cannot is reset (which ends its
+/// transaction): an error, never a quiet continuation.
+fn leave(conn: ?*c.PGconn) !void {
+    if (c.PQpipelineStatus(conn) == c.PQ_PIPELINE_OFF) return;
+    while (c.PQgetResult(conn)) |r| c.PQclear(r);
+    if (c.PQexitPipelineMode(conn) != 1) {
+        c.PQreset(conn);
+        return error.TransactionLost;
+    }
+}
+
+/// On an error mid-round: a pipeline still open is ended by a reset.
+fn resetIfPipelined(conn: ?*c.PGconn) void {
+    if (c.PQpipelineStatus(conn) != c.PQ_PIPELINE_OFF) c.PQreset(conn);
+}
+
+/// The single path's first exchange: BEGIN, the claim and SAVEPOINT zb_write in one
+/// pipeline round. The savepoint is taken before the claim's answer is known; an
+/// unclaimed write rolls it all back. On success the transaction is open, out of pipeline
+/// mode. Any failure is the receipts' (the caller rolls back and retries).
+pub fn beginClaim(a: std.mem.Allocator, conn: ?*c.PGconn, principal: [:0]const u8, id: [:0]const u8, route: []const u8, payload: []const u8) !Claim {
+    if (c.PQenterPipelineMode(conn) != 1) return error.ReceiptInfrastructure;
+    errdefer resetIfPipelined(conn);
     const values = [_]?[*]const u8{ principal.ptr, id.ptr, route.ptr, payload.ptr };
     const lengths = [_]c_int{ 0, 0, @intCast(route.len), @intCast(payload.len) };
     const formats = [_]c_int{ 0, 0, 1, 1 };
-    const r = c.PQexecParams(conn, claim_sql, 4, null, @ptrCast(&values), &lengths, &formats, 0);
-    defer c.PQclear(r);
-    if (c.PQresultStatus(r) != c.PGRES_TUPLES_OK) {
-        const m = c.PQresultErrorMessage(r);
-        log.err("🔴 receipt claim failed: {s}", .{if (m != null) std.mem.span(m) else ""});
-        return error.ReceiptInfrastructure;
+    const sent = c.PQsendQueryParams(conn, "BEGIN", 0, null, null, null, null, 0) == 1 and
+        c.PQsendQueryParams(conn, claim_sql, 4, null, @ptrCast(&values), &lengths, &formats, 0) == 1 and
+        c.PQsendQueryParams(conn, "SAVEPOINT zb_write", 0, null, null, null, null, 0) == 1 and
+        c.PQpipelineSync(conn) == 1;
+    if (!sent) return error.ReceiptInfrastructure;
+    var failed_at: usize = 0;
+    const rs = try collect(a, conn, 3, &failed_at);
+    defer clearAll(rs);
+    try leave(conn);
+    if (failed_at != 3) return error.ReceiptInfrastructure;
+    return readClaim(a, rs[1]);
+}
+
+/// The single path's last exchange: the outcome, the application's deferred constraints
+/// checked now (SET CONSTRAINTS ALL IMMEDIATE) and COMMIT, in one pipeline round. The
+/// receipt's own deferred check passes, since its outcome is set first.
+///   error.ReceiptInfrastructure  the finish was refused
+///   error.DeferredRefused        a deferred constraint refused the write; `failure` holds
+///                                why, and the transaction is aborted but open (the caller
+///                                rolls back to the savepoint and records the rejection)
+///   error.CommitFailed           refused or lost at COMMIT: ambiguous, retry
+pub fn finishCommit(a: std.mem.Allocator, conn: ?*c.PGconn, principal: [:0]const u8, id: [:0]const u8, outcome: [:0]const u8, failure: *Failure) !void {
+    if (c.PQenterPipelineMode(conn) != 1) return error.ReceiptInfrastructure;
+    errdefer resetIfPipelined(conn);
+    const values = [_]?[*:0]const u8{ principal.ptr, id.ptr, outcome.ptr };
+    const sent = c.PQsendQueryParams(conn, finish_sql, 3, null, &values, null, null, 0) == 1 and
+        c.PQsendQueryParams(conn, "SET CONSTRAINTS ALL IMMEDIATE", 0, null, null, null, null, 0) == 1 and
+        c.PQsendQueryParams(conn, "COMMIT", 0, null, null, null, null, 0) == 1 and
+        c.PQpipelineSync(conn) == 1;
+    if (!sent) return error.CommitFailed;
+    var failed_at: usize = 0;
+    const rs = collect(a, conn, 3, &failed_at) catch return error.CommitFailed; // lost mid-round: ambiguous
+    defer clearAll(rs);
+    try leave(conn);
+    if (failed_at == 0) return error.ReceiptInfrastructure;
+    if (failed_at == 1) {
+        note(failure, rs[1]);
+        return error.DeferredRefused;
     }
-    return readClaim(a, r);
+    if (failed_at == 2 or !committed(rs[2])) return error.CommitFailed;
 }
 
 pub fn finishOne(conn: ?*c.PGconn, principal: [:0]const u8, id: [:0]const u8, outcome: [:0]const u8) !void {
