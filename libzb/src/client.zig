@@ -4939,7 +4939,10 @@ pub const SyncClient = struct {
         const Mark = struct { mid: storage.Value, routes: []const u8, tbl: []const u8, tenant: ?[]const u8 };
         var marks: std.ArrayList(Mark) = .empty;
         for (rows) |r| {
-            if (!(r[3] == .text and std.mem.eql(u8, r[3].text, "pending"))) continue;
+            // Empty-route markers from older clients stay unresolved until their table
+            // is followed again and has an authoritative recovery route.
+            const no_routes = r[4] != .text or r[4].text.len == 0;
+            if (!(r[3].eqlText("pending") or no_routes)) continue;
             const tbl = if (r[1] == .text) r[1].text else continue;
             const tenant: ?[]const u8 = if (r[2] == .text) r[2].text else null;
             var routes: std.ArrayList(u8) = .empty;
@@ -4953,6 +4956,7 @@ pub const SyncClient = struct {
                     }
                 }
             }
+            if (routes.items.len == 0) continue; // on-demand/unfollowed: no refresh proof
             var it = std.mem.splitScalar(u8, routes.items, ',');
             while (it.next()) |route| if (route.len > 0 and !self.reconciling.contains(route)) try rewind.put(a, route, {});
             try marks.append(a, .{ .mid = r[0], .routes = routes.items, .tbl = tbl, .tenant = tenant });
@@ -5002,21 +5006,36 @@ pub const SyncClient = struct {
         for (rows) |r| {
             const state = if (r[3] == .text) r[3].text else "";
             const routes = if (r[4] == .text) r[4].text else "";
-            if (std.mem.eql(u8, state, "rewound")) {
+            const tbl = if (r[1] == .text) r[1].text else continue;
+            if (!self.states.contains(tbl) or self.isOnDemand(tbl)) {
+                // Configuration can remove a recovery path after it was rewound.
+                // Following the table again must require a new full and rewind.
+                if (!std.mem.eql(u8, state, "pending") or routes.len > 0) {
+                    _ = try self.st.query(a, "UPDATE _zbz_reconcile SET state = 'pending', routes = '', targets = '' WHERE msg_id = ?", &.{r[0]});
+                }
+                continue;
+            }
+            if (routes.len == 0) continue;
+            const no_targets = r[7] != .text or r[7].text.len == 0;
+            if (std.mem.eql(u8, state, "rewound") or (std.mem.eql(u8, state, "healed") and no_targets)) {
                 var it = std.mem.splitScalar(u8, routes, ',');
                 const waiting = while (it.next()) |route| {
                     if (route.len > 0 and self.reconciling.contains(route)) break true;
                 } else false;
                 if (waiting) continue;
-                var targets: std.ArrayList(u8) = .empty;
-                var it2 = std.mem.splitScalar(u8, routes, ',');
-                while (it2.next()) |route| {
-                    if (route.len == 0) continue;
-                    const last: u64 = if (self.streamFacts(route)) |f| f.last_seq else |_| continue;
-                    if (targets.items.len > 0) try targets.append(a, ',');
-                    try targets.appendSlice(a, try std.fmt.allocPrint(a, "{s}:{d}", .{ route, last }));
-                }
-                _ = try self.st.query(a, "UPDATE _zbz_reconcile SET state = 'healed', targets = ? WHERE msg_id = ?", &.{ .{ .text = targets.items }, r[0] });
+                const Reader = struct {
+                    client: *SyncClient,
+                    fn last(reader: @This(), route: []const u8) !u64 {
+                        return (try reader.client.streamFacts(route)).last_seq;
+                    }
+                };
+                // All targets must be verified. A timeout, permission error or missing
+                // stream cannot turn a partially captured target list into completion.
+                const targets = reconciliationTargets(a, routes, Reader{ .client = self }) catch |err| {
+                    log.info("reconcile {s}: tail targets unavailable ({s}) — marker retained", .{ if (r[0] == .text) r[0].text else "?", @errorName(err) });
+                    continue; // an unavailable route cannot stall unrelated markers
+                };
+                _ = try self.st.query(a, "UPDATE _zbz_reconcile SET state = 'healed', targets = ? WHERE msg_id = ?", &.{ .{ .text = targets }, r[0] });
                 continue;
             }
             if (!std.mem.eql(u8, state, "healed")) continue;
@@ -5704,6 +5723,38 @@ pub fn execDdl(st: *storage.Storage, sql: []const u8) !void {
     const s2 = try std.mem.replaceOwned(u8, a, s1, " INTEGER", " BIGINT");
     defer a.free(s2);
     return st.execSimple(s2);
+}
+
+/// Capture every route's tail before persisting any reconciliation completion state.
+fn reconciliationTargets(a: std.mem.Allocator, routes: []const u8, reader: anytype) ![]const u8 {
+    var targets: std.ArrayList(u8) = .empty;
+    var it = std.mem.splitScalar(u8, routes, ',');
+    while (it.next()) |route| {
+        if (route.len == 0) continue;
+        const last = try reader.last(route);
+        if (targets.items.len > 0) try targets.append(a, ',');
+        try targets.appendSlice(a, try std.fmt.allocPrint(a, "{s}:{d}", .{ route, last }));
+    }
+    if (targets.items.len == 0) return error.ReconciliationRouteUnavailable;
+    return targets.items;
+}
+
+test "reconciliation targets: a failed route never yields a partial completion proof" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const Reader = struct {
+        fail: bool,
+        fn last(r: @This(), route: []const u8) !u64 {
+            if (std.mem.eql(u8, route, "CDC_b")) {
+                if (r.fail) return error.Timeout;
+                return 12;
+            }
+            return 0; // a verified empty stream is a real target too
+        }
+    };
+    try std.testing.expectError(error.Timeout, reconciliationTargets(arena.allocator(), "CDC_a,CDC_b", Reader{ .fail = true }));
+    try std.testing.expectError(error.ReconciliationRouteUnavailable, reconciliationTargets(arena.allocator(), "", Reader{ .fail = false }));
+    try std.testing.expectEqualStrings("CDC_a:0,CDC_b:12", try reconciliationTargets(arena.allocator(), "CDC_a,CDC_b", Reader{ .fail = false }));
 }
 
 test "duckdbType: PostgreSQL's spellings as DuckDB's (§10fl)" {

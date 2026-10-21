@@ -41,9 +41,10 @@ class Libzb:
         finally:
             self.lib.zb_free(pointer)
 
-    async def open(self):
+    async def open(self, ondemand=False):
         opts = json.dumps({"natsUrl": self.stack.url, "credsPath": self.stack.creds(self.who), "principal": self.who, "jsDomain": "hub",
-                           "tables": ["s2_row"], "dbPath": str(self.db), "heartbeatMs": 0}).encode()
+                           "tables": [] if ondemand else ["s2_row"], "ondemandTables": ["s2_row"] if ondemand else [],
+                           "dbPath": str(self.db), "heartbeatMs": 0}).encode()
         self.h = await asyncio.to_thread(self.lib.zb_client_connect, opts)
         assert self.h, "connect"
         r = await asyncio.to_thread(lambda: self.take(self.lib.zb_client_sync(self.h)))
@@ -86,14 +87,14 @@ class Ts:
             raise RuntimeError(r["error"])
         return r["value"]
 
-    async def open(self):
+    async def open(self, ondemand=False):
         if self.proc is None:
             self.log = open(self.stack.tmp / f"{self.stack.name}-ts-{self.who}.log", "a")
             self.proc = await asyncio.create_subprocess_exec(
                 "node", "--experimental-strip-types", "--no-warnings", str(zb.ROOT / "scripts/scenarios/reconcile_client.mts"),
                 self.stack.url, self.stack.creds(self.who), str(self.db), self.who, "s2_row",
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=self.log)
-        await self.call(cmd="open")
+        await self.call(cmd="open", ondemand=ondemand)
 
     async def close(self):
         if self.proc:
@@ -264,6 +265,86 @@ async def main():
                 await c.close()
                 with sqlite3.connect(db) as lite:
                     lite.execute("DROP TABLE zebridge_gc_watermark")
+
+                # Persist each crash boundary explicitly, then reopen the real client.
+                # No request is admitted: these writes cannot have committed.
+                route = zb.TOPOLOGY["cdc_streams"]["public"]
+                for state in ("pending", "rewound", "healed"):
+                    await c.open()
+                    await admission_stop()
+                    kr = str(uuid.uuid4())
+                    await c.mutate(kr, 60)
+                    await c.close()
+                    bad_marker = "unverifiable-" + str(uuid.uuid4()) if state == "healed" else None
+                    with sqlite3.connect(db) as lite:
+                        mid, payload = lite.execute("SELECT msg_id, payload FROM _zebridge_outbox").fetchone()
+                        env = json.loads(payload)
+                        lite.execute("DELETE FROM _zebridge_outbox WHERE msg_id = ?", (mid,))
+                        targets = f"{route}:{(await js.stream_info(route)).state.last_seq}" if state == "healed" else ""
+                        routes = "" if state == "pending" else route
+                        if kind == "libzb":
+                            lite.execute("INSERT INTO _zbz_reconcile (msg_id,tbl,tenant,reason,version,data,since,state,routes,targets) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                         (mid, "s2_row", "_default", "MessageIdExpired", env["version"], json.dumps(env.get("data")), int(time.time()*1000), state, routes, targets))
+                            if state == "rewound":
+                                lite.execute("DELETE FROM _zbz_generations WHERE tbl = 's2_row'")
+                        else:
+                            write = {"msgId": mid, "table": "s2_row", "version": env["version"], "key": env["key"]}
+                            lite.execute("INSERT INTO _zebridge_reconcile (msg_id,tbl,reason,version,data,since,state,routes,targets) VALUES (?,?,?,?,?,?,?,?,?)",
+                                         (mid, "s2_row", "MessageIdExpired", env["version"], json.dumps(write), int(time.time()*1000), state, routes, targets))
+                            if state == "rewound":
+                                lite.execute("DELETE FROM _zebridge_generations WHERE tbl = 's2_row'")
+                        if state == "rewound":
+                            positions = "_zbz_stream_seq" if kind == "libzb" else "_zebridge_stream_seq"
+                            lite.execute(f"UPDATE {positions} SET last_seq = 0 WHERE stream = ?", (route,))
+                        if state == "healed":
+                            # The full already removed the optimistic row before this crash.
+                            lite.execute("DELETE FROM s2_row WHERE id = ?", (kr,))
+                            # An older marker's unavailable route must not stop this
+                            # healthy marker clearing in either client implementation.
+                            markers = "_zbz_reconcile" if kind == "libzb" else "_zebridge_reconcile"
+                            lite.execute(f"INSERT INTO {markers} (msg_id,tbl,reason,since,state,routes) VALUES (?,?,?,?,?,?)",
+                                         (bad_marker, "s2_row", "ReceiptUnreadable", 0, "healed", "CDC_unverifiable"))
+                    await admission_start()
+                    await c.open()
+                    ok = await until(c, lambda n: _done(c, kr, n - int(bad_marker is not None)))
+                    check(ok and await c.row(kr) is None and hub.executions("s2_row", kr) == 0 and not await c.outbox(),
+                          f"{kind}: restart resumes persisted {state} reconciliation without a resend"
+                          + (", despite an older unverifiable route" if bad_marker else ""))
+                    await c.close()
+                    if bad_marker:
+                        with sqlite3.connect(db) as lite:
+                            lite.execute(f"DELETE FROM {markers} WHERE msg_id = ?", (bad_marker,))
+
+                # On-demand tables have no automatic seed/tail. Stay unresolved across
+                # a restart, then recover once the same database follows the table.
+                await c.open(ondemand=True)
+                await bridge_stop()
+                ko = str(uuid.uuid4())
+                await c.mutate(ko, 70)
+                await expire_until_now()
+                await bridge_start()
+                ok = await until(c, lambda n: _indeterminate(c, ko))
+                for _ in range(3):
+                    unresolved = await c.step()
+                check(ok and unresolved == 1 and "reconciled" not in outcomes_for(c, ko) and await c.row(ko) == 70,
+                      f"{kind}: on-demand indeterminate stays unresolved, never falsely reconciled")
+                await c.close()
+                # A table can also become on-demand after an earlier heal. Its old
+                # route/target must not authorize completion under this configuration.
+                old_target = f"{route}:{(await js.stream_info(route)).state.last_seq}"
+                with sqlite3.connect(db) as lite:
+                    markers = "_zbz_reconcile" if kind == "libzb" else "_zebridge_reconcile"
+                    lite.execute(f"UPDATE {markers} SET state = 'healed', routes = ?, targets = ?", (route, old_target))
+                await c.open(ondemand=True)
+                unresolved = await c.step()
+                check(unresolved == 1 and "reconciled" not in outcomes_for(c, ko),
+                      f"{kind}: on-demand marker survives reopening even with an earlier healed route")
+                await c.close()
+                await c.open()
+                ok = await until(c, lambda n: _done(c, ko, n))
+                check(ok and await c.row(ko) is None and hub.executions("s2_row", ko) == 0,
+                      f"{kind}: following the table later reconciles it from the hub")
+                await c.close()
             await admin.close()
         finally:
             for c in clients:
@@ -286,6 +367,10 @@ async def _done(c, key, reconciling):
 
 async def _applied(c, key):
     return "applied" in [o.get("outcome") for o in c.outcomes if _matches(o, key)]
+
+
+async def _indeterminate(c, key):
+    return "indeterminate" in [o.get("outcome") for o in c.outcomes if _matches(o, key)]
 
 
 def _matches(o, key):

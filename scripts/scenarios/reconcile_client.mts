@@ -7,8 +7,8 @@ const [, , url, creds, db, principal, table] = process.argv;
 const verdicts: unknown[] = [];
 let client: ZeBridge | null = null;
 
-const open = async () => {
-  client = new ZeBridge({ natsUrl: url, credsPath: creds, dbPath: db, principal, jsDomain: 'hub', tables: [table], heartbeatMs: 0 });
+const open = async (ondemand = false) => {
+  client = new ZeBridge({ natsUrl: url, credsPath: creds, dbPath: db, principal, jsDomain: 'hub', tables: ondemand ? [] : [table], ondemandTables: ondemand ? [table] : [], heartbeatMs: 0 });
   client.onVerdict((v) => verdicts.push(v));
   client.onLog((topic, data, level) => console.error(JSON.stringify({ topic, data, level })));
   await client.connect();
@@ -16,7 +16,7 @@ const open = async () => {
 
 const answer = async (cmd: any): Promise<unknown> => {
   switch (cmd.cmd) {
-    case 'open': await open(); return { ok: true };
+    case 'open': await open(cmd.ondemand); return { ok: true };
     case 'close': await client?.close(); client = null; return { ok: true };
     case 'mutate': return await client!.mutate(cmd.table, cmd.op, cmd.key, cmd.values);
     case 'flush': await client!.flushOutbox(); return { ok: true };

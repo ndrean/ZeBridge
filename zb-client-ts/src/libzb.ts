@@ -602,6 +602,25 @@ export class ZeBridge {
   /// whose generation is no longer current stops at its next message, without flushing or
   /// acking what it holds; the current one re-reads that from the stored position.
   private tailGen = new Map<string, number>();
+  /// Stop buffered work and wait for active flush/idle work before rewinding a route.
+  private tailStops = new Map<string, () => Promise<void>>();
+  private streamWork: Promise<void> = Promise.resolve();
+
+  /// Consumer setup and reconciliation rewinds must not race each other's positions.
+  private changeStreams(fn: () => Promise<void>): Promise<void> {
+    const work = this.streamWork.then(fn);
+    this.streamWork = work.catch(() => {});
+    return work;
+  }
+
+  private async stopTail(stream: string): Promise<void> {
+    this.tailGen.set(stream, (this.tailGen.get(stream) ?? 0) + 1);
+    const stop = this.tailStops.get(stream);
+    if (stop) {
+      await stop();
+      if (this.tailStops.get(stream) === stop) this.tailStops.delete(stream);
+    }
+  }
 
   /// `version` is the stamp the write carries: the CDC echo that confirms it is the
   /// row bearing THAT stamp, not any row on the same key (§10dt).
@@ -1416,6 +1435,7 @@ export class ZeBridge {
     const nc = this.nc;
     this.nc = null;
     if (nc) await nc.close();
+    for (const route of this.tailStops.keys()) await this.stopTail(route);
   }
 
   // ─── internals ────────────────────────────────────────────────────────────
@@ -3447,7 +3467,11 @@ export class ZeBridge {
 
   // ── the main orchestration: gap check → seed → CDC ────────────────────────
 
-  private async subscribeStreams() {
+  private subscribeStreams(): Promise<void> {
+    return this.changeStreams(() => this.subscribeStreamsOnce());
+  }
+
+  private async subscribeStreamsOnce() {
     if (!this.nc) return;
     // Throw-proof from the first await: this function runs as a floating
     // promise from the reconnect handler and the status-loop restart, and an
@@ -3639,6 +3663,7 @@ export class ZeBridge {
     try {
       for (const streamName of this.cdcStreams()) {
         const setupStart = performance.now();
+        await this.stopTail(streamName);
         // A stream that is fully consumed (or empty) delivers no message, so the
         // per-batch persist below never fires — record a floor now, or a quiet
         // stream reads as `local 0` forever and re-seeds every reconnect.
@@ -3720,6 +3745,8 @@ export class ZeBridge {
             );
           }
         } catch { /* stream info unavailable — the per-batch persist still covers it */ }
+        // A reconciliation whose seed could not splice must not replay from zero.
+        if (this.hubOnly.has(streamName) && !this.healedRoutes.has(streamName)) continue;
         const last = this.globalSyncState.seq[streamName] ?? 0;
         const filters = this.cdcFilters(streamName);
         const ci = await jsm.consumers.add(streamName, {
@@ -3757,6 +3784,17 @@ export class ZeBridge {
           let curName: string = ci.name;
           let curPending: number | null = ci.num_pending ?? null;
           let attempt = 0;
+          let flushWork: Promise<void> | null = null;
+          let idleWork: Promise<void> | null = null;
+          let idleGuard: ReturnType<typeof setInterval> | null = null;
+          let discardBatch = () => {};
+          this.tailStops.set(streamName, async () => {
+            discardBatch();
+            if (idleGuard) clearInterval(idleGuard);
+            try { curIter?.stop(); } catch { /* already stopped */ }
+            // Work already inside a storage transaction must settle BEFORE the rewind.
+            await Promise.all([flushWork, idleWork]);
+          });
           // §10ei: the last sequence this tail was handed — the gap rule, LIVE. The next
           // message is `lastSeen + 1` unless the stream pruned under the consumer (a tab
           // throttled in the background, a slow apply) and the server says nothing — or
@@ -3770,6 +3808,7 @@ export class ZeBridge {
           if (!curIter) {
             attempt++;
             await new Promise((r) => setTimeout(r, 1000));
+            if (superseded()) break;
             try {
               const resumeFrom = this.globalSyncState.seq[streamName] ?? 0;
               // The same filter as the first consumer (§10ja: the recreation used to drop
@@ -3786,6 +3825,7 @@ export class ZeBridge {
               const consumer2 = await js.consumers.get(streamName, ci2.name);
               curPending = ci2.num_pending ?? null;
               curIter = await consumer2.consume();
+              if (superseded()) { curIter.stop(); break; }
               lastSeen = resumeFrom;
               this.appendLog('SYS', `${streamName}: tail recreated (attempt ${attempt}) from seq ${resumeFrom}, ${curPending ?? '?'} pending`, 'WARNING');
             } catch (e) {
@@ -3814,8 +3854,13 @@ export class ZeBridge {
           let batchMsgs: any[] = [];
           let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
-          const flushBatch = async () => {
+          discardBatch = () => {
             if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+            batch = []; batchMsgs = [];
+          };
+          const applyBuffered = async () => {
+            if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+            if (superseded()) { discardBatch(); return; }
             if (!batch.length) return;
             const toApply = batch;
             const toAck = batchMsgs;
@@ -3823,6 +3868,7 @@ export class ZeBridge {
             batchMsgs = [];
             try {
               await this.transaction(async (txExec) => {
+                if (superseded()) return;
                 // PROTOCOL.md §4's FK rule in executable form: enforcement waits for
                 // this batch's COMMIT, so a child arriving before its parent inside
                 // one batch cannot fail the apply.
@@ -3833,8 +3879,10 @@ export class ZeBridge {
                   await this.applyBatchPlanned(toApply, txExec);
                 }
               });
+              if (superseded()) return;
               for (const { table, ev } of toApply) this.triggerChange(table, ev);
             } catch (err) {
+              if (superseded()) return;
               // ⚠️ This used to log and fall through to the ack below, so ONE bad event
               // silently discarded the other 99 and the replica still reported itself
               // caught up. Measured 2026-08-26: six batches × 100 events dropped that
@@ -3844,6 +3892,7 @@ export class ZeBridge {
               // transaction, so only the genuinely bad event is affected.
               await this.applyBatchIsolated(streamName, toApply, String(err));
             }
+            if (superseded()) return;
             // Held events are accounted for (retried after later batches), so acking
             // here is correct — what must never happen again is acking events that
             // were neither applied nor held.
@@ -3879,12 +3928,19 @@ export class ZeBridge {
             }
             await this.retryFkHeld(streamName);
           };
+          const flushBatch = () => {
+            // Chain every caller, including timers that fire while another caller is
+            // waiting. stopTail must await the entire queue, not just its first job.
+            const work = (flushWork ?? Promise.resolve()).then(applyBuffered);
+            flushWork = work;
+            return work.finally(() => { if (flushWork === work) flushWork = null; });
+          };
 
           let lastMsgAt = Date.now();
           const itRef = curIter;
-          const idleGuard = setInterval(() => {
-            if (Date.now() - lastMsgAt < 25_000) return;
-            void (async () => {
+          idleGuard = setInterval(() => {
+            if (superseded() || idleWork || Date.now() - lastMsgAt < 25_000) return;
+            idleWork = (async () => {
               try {
                 // §10ja: ask the CONSUMER, not the stream. "The stream's last sequence is
                 // past my position" is always true for a consumer filtered to this
@@ -3905,6 +3961,7 @@ export class ZeBridge {
                 let pending = -1;
                 let ci: any = null;
                 try { ci = await jsm.consumers.info(streamName, curName); pending = ci?.num_pending ?? 0; } catch { /* gone */ }
+                if (superseded()) return;
                 if (pending !== 0) {
                   this.appendLog('SYS', `${streamName}: consumer idle 25s with ${pending < 0 ? 'no consumer on the server' : `${pending} message(s) waiting`} (stored ${stored}) — deaf; recreating`, 'WARNING');
                   try { itRef.stop(); } catch { /* already ended */ }
@@ -3946,7 +4003,7 @@ export class ZeBridge {
                   );
                 }
               } catch { /* stream info unavailable mid-outage — keep waiting */ }
-            })();
+            })().finally(() => { idleWork = null; });
           }, 10_000);
           try {
           for await (const msg of curIter) {
@@ -3985,6 +4042,7 @@ export class ZeBridge {
               try { itRef.stop(); } catch { /* already ended */ }
               break;
             }
+            if (superseded()) break;
             lastSeen = msg.seq;
             processedSinceStart++;
             if (processedSinceStart % progressEvery === 0) {
@@ -4035,7 +4093,7 @@ export class ZeBridge {
             // Contained, whatever it is: a tail must never take the process down.
             this.appendLog('SYS', `${streamName}: tail iterator errored (${e}) — will recreate`, 'ERROR');
           } finally { clearInterval(idleGuard); }
-          if (superseded()) { batch = []; batchMsgs = []; break; }
+          if (superseded()) { discardBatch(); break; }
           await flushBatch();
           curIter = null; // consumed — never iterate it again (see above)
           if (!this.nc) break;
@@ -4271,7 +4329,11 @@ export class ZeBridge {
   /// path seeds from the HUB's chain and resumes the tail at the chain's cut — every
   /// commit after the cut arrives too. Rewinding the route, rather than waiting for a
   /// chain newer than the replica's position, cannot starve under continuing load.
-  private async reconcileRewind() {
+  private reconcileRewind(): Promise<void> {
+    return this.changeStreams(() => this.reconcileRewindOnce());
+  }
+
+  private async reconcileRewindOnce() {
     await this.outboxInitPromise;
     const rows: any[] = await this.run(`SELECT msg_id, tbl, state, routes FROM _zebridge_reconcile ORDER BY since`);
     if (!this.reconcileLoaded) {
@@ -4285,15 +4347,22 @@ export class ZeBridge {
         }
       }
     }
-    const pending = rows.filter((r) => r.state === 'pending');
+    // Older clients may have persisted an empty route for an on-demand/unfollowed
+    // table. It stays unresolved and can acquire a recovery route when followed.
+    const pending = rows.filter((r) => r.state === 'pending' || !r.routes);
     if (!pending.length) return;
     const rewind = new Set<string>();
-    const marks = pending.map((r) => {
+    const marks = pending.flatMap((r) => {
       const tenant = this.syncedTables.has(r.tbl) && !this.ondemandSet.has(r.tbl) ? this.effectiveTenantFor(r.tbl) : null;
       const route = tenant === null ? '' : this.cdcStreamForTenant(tenant);
-      if (route && !this.hubOnly.has(route)) rewind.add(route);
-      return { msgId: String(r.msg_id), tbl: String(r.tbl), route };
+      if (!route) return [];
+      if (!this.hubOnly.has(route) || (this.globalSyncState.seq[route] ?? 0) > 0 || this.tailStops.has(route)) rewind.add(route);
+      return [{ msgId: String(r.msg_id), tbl: String(r.tbl), route }];
     });
+    if (!marks.length) return;
+    // Fence every old callback and await work already in storage before writing zero.
+    for (const route of rewind) await this.stopTail(route);
+    for (const m of marks) this.healedRoutes.delete(m.route);
     await this.transaction(async (txExec) => {
       for (const route of rewind) {
         await txExec(`INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, 0) ON CONFLICT(stream) DO UPDATE SET last_seq = 0`, route);
@@ -4304,9 +4373,6 @@ export class ZeBridge {
       }
     });
     for (const route of rewind) {
-      // The live tail stops at its next message without applying it: its position must
-      // stay at 0 until the heal.
-      this.tailGen.set(route, (this.tailGen.get(route) ?? 0) + 1);
       this.globalSyncState.seq[route] = 0;
       this.hubOnly.add(route);
       this.appendLog('SYS', `${route}: rewound for reconciliation — reseeding from the hub`, 'WARNING');
@@ -4315,23 +4381,40 @@ export class ZeBridge {
 
   /// A rewound marker whose route healed waits for the tail to reach the stream's end as
   /// it is now — a commit after the chain's cut arrives by the tail, not the seed; a
-  /// healed one clears once it did. True while any marker remains.
+  /// healed one clears once it did. True while a recoverable marker needs another pass;
+  /// parked markers remain durable but wake only on connect/configuration changes.
   private async reconcileClear(): Promise<boolean> {
     for (const route of this.healedRoutes) this.hubOnly.delete(route);
     this.healedRoutes.clear();
     const live = new Set(this.cdcStreams());
     for (const route of [...this.hubOnly]) if (!live.has(route)) this.hubOnly.delete(route);
-    const rows: any[] = await this.run(`SELECT msg_id, state, routes, targets, data FROM _zebridge_reconcile ORDER BY since`);
+    const rows: any[] = await this.run(`SELECT msg_id, tbl, state, routes, targets, data FROM _zebridge_reconcile ORDER BY since`);
     let left = 0;
     for (const r of rows) {
       const routes = String(r.routes ?? '').split(',').filter(Boolean);
-      if (r.state === 'rewound') {
+      if (!this.syncedTables.has(r.tbl) || this.ondemandSet.has(r.tbl)) {
+        // A configuration change can remove the recovery path even after a rewind.
+        // Require a fresh rewind if this table is followed again later.
+        if (r.state !== 'pending' || routes.length) {
+          await this.run(`UPDATE _zebridge_reconcile SET state = 'pending', routes = '', targets = '' WHERE msg_id = ?`, r.msg_id);
+        }
+        continue;
+      }
+      if (!routes.length) continue; // no recovery route: no polling timer
+      if (r.state === 'rewound' || (r.state === 'healed' && !r.targets)) {
         left++;
         if (routes.some((route) => this.hubOnly.has(route)) || !this.nc) continue;
-        const jsm = await this.transport.jetstreamManager(this.nc, this.jsOpts());
         const targets: string[] = [];
-        for (const route of routes) {
-          try { targets.push(`${route}:${(await jsm.streams.info(route))?.state?.last_seq ?? 0}`); } catch { /* gone: nothing to wait for */ }
+        try {
+          const jsm = await this.transport.jetstreamManager(this.nc, this.jsOpts());
+          for (const route of routes) {
+            const last = (await jsm.streams.info(route))?.state?.last_seq;
+            if (!Number.isSafeInteger(last) || last < 0) throw new Error(`${route}: missing reconciliation tail target`);
+            targets.push(`${route}:${last}`);
+          }
+        } catch (e) {
+          this.appendLog('SYS', `reconcile ${r.msg_id}: tail targets unavailable (${e}) — marker retained`, 'WARNING');
+          continue; // keep retrying this marker, while independent markers progress
         }
         await this.run(`UPDATE _zebridge_reconcile SET state = 'healed', targets = ? WHERE msg_id = ?`, targets.join(','), r.msg_id);
         continue;
@@ -4352,7 +4435,8 @@ export class ZeBridge {
   }
 
   /// Rewind, heal through `subscribeStreams` (the gap path), clear. Retried every few
-  /// seconds while markers remain, and at every connect.
+  /// seconds while recoverable markers remain, and at every connect. Parked markers
+  /// stay visible through reconciling() without keeping a polling timer alive.
   private async reconcile(): Promise<void> {
     if (this.reconcileBusy || !this.nc) return;
     this.reconcileBusy = true;
