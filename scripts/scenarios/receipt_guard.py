@@ -33,22 +33,28 @@ def main():
     def ident(n):
         return f"zb1-t{int(time.time() * 1000)}-INSERT-c1-t-k1-{n}-v{uuid.uuid4().hex[:8]}"
 
-    def lookup(ids, body=b"x"):
+    def lookup(ids, bodies=None, principal="alice"):
+        bodies = bodies or ["x"] * len(ids)
         arr = ",".join(f"'{i}'" for i in ids)
         return (f"SELECT string_agg(status || '=' || encode(fingerprint, 'hex'), ' ' ORDER BY ord) FROM zebridge_private.lookup_receipts("
-                f"'alice', ARRAY[{arr}], ARRAY[{','.join(['convert_to(%s,%s)' % (repr('r'), repr('UTF8'))] * len(ids))}]::bytea[], "
-                f"ARRAY[{','.join(['convert_to(%s,%s)' % (repr(body.decode()), repr('UTF8'))] * len(ids))}]::bytea[]);\n")
+                f"'{principal}', ARRAY[{arr}], ARRAY[{','.join(["convert_to('r','UTF8')"] * len(ids))}]::bytea[], "
+                f"ARRAY[{','.join(f"convert_to('{b}','UTF8')" for b in bodies)}]::bytea[]);\n")
 
-    def lock(ids):
+    def lock(ids, principals=None):
+        principals = principals or ["alice"] * len(ids)
         arr = ",".join(f"'{i}'" for i in ids)
-        return f"SELECT zebridge_private.lock_receipts(ARRAY[{','.join(["'alice'"] * len(ids))}], ARRAY[{arr}]);\n"
+        return f"SELECT zebridge_private.lock_receipts(ARRAY[{','.join(f"'{q}'" for q in principals)}], ARRAY[{arr}]);\n"
 
-    def record(ids, fp_sql):
+    def body_fp(b):
+        return f"sha256(int4send(1) || convert_to('r','UTF8') || convert_to('{b}','UTF8'))"
+
+    def record(ids, fp_sql, principal="alice"):
+        fps = fp_sql if isinstance(fp_sql, list) else [fp_sql] * len(ids)
         arr = ",".join(f"'{i}'" for i in ids)
-        return (f"SELECT zebridge_private.record_receipts('alice', ARRAY[{arr}], ARRAY[{','.join([fp_sql] * len(ids))}]::bytea[], "
+        return (f"SELECT zebridge_private.record_receipts('{principal}', ARRAY[{arr}], ARRAY[{','.join(fps)}]::bytea[], "
                 f"ARRAY[{','.join(["'{\"status\":\"accepted\"}'"] * len(ids))}]::jsonb[]);\n")
 
-    fp = "sha256(int4send(1) || convert_to('r','UTF8') || convert_to('x','UTF8'))"
+    fp = body_fp("x")
     wrong_fp = "sha256(convert_to('other','UTF8'))"
     close = "SELECT zebridge_private.close_guard();\n"
 
@@ -78,6 +84,19 @@ def main():
               "same count, different identity (A,Z for A,B): close_guard refuses")
         r = tx(lock([a]) + lookup([a]) + record([a], wrong_fp) + close)
         check(r.returncode != 0 and "not the undecided writes" in r.stderr, "same ID, different fingerprint: close_guard refuses")
+
+        # The comparison is of multisets: the order of arrival must not matter.
+        p1, p2 = ident("P1"), ident("P2")
+        r = tx(lock([p1, p2]) + lookup([p1, p2], ["one", "two"]) + record([p2, p1], [body_fp("two"), body_fp("one")]) + close)
+        check(r.returncode == 0, "lookup [P1,P2], record [P2,P1] (each with its own fingerprint): close_guard accepts")
+        q1, q2 = ident("Q1"), ident("Q2")
+        r = tx(lock([q1, q2]) + lookup([q1, q2], ["one", "two"]) + record([q2, q1], [body_fp("one"), body_fp("two")]) + close)
+        check(r.returncode != 0 and "not the undecided writes" in r.stderr,
+              "lookup [Q1,Q2], record [Q2,Q1] with the fingerprints swapped between them: close_guard refuses")
+        s1, s2 = ident("S1"), ident("S2")
+        r = tx(lock([s1, s2], ["alice", "bob"]) + lookup([s1], ["one"]) + lookup([s2], ["two"], principal="bob")
+               + record([s2], [body_fp("two")], principal="bob") + record([s1], [body_fp("one")]) + close)
+        check(r.returncode == 0, "two principal groups looked up alice then bob, recorded bob then alice: close_guard accepts")
 
         r = tx(lock([a]) + lookup([a]))
         check(r.returncode != 0 and "would commit without their receipts" in r.stderr, "COMMIT with no receipt: the deferred guard check refuses it")

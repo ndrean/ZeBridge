@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Mutation receipts in a disposable local PostgreSQL database (hub fallback, stage 2a).
 
-Exercises the zebridge_private receipt storage through the writer's three functions:
-month derivation from the ID, claim/duplicate/conflict/expired/future/invalid verdicts,
-the deferred "no unfinished receipt commits" rule, a concurrent duplicate claim, the
-legacy sentinel, the monotonic minimum, privileges, DDL silence, pruning and pg_dump.
+Exercises the zebridge_private receipt storage through the writer's functions (receipts-locks
+prototype: lock_receipts, lookup_receipts, record_receipts, close_guard): month derivation
+from the ID, claimed/duplicate/conflict/expired/future/invalid verdicts, one receipt per
+write, a concurrent duplicate waiting on the lock, the legacy sentinel, the monotonic
+minimum, privileges, DDL silence, pruning and pg_dump.
+
+ZB_RECEIPT_GUARD=1 runs variant B: the database's completion guard is switched on, every
+finish closes it, and a lookup committed without its receipt must be refused.
 """
 import datetime
 import os
@@ -16,6 +20,7 @@ import uuid
 import zb
 
 BRIDGE = pathlib.Path(os.environ.get("ZB_BRIDGE_BIN", zb.ROOT / "zig-out/bin/bridge"))
+GUARD = os.environ.get("ZB_RECEIPT_GUARD") == "1"
 
 
 def ms(dt):
@@ -40,21 +45,26 @@ def main():
         failures += not ok
 
     def claim(ids, payloads=None, principal="alice", as_writer=True, extra=""):
-        """claim_receipts for `ids` (same route, payload per id or 'p'), finished with {"ok":n} unless extra says otherwise."""
+        """lock_receipts then lookup_receipts for `ids` (same route, payload per id or 'p'), then `extra` (a finish)."""
         payloads = payloads or ["p"] * len(ids)
         arr = lambda xs: "ARRAY[" + ",".join(f"convert_to('{x}','UTF8')" for x in xs) + "]::bytea[]"
         ids_sql = "ARRAY[" + ",".join(f"'{i}'" for i in ids) + "]::text[]"
         role = f"SET ROLE {writer};" if as_writer else ""
-        return sql(f"{role} BEGIN; SELECT ord, status, coalesce(outcome::text, '') FROM zebridge_private.claim_receipts("
+        return sql(f"{role} BEGIN; SELECT zebridge_private.lock_receipts(ARRAY[" + ",".join([f"'{principal}'"] * len(ids)) + f"]::text[], {ids_sql}); "
+                   f"SELECT ord, status, coalesce(outcome::text, '') FROM zebridge_private.lookup_receipts("
                    f"'{principal}', {ids_sql}, {arr(['mutation.' + principal + '.t.insert'] * len(ids))}, {arr(payloads)}); {extra} COMMIT;",
                    check=False)
 
     def statuses(result):
         return [line.split("|")[1] for line in result.stdout.splitlines() if line.count("|") == 2]
 
-    def finish(ids, principal="alice"):
-        return (f"SELECT zebridge_private.finish_receipts('{principal}', ARRAY[" + ",".join(f"'{i}'" for i in ids) + "]::text[], ARRAY["
-                + ",".join('\'{"ok":1}\'::jsonb' for _ in ids) + "]);")
+    def finish(ids, principal="alice", payloads=None, outcome='{"ok":1}'):
+        """record_receipts for `ids` (their fingerprints over the route and payload, 'p' unless given), then close_guard in B."""
+        payloads = payloads or ["p"] * len(ids)
+        route = f"convert_to('mutation.{principal}.t.insert','UTF8')"
+        fps = ",".join(f"sha256(int4send(length({route})) || {route} || convert_to('{x}','UTF8'))" for x in payloads)
+        return (f"SELECT zebridge_private.record_receipts('{principal}', ARRAY[" + ",".join(f"'{i}'" for i in ids) + f"]::text[], ARRAY[{fps}]::bytea[], ARRAY["
+                + ",".join(f"'{outcome}'::jsonb" for _ in ids) + "]);" + (" SELECT zebridge_private.close_guard();" if GUARD else ""))
 
     now = datetime.datetime.now(datetime.timezone.utc)
     this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -69,6 +79,11 @@ def main():
         rendered = subprocess.run([str(BRIDGE), "--init-sql"], env=env, capture_output=True, text=True, check=True).stdout
         first = sql(rendered)
         sql(rendered)  # idempotent re-apply
+        if GUARD:
+            sql("UPDATE zebridge_private.receipt_policy SET completion_guard = true")
+            sql(rendered)  # a re-apply keeps the guard on
+            check(sql("SELECT completion_guard FROM zebridge_private.receipt_policy").stdout.strip() == "t",
+                  "variant B: the completion guard is on and survives a re-apply of --init-sql")
         check(first.stdout.strip() == "", "installing receipts prints nothing into --init-sql's output")
         count_parts = "SELECT count(*) FROM pg_inherits WHERE inhparent = 'zebridge_private.receipts'::regclass"
         check(sql(count_parts).stdout.strip() == "0", "installation creates no partition (pg_restore --clean must not meet one)")
@@ -117,11 +132,16 @@ def main():
 
         unfinished = f"zb1-t{ms(now)}-c1-t-6"
         r = claim([unfinished])
-        check(r.returncode != 0 and "without an outcome" in r.stderr, "a claim cannot commit without its outcome")
+        if GUARD:
+            check(r.returncode != 0 and "would commit without their receipts" in r.stderr,
+                  "variant B: a lookup that found the ID undecided cannot commit without its receipt")
+        else:
+            check(r.returncode == 0 and statuses(r) == ["claimed"],
+                  "variant A: a lookup inserts nothing, so committing without a receipt is not refused (A's limitation)")
         r = claim([unfinished], extra=finish([unfinished]))
-        check(statuses(r) == ["claimed"], "the refused commit left nothing behind: the ID is claimed afresh")
+        check(statuses(r) == ["claimed"], "nothing was left behind: the ID is still undecided, then recorded")
         r = sql(f"SET ROLE {writer}; BEGIN; {finish([new_id])} COMMIT;", check=False)
-        check(r.returncode != 0, "a decided receipt cannot be finished again")
+        check(r.returncode != 0, "a decided receipt cannot be recorded again")
 
         boundary = f"zb1-t{last_ms_prev_month}-c1-t-7"
         claim([boundary], extra=finish([boundary]))
@@ -142,17 +162,20 @@ def main():
         racing = f"zb1-t{ms(now)}-c1-t-9"
         ids, route, payload = f"ARRAY['{racing}']::text[]", "ARRAY[convert_to('r','UTF8')]::bytea[]", "ARRAY[convert_to('p','UTF8')]::bytea[]"
         a_proc = subprocess.Popen([*base, "-d", name], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        a_proc.stdin.write(f"SET ROLE {writer}; BEGIN; SELECT status FROM zebridge_private.claim_receipts('alice', {ids}, {route}, {payload}); "
-                           f"SELECT pg_sleep(2); SELECT zebridge_private.finish_receipts('alice', {ids}, ARRAY['{{\"by\":\"A\"}}'::jsonb]); COMMIT;")
+        lock = f"SELECT zebridge_private.lock_receipts(ARRAY['alice']::text[], {ids});"
+        fps = "ARRAY[sha256(int4send(1) || convert_to('r','UTF8') || convert_to('p','UTF8'))]::bytea[]"
+        close = " SELECT zebridge_private.close_guard();" if GUARD else ""
+        a_proc.stdin.write(f"SET ROLE {writer}; BEGIN; {lock} SELECT status FROM zebridge_private.lookup_receipts('alice', {ids}, {route}, {payload}); "
+                           f"SELECT pg_sleep(2); SELECT zebridge_private.record_receipts('alice', {ids}, {fps}, ARRAY['{{\"by\":\"A\"}}'::jsonb]);{close} COMMIT;")
         a_proc.stdin.close()
         time.sleep(.7)
         started = time.monotonic()
-        b_out = sql(f"SET ROLE {writer}; BEGIN; SELECT status || '|' || coalesce(outcome::text, '') FROM zebridge_private.claim_receipts("
+        b_out = sql(f"SET ROLE {writer}; BEGIN; {lock} SELECT status || '|' || coalesce(outcome::text, '') FROM zebridge_private.lookup_receipts("
                     f"'alice', {ids}, {route}, {payload}); COMMIT;", check=False)
         waited = time.monotonic() - started
         a_out, _ = a_proc.communicate(timeout=30)
-        check(a_out.split()[0] == "claimed" and b_out.stdout.strip() == 'duplicate|{"by": "A"}' and waited > .8,
-              f"a concurrent duplicate waits for the winner and returns its outcome ({waited:.1f} s)")
+        check(a_out.split()[-1] == "claimed" and b_out.stdout.strip() == 'duplicate|{"by": "A"}' and waited > .8,
+              f"a concurrent duplicate waits on the winner's lock and returns its outcome ({waited:.1f} s)")
 
         floor = lambda: int(sql("SELECT min_accepted_ms FROM zebridge_private.receipt_policy").stdout)
         before = floor()
@@ -178,7 +201,7 @@ def main():
             (f"SET ROLE {writer}; SELECT count(*) FROM zebridge_private.receipts", "the writer cannot read receipts directly"),
             (f"SET ROLE {writer}; SELECT count(*) FROM zebridge_private.{nxt}", "the writer cannot address a partition directly"),
             (f"SET ROLE {writer}; INSERT INTO zebridge_private.receipts VALUES ('alice', 'c-y', '1900-01-01', sha256('y'), '{{}}')",
-             "the writer cannot insert a receipt except through claim_receipts"),
+             "the writer cannot insert a receipt except through record_receipts"),
             (f"SET ROLE {writer}; SELECT zebridge_private.prune_receipts()", "the writer cannot prune"),
             ("SELECT * FROM zebridge_grant_edge_writes('zebridge_private.receipts'::regclass)", "receipts cannot be opened to edge writes"),
             (f"SELECT * FROM zebridge_grant_edge_writes('zebridge_private.{nxt}'::regclass)", "nor can one of their partitions"),
@@ -188,7 +211,7 @@ def main():
         pg_bin = pathlib.Path(zb._psql_binary()).parent
         dump = subprocess.run([str(pg_bin / "pg_dump"), "-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-Fc", name], capture_output=True, check=True).stdout
         listing = subprocess.run([str(pg_bin / "pg_restore"), "-l"], input=dump, capture_output=True, check=True).stdout.decode()
-        check("TABLE DATA zebridge_private receipts_legacy" in listing and "FUNCTION zebridge_private claim_receipts" in listing
+        check("TABLE DATA zebridge_private receipts_legacy" in listing and "FUNCTION zebridge_private lookup_receipts" in listing
               and "TABLE DATA zebridge_private receipt_policy" in listing, "a full pg_dump carries the private schema, its partitions and policy")
 
         sql(f"UPDATE zebridge_private.receipt_policy SET min_accepted_ms = {ms(this_month)}")

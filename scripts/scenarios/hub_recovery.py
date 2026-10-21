@@ -4,6 +4,10 @@
 Creates two scratch databases and private NATS servers. A native client writes
 through admission, a checkpoint drains it, and a replacement hub rebuilds from
 pg_restore under the same NATS identity. The old replica must converge too.
+
+ZB_RECEIPT_GUARD=1 (receipts-locks variant B; ZB_BRIDGE_BIN built with -Dreceipt-guard=true)
+switches the source's completion guard on: the restore must carry it, or the replacement
+bridge refuses to start.
 """
 import asyncio
 import ctypes
@@ -27,6 +31,7 @@ from rotate_client_key import client_creds as mint_client
 
 ROOT = zb.ROOT
 BRIDGE = pathlib.Path(os.environ.get("ZB_BRIDGE_BIN", ROOT / "zig-out/bin/bridge"))
+GUARD = os.environ.get("ZB_RECEIPT_GUARD") == "1"
 LIBRARY = pathlib.Path(os.environ.get("ZB_LIBZB", ROOT / "libzb/zig-out/lib" / ("libzbcore.dylib" if os.uname().sysname == "Darwin" else "libzbcore.so")))
 spec = importlib.util.spec_from_file_location("checkpoint", ROOT / "deploy/backup-hub.py")
 backup = importlib.util.module_from_spec(spec)
@@ -104,6 +109,8 @@ async def main():
             sql(f'CREATE DATABASE "{source}"', "postgres")
             made.append(source)
             sql(render(source))
+            if GUARD:
+                sql("UPDATE zebridge_private.receipt_policy SET completion_guard = true")
             sql("CREATE TABLE recovery_row (id uuid PRIMARY KEY, v int NOT NULL, updated_at timestamptz NOT NULL DEFAULT now()); "
                 "SELECT * FROM zebridge_enable('public.recovery_row', public_reason => 'recovery fixture', writable => true, "
                 "version_col => 'updated_at', allow_physical_deletes => true, publication => 'recovery_pub', dry_run => false); "
@@ -199,11 +206,14 @@ async def main():
             receipt_args = (f"'lf-edge1.recovery_device', ARRAY['{receipt_id}']::text[], "
                             "ARRAY[convert_to('mutation.lf-edge1.recovery_device.recovery_row.insert','UTF8')]::bytea[], "
                             "ARRAY[convert_to('{}','UTF8')]::bytea[]")
+            route = "convert_to('mutation.lf-edge1.recovery_device.recovery_row.insert','UTF8')"
             sql("SELECT count(*) FROM zebridge_private.maintain_receipts(); BEGIN; "
-                f"SELECT count(*) FROM zebridge_private.claim_receipts({receipt_args}); "
-                f"SELECT zebridge_private.finish_receipts('lf-edge1.recovery_device', ARRAY['{receipt_id}']::text[], "
-                "ARRAY['{\"committed\":true}'::jsonb]); COMMIT;")
-            policy_sql = "SELECT retention_days || '|' || min_accepted_ms FROM zebridge_private.receipt_policy"
+                f"SELECT zebridge_private.lock_receipts(ARRAY['lf-edge1.recovery_device']::text[], ARRAY['{receipt_id}']::text[]); "
+                f"SELECT count(*) FROM zebridge_private.lookup_receipts({receipt_args}); "
+                f"SELECT zebridge_private.record_receipts('lf-edge1.recovery_device', ARRAY['{receipt_id}']::text[], "
+                f"ARRAY[sha256(int4send(length({route})) || {route} || convert_to('{{}}','UTF8'))]::bytea[], "
+                "ARRAY['{\"committed\":true}'::jsonb]); " + ("SELECT zebridge_private.close_guard(); " if GUARD else "") + "COMMIT;")
+            policy_sql = "SELECT retention_days || '|' || min_accepted_ms || '|' || completion_guard FROM zebridge_private.receipt_policy"
             source_policy = sql(policy_sql)
             checkpoint = tmp / "checkpoint"
             def dump(path):
@@ -235,13 +245,14 @@ async def main():
             assert restore.returncode == 0, restore.stderr[-1800:]
             check(sql("SELECT string_agg(v::text,',' ORDER BY v) FROM recovery_row", restored) == "10,20",
                   "pg_restore recovers the checkpoint, including the acknowledged client mutation")
-            check(sql(f"SELECT status || '|' || outcome::text FROM zebridge_private.claim_receipts({receipt_args})", restored)
+            check(sql(f"SELECT status || '|' || outcome::text FROM zebridge_private.lookup_receipts({receipt_args})", restored)
                   == 'duplicate|{"committed": true}'
                   and int(sql("SELECT count(*) FROM pg_inherits WHERE inhparent = 'zebridge_private.receipts'::regclass", restored)) >= 7,
                   "restored receipts and partitions answer a replayed ID with its recorded outcome")
             restored_policy = sql(policy_sql, restored)
-            check(restored_policy == source_policy and int(source_policy.split("|")[1]) > 0,
-                  f"the receipt policy is restored exactly: retention and minimum accepted time ({restored_policy})")
+            check(restored_policy == source_policy and int(source_policy.split("|")[1]) > 0
+                  and source_policy.split("|")[2] == ("true" if GUARD else "false"),
+                  f"the receipt policy is restored exactly: retention, minimum accepted time and completion guard ({restored_policy})")
             sql("SELECT count(*) FROM zebridge_private.maintain_receipts()", restored)  # what the replacement bridge runs at startup
             check(int(sql(policy_sql, restored).split("|")[1]) >= int(source_policy.split("|")[1]),
                   "startup maintenance on the restored database keeps or advances the minimum, never lowers it")

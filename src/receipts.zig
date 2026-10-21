@@ -76,7 +76,8 @@ fn placeholders(a: std.mem.Allocator, sql: *std.ArrayList(u8), first: usize, n: 
 }
 
 /// Every receipt key of a batch, all principals, in one call: lock_receipts takes the locks
-/// in one global order (sorted keys), so two batches never wait on each other in a cycle.
+/// in one global order (sorted keys), so no two transactions wait on each other's receipt
+/// locks in a cycle. Row locks and triggers can still deadlock: that recovery stays.
 pub fn sendLocks(a: std.mem.Allocator, conn: ?*c.PGconn, principals: []const [:0]const u8, ids: []const [:0]const u8) !bool {
     const n = ids.len;
     var sql: std.ArrayList(u8) = .empty;

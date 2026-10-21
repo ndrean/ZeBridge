@@ -1339,14 +1339,18 @@ $$;
 -- Lock every (principal, ID) of a batch, in one global order (sorted lock keys across
 -- principals), before any receipt is read: a concurrent duplicate waits here, then finds
 -- the winner's receipt. Transaction-scoped: released at COMMIT or ROLLBACK. The key is a
--- 32-bit hash under a fixed class (0x5A42, "ZB"): a collision only serializes two writes.
+-- 64-bit hash (hashtextextended, seed 0x5A42 "ZB") in the single-bigint advisory lock
+-- space: a collision, with these keys or another application's bigint locks, only
+-- serializes two transactions; the receipt itself is still the exact text key. The one
+-- order rules out cycles among these locks only: application row locks and triggers can
+-- still deadlock, and the listener's deadlock recovery still applies.
 CREATE OR REPLACE FUNCTION zebridge_private.lock_receipts(p_principals text[], p_ids text[])
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
-    k integer;
+    k bigint;
 BEGIN
-    FOR k IN SELECT DISTINCT hashtext(x.pr || chr(31) || x.id) FROM unnest(p_principals, p_ids) AS x(pr, id) ORDER BY 1 LOOP
-        PERFORM pg_advisory_xact_lock(23106, k);
+    FOR k IN SELECT DISTINCT hashtextextended(x.pr || chr(31) || x.id, 23106) FROM unnest(p_principals, p_ids) AS x(pr, id) ORDER BY 1 LOOP
+        PERFORM pg_advisory_xact_lock(k);
     END LOOP;
 END;
 $$;
@@ -1478,7 +1482,9 @@ $$;
 
 -- Variant B's finalizer: the receipts this transaction inserted must be exactly the
 -- undecided set lookup_receipts recorded, entry for entry (key and fingerprint, as
--- multisets). Then the guard goes, and the deferred check lets the COMMIT through.
+-- multisets: both sides sorted by key, then fingerprint, whatever order they arrived in;
+-- an aggregate's ORDER BY 1 would sort by the constant 1, keeping arrival order). Then
+-- the guard goes, and the deferred check lets the COMMIT through.
 CREATE OR REPLACE FUNCTION zebridge_private.close_guard()
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
@@ -1488,9 +1494,9 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'close_guard: no guard for this transaction' USING ERRCODE = 'ZBG01';
     END IF;
-    IF (SELECT coalesce(array_agg(k || ':' || encode(f, 'hex') ORDER BY 1), '{}') FROM unnest(g.expected_keys, g.expected_fps) AS e(k, f))
+    IF (SELECT coalesce(array_agg(k || ':' || encode(f, 'hex') ORDER BY k, f), '{}') FROM unnest(g.expected_keys, g.expected_fps) AS e(k, f))
        IS DISTINCT FROM
-       (SELECT coalesce(array_agg(k || ':' || encode(f, 'hex') ORDER BY 1), '{}') FROM unnest(g.actual_keys, g.actual_fps) AS a(k, f)) THEN
+       (SELECT coalesce(array_agg(k || ':' || encode(f, 'hex') ORDER BY k, f), '{}') FROM unnest(g.actual_keys, g.actual_fps) AS a(k, f)) THEN
         RAISE EXCEPTION 'close_guard: the receipts recorded are not the undecided writes of this transaction'
             USING ERRCODE = 'ZBG01';
     END IF;
