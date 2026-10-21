@@ -151,7 +151,7 @@ def max_window(events, seconds=4):
 async def main():
     count = int(os.environ.get('ZB_OUTBOX_STORM_CLIENTS', '8'))
     pending = int(os.environ.get('ZB_OUTBOX_PENDING', '256'))
-    window = 128
+    window = int(os.environ.get('ZB_OUTBOX_WINDOW', '128'))  # the clients' build under test
     budget = float(os.environ.get('ZB_OUTBOX_DRAIN_SECONDS', '180'))
     cdc = os.environ.get('ZB_OUTBOX_CDC') == '1'
     legacy = os.environ.get('ZB_OUTBOX_LEGACY_PUMP') == '1'
@@ -312,6 +312,9 @@ async def main():
                   f'every original ID commits once with one receipt: rows|executions|receipts {result}')
             print(json.dumps({'clients':count,'pending_per_client':pending,'workers':len(workers),'window':window if check_window else None,'cdc_fanout':cdc,'legacy_host_pump':legacy,'consumer_peak':consumer_peak,'max_gets_per_client_4s':max_get,'max_publishes_per_client_4s':max_pub,
                               'drain_seconds':round(time.monotonic()-resumed,3),
+                              # Replay time without the reconnect jitter or the 1 s sampling:
+                              # the first publish after the bridge resumed to the last one.
+                              'replay_seconds':round(max((t for e in events.values() for t,_ in e['pub'] if t >= resumed), default=resumed) - min((t for e in events.values() for t,_ in e['pub'] if t >= resumed), default=resumed),3),
                               'total_gets':sum(len(e['get']) for e in events.values()),'total_publishes':sum(len(e['pub']) for e in events.values())}))
             # Teardown/heap scans of hundreds of local handles are not the fleet
             # reconnect under test. Keep them staged like initial setup.

@@ -299,6 +299,7 @@ const Startup = struct {
 };
 
 pub const outbox_window: usize = 128;
+const outbox_window_text = std.fmt.comptimePrint("{d}", .{outbox_window});
 
 pub const SyncClient = struct {
     a: std.mem.Allocator,
@@ -4687,7 +4688,7 @@ pub const SyncClient = struct {
         // A full quiet window sleeps until its nearest per-entry deadline. A
         // verdict or newly queued edit invalidates this cache immediately.
         defer {
-            if (self.st.query(a, "SELECT CASE WHEN (SELECT count(*) FROM _zebridge_outbox WHERE retry_at>0)<128 AND EXISTS(SELECT 1 FROM _zebridge_outbox WHERE retry_at=0) THEN 0 ELSE COALESCE((SELECT min(retry_at) FROM _zebridge_outbox WHERE retry_at>0),9223372036854775807) END", &.{})) |next| {
+            if (self.st.query(a, "SELECT CASE WHEN (SELECT count(*) FROM _zebridge_outbox WHERE retry_at>0)<" ++ outbox_window_text ++ " AND EXISTS(SELECT 1 FROM _zebridge_outbox WHERE retry_at=0) THEN 0 ELSE COALESCE((SELECT min(retry_at) FROM _zebridge_outbox WHERE retry_at>0),9223372036854775807) END", &.{})) |next| {
                 self.outbox_next_check_ms = next[0][0].integer;
             } else |_| self.outbox_next_check_ms = nowMillis() + 1000;
         }
@@ -5756,7 +5757,7 @@ fn reserveOutboxLocked(st: *storage.Storage, a: std.mem.Allocator, now_ms: i64) 
     }
     // A backwards wall-clock adjustment cannot park a reservation indefinitely.
     _ = try st.query(a, "UPDATE _zebridge_outbox SET retry_at = ? WHERE retry_at > ?", &.{ .{ .integer = now_ms + 61_000 }, .{ .integer = now_ms + 61_000 } });
-    return try st.query(a, "SELECT msg_id, subject, payload, tbl, row_id, before, published, attempts FROM _zebridge_outbox WHERE retry_at > 0 AND retry_at <= ? ORDER BY retry_at, attempts, created_at, msg_id LIMIT 128", &.{.{ .integer = now_ms }});
+    return try st.query(a, "SELECT msg_id, subject, payload, tbl, row_id, before, published, attempts FROM _zebridge_outbox WHERE retry_at > 0 AND retry_at <= ? ORDER BY retry_at, attempts, created_at, msg_id LIMIT " ++ outbox_window_text, &.{.{ .integer = now_ms }});
 }
 
 /// One required string from grammar.json, by path. The error names the key, because
@@ -6976,8 +6977,8 @@ test "outbox window: reservations survive reopening and only definitive removal 
     var st = try storage.Storage.open(path);
     defer st.close();
     try execDdl(&st, "CREATE TABLE _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT, payload TEXT, tbl TEXT, row_id TEXT, before TEXT, published INTEGER DEFAULT 1, attempts INTEGER DEFAULT 0, created_at INTEGER, retry_at INTEGER DEFAULT 0)");
-    _ = try st.query(a, "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<299) INSERT INTO _zebridge_outbox(msg_id,subject,payload,tbl,row_id,created_at) SELECT 'id'||i,'s','{}','t',i,i FROM n", &.{});
-    try std.testing.expectEqual(@as(usize, 128), (try reserveOutbox(&st, a, 1000)).len);
+    _ = try st.query(a, "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<" ++ std.fmt.comptimePrint("{d}", .{outbox_window * 2 + 43}) ++ ") INSERT INTO _zebridge_outbox(msg_id,subject,payload,tbl,row_id,created_at) SELECT 'id'||i,'s','{}','t',i,i FROM n", &.{});
+    try std.testing.expectEqual(outbox_window, (try reserveOutbox(&st, a, 1000)).len);
     _ = try st.query(a, "UPDATE _zebridge_outbox SET retry_at=9000 WHERE retry_at>0", &.{});
     st.close();
     st = try storage.Storage.open(path);
@@ -6985,9 +6986,9 @@ test "outbox window: reservations survive reopening and only definitive removal 
     _ = try st.query(a, "DELETE FROM _zebridge_outbox WHERE msg_id='id0'", &.{});
     const next = try reserveOutbox(&st, a, 1002);
     try std.testing.expectEqual(@as(usize, 1), next.len);
-    try std.testing.expectEqualStrings("id128", next[0][0].text);
+    try std.testing.expectEqualStrings("id" ++ outbox_window_text, next[0][0].text);
     _ = try st.query(a, "UPDATE _zebridge_outbox SET retry_at=1 WHERE msg_id='id7'", &.{});
     const retry = try reserveOutbox(&st, a, 1003);
-    try std.testing.expectEqual(@as(usize, 2), retry.len); // id128 is still reserved, unsent
+    try std.testing.expectEqual(@as(usize, 2), retry.len); // id<window> is still reserved, unsent
     try std.testing.expectEqualStrings("id7", retry[0][0].text);
 }
