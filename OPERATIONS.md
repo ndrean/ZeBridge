@@ -6,6 +6,8 @@ The reference for running ZeBridge: the CLI, the doctor (`--diagnose`), what nee
 
 - [The CLI](#the-cli)
 - [Diagnose](#diagnose)
+- [Upgrading mutation receipts](#upgrading-mutation-receipts)
+  - [Release note: older clients and indeterminate verdicts](#release-note-older-clients-and-indeterminate-verdicts)
 - [Restart rules](#restart-rules)
   - [Checking a table / database against the bridge's rules](#checking-a-table--database-against-the-bridges-rules)
 - [Suspended tables](#suspended-tables)
@@ -138,6 +140,34 @@ What it checks, in order:
 It ends with `🩺 DIAGNOSE: all clear` (exit 0) or the number of findings (exit 1).
 
 More in [Verify the wiring](DEPLOYMENT.md#7-verify-the-wiring).
+
+[⬆️](#table-of-contents)
+
+---
+
+## Upgrading mutation receipts
+
+**Apply the new bridge's init SQL before replacing or starting the running bridge.** Receipt storage and its writer functions are part of the database contract; deploying only a new binary or container image is not a complete upgrade. The bridge checks the receipt schema, writer privileges and completion-guard setting before starting any mutation lane. This applies to Ansible and Docker deployments alike.
+
+1. Stage the candidate binary or image separately from the running one and preserve a verified [hub checkpoint](#hub-checkpoints-and-recovery), including `zebridge_private` and its receipt policy. Pause mutation admission, drain accepted writes with the old workers, and stop the old bridge workers before changing their receipt functions. Clients retain unacknowledged writes in their outboxes.
+2. Render the init SQL with the candidate binary, using the target deployment's existing reader/writer URLs and publication. Review it and apply it as the database administrator, with errors stopping the migration. The rendered file contains role passwords; create it with restrictive permissions.
+
+```sh
+set -a; . ./.env.admin; . ./.env.bridge; set +a
+umask 077
+/path/to/new/bridge --init-sql > zebridge-upgrade.sql
+psql "$ADMIN_DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f zebridge-upgrade.sql
+```
+
+3. On the `receipts-locks` candidate, select the same variant in the binary and database. Variant B requires a bridge built with `-Dreceipt-guard=true` and the administrator setting `UPDATE zebridge_private.receipt_policy SET completion_guard = true WHERE singleton;` after the init SQL succeeds. The installer does not enable B automatically. Enabling the guard is one-way: the database refuses to turn it off, and a mismatched bridge refuses to start. Variant A remains experimental; its early-commit fault can commit writes without receipts.
+4. Upgrade and start the bridge workers, then resume mutation admission after startup succeeds. Startup maintenance creates the required monthly partitions and the legacy partition before the first receipt lookup; installation itself creates no partitions. Existing receipts and the monotonic minimum accepted timestamp must survive the upgrade. Do not clear them or recreate the policy to make a startup check pass.
+5. Verify an actual client write commits, echoes and clears its outbox, and check receipt maintenance and worker logs. A binary rollback alone is not a database rollback: retain a compatible schema/build combination and use the checkpoint recovery procedure if restoration is required.
+
+### Release note: older clients and indeterminate verdicts
+
+Deploy client builds with durable `indeterminate` reconciliation, including the fixes in `251ad46`, before relying on automatic recovery from expired or reused message IDs. Older libzb settles an unfamiliar `indeterminate` verdict silently: it removes the outbox entry without reverting or scheduling an authoritative refresh. Older TS can also publish the original write once more during outbox replay after collecting that unfamiliar verdict. Receipt checks still protect a retained receipt from executing twice, but neither old client guarantees that its local optimistic value is reconciled.
+
+When no earlier attempt committed, an old client can therefore keep a local value that the hub never stored. Upgrading the client does not reconstruct reconciliation markers for entries already settled by old code; affected replicas need an authoritative full resync. Current clients report `indeterminate`, persist recovery atomically with removing the outbox entry, and report `reconciled` only after verified hub recovery. On-demand and unfollowed tables remain visibly unresolved until a recovery path exists. See [PROTOCOL §7.4c](PROTOCOL.md#74c-reconciling-an-indeterminate-write). Legacy message IDs remain accepted, and the public C ABI remains version 7.
 
 [⬆️](#table-of-contents)
 
