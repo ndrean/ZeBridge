@@ -21,7 +21,7 @@ info): the bridge's LOOP iters summed over the burst, per event, and CPU microse
 signal; CPU per event catches per-iteration cost growth that iterations alone cannot see.
 Not part of the scenario battery: run it on purpose, under caffeinate.
 """
-import argparse, asyncio, json, os, pathlib, re, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request
+import argparse, asyncio, hashlib, json, os, pathlib, re, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request
 
 import nats
 import nkeys
@@ -54,6 +54,7 @@ def main():
     ap.add_argument("--dup-window-s", type=float, default=5)
     ap.add_argument("--per-process", type=float, default=5000, help="writes/s per load process")
     ap.add_argument("--out", type=pathlib.Path, required=True)
+    ap.add_argument("--receipt-guard", action="store_true", help="switch receipt_policy.completion_guard on (receipts-locks variant B)")
     a = ap.parse_args()
     pgbin = pathlib.Path(zb._psql_binary()).parent
     procs, made = [], {}
@@ -95,7 +96,12 @@ def main():
         env = dict(os.environ, DATABASE_READER_URL=f"postgres://bench_reader:x@127.0.0.1:{pg_port}/{db}",
                    DATABASE_WRITER_URL=f"postgres://bench_writer:x@127.0.0.1:{pg_port}/{db}", TARGET_DB=db,
                    BRIDGE_CDC_PUBLICATION="bench_pub")
-        sql(subprocess.run([str(a.bridge), "--init-sql"], env=env, capture_output=True, text=True, check=True).stdout)
+        init_sql = subprocess.run([str(a.bridge), "--init-sql"], env=env, capture_output=True, text=True, check=True).stdout
+        sql(init_sql)
+        # The schema version each result ran on: the rendered init SQL's hash.
+        schema = {"schema_sha256": hashlib.sha256(init_sql.encode()).hexdigest()[:16], "receipt_guard": a.receipt_guard}
+        if a.receipt_guard:
+            sql("UPDATE zebridge_private.receipt_policy SET completion_guard = true")
         sql(DDL)
         refused = sql("SELECT step || ': ' || detail FROM zebridge_enable('public.sensor_events'::regclass, tenant_col => 'tenant_id', "
                       "writable => true, version_col => 'updated_at', tombstone_col => 'deleted_at', publication => 'bench_pub', "
@@ -167,7 +173,7 @@ def main():
             text = (work / "bridge.log").read_bytes()[mark:].decode(errors="replace")
             loops = [tuple(map(int, m)) for m in re.findall(r"LOOP iters=(\d+) idle=(\d+)", text)]
             iters = sum(i - d for i, d in loops)
-            result = {"label": a.label, "variant": "cdc", "rows": 2_000_000, "events": e1 - e0, "insert_s": round(inserted, 1),
+            result = {"label": a.label, **schema, "variant": "cdc", "rows": 2_000_000, "events": e1 - e0, "insert_s": round(inserted, 1),
                       "drain_s": round(drained, 1), "events_per_s": round((e1 - e0) / drained), "loop_lines": len(loops),
                       "working_iters": iters, "working_iters_per_event": round(iters / max(1, e1 - e0), 4),
                       "cpu_s": round(c1 - c0, 2), "cpu_us_per_event": round((c1 - c0) * 1e6 / max(1, e1 - e0), 2)}
@@ -228,7 +234,7 @@ def main():
         final = samples[-1][1]
         reached = min((ts for ts, r in samples if r == final), default=end)
         during = [b for b in backlog if start <= b[0] <= end + 120]
-        result = {"label": a.label, "variant": a.variant, "lanes": a.lanes, "offered_per_s": a.rate, "seconds": a.seconds,
+        result = {"label": a.label, **schema, "variant": a.variant, "lanes": a.lanes, "offered_per_s": a.rate, "seconds": a.seconds,
                   "load_processes": n, "dup_window_s": window,
                   "drain_s": round(max(0.0, reached - (start + a.seconds)), 1),
                   "backlog_max_pending": max((b[1] for b in during), default=None),

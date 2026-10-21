@@ -1198,38 +1198,50 @@ RETURNS date LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
                 ELSE zebridge_private.month_of_ms(zebridge_private.receipt_created_ms(message_id)) END
 $$;
 
--- outcome is NULL only between the claim and the end of its transaction; the deferred
--- trigger below refuses a commit that leaves it NULL. There is no default partition:
--- a month without one is an operational error, never a silently accepted write.
+-- (receipts-locks prototype) A receipt is inserted once, complete, after its write ran:
+-- outcome is NOT NULL. Concurrent duplicates are kept apart by transaction-scoped advisory
+-- locks taken before the receipt is read (lock_receipts), not by a placeholder row.
+-- There is no default partition: a month without one is an operational error.
 CREATE TABLE IF NOT EXISTS zebridge_private.receipts (
     principal   text        NOT NULL,
     message_id  text        NOT NULL,
     id_month    date        NOT NULL,
     fingerprint bytea       NOT NULL CHECK (length(fingerprint) = 32),
-    outcome     jsonb,
+    outcome     jsonb       NOT NULL,
     claimed_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (principal, message_id, id_month),
     CONSTRAINT receipts_month_from_id CHECK (id_month IS NOT DISTINCT FROM zebridge_private.receipt_month(message_id))
 ) PARTITION BY RANGE (id_month);
+ALTER TABLE zebridge_private.receipts ALTER COLUMN outcome SET NOT NULL;
+DROP TRIGGER IF EXISTS receipts_finished ON zebridge_private.receipts;
+DROP FUNCTION IF EXISTS zebridge_private.receipt_finished();
 
--- SECURITY DEFINER: a deferred trigger fires at COMMIT as the committing role (the
--- writer), which has no privilege on this table.
-CREATE OR REPLACE FUNCTION zebridge_private.receipt_finished()
+-- Variant B's completion guard (receipt_policy.completion_guard): one row per transaction that has undecided writes, holding
+-- the exact (principal, ID, fingerprint) set lookup_receipts left undecided (expected) and
+-- the set record_receipts inserted (actual). close_guard deletes it only when the two sets
+-- are identical; a deferred check refuses any COMMIT that still has its guard. Unused by
+-- variant A (completion_guard false); the caller cannot choose. Every guard error is SQLSTATE ZBG01: the
+-- bridge's, never read as a refusal of the client's write.
+CREATE TABLE IF NOT EXISTS zebridge_private.receipt_guards (
+    txid          xid8    PRIMARY KEY,
+    expected_keys text[]  NOT NULL DEFAULT '{}',
+    expected_fps  bytea[] NOT NULL DEFAULT '{}',
+    actual_keys   text[]  NOT NULL DEFAULT '{}',
+    actual_fps    bytea[] NOT NULL DEFAULT '{}'
+);
+CREATE OR REPLACE FUNCTION zebridge_private.receipt_guard_closed()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 BEGIN
-    -- Re-read: the same transaction may have finished the row after inserting it.
-    IF EXISTS (SELECT 1 FROM zebridge_private.receipts r
-               WHERE r.principal = NEW.principal AND r.message_id = NEW.message_id
-                 AND r.id_month = NEW.id_month AND r.outcome IS NULL) THEN
-        RAISE EXCEPTION 'receipt % of % would commit without an outcome', NEW.message_id, NEW.principal
-            USING ERRCODE = '23514';
+    IF EXISTS (SELECT 1 FROM zebridge_private.receipt_guards g WHERE g.txid = NEW.txid) THEN
+        RAISE EXCEPTION 'a transaction with undecided writes would commit without their receipts'
+            USING ERRCODE = 'ZBG01';
     END IF;
     RETURN NULL;
 END;
 $$;
-DROP TRIGGER IF EXISTS receipts_finished ON zebridge_private.receipts;
-CREATE CONSTRAINT TRIGGER receipts_finished AFTER INSERT ON zebridge_private.receipts
-    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION zebridge_private.receipt_finished();
+DROP TRIGGER IF EXISTS receipt_guard_closed ON zebridge_private.receipt_guards;
+CREATE CONSTRAINT TRIGGER receipt_guard_closed AFTER INSERT ON zebridge_private.receipt_guards
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION zebridge_private.receipt_guard_closed();
 
 -- One row: the retention and the minimum accepted creation time. The minimum only ever
 -- rises, so a dropped month can never become admissible again through a config change.
@@ -1239,6 +1251,9 @@ CREATE TABLE IF NOT EXISTS zebridge_private.receipt_policy (
     retention_days  integer NOT NULL DEFAULT 180 CHECK (retention_days BETWEEN 1 AND 3650),
     min_accepted_ms bigint  NOT NULL DEFAULT 0 CHECK (min_accepted_ms >= 0)
 );
+-- receipts-locks prototype: variant B's completion guard, on for every transaction once
+-- set (the bridge refuses to start if its build disagrees). One-way: never switched off.
+ALTER TABLE zebridge_private.receipt_policy ADD COLUMN IF NOT EXISTS completion_guard boolean NOT NULL DEFAULT false;
 INSERT INTO zebridge_private.receipt_policy DEFAULT VALUES ON CONFLICT DO NOTHING;
 
 CREATE OR REPLACE FUNCTION zebridge_private.receipt_policy_guard()
@@ -1250,6 +1265,9 @@ BEGIN
     IF NEW.min_accepted_ms < OLD.min_accepted_ms THEN
         RAISE EXCEPTION 'min_accepted_ms only rises (% -> %)', OLD.min_accepted_ms, NEW.min_accepted_ms
             USING ERRCODE = '23514';
+    END IF;
+    IF OLD.completion_guard AND NOT NEW.completion_guard THEN
+        RAISE EXCEPTION 'the completion guard is never switched off' USING ERRCODE = '23514';
     END IF;
     RETURN NEW;
 END;
@@ -1279,7 +1297,7 @@ BEGIN
     END IF;
     IF to_regclass('zebridge_private.receipts_legacy') IS NULL THEN
         CREATE TABLE zebridge_private.receipts_legacy PARTITION OF zebridge_private.receipts
-            FOR VALUES FROM ('1900-01-01') TO ('1900-02-01') WITH (fillfactor = 70);
+            FOR VALUES FROM ('1900-01-01') TO ('1900-02-01');
         RETURN NEXT 'receipts_legacy';
     END IF;
     m := zebridge_private.month_of_ms(floor_ms);
@@ -1287,9 +1305,8 @@ BEGIN
     WHILE m <= last_m LOOP
         part := 'receipts_' || to_char(m, 'YYYY_MM');
         IF to_regclass('zebridge_private.' || part) IS NULL THEN
-            -- fillfactor 70: room on the page for finish_receipts' update, which touches no
-            -- indexed column, to be a HOT update (no new index entry).
-            EXECUTE format('CREATE TABLE zebridge_private.%I PARTITION OF zebridge_private.receipts FOR VALUES FROM (%L) TO (%L) WITH (fillfactor = 70)',
+            -- Insert-only (receipts-locks): full pages, no room kept for updates.
+            EXECUTE format('CREATE TABLE zebridge_private.%I PARTITION OF zebridge_private.receipts FOR VALUES FROM (%L) TO (%L)',
                            part, m, (m + interval '1 month')::date);
             RETURN NEXT part;
         END IF;
@@ -1319,24 +1336,28 @@ BEGIN
 END;
 $$;
 
--- Claim a batch's receipts before its writes execute. One row per input position:
---   claimed   new: execute it, then finish_receipts with its outcome, same transaction
---   duplicate already decided: do NOT execute; `outcome` is the recorded one
---   repeat    the same ID earlier in this batch, same content: answer as that one
---   conflict  the same ID with different content (here or recorded): refuse it
---   expired   created before the minimum accepted time, and no receipt: not executed by
---             this attempt (an earlier one may have committed; the receipt is gone)
---   future    created more than 60 s ahead of this database's wall clock, and no receipt:
---             retryable, since a clock stepped back can make an accepted ID look future
---   invalid   empty, too long, not one subject token, or a malformed zb1- ID
--- A receipt is looked up BEFORE the time checks: an ID that has one gets its recorded
--- outcome however old or (by today's clock) future it looks.
--- The fingerprint is sha256 of the route's length (4 bytes), the route, then the payload:
--- the exact bytes received, never re-serialized JSON. Keys are inserted sorted, so
--- concurrent batches take index locks in one order. Under READ COMMITTED each statement
--- below takes a fresh snapshot: the lookup after the insert sees a concurrent winner.
-CREATE OR REPLACE FUNCTION zebridge_private.claim_receipts(p_principal text, p_ids text[], p_routes bytea[], p_payloads bytea[])
-RETURNS TABLE(ord integer, status text, outcome jsonb)
+-- Lock every (principal, ID) of a batch, in one global order (sorted lock keys across
+-- principals), before any receipt is read: a concurrent duplicate waits here, then finds
+-- the winner's receipt. Transaction-scoped: released at COMMIT or ROLLBACK. The key is a
+-- 32-bit hash under a fixed class (0x5A42, "ZB"): a collision only serializes two writes.
+CREATE OR REPLACE FUNCTION zebridge_private.lock_receipts(p_principals text[], p_ids text[])
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+    k integer;
+BEGIN
+    FOR k IN SELECT DISTINCT hashtext(x.pr || chr(31) || x.id) FROM unnest(p_principals, p_ids) AS x(pr, id) ORDER BY 1 LOOP
+        PERFORM pg_advisory_xact_lock(23106, k);
+    END LOOP;
+END;
+$$;
+
+-- After lock_receipts: one row per position, without inserting anything.
+--   claimed   undecided: execute it, then record_receipts with its outcome
+--   duplicate / repeat / conflict / expired / future / invalid: as claim_receipts did
+-- `fingerprint` is returned for record_receipts. With the completion guard on, the
+-- undecided entries become this transaction's guard (variant B).
+CREATE OR REPLACE FUNCTION zebridge_private.lookup_receipts(p_principal text, p_ids text[], p_routes bytea[], p_payloads bytea[])
+RETURNS TABLE(ord integer, status text, outcome jsonb, fingerprint bytea)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog
 SET enable_hashjoin = off SET enable_mergejoin = off SET enable_seqscan = off AS $$
 DECLARE
@@ -1346,32 +1367,27 @@ DECLARE
     months   date[];
     verdicts text[];
     timing   text[];
-    claimed  text[];
     first    integer;
     rec_fp   bytea;
     rec_outcome jsonb;
+    g_keys   text[] := '{}';
+    g_fps    bytea[] := '{}';
+    p_guard  boolean;
 BEGIN
     IF p_principal IS NULL OR p_principal = '' THEN
         RAISE EXCEPTION 'a receipt needs an authenticated principal' USING ERRCODE = '22023';
     END IF;
     IF cardinality(p_ids) IS DISTINCT FROM cardinality(p_routes)
        OR cardinality(p_ids) IS DISTINCT FROM cardinality(p_payloads) THEN
-        RAISE EXCEPTION 'claim_receipts: ids, routes and payloads differ in length' USING ERRCODE = '22023';
+        RAISE EXCEPTION 'lookup_receipts: ids, routes and payloads differ in length' USING ERRCODE = '22023';
     END IF;
-    SELECT min_accepted_ms INTO floor_ms FROM zebridge_private.receipt_policy;
-
-    -- 1. Fingerprint every position and check its shape; the time checks are kept apart
-    --    (`timing`), to be applied only when no receipt exists.
+    SELECT min_accepted_ms, completion_guard INTO floor_ms, p_guard FROM zebridge_private.receipt_policy;
     SELECT array_agg(i.fp ORDER BY i.n), array_agg(i.m ORDER BY i.n), array_agg(i.v ORDER BY i.n), array_agg(i.t ORDER BY i.n)
       INTO fps, months, verdicts, timing
       FROM (SELECT x.n,
                    sha256(int4send(length(x.r)) || x.r || x.p) AS fp,
                    zebridge_private.receipt_month(x.id) AS m,
                    CASE WHEN x.id IS NULL OR x.r IS NULL OR x.p IS NULL
-                             -- One byte policy with admission and both builders: 1-512 BYTES, no
-                             -- '.', '*', '>' and no ASCII control or space byte; UTF-8 is allowed.
-                             -- Explicit bytes, not [:space:]: those classes are Unicode-aware here
-                             -- and would refuse U+2003 or U+0085 that admission accepted.
                              OR octet_length(x.id) NOT BETWEEN 1 AND 512 OR x.id ~ '[.*>\x01-\x20\x7f]'
                              OR zebridge_private.receipt_month(x.id) IS NULL THEN 'invalid'
                         ELSE 'candidate' END AS v,
@@ -1380,29 +1396,10 @@ BEGIN
                         ELSE 'ok' END AS t
               FROM unnest(p_ids, p_routes, p_payloads) WITH ORDINALITY AS x(id, r, p, n)) i;
 
-    -- 2. Claim the first occurrence of each candidate ID that passes the time checks, keys
-    --    sorted. An expired or future one is never claimed: it can only match a receipt.
-    WITH firsts AS (
-        SELECT DISTINCT ON (p_ids[n]) p_ids[n] AS id, months[n] AS m, fps[n] AS fp
-          FROM generate_subscripts(p_ids, 1) AS n
-         WHERE verdicts[n] = 'candidate' AND timing[n] = 'ok'
-         ORDER BY p_ids[n], n
-    ), ins AS (
-        INSERT INTO zebridge_private.receipts (principal, message_id, id_month, fingerprint)
-        SELECT p_principal, f.id, f.m, f.fp FROM firsts f ORDER BY f.id
-        ON CONFLICT (principal, message_id, id_month) DO NOTHING
-        RETURNING message_id
-    )
-    SELECT coalesce(array_agg(message_id), '{}') INTO claimed FROM ins;
-
-    -- 3. Answer every position. Each lookup is its own statement, so a fresh snapshot sees
-    --    a concurrent winner; and each is a full-key equality, so it is an index probe in one
-    --    partition whatever plan this session cached. (A join on generate_subscripts, plain or
-    --    LATERAL, was planned while the table was still empty, kept its scan as the table
-    --    grew, and slowed each claim down batch after batch: 19 → 141 ms per 64 writes.)
     FOR n IN 1 .. coalesce(cardinality(p_ids), 0) LOOP
         ord := n;
         outcome := NULL;
+        fingerprint := fps[n];
         IF verdicts[n] <> 'candidate' THEN
             status := verdicts[n];
         ELSE
@@ -1415,8 +1412,6 @@ BEGIN
             END LOOP;
             IF first < n THEN
                 status := CASE WHEN fps[n] = fps[first] THEN 'repeat' ELSE 'conflict' END;
-            ELSIF p_ids[n] = ANY (claimed) THEN
-                status := 'claimed';
             ELSE
                 SELECT r.fingerprint, r.outcome INTO rec_fp, rec_outcome
                   FROM zebridge_private.receipts r
@@ -1427,41 +1422,79 @@ BEGIN
                 ELSIF FOUND THEN
                     status := 'conflict';
                 ELSIF timing[n] <> 'ok' THEN
-                    status := timing[n]; -- no receipt: now the time checks
+                    status := timing[n];
                 ELSE
-                    status := 'conflict';
+                    status := 'claimed';
+                    g_keys := g_keys || (p_principal || chr(31) || p_ids[n]);
+                    g_fps := g_fps || fps[n];
                 END IF;
             END IF;
         END IF;
         RETURN NEXT;
     END LOOP;
+    IF p_guard AND cardinality(g_keys) > 0 THEN
+        INSERT INTO zebridge_private.receipt_guards AS g (txid, expected_keys, expected_fps)
+        VALUES (pg_current_xact_id(), g_keys, g_fps)
+        ON CONFLICT (txid) DO UPDATE SET expected_keys = g.expected_keys || EXCLUDED.expected_keys,
+                                         expected_fps = g.expected_fps || EXCLUDED.expected_fps;
+    END IF;
 END;
 $$;
 
--- Record the outcome of every receipt this transaction claimed. Refuses an ID that is not
--- an unfinished claim visible to this transaction, and a NULL outcome.
-CREATE OR REPLACE FUNCTION zebridge_private.finish_receipts(p_principal text, p_ids text[], p_outcomes jsonb[])
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog
--- Index probes only, whatever the statistics say: a plan made while the table was empty,
--- and cached for the session, must not become a scan of every partition as it grows. The
--- UPDATE is set-based on purpose: starting an UPDATE on a partitioned table costs about
--- 100 µs, so one per ID (a loop) cost more than the rows themselves.
-SET enable_hashjoin = off SET enable_mergejoin = off SET enable_seqscan = off AS $$
+-- Insert the completed receipts of one principal, once. A plain INSERT: a conflict raises
+-- (unique_violation), so the transaction can never commit a write without its own
+-- receipt. With the completion guard on, the inserted set is added to this transaction's
+-- guard.
+CREATE OR REPLACE FUNCTION zebridge_private.record_receipts(p_principal text, p_ids text[], p_fps bytea[], p_outcomes jsonb[])
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
-    done integer;
+    p_guard boolean;
 BEGIN
-    IF cardinality(p_ids) IS DISTINCT FROM cardinality(p_outcomes) OR array_position(p_outcomes, NULL) IS NOT NULL THEN
-        RAISE EXCEPTION 'finish_receipts: one non-null outcome per ID' USING ERRCODE = '22023';
+    SELECT completion_guard INTO p_guard FROM zebridge_private.receipt_policy;
+    IF cardinality(p_ids) IS DISTINCT FROM cardinality(p_fps) OR cardinality(p_ids) IS DISTINCT FROM cardinality(p_outcomes)
+       OR array_position(p_outcomes, NULL) IS NOT NULL THEN
+        RAISE EXCEPTION 'record_receipts: one fingerprint and one non-null outcome per ID' USING ERRCODE = '22023';
     END IF;
-    UPDATE zebridge_private.receipts r SET outcome = o.outcome
-      FROM unnest(p_ids, p_outcomes) AS o(id, outcome)
-     WHERE r.principal = p_principal AND r.message_id = o.id
-       AND r.id_month = zebridge_private.receipt_month(o.id) AND r.outcome IS NULL;
-    GET DIAGNOSTICS done = ROW_COUNT;
-    IF done <> cardinality(p_ids) THEN
-        RAISE EXCEPTION 'finish_receipts: % of % IDs were unfinished claims of %', done, cardinality(p_ids), p_principal
-            USING ERRCODE = '23514';
+    INSERT INTO zebridge_private.receipts (principal, message_id, id_month, fingerprint, outcome)
+    SELECT p_principal, o.id, zebridge_private.receipt_month(o.id), o.fp, o.outcome
+      FROM unnest(p_ids, p_fps, p_outcomes) AS o(id, fp, outcome);
+    IF p_guard THEN
+        UPDATE zebridge_private.receipt_guards g
+           SET actual_keys = g.actual_keys || ARRAY(SELECT p_principal || chr(31) || i FROM unnest(p_ids) AS i),
+               actual_fps = g.actual_fps || p_fps
+         WHERE g.txid = pg_current_xact_id();
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'record_receipts: no guard for this transaction' USING ERRCODE = 'ZBG01';
+        END IF;
     END IF;
+END;
+$$;
+
+-- Whether the completion guard is on: the bridge's boot check compares it with its build.
+CREATE OR REPLACE FUNCTION zebridge_private.completion_guard_on()
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
+    SELECT completion_guard FROM zebridge_private.receipt_policy
+$$;
+
+-- Variant B's finalizer: the receipts this transaction inserted must be exactly the
+-- undecided set lookup_receipts recorded, entry for entry (key and fingerprint, as
+-- multisets). Then the guard goes, and the deferred check lets the COMMIT through.
+CREATE OR REPLACE FUNCTION zebridge_private.close_guard()
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+    g zebridge_private.receipt_guards%ROWTYPE;
+BEGIN
+    SELECT * INTO g FROM zebridge_private.receipt_guards WHERE txid = pg_current_xact_id() FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'close_guard: no guard for this transaction' USING ERRCODE = 'ZBG01';
+    END IF;
+    IF (SELECT coalesce(array_agg(k || ':' || encode(f, 'hex') ORDER BY 1), '{}') FROM unnest(g.expected_keys, g.expected_fps) AS e(k, f))
+       IS DISTINCT FROM
+       (SELECT coalesce(array_agg(k || ':' || encode(f, 'hex') ORDER BY 1), '{}') FROM unnest(g.actual_keys, g.actual_fps) AS a(k, f)) THEN
+        RAISE EXCEPTION 'close_guard: the receipts recorded are not the undecided writes of this transaction'
+            USING ERRCODE = 'ZBG01';
+    END IF;
+    DELETE FROM zebridge_private.receipt_guards WHERE txid = g.txid;
 END;
 $$;
 
@@ -1476,8 +1509,11 @@ BEGIN
     END LOOP;
 END $$;
 GRANT EXECUTE ON FUNCTION zebridge_private.maintain_receipts() TO ${POSTGRES_WRITER_USER};
-GRANT EXECUTE ON FUNCTION zebridge_private.claim_receipts(text, text[], bytea[], bytea[]) TO ${POSTGRES_WRITER_USER};
-GRANT EXECUTE ON FUNCTION zebridge_private.finish_receipts(text, text[], jsonb[]) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.lock_receipts(text[], text[]) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.lookup_receipts(text, text[], bytea[], bytea[]) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.record_receipts(text, text[], bytea[], jsonb[]) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.close_guard() TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.completion_guard_on() TO ${POSTGRES_WRITER_USER};
 -- No partition is created here: the bridge runs maintain_receipts at startup. A recovery
 -- applies this file before `pg_restore --clean`, which cannot drop a partition's
 -- inherited primary key; with no partitions present it restores the dumped ones intact.

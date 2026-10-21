@@ -1153,7 +1153,7 @@ pub const MutationListener = struct {
                 }
                 // The refusal is this write's outcome: its receipt records it, so a retry
                 // is answered `rejected` without running again.
-                if (!self.recordRejection(a, conn, principal_z, id_z, @errorName(err))) return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+                if (!self.recordRejection(a, conn, principal_z, id_z, claim.fingerprint, @errorName(err))) return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
                 self.deadLetter(conn_nats, msg, payload, err);
                 self.publishVerdict(conn_nats, msg, mutation.principal, "rejected", @errorName(err));
                 // ACK, not NACK: the message is handled — badly, but finally.
@@ -1192,9 +1192,10 @@ pub const MutationListener = struct {
 
         // The application's deferred constraints are checked before COMMIT, while this
         // write can still be rolled back alone: at COMMIT their failure would take the
-        // receipt with it. The receipt's own deferred check passes, its outcome set first.
+        // receipt with it. In variant B the guard is closed first, so its check passes.
         var failure: receipts.Failure = .{};
-        receipts.finishCommit(a, conn, principal_z, id_z, outcome, &failure) catch |err| switch (err) {
+        const fp = claim.fingerprint orelse return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        receipts.finishCommit(a, conn, principal_z, id_z, fp, outcome, faultAt(.commit_before_receipts), &failure) catch |err| switch (err) {
             error.DeferredRefused => {
                 const sqlstate = std.mem.sliceTo(&failure.sqlstate, 0);
                 self.rememberFailure(sqlstate, failure.message[0..failure.message_len]);
@@ -1204,7 +1205,7 @@ pub const MutationListener = struct {
                     return self.retryOrFail(conn_nats, msg, mutation.principal, "MutationFailed");
                 }
                 log.info("⛔ Mutation refused at its deferred constraints [{s}] on '{s}': SQLSTATE {s}", .{ mutation.principal, mutation.table, sqlstate });
-                if (!self.recordRejection(a, conn, principal_z, id_z, "MutationFailed")) return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+                if (!self.recordRejection(a, conn, principal_z, id_z, claim.fingerprint, "MutationFailed")) return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
                 self.deadLetter(conn_nats, msg, payload, error.MutationFailed);
                 self.publishVerdict(conn_nats, msg, mutation.principal, "rejected", "MutationFailed");
                 msg.ack() catch {};
@@ -1375,6 +1376,17 @@ pub const MutationListener = struct {
         const groups = try principalRuns(a, items.items, order.items);
         if (c.PQenterPipelineMode(conn) != 1) return error.MutationFailed;
         var sent_ok = c.PQsendQueryParams(conn, "BEGIN", 0, null, null, null, null, 0) == 1;
+        // Every receipt key locked first, in one call, before any receipt is read: a
+        // concurrent duplicate waits here and then finds the winner's receipt.
+        {
+            const principals = try a.alloc([:0]const u8, order.items.len);
+            const ids = try a.alloc([:0]const u8, order.items.len);
+            for (order.items, 0..) |k, n| {
+                principals[n] = items.items[k].principal_z;
+                ids[n] = items.items[k].id_z;
+            }
+            sent_ok = sent_ok and try receipts.sendLocks(a, conn, principals, ids);
+        }
         for (groups) |g| {
             const span = order.items[g[0]..g[1]];
             const ids = try a.alloc([:0]const u8, span.len);
@@ -1389,7 +1401,7 @@ pub const MutationListener = struct {
         }
         var failed_at: usize = 0;
         if (!sent_ok or c.PQpipelineSync(conn) != 1) return error.MutationFailed;
-        const r1 = try receipts.collect(a, conn, groups.len + 1, &failed_at);
+        const r1 = try receipts.collect(a, conn, groups.len + 2, &failed_at);
         defer receipts.clearAll(r1);
         try self.leavePipeline(conn);
         if (failed_at != r1.len) return error.ReceiptInfrastructure;
@@ -1398,7 +1410,7 @@ pub const MutationListener = struct {
         try requireTransaction(conn);
         for (groups, 0..) |g, gi| {
             const claims = try a.alloc(receipts.Claim, g[1] - g[0]);
-            try receipts.readClaims(a, r1[gi + 1], claims);
+            try receipts.readClaims(a, r1[gi + 2], claims);
             for (order.items[g[0]..g[1]], claims) |k, claim| items.items[k].claim = claim;
         }
         for (items.items, 0..) |*it, k| {
@@ -1499,12 +1511,16 @@ pub const MutationListener = struct {
             const fgroups = try principalRuns(a, items.items, done.items);
             if (c.PQenterPipelineMode(conn) != 1) return error.MutationFailed;
             sent_ok = true;
-            for (fgroups) |g| {
+            // Test fault: COMMIT after the writes, with no receipt (and no close_guard).
+            const skip_receipts = faultAt(.commit_before_receipts);
+            for (if (skip_receipts) fgroups[0..0] else fgroups) |g| {
                 const span = done.items[g[0]..g[1]];
                 const ids = try a.alloc([:0]const u8, span.len);
+                const fps = try a.alloc([:0]const u8, span.len);
                 const outcomes = try a.alloc([:0]const u8, span.len);
                 for (span, 0..) |k, n| {
                     ids[n] = items.items[k].id_z;
+                    fps[n] = items.items[k].claim.fingerprint orelse return error.ReceiptInfrastructure;
                     if (items.items[k].refused) |err| {
                         outcomes[n] = try receipts.outcomeJson(a, .{ .status = "rejected", .reason = @errorName(err) });
                         continue;
@@ -1516,10 +1532,13 @@ pub const MutationListener = struct {
                         .version = pnd.version_buf[0..pnd.version_len],
                     });
                 }
-                sent_ok = sent_ok and try receipts.sendFinishes(a, conn, items.items[span[0]].principal_z, ids, outcomes);
+                sent_ok = sent_ok and try receipts.sendFinishes(a, conn, items.items[span[0]].principal_z, ids, fps, outcomes);
                 if (faultAt(.oom_in_finishes)) return error.OutOfMemory; // a finish queued, the pipeline open
             }
-            const finishes = fgroups.len;
+            // Variant B: close_guard verifies the receipts are exactly the undecided set.
+            const close = receipts.guard and !skip_receipts;
+            if (close) sent_ok = sent_ok and c.PQsendQueryParams(conn, receipts.close_sql, 0, null, null, null, null, 0) == 1;
+            const finishes = (if (skip_receipts) 0 else fgroups.len) + @intFromBool(close);
             sent_ok = sent_ok and c.PQsendQueryParams(conn, "COMMIT", 0, null, null, null, null, 0) == 1;
             if (!sent_ok or c.PQpipelineSync(conn) != 1) return error.MutationFailed;
             // Lost before the COMMIT's answer: ambiguous. The replay claims again, and a
@@ -1527,8 +1546,9 @@ pub const MutationListener = struct {
             const r4 = try receipts.collect(a, conn, finishes + 1, &failed_at);
             defer receipts.clearAll(r4);
             try self.leavePipeline(conn);
-            // A finish refused (receipt trouble) or the COMMIT refused (a deferred
-            // constraint): nothing committed. The replay judges each write alone.
+            // A receipt or the guard refused (receipt trouble) or the COMMIT refused (a
+            // deferred constraint, or B's open guard): nothing committed. The replay judges
+            // each write alone.
             if (failed_at < finishes) return error.ReceiptInfrastructure;
             if (failed_at != r4.len or !receipts.committed(r4[finishes])) return error.MutationFailed;
         }
@@ -1622,11 +1642,18 @@ pub const MutationListener = struct {
     /// binary of scripts/scenarios/receipt_faults.py); every other build has none, and no
     /// environment variable can turn it on. ZB_TEST_FAULT picks the point; each fault that
     /// actually fires logs `ZB_TEST_FAULT <point> fired`, which the scenario asserts.
-    const TestFault = enum { none, reset_after_claims, oom_in_claims, oom_in_finishes };
+    /// commit_before_receipts fires once per process: the replay then runs normally, so
+    /// the scenario sees what that one COMMIT left behind.
+    const TestFault = enum { none, reset_after_claims, oom_in_claims, oom_in_finishes, commit_before_receipts };
     var test_fault: ?TestFault = null;
+    var fired_once = false;
     fn faultAt(point: TestFault) bool {
         if (comptime !@import("build_options").test_faults) return false;
         if (testFault() != point) return false;
+        if (point == .commit_before_receipts) {
+            if (fired_once) return false;
+            fired_once = true;
+        }
         log.warn("ZB_TEST_FAULT {s} fired", .{@tagName(point)});
         return true;
     }
@@ -2128,7 +2155,12 @@ pub const MutationListener = struct {
 
     /// The write failed permanently after its claim: undo the write (the savepoint), keep
     /// the claim, record `rejected` with this failure, and commit. False: roll back.
-    fn recordRejection(self: *MutationListener, a: std.mem.Allocator, conn: ?*c.PGconn, principal_z: [:0]const u8, id_z: [:0]const u8, reason: []const u8) bool {
+    /// The lock and (variant B) the guard were taken before the savepoint: both survive.
+    fn recordRejection(self: *MutationListener, a: std.mem.Allocator, conn: ?*c.PGconn, principal_z: [:0]const u8, id_z: [:0]const u8, fingerprint: ?[:0]const u8, reason: []const u8) bool {
+        const fp = fingerprint orelse {
+            receipts.rollback(conn);
+            return false;
+        };
         receipts.exec(conn, "ROLLBACK TO SAVEPOINT zb_write", null) catch {
             receipts.rollback(conn);
             return false;
@@ -2137,7 +2169,7 @@ pub const MutationListener = struct {
             receipts.rollback(conn);
             return false;
         };
-        receipts.finishOne(conn, principal_z, id_z, outcome) catch {
+        receipts.finishOne(conn, principal_z, id_z, fp, outcome) catch {
             receipts.rollback(conn);
             return false;
         };
