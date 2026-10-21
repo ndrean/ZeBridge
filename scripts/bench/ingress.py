@@ -47,7 +47,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bridge", required=True, type=pathlib.Path)
     ap.add_argument("--label", required=True)
-    ap.add_argument("--variant", choices=("sensors", "legacy", "zb1", "dup", "reject", "single", "cdc"), required=True)
+    ap.add_argument("--variant", choices=("sensors", "legacy", "zb1", "dup", "reject", "single", "cdc", "echo"), required=True)
+    ap.add_argument("--lib", type=pathlib.Path, help="echo: the libzb shared library the probe client loads")
+    ap.add_argument("--probes", type=int, default=200, help="echo: probe writes")
     ap.add_argument("--rate", type=float, required=True, help="writes/s offered in total")
     ap.add_argument("--seconds", type=float, default=30)
     ap.add_argument("--lanes", type=int, default=1)
@@ -112,6 +114,9 @@ def main():
         if refused:
             raise RuntimeError("zebridge_enable refused: " + refused)
         sql("INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('bob', 'globex')")
+        if a.variant == "echo":
+            # The probe's own tenant: its CDC stream carries only its writes (the load is globex's).
+            sql("INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('carol', 'acme')")
         if a.variant == "cdc":
             sql("CREATE TABLE public.users (id bigserial PRIMARY KEY, name text, email text, inserted_at timestamptz, updated_at timestamptz NOT NULL)")
             refused = sql("SELECT step || ': ' || detail FROM zebridge_enable('public.users'::regclass, public_reason => 'burst benchmark', "
@@ -132,7 +137,8 @@ def main():
         server = spawn(["nats-server", "-c", str(work / "nats.conf")], dict(os.environ), "nats")
         wait_log(server, "nats", "Server is ready")
         env = dict(env, NATS_URL=url, NATS_CREDS=str(ident / "creds/bridge.creds"), NATS_JS_DOMAIN="hub", NATS_TLS_CA="",
-                   MUTATION_ADMISSION="1", GENERATIONS_ENABLED="0", ZB_INGRESS_LANES=str(a.lanes), LOG_LEVEL="info")
+                   MUTATION_ADMISSION="1", GENERATIONS_ENABLED="1" if a.variant == "echo" else "0", GENERATION_CADENCE_SECONDS="30",
+                   ZB_INGRESS_LANES=str(a.lanes), LOG_LEVEL="info")
         gate = spawn([str(a.bridge), "--mutation-ingress"], env, "admission")
         wait_log(gate, "admission", "mutation admission ready")
         bridge = spawn([str(a.bridge), "--pub", "bench_pub", "--slot", "bench_slot", "--port", str(http_port)], env, "bridge")
@@ -148,6 +154,47 @@ def main():
             await nc.close()
             return window
         window = asyncio.run(set_window())
+
+        if a.variant == "echo":
+            carol = work / "carol.creds"
+            carol.write_text(mint_client(keys["SK_CLIENT_SEED"], account, "carol", "acme"))
+            async def projected(principal, timeout=60):
+                # The bridge projects membership into $KV.tenants asynchronously after start.
+                nc = await nats.connect(url, user_credentials=str(ident / "creds/bridge.creds"))
+                try:
+                    kv = await nc.jetstream(domain="hub").key_value("tenants")
+                    end = time.monotonic() + timeout
+                    while time.monotonic() < end:
+                        try:
+                            await kv.get(principal)
+                            return True
+                        except Exception:
+                            await asyncio.sleep(.2)
+                    return False
+                finally:
+                    await nc.close()
+            if not asyncio.run(projected("carol")):
+                raise RuntimeError("$KV.tenants.carol was never projected")
+            load = None
+            if a.rate > 0:
+                load = subprocess.Popen([str(PY), "-u", str(ROOT / "scripts/bench/ingress_load.py"), "--url", url, "--creds", str(bob),
+                                         "--variant", "zb1", "--rate", str(a.rate), "--seconds", str(a.seconds)],
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                time.sleep(3)  # the load reaches its rate before the first probe
+            probe = subprocess.run([str(PY), "-u", str(ROOT / "scripts/bench/echo_probe.py"), "--lib", str(a.lib), "--url", url,
+                                    "--creds", str(carol), "--principal", "carol", "--tenant", "acme", "--db", str(work / "carol.sqlite3"),
+                                    "--count", str(a.probes)], stdout=subprocess.PIPE, stderr=open(os.environ.get("ZB_ECHO_PROBE_LOG", str(work / "probe.log")), "w"), text=True, timeout=a.seconds + 300)
+            probe_result = json.loads(probe.stdout.strip().splitlines()[-1]) if probe.returncode == 0 and probe.stdout.strip() else {"error": probe.stdout[-800:] + pathlib.Path(os.environ.get("ZB_ECHO_PROBE_LOG", str(work / "probe.log"))).read_text(errors="replace")[-1500:]}
+            load_result = None
+            if load:
+                out = load.communicate(timeout=a.seconds + 180)[0]
+                load_result = json.loads(out.strip().splitlines()[-1]) if out.strip() else {"raw": out[-500:]}
+            result = {"label": a.label, **schema, "variant": "echo", "lanes": a.lanes, "background_per_s": a.rate,
+                      "probe": probe_result, "load": {k: load_result.get(k) for k in ("phase1",)} if load_result else None}
+            with open(a.out, "a") as f:
+                f.write(json.dumps(result) + "\n")
+            print(json.dumps(result, indent=1))
+            return
 
         if a.variant == "cdc":
             def http(path):
