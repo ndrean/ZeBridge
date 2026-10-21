@@ -50,6 +50,7 @@ def main():
     ap.add_argument("--variant", choices=("sensors", "legacy", "zb1", "dup", "reject", "single", "cdc", "echo"), required=True)
     ap.add_argument("--lib", type=pathlib.Path, help="echo: the libzb shared library the probe client loads")
     ap.add_argument("--probes", type=int, default=200, help="echo: probe writes")
+    ap.add_argument("--principals", type=int, default=1, help="writers spread over this many principals (tenant globex)")
     ap.add_argument("--rate", type=float, required=True, help="writes/s offered in total")
     ap.add_argument("--seconds", type=float, default=30)
     ap.add_argument("--lanes", type=int, default=1)
@@ -114,6 +115,9 @@ def main():
         if refused:
             raise RuntimeError("zebridge_enable refused: " + refused)
         sql("INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('bob', 'globex')")
+        writers = [f"w{i:03d}" for i in range(a.principals)] if a.principals > 1 else []
+        if writers:
+            sql("INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES " + ",".join(f"('{w}', 'globex')" for w in writers))
         if a.variant == "echo":
             # The probe's own tenant: its CDC stream carries only its writes (the load is globex's).
             sql("INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('carol', 'acme')")
@@ -133,6 +137,9 @@ def main():
                                         f'max_payload: 8MB\njetstream {{ domain: hub, store_dir: "{work}/js" }}\n')
         bob = work / "bob.creds"
         bob.write_text(mint_client(keys["SK_CLIENT_SEED"], account, "bob", "globex"))
+        (work / "creds").mkdir(exist_ok=True)
+        for w in writers:
+            (work / "creds" / f"{w}.creds").write_text(mint_client(keys["SK_CLIENT_SEED"], account, w, "globex"))
         url = f"nats://127.0.0.1:{nats_port}"
         server = spawn(["nats-server", "-c", str(work / "nats.conf")], dict(os.environ), "nats")
         wait_log(server, "nats", "Server is ready")
@@ -154,6 +161,26 @@ def main():
             await nc.close()
             return window
         window = asyncio.run(set_window())
+
+        async def all_projected(names, timeout=90):
+            nc = await nats.connect(url, user_credentials=str(ident / "creds/bridge.creds"))
+            try:
+                kv = await nc.jetstream(domain="hub").key_value("tenants")
+                end = time.monotonic() + timeout
+                for name in names:
+                    while True:
+                        try:
+                            await kv.get(name)
+                            break
+                        except Exception:
+                            if time.monotonic() > end:
+                                return False
+                            await asyncio.sleep(.1)
+                return True
+            finally:
+                await nc.close()
+        if writers and not asyncio.run(all_projected(writers)):
+            raise RuntimeError("the writers' membership was never projected")
 
         if a.variant == "echo":
             carol = work / "carol.creds"
@@ -256,6 +283,8 @@ def main():
                 args = [str(PY), "-u", str(ROOT / "scripts/bench/ingress_load.py"), "--url", url, "--creds", str(bob),
                         "--variant", a.variant, "--rate", str(a.rate / n), "--seconds", str(a.seconds),
                         "--first-id", str(i * 1000), "--dup-wait-s", str(a.dup_window_s + 3)]
+                if writers:  # this process's share of the principals
+                    args += ["--principals", ",".join(writers[i::n]), "--creds-dir", str(work / "creds")]
             loads.append(subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
         outputs = [p.communicate(timeout=a.seconds * 3 + 180)[0] for p in loads]
         end = time.monotonic()
@@ -284,7 +313,7 @@ def main():
         final = samples[-1][1]
         reached = min((ts for ts, r in samples if r == final), default=end)
         during = [b for b in backlog if start <= b[0] <= end + 120]
-        result = {"label": a.label, **schema, "variant": a.variant, "lanes": a.lanes, "offered_per_s": a.rate, "seconds": a.seconds,
+        result = {"label": a.label, **schema, "variant": a.variant, "lanes": a.lanes, "principals": a.principals, "offered_per_s": a.rate, "seconds": a.seconds,
                   "load_processes": n, "dup_window_s": window,
                   "drain_s": round(max(0.0, reached - (start + a.seconds)), 1),
                   "backlog_max_pending": max((b[1] for b in during), default=None),

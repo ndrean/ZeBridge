@@ -63,10 +63,10 @@ async def main():
     ap.add_argument("--workers", type=int, default=100, help="concurrent publishers, as sensors are")
     ap.add_argument("--reject-share", type=float, default=0.02)
     ap.add_argument("--dup-wait-s", type=float, default=8.0)
+    ap.add_argument("--principals", default="", help="comma-separated principals, one connection each (creds in --creds-dir)")
+    ap.add_argument("--creds-dir", default="")
     a = ap.parse_args()
 
-    nc = await nats.connect(a.url, user_credentials=a.creds, inbox_prefix=f"_INBOX.{a.principal}".encode())
-    js = nc.jetstream()
     phases = [Phase(), Phase()]
     sent_at, answered = {}, {}
 
@@ -85,15 +85,23 @@ async def main():
             status = "unreadable"
         phases[ph].verdicts[status] = phases[ph].verdicts.get(status, 0) + 1
 
-    await nc.subscribe(f"mutation_ack.{a.principal}.*", cb=on_verdict)
-    subject = f"mutation.{a.principal}.{TABLE}.insert"
+    # Writers spread over principals: one connection each, as devices are. Receipts are
+    # grouped per principal, so how many principals share a batch matters.
+    names = [x for x in a.principals.split(",") if x] or [a.principal]
+    conns = []
+    for name in names:
+        creds = f"{a.creds_dir}/{name}.creds" if a.principals else a.creds
+        nc = await nats.connect(a.url, user_credentials=creds, inbox_prefix=f"_INBOX.{name}".encode())
+        await nc.subscribe(f"mutation_ack.{name}.*", cb=on_verdict)
+        conns.append((name, nc, nc.jetstream()))
     period = a.workers / a.rate
     sent_log = []  # (msg_id, body) for the dup variant's phase 2
 
-    async def publish(ph, mid, body):
+    async def publish(ph, mid, body, w=0):
+        name, _, js = conns[w % len(conns)]
         sent_at[mid] = (time.monotonic(), ph)
         try:
-            await js.publish(subject, body, headers={"Nats-Msg-Id": mid})
+            await js.publish(f"mutation.{name}.{TABLE}.insert", body, headers={"Nats-Msg-Id": mid})
             phases[ph].sent += 1
         except Exception:
             phases[ph].errors += 1
@@ -117,8 +125,8 @@ async def main():
             body = msgpack.packb({"key": {"event_id": row["event_id"]}, "data": row, "version": row["updated_at"], "client_id": client})
             mid = eid.hex if a.variant == "legacy" else zb1_id(int(now * 1000), client, row["event_id"], row["updated_at"])
             if a.variant == "dup":
-                sent_log.append((mid, body))
-            await publish(0, mid, body)
+                sent_log.append((mid, body, w))
+            await publish(0, mid, body, w)
 
     async def settle(ph, timeout=30):
         end = time.monotonic() + timeout
@@ -154,17 +162,18 @@ async def main():
         chunk = max(1, len(sent_log) // a.workers)
 
         async def resend(part):
-            for i, (mid, body) in enumerate(part):
+            for i, (mid, body, w) in enumerate(part):
                 due = resend_start + (i * a.workers) / a.rate
                 await asyncio.sleep(max(0.0, due - time.monotonic()))
-                await publish(1, mid, body)
+                await publish(1, mid, body, w)  # the same principal: a receipt is per principal
 
         await asyncio.gather(*(resend(sent_log[i:i + chunk]) for i in range(0, len(sent_log), chunk)))
         await settle(1)
         result["phase2_duplicates"] = phases[1].summary()
     result["unverdicted"] = len(sent_at)
     print(json.dumps(result), flush=True)
-    await nc.drain()
+    for _, nc, _ in conns:
+        await nc.drain()
 
 
 if __name__ == "__main__":

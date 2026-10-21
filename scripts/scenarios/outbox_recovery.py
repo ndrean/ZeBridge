@@ -8,6 +8,12 @@ This isolates recovery traffic from CDC fanout; it is not a CDC capacity result.
 The fixture restores realistic queued JSON envelopes directly into SQLite, leaving
 their IDs/bytes immutable. Workers never explicitly flush unless the comparison's
 ZB_OUTBOX_LEGACY_PUMP is set for both revisions.
+
+Recovery under live traffic: ZB_OUTBOX_LIVE_RATE (writes/s, principal bob, zb1 inserts on
+s2_row from 50 paced publishers awaiting their PubAcks) starts when the bridge resumes and
+runs until the backlog drained plus ZB_OUTBOX_LIVE_SECONDS. ZB_OUTBOX_LANES sets the
+bridge's lanes (2 by default). The result line adds the live load's committed rate,
+publish errors and verdict latency beside the backlog's drain and replay times.
 """
 import asyncio, ctypes, json, os, pathlib, resource, signal, sqlite3, sys, tempfile, threading, time, uuid
 from collections import defaultdict
@@ -165,7 +171,7 @@ async def main():
         passed += bool(ok); failed += not ok
     with tempfile.TemporaryDirectory(prefix='zb-outbox-storm-') as tmp:
         root = pathlib.Path(tmp)
-        stack, observer, workers = RecoveryStack(root), None, []
+        stack, observer, workers = RecoveryStack(root, lanes=int(os.environ.get('ZB_OUTBOX_LANES', '2'))), None, []
         events = defaultdict(lambda: defaultdict(list))
         all_options, original = [], {}
         try:
@@ -174,7 +180,10 @@ async def main():
             keys = dict(l.split('=',1) for l in (ident/'operator.store').read_text().splitlines() if '=' in l and not l.startswith('#'))
             account = nkeys.from_seed(keys['ACCOUNT_SEED'].encode()).public_key.decode()
             who = [f'q{i:04d}' for i in range(count)]
-            stack.sql('INSERT INTO zebridge_user_tenants VALUES ' + ','.join(f"('{p}','_default')" for p in who))
+            # Live traffic comes from many principals: one principal at thousands of writes
+            # a second would meet its own queued-write cap (MUTATION_BACKLOG_PER_PRINCIPAL).
+            live_who = [f'l{i:03d}' for i in range(int(os.environ.get('ZB_OUTBOX_LIVE_PRINCIPALS', '50')))] if float(os.environ.get('ZB_OUTBOX_LIVE_RATE', '0')) > 0 else []
+            stack.sql('INSERT INTO zebridge_user_tenants VALUES ' + ','.join(f"('{p}','_default')" for p in who + live_who))
             # Keep real admission, listener, receipts and verdict delivery, without
             # turning 32,000 writes into millions of unrelated CDC deliveries.
             if not cdc: stack.sql('ALTER PUBLICATION hf2_pub DROP TABLE s2_row, s2_parent, s2_child')
@@ -184,7 +193,7 @@ async def main():
             # freeze it halfway through the fleet and make later clients time out.
             kv = await observer.jetstream(domain='hub').key_value('tenants')
             deadline = time.monotonic()+60
-            for principal in who:
+            for principal in who + live_who:
                 while True:
                     try:
                         await kv.get(principal)
@@ -281,6 +290,44 @@ async def main():
             await asyncio.sleep(2)
             stack.procs['bridge'].send_signal(signal.SIGCONT)
             resumed = time.monotonic()
+            live_rate = float(os.environ.get('ZB_OUTBOX_LIVE_RATE', '0'))
+            live_stop = asyncio.Event()
+            live = {'sent': 0, 'errors': 0, 'verdicts': {}, 'ms': [], 'at': {}}
+            async def live_load():
+                # One connection and one paced publisher per live principal.
+                conns = []
+                for p in live_who:
+                    creds = root / (p + '.creds')
+                    creds.write_text(client_creds(keys['SK_CLIENT_SEED'], account, p, '_default'))
+                    nc = await nats.connect(stack.url, user_credentials=str(creds), inbox_prefix=f'_INBOX.{p}'.encode(), max_reconnect_attempts=-1)
+                    async def on_verdict(m):
+                        mid = m.subject.rsplit('.', 1)[-1]
+                        t0 = live['at'].pop(mid, None)
+                        if t0 is None: return
+                        live['ms'].append((time.monotonic() - t0) * 1000)
+                        live.setdefault('arrivals', []).append((time.monotonic(), (time.monotonic() - t0) * 1000))
+                        status = json.loads(m.data).get('status', '?')
+                        live['verdicts'][status] = live['verdicts'].get(status, 0) + 1
+                    await nc.subscribe(f'mutation_ack.{p}.*', cb=on_verdict)
+                    conns.append((p, nc, nc.jetstream()))
+                period = len(conns) / live_rate
+                async def publisher(i, p, js):
+                    k, t0 = 0, time.monotonic() + i * period / len(conns)
+                    while not live_stop.is_set():
+                        await asyncio.sleep(max(0.0, t0 + k * period - time.monotonic()))
+                        k += 1
+                        mid, body = write('s2_row', str(uuid.uuid4()), {'v': 1}, client='live')
+                        live['at'][mid] = time.monotonic()
+                        try:
+                            await js.publish(f'mutation.{p}.s2_row.insert', body, headers={'Nats-Msg-Id': mid})
+                            live['sent'] += 1
+                        except Exception:
+                            live['errors'] += 1
+                            live['at'].pop(mid, None)
+                await asyncio.gather(*(publisher(i, p, js) for i, (p, _, js) in enumerate(conns)))
+                await asyncio.sleep(3)  # the last verdicts
+                for _, nc, _ in conns: await nc.close()
+            live_task = asyncio.create_task(live_load()) if live_rate > 0 else None
             deadline = resumed+budget
             left = [None]*count
             next_report = resumed+30
@@ -298,23 +345,43 @@ async def main():
                     await consumers('draining')
                     next_report += 30
                 await asyncio.sleep(1)
+            drained_at = time.monotonic()
             check(all(n==0 for n in left) and not any(s.get('errors') for s in states), f'all {count} outboxes drain automatically after a real hub restart (remaining {sum(n or 0 for n in left)})')
+            live_result = None
+            if live_task:
+                await asyncio.sleep(float(os.environ.get('ZB_OUTBOX_LIVE_SECONDS', '5')))
+                live_stop.set()
+                await live_task
+                ms = sorted(live['ms'])
+                pct = lambda q: round(ms[min(len(ms) - 1, int(q * len(ms)))], 1) if ms else None
+                ran = time.monotonic() - resumed - 3
+                live_result = {'offered_per_s': live_rate, 'sent': live['sent'], 'publish_errors': live['errors'], 'verdicts': live['verdicts'],
+                               'committed_per_s': round(live['verdicts'].get('accepted', 0) / ran), 'ack_p50_ms': pct(.5), 'ack_p99_ms': pct(.99),
+                               'unanswered': len(live['at']),
+                               # Back to normal: the last live verdict slower than 200 ms, from the bridge's resume.
+                               'live_normal_after_s': round(max((t for t, ms_ in live.get('arrivals', []) if ms_ > 200), default=resumed) - resumed, 1)}
+                print(json.dumps({'live_load': live_result}))
             if not all(n==0 for n in left):
                 print(json.dumps(states))
             if os.environ.get('ZB_OUTBOX_IDLE_TAIL') == '1' and mode != 'ts':
                 check(all(n>0 for state in states for n in state.get('quick_settling_polls',[])), 'verdicts wake a one-second idle CDC poll and immediately refill the window')
             await consumers('drain finished')
-            result = stack.sql("SELECT (SELECT count(*) FROM s2_row)||'|'||(SELECT count(*) FROM audit WHERE tbl='s2_row')||'|'||(SELECT count(*) FROM zebridge_private.receipts)")
+            # The live load (principals l…) adds its own rows; each accepted one is one row and one execution.
+            # One statement, one snapshot: queued live writes may still be committing.
+            result = stack.sql("WITH l AS (SELECT count(*) AS n FROM zebridge_private.receipts WHERE principal LIKE 'l%') "
+                               "SELECT ((SELECT count(*) FROM s2_row) - l.n)||'|'||((SELECT count(*) FROM audit WHERE tbl='s2_row') - l.n)||'|'||"
+                               "(SELECT count(*) FROM zebridge_private.receipts WHERE principal NOT LIKE 'l%') FROM l")
             expected = count*pending
-            recorded = {tuple(line.split('|',1)) for line in stack.sql("SELECT principal||'|'||message_id FROM zebridge_private.receipts").splitlines()}
+            recorded = {tuple(line.split('|',1)) for line in stack.sql("SELECT principal||'|'||message_id FROM zebridge_private.receipts WHERE principal NOT LIKE 'l%'").splitlines()}
             expected_keys = {(p,mid) for p,rows in original.items() for mid,_ in rows}
             check(result == f'{expected}|{expected}|{expected}' and recorded == expected_keys,
                   f'every original ID commits once with one receipt: rows|executions|receipts {result}')
             print(json.dumps({'clients':count,'pending_per_client':pending,'workers':len(workers),'window':window if check_window else None,'cdc_fanout':cdc,'legacy_host_pump':legacy,'consumer_peak':consumer_peak,'max_gets_per_client_4s':max_get,'max_publishes_per_client_4s':max_pub,
-                              'drain_seconds':round(time.monotonic()-resumed,3),
+                              'drain_seconds':round(drained_at-resumed,3),
+                              'lanes':stack.lanes,'live':live_result,
                               # Replay time without the reconnect jitter or the 1 s sampling:
                               # the first publish after the bridge resumed to the last one.
-                              'replay_seconds':round(max((t for e in events.values() for t,_ in e['pub'] if t >= resumed), default=resumed) - min((t for e in events.values() for t,_ in e['pub'] if t >= resumed), default=resumed),3),
+                              'replay_seconds':round(max((t for p,e in events.items() if p in who for t,_ in e['pub'] if t >= resumed), default=resumed) - min((t for p,e in events.items() if p in who for t,_ in e['pub'] if t >= resumed), default=resumed),3),
                               'total_gets':sum(len(e['get']) for e in events.values()),'total_publishes':sum(len(e['pub']) for e in events.values())}))
             # Teardown/heap scans of hundreds of local handles are not the fleet
             # reconnect under test. Keep them staged like initial setup.
