@@ -3,6 +3,7 @@
 /// (optional peers) — a browser bundle never sees this file.
 import Database from 'better-sqlite3';
 import { connect as tcpConnect } from '@nats-io/transport-node';
+import { bindEndpointTls } from './node-tls.ts';
 import { unlink } from 'node:fs/promises';
 import type { Exec, StorageFactory } from './storage.ts';
 
@@ -112,4 +113,4 @@ export const nodeStorage: StorageFactory = (dbName) => {
 };
 
 /// TCP dial with the same option shape the core passes to its default (wsconnect).
-export const nodeConnect = (opts: any) => tcpConnect(opts);
+export const nodeConnect = (opts: any) => tcpConnect(bindEndpointTls(opts));

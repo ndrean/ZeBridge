@@ -1,4 +1,6 @@
 # nats-server.conf — generated from nats-server.conf.template by nats-config-gen.
+# Keep client pools confined to enrolled endpoints: if adding a cluster block, set
+# cluster.no_advertise: true. leafnodes.no_advertise controls leaf peers only.
 # ${NATS_BRIDGE_NKEY_PUB}, ${NATS_ALICE_PASSWORD}, ${NATS_BOB_PASSWORD},
 # ${NATS_JOHN_PASSWORD}, ${NATS_MARY_PASSWORD} and ${OPEN_TENANT} are substituted at
 # startup (nats-config-gen, from .env.admin).

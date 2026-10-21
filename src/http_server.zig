@@ -565,6 +565,29 @@ pub const Server = struct {
         return std.fmt.allocPrint(a, ",\"{s}\":{s}", .{ name, encoded });
     }
 
+    /// Preserve enrollment order, with the assigned leaf before the hub. Singular
+    /// fields remain on the wire for deployed clients that do not read the lists.
+    fn identityEndpoints(a: std.mem.Allocator, singular: []const u8, plural: []const u8, primary: ?[]const u8, hub: ?[]const u8) ![]u8 {
+        var urls: std.ArrayList([]const u8) = .empty;
+        defer urls.deinit(a);
+        for ([_]?[]const u8{ primary, hub }) |value| {
+            var parts = std.mem.splitScalar(u8, value orelse continue, ',');
+            while (parts.next()) |part| {
+                const url = std.mem.trim(u8, part, " \t");
+                if (url.len == 0) continue;
+                for (urls.items) |seen| {
+                    if (std.mem.eql(u8, url, seen)) break;
+                } else try urls.append(a, url);
+            }
+        }
+        if (urls.items.len == 0) return a.dupe(u8, "");
+        const legacy = try identityUrl(a, singular, urls.items[0]);
+        defer a.free(legacy);
+        const list = try std.json.Stringify.valueAlloc(a, urls.items, .{});
+        defer a.free(list);
+        return std.fmt.allocPrint(a, "{s},\"{s}\":{s}", .{ legacy, plural, list });
+    }
+
     fn identityPayload(self: *Server, base_ctx: EnrollCtx, conn: *c.PGconn, jwt: []const u8, principal: []const u8) ![]u8 {
         var ctx = base_ctx;
         var scoped_result: ?*c.PGresult = null;
@@ -583,10 +606,10 @@ pub const Server = struct {
         std.crypto.hash.sha2.Sha256.hash(topology_mod.embedded_json, &ghash, .{});
         const dom_part = if (ctx.js_domain) |d| try std.fmt.allocPrint(self.allocator, ",\"js_domain\":\"{s}\"", .{d}) else "";
         defer if (ctx.js_domain != null) self.allocator.free(dom_part);
-        const url_part = if (ctx.nats_url) |u| try identityUrl(self.allocator, "nats_url", u) else "";
-        defer if (ctx.nats_url != null) self.allocator.free(url_part);
-        const ws_part = if (ctx.nats_ws_url) |u| try identityUrl(self.allocator, "nats_ws_url", u) else "";
-        defer if (ctx.nats_ws_url != null) self.allocator.free(ws_part);
+        const url_part = try identityEndpoints(self.allocator, "nats_url", "nats_urls", ctx.nats_url, base_ctx.nats_url);
+        defer self.allocator.free(url_part);
+        const ws_part = try identityEndpoints(self.allocator, "nats_ws_url", "nats_ws_urls", ctx.nats_ws_url, base_ctx.nats_ws_url);
+        defer self.allocator.free(ws_part);
         return std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\",\"grammar_hash\":\"{x}\"{s}{s}{s},\"grammar\":{s}}}\n", .{ jwt, principal, &ghash, dom_part, url_part, ws_part, topology_mod.embedded_json });
     }
 
@@ -1033,4 +1056,26 @@ fn rosterTenants(a: std.mem.Allocator, conn: *c.PGconn, principal: []const u8) !
     const out = try a.alloc([]const u8, n);
     for (0..n) |i| out[i] = try a.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 0)));
     return out;
+}
+
+test "identity endpoints keep the assigned leaf before the hub and the legacy primary" {
+    const a = std.testing.allocator;
+    const fields = try Server.identityEndpoints(a, "nats_url", "nats_urls", "tls://leaf:4222", "tls://hub:4222,tls://leaf:4222");
+    defer a.free(fields);
+    const json = try std.fmt.allocPrint(a, "{{{s}}}", .{fields[1..]});
+    defer a.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try std.testing.expectEqualStrings("tls://leaf:4222", o.get("nats_url").?.string);
+    const urls = o.get("nats_urls").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), urls.len);
+    try std.testing.expectEqualStrings("tls://leaf:4222", urls[0].string);
+    try std.testing.expectEqualStrings("tls://hub:4222", urls[1].string);
+    const hub = try Server.identityEndpoints(a, "nats_ws_url", "nats_ws_urls", "wss://hub", "wss://hub");
+    defer a.free(hub);
+    try std.testing.expectEqualStrings(",\"nats_ws_url\":\"wss://hub\",\"nats_ws_urls\":[\"wss://hub\"]", hub);
+    const absent = try Server.identityEndpoints(a, "nats_url", "nats_urls", null, null);
+    defer a.free(absent);
+    try std.testing.expectEqualStrings("", absent);
 }

@@ -9,7 +9,7 @@ A leaf is a regional NATS server. PostgreSQL, the bridge, authoritative CDC stre
 | CDC, schemas, mutations and verdicts | hub through the link | hub through the link |
 | Enrollment, renewal and signed account feed | hub HTTPS | hub HTTPS |
 
-A leaf's JetStream is a cache, not an authority for client writes. Clients use `jsDomain: "hub"` and, on a seeding leaf, `seedDomain: "<leaf-domain>"`. When a cache read fails, the client can request the hub through its existing connection. If the entire leaf connection is unavailable, the application needs a reachable hub connection or another authorized leaf; cache fallback alone does not supply connection failover.
+A leaf's JetStream is a cache, not an authority for client writes. Clients use `jsDomain: "hub"` and, on a seeding leaf, `seedDomain: "<leaf-domain>"`. A failed cache read falls back to the hub through the existing connection. Enrollment also supplies ordered connection endpoints: the assigned leaf first, then the hub. If the leaf cannot be reached or its connection fails, the client tries the hub with the same credentials, replica and queued writes. It stays on a working hub connection when the leaf returns. A live leaf whose link to the hub has failed does not trigger a connection switch yet; hub-domain work waits for that path to recover. The hub remains the authority and must be available for writes and live CDC.
 
 ## Tenant and identity boundaries
 
@@ -25,7 +25,7 @@ Use the **same explicit tenant list** in this row, credential minting and deploy
 
 The registry is the canonical enrollment policy. JWT grants are fixed when minted: editing a registry row does not revoke existing credentials. Retire memberships and keys and clear obsolete cached data as part of any tenant removal. A compromised leaf remains trusted for its configured tenants and principal namespace. Do not install unrestricted hub client or service credentials on a leaf; their bearer authority can be delegated by anyone possessing them.
 
-For a scoped principal, enrollment returns the registry's regional NATS URLs when configured. The app still supplies `seedDomain`. Existing root identities remain usable on the hub; moving them behind a restricted leaf requires new scoped identities and replicas. Drain or deliberately export pending local outboxes before changing an identity; do not discard an offline replica with unsubmitted writes.
+For a scoped principal, `/enroll` and `/renew` return `nats_urls` and `nats_ws_urls`: the registry's regional URL followed by the hub's `ENROLL_NATS_URL` or `ENROLL_NATS_WS_URL`, with duplicate addresses removed. Root principals receive the hub endpoints. Singular `nats_url` and `nats_ws_url` carry the first address for clients that do not read lists. Both libraries persist the lists in the identity; reopening uses them without an HTTP request while the JWT remains valid. Renewal saves changed addresses for the next client instance; the active connection pool keeps the list it opened with. An explicit `natsUrl` replaces the entire enrolled list. The app still supplies `seedDomain`. Existing root identities remain usable on the hub; moving them behind a restricted leaf requires new scoped identities and replicas. Drain or deliberately export pending local outboxes before changing an identity; do not discard an offline replica with unsubmitted writes.
 
 ## Credentials and trust from the hub
 

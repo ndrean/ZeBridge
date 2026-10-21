@@ -22,6 +22,7 @@
 /// read-only connection is not available here the way `libzebridge` native has one).
 
 import { natsTransport } from './transport.ts';
+import { endpointIdentity, identityEndpointUrl, orderedEndpoints } from './endpoints.ts';
 import { currentPlatform, type Platform, type PlatformName } from './platform.ts';
 import type { Transport, TransportConnection, JetStreamOpts, UserKeyPair } from './transport.ts';
 import { decode, encode, decodeMulti } from '@msgpack/msgpack';
@@ -371,6 +372,8 @@ export interface EnrolledIdentity {
   creds: string;
   nats_url?: string;
   nats_ws_url?: string;
+  nats_urls?: string[];
+  nats_ws_urls?: string[];
   grammar_hash?: string;
   js_domain?: string;
   /// The bridge's clock minus this device's, in seconds, from the JWT's `iat` when it
@@ -413,8 +416,7 @@ export async function enrollAt(bridgeUrl: string, code: string, transport: Trans
   return {
     version: 1, bridge_url: base, principal: p.principal, creds: credsFileText(p.jwt, kp.seed),
     clock_offset: offsetFrom(credsFileText(p.jwt, kp.seed)),
-    ...(p.nats_url ? { nats_url: p.nats_url } : {}),
-    ...(p.nats_ws_url ? { nats_ws_url: p.nats_ws_url } : {}),
+    ...endpointIdentity(p),
     ...(p.grammar_hash ? { grammar_hash: p.grammar_hash } : {}),
     ...(p.js_domain ? { js_domain: p.js_domain } : {}),
   };
@@ -463,7 +465,7 @@ export function identityUsable(text: string, natsUrl: string | undefined, overWe
   try {
     const id = JSON.parse(text) as Partial<EnrolledIdentity>;
     if (typeof id.creds !== 'string' || id.creds.length === 0) return false;
-    return !!(natsUrl || (overWebSocket ? id.nats_ws_url : id.nats_url));
+    return !!(natsUrl ? orderedEndpoints(natsUrl).length : identityEndpointUrl(id, overWebSocket));
   } catch {
     return false;
   }
@@ -506,8 +508,7 @@ export async function renewAt(id: EnrolledIdentity, transport: Transport = natsT
   return {
     version: 1, bridge_url: id.bridge_url, principal: p.principal ?? id.principal, creds: credsFileText(p.jwt, seed),
     clock_offset: offsetFrom(credsFileText(p.jwt, seed)),
-    ...(p.nats_url ? { nats_url: p.nats_url } : {}),
-    ...(p.nats_ws_url ? { nats_ws_url: p.nats_ws_url } : {}),
+    ...endpointIdentity(p),
     ...(p.grammar_hash ? { grammar_hash: p.grammar_hash } : {}),
     ...(p.js_domain ? { js_domain: p.js_domain } : {}),
   };
@@ -627,6 +628,8 @@ export class ZeBridge {
   private pendingWrites = new Map<string, { table: string; id: number | string; at: number; version?: string | null }>();
   /// §10fk: a `rate_limited` verdict names `retry_after_ms`; the outbox is not flushed before then.
   private holdUntil = 0;
+  private nextOutboxRetry = 0;
+  private outboxWork: Promise<void> | null = null;
   /// §10do: UPDATEs judged `stale` whose columns may still be rebased onto the
   /// winning row. Held until that row is here (it may already be), then either
   /// resubmitted with a fresh stamp or dropped and surfaced.
@@ -814,7 +817,7 @@ export class ZeBridge {
         this.identityNow = id;
         c.creds = id.creds;
         c.principal = principalFromCreds(id.creds) ?? id.principal;
-        c.natsUrl ??= (this.platform.natsOverWebSocket ? id.nats_ws_url : id.nats_url) ?? undefined;
+        c.natsUrl ??= identityEndpointUrl(id, !!this.platform.natsOverWebSocket);
         c.grammarHash ??= id.grammar_hash ?? undefined;
         c.jsDomain ??= id.js_domain ?? undefined;
         c.bridgeUrl ??= id.bridge_url;
@@ -1243,7 +1246,9 @@ export class ZeBridge {
 
       const dial = this.config.connect ?? this.platform.connect ?? this.transport.connect;
       const opts = {
-        servers: this.config.natsUrl,
+        servers: orderedEndpoints(this.config.natsUrl!),
+        noRandomize: true,
+        ignoreClusterUpdates: true,
         ...(this.config.creds
           ? { authenticator: this.transport.credsAuthenticator(() => new TextEncoder().encode(this.config.creds!)) }
           : { user: this.config.principal, pass: this.config.password }),
@@ -1327,13 +1332,15 @@ export class ZeBridge {
             for await (const st of this.nc.status()) {
               const t = String((st as any).type);
               if (t === 'reconnect') {
+                this.naturallyConnected = true;
                 this.emitStatus('connected');
+                this.nextOutboxRetry = performance.now() + Math.floor(Math.random() * 1000);
                 if (this.resyncing) continue;
                 this.resyncing = true;
-                this.appendLog('SYS', 'NATS reconnected — flushing outbox and re-syncing streams', 'INFO');
-                void this.flushOutbox();
+                this.appendLog('SYS', 'NATS reconnected — scheduling outbox recovery and re-syncing streams', 'INFO');
                 void this.subscribeStreams().catch(() => {}).finally(() => { this.resyncing = false; });
               } else if (t === 'disconnect') {
+                this.naturallyConnected = false;
                 this.emitStatus('disconnected');
               } else if (t === 'error') {
                 // The server's own verdict (§10dl): `-ERR 'Authentication Revoked'`,
@@ -1435,6 +1442,7 @@ export class ZeBridge {
     const nc = this.nc;
     this.nc = null;
     if (nc) await nc.close();
+    await this.outboxWork?.catch(() => {});
     for (const route of this.tailStops.keys()) await this.stopTail(route);
   }
 
@@ -4490,6 +4498,14 @@ export class ZeBridge {
 
   private sweepPendingWrites() {
     const now = Date.now();
+    // A reconnect can precede admission's own reconnect, or arrive while stream
+    // recovery is already running. Retrying is independent of that recovery and
+    // bounded even when the first publish after reconnect has no responder.
+    const retryNow = performance.now();
+    if (this.nc && this.naturallyConnected && retryNow >= this.nextOutboxRetry) {
+      this.nextOutboxRetry = retryNow + 5000 + Math.floor(Math.random() * 1000);
+      void this.flushOutbox().catch((e) => this.appendLog('OUTBOX', `recovery failed, pending writes retained: ${e}`, 'WARNING'));
+    }
     for (const [msgId, w] of this.pendingWrites) {
       if (now - w.at < WRITE_TIMEOUT_MS) continue;
       this.pendingWrites.delete(msgId);
@@ -4616,6 +4632,16 @@ export class ZeBridge {
   /// log. Safe to run repeatedly: original msg ids make replays idempotent. Entries
   /// are only popped by a verdict or a CDC echo (§7.1), never on send failure.
   public async flushOutbox() {
+    if (this.outboxWork) return this.outboxWork;
+    const work = this.flushOutboxOnce();
+    this.outboxWork = work;
+    try { await work; }
+    finally { if (this.outboxWork === work) this.outboxWork = null; }
+  }
+
+  private async flushOutboxOnce() {
+    const nc = this.nc;
+    if (!nc) return;
     let rows: any[] = [];
     try {
       rows = await this.outboxAll();
@@ -4623,7 +4649,7 @@ export class ZeBridge {
       this.appendLog('OUTBOX', `could not be read: ${err}`, 'ERROR');
       return;
     }
-    if (!rows.length) return;
+    if (!rows.length || this.nc !== nc) return;
     if (Date.now() < this.holdUntil) return; // §10fk: rate limited — not yet
 
     // ── first, the verdicts already waiting for us (PROTOCOL §7.4b) ──────────
@@ -4672,7 +4698,7 @@ export class ZeBridge {
 
     this.appendLog('OUTBOX', `replaying ${rows.length} unconfirmed write(s)`, 'INFO');
     for (const r of rows) {
-      if (!this.nc) return;
+      if (this.nc !== nc) return;
       try {
         const h = this.transport.headers();
         h.set('Nats-Msg-Id', r.msg_id);

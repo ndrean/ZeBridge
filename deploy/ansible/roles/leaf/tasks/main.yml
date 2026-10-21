@@ -1,7 +1,8 @@
 # One leaf: nats-server with TLS for phones (4222) and browsers (a websocket), the hub's
-# trust, and a remote to the hub's leafnodes port with the leaf's own credentials. No
-# JetStream: the devices' stream calls reach the hub's through the domain they enrolled
-# with (js_domain).
+# trust, and a remote to the hub's leafnodes port with the leaf's own credentials.
+# Client stream calls use the hub's domain; the optional local JetStream holds seeds.
+# If adding a cluster block, require cluster.no_advertise: true so clients retain
+# their enrolled endpoint pools. leafnodes.no_advertise controls leaf peers only.
 
 - name: Packages
   ansible.builtin.apt:

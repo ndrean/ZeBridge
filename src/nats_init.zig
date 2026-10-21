@@ -782,6 +782,7 @@ fn runDev(
         \\# owns every stream. That is the point — the whole stack in ten seconds, not a
         \\# JWT in sight — and exactly why this file must never reach production. The
         \\# production shape is `--init-nats --mode operator`.
+        \\# If adding a cluster block, require cluster.no_advertise: true to retain enrolled client pools.
         \\port: {d}
         \\http_port: {d}
         \\websocket {{
@@ -999,6 +1000,7 @@ fn runOperator(
         \\  {s}: {s}
         \\}}
         \\
+        \\# If adding a cluster block, require cluster.no_advertise: true to retain enrolled client pools.
         \\port: {d}
         \\http_port: {d}
         \\websocket {{

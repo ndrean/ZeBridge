@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Hub fallback, stage 1: real TS buffered/streaming seeds from a scoped leaf.
+"""Hub fallback: mirrored seeds, durable retries and ordered endpoint failover.
 
-Own disposable local operator-mode NATS servers; no PostgreSQL or VPS is touched.
-Later stages add durable receipts and connection failover to this scenario.
+Stage 1 uses disposable NATS; stages 2 and 3 also use their own PostgreSQL databases.
+No shared dev database or VPS is touched.
 """
 import asyncio
 import copy
@@ -262,11 +262,13 @@ async def main():
 
 
 if __name__ == "__main__":
-    # ZB_HUB_FALLBACK_STAGES picks stages ("1 2" by default); stage 2 lives in its own
-    # module because its fixtures (PostgreSQL, a bridge, libzb) differ from stage 1's.
-    stages = os.environ.get("ZB_HUB_FALLBACK_STAGES", "1 2").split()
+    # Each stage owns and tears down its fixtures, independently of the others.
+    stages = os.environ.get("ZB_HUB_FALLBACK_STAGES", "1 2 3").split()
     code = asyncio.run(main()) if "1" in stages else 0
     if "2" in stages:
         import hub_fallback_stage2
         code |= asyncio.run(hub_fallback_stage2.main())
+    if "3" in stages:
+        import hub_fallback_endpoints
+        code |= asyncio.run(hub_fallback_endpoints.main())
     raise SystemExit(code)

@@ -405,3 +405,59 @@ test('a stored identity is usable with creds and a NATS URL for its platform', a
   assert.equal(identityUsable(JSON.stringify({ nats_ws_url: 'wss://w' }), undefined, true), false);
   assert.equal(identityUsable('{not json', undefined, true), false);
 });
+
+test('endpoint order is stable, overrides are complete and TLS cannot downgrade', async () => {
+  const { orderedEndpoints, identityEndpointUrl, endpointIdentity } = await import('./endpoints.ts');
+  assert.deepEqual(orderedEndpoints(' tls://leaf:4222, tls://hub:4222,tls://leaf:4222 '), ['tls://leaf:4222', 'tls://hub:4222']);
+  const id = endpointIdentity({ nats_url: 'tls://legacy', nats_ws_url: 'wss://legacy', nats_urls: ['tls://leaf', 'tls://hub'], nats_ws_urls: ['wss://leaf', 'wss://hub'] });
+  assert.equal(identityEndpointUrl(id, false), 'tls://leaf,tls://hub');
+  assert.equal(identityEndpointUrl(id, true), 'wss://leaf,wss://hub');
+  assert.equal(identityEndpointUrl({ nats_url: 'tls://legacy' }, false), 'tls://legacy');
+  assert.equal(identityEndpointUrl({ nats_url: 'tls://legacy' }, true), undefined);
+  assert.deepEqual(orderedEndpoints('tls://override'), ['tls://override']);
+  for (const invalid of ['tls://leaf,nats://hub', 'wss://leaf,ws://hub', 'tls://leaf,hub', 'tls://leaf,,tls://hub', 'tls://bad\nhost']) {
+    assert.throws(() => orderedEndpoints(invalid));
+  }
+  for (const list of [[], [''], [null], 'tls://hub', ['tls://leaf,tls://hub']]) {
+    assert.throws(() => endpointIdentity({ nats_urls: list }));
+  }
+});
+
+test('enroll and renew preserve ordered endpoints for both transports', async (t) => {
+  const { enrollAt, renewAt, identityUsable } = await import('./libzb.ts');
+  const payload = { jwt: 'header.payload.sig', principal: 'lf-edge.alice', nats_url: 'tls://leaf', nats_ws_url: 'wss://leaf', nats_urls: ['tls://leaf', 'tls://hub'], nats_ws_urls: ['wss://leaf', 'wss://hub'] };
+  t.mock.method(globalThis, 'fetch', async () => Response.json(payload));
+  const enrolled = await enrollAt('https://bridge', 'invite');
+  const renewed = await renewAt(enrolled);
+  for (const id of [enrolled, renewed, JSON.parse(JSON.stringify(renewed))]) {
+    assert.deepEqual(id.nats_urls, payload.nats_urls);
+    assert.deepEqual(id.nats_ws_urls, payload.nats_ws_urls);
+    assert.equal(identityUsable(JSON.stringify(id), undefined, false), true);
+    assert.equal(identityUsable(JSON.stringify(id), undefined, true), true);
+  }
+  assert.equal(identityUsable(JSON.stringify({ creds: enrolled.creds, nats_urls: payload.nats_urls }), undefined, false), true);
+});
+
+test('Node TLS verifies the selected URL on initial connect and reconnect', async () => {
+  const { bindEndpointTls } = await import('./node-tls.ts');
+  const leaf = { hostname: '127.0.0.1' }, hub = { hostname: 'hub.example' };
+  const opts = bindEndpointTls({ servers: ['tls://127.0.0.1', 'tls://hub.example'], tls: { caFile: '/roots.pem' } });
+  assert.ok(opts.tls.checkServerIdentity('localhost', { subjectaltname: 'DNS:localhost' }), 'a missing endpoint selection fails closed');
+  assert.equal(opts.reconnectToServer([leaf, hub], null), null);
+  assert.equal(opts.tls.servername, undefined);
+  // The fallback name passed by Node must not authorize the wrong endpoint.
+  assert.ok(opts.tls.checkServerIdentity('localhost', { subjectaltname: 'DNS:localhost' }));
+  assert.equal(opts.tls.checkServerIdentity('localhost', { subjectaltname: 'IP Address:127.0.0.1' }), undefined);
+  opts.reconnectToServer([hub, leaf], null);
+  assert.equal(opts.tls.servername, 'hub.example');
+  assert.ok(opts.tls.checkServerIdentity('127.0.0.1', { subjectaltname: 'IP Address:127.0.0.1' }));
+  assert.equal(opts.tls.checkServerIdentity('127.0.0.1', { subjectaltname: 'DNS:hub.example' }), undefined);
+  const custom = bindEndpointTls({ reconnectToServer: () => ({ server: hub, delay: 17 }), tls: { caFile: '/roots.pem', checkServerIdentity: () => new Error('pin refused') } });
+  assert.deepEqual(custom.reconnectToServer([leaf, hub], null), { server: hub, delay: 17 });
+  assert.equal(custom.tls.servername, 'hub.example');
+  assert.equal(custom.tls.checkServerIdentity('', { subjectaltname: 'DNS:hub.example' }).message, 'pin refused');
+  assert.throws(() => bindEndpointTls({ servers: ['tls://hub.example'], tls: null }));
+  assert.throws(() => bindEndpointTls({ servers: [' TLS://hub.example '], tls: null }));
+  const plain = { servers: ['nats://localhost:4222'] };
+  assert.equal(bindEndpointTls(plain), plain, 'plain development connections do not acquire required TLS');
+});

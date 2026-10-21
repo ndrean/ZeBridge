@@ -49,6 +49,11 @@ pub const Identity = struct {
     principal: []u8,
     creds: []u8,
     nats_url: ?[]u8 = null,
+    nats_ws_url: ?[]u8 = null,
+    /// Ordered wire arrays held as comma-separated URLs for the transport's existing
+    /// URL option. The identity file keeps them as arrays, shared with zb-client-ts.
+    nats_urls: ?[]u8 = null,
+    nats_ws_urls: ?[]u8 = null,
     grammar_hash: ?[]u8 = null,
     js_domain: ?[]u8 = null,
     /// The bridge's clock minus this device's, in seconds, taken from the JWT's `iat`
@@ -67,6 +72,9 @@ pub const Identity = struct {
         a.free(self.principal);
         a.free(self.creds);
         if (self.nats_url) |v| a.free(v);
+        if (self.nats_ws_url) |v| a.free(v);
+        if (self.nats_urls) |v| a.free(v);
+        if (self.nats_ws_urls) |v| a.free(v);
         if (self.grammar_hash) |v| a.free(v);
         if (self.js_domain) |v| a.free(v);
     }
@@ -189,6 +197,7 @@ pub fn enroll(a: std.mem.Allocator, bridge_url: []const u8, code: []const u8, ca
     };
     errdefer id.deinit(a);
     if (str(o, "nats_url")) |v| id.nats_url = try a.dupe(u8, v);
+    try readEndpoints(a, o, &id);
     if (str(o, "grammar_hash")) |v| id.grammar_hash = try a.dupe(u8, v);
     if (str(o, "js_domain")) |v| id.js_domain = try a.dupe(u8, v);
     id.clock_offset = offsetFrom(id.creds, localNow());
@@ -392,6 +401,7 @@ pub fn renew(a: std.mem.Allocator, id: Identity, server_now: i64, ca_file: ?[]co
     };
     errdefer out.deinit(a);
     if (str(o, "nats_url")) |v| out.nats_url = try a.dupe(u8, v);
+    try readEndpoints(a, o, &out);
     if (str(o, "grammar_hash")) |v| out.grammar_hash = try a.dupe(u8, v);
     if (str(o, "js_domain")) |v| out.js_domain = try a.dupe(u8, v);
     out.clock_offset = offsetFrom(out.creds, localNow());
@@ -411,6 +421,36 @@ fn str(o: Value, k: []const u8) ?[]const u8 {
     if (o != .object) return null;
     const v = o.object.get(k) orelse return null;
     return if (v == .string and v.string.len > 0) v.string else null;
+}
+
+fn endpointList(a: std.mem.Allocator, o: Value, key: []const u8) !?[]u8 {
+    const value = o.object.get(key) orelse return null;
+    if (value != .array or value.array.items.len == 0) return fail("{s} must be a nonempty endpoint list", .{key});
+    var urls: std.ArrayList([]const u8) = .empty;
+    defer urls.deinit(a);
+    for (value.array.items) |item| {
+        if (item != .string) return fail("{s} contains a non-string endpoint", .{key});
+        const url = std.mem.trim(u8, item.string, " \t");
+        if (url.len == 0) return fail("{s} contains an empty endpoint", .{key});
+        for (url) |ch| if (ch <= 0x20 or ch == 0x7f or ch == ',') return fail("{s} contains an invalid endpoint", .{key});
+        for (urls.items) |seen| {
+            if (std.mem.eql(u8, url, seen)) break;
+        } else try urls.append(a, url);
+    }
+    return try std.mem.join(a, ",", urls.items);
+}
+
+fn readEndpoints(a: std.mem.Allocator, o: Value, id: *Identity) !void {
+    if (str(o, "nats_ws_url")) |v| id.nats_ws_url = try a.dupe(u8, v);
+    id.nats_urls = try endpointList(a, o, "nats_urls");
+    id.nats_ws_urls = try endpointList(a, o, "nats_ws_urls");
+}
+
+fn saveEndpoints(a: std.mem.Allocator, obj: *std.json.ObjectMap, key: []const u8, urls: ?[]const u8) !void {
+    var list: std.array_list.Managed(Value) = .init(a);
+    var parts = std.mem.splitScalar(u8, urls orelse return, ',');
+    while (parts.next()) |url| try list.append(.{ .string = url });
+    try obj.put(a, key, .{ .array = list });
 }
 
 /// Android keeps an app's private files under `/data/user/<user>/<package>/` (also reached
@@ -516,6 +556,7 @@ pub fn load(a: std.mem.Allocator, path: []const u8) !?Identity {
     };
     errdefer id.deinit(a);
     if (str(o, "nats_url")) |v| id.nats_url = try a.dupe(u8, v);
+    try readEndpoints(a, o, &id);
     if (str(o, "grammar_hash")) |v| id.grammar_hash = try a.dupe(u8, v);
     if (str(o, "js_domain")) |v| id.js_domain = try a.dupe(u8, v);
     if (o.object.get("clock_offset")) |v| if (v == .integer) {
@@ -535,6 +576,9 @@ pub fn save(a: std.mem.Allocator, path: []const u8, id: Identity) !void {
     try obj.put(aa, "principal", .{ .string = id.principal });
     try obj.put(aa, "creds", .{ .string = id.creds });
     if (id.nats_url) |v| try obj.put(aa, "nats_url", .{ .string = v });
+    if (id.nats_ws_url) |v| try obj.put(aa, "nats_ws_url", .{ .string = v });
+    try saveEndpoints(aa, &obj, "nats_urls", id.nats_urls);
+    try saveEndpoints(aa, &obj, "nats_ws_urls", id.nats_ws_urls);
     if (id.grammar_hash) |v| try obj.put(aa, "grammar_hash", .{ .string = v });
     if (id.js_domain) |v| try obj.put(aa, "js_domain", .{ .string = v });
     try obj.put(aa, "clock_offset", .{ .integer = id.clock_offset });
@@ -572,6 +616,9 @@ test "an identity survives save and load, and the file is private" {
         .principal = try a.dupe(u8, "alice"),
         .creds = try credsText(a, "eyJ0eXAi.jwt.sig", "SUAEXAMPLESEED"),
         .nats_url = try a.dupe(u8, "tls://zb.example.com:4222"),
+        .nats_urls = try a.dupe(u8, "tls://leaf.example.com:4222,tls://zb.example.com:4222"),
+        .nats_ws_url = try a.dupe(u8, "wss://leaf.example.com"),
+        .nats_ws_urls = try a.dupe(u8, "wss://leaf.example.com,wss://zb.example.com"),
         .grammar_hash = try a.dupe(u8, "848d9fc8"),
         .clock_offset = -3600,
     };
@@ -582,11 +629,32 @@ test "an identity survives save and load, and the file is private" {
     try std.testing.expectEqualStrings(id.creds, back.creds);
     try std.testing.expectEqualStrings("alice", back.principal);
     try std.testing.expectEqualStrings("tls://zb.example.com:4222", back.nats_url.?);
+    try std.testing.expectEqualStrings(id.nats_urls.?, back.nats_urls.?);
+    try std.testing.expectEqualStrings(id.nats_ws_url.?, back.nats_ws_url.?);
+    try std.testing.expectEqualStrings(id.nats_ws_urls.?, back.nats_ws_urls.?);
     try std.testing.expect(back.js_domain == null);
     try std.testing.expectEqual(@as(i64, -3600), back.clock_offset);
     const st = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{});
     try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(@intFromEnum(st.permissions))) & 0o777);
     try std.testing.expect((try load(a, "zbz-no-such-identity.json")) == null);
+}
+
+test "endpoint arrays preserve order and reject malformed identity fields" {
+    const a = std.testing.allocator;
+    const good = try std.json.parseFromSlice(Value, a, "{\"nats_urls\":[\"tls://leaf\",\"tls://hub\",\"tls://leaf\"]}", .{});
+    defer good.deinit();
+    const urls = (try endpointList(a, good.value, "nats_urls")).?;
+    defer a.free(urls);
+    try std.testing.expectEqualStrings("tls://leaf,tls://hub", urls);
+    try std.testing.expect((try endpointList(a, good.value, "nats_ws_urls")) == null);
+    for ([_][]const u8{ "[]", "\"tls://hub\"", "[null]", "[\"\"]", "[\"tls://leaf,tls://hub\"]", "[\"tls://bad\\nhost\"]" }) |bad| {
+        const input = try std.fmt.allocPrint(a, "{{\"nats_urls\":{s}}}", .{bad});
+        defer a.free(input);
+        const parsed = try std.json.parseFromSlice(Value, a, input, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.EnrollFailed, endpointList(a, parsed.value, "nats_urls"));
+    }
+    last_failure = null;
 }
 
 test "a code outside the safe alphabet is refused before any request" {

@@ -146,7 +146,7 @@ One vocabulary: the same key means the same thing in libzb's `opts_json` and in 
 | `bridgeUrl` | ✅ where `invite` is redeemed (`/enroll`) and the JWT renewed (`/renew`); kept in the identity | ✅ the same, and where the grammar hash is fetched when `grammarHash` is unset |
 | `invite` | ✅ first run only: with `bridgeUrl` and no stored identity, enrolls this device | ✅ the same |
 | `identityPath` | ✅ where the identity is kept (JSON, mode 0600); default `<dbPath>.identity`, else `zebridge.identity`. On Android, a replica in the app's private folder keeps it in the app's `no_backup/` (Android backs up everything else, the device's key with it); an identity found beside the replica moves there once. On iOS it is flagged out of iCloud and computer backups (`kCFURLIsExcludedFromBackupKey`). Apps read who they are from the client (`principal`), never from this file | ✅ the same file on Node; a localStorage key in the browser |
-| `natsUrl` | ✅ optional once enrolled: the identity carries it | ✅ the same (the identity's `nats_ws_url` in the browser) |
+| `natsUrl` | ✅ optional once enrolled; a comma-separated ordered endpoint list, replacing the whole enrolled list when supplied | ✅ the same; defaults to the identity's native list on Node and WebSocket list in the browser |
 | `creds` | ✅ the .creds TEXT; wins over the identity | ✅ |
 | `credsPath` | ✅ a .creds file | ✅ where there is a filesystem (Node) |
 | `principal` | ✅ optional: the creds or the identity name it | ✅ the same (also the inbox prefix on both) |
@@ -163,12 +163,16 @@ One vocabulary: the same key means the same thing in libzb's `opts_json` and in 
 | `seedStreaming`, `seedStreamingAboveBytes` | ✅ | ✅ |
 | `jsDomain` | ✅ | ✅ |
 | `seedDomain` | ✅ optional leaf domain for generation manifests and objects; falls back to `jsDomain` | ✅ the same, for buffered and streaming seeds; schemas, membership, CDC and writes still use `jsDomain` |
-| `caFile` | ✅ a PEM bundle of trusted roots for `https://` enrollment and renewal and a `tls://` NATS URL, in place of the system's. Unset on iOS and Android, where Zig reads no trust store, libzb uses its own copy of Mozilla's bundle (refreshed by `libzb/scripts/refresh-roots.sh`) | — (the platform's TLS: the browser's; on Node its built-in roots, `NODE_EXTRA_CA_CERTS` for a private CA) |
+| `caFile` | ✅ a PEM bundle of trusted roots for `https://` enrollment and renewal and every `tls://` endpoint, in place of the system's. Unset on iOS and Android, where Zig reads no trust store, libzb uses its own copy of Mozilla's bundle (refreshed by `libzb/scripts/refresh-roots.sh`) | — (the platform's TLS: the browser's; on Node its built-in roots, `NODE_EXTRA_CA_CERTS` for a private CA) |
 | `bulkCdc`, `bulkStatement`, `cdcBatchEvents` | — (the DuckDB path is always bulk, SQLite per event) | ✅ tuning |
 | `platform` | — (one build per platform) | asserts the entry the bundler picked |
 | `storage`, `transport`, `connect`, `zstdDecompress`, `zstdDecompressStream`, `zstdCompress` | — | overrides, for a test or a storage of your own; an app never needs them |
 
+Enrolled identities keep ordered native and WebSocket endpoint lists, assigned leaf first and hub second; older identities with only a singular URL remain usable. Connection failures try the next address with the same identity, replica and outbox. libzb's normal `poll` loop retries queued writes at bounded intervals with jitter; TS retries through its event loop independently of stream recovery. Hosts must keep polling libzb. Renewal saves updated lists for the next client instance; the active connection pool keeps the list it opened with. `natsUrl` accepts comma-separated addresses without changing C ABI 7. Secure and plaintext addresses cannot share a list, and each TLS connection checks its own URL's name. This does not yet switch away from a still-connected leaf whose hub link is down, nor move a healthy hub connection back when a leaf returns.
+
 ## TLS on iOS and Android
+
+Use DNS names with matching DNS subject alternative names for native TLS endpoints. The vendored native TLS verifier does not accept a certificate containing only an IP subject alternative name; it fails closed. The endpoint scenario's loopback certificate carries both DNS and IP alternatives. Node and WebSocket clients verify IP URLs against IP alternatives.
 
 libzb checks every `https://` (enrollment, renewal) and `tls://` (NATS) connection against
 trusted root certificates. On macOS, Linux and Windows it reads the system's. On iOS and

@@ -1,6 +1,8 @@
 # The NATS configuration comes from the bridge (`--init-nats operator`), ONCE: running it
 # again would make a new operator, and every enrolled device would be refused. Then the
 # listeners are set, each edit checked by `nats-server -t` before it is written.
+# If adding a cluster block, require cluster.no_advertise: true so clients retain
+# their enrolled endpoint pools. leafnodes.no_advertise controls leaf peers only.
 
 - name: The configuration, generated once (operator, accounts, the bridge's creds)
   ansible.builtin.command: >-

@@ -1298,3 +1298,11 @@ control: with the lookup put back first, the new test fails (1 create, 2 info). 
 one device's open: `CONSUMER.INFO` 8 → 4 (the 4 left are libzb's own health checks); the
 device's open plus 34 s idle is 38 requests, against 375 before §37. `check-series.sh`
 green over 37.
+
+## 39. Failed endpoints preserve the configured connection order (2026-10-21)
+
+**How it appeared.** Ordered leaf-to-hub fallback exposed `ServerPool.getNextServer` using swap-removal to rotate or exhaust a failed server. With three or more configured endpoints, removing the first moved the last ahead of the second, so the retry pool no longer followed enrollment order.
+
+**Change** (`38-nats.zig-ordered-server-pool.patch`): both removals use ordered removal. Retried servers rotate to the end without reordering the others; an exhausted server leaves the remaining order intact. Two four-endpoint unit tests cover retry rotation and exhaustion.
+
+**Verified:** before the fix, the two new tests fail (8 pass, 2 fail); after it, the pool tests pass 10/10 in Debug and ReleaseSafe. The SDK `test-unit` suite passes 143 tests with 2 skipped in both modes. The endpoint scenario exercises an unreachable first address followed by a real TLS leaf and hub, reads the live native pool at initial connect, observes a real asynchronous INFO, then kills the leaf and checks reconnection to the hub with its distinct TLS name. `check-series.sh` reproduces the working source from upstream plus all 37 patch files. The submodule pointer remains unchanged.

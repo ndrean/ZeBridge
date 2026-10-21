@@ -86,6 +86,10 @@ that prefix. A wrong domain is not a mismatch the client can detect at connect: 
 first request simply finds no responder (`503`, `Nats-Subject: $JS.<wrong>.API.…`), the
 same symptom as a missing grant.
 
+Enrollment and renewal also carry ordered endpoint arrays, `nats_urls` for native TCP and `nats_ws_urls` for WebSocket. A scoped identity receives its registered leaf address first, followed by the hub addresses configured by `ENROLL_NATS_URL` and `ENROLL_NATS_WS_URL`; repeated addresses are removed without changing order. Singular `nats_url` and `nats_ws_url` carry the first address for clients that read only those fields. Absent arrays fall back to the singular fields; present arrays must be nonempty lists of nonempty URL strings. Both transports' lists persist with the identity, and a new connection selects its platform's list unless an explicit `natsUrl` replaces it. Renewal saves updated lists for the next client instance; the active connection pool keeps the list it opened with. Secure and plaintext endpoints cannot share a list, and each TLS handshake verifies that endpoint's own name.
+
+Connection failure tries the next configured endpoint with the same principal, credentials, replica, message IDs and payload bytes. Clients retain queued writes while all endpoints are unavailable and retry when service returns; a healthy hub connection is not interrupted when the leaf returns. This covers connection loss, not a live leaf whose link to the hub is broken, and does not make the hub highly available. TS disables server randomization and ignores advertised cluster updates. Native endpoint confinement relies on managed NATS configurations not advertising client endpoints; any future route cluster must set `cluster.no_advertise: true`.
+
 The grammar carries only the static wire names — `streams`, `subjects`, `kv`,
 `cdc_streams`, `open_tenant`, `generations`, `results`. Which tables replicate, and their
 tenancy and LWW columns, is not in this file: that lives in `zebridge_catalogue` (§8b).

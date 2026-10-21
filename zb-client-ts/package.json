@@ -106,7 +106,7 @@
     "typescript": "^5.7.2"
   },
   "peerDependencies": {
-    "@nats-io/transport-node": ">=3",
+    "@nats-io/transport-node": ">=3.4.0",
     "better-sqlite3": ">=11"
   },
   "peerDependenciesMeta": {

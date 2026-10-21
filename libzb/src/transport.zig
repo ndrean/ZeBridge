@@ -10,6 +10,21 @@ const log = std.log.scoped(.libzb);
 const android_io = @import("android_io.zig"); // Android: names through getaddrinfo (§10ln)
 const nats = @import("nats");
 
+/// A list has one security mode. Never let a secure primary fall back to plaintext.
+fn endpointTls(urls: []const u8) !bool {
+    var secure: ?bool = null;
+    var parts = std.mem.splitScalar(u8, urls, ',');
+    while (parts.next()) |part| {
+        const url = std.mem.trim(u8, part, " \t");
+        if (url.len == 0) return error.InvalidUrl;
+        const tls = if (std.mem.startsWith(u8, url, "tls://")) true else if (std.mem.startsWith(u8, url, "nats://") or std.mem.find(u8, url, "://") == null) false else return error.InvalidUrl;
+        for (url) |ch| if (ch <= 0x20 or ch == 0x7f) return error.InvalidUrl;
+        if (secure) |previous| if (previous != tls) return error.MixedEndpointSecurity;
+        secure = tls;
+    }
+    return secure orelse error.InvalidUrl;
+}
+
 pub const ConnectOptions = struct {
     url: []const u8,
     /// Path to a .creds file (operator/JWT mode) — wins over user/password.
@@ -35,6 +50,15 @@ pub const ConnectOptions = struct {
     /// system's: Zig reads no trust store on iOS, so a phone host ships its own.
     ca_file: ?[]const u8 = null,
 };
+
+test "endpoint lists keep one security mode and reject missing entries" {
+    try std.testing.expect(try endpointTls("  tls://leaf.example:4222, tls://hub.example:4222"));
+    try std.testing.expect(!try endpointTls("nats://leaf.example:4222,hub.example:4222"));
+    try std.testing.expectError(error.MixedEndpointSecurity, endpointTls("tls://leaf.example,nats://hub.example"));
+    try std.testing.expectError(error.MixedEndpointSecurity, endpointTls("leaf.example,tls://hub.example"));
+    try std.testing.expectError(error.InvalidUrl, endpointTls("nats://leaf.example,,nats://hub.example"));
+    try std.testing.expectError(error.InvalidUrl, endpointTls("nats://leaf.example,\nnats://hub.example"));
+}
 
 /// §10fh: a chain object read through a PULL consumer, a few chunks at a time — the
 /// streaming seed's source. The object store's own reader is a push subscription:
@@ -219,6 +243,7 @@ pub const Transport = struct {
     os_bucket: []u8 = &.{},
 
     pub fn connect(allocator: std.mem.Allocator, opts: ConnectOptions) !*Transport {
+        const uses_tls = try endpointTls(opts.url);
         const self = try allocator.create(Transport);
         errdefer allocator.destroy(self);
         // ⚠️ A struct literal, so the defaulted fields (`os`, `os_bucket`) are set.
@@ -257,7 +282,7 @@ pub const Transport = struct {
                 .reconnect = .{ .allow_reconnect = true, .max_reconnect = std.math.maxInt(u32) },
                 // Only on a tls:// URL: TLS options on a nats:// URL would force TLS on a
                 // server that does not speak it.
-                .tls = if (opts.ca_file != null and std.ascii.startsWithIgnoreCase(opts.url, "tls://")) .{ .ca_file = opts.ca_file } else null,
+                .tls = if (opts.ca_file != null and uses_tls) .{ .ca_file = opts.ca_file } else null,
             });
             if (self.conn.connect(opts.url)) |_| break else |err| {
                 self.conn.deinit();

@@ -2,6 +2,8 @@
 # the shared mirror keeper. Copy this whole directory and build the NATS image.
 # A distinct LEAF_JS_DOMAIN enables seeding caches. Explicit tenants are required
 # for both modes. See ../README.md and ../../../LEAF_NODES.md for migration.
+# If adding a cluster block, require cluster.no_advertise: true so clients retain
+# their enrolled endpoint pools. leafnodes.no_advertise controls leaf peers only.
 
 services:
   # One certificate for LEAF_HOST, from Let's Encrypt on port 80, renewed twice a day.

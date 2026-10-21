@@ -667,7 +667,11 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     // One acquire per statement, its errdefer on the next line — and here they FIRE,
     // because this function returns an error union.
     // §10hn: `natsUrl`, the one name both clients share; else where /enroll said to dial.
-    const url_s = idv.or_(str.get(o, "natsUrl", ""), if (ident) |i| i.nats_url else null);
+    const url_s = idv.or_(str.get(o, "natsUrl", ""), if (ident) |i| i.nats_urls orelse i.nats_url else null);
+    if (ident != null and url_s.len == 0) {
+        enroll.last_failure = "the identity has no native NATS endpoints; set ENROLL_NATS_URL on the bridge or pass natsUrl";
+        return error.EnrollFailed;
+    }
     const url = try a.dupeSentinel(u8, if (url_s.len > 0) url_s else "nats://127.0.0.1:4222", 0);
     errdefer a.free(url);
     const creds = try a.dupeSentinel(u8, str.get(o, "credsPath", ""), 0);
@@ -1238,8 +1242,6 @@ export fn zb_client_reply(handle: u64, id: u64, answer_json: ?[*:0]const u8) ?[*
 /// The host's loop body: `while (running) poll(h, 1000)`. Returns as soon as a CDC
 /// batch was applied, or after `wait_ms` with nothing — never earlier on idle, so the
 /// host's loop does not spin. Requires a prior `zb_client_sync` (schemas, positions).
-
-
 /// §10jt: every eighth of the JWT's life (at most a minute), from the host's poll thread: a JWT with less than
 /// a quarter of its life left is renewed with the identity's key, the identity file is
 /// rewritten, and the new creds go to the connection for its NEXT handshake (nats.zig

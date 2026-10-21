@@ -210,6 +210,18 @@ pub fn build(b: *std.Build) void {
     const nats_dep = b.dependency("nats", .{ .target = target, .optimize = optimize });
     const msgpack_dep = b.dependency("zig_msgpack", .{ .target = target, .optimize = optimize });
 
+    // A scenario-only driver can inspect the actual NATS pool without adding an ABI
+    // function or a client configuration option.
+    const probe_mod = b.createModule(.{
+        .root_source_file = b.path("src/endpoint_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    probe_mod.addImport("nats", nats_dep.module("nats"));
+    const probe = b.addExecutable(.{ .name = "zb-endpoint-probe", .root_module = probe_mod });
+    b.step("endpoint-probe", "Build the native endpoint scenario driver").dependOn(&b.addInstallArtifact(probe, .{}).step);
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/capi.zig"),
         // §10ir: Android links the archive into a shared library with the NDK's clang

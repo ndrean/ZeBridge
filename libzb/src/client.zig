@@ -376,6 +376,11 @@ pub const SyncClient = struct {
     /// §10fk: a `rate_limited` verdict names `retry_after_ms`; the outbox is not
     /// flushed before then. The write stays queued, exactly as after `failed`.
     hold_until_ms: i64 = 0,
+    /// The host's normal poll loop also pumps pending writes after an outage. Bound
+    /// the work and spread reconnecting devices; flushOutbox retains its send grace,
+    /// rate-limit gate and original durable IDs/bytes.
+    next_outbox_retry_ms: i64 = 0,
+    outbox_reconnect_epoch: u64 = 0,
     /// Streams the gap rule found RESTARTED (position beyond last_seq, NOTES §10bm's
     /// third shape) and no manifest has re-anchored on since. While a stream is here, a
     /// manifest whose `cutoff_seq` is beyond the stream's last_seq was cut on the previous
@@ -3697,6 +3702,20 @@ pub const SyncClient = struct {
     /// can sit unseen: a responder polls with a short wait.
     pub fn poll(self: *SyncClient, report_a: std.mem.Allocator, wait_ms: u64) !PollReport {
         self.beginPass();
+        if (self.t.conn.getStatus() == .connected and !self.revoked) {
+            const now = @divTrunc(usMono(), 1000);
+            const epoch = self.t.conn.reconnect_epoch.load(.acquire);
+            if (epoch != self.outbox_reconnect_epoch) {
+                self.outbox_reconnect_epoch = epoch;
+                self.next_outbox_retry_ms = now + self.outboxRetryJitter();
+            }
+            if (now >= self.next_outbox_retry_ms) {
+                self.next_outbox_retry_ms = now + 5_000 + self.outboxRetryJitter();
+                _ = self.flushOutbox() catch |err| {
+                    log.info("outbox recovery: {s} — pending writes retained for a later poll", .{@errorName(err)});
+                };
+            }
+        }
         var requests: std.ArrayList(Request) = .empty;
         if (self.serve_subs.len > 0) try self.drainServe(report_a, &requests);
         var r = try self.pollInner(report_a, wait_ms);
@@ -3705,6 +3724,12 @@ pub const SyncClient = struct {
             r.requests = requests.items;
         }
         return r;
+    }
+
+    fn outboxRetryJitter(self: *SyncClient) i64 {
+        var bytes: [2]u8 = undefined;
+        self.t.conn.io.random(&bytes);
+        return @intCast(std.mem.readInt(u16, &bytes, .little) % 1_000);
     }
 
     fn pollInner(self: *SyncClient, report_a: std.mem.Allocator, wait_ms: u64) !PollReport {

@@ -1,0 +1,55 @@
+diff --git a/src/server_pool.zig b/src/server_pool.zig
+index 21de045..cd7c481 100644
+--- a/src/server_pool.zig
++++ b/src/server_pool.zig
+@@ -136,13 +136,15 @@ pub const ServerPool = struct {
+         if (current_srv.reconnects < max_reconnect) {
+             // Remove current server and move it to back (like C library)
+             // Remove using the stored key and get the mutable server back
+-            const removed_server = self.servers.fetchSwapRemove(current_srv.key).?;
++            // Swap-removal would move the last endpoint ahead of the next configured
++            // one. Preserve the remaining order before appending this server.
++            const removed_server = self.servers.fetchOrderedRemove(current_srv.key).?;
+ 
+             // Add current server back at the end - capacity guaranteed since we just removed
+             self.servers.putAssumeCapacity(removed_server.key, removed_server.value);
+         } else {
+             // Remove the server permanently (like C library lines 104-106)
+-            const removed_server = self.servers.fetchSwapRemove(current_srv.key).?;
++            const removed_server = self.servers.fetchOrderedRemove(current_srv.key).?;
+             removed_server.value.deinit(self.allocator);
+             self.allocator.destroy(removed_server.value);
+         }
+@@ -171,6 +173,32 @@ pub const ServerPool = struct {
+     }
+ };
+ 
++test "server selection preserves configured order across failures and retries" {
++    var pool = ServerPool.init(std.testing.allocator);
++    defer pool.deinit();
++    for ([_][]const u8{ "nats://leaf:4222", "nats://hub:4222", "nats://standby:4222", "nats://last:4222" }) |url| {
++        _ = try pool.addServer(url, false);
++    }
++    var current = (try pool.getNextServer(100, null)).?;
++    for ([_][]const u8{ "hub:4222", "standby:4222", "last:4222", "leaf:4222", "hub:4222" }) |key| {
++        current = (try pool.getNextServer(100, current)).?;
++        try std.testing.expectEqualStrings(key, current.key);
++    }
++}
++
++test "exhausting a server does not reorder remaining endpoints" {
++    var pool = ServerPool.init(std.testing.allocator);
++    defer pool.deinit();
++    for ([_][]const u8{ "nats://leaf:4222", "nats://hub:4222", "nats://standby:4222" }) |url| {
++        _ = try pool.addServer(url, false);
++    }
++    const first = (try pool.getNextServer(5, null)).?;
++    first.reconnects = 5;
++    const next = (try pool.getNextServer(5, first)).?;
++    try std.testing.expectEqualStrings("hub:4222", next.key);
++    try std.testing.expectEqual(@as(usize, 2), pool.getSize());
++}
++
+ test "server pool basic operations" {
+     var gpa = std.heap.DebugAllocator(.{}){};
+     defer _ = gpa.deinit();
