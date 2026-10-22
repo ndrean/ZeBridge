@@ -41,7 +41,7 @@ dependencies {
 }
 
 mavenPublishing {
-    coordinates("eu.zebridge", "zebridge-android", "0.2.6")
+    coordinates("eu.zebridge", "zebridge-android", "0.2.7")
     configure(AndroidSingleVariantLibrary(
         javadocJar = JavadocJar.Empty(),
         sourcesJar = SourcesJar.Sources(),

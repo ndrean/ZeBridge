@@ -20,7 +20,7 @@ Docker Engine, the standard (rootful) daemon, with the compose plugin. Rootless 
 2. The two files, on the server:
 
    ```sh
-   V=0.2.6
+   V=0.2.7
    mkdir zebridge && cd zebridge
    curl -fsSLO https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/compose.yml
    curl -fsSL -o .env https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/.env.example
