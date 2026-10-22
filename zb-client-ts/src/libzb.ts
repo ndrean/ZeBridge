@@ -22,6 +22,7 @@
 /// read-only connection is not available here the way `libzebridge` native has one).
 
 import { natsTransport } from './transport.ts';
+import { Measure, type MeasureCounts } from './measure.ts';
 import { endpointIdentity, identityEndpointUrl, orderedEndpoints } from './endpoints.ts';
 import { currentPlatform, type Platform, type PlatformName } from './platform.ts';
 import type { Transport, TransportConnection, JetStreamOpts, UserKeyPair } from './transport.ts';
@@ -587,6 +588,8 @@ export class ZeBridge {
   /// §10hn: the on-demand tables (deduplicated); cdcFilters, the seed planner and the
   /// epoch re-seed all skip these.
   private ondemandSet = new Set<string>();
+  /// ZB_MEASURE (measure.ts): the seeding report's lines, off unless asked for.
+  private measure = new Measure((line) => this.appendLog('SYS', line, 'INFO'));
   /// §10kj: per CDC stream, `num_pending` of the last message applied (memory only).
   private lastPending: Record<string, number> = {};
   private warnedNoTables = false;
@@ -2371,6 +2374,7 @@ export class ZeBridge {
   /// replay them in the order they were received, not by lsn (which is NOT
   /// monotonic in delivery order — NOTES §10f).
   private async holdEvent(table: string, ev: any, reason: string) {
+    this.measure.held(ev);
     const lsn = typeof ev?.lsn === 'number' ? ev.lsn : 0;
     try {
       const r = await this.run(
@@ -2878,7 +2882,7 @@ export class ZeBridge {
   /// §10ix: the streaming read of one plan step, or null for the buffered path —
   /// streaming off, or an object under `seedStreamingAboveBytes`.
   private async chainStepStream(os: any, bucket: string, step: PlanStep, table: string, jsOpts: JetStreamOpts | undefined):
-    Promise<{ columns: string[]; nrows: number; batches: AsyncIterable<any[][]>; tail: () => Promise<Record<string, any>> } | null> {
+    Promise<{ columns: string[]; nrows: number; size: number; batches: AsyncIterable<any[][]>; tail: () => Promise<Record<string, any>> } | null> {
     if (!this.config.seedStreaming) return null;
     let src: { info: any; chunks: AsyncIterable<Uint8Array> } | null;
     try { src = await this.objectChunkStream(os, bucket, step.name, jsOpts); }
@@ -2886,7 +2890,7 @@ export class ZeBridge {
     if (!src || src.info.size < (this.config.seedStreamingAboveBytes ?? 8 * 1024 * 1024)) return null;
     const doc = await this.chainDocStream(await this.zstdChunkStream(src.chunks));
     if (!doc) { this.appendLog('SYS', `${table}: chain object ${step.name} is not a chain document — buffered path`, 'WARN'); return null; }
-    return doc;
+    return { ...doc, size: src.info.size };
   }
 
   /// §10ix: the object's chunks as they arrive, never assembled — the same bounded pull
@@ -3215,14 +3219,24 @@ export class ZeBridge {
 
     let os: any;
     try { os = await this.transport.objectStore(this.nc, manifest.bucket, seedOpts); } catch (e) { this.appendLog('SYS', `${table}: chain bucket ${manifest.bucket} unreachable: ${e}`, 'ERROR'); return false; }
+    // ZB_MEASURE: the buffered step's split — fetch, inflate, decode — and its bytes.
+    let lastDoc = { bytes: 0, fetch_ms: 0, inflate_ms: 0, decode_ms: 0 };
+    const chainT0 = Date.now();
     const fetchDoc = async (name: string): Promise<any | null> => {
       try {
+        const t0 = Date.now();
         let blob = await this.objectBlob(os, manifest.bucket, name, seedOpts);
         if (!blob) return null;
+        const t1 = Date.now();
+        const bytes = blob.length;
         blob = await this.maybeZstd(blob); // §10w: sniffed by magic, mixed chains fine
-        return decode(blob) as any; // objects are msgpack
+        const t2 = Date.now();
+        const doc = decode(blob) as any; // objects are msgpack
+        lastDoc = { bytes, fetch_ms: t1 - t0, inflate_ms: t2 - t1, decode_ms: Date.now() - t2 };
+        return doc;
       } catch (e) { this.appendLog('SYS', `${table}: chain object ${name} unreadable: ${e}`, 'ERROR'); return null; }
     };
+    const chainTotals = { bytes: 0, fetch_ms: 0, inflate_ms: 0, decode_ms: 0, apply_ms: 0, streamed: 0 };
 
     let watermark: string | null = null;
     try {
@@ -3237,10 +3251,13 @@ export class ZeBridge {
     const applyPlan = async (plan: PlanStep[]): Promise<number | null> => {
       let applied = 0;
       for (const step of plan) {
+        const stepT0 = Date.now();
+        const applied0 = applied;
         // §10ix: a large step streams; anything else, or any host that cannot stream,
         // takes the buffered path. Both apply through the same `applyWindow` below.
         const stream = await this.chainStepStream(os, manifest.bucket, step, table, seedOpts);
         const doc = stream ? null : await fetchDoc(step.name);
+        const applyT0 = Date.now();
         if (!stream && !doc) return null; // pruned under us — caller re-reads
         const cols: string[] = (stream ? stream.columns : doc.columns) ?? [];
         if (!cols.length || !cols.every((c) => state.columns.includes(c))) {
@@ -3418,6 +3435,16 @@ export class ZeBridge {
         } finally {
           if (sqlite) { try { await this.run('PRAGMA cache_size = -2000'); } catch { /* as above */ } }
         }
+        if (this.measure.enabled) {
+          // A streamed step overlaps fetch, inflate and apply: only its wall time is whole.
+          const split = stream ? { bytes: stream.size, fetch_ms: null, inflate_ms: null, decode_ms: null, apply_ms: null }
+            : { ...lastDoc, apply_ms: Date.now() - applyT0 };
+          chainTotals.bytes += split.bytes;
+          if (stream) chainTotals.streamed++;
+          else for (const k of ['fetch_ms', 'inflate_ms', 'decode_ms', 'apply_ms'] as const) chainTotals[k] += split[k] ?? 0;
+          this.measure.emit({ m: 'step', table, tenant: tenantForTable, object: step.name, kind: step.kind, rows: applied - applied0,
+            t0_ms: stepT0, ms: Date.now() - stepT0, ...split, streamed: !!stream });
+        }
       }
       return applied;
     };
@@ -3468,6 +3495,12 @@ export class ZeBridge {
     // A full replaced the rows: this client's writes still queued lost their optimistic
     // copies with them, so they go back on top (PROTOCOL §7.4c).
     if (plan.some((stp: PlanStep) => stp.kind === 'full')) await this.reapplyPending(table);
+    if (this.measure.enabled) {
+      const fulls = plan.filter((stp: PlanStep) => stp.kind === 'full').length;
+      this.measure.emit({ m: 'chain', table, tenant: tenantForTable, gen: manifest.gen, full_gen: manifest.full?.gen ?? 0, fulls, deltas: plan.length - fulls,
+        rows: applied, t0_ms: chainT0, t1_ms: Date.now(), ...chainTotals, cutoff_version: manifest.cutoff_version ?? '',
+        cdc_stream: manifest.cdc_stream ?? '', cutoff_seq: manifest.cutoff_seq ?? -1, shared_cutoff_seq: sharedSeq ?? -1 });
+    }
     this.triggerChange(table);
     this.appendLog('SYS', `Seeded ${table} from generation chain g${manifest.gen} (${applied} row(s), watermark ${manifest.cutoff_version} @ ${manifest.cutoff_lsn})`, 'INFO');
     return true;
@@ -3823,6 +3856,8 @@ export class ZeBridge {
         });
         const consumer = await js.consumers.get(streamName, ci.name);
         const setupMs = Math.round(performance.now() - setupStart);
+        // ZB_MEASURE: a tail opening at or past its target has nothing to catch up.
+        this.measure.positions(this.globalSyncState.seq);
         this.appendLog('SYS', `CDC consumer on ${streamName} (from seq ${last || 'all'}, ${ci.num_pending ?? '?'} messages pending, consumer setup took ${setupMs}ms)`, 'INFO');
 
         const iter = await consumer.consume();
@@ -3930,6 +3965,20 @@ export class ZeBridge {
             const toAck = batchMsgs;
             batch = [];
             batchMsgs = [];
+            // ZB_MEASURE: this batch's events at or below the stream's catch-up target —
+            // gated by core.seedGateDrops (the rule both apply paths use; anchors do not
+            // move inside a batch), held counted where they are held, added once applied.
+            let mc: Partial<MeasureCounts> | null = null;
+            const mt = this.measure.open(streamName);
+            if (mt) {
+              mc = { messages: toAck.filter((m) => (m.seq ?? 0) <= mt.target).length, events: 0, gated: 0 };
+              for (const { table, ev } of toApply) {
+                if (!this.measure.counts(ev.stream, ev.seq)) continue;
+                mc.events!++;
+                const st = this.syncedTables.get(table);
+                if (st && !st.unseeded && seedGateDrops(ev, st)) mc.gated!++;
+              }
+            }
             try {
               await this.transaction(async (txExec) => {
                 if (superseded()) return;
@@ -3989,6 +4038,11 @@ export class ZeBridge {
               } catch (e) {
                 this.appendLog('SQLITE', `Failed to persist ${streamName} position: ${e}`, 'ERROR');
               }
+            }
+            if (mt && mc) {
+              this.measure.add(streamName, mc);
+              if (maxSeq >= mt.target) this.measure.reached(streamName, 'position', maxSeq);
+              else if (lastMsg && lastMsg.info?.pending === 0) this.measure.reached(streamName, 'pending', maxSeq);
             }
             await this.retryFkHeld(streamName);
           };

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { encode } from '@msgpack/msgpack';
 import { ZeBridge } from './libzb.ts';
+import { Measure } from './measure.ts';
 import { loadCore } from './wasm-core.ts';
 
 // Exercise the actual orchestration methods, with SQLite and a controllable NATS seam.
@@ -33,7 +34,7 @@ function fixture(path = ':memory:') {
   Object.assign(c, {
     outboxInitPromise: Promise.resolve(), reconcileLoaded: false, streamWork: Promise.resolve(),
     globalSyncState: { seq }, hubOnly: new Set(), healedRoutes: new Set(),
-    tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), streamsSubscribed: false, syncedTables: new Map([['item', {}]]), ondemandSet: new Set(),
+    tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), streamsSubscribed: false, measure: new Measure(() => {}), syncedTables: new Map([['item', {}]]), ondemandSet: new Set(),
     streamCreated: new Map([['CDC_acme', 'same']]), restarted: new Set(), failed: new Set(), nc: {},
     transport: {
       jetstreamManager: async () => ({ streams: { info: async () => ({ state: { last_seq: 12 } }) } }),

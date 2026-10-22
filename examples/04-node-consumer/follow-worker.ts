@@ -26,7 +26,9 @@ const zb = new ZeBridge({
 zb.onLog((t: string, d: any, level: string) => {
   if (t === 'CDC' || t.startsWith('cdc.')) return; // one line per event would dwarf the run
   // Wall-clock seconds first: a harness lines this log up with its own events.
-  console.error(`${(Date.now() / 1000).toFixed(3)} [${t} ${level}] ${typeof d === 'string' ? d : JSON.stringify(d)}`.slice(0, 320));
+  const line = `${(Date.now() / 1000).toFixed(3)} [${t} ${level}] ${typeof d === 'string' ? d : JSON.stringify(d)}`;
+  // ZB_MEASURE's records are read whole by the harness.
+  console.error(typeof d === 'string' && d.startsWith('measure {') ? line : line.slice(0, 320));
 });
 
 try {

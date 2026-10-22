@@ -200,6 +200,75 @@ var trace_enabled: bool = false;
 /// ZB_APPLY_STATS=1: where live apply time goes, summed and printed every 5 s (§10jn).
 var apply_stats_enabled: bool = false;
 
+/// ZB_MEASURE=1: one `measure {json}` info line per chain step, per chain applied and per
+/// stream reaching its catch-up target — gen_follow.py's seeding report. The targets come
+/// from ZB_CATCHUP_TARGETS=CDC_acme=812,CDC_PUBLIC=0: per stream, the seq of the last
+/// message this client's filter matched when the connection began, read by the harness
+/// before connecting. Without a fixed target, "what CDC replayed afterwards" never ends
+/// under live traffic. Per process and re-read at each connect, like the probes above.
+var measure_enabled: bool = false;
+const MeasureCounts = struct {
+    /// Messages at or below the target delivered to this client, and their events.
+    messages: u64 = 0,
+    events: u64 = 0,
+    applied: u64 = 0,
+    /// Dropped by the seed gate: the chain already carries them.
+    gated: u64 = 0,
+    /// Into the inbox (missing parent, unknown column).
+    held: u64 = 0,
+    failed: u64 = 0,
+    fn add(t: *MeasureCounts, o: MeasureCounts) void {
+        inline for (std.meta.fields(MeasureCounts)) |f| @field(t, f.name) += @field(o, f.name);
+    }
+};
+const MeasureTarget = struct {
+    name: [64]u8 = undefined,
+    len: usize = 0,
+    target: u64 = 0,
+    reached: bool = false,
+    counts: MeasureCounts = .{},
+    fn stream(t: *const MeasureTarget) []const u8 {
+        return t.name[0..t.len];
+    }
+};
+var measure_targets: [8]MeasureTarget = [_]MeasureTarget{.{}} ** 8;
+var measure_n: usize = 0;
+
+fn measureInit() void {
+    measure_enabled = std.c.getenv("ZB_MEASURE") != null;
+    measure_n = 0;
+    if (!measure_enabled) return;
+    const v = std.c.getenv("ZB_CATCHUP_TARGETS") orelse return;
+    var it = std.mem.tokenizeScalar(u8, std.mem.span(v), ',');
+    while (it.next()) |pair| {
+        if (measure_n == measure_targets.len) break;
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (eq > 64) continue;
+        var t: MeasureTarget = .{ .len = eq, .target = std.fmt.parseInt(u64, pair[eq + 1 ..], 10) catch continue };
+        @memcpy(t.name[0..eq], pair[0..eq]);
+        // Nothing this client follows was on the stream: no catch-up to wait for.
+        t.reached = t.target == 0;
+        measure_targets[measure_n] = t;
+        measure_n += 1;
+    }
+}
+
+/// The target still open on `stream`, if any.
+fn measureOpen(stream: []const u8) ?*MeasureTarget {
+    if (!measure_enabled) return null;
+    for (measure_targets[0..measure_n]) |*t| if (!t.reached and std.mem.eql(u8, t.stream(), stream)) return t;
+    return null;
+}
+
+/// `stream` is at or past its target: one line, once. `via` says how it was seen —
+/// `position` (the stored position passed it) or `pending` (the server had nothing left
+/// for this consumer after a message, so nothing at or below the target is still owed).
+fn measureReached(t: *MeasureTarget, via: []const u8, position: u64) void {
+    t.reached = true;
+    const c = t.counts;
+    log.info("measure {{\"m\":\"catchup\",\"stream\":\"{s}\",\"target\":{d},\"position\":{d},\"via\":\"{s}\",\"at_ms\":{d},\"messages\":{d},\"events\":{d},\"applied\":{d},\"gated\":{d},\"held\":{d},\"failed\":{d}}}", .{ t.stream(), t.target, position, via, nowMillis(), c.messages, c.events, c.applied, c.gated, c.held, c.failed });
+}
+
 /// Microseconds on the monotonic clock: phase timings, never compared with wall time.
 fn usMono() i64 {
     var ts: std.c.timespec = undefined;
@@ -538,6 +607,7 @@ pub const SyncClient = struct {
         // dropped, what the server said in the idle check (§10ja, the deaf tail hunt).
         trace_enabled = std.c.getenv("ZB_TAIL_TRACE") != null;
         apply_stats_enabled = std.c.getenv("ZB_APPLY_STATS") != null;
+        measureInit();
         test_drop_every = if (std.c.getenv("ZB_TEST_DROP_DELIVERY")) |v| (std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0) else 0;
 
         self.* = .{
@@ -2141,6 +2211,14 @@ pub const SyncClient = struct {
         return self.applyChainFrom(table, tenant, self.t.js, false);
     }
 
+    /// ZB_MEASURE: one chain step. A streamed step overlaps fetch, inflate and apply, so
+    /// its phases are the reader's split, and only `ms` (the step's wall time) is whole.
+    fn measureStep(table: []const u8, tenant: []const u8, step: Value, is_full: bool, bytes: u64, rows: usize, t0: i64, ph0: [4]i64, ph: [4]i64, streamed: bool) void {
+        log.info("measure {{\"m\":\"step\",\"table\":\"{s}\",\"tenant\":\"{s}\",\"object\":\"{s}\",\"kind\":\"{s}\",\"bytes\":{d},\"rows\":{d},\"t0_ms\":{d},\"ms\":{d},\"fetch_ms\":{d},\"inflate_ms\":{d},\"decode_ms\":{d},\"apply_ms\":{d},\"streamed\":{}}}", .{
+            table, tenant, step.object.get("name").?.string, if (is_full) "full" else "delta", bytes, rows, t0, msNow() - t0, ph[0] - ph0[0], ph[1] - ph0[1], ph[2] - ph0[2], ph[3] - ph0[3], streamed,
+        });
+    }
+
     fn applyChainFrom(self: *SyncClient, table: []const u8, tenant: []const u8, src: @import("nats").JetStream, from_seed: bool) !void {
         // Per-call: a seed can be megabytes, and it is dead the moment it is applied.
         // Only `seed_stream` leaves this arena, duped into the client arena explicitly
@@ -2148,6 +2226,7 @@ pub const SyncClient = struct {
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const a = ca.allocator();
+        const chain_t0 = nowMillis();
         const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ tenant, table });
         const man_bytes = (try transport.Transport.kvGetIn(src, a, self.kv_generations, key)) orelse {
             if (from_seed) return error.SeedStale;
@@ -2256,6 +2335,7 @@ pub const SyncClient = struct {
         var streamed: usize = 0;
         // Phase timers (§10ez): where a seed's time goes — fetch, inflate, decode, apply.
         var ph = [_]i64{ 0, 0, 0, 0 };
+        var bytes_total: u64 = 0;
         // §10ez: a seed inserts millions of random keys into a b-tree; SQLite's default
         // page cache is 2 MB, so nearly every insert touched a cold page. 128 MB for the
         // seed, the default back after — the replica's steady state is small.
@@ -2269,6 +2349,9 @@ pub const SyncClient = struct {
             const step_a = sa.allocator();
             var t_ph = msNow();
             const is_full = std.mem.eql(u8, step.object.get("kind").?.string, "full");
+            const step_t0 = t_ph;
+            const ph0 = ph;
+            const applied0 = applied;
             const raw: []const u8 = if (self.opts.seed_streaming) blk: {
                 // The object's size is in its meta, read before any chunk: a small
                 // step takes the whole-object path through the same pull reader.
@@ -2277,6 +2360,8 @@ pub const SyncClient = struct {
                     defer pull.deinit();
                     applied += try self.applyStepStreaming(step_a, table, tenant, st, man, step, &pull, is_full, &ph);
                     streamed += 1;
+                    bytes_total += pull.size;
+                    if (measure_enabled) measureStep(table, tenant, step, is_full, pull.size, applied - applied0, step_t0, ph0, ph, true);
                     continue;
                 }
                 defer pull.deinit();
@@ -2342,6 +2427,8 @@ pub const SyncClient = struct {
             }
             applied += idx.offsets.len;
             ph[3] += msNow() - t_ph;
+            bytes_total += raw.len;
+            if (measure_enabled) measureStep(table, tenant, step, is_full, raw.len, applied - applied0, step_t0, ph0, ph, false);
         }
 
         // Anchors (findings 7 + 10): the ONE place the gate may anchor to — per
@@ -2382,6 +2469,16 @@ pub const SyncClient = struct {
             if (kind != null and kind.? == .string and std.mem.eql(u8, kind.?.string, "full")) break true;
         } else false;
         if (had_full) self.reapplyPending(a, table, tenant, !self.multiTenant(st.*)) catch |err| log.err("{s}: re-applying pending writes over the seed failed: {s}", .{ table, @errorName(err) });
+        if (measure_enabled) {
+            var fulls: usize = 0;
+            for (plan.array.items) |step| {
+                if (std.mem.eql(u8, step.object.get("kind").?.string, "full")) fulls += 1;
+            }
+            const full_gen: i64 = if (man.object.get("full")) |f| (if (f == .object) (if (f.object.get("gen")) |g| (if (g == .integer) g.integer else 0) else 0) else 0) else 0;
+            log.info("measure {{\"m\":\"chain\",\"table\":\"{s}\",\"tenant\":\"{s}\",\"gen\":{d},\"full_gen\":{d},\"fulls\":{d},\"deltas\":{d},\"rows\":{d},\"bytes\":{d},\"t0_ms\":{d},\"t1_ms\":{d},\"fetch_ms\":{d},\"inflate_ms\":{d},\"decode_ms\":{d},\"apply_ms\":{d},\"streamed\":{d},\"cutoff_version\":\"{s}\",\"cdc_stream\":\"{s}\",\"cutoff_seq\":{d},\"shared_cutoff_seq\":{d}}}", .{
+                table, tenant, if (man.object.get("gen")) |v| v.integer else 0, full_gen, fulls, plan.array.items.len - fulls, applied, bytes_total, chain_t0, nowMillis(), ph[0], ph[1], ph[2], ph[3], streamed, cv, cdc_stream, cutoff_seq, shared_seq orelse -1,
+            });
+        }
         if (streamed > 0) {
             log.info("{s}: seeded {d} row(s) from chain g{d} — fetch {d} ms, inflate {d} ms, decode {d} ms, apply {d} ms ({d} of {d} step(s) streamed: fetch+inflate as read, decode = the stage's sort)", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0, ph[0], ph[1], ph[2], ph[3], streamed, plan.array.items.len });
         } else {
@@ -3222,11 +3319,18 @@ pub const SyncClient = struct {
             /// all. A COMMIT refused (a parent missing across BATCHES) rolls back and the
             /// caller replays with immediate checks, holding what cannot land.
             deferred: bool,
+            /// ZB_MEASURE: this attempt's events at or below the stream's catch-up target,
+            /// reset per attempt, added to the target once a transaction commits.
+            mc: *MeasureCounts,
+            mt: ?*MeasureTarget,
             fn apply(cx: @This(), st_: *storage.Storage) !void {
+                cx.mc.* = .{};
                 if (st_.engine == .duckdb) return cx.client.applyBatchPlanned(cx, st_);
                 if (cx.deferred) try st_.execSimple("PRAGMA defer_foreign_keys = ON;");
                 for (cx.messages) |m| {
                     const seq = m.metadata.sequence.stream;
+                    const counted = if (cx.mt) |t| seq <= t.target else false;
+                    if (counted) cx.mc.messages += 1;
                     const doc = decodeMsgpack(cx.a, m.msg.data) catch continue;
                     const events: []const Value = if (doc == .array) doc.array.items else &.{doc};
                     for (events) |ev| {
@@ -3235,6 +3339,11 @@ pub const SyncClient = struct {
                         if (cx.client.states.get(table) == null) continue;
                         cx.offered.* += 1;
                         var applied_here = true;
+                        const gated_before = cx.client.gated;
+                        if (counted) cx.mc.events += 1;
+                        defer if (counted) {
+                            if (cx.client.gated != gated_before) cx.mc.gated += 1 else if (applied_here) cx.mc.applied += 1;
+                        };
                         cx.client.applyEvent(table, ev, m.metadata.stream, seq) catch |err| switch (err) {
                             // An OOM here is a `try`, not a `catch {}`: a dropped hold is an
                             // event that is acked, positioned past, and never applied.
@@ -3243,16 +3352,19 @@ pub const SyncClient = struct {
                             // so the inbox is the only thing that remembers it.
                             error.FkHeld => {
                                 applied_here = false;
+                                if (counted) cx.mc.held += 1;
                                 try holdEvent(st_, cx.a, table, ev, "missing-parent");
                             },
                             error.SchemaBehind => {
                                 applied_here = false;
+                                if (counted) cx.mc.held += 1;
                                 try holdEvent(st_, cx.a, table, ev, "unknown-column");
                             },
                             // Anything else is an event acked, positioned past and never
                             // applied — it must at least be SAID. The SQLite text names the cause.
                             else => |e| {
                                 applied_here = false;
+                                if (counted) cx.mc.failed += 1;
                                 // §10hf: DuckDB aborts the whole transaction on a failed
                                 // statement — every later statement would fail too, and the
                                 // batch would be acked with nothing applied. Hand it to the
@@ -3278,7 +3390,10 @@ pub const SyncClient = struct {
             }
         };
         var offered: usize = 0;
+        var mc: MeasureCounts = .{};
         var ctx = Ctx{
+            .mc = &mc,
+            .mt = measureOpen(stream),
             .client = self,
             .a = ba.allocator(),
             .stream = stream,
@@ -3310,6 +3425,16 @@ pub const SyncClient = struct {
                 try self.applyBatchIsolated(report_a, stream, messages, max_seq, changed_map, &offered);
             };
         };
+        // ZB_MEASURE: the attempt that committed is the one counted (the isolated
+        // replay, rare, keeps the counts of the attempt before it).
+        if (ctx.mt) |t| {
+            t.counts.add(mc);
+            if (max_seq.* >= t.target) {
+                measureReached(t, "position", max_seq.*);
+            } else if (messages.len > 0 and messages[messages.len - 1].metadata.num_pending == 0) {
+                measureReached(t, "pending", max_seq.*);
+            }
+        }
         const us_acks = usMono();
         for (messages) |m| m.ack() catch {};
         // §10kj: the server's own count of what is left behind the last message of the
@@ -4013,6 +4138,12 @@ pub const SyncClient = struct {
             }
         }
         if (applied > 0) self.retryHeld(report_a, &changed_map);
+        // ZB_MEASURE: a position moved without a delivery — the idle check advancing a
+        // filtered consumer past others' messages, or a chain landing past the target.
+        if (measure_enabled) for (measure_targets[0..measure_n]) |*mt| if (!mt.reached) {
+            const pos = self.storedSeq(mt.stream()) catch continue;
+            if (pos >= mt.target) measureReached(mt, "position", pos);
+        };
         self.drainRebase();
         const settled = try self.drainVerdictsWith(0, 1);
         self.heartbeatIfDue() catch |err| log.info("heartbeat: {s}", .{@errorName(err)});

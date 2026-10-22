@@ -140,6 +140,118 @@ def replica_exact(db) -> dict:
         con.close()
 
 
+def catchup_targets(url: str) -> dict:
+    """Per stream this client tails, the seq of the last message its filter matches, read
+    just before a leg connects: the fixed end of that leg's CDC catch-up (0: nothing to
+    catch up). Ongoing traffic after it is live following, not catch-up."""
+    out = {}
+    open_t = os.environ.get("OPEN_TENANT", "_default")
+    for stream, subj in ((f"CDC_{TENANT}", f"cdc.{TENANT}.{TABLE}.>"), ("CDC_PUBLIC", f"cdc.{open_t}.{TABLE}.>")):
+        r = subprocess.run(["nats", "--server", url, "req", f"$JS.API.STREAM.MSG.GET.{stream}", json.dumps({"last_by_subj": subj})],
+                           capture_output=True, text=True, timeout=15)
+        try:
+            out[stream] = int(json.loads(r.stdout).get("message", {}).get("seq", 0))
+        except (json.JSONDecodeError, ValueError):
+            out[stream] = 0
+    return out
+
+
+def measure_env(targets: dict) -> dict:
+    return {"ZB_MEASURE": "1", "ZB_CATCHUP_TARGETS": ",".join(f"{k}={v}" for k, v in targets.items())}
+
+
+def pg_time_ms(v: str):
+    """A PostgreSQL timestamptz's text (the chain's cutoff_version) as epoch ms."""
+    import datetime
+    try:
+        t = v.replace(" ", "T")
+        if t[-3] in "+-" and t[-3:].lstrip("+-").isdigit():
+            t += ":00"
+        return datetime.datetime.fromisoformat(t).timestamp() * 1000
+    except (ValueError, IndexError):
+        return None
+
+
+def seeding_report(name: str, events: list, logtext: str) -> list:
+    """Each leg's reconnect work from the clients' ZB_MEASURE lines: the chain (full and
+    deltas apart: objects, bytes, fetch / inflate / decode / apply), its age at connect,
+    and the CDC catch-up to the targets fixed before connecting, per stream. Download and
+    apply overlap on a streamed step, so step times are reported, never summed into the
+    total; `usable` is connect start to the last of: newest id seen, every target reached."""
+    recs = []
+    for line in logtext.splitlines():
+        i = line.find("measure {")
+        if i >= 0:
+            try:
+                recs.append(json.loads(line[i + 8:]))
+            except json.JSONDecodeError:
+                pass
+    legs = [e for e in events if e["event"] == "leg"]
+    caught = {e["leg"]: e for e in events if e["event"] == "caught_up"}
+    out = []
+    for k, leg in enumerate(legs):
+        lo, hi = leg["start_ms"], (legs[k + 1]["start_ms"] if k + 1 < len(legs) else float("inf"))
+        mine = [r for r in recs if lo <= r.get("t0_ms", r.get("at_ms", 0)) < hi]
+        chains = [r for r in mine if r["m"] == "chain"]
+        steps = [r for r in mine if r["m"] == "step"]
+        ups = {r["stream"]: r for r in mine if r["m"] == "catchup"}
+        c = caught.get(leg["leg"])
+        ends = [lo + c["catchup_s"] * 1000] if c else []
+        streams = {}
+        for stream, target in leg["targets"].items():
+            u = ups.get(stream)
+            if target == 0:
+                streams[stream] = {"target": 0}
+            elif u:
+                ends.append(u["at_ms"])
+                streams[stream] = {k2: u[k2] for k2 in ("target", "via", "messages", "events", "applied", "gated", "held", "failed")} | {"reached_s": round((u["at_ms"] - lo) / 1000, 2)}
+            else:
+                streams[stream] = {"target": target, "reached_s": None}
+        unreached = any(v.get("reached_s", 0) is None for v in streams.values())
+        usable_ms = None if (unreached or not c) else max(ends)
+        row = {"client": name, "leg": leg["leg"], "cold": leg["cold"], "targets": leg["targets"],
+               "usable_s": None if usable_ms is None else round((usable_ms - lo) / 1000, 2),
+               "chains": [], "streams": streams}
+        for ch in chains:
+            cut = pg_time_ms(ch.get("cutoff_version", ""))
+            # A chain started after the replica was usable is a reseed while following
+            # live (a gap), not reconnect work: its age is taken at its own start.
+            live = usable_ms is not None and ch["t0_ms"] > usable_ms
+            at = ch["t0_ms"] if live else lo
+            row["chains"].append({**{k2: ch.get(k2) for k2 in ("gen", "full_gen", "fulls", "deltas", "rows", "bytes", "fetch_ms", "inflate_ms", "decode_ms", "apply_ms", "streamed", "cutoff_seq", "shared_cutoff_seq")},
+                                  "start_s": round((ch["t0_ms"] - lo) / 1000, 2), "ms": ch["t1_ms"] - ch["t0_ms"], "live_reseed": live,
+                                  "age_s": round((at - cut) / 1000, 1) if cut else None})
+        row["steps"] = [{k2: st.get(k2) for k2 in ("kind", "object", "bytes", "rows", "ms", "fetch_ms", "inflate_ms", "decode_ms", "apply_ms", "streamed")}
+                        | {"live_reseed": usable_ms is not None and st["t0_ms"] > usable_ms} for st in steps]
+        out.append(row)
+    return out
+
+
+def print_seeding(rows: list):
+    def mb(b):
+        return f"{(b or 0) / 1048576:.2f} MB"
+    for r in rows:
+        print(f"  leg {r['leg']}{' (cold join)' if r['cold'] else ''}: usable after {r['usable_s']} s; targets {r['targets']}")
+        if not [ch for ch in r["chains"] if not ch["live_reseed"]]:
+            print("    no chain applied at connect: resumed from the stored position")
+        for ch in r["chains"]:
+            when = f"RESEED while live at {ch['start_s']} s, age {ch['age_s']} s then" if ch["live_reseed"] else f"age {ch['age_s']} s at connect"
+            print(f"    chain g{ch['gen']} (full g{ch['full_gen']} ×{ch['fulls']}, {ch['deltas']} delta(s)), {when}: "
+                  f"{ch['rows']} rows, {mb(ch['bytes'])}, {ch['ms']} ms from {ch['start_s']} s "
+                  f"[fetch {ch['fetch_ms']}, inflate {ch['inflate_ms']}, decode {ch['decode_ms']}, apply {ch['apply_ms']} ms; {ch['streamed']} streamed]")
+        for st in r["steps"]:
+            print(f"      {st['kind']:5} {st['object']}: {st['rows']} rows, {mb(st['bytes'])}, {st['ms']} ms"
+                  + ("" if st["streamed"] else f" [fetch {st['fetch_ms']}, inflate {st['inflate_ms']}, decode {st['decode_ms']}, apply {st['apply_ms']}]"))
+        for stream, v in r["streams"].items():
+            if v["target"] == 0:
+                print(f"    {stream}: nothing to catch up")
+            elif v.get("reached_s") is None:
+                print(f"    {stream}: target {v['target']} NOT reached")
+            else:
+                print(f"    {stream}: target {v['target']} reached at {v['reached_s']} s via {v['via']} — {v['messages']} msg(s), {v['events']} event(s): "
+                      f"{v['applied']} applied, {v['gated']} gated, {v['held']} held" + (f", {v['failed']} failed" if v.get("failed") else ""))
+
+
 def matches(l, truth) -> bool:
     return (l.get("count") == l.get("distinct") == truth["count"] and l.get("min") == truth["min"] and l.get("max") == truth["max"]
             and (truth.get("notes") is None or l.get("notes") == truth["notes"]))
@@ -177,8 +289,10 @@ def ts_worker(a) -> int:
         while time.time() < a.t0 + t_open:
             time.sleep(0.2)
         target = pg_max()
+        targets = catchup_targets(a.url)
         t_c = time.time()
-        proc = subprocess.Popen(["node", "--experimental-strip-types", "follow-worker.ts"], cwd=NODE_DIR, env=env,
+        say(event="leg", leg=i, start_ms=int(t_c * 1000), targets=targets, cold=i == 0)
+        proc = subprocess.Popen(["node", "--experimental-strip-types", "follow-worker.ts"], cwd=NODE_DIR, env=env | measure_env(targets),
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
         first = proc.stdout.readline()
         connect_s = time.time() - t_c
@@ -265,7 +379,10 @@ def worker(a) -> int:
         while time.time() < a.t0 + t_open:
             time.sleep(0.2)
         target = pg_max()
+        targets = catchup_targets(a.url)
+        os.environ.update(measure_env(targets))  # libzb reads them at each connect
         t_c = time.time()
+        say(event="leg", leg=i, start_ms=int(t_c * 1000), targets=targets, cold=i == 0)
         h = lib.zb_client_connect(json.dumps({"natsUrl": a.url, "dbPath": a.db, "tables": [TABLE], "heartbeatMs": 0,
                                               "clientId": f"gen-{a.name}", "principal": f"gen_{a.name}"}).encode())
         if not h:
@@ -462,6 +579,10 @@ def main() -> int:
             logtext = (wdir / "libzb.log").read_text(errors="replace")
             counts = {k: logtext.count(v) for k, v in MARKS.items()}
             print(f"\n{name} ({SCHEDULE[name][0]})  schedule {SCHEDULE[name][1]}")
+            seeding = seeding_report(name, events, logtext)
+            print_seeding(seeding)
+            for row in seeding:
+                print("seeding " + json.dumps(row))
             for e in events:
                 if e["event"] == "caught_up":
                     flag = "  ⚠️ slow" if e["catchup_s"] > SLOW_S else ""
