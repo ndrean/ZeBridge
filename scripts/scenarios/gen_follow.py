@@ -107,19 +107,20 @@ def final_truth(done_file) -> dict:
         return {"count": n, "min": 1, "max": n, "notes": None}
 
 
-def rows_digest(lines) -> tuple:
-    """sha256 over ordered `id<TAB>note` lines, and how many: the exact row comparison
-    (an aggregate like sum(length(note)) can hide offsetting errors)."""
-    import hashlib
-    h, n = hashlib.sha256(), 0
-    for line in lines:
-        h.update(line.encode() + b"\n")
-        n += 1
-    return h.hexdigest(), n
+def frame(i, note) -> bytes:
+    """One row, framed: `id:N` for a NULL note, `id:S<bytes>:<note>` otherwise. The length
+    prefix keeps NULL apart from '' and lets a note hold any byte, tabs and newlines included.
+    PG_DIGEST_SQL builds the same frames on the server."""
+    return f"{i}:N".encode() if note is None else f"{i}:S{len(note.encode())}:".encode() + note.encode()
 
 
-EXACT_SQL = f"SELECT id, note FROM {TABLE} WHERE tenant_id = '{TENANT}' ORDER BY id"
-SHARED_SQL = f"SELECT note FROM {TABLE} WHERE id = 0 AND tenant_id = '{{open}}'"
+# The exact comparison: sha256 over the ordered framed rows (an aggregate like
+# sum(length(note)) can hide offsetting errors). PostgreSQL hashes its own rows, so no
+# text output sits between the two sides.
+PG_DIGEST_SQL = (f"SELECT count(*), encode(sha256(coalesce(string_agg(convert_to(id::text || ':' || "
+                 f"CASE WHEN note IS NULL THEN 'N' ELSE 'S' || octet_length(note) || ':' || note END, 'UTF8'), '' ORDER BY id), '')), 'hex') "
+                 f"FROM public.{TABLE} WHERE tenant_id = '{TENANT}' AND deleted_at IS NULL")
+SHARED_SQL = f"SELECT CASE WHEN note IS NULL THEN 'N' ELSE 'S' || note END FROM {TABLE} WHERE id = 0 AND tenant_id = '{{open}}'"
 
 
 def replica_exact(db) -> dict:
@@ -127,7 +128,12 @@ def replica_exact(db) -> dict:
     import sqlite3
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
     try:
-        digest, n = rows_digest(f"{i}\t{'' if note is None else note}" for i, note in con.execute(EXACT_SQL))
+        import hashlib
+        h, n = hashlib.sha256(), 0
+        for i, note in con.execute(f"SELECT id, note FROM {TABLE} WHERE tenant_id = '{TENANT}' ORDER BY id"):
+            h.update(frame(i, note))
+            n += 1
+        digest = h.hexdigest()
         shared = con.execute(SHARED_SQL.format(open=os.environ.get("OPEN_TENANT", "_default"))).fetchone()
         return {"digest": digest, "rows": n, "shared": shared[0] if shared else None}
     finally:
@@ -421,10 +427,8 @@ def main() -> int:
                                                      f"FROM public.{TABLE} WHERE tenant_id = '{TENANT}' AND deleted_at IS NULL").stdout.strip().split("|"))
         done_file.write_text(json.dumps({"count": n, "min": lo, "max": hi, "notes": notes}))
         # The exact truth: PostgreSQL's ordered live rows, and its shared row.
-        pg_rows = subprocess.run([bt.PSQL, bt.db_url(bt.ADMIN_URL, bt.DB), "-At", "-F", "\t", "-c",
-                                  EXACT_SQL.replace(f"tenant_id = '{TENANT}'", f"tenant_id = '{TENANT}' AND deleted_at IS NULL")],
-                                 capture_output=True, text=True, check=True).stdout.splitlines()
-        pg_digest, pg_n = rows_digest(pg_rows)
+        pg_n, pg_digest = bt.psql(PG_DIGEST_SQL).stdout.strip().split("|")
+        pg_n = int(pg_n)
         pg_shared = bt.psql(SHARED_SQL.format(open=os.environ.get("OPEN_TENANT", "_default")).replace(f"FROM {TABLE}", f"FROM public.{TABLE}")).stdout.strip()
         print(f"emitter done: {hi} ids in {TENANT}, {n} live, over {time.time() - t0:.0f} s ({a.rate}/s, updates {a.update_rate}/s, deletes {a.delete_rate}/s, noise {a.noise}/s)")
         exits = {}
