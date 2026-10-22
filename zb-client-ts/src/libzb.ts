@@ -677,6 +677,9 @@ export class ZeBridge {
   /// Reconciliation of `indeterminate` writes (PROTOCOL §7.4c): routes rewound for an
   /// authoritative reseed, seeded from the hub only until healed.
   private hubOnly = new Set<string>();
+  /// Tables whose chain is being applied by the delta path's choice: applyGenerationsFrom
+  /// checks the manifest it reads against core.deltaEligible again before any row changes.
+  private applyingByChoice = new Set<string>();
   private healedRoutes = new Set<string>();
   private reconcileLoaded = false;
   private reconcileBusy = false;
@@ -3343,6 +3346,22 @@ export class ZeBridge {
       watermark = r[0]?.watermark ?? null;
     } catch { /* fresh replica */ }
 
+    // The delta path approved a manifest; this is the one read now (on the leaf, or the
+    // hub's on fallback, or again after a pruned object). Checked again before any row
+    // changes: a newer base published in between may carry an absence its deltas cannot.
+    const stillEligible = async (man: any, wm: string | null): Promise<boolean> => {
+      if (!this.applyingByChoice.has(table)) return true;
+      const route = this.cdcStreamForTenant(tenantForTable);
+      let created = '';
+      try { created = String(((await (await this.transport.jetstreamManager(this.nc!, this.jsOpts())).streams.info(route)) as { created?: unknown }).created ?? ''); } catch { /* unknown: not compared */ }
+      const same = man?.cdc_stream === route && (!man.cdc_stream_created || !created || man.cdc_stream_created === created);
+      const cut = same && typeof man.cutoff_seq === 'number' ? man.cutoff_seq : null;
+      const e = deltaEligible({ manifest: man, watermark: wm, stored: this.globalSyncState.seq[route] ?? 0, cut });
+      if (!e.take) this.appendLog('SYS', `${table}: the chain read for the delta path is no longer eligible (${e.why}, g${man?.gen}) — nothing applied; the CDC replays`, 'INFO');
+      return e.take;
+    };
+    if (!(await stillEligible(manifest, watermark))) return false;
+
     // The walk itself is core.planFromManifest; `watermark` is read at call
     // time (it resets to null on a mid-walk manifest re-read).
     const planFrom = (man: any) => planFromManifest(man, watermark);
@@ -3566,6 +3585,7 @@ export class ZeBridge {
       manifest = await readManifest();
       if (!manifest?.full?.object) return false;
       watermark = null;
+      if (!(await stillEligible(manifest, watermark))) return false;
       plan = planFrom(manifest);
       if (fullPredatesReplica(manifest, plan)) return false;
       applied = await applyPlan(plan);
@@ -3721,6 +3741,14 @@ export class ZeBridge {
         if (scoped.gapped.includes(stream)) continue;
         for (const table of await this.streamDeltas(stream, tableRoutes, scoped.gapped, jsm)) { tablesToSeed.add(table); byChoice.add(table); }
       }
+      // ZB_TEST_DELTA_PAUSE=<subject> (delta_revalidate.py): after a selection, ask the test
+      // and wait for its reply — it replaces the approved manifest in between, so the
+      // recheck at application is exercised deterministically. Node only.
+      const pause = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.ZB_TEST_DELTA_PAUSE;
+      if (byChoice.size && pause) {
+        this.appendLog('SYS', 'test: paused between the delta path\'s selection and its application', 'INFO');
+        try { await this.nc!.request(pause, new Uint8Array(0), { timeout: 30_000 }); } catch (e) { this.appendLog('SYS', `test: pause request failed (${e})`, 'WARNING'); }
+      }
       const gap = tablesToSeed.size > 0;
 
       if (!gap) {
@@ -3761,7 +3789,10 @@ export class ZeBridge {
         for (const table of tablesToSeed) seedPromises.push((async () => {
           // Generations are the ONLY seeding path (NOTES.md §1.13, §10h): the
           // producer builds once on a cadence, every client catches up on deltas.
-          if (await this.applyGenerations(table)) {
+          if (byChoice.has(table)) this.applyingByChoice.add(table);
+          let applied: boolean;
+          try { applied = await this.applyGenerations(table); } finally { this.applyingByChoice.delete(table); }
+          if (applied) {
             seededThisPass.add(table);
             this.reach('snapshot');
             return;

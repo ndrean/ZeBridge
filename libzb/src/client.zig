@@ -395,6 +395,11 @@ pub const SyncClient = struct {
     /// tail must outlive the call (the batch's messages belong to it), so a heal leaves it
     /// to the loop, which drops it once the batch is acked.
     in_hand: ?[]const u8 = null,
+    /// The chain being applied was chosen by the delta path: whatever manifest
+    /// applyChainFrom reads (the leaf's, the hub's on fallback) is checked again with
+    /// core.deltaEligible before any row changes — the one approved may have been
+    /// replaced in between, by a newer base among others.
+    applying_by_choice: bool = false,
     startup: Startup = .{},
 
     // ── grammar.json, and ONLY grammar.json (PROTOCOL §1) ─────────────────────
@@ -1738,6 +1743,13 @@ pub const SyncClient = struct {
         // pairs whose chains stand in for their streams' CDC backlog, decided per stream
         // before any object is fetched.
         const delta_pairs: []const DeltaPair = if (self.offer_deltas) try self.chooseDeltas(a, &gapped) else &.{};
+        // ZB_TEST_DELTA_PAUSE=<subject> (delta_revalidate.py): after a selection, ask the
+        // test and wait for its reply — it replaces the approved manifest in between, so
+        // the recheck at application is exercised deterministically.
+        if (delta_pairs.len > 0) if (std.c.getenv("ZB_TEST_DELTA_PAUSE")) |subj| {
+            log.info("test: paused between the delta path's selection and its application", .{});
+            if (self.t.js.nc.request(std.mem.span(subj), "", .{ .duration = .{ .raw = .fromMilliseconds(30_000), .clock = .awake } })) |m| m.deinit() else |err| log.warn("test: pause request failed ({s})", .{@errorName(err)});
+        };
         for (self.followed) |table| {
             if (self.isOnDemand(table)) continue; // §10hj: never seeded from a chain
             const st = self.states.get(table) orelse continue;
@@ -1760,7 +1772,10 @@ pub const SyncClient = struct {
                 const pending_before = self.reseed_pending;
                 self.reseed_pending = false;
                 self.chain_applied = false;
-                const ok = if (self.applyChain(table, tenant)) |_| !self.reseed_pending else |err| blk: {
+                self.applying_by_choice = by_choice;
+                const applied_result = self.applyChain(table, tenant);
+                self.applying_by_choice = false;
+                const ok = if (applied_result) |_| !self.reseed_pending else |err| blk: {
                     log.err("{s}: seeding failed: {s} — retried at the next poll", .{ table, @errorName(err) });
                     self.rememberUnseeded(table, @errorName(err));
                     break :blk false;
@@ -2474,6 +2489,22 @@ pub const SyncClient = struct {
         // D2's destruction guard: a full from a chain older than this replica's
         // position would destroy rows CDC will never re-deliver.
         const cdc_stream = if (man.object.get("cdc_stream")) |v| (if (v == .string) v.string else "") else "";
+        // The delta path approved a manifest; this is the one read now. Checked again
+        // before any row changes: a newer base published in between (or the hub's copy
+        // read on fallback) may carry an absence its deltas cannot.
+        if (self.applying_by_choice) {
+            const route = try self.routeFor(a, tenant);
+            const stored_r: i64 = @intCast(try self.storedSeq(route));
+            const created_now: []const u8 = if (self.streamFacts(route)) |f| f.created else |_| "";
+            const m_created = if (man.object.get("cdc_stream_created")) |v| (if (v == .string) v.string else "") else "";
+            const same = std.mem.eql(u8, cdc_stream, route) and (m_created.len == 0 or created_now.len == 0 or std.mem.eql(u8, m_created, created_now));
+            const cut_r: ?i64 = if (!same) null else if (man.object.get("cutoff_seq")) |v| (if (v == .integer) v.integer else null) else null;
+            const e = try core.deltaEligible(a, man, watermark, stored_r, cut_r);
+            if (!e.take) {
+                log.info("{s}: the chain read for the delta path is no longer eligible ({s}, g{d}) — nothing applied; the CDC replays", .{ table, e.why, if (man.object.get("gen")) |v| v.integer else 0 });
+                return error.DeltaPathRefused;
+            }
+        }
         const pos: i64 = if (cdc_stream.len > 0) @intCast(try self.storedSeq(cdc_stream)) else 0;
         if (core.fullPredatesReplica(man, plan.array, pos)) {
             if (from_seed) return error.SeedStale;
