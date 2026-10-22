@@ -304,8 +304,11 @@ class Topology:
     KV_generations sourced from the hub's per-tenant projections (made by the bridge's own
     --prepare-projections), and OBJ_gen-<tenant> mirrored."""
 
-    def __init__(self, tmp: pathlib.Path, via: str, delay_ms: float, mbit: float):
+    def __init__(self, tmp: pathlib.Path, via: str, delay_ms: float, mbit: float, client_relay: bool = False):
         self.tmp, self.via, self.delay_ms, self.mbit = tmp, via, delay_ms, mbit
+        # The clients' own path through a relay too (--client-cut-at): to their server,
+        # the leaf or the hub, so it can be cut under them.
+        self.client_relay = client_relay
         self.procs: dict = {}
         self.bridge_pid = None
 
@@ -335,11 +338,15 @@ class Topology:
         self.spawn("link", netem + ["--listen", str(LINK_PROXY), "--to", f"127.0.0.1:{LINK_PORT}"])
         self.wait_log("link", "listening")
         self.far = self.via == "hub" and (self.delay_ms or self.mbit)
-        if self.far:
-            self.spawn("clientlink", netem + ["--listen", str(CLIENT_PROXY), "--to", f"127.0.0.1:{HUB_PORT}"])
+        if self.far or self.client_relay:
+            # The hub is the far end: its relay carries the delay. The leaf is near.
+            local = [sys.executable, str(pathlib.Path(__file__).with_name("netem.py")), "--delay-ms", "0", "--rate-mbit", "0"]
+            target = HUB_PORT if self.via == "hub" else LEAF_PORT
+            self.spawn("clientlink", (netem if self.far else local) + ["--listen", str(CLIENT_PROXY), "--to", f"127.0.0.1:{target}"])
             self.wait_log("clientlink", "listening")
         self.hub_url = f"nats://127.0.0.1:{HUB_PORT}"
-        self.client_url = f"nats://127.0.0.1:{LEAF_PORT}" if self.via == "leaf" else f"nats://127.0.0.1:{CLIENT_PROXY if self.far else HUB_PORT}"
+        relayed = self.far or self.client_relay
+        self.client_url = f"nats://127.0.0.1:{CLIENT_PROXY}" if relayed else f"nats://127.0.0.1:{LEAF_PORT if self.via == 'leaf' else HUB_PORT}"
         cli = ["nats", "--server", self.hub_url]
         for args in (["kv", "add", "schemas", "--history=10", "--replicas=1"], ["kv", "add", "tenants", "--history=1", "--replicas=1"],
                      ["kv", "add", "generations", "--history=1", "--replicas=1"], ["kv", "add", "live", "--history=1", "--ttl=90s", "--replicas=1"],
@@ -696,6 +703,8 @@ def main() -> int:
     ap.add_argument("--link-mbit", type=float, default=0, help="bandwidth to the hub, Mbit/s per direction (0: unlimited)")
     ap.add_argument("--cut-at", type=float, help="seconds into the load: cut the leaf's link to the hub (--via leaf)")
     ap.add_argument("--cut-for", type=float, default=40, help="seconds the link stays cut")
+    ap.add_argument("--client-cut-at", type=float, help="seconds into the load: cut the clients' own connections (automatic reconnects)")
+    ap.add_argument("--client-cut-for", type=float, default=30, help="seconds the clients' connections stay cut")
     ap.add_argument("--hub-url", help=argparse.SUPPRESS)
     ap.add_argument("--guarded", action="store_true", help="install the write guards on the table: deletes are tombstones by contract (the delta path)")
     ap.add_argument("--preload", type=int, default=0, help="rows of a tenant no client follows, before the load: a large table")
@@ -728,7 +737,7 @@ def main() -> int:
         # stay under half of it and the producer's size rule does not rebuild the base each
         # cut — a busy tenant in a big multi-tenant table.
         bt.psql(f"INSERT INTO public.{TABLE} (id, tenant_id, note) SELECT 900000000 + g, 'bulk', 'b' FROM generate_series(1, {a.preload}) g")
-    topo = Topology(tmp, a.via, a.link_delay_ms, a.link_mbit)
+    topo = Topology(tmp, a.via, a.link_delay_ms, a.link_mbit, client_relay=a.client_cut_at is not None)
     topo.start()
     url = topo.hub_url
     env = {k: v for k, v in os.environ.items() if k not in ("NATS_BRIDGE_NKEY_SEED", "NATS_CREDS", "ZB_SIGNING_SEED", "NATS_TLS_CA")}
@@ -797,6 +806,17 @@ def main() -> int:
                 topo.signal("link", signal.SIGUSR2)
                 print(f"link restored at {time.time() - t0:.1f} s", flush=True)
             threading.Thread(target=cutter, daemon=True).start()
+        if a.client_cut_at is not None:
+            # The clients' own connections cut: every client open across it reconnects by
+            # itself, its handle alive — the delta path must be weighed then too.
+            def client_cutter():
+                time.sleep(max(0, t0 + a.client_cut_at - time.time()))
+                topo.signal("clientlink", signal.SIGUSR1)
+                print(f"client link cut at {time.time() - t0:.1f} s", flush=True)
+                time.sleep(a.client_cut_for)
+                topo.signal("clientlink", signal.SIGUSR2)
+                print(f"client link restored at {time.time() - t0:.1f} s", flush=True)
+            threading.Thread(target=client_cutter, daemon=True).start()
         for name, (kind, sched) in schedule.items():
             wdir = tmp / name
             wdir.mkdir()

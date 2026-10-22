@@ -400,6 +400,10 @@ pub const SyncClient = struct {
     /// core.deltaEligible before any row changes — the one approved may have been
     /// replaced in between, by a newer base among others.
     applying_by_choice: bool = false,
+    /// The connection's reconnect epoch the delta path last saw (null: not yet read). A
+    /// change is an automatic reconnect with this handle alive: the delta path is offered
+    /// then too, as on a reopen — zb-client-ts does it on every reconnect pass.
+    delta_epoch: ?u64 = null,
     startup: Startup = .{},
 
     // ── grammar.json, and ONLY grammar.json (PROTOCOL §1) ─────────────────────
@@ -4217,6 +4221,20 @@ pub const SyncClient = struct {
         self.drainSchemaWatch(report_a, &changed_map, &seeded_map) catch |err| log.info("schema watch: {s}", .{@errorName(err)});
         // Then the writes answered `indeterminate`, before any route is tailed.
         self.reconcile(report_a, &seeded_map) catch |err| log.warn("reconcile: {s} — retried at the next pass", .{@errorName(err)});
+        // An automatic reconnect, this handle alive: the backlog it left behind may be
+        // cheaper as its chains' deltas (core.streamDeltaChoice), exactly as on a reopen.
+        // Before any tail is read; a stream that moves forward drops its tail, and what
+        // the old consumer still delivers is a straggler, acked and not applied.
+        {
+            const epoch = self.t.conn.reconnect_epoch.load(.acquire);
+            if (self.delta_epoch) |seen| if (seen != epoch and self.synced_once and self.t.conn.getStatus() == .connected) {
+                log.info("reconnected — weighing the delta path for the backlog", .{});
+                self.offer_deltas = true;
+                defer self.offer_deltas = false;
+                self.gapAndSeed(report_a, &seeded_map) catch |err| log.info("delta path after the reconnect: {s} — the tails replay", .{@errorName(err)});
+            };
+            self.delta_epoch = epoch;
+        }
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const streams = try self.cdcStreams(ca.allocator());
