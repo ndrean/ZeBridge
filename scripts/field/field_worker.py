@@ -10,7 +10,7 @@ orchestrator's done file (PostgreSQL's digest) and polls until the replica equal
 
 Needs: Python 3.10+, nats-py (for the target), the libzb .so (--lib).
 """
-import argparse, asyncio, ctypes, hashlib, json, os, pathlib, sqlite3, sys, tempfile, time
+import argparse, asyncio, ctypes, hashlib, json, os, pathlib, sqlite3, sys, tempfile, threading, time
 
 TABLE = "storm_items"
 
@@ -56,7 +56,9 @@ async def stream_last(url, creds_text, domain, stream, principal):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--name", required=True)
+    ap.add_argument("--name", help="one client (measured: ZB_MEASURE is per process)")
+    ap.add_argument("--batch", help="a JSON file [{name, schedule}, …]: one thread per client, unmeasured; "
+                                    "--db/--identity/--invite-file then hold {name}")
     ap.add_argument("--lib", required=True)
     ap.add_argument("--db", required=True)
     ap.add_argument("--identity", required=True, help="kept across runs: the invite is redeemed once")
@@ -66,7 +68,7 @@ def main():
     ap.add_argument("--hub-nats", required=True, help="the hub, for the catch-up target")
     ap.add_argument("--seed-domain", default="")
     ap.add_argument("--tenant", default="storm")
-    ap.add_argument("--schedule", required=True, help='[[open_s, close_s|null], ...] from --t0')
+    ap.add_argument("--schedule", help='[[open_s, close_s|null], ...] from --t0')
     ap.add_argument("--t0", type=float, required=True)
     ap.add_argument("--done-file", required=True)
     a = ap.parse_args()
@@ -84,8 +86,28 @@ def main():
         finally:
             lib.zb_free(p)
 
+    lock = threading.Lock()
+
+    if a.batch:
+        threads = []
+        for c in json.loads(pathlib.Path(a.batch).read_text()):
+            spec = argparse.Namespace(**vars(a))
+            spec.name, spec.schedule = c["name"], json.dumps(c["schedule"])
+            for k in ("db", "identity", "invite_file"):
+                setattr(spec, k, getattr(a, k).format(name=c["name"]))
+            t = threading.Thread(target=run_client, args=(spec, lib, take, lock, False), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+        return 0
+    return run_client(a, lib, take, lock, True)
+
+
+def run_client(a, lib, take, lock, measure):
     def say(**kv):
-        print(json.dumps({"t": round(time.time() - a.t0, 1), **kv}), flush=True)
+        with lock:
+            print(json.dumps({"t": round(time.time() - a.t0, 1), "client": a.name, **kv}), flush=True)
 
     identity = pathlib.Path(a.identity)
     stream = f"CDC_{a.tenant}"
@@ -96,17 +118,18 @@ def main():
         if a.seed_domain:
             opts["seedDomain"] = a.seed_domain
         targets = {stream: 0, "CDC_PUBLIC": 0}
-        if identity.exists():
+        if identity.exists() and measure:
             ident = json.loads(identity.read_text())
             try:
                 targets[stream] = asyncio.run(stream_last(a.hub_nats, ident["creds"], ident.get("js_domain") or "hub", stream, ident["principal"]))
             except Exception as e:
                 say(event="target_failed", leg=i, error=str(e)[:200])
-        else:
+        if not identity.exists():
             opts["bridgeUrl"] = a.bridge
             opts["invite"] = pathlib.Path(a.invite_file).read_text().strip()
-        os.environ["ZB_MEASURE"] = "1"
-        os.environ["ZB_CATCHUP_TARGETS"] = ",".join(f"{k}={v}" for k, v in targets.items())
+        if measure:  # process-wide in libzb: only a client alone in its process is measured
+            os.environ["ZB_MEASURE"] = "1"
+            os.environ["ZB_CATCHUP_TARGETS"] = ",".join(f"{k}={v}" for k, v in targets.items())
         t_c = time.time()
         say(event="leg", leg=i, start_ms=int(t_c * 1000), targets=targets, cold=i == 0)
         h = lib.zb_client_connect(json.dumps(opts).encode())

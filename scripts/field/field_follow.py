@@ -40,6 +40,15 @@ SCHEDULE = {
     "away4": [[20, 300], [540, None]],
     "away8": [[20, 240], [720, None]],
 }
+ROLES = ["steady"] * 6 + ["cold", "away1", "away4", "away8"]  # the extra clients, one in ten each
+
+
+def extra_clients(n):
+    """Clients beyond the five measured ones: c006…c<n>, their role by position, one
+    schedule per role (SCHEDULE's), unmeasured, ten to a process."""
+    return [{"name": f"c{i:03d}", "schedule": SCHEDULE[ROLES[i % 10]]} for i in range(6, n + 1)]
+
+
 DIGEST_SQL = (f"SELECT count(*), encode(sha256(coalesce(string_agg(convert_to(id || ':' || "
               f"CASE WHEN note IS NULL THEN 'N' ELSE 'S' || octet_length(note) || ':' || note END, 'UTF8'), '' ORDER BY id COLLATE \"C\"), '')), 'hex') "
               f"FROM public.{TABLE} WHERE tenant_id = '{TENANT}' AND deleted_at IS NULL")
@@ -124,6 +133,7 @@ def main() -> int:
     ap.add_argument("--updates", type=int, default=50)
     ap.add_argument("--deletes", type=int, default=50)
     ap.add_argument("--out", default=str(ROOT / "docs" / "bench" / "field"))
+    ap.add_argument("--clients", type=int, default=5, help="5 measured clients, plus c006…cN (unmeasured, ten per process)")
     a = ap.parse_args()
 
     run = time.strftime("%m%d%H%M") + a.via[0]
@@ -131,7 +141,9 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     env = supabase_env()
     # Preflight: the VPS has what the clients need.
-    missing = ssh(CANADA, f"cd ~/{REMOTE} && for f in venv/bin/python lib/libzbcore.so {' '.join(f'invites/{n}.code' for n in SCHEDULE)}; do "
+    extra = extra_clients(a.clients)
+    names = list(SCHEDULE) + [c["name"] for c in extra]
+    missing = ssh(CANADA, f"cd ~/{REMOTE} && for f in venv/bin/python lib/libzbcore.so {' '.join(f'invites/{n}.code' for n in names)}; do "
                           f"[ -e $f ] || [ -e ids/$(basename $f .code).identity ] || echo $f; done", check=False).split()
     if missing:
         sys.exit(f"missing on the VPS: {missing} — see docs/plans/field-measurements.md")
@@ -154,7 +166,14 @@ def main() -> int:
                         f"--db runs/{run}/{name}.sqlite3 --identity ids/{name}.identity --invite-file invites/{name}.code "
                         f"--nats {nats} --hub-nats {HUB_NATS} {seed} --tenant {TENANT} --schedule '{json.dumps(sched)}' --t0 {t0} "
                         f"--done-file runs/{run}/done > runs/{run}/{name}.events 2> runs/{run}/{name}.log < /dev/null")
-    ssh(CANADA, f"cd ~/{REMOTE} && " + " && ".join(launches) + f" && sleep 1 && pgrep -fc field_worker.py")
+    for k in range(0, len(extra), 10):
+        group = extra[k:k + 10]
+        ssh(CANADA, f"cat > {REMOTE}/runs/{run}/batch{k // 10}.json", input=json.dumps(group))
+        launches.append(f"setsid -f venv/bin/python field_worker.py --batch runs/{run}/batch{k // 10}.json --lib lib/libzbcore.so "
+                        f"--db 'runs/{run}/{{name}}.sqlite3' --identity 'ids/{{name}}.identity' --invite-file 'invites/{{name}}.code' "
+                        f"--nats {nats} --hub-nats {HUB_NATS} {seed} --tenant {TENANT} --t0 {t0} "
+                        f"--done-file runs/{run}/done > runs/{run}/batch{k // 10}.events 2> runs/{run}/batch{k // 10}.log < /dev/null")
+    print("workers running: " + ssh(CANADA, f"cd ~/{REMOTE} && " + " && ".join(launches) + f" && sleep 1 && pgrep -fc field_worker.py").strip(), flush=True)
     while time.time() < t0:
         time.sleep(0.5)
     c0 = counters()
@@ -173,7 +192,7 @@ def main() -> int:
     end = time.time() + 420
     while time.time() < end:
         finals = ssh(CANADA, f"cat {REMOTE}/runs/{run}/*.events | grep -c '\"final\"'", check=False).strip()
-        if finals == str(len(SCHEDULE)):
+        if finals == str(len(names)):
             break
         time.sleep(10)
     c2 = counters()
@@ -198,6 +217,16 @@ def main() -> int:
         gen_follow.print_seeding(rows)
         for r in rows:
             print("seeding " + json.dumps(r))
+    if extra:
+        finals = []
+        for ev in sorted(out.glob("batch*.events")):
+            finals += [json.loads(l) for l in ev.read_text().splitlines() if '"final"' in l]
+        exact = [f for f in finals if f.get("exact")]
+        failed += len(extra) - len(exact)
+        conv = sorted(f["converge_s"] for f in exact)
+        print(f"\n{'✓' if len(exact) == len(extra) else '✗'} {len(extra)} unmeasured clients: {len(exact)} exact, "
+              f"{len(finals) - len(exact)} not, {len(extra) - len(finals)} without a final result"
+              + (f"; converged after the load in {conv[0]}–{conv[-1]} s (median {conv[len(conv) // 2]})" if conv else ""))
     print(f"\nlogs: {out}")
     return 1 if failed else 0
 
