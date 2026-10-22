@@ -46,7 +46,9 @@ DIGEST_SQL = (f"SELECT count(*), encode(sha256(coalesce(string_agg(convert_to(id
 
 
 def ssh(host, cmd, check=True, input=None):
-    r = subprocess.run(["ssh", "-o", "BatchMode=yes", host, cmd], capture_output=True, text=True, input=input)
+    # -n unless there is input: ssh then never waits on this process's stdin.
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes"] + ([] if input is not None else ["-n"]) + [host, cmd],
+                       capture_output=True, text=True, input=input)
     if check and r.returncode:
         sys.exit(f"ssh {host}: {cmd[:80]}… failed:\n{r.stderr[-800:]}")
     return r.stdout
@@ -93,17 +95,22 @@ def counters():
         t = ssh(host, f"ps -o times= -p $({pid_cmd})", check=False).strip()
         return int(t) if t.isdigit() else None
     hub = json.loads(ssh(HUB, "curl -s 127.0.0.1:8222/varz"))
-    leaf = json.loads(ssh(CANADA, "sudo docker exec zebridge-leaf-mirrors-1 wget -qO- http://127.0.0.1:8222/varz"))
+    # The leaf's traffic, exactly: the hub's own count of its link to the Canada leaf
+    # (/leafz, per leaf connection; "out" = hub → leaf). Docker's per-container counters
+    # disagreed with themselves (2026-10-22: +30 MB in, +310 MB out for a leaf relaying ~300 MB).
+    leafz = json.loads(ssh(HUB, "curl -s '127.0.0.1:8222/leafz'"))
+    link = next((l for l in leafz.get("leafs", []) if l.get("ip") == CANADA.split("@")[1]), {})
+    leaf = {"out_bytes": link.get("out_bytes"), "in_bytes": link.get("in_bytes"), "out_msgs": link.get("out_msgs")}
     return {"t": time.time(),
             "hub": {"out_bytes": hub["out_bytes"], "in_bytes": hub["in_bytes"], "out_msgs": hub["out_msgs"],
                     "nats_cpu_s": cpu(HUB, "pidof nats-server"), "bridge_cpu_s": cpu(HUB, "systemctl show -p MainPID --value zebridge")},
-            "leaf": {"out_bytes": leaf["out_bytes"], "in_bytes": leaf["in_bytes"], "out_msgs": leaf["out_msgs"],
-                     "nats_cpu_s": cpu(CANADA, "pidof nats-server")}}
+            "link_to_leaf": {"out_bytes": leaf["out_bytes"], "in_bytes": leaf["in_bytes"], "out_msgs": leaf["out_msgs"]},
+            "leaf": {"nats_cpu_s": cpu(CANADA, "pidof nats-server")}}
 
 
 def delta(a, b):
     out = {}
-    for side in ("hub", "leaf"):
+    for side in ("hub", "link_to_leaf", "leaf"):
         out[side] = {k: (b[side][k] - a[side][k]) if a[side][k] is not None and b[side][k] is not None else None for k in a[side]}
     out["seconds"] = round(b["t"] - a["t"], 1)
     return out
@@ -138,12 +145,16 @@ def main() -> int:
     t0 = time.time() + 15
     nats = LEAF_NATS if a.via == "leaf" else HUB_NATS
     seed = f"--seed-domain {SEED_DOMAIN}" if a.via == "leaf" else ""
+    # All five in one ssh call, each detached in its own session (setsid -f): a backgrounded
+    # process that still held the session kept `ssh` from returning, and the launch stalled
+    # after the first worker (2026-10-22).
+    launches = []
     for name, sched in SCHEDULE.items():
-        cmd = (f"cd ~/{REMOTE} && nohup venv/bin/python field_worker.py --name {name} --lib lib/libzbcore.so "
-               f"--db runs/{run}/{name}.sqlite3 --identity ids/{name}.identity --invite-file invites/{name}.code "
-               f"--nats {nats} --hub-nats {HUB_NATS} {seed} --tenant {TENANT} --schedule '{json.dumps(sched)}' --t0 {t0} "
-               f"--done-file runs/{run}/done > runs/{run}/{name}.events 2> runs/{run}/{name}.log < /dev/null &")
-        ssh(CANADA, cmd)
+        launches.append(f"setsid -f venv/bin/python field_worker.py --name {name} --lib lib/libzbcore.so "
+                        f"--db runs/{run}/{name}.sqlite3 --identity ids/{name}.identity --invite-file invites/{name}.code "
+                        f"--nats {nats} --hub-nats {HUB_NATS} {seed} --tenant {TENANT} --schedule '{json.dumps(sched)}' --t0 {t0} "
+                        f"--done-file runs/{run}/done > runs/{run}/{name}.events 2> runs/{run}/{name}.log < /dev/null")
+    ssh(CANADA, f"cd ~/{REMOTE} && " + " && ".join(launches) + f" && sleep 1 && pgrep -fc field_worker.py")
     while time.time() < t0:
         time.sleep(0.5)
     c0 = counters()
@@ -155,7 +166,9 @@ def main() -> int:
     if load.returncode:
         print(f"⚠️ the load stopped early: {load.stderr[-400:]}")
     n, digest = psql(env, DIGEST_SQL).split("|")
-    ssh(CANADA, f"cat > {REMOTE}/runs/{run}/done", input=json.dumps({"digest": digest, "rows": int(n)}))
+    # Atomically: a worker polling for the file must never read it half written.
+    ssh(CANADA, f"cat > {REMOTE}/runs/{run}/done.tmp && mv {REMOTE}/runs/{run}/done.tmp {REMOTE}/runs/{run}/done",
+        input=json.dumps({"digest": digest, "rows": int(n)}))
     print(f"load done after {time.time() - t0:.0f} s: {n} live rows in {TENANT}, digest {digest[:12]}", flush=True)
     end = time.time() + 420
     while time.time() < end:

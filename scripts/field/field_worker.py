@@ -131,7 +131,12 @@ def main():
             say(event="offline", leg=i, connect_s=round(connect_s, 2), sync_error=synced.get("error"), poll_errors=poll_errors)
             lib.zb_client_close(h)
             continue
-        truth = json.loads(pathlib.Path(a.done_file).read_text())
+        truth = None
+        while truth is None:  # written atomically by the orchestrator, but never trust a half file
+            try:
+                truth = json.loads(pathlib.Path(a.done_file).read_text())
+            except (json.JSONDecodeError, OSError):
+                time.sleep(0.5)
         t_f = time.time()
         have = {}
         while time.time() - t_f < 300:
