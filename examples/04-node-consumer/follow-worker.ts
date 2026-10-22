@@ -3,7 +3,8 @@
 /// follows CDC; the harness reads the replica's SQLite file directly and compares it with
 /// PostgreSQL. No stdin protocol — query-worker.ts is the one that answers SQL.
 ///
-/// Env: NATS_URL, ZB_DB, ZB_TABLES (comma list), ZB_PRINCIPAL, ZB_CREDS (optional: the
+/// Env: NATS_URL, ZB_DB, ZB_TABLES (comma list), ZB_PRINCIPAL, ZB_JS_DOMAIN and ZB_SEED_DOMAIN
+/// (optional: a seeding leaf), ZB_CREDS (optional: the
 /// scratch nats-server of a benchmark has no auth, and the creds file does not exist).
 import { existsSync, readFileSync } from 'node:fs';
 import { ZeBridge } from '@zebridge/client';
@@ -20,6 +21,9 @@ const zb = new ZeBridge({
   cdcBatchEvents: process.env.ZB_BATCH_EVENTS ? Number(process.env.ZB_BATCH_EVENTS) : undefined,
   creds,
   heartbeatMs: 0,
+  // Through a seeding leaf: CDC and writes on the hub's domain, chains from the leaf's mirrors.
+  jsDomain: process.env.ZB_JS_DOMAIN || undefined,
+  seedDomain: process.env.ZB_SEED_DOMAIN || undefined,
   tables: process.env.ZB_TABLES ? process.env.ZB_TABLES.split(',').map((t) => t.trim()).filter(Boolean) : '*', // §10hn
   dbPath: DB,
 });
