@@ -388,6 +388,10 @@ pub const SyncClient = struct {
     /// behind a cut leaf) is finished when the hub returns instead of leaving tails to run
     /// over a replica with no tenant and no positions table.
     synced_once: bool = false,
+    /// The stream whose fetched batch the drain loop holds while it calls gapAndSeed: its
+    /// tail must outlive the call (the batch's messages belong to it), so a heal leaves it
+    /// to the loop, which drops it once the batch is acked.
+    in_hand: ?[]const u8 = null,
     startup: Startup = .{},
 
     // ── grammar.json, and ONLY grammar.json (PROTOCOL §1) ─────────────────────
@@ -1855,6 +1859,17 @@ pub const SyncClient = struct {
                     // A first run (stored 0) resumes there too, silently: it is not a healed gap.
                     if (stored > 0) log.info("{s}: gap healed — resuming at {d} (was {d}, the stream holds from {d})", .{ stream, res.to, stored, first });
                     try self.persistSeq(stream, @intCast(res.to));
+                    // Every healed stream reopens at its new position, not only the one whose
+                    // hole was seen: while its own hole stayed open its consumer was handed the
+                    // messages after it and left them unacked, so its delivery is past them;
+                    // reading on with it skipped them, and their redeliveries then read as
+                    // duplicates (a 90 s leaf cut, 2026-10-22: shared deletes lost on
+                    // CDC_PUBLIC, healed in the same pass as CDC_acme's hole).
+                    const holding = if (self.in_hand) |h| std.mem.eql(u8, h, stream) else false;
+                    if (!holding) {
+                        self.dropTail(stream);
+                        self.resetFlow(stream);
+                    }
                 }
             }
         }
@@ -4139,7 +4154,9 @@ pub const SyncClient = struct {
                     const first_here = pending[0].metadata.sequence.stream;
                     log.warn("{s}: {d} message(s) pruned under the live consumer (position {d}, delivered {d}) — taking the gap: re-seeding the tables routed to it", .{ stream, first_here - last - 1, last, first_here });
                     self.reseed_pending = false;
+                    self.in_hand = stream;
                     self.gapAndSeed(report_a, &seeded_map) catch |err| log.err("{s}: re-seed after the hole failed: {s}", .{ stream, @errorName(err) });
+                    self.in_hand = null;
                     if (self.reseed_pending) {
                         log.warn("{s}: the hole stays open — waiting for the producer's next generation before moving past it", .{stream});
                         break;
