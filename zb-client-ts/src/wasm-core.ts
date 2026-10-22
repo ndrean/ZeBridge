@@ -19,6 +19,8 @@ type Exports = {
   zb_caught_up_position(pos: bigint, firstSeq: bigint, lastSeq: bigint, numPending: bigint, numAckPending: bigint, deliveredCount: bigint, delivered: bigint): bigint;
   zb_scope_seeding(ptr: number, len: number): bigint;
   zb_stream_resume(ptr: number, len: number): bigint;
+  zb_prefer_deltas(ptr: number, len: number): bigint;
+  zb_stream_forward(ptr: number, len: number): bigint;
   zb_merge_registers(ptr: number, len: number): bigint;
 };
 
@@ -99,6 +101,23 @@ export function scopeSeeding(
 export function streamResume(stored: number, firstSeq: number, cuts: (number | null)[]): { to: number; blocked: boolean } {
   const c = core();
   return call(c.zb_stream_resume, 'streamResume', { stored, firstSeq, cuts });
+}
+
+/// Whether a reconnect with no gap takes its chain's deltas instead of replaying the CDC
+/// backlog up to the chain's cut. The same rule on the hub or a seeding leaf: it reads the
+/// plan (planFromManifest with the replica's watermark), the position, the cut and two
+/// sizes, never where the chain comes from. `why` names the reason. libzb core.preferDeltas.
+export function preferDeltas(a: { plan: unknown[]; stored: number; cut: number | null; avgMessageBytes: number; deltaBytes: number }): { take: boolean; why: string } {
+  const c = core();
+  return call(c.zb_prefer_deltas, 'preferDeltas', a);
+}
+
+/// Where a stream with no gap moves after chains taken by choice: to the lowest cut when
+/// every table depending on it took a chain this pass (`cuts`: null for one that did
+/// not), else nowhere; never backwards. libzb core.streamForward.
+export function streamForward(stored: number, cuts: (number | null)[]): number {
+  const c = core();
+  return call(c.zb_stream_forward, 'streamForward', { stored, cuts }).to;
 }
 
 /// Where an idle, caught-up consumer's position may move: to the stream's end when

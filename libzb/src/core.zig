@@ -390,6 +390,83 @@ pub fn streamResumeJson(a: std.mem.Allocator, args: Value) !Value {
     return .{ .object = o };
 }
 
+// ─── the delta path: a reconnect that takes the chain instead of the CDC backlog ──
+
+/// How many times smaller the deltas must be than the CDC they replace. The CDC side is
+/// an estimate from the whole stream's average message size, and a filtered consumer
+/// receives only part of the stream, so the estimate runs high: the margin keeps a
+/// near tie on CDC, which needs no chain at all.
+pub const delta_margin: i64 = 2;
+
+pub const DeltaChoice = struct { take: bool, why: []const u8 };
+
+/// Whether a replica that reconnects with no gap should take its chain's deltas instead
+/// of replaying the CDC backlog up to the chain's cut. The same rule wherever the client
+/// is connected: it reads the manifest, the positions and two sizes, never where the
+/// chain will be fetched from (a seeding leaf or the hub — the transport's business).
+///
+///   `plan`  planFromManifest with the replica's watermark;
+///   `stored` the replica's position on the table's route; `cut` the chain's cut there;
+///   `avg_msg_bytes` the stream's bytes / messages; `delta_bytes` the plan's objects.
+///
+/// Taken only when the plan holds no full. That is what makes the jump sound: a delta
+/// carries every row whose version moved and every tombstone, but not an absence — and
+/// the producer forces a new base whenever rows went without a version move (physical
+/// deletes, a TRUNCATE), as planFromManifest forces one past the gc watermark. A plan
+/// without a full therefore misses nothing the CDC between `stored` and `cut` carried.
+/// The CDC after the cut is replayed either way.
+pub fn preferDeltas(plan: Value, stored: i64, cut: ?i64, avg_msg_bytes: i64, delta_bytes: i64) DeltaChoice {
+    const c = cut orelse return .{ .take = false, .why = "no-cut" };
+    if (c <= stored) return .{ .take = false, .why = "not-ahead" };
+    if (plan != .array or plan.array.items.len == 0) return .{ .take = false, .why = "nothing-newer" };
+    for (plan.array.items) |step| {
+        if (std.mem.eql(u8, getStr(step, "kind") orelse "", "full")) return .{ .take = false, .why = "needs-full" };
+    }
+    if (avg_msg_bytes <= 0 or delta_bytes < 0) return .{ .take = false, .why = "no-estimate" };
+    const cdc_bytes = (c - stored) *| avg_msg_bytes;
+    if (delta_bytes *| delta_margin >= cdc_bytes) return .{ .take = false, .why = "cdc-cheaper" };
+    return .{ .take = true, .why = "deltas" };
+}
+
+/// preferDeltas over JSON: `{"plan", "stored", "cut", "avgMessageBytes", "deltaBytes"}`
+/// → `{"take", "why"}`.
+pub fn preferDeltasJson(a: std.mem.Allocator, args: Value) !Value {
+    if (args != .object) return error.BadArgs;
+    const cut_v = args.object.get("cut");
+    const cut: ?i64 = if (cut_v != null and cut_v.? == .integer) cut_v.?.integer else null;
+    const r = preferDeltas(args.object.get("plan") orelse .null, getInt(args, "stored") orelse 0, cut, getInt(args, "avgMessageBytes") orelse 0, getInt(args, "deltaBytes") orelse -1);
+    var o: std.json.ObjectMap = .empty;
+    try o.put(a, "take", .{ .bool = r.take });
+    try o.put(a, "why", .{ .string = r.why });
+    return .{ .object = o };
+}
+
+/// Where a stream with NO gap moves after a pass that applied chains by choice
+/// (preferDeltas). `cuts`: one entry per (table, tenant) depending on the stream — the
+/// cut of a chain applied IN THIS PASS (the route's `cutoff_seq`, or `shared_cutoff_seq`
+/// on the shared route), null for one that took none. Forward to the lowest cut only
+/// when every dependent took a chain: one that did not still needs the events between.
+/// Never backwards — a chain behind the position is the rewind rule's case, not this
+/// one — and never for a stream no table depends on.
+pub fn streamForward(stored: i64, cuts: []const ?i64) i64 {
+    if (cuts.len == 0) return stored;
+    var low: i64 = std.math.maxInt(i64);
+    for (cuts) |c| low = @min(low, c orelse return stored);
+    return @max(stored, low);
+}
+
+/// streamForward over JSON: `{"stored", "cuts": [n|null, …]}` → `{"to"}`.
+pub fn streamForwardJson(a: std.mem.Allocator, args: Value) !Value {
+    if (args != .object) return error.BadArgs;
+    const cv = args.object.get("cuts") orelse return error.BadArgs;
+    if (cv != .array) return error.BadArgs;
+    const cuts = try a.alloc(?i64, cv.array.items.len);
+    for (cv.array.items, 0..) |c, i| cuts[i] = if (c == .integer) c.integer else null;
+    var o: std.json.ObjectMap = .empty;
+    try o.put(a, "to", .{ .integer = streamForward(getInt(args, "stored") orelse 0, cuts) });
+    return .{ .object = o };
+}
+
 // ─── the apply SQL builders ─────────────────────────────────────────────────
 
 /// §10ex: the one object that is NOT JSON text — bytes, as `{"$bin": "<base64>"}`

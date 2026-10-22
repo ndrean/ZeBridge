@@ -158,6 +158,12 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
     if (eq(u8, name, "streamResume")) {
         return try core.valueToString(a, try core.streamResumeJson(a, args));
     }
+    if (eq(u8, name, "preferDeltas")) {
+        return try core.valueToString(a, try core.preferDeltasJson(a, args));
+    }
+    if (eq(u8, name, "streamForward")) {
+        return try core.valueToString(a, try core.streamForwardJson(a, args));
+    }
     if (eq(u8, name, "fkKind")) {
         const msg = args.object.get("message").?.string;
         if (core.foreignKeyFailureKind(msg)) |k| {

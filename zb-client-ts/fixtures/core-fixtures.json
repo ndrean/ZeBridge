@@ -5351,6 +5351,237 @@
       "blocked": false
     }
   ],
+  "preferDeltas": [
+    {
+      "name": "a reconnect 30 s behind a busy table: two deltas far smaller than the backlog — take them",
+      "plan": [
+        {
+          "name": "t-g8-delta",
+          "kind": "delta"
+        },
+        {
+          "name": "t-g9-delta",
+          "kind": "delta"
+        }
+      ],
+      "stored": 581,
+      "cut": 1043,
+      "avgMessageBytes": 110000,
+      "deltaBytes": 250000,
+      "take": true,
+      "why": "deltas"
+    },
+    {
+      "name": "checkpoints apply like deltas — take them",
+      "plan": [
+        {
+          "name": "t-g7-checkpoint",
+          "kind": "checkpoint"
+        },
+        {
+          "name": "t-g9-delta",
+          "kind": "delta"
+        }
+      ],
+      "stored": 581,
+      "cut": 1043,
+      "avgMessageBytes": 110000,
+      "deltaBytes": 300000,
+      "take": true,
+      "why": "deltas"
+    },
+    {
+      "name": "the plan needs a base (rows went without a version move: a physical delete, a TRUNCATE, a reap past the gc watermark) — stay on CDC",
+      "plan": [
+        {
+          "name": "t-g10-full",
+          "kind": "full"
+        },
+        {
+          "name": "t-g11-delta",
+          "kind": "delta"
+        }
+      ],
+      "stored": 581,
+      "cut": 1043,
+      "avgMessageBytes": 110000,
+      "deltaBytes": 1000,
+      "take": false,
+      "why": "needs-full"
+    },
+    {
+      "name": "the chain's cut is behind the position — stay (the rewind rule's case, not this one)",
+      "plan": [
+        {
+          "name": "t-g9-delta",
+          "kind": "delta"
+        }
+      ],
+      "stored": 1100,
+      "cut": 1043,
+      "avgMessageBytes": 110000,
+      "deltaBytes": 1000,
+      "take": false,
+      "why": "not-ahead"
+    },
+    {
+      "name": "the chain's cut is the position — nothing to replace",
+      "plan": [
+        {
+          "name": "t-g9-delta",
+          "kind": "delta"
+        }
+      ],
+      "stored": 1043,
+      "cut": 1043,
+      "avgMessageBytes": 110000,
+      "deltaBytes": 1000,
+      "take": false,
+      "why": "not-ahead"
+    },
+    {
+      "name": "a manifest without a cut proves no position — stay",
+      "plan": [
+        {
+          "name": "t-g9-delta",
+          "kind": "delta"
+        }
+      ],
+      "stored": 581,
+      "cut": null,
+      "avgMessageBytes": 110000,
+      "deltaBytes": 1000,
+      "take": false,
+      "why": "no-cut"
+    },
+    {
+      "name": "nothing newer than the replica's watermark — stay",
+      "plan": [],
+      "stored": 581,
+      "cut": 1043,
+      "avgMessageBytes": 110000,
+      "deltaBytes": 0,
+      "take": false,
+      "why": "nothing-newer"
+    },
+    {
+      "name": "a short absence: the deltas repeat rows the replica already has from CDC — CDC is cheaper",
+      "plan": [
+        {
+          "name": "t-g9-delta",
+          "kind": "delta"
+        }
+      ],
+      "stored": 1000,
+      "cut": 1010,
+      "avgMessageBytes": 5000,
+      "deltaBytes": 250000,
+      "take": false,
+      "why": "cdc-cheaper"
+    },
+    {
+      "name": "a near tie stays on CDC: the deltas must be under half the estimate",
+      "plan": [
+        {
+          "name": "t-g9-delta",
+          "kind": "delta"
+        }
+      ],
+      "stored": 100,
+      "cut": 110,
+      "avgMessageBytes": 1000,
+      "deltaBytes": 5000,
+      "take": false,
+      "why": "cdc-cheaper"
+    },
+    {
+      "name": "just under half the estimate — take",
+      "plan": [
+        {
+          "name": "t-g9-delta",
+          "kind": "delta"
+        }
+      ],
+      "stored": 100,
+      "cut": 110,
+      "avgMessageBytes": 1000,
+      "deltaBytes": 4999,
+      "take": true,
+      "why": "deltas"
+    },
+    {
+      "name": "the stream's message size unknown — stay",
+      "plan": [
+        {
+          "name": "t-g9-delta",
+          "kind": "delta"
+        }
+      ],
+      "stored": 581,
+      "cut": 1043,
+      "avgMessageBytes": 0,
+      "deltaBytes": 1000,
+      "take": false,
+      "why": "no-estimate"
+    },
+    {
+      "name": "the deltas' size unknown — stay",
+      "plan": [
+        {
+          "name": "t-g9-delta",
+          "kind": "delta"
+        }
+      ],
+      "stored": 581,
+      "cut": 1043,
+      "avgMessageBytes": 110000,
+      "deltaBytes": -1,
+      "take": false,
+      "why": "no-estimate"
+    }
+  ],
+  "streamForward": [
+    {
+      "name": "the one table on the stream took its deltas: forward to its cut",
+      "stored": 581,
+      "cuts": [
+        1043
+      ],
+      "to": 1043
+    },
+    {
+      "name": "every table took a chain: forward to the lowest cut, the seed gate drops what the others carried",
+      "stored": 100,
+      "cuts": [
+        400,
+        300
+      ],
+      "to": 300
+    },
+    {
+      "name": "one table took none: it still needs the events between — stay",
+      "stored": 100,
+      "cuts": [
+        400,
+        null
+      ],
+      "to": 100
+    },
+    {
+      "name": "a cut behind the position never moves it back",
+      "stored": 500,
+      "cuts": [
+        400
+      ],
+      "to": 500
+    },
+    {
+      "name": "no table depends on the stream: stay",
+      "stored": 100,
+      "cuts": [],
+      "to": 100
+    }
+  ],
   "messageId": [
     {
       "name": "lossy sanitizing: a.b ...",

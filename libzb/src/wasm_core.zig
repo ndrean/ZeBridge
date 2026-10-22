@@ -61,6 +61,22 @@ export fn zb_stream_resume(ptr: [*]const u8, len: usize) u64 {
     return result(out);
 }
 
+/// core.preferDeltas: `{"plan", "stored", "cut", "avgMessageBytes", "deltaBytes"}` →
+/// `{"take", "why"}` — a reconnect takes the chain's deltas instead of the CDC backlog.
+export fn zb_prefer_deltas(ptr: [*]const u8, len: usize) u64 {
+    const args = parseArgs(ptr, len) orelse return 0;
+    const out = core.preferDeltasJson(arena.allocator(), args) catch return 0;
+    return result(out);
+}
+
+/// core.streamForward: `{"stored", "cuts": [n|null]}` → `{"to"}` — where a stream with no
+/// gap moves after chains taken by choice.
+export fn zb_stream_forward(ptr: [*]const u8, len: usize) u64 {
+    const args = parseArgs(ptr, len) orelse return 0;
+    const out = core.streamForwardJson(arena.allocator(), args) catch return 0;
+    return result(out);
+}
+
 /// core.scopeSeeding: `{"streams": {...}, "tables": {...}}` → `{"gapped": [...], "tablesToSeed": [...]}`.
 export fn zb_scope_seeding(ptr: [*]const u8, len: usize) u64 {
     const args = parseArgs(ptr, len) orelse return 0;

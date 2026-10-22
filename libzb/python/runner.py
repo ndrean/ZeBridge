@@ -54,6 +54,8 @@ SECTIONS = {
     "tombstoned":      (lambda c: {"tombstoneColumn": c["tombstoneColumn"], "data": c["data"]}, lambda c: c["drops"]),
     "position":        (lambda c: {"stored": c["stored"], "batch": c["batch"]},    lambda c: c["next"]),
     "streamResume":    (lambda c: {"stored": c["stored"], "firstSeq": c["firstSeq"], "cuts": c["cuts"]}, lambda c: {"to": c["to"], "blocked": c["blocked"]}),
+    "preferDeltas":    (lambda c: {k: c[k] for k in ("plan", "stored", "cut", "avgMessageBytes", "deltaBytes")}, lambda c: {"take": c["take"], "why": c["why"]}),
+    "streamForward":   (lambda c: {"stored": c["stored"], "cuts": c["cuts"]}, lambda c: {"to": c["to"]}),
     "caughtUp":        (lambda c: {k: c[k] for k in ("pos", "firstSeq", "lastSeq", "numPending", "numAckPending", "deliveredCount", "delivered") if k in c}, lambda c: c["next"]),
     "fkKind":          (lambda c: {"message": c["message"]},                       lambda c: c["kind"]),
     "pgTsToWire":      (lambda c: {"in": c["in"]},                                 lambda c: c["out"]),
