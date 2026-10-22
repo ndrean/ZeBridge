@@ -22,7 +22,7 @@
 /// read-only connection is not available here the way `libzebridge` native has one).
 
 import { natsTransport } from './transport.ts';
-import { Measure, type MeasureCounts } from './measure.ts';
+import { Measure, MeasureAttempt, emptyMeasureCounts, type MeasureCounts } from './measure.ts';
 import { endpointIdentity, identityEndpointUrl, orderedEndpoints } from './endpoints.ts';
 import { currentPlatform, type Platform, type PlatformName } from './platform.ts';
 import type { Transport, TransportConnection, JetStreamOpts, UserKeyPair } from './transport.ts';
@@ -2321,35 +2321,57 @@ export class ZeBridge {
     await this.retryFkHeld(`schema:${table}`);
   }
 
+  /// Tentative measurement outcomes, owned by one transaction attempt.
+  private measurementAttempt(stream: string, entries: { table: string; ev: any }[]): MeasureAttempt | undefined {
+    if (!this.measure.open(stream)) return;
+    const counted = entries.filter(({ ev }) => this.measure.counts(ev.stream, ev.seq));
+    const attempt = new MeasureAttempt(counted.map(({ table, ev }) => {
+      const state = this.syncedTables.get(table);
+      return { ev, gated: !!state && !state.unseeded && seedGateDrops(ev, state) };
+    }));
+    for (const { table, ev } of counted) {
+      if (!this.syncedTables.has(table) || !ev.data || typeof ev.data !== 'object') attempt.failed(ev);
+    }
+    return attempt;
+  }
+
   /// A batch failed as a unit — replay it event by event so one bad row cannot take
   /// the rest with it. Anything failing a FOREIGN KEY check is HELD, not dropped:
-  /// its parent may simply be in a later batch, which happens whenever a single
-  /// PostgreSQL transaction is larger than the bridge's ring and gets split across
-  /// batches (NOTES.md finding 5).
+  /// its parent may simply be in a later batch (NOTES.md finding 5).
   private async applyBatchIsolated(streamName: string, toApply: { table: string; ev: any }[], batchErr: string) {
     let applied = 0, held = 0, failed = 0;
+    const measured = emptyMeasureCounts();
     for (const { table, ev } of toApply) {
+      let attempt = this.measurementAttempt(streamName, [{ table, ev }]);
       try {
         await this.transaction(async (txExec) => {
           await this.dialect.deferForeignKeys(txExec);
-          await this.applyEvent(table, ev, txExec);
+          await this.applyEvent(table, ev, txExec, false, attempt);
         });
         applied++;
         this.triggerChange(table, ev);
       } catch (e) {
+        // The refused transaction's tentative holds/outcomes did not commit.
+        attempt = this.measurementAttempt(streamName, [{ table, ev }]);
         const kind = foreignKeyFailureKind(e);
         if (kind === 'missing-parent') {
-          await this.holdEvent(table, ev, String(e));
+          await this.holdEvent(table, ev, String(e), attempt);
           held++;
         } else if (kind === 'mismatch') {
           // Waiting cannot fix this: the parent key is not the PK and carries no
           // UNIQUE index, so the constraint should never have been ported.
           failed++;
+          attempt?.failed(ev);
           this.appendLog('CDC', `DROPPED ${ev?.operation} on ${table}: ${e} — the ported FK is unsatisfiable, its parent key needs a UNIQUE index (NOTES §10d)`, 'ERROR');
         } else {
           failed++;
+          attempt?.failed(ev);
           this.appendLog('CDC', `DROPPED ${ev?.operation} on ${table} (lsn ${ev?.lsn}): ${e}`, 'ERROR');
         }
+      }
+      if (attempt) {
+        const counts = attempt.snapshot();
+        for (const key of Object.keys(counts) as (keyof MeasureCounts)[]) measured[key] += counts[key];
       }
     }
     this.appendLog(
@@ -2358,6 +2380,7 @@ export class ZeBridge {
         `${applied} applied, ${held} held for a missing parent, ${failed} dropped`,
       failed ? 'ERROR' : 'WARNING',
     );
+    return measured;
   }
 
   private async deleteHeld(rows: { id?: number }[], exec: Exec = this.run) {
@@ -2373,8 +2396,7 @@ export class ZeBridge {
   /// `id` is AUTOINCREMENT: arrival order is apply order, and a restart must
   /// replay them in the order they were received, not by lsn (which is NOT
   /// monotonic in delivery order — NOTES §10f).
-  private async holdEvent(table: string, ev: any, reason: string) {
-    this.measure.held(ev);
+  private async holdEvent(table: string, ev: any, reason: string, attempt?: MeasureAttempt) {
     const lsn = typeof ev?.lsn === 'number' ? ev.lsn : 0;
     try {
       const r = await this.run(
@@ -2387,6 +2409,7 @@ export class ZeBridge {
       this.fkHeld.push({ table, ev });
       this.appendLog('CDC', `held event could not be persisted (${err}) — it survives only until restart`, 'ERROR');
     }
+    attempt?.held(ev);
   }
 
   /// Reload holds after a restart, in arrival order.
@@ -2520,7 +2543,7 @@ export class ZeBridge {
 
   /// `ev.optimistic` marks a synthetic event from our own mutate(): lsn is a sentinel
   /// so the gate never blocks it, and neither the echo-pop nor resume bookkeeping run.
-  private async applyEvent(table: string, ev: any, exec: Exec = this.run, seed = false) {
+  private async applyEvent(table: string, ev: any, exec: Exec = this.run, seed = false, attempt?: MeasureAttempt) {
     const state = this.syncedTables.get(table);
     if (!state || !ev?.data) return;
     // §10et: a table still waiting for its chain holds its events — applying them to
@@ -2532,7 +2555,8 @@ export class ZeBridge {
     if (state.unseeded && !seed) {
       const held = (state.unseededHeld ?? 0) + 1;
       state.unseededHeld = held;
-      if (held <= UNSEEDED_HOLD_MAX) { await this.holdEvent(table, ev, 'unseeded'); return; }
+      if (held <= UNSEEDED_HOLD_MAX) { await this.holdEvent(table, ev, 'unseeded', attempt); return; }
+      attempt?.failed(ev);
       if (held === UNSEEDED_HOLD_MAX + 1) this.appendLog('SYS', `${table}: ${UNSEEDED_HOLD_MAX} events held while waiting for a chain that never came — dropping further events; reconnect once the producer has built one`, 'ERROR');
       return;
     }
@@ -2581,7 +2605,7 @@ export class ZeBridge {
       if (unknown.length) {
         // Durable, in the inbox (CLIENTS.md, §10de): a host killed while a migration
         // is in flight must not lose the rows that arrived in the new shape.
-        await this.holdEvent(table, ev, `unknown column(s) [${unknown.join(', ')}]`);
+        await this.holdEvent(table, ev, `unknown column(s) [${unknown.join(', ')}]`, attempt);
         this.appendLog('CDC', `Holding ${op} on ${table}: unknown column(s) [${unknown.join(', ')}] — awaiting schema newer than lsn ${state.lsn}`, 'HOLD');
         this.scheduleRecount();
         return;
@@ -2707,7 +2731,7 @@ export class ZeBridge {
   /// never a silent drop) and counted as a fallback. The per-event duties — HLC floor,
   /// echo, rebase — still run for every bulked event; the position advances once per
   /// statement with the maxima.
-  private async applyBatchPlanned(toApply: { table: string; ev: any }[], exec: Exec) {
+  private async applyBatchPlanned(toApply: { table: string; ev: any }[], exec: Exec, attempt?: MeasureAttempt) {
     const tables: Record<string, CdcBulkTable> = {};
     for (const { table } of toApply) {
       if (tables[table]) continue;
@@ -2719,7 +2743,7 @@ export class ZeBridge {
     for (const seg of segments) {
       if (seg.kind === 'single') {
         this.bulkStats.single++;
-        await this.applyEvent(toApply[seg.event].table, toApply[seg.event].ev, exec);
+        await this.applyEvent(toApply[seg.event].table, toApply[seg.event].ev, exec, false, attempt);
       } else if (seg.kind === 'bulk') {
         const state = this.syncedTables.get(seg.table)!;
         try {
@@ -2734,7 +2758,7 @@ export class ZeBridge {
         } catch (err) {
           this.bulkStats.fallbacks++;
           this.appendLog('CDC', `bulk upsert of ${seg.rows.length} row(s) on ${seg.table} failed: ${err} — applying them one at a time`, 'WARNING');
-          for (const i of seg.events) await this.applyEvent(toApply[i].table, toApply[i].ev, exec);
+          for (const i of seg.events) await this.applyEvent(toApply[i].table, toApply[i].ev, exec, false, attempt);
           continue;
         }
         this.bulkStats.statements++;
@@ -3497,7 +3521,9 @@ export class ZeBridge {
     if (plan.some((stp: PlanStep) => stp.kind === 'full')) await this.reapplyPending(table);
     if (this.measure.enabled) {
       const fulls = plan.filter((stp: PlanStep) => stp.kind === 'full').length;
-      this.measure.emit({ m: 'chain', table, tenant: tenantForTable, gen: manifest.gen, full_gen: manifest.full?.gen ?? 0, fulls, deltas: plan.length - fulls,
+      // `seed`: from the seeding leaf's mirrors (seedDomain); `hub`: from the hub.
+      const source = seedOpts?.domain && seedOpts.domain === this.config.seedDomain ? 'seed' : 'hub';
+      this.measure.emit({ m: 'chain', table, tenant: tenantForTable, source, gen: manifest.gen, full_gen: manifest.full?.gen ?? 0, fulls, deltas: plan.length - fulls,
         rows: applied, t0_ms: chainT0, t1_ms: Date.now(), ...chainTotals, cutoff_version: manifest.cutoff_version ?? '',
         cdc_stream: manifest.cdc_stream ?? '', cutoff_seq: manifest.cutoff_seq ?? -1, shared_cutoff_seq: sharedSeq ?? -1 });
     }
@@ -3965,20 +3991,11 @@ export class ZeBridge {
             const toAck = batchMsgs;
             batch = [];
             batchMsgs = [];
-            // ZB_MEASURE: this batch's events at or below the stream's catch-up target —
-            // gated by core.seedGateDrops (the rule both apply paths use; anchors do not
-            // move inside a batch), held counted where they are held, added once applied.
-            let mc: Partial<MeasureCounts> | null = null;
+            // Measurements are staged with the transaction, never published by a hold
+            // that a failed COMMIT can roll back. Isolated replay supplies its own counts.
+            let mc: MeasureCounts | undefined;
             const mt = this.measure.open(streamName);
-            if (mt) {
-              mc = { messages: toAck.filter((m) => (m.seq ?? 0) <= mt.target).length, events: 0, gated: 0 };
-              for (const { table, ev } of toApply) {
-                if (!this.measure.counts(ev.stream, ev.seq)) continue;
-                mc.events!++;
-                const st = this.syncedTables.get(table);
-                if (st && !st.unseeded && seedGateDrops(ev, st)) mc.gated!++;
-              }
-            }
+            const attempt = this.measurementAttempt(streamName, toApply);
             try {
               await this.transaction(async (txExec) => {
                 if (superseded()) return;
@@ -3987,12 +4004,13 @@ export class ZeBridge {
                 // one batch cannot fail the apply.
                 await this.dialect.deferForeignKeys(txExec);
                 if (this.config.bulkCdc === false) {
-                  for (const { table, ev } of toApply) await this.applyEvent(table, ev, txExec);
+                  for (const { table, ev } of toApply) await this.applyEvent(table, ev, txExec, false, attempt);
                 } else {
-                  await this.applyBatchPlanned(toApply, txExec);
+                  await this.applyBatchPlanned(toApply, txExec, attempt);
                 }
               });
               if (superseded()) return;
+              mc = attempt?.snapshot();
               for (const { table, ev } of toApply) this.triggerChange(table, ev);
             } catch (err) {
               if (superseded()) return;
@@ -4003,7 +4021,7 @@ export class ZeBridge {
               //
               // Isolate instead: replay the batch ONE EVENT AT A TIME, each in its own
               // transaction, so only the genuinely bad event is affected.
-              await this.applyBatchIsolated(streamName, toApply, String(err));
+              mc = await this.applyBatchIsolated(streamName, toApply, String(err));
             }
             if (superseded()) return;
             // Held events are accounted for (retried after later batches), so acking
@@ -4040,6 +4058,10 @@ export class ZeBridge {
               }
             }
             if (mt && mc) {
+              const inTarget = toAck.filter((m) => (m.seq ?? 0) <= mt.target);
+              mc.messages = inTarget.length;
+              // Payload bytes as delivered (msgpack, before decoding): CDC's transfer cost.
+              mc.bytes = inTarget.reduce((n, m) => n + (m.data?.length ?? 0), 0);
               this.measure.add(streamName, mc);
               if (maxSeq >= mt.target) this.measure.reached(streamName, 'position', maxSeq);
               else if (lastMsg && lastMsg.info?.pending === 0) this.measure.reached(streamName, 'pending', maxSeq);

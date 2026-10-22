@@ -210,6 +210,8 @@ var measure_enabled: bool = false;
 const MeasureCounts = struct {
     /// Messages at or below the target delivered to this client, and their events.
     messages: u64 = 0,
+    /// Their payload bytes as delivered (msgpack, before any decoding).
+    bytes: u64 = 0,
     events: u64 = 0,
     applied: u64 = 0,
     /// Dropped by the seed gate: the chain already carries them.
@@ -266,7 +268,7 @@ fn measureOpen(stream: []const u8) ?*MeasureTarget {
 fn measureReached(t: *MeasureTarget, via: []const u8, position: u64) void {
     t.reached = true;
     const c = t.counts;
-    log.info("measure {{\"m\":\"catchup\",\"stream\":\"{s}\",\"target\":{d},\"position\":{d},\"via\":\"{s}\",\"at_ms\":{d},\"messages\":{d},\"events\":{d},\"applied\":{d},\"gated\":{d},\"held\":{d},\"failed\":{d}}}", .{ t.stream(), t.target, position, via, nowMillis(), c.messages, c.events, c.applied, c.gated, c.held, c.failed });
+    log.info("measure {{\"m\":\"catchup\",\"stream\":\"{s}\",\"target\":{d},\"position\":{d},\"via\":\"{s}\",\"at_ms\":{d},\"messages\":{d},\"bytes\":{d},\"events\":{d},\"applied\":{d},\"gated\":{d},\"held\":{d},\"failed\":{d}}}", .{ t.stream(), t.target, position, via, nowMillis(), c.messages, c.bytes, c.events, c.applied, c.gated, c.held, c.failed });
 }
 
 /// Microseconds on the monotonic clock: phase timings, never compared with wall time.
@@ -2475,8 +2477,8 @@ pub const SyncClient = struct {
                 if (std.mem.eql(u8, step.object.get("kind").?.string, "full")) fulls += 1;
             }
             const full_gen: i64 = if (man.object.get("full")) |f| (if (f == .object) (if (f.object.get("gen")) |g| (if (g == .integer) g.integer else 0) else 0) else 0) else 0;
-            log.info("measure {{\"m\":\"chain\",\"table\":\"{s}\",\"tenant\":\"{s}\",\"gen\":{d},\"full_gen\":{d},\"fulls\":{d},\"deltas\":{d},\"rows\":{d},\"bytes\":{d},\"t0_ms\":{d},\"t1_ms\":{d},\"fetch_ms\":{d},\"inflate_ms\":{d},\"decode_ms\":{d},\"apply_ms\":{d},\"streamed\":{d},\"cutoff_version\":\"{s}\",\"cdc_stream\":\"{s}\",\"cutoff_seq\":{d},\"shared_cutoff_seq\":{d}}}", .{
-                table, tenant, if (man.object.get("gen")) |v| v.integer else 0, full_gen, fulls, plan.array.items.len - fulls, applied, bytes_total, chain_t0, nowMillis(), ph[0], ph[1], ph[2], ph[3], streamed, cv, cdc_stream, cutoff_seq, shared_seq orelse -1,
+            log.info("measure {{\"m\":\"chain\",\"table\":\"{s}\",\"tenant\":\"{s}\",\"source\":\"{s}\",\"gen\":{d},\"full_gen\":{d},\"fulls\":{d},\"deltas\":{d},\"rows\":{d},\"bytes\":{d},\"t0_ms\":{d},\"t1_ms\":{d},\"fetch_ms\":{d},\"inflate_ms\":{d},\"decode_ms\":{d},\"apply_ms\":{d},\"streamed\":{d},\"cutoff_version\":\"{s}\",\"cdc_stream\":\"{s}\",\"cutoff_seq\":{d},\"shared_cutoff_seq\":{d}}}", .{
+                table, tenant, if (from_seed) "seed" else "hub", if (man.object.get("gen")) |v| v.integer else 0, full_gen, fulls, plan.array.items.len - fulls, applied, bytes_total, chain_t0, nowMillis(), ph[0], ph[1], ph[2], ph[3], streamed, cv, cdc_stream, cutoff_seq, shared_seq orelse -1,
             });
         }
         if (streamed > 0) {
@@ -3330,7 +3332,10 @@ pub const SyncClient = struct {
                 for (cx.messages) |m| {
                     const seq = m.metadata.sequence.stream;
                     const counted = if (cx.mt) |t| seq <= t.target else false;
-                    if (counted) cx.mc.messages += 1;
+                    if (counted) {
+                        cx.mc.messages += 1;
+                        cx.mc.bytes += m.msg.data.len;
+                    }
                     const doc = decodeMsgpack(cx.a, m.msg.data) catch continue;
                     const events: []const Value = if (doc == .array) doc.array.items else &.{doc};
                     for (events) |ev| {
@@ -3422,11 +3427,13 @@ pub const SyncClient = struct {
                 log.warn("{s}: batch refused again ({s}: {s}) — one transaction per event", .{ stream, @errorName(err2), self.st.commitErr() });
                 offered = 0;
                 max_seq.* = last;
-                try self.applyBatchIsolated(report_a, stream, messages, max_seq, changed_map, &offered);
+                // Both attempts rolled back. The per-event transactions supply the
+                // counts of their own committed outcomes, not the aborted batch's.
+                mc = .{};
+                try self.applyBatchIsolated(report_a, stream, messages, max_seq, changed_map, &offered, ctx.mt, &mc);
             };
         };
-        // ZB_MEASURE: the attempt that committed is the one counted (the isolated
-        // replay, rare, keeps the counts of the attempt before it).
+        // ZB_MEASURE: only committed attempts, including isolated replay, are counted.
         if (ctx.mt) |t| {
             t.counts.add(mc);
             if (max_seq.* >= t.target) {
@@ -3451,7 +3458,7 @@ pub const SyncClient = struct {
     /// §10hf: the batch one event per transaction — the TS client's `applyBatchIsolated`.
     /// A held event is held durably as in the batch path; a refused one is printed and
     /// skipped, never poisoning its neighbours. The position is persisted last.
-    fn applyBatchIsolated(self: *SyncClient, report_a: ?std.mem.Allocator, stream: []const u8, messages: []const *@import("nats").JetStreamMessage, max_seq: *u64, changed_map: ?*std.array_hash_map.String(void), offered: *usize) !void {
+    fn applyBatchIsolated(self: *SyncClient, report_a: ?std.mem.Allocator, stream: []const u8, messages: []const *@import("nats").JetStreamMessage, max_seq: *u64, changed_map: ?*std.array_hash_map.String(void), offered: *usize, mt: ?*MeasureTarget, mc: *MeasureCounts) !void {
         const pos_before = max_seq.*;
         var ba = std.heap.ArenaAllocator.init(self.a);
         defer ba.deinit();
@@ -3487,6 +3494,11 @@ pub const SyncClient = struct {
         var refused: usize = 0;
         for (messages) |m| {
             const seq = m.metadata.sequence.stream;
+            const counted = if (mt) |t| seq <= t.target else false;
+            if (counted) {
+                mc.messages += 1;
+                mc.bytes += m.msg.data.len;
+            }
             const doc = decodeMsgpack(a, m.msg.data) catch continue;
             const events: []const Value = if (doc == .array) doc.array.items else &.{doc};
             for (events) |ev| {
@@ -3495,6 +3507,19 @@ pub const SyncClient = struct {
                 if (self.states.get(table) == null) continue;
                 offered.* += 1;
                 var outcome: Outcome = .applied;
+                const gated_before = self.gated;
+                if (counted) mc.events += 1;
+                defer if (counted) {
+                    switch (outcome) {
+                        .applied => if (self.gated != gated_before) {
+                            mc.gated += 1;
+                        } else {
+                            mc.applied += 1;
+                        },
+                        .held => mc.held += 1,
+                        .refused => mc.failed += 1,
+                    }
+                };
                 const one = One{ .client = self, .a = a, .table = table, .ev = ev, .stream = m.metadata.stream, .seq = seq, .outcome = &outcome };
                 self.st.transaction(one, One.apply) catch |err| {
                     const reason: ?[]const u8 = switch (err) {
@@ -3507,12 +3532,14 @@ pub const SyncClient = struct {
                         // after the batch like every held event (§10dg).
                         self.st.transaction(Hold{ .a = a, .table = table, .ev = ev, .reason = why }, Hold.apply) catch |e2| {
                             refused += 1;
+                            outcome = .refused;
                             log.err("{s}: event at seq {d} could not be held ({s}: {s}) — dropped", .{ table, seq, @errorName(e2), self.st.errMsg() });
                             continue;
                         };
                         outcome = .held;
                     } else {
                         refused += 1;
+                        outcome = .refused;
                         log.warn("{s}: event at seq {d} refused alone ({s}: {s}) — dropped", .{ table, seq, @errorName(err), self.st.errMsg() });
                         continue;
                     }
@@ -4296,12 +4323,18 @@ pub const SyncClient = struct {
         var events_v = std.json.Array.init(a);
         for (cx.messages) |m| {
             const seq = m.metadata.sequence.stream;
+            const counted = if (cx.mt) |t| seq <= t.target else false;
+            if (counted) {
+                cx.mc.messages += 1;
+                cx.mc.bytes += m.msg.data.len;
+            }
             const doc = decodeMsgpack(a, m.msg.data) catch continue;
             const items: []const Value = if (doc == .array) doc.array.items else &.{doc};
             for (items) |ev| {
                 if (ev != .object) continue;
                 const table = if (ev.object.get("table")) |v| (if (v == .string) v.string else continue) else continue;
                 const st = self.states.get(table) orelse continue;
+                if (counted) cx.mc.events += 1;
                 if (tables_v.get(table) == null) {
                     var tv: std.json.ObjectMap = .empty;
                     var cols = std.json.Array.init(a);
@@ -4357,6 +4390,11 @@ pub const SyncClient = struct {
             const kind = seg.object.get("kind").?.string;
             if (std.mem.eql(u8, kind, "drop")) {
                 cx.offered.* += 1;
+                const i: usize = @intCast(seg.object.get("event").?.integer);
+                if (cx.mt) |t| if (evs.items[i].seq <= t.target) {
+                    const why = seg.object.get("why").?.string;
+                    if (std.mem.eql(u8, why, "gate")) cx.mc.gated += 1 else cx.mc.failed += 1;
+                };
                 continue;
             }
             if (std.mem.eql(u8, kind, "single")) {
@@ -4367,14 +4405,23 @@ pub const SyncClient = struct {
                 cx.offered.* += 1;
                 singles += 1;
                 var applied_here = true;
+                const counted = if (cx.mt) |t| e.seq <= t.target else false;
+                const gated_before = self.gated;
+                defer if (counted) {
+                    if (applied_here) {
+                        if (self.gated != gated_before) cx.mc.gated += 1 else cx.mc.applied += 1;
+                    }
+                };
                 self.applyEvent(e.table, e.ev, e.stream, e.seq) catch |err| switch (err) {
                     error.FkHeld => {
                         applied_here = false;
                         try holdEvent(st_, a, e.table, e.ev, "missing-parent");
+                        if (counted) cx.mc.held += 1;
                     },
                     error.SchemaBehind => {
                         applied_here = false;
                         try holdEvent(st_, a, e.table, e.ev, "unknown-column");
+                        if (counted) cx.mc.held += 1;
                     },
                     else => |err2| {
                         log.err("{s}: event at seq {d} aborted the batch: {s} — duckdb: {s}", .{ e.table, e.seq, @errorName(err2), st_.errMsg() });
@@ -4469,6 +4516,9 @@ pub const SyncClient = struct {
             for (ev_idx) |iv| {
                 const e = evs.items[@intCast(iv.integer)];
                 cx.offered.* += 1;
+                if (cx.mt) |t| if (e.seq <= t.target) {
+                    cx.mc.applied += 1;
+                };
                 if (e.ev.object.get("data")) |dv| try self.feedFloor(a, st, dv);
             }
             if (cx.report_a) |ra_| if (cx.changed_map) |cm| {
@@ -6116,6 +6166,56 @@ pub fn discardOutbox(st: *storage.Storage, a: std.mem.Allocator, table: []const 
     if (k == 0) return;
     _ = try st.query(a, "DELETE FROM _zebridge_outbox WHERE tbl = ?", &.{.{ .text = table }});
     log.info("{s}: {d} queued write(s) discarded — the table was {s} — surface this to the user", .{ table, k, why });
+}
+
+test "measurement: isolated replay counts committed outcomes and excludes events past the target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Only the storage/apply fields are used: no NATS connection or acknowledgments.
+    var client: SyncClient = undefined;
+    client.a = a;
+    client.st = try storage.Storage.open(":memory:");
+    defer client.st.close();
+    client.states = .empty;
+    client.rebase = .empty;
+    client.gated = 0;
+    try client.st.execSimple("CREATE TABLE item (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
+    try client.st.execSimple("CREATE TABLE _zbz_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER)");
+    try ensureInbox(&client.st);
+    const state: TableState = .{ .pk = &.{"id"}, .cols = &.{ "id", "value" }, .version_col = null, .tenant_col = null, .tombstone_col = null, .routes = &.{"CDC_acme"} };
+    try client.states.put(a, "item", state);
+    var seeded = state;
+    try seeded.anchors.append(a, .{ .stream = "CDC_acme", .seq = 5, .lsn = 0 });
+    try client.states.put(a, "seeded", seeded);
+    const first = (try std.json.parseFromSlice(Value, a,
+        \\[{"table":"item","operation":"INSERT","data":{"id":1,"value":"ok"}},
+        \\ {"table":"item","operation":"INSERT","data":{"id":2,"new_column":"wait"}},
+        \\ {"table":"item","operation":"INSERT","data":{"id":3,"value":null}},
+        \\ {"table":"seeded","operation":"INSERT","data":{"id":4,"value":"gated"}}]
+    , .{})).value;
+    const later = (try std.json.parseFromSlice(Value, a,
+        \\{"table":"item","operation":"INSERT","data":{"id":6,"value":"live"}}
+    , .{})).value;
+    var raw: [2]@import("nats").Message = undefined;
+    raw[0].data = try encodeMsgpack(a, first);
+    raw[1].data = try encodeMsgpack(a, later);
+    var messages = [_]@import("nats").JetStreamMessage{
+        .{ .msg = &raw[0], .nc = undefined, .metadata = .{ .stream = "CDC_acme", .sequence = .{ .stream = 5 } } },
+        .{ .msg = &raw[1], .nc = undefined, .metadata = .{ .stream = "CDC_acme", .sequence = .{ .stream = 6 } } },
+    };
+    var target: MeasureTarget = .{ .target = 5 };
+    var counts: MeasureCounts = .{};
+    var position: u64 = 0;
+    var offered: usize = 0;
+    try client.applyBatchIsolated(null, "CDC_acme", &.{ &messages[0], &messages[1] }, &position, null, &offered, &target, &counts);
+    try std.testing.expectEqualDeep(MeasureCounts{ .messages = 1, .bytes = raw[0].data.len, .events = 4, .applied = 1, .gated = 1, .held = 1, .failed = 1 }, counts);
+    try std.testing.expectEqual(@as(u64, 6), position);
+    const rows = try client.st.query(a, "SELECT id FROM item ORDER BY id", &.{});
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(i64, 6), rows[1][0].integer);
+    const held = try client.st.query(a, "SELECT count(*) FROM _zbz_inbox", &.{});
+    try std.testing.expectEqual(@as(i64, 1), held[0][0].integer);
 }
 
 test "inbox: a held event survives closing the database, and a seed past it prunes it" {

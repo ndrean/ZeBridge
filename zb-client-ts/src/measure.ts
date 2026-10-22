@@ -6,11 +6,36 @@
 /// connecting. Without a fixed target, "what CDC replayed afterwards" never ends under
 /// live traffic. Node only: a browser has no environment and never measures.
 
-export interface MeasureCounts { messages: number; events: number; applied: number; gated: number; held: number }
+export interface MeasureCounts { messages: number; bytes: number; events: number; applied: number; gated: number; held: number; failed: number }
 
 interface Target { stream: string; target: number; reached: boolean; counts: MeasureCounts }
 
-const zero = (): MeasureCounts => ({ messages: 0, events: 0, applied: 0, gated: 0, held: 0 });
+export const emptyMeasureCounts = (): MeasureCounts => ({ messages: 0, bytes: 0, events: 0, applied: 0, gated: 0, held: 0, failed: 0 });
+
+/// One transaction attempt. Holds and failures replace an event's tentative outcome;
+/// callers publish the snapshot only after commit, or discard it on rollback.
+export class MeasureAttempt {
+  private outcomes = new Map<object, { count: number; status: 'applied' | 'gated' | 'held' | 'failed' }>();
+
+  constructor(events: { ev: object; gated: boolean }[]) {
+    for (const { ev, gated } of events) {
+      const old = this.outcomes.get(ev);
+      this.outcomes.set(ev, { count: (old?.count ?? 0) + 1, status: gated ? 'gated' : 'applied' });
+    }
+  }
+
+  held(ev: object) { const entry = this.outcomes.get(ev); if (entry) entry.status = 'held'; }
+  failed(ev: object) { const entry = this.outcomes.get(ev); if (entry) entry.status = 'failed'; }
+
+  snapshot(): MeasureCounts {
+    const counts = emptyMeasureCounts();
+    for (const { count, status } of this.outcomes.values()) {
+      counts.events += count;
+      counts[status] += count;
+    }
+    return counts;
+  }
+}
 
 export class Measure {
   readonly enabled: boolean;
@@ -28,7 +53,7 @@ export class Measure {
       if (eq <= 0 || !Number.isInteger(target)) continue;
       const stream = pair.slice(0, eq);
       // Nothing this client follows was on the stream: no catch-up to wait for.
-      this.targets.set(stream, { stream, target, reached: target === 0, counts: zero() });
+      this.targets.set(stream, { stream, target, reached: target === 0, counts: emptyMeasureCounts() });
     }
   }
 
@@ -48,11 +73,6 @@ export class Measure {
     return !!t && typeof seq === 'number' && seq > 0 && seq <= t.target;
   }
 
-  /// A hold (missing parent, unknown column, unseeded table) of a counted event.
-  held(ev: { stream?: string; seq?: number }) {
-    if (this.counts(ev.stream, ev.seq)) this.targets.get(ev.stream!)!.counts.held++;
-  }
-
   add(stream: string, c: Partial<MeasureCounts>) {
     const t = this.open(stream);
     if (!t) return;
@@ -66,10 +86,8 @@ export class Measure {
     const t = this.open(stream);
     if (!t) return;
     t.reached = true;
-    // `applied` is what was neither gated nor held: a failed event is said by the
-    // isolated replay's own log line, not counted apart here (libzb counts it).
     const c = t.counts;
-    this.emit({ m: 'catchup', stream, target: t.target, position, via, at_ms: Date.now(), ...c, applied: c.events - c.gated - c.held, failed: null });
+    this.emit({ m: 'catchup', stream, target: t.target, position, via, at_ms: Date.now(), ...c });
   }
 
   /// Every open target the stored positions have passed — a chain landing past it, or a
