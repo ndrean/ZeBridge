@@ -35,14 +35,16 @@ def replica_digest(db, tenant):
         return {"error": str(e)}
 
 
-async def stream_last(url, creds_text, domain, stream):
+async def stream_last(url, creds_text, domain, stream, principal):
     import nats
     with tempfile.NamedTemporaryFile("w", suffix=".creds", delete=False) as f:
         f.write(creds_text)
         path = f.name
     os.chmod(path, 0o600)
     try:
-        nc = await nats.connect(url, user_credentials=path, connect_timeout=10)
+        # A client may only subscribe under `_INBOX.<principal>.>` (its JWT's grant, as
+        # libzb's own inbox prefix): nats-py's default `_INBOX.<id>` is refused.
+        nc = await nats.connect(url, user_credentials=path, connect_timeout=10, inbox_prefix=f"_INBOX.{principal}")
         try:
             info = await nc.jetstream(domain=domain).stream_info(stream)
             return info.state.last_seq
@@ -97,7 +99,7 @@ def main():
         if identity.exists():
             ident = json.loads(identity.read_text())
             try:
-                targets[stream] = asyncio.run(stream_last(a.hub_nats, ident["creds"], ident.get("js_domain") or "hub", stream))
+                targets[stream] = asyncio.run(stream_last(a.hub_nats, ident["creds"], ident.get("js_domain") or "hub", stream, ident["principal"]))
             except Exception as e:
                 say(event="target_failed", leg=i, error=str(e)[:200])
         else:
