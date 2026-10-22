@@ -3492,6 +3492,9 @@ export class ZeBridge {
 
   private async subscribeStreamsOnce() {
     if (!this.nc) return;
+    // The tables a chain was applied to in this pass: each took the chain's state as of
+    // its cut, which step 2 must replay from on every stream it rides.
+    const seededThisPass = new Set<string>();
     // Throw-proof from the first await: this function runs as a floating
     // promise from the reconnect handler and the status-loop restart, and an
     // unhandled rejection here KILLED THE PROCESS when the connection happened
@@ -3606,10 +3609,15 @@ export class ZeBridge {
         //
         // A table that cannot seed is ITS OWN failure (`this.failed`), never a
         // reason to starve the rest.
+        // No tail may apply events while a chain rewrites rows: the chain's state is as of
+        // its cut, and an event the tail applied past the cut would be overwritten, then
+        // skipped when the tail resumes (the tails are reopened in step 2).
+        for (const stream of [...this.tailStops.keys()]) await this.stopTail(stream);
         for (const table of tablesToSeed) seedPromises.push((async () => {
           // Generations are the ONLY seeding path (NOTES.md §1.13, §10h): the
           // producer builds once on a cadence, every client catches up on deltas.
           if (await this.applyGenerations(table)) {
+            seededThisPass.add(table);
             this.reach('snapshot');
             return;
           }
@@ -3737,6 +3745,37 @@ export class ZeBridge {
           try { firstSeq = (await jsm.streams.info(streamName))?.state?.first_seq ?? 0; } catch { /* keep the position */ }
           // A stream no seeded table depends on takes the tail: the quiet-stream case.
           const decided = cuts.length && seeded.length ? streamResume(stored0, firstSeq, cuts) : { to: stored0 > 0 ? stored0 : floor, blocked: false };
+          // A table reseeded in this pass now holds the chain's state as of its cut on this
+          // stream. When the position is past that cut — the stream itself had no gap, a gap
+          // on the table's OTHER route (the shared stream) reseeded it — the events between
+          // the cut and the position were applied and then overwritten by the chain, deletes
+          // included: they must replay. Measured before this rule: a client kept 4,000 rows
+          // PostgreSQL had deleted (gen_follow, shared-stream gap at 2,000 ids/s).
+          let rewindTo = decided.to;
+          for (const table of seededThisPass) {
+            const st = this.syncedTables.get(table);
+            const t = this.effectiveTenantFor(table);
+            if (!st || t === null) continue;
+            const route = this.cdcStreamForTenant(t);
+            const cut = route === streamName
+              ? (st.seedStream === streamName && typeof st.seedSeq === 'number' ? st.seedSeq : null)
+              : (pub === streamName && route !== pub && typeof st.sharedSeedSeq === 'number' ? st.sharedSeedSeq : null);
+            if (cut === null || cut >= rewindTo) continue;
+            if (firstSeq > 1 && cut < firstSeq - 1) {
+              this.appendLog('SYS', `${streamName}: ${table}'s chain was cut at ${cut}, before the stream's oldest message (${firstSeq}) — the events after it cannot replay`, 'ERROR');
+              continue;
+            }
+            rewindTo = cut;
+          }
+          if (rewindTo < decided.to) {
+            this.appendLog('SYS', `${streamName}: rewound to ${rewindTo} (was ${decided.to}) — a table reseeded here replays the events after its chain's cut`, 'WARNING');
+            this.globalSyncState.seq[streamName] = rewindTo;
+            await this.run(
+              `INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?)
+               ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
+              streamName, rewindTo,
+            );
+          }
           if (decided.blocked) {
             this.appendLog('SYS', `${streamName}: the gap stays open — no chain past the stream's oldest message (${firstSeq}) yet; waiting for the producer's next generation`, 'WARNING');
           }
@@ -3754,7 +3793,7 @@ export class ZeBridge {
             });
             if (riding.every((t) => have.has(t) && !this.failed.has(t))) this.healedRoutes.add(streamName);
           }
-          if (decided.to > stored0) {
+          if (decided.to > stored0 && rewindTo >= decided.to) {
             if (stored0 > 0) this.appendLog('SYS', `${streamName}: gap healed — resuming at ${decided.to} (was ${stored0}, stream holds from ${firstSeq})`, 'INFO');
             this.globalSyncState.seq[streamName] = decided.to;
             await this.run(

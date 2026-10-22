@@ -262,3 +262,43 @@ test('a stream with no followed table gets no tail consumer', async () => {
     assert.equal(c.tailFilters.has('CDC_acme'), false);
   } finally { c.nc = null; db.close(); }
 });
+
+test('a reseed caused by a shared-stream gap rewinds the table\'s own stream to the chain\'s cut', async () => {
+  await loadCore(readFileSync(new URL('../wasm/zb_core.wasm', import.meta.url)));
+  const { db, c } = fixture();
+  try {
+    // A tenant table: own rows on CDC_acme (no gap: stored 20, stream 1..25), open-tenant rows
+    // on CDC_PUBLIC (a real gap: stored 5, the stream now starts at 10).
+    c.cdcFilters = ZeBridge.prototype['cdcFilters' as keyof ZeBridge];
+    c.cdcStreams = () => ['CDC_acme', 'CDC_PUBLIC'];
+    c.cdcStreamForTenant = (t: string) => (t === '_default' ? 'CDC_PUBLIC' : 'CDC_acme');
+    c.config = { grammar: { cdc_streams: { public: 'CDC_PUBLIC', tenant_prefix: 'CDC_' }, open_tenant: '_default' }, cdcBatchEvents: 20000 };
+    c.tenantValue = 'acme';
+    c.syncedTables = new Map([['item', { tenantColumn: 'tenant_id', pkCols: ['id'] }]]);
+    c.streamCreated = new Map([['CDC_acme', 'same'], ['CDC_PUBLIC', 'same']]);
+    c.globalSyncState.seq = { CDC_acme: 20, CDC_PUBLIC: 5 };
+    db.exec("INSERT INTO _zebridge_stream_seq VALUES ('CDC_acme', 20, 'same'), ('CDC_PUBLIC', 5, 'same')");
+    db.exec("INSERT INTO _zebridge_generations VALUES ('item')");
+    c.dialect = { setForeignKeys: async () => {}, foreignKeyViolations: async () => 0 };
+    // The chain: its cut on CDC_acme (12) is older than the stored position (20).
+    c.applyGenerations = async (table: string) => {
+      const st = c.syncedTables.get(table);
+      Object.assign(st, { seedSeq: 12, seedStream: 'CDC_acme', sharedSeedSeq: 15, seedLsn: 1 });
+      return true;
+    };
+    const starts: Record<string, number | undefined> = {};
+    const info: Record<string, any> = { CDC_acme: { first_seq: 1, last_seq: 25 }, CDC_PUBLIC: { first_seq: 10, last_seq: 30 } };
+    c.transport.jetstreamManager = async () => ({
+      streams: { info: async (name: string) => ({ created: 'same', state: info[name] }) },
+      consumers: { add: async (name: string, cfg: any) => { starts[name] = cfg.opt_start_seq; return { name: 'x', num_pending: 0 }; } },
+    });
+    c.transport.jetstream = () => ({ consumers: { get: async () => ({ consume: async () => ({ [Symbol.asyncIterator]() { return this; }, next: () => new Promise(() => {}), stop() {} }) }) } });
+    await c.subscribeStreams();
+    assert.equal(starts.CDC_acme, 13, 'the own stream replays from the chain\'s cut, not from the stored position');
+    assert.equal(starts.CDC_PUBLIC, 16, 'the gapped shared stream resumes at the shared cut');
+    assert.equal(db.prepare("SELECT last_seq FROM _zebridge_stream_seq WHERE stream = 'CDC_acme'").get()!.last_seq, 12);
+  } finally {
+    for (const stream of [...c.tailStops.keys()]) await c.stopTail(stream); // their idle timers
+    c.nc = null; db.close();
+  }
+});

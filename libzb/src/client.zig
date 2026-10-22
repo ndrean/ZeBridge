@@ -449,6 +449,9 @@ pub const SyncClient = struct {
     /// The `reconciling` routes the last `gapAndSeed` healed (resumed, not blocked).
     healed_routes: std.array_hash_map.String(void) = .empty,
     reconcile_loaded: bool = false,
+    /// Set when `applyChainFrom` applied a chain (its watermark written), for `gapAndSeed`
+    /// to know which (table, tenant) now holds a chain's state as of its cut.
+    chain_applied: bool = false,
     outbox_ready: bool = false,
     /// Events the seed gate dropped, for the trace.
     gated: usize = 0,
@@ -1644,6 +1647,9 @@ pub const SyncClient = struct {
         // the others are judged by core.streamResume below, from what each chain PROVED
         // on them (§10lw).
         var blocked: std.array_hash_map.String(void) = .empty;
+        // The (table, tenant) pairs a chain was applied to in this pass.
+        const Applied = struct { table: []const u8, tenant: []const u8 };
+        var applied_now: std.ArrayList(Applied) = .empty;
         for (self.followed) |table| {
             if (self.isOnDemand(table)) continue; // §10hj: never seeded from a chain
             const st = self.states.get(table) orelse continue;
@@ -1661,12 +1667,14 @@ pub const SyncClient = struct {
                 // that is not there yet, or cannot splice, leaves `reseed_pending` set.
                 const pending_before = self.reseed_pending;
                 self.reseed_pending = false;
+                self.chain_applied = false;
                 const ok = if (self.applyChain(table, tenant)) |_| !self.reseed_pending else |err| blk: {
                     log.err("{s}: seeding failed: {s} — retried at the next poll", .{ table, @errorName(err) });
                     self.rememberUnseeded(table, @errorName(err));
                     break :blk false;
                 };
                 self.reseed_pending = pending_before or self.reseed_pending or !ok;
+                if (self.chain_applied) try applied_now.append(a, .{ .table = table, .tenant = tenant });
                 const has_chain = (try self.st.query(a, "SELECT tbl FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } })).len > 0;
                 if (ok and has_chain) {
                     _ = self.unseeded.swapRemove(table);
@@ -1692,6 +1700,37 @@ pub const SyncClient = struct {
                     self.reseed_pending = true;
                     break :outer;
                 }
+            }
+        }
+        // A table a chain was applied to holds the chain's state as of its cut, on each
+        // stream it rides. A stream with no gap of its own keeps its position — but when a
+        // gap on the table's OTHER route (the shared stream) reseeded it, the events between
+        // the cut and that position were applied and then overwritten by the chain, deletes
+        // included: the stream rewinds to the cut, and they replay. Found on zb-client-ts
+        // (gen_follow with deletes: 4,000 rows PostgreSQL had deleted survived a reseed).
+        for (applied_now.items) |ap| {
+            const st = self.states.get(ap.table) orelse continue;
+            const rows = try self.st.query(a, "SELECT anchor_stream, anchor_seq, shared_seq FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = ap.table }, .{ .text = ap.tenant } });
+            if (rows.len == 0) continue;
+            const own_route = try self.routeFor(a, ap.tenant);
+            const Pair = struct { stream: []const u8, cut: ?i64 };
+            const pairs = [_]Pair{
+                .{ .stream = own_route, .cut = if (rows[0][0].eqlText(own_route) and rows[0][1] == .integer and rows[0][1].integer > 0) rows[0][1].integer else null },
+                .{ .stream = st.shared_route orelse "", .cut = if (st.shared_route != null and rows[0][2] == .integer) rows[0][2].integer else null },
+            };
+            for (pairs) |pr| {
+                const cut = pr.cut orelse continue;
+                if (pr.stream.len == 0 or gapped.contains(pr.stream)) continue; // the gap path decides those
+                const stored: i64 = @intCast(try self.storedSeq(pr.stream));
+                if (cut >= stored) continue;
+                const first: i64 = if (self.streamFacts(pr.stream)) |f| @intCast(f.first_seq) else |_| continue;
+                if (first > 1 and cut < first - 1) {
+                    log.err("{s}: {s}'s chain was cut at {d}, before the stream's oldest message ({d}) — the events after it cannot replay", .{ pr.stream, ap.table, cut, first });
+                    continue;
+                }
+                log.warn("{s}: rewound to {d} (was {d}) — {s} was reseeded here and replays the events after its chain's cut", .{ pr.stream, cut, stored, ap.table });
+                try self.persistSeq(pr.stream, @intCast(cut));
+                self.dropTail(pr.stream);
             }
         }
         // §10ei, §10lw: where a gapped stream resumes is core.streamResume — the rule
@@ -2335,6 +2374,7 @@ pub const SyncClient = struct {
         // A held event at or below the seed's LSN is inside the chain just applied:
         // superseded, not waiting (the TS client's pruneInboxSeeded).
         try pruneInboxSeeded(&self.st, a, table, seed_lsn);
+        self.chain_applied = true;
         // A full replaced the rows: this client's writes still queued lost their optimistic
         // copies with them, so they go back on top (PROTOCOL §7.4c).
         const had_full = for (plan.array.items) |step| {

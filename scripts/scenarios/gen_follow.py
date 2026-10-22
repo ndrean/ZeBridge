@@ -72,15 +72,21 @@ class Live:
     (ids, and seconds at the emitter's rate), and its holes: (max - min + 1) - count over the
     live rows, which the contiguous oracle keeps at 0 for a consistent replica."""
 
-    def __init__(self, rate):
-        self.rate, self.lags, self.holes, self.at = max(1, rate), [], 0, 0.0
+    def __init__(self, rate, say=None):
+        self.rate, self.lags, self.holes, self.at, self.say, self.last = max(1, rate), [], 0, 0.0, say, None
 
     def sample(self, pg_max, l):
         if time.time() - self.at < 1 or "max" not in l:
             return
         self.at = time.time()
         self.lags.append(max(0, pg_max - l["max"]))
-        self.holes = max(self.holes, (l["max"] - l["min"] + 1) - l["count"] if l["count"] else 0)
+        holes = (l["max"] - l["min"] + 1) - l["count"] if l["count"] else 0
+        self.holes = max(self.holes, holes)
+        # A timeline of the replica while it has holes (and the sample after): when they
+        # open and close, to line up with the client's own log.
+        if self.say and (holes or self.last):
+            self.say(event="holes", holes=holes, min=l["min"], max=l["max"], count=l["count"], wall=round(time.time(), 3))
+        self.last = holes
 
     def report(self):
         if not self.lags:
@@ -150,7 +156,7 @@ def ts_worker(a) -> int:
         if not ready:
             say(event="open_failed", leg=i, said=first.strip()[:160]); proc.kill(); return 1
         caught = None
-        live = Live(a.rate)
+        live = Live(a.rate, say)
         end = (a.t0 + t_close) if t_close is not None else None
         while True:
             now = time.time()
@@ -235,7 +241,7 @@ def worker(a) -> int:
         connect_s = time.time() - t_c
         caught = None
         poll_errors = 0
-        live = Live(a.rate)
+        live = Live(a.rate, say)
         end = (a.t0 + t_close) if t_close is not None else None
         while True:
             p = take(lib.zb_client_poll(h, 500))

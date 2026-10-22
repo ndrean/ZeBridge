@@ -25,7 +25,8 @@ const zb = new ZeBridge({
 });
 zb.onLog((t: string, d: any, level: string) => {
   if (t === 'CDC' || t.startsWith('cdc.')) return; // one line per event would dwarf the run
-  console.error(`[${t} ${level}] ${typeof d === 'string' ? d : JSON.stringify(d)}`.slice(0, 300));
+  // Wall-clock seconds first: a harness lines this log up with its own events.
+  console.error(`${(Date.now() / 1000).toFixed(3)} [${t} ${level}] ${typeof d === 'string' ? d : JSON.stringify(d)}`.slice(0, 320));
 });
 
 try {
