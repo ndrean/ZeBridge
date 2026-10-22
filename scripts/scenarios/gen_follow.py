@@ -107,6 +107,33 @@ def final_truth(done_file) -> dict:
         return {"count": n, "min": 1, "max": n, "notes": None}
 
 
+def rows_digest(lines) -> tuple:
+    """sha256 over ordered `id<TAB>note` lines, and how many: the exact row comparison
+    (an aggregate like sum(length(note)) can hide offsetting errors)."""
+    import hashlib
+    h, n = hashlib.sha256(), 0
+    for line in lines:
+        h.update(line.encode() + b"\n")
+        n += 1
+    return h.hexdigest(), n
+
+
+EXACT_SQL = f"SELECT id, note FROM {TABLE} WHERE tenant_id = '{TENANT}' ORDER BY id"
+SHARED_SQL = f"SELECT note FROM {TABLE} WHERE id = 0 AND tenant_id = '{{open}}'"
+
+
+def replica_exact(db) -> dict:
+    """The replica's ordered rows and its shared row, read from its SQLite file."""
+    import sqlite3
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+    try:
+        digest, n = rows_digest(f"{i}\t{'' if note is None else note}" for i, note in con.execute(EXACT_SQL))
+        shared = con.execute(SHARED_SQL.format(open=os.environ.get("OPEN_TENANT", "_default"))).fetchone()
+        return {"digest": digest, "rows": n, "shared": shared[0] if shared else None}
+    finally:
+        con.close()
+
+
 def matches(l, truth) -> bool:
     return (l.get("count") == l.get("distinct") == truth["count"] and l.get("min") == truth["min"] and l.get("max") == truth["max"]
             and (truth.get("notes") is None or l.get("notes") == truth["notes"]))
@@ -393,17 +420,41 @@ def main() -> int:
         n, lo, hi, notes = (int(x) for x in bt.psql(f"SELECT count(*), coalesce(min(id), 0), coalesce(max(id), 0), coalesce(sum(length(note)), 0) "
                                                      f"FROM public.{TABLE} WHERE tenant_id = '{TENANT}' AND deleted_at IS NULL").stdout.strip().split("|"))
         done_file.write_text(json.dumps({"count": n, "min": lo, "max": hi, "notes": notes}))
+        # The exact truth: PostgreSQL's ordered live rows, and its shared row.
+        pg_rows = subprocess.run([bt.PSQL, bt.db_url(bt.ADMIN_URL, bt.DB), "-At", "-F", "\t", "-c",
+                                  EXACT_SQL.replace(f"tenant_id = '{TENANT}'", f"tenant_id = '{TENANT}' AND deleted_at IS NULL")],
+                                 capture_output=True, text=True, check=True).stdout.splitlines()
+        pg_digest, pg_n = rows_digest(pg_rows)
+        pg_shared = bt.psql(SHARED_SQL.format(open=os.environ.get("OPEN_TENANT", "_default")).replace(f"FROM {TABLE}", f"FROM public.{TABLE}")).stdout.strip()
         print(f"emitter done: {hi} ids in {TENANT}, {n} live, over {time.time() - t0:.0f} s ({a.rate}/s, updates {a.update_rate}/s, deletes {a.delete_rate}/s, noise {a.noise}/s)")
+        exits = {}
         for name, (p, _) in workers.items():
             try:
-                p.wait(timeout=600)
+                exits[name] = p.wait(timeout=600)
             except subprocess.TimeoutExpired:
                 p.kill()
+                exits[name] = "timeout"
 
         # ── the report ──
         failed = 0
+        print(f"PostgreSQL: {pg_n} live rows in {TENANT}, digest {pg_digest[:12]}, shared row {pg_shared!r}")
         for name, (_, wdir) in workers.items():
             events = [json.loads(l) for l in (wdir / "events.jsonl").read_text().splitlines() if l.strip()]
+            # A client passes only by exiting cleanly with exactly one final result whose
+            # replica equals PostgreSQL row for row, shared row included: a crash or a timeout
+            # before `final` must fail the run, not vanish from it.
+            finals = [e for e in events if e["event"] == "final"]
+            try:
+                exact = replica_exact(wdir / "replica.sqlite3")
+            except Exception as err:
+                exact = {"error": str(err)}
+            exact_ok = exact.get("digest") == pg_digest and exact.get("rows") == pg_n and exact.get("shared") == pg_shared
+            if exits.get(name) != 0 or len(finals) != 1 or not exact_ok:
+                failed += 1
+                print(f"\n✗ {name}: exit {exits.get(name)}, {len(finals)} final result(s), exact rows "
+                      f"{'match' if exact_ok else 'DIFFER: ' + json.dumps({k: (v[:12] if k == 'digest' else v) for k, v in exact.items()})}")
+            else:
+                print(f"\n✓ {name}: exit 0, one final result, {exact['rows']} rows equal PostgreSQL's in order (id, note), shared row present")
             logtext = (wdir / "libzb.log").read_text(errors="replace")
             counts = {k: logtext.count(v) for k, v in MARKS.items()}
             print(f"\n{name} ({SCHEDULE[name][0]})  schedule {SCHEDULE[name][1]}")
