@@ -69,6 +69,8 @@ def main():
     ap.add_argument("--seed-domain", default="")
     ap.add_argument("--tenant", default="storm")
     ap.add_argument("--schedule", help='[[open_s, close_s|null], ...] from --t0')
+    ap.add_argument("--enroll-only", action="store_true",
+                    help="with --batch: redeem each client's invite in turn (backing off when refused), keep the identity, connect nothing else")
     ap.add_argument("--t0", type=float, required=True)
     ap.add_argument("--done-file", required=True)
     a = ap.parse_args()
@@ -77,6 +79,7 @@ def main():
     lib.zb_free.argtypes = [ctypes.c_void_p]
     lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
     lib.zb_client_close.argtypes = [ctypes.c_uint64]
+    lib.zb_last_error.restype = ctypes.c_char_p
     for n, extra in (("sync", []), ("poll", [ctypes.c_uint64])):
         f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + extra
 
@@ -87,6 +90,33 @@ def main():
             lib.zb_free(p)
 
     lock = threading.Lock()
+
+    if a.batch and a.enroll_only:
+        # One at a time: the bridge redeems a few invites at a time, and a crowd of them
+        # from one address is refused (2026-10-22: 92 of 95 at once never enrolled).
+        failed = 0
+        for c in json.loads(pathlib.Path(a.batch).read_text()):
+            ident = pathlib.Path(a.identity.format(name=c["name"]))
+            if ident.exists():
+                print(json.dumps({"client": c["name"], "enroll": "kept"}), flush=True)
+                continue
+            opts = {"dbPath": a.db.format(name=c["name"]), "identityPath": str(ident), "tables": [TABLE], "heartbeatMs": 0,
+                    "natsUrl": a.nats, "bridgeUrl": a.bridge,
+                    "invite": pathlib.Path(a.invite_file.format(name=c["name"])).read_text().strip()}
+            delay, why = 2.0, ""
+            for attempt in range(12):
+                h = lib.zb_client_connect(json.dumps(opts).encode())
+                if h:
+                    lib.zb_client_close(h)
+                    break
+                why = (lib.zb_last_error() or b"").decode(errors="replace")[:200]
+                time.sleep(delay)
+                delay = min(delay * 1.5, 30)
+            ok = ident.exists()
+            failed += not ok
+            print(json.dumps({"client": c["name"], "enroll": "enrolled" if ok else "failed", "attempts": attempt + 1,
+                              **({} if ok else {"error": why})}), flush=True)
+        return 1 if failed else 0
 
     if a.batch:
         threads = []
@@ -134,9 +164,10 @@ def run_client(a, lib, take, lock, measure):
         say(event="leg", leg=i, start_ms=int(t_c * 1000), targets=targets, cold=i == 0)
         h = lib.zb_client_connect(json.dumps(opts).encode())
         while not h:
+            why = (lib.zb_last_error() or b"").decode(errors="replace")[:200]
             if time.time() - t_c > 300:
-                say(event="open_failed", leg=i); return 1
-            say(event="open_retry", leg=i)
+                say(event="open_failed", leg=i, error=why); return 1
+            say(event="open_retry", leg=i, error=why)
             time.sleep(5)
             h = lib.zb_client_connect(json.dumps(opts).encode())
         synced = take(lib.zb_client_sync(h))

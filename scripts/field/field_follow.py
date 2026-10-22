@@ -134,6 +134,7 @@ def main() -> int:
     ap.add_argument("--deletes", type=int, default=50)
     ap.add_argument("--out", default=str(ROOT / "docs" / "bench" / "field"))
     ap.add_argument("--clients", type=int, default=5, help="5 measured clients, plus c006…cN (unmeasured, ten per process)")
+    ap.add_argument("--enroll-only", action="store_true", help="redeem the extra clients' invites one by one, keep their identities, and stop")
     a = ap.parse_args()
 
     run = time.strftime("%m%d%H%M") + a.via[0]
@@ -149,6 +150,19 @@ def main() -> int:
         sys.exit(f"missing on the VPS: {missing} — see docs/plans/field-measurements.md")
     subprocess.run(["scp", "-q", str(pathlib.Path(__file__).with_name("field_worker.py")), f"{CANADA}:{REMOTE}/field_worker.py"], check=True)
     ssh(CANADA, f"mkdir -p {REMOTE}/ids {REMOTE}/runs/{run} && chmod 700 {REMOTE}/ids")
+    if a.enroll_only:
+        ssh(CANADA, f"cat > {REMOTE}/runs/{run}/enroll.json", input=json.dumps(extra))
+        out_text = ssh(CANADA, f"cd ~/{REMOTE} && venv/bin/python field_worker.py --batch runs/{run}/enroll.json --enroll-only "
+                               f"--lib lib/libzbcore.so --db 'runs/{run}/{{name}}.sqlite3' --identity 'ids/{{name}}.identity' "
+                               f"--invite-file 'invites/{{name}}.code' --nats {HUB_NATS} --hub-nats {HUB_NATS} --t0 0 --done-file /dev/null "
+                               f"2> runs/{run}/enroll.log; rm -f runs/{run}/c*.sqlite3*", check=False)
+        rows = [json.loads(l) for l in out_text.splitlines() if l.strip()]
+        from collections import Counter
+        print(Counter(r["enroll"] for r in rows))
+        for r in rows:
+            if r["enroll"] == "failed":
+                print("  ", r)
+        return 0 if all(r["enroll"] != "failed" for r in rows) else 1
 
     print(f"run {run}: via {a.via}, {a.seconds} s of load ({a.inserts} inserts, {a.updates} updates, {a.deletes} deletes /s)", flush=True)
     c_idle0 = counters()
