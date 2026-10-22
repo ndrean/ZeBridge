@@ -59,8 +59,8 @@ pub fn parseOutcome(a: std.mem.Allocator, text: []const u8) !Outcome {
 }
 
 const lock_sql = "SELECT zebridge_private.lock_receipts(ARRAY[$1::text], ARRAY[$2::text])";
-const claim_sql = "SELECT status, outcome::text, fingerprint FROM zebridge_private.lookup_receipts($1, ARRAY[$2::text], ARRAY[$3::bytea], ARRAY[$4::bytea])";
-const finish_sql = "SELECT zebridge_private.record_receipts($1, ARRAY[$2::text], ARRAY[$3::bytea], ARRAY[$4::jsonb])";
+const claim_sql = "SELECT status, outcome::text, fingerprint FROM zebridge_private.lookup_receipts(ARRAY[$1::text], ARRAY[$2::text], ARRAY[$3::bytea], ARRAY[$4::bytea])";
+const finish_sql = "SELECT zebridge_private.record_receipts(ARRAY[$1::text], ARRAY[$2::text], ARRAY[$3::bytea], ARRAY[$4::jsonb])";
 pub const close_sql = "SELECT zebridge_private.close_guard()";
 
 /// `$first`, `$first+1`, … as `ARRAY[$i::cast, …]`: every element its own parameter, so
@@ -94,53 +94,58 @@ pub fn sendLocks(a: std.mem.Allocator, conn: ?*c.PGconn, principals: []const [:0
     return c.PQsendQueryParams(conn, sql_z.ptr, @intCast(2 * n), null, values.ptr, null, null, 0) == 1;
 }
 
-/// One principal's lookups in one call, pipelined; the rows come back in `ids` order. The
-/// routes and payloads go as binary parameters: the exact bytes received, which is what
-/// the fingerprint is taken over. (Per call, a function costs about 60 µs over its rows:
-/// one call per principal, not per write.)
-pub fn sendClaims(a: std.mem.Allocator, conn: ?*c.PGconn, principal: [:0]const u8, ids: []const [:0]const u8, routes: []const []const u8, payloads: []const []const u8) !bool {
+/// A batch's lookups in one call, pipelined, a principal per row; the rows come back in
+/// `ids` order. The routes and payloads go as binary parameters: the exact bytes received,
+/// which is what the fingerprint is taken over. One call per batch, not per principal: a
+/// function call costs about 60 µs over its rows, and a batch from 200 devices paid it
+/// 200 times (measured: one lane at 2,035 writes/s against 4,120 from one principal).
+pub fn sendClaims(a: std.mem.Allocator, conn: ?*c.PGconn, principals: []const [:0]const u8, ids: []const [:0]const u8, routes: []const []const u8, payloads: []const []const u8) !bool {
     const n = ids.len;
     var sql: std.ArrayList(u8) = .empty;
-    try sql.appendSlice(a, "SELECT status, outcome::text, fingerprint FROM zebridge_private.lookup_receipts($1, ");
-    try placeholders(a, &sql, 2, n, "text");
+    try sql.appendSlice(a, "SELECT status, outcome::text, fingerprint FROM zebridge_private.lookup_receipts(");
+    try placeholders(a, &sql, 1, n, "text");
     try sql.appendSlice(a, ", ");
-    try placeholders(a, &sql, 2 + n, n, "bytea");
+    try placeholders(a, &sql, 1 + n, n, "text");
     try sql.appendSlice(a, ", ");
-    try placeholders(a, &sql, 2 + 2 * n, n, "bytea");
+    try placeholders(a, &sql, 1 + 2 * n, n, "bytea");
+    try sql.appendSlice(a, ", ");
+    try placeholders(a, &sql, 1 + 3 * n, n, "bytea");
     try sql.appendSlice(a, ") ORDER BY ord");
     const sql_z = try a.dupeZ(u8, sql.items);
-    const values = try a.alloc(?[*]const u8, 1 + 3 * n);
-    const lengths = try a.alloc(c_int, 1 + 3 * n);
-    const formats = try a.alloc(c_int, 1 + 3 * n);
-    values[0], lengths[0], formats[0] = .{ principal.ptr, 0, 0 };
+    const values = try a.alloc(?[*]const u8, 4 * n);
+    const lengths = try a.alloc(c_int, 4 * n);
+    const formats = try a.alloc(c_int, 4 * n);
     for (0..n) |i| {
-        values[1 + i], lengths[1 + i], formats[1 + i] = .{ ids[i].ptr, 0, 0 };
-        values[1 + n + i], lengths[1 + n + i], formats[1 + n + i] = .{ routes[i].ptr, @intCast(routes[i].len), 1 };
-        values[1 + 2 * n + i], lengths[1 + 2 * n + i], formats[1 + 2 * n + i] = .{ payloads[i].ptr, @intCast(payloads[i].len), 1 };
+        values[i], lengths[i], formats[i] = .{ principals[i].ptr, 0, 0 };
+        values[n + i], lengths[n + i], formats[n + i] = .{ ids[i].ptr, 0, 0 };
+        values[2 * n + i], lengths[2 * n + i], formats[2 * n + i] = .{ routes[i].ptr, @intCast(routes[i].len), 1 };
+        values[3 * n + i], lengths[3 * n + i], formats[3 * n + i] = .{ payloads[i].ptr, @intCast(payloads[i].len), 1 };
     }
-    return c.PQsendQueryParams(conn, sql_z.ptr, @intCast(1 + 3 * n), null, values.ptr, lengths.ptr, formats.ptr, 0) == 1;
+    return c.PQsendQueryParams(conn, sql_z.ptr, @intCast(4 * n), null, values.ptr, lengths.ptr, formats.ptr, 0) == 1;
 }
 
-/// One principal's complete receipts in one call, pipelined (one INSERT).
-pub fn sendFinishes(a: std.mem.Allocator, conn: ?*c.PGconn, principal: [:0]const u8, ids: []const [:0]const u8, fps: []const [:0]const u8, outcomes: []const [:0]const u8) !bool {
+/// A batch's complete receipts in one call, pipelined (one INSERT), a principal per row.
+pub fn sendFinishes(a: std.mem.Allocator, conn: ?*c.PGconn, principals: []const [:0]const u8, ids: []const [:0]const u8, fps: []const [:0]const u8, outcomes: []const [:0]const u8) !bool {
     const n = ids.len;
     var sql: std.ArrayList(u8) = .empty;
-    try sql.appendSlice(a, "SELECT zebridge_private.record_receipts($1, ");
-    try placeholders(a, &sql, 2, n, "text");
+    try sql.appendSlice(a, "SELECT zebridge_private.record_receipts(");
+    try placeholders(a, &sql, 1, n, "text");
     try sql.appendSlice(a, ", ");
-    try placeholders(a, &sql, 2 + n, n, "bytea");
+    try placeholders(a, &sql, 1 + n, n, "text");
     try sql.appendSlice(a, ", ");
-    try placeholders(a, &sql, 2 + 2 * n, n, "jsonb");
+    try placeholders(a, &sql, 1 + 2 * n, n, "bytea");
+    try sql.appendSlice(a, ", ");
+    try placeholders(a, &sql, 1 + 3 * n, n, "jsonb");
     try sql.append(a, ')');
     const sql_z = try a.dupeZ(u8, sql.items);
-    const values = try a.alloc(?[*:0]const u8, 1 + 3 * n);
-    values[0] = principal.ptr;
+    const values = try a.alloc(?[*:0]const u8, 4 * n);
     for (0..n) |i| {
-        values[1 + i] = ids[i].ptr;
-        values[1 + n + i] = fps[i].ptr;
-        values[1 + 2 * n + i] = outcomes[i].ptr;
+        values[i] = principals[i].ptr;
+        values[n + i] = ids[i].ptr;
+        values[2 * n + i] = fps[i].ptr;
+        values[3 * n + i] = outcomes[i].ptr;
     }
-    return c.PQsendQueryParams(conn, sql_z.ptr, @intCast(1 + 3 * n), null, values.ptr, null, null, 0) == 1;
+    return c.PQsendQueryParams(conn, sql_z.ptr, @intCast(4 * n), null, values.ptr, null, null, 0) == 1;
 }
 
 /// A grouped claim's rows, one per ID in send order.
@@ -375,8 +380,8 @@ pub fn bootCheck(conn: ?*c.PGconn) !void {
     const sql =
         \\SELECT has_schema_privilege(current_user, 'zebridge_private', 'USAGE')
         \\   AND has_function_privilege(current_user, 'zebridge_private.lock_receipts(text[], text[])', 'EXECUTE')
-        \\   AND has_function_privilege(current_user, 'zebridge_private.lookup_receipts(text, text[], bytea[], bytea[])', 'EXECUTE')
-        \\   AND has_function_privilege(current_user, 'zebridge_private.record_receipts(text, text[], bytea[], jsonb[])', 'EXECUTE')
+        \\   AND has_function_privilege(current_user, 'zebridge_private.lookup_receipts(text[], text[], bytea[], bytea[])', 'EXECUTE')
+        \\   AND has_function_privilege(current_user, 'zebridge_private.record_receipts(text[], text[], bytea[], jsonb[])', 'EXECUTE')
         \\   AND has_function_privilege(current_user, 'zebridge_private.close_guard()', 'EXECUTE')
         \\   AND has_function_privilege(current_user, 'zebridge_private.maintain_receipts()', 'EXECUTE')
     ;

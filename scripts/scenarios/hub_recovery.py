@@ -202,14 +202,14 @@ async def main():
                   f"a write crosses admission, commits, echoes and clears its original client outbox (rows {rows(h)}, pending {pending(h)})")
             # A decided receipt in monthly partitions, as a running bridge leaves them.
             receipt_id = f"zb1-t{int(time.time() * 1000)}-recovery-1"
-            receipt_args = (f"'lf-edge1.recovery_device', ARRAY['{receipt_id}']::text[], "
+            receipt_args = (f"ARRAY['lf-edge1.recovery_device']::text[], ARRAY['{receipt_id}']::text[], "
                             "ARRAY[convert_to('mutation.lf-edge1.recovery_device.recovery_row.insert','UTF8')]::bytea[], "
                             "ARRAY[convert_to('{}','UTF8')]::bytea[]")
             route = "convert_to('mutation.lf-edge1.recovery_device.recovery_row.insert','UTF8')"
             sql("SELECT count(*) FROM zebridge_private.maintain_receipts(); BEGIN; "
                 f"SELECT zebridge_private.lock_receipts(ARRAY['lf-edge1.recovery_device']::text[], ARRAY['{receipt_id}']::text[]); "
                 f"SELECT count(*) FROM zebridge_private.lookup_receipts({receipt_args}); "
-                f"SELECT zebridge_private.record_receipts('lf-edge1.recovery_device', ARRAY['{receipt_id}']::text[], "
+                f"SELECT zebridge_private.record_receipts(ARRAY['lf-edge1.recovery_device']::text[], ARRAY['{receipt_id}']::text[], "
                 f"ARRAY[sha256(int4send(length({route})) || {route} || convert_to('{{}}','UTF8'))]::bytea[], "
                 "ARRAY['{\"committed\":true}'::jsonb]); " + ("SELECT zebridge_private.close_guard(); " if GUARD else "") + "COMMIT;")
             policy_sql = "SELECT retention_days || '|' || min_accepted_ms || '|' || completion_guard FROM zebridge_private.receipt_policy"

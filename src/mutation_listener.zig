@@ -1370,10 +1370,9 @@ pub const MutationListener = struct {
         // From here on, ANY error return (allocation failures included) leaves the
         // connection idle and outside any transaction, ready for the per-message replay.
         errdefer self.abandonTransaction(conn);
-        // One claim call per principal (a function call costs about 60 µs beyond its rows):
-        // `order` is sorted by (principal, ID), so a group is a run of one principal, its IDs
-        // in key order, which is the lock order.
-        const groups = try principalRuns(a, items.items, order.items);
+        // One lookup call for the whole batch, a principal per row: a function call costs
+        // about 60 µs beyond its rows, and one call per principal made a batch from many
+        // devices pay it per device. `order` is sorted by (principal, ID).
         if (c.PQenterPipelineMode(conn) != 1) return error.MutationFailed;
         var sent_ok = c.PQsendQueryParams(conn, "BEGIN", 0, null, null, null, null, 0) == 1;
         // Every receipt key locked first, in one call, before any receipt is read: a
@@ -1387,31 +1386,33 @@ pub const MutationListener = struct {
             }
             sent_ok = sent_ok and try receipts.sendLocks(a, conn, principals, ids);
         }
-        for (groups) |g| {
-            const span = order.items[g[0]..g[1]];
+        {
+            const span = order.items;
+            const principals = try a.alloc([:0]const u8, span.len);
             const ids = try a.alloc([:0]const u8, span.len);
             const routes = try a.alloc([]const u8, span.len);
             const payloads = try a.alloc([]const u8, span.len);
             for (span, 0..) |k, n| {
+                principals[n] = items.items[k].principal_z;
                 ids[n] = items.items[k].id_z;
                 routes[n] = items.items[k].route;
                 payloads[n] = items.items[k].msg.msg.data;
             }
-            sent_ok = sent_ok and try receipts.sendClaims(a, conn, items.items[span[0]].principal_z, ids, routes, payloads);
+            sent_ok = sent_ok and try receipts.sendClaims(a, conn, principals, ids, routes, payloads);
         }
         var failed_at: usize = 0;
         if (!sent_ok or c.PQpipelineSync(conn) != 1) return error.MutationFailed;
-        const r1 = try receipts.collect(a, conn, groups.len + 2, &failed_at);
+        const r1 = try receipts.collect(a, conn, 3, &failed_at);
         defer receipts.clearAll(r1);
         try self.leavePipeline(conn);
         if (failed_at != r1.len) return error.ReceiptInfrastructure;
         if (faultAt(.oom_in_claims)) return error.OutOfMemory;
         if (faultAt(.reset_after_claims)) c.PQreset(conn); // the transaction and its claims are gone
         try requireTransaction(conn);
-        for (groups, 0..) |g, gi| {
-            const claims = try a.alloc(receipts.Claim, g[1] - g[0]);
-            try receipts.readClaims(a, r1[gi + 2], claims);
-            for (order.items[g[0]..g[1]], claims) |k, claim| items.items[k].claim = claim;
+        {
+            const claims = try a.alloc(receipts.Claim, order.items.len);
+            try receipts.readClaims(a, r1[2], claims);
+            for (order.items, claims) |k, claim| items.items[k].claim = claim;
         }
         for (items.items, 0..) |*it, k| {
             if (it.first == k) continue;
@@ -1507,18 +1508,19 @@ pub const MutationListener = struct {
             // The transaction must still hold the claims and the writes: a COMMIT sent
             // outside one answers only a warning, with the very tag COMMIT.
             try requireTransaction(conn);
-            // One finish call per principal, over the decided writes in `order`.
-            const fgroups = try principalRuns(a, items.items, done.items);
+            // One record call for every decided write in `order`, a principal per row.
             if (c.PQenterPipelineMode(conn) != 1) return error.MutationFailed;
             sent_ok = true;
             // Test fault: COMMIT after the writes, with no receipt (and no close_guard).
             const skip_receipts = faultAt(.commit_before_receipts);
-            for (if (skip_receipts) fgroups[0..0] else fgroups) |g| {
-                const span = done.items[g[0]..g[1]];
+            if (!skip_receipts) {
+                const span = done.items;
+                const principals = try a.alloc([:0]const u8, span.len);
                 const ids = try a.alloc([:0]const u8, span.len);
                 const fps = try a.alloc([:0]const u8, span.len);
                 const outcomes = try a.alloc([:0]const u8, span.len);
                 for (span, 0..) |k, n| {
+                    principals[n] = items.items[k].principal_z;
                     ids[n] = items.items[k].id_z;
                     fps[n] = items.items[k].claim.fingerprint orelse return error.ReceiptInfrastructure;
                     if (items.items[k].refused) |err| {
@@ -1532,13 +1534,13 @@ pub const MutationListener = struct {
                         .version = pnd.version_buf[0..pnd.version_len],
                     });
                 }
-                sent_ok = sent_ok and try receipts.sendFinishes(a, conn, items.items[span[0]].principal_z, ids, fps, outcomes);
-                if (faultAt(.oom_in_finishes)) return error.OutOfMemory; // a finish queued, the pipeline open
+                sent_ok = sent_ok and try receipts.sendFinishes(a, conn, principals, ids, fps, outcomes);
+                if (faultAt(.oom_in_finishes)) return error.OutOfMemory; // the record queued, the pipeline open
             }
             // close_guard verifies the receipts are exactly the undecided set.
             const close = receipts.guard and !skip_receipts;
             if (close) sent_ok = sent_ok and c.PQsendQueryParams(conn, receipts.close_sql, 0, null, null, null, null, 0) == 1;
-            const finishes = (if (skip_receipts) 0 else fgroups.len) + @intFromBool(close);
+            const finishes = @as(usize, @intFromBool(!skip_receipts)) + @intFromBool(close);
             sent_ok = sent_ok and c.PQsendQueryParams(conn, "COMMIT", 0, null, null, null, null, 0) == 1;
             if (!sent_ok or c.PQpipelineSync(conn) != 1) return error.MutationFailed;
             // Lost before the COMMIT's answer: ambiguous. The replay claims again, and a
@@ -1584,21 +1586,6 @@ pub const MutationListener = struct {
             }
             it.msg.ack() catch {};
         }
-    }
-
-    /// Runs of one principal in `keys` (indexes into `items`, sorted by principal): one
-    /// [start, end) per run.
-    fn principalRuns(a: std.mem.Allocator, items: []const BatchItem, keys: []const usize) ![]const [2]usize {
-        var runs: std.ArrayList([2]usize) = .empty;
-        var from: usize = 0;
-        for (keys, 0..) |k, n| {
-            if (n > from and !std.mem.eql(u8, items[k].principal_z, items[keys[from]].principal_z)) {
-                try runs.append(a, .{ from, n });
-                from = n;
-            }
-        }
-        if (keys.len > from) try runs.append(a, .{ from, keys.len });
-        return runs.items;
     }
 
     /// Leave pipeline mode after a round. A connection that cannot is reset, which ends

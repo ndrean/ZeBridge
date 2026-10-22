@@ -37,7 +37,7 @@ def main():
         bodies = bodies or ["x"] * len(ids)
         arr = ",".join(f"'{i}'" for i in ids)
         return (f"SELECT string_agg(status || '=' || encode(fingerprint, 'hex'), ' ' ORDER BY ord) FROM zebridge_private.lookup_receipts("
-                f"'{principal}', ARRAY[{arr}], ARRAY[{','.join(["convert_to('r','UTF8')"] * len(ids))}]::bytea[], "
+                f"ARRAY[{','.join([f"'{principal}'"] * len(ids))}], ARRAY[{arr}], ARRAY[{','.join(["convert_to('r','UTF8')"] * len(ids))}]::bytea[], "
                 f"ARRAY[{','.join(f"convert_to('{b}','UTF8')" for b in bodies)}]::bytea[]);\n")
 
     def lock(ids, principals=None):
@@ -51,7 +51,7 @@ def main():
     def record(ids, fp_sql, principal="alice"):
         fps = fp_sql if isinstance(fp_sql, list) else [fp_sql] * len(ids)
         arr = ",".join(f"'{i}'" for i in ids)
-        return (f"SELECT zebridge_private.record_receipts('{principal}', ARRAY[{arr}], ARRAY[{','.join(fps)}]::bytea[], "
+        return (f"SELECT zebridge_private.record_receipts(ARRAY[{','.join([f"'{principal}'"] * len(ids))}], ARRAY[{arr}], ARRAY[{','.join(fps)}]::bytea[], "
                 f"ARRAY[{','.join(["'{\"status\":\"accepted\"}'"] * len(ids))}]::jsonb[]);\n")
 
     fp = body_fp("x")

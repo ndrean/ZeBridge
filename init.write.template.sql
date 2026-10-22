@@ -1358,12 +1358,16 @@ BEGIN
 END;
 $$;
 
--- After lock_receipts: one row per position, without inserting anything.
+-- After lock_receipts: one row per position, without inserting anything. A whole batch in
+-- one call, a principal per row: a function call has a fixed cost, so one call per
+-- principal made a batch from many devices pay that cost once per device.
 --   claimed   undecided: execute it, then record_receipts with its outcome
---   duplicate / repeat / conflict / expired / future / invalid: as claim_receipts did
--- `fingerprint` is returned for record_receipts. With the completion guard on, the
--- undecided entries become this transaction's guard when enabled.
-CREATE OR REPLACE FUNCTION zebridge_private.lookup_receipts(p_principal text, p_ids text[], p_routes bytea[], p_payloads bytea[])
+--   duplicate / repeat / conflict / expired / future / invalid
+-- A repeat is a later position with the same (principal, ID) in the same call. With the
+-- completion guard on, the undecided entries become this transaction's guard.
+DROP FUNCTION IF EXISTS zebridge_private.lookup_receipts(text, text[], bytea[], bytea[]);
+DROP FUNCTION IF EXISTS zebridge_private.record_receipts(text, text[], bytea[], jsonb[]);
+CREATE OR REPLACE FUNCTION zebridge_private.lookup_receipts(p_principals text[], p_ids text[], p_routes bytea[], p_payloads bytea[])
 RETURNS TABLE(ord integer, status text, outcome jsonb, fingerprint bytea)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog
 SET enable_hashjoin = off SET enable_mergejoin = off SET enable_seqscan = off AS $$
@@ -1374,34 +1378,39 @@ DECLARE
     months   date[];
     verdicts text[];
     timing   text[];
-    first    integer;
+    firsts   integer[];
     rec_fp   bytea;
     rec_outcome jsonb;
     g_keys   text[] := '{}';
     g_fps    bytea[] := '{}';
     p_guard  boolean;
 BEGIN
-    IF p_principal IS NULL OR p_principal = '' THEN
+    IF cardinality(p_principals) IS DISTINCT FROM cardinality(p_ids)
+       OR cardinality(p_ids) IS DISTINCT FROM cardinality(p_routes)
+       OR cardinality(p_ids) IS DISTINCT FROM cardinality(p_payloads) THEN
+        RAISE EXCEPTION 'lookup_receipts: principals, ids, routes and payloads differ in length' USING ERRCODE = '22023';
+    END IF;
+    IF EXISTS (SELECT 1 FROM unnest(p_principals) AS pr WHERE pr IS NULL OR pr = '') THEN
         RAISE EXCEPTION 'a receipt needs an authenticated principal' USING ERRCODE = '22023';
     END IF;
-    IF cardinality(p_ids) IS DISTINCT FROM cardinality(p_routes)
-       OR cardinality(p_ids) IS DISTINCT FROM cardinality(p_payloads) THEN
-        RAISE EXCEPTION 'lookup_receipts: ids, routes and payloads differ in length' USING ERRCODE = '22023';
-    END IF;
     SELECT min_accepted_ms, completion_guard INTO floor_ms, p_guard FROM zebridge_private.receipt_policy;
-    SELECT array_agg(i.fp ORDER BY i.n), array_agg(i.m ORDER BY i.n), array_agg(i.v ORDER BY i.n), array_agg(i.t ORDER BY i.n)
-      INTO fps, months, verdicts, timing
-      FROM (SELECT x.n,
-                   sha256(int4send(length(x.r)) || x.r || x.p) AS fp,
-                   zebridge_private.receipt_month(x.id) AS m,
-                   CASE WHEN x.id IS NULL OR x.r IS NULL OR x.p IS NULL
-                             OR octet_length(x.id) NOT BETWEEN 1 AND 512 OR x.id ~ '[.*>\x01-\x20\x7f]'
-                             OR zebridge_private.receipt_month(x.id) IS NULL THEN 'invalid'
-                        ELSE 'candidate' END AS v,
-                   CASE WHEN zebridge_private.receipt_created_ms(x.id) < floor_ms THEN 'expired'
-                        WHEN zebridge_private.receipt_created_ms(x.id) > now_ms + 60000 THEN 'future'
-                        ELSE 'ok' END AS t
-              FROM unnest(p_ids, p_routes, p_payloads) WITH ORDINALITY AS x(id, r, p, n)) i;
+    SELECT array_agg(i.fp ORDER BY i.n), array_agg(i.m ORDER BY i.n), array_agg(i.v ORDER BY i.n), array_agg(i.t ORDER BY i.n),
+           array_agg(i.f ORDER BY i.n)
+      INTO fps, months, verdicts, timing, firsts
+      FROM (SELECT c.*,
+                   -- The first position of this (principal, ID) among the valid candidates.
+                   CASE WHEN c.v = 'candidate' THEN min(c.n) FILTER (WHERE c.v = 'candidate') OVER (PARTITION BY c.pr, c.id) END AS f
+              FROM (SELECT x.n::integer AS n, x.pr, x.id,
+                           sha256(int4send(length(x.r)) || x.r || x.p) AS fp,
+                           zebridge_private.receipt_month(x.id) AS m,
+                           CASE WHEN x.id IS NULL OR x.r IS NULL OR x.p IS NULL
+                                     OR octet_length(x.id) NOT BETWEEN 1 AND 512 OR x.id ~ '[.*>\x01-\x20\x7f]'
+                                     OR zebridge_private.receipt_month(x.id) IS NULL THEN 'invalid'
+                                ELSE 'candidate' END AS v,
+                           CASE WHEN zebridge_private.receipt_created_ms(x.id) < floor_ms THEN 'expired'
+                                WHEN zebridge_private.receipt_created_ms(x.id) > now_ms + 60000 THEN 'future'
+                                ELSE 'ok' END AS t
+                      FROM unnest(p_principals, p_ids, p_routes, p_payloads) WITH ORDINALITY AS x(pr, id, r, p, n)) c) i;
 
     FOR n IN 1 .. coalesce(cardinality(p_ids), 0) LOOP
         ord := n;
@@ -1409,32 +1418,23 @@ BEGIN
         fingerprint := fps[n];
         IF verdicts[n] <> 'candidate' THEN
             status := verdicts[n];
+        ELSIF firsts[n] < n THEN
+            status := CASE WHEN fps[n] = fps[firsts[n]] THEN 'repeat' ELSE 'conflict' END;
         ELSE
-            first := n;
-            FOR e IN 1 .. n - 1 LOOP
-                IF p_ids[e] = p_ids[n] AND verdicts[e] = 'candidate' THEN
-                    first := e;
-                    EXIT;
-                END IF;
-            END LOOP;
-            IF first < n THEN
-                status := CASE WHEN fps[n] = fps[first] THEN 'repeat' ELSE 'conflict' END;
+            SELECT r.fingerprint, r.outcome INTO rec_fp, rec_outcome
+              FROM zebridge_private.receipts r
+             WHERE r.principal = p_principals[n] AND r.message_id = p_ids[n] AND r.id_month = months[n];
+            IF FOUND AND rec_fp = fps[n] THEN
+                status := 'duplicate';
+                outcome := rec_outcome;
+            ELSIF FOUND THEN
+                status := 'conflict';
+            ELSIF timing[n] <> 'ok' THEN
+                status := timing[n];
             ELSE
-                SELECT r.fingerprint, r.outcome INTO rec_fp, rec_outcome
-                  FROM zebridge_private.receipts r
-                 WHERE r.principal = p_principal AND r.message_id = p_ids[n] AND r.id_month = months[n];
-                IF FOUND AND rec_fp = fps[n] THEN
-                    status := 'duplicate';
-                    outcome := rec_outcome;
-                ELSIF FOUND THEN
-                    status := 'conflict';
-                ELSIF timing[n] <> 'ok' THEN
-                    status := timing[n];
-                ELSE
-                    status := 'claimed';
-                    g_keys := g_keys || (p_principal || chr(31) || p_ids[n]);
-                    g_fps := g_fps || fps[n];
-                END IF;
+                status := 'claimed';
+                g_keys := g_keys || (p_principals[n] || chr(31) || p_ids[n]);
+                g_fps := g_fps || fps[n];
             END IF;
         END IF;
         RETURN NEXT;
@@ -1448,26 +1448,30 @@ BEGIN
 END;
 $$;
 
--- Insert the completed receipts of one principal, once. A plain INSERT: a conflict raises
--- (unique_violation), so the transaction can never commit a write without its own
--- receipt. With the completion guard on, the inserted set is added to this transaction's
--- guard.
-CREATE OR REPLACE FUNCTION zebridge_private.record_receipts(p_principal text, p_ids text[], p_fps bytea[], p_outcomes jsonb[])
+-- Insert the completed receipts of a batch, once, a principal per row. A plain INSERT: a
+-- conflict raises (unique_violation), so the transaction can never commit a write without
+-- its own receipt. With the completion guard on, the inserted set is added to this
+-- transaction's guard.
+CREATE OR REPLACE FUNCTION zebridge_private.record_receipts(p_principals text[], p_ids text[], p_fps bytea[], p_outcomes jsonb[])
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
     p_guard boolean;
 BEGIN
     SELECT completion_guard INTO p_guard FROM zebridge_private.receipt_policy;
-    IF cardinality(p_ids) IS DISTINCT FROM cardinality(p_fps) OR cardinality(p_ids) IS DISTINCT FROM cardinality(p_outcomes)
+    IF cardinality(p_principals) IS DISTINCT FROM cardinality(p_ids)
+       OR cardinality(p_ids) IS DISTINCT FROM cardinality(p_fps) OR cardinality(p_ids) IS DISTINCT FROM cardinality(p_outcomes)
        OR array_position(p_outcomes, NULL) IS NOT NULL THEN
-        RAISE EXCEPTION 'record_receipts: one fingerprint and one non-null outcome per ID' USING ERRCODE = '22023';
+        RAISE EXCEPTION 'record_receipts: one principal, fingerprint and non-null outcome per ID' USING ERRCODE = '22023';
+    END IF;
+    IF EXISTS (SELECT 1 FROM unnest(p_principals) AS pr WHERE pr IS NULL OR pr = '') THEN
+        RAISE EXCEPTION 'a receipt needs an authenticated principal' USING ERRCODE = '22023';
     END IF;
     INSERT INTO zebridge_private.receipts (principal, message_id, id_month, fingerprint, outcome)
-    SELECT p_principal, o.id, zebridge_private.receipt_month(o.id), o.fp, o.outcome
-      FROM unnest(p_ids, p_fps, p_outcomes) AS o(id, fp, outcome);
+    SELECT o.pr, o.id, zebridge_private.receipt_month(o.id), o.fp, o.outcome
+      FROM unnest(p_principals, p_ids, p_fps, p_outcomes) AS o(pr, id, fp, outcome);
     IF p_guard THEN
         UPDATE zebridge_private.receipt_guards g
-           SET actual_keys = g.actual_keys || ARRAY(SELECT p_principal || chr(31) || i FROM unnest(p_ids) AS i),
+           SET actual_keys = g.actual_keys || ARRAY(SELECT o.pr || chr(31) || o.id FROM unnest(p_principals, p_ids) WITH ORDINALITY AS o(pr, id, n) ORDER BY o.n),
                actual_fps = g.actual_fps || p_fps
          WHERE g.txid = pg_current_xact_id();
         IF NOT FOUND THEN
@@ -1519,8 +1523,8 @@ BEGIN
 END $$;
 GRANT EXECUTE ON FUNCTION zebridge_private.maintain_receipts() TO ${POSTGRES_WRITER_USER};
 GRANT EXECUTE ON FUNCTION zebridge_private.lock_receipts(text[], text[]) TO ${POSTGRES_WRITER_USER};
-GRANT EXECUTE ON FUNCTION zebridge_private.lookup_receipts(text, text[], bytea[], bytea[]) TO ${POSTGRES_WRITER_USER};
-GRANT EXECUTE ON FUNCTION zebridge_private.record_receipts(text, text[], bytea[], jsonb[]) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.lookup_receipts(text[], text[], bytea[], bytea[]) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.record_receipts(text[], text[], bytea[], jsonb[]) TO ${POSTGRES_WRITER_USER};
 GRANT EXECUTE ON FUNCTION zebridge_private.close_guard() TO ${POSTGRES_WRITER_USER};
 GRANT EXECUTE ON FUNCTION zebridge_private.completion_guard_on() TO ${POSTGRES_WRITER_USER};
 -- No partition is created here: the bridge runs maintain_receipts at startup. A recovery

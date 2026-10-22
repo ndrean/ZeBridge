@@ -53,7 +53,7 @@ def main():
         role = f"SET ROLE {writer};" if as_writer else ""
         return sql(f"{role} BEGIN; SELECT zebridge_private.lock_receipts(ARRAY[" + ",".join([f"'{principal}'"] * len(ids)) + f"]::text[], {ids_sql}); "
                    f"SELECT ord, status, coalesce(outcome::text, '') FROM zebridge_private.lookup_receipts("
-                   f"'{principal}', {ids_sql}, {arr(['mutation.' + principal + '.t.insert'] * len(ids))}, {arr(payloads)}); {extra} COMMIT;",
+                   f"ARRAY[" + ",".join([f"'{principal}'"] * len(ids)) + f"]::text[], {ids_sql}, {arr(['mutation.' + principal + '.t.insert'] * len(ids))}, {arr(payloads)}); {extra} COMMIT;",
                    check=False)
 
     def statuses(result):
@@ -64,7 +64,7 @@ def main():
         payloads = payloads or ["p"] * len(ids)
         route = f"convert_to('mutation.{principal}.t.insert','UTF8')"
         fps = ",".join(f"sha256(int4send(length({route})) || {route} || convert_to('{x}','UTF8'))" for x in payloads)
-        return (f"SELECT zebridge_private.record_receipts('{principal}', ARRAY[" + ",".join(f"'{i}'" for i in ids) + f"]::text[], ARRAY[{fps}]::bytea[], ARRAY["
+        return (f"SELECT zebridge_private.record_receipts(ARRAY[" + ",".join([f"'{principal}'"] * len(ids)) + "]::text[], ARRAY[" + ",".join(f"'{i}'" for i in ids) + f"]::text[], ARRAY[{fps}]::bytea[], ARRAY["
                 + ",".join(f"'{outcome}'::jsonb" for _ in ids) + "]);" + (" SELECT zebridge_private.close_guard();" if GUARD else ""))
 
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -155,6 +155,26 @@ def main():
         r = claim([new_id], principal="bob", extra=finish([new_id], principal="bob"))
         check(statuses(r) == ["claimed"], "receipts are per principal: another principal's identical ID is its own")
 
+        # One call for a whole batch, a principal per row: the same ID from carol and dave
+        # is two writes; carol's second copy is a repeat. Each keeps its own outcome.
+        mixed = f"zb1-t{ms(now)}-c1-t-mixed"
+        who, bodies = ["carol", "dave", "carol"], ["p", "q", "p"]
+        rt = lambda w: f"convert_to('mutation.{w}.t.insert','UTF8')"
+        arr = lambda xs: "ARRAY[" + ",".join(xs) + "]"
+        look = (f"SELECT zebridge_private.lock_receipts({arr([repr(w) for w in who])}::text[], {arr([repr(mixed)] * 3)}::text[]); "
+                f"SELECT ord, status, coalesce(outcome::text, '') FROM zebridge_private.lookup_receipts({arr([repr(w) for w in who])}::text[], "
+                f"{arr([repr(mixed)] * 3)}::text[], {arr([rt(w) for w in who])}::bytea[], {arr([f'convert_to({b!r},{chr(39)}UTF8{chr(39)})' for b in bodies])}::bytea[]);")
+        fp = lambda w, b: f"sha256(int4send(length({rt(w)})) || {rt(w)} || convert_to('{b}','UTF8'))"
+        rec = (f"SELECT zebridge_private.record_receipts(ARRAY['carol','dave']::text[], ARRAY['{mixed}','{mixed}']::text[], "
+               f"ARRAY[{fp('carol','p')}, {fp('dave','q')}]::bytea[], ARRAY['{{\"by\":\"carol\"}}'::jsonb, '{{\"by\":\"dave\"}}'::jsonb]);"
+               + (" SELECT zebridge_private.close_guard();" if GUARD else ""))
+        r = sql(f"SET ROLE {writer}; BEGIN; {look} {rec} COMMIT;", check=False)
+        check(r.returncode == 0 and statuses(r) == ["claimed", "claimed", "repeat"],
+              f"one call, several principals: the same ID from two principals is two writes, a second copy a repeat ({statuses(r)})")
+        r = sql(f"SET ROLE {writer}; BEGIN; {look} COMMIT;", check=False)
+        check(statuses(r) == ["duplicate", "duplicate", "repeat"] and '{"by": "carol"}' in r.stdout and '{"by": "dave"}' in r.stdout,
+              "each principal's receipt answers with its own outcome")
+
         # Concurrent duplicate: A claims and holds; B's claim waits on A's index entry,
         # then sees A's committed outcome. B must not execute.
         racing = f"zb1-t{ms(now)}-c1-t-9"
@@ -163,13 +183,13 @@ def main():
         lock = f"SELECT zebridge_private.lock_receipts(ARRAY['alice']::text[], {ids});"
         fps = "ARRAY[sha256(int4send(1) || convert_to('r','UTF8') || convert_to('p','UTF8'))]::bytea[]"
         close = " SELECT zebridge_private.close_guard();" if GUARD else ""
-        a_proc.stdin.write(f"SET ROLE {writer}; BEGIN; {lock} SELECT status FROM zebridge_private.lookup_receipts('alice', {ids}, {route}, {payload}); "
-                           f"SELECT pg_sleep(2); SELECT zebridge_private.record_receipts('alice', {ids}, {fps}, ARRAY['{{\"by\":\"A\"}}'::jsonb]);{close} COMMIT;")
+        a_proc.stdin.write(f"SET ROLE {writer}; BEGIN; {lock} SELECT status FROM zebridge_private.lookup_receipts(ARRAY['alice']::text[], {ids}, {route}, {payload}); "
+                           f"SELECT pg_sleep(2); SELECT zebridge_private.record_receipts(ARRAY['alice']::text[], {ids}, {fps}, ARRAY['{{\"by\":\"A\"}}'::jsonb]);{close} COMMIT;")
         a_proc.stdin.close()
         time.sleep(.7)
         started = time.monotonic()
         b_out = sql(f"SET ROLE {writer}; BEGIN; {lock} SELECT status || '|' || coalesce(outcome::text, '') FROM zebridge_private.lookup_receipts("
-                    f"'alice', {ids}, {route}, {payload}); COMMIT;", check=False)
+                    f"ARRAY['alice']::text[], {ids}, {route}, {payload}); COMMIT;", check=False)
         waited = time.monotonic() - started
         a_out, _ = a_proc.communicate(timeout=30)
         check(a_out.split()[-1] == "claimed" and b_out.stdout.strip() == 'duplicate|{"by": "A"}' and waited > .8,

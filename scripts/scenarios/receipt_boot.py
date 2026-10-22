@@ -74,13 +74,13 @@ async def main():
                   "reapplying SQL preserves the exact policy, retry minimum and receipt")
             check(hub.sql("BEGIN; SELECT zebridge_private.lock_receipts(ARRAY['alice'], ARRAY['legacy-finalize-b']); "
                           "SELECT status || ':' || (outcome->>'version') FROM zebridge_private.lookup_receipts("
-                          "'alice', ARRAY['legacy-finalize-b'], ARRAY[convert_to('r','UTF8')], ARRAY[convert_to('x','UTF8')]); COMMIT;")
+                          "ARRAY['alice'], ARRAY['legacy-finalize-b'], ARRAY[convert_to('r','UTF8')], ARRAY[convert_to('x','UTF8')]); COMMIT;")
                   .endswith("duplicate:saved"), "the preserved receipt still answers a retry")
             await boot()
 
             writer = hub.name + "_w"
             for privilege in (f'REVOKE USAGE ON SCHEMA zebridge_private FROM "{writer}"',
-                              f'REVOKE EXECUTE ON FUNCTION zebridge_private.record_receipts(text,text[],bytea[],jsonb[]) FROM "{writer}"'):
+                              f'REVOKE EXECUTE ON FUNCTION zebridge_private.record_receipts(text[],text[],bytea[],jsonb[]) FROM "{writer}"'):
                 hub.sql(privilege)
                 await boot(error="writer role may not use the mutation receipts")
                 hub.sql(install)
