@@ -371,7 +371,10 @@ pub const Transport = struct {
     pub fn kvGetIn(js: nats.JetStream, a: std.mem.Allocator, bucket: []const u8, key: []const u8) !?[]u8 {
         var kv = try js.kvBind(bucket);
         defer kv.deinit();
-        var entry = kv.get(key) catch return null;
+        // Only a key that is not there is "no value". An unreachable hub (NoResponders, a
+        // timeout: a leaf cut off from it) is an error the caller sees: read as "absent",
+        // it marked a tenant-scoped client as having no tenant for the whole session.
+        var entry = kv.get(key) catch |err| return if (err == error.KeyNotFound) null else err;
         defer entry.deinit();
         return try a.dupe(u8, entry.value);
     }

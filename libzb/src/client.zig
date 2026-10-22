@@ -383,6 +383,11 @@ pub const SyncClient = struct {
     opts: Options,
     /// `syncOnce` runs the one-time steps once; the per-pass steps every call.
     schemas_synced: bool = false,
+    /// A whole `syncOnce` has succeeded: tenant, schemas, positions table, seeds, drain.
+    /// Until then `poll` runs it first, so a first sync that failed (the hub out of reach
+    /// behind a cut leaf) is finished when the hub returns instead of leaving tails to run
+    /// over a replica with no tenant and no positions table.
+    synced_once: bool = false,
     startup: Startup = .{},
 
     // ── grammar.json, and ONLY grammar.json (PROTOCOL §1) ─────────────────────
@@ -3890,6 +3895,15 @@ pub const SyncClient = struct {
     /// BEFORE the CDC wait and again after it, so `wait_ms` bounds how long a question
     /// can sit unseen: a responder polls with a short wait.
     pub fn poll(self: *SyncClient, report_a: std.mem.Allocator, wait_ms: u64) !PollReport {
+        // A host that polls after a failed first sync gets the sync retried here, and its
+        // error, until it succeeds: nothing below is meaningful before it.
+        // A failed attempt waits out `wait_ms` like any poll: an unreachable hub answers
+        // NoResponders at once, and a host polling in a loop spun on it (1.1 M errors in
+        // a 90 s leaf cut, and the leaf's CPU with it).
+        if (!self.synced_once) _ = self.syncOnce() catch |err| {
+            if (wait_ms > 0) std.Io.sleep(self.t.conn.io, .fromMilliseconds(@intCast(wait_ms)), .awake) catch {};
+            return err;
+        };
         self.beginPass();
         const early = if (self.t.conn.getStatus() == .connected and !self.revoked)
             try self.drainVerdictsWith(0, 1)
@@ -4138,15 +4152,20 @@ pub const SyncClient = struct {
                     // seq overwrites the healed position — backwards (11197) — so the next
                     // message reads as a hole: re-seed, again, for ever. What the chain covers
                     // is acked, not applied; zb-client-ts drops the batch in hand the same way.
+                    // Nor is the rest of the batch applied: while the hole stayed open,
+                    // earlier polls were handed the messages after the healed position and
+                    // left them unacked, so this consumer's delivery is past them. Applying
+                    // what it holds now skipped them, and their redeliveries then read as
+                    // duplicates (a 90 s leaf cut, 2026-10-22: two shared deletes lost). The
+                    // tail is reopened at the healed position, and the server sends the
+                    // rest again in order — what the TS client does by stopping its tails
+                    // before a chain applies.
                     const healed = try self.storedSeq(stream);
                     if (healed > last) {
-                        var beyond: std.ArrayList(*@import("nats").JetStreamMessage) = .empty;
-                        for (pending) |m| {
-                            if (m.metadata.sequence.stream > healed) try beyond.append(a, m) else m.ack() catch {};
-                        }
-                        pending = beyond.items;
-                        last = healed;
-                        continue; // the rest, scanned again
+                        for (pending) |m| if (m.metadata.sequence.stream <= healed) m.ack() catch {};
+                        self.dropTail(stream);
+                        self.resetFlow(stream);
+                        break;
                     }
                 }
                 var max_seq = last;
@@ -5816,6 +5835,7 @@ pub const SyncClient = struct {
         self.heartbeatIfDue() catch |err| log.info("heartbeat: {s}", .{@errorName(err)});
         self.startup.mark("heartbeat");
         if (first) self.startup.report(self.opts.principal);
+        self.synced_once = true;
         return .{ .tenant = self.tenant, .tenants = self.tenants, .first = first };
     }
 
