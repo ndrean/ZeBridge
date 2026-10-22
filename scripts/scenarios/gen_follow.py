@@ -51,7 +51,7 @@ SCHEDULE = {
     "ts_bob": ("ts", [(75, 120), (150, None)]),
     "ts_alice": ("ts", [(75, 170), (175, None)]),
 }
-NODE_DIR = ROOT / "examples" / "04-node-consumer"
+NODE_DIR = pathlib.Path(os.environ.get("ZB_NODE_DIR", ROOT / "examples" / "04-node-consumer"))  # another zb-client-ts revision
 # libzb's own words, counted per client (libzb/src/client.zig)
 MARKS = {
     # zb-client-ts (examples/04-node-consumer, the library's log on stderr)
@@ -65,6 +65,45 @@ MARKS = {
     "gap healed": "gap healed",
     "pruned under the drain": "pruned under",
 }
+
+
+class Live:
+    """After catch-up, once a second: how far behind PostgreSQL's newest id the replica is
+    (ids, and seconds at the emitter's rate), and its holes: (max - min + 1) - count over the
+    live rows, which the contiguous oracle keeps at 0 for a consistent replica."""
+
+    def __init__(self, rate):
+        self.rate, self.lags, self.holes, self.at = max(1, rate), [], 0, 0.0
+
+    def sample(self, pg_max, l):
+        if time.time() - self.at < 1 or "max" not in l:
+            return
+        self.at = time.time()
+        self.lags.append(max(0, pg_max - l["max"]))
+        self.holes = max(self.holes, (l["max"] - l["min"] + 1) - l["count"] if l["count"] else 0)
+
+    def report(self):
+        if not self.lags:
+            return {}
+        xs = sorted(self.lags)
+        q = lambda f: xs[min(len(xs) - 1, int(f * len(xs)))]
+        return {"live_samples": len(xs), "lag_p50_s": round(q(.5) / self.rate, 2), "lag_p99_s": round(q(.99) / self.rate, 2),
+                "lag_max_s": round(xs[-1] / self.rate, 2), "holes_max": self.holes}
+
+
+def final_truth(done_file) -> dict:
+    """PostgreSQL's live rows when the emitter stopped (JSON; a bare count from older runs)."""
+    text = pathlib.Path(done_file).read_text()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        n = int(text)
+        return {"count": n, "min": 1, "max": n, "notes": None}
+
+
+def matches(l, truth) -> bool:
+    return (l.get("count") == l.get("distinct") == truth["count"] and l.get("min") == truth["min"] and l.get("max") == truth["max"]
+            and (truth.get("notes") is None or l.get("notes") == truth["notes"]))
 
 
 # ── the worker: one client, one process ────────────────────────────────────────
@@ -85,8 +124,8 @@ def ts_worker(a) -> int:
         try:
             con = sqlite3.connect(f"file:{a.db}?mode=ro", uri=True, timeout=2)
             try:
-                n, d, lo, hi = con.execute(f"SELECT count(*), count(DISTINCT id), coalesce(min(id), 0), coalesce(max(id), 0) FROM {TABLE} WHERE tenant_id = '{TENANT}'").fetchone()
-                return {"count": n, "distinct": d, "min": lo, "max": hi}
+                n, d, lo, hi, notes = con.execute(f"SELECT count(*), count(DISTINCT id), coalesce(min(id), 0), coalesce(max(id), 0), coalesce(sum(length(note)), 0) FROM {TABLE} WHERE tenant_id = '{TENANT}'").fetchone()
+                return {"count": n, "distinct": d, "min": lo, "max": hi, "notes": notes}
             finally:
                 con.close()
         except Exception as e:
@@ -111,36 +150,41 @@ def ts_worker(a) -> int:
         if not ready:
             say(event="open_failed", leg=i, said=first.strip()[:160]); proc.kill(); return 1
         caught = None
+        live = Live(a.rate)
         end = (a.t0 + t_close) if t_close is not None else None
         while True:
             now = time.time()
             if caught is None:
-                if local().get("max", -1) >= target:
+                l = local()
+                if l.get("max", -1) >= target:
                     caught = now - t_c
-                    say(event="caught_up", leg=i, target=target, connect_s=round(connect_s, 2), catchup_s=round(caught, 2))
+                    say(event="caught_up", leg=i, target=target, connect_s=round(connect_s, 2), catchup_s=round(caught, 2),
+                        holes=(l["max"] - l["min"] + 1) - l["count"])
                 elif now - t_c > 300:
-                    say(event="never_caught_up", leg=i, target=target, local=local()); break
+                    say(event="never_caught_up", leg=i, target=target, local=l); break
+            elif not pathlib.Path(a.done_file).exists():
+                live.sample(pg_max(), local())
             if end is not None and now >= end:
                 break
             if end is None and pathlib.Path(a.done_file).exists() and caught is not None:
                 break
             time.sleep(0.25)
         if t_close is not None:
-            say(event="offline", leg=i, poll_errors=0)
+            say(event="offline", leg=i, poll_errors=0, **live.report())
             proc.terminate()
             try: proc.wait(timeout=20)
             except subprocess.TimeoutExpired: proc.kill()
             continue
         while not pathlib.Path(a.done_file).exists():
+            live.sample(pg_max(), local())
             time.sleep(0.5)
-        final_pg = int(pathlib.Path(a.done_file).read_text())
+        truth = final_truth(a.done_file)
         t_f = time.time()
         while time.time() - t_f < 180:
-            l = local()
-            if l.get("count") == final_pg and l.get("distinct") == final_pg and l.get("min") == 1 and l.get("max") == final_pg:
+            if matches(local(), truth):
                 break
             time.sleep(0.5)
-        say(event="final", local=local(), pg=final_pg, converge_s=round(time.time() - t_f, 1), poll_errors=0)
+        say(event="final", local=local(), pg=truth, converge_s=round(time.time() - t_f, 1), poll_errors=0, **live.report())
         proc.terminate()
         try: proc.wait(timeout=20)
         except subprocess.TimeoutExpired: proc.kill()
@@ -171,11 +215,11 @@ def worker(a) -> int:
         return int(out or 0)
 
     def local(h) -> dict:
-        r = take(lib.zb_client_query(h, f"SELECT count(*), count(DISTINCT id), coalesce(min(id), 0), coalesce(max(id), 0) FROM {TABLE} WHERE tenant_id = '{TENANT}'".encode(), b"[]"))
+        r = take(lib.zb_client_query(h, f"SELECT count(*), count(DISTINCT id), coalesce(min(id), 0), coalesce(max(id), 0), coalesce(sum(length(note)), 0) FROM {TABLE} WHERE tenant_id = '{TENANT}'".encode(), b"[]"))
         if "error" in r:
             return {"error": r["error"]}
-        n, d, lo, hi = (int(x) for x in r["rows"][0])
-        return {"count": n, "distinct": d, "min": lo, "max": hi}
+        n, d, lo, hi, notes = (int(x) for x in r["rows"][0])
+        return {"count": n, "distinct": d, "min": lo, "max": hi, "notes": notes}
 
     sched = json.loads(a.schedule)
     for i, (t_open, t_close) in enumerate(sched):
@@ -191,6 +235,7 @@ def worker(a) -> int:
         connect_s = time.time() - t_c
         caught = None
         poll_errors = 0
+        live = Live(a.rate)
         end = (a.t0 + t_close) if t_close is not None else None
         while True:
             p = take(lib.zb_client_poll(h, 500))
@@ -202,28 +247,30 @@ def worker(a) -> int:
                 if l.get("max", -1) >= target:
                     caught = now - t_c
                     say(event="caught_up", leg=i, target=target, connect_s=round(connect_s, 2), catchup_s=round(caught, 2),
-                        sync_error=synced.get("error"))
+                        sync_error=synced.get("error"), holes=(l["max"] - l["min"] + 1) - l["count"])
                 elif now - t_c > 300:
                     say(event="never_caught_up", leg=i, target=target, local=l); break
+            elif not (a.done_file and pathlib.Path(a.done_file).exists()):
+                live.sample(pg_max(), local(h))
             if end is not None and now >= end:
                 break
             if end is None and a.done_file and pathlib.Path(a.done_file).exists() and caught is not None:
                 break
         if t_close is not None:
-            say(event="offline", leg=i, poll_errors=poll_errors)
+            say(event="offline", leg=i, poll_errors=poll_errors, **live.report())
             lib.zb_client_close(h)
             continue
         # The last leg: once the emitter is done, poll until this replica equals PostgreSQL.
         while not pathlib.Path(a.done_file).exists():
             take(lib.zb_client_poll(h, 500))
-        final_pg = int(pathlib.Path(a.done_file).read_text())
+            live.sample(pg_max(), local(h))
+        truth = final_truth(a.done_file)
         t_f = time.time()
         while time.time() - t_f < 180:
             take(lib.zb_client_poll(h, 500))
-            l = local(h)
-            if l.get("count") == final_pg and l.get("distinct") == final_pg and l.get("min") == 1 and l.get("max") == final_pg:
+            if matches(local(h), truth):
                 break
-        say(event="final", local=local(h), pg=final_pg, converge_s=round(time.time() - t_f, 1), poll_errors=poll_errors)
+        say(event="final", local=local(h), pg=truth, converge_s=round(time.time() - t_f, 1), poll_errors=poll_errors, **live.report())
         lib.zb_client_close(h)
     return 0
 
@@ -249,12 +296,24 @@ def setup_tables(bt) -> None:
     bt.psql(f"INSERT INTO public.{TABLE} (id, tenant_id, note) VALUES (0, '{open_tenant}', 'shared')")
 
 
-def emitter_sql(path: pathlib.Path, seconds: int, rate: int, noise: int) -> None:
+DELETE_AFTER_S = 30
+
+
+def emitter_sql(path: pathlib.Path, seconds: int, rate: int, noise: int, deletes: int = 0, updates: int = 0) -> None:
     """One psql session: each second `rate` new ids in acme and `noise` public rows, paced on
-    the wall clock from the session's own start."""
+    the wall clock from the session's own start. `updates`: the previous second's first ids
+    get a note whose length changes each second (the final oracle sums note lengths).
+    `deletes`: from DELETE_AFTER_S on, the oldest live ids are tombstoned, so the live set
+    stays one contiguous range and holes stay measurable."""
     lines = ["SELECT set_config('zb.gen_t0', extract(epoch from clock_timestamp())::text, false);"]
     for s in range(seconds):
         lines.append(f"INSERT INTO public.{TABLE} (id, tenant_id, note) SELECT g, '{TENANT}', 'n' FROM generate_series({s * rate + 1}, {(s + 1) * rate}) g;")
+        if updates and s > 0:
+            lo = (s - 1) * rate + 1
+            lines.append(f"UPDATE public.{TABLE} SET note = repeat('u', {s % 9 + 2}), updated_at = now() WHERE tenant_id = '{TENANT}' AND id BETWEEN {lo} AND {lo + min(updates, rate) - 1};")
+        if deletes and s >= DELETE_AFTER_S:
+            k = s - DELETE_AFTER_S
+            lines.append(f"UPDATE public.{TABLE} SET deleted_at = now(), updated_at = now() WHERE tenant_id = '{TENANT}' AND id BETWEEN {k * deletes + 1} AND {(k + 1) * deletes};")
         if noise:
             lines.append(f"INSERT INTO public.{NOISE} (id, payload) SELECT g, 'x' FROM generate_series({s * noise + 1}, {(s + 1) * noise}) g;")
         lines.append(f"SELECT pg_sleep(greatest(0, current_setting('zb.gen_t0')::float8 + {s + 1} - extract(epoch from clock_timestamp())));")
@@ -266,6 +325,8 @@ def main() -> int:
     ap.add_argument("--seconds", type=int, default=200)
     ap.add_argument("--rate", type=int, default=200, help="new ids per second in acme")
     ap.add_argument("--noise", type=int, default=500, help="public rows per second (prunes CDC_PUBLIC)")
+    ap.add_argument("--update-rate", type=int, default=0, help="ids updated per second (the previous second's)")
+    ap.add_argument("--delete-rate", type=int, default=0, help=f"oldest live ids tombstoned per second, from {DELETE_AFTER_S} s")
     ap.add_argument("--worker", help=argparse.SUPPRESS)
     ap.add_argument("--t0", type=float, help=argparse.SUPPRESS)
     ap.add_argument("--url", help=argparse.SUPPRESS)
@@ -310,7 +371,7 @@ def main() -> int:
             sys.exit(f"the bridge never became ready:\n{blog.read_text(errors='replace')[-1500:]}")
         time.sleep(CADENCE_S + 5)  # a first chain of every pair, the shared row in it
         load = tmp / "emit.sql"
-        emitter_sql(load, a.seconds, a.rate, a.noise)
+        emitter_sql(load, a.seconds, a.rate, a.noise, a.delete_rate, a.update_rate)
         done_file = tmp / "done"
         t0 = time.time()
         emitter = subprocess.Popen([bt.PSQL, bt.db_url(bt.ADMIN_URL, bt.DB), "-q", "-f", str(load)],
@@ -320,12 +381,13 @@ def main() -> int:
             wdir.mkdir()
             workers[name] = (subprocess.Popen(
                 [sys.executable, __file__, "--worker", "1", "--t0", str(t0), "--url", url, "--db", str(wdir / "replica.sqlite3"),
-                 "--name", name, "--kind", kind, "--schedule", json.dumps(sched), "--done-file", str(done_file)],
+                 "--name", name, "--kind", kind, "--schedule", json.dumps(sched), "--done-file", str(done_file), "--rate", str(a.rate)],
                 stdout=(wdir / "events.jsonl").open("w"), stderr=(wdir / "libzb.log").open("w"), env=os.environ.copy()), wdir)
         emitter.wait()
-        final = int(bt.psql(f"SELECT count(*) FROM public.{TABLE} WHERE tenant_id = '{TENANT}'").stdout.strip())
-        done_file.write_text(str(final))
-        print(f"emitter done: {final} ids in {TENANT} over {time.time() - t0:.0f} s ({a.rate}/s, noise {a.noise}/s)")
+        n, lo, hi, notes = (int(x) for x in bt.psql(f"SELECT count(*), coalesce(min(id), 0), coalesce(max(id), 0), coalesce(sum(length(note)), 0) "
+                                                     f"FROM public.{TABLE} WHERE tenant_id = '{TENANT}' AND deleted_at IS NULL").stdout.strip().split("|"))
+        done_file.write_text(json.dumps({"count": n, "min": lo, "max": hi, "notes": notes}))
+        print(f"emitter done: {hi} ids in {TENANT}, {n} live, over {time.time() - t0:.0f} s ({a.rate}/s, updates {a.update_rate}/s, deletes {a.delete_rate}/s, noise {a.noise}/s)")
         for name, (p, _) in workers.items():
             try:
                 p.wait(timeout=600)
@@ -342,13 +404,17 @@ def main() -> int:
             for e in events:
                 if e["event"] == "caught_up":
                     flag = "  ⚠️ slow" if e["catchup_s"] > SLOW_S else ""
-                    print(f"  t={e['t']:>6}s leg {e['leg']}: connect{'' if SCHEDULE[name][0] == 'ts' else '+sync'} {e['connect_s']} s{'  ⚠️ slow connect' if e['connect_s'] > SLOW_S else ''}, caught up with max(id) {e['target']} after {e['catchup_s']} s{flag}")
+                    print(f"  t={e['t']:>6}s leg {e['leg']}: connect{'' if SCHEDULE[name][0] == 'ts' else '+sync'} {e['connect_s']} s{'  ⚠️ slow connect' if e['connect_s'] > SLOW_S else ''}, caught up with max(id) {e['target']} after {e['catchup_s']} s, holes {e.get('holes')}{flag}")
+                elif e["event"] == "offline" and e.get("live_samples"):
+                    print(f"         live until offline: lag p50 {e['lag_p50_s']} s, p99 {e['lag_p99_s']} s, max {e['lag_max_s']} s, holes max {e['holes_max']}")
                 elif e["event"] == "final":
-                    l = e["local"]
-                    ok = l.get("count") == l.get("distinct") == e["pg"] and l.get("min") == 1 and l.get("max") == e["pg"]
+                    l, truth = e["local"], e["pg"] if isinstance(e["pg"], dict) else {"count": e["pg"], "min": 1, "max": e["pg"], "notes": None}
+                    ok = matches(l, truth)
                     failed += 0 if ok else 1
-                    print(f"  final: {'✓' if ok else '✗'} count {l.get('count')} distinct {l.get('distinct')} min {l.get('min')} max {l.get('max')} "
-                          f"(PostgreSQL {e['pg']}), converged in {e['converge_s']} s, poll errors {e['poll_errors']}")
+                    if e.get("live_samples"):
+                        print(f"  live: lag p50 {e['lag_p50_s']} s, p99 {e['lag_p99_s']} s, max {e['lag_max_s']} s, holes max {e['holes_max']} ({e['live_samples']} samples)")
+                    print(f"  final: {'✓' if ok else '✗'} count {l.get('count')} distinct {l.get('distinct')} min {l.get('min')} max {l.get('max')} notes {l.get('notes')} "
+                          f"(PostgreSQL {truth}), converged in {e['converge_s']} s, poll errors {e['poll_errors']}")
                 elif e["event"] in ("never_caught_up", "open_failed"):
                     failed += 1
                     print(f"  ✗ {e}")
