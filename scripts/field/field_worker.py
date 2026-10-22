@@ -70,7 +70,8 @@ def main():
     ap.add_argument("--tenant", default="storm")
     ap.add_argument("--schedule", help='[[open_s, close_s|null], ...] from --t0')
     ap.add_argument("--enroll-only", action="store_true",
-                    help="with --batch: redeem each client's invite in turn (backing off when refused), keep the identity, connect nothing else")
+                    help="with --batch: redeem the clients' invites (backing off when refused), keep the identities, connect nothing else")
+    ap.add_argument("--enroll-parallel", type=int, default=8, help="with --enroll-only: how many redeem at once")
     ap.add_argument("--t0", type=float, required=True)
     ap.add_argument("--done-file", required=True)
     a = ap.parse_args()
@@ -92,31 +93,49 @@ def main():
     lock = threading.Lock()
 
     if a.batch and a.enroll_only:
-        # One at a time: the bridge redeems a few invites at a time, and a crowd of them
-        # from one address is refused (2026-10-22: 92 of 95 at once never enrolled).
-        failed = 0
-        for c in json.loads(pathlib.Path(a.batch).read_text()):
+        # Like a fleet: up to --enroll-parallel clients redeem at once, each backing off on
+        # its own (exponential, jittered) when refused — at the bridge's real limit, not a
+        # queue. Every refusal's reason (zb_last_error) is kept: the bridge's 503 "busy" and a
+        # proxy's refusal look the same from the outcome alone.
+        import random
+        clients = json.loads(pathlib.Path(a.batch).read_text())
+        gate = threading.Semaphore(a.enroll_parallel)
+        out = []
+        t_all = time.time()
+
+        def enroll(c):
             ident = pathlib.Path(a.identity.format(name=c["name"]))
             if ident.exists():
-                print(json.dumps({"client": c["name"], "enroll": "kept"}), flush=True)
-                continue
+                out.append({"client": c["name"], "enroll": "kept"})
+                return
             opts = {"dbPath": a.db.format(name=c["name"]), "identityPath": str(ident), "tables": [TABLE], "heartbeatMs": 0,
                     "natsUrl": a.nats, "bridgeUrl": a.bridge,
                     "invite": pathlib.Path(a.invite_file.format(name=c["name"])).read_text().strip()}
-            delay, why = 2.0, ""
-            for attempt in range(12):
-                h = lib.zb_client_connect(json.dumps(opts).encode())
+            delay, reasons, t0 = 1.0, {}, time.time()
+            for attempt in range(15):
+                with gate:
+                    h = lib.zb_client_connect(json.dumps(opts).encode())
+                    why = "" if h else (lib.zb_last_error() or b"").decode(errors="replace")[:160]
                 if h:
                     lib.zb_client_close(h)
                     break
-                why = (lib.zb_last_error() or b"").decode(errors="replace")[:200]
-                time.sleep(delay)
-                delay = min(delay * 1.5, 30)
+                reasons[why] = reasons.get(why, 0) + 1
+                time.sleep(delay * random.uniform(0.5, 1.5))
+                delay = min(delay * 2, 30)
             ok = ident.exists()
-            failed += not ok
-            print(json.dumps({"client": c["name"], "enroll": "enrolled" if ok else "failed", "attempts": attempt + 1,
-                              **({} if ok else {"error": why})}), flush=True)
-        return 1 if failed else 0
+            with lock:
+                out.append({"client": c["name"], "enroll": "enrolled" if ok else "failed", "attempts": attempt + 1,
+                            "seconds": round(time.time() - t0, 1), **({"refusals": reasons} if reasons else {})})
+
+        threads = [threading.Thread(target=enroll, args=(c,)) for c in clients]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for r in sorted(out, key=lambda r: r["client"]):
+            print(json.dumps(r), flush=True)
+        print(json.dumps({"summary": True, "seconds": round(time.time() - t_all, 1), "parallel": a.enroll_parallel}), flush=True)
+        return 1 if any(r["enroll"] == "failed" for r in out) else 0
 
     if a.batch:
         threads = []

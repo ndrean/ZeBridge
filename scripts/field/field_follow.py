@@ -134,7 +134,8 @@ def main() -> int:
     ap.add_argument("--deletes", type=int, default=50)
     ap.add_argument("--out", default=str(ROOT / "docs" / "bench" / "field"))
     ap.add_argument("--clients", type=int, default=5, help="5 measured clients, plus c006…cN (unmeasured, ten per process)")
-    ap.add_argument("--enroll-only", action="store_true", help="redeem the extra clients' invites one by one, keep their identities, and stop")
+    ap.add_argument("--enroll-only", action="store_true", help="redeem the extra clients' invites, keep their identities, and stop")
+    ap.add_argument("--enroll-parallel", type=int, default=8, help="with --enroll-only: how many redeem at once")
     a = ap.parse_args()
 
     run = time.strftime("%m%d%H%M") + a.via[0]
@@ -154,14 +155,23 @@ def main() -> int:
         ssh(CANADA, f"cat > {REMOTE}/runs/{run}/enroll.json", input=json.dumps(extra))
         out_text = ssh(CANADA, f"cd ~/{REMOTE} && venv/bin/python field_worker.py --batch runs/{run}/enroll.json --enroll-only "
                                f"--lib lib/libzbcore.so --db 'runs/{run}/{{name}}.sqlite3' --identity 'ids/{{name}}.identity' "
-                               f"--invite-file 'invites/{{name}}.code' --nats {HUB_NATS} --hub-nats {HUB_NATS} --t0 0 --done-file /dev/null "
+                               f"--invite-file 'invites/{{name}}.code' --nats {HUB_NATS} --hub-nats {HUB_NATS} --t0 0 --done-file /dev/null --enroll-parallel {a.enroll_parallel} "
                                f"2> runs/{run}/enroll.log; rm -f runs/{run}/c*.sqlite3*", check=False)
         rows = [json.loads(l) for l in out_text.splitlines() if l.strip()]
+        summary = next((r for r in rows if r.get("summary")), {})
+        rows = [r for r in rows if not r.get("summary")]
         from collections import Counter
-        print(Counter(r["enroll"] for r in rows))
+        done = [r for r in rows if r["enroll"] == "enrolled"]
+        print(f"{Counter(r['enroll'] for r in rows)} in {summary.get('seconds')} s, {summary.get('parallel')} at once"
+              + (f"; {len(done) / summary['seconds']:.1f} enrollments/s" if done and summary.get("seconds") else ""))
+        refusals = Counter()
+        for r in rows:
+            refusals.update(r.get("refusals", {}))
+        for why, n in refusals.most_common(5):
+            print(f"  refused {n}×: {why or '(no reason given)'}")
         for r in rows:
             if r["enroll"] == "failed":
-                print("  ", r)
+                print("  failed:", r)
         return 0 if all(r["enroll"] != "failed" for r in rows) else 1
 
     print(f"run {run}: via {a.via}, {a.seconds} s of load ({a.inserts} inserts, {a.updates} updates, {a.deletes} deletes /s)", flush=True)
