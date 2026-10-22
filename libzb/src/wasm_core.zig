@@ -61,11 +61,26 @@ export fn zb_stream_resume(ptr: [*]const u8, len: usize) u64 {
     return result(out);
 }
 
-/// core.preferDeltas: `{"plan", "stored", "cut", "avgMessageBytes", "deltaBytes"}` →
-/// `{"take", "why"}` — a reconnect takes the chain's deltas instead of the CDC backlog.
-export fn zb_prefer_deltas(ptr: [*]const u8, len: usize) u64 {
+/// core.deltaEligible: `{"manifest", "watermark", "stored", "cut"}` → `{"take", "why"}` —
+/// may one (table, tenant)'s chain stand in for the CDC to its cut.
+export fn zb_delta_eligible(ptr: [*]const u8, len: usize) u64 {
     const args = parseArgs(ptr, len) orelse return 0;
-    const out = core.preferDeltasJson(arena.allocator(), args) catch return 0;
+    const out = core.deltaEligibleJson(arena.allocator(), args) catch return 0;
+    return result(out);
+}
+
+/// core.cdcBacklogBytes: `{"stored", "cut", "streamMessages", "streamBytes",
+/// "matchedMessages"}` → `{"bytes"}`.
+export fn zb_cdc_backlog_bytes(ptr: [*]const u8, len: usize) u64 {
+    const args = parseArgs(ptr, len) orelse return 0;
+    const out = core.cdcBacklogBytesJson(arena.allocator(), args) catch return 0;
+    return result(out);
+}
+
+/// core.streamDeltaChoice: `{"whys", "deltaBytes", "backlogBytes"}` → `{"take", "why"}`.
+export fn zb_stream_delta_choice(ptr: [*]const u8, len: usize) u64 {
+    const args = parseArgs(ptr, len) orelse return 0;
+    const out = core.streamDeltaChoiceJson(arena.allocator(), args) catch return 0;
     return result(out);
 }
 

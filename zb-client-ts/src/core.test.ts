@@ -126,7 +126,7 @@ import {
   keyShape, typeShape, retypedColumns, isReadOnlySql,
 } from './core.ts';
 
-import { loadCore, scopeSeeding, caughtUpPosition, streamResume, preferDeltas, streamForward, mergeRegisters } from './wasm-core.ts';
+import { loadCore, scopeSeeding, caughtUpPosition, streamResume, deltaEligible, cdcBacklogBytes, streamDeltaChoice, streamForward, mergeRegisters } from './wasm-core.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 // The rules libzb owns run from the module this package ships (wasm-core.ts).
@@ -182,8 +182,14 @@ for (const c of fx.position) {
 for (const c of fx.streamResume) {
   test(`streamResume: ${c.name}`, () => assert.deepEqual(streamResume(c.stored, c.firstSeq, c.cuts), { to: c.to, blocked: c.blocked }));
 }
-for (const c of fx.preferDeltas) {
-  test(`preferDeltas: ${c.name}`, () => assert.deepEqual(preferDeltas(c), { take: c.take, why: c.why }));
+for (const c of fx.deltaEligible) {
+  test(`deltaEligible: ${c.name}`, () => assert.deepEqual(deltaEligible(c), { take: c.take, why: c.why }));
+}
+for (const c of fx.cdcBacklogBytes) {
+  test(`cdcBacklogBytes: ${c.name}`, () => assert.equal(cdcBacklogBytes(c), c.bytes));
+}
+for (const c of fx.streamDeltaChoice) {
+  test(`streamDeltaChoice: ${c.name}`, () => assert.deepEqual(streamDeltaChoice(c.whys, c.deltaBytes, c.backlogBytes), { take: c.take, why: c.why }));
 }
 for (const c of fx.streamForward) {
   test(`streamForward: ${c.name}`, () => assert.equal(streamForward(c.stored, c.cuts), c.to));

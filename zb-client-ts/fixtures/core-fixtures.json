@@ -5351,193 +5351,483 @@
       "blocked": false
     }
   ],
-  "preferDeltas": [
+  "deltaEligible": [
     {
-      "name": "a reconnect 30 s behind a busy table: two deltas far smaller than the backlog — take them",
-      "plan": [
-        {
-          "name": "t-g8-delta",
-          "kind": "delta"
+      "name": "a guarded table (every delete a tombstone), two deltas past the replica's watermark, the cut ahead — eligible",
+      "manifest": {
+        "deletes": "tombstoned",
+        "full": {
+          "gen": 1,
+          "object": "t-g1-full",
+          "cutoff": "2026-10-22T10:00:01.000000Z"
         },
-        {
-          "name": "t-g9-delta",
-          "kind": "delta"
-        }
-      ],
+        "deltas": [
+          {
+            "gen": 7,
+            "object": "t-g7-delta",
+            "prev_cutoff": "2026-10-22T10:00:06.000000Z",
+            "cutoff": "2026-10-22T10:00:07.000000Z"
+          },
+          {
+            "gen": 8,
+            "object": "t-g8-delta",
+            "prev_cutoff": "2026-10-22T10:00:07.000000Z",
+            "cutoff": "2026-10-22T10:00:08.000000Z"
+          }
+        ],
+        "cutoff_seq": 1043,
+        "cdc_stream": "CDC_acme"
+      },
+      "watermark": "2026-10-22T10:00:06.000000Z",
       "stored": 581,
       "cut": 1043,
-      "avgMessageBytes": 110000,
-      "deltaBytes": 250000,
       "take": true,
-      "why": "deltas"
+      "why": "eligible"
     },
     {
-      "name": "checkpoints apply like deltas — take them",
-      "plan": [
-        {
-          "name": "t-g7-checkpoint",
-          "kind": "checkpoint"
+      "name": "P1: a physical delete since the replica's chain — the producer built a new full alongside g7's delta, which still reaches the watermark (planFromManifest returns that delta alone); it cannot carry the absence — refused",
+      "manifest": {
+        "full": {
+          "gen": 7,
+          "object": "t-g7-full",
+          "cutoff": "2026-10-22T10:00:07.000000Z"
         },
-        {
-          "name": "t-g9-delta",
-          "kind": "delta"
-        }
-      ],
+        "deltas": [
+          {
+            "gen": 7,
+            "object": "t-g7-delta",
+            "prev_cutoff": "2026-10-22T10:00:06.000000Z",
+            "cutoff": "2026-10-22T10:00:07.000000Z"
+          }
+        ],
+        "cutoff_seq": 1043,
+        "cdc_stream": "CDC_acme"
+      },
+      "watermark": "2026-10-22T10:00:06.000000Z",
       "stored": 581,
       "cut": 1043,
-      "avgMessageBytes": 110000,
-      "deltaBytes": 300000,
-      "take": true,
-      "why": "deltas"
+      "take": false,
+      "why": "deletes-not-tombstoned"
     },
     {
-      "name": "the plan needs a base (rows went without a version move: a physical delete, a TRUNCATE, a reap past the gc watermark) — stay on CDC",
-      "plan": [
-        {
-          "name": "t-g10-full",
-          "kind": "full"
+      "name": "the same chain on a guarded table (a TRUNCATE or a rewrite built the base): any base newer than the watermark refuses",
+      "manifest": {
+        "full": {
+          "gen": 7,
+          "object": "t-g7-full",
+          "cutoff": "2026-10-22T10:00:07.000000Z"
         },
-        {
-          "name": "t-g11-delta",
-          "kind": "delta"
-        }
-      ],
+        "deltas": [
+          {
+            "gen": 7,
+            "object": "t-g7-delta",
+            "prev_cutoff": "2026-10-22T10:00:06.000000Z",
+            "cutoff": "2026-10-22T10:00:07.000000Z"
+          }
+        ],
+        "cutoff_seq": 1043,
+        "cdc_stream": "CDC_acme",
+        "deletes": "tombstoned"
+      },
+      "watermark": "2026-10-22T10:00:06.000000Z",
       "stored": 581,
       "cut": 1043,
-      "avgMessageBytes": 110000,
-      "deltaBytes": 1000,
+      "take": false,
+      "why": "new-base"
+    },
+    {
+      "name": "no newer base, deltas only, but the table may delete physically — refused: an absence is never inferred from a plan",
+      "manifest": {
+        "full": {
+          "gen": 1,
+          "object": "t-g1-full",
+          "cutoff": "2026-10-22T10:00:01.000000Z"
+        },
+        "deltas": [
+          {
+            "gen": 7,
+            "object": "t-g7-delta",
+            "prev_cutoff": "2026-10-22T10:00:06.000000Z",
+            "cutoff": "2026-10-22T10:00:07.000000Z"
+          },
+          {
+            "gen": 8,
+            "object": "t-g8-delta",
+            "prev_cutoff": "2026-10-22T10:00:07.000000Z",
+            "cutoff": "2026-10-22T10:00:08.000000Z"
+          }
+        ],
+        "cutoff_seq": 1043,
+        "cdc_stream": "CDC_acme"
+      },
+      "watermark": "2026-10-22T10:00:06.000000Z",
+      "stored": 581,
+      "cut": 1043,
+      "take": false,
+      "why": "deletes-not-tombstoned"
+    },
+    {
+      "name": "a manifest that says deletes are physical — refused",
+      "manifest": {
+        "deletes": "physical",
+        "full": {
+          "gen": 1,
+          "object": "t-g1-full",
+          "cutoff": "2026-10-22T10:00:01.000000Z"
+        },
+        "deltas": [
+          {
+            "gen": 7,
+            "object": "t-g7-delta",
+            "prev_cutoff": "2026-10-22T10:00:06.000000Z",
+            "cutoff": "2026-10-22T10:00:07.000000Z"
+          },
+          {
+            "gen": 8,
+            "object": "t-g8-delta",
+            "prev_cutoff": "2026-10-22T10:00:07.000000Z",
+            "cutoff": "2026-10-22T10:00:08.000000Z"
+          }
+        ],
+        "cutoff_seq": 1043,
+        "cdc_stream": "CDC_acme"
+      },
+      "watermark": "2026-10-22T10:00:06.000000Z",
+      "stored": 581,
+      "cut": 1043,
+      "take": false,
+      "why": "deletes-not-tombstoned"
+    },
+    {
+      "name": "a replica with no watermark has no chain to continue — refused",
+      "manifest": {
+        "deletes": "tombstoned",
+        "full": {
+          "gen": 1,
+          "object": "t-g1-full",
+          "cutoff": "2026-10-22T10:00:01.000000Z"
+        },
+        "deltas": [
+          {
+            "gen": 7,
+            "object": "t-g7-delta",
+            "prev_cutoff": "2026-10-22T10:00:06.000000Z",
+            "cutoff": "2026-10-22T10:00:07.000000Z"
+          },
+          {
+            "gen": 8,
+            "object": "t-g8-delta",
+            "prev_cutoff": "2026-10-22T10:00:07.000000Z",
+            "cutoff": "2026-10-22T10:00:08.000000Z"
+          }
+        ],
+        "cutoff_seq": 1043,
+        "cdc_stream": "CDC_acme"
+      },
+      "watermark": null,
+      "stored": 581,
+      "cut": 1043,
+      "take": false,
+      "why": "new-base"
+    },
+    {
+      "name": "tombstones reaped past the replica's watermark (gc_watermark newer): the plan needs a base — refused",
+      "manifest": {
+        "deletes": "tombstoned",
+        "full": {
+          "gen": 1,
+          "object": "t-g1-full",
+          "cutoff": "2026-10-22T10:00:01.000000Z"
+        },
+        "deltas": [
+          {
+            "gen": 7,
+            "object": "t-g7-delta",
+            "prev_cutoff": "2026-10-22T10:00:06.000000Z",
+            "cutoff": "2026-10-22T10:00:07.000000Z"
+          },
+          {
+            "gen": 8,
+            "object": "t-g8-delta",
+            "prev_cutoff": "2026-10-22T10:00:07.000000Z",
+            "cutoff": "2026-10-22T10:00:08.000000Z"
+          }
+        ],
+        "cutoff_seq": 1043,
+        "cdc_stream": "CDC_acme",
+        "gc_watermark": "2026-10-22T10:00:07.000000Z"
+      },
+      "watermark": "2026-10-22T10:00:06.000000Z",
+      "stored": 581,
+      "cut": 1043,
       "take": false,
       "why": "needs-full"
     },
     {
-      "name": "the chain's cut is behind the position — stay (the rewind rule's case, not this one)",
-      "plan": [
-        {
-          "name": "t-g9-delta",
-          "kind": "delta"
-        }
-      ],
+      "name": "nothing newer than the replica's watermark",
+      "manifest": {
+        "deletes": "tombstoned",
+        "full": {
+          "gen": 1,
+          "object": "t-g1-full",
+          "cutoff": "2026-10-22T10:00:01.000000Z"
+        },
+        "deltas": [
+          {
+            "gen": 7,
+            "object": "t-g7-delta",
+            "prev_cutoff": "2026-10-22T10:00:06.000000Z",
+            "cutoff": "2026-10-22T10:00:07.000000Z"
+          },
+          {
+            "gen": 8,
+            "object": "t-g8-delta",
+            "prev_cutoff": "2026-10-22T10:00:07.000000Z",
+            "cutoff": "2026-10-22T10:00:08.000000Z"
+          }
+        ],
+        "cutoff_seq": 1043,
+        "cdc_stream": "CDC_acme"
+      },
+      "watermark": "2026-10-22T10:00:08.000000Z",
+      "stored": 581,
+      "cut": 1043,
+      "take": false,
+      "why": "nothing-newer"
+    },
+    {
+      "name": "the chain's cut is behind the position (the rewind rule's case)",
+      "manifest": {
+        "deletes": "tombstoned",
+        "full": {
+          "gen": 1,
+          "object": "t-g1-full",
+          "cutoff": "2026-10-22T10:00:01.000000Z"
+        },
+        "deltas": [
+          {
+            "gen": 7,
+            "object": "t-g7-delta",
+            "prev_cutoff": "2026-10-22T10:00:06.000000Z",
+            "cutoff": "2026-10-22T10:00:07.000000Z"
+          },
+          {
+            "gen": 8,
+            "object": "t-g8-delta",
+            "prev_cutoff": "2026-10-22T10:00:07.000000Z",
+            "cutoff": "2026-10-22T10:00:08.000000Z"
+          }
+        ],
+        "cutoff_seq": 1043,
+        "cdc_stream": "CDC_acme"
+      },
+      "watermark": "2026-10-22T10:00:06.000000Z",
       "stored": 1100,
       "cut": 1043,
-      "avgMessageBytes": 110000,
-      "deltaBytes": 1000,
       "take": false,
       "why": "not-ahead"
     },
     {
       "name": "the chain's cut is the position — nothing to replace",
-      "plan": [
-        {
-          "name": "t-g9-delta",
-          "kind": "delta"
-        }
-      ],
+      "manifest": {
+        "deletes": "tombstoned",
+        "full": {
+          "gen": 1,
+          "object": "t-g1-full",
+          "cutoff": "2026-10-22T10:00:01.000000Z"
+        },
+        "deltas": [
+          {
+            "gen": 7,
+            "object": "t-g7-delta",
+            "prev_cutoff": "2026-10-22T10:00:06.000000Z",
+            "cutoff": "2026-10-22T10:00:07.000000Z"
+          },
+          {
+            "gen": 8,
+            "object": "t-g8-delta",
+            "prev_cutoff": "2026-10-22T10:00:07.000000Z",
+            "cutoff": "2026-10-22T10:00:08.000000Z"
+          }
+        ],
+        "cutoff_seq": 1043,
+        "cdc_stream": "CDC_acme"
+      },
+      "watermark": "2026-10-22T10:00:06.000000Z",
       "stored": 1043,
       "cut": 1043,
-      "avgMessageBytes": 110000,
-      "deltaBytes": 1000,
       "take": false,
       "why": "not-ahead"
     },
     {
-      "name": "a manifest without a cut proves no position — stay",
-      "plan": [
-        {
-          "name": "t-g9-delta",
-          "kind": "delta"
-        }
-      ],
+      "name": "a manifest without a cut proves no position",
+      "manifest": {
+        "deletes": "tombstoned",
+        "full": {
+          "gen": 1,
+          "object": "t-g1-full",
+          "cutoff": "2026-10-22T10:00:01.000000Z"
+        },
+        "deltas": [
+          {
+            "gen": 7,
+            "object": "t-g7-delta",
+            "prev_cutoff": "2026-10-22T10:00:06.000000Z",
+            "cutoff": "2026-10-22T10:00:07.000000Z"
+          },
+          {
+            "gen": 8,
+            "object": "t-g8-delta",
+            "prev_cutoff": "2026-10-22T10:00:07.000000Z",
+            "cutoff": "2026-10-22T10:00:08.000000Z"
+          }
+        ],
+        "cutoff_seq": 1043,
+        "cdc_stream": "CDC_acme"
+      },
+      "watermark": "2026-10-22T10:00:06.000000Z",
       "stored": 581,
       "cut": null,
-      "avgMessageBytes": 110000,
-      "deltaBytes": 1000,
       "take": false,
       "why": "no-cut"
-    },
+    }
+  ],
+  "cdcBacklogBytes": [
     {
-      "name": "nothing newer than the replica's watermark — stay",
-      "plan": [],
+      "name": "the table is the whole stream: every message in the range is its own",
       "stored": 581,
       "cut": 1043,
-      "avgMessageBytes": 110000,
-      "deltaBytes": 0,
-      "take": false,
-      "why": "nothing-newer"
+      "streamMessages": 1000,
+      "streamBytes": 110000000,
+      "matchedMessages": 1000,
+      "bytes": 50820000
     },
     {
-      "name": "a short absence: the deltas repeat rows the replica already has from CDC — CDC is cheaper",
-      "plan": [
-        {
-          "name": "t-g9-delta",
-          "kind": "delta"
-        }
+      "name": "a small followed table on a busy stream: one message in a thousand is its own — the backlog is small",
+      "stored": 581,
+      "cut": 1043,
+      "streamMessages": 1000,
+      "streamBytes": 110000000,
+      "matchedMessages": 1,
+      "bytes": 50820
+    },
+    {
+      "name": "half the stream is this client's tables",
+      "stored": 581,
+      "cut": 1043,
+      "streamMessages": 1000,
+      "streamBytes": 110000000,
+      "matchedMessages": 500,
+      "bytes": 25410000
+    },
+    {
+      "name": "the cut behind the position: nothing to fetch",
+      "stored": 1100,
+      "cut": 1043,
+      "streamMessages": 1000,
+      "streamBytes": 110000000,
+      "matchedMessages": 1000,
+      "bytes": 0
+    },
+    {
+      "name": "the stream's size unknown",
+      "stored": 581,
+      "cut": 1043,
+      "streamMessages": 0,
+      "streamBytes": 0,
+      "matchedMessages": 0,
+      "bytes": -1
+    },
+    {
+      "name": "counts taken a moment apart: the share never exceeds the whole stream",
+      "stored": 581,
+      "cut": 1043,
+      "streamMessages": 1000,
+      "streamBytes": 110000000,
+      "matchedMessages": 1200,
+      "bytes": 50820000
+    }
+  ],
+  "streamDeltaChoice": [
+    {
+      "name": "every table on the stream eligible, deltas a fraction of the backlog — take them",
+      "whys": [
+        "eligible",
+        "eligible"
       ],
-      "stored": 1000,
-      "cut": 1010,
-      "avgMessageBytes": 5000,
       "deltaBytes": 250000,
-      "take": false,
-      "why": "cdc-cheaper"
-    },
-    {
-      "name": "a near tie stays on CDC: the deltas must be under half the estimate",
-      "plan": [
-        {
-          "name": "t-g9-delta",
-          "kind": "delta"
-        }
-      ],
-      "stored": 100,
-      "cut": 110,
-      "avgMessageBytes": 1000,
-      "deltaBytes": 5000,
-      "take": false,
-      "why": "cdc-cheaper"
-    },
-    {
-      "name": "just under half the estimate — take",
-      "plan": [
-        {
-          "name": "t-g9-delta",
-          "kind": "delta"
-        }
-      ],
-      "stored": 100,
-      "cut": 110,
-      "avgMessageBytes": 1000,
-      "deltaBytes": 4999,
+      "backlogBytes": 50820000,
       "take": true,
       "why": "deltas"
     },
     {
-      "name": "the stream's message size unknown — stay",
-      "plan": [
-        {
-          "name": "t-g9-delta",
-          "kind": "delta"
-        }
+      "name": "one table on the stream declines: it needs the CDC anyway, the stream cannot move — nobody fetches",
+      "whys": [
+        "eligible",
+        "deletes-not-tombstoned"
       ],
-      "stored": 581,
-      "cut": 1043,
-      "avgMessageBytes": 0,
       "deltaBytes": 1000,
+      "backlogBytes": 50820000,
+      "take": false,
+      "why": "deletes-not-tombstoned"
+    },
+    {
+      "name": "a small table on a busy stream: its filtered backlog is smaller than its deltas — stay on CDC",
+      "whys": [
+        "eligible"
+      ],
+      "deltaBytes": 250000,
+      "backlogBytes": 50820,
+      "take": false,
+      "why": "cdc-cheaper"
+    },
+    {
+      "name": "a near tie stays on CDC: the deltas must be under half the backlog",
+      "whys": [
+        "eligible"
+      ],
+      "deltaBytes": 5000,
+      "backlogBytes": 10000,
+      "take": false,
+      "why": "cdc-cheaper"
+    },
+    {
+      "name": "just under half — take",
+      "whys": [
+        "eligible"
+      ],
+      "deltaBytes": 4999,
+      "backlogBytes": 10000,
+      "take": true,
+      "why": "deltas"
+    },
+    {
+      "name": "the backlog unknown — stay",
+      "whys": [
+        "eligible"
+      ],
+      "deltaBytes": 1000,
+      "backlogBytes": -1,
       "take": false,
       "why": "no-estimate"
     },
     {
       "name": "the deltas' size unknown — stay",
-      "plan": [
-        {
-          "name": "t-g9-delta",
-          "kind": "delta"
-        }
+      "whys": [
+        "eligible"
       ],
-      "stored": 581,
-      "cut": 1043,
-      "avgMessageBytes": 110000,
       "deltaBytes": -1,
+      "backlogBytes": 10000,
       "take": false,
       "why": "no-estimate"
+    },
+    {
+      "name": "no table depends on the stream",
+      "whys": [],
+      "deltaBytes": 0,
+      "backlogBytes": 10000,
+      "take": false,
+      "why": "no-dependents"
     }
   ],
   "streamForward": [

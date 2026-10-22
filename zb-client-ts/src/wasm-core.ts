@@ -19,7 +19,9 @@ type Exports = {
   zb_caught_up_position(pos: bigint, firstSeq: bigint, lastSeq: bigint, numPending: bigint, numAckPending: bigint, deliveredCount: bigint, delivered: bigint): bigint;
   zb_scope_seeding(ptr: number, len: number): bigint;
   zb_stream_resume(ptr: number, len: number): bigint;
-  zb_prefer_deltas(ptr: number, len: number): bigint;
+  zb_delta_eligible(ptr: number, len: number): bigint;
+  zb_cdc_backlog_bytes(ptr: number, len: number): bigint;
+  zb_stream_delta_choice(ptr: number, len: number): bigint;
   zb_stream_forward(ptr: number, len: number): bigint;
   zb_merge_registers(ptr: number, len: number): bigint;
 };
@@ -103,13 +105,26 @@ export function streamResume(stored: number, firstSeq: number, cuts: (number | n
   return call(c.zb_stream_resume, 'streamResume', { stored, firstSeq, cuts });
 }
 
-/// Whether a reconnect with no gap takes its chain's deltas instead of replaying the CDC
-/// backlog up to the chain's cut. The same rule on the hub or a seeding leaf: it reads the
-/// plan (planFromManifest with the replica's watermark), the position, the cut and two
-/// sizes, never where the chain comes from. `why` names the reason. libzb core.preferDeltas.
-export function preferDeltas(a: { plan: unknown[]; stored: number; cut: number | null; avgMessageBytes: number; deltaBytes: number }): { take: boolean; why: string } {
-  const c = core();
-  return call(c.zb_prefer_deltas, 'preferDeltas', a);
+/// May one (table, tenant)'s chain stand in for the CDC between the replica's position on
+/// its route and the chain's cut: only where the manifest states every delete is a
+/// tombstone (`"deletes": "tombstoned"`), no base is newer than the replica's watermark,
+/// and the plan holds deltas only. From the manifest alone, the same on the hub or a
+/// seeding leaf. libzb core.deltaEligible.
+export function deltaEligible(a: { manifest: unknown; watermark: string | null; stored: number; cut: number | null }): { take: boolean; why: string } {
+  return call(core().zb_delta_eligible, 'deltaEligible', a);
+}
+
+/// The CDC a replica would fetch from `stored` to `cut`: the distance, times the share of
+/// the stream's messages its filter matches, times the average message size; -1 unknown.
+/// libzb core.cdcBacklogBytes.
+export function cdcBacklogBytes(a: { stored: number; cut: number; streamMessages: number; streamBytes: number; matchedMessages: number }): number {
+  return call(core().zb_cdc_backlog_bytes, 'cdcBacklogBytes', a).bytes;
+}
+
+/// One stream's choice before any object is fetched: every dependent eligible (`whys`),
+/// and the deltas under half the backlog. libzb core.streamDeltaChoice.
+export function streamDeltaChoice(whys: string[], deltaBytes: number, backlogBytes: number): { take: boolean; why: string } {
+  return call(core().zb_stream_delta_choice, 'streamDeltaChoice', { whys, deltaBytes, backlogBytes });
 }
 
 /// Where a stream with no gap moves after chains taken by choice: to the lowest cut when

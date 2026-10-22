@@ -1911,9 +1911,14 @@ pub const GenerationProducer = struct {
             try std.fmt.allocPrint(alloc, "\"gc_watermark\":\"{s}\",", .{gc_watermark})
         else
             "";
-        const manifest = try std.fmt.allocPrint(alloc, "{{\"gen\":{d},\"seed_epoch\":{d},\"bucket\":\"{s}\",{s}{s}{s}\"cutoff_version\":\"{s}\",\"cutoff_lsn\":\"{s}\"," ++
+        // The deletion contract a client's delta path relies on (core.deltaEligible): under
+        // the soft-delete guard every DELETE is a tombstone a delta carries, and only the
+        // sweeper deletes physically (its reaps answered by the gc watermark). Stated only
+        // then: elsewhere a physical delete leaves no trace in a delta.
+        const deletes_frag: []const u8 = if (guarded) "\"deletes\":\"tombstoned\"," else "";
+        const manifest = try std.fmt.allocPrint(alloc, "{{\"gen\":{d},\"seed_epoch\":{d},\"bucket\":\"{s}\",{s}{s}{s}{s}\"cutoff_version\":\"{s}\",\"cutoff_lsn\":\"{s}\"," ++
             "\"version_column\":\"{s}\"," ++
-            "\"full\":{{\"gen\":{d},\"object\":\"{s}-g{d}-full\",\"cutoff\":\"{s}\"{s}}},\"checkpoints\":{s},\"deltas\":[{s}]}}", .{ gen, cat_epoch, bucket, seq_frag, shared_frag, gc_frag, cutoff_version, lsn, vcol, full_gen_m, table, full_gen_m, full_cutoff_m, if (full_sorted_m) ",\"sorted\":true" else "", ckpts_json, deltas_json.items });
+            "\"full\":{{\"gen\":{d},\"object\":\"{s}-g{d}-full\",\"cutoff\":\"{s}\"{s}}},\"checkpoints\":{s},\"deltas\":[{s}]}}", .{ gen, cat_epoch, bucket, seq_frag, shared_frag, gc_frag, deletes_frag, cutoff_version, lsn, vcol, full_gen_m, table, full_gen_m, full_cutoff_m, if (full_sorted_m) ",\"sorted\":true" else "", ckpts_json, deltas_json.items });
         _ = try kv.put(key, manifest, .{});
 
         // ── objects and manifest live: NOW the row becomes the producer's memory ──

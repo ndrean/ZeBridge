@@ -392,49 +392,98 @@ pub fn streamResumeJson(a: std.mem.Allocator, args: Value) !Value {
 
 // ─── the delta path: a reconnect that takes the chain instead of the CDC backlog ──
 
-/// How many times smaller the deltas must be than the CDC they replace. The CDC side is
-/// an estimate from the whole stream's average message size, and a filtered consumer
-/// receives only part of the stream, so the estimate runs high: the margin keeps a
-/// near tie on CDC, which needs no chain at all.
+/// How many times smaller the deltas must be than the CDC they replace. The backlog is
+/// an estimate (cdcBacklogBytes); a near tie stays on CDC, which needs no chain at all.
 pub const delta_margin: i64 = 2;
 
 pub const DeltaChoice = struct { take: bool, why: []const u8 };
 
-/// Whether a replica that reconnects with no gap should take its chain's deltas instead
-/// of replaying the CDC backlog up to the chain's cut. The same rule wherever the client
-/// is connected: it reads the manifest, the positions and two sizes, never where the
-/// chain will be fetched from (a seeding leaf or the hub — the transport's business).
+/// May one (table, tenant)'s chain stand in for the CDC between the replica's position
+/// on its route (`stored`) and the chain's cut there (`cut`)? Decided from the manifest
+/// alone — the same answer on the hub or on a seeding leaf, before any object is read.
 ///
-///   `plan`  planFromManifest with the replica's watermark;
-///   `stored` the replica's position on the table's route; `cut` the chain's cut there;
-///   `avg_msg_bytes` the stream's bytes / messages; `delta_bytes` the plan's objects.
-///
-/// Taken only when the plan holds no full. That is what makes the jump sound: a delta
-/// carries every row whose version moved and every tombstone, but not an absence — and
-/// the producer forces a new base whenever rows went without a version move (physical
-/// deletes, a TRUNCATE), as planFromManifest forces one past the gc watermark. A plan
-/// without a full therefore misses nothing the CDC between `stored` and `cut` carried.
-/// The CDC after the cut is replayed either way.
-pub fn preferDeltas(plan: Value, stored: i64, cut: ?i64, avg_msg_bytes: i64, delta_bytes: i64) DeltaChoice {
+/// A delta carries every row whose version moved and every tombstone, never an absence.
+/// So the chain may replace CDC only where every delete is a tombstone by contract: the
+/// manifest says `"deletes": "tombstoned"` only when the producer cut a table under the
+/// soft-delete guard, which turns every DELETE into a tombstone and leaves physical
+/// deletes to the sweeper (whose reaps planFromManifest already answers with a full past
+/// the gc watermark). Physical deletes elsewhere cannot be inferred from a delta-only
+/// plan: the producer may build a new base after one and still offer a delta that
+/// reaches the replica's watermark. So any base newer than the watermark refuses too —
+/// on a guarded table that is a TRUNCATE or a rewrite.
+pub fn deltaEligible(a: std.mem.Allocator, man: Value, watermark: ?[]const u8, stored: i64, cut: ?i64) !DeltaChoice {
     const c = cut orelse return .{ .take = false, .why = "no-cut" };
     if (c <= stored) return .{ .take = false, .why = "not-ahead" };
+    if (!std.mem.eql(u8, getStr(man, "deletes") orelse "", "tombstoned")) return .{ .take = false, .why = "deletes-not-tombstoned" };
+    const wm = watermark orelse return .{ .take = false, .why = "new-base" };
+    const base_v = if (man == .object) (man.object.get("base") orelse man.object.get("full")) else null;
+    if (base_v) |b| if (getStr(b, "cutoff")) |bc| if (std.mem.order(u8, bc, wm) == .gt) return .{ .take = false, .why = "new-base" };
+    const plan = try planFromManifest(a, man, wm);
     if (plan != .array or plan.array.items.len == 0) return .{ .take = false, .why = "nothing-newer" };
     for (plan.array.items) |step| {
         if (std.mem.eql(u8, getStr(step, "kind") orelse "", "full")) return .{ .take = false, .why = "needs-full" };
     }
-    if (avg_msg_bytes <= 0 or delta_bytes < 0) return .{ .take = false, .why = "no-estimate" };
-    const cdc_bytes = (c - stored) *| avg_msg_bytes;
-    if (delta_bytes *| delta_margin >= cdc_bytes) return .{ .take = false, .why = "cdc-cheaper" };
-    return .{ .take = true, .why = "deltas" };
+    return .{ .take = true, .why = "eligible" };
 }
 
-/// preferDeltas over JSON: `{"plan", "stored", "cut", "avgMessageBytes", "deltaBytes"}`
-/// → `{"take", "why"}`.
-pub fn preferDeltasJson(a: std.mem.Allocator, args: Value) !Value {
+/// deltaEligible over JSON: `{"manifest", "watermark", "stored", "cut"}` → `{"take", "why"}`.
+pub fn deltaEligibleJson(a: std.mem.Allocator, args: Value) !Value {
     if (args != .object) return error.BadArgs;
     const cut_v = args.object.get("cut");
     const cut: ?i64 = if (cut_v != null and cut_v.? == .integer) cut_v.?.integer else null;
-    const r = preferDeltas(args.object.get("plan") orelse .null, getInt(args, "stored") orelse 0, cut, getInt(args, "avgMessageBytes") orelse 0, getInt(args, "deltaBytes") orelse -1);
+    const r = try deltaEligible(a, args.object.get("manifest") orelse .null, getStr(args, "watermark"), getInt(args, "stored") orelse 0, cut);
+    return choiceJson(a, r);
+}
+
+/// The CDC a replica would fetch from `stored` to `cut`: the sequence distance, scaled by
+/// the share of the stream's messages its own filter matches (`matched_messages`, from
+/// the stream's per-subject counts), times the stream's average message size. The share
+/// keeps a small table on a busy stream from reading as a large backlog: the distance
+/// alone counts every other table's messages too. Still an estimate (the share is over
+/// the retained stream, not the range); -1 when the stream's size is unknown.
+pub fn cdcBacklogBytes(stored: i64, cut: i64, stream_messages: i64, stream_bytes: i64, matched_messages: i64) i64 {
+    if (stream_messages <= 0 or stream_bytes < 0 or matched_messages < 0) return -1;
+    const distance: f64 = @floatFromInt(@max(0, cut - stored));
+    const share = @min(1.0, @as(f64, @floatFromInt(matched_messages)) / @as(f64, @floatFromInt(stream_messages)));
+    const avg = @as(f64, @floatFromInt(stream_bytes)) / @as(f64, @floatFromInt(stream_messages));
+    return @intFromFloat(@floor(distance * share * avg));
+}
+
+/// cdcBacklogBytes over JSON: `{"stored", "cut", "streamMessages", "streamBytes",
+/// "matchedMessages"}` → `{"bytes"}`.
+pub fn cdcBacklogBytesJson(a: std.mem.Allocator, args: Value) !Value {
+    if (args != .object) return error.BadArgs;
+    var o: std.json.ObjectMap = .empty;
+    try o.put(a, "bytes", .{ .integer = cdcBacklogBytes(getInt(args, "stored") orelse 0, getInt(args, "cut") orelse 0, getInt(args, "streamMessages") orelse 0, getInt(args, "streamBytes") orelse -1, getInt(args, "matchedMessages") orelse -1) });
+    return .{ .object = o };
+}
+
+/// One stream's choice, made before any object is fetched: every (table, tenant)
+/// depending on it must be eligible (deltaEligible) — one that declines needs the CDC
+/// anyway, so the stream would not move (streamForward) and the deltas would add bytes
+/// without removing any — and the deltas of all of them must be under half the CDC they
+/// replace (cdcBacklogBytes to the lowest cut). `whys`: each dependent's deltaEligible
+/// reason; the first one that is not "eligible" is the answer.
+pub fn streamDeltaChoice(whys: []const []const u8, delta_bytes: i64, backlog_bytes: i64) DeltaChoice {
+    if (whys.len == 0) return .{ .take = false, .why = "no-dependents" };
+    for (whys) |w| if (!std.mem.eql(u8, w, "eligible")) return .{ .take = false, .why = w };
+    if (delta_bytes < 0 or backlog_bytes < 0) return .{ .take = false, .why = "no-estimate" };
+    if (delta_bytes *| delta_margin >= backlog_bytes) return .{ .take = false, .why = "cdc-cheaper" };
+    return .{ .take = true, .why = "deltas" };
+}
+
+/// streamDeltaChoice over JSON: `{"whys": [...], "deltaBytes", "backlogBytes"}` →
+/// `{"take", "why"}`.
+pub fn streamDeltaChoiceJson(a: std.mem.Allocator, args: Value) !Value {
+    if (args != .object) return error.BadArgs;
+    const wv = args.object.get("whys") orelse return error.BadArgs;
+    if (wv != .array) return error.BadArgs;
+    const whys = try a.alloc([]const u8, wv.array.items.len);
+    for (wv.array.items, 0..) |w, i| whys[i] = if (w == .string) w.string else "";
+    return choiceJson(a, streamDeltaChoice(whys, getInt(args, "deltaBytes") orelse -1, getInt(args, "backlogBytes") orelse -1));
+}
+
+fn choiceJson(a: std.mem.Allocator, r: DeltaChoice) !Value {
     var o: std.json.ObjectMap = .empty;
     try o.put(a, "take", .{ .bool = r.take });
     try o.put(a, "why", .{ .string = r.why });
@@ -442,7 +491,7 @@ pub fn preferDeltasJson(a: std.mem.Allocator, args: Value) !Value {
 }
 
 /// Where a stream with NO gap moves after a pass that applied chains by choice
-/// (preferDeltas). `cuts`: one entry per (table, tenant) depending on the stream — the
+/// (streamDeltaChoice). `cuts`: one entry per (table, tenant) depending on the stream — the
 /// cut of a chain applied IN THIS PASS (the route's `cutoff_seq`, or `shared_cutoff_seq`
 /// on the shared route), null for one that took none. Forward to the lowest cut only
 /// when every dependent took a chain: one that did not still needs the events between.
