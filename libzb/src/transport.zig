@@ -100,6 +100,25 @@ pub const ObjectPull = struct {
         return openIn(t, t.js, a, bucket, name);
     }
 
+    /// The object's size from its meta message alone, no chunk consumer: what the delta
+    /// path (core.preferDeltas) weighs against the CDC backlog. Absent or deleted:
+    /// error.ObjectNotFound.
+    pub fn sizeIn(js: nats.JetStream, a: std.mem.Allocator, bucket: []const u8, name: []const u8) !u64 {
+        const stream = try std.fmt.allocPrint(a, "OBJ_{s}", .{bucket});
+        const enc = try a.alloc(u8, std.base64.url_safe.Encoder.calcSize(name.len));
+        _ = std.base64.url_safe.Encoder.encode(enc, name);
+        const meta_subject = try std.fmt.allocPrint(a, "$O.{s}.M.{s}", .{ bucket, enc });
+        const msg = js.getMsg(stream, .{ .last_by_subj = meta_subject, .direct = true }) catch |err| switch (err) {
+            error.MessageNotFound => return error.ObjectNotFound,
+            else => return err,
+        };
+        defer msg.deinit();
+        const Info = struct { size: u64 = 0, deleted: bool = false };
+        const info = try std.json.parseFromSliceLeaky(Info, a, msg.data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+        if (info.deleted) return error.ObjectNotFound;
+        return info.size;
+    }
+
     pub fn openIn(t: *Transport, js: nats.JetStream, a: std.mem.Allocator, bucket: []const u8, name: []const u8) !ObjectPull {
         const stream = try std.fmt.allocPrint(a, "OBJ_{s}", .{bucket});
         const enc = try a.alloc(u8, std.base64.url_safe.Encoder.calcSize(name.len));

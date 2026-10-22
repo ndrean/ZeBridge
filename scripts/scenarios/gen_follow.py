@@ -251,6 +251,9 @@ def seeding_report(name: str, events: list, logtext: str, fresh: list = ()) -> l
                                   "hub_gen": hub_gen, "gens_behind_hub": (hub_gen - ch["gen"]) if hub_gen is not None and ch.get("gen") is not None else None,
                                   "start_s": round((ch["t0_ms"] - lo) / 1000, 2), "ms": ch["t1_ms"] - ch["t0_ms"], "live_reseed": live,
                                   "age_s": round((at - cut) / 1000, 1) if cut else None})
+        # The delta path: what each stream with no gap decided on this (re)connect, and why.
+        row["delta_choices"] = [{k2: r.get(k2) for k2 in ("stream", "take", "why", "dependents", "stored", "cut", "matched_messages", "backlog_bytes", "delta_bytes")}
+                                for r in mine if r["m"] == "delta_choice"]
         row["steps"] = [{k2: st.get(k2) for k2 in ("kind", "object", "bytes", "rows", "ms", "fetch_ms", "inflate_ms", "decode_ms", "apply_ms", "streamed")}
                         | {"live_reseed": target_ms is not None and st["t0_ms"] > target_ms} for st in steps]
         out.append(row)
@@ -262,6 +265,9 @@ def print_seeding(rows: list):
         return f"{(b or 0) / 1048576:.2f} MB"
     for r in rows:
         print(f"  leg {r['leg']}{' (cold join)' if r['cold'] else ''}: CDC targets and newest ID reached after {r['target_catchup_s']} s (held work may remain); targets {r['targets']}")
+        for dc in r.get("delta_choices", []):
+            print(f"    delta path {dc['stream']}: {'TAKEN' if dc['take'] else 'not taken'} ({dc['why']}); {dc['dependents']} table(s), position {dc['stored']} → cut {dc['cut']}"
+                  + (f", backlog ~{mb(dc['backlog_bytes'])} ({dc['matched_messages']} matching msgs in the stream), deltas {mb(dc['delta_bytes'])}" if dc.get("backlog_bytes", -1) >= 0 else ""))
         if not [ch for ch in r["chains"] if not ch["live_reseed"]]:
             print("    no chain applied at connect: resumed from the stored position")
         for ch in r["chains"]:
@@ -691,6 +697,8 @@ def main() -> int:
     ap.add_argument("--cut-at", type=float, help="seconds into the load: cut the leaf's link to the hub (--via leaf)")
     ap.add_argument("--cut-for", type=float, default=40, help="seconds the link stays cut")
     ap.add_argument("--hub-url", help=argparse.SUPPRESS)
+    ap.add_argument("--guarded", action="store_true", help="install the write guards on the table: deletes are tombstones by contract (the delta path)")
+    ap.add_argument("--preload", type=int, default=0, help="rows of a tenant no client follows, before the load: a large table")
     ap.add_argument("--worker", help=argparse.SUPPRESS)
     ap.add_argument("--t0", type=float, help=argparse.SUPPRESS)
     ap.add_argument("--url", help=argparse.SUPPRESS)
@@ -711,6 +719,15 @@ def main() -> int:
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="gen-follow-"))
     bt.setup_database()
     setup_tables(bt)
+    if a.guarded:
+        # The deletion contract the delta path needs: every DELETE a tombstone, stated by
+        # the producer in each manifest ("deletes": "tombstoned").
+        bt.psql(f"SELECT zebridge_install_write_guards('public.{TABLE}'::regclass, 'updated_at', 'deleted_at', 'tenant_id')")
+    if a.preload:
+        # Rows of a tenant no client follows: a large table, so a generation's changed rows
+        # stay under half of it and the producer's size rule does not rebuild the base each
+        # cut — a busy tenant in a big multi-tenant table.
+        bt.psql(f"INSERT INTO public.{TABLE} (id, tenant_id, note) SELECT 900000000 + g, 'bulk', 'b' FROM generate_series(1, {a.preload}) g")
     topo = Topology(tmp, a.via, a.link_delay_ms, a.link_mbit)
     topo.start()
     url = topo.hub_url

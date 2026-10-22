@@ -30,7 +30,7 @@ import { decode, encode, decodeMulti } from '@msgpack/msgpack';
 import type { Storage, StorageFactory, Exec as StorageExec } from './storage.ts';
 
 import { sqliteDialect, type Dialect } from './dialect.ts';
-import { loadCore, scopeSeeding, caughtUpPosition, streamResume } from './wasm-core.ts';
+import { loadCore, scopeSeeding, caughtUpPosition, streamResume, deltaEligible, cdcBacklogBytes, streamDeltaChoice, streamForward } from './wasm-core.ts';
 import { v7 as uuidv7 } from 'uuid';
 import { heartbeatPayload,
   seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica as coreFullPredates,
@@ -3102,6 +3102,81 @@ export class ZeBridge {
   /// so every table was seeded TWICE concurrently (every `Seeded` line printed twice;
   /// two readers on the same 15 MiB object). A second request joins the one in flight.
   private seedInFlight = new Map<string, Promise<boolean>>();
+  /// The delta path on a (re)connect for one stream with no gap (core.streamDeltaChoice):
+  /// whether every table depending on it may take its chain instead of the CDC to the
+  /// chain's cut, decided before any object is fetched — the same on the hub or a seeding
+  /// leaf. Returns the tables to seed by choice; any failure answers "replay the CDC".
+  private async streamDeltas(stream: string, routes: Record<string, { route: string; sharedRoute?: string; seeded: boolean }>, gapped: string[], jsm: any): Promise<string[]> {
+    const GEN = this.config.grammar.generations;
+    if (!GEN || !this.nc) return [];
+    try {
+      const stored = this.globalSyncState.seq[stream] ?? 0;
+      const info = await jsm.streams.info(stream);
+      const created = String((info as { created?: unknown }).created ?? '');
+      const whys: string[] = [];
+      const deps: { table: string; man: any; watermark: string | null; src: JetStreamOpts | undefined }[] = [];
+      let lowCut: number | null = null;
+      for (const [table, r] of Object.entries(routes)) {
+        const own = r.route === stream;
+        const shared = !own && r.sharedRoute === stream;
+        if (!own && !shared) continue;
+        // Seeded this pass anyway (never seeded, or its other route gapped): the gap
+        // path owns it; keep the stream on its CDC.
+        if (!r.seeded || gapped.includes(r.route) || (r.sharedRoute && gapped.includes(r.sharedRoute))) { whys.push('seeding-owed'); continue; }
+        const tenant = this.effectiveTenantFor(table);
+        if (tenant === null) { whys.push('no-cut'); continue; }
+        const read = async (opts: JetStreamOpts | undefined) => {
+          const kv = await this.transport.kv(this.nc!, GEN.kv, { allow_direct: true }, opts);
+          const entry = await kv.get(`${tenant}.${table}`);
+          return entry && entry.operation === 'PUT' && entry.value?.length ? JSON.parse(td.decode(entry.value)) : null;
+        };
+        let src = !this.hubOnly.has(r.route) && this.config.seedDomain && this.config.seedDomain !== this.config.jsDomain
+          ? { domain: this.config.seedDomain } : this.jsOpts();
+        let man = await read(src).catch(() => null);
+        if (!man && src !== this.jsOpts()) { src = this.jsOpts(); man = await read(src); }
+        if (!man) { whys.push('no-cut'); continue; }
+        const rows: any[] = (await this.run(`SELECT watermark FROM _zebridge_generations WHERE tbl = ?`, table)) ?? [];
+        const watermark: string | null = rows[0]?.watermark ?? null;
+        // The cut on THIS stream, on the incarnation it was taken on.
+        const [kStream, kCreated, kCut] = own ? ['cdc_stream', 'cdc_stream_created', 'cutoff_seq'] : ['shared_cdc_stream', 'shared_cdc_stream_created', 'shared_cutoff_seq'];
+        const same = man[kStream] === stream && (!man[kCreated] || !created || man[kCreated] === created);
+        const cut = same && typeof man[kCut] === 'number' ? man[kCut] as number : null;
+        whys.push(deltaEligible({ manifest: man, watermark, stored, cut }).why);
+        if (cut !== null) lowCut = lowCut === null ? cut : Math.min(lowCut, cut);
+        deps.push({ table, man, watermark, src });
+      }
+      // Every dependent must be eligible before any object is fetched.
+      let choice = streamDeltaChoice(whys, 0, 1);
+      let matched = -1, backlog = -1, deltaBytes = -1;
+      if (choice.take) {
+        matched = 0;
+        for (const f of this.cdcFilters(stream)) {
+          const fi = await jsm.streams.info(stream, { subjects_filter: f });
+          for (const n of Object.values(fi.state.subjects ?? {})) matched += Number(n);
+        }
+        backlog = cdcBacklogBytes({ stored, cut: lowCut ?? stored, streamMessages: info.state.messages, streamBytes: info.state.bytes, matchedMessages: matched });
+        deltaBytes = 0;
+        for (const d of deps) {
+          const os = await this.transport.objectStore(this.nc, d.man.bucket, d.src);
+          for (const step of planFromManifest(d.man, d.watermark)) {
+            const oi = await os.info(step.name);
+            if (!oi || oi.deleted) { deltaBytes = -1; break; }
+            deltaBytes += oi.size ?? 0;
+          }
+          if (deltaBytes < 0) break;
+        }
+        choice = streamDeltaChoice(whys, deltaBytes, backlog);
+      }
+      this.measure.emit({ m: 'delta_choice', stream, take: choice.take, why: choice.why, dependents: whys.length, stored, cut: lowCut ?? -1, matched_messages: matched, backlog_bytes: backlog, delta_bytes: deltaBytes, t0_ms: Date.now() });
+      if (!choice.take) return [];
+      this.appendLog('SYS', `${stream}: ${(lowCut ?? stored) - stored} message(s) behind — taking the chains' deltas (${Math.floor(deltaBytes / 1024)} KiB) over the CDC backlog (~${Math.floor(backlog / 1024)} KiB) for [${deps.map((d) => d.table).join(', ')}]`, 'INFO');
+      return deps.map((d) => d.table);
+    } catch (e) {
+      this.appendLog('SYS', `${stream}: delta path not weighed (${e}) — replaying its CDC backlog`, 'INFO');
+      return [];
+    }
+  }
+
   private applyGenerations(table: string): Promise<boolean> {
     const inflight = this.seedInFlight.get(table);
     if (inflight) return inflight;
@@ -3554,6 +3629,9 @@ export class ZeBridge {
     // The tables a chain was applied to in this pass: each took the chain's state as of
     // its cut, which step 2 must replay from on every stream it rides.
     const seededThisPass = new Set<string>();
+    // The tables seeded by choice (the delta path), not because of a gap: a failure just
+    // replays the CDC backlog — nothing was owed.
+    const byChoice = new Set<string>();
     // Throw-proof from the first await: this function runs as a floating
     // promise from the reconnect handler and the status-loop restart, and an
     // unhandled rejection here KILLED THE PROCESS when the connection happened
@@ -3636,6 +3714,13 @@ export class ZeBridge {
       const gapDetail = scoped.gapped.map(
         (g) => `${g}: local ${streamGaps[g].stored}, stream first ${streamGaps[g].firstSeq}`);
       const tablesToSeed = new Set(scoped.tablesToSeed);
+      // The delta path (core.streamDeltaChoice): per stream with no gap, decided before any
+      // object is fetched — every table depending on it may take its chain instead of the
+      // CDC to the chain's cut. This pass runs at connect and at every reconnect.
+      for (const stream of new Set(Object.values(tableRoutes).map((r) => r.route))) {
+        if (scoped.gapped.includes(stream)) continue;
+        for (const table of await this.streamDeltas(stream, tableRoutes, scoped.gapped, jsm)) { tablesToSeed.add(table); byChoice.add(table); }
+      }
       const gap = tablesToSeed.size > 0;
 
       if (!gap) {
@@ -3648,6 +3733,7 @@ export class ZeBridge {
         const firstRun = seededBefore.size === 0 && scoped.gapped.every((g) => streamGaps[g].stored === 0);
         this.appendLog('SYS',
           `${firstRun ? 'First run — ' : gapDetail.length ? `Gap detected! ${gapDetail.join('; ')}. ` : ''}` +
+          `${byChoice.size ? `Taking deltas over the CDC backlog for [${[...byChoice].join(', ')}]. ` : ''}` +
           `Seeding ${tablesToSeed.size} table(s) [${[...tablesToSeed].join(', ')}]` +
           `${untouched > 0 ? `; ${untouched} table(s) resume untouched` : ''}`, firstRun ? 'INFO' : 'WARNING');
 
@@ -3678,6 +3764,11 @@ export class ZeBridge {
           if (await this.applyGenerations(table)) {
             seededThisPass.add(table);
             this.reach('snapshot');
+            return;
+          }
+          if (byChoice.has(table)) {
+            // Steps already applied are version-guarded; the position has not moved.
+            this.appendLog('SYS', `${table}: the delta path did not complete — replaying the CDC backlog instead`, 'INFO');
             return;
           }
 
@@ -3851,6 +3942,36 @@ export class ZeBridge {
               return tn !== null && this.cdcStreamForTenant(tn) === streamName;
             });
             if (riding.every((t) => have.has(t) && !this.failed.has(t))) this.healedRoutes.add(streamName);
+          }
+          // The delta path's other half (core.streamForward): with no gap, the stream moves to
+          // the lowest cut of the chains applied THIS pass when every table depending on
+          // it took one; the events up to there are in them. Otherwise it stays, and the
+          // seed gate drops what the chains carried.
+          if (decided.to === stored0 && rewindTo === stored0 && seededThisPass.size) {
+            const passCuts: (number | null)[] = [];
+            for (const table of this.syncedTables.keys()) {
+              if (this.ondemandSet.has(table)) continue;
+              const t = this.effectiveTenantFor(table);
+              if (t === null) continue;
+              const route = this.cdcStreamForTenant(t);
+              const st = this.syncedTables.get(table);
+              const took = seededThisPass.has(table) && !this.failed.has(table);
+              if (route === streamName) {
+                passCuts.push(took && st?.seedStream === streamName && typeof st.seedSeq === 'number' ? st.seedSeq : null);
+              } else if (pub === streamName && route !== pub) {
+                passCuts.push(took && typeof st?.sharedSeedSeq === 'number' ? st.sharedSeedSeq : null);
+              }
+            }
+            const to = streamForward(stored0, passCuts);
+            if (to > stored0) {
+              this.appendLog('SYS', `${streamName}: forwarded to ${to} (was ${stored0}) — every table on it took its chain's deltas; the CDC between is in them`, 'INFO');
+              this.globalSyncState.seq[streamName] = to;
+              await this.run(
+                `INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?)
+                 ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
+                streamName, to,
+              );
+            }
           }
           if (decided.to > stored0 && rewindTo >= decided.to) {
             if (stored0 > 0) this.appendLog('SYS', `${streamName}: gap healed — resuming at ${decided.to} (was ${stored0}, stream holds from ${firstSeq})`, 'INFO');

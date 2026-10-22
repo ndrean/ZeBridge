@@ -388,6 +388,9 @@ pub const SyncClient = struct {
     /// behind a cut leaf) is finished when the hub returns instead of leaving tails to run
     /// over a replica with no tenant and no positions table.
     synced_once: bool = false,
+    /// The pass may take a chain's deltas by choice (core.streamDeltaChoice): the first sync
+    /// of this handle — a reopen behind a CDC backlog — not every timer sync.
+    offer_deltas: bool = false,
     /// The stream whose fetched batch the drain loop holds while it calls gapAndSeed: its
     /// tail must outlive the call (the batch's messages belong to it), so a heal leaves it
     /// to the loop, which drops it once the batch is acked.
@@ -1731,6 +1734,10 @@ pub const SyncClient = struct {
         // The (table, tenant) pairs a chain was applied to in this pass.
         const Applied = struct { table: []const u8, tenant: []const u8 };
         var applied_now: std.ArrayList(Applied) = .empty;
+        // The delta path (core.streamDeltaChoice), on a reopen only: the (table, tenant)
+        // pairs whose chains stand in for their streams' CDC backlog, decided per stream
+        // before any object is fetched.
+        const delta_pairs: []const DeltaPair = if (self.offer_deltas) try self.chooseDeltas(a, &gapped) else &.{};
         for (self.followed) |table| {
             if (self.isOnDemand(table)) continue; // §10hj: never seeded from a chain
             const st = self.states.get(table) orelse continue;
@@ -1742,7 +1749,11 @@ pub const SyncClient = struct {
                 // ⚠️ `try`, not "treat a failed read as never seeded": that would answer a
                 // locked database with a full re-seed (the same trap as `storedSeq`).
                 const seeded = (try self.st.query(a, "SELECT tbl FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } })).len > 0;
-                if (!(gapped.contains(route) or shared_gapped or !seeded)) continue;
+                // The delta path: chosen per stream before this loop (chooseDeltas).
+                const by_choice = for (delta_pairs) |dp| {
+                    if (std.mem.eql(u8, dp.table, table) and std.mem.eql(u8, dp.tenant, tenant)) break true;
+                } else false;
+                if (!(gapped.contains(route) or shared_gapped or !seeded or by_choice)) continue;
                 // One table's failure is one table's failure (the TS rule): the rest
                 // still seed, and the next poll's gap check retries this one. A chain
                 // that is not there yet, or cannot splice, leaves `reseed_pending` set.
@@ -1754,6 +1765,13 @@ pub const SyncClient = struct {
                     self.rememberUnseeded(table, @errorName(err));
                     break :blk false;
                 };
+                if (by_choice and !ok) {
+                    // Nothing was owed: the CDC backlog still carries all of it, and the
+                    // position has not moved. Steps already applied are version-guarded.
+                    log.info("{s}: the delta path did not complete — replaying the CDC backlog instead", .{table});
+                    self.reseed_pending = pending_before;
+                    continue;
+                }
                 self.reseed_pending = pending_before or self.reseed_pending or !ok;
                 if (self.chain_applied) try applied_now.append(a, .{ .table = table, .tenant = tenant });
                 const has_chain = (try self.st.query(a, "SELECT tbl FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } })).len > 0;
@@ -1812,6 +1830,51 @@ pub const SyncClient = struct {
                 log.warn("{s}: rewound to {d} (was {d}) — {s} was reseeded here and replays the events after its chain's cut", .{ pr.stream, cut, stored, ap.table });
                 try self.persistSeq(pr.stream, @intCast(cut));
                 self.dropTail(pr.stream);
+            }
+        }
+        // The delta path's other half (core.streamForward): a stream with no gap moves to
+        // the lowest cut of the chains applied this pass, when every (table, tenant)
+        // depending on it took one — the events up to there are in the chains. One that
+        // took none still needs them: the stream stays, the seed gate drops what the
+        // chains carried.
+        if (applied_now.items.len > 0) {
+            var moved: std.array_hash_map.String(void) = .empty;
+            for (applied_now.items) |ap| {
+                const st = self.states.get(ap.table) orelse continue;
+                for ([_][]const u8{ try self.routeFor(a, ap.tenant), st.shared_route orelse "" }) |stream| {
+                    if (stream.len == 0 or gapped.contains(stream) or moved.contains(stream)) continue;
+                    try moved.put(a, stream, {});
+                    var cuts: std.ArrayList(?i64) = .empty;
+                    for (self.followed) |table| {
+                        if (self.isOnDemand(table)) continue;
+                        const dst = self.states.get(table) orelse continue;
+                        for (self.tenantsFor(dst)) |tenant| {
+                            const own = std.mem.eql(u8, try self.routeFor(a, tenant), stream);
+                            const shared = !own and if (dst.shared_route) |sr| std.mem.eql(u8, sr, stream) else false;
+                            if (!own and !shared) continue;
+                            const took = for (applied_now.items) |x| {
+                                if (std.mem.eql(u8, x.table, table) and std.mem.eql(u8, x.tenant, tenant)) break true;
+                            } else false;
+                            var cut: ?i64 = null;
+                            if (took) {
+                                const rows = try self.st.query(a, "SELECT anchor_stream, anchor_seq, shared_seq FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } });
+                                if (rows.len > 0) {
+                                    if (own) {
+                                        if (rows[0][0].eqlText(stream) and rows[0][1] == .integer and rows[0][1].integer > 0) cut = rows[0][1].integer;
+                                    } else if (rows[0][2] == .integer) cut = rows[0][2].integer;
+                                }
+                            }
+                            try cuts.append(a, cut);
+                        }
+                    }
+                    const stored: i64 = @intCast(try self.storedSeq(stream));
+                    const to = core.streamForward(stored, cuts.items);
+                    if (to > stored) {
+                        log.info("{s}: forwarded to {d} (was {d}) — every table on it took its chain's deltas; the CDC between is in them", .{ stream, to, stored });
+                        try self.persistSeq(stream, @intCast(to));
+                        self.dropTail(stream);
+                    }
+                }
             }
         }
         // §10ei, §10lw: where a gapped stream resumes is core.streamResume — the rule
@@ -2214,6 +2277,140 @@ pub const SyncClient = struct {
     /// stream or the replica, an object not mirrored yet, the leaf unreachable. Retrying
     /// from the hub replays the chain from the stored watermark, as any failed seed does
     /// on its next turn; a failure of the replica itself fails again there and is returned.
+    const DeltaPair = struct { table: []const u8, tenant: []const u8 };
+
+    /// The delta path on a reopen (core.streamDeltaChoice): for each stream with no gap,
+    /// whether every (table, tenant) depending on it may take its chain instead of the
+    /// CDC to the chain's cut — decided before any object is fetched, the same on the
+    /// hub or a seeding leaf. Returns the pairs to seed by choice. Any failure answers
+    /// "replay the CDC", which is never wrong.
+    fn chooseDeltas(self: *SyncClient, a: std.mem.Allocator, gapped: *const std.array_hash_map.String(i64)) ![]const DeltaPair {
+        var out: std.ArrayList(DeltaPair) = .empty;
+        var streams: std.array_hash_map.String(void) = .empty;
+        for (self.followed) |table| {
+            if (self.isOnDemand(table)) continue;
+            const st = self.states.get(table) orelse continue;
+            for (self.tenantsFor(st)) |tenant| try streams.put(a, try self.routeFor(a, tenant), {});
+        }
+        var sit = streams.iterator();
+        while (sit.next()) |se| {
+            const stream = se.key_ptr.*;
+            if (gapped.contains(stream) or self.dark.contains(stream)) continue;
+            const pick = self.streamDeltas(a, stream, gapped) catch |err| {
+                log.info("{s}: delta path not weighed ({s}) — replaying its CDC backlog", .{ stream, @errorName(err) });
+                continue;
+            };
+            try out.appendSlice(a, pick);
+        }
+        return out.items;
+    }
+
+    fn streamDeltas(self: *SyncClient, a: std.mem.Allocator, stream: []const u8, gapped: *const std.array_hash_map.String(i64)) ![]const DeltaPair {
+        const stored: i64 = @intCast(try self.storedSeq(stream));
+        const facts = try self.streamFacts(stream);
+        const Dep = struct { pair: DeltaPair, man: Value, watermark: ?[]const u8, src: @import("nats").JetStream };
+        var deps: std.ArrayList(Dep) = .empty;
+        var whys: std.ArrayList([]const u8) = .empty;
+        var low_cut: ?i64 = null;
+        for (self.followed) |table| {
+            if (self.isOnDemand(table)) continue;
+            const st = self.states.get(table) orelse continue;
+            for (self.tenantsFor(st)) |tenant| {
+                const route = try self.routeFor(a, tenant);
+                const own = std.mem.eql(u8, route, stream);
+                const shared = !own and if (st.shared_route) |sr| std.mem.eql(u8, sr, stream) else false;
+                if (!own and !shared) continue;
+                // Seeded this pass anyway (never seeded, or its other route gapped): the
+                // gap path owns it; keep the stream on its CDC.
+                const seeded = (try self.st.query(a, "SELECT tbl FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } })).len > 0;
+                const other_gapped = gapped.contains(route) or (if (st.shared_route) |sr| gapped.contains(sr) else false);
+                if (!seeded or other_gapped) {
+                    try whys.append(a, "seeding-owed");
+                    continue;
+                }
+                const hub_only = self.reconciling.contains(route);
+                var src = if (hub_only) self.t.js else (self.t.seed_js orelse self.t.js);
+                const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ tenant, table });
+                const man_bytes = (try transport.Transport.kvGetIn(src, a, self.kv_generations, key)) orelse blk: {
+                    src = self.t.js;
+                    break :blk (try transport.Transport.kvGetIn(src, a, self.kv_generations, key)) orelse {
+                        try whys.append(a, "no-cut");
+                        continue;
+                    };
+                };
+                const man = (try std.json.parseFromSlice(Value, a, man_bytes, .{})).value;
+                const wm_rows = try self.st.query(a, "SELECT watermark FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } });
+                const watermark: ?[]const u8 = if (wm_rows.len > 0 and wm_rows[0][0] == .text) wm_rows[0][0].text else null;
+                // The cut on THIS stream, on the incarnation it was taken on.
+                const k_stream = if (own) "cdc_stream" else "shared_cdc_stream";
+                const k_created = if (own) "cdc_stream_created" else "shared_cdc_stream_created";
+                const k_cut = if (own) "cutoff_seq" else "shared_cutoff_seq";
+                const m_stream = if (man.object.get(k_stream)) |v| (if (v == .string) v.string else "") else "";
+                const m_created = if (man.object.get(k_created)) |v| (if (v == .string) v.string else "") else "";
+                const same = std.mem.eql(u8, m_stream, stream) and (m_created.len == 0 or facts.created.len == 0 or std.mem.eql(u8, m_created, facts.created));
+                const cut: ?i64 = if (!same) null else if (man.object.get(k_cut)) |v| (if (v == .integer) v.integer else null) else null;
+                const e = try core.deltaEligible(a, man, watermark, stored, cut);
+                try whys.append(a, e.why);
+                if (cut) |c| low_cut = if (low_cut) |l| @min(l, c) else c;
+                try deps.append(a, .{ .pair = .{ .table = table, .tenant = tenant }, .man = man, .watermark = watermark, .src = src });
+            }
+        }
+        // Every dependent must be eligible before any object is fetched.
+        var choice = core.streamDeltaChoice(whys.items, 0, 1);
+        var backlog: i64 = -1;
+        var delta_bytes: i64 = -1;
+        var matched: i64 = -1;
+        if (choice.take) {
+            matched = self.filterMessages(a, stream) catch -1;
+            backlog = core.cdcBacklogBytes(stored, low_cut orelse stored, @intCast(facts.messages), @intCast(facts.bytes), matched);
+            delta_bytes = 0;
+            for (deps.items) |d| {
+                const plan = try core.planFromManifest(a, d.man, d.watermark);
+                const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, d.pair.tenant });
+                for (plan.array.items) |step| {
+                    const name = if (step.object.get("name")) |v| (if (v == .string) v.string else "") else "";
+                    const size = transport.ObjectPull.sizeIn(d.src, a, bucket, name) catch transport.ObjectPull.sizeIn(self.t.js, a, bucket, name) catch {
+                        delta_bytes = -1;
+                        break;
+                    };
+                    delta_bytes += @intCast(size);
+                }
+                if (delta_bytes < 0) break;
+            }
+            choice = core.streamDeltaChoice(whys.items, delta_bytes, backlog);
+        }
+        if (measure_enabled) log.info("measure {{\"m\":\"delta_choice\",\"stream\":\"{s}\",\"take\":{},\"why\":\"{s}\",\"dependents\":{d},\"stored\":{d},\"cut\":{d},\"matched_messages\":{d},\"backlog_bytes\":{d},\"delta_bytes\":{d},\"t0_ms\":{d}}}", .{ stream, choice.take, choice.why, whys.items.len, stored, low_cut orelse -1, matched, backlog, delta_bytes, nowMillis() });
+        if (!choice.take) return &.{};
+        log.info("{s}: {d} message(s) behind — taking the chains' deltas ({d} KiB) over the CDC backlog (~{d} KiB) for {d} table(s)", .{ stream, (low_cut orelse stored) - stored, @divTrunc(delta_bytes, 1024), @divTrunc(backlog, 1024), deps.items.len });
+        const out = try a.alloc(DeltaPair, deps.items.len);
+        for (deps.items, 0..) |d, i| out[i] = d.pair;
+        return out;
+    }
+
+    /// The messages on `stream` this client's filters match, from the stream's per-subject
+    /// counts (STREAM.INFO with `subjects_filter`): the share of the stream a backlog is
+    /// made of, for core.cdcBacklogBytes.
+    fn filterMessages(self: *SyncClient, a: std.mem.Allocator, stream: []const u8) !i64 {
+        var total: i64 = 0;
+        const subject = try self.t.js.apiSubject(a, "STREAM.INFO.{s}", .{stream});
+        for (try self.cdcFilters(a, stream)) |f| {
+            const body = try std.fmt.allocPrint(a, "{{\"subjects_filter\":\"{s}\"}}", .{f});
+            const msg = try self.t.js.nc.request(subject, body, self.t.js.opts.request_timeout);
+            defer msg.deinit();
+            const v = try std.json.parseFromSliceLeaky(Value, a, msg.data, .{});
+            if (v != .object or v.object.get("error") != null) return error.StreamInfoRefused;
+            const state = v.object.get("state") orelse return error.StreamInfoRefused;
+            const subjects = if (state == .object) state.object.get("subjects") else null;
+            if (subjects) |sv| if (sv == .object) {
+                var it = sv.object.iterator();
+                while (it.next()) |e| if (e.value_ptr.* == .integer) {
+                    total += e.value_ptr.integer;
+                };
+            };
+        }
+        return total;
+    }
+
     fn applyChain(self: *SyncClient, table: []const u8, tenant: []const u8) !void {
         // A route under reconciliation seeds from the hub only: a leaf's copy may be
         // behind the very commit the reconciliation is about.
@@ -3104,7 +3301,9 @@ pub const SyncClient = struct {
         return null;
     }
 
-    const StreamFacts = struct { first_seq: u64, last_seq: u64, created: []const u8 };
+    /// `messages` and `bytes`: the stream's state, for its average message size (the
+    /// delta path's estimate of a CDC backlog).
+    const StreamFacts = struct { first_seq: u64, last_seq: u64, created: []const u8, messages: u64 = 0, bytes: u64 = 0 };
 
     /// A new pass: what the last one learnt of the streams is forgotten. `poll`, `syncOnce`
     /// and `join` start one; a caller driving the steps itself (`gapAndSeed`, `drainCdc`)
@@ -3125,6 +3324,8 @@ pub const SyncClient = struct {
             .first_seq = info.value.state.first_seq,
             .last_seq = info.value.state.last_seq,
             .created = try pa.dupe(u8, info.value.created),
+            .messages = info.value.state.messages,
+            .bytes = info.value.state.bytes,
         };
         try self.pass_streams.put(pa, try pa.dupe(u8, stream), f);
         return f;
@@ -5843,6 +6044,8 @@ pub const SyncClient = struct {
         // this client runs lands on its next sync (§10v's alter/rebuild path).
         try self.syncSchemas();
         self.startup.mark("schemas");
+        self.offer_deltas = !self.synced_once;
+        defer self.offer_deltas = false;
         self.reconcile(null, null) catch |err| log.warn("reconcile: {s} — retried at the next pass", .{@errorName(err)});
         try self.gapAndSeed(null, null);
         self.startup.mark("seed");
