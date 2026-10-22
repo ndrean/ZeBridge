@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""One field client: libzb through its C ABI, on a machine near a leaf, against the real hub.
+
+Run by field_follow.py over ssh, one process per client. The first connect redeems an invite
+(`bridgeUrl` + `invite`); the identity is kept beside the replica and reused on every leg.
+Each leg: read the catch-up target (CDC_<tenant>'s last sequence, with the client's own
+credentials), connect with ZB_MEASURE on, poll until the target is reached, follow until the
+leg ends. JSON events on stdout, libzb's log on stderr. After the last leg it waits for the
+orchestrator's done file (PostgreSQL's digest) and polls until the replica equals it.
+
+Needs: Python 3.10+, nats-py (for the target), the libzb .so (--lib).
+"""
+import argparse, asyncio, ctypes, hashlib, json, os, pathlib, sqlite3, sys, tempfile, time
+
+TABLE = "storm_items"
+
+
+def frame(i, note) -> bytes:
+    """gen_follow.frame: `id:N` for a NULL note, `id:S<bytes>:<note>` otherwise."""
+    return f"{i}:N".encode() if note is None else f"{i}:S{len(note.encode())}:".encode() + note.encode()
+
+
+def replica_digest(db, tenant):
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        try:
+            h, n = hashlib.sha256(), 0
+            for i, note in con.execute(f"SELECT id, note FROM {TABLE} WHERE tenant_id = ? ORDER BY id", (tenant,)):
+                h.update(frame(i, note))
+                n += 1
+            return {"digest": h.hexdigest(), "rows": n}
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        return {"error": str(e)}
+
+
+async def stream_last(url, creds_text, domain, stream):
+    import nats
+    with tempfile.NamedTemporaryFile("w", suffix=".creds", delete=False) as f:
+        f.write(creds_text)
+        path = f.name
+    os.chmod(path, 0o600)
+    try:
+        nc = await nats.connect(url, user_credentials=path, connect_timeout=10)
+        try:
+            info = await nc.jetstream(domain=domain).stream_info(stream)
+            return info.state.last_seq
+        finally:
+            await nc.close()
+    finally:
+        os.unlink(path)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--name", required=True)
+    ap.add_argument("--lib", required=True)
+    ap.add_argument("--db", required=True)
+    ap.add_argument("--identity", required=True, help="kept across runs: the invite is redeemed once")
+    ap.add_argument("--bridge", default="https://bridge.zebridge.eu")
+    ap.add_argument("--invite-file", required=True, help="the invite code, used on the first connect only")
+    ap.add_argument("--nats", required=True, help="the NATS this client dials: the leaf or the hub")
+    ap.add_argument("--hub-nats", required=True, help="the hub, for the catch-up target")
+    ap.add_argument("--seed-domain", default="")
+    ap.add_argument("--tenant", default="storm")
+    ap.add_argument("--schedule", required=True, help='[[open_s, close_s|null], ...] from --t0')
+    ap.add_argument("--t0", type=float, required=True)
+    ap.add_argument("--done-file", required=True)
+    a = ap.parse_args()
+
+    lib = ctypes.CDLL(a.lib)
+    lib.zb_free.argtypes = [ctypes.c_void_p]
+    lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+    lib.zb_client_close.argtypes = [ctypes.c_uint64]
+    for n, extra in (("sync", []), ("poll", [ctypes.c_uint64])):
+        f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + extra
+
+    def take(p):
+        try:
+            return json.loads(ctypes.string_at(p).decode())
+        finally:
+            lib.zb_free(p)
+
+    def say(**kv):
+        print(json.dumps({"t": round(time.time() - a.t0, 1), **kv}), flush=True)
+
+    identity = pathlib.Path(a.identity)
+    stream = f"CDC_{a.tenant}"
+    for i, (t_open, t_close) in enumerate(json.loads(a.schedule)):
+        while time.time() < a.t0 + t_open:
+            time.sleep(0.2)
+        opts = {"dbPath": a.db, "identityPath": a.identity, "tables": [TABLE], "heartbeatMs": 0, "natsUrl": a.nats, "clientId": f"field-{a.name}"}
+        if a.seed_domain:
+            opts["seedDomain"] = a.seed_domain
+        targets = {stream: 0, "CDC_PUBLIC": 0}
+        if identity.exists():
+            ident = json.loads(identity.read_text())
+            try:
+                targets[stream] = asyncio.run(stream_last(a.hub_nats, ident["creds"], ident.get("js_domain") or "hub", stream))
+            except Exception as e:
+                say(event="target_failed", leg=i, error=str(e)[:200])
+        else:
+            opts["bridgeUrl"] = a.bridge
+            opts["invite"] = pathlib.Path(a.invite_file).read_text().strip()
+        os.environ["ZB_MEASURE"] = "1"
+        os.environ["ZB_CATCHUP_TARGETS"] = ",".join(f"{k}={v}" for k, v in targets.items())
+        t_c = time.time()
+        say(event="leg", leg=i, start_ms=int(t_c * 1000), targets=targets, cold=i == 0)
+        h = lib.zb_client_connect(json.dumps(opts).encode())
+        while not h:
+            if time.time() - t_c > 300:
+                say(event="open_failed", leg=i); return 1
+            say(event="open_retry", leg=i)
+            time.sleep(5)
+            h = lib.zb_client_connect(json.dumps(opts).encode())
+        synced = take(lib.zb_client_sync(h))
+        connect_s = time.time() - t_c
+        poll_errors = 0
+        end = (a.t0 + t_close) if t_close is not None else None
+        # The leg's work is measured by libzb itself (the catch-up records); here the leg
+        # only runs its course: until it closes, or for the last leg until the done file.
+        while True:
+            p = take(lib.zb_client_poll(h, 500))
+            poll_errors += bool(p.get("error"))
+            if end is not None and time.time() >= end:
+                break
+            if end is None and pathlib.Path(a.done_file).exists():
+                break
+        if t_close is not None:
+            say(event="offline", leg=i, connect_s=round(connect_s, 2), sync_error=synced.get("error"), poll_errors=poll_errors)
+            lib.zb_client_close(h)
+            continue
+        truth = json.loads(pathlib.Path(a.done_file).read_text())
+        t_f = time.time()
+        have = {}
+        while time.time() - t_f < 300:
+            take(lib.zb_client_poll(h, 500))
+            have = replica_digest(a.db, a.tenant)
+            if have.get("digest") == truth["digest"] and have.get("rows") == truth["rows"]:
+                break
+        say(event="final", leg=i, connect_s=round(connect_s, 2), exact=have.get("digest") == truth["digest"] and have.get("rows") == truth["rows"],
+            rows=have.get("rows"), want_rows=truth["rows"], converge_s=round(time.time() - t_f, 1), poll_errors=poll_errors)
+        lib.zb_client_close(h)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
