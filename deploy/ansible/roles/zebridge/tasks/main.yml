@@ -119,6 +119,9 @@
     enabled: "{{ zb_mutation_admission | bool }}"
     state: "{{ zb_mutation_admission | bool | ternary('started', 'stopped') }}"
     daemon_reload: true
+  # --check does not write the unit above: on a hub that never had admission, systemd has
+  # no such service yet and the dry run stopped here (0.2.7 upgrade, 2026-10-22).
+  ignore_errors: "{{ ansible_check_mode }}"
 
 - name: The bridge and the sweeper as services
   ansible.builtin.copy:
