@@ -54,6 +54,14 @@ jobs:
         run: |
           mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
           zig build test -Dvendor=true
+      # A 32-bit target, compiled only: no 64-bit atomics there, and the release jobs
+      # (Maven, React Native, pub.dev) are the only other builds that would notice.
+      - name: Android armv7 compiles
+        working-directory: libzb
+        run: |
+          ndk="$(../scripts/android-ndk.sh)"
+          zig build lib -Dtarget=arm-linux-androideabi -Dcpu=cortex_a7 -Dvendor=true -Dandroid-api=29 \
+            --sysroot "$ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
 
   client-ts:
     name: zb-client-ts (typecheck, tests)
