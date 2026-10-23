@@ -6,9 +6,14 @@
 # Three plays, because a leaf needs two things only the hub has: the trust lines of its
 # nats-server.conf (the operator and the accounts), and a leaf credential minted from
 # operator.store. They travel through Ansible's memory, never through a file here.
+#
+# A leaf that runs as a Docker Compose stack (deploy/compose, leaf mode) belongs to
+# `leaves` too, since the hub's admission learns every leaf name from that group, and
+# ALSO to `compose_leaves`: the leaf plays skip it, so no nats.service is ever written or
+# started beside its container.
 
 - name: What each leaf already holds
-  hosts: leaves
+  hosts: leaves:!compose_leaves
   become: true
   gather_facts: false
   tasks:
@@ -144,7 +149,7 @@
       no_log: true
 
 - name: The leaves
-  hosts: leaves
+  hosts: leaves:!compose_leaves
   become: true
   # The settings and secrets the hub's group has (the domain, nats_version, the
   # Cloudflare token for certbot), read when the play runs.

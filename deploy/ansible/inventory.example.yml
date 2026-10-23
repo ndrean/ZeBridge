@@ -16,3 +16,7 @@ all:
           leaf_tenants: [demo, storm]
           leaf_js_domain: strasbourg
           leaf_host: leaf1.zebridge.eu
+    # Leaves run by Docker Compose (deploy/compose): listed under `leaves` as well, for the
+    # hub; leaf.yml's leaf plays skip them. Empty when every leaf is Ansible's.
+    compose_leaves:
+      hosts: {}
