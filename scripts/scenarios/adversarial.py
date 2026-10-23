@@ -61,7 +61,7 @@ async def legit_write_flows(js, uid, tag):
     env = msgpack.packb({"key": {"uid": uid}, "version": version, "client_id": "c-adv",
                          "data": {"uid": uid, "value": target, "updated_at": version}})
     await js.publish(zb.subject(MUT, ADVERSARY, "counter_public", "update"), env,
-                     headers={"Nats-Msg-Id": f"adv-legit-{tag}-{version}"})
+                     headers={"Nats-Msg-Id": f"adv-legit-{tag}-{version}".replace(".", "_")})  # an ID may not hold a "."
     for _ in range(20):
         if counter_value() == str(target):
             return True
@@ -164,7 +164,7 @@ async def scenario() -> int:
             version = f"2026-01-01T00:00:{i:02d}.000000Z"
             try:
                 await js.publish(zb.subject(MUT, ADVERSARY, "counter_public", "update"), raw,
-                                 headers={"Nats-Msg-Id": f"adv-hostile-{i}-{version}"})
+                                 headers={"Nats-Msg-Id": f"adv-hostile-{i}-{version}".replace(".", "_")})
             except Exception:
                 # the CLIENT-side publish may itself reject (e.g. a broker limit) —
                 # that is fine, the point is the bridge must not die

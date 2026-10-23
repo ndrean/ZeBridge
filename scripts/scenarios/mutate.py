@@ -170,6 +170,11 @@ async def main():
     js = nc.jetstream()
     base = zb.subject(zb.TOPOLOGY["subjects"]["mutations_prefix"], PRINCIPAL, table)
 
+    async def publish(subject: str, body: bytes):
+        """One write, with its own `Nats-Msg-Id`: the ID keys the write's receipt, and a
+        write without one is refused before it is queued."""
+        return await js.publish(subject, body, headers={"Nats-Msg-Id": f"mutate-{uuid.uuid4().hex[:16]}"})
+
     try:
         print()
         # Minutes behind now, not a pinned day: a write stamped before the GC watermark
@@ -180,7 +185,7 @@ async def main():
             ("update", "NEWER wins", 20, "applied"),
         ]:
             version = zb.recent_version(minutes_ago)
-            await js.publish(
+            await publish(
                 f"{base}.{op}",
                 msgpack.packb({
                     "key": {pk_col: row_id},
@@ -205,7 +210,7 @@ async def main():
               f"some_text is {text!r}, expected 'NEWER wins'"
               + (" — the stale write WON; the version guard is not applied" if text and "STALE" in text else ""))
 
-        await js.publish(
+        await publish(
             f"{base}.delete",
             # The delete's version is the tombstone's timestamp, and the sweeper reaps
             # tombstones older than GC_THRESHOLD: a delete pinned to 2026-08-16 was reaped
@@ -241,10 +246,10 @@ async def main():
 
         sparse = full_row(columns, sparse_key, "sparse insert", now)
         sparse.pop(pk_col, None)
-        await js.publish(f"{base}.insert", msgpack.packb(
+        await publish(f"{base}.insert", msgpack.packb(
             {"key": {pk_col: sparse_key}, "data": sparse, "version": now, "client_id": "c1"}))
         # key K, data naming J: one row stored under J while the verdict names K.
-        await js.publish(f"{base}.insert", msgpack.packb(
+        await publish(f"{base}.insert", msgpack.packb(
             {"key": {pk_col: key_k}, "data": full_row(columns, key_j, "mismatched key", now),
              "version": now, "client_id": "c1"}))
         print("\n  insert with the key only in `key` — expect the row under that key")

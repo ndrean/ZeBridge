@@ -118,8 +118,9 @@ async def run() -> int:
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
 
     # a chain must exist to seed from
+    # LOG_LEVEL=debug: the wait below is for the producer's "🗜️" line, logged at debug.
     env = {"GENERATIONS_ENABLED": "1", "GENERATION_CADENCE_SECONDS": "5",
-           "GENERATION_RULES": f"{TABLE}:{TENANT}"}
+           "GENERATION_RULES": f"{TABLE}:{TENANT}", "LOG_LEVEL": "debug"}
     rnd = random.Random(20260903)
     with zb.Bridge(LOG, **env) as br:
         if not br.wait_for_log(f"🗜️ '{TENANT}'/'{TABLE}'", timeout=120):

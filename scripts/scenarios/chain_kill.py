@@ -175,8 +175,9 @@ async def run() -> int:
     size = zb.psql(f"SELECT pg_size_pretty(pg_total_relation_size('{TABLE}'))")
     zb.ok(f"fixture: {ROWS} rows ({size}) in one tenant, generations on")
 
+    # LOG_LEVEL=debug: the targeted kills wait for the producer's "🗜️" line, logged at debug.
     env = {"GENERATIONS_ENABLED": "1", "GENERATION_CADENCE_SECONDS": "5",
-           "GENERATION_RULES": f"{TABLE}:{TENANT}"}
+           "GENERATION_RULES": f"{TABLE}:{TENANT}", "LOG_LEVEL": "debug"}
     rnd = random.Random(20260901)
 
     # ── phase A: kill in the window between the object and the manifest ──────

@@ -226,7 +226,7 @@ async def main():
               # as a CLIENT principal: the mutation lane is confined per principal by JWT
               nc = await zb.connect_as(PRINCIPAL)
               await nc.jetstream().publish(zb.subject(MUT, PRINCIPAL, "counter_public", "update"), env_bytes,
-                                           headers={"Nats-Msg-Id": "chaos-" + version})
+                                           headers={"Nats-Msg-Id": "chaos-" + version.replace(".", "_")})  # an ID may not hold a "."
               await nc.close()
               deadline = time.time() + 20
               while time.time() < deadline and not mut_ok:

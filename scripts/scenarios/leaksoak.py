@@ -179,7 +179,7 @@ async def main():
                 })
                 try:
                     await js.publish(zb.subject(MUT, who, "counter_public", "update"), envelope,
-                                     headers={"Nats-Msg-Id": f"soak-{rounds}-{version}"})
+                                     headers={"Nats-Msg-Id": f"soak-{rounds}-{version}".replace(".", "_")})  # an ID may not hold a "."
                 except Exception:
                     pass
             if not swept and time.time() > deadline - SOAK / 2:

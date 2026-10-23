@@ -144,13 +144,14 @@ async def main():
     async def send(op: str, uid: str, text: str, version: str,
                    client_id: str = LOW, msg_id: str | None = None,
                    tombstone: bool = False):
-        """Publish one mutation. `msg_id` is reused verbatim to simulate a replay."""
+        """Publish one mutation, with a fresh `Nats-Msg-Id` (a write without one is refused
+        before it is queued). `msg_id` is reused verbatim to simulate a replay."""
         data = row(uid, text, version)
         if tombstone:
             data[tomb_col] = version
         payload = {"key": {"uid": uid}, "data": data,
                    "version": version, "client_id": client_id}
-        hdr = {"Nats-Msg-Id": msg_id} if msg_id else None
+        hdr = {"Nats-Msg-Id": msg_id or f"offline-{uuid.uuid4().hex[:16]}"}
         ack = await js.publish(f"{base}.{op}", msgpack.packb(payload), headers=hdr)
         await asyncio.sleep(SETTLE)
         return ack
