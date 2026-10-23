@@ -58,7 +58,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v5
         with:
-          node-version: 22.14
+          node-version: 22   # zb-client-ts needs >=22.15 (package.json engines); CI runs the latest 22 too
           # npm finds its OIDC login through the .npmrc this writes (npm's own examples).
           registry-url: https://registry.npmjs.org
           package-manager-cache: false   # no cache in a release build (npm's advice)
@@ -101,7 +101,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v5
         with:
-          node-version: 22.14
+          node-version: 22   # zb-client-ts needs >=22.15 (package.json engines); CI runs the latest 22 too
           registry-url: https://registry.npmjs.org
           package-manager-cache: false   # no cache in a release build; pnpm pack installs nothing
       - uses: actions/setup-java@v5
