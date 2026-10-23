@@ -1306,3 +1306,11 @@ green over 37.
 **Change** (`38-nats.zig-ordered-server-pool.patch`): both removals use ordered removal. Retried servers rotate to the end without reordering the others; an exhausted server leaves the remaining order intact. Two four-endpoint unit tests cover retry rotation and exhaustion.
 
 **Verified:** before the fix, the two new tests fail (8 pass, 2 fail); after it, the pool tests pass 10/10 in Debug and ReleaseSafe. The SDK `test-unit` suite passes 143 tests with 2 skipped in both modes. The endpoint scenario exercises an unreachable first address followed by a real TLS leaf and hub, reads the live native pool at initial connect, observes a real asynchronous INFO, then kills the leaf and checks reconnection to the hub with its distinct TLS name. `check-series.sh` reproduces the working source from upstream plus all 37 patch files. The submodule pointer remains unchanged.
+
+## 40. Patch 39: xsync pinned to v1.0.1, which builds on 0.16 and 0.17 (2026-10-23)
+
+**How it appeared.** The Zig 0.17 port (parked on branch `zig-0.17`) carried xsync as a local patch: 0.17 made `Io.Threaded.mutexLock` cancelable, and xsync v1.0.0 calls it. xsync v1.0.1 (2026-10-13) uses `mutexLockUncancelable` where it exists, so one source builds on both compilers.
+
+**Change** (`39-nats.zig-xsync-1.0.1.patch`): `build.zig.zon` only — the `xsync` dependency's URL and hash, from `zig fetch --save=xsync "git+https://github.com/lalinsky/xsync.zig?ref=v1.0.1"`. Cut as patch 35 was: the diff of `build.zig.zon` between upstream plus the series and the working tree (`new-patch.sh` cuts `src/` and `tests/` only).
+
+**Verified on 0.16.0:** nats.zig `test-unit` 143/143, the bridge 410/410, libzb 48 passed and 2 skipped. One libzb `zig build test` run failed under the build runner and passed when run directly and on two reruns: recorded as a flake. `check-series.sh` green. The switch to 0.17 no longer needs an xsync patch; the submodule pointer is unchanged.
