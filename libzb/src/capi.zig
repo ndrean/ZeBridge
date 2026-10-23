@@ -596,9 +596,9 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             if (comptime builtin.target.abi.isAndroid()) {
                 if (try enroll.androidNoBackupPath(a, db_given)) |nb| {
                     defer a.free(beside);
-                    const old_z = try a.dupeZ(u8, beside);
+                    const old_z = try a.dupeSentinel(u8, beside, 0);
                     defer a.free(old_z);
-                    const new_z = try a.dupeZ(u8, nb);
+                    const new_z = try a.dupeSentinel(u8, nb, 0);
                     defer a.free(new_z);
                     enroll.moveIdentity(old_z, new_z);
                     break :blk nb;
@@ -1337,7 +1337,7 @@ export fn zb_client_poll(handle: u64, wait_ms: u64) ?[*:0]u8 {
 // same steps as zb_client_wipe, plus the identity; the handle is then gone, and
 // remembered, so zb_client_revoked still answers 1 and every other call `Revoked`.
 
-var purged_handles: [64]u64 = [_]u64{0} ** 64;
+var purged_handles: [64]u64 = @splat(0);
 var purged_next: usize = 0;
 
 fn wasPurged(handle: u64) bool {

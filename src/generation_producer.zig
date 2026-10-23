@@ -670,7 +670,7 @@ pub const GenerationProducer = struct {
         if (jobs.len == 0) return;
         const n_workers: usize = if (parallel) @min(@as(usize, self.workers), jobs.len) else 1;
         var next = std.atomic.Value(usize).init(0);
-        var threads: [max_workers]?std.Thread = .{null} ** max_workers;
+        var threads: [max_workers]?std.Thread = @splat(null);
         if (n_workers > 1) {
             log.debug("🧬 {d} job(s) over {d} worker(s)", .{ jobs.len, n_workers });
             for (0..n_workers) |w| {
@@ -2553,7 +2553,7 @@ test "mp: the chain document's shapes decode as msgpack" {
     try mp.int(&out, a, 300);
     try mp.float(&out, a, 1.5);
     try mp.str(&out, a, "kind");
-    try mp.str(&out, a, "x" ** 40);
+    try mp.str(&out, a, &@as([40]u8, @splat('x')));
     // fixmap(2) "rows" fixarray(3) negfixint(-5) int16(300) float64 "kind" str8(40)
     try std.testing.expectEqual(@as(u8, 0x82), out.items[0]);
     try std.testing.expectEqual(@as(u8, 0xa4), out.items[1]);

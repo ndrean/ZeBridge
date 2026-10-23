@@ -6,7 +6,7 @@ const std = @import("std");
 
 pub const Status = enum { accepted, stale, row_deleted, rejected, failed, other };
 
-var counts = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** @typeInfo(Status).@"enum".fields.len;
+var counts: [@typeInfo(Status).@"enum".field_names.len]std.atomic.Value(u64) = @splat(.init(0));
 /// `failed` because the ingress rate limit refused it (MUTATION_RATE_PER_PRINCIPAL) —
 /// counted inside `failed` too, and here on its own so a limit is told from a fault.
 var rate_limited = std.atomic.Value(u64).init(0);
@@ -19,8 +19,9 @@ pub fn record(status: []const u8, reason: []const u8) void {
 
 pub fn writePrometheus(w: *std.Io.Writer) !void {
     try w.print("# HELP bridge_mutation_verdicts_total Write verdicts published to clients, by status (accepted, stale, row_deleted, rejected, failed)\n# TYPE bridge_mutation_verdicts_total counter\n", .{});
-    inline for (@typeInfo(Status).@"enum".fields) |f| {
-        try w.print("bridge_mutation_verdicts_total{{status=\"" ++ f.name ++ "\"}} {d}\n", .{counts[f.value].load(.monotonic)});
+    const info = @typeInfo(Status).@"enum";
+    inline for (info.field_names, info.field_values) |name, value| {
+        try w.print("bridge_mutation_verdicts_total{{status=\"" ++ name ++ "\"}} {d}\n", .{counts[value].load(.monotonic)});
     }
     try w.print("# HELP bridge_mutation_rate_limited_total Writes refused by the ingress rate limit (also counted as failed)\n# TYPE bridge_mutation_rate_limited_total counter\nbridge_mutation_rate_limited_total {d}\n", .{rate_limited.load(.monotonic)});
 }

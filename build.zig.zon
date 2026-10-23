@@ -2,7 +2,7 @@
     .name = .bridge,
     .version = "0.2.7",
     .fingerprint = 0x69780f9fa376900c,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zig_msgpack = .{
             .url = "git+https://github.com/zigcc/zig-msgpack?ref=0.0.19#39c933f51dd9ee53fff119da877719f98aa174c2",

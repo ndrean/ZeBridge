@@ -220,7 +220,7 @@ const MeasureCounts = struct {
     held: u64 = 0,
     failed: u64 = 0,
     fn add(t: *MeasureCounts, o: MeasureCounts) void {
-        inline for (std.meta.fields(MeasureCounts)) |f| @field(t, f.name) += @field(o, f.name);
+        inline for (@typeInfo(MeasureCounts).@"struct".field_names) |n| @field(t, n) += @field(o, n);
     }
 };
 const MeasureTarget = struct {
@@ -233,7 +233,7 @@ const MeasureTarget = struct {
         return t.name[0..t.len];
     }
 };
-var measure_targets: [8]MeasureTarget = [_]MeasureTarget{.{}} ** 8;
+var measure_targets: [8]MeasureTarget = @splat(.{});
 var measure_n: usize = 0;
 
 fn measureInit() void {
@@ -342,7 +342,7 @@ const Startup = struct {
     const Mark = struct { name: []const u8 = "", ms: i64 = 0 };
     t0: i64 = 0,
     last: i64 = 0,
-    marks: [16]Mark = [_]Mark{.{}} ** 16,
+    marks: [16]Mark = @splat(.{}),
     n: usize = 0,
     done: bool = false,
 

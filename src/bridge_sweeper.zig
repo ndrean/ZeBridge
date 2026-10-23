@@ -160,10 +160,10 @@ const usage =
 pub fn main(init: std.process.Init) !void {
     // Debug: the leak-checking allocator, its report printed when main returns.
     var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
-    defer if (@import("builtin").mode == .Debug) {
+    defer if (@import("builtin").mode == .debug) {
         _ = debug_alloc.deinit();
     };
-    const allocator = if (@import("builtin").mode == .Debug) debug_alloc.allocator() else std.heap.c_allocator;
+    const allocator = if (@import("builtin").mode == .debug) debug_alloc.allocator() else std.heap.c_allocator;
     runtime_log_level = levelFrom(init.minimal.environ.getPosix("LOG_LEVEL"));
 
     // Arguments first, before anything touches the database: this process deletes

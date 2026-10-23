@@ -123,7 +123,7 @@ pub const BinShape = enum(u8) {
 };
 
 const ExtType = struct { oid: u32 = 0, shape: BinShape = .none };
-pub var extension_types: [8]ExtType = [_]ExtType{.{}} ** 8;
+pub var extension_types: [8]ExtType = @splat(.{});
 
 /// Registered at boot, and again when the schema pass meets an OID it does not know (an
 /// extension created after boot) — while the replication thread reads. A new slot's
@@ -147,7 +147,7 @@ pub fn registerExtensionType(oid: u32, shape: BinShape) void {
 test "registerExtensionType: a second lookup (an extension created after boot) adds, never duplicates" {
     const saved = extension_types;
     defer extension_types = saved;
-    extension_types = [_]ExtType{.{}} ** 8;
+    extension_types = @splat(.{});
     try std.testing.expectEqual(BinShape.none, extensionShape(90001));
     registerExtensionType(90001, .raw); // the boot lookup
     registerExtensionType(90001, .raw); // the same type found again: one slot

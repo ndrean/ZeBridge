@@ -157,6 +157,6 @@ pub const libpq = Engine(Libpq, "postgres", "ZB_LIBPQ_LIB", libpq_paths, &libpq_
 test "every name resolves to a function in the translated headers" {
     // Compile-time proof: `Api` takes `@TypeOf(@field(C, n))` for each name, so a
     // typo or a function the header lacks fails the build here, not at a customer.
-    try std.testing.expect(@typeInfo(DuckDB).@"struct".fields.len == duckdb_fns.len);
-    try std.testing.expect(@typeInfo(Libpq).@"struct".fields.len == libpq_fns.len);
+    try std.testing.expect(@typeInfo(DuckDB).@"struct".field_names.len == duckdb_fns.len);
+    try std.testing.expect(@typeInfo(Libpq).@"struct".field_names.len == libpq_fns.len);
 }

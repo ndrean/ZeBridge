@@ -32,8 +32,8 @@ apt-get install -y -qq curl xz-utils ca-certificates libpq-dev:$deb libzstd-dev:
 ln -sf /usr/lib/$arch-linux-gnu/libpq.so /usr/lib/libpq.so
 ln -sf /usr/lib/$arch-linux-gnu/libzstd.so /usr/lib/libzstd.so
 if [ ! -x /cache/zig/zig ]; then
-  curl -sL https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz | tar -xJ -C /cache
-  mv /cache/zig-aarch64-linux-0.16.0 /cache/zig
+  curl -sL https://ziglang.org/download/0.17.0/zig-aarch64-linux-0.17.0.tar.xz | tar -xJ -C /cache
+  mv /cache/zig-aarch64-linux-0.17.0 /cache/zig
 fi
 cd /src
 /cache/zig/zig build bridge sweeper -Dtarget=$arch-linux-gnu.2.35 -Doptimize=ReleaseSafe \

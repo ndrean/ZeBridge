@@ -520,7 +520,7 @@ pub fn render(
     errdefer out.deinit(allocator);
 
     // One bit per argument; every one must be consumed.
-    var used = [_]bool{false} ** 8;
+    var used: [8]bool = @splat(false);
     if (args.len > used.len) return RenderError.MalformedPattern;
 
     var i: usize = 0;
@@ -704,7 +704,8 @@ test "the test fixture matches the repository's own grammar.json" {
     const real = owned.topology;
     const fixture = Topology.for_tests;
 
-    inline for (@typeInfo(Topology).@"struct".fields) |f| {
+    const info = @typeInfo(Topology).@"struct";
+    inline for (info.field_names, info.field_types) |name, ftype| {
         // `tenants` is the one field that is not a name or a pattern — it is data
         // (whichever tenants a deployment happens to declare), so it is `[]const
         // []const u8`, not `[]const u8`, and `expectEqualStrings` does not even
@@ -714,17 +715,17 @@ test "the test fixture matches the repository's own grammar.json" {
         // some for the multi-tenant scenarios — that difference is intentional, not
         // drift, and this test exists to catch drift in the *names*, not to assert the
         // fixture is a byte-for-byte copy of the file.
-        if (comptime std.mem.eql(u8, f.name, "tenants")) continue;
+        if (comptime std.mem.eql(u8, name, "tenants")) continue;
         // Same reasoning as `tenants` — a data field, not a name, and `for_tests`
         // deliberately carries none so unit tests default to no untenanted table being
         // CDC-routable via `public_tables` either.
-        if (comptime std.mem.eql(u8, f.name, "public_tables")) continue;
+        if (comptime std.mem.eql(u8, name, "public_tables")) continue;
         // §10hq added a numeric field (the inline answer ceiling); a name compares as
         // a string, anything else as a value.
-        if (comptime f.type == []const u8) {
-            try testing.expectEqualStrings(@field(fixture, f.name), @field(real, f.name));
+        if (comptime ftype == []const u8) {
+            try testing.expectEqualStrings(@field(fixture, name), @field(real, name));
         } else {
-            try testing.expectEqual(@field(fixture, f.name), @field(real, f.name));
+            try testing.expectEqual(@field(fixture, name), @field(real, name));
         }
     }
 }

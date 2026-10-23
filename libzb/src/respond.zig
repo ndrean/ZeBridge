@@ -45,10 +45,10 @@ fn onSignal(_: std.posix.SIG) callconv(.c) void {
 pub fn main(init: std.process.Init) !u8 {
     // Debug: the leak-checking allocator, its report printed when main returns.
     var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
-    defer if (@import("builtin").mode == .Debug) {
+    defer if (@import("builtin").mode == .debug) {
         _ = debug_alloc.deinit();
     };
-    const a = if (@import("builtin").mode == .Debug) debug_alloc.allocator() else std.heap.c_allocator;
+    const a = if (@import("builtin").mode == .debug) debug_alloc.allocator() else std.heap.c_allocator;
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(a);

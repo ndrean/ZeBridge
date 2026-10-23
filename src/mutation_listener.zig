@@ -1111,8 +1111,8 @@ pub const MutationListener = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const principal_z = a.dupeZ(u8, mutation.principal) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
-        const id_z = a.dupeZ(u8, msgIdOf(msg).?) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        const principal_z = a.dupeSentinel(u8, mutation.principal, 0) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        const id_z = a.dupeSentinel(u8, msgIdOf(msg).?, 0) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
         // Three exchanges when it succeeds: (1) BEGIN, the claim, SAVEPOINT; (2) the write
         // and its classify; (3) the outcome, the deferred constraints, COMMIT.
         const claim = receipts.beginClaim(a, conn, principal_z, id_z, subject, payload) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
@@ -1350,8 +1350,8 @@ pub const MutationListener = struct {
                 continue;
             }
             if (self.rateLimited(conn, conn_nats, msg, mutation)) continue;
-            const principal_z = try a.dupeZ(u8, mutation.principal);
-            const id_z = try a.dupeZ(u8, msgIdOf(msg).?);
+            const principal_z = try a.dupeSentinel(u8, mutation.principal, 0);
+            const id_z = try a.dupeSentinel(u8, msgIdOf(msg).?, 0);
             var first = items.items.len;
             for (items.items, 0..) |it, k| {
                 if (std.mem.eql(u8, it.principal_z, principal_z) and std.mem.eql(u8, it.id_z, id_z)) {
@@ -3909,7 +3909,7 @@ test "rememberFailure: an over-long message truncates instead of overflowing" {
     l.last_sqlstate_len = 0;
     l.last_error_len = 0;
 
-    const long = "E" ** 4096;
+    const long: []const u8 = &@as([4096]u8, @splat('E'));
     l.rememberFailure("XX000", long);
     try std.testing.expect(l.lastError().len <= l.last_error_buf.len);
 }

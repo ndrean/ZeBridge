@@ -315,9 +315,9 @@ test "isSubjectToken: whitespace and control characters end the subject on the w
 
 test "isSubjectToken: empty and over-long are refused" {
     try std.testing.expect(!isSubjectToken(""));
-    const long = "a" ** (max_subject_token_len + 1);
+    const long: []const u8 = &@as([max_subject_token_len + 1]u8, @splat('a'));
     try std.testing.expect(!isSubjectToken(long));
-    const at_limit = "a" ** max_subject_token_len;
+    const at_limit: []const u8 = &@as([max_subject_token_len]u8, @splat('a'));
     try std.testing.expect(isSubjectToken(at_limit));
 }
 

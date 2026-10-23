@@ -27,7 +27,7 @@ for slice in ios ios-sim ios-sim-x64; do
   esac
   out="$libzb/zig-out/$slice"
   (cd "$libzb" && zig build lib -Dtarget=$target -Dvendor=true \
-      --sysroot "$(xcrun --sdk $sdk --show-sdk-path)" -Doptimize=ReleaseFast -p "zig-out/$slice")
+      --sysroot "$(xcrun --sdk $sdk --show-sdk-path)" -Dsysroot="$(xcrun --sdk $sdk --show-sdk-path)" -Doptimize=ReleaseFast -p "zig-out/$slice")
   # Zig's archive → its objects (Apple's ld wants its own archive index).
   rm -rf "$out/repack"; mkdir -p "$out/repack"
   (cd "$out/repack" && ar x ../lib/libzbcore.a && chmod 644 ./*.o)

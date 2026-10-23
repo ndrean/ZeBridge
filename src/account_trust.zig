@@ -42,12 +42,12 @@ pub fn refreshIssuedAt(a: std.mem.Allocator, io: std.Io, claims: []const u8) ![]
 }
 
 test "public account extraction selects one account and never another conf field" {
-    const key = "A" ** 56;
+    const key: []const u8 = &@as([56]u8, @splat('A'));
     const jwt = "eyHeader.eyClaims.Signature";
     const conf = "operator: eyOperator.public.signature\nresolver_preload {\n" ++ key ++ ": \"" ++ jwt ++ "\"\n}\npassword: secret\n";
     try std.testing.expectEqualStrings(jwt, try accountJwt(conf, key));
     try std.testing.expectError(error.InvalidAccount, accountJwt(conf, "wrong"));
-    try std.testing.expectError(error.AccountNotFound, accountJwt(conf, "AB" ** 28));
+    try std.testing.expectError(error.AccountNotFound, accountJwt(conf, "ABABABABABABABABABABABABABABABABABABABABABABABABABABABAB"));
     try std.testing.expectError(error.InvalidAccountJwt, accountJwt(key ++ ": secret\n", key));
 }
 

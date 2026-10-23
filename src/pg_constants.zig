@@ -53,8 +53,8 @@ pub const PgOid = enum(u32) {
 /// anything — which is what makes the unknown case silent unless it is asked about
 /// explicitly.
 pub fn isKnownOid(oid: u32) bool {
-    inline for (@typeInfo(PgOid).@"enum".fields) |field| {
-        if (field.value == oid) return true;
+    inline for (@typeInfo(PgOid).@"enum".field_values) |value| {
+        if (value == oid) return true;
     }
     return false;
 }

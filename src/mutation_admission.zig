@@ -15,7 +15,7 @@ pub const original_id_header = "ZB-Client-Msg-Id";
 pub const leaf_tenants_header = "ZB-Leaf-Tenants";
 var stopping: std.atomic.Value(bool) = .init(false);
 const SignalHandler = @typeInfo(@TypeOf(@as(std.posix.Sigaction, undefined).handler.handler)).optional.child;
-const Signal = @typeInfo(@typeInfo(SignalHandler).pointer.child).@"fn".params[0].type.?;
+const Signal = @typeInfo(@typeInfo(SignalHandler).pointer.child).@"fn".param_types[0].?;
 
 fn stop(_: Signal) callconv(.c) void {
     stopping.store(true, .release);
@@ -327,10 +327,10 @@ fn optionalEnv(init: *const std.process.Init, key: []const u8) ?[]const u8 {
 
 pub fn run(init: *const std.process.Init) u8 {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer if (builtin.mode == .Debug) {
+    defer if (builtin.mode == .debug) {
         _ = gpa.deinit();
     };
-    const a = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
+    const a = if (builtin.mode == .debug) gpa.allocator() else std.heap.c_allocator;
     runImpl(init, a) catch |err| {
         log.err("mutation admission stopped: {s}", .{@errorName(err)});
         return 1;
@@ -382,9 +382,14 @@ test "message IDs: zb1 IDs are strict, legacy IDs pass, nothing else does" {
     // Not one subject token, empty, or too long.
     for ([_][]const u8{ "", "a.b", "a*", "a>", "a b", "a\tb", "a\x01b", "a\x7fb" }) |id|
         try std.testing.expect(!validMessageId(id));
-    try std.testing.expect(validMessageId("x" ** 512) and !validMessageId("x" ** 513));
+    try std.testing.expect(validMessageId(&@as([512]u8, @splat('x'))) and !validMessageId(&@as([513]u8, @splat('x'))));
     // Bytes, not characters, and ASCII only: Unicode spaces are ordinary UTF-8 (the same
     // policy as both builders and PostgreSQL's receipt check).
     try std.testing.expect(validMessageId("a\u{2003}b") and validMessageId("a\u{85}b") and validMessageId("a\u{a0}b"));
-    try std.testing.expect(!validMessageId("\u{2003}" ** 171)); // 513 bytes, 171 characters
+    const em_spaces = comptime blk: {
+        var b: [513]u8 = undefined;
+        for (0..171) |i| @memcpy(b[i * 3 ..][0..3], "\u{2003}");
+        break :blk b;
+    };
+    try std.testing.expect(!validMessageId(&em_spaces)); // 513 bytes, 171 characters
 }

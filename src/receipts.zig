@@ -51,7 +51,7 @@ pub const Outcome = struct {
 
 pub fn outcomeJson(a: std.mem.Allocator, o: Outcome) ![:0]u8 {
     const text = try std.json.Stringify.valueAlloc(a, o, .{});
-    return a.dupeZ(u8, text);
+    return a.dupeSentinel(u8, text, 0);
 }
 
 pub fn parseOutcome(a: std.mem.Allocator, text: []const u8) !Outcome {
@@ -85,7 +85,7 @@ pub fn sendLocks(a: std.mem.Allocator, conn: ?*c.PGconn, principals: []const [:0
     try sql.appendSlice(a, ", ");
     try placeholders(a, &sql, 1 + n, n, "text");
     try sql.append(a, ')');
-    const sql_z = try a.dupeZ(u8, sql.items);
+    const sql_z = try a.dupeSentinel(u8, sql.items, 0);
     const values = try a.alloc(?[*:0]const u8, 2 * n);
     for (0..n) |i| {
         values[i] = principals[i].ptr;
@@ -111,7 +111,7 @@ pub fn sendClaims(a: std.mem.Allocator, conn: ?*c.PGconn, principals: []const [:
     try sql.appendSlice(a, ", ");
     try placeholders(a, &sql, 1 + 3 * n, n, "bytea");
     try sql.appendSlice(a, ") ORDER BY ord");
-    const sql_z = try a.dupeZ(u8, sql.items);
+    const sql_z = try a.dupeSentinel(u8, sql.items, 0);
     const values = try a.alloc(?[*]const u8, 4 * n);
     const lengths = try a.alloc(c_int, 4 * n);
     const formats = try a.alloc(c_int, 4 * n);
@@ -137,7 +137,7 @@ pub fn sendFinishes(a: std.mem.Allocator, conn: ?*c.PGconn, principals: []const 
     try sql.appendSlice(a, ", ");
     try placeholders(a, &sql, 1 + 3 * n, n, "jsonb");
     try sql.append(a, ')');
-    const sql_z = try a.dupeZ(u8, sql.items);
+    const sql_z = try a.dupeSentinel(u8, sql.items, 0);
     const values = try a.alloc(?[*:0]const u8, 4 * n);
     for (0..n) |i| {
         values[i] = principals[i].ptr;
@@ -155,7 +155,7 @@ pub fn readClaims(a: std.mem.Allocator, r: ?*c.PGresult, out: []Claim) !void {
         const row: c_int = @intCast(i);
         const status = std.meta.stringToEnum(Status, std.mem.span(c.PQgetvalue(r, row, 0))) orelse return error.ReceiptInfrastructure;
         const outcome: ?[]const u8 = if (c.PQgetisnull(r, row, 1) == 0) try a.dupe(u8, std.mem.span(c.PQgetvalue(r, row, 1))) else null;
-        const fp: ?[:0]const u8 = if (c.PQgetisnull(r, row, 2) == 0) try a.dupeZ(u8, std.mem.span(c.PQgetvalue(r, row, 2))) else null;
+        const fp: ?[:0]const u8 = if (c.PQgetisnull(r, row, 2) == 0) try a.dupeSentinel(u8, std.mem.span(c.PQgetvalue(r, row, 2)), 0) else null;
         claim.* = .{ .status = status, .outcome = outcome, .fingerprint = fp };
     }
 }

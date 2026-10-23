@@ -1322,3 +1322,11 @@ green over 37.
 **Change** (`40-nats.zig-epoch-u32.patch`): `src/connection.zig` (`reconnect_epoch` is `std.atomic.Value(u32)`) and `src/jetstream.zig` (`PullRequest.epoch: u32`). The epoch is only compared for equality, so wrapping after 4 billion reconnects changes nothing. libzb's copy (`outbox_reconnect_epoch`) follows, outside this series.
 
 **Verified on 0.16.0:** libzb builds for `arm-linux-androideabi` (cortex_a7, NDK 28); nats.zig `test-unit` 143/143, the bridge 410/410, libzb 48 passed and 2 skipped; `check-series.sh` green over 39 files. A 32-bit Moto e20 ran the 10-airports Flutter app on a libzb carrying this change (built with 0.17, 2026-10-23).
+
+## 42. Patch 41: the Zig 0.17 port (branch `zig-0.17-port`, 2026-10-23)
+
+**How it appeared.** The 0.17 port, parked on 2026-10-09 as patch 36 on a branch, redone on `main` after `receipts-locks` merged. `main` had meanwhile taken number 36 (long pull requests) and added 37–39, so the edits are cut again as the last patch.
+
+**Change** (`41-nats.zig-zig-017.patch`, 8 files, 12 hunks): `build.zig` (`std.zon.parse.fromSlice` with its options struct), `src/net_util.zig` (`writeVec` through `io.operate(.net_write)`, `Io.VTable.netWrite` is gone), `src/nuid.zig` (`mutexLockUncancelable`), `src/root.zig`, `src/timestamp.zig`, `src/validation.zig`, `src/inbox.zig` (`**` → `@splat`), `test_runner.zig`. Cut as the diff of those files between upstream plus patches 01–40 and the working tree: `new-patch.sh` cuts `src/` and `tests/` only, and this patch also touches `build.zig` and `test_runner.zig`. The xsync patch the parked branch carried is gone: patch 39 pins xsync v1.0.1, which builds on both.
+
+**Verified on 0.17.0:** nats.zig `test-unit` 143/143, the bridge 410/410, libzb 48 passed and 2 skipped. `check-series.sh` green over 40 files, and a clean apply reproduces `build.zig`, `build.zig.zon` and `test_runner.zig` byte for byte. The switch is a clean break: this patch does not build on 0.16.

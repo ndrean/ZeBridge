@@ -27,14 +27,14 @@ zigbuild() { # <out dir name> <zig target> [extra args...]
 }
 
 android() { # <name> <zig target> <clang target> [zig cpu]
-  zigbuild "$1" "$2" -Dandroid-api=$api --sysroot "$tc/sysroot" ${4:+-Dcpu=$4}
+  zigbuild "$1" "$2" -Dandroid-api=$api --sysroot "$tc/sysroot" -Dsysroot="$tc/sysroot" ${4:+-Dcpu=$4}
   mkdir -p "$here/prebuilt/$1"
   "$tc/bin/clang" --target="$3" -shared -o "$here/prebuilt/$1/libzbcore.so" \
     -Wl,--whole-archive "$libzb/zig-out/dart-$1/lib/libzbcore.a" -Wl,--no-whole-archive -lm -llog
 }
 
 apple() { # <name> <zig target> <sdk>
-  if [ "$3" = macosx ]; then zigbuild "$1" "$2"; else zigbuild "$1" "$2" -Dstatic=false --sysroot "$(xcrun --sdk "$3" --show-sdk-path)"; fi
+  if [ "$3" = macosx ]; then zigbuild "$1" "$2"; else zigbuild "$1" "$2" -Dstatic=false --sysroot "$(xcrun --sdk "$3" --show-sdk-path)" -Dsysroot="$(xcrun --sdk "$3" --show-sdk-path)"; fi
   mkdir -p "$here/prebuilt/$1"
   cp "$libzb/zig-out/dart-$1/lib/libzbcore.dylib" "$here/prebuilt/$1/"
 }

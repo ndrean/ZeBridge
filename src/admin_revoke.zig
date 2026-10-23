@@ -189,7 +189,7 @@ pub fn run(init: *const std.process.Init) u8 {
 /// that an enrolled device can still renew.
 fn revokeKey(init: *const std.process.Init, key: []const u8, conf_path: ?[]const u8) u8 {
     // A user key decodes (prefix U, checksum): the signature itself does not matter here.
-    _ = nats.nkeys.verify(.user, key, "", [_]u8{0} ** 64) catch {
+    _ = nats.nkeys.verify(.user, key, "", @as([64]u8, @splat(0))) catch {
         out("🔴 {s} is not a user public key (U…, 56 characters: the `user key` a mint printed)\n", .{key});
         return 1;
     };

@@ -116,19 +116,9 @@ var pg_shutting_down = std.atomic.Value(bool).init(false);
 
 // Derive signal handler parameter type from posix.Sigaction.
 // On macOS Zig 0.16 the handler takes an anonymous enum(u32), not c_int.
-const sig_num_t = t: {
-    for (@typeInfo(posix.Sigaction).@"struct".fields) |f| {
-        if (std.mem.eql(u8, f.name, "handler")) {
-            for (@typeInfo(f.type).@"union".fields) |uf| {
-                if (std.mem.eql(u8, uf.name, "handler")) {
-                    const opt_ptr = @typeInfo(uf.type).optional.child;
-                    const params = @typeInfo(@typeInfo(opt_ptr).pointer.child).@"fn".params;
-                    break :t params[0].type.?;
-                }
-            }
-        }
-    }
-    break :t c_int;
+const sig_num_t = blk: {
+    const opt_ptr = @typeInfo(@FieldType(@FieldType(posix.Sigaction, "handler"), "handler")).optional.child;
+    break :blk @typeInfo(@typeInfo(opt_ptr).pointer.child).@"fn".param_types[0].?;
 };
 
 fn handleShutdown(_: sig_num_t) callconv(.c) void {
@@ -784,7 +774,7 @@ pub fn main(init: std.process.Init) !void {
         log.warn("⚠️  LOG_LEVEL=debug: per-event hot-path logging costs ~4x CPU under load — throughput numbers taken at this level are invalid", .{});
     }
     const io = init.io;
-    const IS_DEBUG = builtin.mode == .Debug;
+    const IS_DEBUG = builtin.mode == .debug;
 
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     const allocator = if (IS_DEBUG) gpa.allocator() else std.heap.c_allocator;

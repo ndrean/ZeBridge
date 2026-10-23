@@ -1,7 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// Zig 0.17: `--sysroot` reaches only the Maker, not build.zig; pass it as -Dsysroot too.
+var sysroot_opt: ?[]const u8 = null;
+
 pub fn build(b: *std.Build) void {
+    sysroot_opt = b.option([]const u8, "sysroot", "The SDK/NDK sysroot (also pass --sysroot)");
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -61,7 +65,7 @@ pub fn build(b: *std.Build) void {
     // §10jk: and a CROSS target's libc headers: libpq-fe.h includes stdio.h, which the
     // phone SDKs hold under the sysroot — the same reach `addVendored` gives the C
     // sources (§10iq), Android's per-architecture directory included (§10ir).
-    const sysroot_includes: []const []const u8 = if (b.sysroot) |sr| blk: {
+    const sysroot_includes: []const []const u8 = if (sysroot_opt) |sr| blk: {
         const base = b.pathJoin(&.{ sr, "usr", "include" });
         if (target.result.abi == .android or target.result.abi == .androideabi) {
             const triple = target.result.linuxTriple(b.allocator) catch break :blk &.{base};
@@ -152,7 +156,7 @@ pub fn build(b: *std.Build) void {
             // vendored zstd fails on `'string.h' file not found` even though the
             // sysroot was given, because that flag reaches the Zig compilation and not
             // these C files.
-            if (bb.sysroot) |sr| {
+            if (sysroot_opt) |sr| {
                 m.addSystemIncludePath(.{ .cwd_relative = bb.pathJoin(&.{ sr, "usr", "include" }) });
                 // ⚠️ Android's NDK sysroot splits its headers: the portable ones live in
                 // usr/include, the architecture's own (asm/types.h and friends) in
@@ -294,10 +298,10 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag.isDarwin()) lib.headerpad_max_install_names = true;
     // iOS: the identity is flagged out of backups through Core Foundation (enroll.zig). A
     // dynamic library links it here; a static one leaves it to the app, which always links
-    // it. ⚠️ ABSOLUTE, inside the SDK: unlike a library path, Zig does not prepend the
-    // sysroot to a framework path (a relative one searched nothing).
+    // it. The path is the SDK's own, rooted at "/": Zig prepends the sysroot to a framework
+    // path, so the SDK's absolute path would be searched under itself.
     if (target.result.os.tag == .ios and !static) {
-        if (b.sysroot) |sr| mod.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sr, "System", "Library", "Frameworks" }) });
+        if (sysroot_opt != null) mod.addFrameworkPath(.{ .cwd_relative = "/System/Library/Frameworks" });
         mod.linkFramework("CoreFoundation", .{});
     }
     b.installArtifact(lib);
@@ -443,7 +447,7 @@ pub fn build(b: *std.Build) void {
 /// (scripts/refresh-roots.sh): a phone build over six months past Mozilla's date says so.
 fn warnStaleRoots(b: *std.Build) void {
     const io = b.graph.io;
-    const text = std.Io.Dir.cwd().readFileAlloc(io, b.pathFromRoot("src/roots/cacert.date"), b.allocator, .limited(64)) catch {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, b.root.joinString(b.allocator, "src/roots/cacert.date") catch return, b.allocator, .limited(64)) catch {
         std.debug.print("warning: src/roots/cacert.date is missing: run scripts/refresh-roots.sh\n", .{});
         return;
     };
