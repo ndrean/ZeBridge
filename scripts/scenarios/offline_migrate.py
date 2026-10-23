@@ -118,8 +118,17 @@ def main():
                   "the old rows carry the added column's default")
             check("4. server update", any("moved while away" in r for r in replica_rows(nd)),
                   "the update made while they were away is there")
-            left = nd.q("SELECT count(*) FROM _zebridge_outbox")[0][0]
-            check("4. outbox", left == 0, f"the queued write is settled ({left} left)")
+            # Settling is asynchronous: zb-client-ts starts its replay 0-5 s after a
+            # reconnect (jitter, so a fleet does not resend at once), then waits for the
+            # verdict. Converged replicas say nothing about it: poll the outbox itself.
+            t_out, left = time.monotonic(), None
+            while time.monotonic() - t_out < 30:
+                left = nd.q("SELECT count(*) FROM _zebridge_outbox")[0][0]
+                if left == 0:
+                    break
+                time.sleep(0.5)
+            check("4. outbox", left == 0,
+                  f"the queued write is settled ({left} left after {time.monotonic() - t_out:.1f} s)")
     finally:
         if py: py.close()
         if nd: nd.close()
