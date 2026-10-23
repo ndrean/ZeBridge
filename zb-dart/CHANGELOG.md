@@ -1,3 +1,13 @@
+## 0.2.7
+
+- libzb speaks ABI 7 (`zbAbi = 7`): the package refuses an older libzb.
+- Two new write outcomes and `PollReport.reconciling`: `indeterminate` (the write settled but its result is unknown; the table reseeds from the hub), then `reconciled` (the local copy is the authoritative state again).
+- A client that reconnects after missing generation cuts applies the generation deltas instead of replaying the CDC backlog, decided per stream. Only for tables that guarantee tombstones: the bridge marks a guarded table's generations `"deletes":"tombstoned"`.
+- `seedDomain`, a connect option: the first seed is read from a seeding leaf's mirrors, with the hub's as a fallback.
+- Enrollment and renewal return ordered endpoints (a leaf first, then the hub): the client fails over between them and keeps its identity, replica and outbox.
+- Replaying the outbox after a reconnect is bounded by a durable window of writes in flight.
+- Fixes: a reseed rewinds the table's own stream to the chain's cut (deletes made during the reseed were lost); a heal reopens every healed stream; a client recovers when its leaf loses the hub; an open survives a JetStream that answers late; one device sends far fewer JetStream requests (live tails park their pull requests on the server, a consumer is created before it is looked up).
+
 ## 0.2.6
 
 - No change in the package: its version follows ZeBridge's releases. 0.2.6 fixes the
