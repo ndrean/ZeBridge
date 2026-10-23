@@ -3,7 +3,7 @@
 # which hook/build.dart hands to the Dart or Flutter build that asks for it.
 #
 #   android_arm64 android_arm android_x64        libzbcore.so    (NDK clang links Zig's archive)
-#   ios_arm64 ios_sim_arm64 ios_sim_x64          libzbcore.dylib (iOS 13+)
+#   ios_arm64 ios_sim_arm64 ios_sim_x64          libzbcore.dylib (iOS 13+, Xcode clang links Zig's archive)
 #   macos_arm64 macos_x64                        libzbcore.dylib (macOS 13+)
 #   linux_x64 linux_arm64                        libzbcore.so    (glibc 2.35+)
 #
@@ -33,10 +33,24 @@ android() { # <name> <zig target> <clang target> [zig cpu]
     -Wl,--whole-archive "$libzb/zig-out/dart-$1/lib/libzbcore.a" -Wl,--no-whole-archive -lm -llog
 }
 
-apple() { # <name> <zig target> <sdk>
-  if [ "$3" = macosx ]; then zigbuild "$1" "$2"; else zigbuild "$1" "$2" -Dstatic=false --sysroot "$(xcrun --sdk "$3" --show-sdk-path)" -Dsysroot="$(xcrun --sdk "$3" --show-sdk-path)"; fi
+macos() { # <name> <zig target>
+  zigbuild "$1" "$2"
   mkdir -p "$here/prebuilt/$1"
   cp "$libzb/zig-out/dart-$1/lib/libzbcore.dylib" "$here/prebuilt/$1/"
+}
+
+# iOS: Zig builds the archive, Xcode's clang links the dylib, as the NDK's does on Android.
+# Zig 0.17's linker leaves a device dylib's libSystem symbols undefined; Apple's does not.
+# Only `zb_*` is exported: libzb's SQLite stays its own, whatever SQLite the app carries.
+# A Zig whose std cannot build for iOS gets the patched copy (scripts/zig-lib-dir.sh).
+zl=$("$here/../scripts/zig-lib-dir.sh")
+ios() { # <name> <zig target> <sdk> <clang target>
+  sdk=$(xcrun --sdk "$3" --show-sdk-path)
+  ( [ -z "$zl" ] || export ZIG_LIB_DIR="$zl"; zigbuild "$1" "$2" --sysroot "$sdk" -Dsysroot="$sdk" )
+  mkdir -p "$here/prebuilt/$1"
+  xcrun --sdk "$3" clang -dynamiclib -target "$4" -o "$here/prebuilt/$1/libzbcore.dylib" \
+    -Wl,-all_load "$libzb/zig-out/dart-$1/lib/libzbcore.a" -framework CoreFoundation \
+    -install_name @rpath/libzbcore.dylib -Wl,-headerpad_max_install_names -Wl,-exported_symbol,'_zb_*'
 }
 
 linux() { # <name> <zig target>
@@ -48,11 +62,11 @@ linux() { # <name> <zig target>
 android android_arm64 aarch64-linux-android aarch64-linux-android$api
 android android_arm arm-linux-androideabi armv7a-linux-androideabi$api cortex_a7
 android android_x64 x86_64-linux-android x86_64-linux-android$api
-apple ios_arm64 aarch64-ios.13.0 iphoneos
-apple ios_sim_arm64 aarch64-ios.13.0-simulator iphonesimulator
-apple ios_sim_x64 x86_64-ios.13.0-simulator iphonesimulator
-apple macos_arm64 aarch64-macos.13.0 macosx
-apple macos_x64 x86_64-macos.13.0 macosx
+ios ios_arm64 aarch64-ios.13.0 iphoneos arm64-apple-ios13.0
+ios ios_sim_arm64 aarch64-ios.13.0-simulator iphonesimulator arm64-apple-ios13.0-simulator
+ios ios_sim_x64 x86_64-ios.13.0-simulator iphonesimulator x86_64-apple-ios13.0-simulator
+macos macos_arm64 aarch64-macos.13.0
+macos macos_x64 x86_64-macos.13.0
 linux linux_x64 x86_64-linux-gnu.2.35
 linux linux_arm64 aarch64-linux-gnu.2.35
 

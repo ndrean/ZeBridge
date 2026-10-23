@@ -15,6 +15,8 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 libzb=$(cd "$here/../libzb" && pwd)
 
 python3 "$libzb/python/abi_check.py"   # the ABI this copy will report is the one the code pins
+# A Zig whose std cannot build for iOS gets the patched copy (scripts/zig-lib-dir.sh).
+zl=$("$here/../scripts/zig-lib-dir.sh"); [ -z "$zl" ] || export ZIG_LIB_DIR="$zl"
 
 # Three builds: the device (arm64), and the simulator on Apple silicon (arm64) and on Intel
 # (x86_64). A Release build for the simulator compiles both simulator architectures, so the

@@ -97,7 +97,7 @@ jobs:
         run: for p in nats.zig-patch/[0-9][0-9]-nats.zig-*.patch; do git -C nats.zig apply "../$p"; done
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v5
         with:
@@ -150,7 +150,7 @@ jobs:
         run: for p in nats.zig-patch/[0-9][0-9]-nats.zig-*.patch; do git -C nats.zig apply "../$p"; done
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - uses: astral-sh/setup-uv@v6
       - id: v
         name: Is this version new?
@@ -184,7 +184,7 @@ jobs:
         run: for p in nats.zig-patch/[0-9][0-9]-nats.zig-*.patch; do git -C nats.zig apply "../$p"; done
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - uses: actions/setup-java@v5
         with:
           distribution: temurin

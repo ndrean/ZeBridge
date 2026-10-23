@@ -24,7 +24,7 @@ jobs:
         run: for p in nats.zig-patch/[0-9][0-9]-nats.zig-*.patch; do git -C nats.zig apply "../$p"; done
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       # build.zig looks for libpq and zstd under /usr/lib; Ubuntu keeps them in the arch folder.
       - name: Install libpq and zstd
         run: |
@@ -45,7 +45,7 @@ jobs:
         run: for p in nats.zig-patch/[0-9][0-9]-nats.zig-*.patch; do git -C nats.zig apply "../$p"; done
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - name: ABI and zb.h match the code
         run: python3 libzb/python/abi_check.py
       # Zig 0.16 downloads zip sources into <cache>/tmp without creating it first.
@@ -61,7 +61,7 @@ jobs:
         run: |
           ndk="$(../scripts/android-ndk.sh)"
           zig build lib -Dtarget=arm-linux-androideabi -Dcpu=cortex_a7 -Dvendor=true -Dandroid-api=29 \
-            --sysroot "$ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+            --sysroot "$ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot" -Dsysroot="$ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
 
   client-ts:
     name: zb-client-ts (typecheck, tests)

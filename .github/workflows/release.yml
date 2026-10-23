@@ -46,7 +46,7 @@ jobs:
         run: for p in nats.zig-patch/[0-9][0-9]-nats.zig-*.patch; do git -C nats.zig apply "../$p"; done
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - name: Build and package
         run: |
           mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
@@ -72,7 +72,7 @@ jobs:
         run: for p in nats.zig-patch/[0-9][0-9]-nats.zig-*.patch; do git -C nats.zig apply "../$p"; done
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
       - name: Build and package
         run: |
           mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
