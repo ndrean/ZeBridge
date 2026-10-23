@@ -1314,3 +1314,11 @@ green over 37.
 **Change** (`39-nats.zig-xsync-1.0.1.patch`): `build.zig.zon` only — the `xsync` dependency's URL and hash, from `zig fetch --save=xsync "git+https://github.com/lalinsky/xsync.zig?ref=v1.0.1"`. Cut as patch 35 was: the diff of `build.zig.zon` between upstream plus the series and the working tree (`new-patch.sh` cuts `src/` and `tests/` only).
 
 **Verified on 0.16.0:** nats.zig `test-unit` 143/143, the bridge 410/410, libzb 48 passed and 2 skipped. One libzb `zig build test` run failed under the build runner and passed when run directly and on two reruns: recorded as a flake. `check-series.sh` green. The switch to 0.17 no longer needs an xsync patch; the submodule pointer is unchanged.
+
+## 41. Patch 40: the reconnect epoch is 32 bits, so Android armv7 builds again (2026-10-23)
+
+**How it appeared.** A build-only run of `publish.yml` on `main`: the Maven and React Native jobs failed compiling libzb for `arm-linux-androideabi` with "expected 32-bit integer type or smaller; found 64-bit integer type". Patch 36 (long pull requests, 2026-10-19) added `Connection.reconnect_epoch` as a `std.atomic.Value(u64)`, and Zig has no 64-bit atomics on a 32-bit target. CI builds no armv7, so only the release jobs saw it.
+
+**Change** (`40-nats.zig-epoch-u32.patch`): `src/connection.zig` (`reconnect_epoch` is `std.atomic.Value(u32)`) and `src/jetstream.zig` (`PullRequest.epoch: u32`). The epoch is only compared for equality, so wrapping after 4 billion reconnects changes nothing. libzb's copy (`outbox_reconnect_epoch`) follows, outside this series.
+
+**Verified on 0.16.0:** libzb builds for `arm-linux-androideabi` (cortex_a7, NDK 28); nats.zig `test-unit` 143/143, the bridge 410/410, libzb 48 passed and 2 skipped; `check-series.sh` green over 39 files. A 32-bit Moto e20 ran the 10-airports Flutter app on a libzb carrying this change (built with 0.17, 2026-10-23).

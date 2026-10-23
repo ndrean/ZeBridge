@@ -1,0 +1,28 @@
+diff --git a/src/connection.zig b/src/connection.zig
+index a926356..e13b7b2 100644
+--- a/src/connection.zig
++++ b/src/connection.zig
+@@ -481,7 +481,9 @@ pub const Connection = struct {
+     /// completes, before the reconnected callback. The server forgets whatever a client
+     /// had parked on it (a pull request waiting for messages, see `PullRequest.epoch`),
+     /// so state that lives on the server side can tell it is gone by this counter.
+-    reconnect_epoch: std.atomic.Value(u64) = .init(0),
++    /// u32, not u64: a 32-bit target (Android armv7) has no 64-bit atomics, and the
++    /// epoch is only ever compared for equality.
++    reconnect_epoch: std.atomic.Value(u32) = .init(0),
+ 
+     // Exit signal of the current runConnection iteration (protected by mutex)
+     exit_signal: ?*ExitSignal = null,
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+index 2c951c2..fc9019a 100644
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -478,7 +478,7 @@ const PullRequest = struct {
+     order: u64 = 0,
+     /// `Connection.reconnect_epoch` when the request was sent: a reconnect since means
+     /// the server dropped it, whatever its deadline says (see `slotOpen`).
+-    epoch: u64 = 0,
++    epoch: u32 = 0,
+ };
+ 
+ pub const PullSubscription = struct {

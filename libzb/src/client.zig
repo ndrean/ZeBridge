@@ -465,7 +465,7 @@ pub const SyncClient = struct {
     /// Reconnect jitter only. Steady-state refill is verdict-clocked; positive
     /// outbox retry_at reservations survive restart and back off per entry.
     next_outbox_retry_ms: i64 = 0,
-    outbox_reconnect_epoch: u64 = 0,
+    outbox_reconnect_epoch: u32 = 0,
     outbox_retry_on_reconnect: bool = false,
     outbox_next_check_ms: i64 = 0,
     outbox_clock_ms: i64 = 0,
