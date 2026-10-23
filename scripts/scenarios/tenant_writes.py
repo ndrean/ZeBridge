@@ -14,9 +14,9 @@ version) meant one forgotten field turned a private row public with no error.
 Everything runs on a throwaway table this scenario creates and drops, with throwaway
 principals in `zebridge_user_tenants`, so it touches no fixture. ⚠️ Not quite nothing
 left behind: the throwaway tenants `tw_acme`/`tw_globex` are new to a running bridge,
-which onboards them live — `CDC_tw_acme`/`CDC_tw_globex` streams and
-`$KV.tenants.tw_*` keys appear. The keys are deleted in `finally` when `NATS_CREDS` is
-set; the streams are left (empty, and dyntenant.py's territory to prove removable).
+which onboards them live — `CDC_tw_*`/`READINGS_tw_*` streams and `$KV.tenants.tw_*`
+keys appear. `finally` deletes them all once the tenants are unregistered (the keys only
+when `NATS_CREDS` is set): an empty stream still reserves its max_bytes.
 
 ⚠️ Runs its writes as `bridge_writer` with `zb.principal` set **inside the transaction** —
 the one thing that makes RLS and the guard work, and the thing autocommit silently breaks
@@ -91,6 +91,7 @@ def main():
         # then creates CDC_tw_* streams for tenants that no longer exist.
         sql(f"DELETE FROM public.zebridge_user_tenants WHERE principal IN ('{A}','{B}','{P}') "
             f"OR tenant_id IN ('{TA}','{TB}')")
+        zb.drop_tenant_streams(TA, TB)
         if os.environ.get("NATS_CREDS"):
             bucket = zb.TOPOLOGY["kv"]["tenants"]
             for who in (A, B, P):

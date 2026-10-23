@@ -502,6 +502,20 @@ def kv_get(bucket_key: str, key: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def drop_tenant_streams(*tenants: str) -> None:
+    """The streams a throwaway tenant made the bridge create, removed once the scenario has
+    unregistered the tenant: CDC_<t>, READINGS_<t> and the generation object store gen-<t>.
+    The bridge never deletes a departed tenant's streams (that is an operator's call), and
+    CDC_ and READINGS_ each reserve their max_bytes (1 GiB and 256 MiB by default): left
+    behind, a few runs fill the dev server's JetStream reservation and every later stream
+    creation fails with StorageResourcesExceeded. A stream that is not there is fine."""
+    for t in tenants:
+        # READINGS_ is topology.zig's readings_stream_prefix (not in grammar.json).
+        for name in (TOPOLOGY["cdc_streams"]["tenant_prefix"] + t, "READINGS_" + t):
+            nats_cli("stream", "rm", name, "-f")
+        nats_cli("object", "rm", TOPOLOGY["generations"]["bucket_prefix"] + t, "-f")
+
+
 def forget_table(*tables: str) -> None:
     """Purge `$KV.schemas.<table>` for a fixture a scenario is tearing down.
 

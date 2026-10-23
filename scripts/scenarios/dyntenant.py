@@ -135,6 +135,7 @@ def main():
                 f"OR (principal = 'zb_sweeper' AND tenant_id = '{TENANT}')", quiet=True)
         time.sleep(1.5)  # let the delete's own events publish before the stream goes
         zb.nats_cli("stream", "rm", cdc_stream, "-f")
+        zb.drop_tenant_streams(TENANT)   # READINGS_ and gen- too
 
     return 1 if failed else 0
 

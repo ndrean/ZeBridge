@@ -66,6 +66,7 @@ def cleanup(client):
     sql(f"DELETE FROM public.zebridge_invites WHERE principal = '{PRINCIPAL}'")
     zb.nats_cli("kv", "purge", zb.kv_bucket("tenants"), PRINCIPAL, "-f")
     zb.nats_cli("stream", "rm", STREAM, "-f")
+    zb.drop_tenant_streams(TD)   # READINGS_ and gen- too
     for p in (DB, DB + "-wal", DB + "-shm", str(TMP / f"zb_{PRINCIPAL}.creds")):
         pathlib.Path(p).unlink(missing_ok=True)
 

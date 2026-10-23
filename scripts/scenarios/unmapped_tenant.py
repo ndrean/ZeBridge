@@ -140,6 +140,7 @@ def main():
         zb.psql(f"DELETE FROM public.zebridge_user_tenants WHERE tenant_id = '{TENANT}'", quiet=True)
         time.sleep(1.5)  # let the deletes publish before the stream goes
         zb.nats_cli("stream", "rm", cdc_stream, "-f")
+        zb.drop_tenant_streams(TENANT)   # READINGS_ and gen- too
 
     return 1 if failed else 0
 

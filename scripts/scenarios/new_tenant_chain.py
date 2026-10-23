@@ -52,6 +52,7 @@ def cleanup(stream, rows):
     zb.nats_cli("stream", "rm", stream, "-f")
     zb.nats_cli("kv", "del", zb.kv_bucket("generations"), f"{TENANT}.{TABLE}", "-f")
     zb.nats_cli("object", "rm", zb.TOPOLOGY["generations"]["bucket_prefix"] + TENANT, "-f")
+    zb.drop_tenant_streams(TENANT)   # READINGS_ too
     zb.psql(f"DELETE FROM public.zebridge_generations WHERE tenant = '{TENANT}'", quiet=True)
 
 
