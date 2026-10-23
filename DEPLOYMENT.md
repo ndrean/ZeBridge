@@ -584,7 +584,7 @@ Two settings in `.env.bridge` bound each tenant's readings stream; a full stream
 | setting | default | |
 | --- | --- | --- |
 | `READINGS_MAX_AGE_SECONDS` | 86400 (1 day) | how long a reading stays in the stream. The archiver refuses to start when this is shorter than two flushes plus the S3 outage it should survive |
-| `READINGS_MAX_BYTES` | 256 MiB | a disk valve per tenant: one flooding sensor drops its own tenant's oldest readings, never another tenant's |
+| `READINGS_MAX_BYTES` | 64 MiB | a disk valve per tenant: one flooding sensor drops its own tenant's oldest readings, never another tenant's |
 
 🔔 A store made before these two roles has no archiver or sensor key. `bridge --init-nats --update` adds them to the store and the account, and leaves every other key as it is: issued creds and device JWTs stay valid. Run it on the store's file, not from standard input, so the new keys are kept.
 

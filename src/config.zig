@@ -190,7 +190,13 @@ pub const Nats = struct {
     pub const default_cdc_max_age_cadences: u64 = 3;
     pub const min_cdc_max_age_seconds: u64 = 30;
     pub const max_cdc_max_age_seconds: u64 = 30 * 24 * 60 * 60;
-    pub const default_cdc_max_bytes: u64 = 1 << 30;
+    /// 128 MiB, not 1 GiB: every tenant's stream RESERVES its cap on JetStream's storage
+    /// up front, so the cap times the tenants is what a hub must hold, whatever the data
+    /// (1 GiB each allowed ~50 tenants on a 72 GB store holding 10 MB). Sized on the rule
+    /// "ten seconds or more of the worst burst": the firehose of SPEED_TEST.md (~9 MB/s)
+    /// ran clean at 64 MiB and holed only at 32, and 128 MiB holds 30 min (the default
+    /// window at a 600 s cadence) of a tenant writing ~300 changes a second.
+    pub const default_cdc_max_bytes: u64 = 128 << 20;
     pub const min_cdc_max_bytes: u64 = 1 << 20;
     pub const max_cdc_max_bytes: u64 = 1 << 40;
     pub const default_cdc_max_msgs: u64 = 10_000_000;
@@ -200,7 +206,9 @@ pub const Nats = struct {
     /// its own tenant's oldest readings and nothing else.
     pub const default_readings_max_age_seconds: u64 = 24 * 60 * 60;
     pub const min_readings_max_age_seconds: u64 = 60;
-    pub const default_readings_max_bytes: u64 = 256 << 20;
+    /// Reserved per tenant like the CDC cap, hence modest; a deployment whose sensors
+    /// write more raises READINGS_MAX_BYTES.
+    pub const default_readings_max_bytes: u64 = 64 << 20;
     pub const min_readings_max_bytes: u64 = 1 << 20;
     pub const min_cdc_max_msgs: u64 = 1_000;
     pub const max_cdc_max_msgs: u64 = 1_000_000_000;

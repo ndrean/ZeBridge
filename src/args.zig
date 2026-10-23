@@ -192,7 +192,7 @@ const usage =
     \\                        client further behind re-seeds and resumes at
     \\                        the newest cutoff, so this must exceed 2 × cadence.
     \\                        Applied to streams that already exist, too.
-    \\  CDC_MAX_BYTES         a CDC stream's size cap (default: 1 GiB) — a disk
+    \\  CDC_MAX_BYTES         a CDC stream's size cap (default: 128 MiB) — a disk
     \\                        valve; when it ends the window before the age
     \\                        does, bridge_cdc_window_short says so
     \\  CDC_MAX_MSGS          a CDC stream's message cap (default: 10000000)

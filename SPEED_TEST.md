@@ -183,8 +183,8 @@ The upload is a few milliseconds of a cut that takes a quarter of a second; TLS 
 producer's behaviour unchanged. The edge is the cap measured in seconds of burst: at 32 MiB
 the stream held about 172 messages while pruning 35–52 a second, 3.5 to 5 s of history,
 against builds of up to 2.6 s, and both links met holes (TLS in more samples, one run each).
-Size `CDC_MAX_BYTES` for ten seconds or more of the worst burst; the default 1 GiB holds
-about two minutes at this rate.
+Size `CDC_MAX_BYTES` for ten seconds or more of the worst burst; the default 128 MiB holds
+about fourteen seconds at this rate.
 
 ### 4. Two edge topologies, with consumers attached — `scripts/scenarios/firehose_topology.py`
 

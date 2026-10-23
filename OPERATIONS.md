@@ -319,10 +319,10 @@ At boot the bridge checks the writer role's connection limit, and PostgreSQL's `
 | `GC_BATCH_ROWS` | 1000 | how many tombstones the sweeper reaps per transaction |
 | `GC_THRESHOLD_MS` | 604800000 (7 days) | the sweeper's age: a tombstone older than this is reaped (floor 60000). It is the longest a client may stay offline and still catch up through the chain, with its pending edits |
 | `CDC_MAX_AGE_SECONDS` | 3 × cadence | how long a CDC stream keeps an event |
-| `CDC_MAX_BYTES` | 1 GiB | a CDC stream's size cap, a disk valve |
+| `CDC_MAX_BYTES` | 128 MiB | a CDC stream's size cap, a disk valve; reserved per tenant on JetStream's storage |
 | `CDC_MAX_MSGS` | 10,000,000 | a CDC stream's message cap, a disk valve |
 | `READINGS_MAX_AGE_SECONDS` | 86400 (1 day) | how long a tenant's readings stream keeps a sensor reading |
-| `READINGS_MAX_BYTES` | 256 MiB | a readings stream's size cap, per tenant; full, it drops its oldest readings |
+| `READINGS_MAX_BYTES` | 64 MiB | a readings stream's size cap, per tenant and reserved like the CDC cap; full, it drops its oldest readings |
 
 Two inequalities hold them together, both checked by `bridge --diagnose` and at boot:
 
@@ -519,11 +519,11 @@ The `live` bucket holds one heartbeat per connected client: its lag on each stre
 
 | Stream | Purpose | Retention (default) | Consumer Pattern | Role |
 | -------- | ------------------- | ------------- | ----------------------- | -- |
-| **CDC** | Real-time egress changes | `CDC_MAX_AGE_SECONDS`, 3 × the generation cadence; `CDC_MAX_BYTES` 1 GiB and `CDC_MAX_MSGS` 10 M as disk valves | Continuous subscription | READ |
+| **CDC** | Real-time egress changes | `CDC_MAX_AGE_SECONDS`, 3 × the generation cadence; `CDC_MAX_BYTES` 128 MiB and `CDC_MAX_MSGS` 10 M as disk valves | Continuous subscription | READ |
 | **MUTATIONS** | Private admitted writes | No age expiry, 1 GiB, discard new, bounded aggregate backlog per principal; shared fleet ceiling | Continuous subscription | WRITE |
 | **MUTATIONS_ERRORS** | Refused-write diagnostics under admission | 2 h, 64 MiB, discard old | Operator inspection | Service |
 | **VERDICTS** | Write verdicts and the revocation ban | 2 h, 1 GB, discard old: the window a missed verdict can be recovered in | Direct get by key | WRITE |
-| **READINGS_\<tenant\>** | Sensor readings, `sensors.<tenant>.>`, never through PostgreSQL ([examples/16-archive](examples/16-archive)) | `READINGS_MAX_AGE_SECONDS` 1 day, `READINGS_MAX_BYTES` 256 MiB, discard old | the tenant's archiver and responders | READ |
+| **READINGS_\<tenant\>** | Sensor readings, `sensors.<tenant>.>`, never through PostgreSQL ([examples/16-archive](examples/16-archive)) | `READINGS_MAX_AGE_SECONDS` 1 day, `READINGS_MAX_BYTES` 64 MiB, discard old | the tenant's archiver and responders | READ |
 
 Besides the streams, the bridge maintains the seeding buckets: the **`generations` KV** holds one chain manifest per `<tenant>.<table>`, and a per-tenant **`gen-<tenant>` object store** holds the full and delta objects the manifest points to. The producer provisions the object stores at runtime, the same way the bridge provisions per-tenant CDC streams.
 
