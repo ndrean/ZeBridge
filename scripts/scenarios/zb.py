@@ -284,6 +284,19 @@ def run(main):
 
 BRIDGE = ROOT / "zig-out" / "bin" / "bridge"
 SWEEPER = ROOT / "zig-out" / "bin" / "bridge_sweeper"
+
+
+def restore_gc_watermark() -> None:
+    """One sweeper pass at the stack's own GC threshold, after a scenario swept with a
+    short one. Every pass sets the watermark to now() - threshold: a 1 s sweep leaves any
+    write stamped more than a second ago refused (PredatesGcWatermark) until the next
+    normal pass, and a scenario run next that stamps its writes minutes back (recent_version)
+    then fails for no reason of its own. The normal pass puts the watermark back."""
+    short = ("GC_THRESHOLD_MS", "GC_ALLOW_SHORT_THRESHOLD", "GC_INTERVAL_MS", "GC_BATCH_ROWS", "GC_DRY_RUN")
+    env = {k: v for k, v in os.environ.items() if k not in short}
+    r = subprocess.run([str(SWEEPER), "--once"], env=env, capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        print(f"  ⚠️  the restoring sweep failed (rc={r.returncode}): the GC watermark may still trail now() by seconds")
 # `--pub` comes from BRIDGE_CDC_PUBLICATION (publication(), no default): the literal
 # `my_pub` this used to carry was the very defaulting the bridge stopped doing.
 BRIDGE_ARGS = os.environ.get("ZB_BRIDGE_ARGS", "--slot zb_probe --port 9096").split()

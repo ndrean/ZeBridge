@@ -126,6 +126,7 @@ def main():
                 passes += 1
                 remaining = zb.psql(f"SELECT (SELECT count(*) FROM {P} WHERE deleted_at IS NOT NULL) || '/' || (SELECT count(*) FROM {C} WHERE deleted_at IS NOT NULL)").strip()
                 if remaining == "0/0": break
+            zb.restore_gc_watermark()   # the 1 s threshold must not outlive this section
             time.sleep(3); py.poll()
             after = (live(py, P), live(py, C), live(nd, P), live(nd, C))
             batch_lines = [l for l in sweep_out.splitlines() if "batch(es)" in l]
