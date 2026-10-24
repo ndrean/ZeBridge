@@ -135,3 +135,7 @@ dist/
 
 # Gradle caches (a module built inside an app, e.g. zb-react-native/android)
 .gradle/
+
+# Flutter/Dart local overrides (e.g. an example pointed at the local zb-dart): never committed,
+# an app with one cannot build against pub.dev.
+pubspec_overrides.yaml
