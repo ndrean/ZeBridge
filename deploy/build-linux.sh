@@ -23,6 +23,7 @@ esac
 root=$(cd "$(dirname "$0")/.." && pwd)
 cache=${ZB_LINUX_CACHE:-$HOME/.cache/zebridge-linux-build}
 mkdir -p "$cache"
+zig=0.17.0   # the cache keeps its Zig across builds: a different version is replaced, not reused
 
 docker run --rm --platform linux/arm64 -v "$root":/src -v "$cache":/cache debian:13-slim sh -eu -c "
 export DEBIAN_FRONTEND=noninteractive
@@ -31,13 +32,15 @@ apt-get update -qq >/dev/null
 apt-get install -y -qq curl xz-utils ca-certificates libpq-dev:$deb libzstd-dev:$deb >/dev/null
 ln -sf /usr/lib/$arch-linux-gnu/libpq.so /usr/lib/libpq.so
 ln -sf /usr/lib/$arch-linux-gnu/libzstd.so /usr/lib/libzstd.so
-if [ ! -x /cache/zig/zig ]; then
-  curl -sL https://ziglang.org/download/0.17.0/zig-aarch64-linux-0.17.0.tar.xz | tar -xJ -C /cache
-  mv /cache/zig-aarch64-linux-0.17.0 /cache/zig
+if [ \"\$(/cache/zig/zig version 2>/dev/null)\" != $zig ]; then
+  rm -rf /cache/zig
+  curl -sL https://ziglang.org/download/$zig/zig-aarch64-linux-$zig.tar.xz | tar -xJ -C /cache
+  mv /cache/zig-aarch64-linux-$zig /cache/zig
 fi
 cd /src
-/cache/zig/zig build bridge sweeper -Dtarget=$arch-linux-gnu.2.35 -Doptimize=ReleaseSafe \
-  -p /src/zig-out/linux-$arch --cache-dir /cache/local-$arch --global-cache-dir /cache/global
+# The global cache through the environment: Zig 0.17 has no --global-cache-dir flag.
+ZIG_GLOBAL_CACHE_DIR=/cache/global /cache/zig/zig build bridge sweeper -Dtarget=$arch-linux-gnu.2.35 -Doptimize=ReleaseSafe \
+  -p /src/zig-out/linux-$arch --cache-dir /cache/local-$arch
 "
 
 (cd "$root/libzb" && zig build lib respond -Dtarget="$arch-linux-gnu.2.35" -Dvendor=true -Doptimize=ReleaseFast -p "zig-out/linux-$arch")
