@@ -286,6 +286,7 @@ fn runImpl(init: *const std.process.Init, a: std.mem.Allocator) !void {
     log.info("mutation admission ready: {d} queued messages per principal, {d} byte budget", .{ try limits.count(), limits.principal_bytes });
     var refused: u64 = 0;
     var last_warning: i64 = 0;
+    var idle_ms: u64 = 0;
     while (!stopping.load(.acquire)) {
         var activity = false;
         for (subscriptions.items) |subscription| {
@@ -316,7 +317,34 @@ fn runImpl(init: *const std.process.Init, a: std.mem.Allocator) !void {
                 }
             };
         }
-        if (!activity) try std.Io.sleep(init.io, .fromMilliseconds(1), .awake);
+        // Polled, not blocked on: one wait would starve the other subscriptions (the
+        // public subject and one per leaf). Idle, the pause grows to idle_sleep_max_ms:
+        // a fixed 1 ms pause woke the loop 1,000 times a second, 1.4% of a core all day
+        // on a hub with no writes (2026-10-24). The first write after a quiet spell waits
+        // at most that long; while writes keep coming, the loop never sleeps.
+        idle_ms = nextIdleSleep(idle_ms, activity);
+        if (idle_ms > 0) try std.Io.sleep(init.io, .fromMilliseconds(@intCast(idle_ms)), .awake);
+    }
+}
+
+/// The admission loop's pause after a pass, in milliseconds: none after a pass that
+/// relayed something, then 1, 2, 4 … up to `idle_sleep_max_ms` while passes stay empty.
+const idle_sleep_max_ms: u64 = 20;
+
+fn nextIdleSleep(prev_ms: u64, activity: bool) u64 {
+    if (activity) return 0;
+    if (prev_ms == 0) return 1;
+    return @min(prev_ms * 2, idle_sleep_max_ms);
+}
+
+test "admission idles: no pause while busy, a doubling pause up to the ceiling when quiet" {
+    try std.testing.expectEqual(@as(u64, 0), nextIdleSleep(0, true));
+    try std.testing.expectEqual(@as(u64, 0), nextIdleSleep(20, true));
+    var ms: u64 = 0;
+    const want = [_]u64{ 1, 2, 4, 8, 16, 20, 20 };
+    for (want) |w| {
+        ms = nextIdleSleep(ms, false);
+        try std.testing.expectEqual(w, ms);
     }
 }
 
