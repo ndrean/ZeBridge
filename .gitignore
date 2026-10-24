@@ -93,6 +93,8 @@ zb-client-ts/zebridge_*.sqlite3-*
 .env.grafana
 # A cloud PostgreSQL's connection strings (the Supabase demo project): never committed.
 .env.supabase
+# other Supabase projects' connection strings (.env.supa.<name>, e.g. the evaluation's)
+.env.supa.*
 # The compose stack's settings and passwords, on the server only.
 deploy/compose/.env
 /node_modules/
