@@ -1,6 +1,6 @@
 # ZeBridge with Docker Compose
 
-One server runs NATS, the bridge, the sweeper, HAProxy and Let's Encrypt, Prometheus and Grafana, and optionally PostgreSQL. Two files are all it needs, `compose.yml` and a `.env`: HAProxy's, Prometheus's and Grafana's configuration ships inside the release's image (`ghcr.io/ndrean/zebridge`), and follows `ZB_VERSION`.
+One server runs NATS, the bridge, the sweeper, HAProxy and Let's Encrypt, optionally PostgreSQL, and optionally the telemetry: Alloy, sending metrics and logs to a store elsewhere (Grafana Cloud, OpenObserve). Two files are all it needs, `compose.yml` and a `.env`: HAProxy's and Alloy's configuration ships inside the release's image (`ghcr.io/ndrean/zebridge`), and follows `ZB_VERSION`.
 
 | name | port | what |
 | -- | -- | -- |
@@ -8,9 +8,8 @@ One server runs NATS, the bridge, the sweeper, HAProxy and Let's Encrypt, Promet
 | `WS_HOST` | 443 | HAProxy → the NATS websocket, for browsers |
 | `NATS_HOST` | `NATS_PUBLIC_PORT` | NATS with TLS, for native clients (phones, libzb) |
 | (any) | 80 | Let's Encrypt's challenge; everything else is redirected to https |
-| Grafana | 127.0.0.1:3000 | the server's loopback only: an SSH tunnel reaches it |
 
-PostgreSQL, Prometheus, NATS monitoring and the bridge's `/metrics` are not published.
+PostgreSQL, NATS monitoring and the bridge's `/metrics` are not published.
 
 ## Setting up
 
@@ -44,7 +43,6 @@ Docker Engine, the standard (rootful) daemon, with the compose plugin. Rootless 
    ZB_READER_PASSWORD=
    ZB_WRITER_PASSWORD=
    ZB_INVITER_PASSWORD=
-   GRAFANA_ADMIN_PASSWORD=
 
    BRIDGE_CDC_PUBLICATION=zb_pub
    BRIDGE_CDC_SLOT=zb_slot
@@ -53,7 +51,7 @@ Docker Engine, the standard (rootful) daemon, with the compose plugin. Rootless 
    The passwords (letters and digits only), made on the server and written straight into `.env`, never shown:
 
    ```sh
-   for v in PG_ADMIN_PASSWORD ZB_READER_PASSWORD ZB_WRITER_PASSWORD ZB_INVITER_PASSWORD GRAFANA_ADMIN_PASSWORD; do
+   for v in PG_ADMIN_PASSWORD ZB_READER_PASSWORD ZB_WRITER_PASSWORD ZB_INVITER_PASSWORD; do
      sed -i "s|^$v=.*|$v=$(openssl rand -hex 24)|" .env
    done
    ```
@@ -94,15 +92,29 @@ docker compose exec -e INVITER_DATABASE_URL bridge bridge --invite --principal a
 
 It prints the code alone. A backend on this server runs the same command after its own sign-in; a backend elsewhere calls `SELECT zebridge_invite('alice', 'acme', interval '1 hour')` over a connection as `zb_inviter`, which needs a PostgreSQL it can reach (this stack's is not published).
 
-## Metrics
+## Metrics and logs
 
-Prometheus scrapes the bridge and NATS (through the NATS exporter) every 15 s and keeps 30 days or 2 GB, whichever comes first (`PROMETHEUS_RETENTION_TIME`, `_SIZE`). Grafana shows them with two dashboards, the bridge's and NATS's. From your machine:
+With `telemetry` in `COMPOSE_PROFILES`, Alloy scrapes the bridge and NATS (through the NATS exporter) every 15 s and reads every service's log lines, then sends the metrics to a Prometheus remote-write endpoint and the logs to a Loki push endpoint. Nothing is stored on the server: the store is elsewhere, and while it is unreachable Alloy keeps the metrics in its write-ahead log (the `alloy-data` volume) and sends them later.
 
 ```sh
-ssh -L 3000:127.0.0.1:3000 <user>@<server>
+COMPOSE_PROFILES=postgres,telemetry   # or telemetry alone, with an external PostgreSQL
+ZB_METRICS_URL=
+ZB_METRICS_USER=
+ZB_METRICS_PASSWORD=
+ZB_LOGS_URL=
+ZB_LOGS_USER=
+ZB_LOGS_PASSWORD=
+ZB_TELEMETRY_ENVIRONMENT=production   # the `environment` label, so several hubs share one store
 ```
 
-then <http://localhost:3000>, user `admin`, the password `GRAFANA_ADMIN_PASSWORD` from `.env`.
+| store | metrics URL | logs URL | user, password |
+| -- | -- | -- | -- |
+| Grafana Cloud | the stack's Prometheus remote-write URL | the stack's Loki push URL | each instance's ID (they differ), one access-policy token with write scopes |
+| OpenObserve | `https://<host>/api/<org>/prometheus/api/v1/write` | `https://<host>/api/<org>/loki/api/v1/push` | the same user and password for both |
+
+The services log through Docker's journald driver, so the lines also land in the server's journal, and `docker compose logs` reads them back as usual. On a server without systemd-journald, set `ZB_LOG_DRIVER=json-file`: the services then log as Docker does by default, and Alloy reads no logs.
+
+The two dashboards in [telemetry/](../../telemetry) (the bridge's and NATS's) import into Grafana. Metrics are labelled `service` (`cdc-bridge`, `nats-server`) and `environment`; logs carry `service`, `container` and, for the bridge and NATS, `level` (and `scope` for the bridge).
 
 ## Sensor readings and their archive
 

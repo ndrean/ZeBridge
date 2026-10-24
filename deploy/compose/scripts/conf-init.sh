@@ -1,5 +1,5 @@
 #!/bin/sh
-# The configuration the other services read (HAProxy, Prometheus, Grafana, the scripts),
+# The configuration the other services read (HAProxy, Alloy, the scripts),
 # copied from this image into the zb-conf volume at every start: it follows ZB_VERSION.
 set -eu
 rm -rf /conf/* 2>/dev/null || true

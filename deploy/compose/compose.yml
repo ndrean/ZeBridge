@@ -1,18 +1,25 @@
 # ZeBridge on one server with Docker Compose: NATS, the bridge, the sweeper, HAProxy and
-# Let's Encrypt, Prometheus and Grafana, and optionally PostgreSQL. This file and a .env
-# are all a server needs: the configuration ships inside the release's image.
+# Let's Encrypt, optionally PostgreSQL, and optionally the telemetry (Alloy, sending metrics
+# and logs to a store elsewhere). This file and a .env are all a server needs: the
+# configuration ships inside the release's image.
 #
-#   docker compose up -d     # COMPOSE_PROFILES=postgres in .env adds the PostgreSQL below
+#   docker compose up -d     # COMPOSE_PROFILES in .env: postgres, telemetry, or both
 #
 # Published ports: 80 (Let's Encrypt, redirect), 443 (bridge + websocket), NATS_PUBLIC_PORT
-# (native clients, TLS), and Grafana on 127.0.0.1:3000 only (an SSH tunnel reaches it).
-# PostgreSQL, Prometheus, NATS monitoring and the bridge's /metrics stay on the compose
-# network. Docker's published ports bypass ufw. README.md has the steps.
+# (native clients, TLS). PostgreSQL, NATS monitoring and the bridge's /metrics stay on the
+# compose network. Docker's published ports bypass ufw. README.md has the steps.
+
+# Every service logs to the host's journal, tagged with its container name: `docker compose
+# logs` reads it back, and Alloy (profile "telemetry") sends it on. ZB_LOG_DRIVER=json-file
+# for a host without systemd-journald.
+x-logging: &logging
+  driver: ${ZB_LOG_DRIVER:-journald}
 
 x-zebridge: &zebridge
   image: ghcr.io/ndrean/zebridge:${ZB_VERSION:-0.2.7}
   restart: unless-stopped
   init: true   # a small init as PID 1 passes SIGTERM on: a stop takes ms, not Docker's 10 s
+  logging: *logging
 
 x-db: &db
   DATABASE_READER_URL: ${DATABASE_READER_URL:-postgres://zb_reader:${ZB_READER_PASSWORD}@postgres:5432/zebridge}
@@ -30,8 +37,8 @@ x-admission: &admission
 
 services:
   # ── configuration ───────────────────────────────────────────────────────────────
-  # HAProxy's, Prometheus's and Grafana's files and the scripts, from the release's image
-  # into the zb-conf volume, at every start: they follow ZB_VERSION.
+  # HAProxy's and Alloy's files and the scripts, from the release's image into the zb-conf
+  # volume, at every start: they follow ZB_VERSION.
   conf-init:
     <<: *zebridge
     user: root
@@ -46,6 +53,7 @@ services:
   # and NATS start (scripts/certbot-run.sh).
   certbot:
     image: certbot/certbot:v5.8.0
+    logging: *logging
     init: true
     entrypoint: ["/bin/sh", "/conf/scripts/certbot-run.sh"]
     environment:
@@ -75,6 +83,7 @@ services:
 
   nats:
     image: nats:2.15.0-alpine
+    logging: *logging
     init: true
     entrypoint: ["/bin/sh", "/conf/scripts/nats-run.sh"]
     depends_on:
@@ -139,6 +148,7 @@ services:
   # ── HAProxy: 80 and 443 ──────────────────────────────────────────────────────────
   haproxy:
     image: haproxy:3.4.6-alpine
+    logging: *logging
     init: true
     entrypoint: ["/bin/sh", "/conf/scripts/haproxy-run.sh"]
     environment:
@@ -154,49 +164,51 @@ services:
       - zb-conf:/conf:ro
     restart: unless-stopped
 
-  # ── telemetry: the NATS exporter, Prometheus, Grafana ────────────────────────────
+  # ── telemetry (profile "telemetry"): the NATS exporter and Alloy ──────────────────
+  # Alloy sends the metrics (Prometheus remote write) and the logs (Loki push) to the store
+  # named in .env: Grafana Cloud, OpenObserve, any compatible one. Nothing is kept here.
   nats-exporter:
+    profiles: [telemetry]
     image: natsio/prometheus-nats-exporter:0.20.2
+    logging: *logging
     command: ["-port", "7777", "-jsz", "all", "-varz", "-connz", "-leafz", "http://nats:8222"]
     depends_on:
       nats: { condition: service_started }
     restart: unless-stopped
 
-  prometheus:
-    image: prom/prometheus:v3.15.0
-    command:
-      - --config.file=/conf/prometheus.yml
-      - --storage.tsdb.path=/prometheus
-      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-30d}
-      - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-2GB}   # whichever comes first
+  alloy:
+    profiles: [telemetry]
+    image: grafana/alloy:v1.21.2
+    logging: *logging
+    command: ["run", "/conf/alloy/config.alloy", "--storage.path=/var/lib/alloy/data",
+              "--server.http.listen-addr=127.0.0.1:12345"]
+    environment:
+      # No ${…:?} here: compose interpolates every service, profile or not. Alloy says which
+      # one is missing when the profile is on (README.md, "Metrics and logs").
+      ZB_METRICS_URL: ${ZB_METRICS_URL:-}
+      ZB_METRICS_USER: ${ZB_METRICS_USER:-}
+      ZB_METRICS_PASSWORD: ${ZB_METRICS_PASSWORD:-}
+      ZB_LOGS_URL: ${ZB_LOGS_URL:-}
+      ZB_LOGS_USER: ${ZB_LOGS_USER:-}
+      ZB_LOGS_PASSWORD: ${ZB_LOGS_PASSWORD:-}
+      ZB_TELEMETRY_ENVIRONMENT: ${ZB_TELEMETRY_ENVIRONMENT:-production}
     depends_on:
       conf-init: { condition: service_completed_successfully }
+      nats-exporter: { condition: service_started }
     volumes:
-      - prometheus-data:/prometheus
       - zb-conf:/conf:ro
-    restart: unless-stopped
-
-  grafana:
-    image: grafana/grafana:13.2.4
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
-      GF_PATHS_PROVISIONING: /conf/grafana/provisioning
-      GF_USERS_ALLOW_SIGN_UP: "false"
-      GF_ANALYTICS_REPORTING_ENABLED: "false"
-      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
-    # The server's loopback only: open it through an SSH tunnel (README.md).
-    ports: ["127.0.0.1:3000:3000"]
-    depends_on:
-      prometheus: { condition: service_started }
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - zb-conf:/conf:ro
+      - alloy-data:/var/lib/alloy/data   # the write-ahead log: a store that is down loses nothing
+      # the host's journal, where every service of this stack logs (x-logging), read-only
+      - /var/log/journal:/var/log/journal:ro
+      - /run/log/journal:/run/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
     restart: unless-stopped
 
   # ── PostgreSQL (profile "postgres") ──────────────────────────────────────────────
   postgres:
     profiles: [postgres]
     image: postgres:18.6-trixie
+    logging: *logging
     command:
       - postgres
       - -c
@@ -248,6 +260,5 @@ volumes:
   zb-etc:           # nats-server.conf, .env.nats, creds/, operator.store, nats-data/ (JetStream)
   letsencrypt:      # certbot's account and certificates
   certs:            # the copies NATS and HAProxy read (scripts/cert-deploy.sh)
-  prometheus-data:
-  grafana-data:
+  alloy-data:       # Alloy's write-ahead log (profile "telemetry")
   pg-data:
