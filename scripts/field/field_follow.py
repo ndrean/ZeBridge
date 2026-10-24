@@ -22,6 +22,12 @@ nats-server and bridge CPU, hub and leaf bytes), and the exact check.
 
 Before the first run: the setup in docs/plans/field-measurements.md (venv, libzb, invites).
 Needs .env.supabase (SB_ADMIN_URL) in the repository root.
+
+    field_follow.py --target eval --via hub   # the compose-hub evaluation (docs/plans/compose-hub-evaluation.md)
+
+--target eval: the hub is the evaluation VPS (compose or systemd, the same counters), its
+database the Dublin project (.env.supa.dublin), and the clients run on this Mac
+(~/zb-field-eval: invites/, ids/, runs/), so they take no CPU from the hub measured.
 """
 import argparse, json, os, pathlib, re, subprocess, sys, time
 
@@ -31,8 +37,18 @@ import gen_follow  # noqa: E402  seeding_report, print_seeding
 
 HUB, CANADA = "debian@141.95.95.12", "debian@51.222.37.223"
 LEAF_NATS, HUB_NATS = "tls://t-nats.zebridge.eu:4222", "tls://nats.zebridge.eu:4222"
+BRIDGE_URL, ENV_FILE, JS_DOMAIN = "https://bridge.zebridge.eu", ".env.supabase", "hub"
 SEED_DOMAIN, TENANT, TABLE = "scratch", "storm", "storm_items"
 REMOTE = "field"   # ~/field on the VPS: venv/, lib/libzbcore.so, invites/<name>.code, ids/, runs/
+LOCAL = False      # the clients on this Mac (--target eval), not over ssh
+
+
+def use_eval():
+    """--target eval: the hub is the evaluation VPS, the clients run here."""
+    global HUB, CANADA, HUB_NATS, BRIDGE_URL, ENV_FILE, JS_DOMAIN, REMOTE, LOCAL
+    HUB, CANADA = "debian@51.222.37.223", "local"
+    HUB_NATS, BRIDGE_URL = "tls://t-nats.zebridge.eu:4222", "https://t-bridge.zebridge.eu"
+    ENV_FILE, JS_DOMAIN, REMOTE, LOCAL = ".env.supa.dublin", "", "zb-field-eval", True
 SCHEDULE = {
     "steady": [[20, None]],
     "cold": [[60, None]],
@@ -55,9 +71,13 @@ DIGEST_SQL = (f"SELECT count(*), encode(sha256(coalesce(string_agg(convert_to(id
 
 
 def ssh(host, cmd, check=True, input=None):
-    # -n unless there is input: ssh then never waits on this process's stdin.
-    r = subprocess.run(["ssh", "-o", "BatchMode=yes"] + ([] if input is not None else ["-n"]) + [host, cmd],
-                       capture_output=True, text=True, input=input)
+    # "local": the same command in a shell here, from the home directory as ssh would be.
+    if host == "local":
+        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, input=input, cwd=os.path.expanduser("~"))
+    else:
+        # -n unless there is input: ssh then never waits on this process's stdin.
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes"] + ([] if input is not None else ["-n"]) + [host, cmd],
+                           capture_output=True, text=True, input=input)
     if check and r.returncode:
         sys.exit(f"ssh {host}: {cmd[:80]}… failed:\n{r.stderr[-800:]}")
     return r.stdout
@@ -65,7 +85,7 @@ def ssh(host, cmd, check=True, input=None):
 
 def supabase_env():
     env = dict(os.environ)
-    for line in (ROOT / ".env.supabase").read_text().splitlines():
+    for line in (ROOT / ENV_FILE).read_text().splitlines():
         if "=" in line and not line.lstrip().startswith("#"):
             k, v = line.split("=", 1)
             env[k.strip()] = v.strip().strip('"').strip("'")
@@ -99,22 +119,39 @@ def load_sql(run, seconds, ins, upd, dele, delete_after=30):
 
 
 def counters():
-    """Hub: nats-server and bridge CPU seconds, nats bytes/messages. Leaf: bytes/messages."""
+    """Hub: nats-server, bridge, admission and Docker CPU seconds, nats bytes/messages. Leaf:
+    bytes/messages. The same commands for a systemd hub and a compose one: a container's
+    processes are the host's, found by name; /varz by curl, or inside the container when the
+    monitoring port is not published."""
     def cpu(host, pid_cmd):
         t = ssh(host, f"ps -o times= -p $({pid_cmd})", check=False).strip()
         return int(t) if t.isdigit() else None
-    hub = json.loads(ssh(HUB, "curl -s 127.0.0.1:8222/varz"))
+    varz = ("curl -sf 127.0.0.1:8222/varz || sudo docker exec $(sudo docker ps -qf label=com.docker.compose.service=nats) "
+            "wget -qO- http://127.0.0.1:8222/varz")
+    hub = json.loads(ssh(HUB, varz))
+    # Docker's own cost, which a systemd hub does not pay: the daemons, each container's
+    # shim, and docker-proxy relaying the published ports (4222, 80, 443).
+    dk = ssh(HUB, "ps -C dockerd,containerd,containerd-shim-runc-v2,docker-proxy -o times= | awk '{s+=$1} END {print s+0}'",
+             check=False).strip()
+    # The whole machine's busy CPU (/proc/stat: user, nice, system, irq, softirq, steal), in
+    # seconds: what no process accounts for, the kernel's NAT and connection tracking for
+    # Docker's published ports above all, counts here. Hundredths of a second per tick.
+    host = ssh(HUB, "awk '/^cpu /{print ($2+$3+$4+$7+$8+$9)/100}' /proc/stat", check=False).strip()
     # The leaf's traffic, exactly: the hub's own count of its link to the Canada leaf
     # (/leafz, per leaf connection; "out" = hub → leaf). Docker's per-container counters
     # disagreed with themselves (2026-10-22: +30 MB in, +310 MB out for a leaf relaying ~300 MB).
-    leafz = json.loads(ssh(HUB, "curl -s '127.0.0.1:8222/leafz'"))
+    leafz = {} if LOCAL else json.loads(ssh(HUB, "curl -s '127.0.0.1:8222/leafz'"))
     link = next((l for l in leafz.get("leafs", []) if l.get("ip") == CANADA.split("@")[1]), {})
     leaf = {"out_bytes": link.get("out_bytes"), "in_bytes": link.get("in_bytes"), "out_msgs": link.get("out_msgs")}
     return {"t": time.time(),
             "hub": {"out_bytes": hub["out_bytes"], "in_bytes": hub["in_bytes"], "out_msgs": hub["out_msgs"],
-                    "nats_cpu_s": cpu(HUB, "pidof nats-server"), "bridge_cpu_s": cpu(HUB, "systemctl show -p MainPID --value zebridge")},
+                    "nats_cpu_s": cpu(HUB, "pidof nats-server"),
+                    "bridge_cpu_s": cpu(HUB, "pgrep -xf '(/usr/bin/)?bridge'"),
+                    "admission_cpu_s": cpu(HUB, "pgrep -xf '(/usr/bin/)?bridge --mutation-ingress'"),
+                    "docker_cpu_s": int(dk) if dk.isdigit() else None,
+                    "host_cpu_s": round(float(host), 1) if host else None},
             "link_to_leaf": {"out_bytes": leaf["out_bytes"], "in_bytes": leaf["in_bytes"], "out_msgs": leaf["out_msgs"]},
-            "leaf": {"nats_cpu_s": cpu(CANADA, "pidof nats-server")}}
+            "leaf": {"nats_cpu_s": None if LOCAL else cpu(CANADA, "pidof nats-server")}}
 
 
 def delta(a, b):
@@ -128,6 +165,8 @@ def delta(a, b):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--via", choices=("leaf", "hub"), required=True)
+    ap.add_argument("--target", choices=("field", "eval"), default="field",
+                    help="field: the production hub, clients on the Canada VPS; eval: the evaluation VPS, clients here")
     ap.add_argument("--seconds", type=int, default=900)
     ap.add_argument("--inserts", type=int, default=200)
     ap.add_argument("--updates", type=int, default=50)
@@ -137,8 +176,12 @@ def main() -> int:
     ap.add_argument("--enroll-only", action="store_true", help="redeem the extra clients' invites, keep their identities, and stop")
     ap.add_argument("--enroll-parallel", type=int, default=8, help="with --enroll-only: how many redeem at once")
     a = ap.parse_args()
+    if a.target == "eval":
+        if a.via == "leaf":
+            sys.exit("--target eval has no leaf: --via hub")
+        use_eval()
 
-    run = time.strftime("%m%d%H%M") + a.via[0]
+    run = time.strftime("%m%d%H%M") + a.via[0] + ("e" if LOCAL else "")
     out = pathlib.Path(a.out) / run
     out.mkdir(parents=True, exist_ok=True)
     env = supabase_env()
@@ -149,13 +192,17 @@ def main() -> int:
                           f"[ -e $f ] || [ -e ids/$(basename $f .code).identity ] || echo $f; done", check=False).split()
     if missing:
         sys.exit(f"missing on the VPS: {missing} — see docs/plans/field-measurements.md")
-    subprocess.run(["scp", "-q", str(pathlib.Path(__file__).with_name("field_worker.py")), f"{CANADA}:{REMOTE}/field_worker.py"], check=True)
+    worker = str(pathlib.Path(__file__).with_name("field_worker.py"))
+    if LOCAL:
+        subprocess.run(["cp", worker, os.path.expanduser(f"~/{REMOTE}/field_worker.py")], check=True)
+    else:
+        subprocess.run(["scp", "-q", worker, f"{CANADA}:{REMOTE}/field_worker.py"], check=True)
     ssh(CANADA, f"mkdir -p {REMOTE}/ids {REMOTE}/runs/{run} && chmod 700 {REMOTE}/ids")
     if a.enroll_only:
         ssh(CANADA, f"cat > {REMOTE}/runs/{run}/enroll.json", input=json.dumps(extra))
         out_text = ssh(CANADA, f"cd ~/{REMOTE} && venv/bin/python field_worker.py --batch runs/{run}/enroll.json --enroll-only "
                                f"--lib lib/libzbcore.so --db 'runs/{run}/{{name}}.sqlite3' --identity 'ids/{{name}}.identity' "
-                               f"--invite-file 'invites/{{name}}.code' --nats {HUB_NATS} --hub-nats {HUB_NATS} --t0 0 --done-file /dev/null --enroll-parallel {a.enroll_parallel} "
+                               f"--invite-file 'invites/{{name}}.code' --nats {HUB_NATS} --hub-nats {HUB_NATS} --bridge {BRIDGE_URL} --js-domain '{JS_DOMAIN}' --t0 0 --done-file /dev/null --enroll-parallel {a.enroll_parallel} "
                                f"2> runs/{run}/enroll.log; rm -f runs/{run}/c*.sqlite3*", check=False)
         rows = [json.loads(l) for l in out_text.splitlines() if l.strip()]
         summary = next((r for r in rows if r.get("summary")), {})
@@ -188,16 +235,24 @@ def main() -> int:
     for name, sched in SCHEDULE.items():
         launches.append(f"setsid -f venv/bin/python field_worker.py --name {name} --lib lib/libzbcore.so "
                         f"--db runs/{run}/{name}.sqlite3 --identity ids/{name}.identity --invite-file invites/{name}.code "
-                        f"--nats {nats} --hub-nats {HUB_NATS} {seed} --tenant {TENANT} --schedule '{json.dumps(sched)}' --t0 {t0} "
+                        f"--nats {nats} --hub-nats {HUB_NATS} --bridge {BRIDGE_URL} --js-domain '{JS_DOMAIN}' {seed} --tenant {TENANT} --schedule '{json.dumps(sched)}' --t0 {t0} "
                         f"--done-file runs/{run}/done > runs/{run}/{name}.events 2> runs/{run}/{name}.log < /dev/null")
     for k in range(0, len(extra), 10):
         group = extra[k:k + 10]
         ssh(CANADA, f"cat > {REMOTE}/runs/{run}/batch{k // 10}.json", input=json.dumps(group))
         launches.append(f"setsid -f venv/bin/python field_worker.py --batch runs/{run}/batch{k // 10}.json --lib lib/libzbcore.so "
                         f"--db 'runs/{run}/{{name}}.sqlite3' --identity 'ids/{{name}}.identity' --invite-file 'invites/{{name}}.code' "
-                        f"--nats {nats} --hub-nats {HUB_NATS} {seed} --tenant {TENANT} --t0 {t0} "
+                        f"--nats {nats} --hub-nats {HUB_NATS} --bridge {BRIDGE_URL} --js-domain '{JS_DOMAIN}' {seed} --tenant {TENANT} --t0 {t0} "
                         f"--done-file runs/{run}/done > runs/{run}/batch{k // 10}.events 2> runs/{run}/batch{k // 10}.log < /dev/null")
-    print("workers running: " + ssh(CANADA, f"cd ~/{REMOTE} && " + " && ".join(launches) + f" && sleep 1 && pgrep -fc field_worker.py").strip(), flush=True)
+    if LOCAL:
+        # No setsid on macOS: each worker in its own session through Popen, detached.
+        for cmd in launches:
+            subprocess.Popen(["sh", "-c", cmd.removeprefix("setsid -f ")], cwd=os.path.expanduser(f"~/{REMOTE}"),
+                             start_new_session=True, stdin=subprocess.DEVNULL)
+        time.sleep(1)
+        print("workers running: " + ssh(CANADA, "pgrep -f field_worker.py | wc -l").strip(), flush=True)
+    else:
+        print("workers running: " + ssh(CANADA, f"cd ~/{REMOTE} && " + " && ".join(launches) + f" && sleep 1 && pgrep -fc field_worker.py").strip(), flush=True)
     while time.time() < t0:
         time.sleep(0.5)
     c0 = counters()
@@ -220,8 +275,14 @@ def main() -> int:
             break
         time.sleep(10)
     c2 = counters()
-    subprocess.run(["scp", "-q", "-r", f"{CANADA}:{REMOTE}/runs/{run}/", str(out.parent)], check=True)
-    ssh(CANADA, f"rm -f {REMOTE}/runs/{run}/*.sqlite3*")
+    # The replicas first: each worker already compared its own to PostgreSQL's digest, and a
+    # hundred of them, each with its WAL, filled this Mac's disk (2026-10-24: 9.9 GB, and
+    # the copy below doubled it). Then the logs, events and report alone.
+    ssh(CANADA, f"rm -f {REMOTE}/runs/{run}/*.sqlite3 {REMOTE}/runs/{run}/*.sqlite3-wal {REMOTE}/runs/{run}/*.sqlite3-shm", check=False)
+    if LOCAL:
+        subprocess.run(["cp", "-R", os.path.expanduser(f"~/{REMOTE}/runs/{run}/."), str(out)], check=True)
+    else:
+        subprocess.run(["scp", "-q", "-r", f"{CANADA}:{REMOTE}/runs/{run}/", str(out.parent)], check=True)
 
     # ── the report ──
     failed = 0

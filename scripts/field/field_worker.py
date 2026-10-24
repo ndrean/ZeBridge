@@ -46,7 +46,7 @@ async def stream_last(url, creds_text, domain, stream, principal):
         # libzb's own inbox prefix): nats-py's default `_INBOX.<id>` is refused.
         nc = await nats.connect(url, user_credentials=path, connect_timeout=10, inbox_prefix=f"_INBOX.{principal}")
         try:
-            info = await nc.jetstream(domain=domain).stream_info(stream)
+            info = await (nc.jetstream(domain=domain) if domain else nc.jetstream()).stream_info(stream)
             return info.state.last_seq
         finally:
             await nc.close()
@@ -67,6 +67,8 @@ def main():
     ap.add_argument("--nats", required=True, help="the NATS this client dials: the leaf or the hub")
     ap.add_argument("--hub-nats", required=True, help="the hub, for the catch-up target")
     ap.add_argument("--seed-domain", default="")
+    ap.add_argument("--js-domain", default="hub",
+                    help="the hub's JetStream domain when the identity names none; empty for a hub without one")
     ap.add_argument("--tenant", default="storm")
     ap.add_argument("--schedule", help='[[open_s, close_s|null], ...] from --t0')
     ap.add_argument("--enroll-only", action="store_true",
@@ -170,7 +172,7 @@ def run_client(a, lib, take, lock, measure):
         if identity.exists() and measure:
             ident = json.loads(identity.read_text())
             try:
-                targets[stream] = asyncio.run(stream_last(a.hub_nats, ident["creds"], ident.get("js_domain") or "hub", stream, ident["principal"]))
+                targets[stream] = asyncio.run(stream_last(a.hub_nats, ident["creds"], ident.get("js_domain") or a.js_domain, stream, ident["principal"]))
             except Exception as e:
                 say(event="target_failed", leg=i, error=str(e)[:200])
         if not identity.exists():
