@@ -89,6 +89,18 @@ services:
     depends_on:
       nats-init: { condition: service_completed_successfully }
       certbot: { condition: service_started }   # it puts the certificate in place first
+    # Healthy once nats-server answers, which it does only on Let's Encrypt's certificate
+    # (scripts/nats-run.sh): `docker compose up` waits here through the first issuance, a
+    # few seconds to a minute, then starts admission and the bridge. A certificate that
+    # never comes (a name not pointing here, port 80 closed) ends as unhealthy after the
+    # start period; certbot's log says why.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz"]
+      start_period: 5m
+      start_interval: 2s
+      interval: 30s
+      timeout: 5s
+      retries: 3
     ports: ["${NATS_PUBLIC_PORT:-4222}:4222"]
     volumes:
       - zb-etc:/etc/zebridge
@@ -113,7 +125,7 @@ services:
     environment:
       <<: *admission
     depends_on:
-      nats: { condition: service_started }
+      nats: { condition: service_healthy }
     volumes:
       - zb-etc:/etc/zebridge:ro
 
@@ -131,7 +143,7 @@ services:
       MUTATION_RATE_PER_PRINCIPAL: ${MUTATION_RATE_PER_PRINCIPAL:-100}
       MUTATION_RATE_BURST: ${MUTATION_RATE_BURST:-200}
     depends_on:
-      nats: { condition: service_started }
+      nats: { condition: service_healthy }
       admission: { condition: service_healthy }
       pg-init: { condition: service_completed_successfully, required: false }
     volumes:

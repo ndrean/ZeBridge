@@ -19,7 +19,17 @@ if [ ! -f /certs/haproxy.pem ]; then
   cat "$t/crt" "$t/key" > /certs/haproxy.pem
   chmod 644 /certs/fullchain.pem /certs/privkey.pem /certs/haproxy.pem   # this volume only
   rm -rf "$t"
+  # The mark NATS waits on (nats-run.sh): only HAProxy needs a certificate before Let's
+  # Encrypt's, to listen on 443 while port 80 answers the challenge. cert-deploy.sh removes it.
+  : > /certs/temporary
   echo "temporary self-signed certificate in place, until Let's Encrypt's"
+fi
+# A certificate already issued (a kept letsencrypt volume) that /certs does not hold (a new
+# certs volume, or the temporary one just above): install it now. `certbot renew` runs the
+# deploy hook only when it renews, so until the next renewal, weeks away, HAProxy and NATS
+# would serve the temporary certificate, and admission and the clients refuse its name.
+if [ -f "$live/fullchain.pem" ] && ! cmp -s "$live/fullchain.pem" /certs/fullchain.pem; then
+  /conf/scripts/cert-deploy.sh
 fi
 
 # Let's Encrypt's expiry notices go to ACME_EMAIL. Empty, compose refuses to start; a

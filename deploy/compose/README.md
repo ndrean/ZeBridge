@@ -63,7 +63,7 @@ Docker Engine, the standard (rootful) daemon, with the compose plugin. Rootless 
    docker compose up -d
    ```
 
-   The first start issues the certificate, generates the NATS operator and accounts, and sets up the database: roles, functions, publication, and `zb_inviter`.
+   The first start issues the certificate, generates the NATS operator and accounts, and sets up the database: roles, functions, publication, and `zb_inviter`. `up -d` waits for the certificate, usually under a minute, before it starts admission and the bridge: NATS starts only on Let's Encrypt's certificate (clients and admission check its name). If the names do not point at this server yet, or port 80 is closed, NATS ends as unhealthy after five minutes; `docker compose logs certbot` says what is missing, and `docker compose up -d` again picks up once it is fixed.
 4. Check:
 
    ```sh

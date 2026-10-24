@@ -10,4 +10,5 @@ cat "$live/fullchain.pem" "$live/privkey.pem" > /certs/haproxy.pem.new
 # HAProxy runs as its own user: the files are readable inside this volume only.
 chmod 644 /certs/*.new
 for f in fullchain.pem privkey.pem haproxy.pem; do mv "/certs/$f.new" "/certs/$f"; done
+rm -f /certs/temporary   # a real certificate now: NATS may start (nats-run.sh)
 echo "certificate installed for: $(ls /etc/letsencrypt/live | grep -v README | tr '\n' ' ')"
