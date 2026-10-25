@@ -11,6 +11,8 @@
 //! same functions the 91 fixtures pin.
 
 const std = @import("std");
+/// The fence's fault hooks: compiled in only with -Dtest-faults=true (libzb/build.zig).
+const test_faults = @import("libzb_options").test_faults;
 const log = std.log.scoped(.libzb);
 const core = @import("core.zig");
 pub const storage = @import("storage.zig");
@@ -874,6 +876,36 @@ pub const SyncClient = struct {
         return try std.fmt.allocPrint(a, "{s}{s}", .{ self.cdc_prefix, tenant });
     }
 
+    /// ZB_TEST_FENCE_ABORT=<point>: a test crash at a fence boundary (after_chunk,
+    /// before_commit): an immediate exit, nothing after it runs — what a crash leaves
+    /// durable, without the OS's crash report for the host process. Never set outside a test.
+    fn testFenceAbort(point: []const u8) bool {
+        if (comptime !test_faults) return false;
+        const v = std.c.getenv("ZB_TEST_FENCE_ABORT") orelse return false;
+        return std.mem.eql(u8, std.mem.span(v), point);
+    }
+
+    /// The fence's scope rule: is (table, tenant) the only followed pair riding any of
+    /// `streams` (its own route, its shared route)? A rewind replays a stream's events to
+    /// every pair on it; until each pair's applied frontier is kept, only a sole pair may
+    /// be rewound. An empty name matches nothing; on-demand tables ride no tail.
+    fn soleDependent(self: *SyncClient, a: std.mem.Allocator, table: []const u8, tenant: []const u8, streams: []const []const u8) !bool {
+        for (self.followed) |t| {
+            if (self.isOnDemand(t)) continue;
+            const st = self.states.get(t) orelse continue;
+            for (self.tenantsFor(st)) |tn| {
+                if (std.mem.eql(u8, t, table) and std.mem.eql(u8, tn, tenant)) continue;
+                const own = try self.routeFor(a, tn);
+                for (streams) |s| {
+                    if (s.len == 0) continue;
+                    if (std.mem.eql(u8, own, s)) return false;
+                    if (st.shared_route) |sr| if (std.mem.eql(u8, sr, s)) return false;
+                }
+            }
+        }
+        return true;
+    }
+
     /// §10fn: the routes of a table under the current membership. Client arena.
     /// §10hj: an on-demand table — schema yes, seed and tail no.
     fn isOnDemand(self: *SyncClient, table: []const u8) bool {
@@ -1302,6 +1334,11 @@ pub const SyncClient = struct {
             try execDdl(&self.st, "ALTER TABLE _zbz_generations RENAME TO _zbz_generations_v1");
         }
         try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_generations (tbl TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT '', watermark TEXT, cutoff_lsn INTEGER, seed_epoch INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tbl, tenant))");
+        // A fence between its PREPARE and its anchor's commit (the recovery model's §3):
+        // a row here makes the next attempt a fence too, VERIFY and every route's proof
+        // included — after PREPARE the cursor sits AT the cut, so "the full predates the
+        // cursor" no longer says so. Written in PREPARE, deleted with the anchor.
+        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_fence (tbl TEXT NOT NULL, tenant TEXT NOT NULL, PRIMARY KEY (tbl, tenant))");
         // §10jc: the seed gate's anchor, persisted with the watermark it belongs to. Kept
         // in memory only, it died with the process: a client killed after a re-seed and
         // before its tail passed the chain's cutoff re-applied, on relaunch, events the
@@ -1484,6 +1521,7 @@ pub const SyncClient = struct {
         try execSql(&self.st, a, try std.fmt.allocPrint(a, "DROP VIEW IF EXISTS \"{s}_view\";", .{table}));
         try execSql(&self.st, a, try std.fmt.allocPrint(a, "DROP TABLE IF EXISTS \"{s}\";", .{table}));
         _ = self.states.orderedRemove(table);
+        _ = self.st.query(a, "DELETE FROM _zbz_fence WHERE tbl = ?", &.{.{ .text = table }}) catch {};
         log.warn("{s}: dropped locally — the table was dropped upstream", .{table});
     }
 
@@ -2510,10 +2548,31 @@ pub const SyncClient = struct {
             }
         }
         const pos: i64 = if (cdc_stream.len > 0) @intCast(try self.storedSeq(cdc_stream)) else 0;
-        if (core.fullPredatesReplica(man, plan.array, pos)) {
+        const shared_stream_m = if (man.object.get("shared_cdc_stream")) |v| (if (v == .string) v.string else "") else "";
+        // The fence (the recovery model's §3): a chain cut behind this replica's position
+        // replaces the pair's rows, and its routes move back to the chain's cuts in the
+        // anchor's own transaction; the events after the cuts replay. A follower stays
+        // ahead of every new cut, so refusing (D2) left it without an anchor for as long
+        // as writes went on (recreate_recovery.py checks 1 and 3). Only when this pair is
+        // the sole one on those routes: a rewind would replay other tables' applied
+        // events onto them, and their applied frontiers are not kept yet — there D2's
+        // refusal stands. Decided after the splice tests below: the stream must still
+        // hold every event after the cut, on the incarnation the chain was cut on.
+        // A fence interrupted before its anchor's commit (`_zbz_fence`) is still owed: the
+        // retry is a fence too, with every proof, though its cursor now sits at the cut.
+        var fence = false;
+        const predates = core.fullPredatesReplica(man, plan.array, pos);
+        const pending = (try self.st.query(a, "SELECT 1 FROM _zbz_fence WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } })).len > 0;
+        if (predates or pending) {
             if (from_seed) return error.SeedStale;
-            log.warn("{s}: chain predates replica — refusing the full (D2)", .{table});
-            return;
+            // A rewind of the own route (the chain behind the cursor) needs the sole-pair
+            // scope; a pending retry already at or before this cut rewinds nothing there.
+            if (predates and !try self.soleDependent(a, table, tenant, &.{ cdc_stream, shared_stream_m })) {
+                log.warn("{s}: chain predates replica — refusing the full (D2): other tables ride {s}, and a rewind would replay their events", .{ table, cdc_stream });
+                if (pending) self.reseed_pending = true;
+                return;
+            }
+            fence = true;
         }
         // §10ei: a chain older than the STREAM cannot splice — the events between its
         // cutoff and the oldest message the stream still holds are gone, and a client
@@ -2533,6 +2592,9 @@ pub const SyncClient = struct {
         // §10ja (core.ts's shell): checked whenever the field is PRESENT, 0 included — a
         // chain cut on an empty stream predates a stream that now starts past 1.
         const has_cutoff_seq = man.object.get("cutoff_seq") != null;
+        // The fence's own-route condition, proven below: the stream read, on the
+        // incarnation the chain was cut on, still holding the event after the cut.
+        var own_replayable = false;
         if (cdc_stream.len > 0 and has_cutoff_seq) {
             if (self.streamFacts(cdc_stream)) |info| {
                 const first: i64 = @intCast(info.first_seq);
@@ -2558,17 +2620,27 @@ pub const SyncClient = struct {
                     self.reseed_pending = true;
                     return;
                 }
+                own_replayable = gate_seq == cutoff_seq and man_created.len > 0 and info.created.len > 0;
             } else |_| {}
+        }
+        if (fence and !own_replayable) {
+            log.warn("{s}: chain predates replica — refusing the full (D2): its cut on {s} cannot be proven replayable (stream unread, or another incarnation)", .{ table, cdc_stream });
+            self.reseed_pending = true;
+            return;
         }
         // §10lw: the same splice test on the SHARED route — a tenant table's open-tenant
         // rows ride CDC_PUBLIC. A shared cut below its oldest message: the rows between are
         // gone from the stream and not in the chain; wait for the next generation. A cut on
         // a previous incarnation of the stream proves nothing there.
         var shared_seq: ?i64 = null;
+        var shared_proven = false;
         if (man.object.get("shared_cutoff_seq")) |sv| if (sv == .integer and sv.integer >= 0) {
             const sstream = if (man.object.get("shared_cdc_stream")) |v| (if (v == .string) v.string else "") else "";
             const screated = if (man.object.get("shared_cdc_stream_created")) |v| (if (v == .string) v.string else "") else "";
-            if (sstream.len > 0) if (self.streamFacts(sstream)) |info| {
+            // ZB_TEST_SHARED_UNREADABLE (recreate_recovery.py check 4): the shared route's
+            // lookup fails while the own route reads — the fence must refuse, not skip it.
+            const sfacts: anyerror!StreamFacts = if (test_faults and std.c.getenv("ZB_TEST_SHARED_UNREADABLE") != null) error.TestUnreadable else self.streamFacts(sstream);
+            if (sstream.len > 0) if (sfacts) |info| {
                 const same = screated.len == 0 or info.created.len == 0 or std.mem.eql(u8, screated, info.created);
                 if (same) {
                     const first: i64 = @intCast(info.first_seq);
@@ -2579,11 +2651,75 @@ pub const SyncClient = struct {
                         return;
                     }
                     shared_seq = sv.integer;
+                    shared_proven = screated.len > 0 and info.created.len > 0;
                 }
             } else |_| {};
         };
+        // A pair that rides a shared route (a tenant table's open-tenant rows on CDC_PUBLIC)
+        // depends on it: under the fence its coverage there must be PROVEN — a certificate
+        // present, its stream read, on the same incarnation. Unknown coverage refuses the
+        // fence; it is never a route left out. Past the shared cut, the route rewinds too.
+        const pair_shared: ?[]const u8 = if (self.states.get(table)) |s0| s0.shared_route else null;
+        var shared_rewind: ?i64 = null;
+        if (fence) if (pair_shared) |sr| {
+            const q = shared_seq orelse {
+                log.warn("{s}: chain predates replica — refusing the full (D2): its coverage on {s} is unknown (no certificate, the stream unread, or another incarnation)", .{ table, sr });
+                self.reseed_pending = true;
+                return;
+            };
+            if (!shared_proven or !std.mem.eql(u8, sr, shared_stream_m)) {
+                log.warn("{s}: chain predates replica — refusing the full (D2): its shared cut on {s} cannot be proven replayable", .{ table, sr });
+                self.reseed_pending = true;
+                return;
+            }
+            if (@as(i64, @intCast(try self.storedSeq(sr))) > q) {
+                if (!try self.soleDependent(a, table, tenant, &.{sr})) {
+                    log.warn("{s}: chain predates replica — refusing the full (D2): other tables ride {s}, and its rewind would replay their events", .{ table, sr });
+                    self.reseed_pending = true;
+                    return;
+                }
+                shared_rewind = q;
+            }
+        };
 
         const st = self.states.getPtr(table).?;
+        // The fence's PREPARE, before any row changes: the pair durably unseeded and its
+        // routes' cursors at the cuts, in one transaction. A failure or a crash from here
+        // to the anchor's commit leaves "unseeded, cursor at the cut" — the next pass seeds
+        // again, and the tail replays from the cut meanwhile (a rewind never skips) — never
+        // replaced rows under the old cursor. The in-memory anchors on those routes go with
+        // it: an old gate above the cut would drop the very events that must replay.
+        if (fence) {
+            const Prep = struct {
+                client: *SyncClient,
+                a: std.mem.Allocator,
+                table: []const u8,
+                tenant: []const u8,
+                own: []const u8,
+                own_seq: i64,
+                shared: ?[]const u8,
+                shared_seq: i64,
+                fn apply(cx: @This(), s: *storage.Storage) !void {
+                    _ = try s.query(cx.a, "DELETE FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = cx.table }, .{ .text = cx.tenant } });
+                    _ = try s.query(cx.a, "INSERT OR IGNORE INTO _zbz_fence (tbl, tenant) VALUES (?, ?)", &.{ .{ .text = cx.table }, .{ .text = cx.tenant } });
+                    try cx.client.persistSeq(cx.own, @intCast(cx.own_seq));
+                    if (cx.shared) |sh| try cx.client.persistSeq(sh, @intCast(cx.shared_seq));
+                }
+            };
+            try self.st.transaction(Prep{ .client = self, .a = a, .table = table, .tenant = tenant, .own = cdc_stream, .own_seq = @min(pos, cutoff_seq), .shared = if (shared_rewind != null) shared_stream_m else null, .shared_seq = shared_rewind orelse 0 }, Prep.apply);
+            var k: usize = 0;
+            while (k < st.anchors.items.len) {
+                const s_ = st.anchors.items[k].stream;
+                if (std.mem.eql(u8, s_, cdc_stream) or (shared_rewind != null and std.mem.eql(u8, s_, shared_stream_m))) _ = st.anchors.orderedRemove(k) else k += 1;
+            }
+            self.dropTail(cdc_stream);
+            self.resetFlow(cdc_stream);
+            if (shared_rewind != null) {
+                self.dropTail(shared_stream_m);
+                self.resetFlow(shared_stream_m);
+            }
+            log.warn("{s}: fence prepared — chain g{d} cut at {d} on {s} behind position {d}: anchor cleared, cursor at the cut{s}; replacing the rows", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, cdc_stream, pos, if (shared_rewind != null) " (the shared route too)" else "" });
+        }
         const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, tenant });
         var applied: usize = 0;
         var streamed: usize = 0;
@@ -2676,6 +2812,9 @@ pub const SyncClient = struct {
                     });
                     return err;
                 };
+                // ZB_TEST_FENCE_ABORT=after_chunk (recreate_recovery.py check 4): a crash with
+                // part of the replacement committed and no anchor.
+                if (fence and testFenceAbort("after_chunk")) std.process.exit(70);
                 if (to == from) break;
                 from = to;
             }
@@ -2685,9 +2824,66 @@ pub const SyncClient = struct {
             if (measure_enabled) measureStep(table, tenant, step, is_full, raw.len, applied - applied0, step_t0, ph0, ph, false);
         }
 
+        // The fence's VERIFY, after staging and before the anchor: the proof taken before
+        // the download may be stale — the stream can prune or restart while the rows are
+        // replaced. Fresh facts (not this pass's cache) for every route the pair depends
+        // on: the same incarnation, and the event after each cut still held. Otherwise no
+        // anchor: the pair stays unseeded with its cursor at the cut, which the gap rule
+        // then reads as the gap it is — recovery incomplete, a newer chain next.
+        if (fence) {
+            // ZB_TEST_FENCE_SLEEP_MS=<ms> (recreate_recovery.py check 4): hold before the
+            // verify while the test prunes the stream past the cut. A sleep, not a request:
+            // a scoped client may publish to no test subject.
+            if (test_faults) if (std.c.getenv("ZB_TEST_FENCE_SLEEP_MS")) |v| {
+                const ms = std.fmt.parseInt(i64, std.mem.span(v), 10) catch 0;
+                log.info("test: fence holding {d} ms before its verify", .{ms});
+                if (ms > 0) std.Io.sleep(self.t.conn.io, .fromMilliseconds(ms), .awake) catch {};
+            };
+            const Route = struct { stream: []const u8, cut: i64, created: []const u8 };
+            const shared_created_m = if (man.object.get("shared_cdc_stream_created")) |v| (if (v == .string) v.string else "") else "";
+            const routes = [_]?Route{
+                .{ .stream = cdc_stream, .cut = cutoff_seq, .created = man_created },
+                if (pair_shared != null) Route{ .stream = shared_stream_m, .cut = shared_seq.?, .created = shared_created_m } else null,
+            };
+            for (routes) |ro| if (ro) |r| {
+                _ = self.pass_streams.remove(r.stream);
+                const ok_route = if (self.streamFacts(r.stream)) |f|
+                    std.mem.eql(u8, f.created, r.created) and @as(i64, @intCast(f.first_seq)) <= r.cut + 1
+                else |_| false;
+                if (!ok_route) {
+                    log.warn("{s}: fence not committed — {s} no longer holds the events after the cut {d} on the incarnation the chain was cut on; the pair stays unseeded with its cursor at the cut (recovery incomplete)", .{ table, r.stream, r.cut });
+                    self.reseed_pending = true;
+                    return;
+                }
+            };
+            // ZB_TEST_FENCE_ABORT=before_commit: a crash with the rows replaced, the anchor not.
+            if (testFenceAbort("before_commit")) std.process.exit(70);
+        }
+
+        const seed_lsn: i64 = if (man.object.get("cutoff_lsn")) |v| (if (v == .string) core.lsnToNumber(v.string) else 0) else 0;
+        const cv = if (man.object.get("cutoff_version")) |v| (if (v == .string) v.string else "") else "";
+        const anchor_seq: i64 = if (cdc_stream.len > 0 and gate_seq > 0) gate_seq else 0;
+        // The COMMIT. Under the fence the cursors moved in PREPARE; this makes the pair
+        // seeded. Only then the in-memory anchor below: published before, a failed commit
+        // would leave a gate the durable state does not have.
+        const Commit = struct {
+            a: std.mem.Allocator,
+            args: []const storage.Value,
+            key: []const storage.Value,
+            fn apply(cx: @This(), s: *storage.Storage) !void {
+                _ = try s.query(cx.a, "INSERT INTO _zbz_generations (tbl, tenant, watermark, cutoff_lsn, seed_epoch, anchor_stream, anchor_seq, shared_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tbl, tenant) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch, anchor_stream = excluded.anchor_stream, anchor_seq = excluded.anchor_seq, shared_seq = excluded.shared_seq", cx.args);
+                _ = try s.query(cx.a, "DELETE FROM _zbz_fence WHERE tbl = ? AND tenant = ?", cx.key);
+            }
+        };
+        try self.st.transaction(Commit{
+            .a = a,
+            .args = &.{ .{ .text = table }, .{ .text = tenant }, .{ .text = cv }, .{ .integer = seed_lsn }, .{ .integer = st.seed_epoch }, .{ .text = cdc_stream }, .{ .integer = anchor_seq }, if (shared_seq) |q| .{ .integer = q } else .null },
+            .key = &.{ .{ .text = table }, .{ .text = tenant } },
+        }, Commit.apply);
+        if (fence) log.warn("{s}: fenced — chain g{d} cut at {d} on {s} replaced the rows; the position moved back from {d}, the events after the cut replay{s}", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, cdc_stream, pos, if (shared_rewind != null) " (the shared route too)" else "" });
+
         // Anchors (findings 7 + 10): the ONE place the gate may anchor to — per
         // stream (§10fn): this chain's cutoff on the stream it was cut on.
-        const seed_lsn: i64 = if (man.object.get("cutoff_lsn")) |v| (if (v == .string) core.lsnToNumber(v.string) else 0) else 0;
         if (cdc_stream.len > 0) {
             var anchor: SeedAnchor = .{ .stream = try self.aa().dupe(u8, cdc_stream), .seq = 0, .lsn = seed_lsn };
             if (gate_seq > 0) anchor.seq = @intCast(gate_seq);
@@ -2699,7 +2895,6 @@ pub const SyncClient = struct {
             };
             if (!replaced) try st.anchors.append(self.aa(), anchor);
         }
-        const cv = if (man.object.get("cutoff_version")) |v| (if (v == .string) v.string else "") else "";
         // The chain's cutoff is a version this replica has now seen (every seeded row is
         // at or below it): feed the HLC floor, as the TS client does.
         if (cv.len > 0) {
@@ -2710,8 +2905,6 @@ pub const SyncClient = struct {
                 self.seen_floor = self.seen_floor_buf[0..floor.len];
             }
         }
-        const anchor_seq: i64 = if (cdc_stream.len > 0 and gate_seq > 0) gate_seq else 0;
-        _ = try self.st.query(a, "INSERT INTO _zbz_generations (tbl, tenant, watermark, cutoff_lsn, seed_epoch, anchor_stream, anchor_seq, shared_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tbl, tenant) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch, anchor_stream = excluded.anchor_stream, anchor_seq = excluded.anchor_seq, shared_seq = excluded.shared_seq", &.{ .{ .text = table }, .{ .text = tenant }, .{ .text = cv }, .{ .integer = seed_lsn }, .{ .integer = st.seed_epoch }, .{ .text = cdc_stream }, .{ .integer = anchor_seq }, if (shared_seq) |q| .{ .integer = q } else .null });
         // A held event at or below the seed's LSN is inside the chain just applied:
         // superseded, not waiting (the TS client's pruneInboxSeeded).
         try pruneInboxSeeded(&self.st, a, table, seed_lsn);
@@ -3327,7 +3520,13 @@ pub const SyncClient = struct {
         var first_seq: ?u64 = null;
         for (msgs, 0..) |m, i| {
             const sq = m.metadata.sequence.stream;
-            if (prev > 0 and sq > prev + 1) {
+            // Position 0 too (R2: a position certifies what was applied): a first read
+            // on a stream that already pruned its start has a hole before its first
+            // message unless a chain covers it — and then the seed moved the position
+            // to its cut first. Exempted, a cold client joining a pruned stream with no
+            // chain stood at 1,080 holding none of the 2,000 rows pruned before it
+            // (recreate_recovery.py check 3), and every later chain read as older.
+            if (sq > prev + 1) {
                 if (first_seq == null) first_seq = self.streamFirst(stream) orelse std.math.maxInt(u64); // unreadable: a hole, as prunedAfter
                 if (first_seq.? > prev + 1) return i;
             }
@@ -4430,6 +4629,14 @@ pub const SyncClient = struct {
                     const healed = try self.storedSeq(stream);
                     if (healed > last) {
                         for (pending) |m| if (m.metadata.sequence.stream <= healed) m.ack() catch {};
+                        self.dropTail(stream);
+                        self.resetFlow(stream);
+                        break;
+                    }
+                    // A fence moved the position BACK (a chain cut behind it replaced the
+                    // rows): the batch in hand lies past the replay that must come first.
+                    // Not applied, not acked; the tail reopens at the cut.
+                    if (healed < last) {
                         self.dropTail(stream);
                         self.resetFlow(stream);
                         break;

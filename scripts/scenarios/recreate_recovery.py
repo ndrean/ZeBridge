@@ -25,6 +25,18 @@ so then c > p and D2 (`fullPredatesReplica`: c < p) cannot refuse it.
              missing prefix, then whether the chain that follows repairs it or D2
              refuses it for good. No fault is injected.
 
+  --check 4  the fence's boundaries, the load running, a seed-epoch move behind a live
+             follower each time (test hooks in libzb): a crash after a committed chunk and
+             a crash before the anchor's commit leave the replica unseeded with its cursor
+             at the cut, and reopened it recovers; retention overtaking the cut while the
+             fence stages refuses the commit, and a newer chain recovers it; an interrupted
+             fence is still owed on reopening (its cursor now AT the cut), so its retry is
+             verified too: pruned during the retry, it stays incomplete; an unreadable
+             shared route refuses the fence instead of leaving the route out. The hooks
+             exist only in a fault build (libzb: -Dtest-faults=true -p zig-out-faults);
+             the check refuses to run without one, and fails if the ordinary library
+             carries any hook.
+
 Regressions enforced (failing on main as of 2026-10-25, by design): check 1 — V2 one epoch
 increment per recreate, V3 a usable chain within --first-chain-s, V4 the live follower
 re-anchored; check 3 — V8 no certified position past a missing prefix, and recovery
@@ -40,6 +52,10 @@ from contextlib import closing
 import nats, nkeys
 import zb
 from hub_fallback_stage2 import BRIDGE, LIBRARY, port
+
+# Check 4's library: the fence's fault hooks compiled in (an ordinary build has none).
+FAULT_LIBRARY = pathlib.Path(os.environ.get("ZB_FAULT_LIBZB", zb.ROOT / "libzb/zig-out-faults/lib" / LIBRARY.name))
+FAULT_BUILD = "cd libzb && zig build -Doptimize=ReleaseFast -Dtest-faults=true -p zig-out-faults"
 from rotate_client_key import client_creds
 
 T = "rr_items"
@@ -256,8 +272,9 @@ class Js:
 # ── one libzb client per process ─────────────────────────────────────────────
 
 class Client:
-    def __init__(self, stack, name, principal, tenant):
-        self.stack, self.name, self.principal, self.tenant = stack, name, principal, tenant
+    def __init__(self, stack, name, principal, tenant, chunk_rows=None, lib=None):
+        self.stack, self.name, self.principal, self.tenant, self.chunk_rows = stack, name, principal, tenant, chunk_rows
+        self.lib = str(lib or LIBRARY)
         self.db = f"/tmp/zb-rr{stack.tag}-{name}.sqlite3"
         self.log = stack.log(name)
         for s in ("", "-wal", "-shm", ".stop"): pathlib.Path(self.db + s).unlink(missing_ok=True)
@@ -265,14 +282,27 @@ class Client:
         self.p = None
         stack.owned.append(self)
 
-    def start(self):
+    def start(self, env=None):
+        """`env`: test hooks for this process only (ZB_TEST_FENCE_*)."""
         pathlib.Path(self.db + ".stop").unlink(missing_ok=True)
         opts = dict(natsUrl=self.stack.url, credsPath=self.stack.creds[self.principal], principal=self.principal, jsDomain="hub",
-                    clientId=f"rr-{self.name}", dbPath=self.db, tables=[T], heartbeatMs=0)
-        self.p = subprocess.Popen([sys.executable, __file__, "--worker", json.dumps(opts)], stdout=subprocess.DEVNULL, stderr=open(self.log, "a"))
+                    clientId=f"rr-{self.name}", dbPath=self.db, tables=[T], heartbeatMs=0,
+                    **({"seedChunkRows": self.chunk_rows} if self.chunk_rows else {}))
+        self.p = subprocess.Popen([sys.executable, __file__, "--worker", json.dumps(opts), "--lib", self.lib], stdout=subprocess.DEVNULL,
+                                  stderr=open(self.log, "a"), env=dict(os.environ, **(env or {})))
+
+    def exited(self):
+        """The process ended on its own (a test abort): its return code, else None."""
+        return self.p.poll() if self.p else None
+
+    def text(self):
+        return open(self.log, errors="replace").read()
 
     def stop(self):
         if not self.p: return
+        if self.p.poll() is not None:
+            self.p = None
+            return
         pathlib.Path(self.db + ".stop").touch()
         try: self.p.wait(timeout=30)
         except subprocess.TimeoutExpired: self.p.kill()
@@ -297,6 +327,10 @@ class Client:
         r = self._q("SELECT created FROM _zbz_stream_seq WHERE stream = ?", (stream,))
         return r[0][0] if r else None
 
+    def fence_pending(self):
+        r = self._q("SELECT count(*) FROM _zbz_fence WHERE tbl = ?", (T,))
+        return bool(r and r[0][0])
+
     def anchors(self):
         r = self._q("SELECT * FROM _zbz_generations WHERE tbl = ?", (T,))
         if not r: return []
@@ -307,9 +341,9 @@ class Client:
         return len(re.findall(pattern, open(self.log, errors="replace").read()))
 
 
-def worker(opts_json):
+def worker(opts_json, lib_path):
     opts = json.loads(opts_json)
-    lib = ctypes.CDLL(str(LIBRARY))
+    lib = ctypes.CDLL(lib_path or str(LIBRARY))
     lib.zb_free.argtypes = [ctypes.c_void_p]
     lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
     lib.zb_client_close.argtypes = [ctypes.c_uint64]
@@ -547,10 +581,132 @@ async def check3(a, tmp):
         s.stop()
 
 
+async def check4(a, tmp):
+    """The fence's crash and retention boundaries, one client per case, the load running.
+    A seed-epoch move (zebridge_reseed) gives a prompt chain cut behind a live follower."""
+    hooks = (b"ZB_TEST_FENCE_ABORT", b"ZB_TEST_FENCE_SLEEP_MS", b"ZB_TEST_SHARED_UNREADABLE")
+    if not check(f"the ordinary library carries no fault hook ({LIBRARY})", LIBRARY.exists() and not any(h in LIBRARY.read_bytes() for h in hooks)):
+        return
+    if not check(f"check 4 runs on a fault-hook build ({FAULT_LIBRARY})", FAULT_LIBRARY.exists() and all(h in FAULT_LIBRARY.read_bytes() for h in hooks)):
+        note(f"build it: {FAULT_BUILD}")
+        return
+    s = Stack(tmp, "4", a.cadence, {})
+    try:
+        s.start({"pa": "t_a"})
+        s.create_table({"t_a": a.rows}, "a")
+        s.bridge_up()
+        js = await Js().open(s)
+        check("tenant mappings published before any client connects", await js.tenants_ready(s.creds))
+        check(f"a chain ({await wait_manifests(js, ['t_a'], a.cadence + 60)} s)", await js.manifest("t_a") is not None)
+        load = Load(s, "t_a", "c", a.interval_ms / 1000)
+        base = {k for k in s.truth("t_a") if k.startswith("at_a-")}
+
+        async def until(pred, timeout):
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < timeout:
+                r = pred()
+                if asyncio.iscoroutine(r): r = await r
+                if r: return round(time.monotonic() - t0, 1)
+                await asyncio.sleep(1)
+            return None
+
+        async def recovered(c):
+            ok, _ = await anchor_state(c, js, {"t_a"})
+            return ok and base <= (c.rows() or {}).keys()
+
+        def fence_cut(c):
+            m = re.findall(r"fence prepared — chain g\d+ cut at (\d+)", c.text())
+            return int(m[-1]) if m else None
+
+        def reseed():
+            s.sql(f"SELECT count(*) FROM zebridge_reseed('public.{T}'::regclass)")
+
+        clients = []
+        for name, env in (("abort_chunk", {"ZB_TEST_FENCE_ABORT": "after_chunk"}),
+                          ("retry_overtaken", {"ZB_TEST_FENCE_ABORT": "after_chunk"}),
+                          ("abort_commit", {"ZB_TEST_FENCE_ABORT": "before_commit"}),
+                          ("overtaken", {"ZB_TEST_FENCE_SLEEP_MS": "8000"}),
+                          ("shared_unknown", {"ZB_TEST_SHARED_UNREADABLE": "1"})):
+            c = Client(s, name, "pa", "t_a", chunk_rows=200, lib=FAULT_LIBRARY)
+            clients.append(c)
+            c.start()
+            check(f"{name}: seeded and anchored before the case ({await until(lambda: recovered(c), 120)} s)", await recovered(c))
+            c.stop()
+            c.start(env)
+            await asyncio.sleep(5)   # caught up with the load again: its position runs ahead of any new cut
+            reseed()
+            if name == "retry_overtaken":
+                # Two attempts: a crash after a chunk; the reopened client's retry stages
+                # the same fence and the stream prunes past the cut meanwhile. The retry's
+                # cursor sits AT the cut — a fence only because PREPARE left it owed.
+                rc = await until(lambda: c.exited() is not None, 90)
+                cut = fence_cut(c)
+                check(f"retry_overtaken: attempt 1 aborted after a chunk ({c.exited()}): fence owed {c.fence_pending()}, anchors {c.anchors()}, "
+                      f"position {c.position('CDC_t_a')}, cut {cut}",
+                      rc is not None and c.fence_pending() and c.anchors() == [] and c.position("CDC_t_a") == cut)
+                c.p = None
+                held_before = c.text().count("fence holding")
+                c.start({"ZB_TEST_FENCE_SLEEP_MS": "8000"})
+                held = await until(lambda: c.text().count("fence holding") > held_before, 90)
+                cut2 = fence_cut(c)
+                check(f"retry_overtaken: attempt 2 is a fence again, staging (cut {cut2}, cursor {c.position('CDC_t_a')}) — {held} s",
+                      held is not None and cut2 is not None)
+                if cut2 is not None:
+                    await js.js.purge_stream("CDC_t_a", seq=cut2 + 5)
+                    refused = await until(lambda: c.text().count("fence not committed") > 0, 30)
+                    check(f"retry_overtaken: attempt 2 not committed after the stream moved past the cut ({refused} s): fence owed {c.fence_pending()}, "
+                          f"anchors {c.anchors()}, position {c.position('CDC_t_a')}",
+                          refused is not None and c.fence_pending() and c.anchors() == [] and c.position("CDC_t_a") == cut2)
+                secs = await until(lambda: recovered(c), 120)
+                check(f"retry_overtaken: recovered from a newer chain, the fence no longer owed ({secs} s, owed {c.fence_pending()})",
+                      secs is not None and not c.fence_pending())
+            elif name.startswith("abort"):
+                rc = await until(lambda: c.exited() is not None, 90)
+                check(f"{name}: the client aborted at the fence ({c.exited()})", rc is not None)
+                cut = fence_cut(c)
+                check(f"{name}: after the crash — unseeded, cursor at the cut: anchors {c.anchors()}, position {c.position('CDC_t_a')}, cut {cut}",
+                      cut is not None and c.anchors() == [] and c.position("CDC_t_a") == cut)
+                c.p = None
+                c.start()
+                secs = await until(lambda: recovered(c), 90)
+                check(f"{name}: reopened — recovered with a current anchor while writes continue ({secs} s)", secs is not None)
+            elif name == "overtaken":
+                held = await until(lambda: "fence holding" in c.text(), 90)
+                cut = fence_cut(c)
+                check(f"overtaken: the fence is staging (cut {cut}) — {held} s", held is not None and cut is not None)
+                if cut is not None:
+                    await js.js.purge_stream("CDC_t_a", seq=cut + 5)   # retention past the cut, mid-recovery
+                    st = await js.stream("CDC_t_a")
+                    note(f"overtaken: purged CDC_t_a below {cut + 5}: first {st.get('first')}")
+                    refused = await until(lambda: "fence not committed" in c.text(), 30)
+                    check(f"overtaken: not committed after the stream moved past the cut ({refused} s): anchors {c.anchors()}, position {c.position('CDC_t_a')}",
+                          refused is not None and c.anchors() == [] and c.position("CDC_t_a") == cut)
+                secs = await until(lambda: recovered(c), 120)
+                check(f"overtaken: recovered from a newer chain while writes continue ({secs} s)", secs is not None)
+            else:
+                t0 = time.monotonic()
+                await until(lambda: c.count("its coverage on CDC_PUBLIC is unknown") > 0, 60)
+                await asyncio.sleep(10)
+                check(f"shared_unknown: the fence refused with the shared route unreadable — refusals {c.count('its coverage on CDC_PUBLIC is unknown')}, "
+                      f"prepared {c.count('fence prepared')}, anchors {c.anchors()}",
+                      c.count("its coverage on CDC_PUBLIC is unknown") > 0 and c.count("fence prepared") == 0 and c.anchors() == [])
+                c.stop()
+                c.start()
+                secs = await until(lambda: recovered(c), 90)
+                check(f"shared_unknown: reopened with the route readable — recovered while writes continue ({secs} s)", secs is not None)
+        load.end()
+        g = grade(s, clients, 2 * a.cadence + 60)
+        for c in clients: await report(c, g[c.name], js, {"t_a"})
+        await js.close()
+    finally:
+        s.stop()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker")
-    ap.add_argument("--check", default="1,2,3")
+    ap.add_argument("--lib")
+    ap.add_argument("--check", default="1,2,3,4")
     ap.add_argument("--cadence", type=int, default=120)
     ap.add_argument("--max-msgs", type=int, default=1000, help="CDC_MAX_MSGS for checks 2 and 3 (the bridge's minimum is 1000)")
     ap.add_argument("--rows", type=int, default=2000)
@@ -558,13 +714,13 @@ def main():
     ap.add_argument("--first-chain-s", type=int, default=20)
     ap.add_argument("--recover-s", type=int, default=60, help="check 3: recovery while the load still runs")
     a = ap.parse_args()
-    if a.worker: return worker(a.worker)
+    if a.worker: return worker(a.worker, a.lib)
     signal.signal(signal.SIGTERM, signal.default_int_handler)   # torn down like an interrupt
     with tempfile.TemporaryDirectory(prefix="zb-rr-") as d:
         for n in (int(x) for x in a.check.split(",")):
             print(f"── check {n}", flush=True)
             try:
-                asyncio.run({1: check1, 2: check2, 3: check3}[n](a, pathlib.Path(d)))
+                asyncio.run({1: check1, 2: check2, 3: check3, 4: check4}[n](a, pathlib.Path(d)))
             except Exception as e:
                 check(f"check {n} raised: {type(e).__name__}: {str(e)[:400]}", False)
     print(f"  · logs: /tmp/zb_rr<check>_*.log; {'FAILED ' + str(failed) + ' check(s)' if failed else 'clean'}")

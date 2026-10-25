@@ -10,11 +10,17 @@ a client following test_types_v7 re-fetched 3M rows three times because test_typ
 got a burst. The rule now asks the stream whether it still holds what follows the
 position; only a real prune is a gap.
 
-  1. a libzb client follows note_t only, syncs, and records its position
+  1. a libzb client follows note_t only and is SEEDED (an anchor), then one note_t row
+     moves its position past 0; the stream must still hold position + 1. Without a
+     usable chain this is a setup failure, never a pass: a client at position 0 on a
+     stream that pruned its start faces a real hole (recreate_recovery.py check 3)
   2. 200 single-row transactions go into test_types on the same tenant — 200+ messages
      the client's filtered consumer never sees
   3. one note_t row is written
-  4. the client polls: the row arrives, nothing re-seeds, the position reaches the tail
+  4. the client polls: the row arrives, nothing re-seeds, the position reaches the tail;
+     the stream still held position + 1 before and after the burst
+
+Exit codes: 0 pass, 1 a check failed, 2 the setup could not be established.
 """
 import ctypes
 import json
@@ -50,6 +56,13 @@ def main() -> int:
         try: return json.loads(ctypes.string_at(p).decode())
         finally: lib.zb_free(p)
 
+    def stream_state() -> dict:
+        return json.loads(zb.nats_cli("stream", "info", stream, "-j").stdout)["state"]
+
+    def anchored() -> bool:
+        rows = take(lib.zb_client_query(h, b"SELECT count(*) FROM _zbz_generations WHERE tbl = ? AND tenant = ?", json.dumps([FOLLOWED, tenant]).encode()))["rows"]
+        return bool(rows and rows[0][0])
+
     def position() -> int:
         rows = take(lib.zb_client_query(h, b"SELECT last_seq FROM _zbz_stream_seq WHERE stream = ?", json.dumps([stream]).encode()))["rows"]
         return int(rows[0][0]) if rows else 0
@@ -62,8 +75,23 @@ def main() -> int:
     marker = str(uuid.uuid4())[:8]
     try:
         take(lib.zb_client_sync(h)); take(lib.zb_client_poll(h, 500))
+        # ── 1. seeded, then past position 0, the next message still held ──────
+        deadline = time.monotonic() + float(os.environ.get("ZB_FILTERED_GAP_SEED_S", "360"))
+        while not anchored() and time.monotonic() < deadline:
+            take(lib.zb_client_poll(h, 1000))
+        if not anchored():
+            print(f"SETUP FAILED: {FOLLOWED} has no usable chain for {tenant} (no anchor) — the property is not tested")
+            return 2
+        zb.psql(f"INSERT INTO public.{FOLLOWED} (uid, txt, tenant_id, updated_at) VALUES (gen_random_uuid(), 'pre {marker}', '{tenant}', now())", quiet=True)
+        for _ in range(60):
+            take(lib.zb_client_poll(h, 500))
+            if position() > 0 and take(lib.zb_client_query(h, f"SELECT count(*) FROM {FOLLOWED} WHERE txt = ?".encode(), json.dumps([f"pre {marker}"]).encode()))["rows"][0][0]: break
         pos = position()
-        zb.ok(f"client follows {FOLLOWED} only, as {who}/{tenant}: position {pos} on {stream}")
+        st = stream_state()
+        if pos <= 0 or st["first_seq"] > pos + 1:
+            print(f"SETUP FAILED: position {pos}, {stream} holds from {st['first_seq']} — no seeded position the stream still continues from")
+            return 2
+        zb.ok(f"client follows {FOLLOWED} only, as {who}/{tenant}: seeded, position {pos} on {stream}, which holds from {st['first_seq']}")
 
         # ── 2. another table of the same tenant gets a burst ─────────────────
         for i in range(NOISE_TXNS):
@@ -78,6 +106,10 @@ def main() -> int:
             if last >= pos + NOISE_TXNS + 1: break
             time.sleep(0.5)
         zb.ok(f"{NOISE_TXNS} {NOISE} commits then one {FOLLOWED} row: {stream} at {last} (the client's consumer sees only the last)")
+        st = stream_state()
+        if st["first_seq"] > pos + 1:
+            print(f"SETUP FAILED: the burst pruned {stream} past the position ({st['first_seq']} > {pos} + 1) — a real gap, not the property under test")
+            return 2
 
         # ── 4. the client polls ───────────────────────────────────────────────
         # libzb says what it concluded on stderr ("N message(s) pruned under the live
@@ -112,6 +144,7 @@ def main() -> int:
         lib.zb_client_close(h)
         _env.rm_sqlite(db)
         # Soft deletes, like client_gap.py: both tables carry a tombstone column.
+        zb.psql(f"DELETE FROM public.{FOLLOWED} WHERE txt = 'pre {marker}'", quiet=True)
         zb.psql(f"UPDATE public.{NOISE} SET deleted_at = now(), updated_at = now() WHERE some_text LIKE 'noise {marker} %' AND deleted_at IS NULL", quiet=True)
         zb.psql(f"DELETE FROM public.{FOLLOWED} WHERE txt = 'note {marker}'", quiet=True)
     print("PASS" if not failed else f"FAIL ({failed})")

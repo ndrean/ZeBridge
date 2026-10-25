@@ -226,6 +226,13 @@ pub fn build(b: *std.Build) void {
     const probe = b.addExecutable(.{ .name = "zb-endpoint-probe", .root_module = probe_mod });
     b.step("endpoint-probe", "Build the native endpoint scenario driver").dependOn(&b.addInstallArtifact(probe, .{}).step);
 
+    // The fence's fault hooks (ZB_TEST_FENCE_*, ZB_TEST_SHARED_UNREADABLE): off in every
+    // build, compiled in only for scripts/scenarios/recreate_recovery.py check 4's own
+    // library (-Dtest-faults=true -p zig-out-faults), as the bridge's ZB_TEST_FAULT is.
+    // Off, the hooks are not in the binary at all.
+    const libzb_options = b.addOptions();
+    libzb_options.addOption(bool, "test_faults", b.option(bool, "test-faults", "Compile in the fence's ZB_TEST_* fault hooks (recreate_recovery.py check 4 only)") orelse false);
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/capi.zig"),
         // §10ir: Android links the archive into a shared library with the NDK's clang
@@ -240,6 +247,7 @@ pub fn build(b: *std.Build) void {
     // §10dq: the wire grammar is compiled in — the same bytes the bridge embeds.
     mod.addAnonymousImport("grammar", .{ .root_source_file = b.path("../src/grammar.json") });
     mod.addImport("nats", nats_dep.module("nats"));
+    mod.addOptions("libzb_options", libzb_options);
     mod.addImport("msgpack", msgpack_dep.module("msgpack"));
     // §10iq: vendored, or the host's — never both.
     if (vendor) {
@@ -325,6 +333,7 @@ pub fn build(b: *std.Build) void {
     // §10dq: the wire grammar is compiled in — the same bytes the bridge embeds.
     demo_mod.addAnonymousImport("grammar", .{ .root_source_file = b.path("../src/grammar.json") });
     demo_mod.addImport("nats", nats_dep.module("nats"));
+    demo_mod.addOptions("libzb_options", libzb_options);
     demo_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
     // §10iq: vendored, or the host's — never both.
     if (vendor) {
@@ -351,6 +360,7 @@ pub fn build(b: *std.Build) void {
     // §10dq: the wire grammar is compiled in — the same bytes the bridge embeds.
     soak_mod.addAnonymousImport("grammar", .{ .root_source_file = b.path("../src/grammar.json") });
     soak_mod.addImport("nats", nats_dep.module("nats"));
+    soak_mod.addOptions("libzb_options", libzb_options);
     soak_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
     // §10iq: vendored, or the host's — never both.
     if (vendor) {
@@ -374,6 +384,7 @@ pub fn build(b: *std.Build) void {
     zb_mod.addImport("c", c_mod);
     zb_mod.addAnonymousImport("grammar", .{ .root_source_file = b.path("../src/grammar.json") });
     zb_mod.addImport("nats", nats_dep.module("nats"));
+    zb_mod.addOptions("libzb_options", libzb_options);
     zb_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
     // §10iq: vendored, or the host's — never both.
     if (vendor) {
@@ -398,6 +409,7 @@ pub fn build(b: *std.Build) void {
     respond_mod.addImport("c", c_mod);
     respond_mod.addAnonymousImport("grammar", .{ .root_source_file = b.path("../src/grammar.json") });
     respond_mod.addImport("nats", nats_dep.module("nats"));
+    respond_mod.addOptions("libzb_options", libzb_options);
     respond_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
     if (vendor) {
         addVendored(b, respond_mod, sqlite_dep, zstd_dep, &zstd_srcs, arch_include, android_api);
