@@ -103,7 +103,7 @@ async def main():
             for bucket in (zb.TOPOLOGY["kv"]["schemas"], zb.TOPOLOGY["kv"]["tenants"], GEN):
                 await hj.create_key_value(KeyValueConfig(bucket=bucket, history=1, storage="memory", direct=True))
             roster = await hj.key_value(zb.TOPOLOGY["kv"]["tenants"])
-            await roster.put("lf-edge1.alice", b"acme")
+            await roster.put("lf-edge1.alice", b'["acme"]')   # the roster is a JSON array, as the bridge writes it
             schemas = await hj.key_value(zb.TOPOLOGY["kv"]["schemas"])
             columns = [{"name": "uid", "type": "TEXT"}, {"name": "n", "type": "INTEGER"},
                        {"name": "body", "type": "TEXT"}, {"name": "updated_at", "type": "TEXT"},

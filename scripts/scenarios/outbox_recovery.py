@@ -137,7 +137,7 @@ class Worker:
 
 def queue(db, who, count):
     with sqlite3.connect(db) as conn:
-        conn.execute('CREATE TABLE _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT NOT NULL, payload TEXT NOT NULL, tbl TEXT NOT NULL, row_id TEXT NOT NULL, before TEXT, created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, published INTEGER NOT NULL DEFAULT 1, tenant TEXT, optimistic TEXT)')
+        conn.execute('CREATE TABLE _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT NOT NULL, payload TEXT NOT NULL, tbl TEXT NOT NULL, row_id TEXT NOT NULL, before TEXT, created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, published INTEGER NOT NULL DEFAULT 1, retry_at INTEGER NOT NULL DEFAULT 0, tenant TEXT, optimistic TEXT)')
         for i in range(count):
             key = str(uuid.uuid4())
             mid, wire = write('s2_row', key, {'v':i}, client=who)

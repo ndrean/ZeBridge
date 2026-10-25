@@ -91,7 +91,7 @@ async def run_case(kind: str, tmp: pathlib.Path) -> list[tuple[bool, str]]:
         js = nc.jetstream()
         for bucket in (zb.TOPOLOGY["kv"]["schemas"], zb.TOPOLOGY["kv"]["tenants"], zb.TOPOLOGY["generations"]["kv"]):
             await js.create_key_value(KeyValueConfig(bucket=bucket, history=1, storage="memory", direct=True))
-        await (await js.key_value(zb.TOPOLOGY["kv"]["tenants"])).put(principal, TENANT.encode())
+        await (await js.key_value(zb.TOPOLOGY["kv"]["tenants"])).put(principal, json.dumps([TENANT]).encode())   # a JSON array, as the bridge writes it
         await (await js.key_value(zb.TOPOLOGY["kv"]["schemas"])).put(TABLE, json.dumps({
             "pk_columns": ["uid"], "tenant_column": "tenant_id", "version_column": "updated_at",
             "seed_epoch": 1, "lsn": 1, "sqlite": {"columns": COLS}}).encode())
