@@ -9,11 +9,14 @@ migration gate for a table identity that names objects for ever.
      its identities, OIDs and epochs through the new init SQL; the old columns go.
   C  re-applying the init SQL changes no identity and no epoch.
   D  removing a catalogue entry and enabling the table again cannot reset its identity:
-     the incarnation goes on from where it was (so object names never repeat), whether
-     the table was re-created before the new enable or not.
+     the incarnation goes on from where it was (so object names never repeat), and the
+     seed epoch never comes back to a value a replica already holds — above it after a
+     recreate, equal without one; a lowered epoch is raised back to its floor.
   E  grants and wiring: the reader may read the table, the reader and the writer may call
      zebridge_observe_incarnation and nobody else may; the catalogue still rides the
      publication after its columns were dropped.
+  F  infrastructure: zebridge_incarnations is an internal table, and its creation enters
+     no DDL event — on the upgrade too, where the DDL capture is already installed.
 
 Needs the shared PostgreSQL (127.0.0.1:5432, superuser postgres), git (the old templates)
 and a built bridge (--init-sql renders the new ones). No NATS, no bridge process.
@@ -101,6 +104,14 @@ class Db:
         inc, rel, ep = r.split("|")
         return (int(inc) if inc else None, rel, int(ep))
 
+    def floor(self, t):
+        return int(sql(self.name, f"SELECT seed_epoch FROM public.zebridge_incarnations WHERE tbl = '{t}'") or -1)
+
+    def internal(self):
+        """(zebridge_is_internal_table says so, DDL events recorded for it)."""
+        return (sql(self.name, "SELECT public.zebridge_is_internal_table('zebridge_incarnations')") == "t",
+                int(sql(self.name, "SELECT count(*) FROM public.zebridge_ddl_events WHERE table_name = 'zebridge_incarnations'")))
+
     def has_column(self, table, col):
         return sql(self.name, f"SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' "
                               f"AND table_name = '{table}' AND column_name = '{col}'") != "0"
@@ -115,6 +126,7 @@ def main():
         check("A fresh: zebridge_incarnations exists, the catalogue carries no incarnation column",
               sql(a.name, "SELECT to_regclass('public.zebridge_incarnations') IS NOT NULL") == "t"
               and not a.has_column("zebridge_catalogue", "incarnation") and not a.has_column("zebridge_catalogue", "incarnation_relid"))
+        check(f"F fresh: zebridge_incarnations is internal, no DDL event for it: {a.internal()}", a.internal() == (True, 0))
         a.table("t1"); a.enable("t1")
         check(f"A fresh: a first enable records incarnation 1 with the table's OID and no re-seed: {a.ident('t1')}",
               a.ident("t1") == (1, a.oid("t1"), 0))
@@ -156,6 +168,10 @@ def main():
         b.init_new()
         after = {t: b.ident(t) for t in ("t1", "t2")}
         check(f"B after: identities, OIDs and epochs kept through the move: {before} -> {after}", after == before)
+        check(f"B after: the epoch floors start at the catalogue's epochs: t1 {b.floor('t1')}, t2 {b.floor('t2')}",
+              (b.floor("t1"), b.floor("t2")) == (before["t1"][2], before["t2"][2]))
+        check(f"F upgrade (DDL capture installed before): zebridge_incarnations is internal, no DDL event for it: {b.internal()}",
+              b.internal() == (True, 0))
         check("B after: the old catalogue columns are gone",
               not b.has_column("zebridge_catalogue", "incarnation") and not b.has_column("zebridge_catalogue", "incarnation_relid"))
         status = sql(b.name, f"SELECT status FROM zebridge_observe_incarnation('t1', '{b.oid('t1')}'::oid)")
@@ -167,7 +183,8 @@ def main():
         # ── C: re-applying ───────────────────────────────────────────────────
         b.init_new()
         again = {t: b.ident(t) for t in ("t1", "t2")}
-        check(f"C reapply: no identity or epoch moves: {after} -> {again}", again == after)
+        check(f"C reapply: no identity or epoch moves: {after} -> {again}, floors {b.floor('t1')}, {b.floor('t2')}",
+              again == after and (b.floor("t1"), b.floor("t2")) == (after["t1"][2], after["t2"][2]))
 
         # ── D: remove the catalogue entry, enable again ─────────────────────
         prev = b.ident("t1")
@@ -177,6 +194,8 @@ def main():
         d1 = b.ident("t1")
         check(f"D re-enable after a recreate: the incarnation goes on ({prev[0]} -> {d1[0]}), never back to 1; the OID is the live one",
               d1[0] == prev[0] + 1 and d1[1] == b.oid("t1"))
+        check(f"D re-enable after a recreate: the epoch moves above the one replicas hold ({prev[2]} -> {d1[2]}), floor {b.floor('t1')}",
+              d1[2] == prev[2] + 1 and b.floor("t1") == d1[2])
         names = {f"t1-i{prev[0]}-g1-full", f"t1-i{d1[0]}-g1-full"}
         check(f"D object names cannot repeat: {sorted(names)}", len(names) == 2)
         prev2 = b.ident("t2")
@@ -185,6 +204,10 @@ def main():
         d2 = b.ident("t2")
         check(f"D re-enable of the same table: its identity stays ({prev2[0]} -> {d2[0]}, OID kept)",
               d2[0] == prev2[0] and d2[1] == prev2[1])
+        check(f"D re-enable of the same table: its epoch stays ({prev2[2]} -> {d2[2]})", d2[2] == prev2[2])
+        sql(b.name, "UPDATE public.zebridge_catalogue SET seed_epoch = 0 WHERE tbl = 't1';")
+        check(f"D a lowered epoch is raised back to its floor: {b.ident('t1')[2]} (floor {b.floor('t1')})",
+              b.ident("t1")[2] == d1[2] == b.floor("t1"))
     finally:
         for d in dbs:
             d.drop()

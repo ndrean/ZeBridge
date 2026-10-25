@@ -58,6 +58,11 @@ so then c > p and D2 (`fullPredatesReplica`: c < p) cannot refuse it.
              gone, reads its absence and holds BEFORE reading the manifests; the table is
              re-created and the running producer publishes its chain; the cleanup resumes
              — the new chain stays (its bound is the incarnation read with the absence).
+  --check 10 a replacement behind a catalogue removal: a replica seeds and closes; the
+             catalogue entry is deleted, the table dropped and re-created EMPTY, then
+             enabled again. The seed epoch must still move above the replica's (the
+             replacement emits no CDC, so no stream gap can tell it): the returning
+             replica empties and anchors under the new epoch.
 
 Regressions enforced (failing on main as of 2026-10-25, by design): check 1 — V2 one epoch
 increment per recreate, V3 a usable chain within --first-chain-s, V4 the live follower
@@ -1025,11 +1030,63 @@ async def check9(a, tmp):
         s.stop()
 
 
+async def check10(a, tmp):
+    """A replacement behind a catalogue removal reaches a replica that missed it all."""
+    s = Stack(tmp, "10", a.cadence, {})
+    try:
+        s.start({"pa": "t_a"})
+        # One ordinary recreate first: the replica then holds epoch 1, the value a catalogue
+        # row inserted afresh comes back to once its re-enable moves it (0 -> 1).
+        s.create_table({"t_a": a.rows}, "z")
+        s.drop_table(); s.create_table({"t_a": a.rows}, "a")
+        s.bridge_up()
+        js = await Js().open(s)
+        check("tenant mapping published", await js.tenants_ready(s.creds))
+        check(f"a chain ({await wait_manifests(js, ['t_a'], a.cadence + 60)} s), epoch {s.recorded()[1]}", bool(await js.manifest("t_a")))
+        old = Client(s, "old", "pa", "t_a"); old.start()
+        g = grade(s, [old], 120)
+        check(f"the replica is exact on the first table ({g['old']['rows']} rows, {g['old']['s']} s)", g["old"]["exact"])
+        old.stop()
+        held = {r["seed_epoch"] for r in old.anchors()}
+        inc0, ep0, _, _ = s.recorded()
+        s.sql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{T}';")
+        s.drop_table()
+        await asyncio.sleep(3)
+        s.create_table({"t_a": 0}, "b")   # enabled again, and empty: nothing on the CDC stream
+        inc1, ep1, _, _ = s.recorded()
+        check(f"the replacement is a new incarnation ({inc0} -> {inc1}) and the epoch moves above the replica's "
+              f"{sorted(held)}: {ep0} -> {ep1}", inc1 > inc0 and all(ep1 > e for e in held))
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < a.cadence + 60:
+            m = await js.manifest("t_a") or {}
+            if m.get("incarnation") == inc1 and m.get("seed_epoch") == ep1 and await js.epoch() == ep1: break
+            await asyncio.sleep(1)
+        check(f"the descriptor and the chain carry the new epoch ({round(time.monotonic() - t0, 1)} s)",
+              await js.epoch() == ep1 and (await js.manifest("t_a") or {}).get("seed_epoch") == ep1)
+        old.start()
+        g = grade(s, [old], a.cadence + 60)
+        await report(old, g["old"], js, {"t_a"})
+        # The epoch is what told it, not a stream gap or the chain's plan: its own line.
+        moved = [f"seed epoch {e} -> {ep1}" for e in held]
+        check(f"the replica re-seeded on the epoch move ({', '.join(moved)})", all(m in old.text() for m in moved))
+        # The same table catalogued again (no recreate) keeps its epoch: no re-seed for it.
+        old.stop()
+        s.sql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{T}';"
+              f"SELECT count(*) FROM zebridge_enable('public.{T}'::regclass, writable => true, tenant_col => 'tenant_id', "
+              f"version_col => 'updated_at', tombstone_col => 'deleted_at', publication => 'rr_pub', dry_run => false);")
+        inc2, ep2, _, _ = s.recorded()
+        check(f"the same table catalogued again keeps its identity: incarnation {inc1} -> {inc2}, epoch {ep1} -> {ep2}",
+              (inc2, ep2) == (inc1, ep1))
+        await js.close()
+    finally:
+        s.stop()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker")
     ap.add_argument("--lib")
-    ap.add_argument("--check", default="1,2,3,4,5,6,7,8,9")
+    ap.add_argument("--check", default="1,2,3,4,5,6,7,8,9,10")
     ap.add_argument("--cadence", type=int, default=120)
     ap.add_argument("--max-msgs", type=int, default=1000, help="CDC_MAX_MSGS for checks 2 and 3 (the bridge's minimum is 1000)")
     ap.add_argument("--rows", type=int, default=2000)
@@ -1045,7 +1102,7 @@ def main():
             try:
                 asyncio.run({1: check1, 2: check2, 3: check3, 4: check4,
                              5: lambda a_, d_: check1(a_, d_, "restart"), 6: lambda a_, d_: check1(a_, d_, "backstop"),
-                             7: check7, 8: check8, 9: check9}[n](a, pathlib.Path(d)))
+                             7: check7, 8: check8, 9: check9, 10: check10}[n](a, pathlib.Path(d)))
             except Exception as e:
                 check(f"check {n} raised: {type(e).__name__}: {str(e)[:400]}", False)
     print(f"  · logs: /tmp/zb_rr<check>_*.log; {'FAILED ' + str(failed) + ' check(s)' if failed else 'clean'}")
