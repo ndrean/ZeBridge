@@ -308,12 +308,29 @@ CREATE TABLE IF NOT EXISTS public.zebridge_catalogue (
     CHECK ((tenant_col IS NULL) <> (public_reason IS NULL))
 );
 ALTER TABLE public.zebridge_catalogue ADD COLUMN IF NOT EXISTS allow_physical_deletes boolean NOT NULL DEFAULT false;
--- The table's incarnation (one lifetime under its name, from a CREATE to the DROP that
--- ends it): `incarnation_relid` the live table's OID, NULL while there is none; `incarnation` how
--- many lifetimes this name has had. Kept by zebridge_observe_incarnation alone. The OID
--- is the evidence of a replacement, the counter is the identity.
-ALTER TABLE public.zebridge_catalogue ADD COLUMN IF NOT EXISTS incarnation_relid oid;
-ALTER TABLE public.zebridge_catalogue ADD COLUMN IF NOT EXISTS incarnation bigint NOT NULL DEFAULT 0;
+-- A table's incarnations (one lifetime under its name, from a CREATE to the DROP that
+-- ends it): `incarnation_relid` the live table's OID, NULL while there is none;
+-- `incarnation` how many lifetimes this name has had. Kept by zebridge_observe_incarnation
+-- alone. The OID is the evidence of a replacement, the counter is the identity — and the
+-- identity must never repeat (chain objects are named with it), so it lives in its OWN
+-- table: a catalogue row can be deleted and inserted again, and a counter kept on it
+-- started over at 1. Rows here are never deleted.
+CREATE TABLE IF NOT EXISTS public.zebridge_incarnations (
+    tbl               text PRIMARY KEY,
+    incarnation_relid oid,
+    incarnation       bigint NOT NULL DEFAULT 0
+);
+GRANT SELECT ON public.zebridge_incarnations TO ${POSTGRES_READER_USER};
+-- The catalogue carried these two columns for a day (dev): their values move here once.
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'zebridge_catalogue' AND column_name = 'incarnation') THEN
+        INSERT INTO public.zebridge_incarnations (tbl, incarnation_relid, incarnation)
+        SELECT tbl, incarnation_relid, incarnation FROM public.zebridge_catalogue WHERE incarnation > 0
+        ON CONFLICT (tbl) DO NOTHING;
+        ALTER TABLE public.zebridge_catalogue DROP COLUMN incarnation, DROP COLUMN incarnation_relid;
+    END IF;
+END $$;
 GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_READER_USER};
 
 -- The bridge's runtime verdicts, made queryable (NOTES §10cf). A row_too_large
@@ -425,8 +442,8 @@ GRANT EXECUTE ON FUNCTION public.zebridge_reseed(regclass) TO ${POSTGRES_READER_
 --                  uses), so every replica of the old table re-seeds. Not once per tenant
 --                  pair: the producer used to bump it from each pair's build (0 -> 3 for
 --                  three pairs, recreate_recovery.py check 1).
--- A table not catalogued is not observed. The first observation of a catalogued table
--- records it without a re-seed (no replica can hold another incarnation of it).
+-- A table not catalogued is not observed. The first observation of a table records it
+-- without a re-seed (no replica can hold another incarnation of it).
 -- Fresh observations only: an OID is applied only while it IS the live table's, read
 -- after the row lock (so a recreate that held the lock is committed and visible). A
 -- caller that read the OID earlier — the producer reads it, then calls — and lost a race
@@ -434,8 +451,12 @@ GRANT EXECUTE ON FUNCTION public.zebridge_reseed(regclass) TO ${POSTGRES_READER_
 -- observation of an earlier OID moved the incarnation again, bumped the epoch again and
 -- recorded an OID that was no longer the table's. Likewise NULL (a DROP) applies only
 -- while no table of the name exists.
-CREATE OR REPLACE FUNCTION public.zebridge_observe_incarnation(p_tbl text, p_relid oid)
-RETURNS TABLE (incarnation bigint, changed boolean) AS $$
+DROP FUNCTION IF EXISTS public.zebridge_observe_incarnation(text, oid);
+CREATE FUNCTION public.zebridge_observe_incarnation(p_tbl text, p_relid oid)
+RETURNS TABLE (incarnation bigint, status text) AS $$
+-- status: 'new' (a new incarnation recorded), 'current' (the OID is already the
+-- recorded one), 'ended' (a DROP ended it), 'stale' (the OID — or NULL — does not
+-- describe the live table: nothing changed; a caller that read it must read again).
 DECLARE
     prev_relid oid;
     prev_inc   bigint;
@@ -443,38 +464,38 @@ DECLARE
     reseed     boolean;
     live       oid;
 BEGIN
-    SELECT c.incarnation_relid, c.incarnation INTO prev_relid, prev_inc
-      FROM public.zebridge_catalogue c WHERE c.tbl = p_tbl FOR UPDATE;
-    IF NOT FOUND THEN
+    IF NOT EXISTS (SELECT 1 FROM public.zebridge_catalogue c WHERE c.tbl = p_tbl) THEN
         RETURN;
     END IF;
+    INSERT INTO public.zebridge_incarnations (tbl) VALUES (p_tbl) ON CONFLICT (tbl) DO NOTHING;
+    SELECT i.incarnation_relid, i.incarnation INTO prev_relid, prev_inc
+      FROM public.zebridge_incarnations i WHERE i.tbl = p_tbl FOR UPDATE;
     live := to_regclass(format('%I.%I', 'public', p_tbl))::oid;
     IF p_relid IS DISTINCT FROM live THEN
-        RETURN QUERY SELECT prev_inc, false;
+        RETURN QUERY SELECT prev_inc, 'stale'::text;
         RETURN;
     END IF;
     IF p_relid IS NULL THEN
         IF prev_relid IS NOT NULL THEN
-            UPDATE public.zebridge_catalogue c SET incarnation_relid = NULL WHERE c.tbl = p_tbl;
+            UPDATE public.zebridge_incarnations i SET incarnation_relid = NULL WHERE i.tbl = p_tbl;
         END IF;
-        RETURN QUERY SELECT prev_inc, false;
+        RETURN QUERY SELECT prev_inc, 'ended'::text;
         RETURN;
     END IF;
     IF prev_relid = p_relid THEN
-        RETURN QUERY SELECT prev_inc, false;
+        RETURN QUERY SELECT prev_inc, 'current'::text;
         RETURN;
     END IF;
+    UPDATE public.zebridge_incarnations i
+       SET incarnation_relid = p_relid, incarnation = i.incarnation + 1
+     WHERE i.tbl = p_tbl
+     RETURNING i.incarnation INTO now_inc;
     reseed := prev_inc > 0 AND current_setting('zebridge.reseeded_' || md5(p_tbl), true) IS DISTINCT FROM '1';
-    UPDATE public.zebridge_catalogue c
-       SET incarnation_relid = p_relid,
-           incarnation = c.incarnation + 1,
-           seed_epoch = c.seed_epoch + CASE WHEN reseed THEN 1 ELSE 0 END
-     WHERE c.tbl = p_tbl
-     RETURNING c.incarnation INTO now_inc;
     IF reseed THEN
+        UPDATE public.zebridge_catalogue c SET seed_epoch = c.seed_epoch + 1 WHERE c.tbl = p_tbl;
         PERFORM set_config('zebridge.reseeded_' || md5(p_tbl), '1', true);
     END IF;
-    RETURN QUERY SELECT now_inc, true;
+    RETURN QUERY SELECT now_inc, 'new'::text;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public;
 REVOKE ALL ON FUNCTION public.zebridge_observe_incarnation(text, oid) FROM PUBLIC;
@@ -482,12 +503,12 @@ GRANT EXECUTE ON FUNCTION public.zebridge_observe_incarnation(text, oid) TO ${PO
 -- Every catalogued table that exists has an incarnation. Without this, a table catalogued
 -- before the columns existed sat at 0, and its FIRST recreate counted as a first
 -- observation: incarnation 1, no re-seed — its replicas kept the old table's rows. Only
--- rows still at 0 are touched, so re-applying this file changes nothing.
-UPDATE public.zebridge_catalogue c
-   SET incarnation_relid = to_regclass(format('%I.%I', 'public', c.tbl))::oid,
-       incarnation = 1
- WHERE c.incarnation = 0
-   AND to_regclass(format('%I.%I', 'public', c.tbl)) IS NOT NULL;
+-- tables with no row yet are touched, so re-applying this file changes nothing.
+INSERT INTO public.zebridge_incarnations (tbl, incarnation_relid, incarnation)
+SELECT c.tbl, to_regclass(format('%I.%I', 'public', c.tbl))::oid, 1
+  FROM public.zebridge_catalogue c
+ WHERE to_regclass(format('%I.%I', 'public', c.tbl)) IS NOT NULL
+ON CONFLICT (tbl) DO NOTHING;
 -- The writer's grant lives in init.write.template.sql, NOT here: roles are
 -- cluster-wide, so this line passed silently on any cluster where the write half
 -- had ever run — and failed with `role does not exist` only on a fresh cluster
@@ -1387,7 +1408,7 @@ BEGIN
                 -- as "forget this table" and never reads schema_def for it.
                 -- Through EXECUTE: `tbl` is this function's variable AND the catalogue's
                 -- column, and plpgsql refuses the ambiguity at run time.
-                EXECUTE format('SELECT incarnation FROM public.zebridge_catalogue WHERE tbl = %L', tbl)
+                EXECUTE format('SELECT incarnation FROM public.zebridge_incarnations WHERE tbl = %L', tbl)
                     INTO dropped_inc;
                 INSERT INTO public.zebridge_ddl_events
                        (schema_name, table_name, command_tag, schema_def, incarnation)

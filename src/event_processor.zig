@@ -1229,9 +1229,8 @@ pub const EventProcessor = struct {
         return lifted;
     }
 
-    /// `dropped_inc`: the incarnation the DROP ended (its event row says; NULL there — not
-    /// catalogued — is 0). null: no bound — the boot reconcile, for a table that no longer
-    /// exists at all. A chain of a LATER incarnation is never touched: the cleanup reads a
+    /// `dropped_inc`: the incarnation the DROP ended — its event row says, or the boot
+    /// reconcile reads it with the table's absence (none recorded: 0). null: no bound. A chain of a LATER incarnation is never touched: the cleanup reads a
     /// manifest, keeps it if its incarnation is newer, deletes the objects it names (named
     /// per incarnation, so never a later chain's), and purges the key only at the revision
     /// it read — a replacement published in between survives the purge.
@@ -2460,10 +2459,17 @@ pub const EventProcessor = struct {
 
             const key_z = try arena.dupeSentinel(u8, key, 0);
             const params = [_]?[*:0]const u8{key_z.ptr};
-            const pr = c.PQexecParams(conn, "SELECT to_regclass(format('%I.%I', 'public', $1::text)) IS NOT NULL", 1, null, &params[0], null, null, 0);
+            // Absent, and the incarnation that ended, in ONE statement: the bound for the
+            // cleanup below. A table re-created after this answer is a later incarnation
+            // whose chain the cleanup must not touch — the producer is already running
+            // and may publish it before the cleanup reads the manifest, where a
+            // compare-and-set cannot help (nothing moves after that read).
+            const pr = c.PQexecParams(conn, "SELECT to_regclass(format('%I.%I', 'public', $1::text)) IS NOT NULL, " ++
+                "COALESCE((SELECT incarnation FROM public.zebridge_incarnations WHERE tbl = $1::text), 0)::text", 1, null, &params[0], null, null, 0);
             defer c.PQclear(pr);
             if (c.PQresultStatus(pr) != c.PGRES_TUPLES_OK or c.PQntuples(pr) == 0) continue;
             if (!std.mem.eql(u8, std.mem.span(c.PQgetvalue(pr, 0, 0)), "f")) continue;
+            const ended_inc = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(pr, 0, 1)), 10) catch 0;
 
             const tombstone = try std.fmt.allocPrint(arena, "{{\"table\":\"{s}\",\"dropped\":true,\"lsn\":{d}}}", .{ key, boot_lsn });
             const kv_subject = try Topology.render(arena, self.topology.kv_schemas_subject_pattern, &.{.{ .name = "table", .value = key }}, null);
@@ -2476,7 +2482,15 @@ pub const EventProcessor = struct {
             };
             try self.releaseSlotToQueue(slot_idx);
             self.refused.clear(key);
-            self.pruneDroppedTable(arena, key, null);
+            // ZB_TEST_BOOT_PRUNE_SLEEP_MS (recreate_recovery.py check 9, fault builds only):
+            // held after the absence was read and before the manifest is, while the test
+            // re-creates the table and the running producer publishes its chain.
+            if (comptime @import("build_options").test_faults) if (std.c.getenv("ZB_TEST_BOOT_PRUNE_SLEEP_MS")) |v| {
+                const ms = std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0;
+                log.info("🗑️ test: boot cleanup of '{s}' held {d} ms before reading its manifests (incarnation {d} ended)", .{ key, ms, ended_inc });
+                utils.sleep(ms * std.time.ns_per_ms);
+            };
+            self.pruneDroppedTable(arena, key, ended_inc);
             tombstoned += 1;
             log.info("🗑️ '{s}' is in $KV.{s} but no longer in PostgreSQL — tombstone published, chain and streams pruned", .{ key, self.topology.kv_schemas });
         }

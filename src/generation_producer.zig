@@ -1156,12 +1156,24 @@ pub const GenerationProducer = struct {
                 log.info("🧬 test: '{s}'/'{s}': observation of oid {s} held {d} ms", .{ tenant, table, cur_relid, ms });
                 if (ms > 0) std.Io.sleep(self.io, .fromMilliseconds(ms), .awake) catch {};
             };
+            // 'new' (observed here), 'current' (the DDL path did), 'stale' (the OID read
+            // above is no longer the table's — another recreate in between): nothing is
+            // swept or built from a stale fact; the next pass, asked for at once, reads
+            // the OID again. Built on, the stale OID went into this pair's bookkeeping,
+            // and the following pass swept the chain it had just published.
             const observed: []const u8 = blk: {
                 const cur_z = try alloc.dupeSentinel(u8, cur_relid, 0);
                 const params = [_]?[*:0]const u8{ table_z.ptr, cur_z.ptr };
-                const res = queryOne(bkc, "SELECT incarnation::text || CASE WHEN changed THEN ' (observed here)' ELSE ' (already observed)' END FROM public.zebridge_observe_incarnation($1, $2::oid)", &params) catch break :blk "unknown (observation failed)";
+                const res = queryOne(bkc, "SELECT incarnation::text, status FROM public.zebridge_observe_incarnation($1, $2::oid)", &params) catch break :blk "unknown (observation failed)";
                 defer c.PQclear(res);
-                break :blk if (c.PQntuples(res) > 0) try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0))) else "none (not catalogued)";
+                if (c.PQntuples(res) == 0) break :blk "none (not catalogued)";
+                const status = std.mem.span(c.PQgetvalue(res, 0, 1));
+                if (std.mem.eql(u8, status, "stale")) {
+                    log.info("🧬 '{s}'/'{s}': oid {s} is no longer the table's (re-created again meanwhile) — nothing built; the next pass reads it again", .{ tenant, table, cur_relid });
+                    kick();
+                    return;
+                }
+                break :blk try std.fmt.allocPrint(alloc, "{s} ({s})", .{ std.mem.span(c.PQgetvalue(res, 0, 0)), status });
             };
             log.warn("🧬 '{s}'/'{s}': the table was re-created under its name (oid {s} -> {s}) since g{d} — incarnation {s}; sweeping this pair's chain, starting at g1", .{ tenant, table, last_relid.?, cur_relid, last_gen, observed });
             self.sweepPair(alloc, bkc, js, tenant, table) catch |err| log.warn("🧬 sweep of the reborn table's chain failed: {}", .{err});
@@ -1180,7 +1192,7 @@ pub const GenerationProducer = struct {
         // …and the table's incarnation now: this build's objects are named with it.
         const cat_epoch: i64, const inc: i64 = blk: {
             const p = [_]?[*:0]const u8{table_z.ptr};
-            const r = try queryOne(pgc, "SELECT seed_epoch, incarnation FROM public.zebridge_catalogue WHERE tbl = $1", &p);
+            const r = try queryOne(pgc, "SELECT c.seed_epoch, COALESCE(i.incarnation, 0) FROM public.zebridge_catalogue c LEFT JOIN public.zebridge_incarnations i ON i.tbl = c.tbl WHERE c.tbl = $1", &p);
             defer c.PQclear(r);
             if (c.PQntuples(r) == 0) break :blk .{ 0, 0 };
             break :blk .{ std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(r, 0, 0)), 10) catch 0, std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(r, 0, 1)), 10) catch 0 };
@@ -1537,6 +1549,27 @@ pub const GenerationProducer = struct {
             const params = [_]?[*:0]const u8{tenant_z.ptr};
             const res = try queryOne(pgc, set_sql, &params);
             c.PQclear(res);
+        }
+        // The table this snapshot reads, pinned: ACCESS SHARE until the transaction ends
+        // (a DROP waits for it), then its OID. Different from the one this build started
+        // from (read before, and stored in the bookkeeping row) → the table was re-created
+        // in between: nothing is built from mismatched identity facts — the build stops,
+        // and the next pass, asked for at once, starts again from fresh ones.
+        {
+            const lock_sql = try std.fmt.allocPrintSentinel(alloc, "LOCK TABLE \"{s}\" IN ACCESS SHARE MODE", .{table}, 0);
+            const res = try queryOne(pgc, lock_sql, &.{});
+            c.PQclear(res);
+            const params = [_]?[*:0]const u8{table_z.ptr};
+            const r2 = try queryOne(pgc, "SELECT COALESCE(to_regclass(format('%I.%I', 'public', $1::text))::oid::text, '')", &params);
+            defer c.PQclear(r2);
+            const snap_relid = std.mem.span(c.PQgetvalue(r2, 0, 0));
+            if (!std.mem.eql(u8, snap_relid, cur_relid)) {
+                log.info("🧬 '{s}'/'{s}': the table changed under this build (oid {s} -> {s}) — nothing published; the next pass starts from fresh facts", .{ tenant, table, cur_relid, snap_relid });
+                const rb = c.PQexec(pgc, "ROLLBACK");
+                c.PQclear(rb);
+                kick();
+                return;
+            }
         }
 
         // cutoff_version from INSIDE the snapshot transaction (now() = txn start, the
