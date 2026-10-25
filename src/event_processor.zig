@@ -78,6 +78,8 @@ fn isInternalTable(name: []const u8) bool {
         // is not a catalogue move; not published, but its CREATE fires the DDL
         // trigger — same story as zebridge_invites.
         std.mem.eql(u8, name, "zebridge_suspensions") or
+        // Table identities and seed-epoch floors: same story.
+        std.mem.eql(u8, name, "zebridge_incarnations") or
         std.mem.eql(u8, name, "schema_migrations");
 }
 

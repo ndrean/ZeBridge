@@ -1435,6 +1435,11 @@ pub const SyncClient = struct {
             st.seed_epoch = fresh.seed_epoch;
         } else {
             try self.states.put(ca, try ca.dupe(u8, table), fresh);
+            // §10df on a relaunch too: the epoch moved while this replica was closed (a
+            // replacement it never saw, a zebridge_reseed). Compared before the anchors
+            // load, so a dropped watermark takes its anchors with it. Only a republish
+            // compared it before — a relaunch relied on the chain's plan to notice.
+            try self.reseedIfEpochMoved(a, table, seed_epoch);
             // §10jc: the anchors of the chains this replica already applied, back from the
             // replica — a relaunch after a re-seed keeps its seed gate.
             try self.loadAnchors(a, table);

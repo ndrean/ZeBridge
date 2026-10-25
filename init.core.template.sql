@@ -276,6 +276,28 @@ END;
 $$ LANGUAGE plpgsql STABLE;
 
 
+-- keeps the tracker's own rows out of the DDL feed — see PROTOCOL.md §5. Defined before
+-- any table it names is created: on an upgrade the DDL trigger is already installed, and
+-- a table created before its name is listed enters the feed as an application table.
+CREATE OR REPLACE FUNCTION public.zebridge_is_internal_table(tbl text)
+RETURNS boolean AS $$
+    SELECT tbl = ANY (ARRAY[
+        'zebridge_ddl_events',   -- our own DDL tracker
+        'zebridge_generations',  -- generation producer bookkeeping (NOTES.md §1.13)
+        'zebridge_limits',       -- the change-feed width budget (one row)
+        'zebridge_generation_overrides',  -- superseded by zebridge_catalogue.generations
+        'zebridge_catalogue',    -- THE catalogue: one row per replicated table
+        'zebridge_invites',      -- enrollment codes: bridge infrastructure, never replicated
+        'zebridge_suspensions',  -- the refusal registry's psql mirror (§10cy): never replicated
+        'zebridge_incarnations', -- table identities and seed-epoch floors: never replicated
+        -- ⚠️ the principal→tenant roster: BRIDGE INPUT (its CDC feeds $KV.tenants),
+        -- never client-replicated — replicating it would disclose the roster the
+        -- per-key $KV.tenants grant exists to protect (NOTES.md §1.12 part 3).
+        'zebridge_user_tenants',
+        'schema_migrations'      -- Ecto / ActiveRecord migration bookkeeping
+    ]);
+$$ LANGUAGE sql IMMUTABLE;
+
 -- THE CATALOGUE comes first: the guard below and every registration in this file
 -- read it. Public tables used to live in a separate `zebridge_public_tables`; that
 -- was a strict projection of this relation (`tenant_col IS NULL`) and is gone — the
@@ -315,11 +337,17 @@ ALTER TABLE public.zebridge_catalogue ADD COLUMN IF NOT EXISTS allow_physical_de
 -- identity must never repeat (chain objects are named with it), so it lives in its OWN
 -- table: a catalogue row can be deleted and inserted again, and a counter kept on it
 -- started over at 1. Rows here are never deleted.
+-- `seed_epoch` the highest seed epoch the name has had: the catalogue's own column is
+-- the published copy, and a catalogue row inserted again starts from this floor (the
+-- trigger below), never from 0 — a replica compares epochs, so an epoch that came back
+-- to its own value told it nothing of the replacement in between.
 CREATE TABLE IF NOT EXISTS public.zebridge_incarnations (
     tbl               text PRIMARY KEY,
     incarnation_relid oid,
-    incarnation       bigint NOT NULL DEFAULT 0
+    incarnation       bigint NOT NULL DEFAULT 0,
+    seed_epoch        integer NOT NULL DEFAULT 0
 );
+ALTER TABLE public.zebridge_incarnations ADD COLUMN IF NOT EXISTS seed_epoch integer NOT NULL DEFAULT 0;
 GRANT SELECT ON public.zebridge_incarnations TO ${POSTGRES_READER_USER};
 -- The catalogue carried these two columns for a day (dev): their values move here once.
 DO $$ BEGIN
@@ -503,12 +531,39 @@ GRANT EXECUTE ON FUNCTION public.zebridge_observe_incarnation(text, oid) TO ${PO
 -- Every catalogued table that exists has an incarnation. Without this, a table catalogued
 -- before the columns existed sat at 0, and its FIRST recreate counted as a first
 -- observation: incarnation 1, no re-seed — its replicas kept the old table's rows. Only
--- tables with no row yet are touched, so re-applying this file changes nothing.
-INSERT INTO public.zebridge_incarnations (tbl, incarnation_relid, incarnation)
+-- tables never observed are touched (a row the epoch floor alone created is at 0), so
+-- re-applying this file changes nothing.
+INSERT INTO public.zebridge_incarnations AS i (tbl, incarnation_relid, incarnation)
 SELECT c.tbl, to_regclass(format('%I.%I', 'public', c.tbl))::oid, 1
   FROM public.zebridge_catalogue c
  WHERE to_regclass(format('%I.%I', 'public', c.tbl)) IS NOT NULL
-ON CONFLICT (tbl) DO NOTHING;
+ON CONFLICT (tbl) DO UPDATE SET incarnation_relid = EXCLUDED.incarnation_relid, incarnation = 1
+ WHERE i.incarnation = 0;
+
+-- The seed epoch never goes back for a name. Every write of a catalogue row's epoch — an
+-- enable inserting it, zebridge_reseed, an observed replacement — passes through this
+-- floor: an insert or a lowering is raised to the highest epoch the name has had, and
+-- that highest is recorded. Without it a removed and re-inserted catalogue row started
+-- at 0, and the replacement's single move brought it back to the epoch its replicas
+-- already held (1 -> 0 -> 1): a replica that missed the DROP kept the old table's rows.
+CREATE OR REPLACE FUNCTION public.zebridge_catalogue_epoch_floor()
+RETURNS trigger AS $$
+BEGIN
+    INSERT INTO public.zebridge_incarnations AS i (tbl, seed_epoch) VALUES (NEW.tbl, NEW.seed_epoch)
+    ON CONFLICT (tbl) DO UPDATE SET seed_epoch = greatest(i.seed_epoch, EXCLUDED.seed_epoch)
+    RETURNING i.seed_epoch INTO NEW.seed_epoch;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public;
+REVOKE ALL ON FUNCTION public.zebridge_catalogue_epoch_floor() FROM PUBLIC;
+-- An upgrade: the floor starts at the epochs the catalogue holds now.
+INSERT INTO public.zebridge_incarnations AS i (tbl, seed_epoch)
+SELECT c.tbl, c.seed_epoch FROM public.zebridge_catalogue c
+ON CONFLICT (tbl) DO UPDATE SET seed_epoch = greatest(i.seed_epoch, EXCLUDED.seed_epoch);
+DROP TRIGGER IF EXISTS zebridge_catalogue_epoch_floor_t ON public.zebridge_catalogue;
+CREATE TRIGGER zebridge_catalogue_epoch_floor_t
+    BEFORE INSERT OR UPDATE OF tbl, seed_epoch ON public.zebridge_catalogue
+    FOR EACH ROW EXECUTE FUNCTION public.zebridge_catalogue_epoch_floor();
 -- The writer's grant lives in init.write.template.sql, NOT here: roles are
 -- cluster-wide, so this line passed silently on any cluster where the write half
 -- had ever run — and failed with `role does not exist` only on a fresh cluster
@@ -946,24 +1001,6 @@ $$;
 REVOKE ALL ON FUNCTION public.zebridge_oldest_open_xact() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.zebridge_oldest_open_xact() TO ${POSTGRES_READER_USER};
 
--- keeps the tracker's own rows out of the DDL feed — see PROTOCOL.md §5
-CREATE OR REPLACE FUNCTION public.zebridge_is_internal_table(tbl text)
-RETURNS boolean AS $$
-    SELECT tbl = ANY (ARRAY[
-        'zebridge_ddl_events',   -- our own DDL tracker
-        'zebridge_generations',  -- generation producer bookkeeping (NOTES.md §1.13)
-        'zebridge_limits',       -- the change-feed width budget (one row)
-        'zebridge_generation_overrides',  -- superseded by zebridge_catalogue.generations
-        'zebridge_catalogue',    -- THE catalogue: one row per replicated table
-        'zebridge_invites',      -- enrollment codes: bridge infrastructure, never replicated
-        'zebridge_suspensions',  -- the refusal registry's psql mirror (§10cy): never replicated
-        -- ⚠️ the principal→tenant roster: BRIDGE INPUT (its CDC feeds $KV.tenants),
-        -- never client-replicated — replicating it would disclose the roster the
-        -- per-key $KV.tenants grant exists to protect (NOTES.md §1.12 part 3).
-        'zebridge_user_tenants',
-        'schema_migrations'      -- Ecto / ActiveRecord migration bookkeeping
-    ]);
-$$ LANGUAGE sql IMMUTABLE;
 
 -- Retention. The bridge reads these events from the WAL, never from the table, so
 -- rows are disposable the moment they are committed — pruning cannot cause a missed

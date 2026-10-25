@@ -783,6 +783,8 @@ fn isInternalTable(name: []const u8) bool {
         std.mem.eql(u8, name, "zebridge_invites") or
         // The refusal registry's psql mirror (§10cy): same story as the invites.
         std.mem.eql(u8, name, "zebridge_suspensions") or
+        // Table identities and seed-epoch floors: never published, same story.
+        std.mem.eql(u8, name, "zebridge_incarnations") or
         std.mem.eql(u8, name, "schema_migrations");
 }
 
@@ -1217,6 +1219,7 @@ test "isInternalTable" {
     try std.testing.expect(isInternalTable("zebridge_ddl_events"));
     try std.testing.expect(isInternalTable("schema_migrations"));
     try std.testing.expect(isInternalTable("zebridge_suspensions"));
+    try std.testing.expect(isInternalTable("zebridge_incarnations"));
     try std.testing.expect(!isInternalTable("users"));
 }
 
