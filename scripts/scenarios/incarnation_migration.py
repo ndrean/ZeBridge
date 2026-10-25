@@ -17,13 +17,16 @@ migration gate for a table identity that names objects for ever.
      publication after its columns were dropped.
   F  infrastructure: zebridge_incarnations is an internal table, and its creation enters
      no DDL event — on the upgrade too, where the DDL capture is already installed.
+  G  concurrent recreation observation and reseed/upsert: catalogue precedes identity,
+     both operations finish, and the new incarnation and both epoch moves survive.
+  H  an insert waiting behind a catalogue deletion preserves the newly committed floor.
 
 Needs the shared PostgreSQL (127.0.0.1:5432, superuser postgres), git (the old templates)
 and a built bridge (--init-sql renders the new ones). No NATS, no bridge process.
 
   scripts/scenarios/.venv/bin/python scripts/scenarios/incarnation_migration.py
 """
-import os, re, subprocess, sys, uuid
+import os, re, subprocess, sys, time, uuid
 import zb
 from hub_fallback_stage2 import BRIDGE
 
@@ -117,6 +120,124 @@ class Db:
                               f"AND table_name = '{table}' AND column_name = '{col}'") != "0"
 
 
+def concurrency(db, upsert=False):
+    """Hold the identity row; prove the observer owns the catalogue before waiting.
+
+    A reseed or conflicting INSERT must wait on the observer, not take the catalogue
+    and wait on the identity holder. This lock graph deterministically rejects the old
+    order, without depending on PostgreSQL's choice of deadlock victim.
+    """
+    tag = "upsert" if upsert else "reseed"
+    names = {k: f"im_{tag}_{k}_{uuid.uuid4().hex[:6]}" for k in ("holder", "observer", "writer")}
+    children = []
+
+    def start(which, statement, interactive=False):
+        p = subprocess.Popen([*PSQL, "-d", db.name], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+        children.append(p)
+        p.stdin.write(f"SET application_name = '{names[which]}'; SET statement_timeout = '15s'; " + statement + "\n")
+        p.stdin.flush()
+        if not interactive:
+            p.stdin.close()
+            p.stdin = None
+        return p
+
+    def wait_for(query):
+        end = time.monotonic() + 8
+        while time.monotonic() < end:
+            if sql(db.name, query) == "t":
+                return True
+            time.sleep(0.05)
+        return False
+
+    try:
+        # Restore-style recreation: the producer's observer, not DDL capture, must
+        # advance the identity and epoch while the catalogue writer competes with it.
+        sql(db.name, "ALTER EVENT TRIGGER zebridge_ddl_trigger DISABLE; ALTER EVENT TRIGGER zebridge_drop_trigger DISABLE;")
+        db.recreate("t1")
+        sql(db.name, "ALTER EVENT TRIGGER zebridge_ddl_trigger ENABLE; ALTER EVENT TRIGGER zebridge_drop_trigger ENABLE; "
+                    f"ALTER PUBLICATION {PUB} ADD TABLE public.t1;")
+        before = db.ident("t1")
+        holder = start("holder", "BEGIN; SELECT 1 FROM zebridge_incarnations WHERE tbl = 't1' FOR UPDATE;", True)
+        if not wait_for(f"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = '{names['holder']}' AND state = 'idle in transaction')"):
+            raise RuntimeError("identity lock barrier not reached")
+        observer = start("observer", f"SELECT status FROM zebridge_observe_incarnation('t1', '{db.oid('t1')}'::oid);")
+        if not wait_for(f"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = '{names['observer']}' AND wait_event_type = 'Lock')"):
+            raise RuntimeError("observer did not reach identity lock barrier")
+        probe = subprocess.run([*PSQL, "-d", db.name], capture_output=True, text=True,
+                               input="SELECT 1 FROM zebridge_catalogue WHERE tbl = 't1' FOR UPDATE NOWAIT;")
+        check(f"G {tag}: observer holds catalogue while waiting for identity",
+              probe.returncode != 0 and "could not obtain lock" in probe.stderr)
+        statement = ("INSERT INTO zebridge_catalogue SELECT * FROM zebridge_catalogue WHERE tbl = 't1' "
+                     "ON CONFLICT (tbl) DO UPDATE SET seed_epoch = zebridge_catalogue.seed_epoch + 1;" if upsert else
+                     "SELECT count(*) FROM zebridge_reseed('t1');")
+        writer = start("writer", statement)
+        ordered = wait_for(f"SELECT EXISTS (SELECT 1 FROM pg_stat_activity w, pg_stat_activity o "
+                           f"WHERE w.application_name = '{names['writer']}' AND o.application_name = '{names['observer']}' "
+                           "AND o.pid = ANY(pg_blocking_pids(w.pid)))")
+        check(f"G {tag}: catalogue writer waits on observer (catalogue before identity)", ordered)
+        check(f"G {tag}: blocked writer has not attempted an identity write",
+              sql(db.name, f"SELECT NOT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING (pid) "
+                  f"WHERE a.application_name = '{names['writer']}' AND l.relation = 'zebridge_incarnations'::regclass "
+                  "AND l.mode = 'RowExclusiveLock')") == "t")
+        holder.stdin.write("COMMIT;\n")
+        holder.stdin.close(); holder.stdin = None
+        outputs = [p.communicate(timeout=20) for p in children]
+        errors = [err for p, (_, err) in zip(children, outputs) if p.returncode]
+        check(f"G {tag}: both operations finish without deadlock: {errors}", not errors)
+        after = db.ident("t1")
+        check(f"G {tag}: one new incarnation, both epoch moves retained and floor recorded: {before} -> {after}",
+              after == (before[0] + 1, db.oid("t1"), before[2] + 2) and db.floor("t1") == after[2])
+    finally:
+        for p in children:
+            if p.poll() is None:
+                p.kill()
+            p.communicate()
+
+
+def insert_after_delete(db):
+    """The BEFORE read can precede a wait on an uncommitted catalogue deletion."""
+    row = sql(db.name, "SELECT row_to_json(c)::text FROM zebridge_catalogue c WHERE tbl = 't1'")
+    epoch = db.ident("t1")[2]
+    tag = "im_delete_" + uuid.uuid4().hex[:6]
+    holder = subprocess.Popen([*PSQL, "-d", db.name], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+    writer = None
+    try:
+        holder.stdin.write(f"SET application_name = '{tag}_holder'; BEGIN; "
+                           "UPDATE zebridge_catalogue SET seed_epoch = seed_epoch + 1 WHERE tbl = 't1'; "
+                           "DELETE FROM zebridge_catalogue WHERE tbl = 't1';\n")
+        holder.stdin.flush()
+        def wait(query):
+            end = time.monotonic() + 8
+            while time.monotonic() < end:
+                if sql(db.name, query) == 't': return True
+                time.sleep(0.05)
+            return False
+        if not wait(f"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = '{tag}_holder' AND state = 'idle in transaction')"):
+            raise RuntimeError("delete barrier not reached")
+        writer = subprocess.Popen([*PSQL, "-d", db.name], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+        escaped = row.replace("'", "''")
+        writer.stdin.write(f"SET application_name = '{tag}_writer'; SET statement_timeout = '15s'; "
+                           f"INSERT INTO zebridge_catalogue SELECT * FROM json_populate_record(NULL::zebridge_catalogue, '{escaped}');\n")
+        writer.stdin.close(); writer.stdin = None
+        check("H insert waits behind the uncommitted deletion after reading the old floor",
+              wait(f"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = '{tag}_writer' AND wait_event_type = 'Lock')"))
+        holder.stdin.write("COMMIT;\n"); holder.stdin.close(); holder.stdin = None
+        h_out, h_err = holder.communicate(timeout=20)
+        w_out, w_err = writer.communicate(timeout=20)
+        check(f"H insert finishes and preserves the newly committed floor ({epoch} -> {db.floor('t1')})",
+              holder.returncode == writer.returncode == 0 and db.ident("t1")[2] == db.floor("t1") == epoch + 1)
+        if holder.returncode or writer.returncode:
+            raise RuntimeError(h_err + w_err)
+    finally:
+        for p in (holder, writer):
+            if p is not None:
+                if p.poll() is None: p.kill()
+                p.communicate()
+
+
 def main():
     dbs = []
     try:
@@ -208,6 +329,10 @@ def main():
         sql(b.name, "UPDATE public.zebridge_catalogue SET seed_epoch = 0 WHERE tbl = 't1';")
         check(f"D a lowered epoch is raised back to its floor: {b.ident('t1')[2]} (floor {b.floor('t1')})",
               b.ident("t1")[2] == d1[2] == b.floor("t1"))
+        # The two catalogue entry paths must obey the same lock order.
+        concurrency(a)
+        concurrency(a, upsert=True)
+        insert_after_delete(a)
     finally:
         for d in dbs:
             d.drop()

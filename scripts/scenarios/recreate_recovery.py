@@ -63,6 +63,9 @@ so then c > p and D2 (`fullPredatesReplica`: c < p) cannot refuse it.
              enabled again. The seed epoch must still move above the replica's (the
              replacement emits no CDC, so no stream gap can tell it): the returning
              replica empties and anchors under the new epoch.
+  --check 11 observation SQL errors: bounded transient retries and a permanent failure
+             preserve the existing chain (manifest, bookkeeping, objects, epoch); restoring
+             the function recovers the replacement, one epoch move.
 
 Regressions enforced (failing on main as of 2026-10-25, by design): check 1 — V2 one epoch
 increment per recreate, V3 a usable chain within --first-chain-s, V4 the live follower
@@ -1082,11 +1085,89 @@ async def check10(a, tmp):
         s.stop()
 
 
+async def check11(a, tmp):
+    """Observation SQL failures cannot authorize a sweep or publication."""
+    s = Stack(tmp, "11", 20, {})
+    try:
+        s.start({"pa": "t_a"})
+        s.create_table({"t_a": a.rows // 10}, "a")
+        b = s.bridge_up()
+        js = await Js().open(s)
+        check("tenant mapping published", await js.tenants_ready(s.creds))
+        check("initial chain exists", await wait_manifests(js, ["t_a"], 80) is not None)
+        before = await js.manifest("t_a")
+        state = s.chain_state()
+        store = await js.js.object_store("gen-t_a")
+
+        async def objects():
+            try:
+                return sorted(o.name for o in await store.list())
+            except Exception:
+                return []
+        objs, ep0 = await objects(), s.recorded()[1]
+        # A real SQL error from the observation entry point, on a disposable database.
+        # The wrapper retains the production function and its role boundaries.
+        s.sql("""
+            CREATE TABLE zebridge_private.observation_fault (code text NOT NULL);
+            INSERT INTO zebridge_private.observation_fault VALUES ('40001');
+            ALTER FUNCTION public.zebridge_observe_incarnation(text, oid) RENAME TO im_observe_real;
+            CREATE FUNCTION public.zebridge_observe_incarnation(p_tbl text, p_relid oid)
+            RETURNS TABLE (incarnation bigint, status text) LANGUAGE plpgsql SECURITY DEFINER
+            SET search_path = pg_catalog, public AS $$
+            DECLARE fault text;
+            BEGIN
+                SELECT code INTO fault FROM zebridge_private.observation_fault;
+                RAISE EXCEPTION 'observation regression fault' USING ERRCODE = fault;
+            END; $$;
+            REVOKE ALL ON FUNCTION public.zebridge_observe_incarnation(text, oid) FROM PUBLIC;
+        """ + f"GRANT EXECUTE ON FUNCTION public.zebridge_observe_incarnation(text, oid) TO {s.name}_r, {s.name}_w;")
+        s.sql("ALTER EVENT TRIGGER zebridge_ddl_trigger DISABLE; ALTER EVENT TRIGGER zebridge_drop_trigger DISABLE;")
+        s.drop_table(); s.create_table_raw({"t_a": a.rows // 10}, "b")
+        s.sql("ALTER EVENT TRIGGER zebridge_ddl_trigger ENABLE; ALTER EVENT TRIGGER zebridge_drop_trigger ENABLE;")
+        # No DDL observation has run: only the producer can discover the replacement.
+        s.wait_log(b, "IncarnationObservationRetryable", timeout=80)
+        text = pathlib.Path(s.log(b)).read_text(errors="replace")
+        check("serialization failure retried twice, then stopped", text.count("SQLSTATE 40001") == 3
+              and text.count("retrying incarnation observation") == 2)
+        check("failed observation leaves manifest, bookkeeping, objects and epoch unchanged",
+              await js.manifest("t_a") == before and s.chain_state() == state and await objects() == objs
+              and s.recorded()[1] == ep0)
+        check("failed observation never sweeps or starts a replacement chain",
+              "sweeping this pair's chain" not in text)
+        s.sql("UPDATE zebridge_private.observation_fault SET code = '42501';")
+        s.wait_log(b, "SQLSTATE 42501", timeout=60)
+        await asyncio.sleep(1)
+        text = pathlib.Path(s.log(b)).read_text(errors="replace")
+        check("permanent failure is logged once, without immediate retry", text.count("SQLSTATE 42501") == 1)
+        check("permanent failure also preserves the existing chain, its objects and the epoch",
+              await js.manifest("t_a") == before and s.chain_state() == state and await objects() == objs
+              and s.recorded()[1] == ep0)
+        s.sql("DROP FUNCTION public.zebridge_observe_incarnation(text, oid); "
+              "ALTER FUNCTION public.im_observe_real(text, oid) RENAME TO zebridge_observe_incarnation;")
+        deadline = time.monotonic() + 80
+        inc0 = before["incarnation"]
+        while time.monotonic() < deadline:
+            m = await js.manifest("t_a") or {}
+            if m.get("incarnation", 0) > inc0:
+                break
+            await asyncio.sleep(0.5)
+        check("a later successful observation publishes the new incarnation", m.get("incarnation", 0) == inc0 + 1)
+        ep1 = s.recorded()[1]
+        check(f"the epoch moved once, for the replacement only ({ep0} -> {ep1}), and the chain carries it",
+              ep1 == ep0 + 1 and m.get("seed_epoch") == ep1)
+        late = Client(s, "late", "pa", "t_a"); late.start()
+        g = grade(s, [late], 90)
+        await report(late, g["late"], js, {"t_a"})
+        await js.close()
+    finally:
+        s.stop()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker")
     ap.add_argument("--lib")
-    ap.add_argument("--check", default="1,2,3,4,5,6,7,8,9,10")
+    ap.add_argument("--check", default="1,2,3,4,5,6,7,8,9,10,11")
     ap.add_argument("--cadence", type=int, default=120)
     ap.add_argument("--max-msgs", type=int, default=1000, help="CDC_MAX_MSGS for checks 2 and 3 (the bridge's minimum is 1000)")
     ap.add_argument("--rows", type=int, default=2000)
@@ -1102,7 +1183,7 @@ def main():
             try:
                 asyncio.run({1: check1, 2: check2, 3: check3, 4: check4,
                              5: lambda a_, d_: check1(a_, d_, "restart"), 6: lambda a_, d_: check1(a_, d_, "backstop"),
-                             7: check7, 8: check8, 9: check9, 10: check10}[n](a, pathlib.Path(d)))
+                             7: check7, 8: check8, 9: check9, 10: check10, 11: check11}[n](a, pathlib.Path(d)))
             except Exception as e:
                 check(f"check {n} raised: {type(e).__name__}: {str(e)[:400]}", False)
     print(f"  · logs: /tmp/zb_rr<check>_*.log; {'FAILED ' + str(failed) + ' check(s)' if failed else 'clean'}")
