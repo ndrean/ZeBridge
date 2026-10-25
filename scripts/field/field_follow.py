@@ -28,8 +28,26 @@ Needs .env.supabase (SB_ADMIN_URL) in the repository root.
 --target eval: the hub is the evaluation VPS (compose or systemd, the same counters), its
 database the Dublin project (.env.supa.dublin), and the clients run on this Mac
 (~/zb-field-eval: invites/, ids/, runs/), so they take no CPU from the hub measured.
+
+Evidence: truth.jsonl freezes IDs, versions, value hashes and the grading digest in one
+PostgreSQL snapshot. retention.jsonl records stream bounds, limits and manifests every
+10 s. --observer-triggered enables extra samples on recovery warnings for diagnostics
+(coalesced to at most one triggered sample per second), changing observer traffic.
+The observer waits for steady's identity on a first enrollment; errors and missing
+coverage are recorded. counters.json keeps load and convergence windows separate.
+Closed exact replicas are deleted; failed replicas, WAL if needed, and row differences
+are kept in evidence/<client>/. Unfinished workers' originals remain at the client host,
+listed in uncollected-replicas.json, rather than copied while they may still be changing.
+After checksum verification of the extracted collection, stopped source runs are removed;
+unfinished or changed source runs stay in place.
+
+--diagnostic gives every client its own process and native log with client tags. Default
+batch logs identify their worker, not an invented client. Diagnostic and grouped runs
+have different client-process costs; compare routes using the same mode and harness.
 """
-import argparse, json, os, pathlib, re, subprocess, sys, time
+import argparse, json, os, pathlib, re, shlex, subprocess, sys, time
+
+from field_evidence import extract_collection, freeze_truth
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts" / "scenarios"))
@@ -65,9 +83,13 @@ def extra_clients(n):
     return [{"name": f"c{i:03d}", "schedule": SCHEDULE[ROLES[i % 10]]} for i in range(6, n + 1)]
 
 
-DIGEST_SQL = (f"SELECT count(*), encode(sha256(coalesce(string_agg(convert_to(id || ':' || "
-              f"CASE WHEN note IS NULL THEN 'N' ELSE 'S' || octet_length(note) || ':' || note END, 'UTF8'), '' ORDER BY id COLLATE \"C\"), '')), 'hex') "
-              f"FROM public.{TABLE} WHERE tenant_id = '{TENANT}' AND deleted_at IS NULL")
+def worker_groups(extra, diagnostic):
+    groups = [(name, [{"name": name, "schedule": sched}], True) for name, sched in SCHEDULE.items()]
+    if diagnostic:
+        groups.extend((c["name"], [c], False) for c in extra)
+    else:
+        groups.extend((f"batch{k // 10}", extra[k:k + 10], False) for k in range(0, len(extra), 10))
+    return groups
 
 
 def ssh(host, cmd, check=True, input=None):
@@ -175,15 +197,19 @@ def main() -> int:
     ap.add_argument("--clients", type=int, default=5, help="5 measured clients, plus c006…cN (unmeasured, ten per process)")
     ap.add_argument("--enroll-only", action="store_true", help="redeem the extra clients' invites, keep their identities, and stop")
     ap.add_argument("--enroll-parallel", type=int, default=8, help="with --enroll-only: how many redeem at once")
+    ap.add_argument("--diagnostic", action="store_true",
+                    help="one process and attributed native log per client; not comparable to grouped-worker performance runs")
+    ap.add_argument("--observer-triggered", action="store_true",
+                    help="extra retention samples on warnings; leave off for packaging comparisons")
     a = ap.parse_args()
     if a.target == "eval":
         if a.via == "leaf":
             sys.exit("--target eval has no leaf: --via hub")
         use_eval()
 
-    run = time.strftime("%m%d%H%M") + a.via[0] + ("e" if LOCAL else "")
+    run = time.strftime("%m%d%H%M%S") + a.via[0] + ("e" if LOCAL else "")
     out = pathlib.Path(a.out) / run
-    out.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=False)
     env = supabase_env()
     # Preflight: the VPS has what the clients need.
     extra = extra_clients(a.clients)
@@ -192,11 +218,11 @@ def main() -> int:
                           f"[ -e $f ] || [ -e ids/$(basename $f .code).identity ] || echo $f; done", check=False).split()
     if missing:
         sys.exit(f"missing on the VPS: {missing} — see docs/plans/field-measurements.md")
-    worker = str(pathlib.Path(__file__).with_name("field_worker.py"))
+    helpers = [str(pathlib.Path(__file__).with_name(name)) for name in ("field_worker.py", "field_evidence.py")]
     if LOCAL:
-        subprocess.run(["cp", worker, os.path.expanduser(f"~/{REMOTE}/field_worker.py")], check=True)
+        subprocess.run(["cp", *helpers, os.path.expanduser(f"~/{REMOTE}/")], check=True)
     else:
-        subprocess.run(["scp", "-q", worker, f"{CANADA}:{REMOTE}/field_worker.py"], check=True)
+        subprocess.run(["scp", "-q", *helpers, f"{CANADA}:{REMOTE}/"], check=True)
     ssh(CANADA, f"mkdir -p {REMOTE}/ids {REMOTE}/runs/{run} && chmod 700 {REMOTE}/ids")
     if a.enroll_only:
         ssh(CANADA, f"cat > {REMOTE}/runs/{run}/enroll.json", input=json.dumps(extra))
@@ -227,23 +253,52 @@ def main() -> int:
     c_idle1 = counters()
     t0 = time.time() + 15
     nats = LEAF_NATS if a.via == "leaf" else HUB_NATS
-    seed = f"--seed-domain {SEED_DOMAIN}" if a.via == "leaf" else ""
     # All five in one ssh call, each detached in its own session (setsid -f): a backgrounded
     # process that still held the session kept `ssh` from returning, and the launch stalled
     # after the first worker (2026-10-22).
+    groups = worker_groups(extra, a.diagnostic)
+    grammar = json.loads((ROOT / "src" / "grammar.json").read_text())
+    config = {"run": run, "target": a.target, "via": a.via, "t0": t0,
+              "client_process_mode": "diagnostic-isolated" if a.diagnostic else "grouped",
+              "performance_comparable_to_grouped": not a.diagnostic and not a.observer_triggered,
+              "clients": names, "worker_clients": {worker: [c["name"] for c in group] for worker, group, _ in groups},
+              "streams": [f"CDC_{TENANT}", "CDC_PUBLIC"], "manifest_bucket": grammar["generations"]["kv"],
+              "manifest_keys": [f"{TENANT}.{TABLE}", f"{grammar['open_tenant']}.{TABLE}"],
+              "observer_mode": "triggered" if a.observer_triggered else "periodic",
+              "observer_interval_s": 10, "observer_trigger_min_interval_s": 1 if a.observer_triggered else None,
+              "observer_note": "Read-only NATS requests add traffic; comparisons use periodic sampling only.",
+              "load": {"seconds": a.seconds, "inserts": a.inserts, "updates": a.updates, "deletes": a.deletes}}
+    (out / "run-config.json").write_text(json.dumps(config, indent=2) + "\n")
+    ssh(CANADA, f"cat > {REMOTE}/runs/{run}/run-config.json", input=json.dumps(config))
     launches = []
-    for name, sched in SCHEDULE.items():
-        launches.append(f"setsid -f venv/bin/python field_worker.py --name {name} --lib lib/libzbcore.so "
-                        f"--db runs/{run}/{name}.sqlite3 --identity ids/{name}.identity --invite-file invites/{name}.code "
-                        f"--nats {nats} --hub-nats {HUB_NATS} --bridge {BRIDGE_URL} --js-domain '{JS_DOMAIN}' {seed} --tenant {TENANT} --schedule '{json.dumps(sched)}' --t0 {t0} "
-                        f"--done-file runs/{run}/done > runs/{run}/{name}.events 2> runs/{run}/{name}.log < /dev/null")
-    for k in range(0, len(extra), 10):
-        group = extra[k:k + 10]
-        ssh(CANADA, f"cat > {REMOTE}/runs/{run}/batch{k // 10}.json", input=json.dumps(group))
-        launches.append(f"setsid -f venv/bin/python field_worker.py --batch runs/{run}/batch{k // 10}.json --lib lib/libzbcore.so "
-                        f"--db 'runs/{run}/{{name}}.sqlite3' --identity 'ids/{{name}}.identity' --invite-file 'invites/{{name}}.code' "
-                        f"--nats {nats} --hub-nats {HUB_NATS} --bridge {BRIDGE_URL} --js-domain '{JS_DOMAIN}' {seed} --tenant {TENANT} --t0 {t0} "
-                        f"--done-file runs/{run}/done > runs/{run}/batch{k // 10}.events 2> runs/{run}/batch{k // 10}.log < /dev/null")
+    for worker, group, measured in groups:
+        single = len(group) == 1
+        client = group[0]["name"] if single else "{name}"
+        cmd = ["venv/bin/python", "field_worker.py", "--lib", "lib/libzbcore.so",
+               "--db", f"runs/{run}/{client}.sqlite3", "--identity", f"ids/{client}.identity",
+               "--invite-file", f"invites/{client}.code", "--nats", nats, "--hub-nats", HUB_NATS,
+               "--bridge", BRIDGE_URL, "--js-domain", JS_DOMAIN, "--tenant", TENANT,
+               "--t0", str(t0), "--done-file", f"runs/{run}/done"]
+        if a.via == "leaf":
+            cmd += ["--seed-domain", SEED_DOMAIN]
+        if single:
+            cmd += ["--name", client, "--schedule", json.dumps(group[0]["schedule"])]
+            if not measured:
+                cmd += ["--unmeasured"]
+        else:
+            ssh(CANADA, f"cat > {REMOTE}/runs/{run}/{worker}.json", input=json.dumps(group))
+            cmd += ["--batch", f"runs/{run}/{worker}.json"]
+        wrapper = ["venv/bin/python", "field_evidence.py", "logged", "--worker", worker,
+                   "--log", f"runs/{run}/{worker}.log", "--signals", f"runs/{run}/signals.jsonl"]
+        if single:
+            wrapper += ["--client", client]
+        launches.append(f"setsid -f {shlex.join(wrapper + ['--'] + cmd)} > runs/{run}/{worker}.events "
+                        f"2> runs/{run}/{worker}.logger-error < /dev/null")
+    observer = ["venv/bin/python", "field_evidence.py", "observe", "--run-dir", f"runs/{run}",
+                "--identity", "ids/steady.identity", "--nats", HUB_NATS, "--js-domain", JS_DOMAIN, "--t0", str(t0)]
+    if a.observer_triggered:
+        observer.append("--triggered")
+    launches.append(f"setsid -f {shlex.join(observer)} > runs/{run}/observer.log 2>&1 < /dev/null")
     if LOCAL:
         # No setsid on macOS: each worker in its own session through Popen, detached.
         for cmd in launches:
@@ -263,11 +318,15 @@ def main() -> int:
     c1 = counters()
     if load.returncode:
         print(f"⚠️ the load stopped early: {load.stderr[-400:]}")
-    n, digest = psql(env, DIGEST_SQL).split("|")
+    truth = freeze_truth(env, out / "truth.jsonl", TABLE, TENANT)
+    # Send the frozen rows BEFORE releasing workers to grade. No later database read
+    # supplies either the grading digest or failure diagnostics.
+    ssh(CANADA, f"cat > {REMOTE}/runs/{run}/truth.jsonl.tmp && mv {REMOTE}/runs/{run}/truth.jsonl.tmp {REMOTE}/runs/{run}/truth.jsonl",
+        input=(out / "truth.jsonl").read_text())
     # Atomically: a worker polling for the file must never read it half written.
     ssh(CANADA, f"cat > {REMOTE}/runs/{run}/done.tmp && mv {REMOTE}/runs/{run}/done.tmp {REMOTE}/runs/{run}/done",
-        input=json.dumps({"digest": digest, "rows": int(n)}))
-    print(f"load done after {time.time() - t0:.0f} s: {n} live rows in {TENANT}, digest {digest[:12]}", flush=True)
+        input=json.dumps(truth))
+    print(f"load done after {time.time() - t0:.0f} s: {truth['rows']} live rows in {TENANT}, digest {truth['digest'][:12]}", flush=True)
     end = time.time() + 420
     while time.time() < end:
         finals = ssh(CANADA, f"cat {REMOTE}/runs/{run}/*.events | grep -c '\"final\"'", check=False).strip()
@@ -275,14 +334,25 @@ def main() -> int:
             break
         time.sleep(10)
     c2 = counters()
-    # The replicas first: each worker already compared its own to PostgreSQL's digest, and a
-    # hundred of them, each with its WAL, filled this Mac's disk (2026-10-24: 9.9 GB, and
-    # the copy below doubled it). Then the logs, events and report alone.
-    ssh(CANADA, f"rm -f {REMOTE}/runs/{run}/*.sqlite3 {REMOTE}/runs/{run}/*.sqlite3-wal {REMOTE}/runs/{run}/*.sqlite3-shm", check=False)
+    (out / "counters.json").write_text(json.dumps({"idle": delta(c_idle0, c_idle1),
+        "load": delta(c0, c1), "load_through_convergence": delta(c0, c2)}, indent=2) + "\n")
+    ssh(CANADA, f"touch {REMOTE}/runs/{run}/observer.stop")
+    # The collector excludes root-level replicas still owned by unfinished workers.
+    # Closed failures have moved into evidence/<client>/, including any remaining WAL.
+    receipt = json.loads(ssh(CANADA, f"cd {REMOTE} && venv/bin/python field_evidence.py archive --run-dir runs/{run}"))
+    archive = out / "evidence.tar.gz"
     if LOCAL:
-        subprocess.run(["cp", "-R", os.path.expanduser(f"~/{REMOTE}/runs/{run}/."), str(out)], check=True)
+        subprocess.run(["cp", os.path.expanduser(f"~/{REMOTE}/runs/{run}.tar.gz"), str(archive)], check=True)
     else:
-        subprocess.run(["scp", "-q", "-r", f"{CANADA}:{REMOTE}/runs/{run}/", str(out.parent)], check=True)
+        subprocess.run(["scp", "-q", f"{CANADA}:{REMOTE}/runs/{run}.tar.gz", str(archive)], check=True)
+    extract_collection(archive, out, receipt["sha256"])
+    cleanup = json.loads(ssh(CANADA, f"cd {REMOTE} && " + shlex.join([
+        "venv/bin/python", "field_evidence.py", "cleanup", "--run-dir", f"runs/{run}",
+        "--archive-sha256", receipt["sha256"]])))
+    (out / "source-cleanup.json").write_text(json.dumps(cleanup) + "\n")
+    if not cleanup["removed"]:
+        print(f"source run kept: {cleanup['reason']}", flush=True)
+    archive.unlink()
 
     # ── the report ──
     failed = 0
@@ -304,8 +374,10 @@ def main() -> int:
             print("seeding " + json.dumps(r))
     if extra:
         finals = []
-        for ev in sorted(out.glob("batch*.events")):
-            finals += [json.loads(l) for l in ev.read_text().splitlines() if '"final"' in l]
+        extra_names = {c["name"] for c in extra}
+        for ev in sorted(out.glob("*.events")):
+            finals += [r for l in ev.read_text().splitlines() if '"final"' in l
+                       if (r := json.loads(l)).get("client") in extra_names]
         exact = [f for f in finals if f.get("exact")]
         failed += len(extra) - len(exact)
         conv = sorted(f["converge_s"] for f in exact)
@@ -313,7 +385,13 @@ def main() -> int:
               f"{len(finals) - len(exact)} not, {len(extra) - len(finals)} without a final result"
               + (f"; converged after the load in {conv[0]}–{conv[-1]} s (median {conv[len(conv) // 2]})" if conv else ""))
     print(f"\nlogs: {out}")
-    return 1 if failed else 0
+    print(f"client process mode: {config['client_process_mode']}; failed replicas and row differences: {out / 'evidence'}")
+    print(f"observer mode: {config['observer_mode']}")
+    observer_result = json.loads((out / "observer.done").read_text()) if (out / "observer.done").exists() else {}
+    observer_ok = observer_result.get("stream_samples") and observer_result.get("clean_stop")
+    if not observer_ok:
+        print("⚠️ retention observer missing, failed or without readable streams: evidence incomplete (see observer.log)")
+    return 1 if failed or load.returncode or not observer_ok else 0
 
 
 if __name__ == "__main__":

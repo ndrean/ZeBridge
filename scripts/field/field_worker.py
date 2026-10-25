@@ -1,38 +1,22 @@
 #!/usr/bin/env python3
 """One field client: libzb through its C ABI, on a machine near a leaf, against the real hub.
 
-Run by field_follow.py over ssh, one process per client. The first connect redeems an invite
+Run by field_follow.py locally or over ssh: measured clients have their own processes;
+extras share batch workers unless --diagnostic is selected. The first connect redeems an invite
 (`bridgeUrl` + `invite`); the identity is kept beside the replica and reused on every leg.
 Each leg: read the catch-up target (CDC_<tenant>'s last sequence, with the client's own
 credentials), connect with ZB_MEASURE on, poll until the target is reached, follow until the
 leg ends. JSON events on stdout, libzb's log on stderr. After the last leg it waits for the
-orchestrator's done file (PostgreSQL's digest) and polls until the replica equals it.
+orchestrator's done file (the frozen snapshot's digest) and polls until the replica equals
+it. It closes the native handle before grading again and preserving failure evidence.
 
 Needs: Python 3.10+, nats-py (for the target), the libzb .so (--lib).
 """
-import argparse, asyncio, ctypes, hashlib, json, os, pathlib, sqlite3, sys, tempfile, threading, time
+import argparse, asyncio, ctypes, json, os, pathlib, sys, tempfile, threading, time
+
+from field_evidence import finalize_replica, replica_digest
 
 TABLE = "storm_items"
-
-
-def frame(i, note) -> bytes:
-    """gen_follow.frame: `id:N` for a NULL note, `id:S<bytes>:<note>` otherwise."""
-    return f"{i}:N".encode() if note is None else f"{i}:S{len(note.encode())}:".encode() + note.encode()
-
-
-def replica_digest(db, tenant):
-    try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
-        try:
-            h, n = hashlib.sha256(), 0
-            for i, note in con.execute(f"SELECT id, note FROM {TABLE} WHERE tenant_id = ? ORDER BY id", (tenant,)):
-                h.update(frame(i, note))
-                n += 1
-            return {"digest": h.hexdigest(), "rows": n}
-        finally:
-            con.close()
-    except sqlite3.Error as e:
-        return {"error": str(e)}
 
 
 async def stream_last(url, creds_text, domain, stream, principal):
@@ -74,6 +58,7 @@ def main():
     ap.add_argument("--enroll-only", action="store_true",
                     help="with --batch: redeem the clients' invites (backing off when refused), keep the identities, connect nothing else")
     ap.add_argument("--enroll-parallel", type=int, default=8, help="with --enroll-only: how many redeem at once")
+    ap.add_argument("--unmeasured", action="store_true", help="isolated diagnostic extra client, without process-wide timing counters")
     ap.add_argument("--t0", type=float, required=True)
     ap.add_argument("--done-file", required=True)
     a = ap.parse_args()
@@ -141,18 +126,26 @@ def main():
 
     if a.batch:
         threads = []
+        results = []
+        def run_one(spec):
+            try:
+                results.append(run_client(spec, lib, take, lock, False))
+            except Exception as exc:
+                with lock:
+                    print(json.dumps({"client": spec.name, "event": "worker_error", "error": str(exc)}), flush=True)
+                results.append(1)
         for c in json.loads(pathlib.Path(a.batch).read_text()):
             spec = argparse.Namespace(**vars(a))
             spec.name, spec.schedule = c["name"], json.dumps(c["schedule"])
             for k in ("db", "identity", "invite_file"):
                 setattr(spec, k, getattr(a, k).format(name=c["name"]))
-            t = threading.Thread(target=run_client, args=(spec, lib, take, lock, False), daemon=True)
+            t = threading.Thread(target=run_one, args=(spec,), daemon=True)
             t.start()
             threads.append(t)
         for t in threads:
             t.join()
-        return 0
-    return run_client(a, lib, take, lock, True)
+        return int(any(results))
+    return run_client(a, lib, take, lock, not a.unmeasured)
 
 
 def run_client(a, lib, take, lock, measure):
@@ -191,39 +184,44 @@ def run_client(a, lib, take, lock, measure):
             say(event="open_retry", leg=i, error=why)
             time.sleep(5)
             h = lib.zb_client_connect(json.dumps(opts).encode())
-        synced = take(lib.zb_client_sync(h))
-        connect_s = time.time() - t_c
-        poll_errors = 0
-        end = (a.t0 + t_close) if t_close is not None else None
-        # The leg's work is measured by libzb itself (the catch-up records); here the leg
-        # only runs its course: until it closes, or for the last leg until the done file.
-        while True:
-            p = take(lib.zb_client_poll(h, 500))
-            poll_errors += bool(p.get("error"))
-            if end is not None and time.time() >= end:
-                break
-            if end is None and pathlib.Path(a.done_file).exists():
-                break
-        if t_close is not None:
-            say(event="offline", leg=i, connect_s=round(connect_s, 2), sync_error=synced.get("error"), poll_errors=poll_errors)
+        try:
+            synced = take(lib.zb_client_sync(h))
+            connect_s = time.time() - t_c
+            poll_errors = 0
+            end = (a.t0 + t_close) if t_close is not None else None
+            # The leg's work is measured by libzb itself (the catch-up records); here the leg
+            # only runs its course: until it closes, or for the last leg until the done file.
+            while True:
+                p = take(lib.zb_client_poll(h, 500))
+                poll_errors += bool(p.get("error"))
+                if end is not None and time.time() >= end:
+                    break
+                if end is None and pathlib.Path(a.done_file).exists():
+                    break
+            if t_close is not None:
+                say(event="offline", leg=i, connect_s=round(connect_s, 2), sync_error=synced.get("error"), poll_errors=poll_errors)
+                continue
+            truth = None
+            while truth is None:  # written atomically by the orchestrator, but never trust a half file
+                try:
+                    truth = json.loads(pathlib.Path(a.done_file).read_text())
+                except (json.JSONDecodeError, OSError):
+                    time.sleep(0.5)
+            t_f = time.time()
+            have = {}
+            while time.time() - t_f < 300:
+                p = take(lib.zb_client_poll(h, 500))
+                poll_errors += bool(p.get("error"))
+                have = replica_digest(a.db, a.tenant)
+                if have.get("digest") == truth["digest"] and have.get("rows") == truth["rows"]:
+                    break
+            converge_s = round(time.time() - t_f, 1)
+        finally:
+            # No evidence collection or final event while libzb owns the replica.
             lib.zb_client_close(h)
-            continue
-        truth = None
-        while truth is None:  # written atomically by the orchestrator, but never trust a half file
-            try:
-                truth = json.loads(pathlib.Path(a.done_file).read_text())
-            except (json.JSONDecodeError, OSError):
-                time.sleep(0.5)
-        t_f = time.time()
-        have = {}
-        while time.time() - t_f < 300:
-            take(lib.zb_client_poll(h, 500))
-            have = replica_digest(a.db, a.tenant)
-            if have.get("digest") == truth["digest"] and have.get("rows") == truth["rows"]:
-                break
-        say(event="final", leg=i, connect_s=round(connect_s, 2), exact=have.get("digest") == truth["digest"] and have.get("rows") == truth["rows"],
-            rows=have.get("rows"), want_rows=truth["rows"], converge_s=round(time.time() - t_f, 1), poll_errors=poll_errors)
-        lib.zb_client_close(h)
+        evidence = finalize_replica(a.db, a.tenant, truth, a.name)
+        say(event="final", leg=i, connect_s=round(connect_s, 2), want_rows=truth["rows"],
+            converge_s=converge_s, poll_errors=poll_errors, **evidence)
     return 0
 
 
