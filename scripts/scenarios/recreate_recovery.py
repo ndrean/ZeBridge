@@ -19,7 +19,9 @@ so then c > p and D2 (`fullPredatesReplica`: c < p) cannot refuse it.
              client closes, the stream prunes past it (f > p + 1), it returns: exact and
              anchored. Reports whether the chain spliced at once (c >= f - 1) or waited.
   --check 3  an incomplete replica with an advanced cursor — the suspected D2 stalemate.
-             Small caps; bridge #1/#2 as in check 1; reset; the load prunes the new
+             Small caps; bridge #1/#2 as in check 1; reset the way only the producer's
+             backstop sees (event triggers disabled), since the DDL path now cuts a chain
+             at once; the load prunes the new
              incarnation's first messages (its base rows) while no chain exists. A cold
              client joins then. Establishes whether it advances its cursor past the
              missing prefix, then whether the chain that follows repairs it or D2
@@ -36,6 +38,13 @@ so then c > p and D2 (`fullPredatesReplica`: c < p) cannot refuse it.
              exist only in a fault build (libzb: -Dtest-faults=true -p zig-out-faults);
              the check refuses to run without one, and fails if the ordinary library
              carries any hook.
+
+  --check 5  check 1 with the bridge down during the recreate: PostgreSQL observes it (the
+             DDL triggers), the restarted bridge publishes it — one transition, one epoch
+             move, every pair's chain within --first-chain-s of the restart.
+  --check 6  check 1 with the event triggers disabled for the recreate (a restore): the
+             producer's OID check is the only observer — one transition, one epoch move,
+             every pair's chain within a cadence (its only signal) plus 30 s.
 
 Regressions enforced (failing on main as of 2026-10-25, by design): check 1 — V2 one epoch
 increment per recreate, V3 a usable chain within --first-chain-s, V4 the live follower
@@ -192,6 +201,24 @@ class Stack:
         for t, n in rows_by_tenant.items():
             self.sql(f"INSERT INTO public.{T} (id, tenant_id, note) SELECT '{prefix}{t}-' || lpad(i::text, 6, '0'), '{t}', repeat(md5(i::text), 4) "
                      f"FROM generate_series(1, {n}) i;")
+
+    def create_table_raw(self, rows_by_tenant, prefix):
+        """The table re-created the way a restore does it: no zebridge_enable, only put back
+        in the publication — nothing but the producer's OID check can observe it."""
+        self.sql(f"CREATE TABLE public.{T} (id text PRIMARY KEY, tenant_id text NOT NULL, note text, "
+                 f"updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz);"
+                 # A restore keeps the table's row-level security AND its policies: RLS
+                 # alone (no policy) hid every row from the producer's reader — an empty
+                 # full, and the replicas emptied with it. The same helper zebridge_enable
+                 # uses, which observes no incarnation.
+                 f"SELECT public.zebridge_scope_reads_by_tenant('public.{T}'::regclass, 'tenant_id');"
+                 f"ALTER PUBLICATION rr_pub ADD TABLE public.{T};")
+        for t, n in rows_by_tenant.items():
+            self.sql(f"INSERT INTO public.{T} (id, tenant_id, note) SELECT '{prefix}{t}-' || lpad(i::text, 6, '0'), '{t}', repeat(md5(i::text), 4) "
+                     f"FROM generate_series(1, {n}) i;")
+
+    def incarnation(self):
+        return int(self.sql(f"SELECT incarnation FROM public.zebridge_catalogue WHERE tbl = '{T}'") or 0)
 
     def drop_table(self):
         self.sql(f"DROP TABLE public.{T};")
@@ -454,9 +481,13 @@ async def wait_manifests(js, tenants, timeout):
 
 # ── the checks ───────────────────────────────────────────────────────────────
 
-async def check1(a, tmp):
+async def check1(a, tmp, mode="ddl"):
+    """mode ddl (check 1): the DDL triggers observe the recreate; restart (check 5): the
+    bridge is down while they do, and publishes after its restart; backstop (check 6): the
+    triggers are disabled for the recreate (a restore), so only the producer's OID check
+    observes it — bounded by the cadence, its only signal."""
     rows = {"t_a": a.rows, "t_b": a.rows // 10, "t_c": a.rows // 10}
-    s = Stack(tmp, "1", a.cadence, {})
+    s = Stack(tmp, {"ddl": "1", "restart": "5", "backstop": "6"}[mode], a.cadence, {})
     try:
         s.start({"pa": "t_a", "pb": "t_b", "pc": "t_c"})
         s.create_table(rows, "a")
@@ -471,12 +502,26 @@ async def check1(a, tmp):
         live = Client(s, "live", "pa", "t_a"); live.start()
         g = grade(s, [live], 120)
         check(f"live exact on the first incarnation ({g['live']['s']} s)", g["live"]["exact"])
-        e0 = await js.epoch()
+        e0, inc0 = await js.epoch(), s.incarnation()
 
+        if mode == "restart":
+            s.bridge_down(b2)
+            note("bridge down: the recreate is observed in PostgreSQL, published after the restart")
+        if mode == "backstop":
+            s.sql("ALTER EVENT TRIGGER zebridge_ddl_trigger DISABLE; ALTER EVENT TRIGGER zebridge_drop_trigger DISABLE;")
         s.drop_table(); await asyncio.sleep(5)
-        s.create_table(rows, "b")
+        if mode == "backstop":
+            s.create_table_raw(rows, "b")
+            s.sql("ALTER EVENT TRIGGER zebridge_ddl_trigger ENABLE; ALTER EVENT TRIGGER zebridge_drop_trigger ENABLE;")
+            note(f"recreated with the event triggers disabled: incarnation {inc0} -> {s.incarnation()} before any producer build")
+        else:
+            s.create_table(rows, "b")
+        if mode == "restart":
+            await asyncio.sleep(3)
+            s.bridge_up()
         t_create = time.monotonic()
         load = Load(s, "t_a", "c", a.interval_ms / 1000)
+        bound = a.first_chain_s if mode != "backstop" else a.cadence + 30
         epochs, usable, late = [e0], {}, None
         while time.monotonic() - t_create < a.cadence + 90 and len(usable) < len(rows):
             e = await js.epoch()
@@ -485,7 +530,7 @@ async def check1(a, tmp):
                 usable.clear()   # a chain under the previous epoch is no longer usable
             for t in rows:
                 m = await js.manifest(t)
-                if t not in usable and m and m.get("cutoff_seq") and e is not None and e > e0 and m.get("seed_epoch") == e:
+                if t not in usable and m and m.get("cutoff_seq") is not None and e is not None and e > e0 and m.get("seed_epoch") == e:
                     usable[t] = round(time.monotonic() - t_create, 1)
             await asyncio.sleep(1)
         t_watch = time.monotonic()
@@ -497,10 +542,12 @@ async def check1(a, tmp):
         await asyncio.sleep(30)
         load.end()
         final = await js.epoch()
+        check(f"one incarnation transition for one recreate: {inc0} -> {s.incarnation()}", s.incarnation() == inc0 + 1)
         check(f"one seed-epoch increment for one recreate: {' -> '.join(map(str, epochs))}", final == e0 + 1 and len(epochs) == 2)
+        since = "the CREATE" if mode == "ddl" else "the restart" if mode == "restart" else "the CREATE (backstop: the producer's next tick)"
         for t in rows:
-            check(f"pair {t}: a chain under the current epoch within {a.first_chain_s} s of the CREATE: {usable.get(t)} s (cadence {a.cadence} s)",
-                  usable.get(t) is not None and usable[t] <= a.first_chain_s)
+            check(f"pair {t}: a chain under the current epoch within {bound} s of {since}: {usable.get(t)} s (cadence {a.cadence} s)",
+                  usable.get(t) is not None and usable[t] <= bound)
         g = grade(s, [live, late], 2 * a.cadence + 60)
         for c in (live, late): await report(c, g[c.name], js, {"t_a"})
         await js.close()
@@ -554,15 +601,21 @@ async def check3(a, tmp):
         s.bridge_up()
         e0 = await js.epoch()
 
+        # The window with no usable chain: since the incarnation is observed in the DDL's
+        # transaction, the DDL path cuts a chain within a second, so the recreate goes the
+        # way only the producer's backstop sees it (event triggers disabled, a restore) —
+        # a window of up to a cadence, the one in which R2 must still hold.
+        s.sql("ALTER EVENT TRIGGER zebridge_ddl_trigger DISABLE; ALTER EVENT TRIGGER zebridge_drop_trigger DISABLE;")
         s.drop_table(); await asyncio.sleep(5)
-        s.create_table({"t_a": a.rows}, "b")
+        s.create_table_raw({"t_a": a.rows}, "b")
+        s.sql("ALTER EVENT TRIGGER zebridge_ddl_trigger ENABLE; ALTER EVENT TRIGGER zebridge_drop_trigger ENABLE;")
         t_create = time.monotonic()
         await asyncio.sleep(3)
         prefix_end = (await js.stream("CDC_t_a")).get("last", 0)   # the base rows' messages end here
         load = Load(s, "t_a", "c", a.interval_ms / 1000)
 
         def usable(m, e):
-            return bool(m and m.get("cutoff_seq") and e is not None and e > e0 and m.get("seed_epoch") == e)
+            return bool(m and m.get("cutoff_seq") is not None and e is not None and e > e0 and m.get("seed_epoch") == e)
         while time.monotonic() - t_create < a.cadence + 60:
             st = await js.stream("CDC_t_a")
             if st.get("first", 0) > prefix_end + 1: break
@@ -739,7 +792,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker")
     ap.add_argument("--lib")
-    ap.add_argument("--check", default="1,2,3,4")
+    ap.add_argument("--check", default="1,2,3,4,5,6")
     ap.add_argument("--cadence", type=int, default=120)
     ap.add_argument("--max-msgs", type=int, default=1000, help="CDC_MAX_MSGS for checks 2 and 3 (the bridge's minimum is 1000)")
     ap.add_argument("--rows", type=int, default=2000)
@@ -753,7 +806,8 @@ def main():
         for n in (int(x) for x in a.check.split(",")):
             print(f"── check {n}", flush=True)
             try:
-                asyncio.run({1: check1, 2: check2, 3: check3, 4: check4}[n](a, pathlib.Path(d)))
+                asyncio.run({1: check1, 2: check2, 3: check3, 4: check4,
+                             5: lambda a_, d_: check1(a_, d_, "restart"), 6: lambda a_, d_: check1(a_, d_, "backstop")}[n](a, pathlib.Path(d)))
             except Exception as e:
                 check(f"check {n} raised: {type(e).__name__}: {str(e)[:400]}", False)
     print(f"  · logs: /tmp/zb_rr<check>_*.log; {'FAILED ' + str(failed) + ' check(s)' if failed else 'clean'}")

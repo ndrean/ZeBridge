@@ -82,6 +82,7 @@ GRANT SELECT ON public.zebridge_limits TO ${POSTGRES_WRITER_USER};  -- the regis
 GRANT EXECUTE ON FUNCTION public.zebridge_register_limits(text, name, integer, boolean) TO ${POSTGRES_WRITER_USER};
 GRANT EXECUTE ON FUNCTION public.zebridge_set_suspended(text, text) TO ${POSTGRES_WRITER_USER};
 GRANT EXECUTE ON FUNCTION public.zebridge_clear_suspensions() TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION public.zebridge_observe_incarnation(text, oid) TO ${POSTGRES_WRITER_USER};
 
 
 -- Deliberately NOT granted: SELECT/INSERT/UPDATE on any table, and no ALTER DEFAULT

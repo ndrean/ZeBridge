@@ -1239,6 +1239,11 @@ pub const EventProcessor = struct {
         var purges: usize = 0;
         var objects: usize = 0;
         var keys: usize = 0;
+        // Asked now, not as of the DROP's LSN, on purpose: what matters is whether a
+        // later incarnation exists by the time its chains could be pruned. Unanswerable
+        // (no connection): assumed to exist — a ghost chain the producer sweeps later is
+        // harmless, a deleted live one is the bug this guards.
+        const later_incarnation = self.tableExistsNow(arena, table) orelse true;
 
         // One tenant's worth of artifacts. `null` stream names mean "the public
         // pair" (open-tenant rows and untenanted rows both land there).
@@ -1282,6 +1287,15 @@ pub const EventProcessor = struct {
 
             const key = std.fmt.allocPrint(arena, "{s}.{s}", .{ step.tenant, table }) catch return;
 
+            // A table under this name NOW is a later incarnation (the DROP removed this
+            // one): the chains may already be ITS — a bridge restarted after the recreate
+            // built them at its boot tick, before the replay reached this DROP, and
+            // pruning them left every pair without a chain until the cadence (120 s,
+            // recreate_recovery.py check 5). The old incarnation's chain is the
+            // producer's to sweep: its per-pair OID check does. The CDC purge above
+            // stands — in WAL order this DROP precedes every message of the new table.
+            if (later_incarnation) continue;
+
             // ── chain objects, manifest-driven, THEN the manifest ────────────
             // The manifest is the only pointer to the object names, so it is read
             // first and purged last — the reverse of the producer's swap order.
@@ -1299,7 +1313,24 @@ pub const EventProcessor = struct {
             } else |err| log.warn("🧹 prune '{s}': generations bucket unreachable: {s}", .{ table, @errorName(err) });
         }
 
-        log.info("🧹 drop prune for '{s}': {d} stream purge(s), {d} chain object(s), {d} KV key(s)", .{ table, purges, objects, keys });
+        if (later_incarnation)
+            log.info("🧹 drop prune for '{s}': {d} stream purge(s); its chains left — a later incarnation exists, and the producer sweeps the old chain", .{ table, purges })
+        else
+            log.info("🧹 drop prune for '{s}': {d} stream purge(s), {d} chain object(s), {d} KV key(s)", .{ table, purges, objects, keys });
+    }
+
+    /// Does `public.<table>` exist right now? null when the question cannot be asked.
+    fn tableExistsNow(self: *EventProcessor, arena: std.mem.Allocator, table: []const u8) ?bool {
+        var standard_pg_config = self.pg_config.*;
+        standard_pg_config.replication = false;
+        const conn = pg_conn.connect(arena, standard_pg_config) catch return null;
+        defer c.PQfinish(conn);
+        const t_z = arena.dupeSentinel(u8, table, 0) catch return null;
+        const params = [_]?[*:0]const u8{t_z.ptr};
+        const res = c.PQexecParams(conn, "SELECT (to_regclass(format('%I.%I', 'public', $1::text)) IS NOT NULL)::text", 1, null, &params, null, null, 0);
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) return null;
+        return std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, 0, 0)), "true");
     }
 
     /// Delete every object a chain manifest names. Returns how many went.

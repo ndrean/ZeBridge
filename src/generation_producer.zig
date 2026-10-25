@@ -1118,12 +1118,16 @@ pub const GenerationProducer = struct {
                 if (c.PQgetisnull(res, 0, 8) == 0) last_filenode = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 8)));
             }
         }
-        // §10dl: the table's OID now. Different from the last generation's → the table
-        // was dropped and re-created under the same name within one tick — a different
-        // table with the same chain name. Measured: two clients seeded the 40,001 rows
-        // of the old incarnation into a table that had 30,000. The departure sweep
-        // cannot see it (the name never left the publication), so it is done HERE:
-        // old chain swept, epoch bumped (every replica re-seeds), chain restarted at g1.
+        // §10dl: the table's OID now. Different from this pair's last generation's → the
+        // table was dropped and re-created under its name — a different table with the
+        // same chain name. Measured: two clients seeded the 40,001 rows of the old
+        // incarnation into a table that had 30,000. This pair's old chain is swept and
+        // restarted at g1. The incarnation itself is observed through
+        // zebridge_observe_incarnation, the one table-level operation the DDL triggers
+        // call too: usually they already did, and this observes nothing new; when they
+        // could not (a role without the grant), this is the backstop. Either way the
+        // epoch moves once per incarnation, never once per pair (it was 0 -> 3 for three
+        // pairs: recreate_recovery.py check 1).
         const cur_relid: []const u8 = blk: {
             const params = [_]?[*:0]const u8{table_z.ptr};
             const res = try queryOne(pgc, "SELECT COALESCE(to_regclass(format('%I.%I', 'public', $1::text))::oid::text, '')", &params);
@@ -1131,13 +1135,15 @@ pub const GenerationProducer = struct {
             break :blk try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0)));
         };
         if (last_gen != 0 and last_relid != null and cur_relid.len > 0 and !std.mem.eql(u8, last_relid.?, cur_relid)) {
-            log.warn("🧬 '{s}'/'{s}': the table was re-created under its name (oid {s} -> {s}) since g{d} — sweeping the old chain, bumping the seed epoch, starting at g1", .{ tenant, table, last_relid.?, cur_relid, last_gen });
+            const observed: []const u8 = blk: {
+                const cur_z = try alloc.dupeSentinel(u8, cur_relid, 0);
+                const params = [_]?[*:0]const u8{ table_z.ptr, cur_z.ptr };
+                const res = queryOne(bkc, "SELECT incarnation::text || CASE WHEN changed THEN ' (observed here)' ELSE ' (already observed)' END FROM public.zebridge_observe_incarnation($1, $2::oid)", &params) catch break :blk "unknown (observation failed)";
+                defer c.PQclear(res);
+                break :blk if (c.PQntuples(res) > 0) try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0))) else "none (not catalogued)";
+            };
+            log.warn("🧬 '{s}'/'{s}': the table was re-created under its name (oid {s} -> {s}) since g{d} — incarnation {s}; sweeping this pair's chain, starting at g1", .{ tenant, table, last_relid.?, cur_relid, last_gen, observed });
             self.sweepPair(alloc, bkc, js, tenant, table) catch |err| log.warn("🧬 sweep of the reborn table's chain failed: {}", .{err});
-            {
-                const params = [_]?[*:0]const u8{table_z.ptr};
-                const res = queryOne(bkc, "SELECT count(*) FROM public.zebridge_reseed(to_regclass(format('%I.%I', 'public', $1::text)))", &params) catch null;
-                if (res) |r| c.PQclear(r);
-            }
             last_gen = 0;
             last_cutoff = null;
             last_row_count = null;

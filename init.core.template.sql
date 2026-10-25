@@ -308,6 +308,12 @@ CREATE TABLE IF NOT EXISTS public.zebridge_catalogue (
     CHECK ((tenant_col IS NULL) <> (public_reason IS NULL))
 );
 ALTER TABLE public.zebridge_catalogue ADD COLUMN IF NOT EXISTS allow_physical_deletes boolean NOT NULL DEFAULT false;
+-- The table's incarnation (one lifetime under its name, from a CREATE to the DROP that
+-- ends it): `incarnation_relid` the live table's OID, NULL while there is none; `incarnation` how
+-- many lifetimes this name has had. Kept by zebridge_observe_incarnation alone. The OID
+-- is the evidence of a replacement, the counter is the identity.
+ALTER TABLE public.zebridge_catalogue ADD COLUMN IF NOT EXISTS incarnation_relid oid;
+ALTER TABLE public.zebridge_catalogue ADD COLUMN IF NOT EXISTS incarnation bigint NOT NULL DEFAULT 0;
 GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_READER_USER};
 
 -- The bridge's runtime verdicts, made queryable (NOTES §10cf). A row_too_large
@@ -406,6 +412,69 @@ RETURNS TABLE (tbl text, seed_epoch integer) AS $$
 $$ LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, public;
 REVOKE ALL ON FUNCTION public.zebridge_reseed(regclass) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.zebridge_reseed(regclass) TO ${POSTGRES_READER_USER};
+
+-- A table's incarnation, observed (the recovery model's §1): ONE operation, called by the
+-- DDL triggers inside the DDL's own transaction (prompt), by zebridge_enable, and by the
+-- generation producer when a pair finds the OID moved (the backstop for whatever the
+-- triggers did not see). "Already handled" is a comparison, never a count: observing the
+-- same OID twice changes nothing, so every caller may call it.
+--   p_relid NULL   the table is gone: the incarnation ends (incarnation_relid NULL), nothing re-seeds;
+--   same OID       nothing;
+--   another OID    a new incarnation: the counter moves, and — when a previous one existed
+--                  — the seed epoch moves ONCE (the per-transaction marker zebridge_reseed
+--                  uses), so every replica of the old table re-seeds. Not once per tenant
+--                  pair: the producer used to bump it from each pair's build (0 -> 3 for
+--                  three pairs, recreate_recovery.py check 1).
+-- A table not catalogued is not observed. The first observation of a catalogued table
+-- records it without a re-seed (no replica can hold another incarnation of it).
+CREATE OR REPLACE FUNCTION public.zebridge_observe_incarnation(p_tbl text, p_relid oid)
+RETURNS TABLE (incarnation bigint, changed boolean) AS $$
+DECLARE
+    prev_relid oid;
+    prev_inc   bigint;
+    now_inc    bigint;
+    reseed     boolean;
+BEGIN
+    SELECT c.incarnation_relid, c.incarnation INTO prev_relid, prev_inc
+      FROM public.zebridge_catalogue c WHERE c.tbl = p_tbl FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+    IF p_relid IS NULL THEN
+        IF prev_relid IS NOT NULL THEN
+            UPDATE public.zebridge_catalogue c SET incarnation_relid = NULL WHERE c.tbl = p_tbl;
+        END IF;
+        RETURN QUERY SELECT prev_inc, false;
+        RETURN;
+    END IF;
+    IF prev_relid = p_relid THEN
+        RETURN QUERY SELECT prev_inc, false;
+        RETURN;
+    END IF;
+    reseed := prev_inc > 0 AND current_setting('zebridge.reseeded_' || md5(p_tbl), true) IS DISTINCT FROM '1';
+    UPDATE public.zebridge_catalogue c
+       SET incarnation_relid = p_relid,
+           incarnation = c.incarnation + 1,
+           seed_epoch = c.seed_epoch + CASE WHEN reseed THEN 1 ELSE 0 END
+     WHERE c.tbl = p_tbl
+     RETURNING c.incarnation INTO now_inc;
+    IF reseed THEN
+        PERFORM set_config('zebridge.reseeded_' || md5(p_tbl), '1', true);
+    END IF;
+    RETURN QUERY SELECT now_inc, true;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public;
+REVOKE ALL ON FUNCTION public.zebridge_observe_incarnation(text, oid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.zebridge_observe_incarnation(text, oid) TO ${POSTGRES_READER_USER};
+-- Every catalogued table that exists has an incarnation. Without this, a table catalogued
+-- before the columns existed sat at 0, and its FIRST recreate counted as a first
+-- observation: incarnation 1, no re-seed — its replicas kept the old table's rows. Only
+-- rows still at 0 are touched, so re-applying this file changes nothing.
+UPDATE public.zebridge_catalogue c
+   SET incarnation_relid = to_regclass(format('%I.%I', 'public', c.tbl))::oid,
+       incarnation = 1
+ WHERE c.incarnation = 0
+   AND to_regclass(format('%I.%I', 'public', c.tbl)) IS NOT NULL;
 -- The writer's grant lives in init.write.template.sql, NOT here: roles are
 -- cluster-wide, so this line passed silently on any cluster where the write half
 -- had ever run — and failed with `role does not exist` only on a fresh cluster
@@ -967,6 +1036,15 @@ BEGIN
                 INTO catalogued;
             IF catalogued THEN
                 PERFORM public.zebridge_install_width_guard(('public.' || quote_ident(tbl))::regclass);
+                -- The incarnation, in the DDL's own transaction: a CREATE under a name
+                -- that had a table is a new one (the epoch moves once, the catalogue row
+                -- the bridge replicates says so at once). Any other DDL observes the same
+                -- OID and changes nothing.
+                BEGIN
+                    PERFORM public.zebridge_observe_incarnation(tbl, to_regclass('public.' || quote_ident(tbl))::oid);
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE WARNING 'zebridge: % — this role may not observe its incarnation; the generation producer will (a re-created table re-seeds at its next build)', tbl;
+                END;
             END IF;
         END IF;
     END LOOP;
@@ -1289,6 +1367,13 @@ BEGIN
                 INSERT INTO public.zebridge_ddl_events
                        (schema_name, table_name, command_tag, schema_def)
                 VALUES ('public', tbl, 'DROP TABLE', NULL);
+                -- The incarnation ends here, in the DROP's transaction: a later CREATE
+                -- under the name is a new one even if PostgreSQL reuses the OID.
+                BEGIN
+                    PERFORM public.zebridge_observe_incarnation(tbl, NULL);
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE WARNING 'zebridge: % dropped — this role may not end its incarnation; the generation producer will see the new OID', tbl;
+                END;
 
                 -- Reap the table's generated width guard. `zebridge_install_width_guard`
                 -- creates ONE FUNCTION PER TABLE, and DROP TABLE ... CASCADE removes the
@@ -2162,6 +2247,9 @@ BEGIN
             'tombstone_col = EXCLUDED.tombstone_col, tiebreak_col = EXCLUDED.tiebreak_col, '
             'generations = EXCLUDED.generations, allow_physical_deletes = EXCLUDED.allow_physical_deletes',
             short, tenant_col, public_reason, version_col, tombstone_col, tiebreak_col, generations, allow_physical_deletes);
+        -- The incarnation enabled: recorded on a first enable (no re-seed), unchanged on
+        -- a re-run, and a new one if the table was re-created while nothing observed it.
+        PERFORM public.zebridge_observe_incarnation(short, tbl::oid);
     END IF;
     RETURN QUERY SELECT 'catalogue', verb,
         format('zebridge_catalogue[%s]: tenant_col=%s version_col=%s tombstone=%s tiebreak=%s generations=%s allow_physical_deletes=%s '
