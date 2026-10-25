@@ -555,14 +555,15 @@ def wait_for_schema(*tables: str, timeout: float = 30) -> list[str]:
 
 
 def parse_tenants(value: str) -> list[str]:
-    """§10fn: the `$KV.tenants.<principal>` value — a JSON array of tenants (sorted),
-    or the pre-§10fn bare string (one tenant). "" (purged, absent) is no membership."""
+    """§10fn: the `$KV.tenants.<principal>` value — a JSON array of tenants (sorted).
+    "" (purged, absent) is no membership; anything else that is not an array is malformed."""
     v = (value or "").strip()
     if not v:
         return []
-    if v.startswith("["):
-        return [t for t in json.loads(v) if isinstance(t, str) and t]
-    return [v]
+    arr = json.loads(v)
+    if not isinstance(arr, list):
+        raise ValueError(f"tenant list malformed: {v[:80]}")
+    return [t for t in arr if isinstance(t, str) and t]
 
 
 def kv_tenants(principal: str) -> list[str]:

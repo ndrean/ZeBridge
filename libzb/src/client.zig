@@ -838,8 +838,8 @@ pub const SyncClient = struct {
         }
     }
 
-    /// §10fn: the roster set as the bridge writes it — `["acme","globex"]` — or a
-    /// bare tenant string (one tenant, the pre-§10fn value). Sorted, deduplicated.
+    /// §10fn: the roster set as the bridge writes it — `["acme","globex"]`. Anything
+    /// else is malformed. Sorted, deduplicated.
     fn parseTenantList(a: std.mem.Allocator, text: []const u8) ![]const []const u8 {
         var list: std.ArrayList([]const u8) = .empty;
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
@@ -848,7 +848,7 @@ pub const SyncClient = struct {
             if (v != .array) return error.TenantListMalformed;
             for (v.array.items) |it| if (it == .string and it.string.len > 0) try appendUnique(a, &list, it.string);
         } else if (trimmed.len > 0) {
-            try appendUnique(a, &list, trimmed);
+            return error.TenantListMalformed;
         }
         std.mem.sort([]const u8, list.items, {}, lessStr);
         return list.items;
@@ -995,7 +995,7 @@ pub const SyncClient = struct {
         const shape_rows = try st.query(a, "SELECT key_shape, type_shape FROM _zbz_shape WHERE tbl = ?", &.{.{ .text = table }});
         const key_before: ?[]const u8 = if (shape_rows.len > 0 and shape_rows[0][0] == .text) shape_rows[0][0].text else null;
         const type_before: ?[]const u8 = if (shape_rows.len > 0 and shape_rows[0][1] == .text) shape_rows[0][1].text else null;
-        // With no record (a replica from before the record, or one lost to a kill) the
+        // With no record (one lost to a kill) the
         // PHYSICAL pk column names decide — names only, never the engine's type text.
         const rekey = blk: {
             if (existing == null) break :blk false;
@@ -1301,65 +1301,34 @@ pub const SyncClient = struct {
             const val = (try std.json.parseFromSlice(Value, a, bytes, .{})).value;
             try self.applyDescriptor(a, table, val);
         }
-        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)");
         // The stream's identity beside its position (§10bm's third shape, made exact): a
         // position is only meaningful on the stream it was taken on, and `stored >
         // last_seq` can only notice a restart while the new stream is still shorter
-        // than the old position. A replica from before this column has NULL and learns
-        // the identity on its next sync.
-        execDdl(&self.st, "ALTER TABLE _zbz_stream_seq ADD COLUMN created TEXT") catch {};
+        // than the old position.
+        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL, created TEXT)");
         try ensureInbox(&self.st);
-        try self.ensureGenerations(a);
+        try self.ensureGenerations();
         try ensureShape(&self.st);
         // A schema that just moved may be what a held event was waiting for.
         self.retryHeld(null, null);
     }
 
     /// §10fn: the watermark table, keyed by (table, tenant) — one chain per tenant of
-    /// a tenant-scoped table, the open tenant for a public one. A replica from before
-    /// (keyed by table alone) is carried over under the tenant it followed then, so
-    /// the upgrade costs no re-seed.
-    fn ensureGenerations(self: *SyncClient, a: std.mem.Allocator) !void {
-        // §10hg: DuckDB RAISES on pragma_table_info of a table that does not exist, where
-        // SQLite answers no rows — on a fresh DuckDB replica this `try` ended the whole
-        // bookkeeping setup before the CREATE, and every seed then failed on the missing
-        // table ("Catalog Error: Table with name _zbz_generations does not exist").
-        const cols = self.st.query(a, "SELECT name FROM pragma_table_info('_zbz_generations')", &.{}) catch &.{};
-        var has_tenant = false;
-        for (cols) |r| if (r.len > 0 and r[0] == .text and std.mem.eql(u8, r[0].text, "tenant")) {
-            has_tenant = true;
-        };
-        if (cols.len > 0 and !has_tenant) {
-            execDdl(&self.st, "ALTER TABLE _zbz_generations ADD COLUMN seed_epoch INTEGER NOT NULL DEFAULT 0") catch {}; // a replica from before §10df
-            try execDdl(&self.st, "ALTER TABLE _zbz_generations RENAME TO _zbz_generations_v1");
-        }
-        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_generations (tbl TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT '', watermark TEXT, cutoff_lsn INTEGER, seed_epoch INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tbl, tenant))");
+    /// a tenant-scoped table, the open tenant for a public one. A replica in another
+    /// layout is not carried over: it is recreated.
+    fn ensureGenerations(self: *SyncClient) !void {
+        // §10jc: the seed gate's anchor (`anchor_stream`, `anchor_seq`), persisted with the
+        // watermark it belongs to. Kept in memory only, it died with the process: a client
+        // killed after a re-seed and before its tail passed the chain's cutoff re-applied,
+        // on relaunch, events the chain already carried in newer versions. §10lw:
+        // `shared_seq`, the chain's cut on CDC_PUBLIC for a tenant table — what the seed
+        // proved on the shared route its open-tenant rows ride; NULL: nothing proved there.
+        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_generations (tbl TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT '', watermark TEXT, cutoff_lsn INTEGER, seed_epoch INTEGER NOT NULL DEFAULT 0, anchor_stream TEXT, anchor_seq INTEGER, shared_seq INTEGER, PRIMARY KEY (tbl, tenant))");
         // A fence between its PREPARE and its anchor's commit (the recovery model's §3):
         // a row here makes the next attempt a fence too, VERIFY and every route's proof
         // included — after PREPARE the cursor sits AT the cut, so "the full predates the
         // cursor" no longer says so. Written in PREPARE, deleted with the anchor.
         try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_fence (tbl TEXT NOT NULL, tenant TEXT NOT NULL, PRIMARY KEY (tbl, tenant))");
-        // §10jc: the seed gate's anchor, persisted with the watermark it belongs to. Kept
-        // in memory only, it died with the process: a client killed after a re-seed and
-        // before its tail passed the chain's cutoff re-applied, on relaunch, events the
-        // chain already carried in newer versions. (Existing replicas gain the columns.)
-        execDdl(&self.st, "ALTER TABLE _zbz_generations ADD COLUMN anchor_stream TEXT") catch {};
-        execDdl(&self.st, "ALTER TABLE _zbz_generations ADD COLUMN anchor_seq INTEGER") catch {};
-        // §10lw: the chain's cut on CDC_PUBLIC for a tenant table — what the seed proved on
-        // the shared route its open-tenant rows ride. NULL: nothing proved there.
-        execDdl(&self.st, "ALTER TABLE _zbz_generations ADD COLUMN shared_seq INTEGER") catch {};
-        if (cols.len > 0 and !has_tenant) {
-            const old = try self.st.query(a, "SELECT tbl, watermark, cutoff_lsn, seed_epoch FROM _zbz_generations_v1", &.{});
-            for (old) |r| {
-                if (r.len < 4 or r[0] != .text) continue;
-                const st = self.states.get(r[0].text) orelse continue;
-                const tenant = self.tenantsFor(st);
-                if (tenant.len != 1) continue; // several: seeded again, per tenant
-                _ = try self.st.query(a, "INSERT OR REPLACE INTO _zbz_generations (tbl, tenant, watermark, cutoff_lsn, seed_epoch) VALUES (?, ?, ?, ?, ?)", &.{ r[0], .{ .text = tenant[0] }, r[1], r[2], r[3] });
-            }
-            try execDdl(&self.st, "DROP TABLE _zbz_generations_v1");
-            log.info("_zbz_generations: keyed by (table, tenant) now — {d} watermark(s) carried over", .{old.len});
-        }
     }
 
     /// One descriptor onto one table: migrate the physical table and refresh the
@@ -1609,7 +1578,7 @@ pub const SyncClient = struct {
     }
 
     /// The `created` timestamp of the stream this position was taken on, or null for a
-    /// stream never seen (or a replica from before the column).
+    /// stream never seen.
     fn storedCreated(self: *SyncClient, a: std.mem.Allocator, stream: []const u8) !?[]const u8 {
         const rows = try self.st.query(a, "SELECT created FROM _zbz_stream_seq WHERE stream = ?", &.{.{ .text = stream }});
         if (rows.len == 0 or rows[0][0] != .text) return null;
@@ -2701,7 +2670,7 @@ pub const SyncClient = struct {
                 shared_seq: i64,
                 fn apply(cx: @This(), s: *storage.Storage) !void {
                     _ = try s.query(cx.a, "DELETE FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = cx.table }, .{ .text = cx.tenant } });
-                    _ = try s.query(cx.a, "INSERT OR IGNORE INTO _zbz_fence (tbl, tenant) VALUES (?, ?)", &.{ .{ .text = cx.table }, .{ .text = cx.tenant } });
+                    _ = try s.query(cx.a, "INSERT INTO _zbz_fence (tbl, tenant) VALUES (?, ?) ON CONFLICT (tbl, tenant) DO NOTHING", &.{ .{ .text = cx.table }, .{ .text = cx.tenant } });
                     try cx.client.persistSeq(cx.own, @intCast(cx.own_seq));
                     if (cx.shared) |sh| try cx.client.persistSeq(sh, @intCast(cx.shared_seq));
                 }
@@ -5188,7 +5157,7 @@ pub const SyncClient = struct {
     ///
     /// `published` is set, durably, before the first send: a write never published cannot
     /// have committed, so the GC gate may revert it here; a published one goes to the
-    /// bridge, whose receipt knows (an outbox from before the column counts as published).
+    /// bridge, whose receipt knows.
     /// `tenant` is the row's tenant (the open tenant for a public table; NULL when the
     /// write did not name it), `optimistic` the local apply, kept for re-applying after a
     /// full seed replaced the rows.
@@ -5210,10 +5179,6 @@ pub const SyncClient = struct {
             \\  optimistic TEXT
             \\)
         );
-        execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN published INTEGER NOT NULL DEFAULT 1") catch {};
-        execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN tenant TEXT") catch {};
-        execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN optimistic TEXT") catch {};
-        execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN retry_at INTEGER DEFAULT 0") catch {};
         try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_retry ON _zebridge_outbox (retry_at, attempts, created_at, msg_id)");
         try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_recovery ON _zebridge_outbox (attempts, created_at, msg_id)");
         // A write answered `indeterminate`: settled for retransmission, its outcome

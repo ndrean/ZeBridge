@@ -156,9 +156,21 @@ class Stack:
         try: p.wait(timeout=20)
         except subprocess.TimeoutExpired: p.kill()
 
+    def replica_url(self, label):
+        """A PostgreSQL database for one libzb replica, dropped with the stack."""
+        db = f"{self.name}_{label}"
+        self.sql(f'CREATE DATABASE "{db}"', "postgres")
+        self.replicas = getattr(self, "replicas", []) + [db]
+        return f"postgres://postgres@127.0.0.1:5432/{db}"
+
     def stop(self):
         if getattr(self, "stopped", False): return
         self.stopped = True
+        # Every client asked at once, then waited on: one at a time, an interrupted check
+        # spent up to 30 s per client before the stack itself went.
+        for o in self.owned:
+            if isinstance(o, Client) and o.p and o.p.poll() is None:
+                pathlib.Path(o.db + ".stop").touch()
         for o in self.owned:
             try: o.end() if isinstance(o, Load) else o.stop()
             except Exception: pass
@@ -169,7 +181,7 @@ class Stack:
             except subprocess.TimeoutExpired: p.kill()
         subprocess.run([*self.psql, "-d", "postgres"], capture_output=True, text=True,
                        input=f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '{self.name}_slot'; "
-                             f'DROP DATABASE IF EXISTS "{self.name}" WITH (FORCE); DROP ROLE IF EXISTS "{self.name}_r"; DROP ROLE IF EXISTS "{self.name}_w";')
+                             f'DROP DATABASE IF EXISTS "{self.name}" WITH (FORCE); ' + "".join(f'DROP DATABASE IF EXISTS "{r}" WITH (FORCE); ' for r in getattr(self, "replicas", [])) + f'DROP ROLE IF EXISTS "{self.name}_r"; DROP ROLE IF EXISTS "{self.name}_w";')
 
     # fixture
     def create_table(self, rows_by_tenant, prefix):
@@ -272,9 +284,11 @@ class Js:
 # ── one libzb client per process ─────────────────────────────────────────────
 
 class Client:
-    def __init__(self, stack, name, principal, tenant, chunk_rows=None, lib=None):
+    def __init__(self, stack, name, principal, tenant, chunk_rows=None, lib=None, pg_url=None):
+        """`pg_url`: the replica on PostgreSQL storage (libzb's `dbUrl`) instead of SQLite;
+        the db path then only names the process's stop file."""
         self.stack, self.name, self.principal, self.tenant, self.chunk_rows = stack, name, principal, tenant, chunk_rows
-        self.lib = str(lib or LIBRARY)
+        self.lib, self.pg_url = str(lib or LIBRARY), pg_url
         self.db = f"/tmp/zb-rr{stack.tag}-{name}.sqlite3"
         self.log = stack.log(name)
         for s in ("", "-wal", "-shm", ".stop"): pathlib.Path(self.db + s).unlink(missing_ok=True)
@@ -287,7 +301,8 @@ class Client:
         pathlib.Path(self.db + ".stop").unlink(missing_ok=True)
         opts = dict(natsUrl=self.stack.url, credsPath=self.stack.creds[self.principal], principal=self.principal, jsDomain="hub",
                     clientId=f"rr-{self.name}", dbPath=self.db, tables=[T], heartbeatMs=0,
-                    **({"seedChunkRows": self.chunk_rows} if self.chunk_rows else {}))
+                    **({"seedChunkRows": self.chunk_rows} if self.chunk_rows else {}),
+                    **({"dbUrl": self.pg_url} if self.pg_url else {}))
         self.p = subprocess.Popen([sys.executable, __file__, "--worker", json.dumps(opts), "--lib", self.lib], stdout=subprocess.DEVNULL,
                                   stderr=open(self.log, "a"), env=dict(os.environ, **(env or {})))
 
@@ -309,11 +324,26 @@ class Client:
         self.p = None
 
     def _q(self, sql, args=()):
+        if self.pg_url:
+            return self._pg(sql, args)
         try:
             with closing(sqlite3.connect(f"file:{self.db}?mode=ro", uri=True, timeout=2)) as con:
                 return con.execute(sql, args).fetchall()
         except sqlite3.Error:
             return None
+
+    def _pg(self, sql, args):
+        """The same reads on a PostgreSQL replica, through psql. The arguments are this
+        scenario's own names (table, tenant, stream): quoted, never interpolated raw."""
+        for v in args:
+            sql = sql.replace("?", "'" + str(v).replace("'", "''") + "'", 1)
+        r = subprocess.run([zb._psql_binary(), "-X", "-At", "-F", "\x1f", "-P", "null=\\N", "-d", self.pg_url, "-c", sql],
+                           capture_output=True, text=True)
+        if r.returncode:
+            return None
+        def cell(x):
+            return None if x == "\\N" else int(x) if x.lstrip("-").isdigit() else x
+        return [tuple(cell(x) for x in line.split("\x1f")) for line in r.stdout.splitlines()]
 
     def rows(self):
         r = self._q(f"SELECT id, note FROM {T} WHERE tenant_id = ?", (self.tenant,))
@@ -332,10 +362,9 @@ class Client:
         return bool(r and r[0][0])
 
     def anchors(self):
-        r = self._q("SELECT * FROM _zbz_generations WHERE tbl = ?", (T,))
-        if not r: return []
-        cols = [c[1] for c in self._q("PRAGMA table_info(_zbz_generations)")]
-        return [dict(zip(cols, row)) for row in r]
+        cols = ("tenant", "seed_epoch", "anchor_stream", "anchor_seq", "shared_seq", "watermark")
+        r = self._q(f"SELECT {', '.join(cols)} FROM _zbz_generations WHERE tbl = ?", (T,))
+        return [dict(zip(cols, row)) for row in r] if r else []
 
     def count(self, pattern):
         return len(re.findall(pattern, open(self.log, errors="replace").read()))
@@ -626,8 +655,12 @@ async def check4(a, tmp):
                           ("retry_overtaken", {"ZB_TEST_FENCE_ABORT": "after_chunk"}),
                           ("abort_commit", {"ZB_TEST_FENCE_ABORT": "before_commit"}),
                           ("overtaken", {"ZB_TEST_FENCE_SLEEP_MS": "8000"}),
-                          ("shared_unknown", {"ZB_TEST_SHARED_UNREADABLE": "1"})):
-            c = Client(s, name, "pa", "t_a", chunk_rows=200, lib=FAULT_LIBRARY)
+                          ("shared_unknown", {"ZB_TEST_SHARED_UNREADABLE": "1"}),
+                          ("pg_abort_commit", {"ZB_TEST_FENCE_ABORT": "before_commit"}),
+                          ("pg_retry_overtaken", {"ZB_TEST_FENCE_ABORT": "after_chunk"})):
+            # pg_*: the same cases on PostgreSQL storage (one database per case's client).
+            pg = s.replica_url(name) if name.startswith("pg_") else None
+            c = Client(s, name, "pa", "t_a", chunk_rows=200, lib=FAULT_LIBRARY, pg_url=pg)
             clients.append(c)
             c.start()
             check(f"{name}: seeded and anchored before the case ({await until(lambda: recovered(c), 120)} s)", await recovered(c))
@@ -635,13 +668,13 @@ async def check4(a, tmp):
             c.start(env)
             await asyncio.sleep(5)   # caught up with the load again: its position runs ahead of any new cut
             reseed()
-            if name == "retry_overtaken":
+            if name in ("retry_overtaken", "pg_retry_overtaken"):
                 # Two attempts: a crash after a chunk; the reopened client's retry stages
                 # the same fence and the stream prunes past the cut meanwhile. The retry's
                 # cursor sits AT the cut — a fence only because PREPARE left it owed.
                 rc = await until(lambda: c.exited() is not None, 90)
                 cut = fence_cut(c)
-                check(f"retry_overtaken: attempt 1 aborted after a chunk ({c.exited()}): fence owed {c.fence_pending()}, anchors {c.anchors()}, "
+                check(f"{name}: attempt 1 aborted after a chunk ({c.exited()}): fence owed {c.fence_pending()}, anchors {c.anchors()}, "
                       f"position {c.position('CDC_t_a')}, cut {cut}",
                       rc is not None and c.fence_pending() and c.anchors() == [] and c.position("CDC_t_a") == cut)
                 c.p = None
@@ -649,18 +682,18 @@ async def check4(a, tmp):
                 c.start({"ZB_TEST_FENCE_SLEEP_MS": "8000"})
                 held = await until(lambda: c.text().count("fence holding") > held_before, 90)
                 cut2 = fence_cut(c)
-                check(f"retry_overtaken: attempt 2 is a fence again, staging (cut {cut2}, cursor {c.position('CDC_t_a')}) — {held} s",
+                check(f"{name}: attempt 2 is a fence again, staging (cut {cut2}, cursor {c.position('CDC_t_a')}) — {held} s",
                       held is not None and cut2 is not None)
                 if cut2 is not None:
                     await js.js.purge_stream("CDC_t_a", seq=cut2 + 5)
                     refused = await until(lambda: c.text().count("fence not committed") > 0, 30)
-                    check(f"retry_overtaken: attempt 2 not committed after the stream moved past the cut ({refused} s): fence owed {c.fence_pending()}, "
+                    check(f"{name}: attempt 2 not committed after the stream moved past the cut ({refused} s): fence owed {c.fence_pending()}, "
                           f"anchors {c.anchors()}, position {c.position('CDC_t_a')}",
                           refused is not None and c.fence_pending() and c.anchors() == [] and c.position("CDC_t_a") == cut2)
                 secs = await until(lambda: recovered(c), 120)
-                check(f"retry_overtaken: recovered from a newer chain, the fence no longer owed ({secs} s, owed {c.fence_pending()})",
+                check(f"{name}: recovered from a newer chain, the fence no longer owed ({secs} s, owed {c.fence_pending()})",
                       secs is not None and not c.fence_pending())
-            elif name.startswith("abort"):
+            elif name.startswith("abort") or name == "pg_abort_commit":
                 rc = await until(lambda: c.exited() is not None, 90)
                 check(f"{name}: the client aborted at the fence ({c.exited()})", rc is not None)
                 cut = fence_cut(c)

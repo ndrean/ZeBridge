@@ -3073,8 +3073,8 @@ export class ZeBridge {
         let val: string;
         try { val = decode(entry.value) as string; } catch { val = td.decode(entry.value); }
         if (typeof val !== 'string') val = td.decode(entry.value);
-        // §10fn: the value is the roster's SET, a JSON array (`["acme","globex"]`); a
-        // bare string is one tenant. This client follows ONE tenant — the first — and
+        // §10fn: the value is the roster's SET, a JSON array (`["acme","globex"]`). This
+        // client follows ONE tenant — the first — and
         // says so when there are more (membership across several is libzb's, parity
         // queued).
         const list = parseTenantList(val);
@@ -5103,15 +5103,11 @@ export class ZeBridge {
 }
 
 
-/** §10fn: `$KV.tenants.<principal>` — a JSON array of tenants, or one bare tenant. */
+/** §10fn: `$KV.tenants.<principal>` — a JSON array of tenants. Anything else is malformed. */
 export function parseTenantList(value: string): string[] {
   const v = (value ?? '').trim();
   if (!v) return [];
-  if (v.startsWith('[')) {
-    try {
-      const arr = JSON.parse(v);
-      if (Array.isArray(arr)) return arr.filter((t): t is string => typeof t === 'string' && t.length > 0);
-    } catch { /* fall through: not a list */ }
-  }
-  return [v];
+  const arr = JSON.parse(v);
+  if (!Array.isArray(arr)) throw new Error(`tenant list malformed: ${v.slice(0, 80)}`);
+  return arr.filter((t): t is string => typeof t === 'string' && t.length > 0);
 }
