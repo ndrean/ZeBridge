@@ -1164,9 +1164,29 @@ pub const GenerationProducer = struct {
             const observed: []const u8 = blk: {
                 const cur_z = try alloc.dupeSentinel(u8, cur_relid, 0);
                 const params = [_]?[*:0]const u8{ table_z.ptr, cur_z.ptr };
-                const res = queryOne(bkc, "SELECT incarnation::text, status FROM public.zebridge_observe_incarnation($1, $2::oid)", &params) catch break :blk "unknown (observation failed)";
+                const res = c.PQexecParams(bkc, "SELECT incarnation::text, status FROM public.zebridge_observe_incarnation($1, $2::oid)", params.len, null, &params, null, null, 0) orelse return error.IncarnationObservationFailed;
+                if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+                    const state_ptr = c.PQresultErrorField(res, c.PG_DIAG_SQLSTATE);
+                    const state = if (state_ptr != null) std.mem.span(state_ptr) else "unknown";
+                    const retryable = std.mem.eql(u8, state, "40P01") or std.mem.eql(u8, state, "40001");
+                    // The primary message only: the full one spans lines (ERROR, CONTEXT).
+                    const msg_ptr = c.PQresultErrorField(res, c.PG_DIAG_MESSAGE_PRIMARY);
+                    const msg = if (msg_ptr != null) std.mem.span(msg_ptr) else std.mem.trimEnd(u8, std.mem.span(c.PQresultErrorMessage(res)), " \r\n");
+                    if (retryable) {
+                        log.err("🧬 '{s}'/'{s}': incarnation observation failed (SQLSTATE {s}): {s} — nothing swept or built", .{ tenant, table, state, msg });
+                    } else {
+                        // Not a race: the function is missing or the reader may not run it.
+                        log.err("🧬 '{s}'/'{s}': incarnation observation failed (SQLSTATE {s}): {s} — nothing swept or built; re-apply the init SQL (it defines zebridge_observe_incarnation and grants EXECUTE to the reader)", .{ tenant, table, state, msg });
+                    }
+                    c.PQclear(res);
+                    return if (retryable) error.IncarnationObservationRetryable else error.IncarnationObservationFailed;
+                }
                 defer c.PQclear(res);
-                if (c.PQntuples(res) == 0) break :blk "none (not catalogued)";
+                if (c.PQntuples(res) != 1) {
+                    // No row: the table left the catalogue since this tick read it. Not a fault.
+                    log.info("🧬 '{s}'/'{s}': no longer catalogued — nothing built", .{ tenant, table });
+                    return;
+                }
                 const status = std.mem.span(c.PQgetvalue(res, 0, 1));
                 if (std.mem.eql(u8, status, "stale")) {
                     log.info("🧬 '{s}'/'{s}': oid {s} is no longer the table's (re-created again meanwhile) — nothing built; the next pass reads it again", .{ tenant, table, cur_relid });
@@ -2542,6 +2562,12 @@ pub const GenerationProducer = struct {
         while (attempt < 3) : (attempt += 1) {
             var fell_off = false;
             self.buildOne(alloc, pgc, bkc, js, table, tenant, vcol, tcol, tenant_col, guarded, force_cut, &fell_off) catch |err| {
+                if (err == error.IncarnationObservationRetryable and attempt < 2) {
+                    const delay_ms: i64 = @as(i64, 50) << @intCast(attempt);
+                    log.warn("🧬 '{s}'/'{s}': retrying incarnation observation ({d}/3) after {d} ms", .{ tenant, table, attempt + 2, delay_ms });
+                    std.Io.sleep(self.io, .fromMilliseconds(delay_ms), .awake) catch {};
+                    continue;
+                }
                 log.err("🧬 generation build failed for '{s}'/'{s}': {} — next cadence retries", .{ tenant, table, err });
                 return false;
             };

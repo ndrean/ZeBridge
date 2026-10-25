@@ -492,7 +492,9 @@ DECLARE
     reseed     boolean;
     live       oid;
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM public.zebridge_catalogue c WHERE c.tbl = p_tbl) THEN
+    -- All identity writers take the catalogue lock first, including epoch recording.
+    PERFORM 1 FROM public.zebridge_catalogue c WHERE c.tbl = p_tbl FOR UPDATE;
+    IF NOT FOUND THEN
         RETURN;
     END IF;
     INSERT INTO public.zebridge_incarnations (tbl) VALUES (p_tbl) ON CONFLICT (tbl) DO NOTHING;
@@ -549,13 +551,32 @@ ON CONFLICT (tbl) DO UPDATE SET incarnation_relid = EXCLUDED.incarnation_relid, 
 CREATE OR REPLACE FUNCTION public.zebridge_catalogue_epoch_floor()
 RETURNS trigger AS $$
 BEGIN
-    INSERT INTO public.zebridge_incarnations AS i (tbl, seed_epoch) VALUES (NEW.tbl, NEW.seed_epoch)
-    ON CONFLICT (tbl) DO UPDATE SET seed_epoch = greatest(i.seed_epoch, EXCLUDED.seed_epoch)
-    RETURNING i.seed_epoch INTO NEW.seed_epoch;
+    -- BEFORE INSERT also runs before an ON CONFLICT row is locked: only read here.
+    NEW.seed_epoch := greatest(NEW.seed_epoch, coalesce(
+        (SELECT i.seed_epoch FROM public.zebridge_incarnations i WHERE i.tbl = NEW.tbl), 0));
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public;
 REVOKE ALL ON FUNCTION public.zebridge_catalogue_epoch_floor() FROM PUBLIC;
+CREATE OR REPLACE FUNCTION public.zebridge_catalogue_epoch_record()
+RETURNS trigger AS $$
+DECLARE
+    floor_epoch bigint;
+BEGIN
+    -- AFTER INSERT/UPDATE: the catalogue row is now held before the identity row.
+    INSERT INTO public.zebridge_incarnations AS i (tbl, seed_epoch) VALUES (NEW.tbl, NEW.seed_epoch)
+    ON CONFLICT (tbl) DO UPDATE SET seed_epoch = greatest(i.seed_epoch, EXCLUDED.seed_epoch)
+    RETURNING i.seed_epoch INTO floor_epoch;
+    -- An INSERT can wait behind a concurrent DELETE after its BEFORE trigger read
+    -- the floor. Recheck after locking the identity; the catalogue row is ours now.
+    IF NEW.seed_epoch < floor_epoch THEN
+        UPDATE public.zebridge_catalogue SET seed_epoch = floor_epoch
+         WHERE tbl = NEW.tbl AND seed_epoch < floor_epoch;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public;
+REVOKE ALL ON FUNCTION public.zebridge_catalogue_epoch_record() FROM PUBLIC;
 -- An upgrade: the floor starts at the epochs the catalogue holds now.
 INSERT INTO public.zebridge_incarnations AS i (tbl, seed_epoch)
 SELECT c.tbl, c.seed_epoch FROM public.zebridge_catalogue c
@@ -564,6 +585,10 @@ DROP TRIGGER IF EXISTS zebridge_catalogue_epoch_floor_t ON public.zebridge_catal
 CREATE TRIGGER zebridge_catalogue_epoch_floor_t
     BEFORE INSERT OR UPDATE OF tbl, seed_epoch ON public.zebridge_catalogue
     FOR EACH ROW EXECUTE FUNCTION public.zebridge_catalogue_epoch_floor();
+DROP TRIGGER IF EXISTS zebridge_catalogue_epoch_record_t ON public.zebridge_catalogue;
+CREATE TRIGGER zebridge_catalogue_epoch_record_t
+    AFTER INSERT OR UPDATE OF tbl, seed_epoch ON public.zebridge_catalogue
+    FOR EACH ROW EXECUTE FUNCTION public.zebridge_catalogue_epoch_record();
 -- The writer's grant lives in init.write.template.sql, NOT here: roles are
 -- cluster-wide, so this line passed silently on any cluster where the write half
 -- had ever run — and failed with `role does not exist` only on a fresh cluster
