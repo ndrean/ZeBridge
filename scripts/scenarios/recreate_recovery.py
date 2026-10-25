@@ -46,6 +46,14 @@ so then c > p and D2 (`fullPredatesReplica`: c < p) cannot refuse it.
              producer's OID check is the only observer — one transition, one epoch move,
              every pair's chain within a cadence (its only signal) plus 30 s.
 
+  --check 7  a stale observation (fault-hook bridge): in SQL, two recreates then the two
+             earlier OIDs submitted change nothing; through the producer, an observation
+             held across another recreate is rejected — one transition, one epoch move,
+             the recorded OID the live table's.
+  --check 8  the DROP cleanup barrier (fault-hook bridge): the cleanup reads the old
+             manifest and holds, the table is re-created and its chains published, the
+             cleanup resumes — every pair keeps the new manifest and its objects.
+
 Regressions enforced (failing on main as of 2026-10-25, by design): check 1 — V2 one epoch
 increment per recreate, V3 a usable chain within --first-chain-s, V4 the live follower
 re-anchored; check 3 — V8 no certified position past a missing prefix, and recovery
@@ -65,6 +73,9 @@ from hub_fallback_stage2 import BRIDGE, LIBRARY, port
 # Check 4's library: the fence's fault hooks compiled in (an ordinary build has none).
 FAULT_LIBRARY = pathlib.Path(os.environ.get("ZB_FAULT_LIBZB", zb.ROOT / "libzb/zig-out-faults/lib" / LIBRARY.name))
 FAULT_BUILD = "cd libzb && zig build -Doptimize=ReleaseFast -Dtest-faults=true -p zig-out-faults"
+# Checks 7 and 8: the bridge's own fault hooks (ZB_TEST_OBSERVE_SLEEP_MS, ZB_TEST_PRUNE_SLEEP_MS).
+FAULT_BRIDGE = pathlib.Path(os.environ.get("ZB_FAULT_BRIDGE_BIN", zb.ROOT / "zig-out-faults/bin/bridge"))
+FAULT_BRIDGE_BUILD = "zig build -Doptimize=ReleaseFast -Dtest-faults=true -p zig-out-faults"
 from rotate_client_key import client_creds
 
 T = "rr_items"
@@ -101,6 +112,7 @@ class Stack:
         self.name = "zb_rr_" + uuid.uuid4().hex[:8]
         self.psql = [zb._psql_binary(), "-X", "-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-Atq"]
         self.procs, self.bridges = {}, 0
+        self.bridge_bin = BRIDGE
         self.owned = []   # loads and clients: stop() ends them, whatever interrupted the check
 
     def sql(self, statement, db=None):
@@ -155,7 +167,7 @@ class Stack:
         self.bridges += 1
         env = dict(self.env, **({"ZB_FEED_RESTART": "1"} if self.bridges == 1 else {}))
         label = f"bridge{self.bridges}"
-        self.spawn(label, [str(BRIDGE), "--pub", "rr_pub", "--slot", self.name + "_slot", "--port", str(port())], env)
+        self.spawn(label, [str(self.bridge_bin), "--pub", "rr_pub", "--slot", self.name + "_slot", "--port", str(port())], env)
         self.wait_log(label, "Replication started successfully")
         return label
 
@@ -219,6 +231,16 @@ class Stack:
 
     def incarnation(self):
         return int(self.sql(f"SELECT incarnation FROM public.zebridge_catalogue WHERE tbl = '{T}'") or 0)
+
+    def recorded(self):
+        """(incarnation, seed_epoch, recorded OID, live OID) from the catalogue and pg_class."""
+        r = self.sql(f"SELECT incarnation, seed_epoch, coalesce(incarnation_relid::text, ''), "
+                     f"coalesce(to_regclass('public.{T}')::oid::text, '') FROM public.zebridge_catalogue WHERE tbl = '{T}'")
+        inc, ep, rec, live = r.split("|")
+        return int(inc), int(ep), rec, live
+
+    def live_oid(self):
+        return self.sql(f"SELECT coalesce(to_regclass('public.{T}')::oid::text, '')")
 
     def drop_table(self):
         self.sql(f"DROP TABLE public.{T};")
@@ -788,11 +810,132 @@ async def check4(a, tmp):
         s.stop()
 
 
+def fault_bridge_ready():
+    if not check(f"checks 7-8 run on a fault-hook bridge ({FAULT_BRIDGE})",
+                 FAULT_BRIDGE.exists() and b"ZB_TEST_OBSERVE_SLEEP_MS" in FAULT_BRIDGE.read_bytes() and b"ZB_TEST_PRUNE_SLEEP_MS" in FAULT_BRIDGE.read_bytes()):
+        note(f"build it: {FAULT_BRIDGE_BUILD}")
+        return False
+    return check(f"the ordinary bridge carries neither hook ({BRIDGE})",
+                 b"ZB_TEST_OBSERVE_SLEEP_MS" not in BRIDGE.read_bytes() and b"ZB_TEST_PRUNE_SLEEP_MS" not in BRIDGE.read_bytes())
+
+
+async def check7(a, tmp):
+    """A stale observation: an OID read before another recreate changes nothing."""
+    if not fault_bridge_ready(): return
+    rows = {"t_a": a.rows // 10, "t_b": a.rows // 10}
+    s = Stack(tmp, "7", a.cadence, {"ZB_TEST_OBSERVE_SLEEP_MS": "20000"})
+    s.bridge_bin = FAULT_BRIDGE
+    try:
+        s.start({"pa": "t_a", "pb": "t_b"})
+        s.create_table(rows, "a")
+        # ── the rule itself, in SQL: two recreates, then the two earlier OIDs submitted
+        x = s.live_oid()
+        s.drop_table(); s.create_table(rows, "b"); y = s.live_oid()
+        s.drop_table(); s.create_table(rows, "c"); z = s.live_oid()
+        before = s.recorded()
+        for stale in (x, y):
+            s.sql(f"SELECT * FROM public.zebridge_observe_incarnation('{T}', {stale}::oid)")
+        after = s.recorded()
+        check(f"SQL: the earlier OIDs {x} and {y} observed after the table became {z} change nothing: {before} -> {after}",
+              before == after and after[2] == after[3] == z)
+        # ── through the producer: its observation held across another recreate
+        b1 = s.bridge_up()
+        js = await Js().open(s)
+        check("tenant mappings published", await js.tenants_ready(s.creds))
+        check(f"chains ({await wait_manifests(js, rows, a.cadence + 60)} s)", all([await js.manifest(t) for t in rows]))
+        inc0, ep0, _, _ = s.recorded()
+        # a recreate only the producer sees (event triggers off): it reads the OID, holds
+        s.sql("ALTER EVENT TRIGGER zebridge_ddl_trigger DISABLE; ALTER EVENT TRIGGER zebridge_drop_trigger DISABLE;")
+        s.drop_table(); await asyncio.sleep(2); s.create_table_raw(rows, "d")
+        s.sql("ALTER EVENT TRIGGER zebridge_ddl_trigger ENABLE; ALTER EVENT TRIGGER zebridge_drop_trigger ENABLE;")
+        unseen = s.live_oid()
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < a.cadence + 60 and "observation of oid" not in open(s.log(b1), errors="replace").read():
+            await asyncio.sleep(1)
+        held = "observation of oid" in open(s.log(b1), errors="replace").read()
+        check(f"the producer read oid {unseen} and holds its observation ({round(time.monotonic() - t0)} s)", held)
+        # another recreate, through the DDL path, while the observation is held
+        s.drop_table(); await asyncio.sleep(2); s.create_table(rows, "e")
+        current = s.live_oid()
+        await asyncio.sleep(30)   # the held observation is applied meanwhile
+        inc1, ep1, rec1, live1 = s.recorded()
+        check(f"one transition and one epoch move for the observed recreate, none for the stale one: incarnation {inc0} -> {inc1}, "
+              f"epoch {ep0} -> {ep1}", inc1 == inc0 + 1 and ep1 == ep0 + 1)
+        check(f"the recorded OID is the live table's ({rec1} == {live1} == {current}), not the stale {unseen}", rec1 == live1 == current)
+        late = Client(s, "late", "pa", "t_a"); late.start()
+        g = grade(s, [late], a.cadence + 90)
+        await report(late, g["late"], js, {"t_a"})
+        await js.close()
+    finally:
+        s.stop()
+
+
+async def check8(a, tmp):
+    """The DROP cleanup reads the old manifest, the replacement is published, the cleanup
+    resumes: the replacement's manifest and objects survive."""
+    if not fault_bridge_ready(): return
+    rows = {"t_a": a.rows // 10, "t_b": a.rows // 10}
+    # The hold blocks the WAL thread — the CREATE, and the kick it would give, wait behind
+    # it — so the replacement can only come from the producer's own tick, on its own
+    # thread: the race itself. A cadence well inside the hold puts a tick there.
+    cadence, hold_s = 20, 35
+    s = Stack(tmp, "8", cadence, {"ZB_TEST_PRUNE_SLEEP_MS": str(hold_s * 1000)})
+    s.bridge_bin = FAULT_BRIDGE
+    try:
+        s.start({"pa": "t_a", "pb": "t_b"})
+        s.create_table(rows, "a")
+        b1 = s.bridge_up()
+        js = await Js().open(s)
+        check("tenant mappings published", await js.tenants_ready(s.creds))
+        check(f"chains ({await wait_manifests(js, rows, cadence + 60)} s)", all([await js.manifest(t) for t in rows]))
+        inc0 = s.incarnation()
+        s.drop_table()
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 30 and "prune of 'rr_items' held" not in open(s.log(b1), errors="replace").read():
+            await asyncio.sleep(0.2)
+        check(f"the cleanup read the old manifest and holds ({round(time.monotonic() - t0, 1)} s)",
+              "prune of 'rr_items' held" in open(s.log(b1), errors="replace").read())
+        s.create_table(rows, "b")    # the DDL path: a new incarnation, a prompt chain
+        inc1 = s.incarnation()
+        published = {}
+        t1 = time.monotonic()
+        while time.monotonic() - t1 < hold_s - 3 and len(published) < len(rows):
+            for t in rows:
+                m = await js.manifest(t)
+                if m and m.get("incarnation") == inc1: published[t] = round(time.monotonic() - t1, 1)
+            await asyncio.sleep(0.5)
+        check(f"the replacement chains were published while the cleanup held: {published} (incarnation {inc0} -> {inc1})", len(published) == len(rows))
+        t2 = time.monotonic()
+        while time.monotonic() - t2 < hold_s + 20 and "drop prune for 'rr_items'" not in open(s.log(b1), errors="replace").read():
+            await asyncio.sleep(0.5)
+        line = [l for l in open(s.log(b1), errors="replace").read().splitlines() if "drop prune for 'rr_items'" in l]
+        note(f"cleanup: {line[-1][line[-1].index('drop prune'):][:160] if line else 'no line'}")
+        for t in rows:
+            m = await js.manifest(t) or {}
+            names = [m.get("full", {}).get("object")] + [d.get("object") for d in m.get("deltas", [])]
+            store = await js.js.object_store(f"gen-{t}")
+            present = []
+            for n in names:
+                if not n: continue
+                try:
+                    await store.get_info(n); present.append(n)
+                except Exception:
+                    pass
+            check(f"pair {t}: after the cleanup, the manifest is incarnation {m.get('incarnation')} (current {inc1}) and its {len([n for n in names if n])} "
+                  f"object(s) exist ({len(present)})", m.get("incarnation") == inc1 and len(present) == len([n for n in names if n]) and present)
+        late = Client(s, "late", "pa", "t_a"); late.start()
+        g = grade(s, [late], 120)
+        await report(late, g["late"], js, {"t_a"})
+        await js.close()
+    finally:
+        s.stop()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker")
     ap.add_argument("--lib")
-    ap.add_argument("--check", default="1,2,3,4,5,6")
+    ap.add_argument("--check", default="1,2,3,4,5,6,7,8")
     ap.add_argument("--cadence", type=int, default=120)
     ap.add_argument("--max-msgs", type=int, default=1000, help="CDC_MAX_MSGS for checks 2 and 3 (the bridge's minimum is 1000)")
     ap.add_argument("--rows", type=int, default=2000)
@@ -807,7 +950,8 @@ def main():
             print(f"── check {n}", flush=True)
             try:
                 asyncio.run({1: check1, 2: check2, 3: check3, 4: check4,
-                             5: lambda a_, d_: check1(a_, d_, "restart"), 6: lambda a_, d_: check1(a_, d_, "backstop")}[n](a, pathlib.Path(d)))
+                             5: lambda a_, d_: check1(a_, d_, "restart"), 6: lambda a_, d_: check1(a_, d_, "backstop"),
+                             7: check7, 8: check8}[n](a, pathlib.Path(d)))
             except Exception as e:
                 check(f"check {n} raised: {type(e).__name__}: {str(e)[:400]}", False)
     print(f"  · logs: /tmp/zb_rr<check>_*.log; {'FAILED ' + str(failed) + ' check(s)' if failed else 'clean'}")

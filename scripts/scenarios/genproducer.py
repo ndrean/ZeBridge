@@ -6,7 +6,7 @@ scenario proves the bridge runs it, delta chain included. A probe bridge starts 
 `GENERATION_RULES=users:_default` at the minimum cadence and chain depth 3, and the
 producer must:
 
-  1. build g1 unprompted: a full (`users-g1-full`), no delta (nothing to delta
+  1. build g1 unprompted: a full (`users-i<incarnation>-g1-full`), no delta (nothing to delta
      against), a manifest whose jump-in point is that full;
   2. SKIP while nothing changes — "limited cron queries" is a promise, not a mood;
   3. ship a touched row as a DELTA: `kind: "delta"`, exactly the changed row, its
@@ -197,7 +197,8 @@ async def main():
                 return 1
             nrows = int(zb.psql(f"SELECT count(*) FROM public.{TABLE}"))
             man = await manifest()
-            body = await obj_get(f"{TABLE}-g1-full")
+            g1_full = f"{TABLE}-i{man.get('incarnation', 0)}-g1-full"   # named per incarnation
+            body = await obj_get(g1_full)
             try:
                 doc = decode_chain(body)
             except ValueError as e:
@@ -207,7 +208,7 @@ async def main():
             # The fields that name the full; the entry may carry more (`sorted`: the rows are
             # in key order).
             full = man["full"]
-            if (full.get("gen"), full.get("object"), full.get("cutoff")) == (1, f"{TABLE}-g1-full", man["cutoff_version"]) \
+            if (full.get("gen"), full.get("object"), full.get("cutoff")) == (1, g1_full, man["cutoff_version"]) \
                     and man["deltas"] == [] and doc and doc["kind"] == "full" \
                     and len(doc["rows"]) == nrows and doc["gen"] == 1 \
                     and re.fullmatch(r"[0-9A-F]+/[0-9A-F]+", man["cutoff_lsn"]):
@@ -291,7 +292,7 @@ async def main():
             named = {man["full"]["object"], *(d["object"] for d in man.get("deltas", [])),
                      *(ck["object"] for ck in man.get("checkpoints", []))}
             still_named = [n for n in named
-                           if (m := re.match(rf"{TABLE}-g(\d+)-", n)) and int(m.group(1)) in retired]
+                           if (m := re.match(rf"{TABLE}-i\d+-g(\d+)-", n)) and int(m.group(1)) in retired]
             # ⚠️ NOT "exactly DEPTH generations" any more. Retention follows the chain's
             # LEVELS when checkpoints are on (§10gw): the newest base is kept, checkpoints
             # from it on, and deltas only above the newest checkpoint — so a small table
@@ -301,7 +302,7 @@ async def main():
             # fetchable.
             err = chain_ok(man)
             named_gens = sorted({int(m.group(1)) for n in named
-                                 if (m := re.match(rf"{TABLE}-g(\d+)-", n))})
+                                 if (m := re.match(rf"{TABLE}-i\d+-g(\d+)-", n))})
             if chain == named_gens and not still_named \
                     and err is None and await obj_get(man["full"]["object"]) is not None:
                 zb.ok(f"pruned by level: live gens={chain} are exactly the ones the manifest names, "

@@ -61,6 +61,13 @@ const c = c_imports.c;
 
 const log = std.log.scoped(.generation_producer);
 
+/// A chain object's name: `<table>-i<incarnation>-g<gen>-<kind>`. The incarnation keeps a
+/// recreated table's objects apart from its predecessor's — its generations restart at g1
+/// under the same table name — so a cleanup of the old chain can never delete the new.
+pub fn objName(alloc: std.mem.Allocator, table: []const u8, inc: i64, gen: i64, kind: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}-i{d}-g{d}-{s}", .{ table, inc, gen, kind });
+}
+
 pub const GenerationProducer = struct {
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
@@ -983,20 +990,23 @@ pub const GenerationProducer = struct {
         if (osm.openStore(bucket)) |*store_v| {
             var store = store_v.*;
             defer store.deinit();
-            const rows = try queryOne(bkc, "SELECT gen FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen", &pair);
+            const rows = try queryOne(bkc, "SELECT gen, incarnation FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen", &pair);
             defer c.PQclear(rows);
             const ng: usize = @intCast(c.PQntuples(rows));
             for (0..ng) |k| {
-                const g = std.mem.span(c.PQgetvalue(rows, @intCast(k), 0));
-                // "dict": eras cut before 2026-09-24 left a dictionary object per full;
-                // named here so a sweep of an old bucket takes them too.
-                for ([_][]const u8{ "delta", "full", "ckpt", "dict" }) |kind| {
-                    const name = try std.fmt.allocPrint(alloc, "{s}-g{s}-{s}", .{ table, g, kind });
-                    store.delete(name) catch |err| {
-                        if (err != error.ObjectNotFound) log.warn("🧬 sweep: could not delete {s}: {}", .{ name, err });
-                        continue;
+                const g = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(rows, @intCast(k), 0)), 10) catch continue;
+                const row_inc = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(rows, @intCast(k), 1)), 10) catch 0;
+                for ([_][]const u8{ "delta", "full", "ckpt" }) |kind| {
+                    // Each row's objects under the incarnation it was built in; a row from
+                    // before names carried one (0) also under the name it had then.
+                    const names = [_]?[]const u8{ try objName(alloc, table, row_inc, g, kind), if (row_inc == 0) try std.fmt.allocPrint(alloc, "{s}-g{d}-{s}", .{ table, g, kind }) else null };
+                    for (names) |nm| if (nm) |name| {
+                        store.delete(name) catch |err| {
+                            if (err != error.ObjectNotFound) log.warn("🧬 sweep: could not delete {s}: {}", .{ name, err });
+                            continue;
+                        };
+                        deleted += 1;
                     };
-                    deleted += 1;
                 }
             }
         } else |_| {}
@@ -1098,9 +1108,11 @@ pub const GenerationProducer = struct {
         // tolerance applies once) and the table's relfilenode at the last cut.
         var last_floor: ?[]const u8 = null;
         var last_filenode: ?[]const u8 = null;
+        // The incarnation the pair's last generation was built under (its objects' names).
+        var last_inc: i64 = 0;
         {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, row_count, del_count, seed_epoch, col_shape, relid::text, open_xact_floor::text, filenode::text FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &params);
+            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, row_count, del_count, seed_epoch, col_shape, relid::text, open_xact_floor::text, filenode::text, incarnation FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &params);
             defer c.PQclear(res);
             if (c.PQntuples(res) > 0) {
                 last_gen = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
@@ -1116,6 +1128,7 @@ pub const GenerationProducer = struct {
                 if (c.PQgetisnull(res, 0, 6) == 0) last_relid = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 6)));
                 if (c.PQgetisnull(res, 0, 7) == 0) last_floor = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 7)));
                 if (c.PQgetisnull(res, 0, 8) == 0) last_filenode = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 8)));
+                last_inc = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 9)), 10) catch 0;
             }
         }
         // §10dl: the table's OID now. Different from this pair's last generation's → the
@@ -1135,6 +1148,14 @@ pub const GenerationProducer = struct {
             break :blk try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0)));
         };
         if (last_gen != 0 and last_relid != null and cur_relid.len > 0 and !std.mem.eql(u8, last_relid.?, cur_relid)) {
+            // ZB_TEST_OBSERVE_SLEEP_MS (recreate_recovery.py check 7, fault builds only):
+            // the OID read above, the observation delayed past another recreate — it must
+            // then change nothing (zebridge_observe_incarnation applies fresh OIDs only).
+            if (comptime @import("build_options").test_faults) if (std.c.getenv("ZB_TEST_OBSERVE_SLEEP_MS")) |v| {
+                const ms = std.fmt.parseInt(i64, std.mem.span(v), 10) catch 0;
+                log.info("🧬 test: '{s}'/'{s}': observation of oid {s} held {d} ms", .{ tenant, table, cur_relid, ms });
+                if (ms > 0) std.Io.sleep(self.io, .fromMilliseconds(ms), .awake) catch {};
+            };
             const observed: []const u8 = blk: {
                 const cur_z = try alloc.dupeSentinel(u8, cur_relid, 0);
                 const params = [_]?[*:0]const u8{ table_z.ptr, cur_z.ptr };
@@ -1156,12 +1177,29 @@ pub const GenerationProducer = struct {
         // §10df: the catalogue's seed_epoch now. Different from the one the last
         // generation was built under → zebridge_reseed() ran → a FULL, whatever the
         // counts and versions say (a re-key or a volatile default moves neither).
-        const cat_epoch: i64 = blk: {
+        // …and the table's incarnation now: this build's objects are named with it.
+        const cat_epoch: i64, const inc: i64 = blk: {
             const p = [_]?[*:0]const u8{table_z.ptr};
-            const r = try queryOne(pgc, "SELECT seed_epoch FROM public.zebridge_catalogue WHERE tbl = $1", &p);
+            const r = try queryOne(pgc, "SELECT seed_epoch, incarnation FROM public.zebridge_catalogue WHERE tbl = $1", &p);
             defer c.PQclear(r);
-            break :blk if (c.PQntuples(r) > 0) (std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(r, 0, 0)), 10) catch 0) else 0;
+            if (c.PQntuples(r) == 0) break :blk .{ 0, 0 };
+            break :blk .{ std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(r, 0, 0)), 10) catch 0, std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(r, 0, 1)), 10) catch 0 };
         };
+        // A chain built under another incarnation (the OID check above covers a recreate it
+        // saw; this, one observed elsewhere first, and a chain from before objects carried
+        // the incarnation) is swept and restarted at g1 under this one.
+        if (last_gen != 0 and last_inc != inc) {
+            log.warn("🧬 '{s}'/'{s}': the chain since g{d} was built under incarnation {d}, the table is at {d} — sweeping this pair's chain, starting at g1", .{ tenant, table, last_gen, last_inc, inc });
+            self.sweepPair(alloc, bkc, js, tenant, table) catch |err| log.warn("🧬 sweep of the previous incarnation's chain failed: {}", .{err});
+            last_gen = 0;
+            last_cutoff = null;
+            last_row_count = null;
+            last_del_count = null;
+            last_epoch = 0;
+            last_col_shape = null;
+            last_floor = null;
+            last_filenode = null;
+        }
         {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
             const res = try queryOne(bkc, "SELECT gen FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_full AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &params);
@@ -1290,14 +1328,9 @@ pub const GenerationProducer = struct {
                                     if (man == .object) {
                                         if (man.object.get("full")) |f| if (f == .object) {
                                             if (f.object.get("object")) |o| if (o == .string) store0.delete(o.string) catch {};
-                                            if (f.object.get("gen")) |g| if (g == .integer) {
-                                                const dname = try std.fmt.allocPrint(alloc, "{s}-g{d}-dict", .{ table, g.integer });
-                                                store0.delete(dname) catch {};
-                                            };
                                         };
                                         if (man.object.get("deltas")) |ds| if (ds == .array) for (ds.array.items) |d| if (d == .object) {
                                             if (d.object.get("object")) |o| if (o == .string) store0.delete(o.string) catch {};
-                                            if (d.object.get("dict")) |o| if (o == .string) store0.delete(o.string) catch {};
                                         };
                                     }
                                 } else |_| {}
@@ -1728,7 +1761,7 @@ pub const GenerationProducer = struct {
             return err;
         };
         defer store.deinit();
-        const full_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-full", .{ table, gen });
+        const full_name = try objName(alloc, table, inc, gen, "full");
         var full_obj: ?FullObject = null;
         var full_rows: usize = 0;
         var widest_row: usize = 0;
@@ -1763,7 +1796,7 @@ pub const GenerationProducer = struct {
         var delta_rows: usize = 0;
         if (build_delta) {
             const sql = try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" >= {s}{s}", .{ cols_sel, table, vcol, lower_bound.?, order_by });
-            const delta_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-delta", .{ table, gen });
+            const delta_name = try objName(alloc, table, inc, gen, "delta");
             const t_q = utils.unixMillis();
             delta_obj = try putChainObject(alloc, self.allocator, pgc, &store, delta_name, sql, gen, cutoff_version, vcol, "delta", last_cutoff);
             delta_rows = delta_obj.?.rows;
@@ -1870,7 +1903,8 @@ pub const GenerationProducer = struct {
                 }
                 if (prev.len > 0) {
                     const sorted_frag: []const u8 = if (c.PQgetvalue(res, @intCast(i), 4)[0] == 't') ",\"sorted\":true" else "";
-                    const frag = try std.fmt.allocPrint(alloc, "{s}{{\"gen\":{s},\"object\":\"{s}-g{s}-delta\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\"{s}}}", .{ if (deltas_json.items.len > 0) "," else "", g, table, g, prev, cutoff, sorted_frag });
+                    const dname = try objName(alloc, table, inc, std.fmt.parseInt(i64, g, 10) catch 0, "delta");
+                    const frag = try std.fmt.allocPrint(alloc, "{s}{{\"gen\":{s},\"object\":\"{s}\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\"{s}}}", .{ if (deltas_json.items.len > 0) "," else "", g, dname, prev, cutoff, sorted_frag });
                     try deltas_json.appendSlice(alloc, frag);
                 }
             }
@@ -1881,7 +1915,7 @@ pub const GenerationProducer = struct {
             full_sorted_m = true;
         }
         if (build_delta) {
-            const frag = try std.fmt.allocPrint(alloc, "{s}{{\"gen\":{d},\"object\":\"{s}-g{d}-delta\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\",\"sorted\":true}}", .{ if (deltas_json.items.len > 0) "," else "", gen, table, gen, last_cutoff.?, cutoff_version });
+            const frag = try std.fmt.allocPrint(alloc, "{s}{{\"gen\":{d},\"object\":\"{s}\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\",\"sorted\":true}}", .{ if (deltas_json.items.len > 0) "," else "", gen, try objName(alloc, table, inc, gen, "delta"), last_cutoff.?, cutoff_version });
             try deltas_json.appendSlice(alloc, frag);
         }
 
@@ -1922,9 +1956,11 @@ pub const GenerationProducer = struct {
         // sweeper deletes physically (its reaps answered by the gc watermark). Stated only
         // then: elsewhere a physical delete leaves no trace in a delta.
         const deletes_frag: []const u8 = if (guarded) "\"deletes\":\"tombstoned\"," else "";
-        const manifest = try std.fmt.allocPrint(alloc, "{{\"gen\":{d},\"seed_epoch\":{d},\"bucket\":\"{s}\",{s}{s}{s}{s}\"cutoff_version\":\"{s}\",\"cutoff_lsn\":\"{s}\"," ++
+        // `incarnation`: the table's lifetime this chain describes — what a DROP's cleanup
+        // compares before it removes anything (event_processor.pruneDroppedTable).
+        const manifest = try std.fmt.allocPrint(alloc, "{{\"gen\":{d},\"seed_epoch\":{d},\"incarnation\":{d},\"bucket\":\"{s}\",{s}{s}{s}{s}\"cutoff_version\":\"{s}\",\"cutoff_lsn\":\"{s}\"," ++
             "\"version_column\":\"{s}\"," ++
-            "\"full\":{{\"gen\":{d},\"object\":\"{s}-g{d}-full\",\"cutoff\":\"{s}\"{s}}},\"checkpoints\":{s},\"deltas\":[{s}]}}", .{ gen, cat_epoch, bucket, seq_frag, shared_frag, gc_frag, deletes_frag, cutoff_version, lsn, vcol, full_gen_m, table, full_gen_m, full_cutoff_m, if (full_sorted_m) ",\"sorted\":true" else "", ckpts_json, deltas_json.items });
+            "\"full\":{{\"gen\":{d},\"object\":\"{s}\",\"cutoff\":\"{s}\"{s}}},\"checkpoints\":{s},\"deltas\":[{s}]}}", .{ gen, cat_epoch, inc, bucket, seq_frag, shared_frag, gc_frag, deletes_frag, cutoff_version, lsn, vcol, full_gen_m, try objName(alloc, table, inc, full_gen_m, "full"), full_cutoff_m, if (full_sorted_m) ",\"sorted\":true" else "", ckpts_json, deltas_json.items });
         _ = try kv.put(key, manifest, .{});
 
         // ── objects and manifest live: NOW the row becomes the producer's memory ──
@@ -1942,9 +1978,10 @@ pub const GenerationProducer = struct {
             const epoch_z = try utils.allocPrintZ(alloc, "{d}", .{cat_epoch});
             const shape_z = try alloc.dupeSentinel(u8, col_shape, 0);
             const relid_z: ?[*:0]const u8 = if (cur_relid.len > 0) (try alloc.dupeSentinel(u8, cur_relid, 0)).ptr else null;
-            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", count_z, del_z.ptr, epoch_z.ptr, shape_z.ptr, relid_z, floor_z, filenode_z, obj_bytes_z };
-            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, row_count, del_count, seed_epoch, col_shape, relid, open_xact_floor, filenode, obj_bytes, delta_sorted, full_sorted) " ++
-                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, $8::bigint, $9::bigint, $10::integer, $11, $12::oid, $13::timestamptz, $14::oid, $15::bigint, true, $7::boolean) " ++
+            const inc_z = try utils.allocPrintZ(alloc, "{d}", .{inc});
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", count_z, del_z.ptr, epoch_z.ptr, shape_z.ptr, relid_z, floor_z, filenode_z, obj_bytes_z, inc_z.ptr };
+            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, row_count, del_count, seed_epoch, col_shape, relid, open_xact_floor, filenode, obj_bytes, delta_sorted, full_sorted, incarnation) " ++
+                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, $8::bigint, $9::bigint, $10::integer, $11, $12::oid, $13::timestamptz, $14::oid, $15::bigint, true, $7::boolean, $16::bigint) " ++
                 "ON CONFLICT (tenant, tbl, gen) DO NOTHING", &params);
             c.PQclear(res);
         }
@@ -2211,12 +2248,13 @@ pub const GenerationProducer = struct {
         var epoch_l: []const u8 = "";
         var shape_l: []const u8 = "";
         var relid_l: []const u8 = "";
+        var inc_l: i64 = 0;
         {
             self.pairAcquire(tenant, table);
             defer self.pairRelease(tenant, table);
             {
                 const res = try queryOne(bkc, "SELECT gen, seed_epoch::text, COALESCE(col_shape, ''), COALESCE(relid::text, ''), " ++
-                    "COALESCE((SELECT max(gen) FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_full AND retired_at IS NULL), 0) " ++
+                    "COALESCE((SELECT max(gen) FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_full AND retired_at IS NULL), 0), incarnation " ++
                     "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &pair);
                 defer c.PQclear(res);
                 if (c.PQntuples(res) == 0) return;
@@ -2224,6 +2262,7 @@ pub const GenerationProducer = struct {
                 epoch_l = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 1)));
                 shape_l = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 2)));
                 relid_l = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 3)));
+                inc_l = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 5)), 10) catch 0;
                 const full_now = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 4)), 10) catch 0;
                 if (full_now >= gen_l) return; // the newest generation already carries a full
                 if (j.kind == .checkpoint) {
@@ -2315,7 +2354,7 @@ pub const GenerationProducer = struct {
             }
         }
         const kind_str: []const u8 = if (j.kind == .checkpoint) "checkpoint" else "full";
-        const obj_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-{s}", .{ table, gen_l, if (j.kind == .checkpoint) "ckpt" else "full" });
+        const obj_name = try objName(alloc, table, inc_l, gen_l, if (j.kind == .checkpoint) "ckpt" else "full");
         const sql = if (j.kind == .checkpoint) blk: {
             const lower_lit = try std.mem.replaceOwned(u8, alloc, ckpt_lower, "'", "''");
             break :blk try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" >= '{s}'::timestamptz{s}", .{ cols_sel, table, j.vcol, lower_lit, order_by });
@@ -2397,7 +2436,7 @@ pub const GenerationProducer = struct {
         var deltas: std.json.Array = .init(alloc);
         {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, (try utils.allocPrintZ(alloc, "{d}", .{keep_from})).ptr };
-            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, ''), delta_sorted " ++
+            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, ''), delta_sorted, incarnation " ++
                 "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen > $3 AND retired_at IS NULL ORDER BY gen", &params);
             defer c.PQclear(res);
             for (0..@as(usize, @intCast(c.PQntuples(res)))) |i| {
@@ -2406,7 +2445,8 @@ pub const GenerationProducer = struct {
                 const g = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, @intCast(i), 0)), 10) catch continue;
                 var d: std.json.ObjectMap = .empty;
                 try d.put(alloc, "gen", .{ .integer = g });
-                try d.put(alloc, "object", .{ .string = try std.fmt.allocPrint(alloc, "{s}-g{d}-delta", .{ table, g }) });
+                const row_inc = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, @intCast(i), 4)), 10) catch 0;
+                try d.put(alloc, "object", .{ .string = try objName(alloc, table, row_inc, g, "delta") });
                 try d.put(alloc, "prev_cutoff", .{ .string = try alloc.dupe(u8, prev) });
                 try d.put(alloc, "cutoff", .{ .string = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 1))) });
                 if (c.PQgetvalue(res, @intCast(i), 3)[0] == 't') try d.put(alloc, "sorted", .{ .bool = true });
@@ -2414,6 +2454,13 @@ pub const GenerationProducer = struct {
             }
         }
         var root = man.object;
+        // The manifest read must still be this lane's chain: another incarnation's (the
+        // table re-created while the full was built) is left alone.
+        const man_inc: i64 = if (root.get("incarnation")) |v| (if (v == .integer) v.integer else 0) else 0;
+        if (man_inc != inc_l) {
+            log.info("🧬 '{s}'/'{s}': background {s} for g{d} dropped — the manifest is incarnation {d}'s now, this full was built under {d}", .{ tenant, table, kind_str, gen_l, man_inc, inc_l });
+            return;
+        }
         if (j.kind == .full) {
             var full_obj: std.json.ObjectMap = .empty;
             try full_obj.put(alloc, "gen", .{ .integer = gen_l });
@@ -2429,7 +2476,12 @@ pub const GenerationProducer = struct {
         try root.put(alloc, "deltas", .{ .array = deltas });
         var out: std.Io.Writer.Allocating = .init(alloc);
         try std.json.Stringify.value(std.json.Value{ .object = root }, .{}, &out.writer);
-        _ = try kv.put(key, out.written(), .{});
+        // Only over the manifest read: a newer one published meanwhile (the next build, a
+        // new incarnation) wins, and the next build lists this full from its row anyway.
+        _ = kv.update(key, out.written(), entry.revision) catch |err| {
+            log.info("🧬 '{s}'/'{s}': background {s} for g{d} not attached — the manifest moved since it was read ({}); the next build lists it", .{ tenant, table, kind_str, gen_l, err });
+            return;
+        };
 
         const total_ms = utils.unixMillis() - started_ms;
         self.recordFullBuild(tenant, table, total_ms);
@@ -2942,19 +2994,23 @@ fn pruneChain(alloc: std.mem.Allocator, bkc: *c.PGconn, store: anytype, tenant_z
         "AND (retired_at < now() - ($3 || ' seconds')::interval " ++
         "     OR retired_at NOT IN (SELECT DISTINCT retired_at FROM public.zebridge_generations " ++
         "                           WHERE tenant=$1 AND tbl=$2 AND retired_at IS NOT NULL ORDER BY retired_at DESC LIMIT $4)) " ++
-        "RETURNING gen", &params);
+        "RETURNING gen, incarnation", &params);
     defer c.PQclear(res);
     const pruned: usize = @intCast(c.PQntuples(res));
     if (pruned == 0) return;
     for (0..pruned) |i| {
-        const g = std.mem.span(c.PQgetvalue(res, @intCast(i), 0));
+        const g = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, @intCast(i), 0)), 10) catch continue;
+        const row_inc = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, @intCast(i), 1)), 10) catch 0;
         // §10gu: "ckpt" among them — a pruned checkpoint's object was left in the store
-        // for ever, since only the delta and the full were ever named here. "dict": the
-        // dictionary object eras cut before 2026-09-24 kept per full — gone with its row.
-        for ([_][]const u8{ "delta", "full", "ckpt", "dict" }) |kind| {
-            const old_name = try std.fmt.allocPrint(alloc, "{s}-g{s}-{s}", .{ table, g, kind });
-            store.delete(old_name) catch |err| {
-                if (err != error.ObjectNotFound) log.warn("🧬 could not delete pruned object {s}: {}", .{ old_name, err });
+        // for ever, since only the delta and the full were ever named here. Each under
+        // the incarnation its row was built in; a row from before names carried one (0)
+        // also under the name it had then.
+        for ([_][]const u8{ "delta", "full", "ckpt" }) |kind| {
+            const names = [_]?[]const u8{ try objName(alloc, table, row_inc, g, kind), if (row_inc == 0) try std.fmt.allocPrint(alloc, "{s}-g{d}-{s}", .{ table, g, kind }) else null };
+            for (names) |nm| if (nm) |old_name| {
+                store.delete(old_name) catch |err| {
+                    if (err != error.ObjectNotFound) log.warn("🧬 could not delete pruned object {s}: {}", .{ old_name, err });
+                };
             };
         }
     }
@@ -2967,14 +3023,15 @@ fn checkpointsJson(alloc: std.mem.Allocator, bkc: *c.PGconn, table: []const u8, 
     var out: std.json.Array = .init(alloc);
     const gen_z = try utils.allocPrintZ(alloc, "{d}", .{full_gen});
     const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_z.ptr };
-    const res = GenerationProducer.queryOnePub(bkc, "SELECT gen, cutoff_version::text, COALESCE(ckpt_lower::text, ''), ckpt_sorted " ++
+    const res = GenerationProducer.queryOnePub(bkc, "SELECT gen, cutoff_version::text, COALESCE(ckpt_lower::text, ''), ckpt_sorted, incarnation " ++
         "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_checkpoint AND retired_at IS NULL AND gen > $3 ORDER BY gen", &params) catch return out;
     defer c.PQclear(res);
     for (0..@as(usize, @intCast(c.PQntuples(res)))) |i| {
         const g = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, @intCast(i), 0)), 10) catch continue;
         var ck: std.json.ObjectMap = .empty;
         try ck.put(alloc, "gen", .{ .integer = g });
-        try ck.put(alloc, "object", .{ .string = try std.fmt.allocPrint(alloc, "{s}-g{d}-ckpt", .{ table, g }) });
+        const row_inc = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, @intCast(i), 4)), 10) catch 0;
+        try ck.put(alloc, "object", .{ .string = try objName(alloc, table, row_inc, g, "ckpt") });
         try ck.put(alloc, "lower", .{ .string = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 2))) });
         try ck.put(alloc, "cutoff", .{ .string = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 1))) });
         if (c.PQgetvalue(res, @intCast(i), 3)[0] == 't') try ck.put(alloc, "sorted", .{ .bool = true });

@@ -74,6 +74,7 @@ def teardown_db(principals):
     zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{T}'", quiet=True)
     zb.psql(f"DELETE FROM public.zebridge_generations WHERE tbl = '{T}'", quiet=True)
     zb.psql(f"DROP PUBLICATION IF EXISTS {PUB}", quiet=True)
+    zb.psql(f"DELETE FROM public.zebridge_limits WHERE slot = '{SLOT}'", quiet=True)   # the instance's registration too
     for p in principals:
         for t in ("zebridge_principal_keys", "zebridge_invites", "zebridge_user_tenants"):
             zb.psql(f"DELETE FROM public.{t} WHERE principal = '{p}'", quiet=True)

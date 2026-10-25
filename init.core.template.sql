@@ -427,6 +427,13 @@ GRANT EXECUTE ON FUNCTION public.zebridge_reseed(regclass) TO ${POSTGRES_READER_
 --                  three pairs, recreate_recovery.py check 1).
 -- A table not catalogued is not observed. The first observation of a catalogued table
 -- records it without a re-seed (no replica can hold another incarnation of it).
+-- Fresh observations only: an OID is applied only while it IS the live table's, read
+-- after the row lock (so a recreate that held the lock is committed and visible). A
+-- caller that read the OID earlier — the producer reads it, then calls — and lost a race
+-- with another recreate supplies a stale OID: it changes nothing. Without this a delayed
+-- observation of an earlier OID moved the incarnation again, bumped the epoch again and
+-- recorded an OID that was no longer the table's. Likewise NULL (a DROP) applies only
+-- while no table of the name exists.
 CREATE OR REPLACE FUNCTION public.zebridge_observe_incarnation(p_tbl text, p_relid oid)
 RETURNS TABLE (incarnation bigint, changed boolean) AS $$
 DECLARE
@@ -434,10 +441,16 @@ DECLARE
     prev_inc   bigint;
     now_inc    bigint;
     reseed     boolean;
+    live       oid;
 BEGIN
     SELECT c.incarnation_relid, c.incarnation INTO prev_relid, prev_inc
       FROM public.zebridge_catalogue c WHERE c.tbl = p_tbl FOR UPDATE;
     IF NOT FOUND THEN
+        RETURN;
+    END IF;
+    live := to_regclass(format('%I.%I', 'public', p_tbl))::oid;
+    IF p_relid IS DISTINCT FROM live THEN
+        RETURN QUERY SELECT prev_inc, false;
         RETURN;
     END IF;
     IF p_relid IS NULL THEN
@@ -665,6 +678,9 @@ CREATE TABLE IF NOT EXISTS public.zebridge_ddl_events (
     schema_def JSONB,
     emitted_at TIMESTAMPTZ DEFAULT NOW()
 );
+-- A DROP TABLE row: the incarnation that DROP ended (NULL: not catalogued). The bridge's
+-- cleanup removes only chains of that incarnation or older, never a later one's.
+ALTER TABLE public.zebridge_ddl_events ADD COLUMN IF NOT EXISTS incarnation bigint;
 
 -- Backfill for databases initialised before schema_def existed
 ALTER TABLE public.zebridge_ddl_events ADD COLUMN IF NOT EXISTS schema_def JSONB;
@@ -805,6 +821,10 @@ CREATE TABLE IF NOT EXISTS public.zebridge_generations (
     relid          oid,
     PRIMARY KEY (tenant, tbl, gen)
 );
+-- The incarnation this generation was built under: chain objects are named with it
+-- (`<table>-i<incarnation>-g<gen>-<kind>`), so a recreated table's g1 never shares a
+-- name with its predecessor's, and whoever deletes an old chain cannot hit the new one.
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS incarnation bigint NOT NULL DEFAULT 0;
 -- 2026-09-24: the per-era compression dictionary is gone (NOTES §10iy). Measured on the
 -- 668 MB test_types full: 53% smaller at 4 KB, 3% from 64 KB up — for a training pass,
 -- five columns here, an object per era, and a decoder a phone did not have. Every
@@ -1354,6 +1374,7 @@ RETURNS event_trigger AS $$
 DECLARE
     obj record;
     tbl text;
+    dropped_inc bigint;
 BEGIN
     FOR obj IN SELECT * FROM pg_event_trigger_dropped_objects()
     LOOP
@@ -1364,9 +1385,13 @@ BEGIN
                 -- schema_def is NULL rather than '{"columns":[]}': the table is gone,
                 -- so there is no schema to state. The bridge treats a DROP TABLE tag
                 -- as "forget this table" and never reads schema_def for it.
+                -- Through EXECUTE: `tbl` is this function's variable AND the catalogue's
+                -- column, and plpgsql refuses the ambiguity at run time.
+                EXECUTE format('SELECT incarnation FROM public.zebridge_catalogue WHERE tbl = %L', tbl)
+                    INTO dropped_inc;
                 INSERT INTO public.zebridge_ddl_events
-                       (schema_name, table_name, command_tag, schema_def)
-                VALUES ('public', tbl, 'DROP TABLE', NULL);
+                       (schema_name, table_name, command_tag, schema_def, incarnation)
+                VALUES ('public', tbl, 'DROP TABLE', NULL, dropped_inc);
                 -- The incarnation ends here, in the DROP's transaction: a later CREATE
                 -- under the name is a new one even if PostgreSQL reuses the OID.
                 BEGIN

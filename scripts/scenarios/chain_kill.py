@@ -91,12 +91,13 @@ def check_invariants(label: str) -> list:
             problems.append(f"{label}: the manifest (g{man.get('gen')}) names {len(dangling)} object(s) that do "
                             f"NOT exist: {sorted(dangling)[:3]} — every fresh client fails to seed")
     rows = zb.psql(
-        f"SELECT gen || ' ' || has_full "
+        f"SELECT gen || ' ' || has_full || ' - ' || incarnation "
         f"FROM public.zebridge_generations WHERE tenant = '{TENANT}' AND tbl = '{TABLE}' ORDER BY gen")
     present = objects_in_bucket()
     for line in [r for r in rows.splitlines() if r.strip()]:
-        gen, has_full, dict_obj = (line.split() + ["-", "-"])[:3]
-        wanted = {f"{TABLE}-g{gen}-delta"} if has_full in ("f", "false") else {f"{TABLE}-g{gen}-full"}
+        gen, has_full, dict_obj, inc = (line.split() + ["-", "-", "0"])[:4]
+        # Objects are named per incarnation: `<table>-i<incarnation>-g<gen>-<kind>`.
+        wanted = {f"{TABLE}-i{inc}-g{gen}-delta"} if has_full in ("f", "false") else {f"{TABLE}-i{inc}-g{gen}-full"}
         if dict_obj not in ("-", ""):
             wanted.add(dict_obj)
         missing = {w for w in wanted if w not in present}

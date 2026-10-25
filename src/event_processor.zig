@@ -1229,7 +1229,13 @@ pub const EventProcessor = struct {
         return lifted;
     }
 
-    fn pruneDroppedTable(self: *EventProcessor, arena: std.mem.Allocator, table: []const u8) void {
+    /// `dropped_inc`: the incarnation the DROP ended (its event row says; NULL there — not
+    /// catalogued — is 0). null: no bound — the boot reconcile, for a table that no longer
+    /// exists at all. A chain of a LATER incarnation is never touched: the cleanup reads a
+    /// manifest, keeps it if its incarnation is newer, deletes the objects it names (named
+    /// per incarnation, so never a later chain's), and purges the key only at the revision
+    /// it read — a replacement published in between survives the purge.
+    fn pruneDroppedTable(self: *EventProcessor, arena: std.mem.Allocator, table: []const u8, dropped_inc: ?i64) void {
         const publ = self.publisher orelse return;
         const js = if (publ.js) |*j| j else return;
 
@@ -1239,11 +1245,7 @@ pub const EventProcessor = struct {
         var purges: usize = 0;
         var objects: usize = 0;
         var keys: usize = 0;
-        // Asked now, not as of the DROP's LSN, on purpose: what matters is whether a
-        // later incarnation exists by the time its chains could be pruned. Unanswerable
-        // (no connection): assumed to exist — a ghost chain the producer sweeps later is
-        // harmless, a deleted live one is the bug this guards.
-        const later_incarnation = self.tableExistsNow(arena, table) orelse true;
+        var kept: usize = 0;
 
         // One tenant's worth of artifacts. `null` stream names mean "the public
         // pair" (open-tenant rows and untenanted rows both land there).
@@ -1287,15 +1289,6 @@ pub const EventProcessor = struct {
 
             const key = std.fmt.allocPrint(arena, "{s}.{s}", .{ step.tenant, table }) catch return;
 
-            // A table under this name NOW is a later incarnation (the DROP removed this
-            // one): the chains may already be ITS — a bridge restarted after the recreate
-            // built them at its boot tick, before the replay reached this DROP, and
-            // pruning them left every pair without a chain until the cadence (120 s,
-            // recreate_recovery.py check 5). The old incarnation's chain is the
-            // producer's to sweep: its per-pair OID check does. The CDC purge above
-            // stands — in WAL order this DROP precedes every message of the new table.
-            if (later_incarnation) continue;
-
             // ── chain objects, manifest-driven, THEN the manifest ────────────
             // The manifest is the only pointer to the object names, so it is read
             // first and purged last — the reverse of the producer's swap order.
@@ -1305,32 +1298,57 @@ pub const EventProcessor = struct {
                 if (kv.get(key)) |entry_const| {
                     var entry = entry_const;
                     defer entry.deinit();
+                    // A later incarnation's chain — a bridge restarted after the recreate
+                    // built it at its boot tick before the replay reached this DROP, or the
+                    // producer published it while this ran — is not this DROP's to remove.
+                    const man_inc = manifestIncarnation(arena, entry.value);
+                    if (dropped_inc) |d| if (man_inc > d) {
+                        kept += 1;
+                        continue;
+                    };
+                    // ZB_TEST_PRUNE_SLEEP_MS (recreate_recovery.py check 8, fault builds only):
+                    // held between the manifest's read and its removal, while the test
+                    // re-creates the table and the producer publishes the new chain.
+                    if (comptime @import("build_options").test_faults) if (std.c.getenv("ZB_TEST_PRUNE_SLEEP_MS")) |v| {
+                        const ms = std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0;
+                        log.info("🧹 test: prune of '{s}' held {d} ms after reading {s} (incarnation {d})", .{ table, ms, key, man_inc });
+                        utils.sleep(ms * std.time.ns_per_ms);
+                    };
                     objects += self.deleteChainObjects(arena, js, entry.value);
+                    if (purgeKeyAt(arena, js, &kv, key, entry.revision)) {
+                        keys += 1;
+                    } else |err| {
+                        // Not at the revision read: a newer manifest stands — leave it.
+                        log.info("🧹 prune '{s}': {s} moved since it was read ({s}) — the newer manifest stays", .{ table, key, @errorName(err) });
+                        kept += 1;
+                    }
                 } else |_| {} // no manifest — nothing to point at
-                if (kv.purge(key, .{})) |_| {
-                    keys += 1;
-                } else |err| log.warn("🧹 prune '{s}': generations purge of {s} failed: {s}", .{ table, key, @errorName(err) });
             } else |err| log.warn("🧹 prune '{s}': generations bucket unreachable: {s}", .{ table, @errorName(err) });
         }
 
-        if (later_incarnation)
-            log.info("🧹 drop prune for '{s}': {d} stream purge(s); its chains left — a later incarnation exists, and the producer sweeps the old chain", .{ table, purges })
-        else
-            log.info("🧹 drop prune for '{s}': {d} stream purge(s), {d} chain object(s), {d} KV key(s)", .{ table, purges, objects, keys });
+        log.info("🧹 drop prune for '{s}' (incarnation {?d}): {d} stream purge(s), {d} chain object(s), {d} KV key(s); {d} later chain(s) left", .{ table, dropped_inc, purges, objects, keys, kept });
     }
 
-    /// Does `public.<table>` exist right now? null when the question cannot be asked.
-    fn tableExistsNow(self: *EventProcessor, arena: std.mem.Allocator, table: []const u8) ?bool {
-        var standard_pg_config = self.pg_config.*;
-        standard_pg_config.replication = false;
-        const conn = pg_conn.connect(arena, standard_pg_config) catch return null;
-        defer c.PQfinish(conn);
-        const t_z = arena.dupeSentinel(u8, table, 0) catch return null;
-        const params = [_]?[*:0]const u8{t_z.ptr};
-        const res = c.PQexecParams(conn, "SELECT (to_regclass(format('%I.%I', 'public', $1::text)) IS NOT NULL)::text", 1, null, &params, null, null, 0);
-        defer c.PQclear(res);
-        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) return null;
-        return std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, 0, 0)), "true");
+    /// A manifest's `incarnation` (0 when it has none: a chain from before the field).
+    fn manifestIncarnation(arena: std.mem.Allocator, bytes: []const u8) i64 {
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch return 0;
+        if (v != .object) return 0;
+        const i = v.object.get("incarnation") orelse return 0;
+        return if (i == .integer) i.integer else 0;
+    }
+
+    /// Purge a KV key only if its last revision is still `revision` — a compare-and-set
+    /// (KV's own purge has none): the PURGE is published with the expected last subject
+    /// sequence, and the server refuses it once anything newer was written to the key.
+    fn purgeKeyAt(arena: std.mem.Allocator, js: anytype, kv: anytype, key: []const u8, revision: u64) !void {
+        const subject = try std.fmt.allocPrint(arena, "{s}{s}", .{ kv.subject_prefix, key });
+        const msg = try js.nc.newMsg();
+        defer msg.deinit();
+        try msg.setSubject(subject, true);
+        try msg.headerSet("KV-Operation", "PURGE");
+        try msg.headerSet("Nats-Rollup", "sub");
+        const result = try js.publishMsg(msg, .{ .expected_last_subject_seq = revision });
+        result.deinit();
     }
 
     /// Delete every object a chain manifest names. Returns how many went.
@@ -1534,11 +1552,20 @@ pub const EventProcessor = struct {
         var target_table: ?[]const u8 = null;
         var command_tag: ?[]const u8 = null;
         var schema_def: ?[]const u8 = null;
+        // A DROP's row: the incarnation it ended (NULL — not catalogued — reads as 0).
+        var dropped_inc: i64 = 0;
         for (decoded.items) |col| {
             if (std.mem.eql(u8, col.name, "table_name")) {
                 if (col.value == .text) target_table = col.value.text;
             } else if (std.mem.eql(u8, col.name, "command_tag")) {
                 if (col.value == .text) command_tag = col.value.text;
+            } else if (std.mem.eql(u8, col.name, "incarnation")) {
+                dropped_inc = switch (col.value) {
+                    .int64 => |v| v,
+                    .int32 => |v| v,
+                    .text, .numeric => |t| std.fmt.parseInt(i64, t, 10) catch 0,
+                    else => 0,
+                };
             } else if (std.mem.eql(u8, col.name, "schema_def")) {
                 // JSONB decodes to .jsonb; tolerate .text in case the column type
                 // is ever changed to json/text.
@@ -1608,7 +1635,7 @@ pub const EventProcessor = struct {
 
                 // The tombstone tells clients the table died; this clears what the
                 // tombstone cannot reach — the ghosts a FRESH client would seed from.
-                self.pruneDroppedTable(arena, clean_table);
+                self.pruneDroppedTable(arena, clean_table, dropped_inc);
 
                 log.info("🗑️  DROP TABLE tombstone published for '{s}'", .{clean_table});
                 return slot_idx;
@@ -2449,7 +2476,7 @@ pub const EventProcessor = struct {
             };
             try self.releaseSlotToQueue(slot_idx);
             self.refused.clear(key);
-            self.pruneDroppedTable(arena, key);
+            self.pruneDroppedTable(arena, key, null);
             tombstoned += 1;
             log.info("🗑️ '{s}' is in $KV.{s} but no longer in PostgreSQL — tombstone published, chain and streams pruned", .{ key, self.topology.kv_schemas });
         }
