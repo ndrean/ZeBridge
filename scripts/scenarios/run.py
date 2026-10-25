@@ -54,6 +54,7 @@ GROUPS = {
         "diagnose":      ("none",   "bridge --diagnose: the pre-run doctor says everything, changes nothing"),
         "revoke":        ("bridge", "deleting a principal's mapping purges its $KV.tenants key live"),
         "init_nats":     ("none",   "bridge --init-nats: the whole NATS stack generated, then BOOTED and proven"),
+        "incarnation_migration": ("none", "disposable PostgreSQL: zebridge_incarnations fresh, upgraded from the catalogue's columns, re-applied, re-enabled without resetting identity; grants and publication wiring"),
         "leaf_tenants": ("none", "disposable PostgreSQL: leaf namespaces and explicit tenant lists, refused cross-scope invites, membership changes and policy escalation"),
         "leaf_trust": ("none", "disposable hub and supervised leaf: signed trust refresh, revocation, signing-key rotation, rollback rejection and stale-feed recovery"),
         "leaf_security": ("none",   "disposable Docker hub and leaf: link credentials cannot connect as clients or administer streams; loopback keeper cannot connect directly to the hub; local mirror creation, replication and deletion work"),

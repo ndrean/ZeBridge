@@ -109,8 +109,21 @@ def main() -> int:
         zb.ok(f"a shared row ({open_tenant}) was written and the {tenant} chain captured it "
               "— the chain carries both kinds, because the producer reads under zb_reader_all")
 
-        # ── 3. retention on CDC_PUBLIC, made instant ─────────────────────────
+        # The chain must also COVER what the purge removes: its shared cut is read before
+        # its snapshot (overlap, never gap), so a chain can hold the shared row while its
+        # cut is still below the row's own event — then it cannot splice after the purge,
+        # the client rightly waits for a newer one, and the run failed on the timing of the
+        # cut alone (2026-10-25). Wait for a cut at the head, then purge to it.
         head = stream_state()["last_seq"]
+        while time.monotonic() < deadline + cadence:
+            m = json.loads(zb.kv_get("generations", f"{tenant}.{TABLE}") or "{}")
+            if (m.get("shared_cutoff_seq") or 0) >= head - 1:
+                break
+            time.sleep(3)
+        else:
+            zb.bad(f"no {tenant} chain with a shared cut at the head ({head}) within a cadence"); return 1
+
+        # ── 3. retention on CDC_PUBLIC, made instant ─────────────────────────
         r = zb.nats_cli("stream", "purge", public, "--seq", str(head), "-f")
         if r.returncode != 0:
             zb.bad(f"purge refused: {r.stderr.strip()[:120]} (run as the bridge)"); return 1
