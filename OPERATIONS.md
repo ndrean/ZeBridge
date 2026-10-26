@@ -583,6 +583,12 @@ DATABASE_WRITER_URL=xxx bridge_sweeper [--once]
 
 💡 `--once` runs a single pass and exits.
 
+**One active sweeper per database.** GC is one promise about the database's history, so one process keeps it. The sweeper holds a session-level advisory lock on its working connection and idles without it: a second sweeper (another bridge's, a forgotten cron) logs `another sweeper holds the database's sweeper lock` and asks again every pass; `--once` says so and exits 2. The lock goes with the connection, so a dropped or reset session stops the sweeping until the lock is held again, and a standby takes over within a pass or two. Connect the sweeper **straight to PostgreSQL**, not through a transaction-pooling proxy (a pooler that swaps the server session under a session lock defeats it; the sweeper asks `pg_locks` at every pass and idles if it no longer holds). Use TCP keepalives, or `idle_session_timeout`, on the server if a dead sweeper's session could linger on a half-open connection.
+
+**The floor never goes down, and moves before anything is reaped.** Each pass first advances `zebridge_gc_watermark` to `now() − GC_THRESHOLD_MS` (never backwards), then reaps strictly before the cutoff that call returned, then reports the count. At every committed state what has been reaped is older than the advertised floor. A longer `GC_THRESHOLD_MS` than before (30 days to 180) leaves the floor where it is: deleted history does not come back; the floor starts moving again when time catches up. The database enforces it (a trigger refuses a lower value, a `DELETE` and a `TRUNCATE`), and the bridge's mutation guard reads the same row inside each write's transaction, so every bridge enforces one floor. The contract is in [PROTOCOL §7.5](PROTOCOL.md#where-the-watermark-is-zebridge_gc_watermark).
+
+Upgrading: re-apply `init.core` and `init.write` (the functions the sweeper and the bridge call are in them). Until `zebridge_gc_floor_acquire()` exists the bridge refuses writes with `GcFloorUnavailable` rather than let them through unchecked.
+
 It reaps tombstone _families_ in order, children first, in batches of `GC_BATCH_ROWS` (1000), so a million expired tombstones is a thousand small deletes, never one transaction.
 
 **Why this**? This garbage collector is standard practice and needed to keep Postgres in sync with replicas, because LOCAL deletes are HARD deletes, but they are **propagated back as soft-deletes** via an `UPDATE SET tombstone ...` by the daemon.

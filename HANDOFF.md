@@ -1,4 +1,4 @@
-# Handoff — where the recovery work stands (2026-10-26)
+# Handoff — where the recovery work stands (2026-10-27)
 
 A snapshot for whoever (person or LLM session) picks the work up next. It is a log of a moment, not a
 contract: the contracts are in `NOTES.md`, `GENERATION.md`, `LEAF_NODES.md`; the working rules in `CLAUDE.md`.
@@ -6,7 +6,7 @@ Delete this file once the open items below are closed.
 
 ## State of `main`
 
-`main` is at `974b38d` (PR #14 merged). Everything done so far is on it; no increment branch is open (PR #14, the last, is merged).
+`main` is at `b134a28` (PR #17 merged) plus whatever the open increment below has. Everything listed is on `main`.
 
 | # | Increment | PR |
 |---|---|---|
@@ -19,10 +19,18 @@ Delete this file once the open items below are closed.
 | — | `CLAUDE.md` | #12 |
 | — | Every full is destructive: owed record + cleared anchor before the first chunk; leaf refusals fall back to the hub | #13 |
 | — | nats.zig becomes a fork submodule | #14 |
+| — | A plain full is decided again before its first chunk (CDC overtaking the download); the chain waits survive a throwing attempt | #16 |
+| — | The shared route is judged on its own cut (a full is a fence when CDC_PUBLIC alone is past its cut) | #17 |
 
-**Not started: 5. multi-bridge GC isolation.** Outstanding proof obligations (not yet turned into scenarios):
-snapshot boundaries / overlap replay, pending writes across a recreate, clients connecting before tenant
-mappings arrive.
+**5. GC floor (branch `gc-watermark-isolation`, PR to be opened):** decided with the maintainer — one database-wide
+retention policy, one lock-enforced sweeper, a floor that never decreases (enforced in the database), advance-then-reap, and
+the floor read under a shared lock inside each write's transaction. NOTES "One floor, one sweeper" is the record;
+`gc_isolation.py` the acceptance gate. Per-publication floors were rejected (publications overlap); independent retention
+would be per-table floors, not built. Scenarios that run `bridge_sweeper --once` need no sweeper daemon on the same database.
+
+Outstanding proof obligations (not yet turned into scenarios): snapshot boundaries / overlap replay, pending writes across
+a recreate, clients connecting before tenant mappings arrive. Also not live-tested: the ordering "own route behind its cut,
+shared route past its" (unit tests only, #17) and a download paused while CDC advances (unit test only, #16).
 
 ## The nats.zig fork (resolved 2026-10-26)
 

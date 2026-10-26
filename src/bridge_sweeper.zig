@@ -1,6 +1,10 @@
 //! The tombstone GC sidecar. Sweeps every table whose `zebridge_catalogue` row
-//! declares a `tombstone_col`, reaping tombstones
-//! older than `GC_THRESHOLD_MS`, then publishes the watermark.
+//! declares a `tombstone_col`, reaping tombstones older than `GC_THRESHOLD_MS`.
+//!
+//! One policy, one owner, one floor per database (NOTES "One floor, one sweeper"): the sweeper
+//! holds a session-level advisory lock and idles without it; each pass FIRST advances the
+//! watermark (the floor, which the database never lets decrease), THEN reaps before the cutoff
+//! that call returned, then reports the count. Bridges never write the floor; they all read it.
 //!
 //! `SWEEP_ONLY_TABLES` (comma list) narrows one run to the named tables — a SCOPED
 //! run for tests (`scripts/scenarios/sweeper.py` sets it to its own fixture so a test
@@ -57,6 +61,14 @@ fn levelFrom(raw: ?[]const u8) std.log.Level {
 }
 
 const Sweep = struct { table: []const u8, tombstone: []const u8 };
+
+/// One `SELECT <function>()` that answers a boolean; null when the statement failed.
+fn queryBool(conn: *c.PGconn, sql: [*:0]const u8) ?bool {
+    const res = c.PQexec(conn, sql);
+    defer c.PQclear(res);
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) return null;
+    return c.PQgetvalue(res, 0, 0)[0] == 't';
+}
 
 fn freeSweeps(a: std.mem.Allocator, list: *std.ArrayList(Sweep)) void {
     for (list.items) |sw| {
@@ -145,7 +157,9 @@ const usage =
     \\Usage: bridge_sweeper [--once]
     \\
     \\The tombstone GC sidecar: reaps tombstones older than GC_THRESHOLD_MS from every
-    \\table the catalogue declares a tombstone column for, then publishes the watermark.
+    \\table the catalogue declares a tombstone column for, after advancing the watermark (the
+    \\floor, which never decreases). One active sweeper per database: it holds an advisory
+    \\lock on its connection, and idles (--once: exits 2) while another sweeper holds it.
     \\
     \\  --once     one pass, then exit (a controlled run: check, sweep, check)
     \\  --help     this text
@@ -378,10 +392,13 @@ pub fn main(init: std.process.Init) !void {
             for (swps, 0..) |sw, i| {
                 const stmt_name = try utils.allocPrintZ(a, "gc_sweep_{d}", .{i});
                 defer a.free(stmt_name);
+                // A dry run counts against the retention boundary now. A real sweep reaps exactly
+                // before the cutoff `zebridge_gc_advance` returned: the floor is already committed
+                // at or past it, so nothing is ever reaped that the advertised floor does not cover.
                 const sql = if (drun)
                     try utils.allocPrintZ(a, "SELECT count(*) FROM \"{s}\" WHERE \"{s}\" IS NOT NULL AND \"{s}\"::timestamptz < now() - make_interval(secs => $1::double precision);", .{ sw.table, sw.tombstone, sw.tombstone })
                 else
-                    try utils.allocPrintZ(a, "DELETE FROM \"{s}\" WHERE ctid IN (SELECT ctid FROM \"{s}\" WHERE \"{s}\" IS NOT NULL AND \"{s}\"::timestamptz < now() - make_interval(secs => $1::double precision) LIMIT $2::integer);", .{ sw.table, sw.table, sw.tombstone, sw.tombstone });
+                    try utils.allocPrintZ(a, "DELETE FROM \"{s}\" WHERE ctid IN (SELECT ctid FROM \"{s}\" WHERE \"{s}\" IS NOT NULL AND \"{s}\"::timestamptz < $1::timestamptz LIMIT $2::integer);", .{ sw.table, sw.table, sw.tombstone, sw.tombstone });
                 defer a.free(sql);
                 const res = c.PQprepare(conn, stmt_name.ptr, sql.ptr, if (drun) 1 else 2, null);
                 defer c.PQclear(res);
@@ -390,9 +407,14 @@ pub fn main(init: std.process.Init) !void {
                     return error.PrepareFailed;
                 }
             }
-            const wm_res = c.PQprepare(conn, "gc_watermark_update", "UPDATE public.zebridge_gc_watermark SET watermark = now() - make_interval(secs => $1::double precision), threshold_ms = $2::bigint, reaped = $3::bigint, swept_at = now(), updated_at = now() WHERE id = 1", 3, null);
-            defer c.PQclear(wm_res);
-            if (c.PQresultStatus(wm_res) != c.PGRES_COMMAND_OK) return error.PrepareFailed;
+            // The floor protocol (init.write.template.sql): advance first, reap before the cutoff it
+            // returns, report the count. The report leaves the floor alone.
+            const adv_res = c.PQprepare(conn, "gc_advance", "SELECT floor_at::text, reap_before::text FROM public.zebridge_gc_advance($1::double precision, $2::bigint)", 2, null);
+            defer c.PQclear(adv_res);
+            if (c.PQresultStatus(adv_res) != c.PGRES_COMMAND_OK) return error.PrepareFailed;
+            const rep_res = c.PQprepare(conn, "gc_report", "UPDATE public.zebridge_gc_watermark SET reaped = $1::bigint, swept_at = now(), updated_at = now() WHERE id = 1", 1, null);
+            defer c.PQclear(rep_res);
+            if (c.PQresultStatus(rep_res) != c.PGRES_COMMAND_OK) return error.PrepareFailed;
         }
     }.do;
     setup_connection(allocator, pg_conn.?, principal, sweeps.items, dry_run) catch |err| {
@@ -428,6 +450,10 @@ pub fn main(init: std.process.Init) !void {
 
     // Run loop
     var first_pass = true;
+    // The sweeper lock as last reported: 0 not yet asked, 1 held by this session, 2 held elsewhere,
+    // 3 not askable (the connection). Reported on every change, the first answer included, so a standby says it is one.
+    var owner_state: u8 = 0;
+    var ever_owned = false;
     // Said once after the first pass, then once an hour: a sweeper with nothing to reap is
     // otherwise silent, and silence cannot be told from a hang. Each pass: debug.
     var passes: u64 = 0;
@@ -487,13 +513,85 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
 
+        // ── Ownership: ONE active sweeper per database ──────────────────────────────
+        //
+        // GC is one promise about the database's history, so one process keeps it. A session-level
+        // advisory lock on THIS connection (`zebridge_gc_sweeper_lock`, init.write.template.sql) is the
+        // ownership, asked again at the start of every pass: it ends with the connection, so a
+        // dropped or reset session — and a pooler that swaps the server session under us — is seen
+        // as what it is (the lock is not held) and the sweeper takes it again before it reaps anything.
+        // Until then it idles. A second sweeper (another bridge's, a forgotten cron) idles the same way;
+        // two of them with different retentions used to overwrite each other's watermark. A dry run
+        // reaps nothing and needs no ownership. ⚠️ Session locks need a session: connect straight to
+        // PostgreSQL, not through a transaction-pooling proxy.
+        if (!dry_run) {
+            const held = queryBool(pg_conn.?, "SELECT public.zebridge_gc_sweeper_holds()");
+            var owns = held orelse false;
+            if (held != null and !owns) owns = queryBool(pg_conn.?, "SELECT public.zebridge_gc_sweeper_lock()") orelse false;
+            const state: u8 = if (owns) 1 else if (held == null) 3 else 2;
+            if (state != owner_state) {
+                if (owns) {
+                    log.info("holding the database's sweeper lock{s}: this is the one active sweeper", .{if (ever_owned) " again" else ""});
+                    ever_owned = true;
+                } else if (held == null) {
+                    log.warn("cannot ask for the sweeper lock: {s} — no sweeping until it can be held", .{c.PQerrorMessage(pg_conn)});
+                } else if (ever_owned) {
+                    log.warn("the sweeper lock is no longer held by this session: another sweeper holds the database's sweeper lock — idle until it is released", .{});
+                } else {
+                    log.warn("another sweeper holds the database's sweeper lock — idle, asking again every pass", .{});
+                }
+                owner_state = state;
+            }
+            if (!owns) {
+                if (once) {
+                    log.err("another sweeper holds the database's sweeper lock (or it cannot be asked for) — nothing swept (--once)", .{});
+                    std.process.exit(2);
+                }
+                sleepUnlessStopped(interval_ms);
+                continue;
+            }
+        }
+
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const aa = arena.allocator();
 
         var reaped_this_pass: u64 = 0;
 
+        // ── 1. Advance the floor, BEFORE anything is reaped ─────────────────────────
+        //
+        // At every committed state, what has been reaped must be older than the floor that is
+        // advertised: reaped first and published after left a window with the tombstones gone and
+        // the old floor still in force, in which a stale write passed the guard and resurrected its
+        // row. So the floor moves first — never backwards (a longer retention than before leaves it
+        // where it is; it moves again when time catches up) — and the reap cutoff is the boundary
+        // that call returns, not a clock read later. The call also waits for the mutations in flight
+        // (see zebridge_gc_advance), so no write that passed the old floor commits after a tombstone
+        // behind the new one is gone. Failing, it reaps nothing: the pass is skipped, never forced.
+        // The cost is the other way round: for the length of one pass writes in the band between
+        // the old floor and the new one are refused while their tombstones still exist — a client
+        // is told to reload slightly early, never to resurrect a row.
+        var cutoff: ?[:0]const u8 = null;
+        if (!dry_run) {
+            const secs_f = try utils.allocPrintZ(aa, "{d}", .{threshold_ms / 1000});
+            const ms_f = try utils.allocPrintZ(aa, "{d}", .{threshold_ms});
+            const adv_params = [_]?[*:0]const u8{ secs_f.ptr, ms_f.ptr };
+            const adv = c.PQexecPrepared(pg_conn, "gc_advance", 2, &adv_params[0], null, null, 0);
+            defer c.PQclear(adv);
+            if (c.PQresultStatus(adv) == c.PGRES_TUPLES_OK and c.PQntuples(adv) == 1) {
+                cutoff = try utils.allocPrintZ(aa, "{s}", .{std.mem.span(c.PQgetvalue(adv, 0, 1))});
+            } else {
+                log.warn(
+                    "could not advance the floor: {s} — nothing is reaped this pass (a transaction holding the floor lock, " ++
+                        "or the watermark row is missing: re-apply init.write.template.sql)",
+                    .{c.PQerrorMessage(pg_conn)},
+                );
+            }
+        }
+
+        // ── 2. Reap, before the cutoff the advance returned ─────────────────────────
         for (sweeps.items, 0..) |sw, i| {
+            if (!dry_run and cutoff == null) break;
             // The cutoff is computed by PostgreSQL, not here: `now()` on the server is the
             // only clock both sides agree on, and a sweeper whose host clock has drifted
             // would otherwise reap tombstones early — which is exactly the window a client
@@ -512,7 +610,7 @@ pub fn main(init: std.process.Init) !void {
             const stmt_name = try utils.allocPrintZ(aa, "gc_sweep_{d}", .{i});
             const secs = try utils.allocPrintZ(aa, "{d}", .{threshold_ms / 1000});
             const batch_z = try utils.allocPrintZ(aa, "{d}", .{batch_rows});
-            const param_vals = [_]?[*:0]const u8{ secs.ptr, batch_z.ptr };
+            const param_vals = [_]?[*:0]const u8{ if (dry_run) secs.ptr else cutoff.?.ptr, batch_z.ptr };
             var res = c.PQexecPrepared(pg_conn, stmt_name.ptr, if (dry_run) 1 else 2, &param_vals[0], null, null, 0);
             defer c.PQclear(res);
 
@@ -554,52 +652,28 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        // ── Publish the watermark ───────────────────────────────────────────────
+        // ── 3. Report ───────────────────────────────────────────────────────────────
         //
-        // The point of the whole sweep, from a client's perspective. `GC_THRESHOLD_MS` is
-        // the maximum offline window this deployment supports, and until this row existed
-        // a client had no way to locate that line — it could only assume the sweeper was
-        // keeping up. A client whose oldest queued write predates `watermark` must
-        // re-seed instead of flushing, or it resurrects rows deleted while it was away.
+        // The floor was published in step 1, before the deletes, and it is not touched here: this
+        // only reports how many rows the pass reaped (the metric reads it from the row's change, and
+        // an operator reads `swept_at`). `GC_THRESHOLD_MS` is the retention the sweeper was
+        // configured with; the floor is what has actually been done, and the clients enforce the floor.
         //
-        // ⚠️ Written **after** the deletes, never before. The guarantee is "nothing older
-        // than this survives", so publishing first would advertise a line the sweep had
-        // not yet reached — and a client trusting it would discard writes that were still
-        // safe.
+        // No NATS here. The row is replicated by CDC like any other, so every client that is already
+        // consuming changes receives it with no new subscription — and the sweeper stays a PostgreSQL
+        // client with no broker identity to compromise.
         //
-        // `now()` is the server's, not this process's: the sweep's cutoff was computed
-        // server-side for the same reason (a drifted host clock must not move the line).
-        //
-        // No NATS here. The row is replicated by CDC like any other, so every client that
-        // is already consuming changes receives it with no new subscription — and the
-        // sweeper stays a PostgreSQL client with no broker identity to compromise.
-        //
-        // A failure is logged and the loop continues: an unpublished watermark leaves
-        // clients on the previous, *older* value, which is conservative. Stopping the
-        // sweep over it would let tombstones accumulate instead, which is not.
-        var published = false;
-        {
-            const wm_secs = try utils.allocPrintZ(aa, "{d}", .{threshold_ms / 1000});
-            const wm_ms = try utils.allocPrintZ(aa, "{d}", .{threshold_ms});
-            const wm_reaped = try utils.allocPrintZ(aa, "{d}", .{reaped_this_pass});
-            const wm_params = [_]?[*:0]const u8{ wm_secs.ptr, wm_ms.ptr, wm_reaped.ptr };
-
-            const wm_res = c.PQexecPrepared(pg_conn, "gc_watermark_update", 3, &wm_params[0], null, null, 0);
-            defer c.PQclear(wm_res);
-
-            if (c.PQresultStatus(wm_res) != c.PGRES_COMMAND_OK) {
-                log.warn(
-                    "could not publish the watermark: {s}",
-                    .{c.PQerrorMessage(pg_conn)},
-                );
-            } else if (std.mem.eql(u8, std.mem.span(c.PQcmdTuples(wm_res)), "0")) {
-                log.warn(
-                    "the watermark row is missing (zebridge_gc_watermark id=1)." ++
-                        " Clients cannot tell how far back tombstones survive. Re-run init.sql.",
-                    .{},
-                );
-            } else {
-                published = true;
+        // A failed report is logged and the loop continues: the floor is already out, and stopping the
+        // sweep over a counter would let tombstones accumulate.
+        var published = dry_run;
+        if (!dry_run and cutoff != null) {
+            published = true;
+            const rep_n = try utils.allocPrintZ(aa, "{d}", .{reaped_this_pass});
+            const rep_params = [_]?[*:0]const u8{rep_n.ptr};
+            const rep = c.PQexecPrepared(pg_conn, "gc_report", 1, &rep_params[0], null, null, 0);
+            defer c.PQclear(rep);
+            if (c.PQresultStatus(rep) != c.PGRES_COMMAND_OK) {
+                log.warn("could not report the pass: {s}", .{c.PQerrorMessage(pg_conn)});
             }
         }
 
@@ -608,12 +682,12 @@ pub fn main(init: std.process.Init) !void {
         hour_reaped += reaped_this_pass;
         if (!published) hour_unpublished += 1;
         log.debug("pass {d}: {d} table(s), {d} tombstone(s) reaped, watermark {s}", .{
-            passes, sweeps.items.len, reaped_this_pass, if (published) "published" else "NOT published",
+            passes, sweeps.items.len, reaped_this_pass, if (dry_run) "left alone (dry run)" else if (published) "advanced" else "NOT advanced",
         });
         const now_ms = utils.getMilliTimestamp();
         if (passes == 1) {
             log.info("first pass done: {d} table(s) swept, {d} tombstone(s) reaped, watermark {s}; next every {d} s, summed up hourly", .{
-                sweeps.items.len, reaped_this_pass, if (published) "published" else "NOT published", interval_ms / 1000,
+                sweeps.items.len, reaped_this_pass, if (dry_run) "left alone (dry run)" else if (published) "advanced" else "NOT advanced", interval_ms / 1000,
             });
             hour_passes = 0;
             hour_reaped = 0;

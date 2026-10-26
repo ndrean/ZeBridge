@@ -840,6 +840,39 @@ INSERT INTO public.zebridge_gc_watermark (id, watermark, threshold_ms)
 VALUES (1, now(), 0)
 ON CONFLICT (id) DO NOTHING;
 
+-- ⚠️ The floor only moves forward, and the DATABASE says so (NOTES "One floor, one sweeper").
+-- The watermark is a fact about the database's history: once a tombstone is reaped, no writer
+-- can un-reap it, so no value below the floor can ever be true again. A second sweeper with a
+-- shorter or longer retention, a bridge, a restored script, a forged mutation (§10aq dragged it
+-- back six years with one) or a re-applied init file must not be able to lower it. The sweeper's
+-- own SQL uses GREATEST, but that is the sweeper behaving; this is what holds when something else
+-- does not. A raise, not a silent clamp: whoever tried should know.
+--
+-- Break glass, for an operator who has restored the database from a backup taken BEFORE the
+-- reaping, or a test that stages a floor: ALTER TABLE public.zebridge_gc_watermark DISABLE TRIGGER
+-- zebridge_gc_watermark_monotone; (and the same for _no_delete), the UPDATE, then ENABLE TRIGGER.
+CREATE OR REPLACE FUNCTION public.zebridge_gc_watermark_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF NEW.watermark < OLD.watermark THEN
+            RAISE EXCEPTION 'zebridge_gc_watermark: the floor only moves forward (% -> % refused)', OLD.watermark, NEW.watermark
+                USING ERRCODE = 'check_violation',
+                      HINT = 'Tombstones older than the floor are gone; no value below it can be true again. A longer retention takes effect as time catches up.';
+        END IF;
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION 'zebridge_gc_watermark: the floor is never removed (% refused)', TG_OP
+        USING ERRCODE = 'check_violation';
+END $$;
+
+DROP TRIGGER IF EXISTS zebridge_gc_watermark_monotone ON public.zebridge_gc_watermark;
+CREATE TRIGGER zebridge_gc_watermark_monotone BEFORE UPDATE ON public.zebridge_gc_watermark
+    FOR EACH ROW EXECUTE FUNCTION public.zebridge_gc_watermark_guard();
+DROP TRIGGER IF EXISTS zebridge_gc_watermark_no_delete ON public.zebridge_gc_watermark;
+CREATE TRIGGER zebridge_gc_watermark_no_delete BEFORE DELETE OR TRUNCATE ON public.zebridge_gc_watermark
+    FOR EACH STATEMENT EXECUTE FUNCTION public.zebridge_gc_watermark_guard();
+
 -- ⚠️ Published, or the whole design is inert: the row reaches clients through CDC and
 -- nothing else, so a table nobody publishes is a watermark nobody can read.
 --

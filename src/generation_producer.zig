@@ -2412,9 +2412,12 @@ pub const GenerationProducer = struct {
                 return;
             }
             // ⚠️ Completeness (the plan's rule): a checkpoint holds every delete of its
-            // window only while no tombstone inside it can have been reaped. The sweeper
-            // reaps at `now() - threshold`, so a window reaching past that proves nothing
-            // and a FULL is owed instead — said, not silently built.
+            // window only while no tombstone inside it can have been reaped. What was reaped is
+            // everything older than the FLOOR (`zebridge_gc_watermark`, advanced before any reap
+            // and never lowered), so a window opening before it proves nothing and a FULL is
+            // owed instead — said, not silently built. The floor, not `now() - threshold`: a
+            // longer retention than the sweeper ran with before does not bring back what was
+            // already reaped, and the configured number would have said it did.
             const lower_z = try alloc.dupeSentinel(u8, ckpt_lower, 0);
             const gp = [_]?[*:0]const u8{lower_z.ptr};
             // ⚠️ `threshold_ms > 0` is the whole guard's precondition: the row ships with
@@ -2423,7 +2426,7 @@ pub const GenerationProducer = struct {
             // complete — read as "zero retention" instead, this refused every checkpoint
             // ever asked for (measured: a 20 s window rejected as past a 0 ms retention).
             const guard = queryOne(pgc, "SELECT COALESCE((SELECT max(threshold_ms) FROM public.zebridge_gc_watermark), 0) > 0 " ++
-                "AND $1::timestamptz < now() - ((SELECT COALESCE(max(threshold_ms), 0) FROM public.zebridge_gc_watermark) || ' milliseconds')::interval", &gp) catch null;
+                "AND $1::timestamptz < (SELECT max(watermark) FROM public.zebridge_gc_watermark)", &gp) catch null;
             if (guard) |g| {
                 defer c.PQclear(g);
                 if (c.PQgetvalue(g, 0, 0)[0] == 't') {

@@ -2187,7 +2187,7 @@ A **base** carries live rows only: a client applies it as a wipe and a reload in
 > | **written by** | `bridge_sweeper`, once per pass, as principal `zb_sweeper` |
 > | **read by** | every client, through CDC |
 > | **grants** | `SELECT` to the reader, `SELECT/INSERT/UPDATE` to the writer, no `DELETE` |
-> | **rows** | exactly one, `id = 1`, CHECKed |
+> | **rows** | exactly one, `id = 1`, CHECKed; `watermark` only moves forward (trigger) |
 >
 > ⚠️ **Do not drop it, and do not remove it from the publication.** The row reaches clients
 > through CDC and nothing else, so an unpublished watermark is one nobody can read — and
@@ -2198,6 +2198,16 @@ A **base** carries live rows only: a client applies it as a wipe and a reload in
 > correct rather than broken, but it means this table records what the sweeper last did,
 > not that it is running. `SELECT * FROM zebridge_audit_sweeper();` lists tenants whose
 > tombstones will never be reaped because the sweeper is not mapped to them.
+
+#### The floor: one per database, and it never goes down
+
+The watermark is a fact about the database's history — "a write older than this can no longer be replayed safely" — not a setting of whichever bridge or sweeper wrote it last. Once a tombstone is reaped nothing can un-reap it, so:
+
+- **One policy, one owner.** One sweeper per database, enforced by a session-level advisory lock on its working connection; bridges never write the row ([OPERATIONS → Sweeper](OPERATIONS.md#sweeper)).
+- **Monotone, in the database.** A trigger refuses an `UPDATE` that lowers `watermark`, a `DELETE` and a `TRUNCATE`, whoever issues them; re-applying the init SQL leaves the row alone. A longer retention leaves the floor where it is. An operator restoring a backup taken before the reaping steps around the trigger by name (`ALTER TABLE … DISABLE TRIGGER zebridge_gc_watermark_monotone`), knowing what that asserts.
+- **Advance, then reap.** A pass moves the floor first and reaps strictly before the boundary that call returned, so there is never a committed state with a reaped tombstone and an older floor. The advance waits (bounded) for the writes in flight.
+- **Every write is checked against the same floor, inside its own transaction.** The bridge reads the floor under a shared advisory lock in the transaction that holds the write (`zebridge_gc_floor_acquire`); the sweeper's advance takes it exclusively. A write that passed the old floor therefore commits before any tombstone behind the new one is reaped, and a write that starts after reads the new floor — whichever bridge received it. A floor that cannot be read fails the attempt (retried); it is never silently off.
+- **Readers of history use the floor, not the configured retention.** The producer owes a full instead of a checkpoint when the window opens before the floor.
 
 #### Where the watermark is: `zebridge_gc_watermark`
 

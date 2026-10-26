@@ -120,7 +120,11 @@ async def main():
         return zb.psql(f"SELECT count(*) FROM public.{TABLE} WHERE uid='{uid}'").strip() == "1"
 
     def set_watermark(sql_value: str):
-        zb.psql(f"UPDATE public.zebridge_gc_watermark SET watermark = {sql_value} WHERE id = 1")
+        # The floor never goes down (a trigger refuses it); staging one is the operator's break-glass,
+        # by name. The control (D) is exactly "the floor was lower than the deletion".
+        zb.psql("ALTER TABLE public.zebridge_gc_watermark DISABLE TRIGGER zebridge_gc_watermark_monotone; "
+                f"UPDATE public.zebridge_gc_watermark SET watermark = {sql_value} WHERE id = 1; "
+                "ALTER TABLE public.zebridge_gc_watermark ENABLE TRIGGER zebridge_gc_watermark_monotone;")
 
     def check(label: str, cond: bool, detail: str):
         nonlocal failed
