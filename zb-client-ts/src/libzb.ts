@@ -297,6 +297,9 @@ export type ConnStatus = 'connected' | 'disconnected' | 'connecting';
 interface Replacement {
   routes: string[];
   fence: boolean;
+  /// The replacement is durably OWED (`_zebridge_fence`, anchor cleared, table unseeded): a fence
+  /// from its PREPARE, a plain full from `oweReplacement`.
+  owed: boolean;
 }
 
 /// One seed's claim on the stream queue (see applyGenerations).
@@ -3367,9 +3370,15 @@ export class ZeBridge {
   }
 
   private async applyGenerationsFrom(table: string, seedOpts: JetStreamOpts | undefined, run: SeedRun): Promise<boolean> {
-    const hold: Replacement = { routes: [], fence: false };
+    const hold: Replacement = { routes: [], fence: false, owed: false };
     try {
       return await this.applyGenerationsFromHeld(table, seedOpts, run, hold);
+    } catch (e) {
+      // Rows may be half replaced, the anchor gone, the table unseeded and its events held: nothing
+      // else will ask again (a poll loop ends on a throw, a pass only notes the failure), and the
+      // held events are bounded. The retry loop runs for as long as the table is unseeded.
+      if (hold.owed) this.waitForChain(table);
+      throw e;
     } finally {
       this.endReplacement(hold, table, run);
     }
@@ -3429,10 +3438,13 @@ export class ZeBridge {
     // restarted under us and this manifest predates the restart (see `restarted`).
     // `ownReplayable` is what the fence needs: the stream read, on the incarnation the
     // chain was cut on.
-    type Proof = { gateSeq: number; sharedSeq: number | null; ownReplayable: boolean; sharedProven: boolean };
+    type Proof = { gateSeq: number; sharedSeq: number | null; ownReplayable: boolean; sharedProven: boolean; ownLast: number | null };
     const prove = async (man: any): Promise<Proof | null> => {
       let gateSeq = typeof man.cutoff_seq === 'number' && man.cutoff_seq > 0 ? man.cutoff_seq : 0;
       let ownReplayable = false;
+      // The hub's newest event on the route: the CDC left to take after the chain's cut (a leaf's chain
+      // is accepted however old while its suffix is replayable; age and backlog are reported).
+      let ownLast: number | null = null;
       // §10ja: checked whenever the field is PRESENT — 0 included. A chain cut on an empty,
       // brand-new stream says 0, and on a stream that now starts past 1 it predates it: the
       // events between were pruned, and seeding it then tailing from the oldest message left
@@ -3443,6 +3455,7 @@ export class ZeBridge {
           const info = await jsm.streams.info(man.cdc_stream);
           const st = info.state;
           const first = st.first_seq;
+          ownLast = st.last_seq;
           const nowCreated = String((info as { created?: unknown }).created ?? '');
           if (man.cdc_stream_created && nowCreated) {
             if (man.cdc_stream_created !== nowCreated) {
@@ -3488,7 +3501,7 @@ export class ZeBridge {
           }
         } catch { /* stream info unavailable — the shared route stays unproven */ }
       }
-      return { gateSeq, sharedSeq, ownReplayable, sharedProven };
+      return { gateSeq, sharedSeq, ownReplayable, sharedProven, ownLast };
     };
     let proof = await prove(manifest);
     if (!proof) return false;
@@ -3563,6 +3576,8 @@ export class ZeBridge {
           this.appendLog('SYS', `Generation ${step.name} for ${table} references columns the local schema lacks — falling back to snapshot`, 'WARNING');
           return null;
         }
+        // About to delete the baseline: the replacement becomes durably owed first (a fence's already is).
+        if (step.kind === 'full' && !hold.owed) await oweReplacement(manifest);
         // The streaming path meets the object's version column in the TAIL, after the
         // rows; the manifest's is the same column unless the schema moved under the cut,
         // which the tail check reports.
@@ -3761,12 +3776,43 @@ export class ZeBridge {
     const publicRoute = this.config.grammar.cdc_streams?.public;
     const sharedRoute: string | null = publicRoute && ownRoute !== publicRoute ? publicRoute : null;
     // Assigned in `begin` (a closure), so typed through a cast: TS would narrow a plain null.
-    let fenceRun = null as { fromPos: number; shared: boolean } | null;
+    let fenceRun = null as { fromPos: number; shared: boolean; plain?: boolean } | null;
     const fromLeaf = !!this.config.seedDomain && this.config.seedDomain !== this.config.jsDomain && seedOpts?.domain === this.config.seedDomain;
+
+    // A full is DESTRUCTIVE: its first chunk deletes the baseline, and what a later chunk loses is
+    // not in the CDC suffix (a stable row created before the cut). So a replacement that is not a
+    // fence still leaves a durable incomplete state BEFORE its first full chunk — the anchor
+    // cleared, the owed record written, in one transaction — and holds the table's events meanwhile.
+    // A failure then reads as what it is (unseeded, owed): the retry is a fence's retry, with every
+    // proof. Taken once the full's object is in hand, not at the decision: a chain pruned under us
+    // changes nothing. Deltas are not destructive (version-guarded upserts, idempotent under a
+    // retry) and write nothing.
+    const oweReplacement = async (man: any) => {
+      await this.transaction(async (txExec) => {
+        await txExec(`DELETE FROM _zebridge_generations WHERE tbl = ?`, table);
+        await txExec(`INSERT INTO _zebridge_fence (tbl) VALUES (?) ON CONFLICT(tbl) DO NOTHING`, table);
+        await txExec(`DELETE FROM _zebridge_frontier WHERE tbl = ?`, table); // it is replaced: no frontier of its own
+      });
+      this.frontiers.delete(table);
+      state.seedSeq = undefined; state.seedStream = undefined; state.sharedSeedSeq = undefined; state.seedLsn = undefined;
+      state.unseeded = true; // its events are held, not applied, until the anchor commits
+      hold.owed = true;
+      fenceRun = fenceRun ?? { fromPos: this.globalSyncState.seq[man.cdc_stream] ?? 0, shared: false, plain: true };
+    };
 
     // The decision, from fresh facts: positions, the owed record and the other tables' seeded
     // state change under any other fence (a PREPARE moves cursors and unseeds its table), so it
     // is taken again inside `prepareExclusive`, never trusted from before the queue.
+    // The age of the chain and the CDC left to take after its cut (from the hub): reported with every
+    // fence and chain, so a cost-based fallback from a stale leaf can be decided on evidence.
+    const chainCost = (man: any, pr: Proof) => {
+      const t = Date.parse(pgTsToWire(String(man.cutoff_version ?? '')));
+      return {
+        ageMs: Number.isFinite(t) ? Date.now() - t : -1,
+        behind: pr.ownLast !== null && typeof man.cutoff_seq === 'number' ? pr.ownLast - man.cutoff_seq : -1,
+      };
+    };
+
     const decide = async (man: any, pr: Proof, plan: PlanStep[]) => {
       const ownPos = this.globalSyncState.seq[man.cdc_stream] ?? 0;
       const predates = coreFullPredates(man, plan, ownPos);
@@ -3918,6 +3964,7 @@ export class ZeBridge {
           throw stuck;
         }
         hold.fence = true;
+        hold.owed = true;
         this.beginReplacement(table, streams, hold);
         outcome = { kind: 'prepared', ownPos: now.ownPos, sharedMoved: decision.sharedTo !== null, untouched: untouched.length };
       }));
@@ -3925,7 +3972,8 @@ export class ZeBridge {
       if (out.kind === 'wait') { this.appendLog('SYS', `${table}: ${out.why}`, 'WARNING'); return null; }
       if (out.kind === 'plain') return plan;
       fenceRun = { fromPos: out.ownPos, shared: out.sharedMoved };
-      this.appendLog('SYS', `${table}: fence prepared — chain g${man.gen} cut at ${man.cutoff_seq} on ${man.cdc_stream} behind position ${out.ownPos}: anchor cleared, cursor at the cut${out.sharedMoved ? ' (the shared route too)' : ''}; replacing the rows${out.untouched ? ' — the other tables on the route keep their applied frontier' : ''}${fromLeaf ? ' [from the seeding leaf]' : ''}`, 'WARNING');
+      const cost = chainCost(man, pr);
+      this.appendLog('SYS', `${table}: fence prepared — chain g${man.gen} cut at ${man.cutoff_seq} on ${man.cdc_stream} behind position ${out.ownPos}: anchor cleared, cursor at the cut${out.sharedMoved ? ' (the shared route too)' : ''}; replacing the rows${out.untouched ? ' — the other tables on the route keep their applied frontier' : ''}${fromLeaf ? ' [from the seeding leaf]' : ''} (chain ${Math.floor(cost.ageMs / 1000)} s old, ${cost.behind} CDC message(s) after its cut on the hub)`, 'WARNING');
       return plan;
     };
 
@@ -3954,7 +4002,7 @@ export class ZeBridge {
     // incarnation, and the event after each cut still held. Otherwise no anchor: the
     // table stays unseeded with its cursor at the cut and the fence still owed, which the
     // gap rule then reads as the gap it is — recovery incomplete, a newer chain next.
-    if (fenceRun) {
+    if (fenceRun && !fenceRun.plain) {
       await this.fault('before_verify');
       const routes: FenceRoute[] = [{ stream: manifest.cdc_stream, cut: manifest.cutoff_seq, created: String(manifest.cdc_stream_created ?? '') }];
       if (sharedRoute) routes.push({ stream: sharedRoute, cut: proof.sharedSeq ?? -1, created: String(manifest.shared_cdc_stream_created ?? '') });
@@ -4009,9 +4057,9 @@ export class ZeBridge {
       state.unseeded = false;
       // The routes' parking ends with the fence: their tails reopen from the cursors it set.
       this.releaseFence(table);
-      this.appendLog('SYS', `${table}: fenced — chain g${manifest.gen} cut at ${manifest.cutoff_seq} on ${manifest.cdc_stream} replaced the rows; the position moved back from ${fenceRun.fromPos}, the events after the cut replay${fenceRun.shared ? ' (the shared route too)' : ''}`, 'WARNING');
-      if (!run.inPass) void this.subscribeStreams().catch(() => {});
-      await this.drainPending(table);
+      if (!fenceRun.plain) this.appendLog('SYS', `${table}: fenced — chain g${manifest.gen} cut at ${manifest.cutoff_seq} on ${manifest.cdc_stream} replaced the rows; the position moved back from ${fenceRun.fromPos}, the events after the cut replay${fenceRun.shared ? ' (the shared route too)' : ''}`, 'WARNING');
+      if (!run.inPass) void this.subscribeStreams().catch(() => {}); // the routes it held may be open now
+      await this.drainPending(table); // the events held while the rows were replaced
     } else {
       setAnchor();
       await this.pruneInboxSeeded(table, state.lsn);
@@ -4026,7 +4074,8 @@ export class ZeBridge {
       const source = seedOpts?.domain && seedOpts.domain === this.config.seedDomain ? 'seed' : 'hub';
       this.measure.emit({ m: 'chain', table, tenant: tenantForTable, source, gen: manifest.gen, full_gen: manifest.full?.gen ?? 0, fulls, deltas: plan.length - fulls,
         rows: applied, t0_ms: chainT0, t1_ms: Date.now(), ...chainTotals, cutoff_version: manifest.cutoff_version ?? '',
-        cdc_stream: manifest.cdc_stream ?? '', cutoff_seq: manifest.cutoff_seq ?? -1, shared_cutoff_seq: proof.sharedSeq ?? -1 });
+        cdc_stream: manifest.cdc_stream ?? '', cutoff_seq: manifest.cutoff_seq ?? -1, shared_cutoff_seq: proof.sharedSeq ?? -1,
+        cut_age_ms: chainCost(manifest, proof).ageMs, cdc_behind: chainCost(manifest, proof).behind });
     }
     this.triggerChange(table);
     this.appendLog('SYS', `Seeded ${table} from generation chain g${manifest.gen} (${applied} row(s), watermark ${manifest.cutoff_version} @ ${manifest.cutoff_lsn})`, 'INFO');

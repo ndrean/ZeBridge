@@ -910,6 +910,69 @@ pub const SyncClient = struct {
         return std.c.access(v, 0) == 0;
     }
 
+    /// A UTC timestamp as the producer renders it (`2026-10-26 07:00:10.123456+00`, or with a `T`
+    /// and a `Z`) in epoch milliseconds; null when it is not one. The age of a chain is read from it.
+    fn isoMs(text: []const u8) ?i64 {
+        if (text.len < 19) return null;
+        const num = struct {
+            fn at(t: []const u8, from: usize, len: usize) ?i64 {
+                return std.fmt.parseInt(i64, t[from .. from + len], 10) catch null;
+            }
+        };
+        const y = num.at(text, 0, 4) orelse return null;
+        const mo = num.at(text, 5, 2) orelse return null;
+        const d = num.at(text, 8, 2) orelse return null;
+        const h = num.at(text, 11, 2) orelse return null;
+        const mi = num.at(text, 14, 2) orelse return null;
+        const sec = num.at(text, 17, 2) orelse return null;
+        // days from civil (Howard Hinnant's algorithm)
+        const yy = if (mo <= 2) y - 1 else y;
+        const era = @divFloor(yy, 400);
+        const yoe = yy - era * 400;
+        const doy = @divFloor(153 * (if (mo > 2) mo - 3 else mo + 9) + 2, 5) + d - 1;
+        const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+        const days = era * 146097 + doe - 719468;
+        var ms: i64 = 0;
+        if (text.len > 20 and text[19] == '.') {
+            var i: usize = 20;
+            var scale: i64 = 100;
+            while (i < text.len and text[i] >= '0' and text[i] <= '9' and scale > 0) : (i += 1) {
+                ms += @as(i64, text[i] - '0') * scale;
+                scale = @divFloor(scale, 10);
+            }
+        }
+        return ((days * 24 + h) * 60 + mi) * 60_000 + sec * 1000 + ms;
+    }
+
+    /// A full is DESTRUCTIVE: its first chunk deletes the baseline, and what a later chunk loses is not
+    /// in the CDC suffix (a stable row created before the cut). A replacement that is not a fence
+    /// therefore leaves a durable incomplete state BEFORE its first full chunk — the anchor cleared,
+    /// the owed record written, in one transaction. A failure then reads as what it is (unseeded,
+    /// owed): the next poll seeds again, and the retry is a fence's retry, with every proof. Called
+    /// once the full's object is in hand, so a chain pruned under us changes nothing. Deltas are not
+    /// destructive (version-guarded upserts, idempotent under a retry) and write nothing.
+    fn oweReplacement(self: *SyncClient, a: std.mem.Allocator, st: *TableState, table: []const u8, tenant: []const u8, own_stream: []const u8, shared_stream: []const u8, owed: *bool) !void {
+        if (owed.*) return;
+        const Owe = struct {
+            a: std.mem.Allocator,
+            table: []const u8,
+            tenant: []const u8,
+            fn apply(cx: @This(), s_: *storage.Storage) !void {
+                _ = try s_.query(cx.a, "DELETE FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = cx.table }, .{ .text = cx.tenant } });
+                _ = try s_.query(cx.a, "INSERT INTO _zbz_fence (tbl, tenant) VALUES (?, ?) ON CONFLICT (tbl, tenant) DO NOTHING", &.{ .{ .text = cx.table }, .{ .text = cx.tenant } });
+                _ = try s_.query(cx.a, "DELETE FROM _zbz_frontier WHERE tbl = ?", &.{.{ .text = cx.table }}); // it is replaced: no frontier of its own
+            }
+        };
+        try self.st.transaction(Owe{ .a = a, .table = table, .tenant = tenant }, Owe.apply);
+        st.frontiers.clearRetainingCapacity();
+        var k: usize = 0;
+        while (k < st.anchors.items.len) {
+            const s_ = st.anchors.items[k].stream;
+            if (std.mem.eql(u8, s_, own_stream) or (shared_stream.len > 0 and std.mem.eql(u8, s_, shared_stream))) _ = st.anchors.orderedRemove(k) else k += 1;
+        }
+        owed.* = true;
+    }
+
     /// A table left untouched by a fence, with the route whose events it already holds.
     const Untouched = struct { table: []const u8, stream: []const u8 };
     const FenceScope = struct { untouched: []const Untouched = &.{}, refused: ?[]const u8 = null };
@@ -2716,6 +2779,7 @@ pub const SyncClient = struct {
             if (predates) {
                 const sc = try self.fenceScope(a, table, tenant, &.{cdc_stream});
                 if (sc.refused) |why| {
+                    if (from_seed) return error.SeedStale; // the hub's chain is asked, and judged by the same proofs
                     log.warn("{s}: chain predates replica — refusing the full (D2): {s}", .{ table, why });
                     if (pending) self.reseed_pending = true;
                     return;
@@ -2745,6 +2809,10 @@ pub const SyncClient = struct {
         // The fence's own-route condition, proven below: the stream read, on the
         // incarnation the chain was cut on, still holding the event after the cut.
         var own_replayable = false;
+        // The hub's newest event on the route, for the cost of the replay (a leaf's chain is
+        // accepted however old while its suffix is replayable; its age and the CDC left to take
+        // from the hub are reported, so a cost-based fallback can be decided on evidence).
+        var own_last: i64 = -1;
         if (cdc_stream.len > 0 and has_cutoff_seq) {
             if (self.streamFacts(cdc_stream)) |info| {
                 const first: i64 = @intCast(info.first_seq);
@@ -2771,9 +2839,11 @@ pub const SyncClient = struct {
                     return;
                 }
                 own_replayable = gate_seq == cutoff_seq and man_created.len > 0 and info.created.len > 0;
+                own_last = last;
             } else |_| {}
         }
         if (fence and !own_replayable) {
+            if (from_seed) return error.SeedStale; // the hub's chain is asked, and judged by the same proofs
             log.warn("{s}: chain predates replica — refusing the full (D2): its cut on {s} cannot be proven replayable (stream unread, or another incarnation)", .{ table, cdc_stream });
             self.reseed_pending = true;
             return;
@@ -2813,11 +2883,13 @@ pub const SyncClient = struct {
         var shared_rewind: ?i64 = null;
         if (fence) if (pair_shared) |sr| {
             const q = shared_seq orelse {
+                if (from_seed) return error.SeedStale; // the hub's chain is asked, and judged by the same proofs
                 log.warn("{s}: chain predates replica — refusing the full (D2): its coverage on {s} is unknown (no certificate, the stream unread, or another incarnation)", .{ table, sr });
                 self.reseed_pending = true;
                 return;
             };
             if (!shared_proven or !std.mem.eql(u8, sr, shared_stream_m)) {
+                if (from_seed) return error.SeedStale; // the hub's chain is asked, and judged by the same proofs
                 log.warn("{s}: chain predates replica — refusing the full (D2): its shared cut on {s} cannot be proven replayable", .{ table, sr });
                 self.reseed_pending = true;
                 return;
@@ -2825,6 +2897,7 @@ pub const SyncClient = struct {
             if (@as(i64, @intCast(try self.storedSeq(sr))) > q) {
                 const sc = try self.fenceScope(a, table, tenant, &.{sr});
                 if (sc.refused) |why| {
+                    if (from_seed) return error.SeedStale; // the hub's chain is asked, and judged by the same proofs
                     log.warn("{s}: chain predates replica — refusing the full (D2): {s}", .{ table, why });
                     self.reseed_pending = true;
                     return;
@@ -2855,6 +2928,7 @@ pub const SyncClient = struct {
                 const at: i64 = if (is_own) pos else shared_pos;
                 const stored_created = try self.storedCreated(a, u.stream);
                 if (created.len == 0 or stored_created == null or !std.mem.eql(u8, stored_created.?, created)) {
+                    if (from_seed) return error.SeedStale; // the hub's chain is asked, and judged by the same proofs
                     log.warn("{s}: chain predates replica — refusing the full (D2): {s} stays untouched on {s} only if its position and the chain's cut were taken on the same stream incarnation, and that is not settled", .{ table, u.table, u.stream });
                     self.reseed_pending = true;
                     return;
@@ -2910,7 +2984,8 @@ pub const SyncClient = struct {
             };
             _ = self.frontier_parked.swapRemove(cdc_stream);
             if (shared_rewind != null) _ = self.frontier_parked.swapRemove(shared_stream_m);
-            log.warn("{s}: fence prepared — chain g{d} cut at {d} on {s} behind position {d}: anchor cleared, cursor at the cut{s}; replacing the rows{s}{s}", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, cdc_stream, pos, if (shared_rewind != null) " (the shared route too)" else "", if (writes.items.len > 0) " — the other tables on the route keep their applied frontier" else "", if (from_seed) " [from the seeding leaf]" else "" });
+            const age_ms: i64 = if (isoMs(if (man.object.get("cutoff_version")) |v| (if (v == .string) v.string else "") else "")) |t| nowMillis() - t else -1;
+            log.warn("{s}: fence prepared — chain g{d} cut at {d} on {s} behind position {d}: anchor cleared, cursor at the cut{s}; replacing the rows{s}{s} (chain {d} s old, {d} CDC message(s) after its cut on the hub)", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, cdc_stream, pos, if (shared_rewind != null) " (the shared route too)" else "", if (writes.items.len > 0) " — the other tables on the route keep their applied frontier" else "", if (from_seed) " [from the seeding leaf]" else "", @divFloor(age_ms, 1000), if (own_last >= 0) own_last - cutoff_seq else -1 });
         }
         const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, tenant });
         var applied: usize = 0;
@@ -2933,6 +3008,8 @@ pub const SyncClient = struct {
             _ = try self.st.query(a, "DELETE FROM _zbz_frontier WHERE tbl = ?", &.{.{ .text = table }});
             st.frontiers.clearRetainingCapacity();
         }
+        // A fence's PREPARE already wrote it; a plain full writes it before its first full chunk.
+        var owed = fence;
         for (plan.array.items) |step| {
             // Per-step: `raw`, `blob` and `doc` are three copies of the same seed at
             // their largest; freeing them per step bounds the peak at one step's worth.
@@ -2950,6 +3027,7 @@ pub const SyncClient = struct {
                 var pull = try transport.ObjectPull.openIn(self.t, src, step_a, bucket, step.object.get("name").?.string);
                 if (pull.size >= self.opts.seed_streaming_above) {
                     defer pull.deinit();
+                    if (is_full) try self.oweReplacement(a, st, table, tenant, cdc_stream, shared_stream_m, &owed);
                     applied += try self.applyStepStreaming(step_a, table, tenant, st, man, step, &pull, is_full, &ph);
                     streamed += 1;
                     bytes_total += pull.size;
@@ -3004,6 +3082,8 @@ pub const SyncClient = struct {
             ph[2] += msNow() - t_ph;
             t_ph = msNow();
             const chunk: usize = if (self.opts.seed_chunk_rows == 0) @max(idx.offsets.len, 1) else self.opts.seed_chunk_rows;
+            // Columns checked, rows indexed: the baseline is about to go.
+            if (is_full) try self.oweReplacement(a, st, table, tenant, cdc_stream, shared_stream_m, &owed);
             var from: usize = 0;
             while (from < idx.offsets.len or (from == 0 and is_full)) {
                 const to = @min(from + chunk, idx.offsets.len);
@@ -3016,7 +3096,7 @@ pub const SyncClient = struct {
                 };
                 // ZB_TEST_FENCE_ABORT=after_chunk (recreate_recovery.py check 4): a crash with
                 // part of the replacement committed and no anchor.
-                if (fence and testFenceAbort("after_chunk")) std.process.exit(70);
+                if (owed and testFenceAbort("after_chunk")) std.process.exit(70);
                 if (to == from) break;
                 from = to;
             }
@@ -3135,8 +3215,9 @@ pub const SyncClient = struct {
                 if (std.mem.eql(u8, step.object.get("kind").?.string, "full")) fulls += 1;
             }
             const full_gen: i64 = if (man.object.get("full")) |f| (if (f == .object) (if (f.object.get("gen")) |g| (if (g == .integer) g.integer else 0) else 0) else 0) else 0;
-            log.info("measure {{\"m\":\"chain\",\"table\":\"{s}\",\"tenant\":\"{s}\",\"source\":\"{s}\",\"gen\":{d},\"full_gen\":{d},\"fulls\":{d},\"deltas\":{d},\"rows\":{d},\"bytes\":{d},\"t0_ms\":{d},\"t1_ms\":{d},\"fetch_ms\":{d},\"inflate_ms\":{d},\"decode_ms\":{d},\"apply_ms\":{d},\"streamed\":{d},\"cutoff_version\":\"{s}\",\"cdc_stream\":\"{s}\",\"cutoff_seq\":{d},\"shared_cutoff_seq\":{d}}}", .{
+            log.info("measure {{\"m\":\"chain\",\"table\":\"{s}\",\"tenant\":\"{s}\",\"source\":\"{s}\",\"gen\":{d},\"full_gen\":{d},\"fulls\":{d},\"deltas\":{d},\"rows\":{d},\"bytes\":{d},\"t0_ms\":{d},\"t1_ms\":{d},\"fetch_ms\":{d},\"inflate_ms\":{d},\"decode_ms\":{d},\"apply_ms\":{d},\"streamed\":{d},\"cutoff_version\":\"{s}\",\"cdc_stream\":\"{s}\",\"cutoff_seq\":{d},\"shared_cutoff_seq\":{d},\"cut_age_ms\":{d},\"cdc_behind\":{d}}}", .{
                 table, tenant, if (from_seed) "seed" else "hub", if (man.object.get("gen")) |v| v.integer else 0, full_gen, fulls, plan.array.items.len - fulls, applied, bytes_total, chain_t0, nowMillis(), ph[0], ph[1], ph[2], ph[3], streamed, cv, cdc_stream, cutoff_seq, shared_seq orelse -1,
+                if (isoMs(cv)) |t| nowMillis() - t else -1, if (own_last >= 0) own_last - cutoff_seq else -1,
             });
         }
         if (streamed > 0) {
@@ -7091,6 +7172,15 @@ test "applied frontier: a failed read fails closed, and a parked route stays par
     try client.st.execSimple("ALTER TABLE _zbz_frontier RENAME TO _zbz_frontier_away");
     if (client.dropFrontiers("CDC_acme")) |_| return error.TestExpectedAnError else |_| {}
     try std.testing.expectEqual(@as(usize, 1), client.states.getPtr("a").?.frontiers.items.len);
+}
+
+test "isoMs reads the producer's UTC timestamps" {
+    try std.testing.expectEqual(@as(?i64, 1_761_462_010_000), SyncClient.isoMs("2025-10-26 07:00:10+00"));
+    try std.testing.expectEqual(@as(?i64, 1_761_462_010_123), SyncClient.isoMs("2025-10-26T07:00:10.123456Z"));
+    try std.testing.expectEqual(@as(?i64, 0), SyncClient.isoMs("1970-01-01 00:00:00+00"));
+    try std.testing.expectEqual(@as(?i64, 951_782_400_000), SyncClient.isoMs("2000-02-29 00:00:00+00")); // a leap day
+    try std.testing.expectEqual(@as(?i64, null), SyncClient.isoMs(""));
+    try std.testing.expectEqual(@as(?i64, null), SyncClient.isoMs("not a timestamp at all"));
 }
 
 test "fence scope: other tables stay untouched when their coverage is known, and the rest refuses" {
