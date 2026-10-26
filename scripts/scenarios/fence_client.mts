@@ -7,8 +7,9 @@
 //   ZB_TEST_FENCE_ABORT=after_chunk|before_commit   exit(70) at that boundary
 //   ZB_TEST_FENCE_SLEEP_MS=<ms>                     hold before the fence's VERIFY
 //   ZB_TEST_SHARED_UNREADABLE=1                     the shared route's lookup fails
+//   ZB_TEST_FENCE_HOLD_FILE=<path>                  while the file exists, hold before the fence reads the position (the tails keep applying)
 //
-//   node --experimental-strip-types fence_client.mts <natsUrl> <creds> <db> <principal> <table> [seedChunkRows]
+//   node --experimental-strip-types fence_client.mts <natsUrl> <creds> <db> <principal> <table[,table...]> [seedChunkRows]
 import { existsSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { ZeBridge } from '../../zb-client-ts/src/entry-node.ts';
@@ -16,14 +17,19 @@ import { ZeBridge } from '../../zb-client-ts/src/entry-node.ts';
 const [, , url, creds, db, principal, table, chunk] = process.argv;
 const abortAt = process.env.ZB_TEST_FENCE_ABORT;
 const holdMs = Number(process.env.ZB_TEST_FENCE_SLEEP_MS ?? 0);
+const holdFile = process.env.ZB_TEST_FENCE_HOLD_FILE;
 const sharedUnreadable = !!process.env.ZB_TEST_SHARED_UNREADABLE;
 
 const say = (line: string) => console.error(line);
 
 const client = new ZeBridge({
-  natsUrl: url, credsPath: creds, dbPath: db, principal, jsDomain: 'hub', tables: [table], heartbeatMs: 0,
+  natsUrl: url, credsPath: creds, dbPath: db, principal, jsDomain: 'hub', tables: table.split(','), heartbeatMs: 0,
   ...(Number(chunk) > 0 ? { seedChunkRows: Number(chunk) } : {}),
   faultHook: async (point) => {
+    if (point === 'before_decision' && holdFile && existsSync(holdFile)) {
+      say('test: fence holding before reading the position');
+      while (existsSync(holdFile)) await sleep(100);
+    }
     if (point === 'after_chunk' && abortAt === 'after_chunk') process.exit(70);
     if (point === 'before_commit' && abortAt === 'before_commit') process.exit(70);
     if (point === 'before_verify' && holdMs > 0) {

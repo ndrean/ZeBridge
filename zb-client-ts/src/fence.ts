@@ -21,6 +21,15 @@
 /// every proof, though its cursor now sits at the cut and the chain no longer "predates"
 /// it. This file is the DECISION, as pure functions (the I/O is libzb.ts); libzb's
 /// client.zig makes the same decision inline.
+///
+/// A rewind replays a route's events to EVERY table on it. The tables the fence leaves
+/// untouched already hold those events, so each gets an APPLIED FRONTIER (the recovery
+/// model's §1): the route's position when the fence was prepared, kept with the identity of
+/// the stream it was taken on, and replay skips their events at or below it. Version guards
+/// alone cannot: an insert at 11 and a tombstone at 12 applied, a rewind to 10 — the insert
+/// at 11 recreates a row no surviving version rejects. The frontier is spent when the
+/// position passes it, gone when the table is replaced by a chain or the stream restarts.
+/// A table whose coverage is unknown (not seeded) cannot stay untouched: the fence is refused.
 
 /// What the caller learned before any row changes.
 export interface FenceFacts {
@@ -32,8 +41,8 @@ export interface FenceFacts {
   ownStream: string;
   ownPos: number;
   ownCut: number;
-  /// Only this table rides the own route: a rewind would replay no other table's events.
-  soleOwn: boolean;
+  /// Why the other tables on the own route cannot stay untouched (`fenceScope`), or null.
+  ownScopeRefusal: string | null;
   /// The own route's cut is replayable: the stream was read, on the incarnation the chain
   /// was cut on, and the seed gate is not zeroed (`gateSeq === cutoff_seq`).
   ownReplayable: boolean;
@@ -46,8 +55,8 @@ export interface FenceFacts {
   /// The shared cut is proven: both incarnations known and equal.
   sharedProven: boolean;
   sharedPos: number;
-  /// Only this table rides the shared route.
-  soleShared: boolean;
+  /// The same for the shared route.
+  sharedScopeRefusal: string | null;
 }
 
 export type FenceDecision =
@@ -62,10 +71,10 @@ export type FenceDecision =
 export function decideFence(f: FenceFacts): FenceDecision {
   if (!f.predates && !f.pending) return { kind: 'none' };
   const owed = f.pending;
-  // A rewind of the own route (the chain behind the cursor) needs the sole-table scope; a
-  // pending retry already at or before this cut rewinds nothing there.
-  if (f.predates && !f.soleOwn) {
-    return { kind: 'refuse', owed, why: `chain predates replica — refusing the full (D2): other tables ride ${f.ownStream}, and a rewind would replay their events` };
+  // A rewind of the own route (the chain behind the cursor) needs the other tables on it to
+  // stay untouched; a pending retry already at or before this cut rewinds nothing there.
+  if (f.predates && f.ownScopeRefusal !== null) {
+    return { kind: 'refuse', owed, why: `chain predates replica — refusing the full (D2): ${f.ownScopeRefusal}` };
   }
   if (!f.ownReplayable) {
     return { kind: 'refuse', owed, why: `chain predates replica — refusing the full (D2): its cut on ${f.ownStream} cannot be proven replayable (stream unread, or another incarnation)` };
@@ -81,8 +90,8 @@ export function decideFence(f: FenceFacts): FenceDecision {
       return { kind: 'refuse', owed, why: `chain predates replica — refusing the full (D2): its shared cut on ${f.sharedStream} cannot be proven replayable` };
     }
     if (f.sharedPos > f.sharedCut) {
-      if (!f.soleShared) {
-        return { kind: 'refuse', owed, why: `chain predates replica — refusing the full (D2): other tables ride ${f.sharedStream}, and its rewind would replay their events` };
+      if (f.sharedScopeRefusal !== null) {
+        return { kind: 'refuse', owed, why: `chain predates replica — refusing the full (D2): ${f.sharedScopeRefusal}` };
       }
       sharedTo = f.sharedCut;
     }
@@ -111,25 +120,50 @@ export function verifyRoutes(routes: FenceRoute[], facts: (stream: string) => { 
   return null;
 }
 
-/// The tables whose routes include any of `streams`, other than `table`: the ones a
-/// rewind of those streams would replay events onto. `routesOf` gives a table's own route
-/// and its shared route (CDC_PUBLIC for a tenant table), null for a table not followed
-/// (on-demand, or no tenant for this principal).
-export function soleDependent(
+/// A table's applied frontier on one route: it holds every event of `stream` up to `seq`.
+export interface Frontier {
+  stream: string;
+  seq: number;
+}
+
+/// The frontier gate: an event at or below its table's frontier on its stream is already
+/// in the table. (An event with no stream or sequence — a local write — is never gated.)
+export function frontierDrops(ev: { stream?: string; seq?: number }, frontiers: readonly Frontier[] | undefined): boolean {
+  if (!frontiers?.length || typeof ev.seq !== 'number' || !ev.stream) return false;
+  for (const f of frontiers) if (f.stream === ev.stream && ev.seq <= f.seq) return true;
+  return false;
+}
+
+/// A table left untouched by a fence, with the route whose events it already holds.
+export interface Untouched {
+  table: string;
+  stream: string;
+}
+
+/// The fence's scope rule (the recovery model's §3, R3): which OTHER tables ride any of
+/// `streams`, and can they stay untouched? Each gets an applied frontier at the route's
+/// position. That needs its coverage to be KNOWN: a table that is not seeded has none, and
+/// the fence is refused. `routesOf` gives a table's own route and its shared route
+/// (CDC_PUBLIC for a tenant table), null for a table not followed (on-demand, or no tenant
+/// for this principal), which rides nothing. An empty stream name matches nothing.
+export function fenceScope(
   table: string,
   streams: readonly string[],
   tables: Iterable<string>,
   routesOf: (t: string) => { route: string; sharedRoute?: string } | null,
-): boolean {
+  seeded: (t: string) => boolean,
+): { refused: string | null; untouched: Untouched[] } {
   const wanted = streams.filter((s) => s.length > 0);
+  const untouched: Untouched[] = [];
   for (const t of tables) {
     if (t === table) continue;
     const r = routesOf(t);
     if (!r) continue;
     for (const s of wanted) {
-      if (r.route === s) return false;
-      if (r.sharedRoute && r.sharedRoute === s) return false;
+      if (r.route !== s && !(r.sharedRoute && r.sharedRoute === s)) continue;
+      if (!seeded(t)) return { refused: `${t} is not seeded, so its coverage on ${s} is unknown`, untouched: [] };
+      if (!untouched.some((u) => u.table === t && u.stream === s)) untouched.push({ table: t, stream: s });
     }
   }
-  return true;
+  return { refused: null, untouched };
 }

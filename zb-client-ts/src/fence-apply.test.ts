@@ -55,7 +55,12 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
     CREATE TABLE IF NOT EXISTS _zebridge_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL, created TEXT);
     CREATE TABLE IF NOT EXISTS _zebridge_generations (tbl TEXT PRIMARY KEY, watermark TEXT NOT NULL, cutoff_lsn INTEGER NOT NULL, seed_epoch INTEGER NOT NULL DEFAULT 0, seed_seq INTEGER, seed_stream TEXT, shared_seed_seq INTEGER);
     CREATE TABLE IF NOT EXISTS _zebridge_fence (tbl TEXT PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS _zebridge_sync (id INTEGER PRIMARY KEY, global_last_lsn INTEGER, global_last_seq INTEGER);
+    INSERT OR IGNORE INTO _zebridge_sync VALUES (1, 0, 0);
+    CREATE TABLE IF NOT EXISTS _zebridge_frontier (tbl TEXT NOT NULL, stream TEXT NOT NULL, created TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (tbl, stream));
     CREATE TABLE IF NOT EXISTS item (id INTEGER PRIMARY KEY, tenant_id TEXT, note TEXT, updated_at TEXT);
+    CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, tenant_id TEXT, note TEXT, updated_at TEXT);
+    CREATE TABLE IF NOT EXISTS catalogue (id INTEGER PRIMARY KEY, tenant_id TEXT, note TEXT, updated_at TEXT);
   `);
   const c: any = Object.create(ZeBridge.prototype);
   const log: string[] = [];
@@ -71,16 +76,20 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
   const syncedTables = new Map<string, any>([['item', {
     pkCols: ['id'], columns: ['id', 'tenant_id', 'note', 'updated_at'], tenantColumn: 'tenant_id', versionColumn: 'updated_at', seedEpoch: 0,
   }]]);
-  for (const t of opts.others ?? []) syncedTables.set(t, { pkCols: ['id'], columns: ['id'], tenantColumn: 'tenant_id' });
+  for (const t of opts.others ?? []) syncedTables.set(t, {
+    pkCols: ['id'], columns: ['id', 'tenant_id', 'note', 'updated_at'], tenantColumn: 'tenant_id', versionColumn: 'updated_at', seedEpoch: 0,
+  });
+  const streamCreated = new Map<string, string>(db.prepare('SELECT stream, created FROM _zebridge_stream_seq WHERE created IS NOT NULL').all().map((r) => [String(r.stream), String(r.created)]));
   const passes: number[] = [];
   Object.assign(c, {
     nc: {}, tenantValue: 'acme', syncedTables, ondemandSet: new Set(), seedInFlight: new Map(),
     globalSyncState: { seq }, tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(),
     streamWork: Promise.resolve(), streamsSubscribed: true, restarted: new Set(), failed: new Set(), hubOnly: new Set(),
-    applyingByChoice: new Set(), healedRoutes: new Set(), streamCreated: new Map(), fkHeld: [], hlcFloor: '',
+    applyingByChoice: new Set(), healedRoutes: new Set(), streamCreated, fkHeld: [], hlcFloor: '', frontiers: new Map(), frontierGated: 0,
+    pendingWrites: new Map(), rebase: new Map(), bulkStats: { single: 0, statements: 0, bulked: 0, fallbacks: 0 },
     measure: new Measure(() => {}), dialect: sqliteDialect, storage: {}, platform: {},
     config: {
-      principal: 'p', seedChunkRows: 2, faultHook: opts.hook ? (point: string) => opts.hook!(point, c) : undefined,
+      principal: 'p', seedChunkRows: 2, bulkStatement: 'json_each', faultHook: opts.hook ? (point: string) => opts.hook!(point, c) : undefined,
       grammar: {
         generations: { kv: 'generations', bucket_prefix: 'gen-' }, kv: { tenants: 'tenants' }, streams: { cdc: 'CDC' },
         cdc_streams: { public: PUB, tenant_prefix: 'CDC_' }, open_tenant: '_default',
@@ -105,8 +114,9 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
 
 /// A replica holding old rows and an anchor, the position ahead of the new chain's cuts:
 /// the follower the fence exists for.
-function follower(path: string, world: World) {
+function follower(path: string, world: World, seededOthers: string[] = []) {
   const t = client(path, world);
+  for (const o of seededOthers) t.db.exec(`INSERT INTO _zebridge_generations VALUES ('${o}', '${VERSION(1)}', 1, 0, 470, '${OWN}', 70)`);
   t.db.exec(`
     INSERT INTO item VALUES (91,'acme','old','${VERSION(1)}'),(92,'acme','old','${VERSION(1)}'),(93,'acme','old','${VERSION(1)}');
     INSERT INTO _zebridge_stream_seq VALUES ('${OWN}', 500, 'own-1'), ('${PUB}', 90, 'pub-1');
@@ -305,18 +315,143 @@ test('a shared route that cannot be read refuses the fence: nothing prepared, th
   });
 });
 
-test('another table on the same routes: the old refusal (D2) stands and nothing changes', async () => {
+test('another table on the routes that is not seeded: the old refusal (D2) stands and nothing changes', async () => {
   await withDir(async (path) => {
     const w = new World();
     w.publish(2, 5, 300);
-    follower(path, w);
+    follower(path, w); // orders has no anchor: its coverage is unknown
     const t = client(path, w, { others: ['orders'] });
     try {
       assert.equal(await t.c.applyGenerations('item'), false);
-      assert.ok(t.log.some((m) => /refusing the full \(D2\): other tables ride CDC_acme/.test(m)));
+      assert.ok(t.log.some((m) => /refusing the full \(D2\): orders is not seeded, so its coverage on CDC_acme is unknown/.test(m)));
       assert.equal(owed(t.db), 0);
       assert.deepEqual(rows(t.db), ['91:old', '92:old', '93:old']);
       assert.equal(pos(t.db, OWN), 500);
+      assert.equal(frontierRows(t.db).length, 0);
+    } finally { t.close(); }
+  });
+});
+
+const frontierRows = (db: DatabaseSync) => db.prepare('SELECT tbl, stream, created, seq FROM _zebridge_frontier ORDER BY tbl, stream').all().map((r) => ({ ...r }));
+const ev = (table: string, id: number, stream: string, seq: number, note: string, ver = 30) =>
+  ({ table, operation: 'INSERT', data: { id, tenant_id: 'acme', note, updated_at: VERSION(ver) }, stream, seq, lsn: 0 });
+
+test('another seeded table on the routes stays untouched: its frontier is written with the cursors, the events it holds are skipped on replay', async () => {
+  for (const planned of [false, true]) await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 300);
+    follower(path, w, ['orders']);
+    const t = client(path, w, { others: ['orders'] });
+    try {
+      assert.equal(await t.c.applyGenerations('item'), true);
+      assert.deepEqual(rows(t.db), wanted(2, 5));
+      assert.equal(pos(t.db, OWN), 300);
+      // The fenced table is replaced; the untouched one keeps its rows and gets a frontier at
+      // each rewound route's position as it was, on the identity the chain was cut on.
+      assert.deepEqual(frontierRows(t.db), [
+        { tbl: 'orders', stream: PUB, created: 'pub-1', seq: 90 },
+        { tbl: 'orders', stream: OWN, created: 'own-1', seq: 500 },
+      ]);
+      assert.deepEqual([...t.c.frontiers.get('orders')!].sort((a, b) => a.seq - b.seq), [{ stream: PUB, seq: 90 }, { stream: OWN, seq: 500 }]);
+      assert.equal(t.c.frontiers.has('item'), false, 'the fenced table has none of its own');
+      assert.ok(t.log.some((m) => /keep their applied frontier/.test(m)));
+      // The replay: orders already holds everything up to 500 on the own route, 90 on the shared one.
+      const replay = [ev('orders', 1, OWN, 301, 'held'), ev('orders', 2, OWN, 500, 'held'), ev('orders', 3, OWN, 501, 'new'), ev('orders', 4, PUB, 90, 'held'), ev('orders', 5, PUB, 91, 'new')];
+      if (planned) await t.c.applyBatchPlanned(replay.map((e) => ({ table: 'orders', ev: e })), t.c.run);
+      else for (const e of replay) await t.c.applyEvent('orders', e);
+      assert.deepEqual(t.db.prepare('SELECT id, note FROM orders ORDER BY id').all().map((r) => `${r.id}:${r.note}`), ['3:new', '5:new'], 'only past its frontier does the table take events');
+      assert.equal(t.c.frontierGated, 3);
+      // The fenced table itself replays its events (it has no frontier): a replayed event lands.
+      await t.c.applyEvent('item', ev('item', 9, OWN, 305, 'replayed', 40));
+      assert.equal(t.db.prepare('SELECT note FROM item WHERE id = 9').get()?.note, 'replayed');
+    } finally { t.close(); }
+  });
+});
+
+test('a frontier is spent when the position passes it, and gone from the replica with it', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 300);
+    follower(path, w, ['orders']);
+    const t = client(path, w, { others: ['orders'] });
+    try {
+      assert.equal(await t.c.applyGenerations('item'), true);
+      await t.c.advanceGlobal(t.c.run, 0, OWN, 499);
+      assert.equal(frontierRows(t.db).length, 2, 'below the frontier: kept');
+      await t.c.advanceGlobal(t.c.run, 0, OWN, 500);
+      assert.deepEqual(frontierRows(t.db).map((r) => r.stream), [PUB], 'the own route\'s is spent, the shared one is another stream');
+      assert.deepEqual(t.c.frontiers.get('orders'), [{ stream: PUB, seq: 90 }]);
+      await t.c.advanceGlobal(t.c.run, 0, PUB, 120);
+      assert.equal(frontierRows(t.db).length, 0);
+      assert.equal(t.c.frontiers.has('orders'), false);
+    } finally { t.close(); }
+  });
+});
+
+test('the frontier survives a crash after PREPARE and is read back by the reopened client; a stream recreated since kills it', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 300);
+    follower(path, w, ['orders']);
+    const t = client(path, w, { others: ['orders'], hook: crash('after_chunk') });
+    try {
+      await assert.rejects(() => t.c.applyGenerations('item'), /crash at after_chunk/);
+      assert.equal(owed(t.db), 1);
+      assert.equal(pos(t.db, OWN), 300);
+    } finally { t.close(); }
+    // Reopened: the frontier is above the cursor it guards, still there to skip the replay.
+    const r = client(path, w, { others: ['orders'] });
+    try {
+      await r.c.loadFrontiers();
+      assert.deepEqual([...r.c.frontiers.get('orders')].sort((a, b) => a.seq - b.seq), [{ stream: PUB, seq: 90 }, { stream: OWN, seq: 500 }]);
+      assert.equal(await r.c.applyGenerations('item'), true, 'the owed fence recovers');
+      assert.equal(owed(r.db), 0);
+      assert.deepEqual(frontierRows(r.db).map((x) => Number(x.seq)).sort((a, b) => a - b), [90, 500], 'the retry (its cursor at the cut) does not lower them');
+    } finally { r.close(); }
+    // Another incarnation of the route since: what was taken on the old one means nothing.
+    const g = client(path, w, { others: ['orders'] });
+    try {
+      g.db.exec(`UPDATE _zebridge_stream_seq SET created = 'own-2' WHERE stream = '${OWN}'`);
+      g.c.streamCreated.set(OWN, 'own-2');
+      await g.c.loadFrontiers();
+      assert.deepEqual(g.c.frontiers.get('orders'), [{ stream: PUB, seq: 90 }]);
+      assert.deepEqual(frontierRows(g.db).map((x) => x.stream), [PUB], 'the dead row is deleted');
+    } finally { g.close(); }
+  });
+});
+
+test('a stream whose position was stored on another incarnation than the chain\'s cut: the other table cannot stay untouched, the fence is refused', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 300);
+    follower(path, w, ['orders']);
+    const t = client(path, w, { others: ['orders'] });
+    try {
+      t.c.streamCreated.set(OWN, 'own-0'); // the stored position's identity is not the manifest's
+      assert.equal(await t.c.applyGenerations('item'), false);
+      assert.ok(t.log.some((m) => /orders stays untouched on CDC_acme only if its position and the chain's cut were taken on the same stream incarnation/.test(m)));
+      assert.equal(owed(t.db), 0);
+      assert.equal(pos(t.db, OWN), 500);
+      assert.deepEqual(rows(t.db), ['91:old', '92:old', '93:old']);
+    } finally { t.close(); }
+  });
+});
+
+test('a chain applied to a table drops the frontier it held before its first step', async () => {
+  for (const gone of [false, true]) await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 600); // cut past the position: no fence, a plain seed
+    if (gone) w.objects.delete(w.manifest.full.object); // pruned under us: no step is ever applied
+    follower(path, w);
+    const t = client(path, w);
+    // A frontier a fence on another table left for this one.
+    t.db.exec(`INSERT INTO _zebridge_frontier VALUES ('item', '${OWN}', 'own-1', 520)`);
+    t.c.frontiers.set('item', [{ stream: OWN, seq: 520 }]);
+    try {
+      assert.equal(await t.c.applyGenerations('item'), !gone);
+      assert.deepEqual(rows(t.db), gone ? ['91:old', '92:old', '93:old'] : wanted(2, 5));
+      assert.equal(frontierRows(t.db).length, 0, 'gone from the replica');
+      assert.equal(t.c.frontiers.has('item'), false);
     } finally { t.close(); }
   });
 });

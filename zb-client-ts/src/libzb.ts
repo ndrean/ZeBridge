@@ -30,7 +30,7 @@ import { decode, encode, decodeMulti } from '@msgpack/msgpack';
 import type { Storage, StorageFactory, Exec as StorageExec } from './storage.ts';
 
 import { sqliteDialect, type Dialect } from './dialect.ts';
-import { decideFence, soleDependent as soleDependentRoutes, verifyRoutes, type FenceRoute } from './fence.ts';
+import { decideFence, fenceScope as fenceScopeOf, frontierDrops, verifyRoutes, type FenceRoute, type Frontier, type Untouched } from './fence.ts';
 import { loadCore, scopeSeeding, caughtUpPosition, streamResume, deltaEligible, cdcBacklogBytes, streamDeltaChoice, streamForward } from './wasm-core.ts';
 import { v7 as uuidv7 } from 'uuid';
 import { heartbeatPayload,
@@ -156,11 +156,13 @@ export interface ZeBridgeConfig {
   /// §10fb: rows per transaction when a chain step seeds a table (default 50 000;
   /// 0 = one transaction for the step). Bounds memory and how long the lock is held.
   seedChunkRows?: number;
-  /// TEST HARNESSES ONLY. Called at the fence's boundaries — `after_chunk` (a window of the
+  /// TEST HARNESSES ONLY. Called at the fence's boundaries — `before_decision` (the chain is
+  /// read and proven, the position not yet: a harness that waits here lets the tails keep
+  /// applying, so the position runs ahead of the chain's cut), `after_chunk` (a window of the
   /// replacement committed), `before_verify`, `before_commit`, and `shared_lookup` (the
   /// shared route's stream lookup; a throw there makes the route unreadable). A harness
   /// crashes the process, sleeps while it prunes the stream, or throws. Never set in an app.
-  faultHook?: (point: 'after_chunk' | 'before_verify' | 'before_commit' | 'shared_lookup') => void | Promise<void>;
+  faultHook?: (point: 'before_decision' | 'after_chunk' | 'before_verify' | 'before_commit' | 'shared_lookup') => void | Promise<void>;
   /// §10ix (libzb: same name): apply a chain step AS IT ARRIVES — chunks inflated and
   /// decoded into windows of `seedChunkRows`, never the whole document. Measured on a
   /// 3M-row base: 2.5 GB peak when the document was materialised whole (§10iw).
@@ -634,6 +636,12 @@ export class ZeBridge {
   /// moved back to the chain's cut. Released when that fence commits; a parking whose table
   /// is no longer followed is stale and ignored.
   private fenced = new Map<string, string>();
+  /// The applied frontiers (fence.ts), per table: from `_zebridge_frontier`, only those taken on
+  /// the stream identity the stored position carries now. Written by a fence for the tables it
+  /// leaves untouched, spent as the position passes them, gone when the table is replaced.
+  private frontiers = new Map<string, Frontier[]>();
+  /// Events the frontier gate dropped (the log says it when a frontier is spent).
+  private frontierGated = 0;
 
   /// Consumer setup and reconciliation rewinds must not race each other's positions.
   private changeStreams(fn: () => Promise<void>): Promise<void> {
@@ -1549,6 +1557,8 @@ export class ZeBridge {
     `);
     // The fence's owed record (fence.ts): a row between its PREPARE and its anchor's commit.
     await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_fence (tbl TEXT PRIMARY KEY)`);
+    // The applied frontiers (fence.ts): the stream identity they were taken on rides with them.
+    await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_frontier (tbl TEXT NOT NULL, stream TEXT NOT NULL, created TEXT NOT NULL, seq ${this.dialect.int64} NOT NULL, PRIMARY KEY (tbl, stream))`);
     // A replica from before §10df: the column is added; refused, harmlessly, on one that has it.
     try { await this.run(`ALTER TABLE _zebridge_generations ADD COLUMN seed_epoch INTEGER NOT NULL DEFAULT 0`); } catch { /* present */ }
     try { await this.run(`ALTER TABLE _zebridge_stream_seq ADD COLUMN created TEXT`); } catch { /* present */ }
@@ -1573,6 +1583,64 @@ export class ZeBridge {
     for (const r of await this.run(`SELECT stream, last_seq FROM _zebridge_stream_seq`)) {
       this.globalSyncState.seq[(r as any).stream] = (r as any).last_seq ?? 0;
     }
+    await this.loadFrontiers();
+  }
+
+  /// The applied frontiers back from the replica. A row taken on another stream identity —
+  /// the stream was recreated since (R4) — is dead and deleted.
+  private async loadFrontiers() {
+    this.frontiers.clear();
+    try {
+      for (const r of (await this.run(
+        `SELECT f.tbl, f.stream, f.seq FROM _zebridge_frontier f JOIN _zebridge_stream_seq s ON s.stream = f.stream AND s.created = f.created`,
+      )) ?? []) {
+        const seq = Number((r as any).seq);
+        if (!(seq > 0)) continue;
+        const t = String((r as any).tbl);
+        this.frontiers.set(t, [...(this.frontiers.get(t) ?? []), { stream: String((r as any).stream), seq }]);
+      }
+      await this.run(`DELETE FROM _zebridge_frontier WHERE NOT EXISTS (SELECT 1 FROM _zebridge_stream_seq s WHERE s.stream = _zebridge_frontier.stream AND s.created = _zebridge_frontier.created)`);
+    } catch (e) {
+      this.appendLog('SQLITE', `Failed to load the applied frontiers: ${e}`, 'ERROR');
+    }
+  }
+
+  /// The position of `stream` reached `seq`: every frontier on it at or below `seq` is spent
+  /// (replay has passed what those tables already held). Called after the position was persisted,
+  /// with the caller's `exec` where it is inside a transaction.
+  private async spendFrontiers(stream: string, seq: number, exec: Exec = this.run) {
+    if (!this.frontiers.size) return;
+    let spent = false;
+    for (const [t, fr] of [...this.frontiers]) {
+      const keep = fr.filter((f) => !(f.stream === stream && f.seq <= seq));
+      if (keep.length === fr.length) continue;
+      spent = true;
+      if (keep.length) this.frontiers.set(t, keep); else this.frontiers.delete(t);
+    }
+    if (!spent) return;
+    try {
+      await exec(`DELETE FROM _zebridge_frontier WHERE stream = ? AND seq <= ?`, stream, seq);
+    } catch (e) {
+      this.appendLog('SQLITE', `Failed to spend the applied frontiers on ${stream}: ${e}`, 'ERROR');
+    }
+    this.appendLog('SYS', `${stream}: replay passed the applied frontiers at ${seq} — ${this.frontierGated} event(s) skipped so far for the tables that already held them`, 'INFO');
+  }
+
+  /// A stream recreated or restarted (or replayed from 0): no frontier taken on it means anything.
+  private async dropFrontiers(stream: string) {
+    for (const [t, fr] of [...this.frontiers]) {
+      const keep = fr.filter((f) => f.stream !== stream);
+      if (keep.length === fr.length) continue;
+      if (keep.length) this.frontiers.set(t, keep); else this.frontiers.delete(t);
+    }
+    try { await this.run(`DELETE FROM _zebridge_frontier WHERE stream = ?`, stream); } catch { /* none */ }
+  }
+
+  /// A table's rows stop matching its frontier when a chain replaces them as of ITS cut, or the
+  /// table goes: the events up to the frontier must replay for it too.
+  private async dropTableFrontiers(table: string) {
+    this.frontiers.delete(table);
+    try { await this.run(`DELETE FROM _zebridge_frontier WHERE tbl = ?`, table); } catch { /* none */ }
   }
 
   // ── outbox (PROTOCOL.md §7.1) ──────────────────────────────────────────────
@@ -1919,6 +1987,7 @@ export class ZeBridge {
       await this.run(`DROP VIEW IF EXISTS ${table}_view;`);
       await this.run(`DROP TABLE IF EXISTS ${table};`);
       this.syncedTables.delete(table);
+      await this.dropTableFrontiers(table);
       await this.discardOutbox(table, 'dropped');
       this.appendLog('SCHEMA', `Dropped local table "${table}" (${reason})`, 'DROP');
       this.scheduleRecount();
@@ -2353,7 +2422,7 @@ export class ZeBridge {
     const counted = entries.filter(({ ev }) => this.measure.counts(ev.stream, ev.seq));
     const attempt = new MeasureAttempt(counted.map(({ table, ev }) => {
       const state = this.syncedTables.get(table);
-      return { ev, gated: !!state && !state.unseeded && seedGateDrops(ev, state) };
+      return { ev, gated: !!state && !state.unseeded && (seedGateDrops(ev, state) || frontierDrops(ev, this.frontiers.get(table))) };
     }));
     for (const { table, ev } of counted) {
       if (!this.syncedTables.has(table) || !ev.data || typeof ev.data !== 'object') attempt.failed(ev);
@@ -2603,6 +2672,9 @@ export class ZeBridge {
     // (seq-primary because commit-ordered; strict-< lsn fallback anchored only
     // by a seed), pinned executable in fixtures/core-fixtures.json.
     if (!seed && seedGateDrops(ev, state)) return;
+    // The applied frontier (fence.ts): a fence rewound this route for ANOTHER table, and this
+    // one already holds everything up to its frontier.
+    if (!seed && frontierDrops(ev, this.frontiers.get(table))) { this.frontierGated++; return; }
 
     this.feedFloor(state, ev);
 
@@ -2744,6 +2816,7 @@ export class ZeBridge {
            ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
           stream, this.globalSyncState.seq[stream],
         );
+        await this.spendFrontiers(stream, this.globalSyncState.seq[stream], exec);
       }
     } catch (e) {
       this.appendLog('SQLITE', `Failed to update sync state: ${e}`, 'ERROR');
@@ -2764,8 +2837,13 @@ export class ZeBridge {
       const st = this.syncedTables.get(table);
       if (st) tables[table] = { columns: st.columns, pkCols: st.pkCols, tombstoneColumn: st.tombstoneColumn, unseeded: st.unseeded, anchor: st, blobCols: st.blobCols };
     }
-    const segments = planCdcBulk(this.dialect.name, tables, toApply.map(({ table, ev }) =>
-      ({ table, operation: ev?.operation, data: ev?.data, seq: ev?.seq, stream: ev?.stream, lsn: ev?.lsn, optimistic: ev?.optimistic })));
+    const segments = planCdcBulk(this.dialect.name, tables, toApply.map(({ table, ev }) => {
+      // An event the table's applied frontier covers goes to the planner without its data: a
+      // `drop`, like a gated one (the position still counts it).
+      const covered = frontierDrops(ev ?? {}, this.frontiers.get(table));
+      if (covered) this.frontierGated++;
+      return { table, operation: ev?.operation, data: covered ? null : ev?.data, seq: ev?.seq, stream: ev?.stream, lsn: ev?.lsn, optimistic: ev?.optimistic };
+    }));
     for (const seg of segments) {
       if (seg.kind === 'single') {
         this.bulkStats.single++;
@@ -3441,6 +3519,13 @@ export class ZeBridge {
 
     const applyPlan = async (plan: PlanStep[]): Promise<number | null> => {
       let applied = 0;
+      // The chain's steps put rows back as of ITS cut: a delta's upsert re-inserts a row this
+      // table has since deleted (no version rejects an insert onto nothing). Whatever frontier
+      // the table held (a fence on another table left it) no longer describes its rows, so the
+      // events up to it replay for this table too — dropped BEFORE the first step: a crash
+      // between a step and the anchor must not leave rows from the cut under a frontier that
+      // skips the events that correct them.
+      if (plan.length && this.frontiers.has(table)) await this.dropTableFrontiers(table);
       for (const step of plan) {
         const stepT0 = Date.now();
         const applied0 = applied;
@@ -3658,19 +3743,22 @@ export class ZeBridge {
 
     // One manifest's plan and fence decision; null = wait (refused, and said).
     const begin = async (man: any, pr: Proof): Promise<PlanStep[] | null> => {
+      await this.fault('before_decision');
       const plan = planFrom(man);
       const ownPos = this.globalSyncState.seq[man.cdc_stream] ?? 0;
       const predates = coreFullPredates(man, plan, ownPos);
       const pending = await this.fenceOwed(table);
+      const ownScope = predates ? await this.fenceScope(table, [man.cdc_stream ?? '']) : { refused: null, untouched: [] as Untouched[] };
+      const sharedScope = sharedRoute ? await this.fenceScope(table, [sharedRoute]) : { refused: null, untouched: [] as Untouched[] };
       const decision = decideFence({
         predates, pending,
         ownStream: man.cdc_stream ?? '', ownPos, ownCut: typeof man.cutoff_seq === 'number' ? man.cutoff_seq : 0,
-        soleOwn: this.soleDependent(table, [man.cdc_stream ?? '', man.shared_cdc_stream ?? '']),
+        ownScopeRefusal: ownScope.refused,
         ownReplayable: pr.ownReplayable,
         sharedStream: sharedRoute, manifestSharedStream: man.shared_cdc_stream ?? '',
         sharedCut: pr.sharedSeq, sharedProven: pr.sharedProven,
         sharedPos: sharedRoute ? (this.globalSyncState.seq[sharedRoute] ?? 0) : 0,
-        soleShared: sharedRoute ? this.soleDependent(table, [sharedRoute]) : true,
+        sharedScopeRefusal: sharedScope.refused,
       });
       if (decision.kind === 'refuse') { this.appendLog('SYS', `${table}: ${decision.why}`, 'WARNING'); return null; }
       if (decision.kind === 'none') return plan;
@@ -3691,6 +3779,18 @@ export class ZeBridge {
       // very events that must replay.
       const streams = [man.cdc_stream, ...(decision.sharedTo !== null && sharedRoute ? [sharedRoute] : [])];
       const to = (x: string) => (x === man.cdc_stream ? decision.ownTo : (decision.sharedTo as number));
+      // The tables the fence leaves untouched, each with the route it rewinds. Their frontier is
+      // taken on the stream identity the chain's cut was proven on (R4): the stored identity of
+      // the position must be that one, or they cannot stay untouched.
+      const untouched: Untouched[] = [...(predates ? ownScope.untouched : []), ...(decision.sharedTo !== null ? sharedScope.untouched : [])];
+      const createdOf = (x: string) => String(x === man.cdc_stream ? (man.cdc_stream_created ?? '') : (man.shared_cdc_stream_created ?? ''));
+      for (const u of untouched) {
+        const want = createdOf(u.stream);
+        if (!want || this.streamCreated.get(u.stream) !== want) {
+          this.appendLog('SYS', `${table}: chain predates replica — refusing the full (D2): ${u.table} stays untouched on ${u.stream} only if its position and the chain's cut were taken on the same stream incarnation, and that is not settled`, 'WARNING');
+          return null;
+        }
+      }
       const prepare = async () => {
         // The parking is memory the transaction does not own: a PREPARE that fails before
         // it commits must leave it as it found it, or the routes stay parked with nothing
@@ -3699,13 +3799,32 @@ export class ZeBridge {
         try {
           for (const x of streams) this.fenced.set(x, table);
           for (const x of streams) await this.stopTail(x);
+          // The tails are stopped: each route's position is final, and it certifies the
+          // untouched tables (R2) — their frontier is that position, above the cursor it guards.
+          const writes = untouched
+            .map((u) => ({ ...u, created: createdOf(u.stream), seq: this.globalSyncState.seq[u.stream] ?? 0 }))
+            .filter((w) => w.seq > to(w.stream));
           await this.transaction(async (txExec) => {
             await txExec(`DELETE FROM _zebridge_generations WHERE tbl = ?`, table);
             await txExec(`INSERT INTO _zebridge_fence (tbl) VALUES (?) ON CONFLICT(tbl) DO NOTHING`, table);
+            // The fenced table is replaced: what it held before is no frontier of its own.
+            await txExec(`DELETE FROM _zebridge_frontier WHERE tbl = ?`, table);
             for (const x of streams) {
               await txExec(`INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?) ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`, x, to(x));
             }
+            // After the cursors. Monotone on the same stream identity (an earlier, interrupted
+            // fence may have written a higher one), replaced on another.
+            for (const w of writes) {
+              await txExec(
+                `INSERT INTO _zebridge_frontier (tbl, stream, created, seq) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(tbl, stream) DO UPDATE SET
+                   seq = CASE WHEN _zebridge_frontier.created = excluded.created AND _zebridge_frontier.seq > excluded.seq THEN _zebridge_frontier.seq ELSE excluded.seq END,
+                   created = excluded.created`,
+                w.table, w.stream, w.created, w.seq);
+            }
           });
+          // The durable state is the truth: the frontiers back from it.
+          await this.loadFrontiers();
         } catch (e) {
           for (const [x, owner] of parked) { if (owner === undefined) this.fenced.delete(x); else this.fenced.set(x, owner); }
           // The tails were stopped for the PREPARE: reopen them from the cursors, which did
@@ -3722,7 +3841,7 @@ export class ZeBridge {
       // these routes meanwhile.
       await this.withStreamQueue(run, prepare);
       fenceRun = { fromPos: ownPos, shared: decision.sharedTo !== null };
-      this.appendLog('SYS', `${table}: fence prepared — chain g${man.gen} cut at ${man.cutoff_seq} on ${man.cdc_stream} behind position ${ownPos}: anchor cleared, cursor at the cut${decision.sharedTo !== null ? ' (the shared route too)' : ''}; replacing the rows`, 'WARNING');
+      this.appendLog('SYS', `${table}: fence prepared — chain g${man.gen} cut at ${man.cutoff_seq} on ${man.cdc_stream} behind position ${ownPos}: anchor cleared, cursor at the cut${decision.sharedTo !== null ? ' (the shared route too)' : ''}; replacing the rows${untouched.length ? ' — the other tables on the route keep their applied frontier' : ''}`, 'WARNING');
       return plan;
     };
 
@@ -3835,22 +3954,23 @@ export class ZeBridge {
     try { return ((await this.run(`SELECT 1 AS owed FROM _zebridge_fence WHERE tbl = ?`, table)) ?? []).length > 0; } catch { return false; }
   }
 
-  /// Only this table rides any of `streams` (fence.ts's scope rule): a rewind of them would
-  /// replay no other table's events. On-demand tables and tables this principal cannot route
-  /// are not followed and do not count.
-  private soleDependent(table: string, streams: readonly string[]): boolean {
+  /// fence.ts's scope rule for `streams`: the other followed tables riding them keep their rows
+  /// and get an applied frontier, if their coverage is known (they are seeded). On-demand tables
+  /// and tables this principal cannot route are not followed and ride nothing.
+  private async fenceScope(table: string, streams: readonly string[]): Promise<{ refused: string | null; untouched: Untouched[] }> {
     const pub = this.config.grammar.cdc_streams?.public;
-    return soleDependentRoutes(table, streams, this.syncedTables.keys(), (t) => {
+    const have = new Set(((await this.run(`SELECT tbl FROM _zebridge_generations`)) ?? []).map((r: any) => String(r.tbl)));
+    return fenceScopeOf(table, streams, this.syncedTables.keys(), (t) => {
       if (this.ondemandSet.has(t)) return null;
       const tn = this.effectiveTenantFor(t);
       if (tn === null) return null;
       const route = this.cdcStreamForTenant(tn);
       return pub && route !== pub ? { route, sharedRoute: pub } : { route };
-    });
+    }, (t) => have.has(t) && !this.syncedTables.get(t)?.unseeded);
   }
 
   /// The test harness's fault point (config.faultHook); nothing in an app.
-  private async fault(point: 'after_chunk' | 'before_verify' | 'before_commit' | 'shared_lookup'): Promise<void> {
+  private async fault(point: 'before_decision' | 'after_chunk' | 'before_verify' | 'before_commit' | 'shared_lookup'): Promise<void> {
     await this.config.faultHook?.(point);
   }
 
@@ -3918,6 +4038,7 @@ export class ZeBridge {
           this.globalSyncState.seq[streamName] = 0;
           this.restarted.add(streamName);
           await this.run(`UPDATE _zebridge_stream_seq SET last_seq = 0 WHERE stream = ?`, streamName);
+          await this.dropFrontiers(streamName);
         }
         if (created !== '' && (!knownCreated || recreated)) {
           this.streamCreated.set(streamName, created);
@@ -4238,6 +4359,7 @@ export class ZeBridge {
                  ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
                 streamName, to,
               );
+              await this.spendFrontiers(streamName, to);
             }
           }
           if (decided.to > stored0 && rewindTo >= decided.to) {
@@ -4248,6 +4370,7 @@ export class ZeBridge {
                ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
               streamName, decided.to,
             );
+            await this.spendFrontiers(streamName, decided.to);
           }
         } catch { /* stream info unavailable — the per-batch persist still covers it */ }
         // A reconciliation whose seed could not splice must not replay from zero.
@@ -4441,6 +4564,7 @@ export class ZeBridge {
                    ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
                   streamName, maxSeq,
                 );
+                await this.spendFrontiers(streamName, maxSeq);
               } catch (e) {
                 this.appendLog('SQLITE', `Failed to persist ${streamName} position: ${e}`, 'ERROR');
               }
@@ -4529,6 +4653,7 @@ export class ZeBridge {
                      ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
                     streamName, to,
                   );
+                  await this.spendFrontiers(streamName, to);
                 }
               } catch { /* stream info unavailable mid-outage — keep waiting */ }
             })().finally(() => { idleWork = null; });
@@ -4924,6 +5049,7 @@ export class ZeBridge {
     });
     for (const route of rewind) {
       this.globalSyncState.seq[route] = 0;
+      await this.dropFrontiers(route); // replayed from 0: nothing taken on this numbering counts
       this.hubOnly.add(route);
       this.appendLog('SYS', `${route}: rewound for reconciliation — reseeding from the hub`, 'WARNING');
     }

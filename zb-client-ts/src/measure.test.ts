@@ -25,6 +25,7 @@ test('isolated replay counts only final outcomes, including a commit-time failur
     const lines: string[] = [];
     const c: any = Object.create(ZeBridge.prototype);
     c.measure = new Measure((line) => lines.push(line));
+    c.frontiers = new Map();
     c.syncedTables = new Map([['item', {}], ['seeded', { seedSeq: 4, seedStream: 'CDC_acme' }]]);
     c.appendLog = () => {}; c.triggerChange = () => {};
     c.dialect = { deferForeignKeys: async () => {} };
