@@ -293,6 +293,12 @@ export type Verdict = {
 export interface SeedProgress { table: string; step: string; kind: string; applied: number; total: number; done: boolean }
 export type ConnStatus = 'connected' | 'disconnected' | 'connecting';
 
+/// The routes one chain replacement holds (see beginReplacement); `fence`: its PREPARE parked them.
+interface Replacement {
+  routes: string[];
+  fence: boolean;
+}
+
 /// One seed's claim on the stream queue (see applyGenerations).
 interface SeedRun {
   /// Started inside a stream pass, which holds the queue.
@@ -631,11 +637,15 @@ export class ZeBridge {
   private tailFilters = new Map<string, string>();
   private streamsSubscribed = false;
   private streamWork: Promise<void> = Promise.resolve();
-  /// The streams a fence has parked (fence.ts), each with the table whose fence it is. While
-  /// one is here no pass opens a tail on it: a tail would advance the cursor the fence
-  /// moved back to the chain's cut. Released when that fence commits; a parking whose table
-  /// is no longer followed is stale and ignored.
-  private fenced = new Map<string, string>();
+  /// The streams a fence has parked (fence.ts), each with the tables that hold the parking: the
+  /// fence's own and every chain replacement that overlaps it. While a route has an owner no pass
+  /// opens a tail on it: a tail would advance the cursor the fence moved back to the chain's cut,
+  /// or apply a live event to rows another chain is about to replace. The parking ends with its
+  /// LAST owner; an owner whose table is no longer followed is stale and ignored.
+  private fenced = new Map<string, Set<string>>();
+  /// The chain replacements in flight (a fence's, or a plain seed's) per route. A fence that
+  /// commits hands the parking to the ones still running instead of releasing the route.
+  private replacing = new Map<string, Set<string>>();
   /// The applied frontiers (fence.ts), per table: from `_zebridge_frontier`, only those taken on
   /// the stream identity the stored position carries now. Written by a fence for the tables it
   /// leaves untouched, spent as the position passes them, gone when the table is replaced.
@@ -3357,6 +3367,15 @@ export class ZeBridge {
   }
 
   private async applyGenerationsFrom(table: string, seedOpts: JetStreamOpts | undefined, run: SeedRun): Promise<boolean> {
+    const hold: Replacement = { routes: [], fence: false };
+    try {
+      return await this.applyGenerationsFromHeld(table, seedOpts, run, hold);
+    } finally {
+      this.endReplacement(hold, table, run);
+    }
+  }
+
+  private async applyGenerationsFromHeld(table: string, seedOpts: JetStreamOpts | undefined, run: SeedRun, hold: Replacement): Promise<boolean> {
     const GEN = this.config.grammar.generations;
     if (!GEN || !this.nc) return false;
     const state = this.syncedTables.get(table);
@@ -3773,7 +3792,12 @@ export class ZeBridge {
       const plan = planFrom(man);
       const first = await decide(man, pr, plan);
       if (first.decision.kind === 'refuse') { this.appendLog('SYS', `${table}: ${first.decision.why}`, 'WARNING'); return null; }
-      if (first.decision.kind === 'none') return plan;
+      if (first.decision.kind === 'none') {
+        // A plain seed is recorded on its routes all the same: a fence that parks them while it
+        // downloads, and commits first, must hand the parking over (beginReplacement).
+        if (plan.length) await this.prepareExclusive(async () => this.beginReplacement(table, [man.cdc_stream, ...(sharedRoute ? [sharedRoute] : [])].filter((x): x is string => !!x), hold));
+        return plan;
+      }
       // A fence is taken from the hub's chain only (the recovery model, §8): a leaf's copy may
       // be behind the very events the cursor is about to rewind to. Refused here, the caller
       // asks the hub, whose chain is fenced.
@@ -3802,7 +3826,14 @@ export class ZeBridge {
         const now = await decide(man, pr, plan);
         const decision = now.decision;
         if (decision.kind === 'refuse') { outcome = { kind: 'wait', why: decision.why }; return; }
-        if (decision.kind === 'none') { outcome = { kind: 'plain' }; return; }
+        if (decision.kind === 'none') {
+          // A plain seed: it may still overlap a fence on its routes (one decided just before it, or
+          // one that parks them later). Recorded here, in the exclusive section, so that fence's
+          // commit cannot reopen a tail under this replacement's download.
+          if (plan.length) this.beginReplacement(table, [man.cdc_stream, ...(sharedRoute ? [sharedRoute] : [])].filter((x): x is string => !!x), hold);
+          outcome = { kind: 'plain' };
+          return;
+        }
         const streams = [man.cdc_stream, ...(decision.sharedTo !== null && sharedRoute ? [sharedRoute] : [])];
         // The tables the fence leaves untouched, each with the route it rewinds. Their frontier is
         // taken on the stream identity the chain's cut was proven on (R4): the stored identity of
@@ -3819,11 +3850,14 @@ export class ZeBridge {
         // The parking is memory the transaction does not own: a PREPARE that fails before
         // it commits must leave it as it found it, or the routes stay parked with nothing
         // prepared (no fence owed, the anchor intact) and every later pass skips them.
-        const parked = streams.map((x) => [x, this.fenced.get(x)] as const);
+        const parked = streams.map((x) => [x, this.fenced.has(x) ? new Set(this.fenced.get(x)) : undefined] as const);
         let to = (_x: string) => 0;
         let stuck: unknown = null;
         try {
-          for (const x of streams) this.fenced.set(x, table);
+          for (const x of streams) {
+            if (!this.fenced.has(x)) this.fenced.set(x, new Set());
+            this.fenced.get(x)!.add(table);
+          }
           for (const x of streams) await this.stopTail(x);
           // The tails are stopped: each route's position is final, and it certifies the
           // untouched tables (R2) — their frontier is that position, above the cursor it guards.
@@ -3856,7 +3890,7 @@ export class ZeBridge {
           // The durable state is the truth: the frontiers back from it.
           try { await this.loadFrontiers(); } catch (e) { stuck = e; }
         } catch (e) {
-          for (const [x, owner] of parked) { if (owner === undefined) this.fenced.delete(x); else this.fenced.set(x, owner); }
+          for (const [x, owners] of parked) { if (owners === undefined) this.fenced.delete(x); else this.fenced.set(x, owners); }
           // The tails were stopped for the PREPARE: reopen them from the cursors, which did
           // not move (a pass reopens its own in step 2).
           if (!run.inPass) void this.subscribeStreams().catch(() => {});
@@ -3873,6 +3907,8 @@ export class ZeBridge {
           this.appendLog('SYS', `${table}: fence prepared but the applied frontiers could not be read back (${stuck}) — ${streams.join(', ')} stay parked until they can; the fence is still owed`, 'ERROR');
           throw stuck;
         }
+        hold.fence = true;
+        this.beginReplacement(table, streams, hold);
         outcome = { kind: 'prepared', ownPos: now.ownPos, sharedMoved: decision.sharedTo !== null, untouched: untouched.length };
       }));
       const out: PrepOutcome = outcome;
@@ -3962,7 +3998,7 @@ export class ZeBridge {
       setAnchor();
       state.unseeded = false;
       // The routes' parking ends with the fence: their tails reopen from the cursors it set.
-      for (const [x, owner] of [...this.fenced]) if (owner === table) { this.fenced.delete(x); this.tailFilters.delete(x); }
+      this.releaseFence(table);
       this.appendLog('SYS', `${table}: fenced — chain g${manifest.gen} cut at ${manifest.cutoff_seq} on ${manifest.cdc_stream} replaced the rows; the position moved back from ${fenceRun.fromPos}, the events after the cut replay${fenceRun.shared ? ' (the shared route too)' : ''}`, 'WARNING');
       if (!run.inPass) void this.subscribeStreams().catch(() => {});
       await this.drainPending(table);
@@ -4005,6 +4041,51 @@ export class ZeBridge {
       const route = this.cdcStreamForTenant(tn);
       return pub && route !== pub ? { route, sharedRoute: pub } : { route };
     }, (t) => have.has(t) && !this.syncedTables.get(t)?.unseeded);
+  }
+
+  /// No tail may open on this route now (a fence, or a chain replacement overlapping it, holds it).
+  private routeParked(stream: string): boolean {
+    return (this.fenced.get(stream)?.size ?? 0) > 0;
+  }
+
+  /// A chain replacement of `table` starts on `routes` (inside the exclusive section, so it is seen
+  /// by every fence that decides or releases after it). On a route that is parked it JOINS the
+  /// parking; on one that is not, it is only recorded, so a fence that parks it later and commits
+  /// first hands the parking over instead of reopening the tail under this replacement.
+  private beginReplacement(table: string, routes: readonly string[], hold: Replacement) {
+    for (const x of routes) {
+      if (!this.replacing.has(x)) this.replacing.set(x, new Set());
+      this.replacing.get(x)!.add(table);
+      if (!hold.routes.includes(x)) hold.routes.push(x);
+      const owners = this.fenced.get(x);
+      if (owners?.size) owners.add(table);
+    }
+  }
+
+  /// A fence committed: its parking ends, unless a chain replacement is still running on the route
+  /// — that one holds it now.
+  private releaseFence(table: string) {
+    for (const [x, owners] of [...this.fenced]) {
+      if (!owners.delete(table)) continue;
+      const rep = this.replacing.get(x);
+      rep?.delete(table);
+      for (const o of rep ?? []) owners.add(o);
+      if (!owners.size) { this.fenced.delete(x); this.tailFilters.delete(x); }
+    }
+  }
+
+  /// A chain replacement ended (committed, refused, failed): it leaves the routes it held. A fence
+  /// that failed after its PREPARE keeps its own parking (the fence is still owed). When the last
+  /// owner leaves a route its tails reopen.
+  private endReplacement(hold: Replacement, table: string, run: SeedRun) {
+    let reopen = false;
+    for (const x of hold.routes) {
+      this.replacing.get(x)?.delete(table);
+      if (hold.fence) continue;
+      const owners = this.fenced.get(x);
+      if (owners?.delete(table) && !owners.size) { this.fenced.delete(x); this.tailFilters.delete(x); reopen = true; }
+    }
+    if (reopen && !run.inPass) void this.subscribeStreams().catch(() => {});
   }
 
   /// Fences are exclusive: the section that decides a fence again and prepares it runs alone.
@@ -4271,13 +4352,14 @@ export class ZeBridge {
     try {
       for (const streamName of this.cdcStreams()) {
         // A fence is rewinding this route: its end reopens the tail from the cursor it set.
-        const parkedBy = this.fenced.get(streamName);
-        if (parkedBy !== undefined) {
-          if (this.syncedTables.has(parkedBy) && !this.ondemandSet.has(parkedBy)) {
-            this.appendLog('SYS', `${streamName}: parked by ${parkedBy}'s fence — its tail opens when the fence commits`, 'INFO');
+        const owners = this.fenced.get(streamName);
+        if (owners) {
+          for (const o of [...owners]) if (!this.syncedTables.has(o) || this.ondemandSet.has(o)) owners.delete(o); // gone: nothing is owed
+          if (this.routeParked(streamName)) {
+            this.appendLog('SYS', `${streamName}: parked by ${[...owners].join(', ')} — its tail opens when the last of them is through`, 'INFO');
             continue;
           }
-          this.fenced.delete(streamName); // the table is gone: nothing is owed on this route
+          this.fenced.delete(streamName);
         }
         const setupStart = performance.now();
         await this.stopTail(streamName);
