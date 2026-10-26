@@ -503,9 +503,10 @@ pub const MutationListener = struct {
     /// True when PostgreSQL stored something other than what the client sent, which for a
     /// successful write means the future-version clamp fired.
     last_clamped: bool = false,
-    /// §10km: `zebridge_gc_watermark.watermark` in Unix microseconds, read before each
-    /// batch and each single attempt; null when there is no row (no sweeper yet) or the
-    /// read failed, and then the guard is off. See `refreshGcWatermark`.
+    /// §10km: `zebridge_gc_watermark.watermark` in Unix microseconds, read INSIDE the transaction
+    /// of each batch and each single attempt, under the shared floor lock; null only when there is
+    /// no row (nothing was ever reaped), and then there is no floor to enforce. A read that fails
+    /// fails the attempt: the guard is never silently off. See `acquireGcFloor`.
     gc_watermark_us: ?i64 = null,
     /// What actually became of the last successfully-executed write — the three outcomes
     /// PROTOCOL.md §7.1 tells clients to key their outbox on.
@@ -1102,7 +1103,6 @@ pub const MutationListener = struct {
         // Each attempt starts with no remembered reason, so a verdict can only
         // ever quote a failure from *this* message.
         self.clearFailure();
-        self.refreshGcWatermark(conn);
 
         // The receipt first, before the table's metadata, grants or the GC watermark are
         // consulted: a write that already committed is answered from its receipt even if
@@ -1123,6 +1123,13 @@ pub const MutationListener = struct {
             return;
         }
         requireTransaction(conn) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        // The floor, in THIS transaction and under the shared floor lock (see `acquireGcFloor`).
+        self.acquireGcFloor(conn) catch {
+            receipts.rollback(conn);
+            self.clearFailure();
+            self.retryOrFail(conn_nats, msg, mutation.principal, "GcFloorUnavailable");
+            return;
+        };
 
         self.handleMutation(mutation, payload, conn) catch |err| {
             // A SQLSTATE the server returned and we recognise as permanent ends the
@@ -1321,8 +1328,6 @@ pub const MutationListener = struct {
 
         var items: std.ArrayList(BatchItem) = .empty;
         defer items.deinit(self.allocator);
-        // Outside pipeline mode, once for the whole batch (§10km).
-        self.refreshGcWatermark(conn);
 
         for (msgs) |msg| {
             const payload = msg.msg.data;
@@ -1420,6 +1425,11 @@ pub const MutationListener = struct {
             const same = std.mem.eql(u8, f.route, it.route) and std.mem.eql(u8, f.msg.msg.data, it.msg.msg.data);
             it.claim = .{ .status = if (same) .repeat else .conflict };
         }
+
+        // The floor, once for the whole batch, in the batch's transaction and under the shared floor
+        // lock it holds until COMMIT (outside pipeline mode; see `acquireGcFloor`). Any failure
+        // abandons the transaction and the messages are replayed one by one.
+        try self.acquireGcFloor(conn);
 
         // Pre-warm the metas of the claimed writes only, outside pipeline mode. A table
         // that cannot take writes refuses its write here, deterministically, as long as
@@ -2311,15 +2321,29 @@ pub const MutationListener = struct {
     ///     SQLSTATE to react to.
     ///
     /// Neither is a timer: nothing here polls the catalog.
-    /// §10km: re-read the GC watermark the guard in `handleMutation` compares against.
-    /// It never fails the write path: on any error the guard is off for this round, and
-    /// the clients' own gate still holds. Must run outside pipeline mode.
-    fn refreshGcWatermark(self: *MutationListener, conn: ?*c.PGconn) void {
+    /// §10km: the GC floor the guard in `handleMutation` compares against, taken INSIDE the
+    /// transaction that holds the write, under the shared floor lock (`zebridge_gc_floor_acquire`).
+    /// The sweeper advances the floor under the exclusive lock and reaps only after that commits, so
+    /// it waits for this transaction to finish first: a write that passed the floor cannot commit
+    /// after a tombstone behind a newer floor is gone, and one that starts after the advance reads
+    /// the new floor. Read before BEGIN, as it once was, the guard could pass a write against the
+    /// old floor while the sweeper advanced and reaped, and the write then landed on a row whose
+    /// tombstone was already gone. Whichever bridge receives the write reads the one row.
+    ///
+    /// It never silently switches the guard off: null means there is NO row (nothing was ever
+    /// reaped); a read that fails — the function missing because init.write.template.sql was not
+    /// re-applied, the connection gone — fails the attempt, which is retried. Must run outside
+    /// pipeline mode, after the transaction has begun.
+    fn acquireGcFloor(self: *MutationListener, conn: ?*c.PGconn) !void {
         self.gc_watermark_us = null;
-        const res = c.PQexec(conn, "SELECT (extract(epoch FROM watermark) * 1000000)::bigint FROM public.zebridge_gc_watermark WHERE id = 1") orelse return;
+        const res = c.PQexec(conn, "SELECT public.zebridge_gc_floor_acquire()") orelse return error.MutationFailed;
         defer c.PQclear(res);
-        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) return;
-        self.gc_watermark_us = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch null;
+        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) {
+            log.err("🔴 the GC floor could not be read ({s}) — writes are retried, not let through unchecked (re-apply init.write.template.sql if zebridge_gc_floor_acquire is missing)", .{c.PQerrorMessage(conn)});
+            return error.MutationFailed;
+        }
+        if (c.PQgetisnull(res, 0, 0) == 1) return;
+        self.gc_watermark_us = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch return error.MutationFailed;
     }
 
     fn tableMeta(self: *MutationListener, conn: ?*c.PGconn, table: []const u8) !*const TableMeta {

@@ -53,6 +53,7 @@ bridge) and drops it.
   epoch and cleanup barriers. Takes minutes; run one check at a time.
 - `rls_visibility.py` — the RLS guard (a policy that hides rows blocks publication, visible in metrics and `--diagnose`).
 - `leaf_fence.py` — a fence taken from a seeding leaf's chain (hub + leaf nats-servers, no auth).
+- `gc_isolation.py` — the GC floor: competing sweepers, lock-owner failure, rollback and retention increase, a delayed write racing with reaping (private stack).
 - `scripts/scenarios/run.py {offline|live|owns|all}` sequences the groups; `--list` shows them.
 
 **Fault-hook builds.** Crash and timing points are compiled in only with `-Dtest-faults=true` (libzb) and exist as env
@@ -84,6 +85,10 @@ from the same variables by `scripts/scenarios/fence_client.mts`. A scenario fail
   everything against the **hub's** stream and may fence from the leaf's chain; a leaf with a missing object sends the client
   to the hub before anything changes. There is no age bound on a leaf chain by design; its age and CDC backlog are
   reported (`cut_age_ms`, `cdc_behind`).
+- **GC floor:** `zebridge_gc_watermark` is one row per database and never goes down (a trigger refuses it). One sweeper
+  per database, enforced by an advisory lock; each pass advances the floor, then reaps before the cutoff it returned; the
+  bridge reads the floor under a shared lock inside each write's transaction. Multi-bridge shares one GC policy
+  (NOTES "One floor, one sweeper"; `gc_isolation.py`). Scenarios stage a floor by disabling the trigger by name.
 - **RLS guard:** the producer reads as the reader role, so a policy that hides rows would publish an empty full. The guard
   classifies the reader's policies from the catalog; `normalize` keeps quoted identifiers distinct from keywords.
 

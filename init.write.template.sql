@@ -1150,6 +1150,73 @@ END $$;
 
 GRANT SELECT, INSERT, UPDATE ON public.zebridge_gc_watermark TO ${POSTGRES_WRITER_USER};
 
+-- ─── The floor protocol: one sweeper, one floor, and writes that cannot outrun a reap ─────────────
+--
+-- GC is one promise about the DATABASE's history ("a write older than the floor can no longer be
+-- replayed safely"), so it has one policy, one owner and one number, whatever bridges read it.
+-- Advisory-lock keys, class 23106 ('ZB'): objid 1 = the sweeper's ownership (session level), objid 2 =
+-- the floor (transaction level: shared for a mutation, exclusive for the sweeper's advance).
+
+-- The sweeper's ownership: ONE active sweeper per database, a session-level lock held on the
+-- sweeper's working connection. It is lost with that connection (a dead sweeper frees it, a
+-- pooler that swaps the server session loses it), and `zebridge_gc_sweeper_holds` says so.
+CREATE OR REPLACE FUNCTION public.zebridge_gc_sweeper_lock() RETURNS boolean
+LANGUAGE sql AS $$ SELECT pg_try_advisory_lock(23106, 1) $$;
+
+CREATE OR REPLACE FUNCTION public.zebridge_gc_sweeper_holds() RETURNS boolean
+LANGUAGE sql AS $$
+    SELECT EXISTS (SELECT 1 FROM pg_locks
+                    WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                      AND classid = 23106 AND objid = 1 AND objsubid = 2 AND pid = pg_backend_pid() AND granted)
+$$;
+
+-- Step 1 of a sweep, BEFORE any row is reaped: advance the floor to the retention boundary (never
+-- backwards: a longer retention leaves it where it is and it stays until time catches up) and say
+-- where to reap. The exclusive floor lock waits for every in-flight mutation (each holds the shared
+-- lock until it commits) and holds new ones back until this commits, so no write that passed the old
+-- floor can commit after a tombstone behind the new one is gone. `reap_before` <= `floor_at` always:
+-- at every committed state, what was reaped is older than the floor that was advertised.
+-- The wait is bounded (`p_lock_ms`): past it the pass is skipped, not forced.
+CREATE OR REPLACE FUNCTION public.zebridge_gc_advance(p_retention_secs double precision, p_threshold_ms bigint, p_lock_ms integer DEFAULT 5000)
+RETURNS TABLE (floor_at timestamptz, reap_before timestamptz)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_cut   timestamptz;
+    v_floor timestamptz;
+BEGIN
+    PERFORM set_config('lock_timeout', p_lock_ms::text || 'ms', true);
+    PERFORM pg_advisory_xact_lock(23106, 2);
+    v_cut := now() - make_interval(secs => p_retention_secs);
+    -- reaped = 0: this row change is "a pass began", not a report; the pass reports with the count after.
+    UPDATE public.zebridge_gc_watermark w
+       SET watermark = GREATEST(w.watermark, v_cut), threshold_ms = p_threshold_ms,
+           reaped = 0, swept_at = now(), updated_at = now()
+     WHERE w.id = 1
+    RETURNING w.watermark INTO v_floor;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'the watermark row is missing (zebridge_gc_watermark id=1): re-apply init.core.template.sql';
+    END IF;
+    RETURN QUERY SELECT v_floor, v_cut;
+END $$;
+
+-- A mutation's side of the protocol: the shared floor lock, then the floor, IN THE SAME TRANSACTION as
+-- the write it guards. The lock is taken in this function and the floor read after it, as a statement
+-- of its own: a snapshot taken before the wait could miss the advance that just committed.
+-- NULL = no row: nothing was ever reaped, no floor to enforce.
+CREATE OR REPLACE FUNCTION public.zebridge_gc_floor_acquire() RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE v bigint;
+BEGIN
+    PERFORM pg_advisory_xact_lock_shared(23106, 2);
+    SELECT (extract(epoch FROM watermark) * 1000000)::bigint INTO v FROM public.zebridge_gc_watermark WHERE id = 1;
+    RETURN v;
+END $$;
+
+GRANT EXECUTE ON FUNCTION public.zebridge_gc_sweeper_lock() TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION public.zebridge_gc_sweeper_holds() TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION public.zebridge_gc_advance(double precision, bigint, integer) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION public.zebridge_gc_floor_acquire() TO ${POSTGRES_WRITER_USER};
+
 
 -- ─── Mutation receipts: one durable outcome per (principal, original message ID) ─────
 -- A retried write must never execute twice, however long its device stayed offline.

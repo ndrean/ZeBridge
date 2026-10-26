@@ -19353,3 +19353,71 @@ shared route only (`untouched` takes the own scope only when the own route preda
 (no incarnations, another incarnation) refuses the fence like any other, which for the shared-only case means a seed
 that used to proceed waits for a chain whose cut can be proven. The log says which: "(position P, not behind it) …
 only the shared route … is past its cut".
+
+## One floor, one sweeper (2026-10-27)
+
+**What was wrong.** `zebridge_gc_watermark` is one row per database, written by the sweeper with
+`now() − GC_THRESHOLD_MS`. Nothing stopped a second sweeper (the natural second bridge's) from writing it,
+and nothing stopped the value going down: a sweeper with a longer retention, a restore, a re-applied init
+file or a forged mutation (§10aq) could put the floor behind tombstones that were already reaped, and a late
+write then resurrected the row. Two more holes were in the sweeper's own protocol. It reaped first and
+published the floor after, so there was a committed state with the tombstone gone and the old floor in
+force; and the bridge read the floor before the transaction that applied a write, so a write could pass the
+old floor, the sweeper could advance and reap, and the write then land on a row whose tombstone was gone.
+
+**The decision** (the maintainer's, 2026-10-27): GC is a promise about the database's history, so it has one
+policy, one owner and one number. Multi-bridge does not imply independent retention. Per-publication floors
+were considered and rejected: publications overlap and tables move between them, and a short-retention
+sweeper deletes physical history another publication's longer window needs; separate rows cannot bring it
+back. Independent retention would need per-table floors with an ownership or combination rule, which is a
+feature of its own (migration, reassignment). One bridge deployment per database stays the recommendation;
+two are a constrained configuration (DEPLOYMENT.md).
+
+**The contract**, in one place (PROTOCOL §7.5 says it for clients, OPERATIONS → Sweeper for operators):
+
+- *One active sweeper.* `zebridge_gc_sweeper_lock()` is a session-level advisory lock (class 23106, objid 1)
+  taken on the sweeper's working connection. The sweeper asks `zebridge_gc_sweeper_holds()` (a `pg_locks`
+  look) at the start of every pass, so a reset connection, or a pooler that swaps the server session, is seen
+  as not holding and the lock is taken again before anything is reaped; without it the sweeper idles and says
+  so (`--once` exits 2). A dry run needs none.
+- *Monotone in the database.* A `BEFORE UPDATE` trigger refuses a lower `watermark`; a statement trigger
+  refuses `DELETE` and `TRUNCATE`; `INSERT … ON CONFLICT DO NOTHING` is all a re-applied init does. A raise,
+  not a clamp: whoever tried should know. Break glass is `DISABLE TRIGGER zebridge_gc_watermark_monotone`.
+- *Advance, then reap.* `zebridge_gc_advance(retention, threshold_ms)` moves the floor to `GREATEST(floor,
+  now() − retention)` under the exclusive floor lock (class 23106, objid 2, `lock_timeout` 5 s: a pass is
+  skipped, never forced) and returns the boundary `reap_before ≤ floor`. The reap statements take that
+  boundary as a parameter instead of reading `now()` a moment later. Then the pass reports its count in a
+  row change of its own that leaves the floor alone. So at every committed state, reaped ⊆ older than the
+  advertised floor; the price is that for one pass writes in the band between the old floor and the new one
+  are refused while their tombstones still exist (a reload slightly early, never a resurrection).
+- *A longer retention cannot restore history.* 30 days to 180 leaves the floor where it is and it moves
+  again when time catches up; `threshold_ms` in the row is what the sweeper was configured with, the floor is
+  what was done. The producer's checkpoint guard compares a window's opening with the floor now, not with
+  `now() − threshold`: the configured number would have said a longer retention made old windows complete.
+- *Every write is checked against the same floor inside its own transaction.* The mutation listener calls
+  `zebridge_gc_floor_acquire()` after `BEGIN` and the claim (single path: after the claim; batch: between the
+  claim round and the writes), which takes the floor lock shared and then reads the row as a statement of
+  its own (a snapshot taken before the wait could miss the advance that just committed). The sweeper's
+  exclusive request waits for every in-flight write, and a write that starts after reads the new floor.
+  Before, `refreshGcWatermark` ran before `BEGIN` and turned the guard off on any error; now a floor that
+  cannot be read fails the attempt (`GcFloorUnavailable`, retried) and only "no row" means no floor.
+
+**Evidence.** `gc_isolation.py` (a private stack: its own database, nats-server and bridge, real sweeper
+processes, a client principal sending real mutations): the database refuses a lower floor, a delete and a
+truncate from the admin and from the writer role, and a re-applied init leaves the floor; a second sweeper
+(longer retention), a third (2 minutes, which would reap a 30 minute tombstone) and a `--once` run stay out
+while the owner works; the owner's backend is terminated and exactly one session holds the lock again, the
+floor never decreasing; 1 h to 7 days leaves the floor exactly where it was and 7 days to 10 minutes moves
+it forward and reaps; a stale INSERT (newer than the floor, older than the row's tombstone) held in a trigger
+after passing the guard makes the sweeper's advance wait (still running, floor unchanged, tombstone there),
+is judged against the tombstone (`row_deleted`) and the row stays gone. Control, in the same scenario: with
+the floor lock taken out of the mutation's side the sweeper finishes while the write is stalled, reaps the
+tombstone, and the write brings the deleted row back. The stall is a trigger waiting on an advisory lock,
+not a row lock, because a row lock would hold the sweeper's DELETE of that row as well.
+
+**Consequences for the rest of the tree.** `zb.restore_gc_watermark()` and `gc_resurrect.py` stage a floor
+by stepping around the trigger by name (a scenario database has no history worth keeping). Scenarios that run
+`bridge_sweeper --once` need no sweeper daemon holding the lock on the same database: with one it exits 2.
+Upgrading is re-applying `init.core` and `init.write`; until `zebridge_gc_floor_acquire()` exists the bridge
+refuses writes rather than let them through unchecked. Not done: per-table floors; a bridge-side
+`--diagnose` line for "no sweeper holds the lock".

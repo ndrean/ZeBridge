@@ -291,9 +291,16 @@ def restore_gc_watermark() -> None:
     short one. Every pass sets the watermark to now() - threshold: a 1 s sweep leaves any
     write stamped more than a second ago refused (PredatesGcWatermark) until the next
     normal pass, and a scenario run next that stamps its writes minutes back (recent_version)
-    then fails for no reason of its own. The normal pass puts the watermark back."""
+    then fails for no reason of its own. The floor is put back by hand first (it never goes down on its own),
+    then the normal pass publishes the stack's own."""
     short = ("GC_THRESHOLD_MS", "GC_ALLOW_SHORT_THRESHOLD", "GC_INTERVAL_MS", "GC_BATCH_ROWS", "GC_DRY_RUN")
     env = {k: v for k, v in os.environ.items() if k not in short}
+    # The floor never goes down (the database refuses it: NOTES "One floor, one sweeper"), so the normal
+    # pass can no longer put it back by itself. A scenario database has no history worth keeping; the
+    # trigger is stepped around, by name, the way an operator restoring from a backup would.
+    psql("ALTER TABLE public.zebridge_gc_watermark DISABLE TRIGGER zebridge_gc_watermark_monotone; "
+         "UPDATE public.zebridge_gc_watermark SET watermark = now() - interval '7 days' WHERE id = 1 AND watermark > now() - interval '7 days'; "
+         "ALTER TABLE public.zebridge_gc_watermark ENABLE TRIGGER zebridge_gc_watermark_monotone;", quiet=True)
     r = subprocess.run([str(SWEEPER), "--once"], env=env, capture_output=True, text=True, timeout=300)
     if r.returncode != 0:
         print(f"  ⚠️  the restoring sweep failed (rc={r.returncode}): the GC watermark may still trail now() by seconds")
