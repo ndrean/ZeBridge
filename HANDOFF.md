@@ -28,7 +28,7 @@ the floor read under a shared lock inside each write's transaction. NOTES "One f
 `gc_isolation.py` the acceptance gate. Per-publication floors were rejected (publications overlap); independent retention
 would be per-table floors, not built. Scenarios that run `bridge_sweeper --once` need no sweeper daemon on the same database.
 
-**To replay once PR gc-floor-followups is in:** every scenario, as the batteries do. What was run here and what was not: `gc_isolation.py` (49 checks) and `gc_resurrect.py` (10) on private stacks; `sweeper.py` and `sweeper_catalogue.py` on a local PostgreSQL at the default retention. Not run (they need the dev stack, the `nats` CLI, macOS or a Homebrew PostgreSQL): `sweeper_restart.py`, `reaps.py`, `drip.py`, `tombstone_children.py`, `incremental.py` (which still runs a five-second sweeper on the shared database), `multi_bridge.py`'s sync check fails on `main` here too.
+**To replay once PR gc-floor-followups is in:** every scenario, as the batteries do. What was run here and what was not: `gc_isolation.py` (49 checks) and `gc_resurrect.py` (10) on private stacks; `sweeper.py` and `sweeper_catalogue.py` on a local PostgreSQL at the default retention. Not run (they need the dev stack, the `nats` CLI, macOS or a Homebrew PostgreSQL): `sweeper_restart.py`, `reaps.py`, `drip.py`, `tombstone_children.py`, `incremental.py` (its own scratch database and nats-server, so its five-second sweeper touches no shared floor), `multi_bridge.py`'s sync check fails on `main` here too.
 
 Outstanding proof obligations (not yet turned into scenarios): snapshot boundaries / overlap replay, pending writes across
 a recreate, clients connecting before tenant mappings arrive. Also not live-tested: the ordering "own route behind its cut,
@@ -44,6 +44,21 @@ pull fail with "Could not access submodule"; keep the folder empty until `git su
 
 Open decision: `build.zig.zon` still has `.nats = .{ .path = "nats.zig" }` (the submodule); a
 `url = git+https://github.com/ndrean/nats.zig#zebridge/b8ffdd9-1` dependency would drop the submodule.
+
+## Remaining work: verifying the deployment (the code and isolated-test remediation is substantially complete)
+
+A snapshot of the six hardening findings, to be turned into a deployment audit and a restore drill. Nothing below certifies a rollout: the deployed servers have not been re-inspected.
+
+| Finding | Status in the tree | What remains |
+| --- | --- | --- |
+| 1. Mirror credentials administer the hub | separate link/keeper identities, connection restrictions, tenant-scoped grants; security scenarios test direct hub login and upstream deletion refusals | rotate legacy credentials; verify every deployed leaf uses the restricted identities |
+| 2. `/renew` integer-overflow crash | wider arithmetic, boundary unit tests, renewal scenarios | ensure deployed bridge binaries include the fix |
+| 3. Backlog isolation bypass | admission puts each principal's mutations on one private queue subject, with count/size limits | verify admission is on everywhere, direct ingress cannot bypass it, production limits suit the workload; shared storage stays a finite fleet-wide resource |
+| 4. Leaf tenant selection was only caching configuration | tenant lists constrain authorization, manifest projections and admission; scoped principals prevent cross-leaf impersonation | audit deployed tenant lists and the leaf accounts' permissions; a compromised leaf still exposes its authorized tenants' cached data |
+| 5. Revocation needed manual leaf updates | signed trust refresh propagates revocations and rotations; tests cover disconnect, reconnect refusal, stale-trust shutdown | verify the supervisor, refresh endpoint and alerts in production; Compose stops NATS after 300 s without a verified refresh |
+| 6. Destructive reconciliation, untested recovery | mirror discovery no longer authorizes deletion; checkpoint/restore scenarios cover receipts, policy and replacement-hub recovery | an operator restore drill from a real deployed backup; backup scheduling, retention, off-host storage |
+
+Priority after the GC floor: a deployment security audit and a real backup/restore drill (rebuild the hub on another machine, measure the recovery time, state what a restore can lose), alongside the recovery proof obligations above. Also to verify, because the README now states them as design intent: what each component's outage does (bridge, admission, sweeper, hub NATS), above all queue retention and storage limits.
 
 ## Open decisions and ideas
 
