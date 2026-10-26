@@ -14512,7 +14512,7 @@ to `_INBOX.>` capturing the pull deliveries of the bridge and of both POI servic
 The fix is the obvious one and it needed a library change first. The grant is
 `_INBOX.<principal>.>`; a client can only live inside it if it generates its inboxes
 there, and nats.zig hardcoded `_INBOX.` in two files. That is now a connection option
-(`nats.zig-patch/NATS_ZIG_NOTES.md` entry 13), the same option nats.go, nats.js and
+(`NATS_ZIG_NOTES.md` in the nats.zig fork, entry 13), the same option nats.go, nats.js and
 nats-py have carried for years — nats.js documents it as "useful for clients with limited
 subject permissions", which is this sentence.
 
@@ -19291,3 +19291,21 @@ Before these changes, libzb settled an unfamiliar `indeterminate` verdict silent
 Upgrading does not reconstruct reconciliation markers for entries already settled by those clients; affected replicas need an authoritative full resync. The new clients report `indeterminate`, persist recovery atomically with removing the outbox entry, and report `reconciled` only after verified hub recovery. On-demand and unfollowed tables stay unresolved until a recovery path exists. Legacy message IDs remain accepted, and the public C ABI remains version 7.
 
 The minimum compatible release has not been numbered. The `v0.2.6` tag predates these changes, while the candidate's libzb and zb-client-ts manifests still say `0.2.6`; that version string cannot distinguish the implementations. Set the minimum client release in OPERATIONS when the compatible release is assigned, rather than using a commit hash as an operator requirement.
+
+## nats.zig is a fork now (2026-10-26)
+
+The submodule used to point at upstream (`lalinsky/nats.zig` at `b8ffdd9`) and the local changes
+lived in its working tree and as a forty-patch series in `nats.zig-patch/`, re-applied by `git apply`
+loops in seven workflow files (a fresh clone had an unpatched library until they ran, and a patch
+failed outright when upstream moved a line). They are now the history of `ndrean/nats.zig`, branch
+`zebridge`: upstream `b8ffdd9` plus forty commits, one per patch, in the series' order, plus
+`NATS_ZIG_NOTES.md` (the ledger, entry numbers unchanged). The tree was checked equal to the vendored
+working tree, every file but the notes. The gitlink pins a commit of that branch, tagged
+`zebridge/b8ffdd9-1`; the workflows apply nothing; `nats.zig-patch/` keeps a README.
+
+Upstream: the small independent changes (direct-get subject, named consumers, inactive threshold,
+object-store double release and max-age, JetStream error level and domain, creds from memory, KV
+bind) go first as topic branches off upstream `main`; the pull-inbox series is an issue to discuss
+before a patch. What upstream merges drops out of the next rebase of `zebridge`; each rebase is
+tagged and the gitlink moves to the tag (a rebase rewrites commit ids, so an untagged pin can
+become unreachable).

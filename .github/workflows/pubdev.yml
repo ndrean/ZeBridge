@@ -46,8 +46,6 @@ jobs:
           else
             echo "publish=true" >> "$GITHUB_OUTPUT"; echo "zebridge $v is new"
           fi
-      - name: Apply the nats.zig patches
-        run: for p in nats.zig-patch/[0-9][0-9]-nats.zig-*.patch; do git -C nats.zig apply "../$p"; done
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0

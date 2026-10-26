@@ -227,6 +227,6 @@ Measure CDC distribution, snapshot download/apply, mutation commits and outbox r
 
 ## Build from source
 
-Published packages and images are the simplest starting point. To work on the implementation, use the repository's Zig 0.17 toolchain requirements and dependency pins in `build.zig.zon`. The NATS client is vendored with a patch series in `nats.zig-patch/`; see [DISTRIBUTION](DISTRIBUTION.md) for platform builds and packaging.
+Published packages and images are the simplest starting point. To work on the implementation, use the repository's Zig 0.17 toolchain requirements and dependency pins in `build.zig.zon`. The NATS client is a submodule: the fork `ndrean/nats.zig`, branch `zebridge` (upstream plus our patches, one commit each); see [DISTRIBUTION](DISTRIBUTION.md) for platform builds and packaging.
 
 ZeBridge is licensed under [Apache 2.0](LICENSE).
