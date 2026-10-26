@@ -19309,3 +19309,29 @@ bind) go first as topic branches off upstream `main`; the pull-inbox series is a
 before a patch. What upstream merges drops out of the next rebase of `zebridge`; each rebase is
 tagged and the gitlink moves to the tag (a rebase rewrites commit ids, so an untagged pin can
 become unreachable).
+
+## A plain full is decided again before its first chunk; the waits do not end on a throw (2026-10-26)
+
+A full is taken as plain when its cut is ahead of the position, and that is decided before the object
+downloads. In zb-client-ts the tails keep applying CDC during the download (a poll loop's seed does
+not stop them): an event past the cut is applied to the rows and counted by the cursor, then the full's
+`DELETE` removes it, and `oweReplacement` made the replacement durable without asking again. The cursor
+stays past the event, the anchor lands at the cut, nothing is owed: a permanent hole, measured with
+position 500, cut 600, a row at 650.
+
+`settleBeforeFull` (libzb.ts) now runs before the first full chunk: under the stream queue and in the
+exclusive PREPARE section it stops the tails of the chain's routes, reads the position again and decides
+again. Still ahead of the cut: the replacement is owed there, as before, and the tails are given back.
+Passed: the full becomes a fence with the object already in hand (PREPARE moves the cursors back to the
+cut, VERIFY and COMMIT as for any fence), and the 650 event replays on top of the chain. Refused (the
+other tables on the route are not safe to rewind): nothing changed, the seed waits. The fence's PREPARE
+is one closure now (`prepare`), shared by `begin` and this late check.
+
+libzb is not exposed: a client handle is single-threaded and nothing inside `applyChainFrom` applies a CDC
+event, so the position it read at the decision is final for the whole call (comment at the read).
+
+`waitForChain` and `kickReseed` ran their attempts outside any `try`: one throw ended the loop, left the
+table unseeded with its events held, and the `.finally` forgot it. The automatic retry made it worse: a
+failed replacement asks for a wait, `lateSeeds` already holds the table, the ask is ignored, and the throw
+then ends the loop that was running. Each attempt is guarded now; the loop ends only when the chain landed
+or the connection is gone. libzb retries from `poll` and has no such loop.

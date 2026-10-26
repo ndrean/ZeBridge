@@ -2748,6 +2748,9 @@ pub const SyncClient = struct {
                 return error.DeltaPathRefused;
             }
         }
+        // Final for this whole call: a client handle is single-threaded and nothing below applies a CDC
+        // event (the tails are read by `poll`), so the position cannot move while a full downloads and
+        // a plain full cannot be overtaken the way the TS client's can (libzb.ts `settleBeforeFull`).
         const pos: i64 = if (cdc_stream.len > 0) @intCast(try self.storedSeq(cdc_stream)) else 0;
         const shared_stream_m = if (man.object.get("shared_cdc_stream")) |v| (if (v == .string) v.string else "") else "";
         // The fence (the recovery model's §3): a chain cut behind this replica's position
