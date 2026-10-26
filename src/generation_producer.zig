@@ -57,6 +57,7 @@ const writable_tables = @import("writable_tables.zig");
 const topology_mod = @import("topology.zig");
 const c_imports = @import("c_imports.zig");
 const hot_streams = @import("hot_streams.zig");
+const rls_guard = @import("rls_guard.zig");
 const c = c_imports.c;
 
 const log = std.log.scoped(.generation_producer);
@@ -101,6 +102,11 @@ pub const GenerationProducer = struct {
     /// owned by `allocator` and live until deinit, so a copy of a Cut stays valid.
     cuts: std.array_hash_map.String(Cut) = .empty,
     cuts_lock: utils.SpinLock = .{},
+    /// The pairs whose publication the row-level-security guard is blocking (rls_guard.zig).
+    /// The bridge points `rls_ext` at its own registry so /metrics can render it; a
+    /// producer built without one (a test) keeps its own.
+    rls_own: rls_guard.Registry,
+    rls_ext: ?*rls_guard.Registry = null,
     /// §10ki: tenants that have rows but no CDC stream — nobody is mapped to them, so no
     /// client can follow a chain; their pairs are skipped. Said once per tenant, and once
     /// again when the stream appears. Guarded by `cuts_lock`, keys owned by `allocator`.
@@ -199,6 +205,7 @@ pub const GenerationProducer = struct {
         workers: u32,
     ) GenerationProducer {
         return .{
+            .rls_own = rls_guard.Registry.init(allocator),
             .hot = hot,
             .workers = @max(1, @min(workers, max_workers)),
             .edge_scan_seconds = @max(5, cadence_seconds / 4),
@@ -243,13 +250,14 @@ pub const GenerationProducer = struct {
         self.pair_busy.deinit(a);
         for (self.full_pending.keys()) |k| a.free(k);
         self.full_pending.deinit(a);
-        for (self.full_queue.items) |j| for ([_][]const u8{ j.tenant, j.table, j.vcol, j.tcol }) |s| a.free(s);
+        for (self.full_queue.items) |j| for ([_][]const u8{ j.tenant, j.table, j.vcol, j.tcol, j.tenant_col }) |s| a.free(s);
         self.full_queue.deinit(a);
         for (self.edges.keys()) |k| a.free(k);
         self.edges.deinit(a);
         var it = self.streamless.keyIterator();
         while (it.next()) |k| a.free(k.*);
         self.streamless.deinit(a);
+        self.rls_own.deinit();
     }
 
     /// §10du: a tick asked for out of cadence. Set by the catalogue reload when a
@@ -1592,6 +1600,10 @@ pub const GenerationProducer = struct {
             }
         }
 
+        // The reader's read policies for this table, verified inside the snapshot, before a
+        // row is read (see the guard's note above `rlsBlock`).
+        const rls_fp = try self.rlsAdmit(alloc, pgc, tenant, table, tenant_col);
+
         // cutoff_version from INSIDE the snapshot transaction (now() = txn start, the
         // instant both content reads are consistent with). The bookkeeping row is NOT
         // inserted yet — it becomes authoritative only once objects and manifest exist.
@@ -1756,7 +1768,7 @@ pub const GenerationProducer = struct {
                     // §10gf: in the background, behind the deltas, unless the lane has
                     // fallen twice the limit behind (a full it keeps discarding) — then here.
                     if (self.async_fulls and since < 2 * limit) {
-                        if (self.requestFull(tenant, table, vcol, tcol, .full))
+                        if (self.requestFull(tenant, table, vcol, tcol, tenant_col, .full))
                             log.info("🧬 '{s}'/'{s}': the depth rotation's full goes to the background lane (g{d} is the last full, {d} generation(s) since); this build cuts the delta", .{ tenant, table, last_full_gen, since });
                     } else build_full = true;
                 },
@@ -1785,7 +1797,7 @@ pub const GenerationProducer = struct {
             if (due) |d| {
                 defer c.PQclear(d);
                 if (c.PQntuples(d) > 0 and c.PQgetvalue(d, 0, 0)[0] == 't') {
-                    if (self.requestFull(tenant, table, vcol, tcol, .checkpoint))
+                    if (self.requestFull(tenant, table, vcol, tcol, tenant_col, .checkpoint))
                         log.info("🧬 '{s}'/'{s}': a checkpoint is due ({d} s since the last one) — the background lane cuts it behind the deltas", .{ tenant, table, self.checkpoint_s });
                 }
             }
@@ -1798,7 +1810,7 @@ pub const GenerationProducer = struct {
         if (self.checkpoint_s > 0 and self.async_fulls and !build_full and
             base_bytes > 0 and ckpt_bytes * 100 > base_bytes * @as(i64, self.base_rebuild_percent))
         {
-            if (self.requestFull(tenant, table, vcol, tcol, .full))
+            if (self.requestFull(tenant, table, vcol, tcol, tenant_col, .full))
                 log.info("🧬 '{s}'/'{s}': the {d} checkpoint(s) since the base weigh {d} bytes against its {d} ({d}% is the bar) — the lane rebuilds the base", .{ tenant, table, ckpt_above, ckpt_bytes, base_bytes, self.base_rebuild_percent });
         }
 
@@ -1833,6 +1845,7 @@ pub const GenerationProducer = struct {
                 try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL{s}", .{ cols_sel, table, tcol, order_by })
             else
                 try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"{s}", .{ cols_sel, table, order_by });
+            try self.rlsCountGate(alloc, pgc, tenant, table, tenant_col, tcol);
             const t_f = utils.unixMillis();
             full_obj = try putChainObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol, "full", null);
             ph.full += utils.unixMillis() - t_f;
@@ -1876,7 +1889,7 @@ pub const GenerationProducer = struct {
             if (self.async_fulls) {
                 // A refused request means one is already queued for this pair, which
                 // serves the same purpose: either way this cut publishes its delta alone.
-                if (self.requestFull(tenant, table, vcol, tcol, .full)) {
+                if (self.requestFull(tenant, table, vcol, tcol, tenant_col, .full)) {
                     log.info("🧬 '{s}'/'{s}': the delta carries {d} of the table's {d} row(s) — a full is cheaper for a client catching up; the background lane builds one, this cut publishes the delta alone", .{ tenant, table, delta_rows, table_rows });
                 } else {
                     log.debug("🧬 '{s}'/'{s}': the delta carries {d} of {d} row(s); a full is already queued for the lane", .{ tenant, table, delta_rows, table_rows });
@@ -1889,6 +1902,7 @@ pub const GenerationProducer = struct {
                 try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL{s}", .{ cols_sel, table, tcol, order_by })
             else
                 try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"{s}", .{ cols_sel, table, order_by });
+            try self.rlsCountGate(alloc, pgc, tenant, table, tenant_col, tcol);
             const t_f = utils.unixMillis();
             full_obj = try putChainObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol, "full", null);
             ph.full += utils.unixMillis() - t_f;
@@ -1900,6 +1914,9 @@ pub const GenerationProducer = struct {
             const res = try queryOne(pgc, "COMMIT", &.{});
             c.PQclear(res);
         }
+        // Fresh statement, outside the snapshot: did the read policies move under the build?
+        // The objects written above carry names the next build of this generation reuses.
+        try self.rlsRecheck(alloc, pgc, tenant, table, tenant_col, rls_fp);
 
         // The retirement survivor of measureWidestRow (NOTES.md §1.13): the chain
         // carries any width (object chunking), but CDC cannot — a row at or over the
@@ -2175,7 +2192,7 @@ pub const GenerationProducer = struct {
     /// checkpoint carries the rows whose version moved since the last checkpoint (or the
     /// last full), tombstones included — the incremental chain's middle level.
     pub const JobKind = enum { full, checkpoint };
-    pub const FullJob = struct { tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8, kind: JobKind = .full };
+    pub const FullJob = struct { tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8, tenant_col: []const u8, kind: JobKind = .full };
 
     fn pairKey(buf: []u8, tenant: []const u8, table: []const u8) ?[]const u8 {
         return std.fmt.bufPrint(buf, "{s}.{s}", .{ tenant, table }) catch null;
@@ -2215,7 +2232,7 @@ pub const GenerationProducer = struct {
     }
 
     /// Queues the pair's full unless one is queued or building. True when queued now.
-    fn requestFull(self: *GenerationProducer, tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8, kind: JobKind) bool {
+    fn requestFull(self: *GenerationProducer, tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8, tenant_col: []const u8, kind: JobKind) bool {
         var buf: [512]u8 = undefined;
         const key = pairKey(&buf, tenant, table) orelse return false;
         self.cuts_lock.lock();
@@ -2227,6 +2244,7 @@ pub const GenerationProducer = struct {
             .table = a.dupe(u8, table) catch return false,
             .vcol = a.dupe(u8, vcol) catch return false,
             .tcol = a.dupe(u8, tcol) catch return false,
+            .tenant_col = a.dupe(u8, tenant_col) catch return false,
             .kind = kind,
         };
         const owned = a.dupe(u8, key) catch return false;
@@ -2252,7 +2270,10 @@ pub const GenerationProducer = struct {
                 continue;
             };
             var arena = std.heap.ArenaAllocator.init(self.allocator);
-            self.buildFullBehind(arena.allocator(), j) catch |err| log.err("🧬 '{s}'/'{s}': background full failed: {} — the next due delta asks again", .{ j.tenant, j.table, err });
+            self.buildFullBehind(arena.allocator(), j) catch |err| {
+                // A blocked pair was said once by the guard; the cadence asks again.
+                if (err != error.RlsBlocked) log.err("🧬 '{s}'/'{s}': background full failed: {} — the next due delta asks again", .{ j.tenant, j.table, err });
+            };
             arena.deinit();
             var buf: [512]u8 = undefined;
             if (pairKey(&buf, j.tenant, j.table)) |key| {
@@ -2264,6 +2285,7 @@ pub const GenerationProducer = struct {
             self.allocator.free(j.table);
             self.allocator.free(j.vcol);
             self.allocator.free(j.tcol);
+            self.allocator.free(j.tenant_col);
         }
         log.info("🛑 background full lane stopped", .{});
     }
@@ -2298,6 +2320,7 @@ pub const GenerationProducer = struct {
 
         // ── the snapshot, taken right after the pair's newest generation ──────
         var gen_l: i64 = 0;
+        var rls_fp: u64 = 0;
         var epoch_l: []const u8 = "";
         var shape_l: []const u8 = "";
         var relid_l: []const u8 = "";
@@ -2338,6 +2361,12 @@ pub const GenerationProducer = struct {
             const tp = [_]?[*:0]const u8{tenant_z.ptr};
             const st = try queryOne(pgc, set_sql, &tp); // the first statement: the snapshot is taken here
             c.PQclear(st);
+            // The table's lock before the policy check, as buildOne does: from here a policy
+            // change waits for this snapshot instead of landing between check and content.
+            const lock_sql = try std.fmt.allocPrintSentinel(alloc, "LOCK TABLE \"{s}\" IN ACCESS SHARE MODE", .{table}, 0);
+            const lk = try queryOne(pgc, lock_sql, &.{});
+            c.PQclear(lk);
+            rls_fp = try self.rlsAdmit(alloc, pgc, tenant, table, j.tenant_col);
         }
         errdefer {
             const rb = c.PQexec(pgc, "ROLLBACK");
@@ -2401,7 +2430,7 @@ pub const GenerationProducer = struct {
                     log.warn("⚠️ 🧬 '{s}'/'{s}': the checkpoint's window opens at {s}, past the sweeper's tombstone retention — a delete inside it may already be reaped, so a full is owed instead of a checkpoint", .{ tenant, table, ckpt_lower });
                     const rb = try queryOne(pgc, "ROLLBACK", &.{});
                     c.PQclear(rb);
-                    _ = self.requestFull(tenant, table, j.vcol, j.tcol, .full);
+                    _ = self.requestFull(tenant, table, j.vcol, j.tcol, j.tenant_col, .full);
                     return;
                 }
             }
@@ -2421,6 +2450,7 @@ pub const GenerationProducer = struct {
         var osm = js.objectStoreManager();
         var store = try osm.openStore(bucket);
         defer store.deinit();
+        if (j.kind == .full) try self.rlsCountGate(alloc, pgc, tenant, table, j.tenant_col, j.tcol);
         const t_q = utils.unixMillis();
         const fo = try putChainObject(alloc, self.allocator, pgc, &store, obj_name, sql, gen_l, cutoff_l, j.vcol, kind_str, null);
         full_rows = fo.rows;
@@ -2429,6 +2459,12 @@ pub const GenerationProducer = struct {
             const res = try queryOne(pgc, "COMMIT", &.{});
             c.PQclear(res);
         }
+
+        // Fresh statement, outside the snapshot: did the read policies move under the build?
+        self.rlsRecheck(alloc, pgc, tenant, table, j.tenant_col, rls_fp) catch |err| {
+            store.delete(obj_name) catch {};
+            return err;
+        };
 
         // ── attach, under the gate: still the same chain? ─────────────────────
         self.pairAcquire(tenant, table);
@@ -2545,6 +2581,73 @@ pub const GenerationProducer = struct {
         });
     }
 
+    // ── the row-level-security guard (rls_guard.zig) ─────────────────────────────────
+    //
+    // A chain object is a SELECT run by the reader with zb.tenant set, so row-level
+    // security decides what it holds. When the reader's policies hide rows the object
+    // still looks complete: a full that is short reads like a table that is small. The
+    // guard refuses to publish for a pair whose configuration it cannot prove complete,
+    // leaves the previous chain exactly as it was, and says so in the log, /metrics and
+    // --diagnose. Other pairs keep building; the pair is re-checked on every cadence, so
+    // a fixed policy publishes again by itself. All three artifact kinds (full, delta,
+    // checkpoint) are gated: a delta read through the same policy is missing the same
+    // rows, and a chain that moves forward without them cannot be repaired by a later one.
+
+    fn rls(self: *GenerationProducer) *rls_guard.Registry {
+        return self.rls_ext orelse &self.rls_own;
+    }
+
+    /// Records a block; the log line is for a pair that just blocked or whose reason
+    /// changed, not for the cadence repeating itself.
+    fn rlsBlock(self: *GenerationProducer, tenant: []const u8, table: []const u8, v: rls_guard.Verdict, reason: []const u8) void {
+        const change = self.rls().block(tenant, table, v, reason) catch .new;
+        switch (change) {
+            .new, .changed => log.err("🛡️ '{s}'/'{s}': publication BLOCKED ({s}): {s}. The previous chain stays as it is and nothing newer is published for this pair; other pairs are unaffected. The guard checks again every cadence, so fixing the table's read policies is enough (bridge --diagnose names them).", .{ tenant, table, v.wireName(), reason }),
+            .same => log.debug("🛡️ '{s}'/'{s}': still blocked ({s})", .{ tenant, table, v.wireName() }),
+        }
+    }
+
+    /// Inside the snapshot, before a row is read: the reader's policy configuration for
+    /// this table must be one the guard can prove complete. Returns the fingerprint of
+    /// what it verified, for `rlsRecheck`. A failed catalog query is an ordinary build
+    /// failure (the connection, not the table); only a verdict blocks.
+    fn rlsAdmit(self: *GenerationProducer, alloc: std.mem.Allocator, pgc: *c.PGconn, tenant: []const u8, table: []const u8, tenant_col: []const u8) !u64 {
+        const chk = try rls_guard.check(alloc, pgc, table, tenant_col, self.topo.open_tenant);
+        if (chk.verdict != .safe) {
+            self.rlsBlock(tenant, table, chk.verdict, chk.reason);
+            return error.RlsBlocked;
+        }
+        if (self.rls().clear(tenant, table))
+            log.info("🛡️ '{s}'/'{s}': the reader's read policies verify again — publication resumes", .{ tenant, table });
+        return chk.fingerprint;
+    }
+
+    /// After the content was read, before anything is published, on a fresh statement
+    /// outside the snapshot. On PostgreSQL 16 ALTER POLICY waits for a build that holds the
+    /// table, so the configuration cannot move under the reads themselves; this closes what
+    /// is left: the catalog was read as of the snapshot's first statement, a policy committed
+    /// between that and the table lock is invisible to it yet applies to the content, and a
+    /// server that takes a weaker lock would let one in anywhere.
+    fn rlsRecheck(self: *GenerationProducer, alloc: std.mem.Allocator, pgc: *c.PGconn, tenant: []const u8, table: []const u8, tenant_col: []const u8, fingerprint: u64) !void {
+        const fresh = try rls_guard.check(alloc, pgc, table, tenant_col, self.topo.open_tenant);
+        if (rls_guard.recheck(fresh, fingerprint)) |blocked| {
+            self.rlsBlock(tenant, table, blocked[0], blocked[1]);
+            return error.RlsBlocked;
+        }
+    }
+
+    /// A full's second detector, for a tenant-scoped pair: the same explicit filters
+    /// counted with zb.tenant set and cleared. A difference means something besides the
+    /// bridge's own policy narrows the read. Equal counts prove nothing (rls_guard.zig).
+    fn rlsCountGate(self: *GenerationProducer, alloc: std.mem.Allocator, pgc: *c.PGconn, tenant: []const u8, table: []const u8, tenant_col: []const u8, tcol: []const u8) !void {
+        if (tenant_col.len == 0) return;
+        const n = try rls_guard.countMismatch(alloc, pgc, table, tenant_col, tcol, tenant, self.topo.open_tenant);
+        if (n.scoped == n.cleared) return;
+        log.debug("🛡️ '{s}'/'{s}': {d} live row(s) with zb.tenant set, {d} with it cleared", .{ tenant, table, n.scoped, n.cleared });
+        self.rlsBlock(tenant, table, .hidden, "with zb.tenant set the pair reads fewer rows than with it cleared under the same tenant and tombstone filters: a policy besides the bridge's is narrowing the read");
+        return error.RlsBlocked;
+    }
+
     /// §10ej: one pair's build with the bounded retry the post-publish check asks
     /// for: the cut fell off during the build → build again at once, three times at
     /// most. Beyond that the stream prunes faster than this pair builds — a size
@@ -2568,6 +2671,9 @@ pub const GenerationProducer = struct {
                     std.Io.sleep(self.io, .fromMilliseconds(delay_ms), .awake) catch {};
                     continue;
                 }
+                // Blocked by the row-level-security guard: said once when it changed, shown in
+                // /metrics and --diagnose, and re-checked on the next cadence.
+                if (err == error.RlsBlocked) return false;
                 log.err("🧬 generation build failed for '{s}'/'{s}': {} — next cadence retries", .{ tenant, table, err });
                 return false;
             };

@@ -11,6 +11,7 @@ The reference for running ZeBridge: the CLI, the doctor (`--diagnose`), what nee
 - [Restart rules](#restart-rules)
   - [Checking a table / database against the bridge's rules](#checking-a-table--database-against-the-bridges-rules)
 - [Suspended tables](#suspended-tables)
+- [Snapshots blocked by row-level security](#snapshots-blocked-by-row-level-security)
 - [Troubleshooting](#troubleshooting)
 - [Configuration](#configuration)
   - [Main Configuration](#main-configuration)
@@ -247,12 +248,43 @@ Rows written while a table was suspended never reached any replica. A lift after
 
 ---
 
+## Snapshots blocked by row-level security
+
+A chain object (full, delta, checkpoint) is a `SELECT` run by the reader role with `zb.tenant` set, so the reader's row-level-security policies decide which rows it holds. A policy that hides rows leaves a well-formed object that reads exactly like one for a small or empty table, and every client that seeds from it ends up with fewer rows than PostgreSQL has. CDC does not notice: logical decoding has no query, so the live feed keeps carrying the rows the snapshot dropped.
+
+Before a pair (table, tenant) builds, the generation producer checks the reader's policy configuration for the table, inside the snapshot, and again on a fresh statement before it publishes. It reads the catalog: row security on or off, whether the reader bypasses it or owns the table, and every policy that applies to the reader for `SELECT`. It certifies only what it can prove complete, and says one of three things:
+
+| verdict | meaning | examples |
+| --- | --- | --- |
+| `safe` | nothing the bridge ships can be hidden | row security off; the reader owns the table without `FORCE`; the bridge's own tenant policy (`zebridge_scope_reads_by_tenant`) or `USING (true)`, with no restrictive policy beside it |
+| `hidden` | the configuration provably hides rows | row security on and no policy for the reader; the only applicable policies are `USING (false)`; a restrictive `USING (false)` |
+| `unverifiable` | something applies that the bridge does not recognise, and it can hide any subset of rows | a restrictive policy beside the bridge's own; hand-written permissive policies with none of them the bridge's predicate or `true` (an extra permissive policy beside a recognised one only adds rows, so it is fine); a tenant policy on another column or for another open tenant |
+
+A pair that is not `safe` is **blocked**: nothing new is published for it, the previous chain stays exactly as it was, and the other pairs keep building. Every artifact kind is gated, not only the fulls: a delta read through the same policy is missing the same rows, and a chain that moves forward without them cannot be repaired by a later one. The guard checks again at every cadence, so fixing the policy is enough: the next build publishes by itself, with the changes made while it was blocked, and the log says `the reader's read policies verify again`.
+
+Where it shows:
+
+- the log: `publication BLOCKED (hidden|unverifiable): …`, once when a pair blocks or its reason changes, naming the policy;
+- `/metrics`: `bridge_snapshot_rls_blocked_pairs` (how many), `bridge_snapshot_rls_blocks_total`, and `bridge_snapshot_rls_blocked{table,tenant,verdict}` (1 while blocked, 0 after the recovery in this process);
+- `bridge --diagnose`: the read policies of every catalogued table, as the reader, before the bridge starts.
+
+A tenant-scoped table also gets a second, weaker check on each full: the same explicit tenant and tombstone filters counted with `zb.tenant` set and cleared. It catches a policy that reacts to the setting. Equal counts prove nothing, since a restrictive policy hides the same rows both ways; the classification above is the guarantee.
+
+An empty table is not a blocked one: with a valid configuration a table (or a tenant) with no live rows publishes an empty full.
+
+To repair, give the reader a policy the bridge recognises. For a tenant table, `SELECT zebridge_scope_reads_by_tenant('public.<table>', '<tenant column>')` recreates the bridge's own; remove or rewrite the extra policy that `--diagnose` names. If a hand-written policy is deliberate and complete, make it the bridge's predicate or add it as a permissive policy beside it; the bridge will not certify a restrictive one.
+
+[⬆️](#table-of-contents)
+
+---
+
 ## Troubleshooting
 
 Start from what you see. Each row names the check and the rule behind it.
 
 | you see | check | usually |
 | --- | --- | --- |
+| a table's clients stop receiving new generations, or hold fewer rows than PostgreSQL | `bridge_snapshot_rls_blocked_pairs`; the log line `publication BLOCKED`; `bridge --diagnose` | the reader's row-level-security policies may hide rows: see [Snapshots blocked by row-level security](#snapshots-blocked-by-row-level-security) |
 | a table is missing on every client | `SELECT * FROM zebridge_suspensions`; the log line naming the table | suspended: see [Suspended tables](#suspended-tables). Or never enabled: `zebridge_enable` |
 | rows are missing on every client | `bridge_refused_events_dropped_total` on `/metrics`; the table's `seed_epoch` in `zebridge_catalogue` | the table was suspended for a while; the lift re-seeds. If the epoch did not move, `zebridge_reseed('t')` |
 | rows are missing on one client | `bridge_fleet_client_lag_events` for that client; its own log for `held`, `predates`, `waiting for the producer's full` | it is behind, or waiting for the next full after a re-seed; both resolve by themselves |

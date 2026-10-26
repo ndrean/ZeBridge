@@ -6,6 +6,7 @@ const jwt_mint = @import("jwt_mint.zig");
 const c = @import("c_imports.zig").c;
 const nats = @import("nats");
 const refused_tables = @import("refused_tables.zig");
+const rls_guard = @import("rls_guard.zig");
 const rate_limit = @import("rate_limit.zig");
 const pg_health = @import("pg_health.zig");
 const verdict_stats = @import("verdict_stats.zig");
@@ -83,6 +84,8 @@ pub const Server = struct {
     /// Set after construction, like nats_publisher. Only its atomic summaries are read
     /// here — the map belongs to the replication thread (see refused_tables.zig).
     refused: ?*const refused_tables.Registry = null,
+    /// The pairs whose chain the row-level-security guard is not publishing (rls_guard.zig).
+    rls: ?*rls_guard.Registry = null,
     /// §10fk: the ingress rate limit, declared on /status so the operator tool can
     /// check the MUTATIONS stream's own policy against it (the bridge never edits
     /// that stream — NATS policy is the deployment's, not the bridge's).
@@ -1001,6 +1004,7 @@ pub const Server = struct {
             // own exposition text so the metric names stay next to the thing counting.
             var w = std.Io.Writer.fixed(buf[body.len..]);
             if (self.refused) |r| try r.writePrometheus(&w);
+            if (self.rls) |r| try r.writePrometheus(&w);
             if (self.slots) |s| try s.writePrometheus(&w);
             if (self.fleet) |f| try f.writePrometheus(&w);
             if (self.limiter) |l| try writeIngressPrometheus(&w, l);
