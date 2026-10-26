@@ -291,6 +291,16 @@ export type Verdict = {
 export interface SeedProgress { table: string; step: string; kind: string; applied: number; total: number; done: boolean }
 export type ConnStatus = 'connected' | 'disconnected' | 'connecting';
 
+/// One seed's claim on the stream queue (see applyGenerations).
+interface SeedRun {
+  /// Started inside a stream pass, which holds the queue.
+  inPass: boolean;
+  /// A pass joined this seed while it ran: that pass lent its turn.
+  joinedByPass: boolean;
+  /// Set while the seed waits in the queue; starts its work early under a joining pass's turn.
+  lend?: () => void;
+}
+
 interface BucketEntry {
   key: string;
   operation: 'PUT' | 'DEL' | 'PURGE';
@@ -3117,7 +3127,7 @@ export class ZeBridge {
   /// stream subscribe, for every table without a watermark — and both asked at once,
   /// so every table was seeded TWICE concurrently (every `Seeded` line printed twice;
   /// two readers on the same 15 MiB object). A second request joins the one in flight.
-  private seedInFlight = new Map<string, Promise<boolean>>();
+  private seedInFlight = new Map<string, { promise: Promise<boolean>; run: SeedRun }>();
   /// The delta path on a (re)connect for one stream with no gap (core.streamDeltaChoice):
   /// whether every table depending on it may take its chain instead of the CDC to the
   /// chain's cut, decided before any object is fetched — the same on the hub or a seeding
@@ -3195,12 +3205,44 @@ export class ZeBridge {
 
   /// `inPass`: asked from inside a stream pass (subscribeStreamsOnce), which already holds
   /// the stream queue and reopens every tail itself afterwards.
+  ///
+  /// Who owns the stream queue is settled BEFORE a promise is shared. A seed started by a
+  /// poll loop must queue for it (the fence's PREPARE moves cursors and parks routes); a
+  /// pass that then joins that seed holds the queue and waits for it, so the seed would wait
+  /// behind the very pass that waits for it. The joining pass therefore LENDS its turn: from
+  /// the moment it joins, the seed runs its queued work under the pass's turn (the pass does
+  /// nothing else for this table while it waits, which is what the queue protects).
   private applyGenerations(table: string, inPass = false): Promise<boolean> {
-    const inflight = this.seedInFlight.get(table);
-    if (inflight) return inflight;
-    const p = this.applyGenerationsOnce(table, inPass).finally(() => { this.seedInFlight.delete(table); });
-    this.seedInFlight.set(table, p);
-    return p;
+    const flight = this.seedInFlight.get(table);
+    if (flight) {
+      if (inPass && !flight.run.inPass) {
+        flight.run.joinedByPass = true;
+        flight.run.lend?.(); // already queued: start it now, under this pass's turn
+      }
+      return flight.promise;
+    }
+    const run: SeedRun = { inPass, joinedByPass: false };
+    const promise = this.applyGenerationsOnce(table, run).finally(() => { this.seedInFlight.delete(table); });
+    this.seedInFlight.set(table, { promise, run });
+    return promise;
+  }
+
+  /// `fn` with the stream queue's turn: at once for a pass's seed (it holds the queue) or
+  /// one a pass has joined (it lent its turn); otherwise queued, and started early if a pass
+  /// joins this seed while it waits.
+  private withStreamQueue(run: SeedRun, fn: () => Promise<void>): Promise<void> {
+    if (run.inPass || run.joinedByPass) return fn();
+    return new Promise<void>((resolve, reject) => {
+      let started = false;
+      const go = (): Promise<void> => {
+        if (started) return Promise.resolve();
+        started = true;
+        run.lend = undefined;
+        return fn().then(resolve, reject);
+      };
+      run.lend = () => { void go(); };
+      void this.changeStreams(go);
+    });
   }
 
   /// §10ja: is a jump in stream sequence past `pos` a hole? Only if the stream no longer
@@ -3216,23 +3258,23 @@ export class ZeBridge {
     }
   }
 
-  private async applyGenerationsOnce(table: string, inPass: boolean): Promise<boolean> {
+  private async applyGenerationsOnce(table: string, run: SeedRun): Promise<boolean> {
     // A route under reconciliation seeds from the hub only: a leaf's copy may be behind
     // the very commit the reconciliation is about.
     const tenant = this.effectiveTenantFor(table);
     const hubOnly = tenant !== null && this.hubOnly.has(this.cdcStreamForTenant(tenant));
     if (!hubOnly && this.config.seedDomain && this.config.seedDomain !== this.config.jsDomain) {
       try {
-        if (await this.applyGenerationsFrom(table, { domain: this.config.seedDomain }, inPass)) return true;
+        if (await this.applyGenerationsFrom(table, { domain: this.config.seedDomain }, run)) return true;
       } catch (e) {
         this.appendLog('SYS', `${table}: leaf seed failed: ${e}`, 'WARNING');
       }
       this.appendLog('SYS', `${table}: leaf chain unavailable or behind — seeding from the hub`, 'INFO');
     }
-    return this.applyGenerationsFrom(table, this.jsOpts(), inPass);
+    return this.applyGenerationsFrom(table, this.jsOpts(), run);
   }
 
-  private async applyGenerationsFrom(table: string, seedOpts: JetStreamOpts | undefined, inPass = false): Promise<boolean> {
+  private async applyGenerationsFrom(table: string, seedOpts: JetStreamOpts | undefined, run: SeedRun): Promise<boolean> {
     const GEN = this.config.grammar.generations;
     if (!GEN || !this.nc) return false;
     const state = this.syncedTables.get(table);
@@ -3650,22 +3692,35 @@ export class ZeBridge {
       const streams = [man.cdc_stream, ...(decision.sharedTo !== null && sharedRoute ? [sharedRoute] : [])];
       const to = (x: string) => (x === man.cdc_stream ? decision.ownTo : (decision.sharedTo as number));
       const prepare = async () => {
-        for (const x of streams) this.fenced.set(x, table);
-        for (const x of streams) await this.stopTail(x);
-        await this.transaction(async (txExec) => {
-          await txExec(`DELETE FROM _zebridge_generations WHERE tbl = ?`, table);
-          await txExec(`INSERT INTO _zebridge_fence (tbl) VALUES (?) ON CONFLICT(tbl) DO NOTHING`, table);
-          for (const x of streams) {
-            await txExec(`INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?) ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`, x, to(x));
-          }
-        });
+        // The parking is memory the transaction does not own: a PREPARE that fails before
+        // it commits must leave it as it found it, or the routes stay parked with nothing
+        // prepared (no fence owed, the anchor intact) and every later pass skips them.
+        const parked = streams.map((x) => [x, this.fenced.get(x)] as const);
+        try {
+          for (const x of streams) this.fenced.set(x, table);
+          for (const x of streams) await this.stopTail(x);
+          await this.transaction(async (txExec) => {
+            await txExec(`DELETE FROM _zebridge_generations WHERE tbl = ?`, table);
+            await txExec(`INSERT INTO _zebridge_fence (tbl) VALUES (?) ON CONFLICT(tbl) DO NOTHING`, table);
+            for (const x of streams) {
+              await txExec(`INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?) ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`, x, to(x));
+            }
+          });
+        } catch (e) {
+          for (const [x, owner] of parked) { if (owner === undefined) this.fenced.delete(x); else this.fenced.set(x, owner); }
+          // The tails were stopped for the PREPARE: reopen them from the cursors, which did
+          // not move (a pass reopens its own in step 2).
+          if (!run.inPass) void this.subscribeStreams().catch(() => {});
+          throw e;
+        }
         for (const x of streams) this.globalSyncState.seq[x] = to(x);
         state.seedSeq = undefined; state.seedStream = undefined; state.sharedSeedSeq = undefined; state.seedLsn = undefined;
         state.unseeded = true; // its events are held, not applied, until the anchor commits
       };
-      // From a pass, already serialized with every other pass; from a poll loop, queued
-      // behind the pass in flight so none is opening a tail on these routes meanwhile.
-      if (inPass) await prepare(); else await this.changeStreams(prepare);
+      // From a pass (or one a pass has joined), already serialized with every other pass;
+      // from a poll loop, queued behind the pass in flight so none is opening a tail on
+      // these routes meanwhile.
+      await this.withStreamQueue(run, prepare);
       fenceRun = { fromPos: ownPos, shared: decision.sharedTo !== null };
       this.appendLog('SYS', `${table}: fence prepared — chain g${man.gen} cut at ${man.cutoff_seq} on ${man.cdc_stream} behind position ${ownPos}: anchor cleared, cursor at the cut${decision.sharedTo !== null ? ' (the shared route too)' : ''}; replacing the rows`, 'WARNING');
       return plan;
@@ -3752,7 +3807,7 @@ export class ZeBridge {
       // The routes' parking ends with the fence: their tails reopen from the cursors it set.
       for (const [x, owner] of [...this.fenced]) if (owner === table) { this.fenced.delete(x); this.tailFilters.delete(x); }
       this.appendLog('SYS', `${table}: fenced — chain g${manifest.gen} cut at ${manifest.cutoff_seq} on ${manifest.cdc_stream} replaced the rows; the position moved back from ${fenceRun.fromPos}, the events after the cut replay${fenceRun.shared ? ' (the shared route too)' : ''}`, 'WARNING');
-      if (!inPass) void this.subscribeStreams().catch(() => {});
+      if (!run.inPass) void this.subscribeStreams().catch(() => {});
       await this.drainPending(table);
     } else {
       setAnchor();

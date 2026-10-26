@@ -149,7 +149,7 @@ def fixtures(role):
         zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{t}'", quiet=True)
         zb.psql(f"DELETE FROM public.zebridge_generations WHERE tbl = '{t}'", quiet=True)
     cols = "id int PRIMARY KEY, tenant_id text NOT NULL, v text NOT NULL DEFAULT '', " \
-           "updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz"
+           "updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz, \"true\" boolean NOT NULL DEFAULT true"
     old = "now() - interval '1 minute'"
     for t in (OK, BAD):
         zb.psql(f"CREATE TABLE public.{t} ({cols})", quiet=True)
@@ -359,6 +359,14 @@ async def main():
                            [f"CREATE POLICY zb_rls_only_a ON public.{BAD} AS RESTRICTIVE FOR SELECT TO {role} USING (v NOT LIKE 'b%')"],
                            [f"DROP POLICY zb_rls_only_a ON public.{BAD}"],
                            "unverifiable", "zb_rls_only_a", bad_ids, "+r")
+                # A boolean column NAMED "true": PostgreSQL prints USING ("true") and it is a filter,
+                # not the keyword. Row 2 is the one it hides from the reader.
+                await case('a restrictive policy on a column named "true", hiding a row',
+                           [f"CREATE POLICY zb_rls_col_true ON public.{BAD} AS RESTRICTIVE FOR SELECT TO {role} USING (\"true\")",
+                            f"UPDATE public.{BAD} SET \"true\" = false WHERE id = 2"],
+                           [f"DROP POLICY zb_rls_col_true ON public.{BAD}",
+                            f"UPDATE public.{BAD} SET \"true\" = true WHERE id = 2"],
+                           "unverifiable", "zb_rls_col_true", bad_ids, "+q", with_diagnose=True)
 
                 async def midbuild():
                     """Park a build between its policy check and its content, then change the policy."""

@@ -112,10 +112,10 @@ fn isIdentChar(ch: u8) bool {
 /// A policy expression reduced to a form that survives PostgreSQL's pretty-printing:
 /// keywords and unquoted names lowercased, no whitespace or parentheses, no `::text`
 /// casts, no `AS current_setting` aliases. String literals and quoted identifiers are
-/// kept EXACTLY (a policy naming open tenant `_DEFAULT` is not one naming `_default`;
-/// the quotes themselves are dropped). Two expressions that normalise equally are the
-/// same expression for this module's fixed vocabulary; anything else is "not
-/// recognised", which is the safe direction.
+/// kept EXACTLY, quotes included (a policy naming open tenant `_DEFAULT` is not one naming
+/// `_default`, and a column named "true" is not the keyword). Two expressions that
+/// normalise equally are the same expression for this module's fixed vocabulary; anything
+/// else is "not recognised", which is the safe direction.
 pub fn normalize(alloc: std.mem.Allocator, expr: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
@@ -140,9 +140,12 @@ pub fn normalize(alloc: std.mem.Allocator, expr: []const u8) ![]u8 {
                 }
             },
             '"' => {
-                // A quoted identifier, verbatim without its quotes, `""` being one quote.
+                // A quoted identifier, verbatim WITH its quotes, `""` being one quote: it
+                // is a name, never the keyword it spells ("true" is a column, true is not).
+                try out.append(alloc, '"');
                 i += 1;
                 while (i < expr.len) : (i += 1) {
+                    try out.append(alloc, expr[i]);
                     if (expr[i] == '"') {
                         if (i + 1 < expr.len and expr[i + 1] == '"') {
                             i += 1;
@@ -151,7 +154,7 @@ pub fn normalize(alloc: std.mem.Allocator, expr: []const u8) ![]u8 {
                             i += 1;
                             break;
                         }
-                    } else try out.append(alloc, expr[i]);
+                    }
                 }
             },
             ' ', '\t', '\r', '\n' => {
@@ -621,9 +624,25 @@ test "normalize keeps literals and quoted identifiers exact, drops the printing 
     // Keywords and unquoted names are case-insensitive, as in PostgreSQL.
     try std.testing.expectEqualStrings(try normalize(a, "COALESCE(x, '') = ''"), try normalize(a, "coalesce(X,'')=''"));
     // A quoted identifier keeps its case, a doubled quote inside a literal survives.
-    try std.testing.expectEqualStrings("Tenant Id='o''x'", try normalize(a, "(\"Tenant Id\" = 'o''x'::text)"));
+    try std.testing.expectEqualStrings("\"Tenant Id\"='o''x'", try normalize(a, "(\"Tenant Id\" = 'o''x'::text)"));
     // The alias goes, an identifier that merely starts like it does not.
     try std.testing.expectEqualStrings("current_setting'zb.tenant',true", try normalize(a, "current_setting('zb.tenant'::text, true) AS current_setting"));
+}
+
+test "a quoted identifier is never the keyword it spells" {
+    // A boolean column named "true": PostgreSQL prints USING ("true") for it. Read as the
+    // keyword it would be a no-op; it is a filter, so it must not be certified.
+    const base: Policy = .{ .name = "zb_reader_all", .permissive = true, .qual = bridge_qual_text };
+    try std.testing.expectEqual(Verdict.unverifiable, try verdictOf(.{ .rls_enabled = true, .policies = &.{ base, .{ .name = "col_true", .permissive = false, .qual = "\"true\"" } } }, "tenant_id"));
+    try std.testing.expectEqual(Verdict.unverifiable, try verdictOf(.{ .rls_enabled = true, .policies = &.{ base, .{ .name = "col_true", .permissive = false, .qual = "(\"true\")" } } }, "tenant_id"));
+    // A permissive "true"/"false" column is a filter too, never a pass-through or a deny.
+    try std.testing.expectEqual(Verdict.unverifiable, try verdictOf(.{ .rls_enabled = true, .policies = &.{.{ .name = "col_true", .permissive = true, .qual = "\"true\"" }} }, "tenant_id"));
+    try std.testing.expectEqual(Verdict.unverifiable, try verdictOf(.{ .rls_enabled = true, .policies = &.{.{ .name = "col_false", .permissive = true, .qual = "\"false\"" }} }, "tenant_id"));
+    // The keywords themselves are still recognised.
+    try std.testing.expectEqual(Verdict.safe, try verdictOf(.{ .rls_enabled = true, .policies = &.{ base, .{ .name = "noop", .permissive = false, .qual = "TRUE" } } }, "tenant_id"));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expect(!std.mem.eql(u8, try normalize(arena.allocator(), "\"true\""), try normalize(arena.allocator(), "true")));
 }
 
 test "a tenant column that needs quoting is recognised, a different open tenant is not" {
