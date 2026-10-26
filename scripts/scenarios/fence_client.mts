@@ -19,11 +19,14 @@ const abortAt = process.env.ZB_TEST_FENCE_ABORT;
 const holdMs = Number(process.env.ZB_TEST_FENCE_SLEEP_MS ?? 0);
 const holdFile = process.env.ZB_TEST_FENCE_HOLD_FILE;
 const sharedUnreadable = !!process.env.ZB_TEST_SHARED_UNREADABLE;
+// leaf_fence.py: a client behind a seeding leaf (creds '-': the stack has no authentication).
+const seedDomain = process.env.ZB_SEED_DOMAIN;
 
 const say = (line: string) => console.error(line);
 
 const client = new ZeBridge({
-  natsUrl: url, credsPath: creds, dbPath: db, principal, jsDomain: 'hub', tables: table.split(','), heartbeatMs: 0,
+  natsUrl: url, ...(creds === '-' ? {} : { credsPath: creds }), dbPath: db, principal, jsDomain: 'hub', tables: table.split(','), heartbeatMs: 0,
+  ...(seedDomain ? { seedDomain } : {}),
   ...(Number(chunk) > 0 ? { seedChunkRows: Number(chunk) } : {}),
   faultHook: async (point) => {
     if (point === 'before_decision' && holdFile && existsSync(holdFile)) {
