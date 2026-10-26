@@ -17,6 +17,7 @@ function fixture(path = ':memory:') {
       msg_id TEXT PRIMARY KEY, tbl TEXT, state TEXT, routes TEXT,
       targets TEXT DEFAULT '', data TEXT, since INTEGER);
     CREATE TABLE IF NOT EXISTS _zebridge_generations (tbl TEXT);
+    CREATE TABLE IF NOT EXISTS _zebridge_frontier (tbl TEXT NOT NULL, stream TEXT NOT NULL, created TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (tbl, stream));
     CREATE TABLE IF NOT EXISTS _zebridge_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER, created TEXT);
     CREATE TABLE IF NOT EXISTS item (id INTEGER, value TEXT);
   `);
