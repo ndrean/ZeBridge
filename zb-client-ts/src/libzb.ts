@@ -2379,7 +2379,16 @@ export class ZeBridge {
       while (this.nc && this.syncedTables.get(table)?.unseeded) {
         await new Promise((r) => setTimeout(r, GENERATION_SLOW_POLL_MS));
         if (!this.nc) return;
-        if (await this.applyGenerations(table)) {
+        // An attempt that throws is one failed attempt, not the end of the wait: the table is still
+        // unseeded, its events are held, and this loop is the only thing asking (a throw inside an
+        // automatic retry asks for another loop, which `lateSeeds` turns into this one).
+        let landed = false;
+        try {
+          landed = await this.applyGenerations(table);
+        } catch (e) {
+          this.appendLog('SYS', `${table}: late seed attempt failed: ${e} — asking again in ${GENERATION_SLOW_POLL_MS / 1000}s`, 'WARNING');
+        }
+        if (landed) {
           const st = this.syncedTables.get(table);
           if (st) { st.unseeded = false; }
           this.reach('snapshot');
@@ -2410,7 +2419,13 @@ export class ZeBridge {
         const started = Date.now();
         let lastSaid = started;
         while (this.nc) {
-          if (await this.applyGenerations(table)) return;
+          // A throwing attempt is one failed attempt: the epoch moved and the table is waiting for
+          // its full, and this loop is the only thing asking.
+          try {
+            if (await this.applyGenerations(table)) return;
+          } catch (e) {
+            this.appendLog('SYS', `${table}: re-seed attempt failed: ${e} — asking again`, 'WARNING');
+          }
           const waited = Date.now() - started;
           if (Date.now() - lastSaid >= 60_000) {
             lastSaid = Date.now();
@@ -3576,8 +3591,9 @@ export class ZeBridge {
           this.appendLog('SYS', `Generation ${step.name} for ${table} references columns the local schema lacks — falling back to snapshot`, 'WARNING');
           return null;
         }
-        // About to delete the baseline: the replacement becomes durably owed first (a fence's already is).
-        if (step.kind === 'full' && !hold.owed) await oweReplacement(manifest);
+        // About to delete the baseline: the replacement becomes durably owed first (a fence's already is),
+        // and what the position did during the download is settled with the tails stopped (below).
+        if (step.kind === 'full' && !hold.owed && !(await settleBeforeFull(plan))) return null;
         // The streaming path meets the object's version column in the TAIL, after the
         // rows; the manifest's is the same column unless the schema moved under the cut,
         // which the tail check reports.
@@ -3832,53 +3848,18 @@ export class ZeBridge {
       return { ownPos, predates, ownScope, sharedScope, decision };
     };
 
-    // One manifest's plan and fence decision; null = wait (refused, and said).
-    const begin = async (man: any, pr: Proof): Promise<PlanStep[] | null> => {
-      await this.fault('before_decision');
-      const plan = planFrom(man);
-      // A seeding leaf's manifest can arrive before its objects do (two mirrors). Every object of
-      // the plan must be there BEFORE anything changes — a fence's PREPARE included — or the
-      // hub's chain is the one used.
-      if (fromLeaf) {
-        for (const step of plan) {
-          let oi: any = null;
-          try { oi = await os.info(step.name); } catch { /* unreadable: absent */ }
-          if (!oi || oi.deleted) {
-            this.appendLog('SYS', `${table}: the seeding leaf's manifest names ${step.name}, which its cache does not hold yet — seeding from the hub`, 'INFO');
-            return null;
-          }
-        }
-      }
-      const first = await decide(man, pr, plan);
-      if (first.decision.kind === 'refuse') { this.appendLog('SYS', `${table}: ${first.decision.why}`, 'WARNING'); return null; }
-      if (first.decision.kind === 'none') {
-        // A plain seed is recorded on its routes all the same: a fence that parks them while it
-        // downloads, and commits first, must hand the parking over (beginReplacement).
-        if (plan.length) await this.prepareExclusive(async () => this.beginReplacement(table, [man.cdc_stream, ...(sharedRoute ? [sharedRoute] : [])].filter((x): x is string => !!x), hold));
-        return plan;
-      }
-      // A fence is taken from a seeding leaf's chain too (the recovery model, §6): its cut and
-      // identities have their hub meaning, and every proof (`prove`, `decide`, VERIFY) reads the
-      // HUB's stream — the incarnation it was cut on, the event after the cut still retained. A
-      // leaf chain whose suffix the hub no longer holds is refused by those proofs, as before.
-
-      // PREPARE, before any row changes: the table durably unseeded and the routes' cursors
-      // at the cuts, in one transaction, the fence recorded as owed. A failure or a crash
-      // from here to the anchor's commit leaves "unseeded, cursor at the cut" — the next
-      // attempt is a fence again, and the events after the cut replay (a rewind never
-      // skips) — never replaced rows under the old cursor. The tails on these routes stop
-      // first and no pass reopens them (`fenced`): an old gate above the cut would drop the
-      // very events that must replay.
-      //
-      // Fences on one route are exclusive and decided AGAIN inside: two fences with cuts 100 and
-      // 200, each decided against the position as it was before either prepared, would leave the
-      // cursor at the later cut and the table seeded at 100 without events 101..200. Inside, the
-      // position is the one the earlier fence left (the cursor never moves forward), the other
-      // tables are seen as they are now (the earlier fence's table is unseeded: refused), and a
-      // chain that no longer predates the position is no fence at all.
-      type PrepOutcome = { kind: 'prepared'; ownPos: number; sharedMoved: boolean; untouched: number } | { kind: 'plain' } | { kind: 'wait'; why: string };
+    // PREPARE, shared by the fence decided at the start (`begin`) and by a plain seed whose position
+    // moved past the cut while its full downloaded (`settleBeforeFull`). `late` decides again with the
+    // tails stopped and, if the chain is still ahead of the position, owes the plain replacement there.
+    type PrepOutcome = { kind: 'prepared'; ownPos: number; sharedMoved: boolean; untouched: number } | { kind: 'plain' } | { kind: 'wait'; why: string };
+    const prepare = async (man: any, pr: Proof, plan: PlanStep[], late: boolean): Promise<PrepOutcome> => {
       let outcome = { kind: 'wait', why: 'not decided' } as PrepOutcome;
       await this.withStreamQueue(run, () => this.prepareExclusive(async () => {
+        // Late: the full's object is in hand and the first chunk deletes the baseline. The tails on
+        // its routes stop FIRST, so the position read next is final — CDC may have passed the cut
+        // while the object downloaded, and a plain full over that would delete the rows of events
+        // the cursor already counts.
+        if (late) for (const x of [man.cdc_stream, ...(sharedRoute ? [sharedRoute] : [])]) if (x) await this.stopTail(x);
         const now = await decide(man, pr, plan);
         const decision = now.decision;
         if (decision.kind === 'refuse') { outcome = { kind: 'wait', why: decision.why }; return; }
@@ -3887,6 +3868,7 @@ export class ZeBridge {
           // one that parks them later). Recorded here, in the exclusive section, so that fence's
           // commit cannot reopen a tail under this replacement's download.
           if (plan.length) this.beginReplacement(table, [man.cdc_stream, ...(sharedRoute ? [sharedRoute] : [])].filter((x): x is string => !!x), hold);
+          if (late) await oweReplacement(man); // still ahead of the position: owed, here, with the tails stopped
           outcome = { kind: 'plain' };
           return;
         }
@@ -3968,7 +3950,77 @@ export class ZeBridge {
         this.beginReplacement(table, streams, hold);
         outcome = { kind: 'prepared', ownPos: now.ownPos, sharedMoved: decision.sharedTo !== null, untouched: untouched.length };
       }));
-      const out: PrepOutcome = outcome;
+      return outcome;
+    };
+
+    // Before the first chunk of a full that `begin` took as plain. The decision was taken before
+    // the download, and the tails kept running meanwhile (a poll loop's seed does not stop them): the
+    // position may have passed the cut since, and a plain full over rows that already carry those
+    // events deletes them while the cursor still counts them — gone for ever. So the position is read
+    // again with the tails stopped, under the queue: still ahead of it, the replacement is owed (as
+    // before); passed, the full becomes a fence (PREPARE: cursors back to the cut) with the object
+    // already in hand. `false` = wait, nothing changed.
+    const settleBeforeFull = async (plan: PlanStep[]): Promise<boolean> => {
+      const pr = proof as Proof; // proven before `begin` ran: a plan exists only with one
+      const out = await prepare(manifest, pr, plan, true);
+      if (out.kind === 'prepared') {
+        fenceRun = { fromPos: out.ownPos, shared: out.sharedMoved };
+        const cost = chainCost(manifest, pr);
+        this.appendLog('SYS', `${table}: the position passed the cut while the full downloaded — fence prepared — chain g${manifest.gen} cut at ${manifest.cutoff_seq} on ${manifest.cdc_stream} behind position ${out.ownPos}: anchor cleared, cursor at the cut${out.sharedMoved ? ' (the shared route too)' : ''}; replacing the rows${out.untouched ? ' — the other tables on the route keep their applied frontier' : ''}${fromLeaf ? ' [from the seeding leaf]' : ''} (chain ${Math.floor(cost.ageMs / 1000)} s old, ${cost.behind} CDC message(s) after its cut on the hub)`, 'WARNING');
+        return true;
+      }
+      // The tails were stopped for the decision: reopen them, unless a fence parks the route (it keeps
+      // them stopped until it commits, and a pass would find them parked anyway).
+      if (!run.inPass && ![manifest.cdc_stream, sharedRoute].some((x) => x && this.routeParked(x))) void this.subscribeStreams().catch(() => {});
+      if (out.kind === 'wait') { this.appendLog('SYS', `${table}: ${out.why}`, 'WARNING'); return false; }
+      return true;
+    };
+
+    // One manifest's plan and fence decision; null = wait (refused, and said).
+    const begin = async (man: any, pr: Proof): Promise<PlanStep[] | null> => {
+      await this.fault('before_decision');
+      const plan = planFrom(man);
+      // A seeding leaf's manifest can arrive before its objects do (two mirrors). Every object of
+      // the plan must be there BEFORE anything changes — a fence's PREPARE included — or the
+      // hub's chain is the one used.
+      if (fromLeaf) {
+        for (const step of plan) {
+          let oi: any = null;
+          try { oi = await os.info(step.name); } catch { /* unreadable: absent */ }
+          if (!oi || oi.deleted) {
+            this.appendLog('SYS', `${table}: the seeding leaf's manifest names ${step.name}, which its cache does not hold yet — seeding from the hub`, 'INFO');
+            return null;
+          }
+        }
+      }
+      const first = await decide(man, pr, plan);
+      if (first.decision.kind === 'refuse') { this.appendLog('SYS', `${table}: ${first.decision.why}`, 'WARNING'); return null; }
+      if (first.decision.kind === 'none') {
+        // A plain seed is recorded on its routes all the same: a fence that parks them while it
+        // downloads, and commits first, must hand the parking over (beginReplacement).
+        if (plan.length) await this.prepareExclusive(async () => this.beginReplacement(table, [man.cdc_stream, ...(sharedRoute ? [sharedRoute] : [])].filter((x): x is string => !!x), hold));
+        return plan;
+      }
+      // A fence is taken from a seeding leaf's chain too (the recovery model, §6): its cut and
+      // identities have their hub meaning, and every proof (`prove`, `decide`, VERIFY) reads the
+      // HUB's stream — the incarnation it was cut on, the event after the cut still retained. A
+      // leaf chain whose suffix the hub no longer holds is refused by those proofs, as before.
+
+      // PREPARE, before any row changes: the table durably unseeded and the routes' cursors
+      // at the cuts, in one transaction, the fence recorded as owed. A failure or a crash
+      // from here to the anchor's commit leaves "unseeded, cursor at the cut" — the next
+      // attempt is a fence again, and the events after the cut replay (a rewind never
+      // skips) — never replaced rows under the old cursor. The tails on these routes stop
+      // first and no pass reopens them (`fenced`): an old gate above the cut would drop the
+      // very events that must replay.
+      //
+      // Fences on one route are exclusive and decided AGAIN inside: two fences with cuts 100 and
+      // 200, each decided against the position as it was before either prepared, would leave the
+      // cursor at the later cut and the table seeded at 100 without events 101..200. Inside, the
+      // position is the one the earlier fence left (the cursor never moves forward), the other
+      // tables are seen as they are now (the earlier fence's table is unseeded: refused), and a
+      // chain that no longer predates the position is no fence at all.
+      const out = await prepare(man, pr, plan, false);
       if (out.kind === 'wait') { this.appendLog('SYS', `${table}: ${out.why}`, 'WARNING'); return null; }
       if (out.kind === 'plain') return plan;
       fenceRun = { fromPos: out.ownPos, shared: out.sharedMoved };

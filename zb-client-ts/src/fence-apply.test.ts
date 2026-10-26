@@ -3,7 +3,7 @@
 // recovery model's order — PREPARE, replace, VERIFY, COMMIT. The same cases libzb's
 // recreate_recovery.py check 4 runs live, here deterministically: SQLite on a file (a
 // "crash" is a thrown fault and a new client on the same file), a stubbed NATS.
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
@@ -100,6 +100,7 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
     globalSyncState: { seq }, tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(), replacing: new Map(),
     streamWork: Promise.resolve(), streamsSubscribed: true, restarted: new Set(), failed: new Set(), hubOnly: new Set(),
     applyingByChoice: new Set(), healedRoutes: new Set(), streamCreated, fkHeld: [], hlcFloor: '', frontiers: new Map(), frontierGated: 0,
+    lateSeeds: new Set<string>(), reseedKicks: new Map(), fkHolds: 0, scheduleRecount: () => {},
     waits: [] as string[], waitForChain(tb: string) { (this as any).waits.push(tb); }, pendingWrites: new Map(), rebase: new Map(), bulkStats: { single: 0, statements: 0, bulked: 0, fallbacks: 0 },
     measure: new Measure(() => {}), dialect: sqliteDialect, storage: {}, platform: {},
     config: {
@@ -1030,6 +1031,165 @@ test('a plain full that fails after its first chunk is owed too: no overlap need
       assert.equal(owed(t.db), 0);
       assert.equal((anchor(t.db) as any).seed_seq, 600);
     } finally { t.close(); }
+  });
+});
+
+/// The decision to take a full as plain is made BEFORE its download, and the download is slow: the tails
+/// keep applying CDC meanwhile. An event past the cut, applied to the rows and counted by the cursor, is
+/// deleted by the full and never replays — unless the position is read again, with the tails stopped,
+/// before the first chunk, and the full becomes a fence.
+for (const inPass of [false, true]) {
+  test(`CDC passing the cut while a plain full downloads makes it a fence: the cursor goes back, the event replays (${inPass ? 'in a pass' : 'background'})`, async () => {
+    await withDir(async (path) => {
+      const w = new World();
+      w.publish(2, 5, 600); // ahead of the position 500: a plain seed when decided
+      follower(path, w);
+      const slow = deferred();
+      w.hold = () => slow.p;
+      const t = client(path, w);
+      try {
+        const stops: string[] = [];
+        t.c.tailStops.set(OWN, async () => { stops.push(OWN); });
+        const apply = t.c.applyGenerations('item', inPass);
+        for (let i = 0; i < 50 && !t.c.replacing.get(OWN)?.has('item'); i++) await new Promise((r) => setImmediate(r));
+        assert.ok(t.c.replacing.get(OWN)?.has('item'), 'decided plain, the download is paused');
+        assert.equal(pos(t.db, OWN), 500);
+        // The live tail applies the event at 650 to the rows and moves the cursor past the cut.
+        t.db.exec(`INSERT INTO item VALUES (650,'acme','live','${VERSION(20)}')`);
+        t.db.exec(`UPDATE _zebridge_stream_seq SET last_seq = 650 WHERE stream = '${OWN}'`);
+        t.c.globalSyncState.seq[OWN] = 650;
+        slow.go();
+        assert.equal(await within(5000, apply, 'the seed'), true);
+        assert.ok(stops.length > 0, 'the tail was stopped before the rows were replaced');
+        assert.deepEqual(rows(t.db), wanted(2, 5), 'the chain\'s rows replaced the old ones, the live row included');
+        assert.equal(pos(t.db, OWN), 600, 'the cursor is back at the cut: the event at 650 replays on top of the chain');
+        assert.equal(t.c.globalSyncState.seq[OWN], 600);
+        assert.equal((anchor(t.db) as any).seed_seq, 600);
+        assert.equal(owed(t.db), 0, 'committed, nothing owed');
+        assert.equal(t.c.fenced.size, 0, 'the route is released with the commit');
+        assert.ok(t.log.some((m) => /the position passed the cut while the full downloaded/.test(m)));
+        assert.ok(t.log.some((m) => /fenced — chain g2/.test(m)), 'it went through VERIFY and COMMIT like any fence');
+      } finally { t.close(); }
+    });
+  });
+}
+
+test('a plain full whose position stays behind the cut is owed as before, and the tails are given back', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 600);
+    follower(path, w);
+    const t = client(path, w);
+    try {
+      t.c.tailStops.set(OWN, async () => {});
+      assert.equal(await t.c.applyGenerations('item'), true);
+      assert.deepEqual(rows(t.db), wanted(2, 5));
+      assert.equal(pos(t.db, OWN), 500, 'a plain seed moves no cursor');
+      assert.equal((anchor(t.db) as any).seed_seq, 600);
+      assert.equal(owed(t.db), 0);
+      assert.ok(t.passes.length >= 1, 'the tails stopped for the decision are asked for again');
+      assert.equal(t.log.some((m) => /the position passed the cut/.test(m)), false);
+    } finally { t.close(); }
+  });
+});
+
+test('CDC passing the cut during the download when the fence would be refused: nothing is replaced, the old rows and anchor stay', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 600);
+    follower(path, w); // orders has no anchor: its coverage on the route is unknown (D2 refuses a rewind)
+    const slow = deferred();
+    w.hold = () => slow.p;
+    const t = client(path, w, { others: ['orders'] });
+    try {
+      t.c.tailStops.set(OWN, async () => {});
+      const apply = t.c.applyGenerations('item');
+      for (let i = 0; i < 50 && !t.c.replacing.get(OWN)?.has('item'); i++) await new Promise((r) => setImmediate(r));
+      t.db.exec(`UPDATE _zebridge_stream_seq SET last_seq = 650 WHERE stream = '${OWN}'`);
+      t.c.globalSyncState.seq[OWN] = 650;
+      slow.go();
+      assert.equal(await within(5000, apply, 'the seed'), false, 'waits: nothing is destroyed');
+      assert.deepEqual(rows(t.db), ['91:old', '92:old', '93:old']);
+      assert.equal(owed(t.db), 0);
+      assert.equal(pos(t.db, OWN), 650);
+      assert.ok((anchor(t.db) as any), 'the anchor is intact');
+    } finally { t.close(); }
+  });
+});
+
+/// The waits for a chain run on the clock: one failed attempt must not be the last. A throw out of an
+/// attempt (the hub unreachable for a moment, a half-replaced table that fails again) used to end the
+/// loop, leave the table unseeded with its events held, and nothing asking for its chain any more.
+const ticks = async (ms: number, n: number) => {
+  for (let i = 0; i < n; i++) {
+    for (let k = 0; k < 20; k++) await new Promise((r) => setImmediate(r));
+    mock.timers.tick(ms);
+  }
+  for (let k = 0; k < 20; k++) await new Promise((r) => setImmediate(r));
+};
+
+test('the wait for a chain survives an attempt that throws, and asks again until it lands', async () => {
+  await withDir(async (path) => {
+    mock.timers.enable({ apis: ['setTimeout'] });
+    const w = new World();
+    const t = client(path, w);
+    try {
+      t.c.waitForChain = (ZeBridge.prototype as any).waitForChain;
+      let calls = 0;
+      t.c.applyGenerations = async () => { if (++calls <= 2) throw new Error('hub unreachable'); return true; };
+      t.c.waitForChain('item');
+      assert.equal(t.c.syncedTables.get('item').unseeded, true);
+      await ticks(15_000, 4);
+      assert.equal(calls, 3, 'two throws, then the attempt that landed');
+      assert.equal(t.c.syncedTables.get('item').unseeded, false);
+      assert.equal(t.c.lateSeeds.size, 0);
+      assert.equal(t.log.filter((m) => /late seed attempt failed: Error: hub unreachable/.test(m)).length, 2);
+    } finally { t.close(); mock.timers.reset(); }
+  });
+});
+
+test('a replacement that throws again during the wait asks for another loop: the one running goes on', async () => {
+  await withDir(async (path) => {
+    mock.timers.enable({ apis: ['setTimeout'] });
+    const w = new World();
+    w.publish(2, 5, 600);
+    follower(path, w);
+    let armed = true;
+    const t = client(path, w, { hook: async (point) => { if (point === 'after_chunk' && armed) throw new Error('crash at after_chunk'); } });
+    try {
+      t.c.waitForChain = (ZeBridge.prototype as any).waitForChain;
+      // The full fails after its first chunk: owed, so the failure asks for the wait (applyGenerationsFrom).
+      await assert.rejects(() => t.c.applyGenerations('item'), /crash at after_chunk/);
+      assert.equal(t.c.lateSeeds.has('item'), true, 'the wait is running');
+      // The automatic retry fails the same way: it asks for a wait again, and the table is already in
+      // lateSeeds — the exception must not take the running loop with it.
+      await ticks(15_000, 2);
+      assert.equal(t.c.lateSeeds.has('item'), true, 'still waiting after a second failure');
+      assert.equal(t.c.syncedTables.get('item').unseeded, true);
+      armed = false;
+      await ticks(15_000, 3);
+      assert.equal(t.c.syncedTables.get('item').unseeded, false, 'the next attempt seeds it');
+      assert.deepEqual(rows(t.db), wanted(2, 5));
+      assert.equal(owed(t.db), 0);
+      assert.equal(t.c.lateSeeds.size, 0);
+    } finally { t.close(); mock.timers.reset(); }
+  });
+});
+
+test('a re-seed wait survives an attempt that throws too', async () => {
+  await withDir(async (path) => {
+    mock.timers.enable({ apis: ['setTimeout'] });
+    const w = new World();
+    const t = client(path, w);
+    try {
+      let calls = 0;
+      t.c.applyGenerations = async () => { if (++calls <= 2) throw new Error('hub unreachable'); return true; };
+      t.c.kickReseed = (ZeBridge.prototype as any).kickReseed;
+      t.c.kickReseed('item');
+      await ticks(15_000, 4);
+      assert.equal(calls, 3);
+      assert.equal(t.c.reseedKicks.size, 0, 'the loop ended because the chain landed');
+    } finally { t.close(); mock.timers.reset(); }
   });
 });
 
