@@ -19,6 +19,11 @@ behind its position — the case a busy table makes common. Two cases per client
                     the position was refused and the hub's chain fenced.
   leaf_missing      the leaf's manifest is there but its object cache is gone (two mirrors; one lags):
                     nothing is prepared from the leaf — the client says so, and fences the HUB's chain.
+  leaf_stale        the leaf's manifest names an earlier incarnation of the CDC stream (a copy left from
+                    before a recreate): its cut cannot be proven replayable on the hub's stream. That is
+                    NOT retention expiry, and it must not stall recovery: the leaf's refusal sends the
+                    client to the hub's chain, which is fenced. (libzb used to return success there and
+                    never ask the hub.)
 
 The client's schema watch is held (libzb ZB_TEST_SCHEMA_PAUSE_FILE, a fault build; zb-client-ts a
 `before_decision` hold file) until the new chain is on the leaf, and the tails keep applying meanwhile:
@@ -121,6 +126,17 @@ class LeafStack(Stack):
         finally:
             await leaf.close()
 
+    async def doctor_manifest(self, tenant, change):
+        """The leaf's cached manifest rewritten (the hub's stays): what a stale mirror holds."""
+        leaf = await nats.connect(self.leaf_url, connect_timeout=5)
+        try:
+            js = leaf.jetstream(domain="leaf")
+            subject = f"$KV.{zb.kv_bucket('generations')}.{tenant}.{T}"
+            msg = await js.get_last_msg("KV_generations", subject, direct=True)
+            await js.publish(subject, json.dumps(change(json.loads(msg.data))).encode())
+        finally:
+            await leaf.close()
+
     async def leaf_manifest(self, tenant):
         leaf = await nats.connect(self.leaf_url, connect_timeout=5)
         try:
@@ -162,7 +178,7 @@ async def run(a, tmp, ts):
     elif not check(f"the leaf cases run on a fault-hook build ({rr.FAULT_LIBRARY})", rr.FAULT_LIBRARY.exists() and all(h in rr.FAULT_LIBRARY.read_bytes() for h in hooks)):
         note(f"build it: {rr.FAULT_BUILD}")
         return
-    s = LeafStack(tmp, "15" if not ts else "16", a.cadence, {})
+    s = LeafStack(tmp, "leafts" if ts else "leaf", a.cadence, {})
     try:
         s.start({"pa": "t_a"})
         s.create_table({"t_a": a.rows}, "a")
@@ -202,7 +218,7 @@ async def run(a, tmp, ts):
             m, ep = await s.leaf_manifest("t_a") or {}, await js.epoch()
             return ep is not None and m.get("seed_epoch") == ep and ep > epoch0
 
-        for name in ("from_leaf", "leaf_missing"):
+        for name in ("from_leaf", "leaf_missing", "leaf_stale"):
             load = Load(s, "t_a", "c", a.interval_ms / 1000)
             c = (LeafTsClient(s, f"{name}_{kind}", "pa", "t_a", chunk_rows=200) if ts
                  else LeafClient(s, f"{name}_{kind}", "pa", "t_a", chunk_rows=200, lib=rr.FAULT_LIBRARY))
@@ -221,6 +237,10 @@ async def run(a, tmp, ts):
             note(f"{name}: the new chain on the leaf after {await until(leaf_current, 90)} s")
             if name == "leaf_missing":
                 check(f"{name}: the leaf's object cache dropped (its manifest kept)", await s.drop_object_cache("t_a"))
+            if name == "leaf_stale":
+                await s.doctor_manifest("t_a", lambda m: {**m, "cdc_stream_created": "2020-01-01T00:00:00.000000Z"})
+                m = await s.leaf_manifest("t_a")
+                check(f"{name}: the leaf's manifest now names an earlier incarnation of the stream", m.get("cdc_stream_created", "").startswith("2020"))
             await asyncio.sleep(4)   # the tails go on applying: the position runs ahead of the chain's cut
             pause.unlink(missing_ok=True)
             took = await until(lambda: fence_cut(c) is not None, 90)
@@ -263,7 +283,7 @@ def main():
                 asyncio.run(run(a, pathlib.Path(d), ts))
             except Exception as e:
                 check(f"raised: {type(e).__name__}: {str(e)[:400]}", False)
-    print(f"  · logs: /tmp/zb_rr15_*.log, /tmp/zb_rr16_*.log; {'FAILED ' + str(rr.failed) + ' check(s)' if rr.failed else 'clean'}")
+    print(f"  · logs: /tmp/zb_rrleaf_*.log, /tmp/zb_rrleafts_*.log; {'FAILED ' + str(rr.failed) + ' check(s)' if rr.failed else 'clean'}")
     return 1 if rr.failed else 0
 
 

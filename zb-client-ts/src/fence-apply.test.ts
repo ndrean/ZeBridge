@@ -100,7 +100,7 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
     globalSyncState: { seq }, tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(), replacing: new Map(),
     streamWork: Promise.resolve(), streamsSubscribed: true, restarted: new Set(), failed: new Set(), hubOnly: new Set(),
     applyingByChoice: new Set(), healedRoutes: new Set(), streamCreated, fkHeld: [], hlcFloor: '', frontiers: new Map(), frontierGated: 0,
-    pendingWrites: new Map(), rebase: new Map(), bulkStats: { single: 0, statements: 0, bulked: 0, fallbacks: 0 },
+    waits: [] as string[], waitForChain(tb: string) { (this as any).waits.push(tb); }, pendingWrites: new Map(), rebase: new Map(), bulkStats: { single: 0, statements: 0, bulked: 0, fallbacks: 0 },
     measure: new Measure(() => {}), dialect: sqliteDialect, storage: {}, platform: {},
     config: {
       principal: 'p', seedChunkRows: 2, bulkStatement: 'json_each', faultHook: opts.hook ? (point: string) => opts.hook!(point, c) : undefined,
@@ -875,15 +875,18 @@ for (const inPass of [false, true]) {
     w.hold = (name) => (name.startsWith('orders') ? slow.p : undefined); // its download stays paused
     let arrived = 0;
     const both = deferred();
+    const fail = { on: false };
     const t = client(path, w, { others: ['orders'], hook: async (point) => {
+      if (point === 'after_chunk' && fail.on) throw new Error('crash at after_chunk');
       if (point !== 'before_decision') return;
       if (++arrived === 2) both.go();
       await both.p;
     } });
-    return { w, t, slow };
+    return { w, t, slow, fail };
   };
-  /// A real stream pass (step 2 opens the tails) against a stubbed hub: how many consumers it opened.
-  const consumersOpenedBy = async (t: any) => {
+  /// A real stream pass (step 2 opens the tails) against a stubbed hub, started and not awaited: a
+  /// table it finds unseeded joins the replacement in flight and waits for it, as it would.
+  const startPass = (t: any) => {
     let added = 0;
     const real = t.c.transport.jetstreamManager;
     t.c.transport.jetstreamManager = async (...a: any[]) => ({
@@ -893,9 +896,8 @@ for (const inPass of [false, true]) {
     t.c.transport.deliverPolicy = { byStartSequence: 'by_start_sequence', all: 'all' };
     t.c.transport.jetstream = () => ({ consumers: { get: async () => ({ consume: async () => ({ [Symbol.asyncIterator]() { return this; }, next: () => new Promise(() => {}), stop() {} }) }) } });
     t.c.subscribeStreamsOnce = (ZeBridge.prototype as any).subscribeStreamsOnce;
-    await t.c.subscribeStreamsOnce();
-    for (const stream of [...t.c.tailStops.keys()]) await t.c.stopTail(stream);
-    return added;
+    const done = t.c.subscribeStreamsOnce().then(async () => { for (const stream of [...t.c.tailStops.keys()]) await t.c.stopTail(stream); });
+    return { opened: () => added, done };
   };
   const parkedBy = (t: any, stream: string) => [...(t.c.fenced.get(stream) ?? [])].sort();
 
@@ -913,18 +915,58 @@ for (const inPass of [false, true]) {
         assert.deepEqual(parkedBy(t, OWN), ['orders']);
         assert.equal(t.c.routeParked(PUB), true, 'the shared route too');
         assert.equal(pos(t.db, OWN), 100);
-        // A pass now — the poll loop's, the reconnect's — finds no consumer to open on either route.
-        assert.equal(await consumersOpenedBy(t), 0, 'no consumer opens while the replacement writes rows');
+        // A pass now — the poll loop's, the reconnect's — opens no consumer on either route.
+        const pass = startPass(t);
+        await new Promise((r) => setTimeout(r, 100));
+        assert.equal(pass.opened(), 0, 'no consumer opens while the replacement writes rows');
         // The download completes: the replacement ends and only then the route opens (a poll loop asks for the tails).
         const before = t.passes.length;
         slow.go();
         assert.equal(await within(5000, plain, 'the plain seed'), true);
+        await within(5000, pass.done, 'the pass');
         assert.equal(t.c.fenced.size, 0, 'released with the last owner');
-        assert.ok((await consumersOpenedBy(t)) > 0, 'and a pass then opens the consumers (the stub is not what held them back)');
+        assert.equal(pass.opened(), 0, 'that pass found the routes parked and left them');
+        const later = startPass(t);
+        await within(5000, later.done, 'the next pass');
+        assert.ok(later.opened() > 0, 'the next pass opens the consumers (the stub is not what held them back)');
         assert.equal(t.c.replacing.get(OWN)?.size ?? 0, 0);
         assert.equal(t.passes.length - before, inPass ? 0 : 1, 'the tails are asked for when the route opens');
         assert.equal(pos(t.db, OWN), 100, 'the cursor is still at the lower cut: nothing moved it meanwhile');
         assert.deepEqual(rows(t.db), wanted(2, 5));
+      } finally { slow.go(); t.close(); }
+    });
+  });
+
+  test(`a plain replacement that fails after its first chunk leaves the table owed and unseeded, and its retry recovers (${how})`, async () => {
+    await withDir(async (path) => {
+      const { w, t, slow, fail } = await setup(path, true);
+      // orders holds a stable baseline the full's first chunk deletes.
+      t.db.exec(`INSERT INTO orders VALUES (91,'acme','old','${VERSION(1)}'),(92,'acme','old','${VERSION(1)}'),(93,'acme','old','${VERSION(1)}')`);
+      try {
+        const plain = t.c.applyGenerations('orders', inPass); // decided plain (cut 600, ahead of the position)
+        const fence = t.c.applyGenerations('item', inPass);
+        assert.equal(await within(5000, fence, 'the fence'), true, 'the fence is through and has handed the parking to the plain replacement');
+        assert.equal(t.c.routeParked(OWN), true);
+        // The download completes, its first chunk commits (the baseline is deleted), the second fails.
+        fail.on = true;
+        slow.go();
+        await assert.rejects(() => within(5000, plain, 'the plain seed'), /crash at after_chunk/);
+        const owedTables = t.db.prepare('SELECT tbl FROM _zebridge_fence').all().map((r) => r.tbl);
+        assert.deepEqual(owedTables, ['orders'], 'durably owed');
+        assert.equal(t.db.prepare("SELECT count(*) AS n FROM _zebridge_generations WHERE tbl = 'orders'").get()?.n, 0, 'the old anchor is gone: orders is not seeded');
+        assert.equal(t.db.prepare('SELECT count(*) AS n FROM orders WHERE note = \'old\'').get()?.n, 0, 'the baseline was deleted by the first chunk');
+        assert.equal(t.c.syncedTables.get('orders').unseeded, true, 'its events are held, not applied to half-replaced rows');
+        assert.deepEqual(t.c.waits, ['orders'], 'a retry loop runs for it');
+        // The retry (what that loop does) is a fence retry with every proof, and completes it.
+        fail.on = false;
+        assert.equal(await t.c.applyGenerations('orders', false), true);
+        assert.equal(t.db.prepare('SELECT count(*) AS n FROM _zebridge_fence').get()?.n, 0);
+        assert.equal(t.db.prepare("SELECT count(*) AS n FROM _zebridge_generations WHERE tbl = 'orders'").get()?.n, 1, 'anchored again');
+        assert.equal(t.db.prepare('SELECT count(*) AS n FROM orders').get()?.n, 4, 'the chain\'s rows');
+        assert.equal(t.c.syncedTables.get('orders').unseeded, false);
+        assert.equal(t.c.fenced.size, 0);
+        assert.equal(pos(t.db, OWN), 100, 'the cursor stayed at the lower cut');
+        void w;
       } finally { slow.go(); t.close(); }
     });
   });
@@ -938,10 +980,13 @@ for (const inPass of [false, true]) {
         assert.equal(await within(5000, fence, 'the fence'), true);
         assert.equal(t.c.routeParked(OWN), true, 'the fence committed, the plain seed is still writing');
         assert.deepEqual(parkedBy(t, OWN), ['orders']);
-        assert.equal(await consumersOpenedBy(t), 0, 'no consumer opens while the replacement writes rows');
+        const pass = startPass(t);
+        await new Promise((r) => setTimeout(r, 100));
+        assert.equal(pass.opened(), 0, 'no consumer opens while the replacement writes rows');
         assert.equal(pos(t.db, OWN), 100);
         slow.go();
         assert.equal(await within(5000, plain, 'the plain seed'), true);
+        await within(5000, pass.done, 'the pass');
         assert.equal(t.c.fenced.size, 0);
         assert.equal(pos(t.db, OWN), 100);
       } finally { slow.go(); t.close(); }
@@ -961,6 +1006,45 @@ test('a plain seed that is refused or fails leaves the routes it held', async ()
       assert.equal(await t.c.applyGenerations('item'), false);
       assert.equal(t.c.replacing.get(OWN)?.size ?? 0, 0);
       assert.deepEqual([...t.c.fenced.get(OWN)], ['orders'], 'the parking the other owner holds is not this one\'s to release; this one joined it and left it');
+    } finally { t.close(); }
+  });
+});
+
+test('a plain full that fails after its first chunk is owed too: no overlap needed', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 600); // a plain seed: the cut is ahead of the position
+    follower(path, w);
+    let armed = true;
+    const t = client(path, w, { hook: async (point) => { if (point === 'after_chunk' && armed) throw new Error('crash at after_chunk'); } });
+    try {
+      await assert.rejects(() => t.c.applyGenerations('item'), /crash at after_chunk/);
+      assert.equal(owed(t.db), 1);
+      assert.equal(t.db.prepare("SELECT count(*) AS n FROM _zebridge_generations WHERE tbl = 'item'").get()?.n, 0, 'the anchor is cleared with the first chunk\'s owed record');
+      assert.equal(t.c.syncedTables.get('item').unseeded, true);
+      assert.deepEqual(t.c.waits, ['item']);
+      assert.equal(pos(t.db, OWN), 500, 'a plain seed moves no cursor');
+      armed = false;
+      assert.equal(await t.c.applyGenerations('item'), true);
+      assert.deepEqual(rows(t.db), wanted(2, 5));
+      assert.equal(owed(t.db), 0);
+      assert.equal((anchor(t.db) as any).seed_seq, 600);
+    } finally { t.close(); }
+  });
+});
+
+test('a delta-only plan writes no owed record: it is not destructive', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 600);
+    // the same chain as a delta over the replica's watermark: no full step in the plan
+    w.manifest.deltas = [{ gen: 2, object: w.manifest.full.object, cutoff: VERSION(10), sorted: true }];
+    w.manifest.full = { ...w.manifest.full, cutoff: VERSION(0) };
+    follower(path, w);
+    const t = client(path, w);
+    try {
+      assert.equal(await t.c.applyGenerations('item'), true);
+      assert.equal(t.db.prepare('SELECT count(*) AS n FROM _zebridge_fence').get()?.n, 0);
     } finally { t.close(); }
   });
 });

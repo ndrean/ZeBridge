@@ -59,6 +59,16 @@ so then c > p and D2 (`fullPredatesReplica`: c < p) cannot refuse it.
              same assertions. The hold that lets the position run ahead of the new chain's cut is
              the harness's (`faultHook` at `before_decision`, while a file exists).
 
+  --check 15 a destructive replacement that is not a fence. A replica is closed; the stream moves on and
+             a seed-epoch move cuts a chain AHEAD of its position (a plain seed: no cursor moves). It
+             reopens with a crash after the first chunk of the full — the baseline is already deleted, the
+             rest of the rows are not in. The replica must be durably incomplete: the owed record written
+             and the anchor cleared with that first chunk, the position where it was. Reopened again, it
+             recovers (anchored under the current epoch, exact). Before, such a failure left the old
+             anchor over half-replaced rows and nothing owed; the CDC suffix cannot restore the rows the
+             first chunk deleted. Fault build, as check 4.
+  --check 16 check 15 with a zb-client-ts client.
+
   --check 5  check 1 with the bridge down during the recreate: PostgreSQL observes it (the
              DDL triggers), the restarted bridge publishes it — one transition, one epoch
              move, every pair's chain within --first-chain-s of the restart.
@@ -1066,6 +1076,72 @@ async def check13(a, tmp, ts=False):
 
 
 
+async def check15(a, tmp, ts=False):
+    """A destructive plain replacement that fails after its first chunk is durably owed."""
+    hooks = (b"ZB_TEST_FENCE_ABORT", b"ZB_TEST_FENCE_SLEEP_MS", b"ZB_TEST_SHARED_UNREADABLE", b"ZB_TEST_SCHEMA_PAUSE_FILE")
+    if ts:
+        if not check(f"the harness exists ({HARNESS})", HARNESS.exists()):
+            return
+    elif not check(f"check 15 runs on a fault-hook build ({FAULT_LIBRARY})", FAULT_LIBRARY.exists() and all(h in FAULT_LIBRARY.read_bytes() for h in hooks)):
+        note(f"build it: {FAULT_BUILD}")
+        return
+    s = Stack(tmp, "16" if ts else "15", a.cadence, {})
+    try:
+        s.start({"pa": "t_a"})
+        s.create_table({"t_a": a.rows}, "a")
+        s.bridge_up()
+        js = await Js().open(s)
+        check("tenant mappings published before any client connects", await js.tenants_ready(s.creds))
+        check(f"a chain ({await wait_manifests(js, ['t_a'], a.cadence + 60)} s)", await js.manifest("t_a") is not None)
+        load = Load(s, "t_a", "c", a.interval_ms / 1000)
+        base = {k for k in s.truth("t_a") if k.startswith("at_a-")}
+
+        async def until(pred, timeout):
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < timeout:
+                r = pred()
+                if asyncio.iscoroutine(r): r = await r
+                if r: return round(time.monotonic() - t0, 1)
+                await asyncio.sleep(1)
+            return None
+
+        async def recovered(c):
+            ok, _ = await anchor_state(c, js, {"t_a"})
+            return ok and base <= (c.rows() or {}).keys()
+
+        c = (TsClient(s, "plain_abort", "pa", "t_a", chunk_rows=200) if ts
+             else Client(s, "plain_abort", "pa", "t_a", chunk_rows=200, lib=FAULT_LIBRARY))
+        c.start()
+        check(f"seeded and anchored before the case ({await until(lambda: recovered(c), 120)} s)", await recovered(c))
+        c.stop()
+        pos0 = c.position("CDC_t_a")
+        await asyncio.sleep(4)   # the stream moves on while the replica is closed
+        epoch0 = await js.epoch()
+        s.sql(f"SELECT count(*) FROM zebridge_reseed('public.{T}'::regclass)")
+
+        async def new_chain():
+            m, ep = await js.manifest("t_a") or {}, await js.epoch()
+            return ep is not None and ep > epoch0 and m.get("seed_epoch") == ep
+        note(f"the chain under the new epoch after {await until(new_chain, 90)} s (its cut is ahead of the replica's position {pos0})")
+        c.p = None
+        c.start({"ZB_TEST_FENCE_ABORT": "after_chunk"})
+        rc = await until(lambda: c.exited() is not None, 90)
+        check(f"the reopened replica aborted after the first chunk of the full ({c.exited()})", rc is not None and c.exited() == 70)
+        check(f"it is durably incomplete: owed {c.fence_pending()}, anchors {c.anchors()}, position {c.position('CDC_t_a')} (was {pos0}, a plain seed moves no cursor)",
+              c.fence_pending() and c.anchors() == [] and c.position("CDC_t_a") == pos0)
+        c.p = None
+        c.start()
+        secs = await until(lambda: recovered(c), 120)
+        check(f"reopened: recovered under a current anchor while writes continue, nothing owed ({secs} s, owed {c.fence_pending()})",
+              secs is not None and not c.fence_pending())
+        load.end()
+        g = grade(s, [c], 2 * a.cadence + 60)
+        await report(c, g[c.name], js, {"t_a"})
+        await js.close()
+    finally:
+        s.stop()
+
+
 BRIDGE_HOOKS = (b"ZB_TEST_OBSERVE_SLEEP_MS", b"ZB_TEST_PRUNE_SLEEP_MS", b"ZB_TEST_BOOT_PRUNE_SLEEP_MS")
 
 
@@ -1400,7 +1476,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker")
     ap.add_argument("--lib")
-    ap.add_argument("--check", default="1,2,3,4,5,6,7,8,9,10,11,12,13,14")
+    ap.add_argument("--check", default="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16")
     ap.add_argument("--cadence", type=int, default=120)
     ap.add_argument("--max-msgs", type=int, default=1000, help="CDC_MAX_MSGS for checks 2 and 3 (the bridge's minimum is 1000)")
     ap.add_argument("--rows", type=int, default=2000)
@@ -1418,7 +1494,8 @@ def main():
                              5: lambda a_, d_: check1(a_, d_, "restart"), 6: lambda a_, d_: check1(a_, d_, "backstop"),
                              7: check7, 8: check8, 9: check9, 10: check10, 11: check11,
                              12: lambda a_, d_: check4(a_, d_, ts=True), 13: check13,
-                             14: lambda a_, d_: check13(a_, d_, ts=True)}[n](a, pathlib.Path(d)))
+                             14: lambda a_, d_: check13(a_, d_, ts=True), 15: check15,
+                             16: lambda a_, d_: check15(a_, d_, ts=True)}[n](a, pathlib.Path(d)))
             except Exception as e:
                 check(f"check {n} raised: {type(e).__name__}: {str(e)[:400]}", False)
     print(f"  · logs: /tmp/zb_rr<check>_*.log; {'FAILED ' + str(failed) + ' check(s)' if failed else 'clean'}")
