@@ -184,7 +184,7 @@ The supported architecture is offline-capable clients, optional regional seeding
 
 **One bridge deployment per database is the recommended setup.** More than one is a constrained configuration, for what it does buy: different table sets, isolated workloads or deployment lifecycles, or separate NATS deployments from one PostgreSQL database. It is not HA, a second bridge following the same tables adds no useful throughput, and every extra bridge adds replication, snapshot and coordination cost. The constraints (one shared GC policy and one sweeper per database, one publication per table) are in [DEPLOYMENT](DEPLOYMENT.md#running-more-than-one-bridge).
 
-What an outage of one component does (each row is played by `scripts/scenarios/outage_matrix.py`: the effect while the component is down, and that the hub converges when it is back; how *long* it may stay down depends on queue retention and storage limits that are still to be verified under load):
+What an outage of one component does in the production layout (the [Compose](deploy/compose/README.md) and [Ansible](deploy/ansible/README.md) hubs, which run all three ZeBridge processes; the evaluation quick start above has no admission process, so its writes go through the bridge's legacy direct queue and the Admission row does not apply to it). Each row is played by `scripts/scenarios/outage_matrix.py` (the effect while the component is down, and that the hub converges when it is back; how *long* it may stay down depends on queue retention and storage limits that are still to be verified under load):
 
 | Unavailable | Expected effect |
 | --- | --- |
