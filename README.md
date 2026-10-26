@@ -114,7 +114,7 @@ The hub runs NATS and three ZeBridge processes. They have separate responsibilit
 | --- | --- |
 | Bridge (`bridge`) | Reads PostgreSQL changes, builds snapshots, manages enrollment, and applies admitted mutations to PostgreSQL. |
 | Mutation admission (`bridge --mutation-ingress`) | Validates incoming mutation requests and enforces per-principal queue budgets before storing them for the bridge to process. |
-| Sweeper (`bridge_sweeper`) | Reaps old tombstones under the configured recovery policy. |
+| Sweeper (`bridge_sweeper`) | Advances the database's GC floor, then reaps the tombstones older than it. One active sweeper per database. |
 
 ```mermaid
 flowchart LR
@@ -134,7 +134,7 @@ flowchart LR
 - **Changes:** the bridge reads PostgreSQL's logical replication feed and publishes schemas and changes to NATS JetStream. Connected clients apply those changes to their local databases.
 - **Seeding and recovery:** the bridge builds compressed snapshot chains per table and tenant: fulls and deltas. Clients fetch these from NATS and follow CDC after the chain's cut. Eligible reconnects can use deltas to replace a larger CDC backlog.
 - **Writes:** clients publish mutation requests to NATS. The separate admission process validates them and bounds each principal's queued work. The bridge consumes admitted writes, applies them to PostgreSQL and records durable receipts with their outcomes. Matching retries reuse the receipt rather than committing the mutation again.
-- **Housekeeping:** the sweeper reaps old tombstones under the configured recovery policy.
+- **Housekeeping:** the sweeper holds a database-wide lock, advances the GC floor (a watermark that never goes down: a write stamped before it is refused, not replayed) and then reaps tombstones older than it, under one retention (`GC_THRESHOLD_MS`) for the whole database. A second sweeper idles. See [the floor](PROTOCOL.md#the-floor-one-per-database-and-it-never-goes-down).
 - **Services:** responders answer requests over NATS, using their own replica or an external service. A routing responder can wrap Valhalla; an analytics responder can query DuckDB.
 
 Devices seed from shared snapshot objects rather than querying PostgreSQL individually. This keeps a connection storm from becoming a snapshot-query storm on the primary database. PostgreSQL still carries mutation execution and the bridge's snapshot-building work.
@@ -156,6 +156,7 @@ You need PostgreSQL with logical replication and the privileges needed to instal
 | Hub with Docker Compose | [Compose deployment](deploy/compose/README.md) |
 | Hub on a Debian VPS with systemd | [Ansible deployment](deploy/ansible/README.md) |
 | Manual installation and managed PostgreSQL | [DEPLOYMENT](DEPLOYMENT.md) |
+| A managed PostgreSQL, from an empty project (Supabase) | [SUPABASE_TEST](SUPABASE_TEST.md) |
 | Optional regional leaves | [LEAF_NODES](LEAF_NODES.md) |
 
 The setup establishes NATS identities and TLS, installs the database functions and roles, enables the tables, starts admission, the bridge and the sweeper, and issues device invites. Follow the selected deployment guide rather than combining initialization commands from different layouts.
@@ -201,7 +202,7 @@ ZeBridge fits mobile apps, intermittently connected devices, field equipment and
 - **Replication is tenant-based.** A followed table brings the tenant's rows into the replica. A local SQL `WHERE` clause filters what the app reads, not what the device receives. One tenant per consumer at B2C scale is outside the intended topology.
 - **PostgreSQL is the authority.** Offline writes are provisional until judged by the server. This is not peer-to-peer or multi-master replication.
 - **Conflict semantics are explicit.** Ordinary writes use last-writer-wins. Cooperative editing can merge per-field registers; it is not collaborative text editing. See [COOPERATIVE_EDITING](COOPERATIVE_EDITING.md).
-- **Recovery has retention requirements.** CDC retention, chain availability, tombstone GC and mutation receipt retention serve different purposes. An offline duration that permits reads to recover does not automatically permit every old pending write to execute. See [catching up](OPERATIONS.md#catching-up-the-chain-and-the-stream) and [indeterminate write recovery](PROTOCOL.md#74c-reconciling-an-indeterminate-write).
+- **Recovery has retention requirements.** CDC retention, chain availability, tombstone GC and mutation receipt retention serve different purposes. An offline duration that permits reads to recover does not automatically permit every old pending write to execute: a write stamped before the GC floor is refused, because the tombstone that would have overruled it may be gone. See [catching up](OPERATIONS.md#catching-up-the-chain-and-the-stream) and [indeterminate write recovery](PROTOCOL.md#74c-reconciling-an-indeterminate-write).
 - **Local persistence matters.** Deleting a replica or reinstalling an app can destroy unsent writes. Protect device identity and storage as application data.
 - **Operate NATS and PostgreSQL deliberately.** Credentials, replication slots, disk budgets, backups and restore procedures are part of the deployment.
 
@@ -224,7 +225,7 @@ See [SCOPE](SCOPE.md) for the boundaries and [SECURITY](SECURITY.md) for tenant 
 
 [TEST_SCENARIOS](TEST_SCENARIOS.md) describes the scenarios and what each checks. The repository includes client fixtures, database and authorization checks, recovery scenarios, and load harnesses. Consult the code and tests when a reference document disagrees with the implementation.
 
-Measure CDC distribution, snapshot download/apply, mutation commits and outbox recovery separately. They have different bottlenecks. Results depend on the build, database latency, disk, lane count, principal count and recovery load; a historical peak is not a deployment capacity guarantee. The [event ramp](examples/09-event/README.md) and [storm harness](storm/README.md) provide starting points for evaluating your topology.
+Measure CDC distribution, snapshot download/apply, mutation commits and outbox recovery separately. They have different bottlenecks. Results depend on the build, database latency, disk, lane count, principal count and recovery load; a historical peak is not a deployment capacity guarantee. The [event ramp](examples/09-event/README.md) and [storm harness](storm/README.md) provide starting points for evaluating your topology; [SPEED_TEST](SPEED_TEST.md) is one measured example, with its machine and load stated.
 
 ## Documentation
 
@@ -238,12 +239,14 @@ Measure CDC distribution, snapshot download/apply, mutation commits and outbox r
 | Add regional caches and responders | [LEAF_NODES](LEAF_NODES.md) |
 | Change schemas and datasets | [MIGRATIONS](MIGRATIONS.md) |
 | Configure metrics and logs | [OBSERVABILITY_TELEMETRY](OBSERVABILITY_TELEMETRY.md) |
-| Understand the wire and recovery contracts | [PROTOCOL](PROTOCOL.md) |
+| Understand the wire and recovery contracts | [PROTOCOL](PROTOCOL.md), [GENERATION](GENERATION.md) (a client's position on the tenant and public streams) |
 | Check platform artifacts and packaging | [DISTRIBUTION](DISTRIBUTION.md) |
 | Assess scope and tested behavior | [SCOPE](SCOPE.md), [TEST_SCENARIOS](TEST_SCENARIOS.md) |
+| Edit one record from several places | [COOPERATIVE_EDITING](COOPERATIVE_EDITING.md) |
+| Read the design log (numbered `§` sections that code comments cite) | [NOTES](NOTES.md) |
 
 ## Build from source
 
-Published packages and images are the simplest starting point. To work on the implementation, use the repository's Zig 0.17 toolchain requirements and dependency pins in `build.zig.zon`. The NATS client is a submodule: the fork `ndrean/nats.zig`, branch `zebridge` (upstream plus our patches, one commit each); see [DISTRIBUTION](DISTRIBUTION.md) for platform builds and packaging.
+Published packages and images are the simplest starting point. To work on the implementation, use the repository's Zig 0.17 toolchain requirements and dependency pins in `build.zig.zon`. The NATS client is a submodule: the fork `ndrean/nats.zig`, branch `zebridge` (upstream plus our patches, one commit each); see [DISTRIBUTION](DISTRIBUTION.md) for platform builds and packaging, [PG](PG.md) for the `pgoutput` binary formats the bridge decodes, and [CLAUDE.md](CLAUDE.md) for a map of the tree, the build and test commands and the scenarios that act as the real tests.
 
 ZeBridge is licensed under [Apache 2.0](LICENSE).
