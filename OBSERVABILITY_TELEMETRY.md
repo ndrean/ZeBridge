@@ -30,6 +30,8 @@ Both are served by a thread that keeps answering through every outage below — 
 | `bridge_refused_tables` | tables currently suspended or refused — the COUNT | `row_too_large` and structural refusals; falls on the live lift | `suspension_lift.py`, `legacybait.py` |
 | `bridge_refused_table{table,reason}` | the NAMED refusal series: 1 while refused, an explicit 0 after a lift in this process; the family vanishes on restart — which also cleared every ban, so absence and truth agree. psql twin: `SELECT tbl, reason, since FROM zebridge_suspensions;` (written by the running bridge, cleared at boot) | every refusal transition | `suspension_lift.py` |
 | `bridge_refused_events_dropped_total` | events dropped for refused tables | writes hitting a suspended table | `suspension_lift.py` |
+| `bridge_snapshot_rls_blocked_pairs` / `bridge_snapshot_rls_blocks_total` | (table, tenant) pairs whose chain is not being published because the reader's row-level-security configuration may hide rows / times a pair went from publishing to blocked | a policy that hides rows, a missing or restrictive reader policy; falls when the policy is fixed | `rls_visibility.py` |
+| `bridge_snapshot_rls_blocked{table,tenant,verdict}` | the NAMED series: 1 while blocked (`hidden` or `unverifiable`), an explicit 0 after the recovery in this process; psql twin: `bridge --diagnose` | every block and recovery | `rls_visibility.py` |
 | `bridge_nats_publish_ack_seconds_total` / `bridge_nats_publishes_total` | summed publish→PubAck wall time / count (mean = quotient) | load | [SPEED_TEST](SPEED_TEST.md) |
 | `bridge_gc_total_reaped_total` / `bridge_gc_last_sweep_timestamp_seconds` | sweeper activity, read off the watermark row's own change event | sweeper passes; survives a PostgreSQL restart under the daemon | `sweeper_restart.py`, `reaps.py` |
 | `bridge_last_ack_lsn` | the position this bridge confirmed, never the server's WAL head | every ack; jumps with the drained fast-ack | `txn_kill.py`, `pg_restart.py` |
@@ -169,6 +171,7 @@ Worth alerting on:
 | metric | fires when | what it means |
 | --- | --- | --- |
 | `bridge_refused_tables` | `> 0` | a table is **suspended** — no primary key, an undecodable column type, or a row larger than the event buffer. The log line names which and why. |
+| `bridge_snapshot_rls_blocked_pairs` | `> 0` | a pair's chain has stopped moving because the reader's policies may hide rows; the clients of that table keep the previous chain. The log line and `bridge --diagnose` name the policy ([OPERATIONS](OPERATIONS.md#snapshots-blocked-by-row-level-security)). |
 | `bridge_refused_events_dropped_total` | `increase() > 0` | rows are being discarded right now for a suspended table |
 | `bridge_fleet_clients_live{tenant}`, `bridge_fleet_clients_live_all` | drops | clients heartbeating inside the live bucket's TTL ([PROTOCOL §11](PROTOCOL.md#11-liveness--kv-bucket-live-)); a fleet going quiet is visible here before anyone complains |
 | `bridge_fleet_client_lag_events{tenant,principal,stream}` | `> N` for minutes | that client is falling behind on that stream: the messages still pending for it |

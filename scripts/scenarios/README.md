@@ -137,6 +137,7 @@ on the way out, but they will disrupt anything live meanwhile.
 | `race.py` | 24 writers against ingress, through a broker restart |
 | `adversarial.py` | fuzz the two untrusted entry points (mutation payloads, `/enroll`) — survive, refuse once, no bad state |
 | `chaos.py` | broker kill, backend kill, socket exhaustion — and `leaks` reports 0 on the survivor |
+| `rls_visibility.py` | the reader's row-level-security policies cannot shrink a snapshot silently: `ALTER POLICY … USING (false)` after startup, no reader policy, and a restrictive policy hiding some rows each block the pair (`hidden` / `unverifiable`), keep the previous chain, leave an unrelated control table publishing, show in the log, `/metrics` and `--diagnose`, and publish again with the rows written meanwhile once repaired; a build parked between its policy check and its content while the policy changes; an empty table still publishes an empty full. Boots its own NATS and a scoped probe bridge; needs `nats-server` on PATH |
 
 ### manual (listed, never run by the battery)
 

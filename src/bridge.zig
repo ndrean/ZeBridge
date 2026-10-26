@@ -39,6 +39,7 @@ const c = c_imports.c;
 const utils = @import("utils.zig");
 const preflight = @import("preflight.zig");
 const refused_tables = @import("refused_tables.zig");
+const rls_guard = @import("rls_guard.zig");
 const writable_tables = @import("writable_tables.zig");
 const type_registry = @import("type_registry.zig");
 const topology_mod = @import("topology.zig");
@@ -1029,6 +1030,11 @@ pub fn main(init: std.process.Init) !void {
     // has no primary key, and the mutation path must honour either verdict.
     var refused = refused_tables.Registry.init(allocator);
     defer refused.deinit();
+    // The pairs the generation producer is not publishing because the reader's row-level
+    // security may hide rows (rls_guard.zig); rendered on /metrics.
+    var rls_blocked = rls_guard.Registry.init(allocator);
+    defer rls_blocked.deinit();
+    http_srv.rls = &rls_blocked;
     // The psql mirror (§10cf, its own table since §10cy): every refusal transition
     // is projected into zebridge_suspensions — set BEFORE preflight so boot
     // refusals are written too. And cleared wholesale first: the registry is memory,
@@ -1399,6 +1405,7 @@ pub fn main(init: std.process.Init) !void {
         gp.checkpoint_s = runtime_config.generation_checkpoint_seconds;
         gp.base_rebuild_percent = runtime_config.generation_base_rebuild_percent;
         gp.writable = &writable;
+        gp.rls_ext = &rls_blocked;
         try gp.start();
         gen_producer = gp;
         log.info("🧬 Generation producer thread started", .{});
@@ -3073,6 +3080,7 @@ test {
     _ = @import("publication.zig");
     _ = @import("rate_limit.zig");
     _ = @import("refused_tables.zig");
+    _ = @import("rls_guard.zig");
     _ = @import("schema_mapper.zig");
     _ = @import("spsc_queue.zig");
     _ = @import("topology.zig");

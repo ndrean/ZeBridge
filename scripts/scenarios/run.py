@@ -134,6 +134,7 @@ GROUPS = {
         "race":          ("bridge", "24 writers against ingress"),
         "adversarial":   ("bridge", "fuzz the two untrusted entry points"),
         "chaos":         ("bridge", "broker kill, backend kill, socket exhaustion"),
+        "rls_visibility": ("none", "the reader's row-level-security policies cannot shrink a snapshot silently: USING (false) after startup, no reader policy and a restrictive policy each block the pair, keep the previous chain, leave an unrelated table publishing, show in log, /metrics and --diagnose, and resume when repaired; a policy change while a build is parked; an empty table still publishes an empty full (own NATS and scoped probe bridge, needs nats-server)"),
         "nats_outage":   ("bridge", "broker down past the retry budget: bridge stops, resumes, nothing lost"),
         "slot_loss":     ("bridge", "slot invalidated: refused at boot, recovered as a new feed, clients re-seed"),
         "slot_contest":  ("bridge", "two bridges, one slot: the loser refuses cleanly and leaks nothing"),

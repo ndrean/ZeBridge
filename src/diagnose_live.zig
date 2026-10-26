@@ -16,6 +16,7 @@ const c = c_imports.c;
 const Conf = @import("config.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const topology_mod = @import("topology.zig");
+const rls_guard = @import("rls_guard.zig");
 const Http = @import("http_server.zig").Server;
 
 const log = std.log.scoped(.diagnose);
@@ -43,6 +44,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, in: Inputs) usize {
     if (in.enroll) |ctx| findings += enrollmentChecks(in.conn, ctx, in.write_ok);
 
     if (in.core_ok) findings += catalogueChecks(a, in.conn);
+    if (in.core_ok) findings += rlsChecks(a, in.conn, in.topo.open_tenant);
     const running = bridgeStatus(a, io, in.bridge_port, &findings);
     findings += slotChecks(a, in.conn, in.slot_name, running);
 
@@ -156,6 +158,40 @@ fn catalogueChecks(a: std.mem.Allocator, conn: *c.PGconn) usize {
     for (groups.items) |g| printGroup(a, g);
     if (errors == 0) log.info("✅ catalogue: every table matches its catalogue row ({d} warning(s) above)", .{warnings});
     return errors + crossTableAudits(a, conn);
+}
+
+/// What the generation producer's row-level-security guard would say about each
+/// catalogued table right now, as the reader (this connection). A table it would block
+/// publishes no new chain object until its read policies are fixed (rls_guard.zig).
+fn rlsChecks(a: std.mem.Allocator, conn: *c.PGconn, open_tenant: []const u8) usize {
+    const res = c.PQexec(conn, "SELECT cat.tbl, COALESCE(cat.tenant_col::text, '') FROM public.zebridge_catalogue cat " ++
+        "WHERE COALESCE(cat.generations, true) AND NOT public.zebridge_is_internal_table(cat.tbl) " ++
+        "AND EXISTS (SELECT 1 FROM pg_class cl JOIN pg_namespace ns ON ns.oid = cl.relnamespace WHERE ns.nspname = 'public' AND cl.relname = cat.tbl) ORDER BY 1");
+    defer c.PQclear(res);
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+        log.warn("⚠️  could not list the catalogued tables for the read-policy check: {s}", .{std.mem.span(c.PQresultErrorMessage(res))});
+        return 0;
+    }
+    var groups: std.ArrayList(Group) = .empty;
+    var findings: usize = 0;
+    const n: usize = @intCast(c.PQntuples(res));
+    for (0..n) |i| {
+        const row: c_int = @intCast(i);
+        const tbl = a.dupe(u8, std.mem.span(c.PQgetvalue(res, row, 0))) catch continue;
+        const tenant_col = a.dupe(u8, std.mem.span(c.PQgetvalue(res, row, 1))) catch continue;
+        const chk = rls_guard.check(a, conn, tbl, tenant_col, open_tenant) catch |err| {
+            findings += 1;
+            log.err("🔴 '{s}': the read-policy check could not run ({})", .{ tbl, err });
+            continue;
+        };
+        if (chk.verdict == .safe) continue;
+        findings += 1;
+        const text = std.fmt.allocPrint(a, "the reader's read policies are {s}: {s}. The producer publishes nothing new for these tables (the previous chain stays) until this is fixed.", .{ chk.verdict.wireName(), chk.reason }) catch continue;
+        addToGroup(a, &groups, .err, text, tbl) catch {};
+    }
+    for (groups.items) |g| printGroup(a, g);
+    if (findings == 0) log.info("✅ read policies: for every catalogued table the reader's configuration is one the snapshot guard can prove complete", .{});
+    return findings;
 }
 
 const Level = enum { err, warn, info };
