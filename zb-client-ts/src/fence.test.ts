@@ -1,13 +1,13 @@
 // The fence's decision (fence.ts): the same conditions libzb's client.zig applies inline.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { decideFence, routeHolds, soleDependent, verifyRoutes, type FenceFacts } from './fence.ts';
+import { decideFence, fenceScope, frontierDrops, routeHolds, verifyRoutes, type FenceFacts } from './fence.ts';
 
-/// A follower ahead of a new cut on its own route, alone on it, nothing shared.
+/// A follower ahead of a new cut on its own route, the other tables on it fine to leave untouched, nothing shared.
 const base: FenceFacts = {
   predates: true, pending: false,
-  ownStream: 'CDC_acme', ownPos: 500, ownCut: 300, soleOwn: true, ownReplayable: true,
-  sharedStream: null, manifestSharedStream: '', sharedCut: null, sharedProven: false, sharedPos: 0, soleShared: true,
+  ownStream: 'CDC_acme', ownPos: 500, ownCut: 300, ownScopeRefusal: null, ownReplayable: true,
+  sharedStream: null, manifestSharedStream: '', sharedCut: null, sharedProven: false, sharedPos: 0, sharedScopeRefusal: null,
 };
 const withShared = (over: Partial<FenceFacts> = {}): FenceFacts => ({
   ...base, sharedStream: 'CDC_PUBLIC', manifestSharedStream: 'CDC_PUBLIC', sharedCut: 40, sharedProven: true, sharedPos: 90, ...over,
@@ -26,15 +26,15 @@ test('the cursor never moves forward: a cut past the position keeps the position
   assert.deepEqual(decideFence({ ...base, predates: false, pending: true, ownPos: 120, ownCut: 300 }), { kind: 'fence', ownTo: 120, sharedTo: null });
 });
 
-test('another table on the own route: the old refusal (D2) stands', () => {
-  const d = decideFence({ ...base, soleOwn: false });
+test('other tables on the own route that cannot stay untouched: the old refusal (D2) stands, with the scope\'s reason', () => {
+  const d = decideFence({ ...base, ownScopeRefusal: 'items is not seeded, so its coverage on CDC_acme is unknown' });
   assert.equal(d.kind, 'refuse');
-  assert.match((d as { why: string }).why, /other tables ride CDC_acme/);
+  assert.match((d as { why: string }).why, /refusing the full \(D2\): items is not seeded/);
 });
 
 test('an owed fence whose cursor is at the cut needs no sole-table scope on the own route', () => {
   // predates is false (the cursor sits at the cut): a retry rewinds nothing there.
-  assert.deepEqual(decideFence({ ...base, predates: false, pending: true, ownPos: 300, soleOwn: false }), { kind: 'fence', ownTo: 300, sharedTo: null });
+  assert.deepEqual(decideFence({ ...base, predates: false, pending: true, ownPos: 300, ownScopeRefusal: 'x' }), { kind: 'fence', ownTo: 300, sharedTo: null });
 });
 
 test('a cut that cannot be proven replayable refuses, owed or not', () => {
@@ -47,8 +47,8 @@ test('a cut that cannot be proven replayable refuses, owed or not', () => {
 });
 
 test('a refusal says whether a fence is still owed', () => {
-  assert.equal((decideFence({ ...base, soleOwn: false }) as { owed: boolean }).owed, false);
-  assert.equal((decideFence({ ...base, soleOwn: false, pending: true }) as { owed: boolean }).owed, true);
+  assert.equal((decideFence({ ...base, ownScopeRefusal: 'x' }) as { owed: boolean }).owed, false);
+  assert.equal((decideFence({ ...base, ownScopeRefusal: 'x', pending: true }) as { owed: boolean }).owed, true);
 });
 
 test('a shared route: its coverage must be proven, and unknown coverage refuses', () => {
@@ -66,10 +66,10 @@ test('a shared cut on an unproven incarnation, or on another stream, is refused,
   assert.equal(decideFence(withShared({ manifestSharedStream: 'CDC_OTHER' })).kind, 'refuse');
 });
 
-test('another table on the shared route refuses only when the shared route must rewind', () => {
-  assert.equal(decideFence(withShared({ soleShared: false })).kind, 'refuse');
+test('a scope refusal on the shared route matters only when the shared route must rewind', () => {
+  assert.equal(decideFence(withShared({ sharedScopeRefusal: 'x' })).kind, 'refuse');
   // Nothing to rewind on the shared route: the other tables there are not touched.
-  assert.deepEqual(decideFence(withShared({ soleShared: false, sharedPos: 30 })), { kind: 'fence', ownTo: 300, sharedTo: null });
+  assert.deepEqual(decideFence(withShared({ sharedScopeRefusal: 'x', sharedPos: 30 })), { kind: 'fence', ownTo: 300, sharedTo: null });
 });
 
 test('VERIFY: the same incarnation and the event after the cut still held', () => {
@@ -96,21 +96,48 @@ test('VERIFY names the first route that does not hold, and checks every route', 
   assert.equal(bad?.stream, 'CDC_PUBLIC');
 });
 
-test('soleDependent: another table on the own or the shared route, and routes not followed', () => {
+test('fenceScope: the other tables on a route stay untouched when seeded; an unseeded one refuses', () => {
   const routes: Record<string, { route: string; sharedRoute?: string } | null> = {
     orders: { route: 'CDC_acme', sharedRoute: 'CDC_PUBLIC' },
-    items: { route: 'CDC_acme' },
+    items: { route: 'CDC_acme', sharedRoute: 'CDC_PUBLIC' },
     prices: { route: 'CDC_PUBLIC' },
     notes: null, // on demand: not followed
     elsewhere: { route: 'CDC_globex', sharedRoute: 'CDC_PUBLIC' },
   };
   const tables = Object.keys(routes);
   const of = (t: string) => routes[t] ?? null;
-  // orders shares CDC_acme with items.
-  assert.equal(soleDependent('orders', ['CDC_acme'], tables, of), false);
-  // On CDC_PUBLIC alone: prices rides it and elsewhere shares it.
-  assert.equal(soleDependent('orders', ['CDC_PUBLIC'], tables, of), false);
-  // A table alone on its stream; empty stream names are ignored.
-  assert.equal(soleDependent('elsewhere', ['CDC_globex', ''], tables, of), true);
-  assert.equal(soleDependent('notes', ['CDC_acme'], ['notes'], of), true);
+  const all = () => true;
+  // orders rewinds CDC_acme: items rides it, and keeps its rows.
+  assert.deepEqual(fenceScope('orders', ['CDC_acme'], tables, of, all), { refused: null, untouched: [{ table: 'items', stream: 'CDC_acme' }] });
+  // CDC_PUBLIC: items and elsewhere share it, prices rides it; each is listed once.
+  const pub = fenceScope('orders', ['CDC_PUBLIC'], tables, of, all);
+  assert.equal(pub.refused, null);
+  assert.deepEqual(pub.untouched.map((u) => u.table).sort(), ['elsewhere', 'items', 'prices']);
+  // A table alone on its stream, or with nothing else near: nothing to leave untouched.
+  assert.deepEqual(fenceScope('elsewhere', ['CDC_globex'], tables, of, all), { refused: null, untouched: [] });
+  assert.deepEqual(fenceScope('notes', ['CDC_acme'], ['notes'], of, all), { refused: null, untouched: [] });
+  // Empty stream names match nothing.
+  assert.deepEqual(fenceScope('orders', ['', ''], tables, of, all), { refused: null, untouched: [] });
+  // An unseeded table's coverage is unknown: the fence is refused, whichever route it rides.
+  const refused = fenceScope('orders', ['CDC_acme'], tables, of, (t) => t !== 'items');
+  assert.match(refused.refused ?? '', /items is not seeded, so its coverage on CDC_acme is unknown/);
+  assert.deepEqual(refused.untouched, []);
+  // A table that is not followed is not asked about at all.
+  assert.equal(fenceScope('orders', ['CDC_acme'], ['orders', 'notes'], of, () => false).refused, null);
+});
+
+test('frontierDrops: an event at or below its table\'s frontier on ITS stream; local writes never', () => {
+  const fr = [{ stream: 'CDC_acme', seq: 500 }, { stream: 'CDC_PUBLIC', seq: 90 }];
+  assert.equal(frontierDrops({ stream: 'CDC_acme', seq: 500 }, fr), true);
+  assert.equal(frontierDrops({ stream: 'CDC_acme', seq: 301 }, fr), true);
+  assert.equal(frontierDrops({ stream: 'CDC_acme', seq: 501 }, fr), false);
+  // Another stream's frontier says nothing about this one.
+  assert.equal(frontierDrops({ stream: 'CDC_PUBLIC', seq: 91 }, fr), false);
+  assert.equal(frontierDrops({ stream: 'CDC_PUBLIC', seq: 90 }, fr), true);
+  assert.equal(frontierDrops({ stream: 'CDC_other', seq: 1 }, fr), false);
+  // No frontier, no stream, no sequence: not gated.
+  assert.equal(frontierDrops({ stream: 'CDC_acme', seq: 1 }, undefined), false);
+  assert.equal(frontierDrops({ stream: 'CDC_acme', seq: 1 }, []), false);
+  assert.equal(frontierDrops({ seq: 1 }, fr), false);
+  assert.equal(frontierDrops({ stream: 'CDC_acme' }, fr), false);
 });

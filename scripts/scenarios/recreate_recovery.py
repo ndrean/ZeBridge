@@ -55,6 +55,10 @@ so then c > p and D2 (`fullPredatesReplica`: c < p) cannot refuse it.
              committed chunk: the frontier is durable (position at the cut, frontier above it),
              and reopened the replay skips what the table holds. Fault build, as check 4.
 
+  --check 14 check 13 with a zb-client-ts client (fence_client.mts), two tables: the same cases, the
+             same assertions. The hold that lets the position run ahead of the new chain's cut is
+             the harness's (`faultHook` at `before_decision`, while a file exists).
+
   --check 5  check 1 with the bridge down during the recreate: PostgreSQL observes it (the
              DDL triggers), the restarted bridge publishes it — one transition, one epoch
              move, every pair's chain within --first-chain-s of the restart.
@@ -470,7 +474,7 @@ class TsClient(Client):
     def start(self, env=None):
         pathlib.Path(self.db + ".stop").unlink(missing_ok=True)
         args = ["node", "--experimental-strip-types", "--no-warnings", str(HARNESS), self.stack.url, self.stack.creds[self.principal],
-                self.db, self.principal, T, str(self.chunk_rows or 0)]
+                self.db, self.principal, ",".join(self.tables), str(self.chunk_rows or 0)]
         self.p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=open(self.log, "a"), env=dict(os.environ, **(env or {})),
                                   cwd=zb.ROOT / "zb-client-ts")
 
@@ -901,13 +905,21 @@ async def check4(a, tmp, ts=False):
 T2 = "rr_items2"
 
 
-async def check13(a, tmp):
-    """The applied frontier, live: two tables on one tenant route, one of them fenced."""
+async def check13(a, tmp, ts=False):
+    """The applied frontier, live: two tables on one tenant route, one of them fenced.
+    ts: the same cases with a zb-client-ts client (check 14)."""
     hooks = (b"ZB_TEST_FENCE_ABORT", b"ZB_TEST_FENCE_SLEEP_MS", b"ZB_TEST_SHARED_UNREADABLE", b"ZB_TEST_SCHEMA_PAUSE_FILE")
-    if not check(f"check 13 runs on a fault-hook build ({FAULT_LIBRARY})", FAULT_LIBRARY.exists() and all(h in FAULT_LIBRARY.read_bytes() for h in hooks)):
+    if ts:
+        lib_src = (zb.ROOT / "zb-client-ts/src/libzb.ts").read_bytes()
+        if not check("the TypeScript library reads no fault variable (its faultHook is a config option)",
+                     not any(h in lib_src for h in hooks) and b"ZB_TEST_FENCE" not in lib_src):
+            return
+        if not check(f"the harness exists ({HARNESS})", HARNESS.exists()):
+            return
+    elif not check(f"check 13 runs on a fault-hook build ({FAULT_LIBRARY})", FAULT_LIBRARY.exists() and all(h in FAULT_LIBRARY.read_bytes() for h in hooks)):
         note(f"build it: {FAULT_BUILD}")
         return
-    s = Stack(tmp, "13", a.cadence, {})
+    s = Stack(tmp, "14" if ts else "13", a.cadence, {})
     try:
         s.start({"pa": "t_a"})
         s.create_table({"t_a": a.rows}, "a")
@@ -947,7 +959,7 @@ async def check13(a, tmp):
             return None
 
         def seeded(c):
-            held = {r[0] for r in (c._q("SELECT tbl FROM _zbz_generations") or [])}
+            held = {r[0] for r in (c._q(f"SELECT tbl FROM {'_zebridge_generations' if ts else '_zbz_generations'}") or [])}
             return held == {T, T2}
 
         async def recovered(c):
@@ -955,7 +967,7 @@ async def check13(a, tmp):
             return ok and seeded(c) and base[T] <= table_rows(c, T).keys()
 
         def frontier_rows(c):
-            return c._q("SELECT tbl, stream, seq FROM _zbz_frontier") or []
+            return c._q(f"SELECT tbl, stream, seq FROM {'_zebridge_frontier' if ts else '_zbz_frontier'}") or []
 
         def skipped(c):
             m = re.findall(r"(\d+) event\(s\) skipped so far", c.text())
@@ -983,7 +995,8 @@ async def check13(a, tmp):
             # One client and one load per case: a client left running would follow the next case's
             # epoch move too. The two tables together write about what check 4's one does.
             loads = [Load(s, "t_a", "c", 2 * a.interval_ms / 1000, table=T), Load(s, "t_a", "d", 2 * a.interval_ms / 1000, table=T2)]
-            c = Client(s, name, "pa", "t_a", chunk_rows=200, lib=FAULT_LIBRARY)
+            c = (TsClient(s, name, "pa", "t_a", chunk_rows=200) if ts
+                 else Client(s, name, "pa", "t_a", chunk_rows=200, lib=FAULT_LIBRARY))
             c.tables = [T, T2]
             clients.append(c)
             c.start()
@@ -994,7 +1007,7 @@ async def check13(a, tmp):
             # position runs ahead of the chain's cut by as long as the hold lasts.
             pause = pathlib.Path(f"/tmp/zb-rr13-{name}.pause")
             pause.unlink(missing_ok=True)
-            c.start(dict(env, ZB_TEST_SCHEMA_PAUSE_FILE=str(pause)))
+            c.start(dict(env, **{"ZB_TEST_FENCE_HOLD_FILE" if ts else "ZB_TEST_SCHEMA_PAUSE_FILE": str(pause)}))
             await asyncio.sleep(5)   # caught up with the load again
             pause.touch()
             epoch0 = await js.epoch()
@@ -1038,9 +1051,11 @@ async def check13(a, tmp):
                     note(f"{t}: missing {sorted(want.keys() - have.keys())[:5]}, extra {sorted(have.keys() - want.keys())[:5]}, "
                          f"differing {sorted(k for k in want.keys() & have.keys() if want[k] != have[k])[:5]}")
             if name == "frontier_reseeded":
-                # Its own chain replaced the table's rows in the same pass: no frontier survives it
-                # (the events up to it replay), and the rows are exact all the same.
-                check(f"{name}: {T2} got a chain in the fence's pass and kept no frontier ({frontier_rows(c)})", frontier_rows(c) == [])
+                # libzb: its own chain replaced the table's rows in the same pass (a stream it has never read
+                # a message of is gapped for ever): no frontier survives it (the events up to it replay), and
+                # the rows are exact all the same. The TypeScript client has no such quirk: only exactness.
+                if not ts:
+                    check(f"{name}: {T2} got a chain in the fence's pass and kept no frontier ({frontier_rows(c)})", frontier_rows(c) == [])
             else:
                 check(f"{name}: events were skipped through the frontier ({skipped(c)}) and it is spent ({frontier_rows(c)})",
                       skipped(c) > 0 and frontier_rows(c) == [])
@@ -1385,7 +1400,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker")
     ap.add_argument("--lib")
-    ap.add_argument("--check", default="1,2,3,4,5,6,7,8,9,10,11,12,13")
+    ap.add_argument("--check", default="1,2,3,4,5,6,7,8,9,10,11,12,13,14")
     ap.add_argument("--cadence", type=int, default=120)
     ap.add_argument("--max-msgs", type=int, default=1000, help="CDC_MAX_MSGS for checks 2 and 3 (the bridge's minimum is 1000)")
     ap.add_argument("--rows", type=int, default=2000)
@@ -1402,7 +1417,8 @@ def main():
                 asyncio.run({1: check1, 2: check2, 3: check3, 4: check4,
                              5: lambda a_, d_: check1(a_, d_, "restart"), 6: lambda a_, d_: check1(a_, d_, "backstop"),
                              7: check7, 8: check8, 9: check9, 10: check10, 11: check11,
-                             12: lambda a_, d_: check4(a_, d_, ts=True), 13: check13}[n](a, pathlib.Path(d)))
+                             12: lambda a_, d_: check4(a_, d_, ts=True), 13: check13,
+                             14: lambda a_, d_: check13(a_, d_, ts=True)}[n](a, pathlib.Path(d)))
             except Exception as e:
                 check(f"check {n} raised: {type(e).__name__}: {str(e)[:400]}", False)
     print(f"  · logs: /tmp/zb_rr<check>_*.log; {'FAILED ' + str(failed) + ' check(s)' if failed else 'clean'}")
