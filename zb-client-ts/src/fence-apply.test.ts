@@ -27,16 +27,19 @@ class World {
     [PUB]: { created: 'pub-1', first: 1, last: 200 },
   };
   objects = new Map<string, Uint8Array>();
-  manifest: any = null;
+  manifests: Record<string, any> = {};
+  /// The `item` table's manifest (most tests have only that table).
+  get manifest(): any { return this.manifests.item ?? null; }
+  set manifest(m: any) { this.manifests.item = m; }
   /// A chain of `rows` rows (ids 1..rows, note `new`), cut at `cut` on the own route and
   /// `sharedCut` on CDC_PUBLIC; the full alone.
-  publish(gen: number, rows: number, cut: number, sharedCut: number | null = 40) {
-    const name = `item-i1-g${gen}-full`;
+  publish(gen: number, rows: number, cut: number, sharedCut: number | null = 40, table = 'item') {
+    const name = `${table}-i1-g${gen}-full`;
     this.objects.set(name, encode({
       columns: ['id', 'tenant_id', 'note', 'updated_at'], version_column: 'updated_at', kind: 'full', gen,
       rows: Array.from({ length: rows }, (_, i) => [i + 1, 'acme', `new-${gen}`, VERSION(10)]),
     }));
-    this.manifest = {
+    this.manifests[table] = {
       gen, bucket: 'gen-acme', version_column: 'updated_at', seed_epoch: 0,
       full: { gen, object: name, cutoff: VERSION(10), sorted: true }, deltas: [], checkpoints: [],
       cutoff_version: VERSION(10), cutoff_lsn: '0/1000',
@@ -68,9 +71,15 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
     const stmt = db.prepare(sql);
     return stmt.columns().length ? stmt.all(...args) : (stmt.run(...args), []);
   };
-  c.transaction = async (fn: any) => {
-    db.exec('BEGIN');
-    try { await fn(c.run); db.exec('COMMIT'); } catch (e) { db.exec('ROLLBACK'); throw e; }
+  // One connection: transactions run one after the other, as the real driver's do.
+  let txChain: Promise<unknown> = Promise.resolve();
+  c.transaction = (fn: any) => {
+    const work = txChain.then(async () => {
+      db.exec('BEGIN');
+      try { await fn(c.run); db.exec('COMMIT'); } catch (e) { db.exec('ROLLBACK'); throw e; }
+    });
+    txChain = work.catch(() => {});
+    return work;
   };
   const seq = Object.fromEntries(db.prepare('SELECT stream, last_seq FROM _zebridge_stream_seq').all().map((r) => [String(r.stream), Number(r.last_seq)]));
   const syncedTables = new Map<string, any>([['item', {
@@ -96,7 +105,10 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
       },
     },
     transport: {
-      kv: async () => ({ get: async () => (world.manifest ? { operation: 'PUT', value: new TextEncoder().encode(JSON.stringify(world.manifest)) } : null) }),
+      kv: async () => ({ get: async (key: string) => {
+        const m = world.manifests[String(key).split('.').pop() as string];
+        return m ? { operation: 'PUT', value: new TextEncoder().encode(JSON.stringify(m)) } : null;
+      } }),
       objectStore: async () => ({}),
       jetstreamManager: async () => ({ streams: { info: async (name: string) => {
         const st = world.streams[name];
@@ -637,6 +649,137 @@ test('a stream pass that joins a background fence already queued for PREPARE len
       assert.equal(pos(t.db, OWN), 300);
       assert.equal(owed(t.db), 0);
       assert.equal(t.c.fenced.size, 0);
+    } finally { t.close(); }
+  });
+});
+
+/// Two fences at once on one route: the item chain cut at 100 and the orders chain cut at 200,
+/// the position at 500. `inPass`: both run as a stream pass runs its tables (concurrently, under
+/// the queue it holds); otherwise as two poll loops (both queued).
+for (const inPass of [false, true]) {
+  test(`overlapping fences on one route (${inPass ? 'in a pass' : 'background'}): the later cut never moves the cursor forward`, async () => {
+    await withDir(async (path) => {
+      const w = new World();
+      w.publish(2, 5, 100, 40, 'item');
+      w.publish(2, 4, 200, 40, 'orders');
+      follower(path, w, ['orders']);
+      let arrived = 0;
+      const both = deferred();
+      // Both are decided against the same position unless the decision is taken again inside.
+      const t = client(path, w, { others: ['orders'], hook: async (point) => {
+        if (point !== 'before_decision') return;
+        if (++arrived === 2) both.go();
+        await both.p;
+      } });
+      try {
+        const low = t.c.applyGenerations('item', inPass);
+        const high = t.c.applyGenerations('orders', inPass);
+        const [a, b] = await within(5000, Promise.all([low, high]), 'the two fences');
+        assert.equal(a, true);
+        assert.equal(b, true, 'the later cut is a plain seed: it does not predate the position the earlier fence left');
+        assert.equal(pos(t.db, OWN), 100, 'the cursor is at the LOWER cut: the table seeded at 100 needs 101..200');
+        assert.equal(t.c.globalSyncState.seq[OWN], 100);
+        assert.deepEqual(rows(t.db), wanted(2, 5));
+        assert.equal(owed(t.db), 0);
+        assert.equal(t.c.fenced.size, 0);
+        assert.deepEqual(t.db.prepare('SELECT tbl, seed_seq FROM _zebridge_generations ORDER BY tbl').all().map((r) => `${r.tbl}:${r.seed_seq}`), ['item:100', 'orders:200']);
+      } finally { t.close(); }
+    });
+  });
+
+  test(`overlapping fences on one route (${inPass ? 'in a pass' : 'background'}): a fence behind a table still being fenced waits, and takes its turn after`, async () => {
+    await withDir(async (path) => {
+      const w = new World();
+      w.publish(2, 5, 100, 40, 'item');
+      w.publish(2, 4, 200, 40, 'orders');
+      follower(path, w, ['orders']);
+      let arrived = 0;
+      const both = deferred();
+      const t = client(path, w, { others: ['orders'], hook: async (point) => {
+        if (point !== 'before_decision') return;
+        if (++arrived === 2) both.go();
+        await both.p;
+      } });
+      try {
+        // orders first (cut 200), then item (cut 100, behind the position orders left at 200).
+        const high = t.c.applyGenerations('orders', inPass);
+        const low = t.c.applyGenerations('item', inPass);
+        await within(5000, Promise.all([high, low]), 'the two fences');
+        // Whatever the interleaving, the cursor is at the lowest cut and the owed record is clear
+        // once both have been through; a refused one is asked again.
+        if (!(await t.c.applyGenerations('item', inPass))) assert.fail('the retry is a fence');
+        assert.equal(pos(t.db, OWN), 100);
+        assert.equal(owed(t.db), 0);
+        assert.equal(t.c.fenced.size, 0);
+        assert.equal(t.db.prepare('SELECT count(*) AS n FROM _zebridge_generations').get()?.n, 2, 'both tables are anchored');
+      } finally { t.close(); }
+    });
+  });
+}
+
+test('frontier load fails closed: a failed read keeps what memory had, and throws', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    follower(path, w, ['orders']);
+    const t = client(path, w, { others: ['orders'] });
+    try {
+      t.db.exec(`INSERT INTO _zebridge_frontier VALUES ('orders', '${OWN}', 'own-1', 500)`);
+      await t.c.loadFrontiers();
+      assert.deepEqual(t.c.frontiers.get('orders'), [{ stream: OWN, seq: 500 }]);
+      const real = t.c.run;
+      t.c.run = async (sql: string, ...a: any[]) => { if (/FROM _zebridge_frontier f JOIN/.test(sql)) throw new Error('read failed'); return real(sql, ...a); };
+      await assert.rejects(() => t.c.loadFrontiers(), /read failed/);
+      assert.deepEqual(t.c.frontiers.get('orders'), [{ stream: OWN, seq: 500 }], 'not "no frontier"');
+    } finally { t.close(); }
+  });
+});
+
+test('a PREPARE that committed but could not read its frontiers back leaves the routes parked; the owed fence\'s retry restores them', async () => {
+  for (const inPass of [false, true]) await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 300);
+    follower(path, w, ['orders']);
+    const t = client(path, w, { others: ['orders'] });
+    try {
+      const real = t.c.run;
+      let failing = true;
+      t.c.run = async (sql: string, ...a: any[]) => { if (failing && /FROM _zebridge_frontier f JOIN/.test(sql)) throw new Error('read failed'); return real(sql, ...a); };
+      await assert.rejects(() => t.c.applyGenerations('item', inPass), /read failed/);
+      // Durable: the cursors, the owed record and the frontiers; memory: the table unseeded, the
+      // routes parked — no pass or tail applies a replayed event to a table that already holds it.
+      assert.equal(owed(t.db), 1);
+      assert.equal(pos(t.db, OWN), 300);
+      assert.equal(frontierRows(t.db).length, 2);
+      assert.equal(t.c.syncedTables.get('item').unseeded, true);
+      assert.deepEqual([...t.c.fenced].sort(), [[OWN, 'item'], [PUB, 'item']].sort());
+      assert.ok(t.log.some((m) => /could not be read back/.test(m)));
+      // The retry (the fence is still owed) reads them, completes, and releases the routes.
+      failing = false;
+      assert.equal(await t.c.applyGenerations('item', inPass), true);
+      assert.equal(t.c.fenced.size, 0);
+      assert.equal(owed(t.db), 0);
+      assert.deepEqual([...t.c.frontiers.get('orders')].sort((a: any, b: any) => a.seq - b.seq), [{ stream: PUB, seq: 90 }, { stream: OWN, seq: 500 }]);
+      await t.c.applyEvent('orders', ev('orders', 1, OWN, 301, 'held'));
+      assert.equal(t.db.prepare('SELECT count(*) AS n FROM orders').get()?.n, 0, 'the covered event is not applied');
+    } finally { t.close(); }
+  });
+});
+
+test('dropping a table\'s frontier fails closed: the chain is not applied over a frontier that could not be dropped', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 600); // a plain seed
+    follower(path, w);
+    const t = client(path, w);
+    t.db.exec(`INSERT INTO _zebridge_frontier VALUES ('item', '${OWN}', 'own-1', 520)`);
+    t.c.frontiers.set('item', [{ stream: OWN, seq: 520 }]);
+    try {
+      const real = t.c.run;
+      t.c.run = async (sql: string, ...a: any[]) => { if (/^DELETE FROM _zebridge_frontier WHERE tbl = \?/.test(sql.trim())) throw new Error('disk full'); return real(sql, ...a); };
+      await assert.rejects(() => t.c.applyGenerations('item'), /disk full/);
+      assert.deepEqual(rows(t.db), ['91:old', '92:old', '93:old'], 'no step ran');
+      assert.deepEqual(t.c.frontiers.get('item'), [{ stream: OWN, seq: 520 }], 'memory and replica still agree');
+      assert.equal(frontierRows(t.db).length, 1);
     } finally { t.close(); }
   });
 });

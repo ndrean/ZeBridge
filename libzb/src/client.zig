@@ -564,6 +564,9 @@ pub const SyncClient = struct {
     gated: usize = 0,
     /// Events skipped because a fence's applied frontier already covers them (`Frontier`).
     frontier_gated: usize = 0,
+    /// Routes a fence prepared whose untouched tables' frontiers could not be read back: no tail
+    /// opens on them until `restoreParked` (or the fence's retry) reads them.
+    frontier_parked: std.array_hash_map.String(void) = .empty,
     /// §10iz: what kept each table unseeded — the error name of its last failed seed,
     /// by table; an entry leaves when the table seeds. `zb_client_sync` and
     /// `zb_client_poll` report it as `unseeded`, so a host never calls a replica
@@ -1516,16 +1519,41 @@ pub const SyncClient = struct {
 
     /// The applied frontiers of `table`, back from the replica: only those taken on the
     /// stream identity the stored position carries now (R4). A row on another identity —
-    /// the stream was recreated since — is dead and deleted.
+    /// the stream was recreated since — is dead and deleted. FAILS CLOSED: a read that fails
+    /// is an error and leaves memory as it was; it is never "no frontier" (replay would then
+    /// apply events a table already holds).
     fn loadFrontiers(self: *SyncClient, a: std.mem.Allocator, table: []const u8) !void {
         const st = self.states.getPtr(table) orelse return;
-        st.frontiers.clearRetainingCapacity();
-        const rows = self.st.query(a, "SELECT f.stream, f.seq FROM _zbz_frontier f JOIN _zbz_stream_seq s ON s.stream = f.stream AND s.created = f.created WHERE f.tbl = ?", &.{.{ .text = table }}) catch return;
+        const rows = try self.st.query(a, "SELECT f.stream, f.seq FROM _zbz_frontier f JOIN _zbz_stream_seq s ON s.stream = f.stream AND s.created = f.created WHERE f.tbl = ?", &.{.{ .text = table }});
+        var next: std.ArrayList(Frontier) = .empty;
         for (rows) |r| {
             if (r.len < 2 or r[0] != .text or r[1] != .integer or r[1].integer <= 0) continue;
-            try st.frontiers.append(self.aa(), .{ .stream = try self.aa().dupe(u8, r[0].text), .seq = @intCast(r[1].integer) });
+            try next.append(self.aa(), .{ .stream = try self.aa().dupe(u8, r[0].text), .seq = @intCast(r[1].integer) });
         }
+        st.frontiers = next;
+        // Dead rows are already left out by the join; deleting them is housekeeping.
         _ = self.st.query(a, "DELETE FROM _zbz_frontier WHERE tbl = ? AND NOT EXISTS (SELECT 1 FROM _zbz_stream_seq s WHERE s.stream = _zbz_frontier.stream AND s.created = _zbz_frontier.created)", &.{.{ .text = table }}) catch {};
+    }
+
+    /// Every followed table's frontiers, back from the replica. Parked routes (a committed
+    /// PREPARE whose frontiers could not be read back) are released only when this succeeds.
+    fn reloadFrontiers(self: *SyncClient, a: std.mem.Allocator) !void {
+        var it = self.states.iterator();
+        while (it.next()) |e| try self.loadFrontiers(a, e.key_ptr.*);
+    }
+
+    /// A route a fence prepared is not tailed until the frontiers of the tables left untouched
+    /// are in memory: a tail would replay their events onto rows that already hold them.
+    fn restoreParked(self: *SyncClient) void {
+        if (self.frontier_parked.count() == 0) return;
+        var qa = std.heap.ArenaAllocator.init(self.a);
+        defer qa.deinit();
+        self.reloadFrontiers(qa.allocator()) catch |err| {
+            log.warn("applied frontiers still unreadable ({s}) — {d} route(s) stay parked", .{ @errorName(err), self.frontier_parked.count() });
+            return;
+        };
+        log.info("applied frontiers read back — {d} parked route(s) released", .{self.frontier_parked.count()});
+        self.frontier_parked.clearRetainingCapacity();
     }
 
     /// The position of `stream` moved to `seq`: every frontier on it at or below `seq` is
@@ -1551,9 +1579,9 @@ pub const SyncClient = struct {
         log.info("{s}: replay passed the applied frontiers at {d} — {d} event(s) skipped so far for the tables that already held them", .{ stream, seq, self.frontier_gated });
     }
 
-    /// The stream was recreated or its numbering restarted (or a reconciliation replays it
-    /// from 0): no frontier taken on it means anything now.
-    fn dropFrontiers(self: *SyncClient, stream: []const u8) void {
+    /// Memory only: the frontiers on `stream` forgotten (the caller deleted the rows, in its own
+    /// transaction where it has one).
+    fn forgetFrontiers(self: *SyncClient, stream: []const u8) void {
         var it = self.states.iterator();
         while (it.next()) |e| {
             const fr = &e.value_ptr.frontiers;
@@ -1562,9 +1590,17 @@ pub const SyncClient = struct {
                 if (std.mem.eql(u8, fr.items[k].stream, stream)) _ = fr.orderedRemove(k) else k += 1;
             }
         }
+    }
+
+    /// The stream was recreated or its numbering restarted (or a reconciliation replays it
+    /// from 0): no frontier taken on it means anything now. The replica first and an error
+    /// out: a row left behind would come back at the next load over a numbering it does not
+    /// belong to.
+    fn dropFrontiers(self: *SyncClient, stream: []const u8) !void {
         var qa = std.heap.ArenaAllocator.init(self.a);
         defer qa.deinit();
-        _ = self.st.query(qa.allocator(), "DELETE FROM _zbz_frontier WHERE stream = ?", &.{.{ .text = stream }}) catch {};
+        _ = try self.st.query(qa.allocator(), "DELETE FROM _zbz_frontier WHERE stream = ?", &.{.{ .text = stream }});
+        self.forgetFrontiers(stream);
     }
 
     /// §10df: the descriptor's seed_epoch is above the one this replica seeded at —
@@ -1599,7 +1635,7 @@ pub const SyncClient = struct {
         try execSql(&self.st, a, try std.fmt.allocPrint(a, "DROP TABLE IF EXISTS \"{s}\";", .{table}));
         _ = self.states.orderedRemove(table);
         _ = self.st.query(a, "DELETE FROM _zbz_fence WHERE tbl = ?", &.{.{ .text = table }}) catch {};
-        _ = self.st.query(a, "DELETE FROM _zbz_frontier WHERE tbl = ?", &.{.{ .text = table }}) catch {};
+        _ = try self.st.query(a, "DELETE FROM _zbz_frontier WHERE tbl = ?", &.{.{ .text = table }});
         log.warn("{s}: dropped locally — the table was dropped upstream", .{table});
     }
 
@@ -1829,8 +1865,17 @@ pub const SyncClient = struct {
                     } else {
                         log.warn("{s}: stream restarted (position {d} beyond last_seq {d}) — position reset", .{ stream, stored, last });
                     }
-                    try self.persistSeq(stream, 0);
-                    self.dropFrontiers(stream);
+                    // One transaction: the position reset and the frontiers taken on the old numbering go together.
+                    const Reset = struct {
+                        a: std.mem.Allocator,
+                        stream: []const u8,
+                        fn apply(cx: @This(), s_: *storage.Storage) !void {
+                            _ = try s_.query(cx.a, "INSERT INTO _zbz_stream_seq (stream, last_seq) VALUES (?, 0) ON CONFLICT(stream) DO UPDATE SET last_seq = 0", &.{.{ .text = cx.stream }});
+                            _ = try s_.query(cx.a, "DELETE FROM _zbz_frontier WHERE stream = ?", &.{.{ .text = cx.stream }});
+                        }
+                    };
+                    try self.st.transaction(Reset{ .a = a, .stream = stream }, Reset.apply);
+                    self.forgetFrontiers(stream);
                     if (!self.restarted.contains(stream)) try self.restarted.put(self.aa(), try self.aa().dupe(u8, stream), {});
                     // The tail's consumer died with the old stream; `tailFor` would keep
                     // handing back the cached, dead one and every fetch would answer
@@ -2826,9 +2871,7 @@ pub const SyncClient = struct {
                 }
             };
             try self.st.transaction(Prep{ .client = self, .a = a, .table = table, .tenant = tenant, .own = cdc_stream, .own_seq = @min(pos, cutoff_seq), .shared = if (shared_rewind != null) shared_stream_m else null, .shared_seq = shared_rewind orelse 0, .frontiers = writes.items }, Prep.apply);
-            // The durable state is the truth: the untouched tables' frontiers back from it.
-            st.frontiers.clearRetainingCapacity();
-            for (writes.items) |w| try self.loadFrontiers(a, w.table);
+            // Committed: the cursors, the unseeded pair and the owed record are durable, so memory says the same.
             var k: usize = 0;
             while (k < st.anchors.items.len) {
                 const s_ = st.anchors.items[k].stream;
@@ -2840,6 +2883,17 @@ pub const SyncClient = struct {
                 self.dropTail(shared_stream_m);
                 self.resetFlow(shared_stream_m);
             }
+            // The durable state is the truth: every table's frontiers back from it. If they cannot
+            // be read, the routes STAY parked (no tail opens on them) until they can: the fence is
+            // still owed, its retry reads them again.
+            self.reloadFrontiers(a) catch |err| {
+                log.err("{s}: fence prepared but the applied frontiers could not be read back ({s}) — {s} stays parked until they can; the fence is still owed", .{ table, @errorName(err), cdc_stream });
+                try self.frontier_parked.put(self.aa(), try self.aa().dupe(u8, cdc_stream), {});
+                if (shared_rewind != null) try self.frontier_parked.put(self.aa(), try self.aa().dupe(u8, shared_stream_m), {});
+                return err;
+            };
+            _ = self.frontier_parked.swapRemove(cdc_stream);
+            if (shared_rewind != null) _ = self.frontier_parked.swapRemove(shared_stream_m);
             log.warn("{s}: fence prepared — chain g{d} cut at {d} on {s} behind position {d}: anchor cleared, cursor at the cut{s}; replacing the rows{s}", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, cdc_stream, pos, if (shared_rewind != null) " (the shared route too)" else "", if (writes.items.len > 0) " — the other tables on the route keep their applied frontier" else "" });
         }
         const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, tenant });
@@ -4276,6 +4330,7 @@ pub const SyncClient = struct {
     }
 
     fn tailFor(self: *SyncClient, stream: []const u8) !*Tail {
+        if (self.frontier_parked.contains(stream)) return error.FrontiersParked;
         for (self.tails.items) |*t| {
             if (std.mem.eql(u8, t.stream, stream)) return t;
         }
@@ -4559,6 +4614,7 @@ pub const SyncClient = struct {
         var changed_map: std.array_hash_map.String(void) = .empty;
         var seeded_map: std.array_hash_map.String(void) = .empty;
 
+        self.restoreParked();
         // Schema first: a row in a new shape must find its table already moved.
         // ZB_TEST_SCHEMA_PAUSE_FILE=<path> (recreate_recovery.py check 13): while the file
         // exists the schema watch is not drained, so the tails keep applying while a chain
@@ -4613,7 +4669,7 @@ pub const SyncClient = struct {
         var live: std.ArrayList([]const u8) = .empty;
         var subs_list: std.ArrayList(*@import("nats").PullSubscription) = .empty;
         for (streams) |stream| {
-            if (self.isDark(stream)) continue;
+            if (self.isDark(stream) or self.frontier_parked.contains(stream)) continue;
             const tl = self.tailFor(stream) catch |err| {
                 self.markDark(stream, err);
                 continue;
@@ -5898,7 +5954,10 @@ pub const SyncClient = struct {
                 marks: []const Mark,
                 rewind: []const []const u8,
                 fn apply(cx: @This(), s: *storage.Storage) !void {
-                    for (cx.rewind) |route| try cx.client.persistSeq(route, 0);
+                    for (cx.rewind) |route| {
+                        try cx.client.persistSeq(route, 0);
+                        _ = try s.query(cx.a, "DELETE FROM _zbz_frontier WHERE stream = ?", &.{.{ .text = route }}); // replayed from 0: nothing taken on this numbering counts
+                    }
                     for (cx.marks) |m| {
                         if (m.tenant) |t| {
                             _ = try s.query(cx.a, "DELETE FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = m.tbl }, .{ .text = t } });
@@ -5910,7 +5969,7 @@ pub const SyncClient = struct {
                 }
             };
             try self.st.transaction(Ctx{ .client = self, .a = a, .marks = marks.items, .rewind = rewind.keys() }, Ctx.apply);
-            for (rewind.keys()) |route| self.dropFrontiers(route);
+            for (rewind.keys()) |route| self.forgetFrontiers(route);
             for (rewind.keys()) |route| {
                 self.dropTail(route);
                 try self.reconciling.put(self.aa(), try self.aa().dupe(u8, route), {});
@@ -6553,7 +6612,7 @@ pub const SyncClient = struct {
             } else k += 1;
         }
         _ = try self.st.query(a, "DELETE FROM _zbz_stream_seq WHERE stream = ?", &.{.{ .text = route }});
-        self.dropFrontiers(route);
+        try self.dropFrontiers(route);
         _ = self.dark.fetchOrderedRemove(route);
         log.info("tenant: left {s} ({d} membership(s) left)", .{ tenant, self.tenants.len });
     }
@@ -6879,6 +6938,7 @@ fn frontierClient(a: std.mem.Allocator) !SyncClient {
     client.rebase = .empty;
     client.gated = 0;
     client.frontier_gated = 0;
+    client.frontier_parked = .empty;
     client.opts.ondemand = &.{};
     client.followed = &.{};
     client.tenants = &.{"acme"};
@@ -6980,10 +7040,41 @@ test "applied frontier: only the identity it was taken on counts, it survives a 
     try std.testing.expectEqual(@as(usize, 1), left.len);
     try std.testing.expectEqualStrings("CDC_PUBLIC", left[0][0].text);
     // A stream that restarts or is recreated: nothing taken on it means anything now.
-    client.dropFrontiers("CDC_PUBLIC");
+    try client.dropFrontiers("CDC_PUBLIC");
     try std.testing.expectEqual(@as(usize, 0), client.states.getPtr("a").?.frontiers.items.len);
     const none = try client.st.query(a, "SELECT count(*) FROM _zbz_frontier", &.{});
     try std.testing.expectEqual(@as(i64, 0), none[0][0].integer);
+}
+
+test "applied frontier: a failed read fails closed, and a parked route stays parked until the frontiers read back" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var client = try frontierClient(a);
+    defer client.st.close();
+    try client.states.put(a, "a", tenantState(&.{"CDC_acme"}, "CDC_PUBLIC"));
+    try client.st.execSimple("INSERT INTO _zbz_stream_seq VALUES ('CDC_acme', 300, 'inc-1')");
+    try client.st.execSimple("INSERT INTO _zbz_frontier VALUES ('a', 'CDC_acme', 'inc-1', 500)");
+    try client.loadFrontiers(a, "a");
+    try std.testing.expectEqual(@as(usize, 1), client.states.getPtr("a").?.frontiers.items.len);
+    // The read fails: an error, and memory keeps the frontier — never "no frontier".
+    try client.st.execSimple("ALTER TABLE _zbz_frontier RENAME TO _zbz_frontier_away");
+    if (client.loadFrontiers(a, "a")) |_| return error.TestExpectedAnError else |_| {}
+    try std.testing.expectEqual(@as(usize, 1), client.states.getPtr("a").?.frontiers.items.len);
+    // A route a committed PREPARE left parked opens no tail, and stays parked while they cannot be read.
+    try client.frontier_parked.put(a, "CDC_acme", {});
+    try std.testing.expectError(error.FrontiersParked, client.tailFor("CDC_acme"));
+    client.restoreParked();
+    try std.testing.expectEqual(@as(usize, 1), client.frontier_parked.count());
+    // Readable again: released, and the frontier is the replica's.
+    try client.st.execSimple("ALTER TABLE _zbz_frontier_away RENAME TO _zbz_frontier");
+    client.restoreParked();
+    try std.testing.expectEqual(@as(usize, 0), client.frontier_parked.count());
+    try std.testing.expectEqual(@as(usize, 1), client.states.getPtr("a").?.frontiers.items.len);
+    // Dropping fails closed too: the rows go first, and an error leaves memory as it was.
+    try client.st.execSimple("ALTER TABLE _zbz_frontier RENAME TO _zbz_frontier_away");
+    if (client.dropFrontiers("CDC_acme")) |_| return error.TestExpectedAnError else |_| {}
+    try std.testing.expectEqual(@as(usize, 1), client.states.getPtr("a").?.frontiers.items.len);
 }
 
 test "fence scope: other tables stay untouched when their coverage is known, and the rest refuses" {
