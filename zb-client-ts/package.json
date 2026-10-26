@@ -79,7 +79,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test src/core.test.ts src/reconcile.test.ts src/outbox.test.ts src/measure.test.ts",
+    "test": "node --experimental-strip-types --test src/core.test.ts src/reconcile.test.ts src/outbox.test.ts src/measure.test.ts src/fence.test.ts src/fence-apply.test.ts",
     "wasm": "cd ../libzb && zig build wasm-core && cp zig-out/wasm/zb_core.wasm ../zb-client-ts/wasm/zb_core.wasm",
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "prepack": "cp ../LICENSE LICENSE && pnpm run build",

@@ -34,7 +34,7 @@ function fixture(path = ':memory:') {
   Object.assign(c, {
     outboxInitPromise: Promise.resolve(), reconcileLoaded: false, streamWork: Promise.resolve(),
     globalSyncState: { seq }, hubOnly: new Set(), healedRoutes: new Set(),
-    tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), streamsSubscribed: false, measure: new Measure(() => {}), applyingByChoice: new Set(), syncedTables: new Map([['item', {}]]), ondemandSet: new Set(),
+    tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(), streamsSubscribed: false, measure: new Measure(() => {}), applyingByChoice: new Set(), syncedTables: new Map([['item', {}]]), ondemandSet: new Set(),
     streamCreated: new Map([['CDC_acme', 'same']]), restarted: new Set(), failed: new Set(), nc: {},
     transport: {
       jetstreamManager: async () => ({ streams: { info: async () => ({ state: { last_seq: 12 } }) } }),
@@ -262,6 +262,42 @@ test('a stream with no followed table gets no tail consumer', async () => {
     assert.equal(added, 0);
     assert.equal(c.tailFilters.has('CDC_acme'), false);
   } finally { c.nc = null; db.close(); }
+});
+
+test('a route parked by a fence gets no tail until the fence commits; a stale parking is ignored', async () => {
+  await loadCore(readFileSync(new URL('../wasm/zb_core.wasm', import.meta.url)));
+  for (const owner of ['item', 'dropped']) {
+    const { db, c } = fixture();
+    try {
+      c.cdcFilters = ZeBridge.prototype['cdcFilters' as keyof ZeBridge];
+      c.syncedTables = new Map([['item', { tenantColumn: 'tenant_id', pkCols: ['id'], seedLsn: 1, seedStream: 'CDC_acme', seedSeq: 10 }]]);
+      c.config = { grammar: { cdc_streams: { public: 'CDC_PUBLIC', tenant_prefix: 'CDC_' }, open_tenant: '_default' }, cdcBatchEvents: 20000 };
+      c.tenantValue = 'acme';
+      c.cdcStreams = () => ['CDC_acme'];
+      c.globalSyncState.seq.CDC_acme = 10;
+      db.exec("INSERT INTO _zebridge_stream_seq VALUES ('CDC_acme', 10, 'same')");
+      // 'item''s fence has the route; or a table that is no longer followed does.
+      c.fenced.set('CDC_acme', owner);
+      let added = 0;
+      c.transport.jetstreamManager = async () => ({
+        streams: { info: async () => ({ created: 'same', state: { first_seq: 1, last_seq: 11 } }) },
+        consumers: { add: async () => { added++; return { name: 'x', num_pending: 0 }; } },
+      });
+      c.transport.jetstream = () => ({ consumers: { get: async () => ({ consume: async () => ({ [Symbol.asyncIterator]() { return this; }, next: () => new Promise(() => {}), stop() {} }) }) } });
+      await c.subscribeStreams();
+      if (owner === 'item') {
+        assert.equal(added, 0, 'no consumer on a parked route');
+        assert.equal(c.tailFilters.has('CDC_acme'), false);
+        assert.equal(c.fenced.get('CDC_acme'), 'item', 'the parking stays until the fence commits');
+      } else {
+        assert.equal(added, 1, 'a parking whose table is gone does not hold the route');
+        assert.equal(c.fenced.has('CDC_acme'), false);
+      }
+    } finally {
+      for (const stream of [...c.tailStops.keys()]) await c.stopTail(stream);
+      c.nc = null; db.close();
+    }
+  }
 });
 
 test('a reseed caused by a shared-stream gap rewinds the table\'s own stream to the chain\'s cut', async () => {
