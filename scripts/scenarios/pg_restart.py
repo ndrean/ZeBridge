@@ -39,8 +39,8 @@ import _env  # noqa: E402
 TABLE = "test_types"
 TENANT = "acme"
 PRINCIPAL = "alice"
-PG_CTL = "/opt/homebrew/opt/postgresql@18/bin/pg_ctl"
-DATADIR = str(zb.ROOT / "postgres-data")
+PG_CTL = zb.PG_CTL
+DATADIR = zb.PG_DATA
 DOWNTIME_S = 12
 # ⚠️ The exact flags scripts/native/up.sh starts PostgreSQL with. wal_level=logical
 # lives ONLY on the command line (postgresql.conf keeps the default), so a flagless
@@ -64,7 +64,7 @@ def pg_up() -> bool:
 
 
 def pg_start() -> subprocess.CompletedProcess:
-    return pg_ctl("start", "-o", PG_OPTS, "-l", str(zb.ROOT / "scripts" / "native" / "postgres.log"))
+    return pg_ctl("start", "-o", PG_OPTS, "-l", zb.PG_LOG)
 
 
 def ensure_pg_up() -> None:
@@ -153,6 +153,8 @@ async def run(marker: str) -> int:
             if rows_local(h) < 1:
                 zb.bad("the pipe is not flowing before the outage"); return 1
             zb.ok("client live; one row through — now PostgreSQL STOPS entirely")
+            floor_q = "SELECT extract(epoch FROM watermark) FROM public.zebridge_gc_watermark WHERE id = 1"
+            floor_before = zb.psql(floor_q, quiet=True).strip()
 
             # ── 1. the cluster goes away ─────────────────────────────────────
             r = pg_ctl("stop", "-m", "fast")
@@ -305,6 +307,15 @@ async def run(marker: str) -> int:
             else:
                 zb.bad(f"under-fire divergence: PostgreSQL {truth}, client {got} "
                        f"(landed-by-writer ~{landed[0]})")
+                failed += 1
+            # ── 5. the GC floor is durable cluster state too ─────────────────
+            # Two cluster restarts later the floor row is where it was or later: it is the database's
+            # promise about its history, never reset by an outage, a restart or the bridge coming back.
+            floor_after = zb.psql(floor_q, quiet=True).strip()
+            if floor_before and floor_after and float(floor_after) >= float(floor_before):
+                zb.ok("the GC floor survived both cluster restarts and did not go down")
+            else:
+                zb.bad(f"the GC floor went from {floor_before!r} to {floor_after!r} across the restarts")
                 failed += 1
     finally:
         if h:

@@ -40,8 +40,8 @@ import _env  # noqa: E402
 TABLE = "test_types"
 TENANT = "acme"
 PRINCIPAL = "alice"
-PG_CTL = "/opt/homebrew/opt/postgresql@18/bin/pg_ctl"
-DATADIR = str(zb.ROOT / "postgres-data")
+PG_CTL = zb.PG_CTL
+DATADIR = zb.PG_DATA
 PG_OPTS = zb.pg_opts()
 HOLD_S = 4
 LOG = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_matrix_bridge.log"
@@ -57,7 +57,7 @@ def pg_up() -> bool:
 
 
 def pg_start():
-    return pg_ctl("start", "-o", PG_OPTS, "-l", str(zb.ROOT / "scripts" / "native" / "postgres.log"))
+    return pg_ctl("start", "-o", PG_OPTS, "-l", zb.PG_LOG)
 
 
 def ensure_pg_up() -> None:

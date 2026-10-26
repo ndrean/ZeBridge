@@ -243,6 +243,7 @@ def main() -> int:
     ap.add_argument("group", nargs="?", choices=[*GROUPS, "all"], default="offline")
     ap.add_argument("-k", action="append", default=[], help="only scenarios whose name contains this")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--no-preflight", action="store_true", help="skip the check that the database has the GC-floor functions")
     ap.add_argument("--logs", default=os.environ.get("TMPDIR", "/tmp"), help="where per-scenario logs go")
     a = ap.parse_args()
     if a.list:
@@ -264,6 +265,32 @@ def main() -> int:
                        cwd=HERE, env=env_for("bridge"), capture_output=True)
     if a.group == "manual":
         print("manual scenarios are listed, not run: see --list"); return 0
+
+    def preflight() -> bool:
+        """Before a group that touches the stack: the init SQL on this database is the one the binaries
+        expect. The bridge reads the GC floor inside every write's transaction through
+        `zebridge_gc_floor_acquire()` and refuses writes (`GcFloorUnavailable`) while it is missing, and the
+        sweeper needs the other two: a database whose init was not re-applied after the GC-floor change would
+        fail every writing scenario for a reason none of them names."""
+        want = ("zebridge_gc_floor_acquire()", "zebridge_gc_advance(double precision,bigint,integer)", "zebridge_gc_sweeper_lock()")
+        code = ("import zb; " + "; ".join(
+            f"print('{w}', zb.psql(\"SELECT to_regprocedure('public.{w}') IS NOT NULL\", quiet=True))" for w in want))
+        out = subprocess.run([PY, "-c", code], cwd=HERE, env=env_for("bridge"), capture_output=True, text=True).stdout
+        missing = [l.rsplit(" ", 1)[0] for l in out.splitlines() if l.strip() and l.rsplit(" ", 1)[-1] != "t"]
+        if missing or not out.strip():
+            print("preflight: the database does not have the GC-floor functions (" + (", ".join(missing) or "could not ask") + ").\n"
+                  "  Re-apply init.core.template.sql and init.write.template.sql (bridge --init-sql), then run again.\n"
+                  "  --no-preflight skips this check.")
+            return False
+        holders = subprocess.run([PY, "-c", "import zb; print(zb.psql(\"SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=23106 "
+                                  "AND objid=1 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())\", quiet=True))"],
+                                 cwd=HERE, env=env_for("bridge"), capture_output=True, text=True).stdout.strip()
+        if holders not in ("", "0"):
+            print("preflight: a sweeper holds the database's sweeper lock. Scenarios that start a sweeper of their own "
+                  "(sweeper*, reaps, drip, tombstone ones) refuse to run beside it; stop it for the run if you want them.")
+        return True
+    if any(g != "offline" for g in groups) and not a.no_preflight and not preflight():
+        return 2
     results = []
     for g in groups:
         if g != "offline":

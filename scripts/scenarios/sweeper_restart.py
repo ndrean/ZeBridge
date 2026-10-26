@@ -17,6 +17,11 @@ warns about: the table grows and the watermark quietly stops being true.
   4. the NEXT pass reaps them — which is only possible if the reconnect re-ran the
      session setup (statements re-prepared, principal re-set, UTC re-pinned) — and
      the output carries no "prepared statement" error and no FATAL
+  5. (one sweeper per database, NOTES "One floor, one sweeper") the sweeper's lock
+     died with its session and was taken again by the reconnected one: exactly one
+     holder before the outage and after it, the floor row survived and never went
+     down; and a sweeper killed outright (SIGKILL) frees the lock with its session,
+     so a replacement takes it and reaps
 """
 import os
 import pathlib
@@ -29,11 +34,12 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import zb  # noqa: E402
 
 FIX = "zb_sweeper_restart_probe"
-PG_CTL = "/opt/homebrew/opt/postgresql@18/bin/pg_ctl"
-DATADIR = str(zb.ROOT / "postgres-data")
+PG_CTL = zb.PG_CTL
+DATADIR = zb.PG_DATA
 PG_OPTS = zb.pg_opts()
 SWEEPER = zb.ROOT / "zig-out" / "bin" / "bridge_sweeper"
 LOG = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_sweeper_restart.log"
+LOG2 = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_sweeper_restart_replacement.log"
 
 
 def pg_ctl(*args):
@@ -50,7 +56,7 @@ def ensure_pg_up() -> None:
     while time.monotonic() < deadline:
         if pg_up():
             return
-        pg_ctl("start", "-o", PG_OPTS, "-l", str(zb.ROOT / "scripts" / "native" / "postgres.log"))
+        pg_ctl("start", "-o", PG_OPTS, "-l", zb.PG_LOG)
         time.sleep(2)
     print("  ⚠️  PostgreSQL still down after 120s — scripts/native/up.sh needed")
 
@@ -59,6 +65,19 @@ def seed(n: int, tag: str) -> None:
     ripe = zb.ago_ms(zb.gc_retention_ms() + 2 * 3600 * 1000)   # past the stack's own retention
     zb.psql(f"INSERT INTO public.{FIX} (uid, some_text, inserted_at, updated_at, deleted_at) "
             f"SELECT gen_random_uuid(), '{tag}', now(), {ripe}, {ripe} FROM generate_series(1, {n})")
+
+
+def holders() -> int:
+    """Sessions holding the sweeper lock on this database."""
+    out = zb.psql("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND classid = 23106 AND objid = 1 "
+                  "AND objsubid = 2 AND granted AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+                  quiet=True)
+    return int(out) if out else -1
+
+
+def floor_epoch() -> float:
+    out = zb.psql("SELECT extract(epoch FROM watermark) FROM public.zebridge_gc_watermark WHERE id = 1", quiet=True)
+    return float(out) if out else float("nan")
 
 
 def live_tombstones() -> int:
@@ -85,6 +104,7 @@ def main() -> int:
             zb.bad(f"could not enable the fixture: {out[:140]}"); return 1
 
         zb.require_sweeper_free()
+        floor_before = None
         seed(4, "pre-restart")
         # The stack's own retention, never a shorter one (a pass moves the GC floor for good); the
         # tombstones are two hours past it — ripe.
@@ -98,6 +118,11 @@ def main() -> int:
             time.sleep(1)
         if live_tombstones() == 0:
             zb.ok("baseline: the scoped sweeper reaped all 4 ripe tombstones")
+            floor_before = floor_epoch()
+            if holders() == 1:
+                zb.ok("baseline: exactly one session holds the sweeper lock (the daemon's)")
+            else:
+                zb.bad(f"baseline: {holders()} sessions hold the sweeper lock, expected the daemon's alone"); failed += 1
         else:
             zb.bad(f"baseline sweep never completed ({live_tombstones()} tombstones left)")
             return failed + 1
@@ -114,7 +139,7 @@ def main() -> int:
             zb.ok("through 8s of refused connections: the sweeper is alive and retrying")
 
         # ── 3. PostgreSQL returns; fresh ripe tombstones ─────────────────────
-        pg_ctl("start", "-o", PG_OPTS, "-l", str(zb.ROOT / "scripts" / "native" / "postgres.log"))
+        pg_ctl("start", "-o", PG_OPTS, "-l", zb.PG_LOG)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline and not pg_up():
             time.sleep(0.5)
@@ -146,6 +171,45 @@ def main() -> int:
         wm = zb.psql("SELECT reaped FROM public.zebridge_gc_watermark WHERE id = 1").strip()
         if wm and int(wm) >= 4:
             zb.ok(f"the watermark row carries the last pass (reaped={wm}) — telemetry survived too")
+
+        # ── 5. the lock and the floor across the outage ──────────────────────
+        if re.search(r"holding the database's sweeper lock again", text):
+            zb.ok("the reconnected session took the sweeper lock again (the old one died with its connection)")
+        else:
+            zb.bad("the log never says the sweeper took its lock again after the reconnect — "
+                   "it would have idled for good, or reaped without owning the database's GC")
+            failed += 1
+        if holders() == 1:
+            zb.ok("exactly one session holds the sweeper lock after the restart")
+        else:
+            zb.bad(f"{holders()} sessions hold the sweeper lock after the restart, expected one"); failed += 1
+        floor_after = floor_epoch()
+        if floor_before is not None and floor_after >= floor_before:
+            zb.ok(f"the floor survived the cluster restart and did not go down ({floor_before:.0f} → {floor_after:.0f})")
+        else:
+            zb.bad(f"the floor went from {floor_before} to {floor_after} across the restart"); failed += 1
+
+        # A sweeper killed outright frees the lock with its session; a replacement takes it and reaps.
+        proc.kill(); proc.wait(timeout=10)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 15 and holders() != 0:
+            time.sleep(0.5)
+        if holders() == 0:
+            zb.ok("a SIGKILLed sweeper freed the lock with its session")
+        else:
+            zb.bad(f"{holders()} session(s) still hold the lock {time.monotonic() - t0:.0f} s after the sweeper was killed"); failed += 1
+        seed(4, "after-kill")
+        logf2 = open(LOG2, "w")
+        proc = subprocess.Popen([str(SWEEPER)], env=env, stdout=logf2, stderr=subprocess.STDOUT)
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline and live_tombstones() != 0:
+            time.sleep(1)
+        logf2.flush()
+        if live_tombstones() == 0 and "holding the database's sweeper lock" in LOG2.read_text(errors="replace"):
+            zb.ok("the replacement sweeper took the lock and reaped the fresh batch")
+        else:
+            zb.bad(f"the replacement sweeper did not take over ({live_tombstones()} tombstones left)"); failed += 1
+        logf2.close()
     finally:
         if proc and proc.poll() is None:
             proc.terminate()
