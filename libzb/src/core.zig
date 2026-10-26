@@ -1297,13 +1297,39 @@ fn deltaStep(a: std.mem.Allocator, d: Value) !Value {
     return .{ .object = step };
 }
 
+/// The plan has a full: the destructive step. A position past a cut matters only then.
+pub fn planHasFull(plan: std.json.Array) bool {
+    for (plan.items) |step| {
+        if (std.mem.eql(u8, getStr(step, "kind") orelse "", "full")) return true;
+    }
+    return false;
+}
+
+/// The SHARED route (CDC_PUBLIC) is past its chain's cut: the open-tenant events up to the replica's
+/// position are in the rows a full deletes back to the cut, behind a cursor that never replays them.
+/// The route has its own position and its own cut — read independently of the own route's — so this can
+/// hold while `fullPredatesReplica` (the own route) does not. fence.ts `decideFence` makes the same decision.
+pub fn fullPredatesSharedReplica(plan: std.json.Array, shared_cut: ?i64, shared_pos: i64) bool {
+    const cut = shared_cut orelse return false;
+    return planHasFull(plan) and shared_pos > cut;
+}
+
+test "fullPredatesSharedReplica: the shared route past its cut, a plan with a full, a cut that is known" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const with_full = (try std.json.parseFromSliceLeaky(Value, a, "[{\"kind\":\"full\"},{\"kind\":\"delta\"}]", .{})).array;
+    const deltas = (try std.json.parseFromSliceLeaky(Value, a, "[{\"kind\":\"delta\"}]", .{})).array;
+    try std.testing.expect(fullPredatesSharedReplica(with_full, 40, 95)); // own route may be behind its cut; this one is not
+    try std.testing.expect(!fullPredatesSharedReplica(with_full, 40, 40)); // at the cut: nothing after it is in the rows
+    try std.testing.expect(!fullPredatesSharedReplica(with_full, 40, 30));
+    try std.testing.expect(!fullPredatesSharedReplica(deltas, 40, 95)); // not destructive
+    try std.testing.expect(!fullPredatesSharedReplica(with_full, null, 95)); // no proven cut: the fence's own refusals judge it
+}
+
 /// core.ts fullPredatesReplica (D2's destruction guard).
 pub fn fullPredatesReplica(man: Value, plan: std.json.Array, stored_seq: i64) bool {
-    var has_full = false;
-    for (plan.items) |step| {
-        if (std.mem.eql(u8, getStr(step, "kind") orelse "", "full")) has_full = true;
-    }
-    if (!has_full) return false;
+    if (!planHasFull(plan)) return false;
     const cutoff = getInt(man, "cutoff_seq") orelse return false;
     if (cutoff <= 0) return false;
     if (getStr(man, "cdc_stream") == null) return false;

@@ -2883,6 +2883,21 @@ pub const SyncClient = struct {
         // present, its stream read, on the same incarnation. Unknown coverage refuses the
         // fence; it is never a route left out. Past the shared cut, the route rewinds too.
         const pair_shared: ?[]const u8 = if (self.states.get(table)) |s0| s0.shared_route else null;
+        // The shared route is judged on its own position and cut: the two streams are read independently,
+        // so it can be past its cut while the own route is behind theirs (`predates` is the own route's).
+        // A full deletes the open-tenant rows back to that cut, behind a cursor that never replays them.
+        // Only the shared route rewinds then: the own scope is not consulted, its cursor stays.
+        if (!fence) if (pair_shared) |sr| {
+            if (core.fullPredatesSharedReplica(plan.array, shared_seq, @intCast(try self.storedSeq(sr)))) {
+                fence = true;
+                if (!own_replayable) {
+                    if (from_seed) return error.SeedStale; // the hub's chain is asked, and judged by the same proofs
+                    log.warn("{s}: chain predates replica — refusing the full (D2): its cut on {s} cannot be proven replayable (stream unread, or another incarnation)", .{ table, cdc_stream });
+                    self.reseed_pending = true;
+                    return;
+                }
+            }
+        };
         var shared_rewind: ?i64 = null;
         if (fence) if (pair_shared) |sr| {
             const q = shared_seq orelse {
@@ -2988,7 +3003,14 @@ pub const SyncClient = struct {
             _ = self.frontier_parked.swapRemove(cdc_stream);
             if (shared_rewind != null) _ = self.frontier_parked.swapRemove(shared_stream_m);
             const age_ms: i64 = if (isoMs(if (man.object.get("cutoff_version")) |v| (if (v == .string) v.string else "") else "")) |t| nowMillis() - t else -1;
-            log.warn("{s}: fence prepared — chain g{d} cut at {d} on {s} behind position {d}: anchor cleared, cursor at the cut{s}; replacing the rows{s}{s} (chain {d} s old, {d} CDC message(s) after its cut on the hub)", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, cdc_stream, pos, if (shared_rewind != null) " (the shared route too)" else "", if (writes.items.len > 0) " — the other tables on the route keep their applied frontier" else "", if (from_seed) " [from the seeding leaf]" else "", @divFloor(age_ms, 1000), if (own_last >= 0) own_last - cutoff_seq else -1 });
+            // Greppable by the scenarios: "fence prepared — chain g<gen> cut at <cut> on <stream>". A fence only the
+            // SHARED route needs leaves the own cursor where it is, and says so.
+            var where_buf: [320]u8 = undefined;
+            const where: []const u8 = if (predates)
+                std.fmt.bufPrint(&where_buf, "behind position {d}: anchor cleared, cursor at the cut{s}", .{ pos, if (shared_rewind != null) " (the shared route too)" else "" }) catch "behind position"
+            else
+                std.fmt.bufPrint(&where_buf, "(position {d}, not behind it): anchor cleared; only the shared route {s} is past its cut and goes back to it", .{ pos, shared_stream_m }) catch "(not behind it)";
+            log.warn("{s}: fence prepared — chain g{d} cut at {d} on {s} {s}; replacing the rows{s}{s} (chain {d} s old, {d} CDC message(s) after its cut on the hub)", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, cdc_stream, where, if (writes.items.len > 0) " — the other tables on the route keep their applied frontier" else "", if (from_seed) " [from the seeding leaf]" else "", @divFloor(age_ms, 1000), if (own_last >= 0) own_last - cutoff_seq else -1 });
         }
         const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, tenant });
         var applied: usize = 0;

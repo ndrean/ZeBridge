@@ -5,7 +5,7 @@ import { decideFence, fenceScope, frontierDrops, routeHolds, verifyRoutes, type 
 
 /// A follower ahead of a new cut on its own route, the other tables on it fine to leave untouched, nothing shared.
 const base: FenceFacts = {
-  predates: true, pending: false,
+  predates: true, pending: false, hasFull: true,
   ownStream: 'CDC_acme', ownPos: 500, ownCut: 300, ownScopeRefusal: null, ownReplayable: true,
   sharedStream: null, manifestSharedStream: '', sharedCut: null, sharedProven: false, sharedPos: 0, sharedScopeRefusal: null,
 };
@@ -19,6 +19,28 @@ test('a chain that does not predate the replica, with nothing owed, is no fence'
 
 test('a chain cut behind the position, alone on its route: a fence back to the cut', () => {
   assert.deepEqual(decideFence(base), { kind: 'fence', ownTo: 300, sharedTo: null });
+});
+
+test('the shared route alone past its cut is a fence: the own cursor stays, the shared one goes back to its cut', () => {
+  // Own 500 is behind its cut 600; CDC_PUBLIC at 95 is past its cut 40. The full deletes the open-tenant rows of 41..95.
+  const f = withShared({ predates: false, ownPos: 500, ownCut: 600, sharedPos: 95, sharedCut: 40 });
+  assert.deepEqual(decideFence(f), { kind: 'fence', ownTo: 500, sharedTo: 40 });
+});
+
+test('the shared route alone past its cut needs the shared scope to hold, and only that one (the own route is not rewound)', () => {
+  const refused = decideFence(withShared({ predates: false, ownPos: 500, ownCut: 600, sharedPos: 95, sharedScopeRefusal: 'orders is not seeded, so its coverage on CDC_PUBLIC is unknown' }));
+  assert.equal(refused.kind, 'refuse');
+  // The own scope is not consulted: nothing on the own route is rewound.
+  assert.deepEqual(decideFence(withShared({ predates: false, ownPos: 500, ownCut: 600, sharedPos: 95, ownScopeRefusal: 'x' })), { kind: 'fence', ownTo: 500, sharedTo: 40 });
+});
+
+test('the shared route past its cut with a cut that cannot be proven: refused, not a plain full', () => {
+  assert.equal(decideFence(withShared({ predates: false, ownPos: 500, ownCut: 600, sharedPos: 95, sharedProven: false })).kind, 'refuse');
+});
+
+test('the shared route at or behind its cut, or a plan without a full: no fence', () => {
+  assert.deepEqual(decideFence(withShared({ predates: false, ownPos: 500, ownCut: 600, sharedPos: 40 })), { kind: 'none' });
+  assert.deepEqual(decideFence(withShared({ predates: false, ownPos: 500, ownCut: 600, sharedPos: 95, hasFull: false })), { kind: 'none' });
 });
 
 test('the cursor never moves forward: a cut past the position keeps the position', () => {
