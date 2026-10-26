@@ -33,8 +33,11 @@
 
 /// What the caller learned before any row changes.
 export interface FenceFacts {
-  /// core.fullPredatesReplica: a full in the plan is cut behind the replica's position.
+  /// core.fullPredatesReplica: a full in the plan is cut behind the replica's position ON THE OWN
+  /// ROUTE. The shared route is judged here (`sharedAhead`): it has its own position and its own cut.
   predates: boolean;
+  /// The plan has a full: the destructive step that makes a position past a cut matter at all.
+  hasFull: boolean;
   /// An earlier fence of this table was interrupted before its commit (`_zebridge_fence`).
   pending: boolean;
   /// The table's own route, the replica's position on it, and the chain's cut on it.
@@ -69,7 +72,13 @@ export type FenceDecision =
   | { kind: 'refuse'; why: string; owed: boolean };
 
 export function decideFence(f: FenceFacts): FenceDecision {
-  if (!f.predates && !f.pending) return { kind: 'none' };
+  // A full deletes the rows of EVERY route the table rides back to that route's cut. The own route
+  // may be ahead of its chain's cut (`predates`) or the shared one may be, alone: the two streams
+  // are read independently, so the open-tenant events can be consumed past the shared cut while the
+  // tenant's own are still behind theirs. Either way those events are in the rows the full deletes
+  // and behind a cursor that never replays them.
+  const sharedAhead = f.hasFull && f.sharedStream !== null && f.sharedCut !== null && f.sharedPos > f.sharedCut;
+  if (!f.predates && !f.pending && !sharedAhead) return { kind: 'none' };
   const owed = f.pending;
   // A rewind of the own route (the chain behind the cursor) needs the other tables on it to
   // stay untouched; a pending retry already at or before this cut rewinds nothing there.

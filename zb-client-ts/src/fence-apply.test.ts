@@ -463,7 +463,7 @@ test('a stream whose position was stored on another incarnation than the chain\'
 test('a chain applied to a table drops the frontier it held before its first step', async () => {
   for (const gone of [false, true]) await withDir(async (path) => {
     const w = new World();
-    w.publish(2, 5, 600); // cut past the position: no fence, a plain seed
+    w.publish(2, 5, 600, 150); // cut past the position: no fence, a plain seed
     if (gone) w.objects.delete(w.manifest.full.object); // pruned under us: no step is ever applied
     follower(path, w);
     const t = client(path, w);
@@ -844,7 +844,7 @@ test('a PREPARE that committed but could not read its frontiers back leaves the 
 test('dropping a table\'s frontier fails closed: the chain is not applied over a frontier that could not be dropped', async () => {
   await withDir(async (path) => {
     const w = new World();
-    w.publish(2, 5, 600); // a plain seed
+    w.publish(2, 5, 600, 150); // a plain seed
     follower(path, w);
     const t = client(path, w);
     t.db.exec(`INSERT INTO _zebridge_frontier VALUES ('item', '${OWN}', 'own-1', 520)`);
@@ -870,7 +870,7 @@ for (const inPass of [false, true]) {
     // The fence: item cut at 100, behind the position 500. The other: a full that is a plain seed,
     // cut at 200 (decided after the fence moved the cursor to 100) or at 600 (ahead of the position).
     w.publish(2, 5, 100, 40, 'item');
-    w.publish(2, 4, plainFirst ? 600 : 200, 40, 'orders');
+    w.publish(2, 4, plainFirst ? 600 : 200, plainFirst ? 150 : 40, 'orders');
     follower(path, w, ['orders']);
     const slow = deferred();
     w.hold = (name) => (name.startsWith('orders') ? slow.p : undefined); // its download stays paused
@@ -998,7 +998,7 @@ for (const inPass of [false, true]) {
 test('a plain seed that is refused or fails leaves the routes it held', async () => {
   await withDir(async (path) => {
     const w = new World();
-    w.publish(2, 5, 600); // a plain seed ...
+    w.publish(2, 5, 600, 150); // a plain seed ...
     follower(path, w);
     w.objects.delete(w.manifest.full.object); // ... whose chain object is gone: no step ever applies
     const t = client(path, w);
@@ -1014,7 +1014,7 @@ test('a plain seed that is refused or fails leaves the routes it held', async ()
 test('a plain full that fails after its first chunk is owed too: no overlap needed', async () => {
   await withDir(async (path) => {
     const w = new World();
-    w.publish(2, 5, 600); // a plain seed: the cut is ahead of the position
+    w.publish(2, 5, 600, 150); // a plain seed: the cut is ahead of the position
     follower(path, w);
     let armed = true;
     const t = client(path, w, { hook: async (point) => { if (point === 'after_chunk' && armed) throw new Error('crash at after_chunk'); } });
@@ -1042,7 +1042,7 @@ for (const inPass of [false, true]) {
   test(`CDC passing the cut while a plain full downloads makes it a fence: the cursor goes back, the event replays (${inPass ? 'in a pass' : 'background'})`, async () => {
     await withDir(async (path) => {
       const w = new World();
-      w.publish(2, 5, 600); // ahead of the position 500: a plain seed when decided
+      w.publish(2, 5, 600, 150); // ahead of the position 500: a plain seed when decided
       follower(path, w);
       const slow = deferred();
       w.hold = () => slow.p;
@@ -1074,10 +1074,100 @@ for (const inPass of [false, true]) {
   });
 }
 
+/// The shared route (CDC_PUBLIC, the open-tenant rows) has its own position and its own cut. Only IT can be past
+/// its cut while the own route is behind: the two streams are read independently. A full deletes the rows back to
+/// both cuts, so the shared cursor must go back too — or the events between never replay.
+const sharedBehind = (path: string, w: World) => {
+  follower(path, w);
+  const f = client(path, w);
+  f.db.exec(`UPDATE _zebridge_stream_seq SET last_seq = 30 WHERE stream = '${PUB}'`); // the shared cut is 40: behind it
+  f.close();
+};
+
+test('only the shared route is past its cut when the full is decided: a fence, the own cursor stays', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 600, 40); // own 500 < 600; shared 90 > 40
+    follower(path, w);
+    const t = client(path, w);
+    try {
+      t.c.tailStops.set(OWN, async () => {});
+      t.c.tailStops.set(PUB, async () => {});
+      assert.equal(await t.c.applyGenerations('item'), true);
+      assert.deepEqual(rows(t.db), wanted(2, 5));
+      assert.equal(pos(t.db, OWN), 500, 'the own route is not behind its cut: its cursor stays');
+      assert.equal(pos(t.db, PUB), 40, 'the shared cursor went back to its cut: the events after it replay');
+      assert.deepEqual({ ...anchor(t.db) }, { seed_seq: 600, seed_stream: OWN, shared_seed_seq: 40 });
+      assert.equal(owed(t.db), 0);
+      assert.ok(t.log.some((m) => /fence prepared — chain g2 cut at 600 on CDC_acme \(position 500, not behind it\)/.test(m)), t.log.join('\n'));
+    } finally { t.close(); }
+  });
+});
+
+for (const inPass of [false, true]) {
+  test(`CDC passing the SHARED cut while a plain full downloads makes it a fence: the shared cursor goes back, the event replays (${inPass ? 'in a pass' : 'background'})`, async () => {
+    await withDir(async (path) => {
+      const w = new World();
+      w.publish(2, 5, 600, 40);
+      sharedBehind(path, w); // own 500 < cut 600, shared 30 < cut 40: a plain full when decided
+      const slow = deferred();
+      w.hold = () => slow.p;
+      const t = client(path, w);
+      try {
+        t.c.tailStops.set(OWN, async () => {});
+        t.c.tailStops.set(PUB, async () => {});
+        const apply = t.c.applyGenerations('item', inPass);
+        for (let i = 0; i < 50 && !t.c.replacing.get(OWN)?.has('item'); i++) await new Promise((r) => setImmediate(r));
+        assert.ok(t.c.replacing.get(OWN)?.has('item'), 'decided plain, the download is paused');
+        assert.equal(pos(t.db, PUB), 30);
+        // The shared tail applies a row at 95 and its cursor passes the shared cut.
+        t.db.exec(`INSERT INTO item VALUES (95,'acme','shared-live','${VERSION(20)}')`);
+        t.db.exec(`UPDATE _zebridge_stream_seq SET last_seq = 95 WHERE stream = '${PUB}'`);
+        t.c.globalSyncState.seq[PUB] = 95;
+        slow.go();
+        assert.equal(await within(5000, apply, 'the seed'), true);
+        assert.deepEqual(rows(t.db), wanted(2, 5), 'the chain\'s rows replaced the old ones, the shared live row included');
+        assert.equal(pos(t.db, PUB), 40, 'the shared cursor is back at the shared cut: the event at 95 replays on top of the chain');
+        assert.equal(t.c.globalSyncState.seq[PUB], 40);
+        assert.equal(pos(t.db, OWN), 500, 'the own route never passed its cut');
+        assert.deepEqual({ ...anchor(t.db) }, { seed_seq: 600, seed_stream: OWN, shared_seed_seq: 40 });
+        assert.equal(owed(t.db), 0);
+        assert.equal(t.c.fenced.size, 0, 'both routes are released with the commit');
+        assert.ok(t.log.some((m) => /the position passed the cut while the full downloaded — fence prepared/.test(m)));
+        assert.ok(t.log.some((m) => /fenced — chain g2/.test(m)), 'VERIFY and COMMIT like any fence');
+      } finally { t.close(); }
+    });
+  });
+}
+
+test('CDC passing the shared cut during the download when the shared route cannot be rewound: nothing replaced', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 600, 40);
+    sharedBehind(path, w);
+    const slow = deferred();
+    w.hold = () => slow.p;
+    const t = client(path, w, { others: ['orders'] }); // orders rides CDC_PUBLIC and has no anchor: its coverage is unknown
+    try {
+      t.c.tailStops.set(PUB, async () => {});
+      const apply = t.c.applyGenerations('item');
+      for (let i = 0; i < 50 && !t.c.replacing.get(OWN)?.has('item'); i++) await new Promise((r) => setImmediate(r));
+      t.db.exec(`UPDATE _zebridge_stream_seq SET last_seq = 95 WHERE stream = '${PUB}'`);
+      t.c.globalSyncState.seq[PUB] = 95;
+      slow.go();
+      assert.equal(await within(5000, apply, 'the seed'), false, 'waits: nothing is destroyed');
+      assert.deepEqual(rows(t.db), ['91:old', '92:old', '93:old']);
+      assert.equal(owed(t.db), 0);
+      assert.equal(pos(t.db, PUB), 95);
+      assert.ok((anchor(t.db) as any), 'the anchor is intact');
+    } finally { t.close(); }
+  });
+});
+
 test('a plain full whose position stays behind the cut is owed as before, and the tails are given back', async () => {
   await withDir(async (path) => {
     const w = new World();
-    w.publish(2, 5, 600);
+    w.publish(2, 5, 600, 150);
     follower(path, w);
     const t = client(path, w);
     try {
@@ -1096,7 +1186,7 @@ test('a plain full whose position stays behind the cut is owed as before, and th
 test('CDC passing the cut during the download when the fence would be refused: nothing is replaced, the old rows and anchor stay', async () => {
   await withDir(async (path) => {
     const w = new World();
-    w.publish(2, 5, 600);
+    w.publish(2, 5, 600, 150);
     follower(path, w); // orders has no anchor: its coverage on the route is unknown (D2 refuses a rewind)
     const slow = deferred();
     w.hold = () => slow.p;
@@ -1152,7 +1242,7 @@ test('a replacement that throws again during the wait asks for another loop: the
   await withDir(async (path) => {
     mock.timers.enable({ apis: ['setTimeout'] });
     const w = new World();
-    w.publish(2, 5, 600);
+    w.publish(2, 5, 600, 150);
     follower(path, w);
     let armed = true;
     const t = client(path, w, { hook: async (point) => { if (point === 'after_chunk' && armed) throw new Error('crash at after_chunk'); } });
@@ -1196,7 +1286,7 @@ test('a re-seed wait survives an attempt that throws too', async () => {
 test('a delta-only plan writes no owed record: it is not destructive', async () => {
   await withDir(async (path) => {
     const w = new World();
-    w.publish(2, 5, 600);
+    w.publish(2, 5, 600, 150);
     // the same chain as a delta over the replica's watermark: no full step in the plan
     w.manifest.deltas = [{ gen: 2, object: w.manifest.full.object, cutoff: VERSION(10), sorted: true }];
     w.manifest.full = { ...w.manifest.full, cutoff: VERSION(0) };

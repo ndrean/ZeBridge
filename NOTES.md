@@ -19335,3 +19335,21 @@ table unseeded with its events held, and the `.finally` forgot it. The automatic
 failed replacement asks for a wait, `lateSeeds` already holds the table, the ask is ignored, and the throw
 then ends the loop that was running. Each attempt is guarded now; the loop ends only when the chain landed
 or the connection is gone. libzb retries from `poll` and has no such loop.
+
+## The shared route is judged on its own cut (2026-10-27)
+
+The fence's trigger was the OWN route alone: `fullPredatesReplica(man, plan, ownPos)`. A tenant table also rides
+`CDC_PUBLIC` (its open-tenant rows), a stream with its own position and its own cut in the manifest, read
+independently of the tenant's. Own route behind its cut and the shared route past its: the full was taken as plain,
+deleted the open-tenant rows back to the shared cut, and left the shared cursor where it was — the events between
+never replay. It needed no race in libzb (own 500 < cut 600, shared 95 > shared cut 40 at the decision); in the TS
+client the shared tail could also pass its cut during the download, after the late check of the previous section
+had looked only at the own route.
+
+`decideFence` (fence.ts) now has `hasFull` and fences when the shared route alone is past its cut; libzb decides the
+same with `core.fullPredatesSharedReplica` after it has read the shared cut. Only the route that is actually past its
+cut rewinds: the own cursor stays (`ownTo = min(ownPos, ownCut)`), and the scope and frontier checks are made for the
+shared route only (`untouched` takes the own scope only when the own route predates). A shared cut that is not proven
+(no incarnations, another incarnation) refuses the fence like any other, which for the shared-only case means a seed
+that used to proceed waits for a chain whose cut can be proven. The log says which: "(position P, not behind it) …
+only the shared route … is past its cut".

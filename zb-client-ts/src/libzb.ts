@@ -3836,7 +3836,7 @@ export class ZeBridge {
       const ownScope = predates ? await this.fenceScope(table, [man.cdc_stream ?? '']) : { refused: null, untouched: [] as Untouched[] };
       const sharedScope = sharedRoute ? await this.fenceScope(table, [sharedRoute]) : { refused: null, untouched: [] as Untouched[] };
       const decision = decideFence({
-        predates, pending,
+        predates, pending, hasFull: plan.some((x) => x.kind === 'full'),
         ownStream: man.cdc_stream ?? '', ownPos, ownCut: typeof man.cutoff_seq === 'number' ? man.cutoff_seq : 0,
         ownScopeRefusal: ownScope.refused,
         ownReplayable: pr.ownReplayable,
@@ -3851,7 +3851,7 @@ export class ZeBridge {
     // PREPARE, shared by the fence decided at the start (`begin`) and by a plain seed whose position
     // moved past the cut while its full downloaded (`settleBeforeFull`). `late` decides again with the
     // tails stopped and, if the chain is still ahead of the position, owes the plain replacement there.
-    type PrepOutcome = { kind: 'prepared'; ownPos: number; sharedMoved: boolean; untouched: number } | { kind: 'plain' } | { kind: 'wait'; why: string };
+    type PrepOutcome = { kind: 'prepared'; ownPos: number; ownBehind: boolean; sharedMoved: boolean; untouched: number } | { kind: 'plain' } | { kind: 'wait'; why: string };
     const prepare = async (man: any, pr: Proof, plan: PlanStep[], late: boolean): Promise<PrepOutcome> => {
       let outcome = { kind: 'wait', why: 'not decided' } as PrepOutcome;
       await this.withStreamQueue(run, () => this.prepareExclusive(async () => {
@@ -3948,9 +3948,20 @@ export class ZeBridge {
         hold.fence = true;
         hold.owed = true;
         this.beginReplacement(table, streams, hold);
-        outcome = { kind: 'prepared', ownPos: now.ownPos, sharedMoved: decision.sharedTo !== null, untouched: untouched.length };
+        outcome = { kind: 'prepared', ownPos: now.ownPos, ownBehind: now.predates, sharedMoved: decision.sharedTo !== null, untouched: untouched.length };
       }));
       return outcome;
+    };
+
+    /// The log line of a prepared fence, for both ways in (`begin`, `settleBeforeFull`). Greppable by the scenarios:
+    /// "fence prepared — chain g<gen> cut at <cut> on <stream>". A fence that only the SHARED route needs leaves the
+    /// own cursor where it is, and says so.
+    const preparedLine = (man: any, pr: Proof, out: Extract<PrepOutcome, { kind: 'prepared' }>) => {
+      const cost = chainCost(man, pr);
+      const where = out.ownBehind
+        ? `behind position ${out.ownPos}: anchor cleared, cursor at the cut${out.sharedMoved ? ' (the shared route too)' : ''}`
+        : `(position ${out.ownPos}, not behind it): anchor cleared; only the shared route ${sharedRoute} is past its cut and goes back to it`;
+      return `fence prepared — chain g${man.gen} cut at ${man.cutoff_seq} on ${man.cdc_stream} ${where}; replacing the rows${out.untouched ? ' — the other tables on the route keep their applied frontier' : ''}${fromLeaf ? ' [from the seeding leaf]' : ''} (chain ${Math.floor(cost.ageMs / 1000)} s old, ${cost.behind} CDC message(s) after its cut on the hub)`;
     };
 
     // Before the first chunk of a full that `begin` took as plain. The decision was taken before
@@ -3965,8 +3976,7 @@ export class ZeBridge {
       const out = await prepare(manifest, pr, plan, true);
       if (out.kind === 'prepared') {
         fenceRun = { fromPos: out.ownPos, shared: out.sharedMoved };
-        const cost = chainCost(manifest, pr);
-        this.appendLog('SYS', `${table}: the position passed the cut while the full downloaded — fence prepared — chain g${manifest.gen} cut at ${manifest.cutoff_seq} on ${manifest.cdc_stream} behind position ${out.ownPos}: anchor cleared, cursor at the cut${out.sharedMoved ? ' (the shared route too)' : ''}; replacing the rows${out.untouched ? ' — the other tables on the route keep their applied frontier' : ''}${fromLeaf ? ' [from the seeding leaf]' : ''} (chain ${Math.floor(cost.ageMs / 1000)} s old, ${cost.behind} CDC message(s) after its cut on the hub)`, 'WARNING');
+        this.appendLog('SYS', `${table}: the position passed the cut while the full downloaded — ${preparedLine(manifest, pr, out)}`, 'WARNING');
         return true;
       }
       // The tails were stopped for the decision: reopen them, unless a fence parks the route (it keeps
@@ -4024,8 +4034,7 @@ export class ZeBridge {
       if (out.kind === 'wait') { this.appendLog('SYS', `${table}: ${out.why}`, 'WARNING'); return null; }
       if (out.kind === 'plain') return plan;
       fenceRun = { fromPos: out.ownPos, shared: out.sharedMoved };
-      const cost = chainCost(man, pr);
-      this.appendLog('SYS', `${table}: fence prepared — chain g${man.gen} cut at ${man.cutoff_seq} on ${man.cdc_stream} behind position ${out.ownPos}: anchor cleared, cursor at the cut${out.sharedMoved ? ' (the shared route too)' : ''}; replacing the rows${out.untouched ? ' — the other tables on the route keep their applied frontier' : ''}${fromLeaf ? ' [from the seeding leaf]' : ''} (chain ${Math.floor(cost.ageMs / 1000)} s old, ${cost.behind} CDC message(s) after its cut on the hub)`, 'WARNING');
+      this.appendLog('SYS', `${table}: ${preparedLine(man, pr, out)}`, 'WARNING');
       return plan;
     };
 
