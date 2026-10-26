@@ -98,6 +98,28 @@ the responder counting each reading once while the boundary moves.
 `scripts/scenarios/readings_roles.py` runs both programs with their own credentials on a stack
 made by `--init-nats operator`, and checks what each role may and may not do.
 
+## Measured
+
+`python3 examples/16-archive/bench.py` (needs `nats-server` on the PATH, `nats-py` and `duckdb`) runs the archiver's own code on a local stream and times each stage, S3 left out. One run, on a 4-core sandbox with NATS on loopback, 500,000 readings of about 100 bytes (DuckDB 1.5.5, nats-py 2.16, nats-server 2.15.1; the container pins nats-py 2.15.0), numbers rounded:
+
+| stage | rate | per unit |
+| --- | --- | --- |
+| ingest: `next_msg` + `common.reading()` + the dict (the archiver's loop) | 24–28k readings/s | 36–42 µs |
+| of which `next_msg` alone | 39–40k/s | 25 µs |
+| of which `reading()` alone (subject split, `json.loads`, metadata) | 78–81k/s | 12–13 µs |
+| a batched pull, `fetch(5000)`, no decoding (the most nats-py can deliver) | 46–48k/s | |
+| flush: JSON lines → DuckDB → Parquet (zstd), a warm process | 140–300k rows/s | 0.35–0.7 s per 100,000 rows |
+
+What it says:
+
+- **Ingestion is the limit**, about 8 times the cost of the flush: 500,000 readings take about 20 s to read and 2–3 s to write. One archiver serves one tenant, and 25k readings/s sustained is over two billion readings a day, so this is not a bottleneck for a plausible sensor fleet.
+- **A flush stops the loop** (the archiver reads and writes in turn): 0.35–0.7 s per default batch of 100,000. The stream holds the readings meanwhile, and its retention is checked at start against two flushes plus the S3 outage.
+- **Most of the ingest cost is Python**, not the work: even a batched pull stops near 48k/s. A client in another language would be the way past about 40k readings/s; that has not been built or measured, so the figure to beat is the table above.
+- **The flush has little to gain.** Writing the JSON lines to disk and reading them back is the larger part of it, but replacing them with CSV gained 25–40% in a same-process comparison and was not adopted: it changes how strings, empty values and NaN are parsed for a stage that is not the limit. DuckDB writing Parquet from columns already in memory is an order of magnitude faster, which only matters if the rows were produced in columnar form to begin with.
+- **Not measured:** the S3 upload (R2, SeaweedFS), real sensor traffic and its shapes (many sensors, wide payloads), a stream that has fallen behind (catch-up reads), memory (`rows` holds a whole batch as Python dicts), and the responder.
+
+For scale, a bulk export of table rows to Parquet is a different workload: it reads a table in blocks and writes columns, with no per-message round trip. That is where figures in the millions of rows per second belong; the archiver pays one stream message per reading.
+
 ## Not yet
 
 - **The archive lag** on the bridge's `/metrics`: how far each tenant's archive is behind
