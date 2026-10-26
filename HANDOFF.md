@@ -24,35 +24,13 @@ Delete this file once the open items below are closed.
 snapshot boundaries / overlap replay, pending writes across a recreate, clients connecting before tenant
 mappings arrive.
 
-## Blocker: the nats.zig fork does not have the pinned commit yet
+## The nats.zig fork (resolved 2026-10-26)
 
-`main` pins the `nats.zig` gitlink at `da738dccf3b2e1044a87ceef2aaa2641d1e49383` and `.gitmodules` points at
-`https://github.com/ndrean/nats.zig.git`, branch `zebridge`. **That commit exists only in a bundle**, not on
-the fork. Until it is pushed, `git submodule update --init` and CI on `main` fail with "not our ref".
-
-Fix, in the owner's clone of the fork (the sandbox cannot push there; its token is scoped to ZeBridge):
-
-```
-cd ZeBridge/nats.zig
-git remote -v                      # origin must be (a fork of) lalinsky/nats.zig
-git fetch origin                   # the bundle's prerequisite is upstream b8ffdd9
-git bundle verify nats.zig-zebridge.bundle
-git fetch nats.zig-zebridge.bundle zebridge:zebridge
-git tag zebridge/b8ffdd9-1 da738dc
-git push <fork-remote> zebridge zebridge/b8ffdd9-1
-```
-
-`bundle verify` failing with "lacks these prerequisite commit" means the clone does not have upstream
-`b8ffdd9`: add `https://github.com/lalinsky/nats.zig` as a remote and fetch it first.
-
-If the bundle is lost, rebuild the branch: upstream `b8ffdd9`, then one commit per patch of `nats.zig-patch/`
-as it was before PR #14 (`git show 974b38d^1:nats.zig-patch/`; patches `01`…`41`, `03` is absent), applied in
-order with `git apply`, then `NATS_ZIG_NOTES.md` copied from the same place as a last commit. The tree must
-equal the old vendored tree except for that file (`diff -r --exclude=.git`). The commit ids will then differ
-from `da738dc`: repin the gitlink and tag. Alternatively start a session with `ndrean/nats.zig` selected, so
-it can push.
-
-After the push: `git submodule update --init` on a fresh clone of `main`, and one green CI run.
+`main` pins the `nats.zig` gitlink at `da738dccf3b2e1044a87ceef2aaa2641d1e49383`, the tip of branch `zebridge` on
+`https://github.com/ndrean/nats.zig` (also tagged `zebridge/b8ffdd9-1`). The fork has it and
+`git submodule update --init` on `main` was checked from the owner's clone. Pitfall met on the way: a plain
+folder at `nats.zig/` (not a clone) makes git run submodule commands against the superproject and makes the
+pull fail with "Could not access submodule"; keep the folder empty until `git submodule update --init`.
 
 Open decision: `build.zig.zon` still has `.nats = .{ .path = "nats.zig" }` (the submodule); a
 `url = git+https://github.com/ndrean/nats.zig#zebridge/b8ffdd9-1` dependency would drop the submodule.
@@ -85,9 +63,9 @@ nats-server ≥ 2.15, Zig 0.17, a venv at `/opt/zenv` with `nats-py nkeys msgpac
    tarball, `zig fetch ./x.tar.gz`. `libzb/build.zig.zon` may be trimmed locally for that; it is marked
    skip-worktree (`git ls-files -v libzb/build.zig.zon` shows `S`). **Never commit it.** Restore with
    `git update-index --no-skip-worktree libzb/build.zig.zon && git checkout libzb/build.zig.zon`.
-2. **Submodule.** `git submodule update --init` needs the fork (see the blocker). Without it, check the
-   submodule out at the pinned commit from a local copy; a dirty submodule trips the "uncommitted changes"
-   stop hook.
+2. **Submodule.** `git submodule update --init` fetches the fork; if the sandbox cannot reach it, check the
+   submodule out at the pinned commit from a local copy. A submodule left dirty or at another commit trips the
+   "uncommitted changes" stop hook.
 3. **PostgreSQL.** A throwaway server with `wal_level=logical`, trust auth, user `postgres` (CREATEDB):
 
    ```
