@@ -2653,6 +2653,19 @@ pub const SyncClient = struct {
         const watermark: ?[]const u8 = if (wm_rows.len > 0 and wm_rows[0][0] == .text) wm_rows[0][0].text else null;
 
         const plan = try core.planFromManifest(a, man, watermark);
+        // A seeding leaf's manifest can arrive before its objects do (two mirrors). Every object
+        // of the plan must be there BEFORE anything changes — a fence's PREPARE included — or
+        // the hub's chain is the one used.
+        if (from_seed) {
+            const leaf_bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, tenant });
+            for (plan.array.items) |step| {
+                const name = if (step == .object) (if (step.object.get("name")) |v| (if (v == .string) v.string else "") else "") else "";
+                _ = transport.ObjectPull.sizeIn(src, a, leaf_bucket, name) catch {
+                    log.info("{s}: the seeding leaf's manifest names {s}, which its cache does not hold yet — seeding from the hub", .{ table, name });
+                    return error.SeedStale;
+                };
+            }
+        }
         // D2's destruction guard: a full from a chain older than this replica's
         // position would destroy rows CDC will never re-deliver.
         const cdc_stream = if (man.object.get("cdc_stream")) |v| (if (v == .string) v.string else "") else "";
@@ -2692,7 +2705,10 @@ pub const SyncClient = struct {
         const predates = core.fullPredatesReplica(man, plan.array, pos);
         const pending = (try self.st.query(a, "SELECT 1 FROM _zbz_fence WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } })).len > 0;
         if (predates or pending) {
-            if (from_seed) return error.SeedStale;
+            // A fence is taken from a seeding leaf's chain too (the recovery model's §6): its
+            // cut and identities have their hub meaning, and every proof below reads the HUB's
+            // stream — the incarnation it was cut on, the event after the cut still retained.
+            // A leaf chain whose suffix the hub no longer holds is `SeedStale` below, as before.
             // A rewind of the own route (the chain behind the cursor) replays its events to
             // every table on it: the others are left untouched (each keeps an applied
             // frontier) when their coverage is known; a pending retry already at or before
@@ -2894,7 +2910,7 @@ pub const SyncClient = struct {
             };
             _ = self.frontier_parked.swapRemove(cdc_stream);
             if (shared_rewind != null) _ = self.frontier_parked.swapRemove(shared_stream_m);
-            log.warn("{s}: fence prepared — chain g{d} cut at {d} on {s} behind position {d}: anchor cleared, cursor at the cut{s}; replacing the rows{s}", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, cdc_stream, pos, if (shared_rewind != null) " (the shared route too)" else "", if (writes.items.len > 0) " — the other tables on the route keep their applied frontier" else "" });
+            log.warn("{s}: fence prepared — chain g{d} cut at {d} on {s} behind position {d}: anchor cleared, cursor at the cut{s}; replacing the rows{s}{s}", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, cdc_stream, pos, if (shared_rewind != null) " (the shared route too)" else "", if (writes.items.len > 0) " — the other tables on the route keep their applied frontier" else "", if (from_seed) " [from the seeding leaf]" else "" });
         }
         const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, tenant });
         var applied: usize = 0;

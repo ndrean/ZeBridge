@@ -3790,6 +3790,19 @@ export class ZeBridge {
     const begin = async (man: any, pr: Proof): Promise<PlanStep[] | null> => {
       await this.fault('before_decision');
       const plan = planFrom(man);
+      // A seeding leaf's manifest can arrive before its objects do (two mirrors). Every object of
+      // the plan must be there BEFORE anything changes — a fence's PREPARE included — or the
+      // hub's chain is the one used.
+      if (fromLeaf) {
+        for (const step of plan) {
+          let oi: any = null;
+          try { oi = await os.info(step.name); } catch { /* unreadable: absent */ }
+          if (!oi || oi.deleted) {
+            this.appendLog('SYS', `${table}: the seeding leaf's manifest names ${step.name}, which its cache does not hold yet — seeding from the hub`, 'INFO');
+            return null;
+          }
+        }
+      }
       const first = await decide(man, pr, plan);
       if (first.decision.kind === 'refuse') { this.appendLog('SYS', `${table}: ${first.decision.why}`, 'WARNING'); return null; }
       if (first.decision.kind === 'none') {
@@ -3798,13 +3811,10 @@ export class ZeBridge {
         if (plan.length) await this.prepareExclusive(async () => this.beginReplacement(table, [man.cdc_stream, ...(sharedRoute ? [sharedRoute] : [])].filter((x): x is string => !!x), hold));
         return plan;
       }
-      // A fence is taken from the hub's chain only (the recovery model, §8): a leaf's copy may
-      // be behind the very events the cursor is about to rewind to. Refused here, the caller
-      // asks the hub, whose chain is fenced.
-      if (fromLeaf) {
-        this.appendLog('SYS', `${table}: chain predates replica — not fencing from a leaf's chain; the hub's is asked`, 'WARNING');
-        return null;
-      }
+      // A fence is taken from a seeding leaf's chain too (the recovery model, §6): its cut and
+      // identities have their hub meaning, and every proof (`prove`, `decide`, VERIFY) reads the
+      // HUB's stream — the incarnation it was cut on, the event after the cut still retained. A
+      // leaf chain whose suffix the hub no longer holds is refused by those proofs, as before.
 
       // PREPARE, before any row changes: the table durably unseeded and the routes' cursors
       // at the cuts, in one transaction, the fence recorded as owed. A failure or a crash
@@ -3915,7 +3925,7 @@ export class ZeBridge {
       if (out.kind === 'wait') { this.appendLog('SYS', `${table}: ${out.why}`, 'WARNING'); return null; }
       if (out.kind === 'plain') return plan;
       fenceRun = { fromPos: out.ownPos, shared: out.sharedMoved };
-      this.appendLog('SYS', `${table}: fence prepared — chain g${man.gen} cut at ${man.cutoff_seq} on ${man.cdc_stream} behind position ${out.ownPos}: anchor cleared, cursor at the cut${out.sharedMoved ? ' (the shared route too)' : ''}; replacing the rows${out.untouched ? ' — the other tables on the route keep their applied frontier' : ''}`, 'WARNING');
+      this.appendLog('SYS', `${table}: fence prepared — chain g${man.gen} cut at ${man.cutoff_seq} on ${man.cdc_stream} behind position ${out.ownPos}: anchor cleared, cursor at the cut${out.sharedMoved ? ' (the shared route too)' : ''}; replacing the rows${out.untouched ? ' — the other tables on the route keep their applied frontier' : ''}${fromLeaf ? ' [from the seeding leaf]' : ''}`, 'WARNING');
       return plan;
     };
 

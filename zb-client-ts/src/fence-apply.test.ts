@@ -27,6 +27,9 @@ class World {
     [PUB]: { created: 'pub-1', first: 1, last: 200 },
   };
   objects = new Map<string, Uint8Array>();
+  /// A seeding leaf's mirrors, when the test has one: its own manifests and objects.
+  leaf: World | null = null;
+  view(domain?: string): World { return domain === 'leaf' && this.leaf ? this.leaf : this; }
   /// A chain object read waits for this (a slow download), per object name.
   hold?: (name: string) => Promise<void> | undefined;
   manifests: Record<string, any> = {};
@@ -107,11 +110,16 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
       },
     },
     transport: {
-      kv: async () => ({ get: async (key: string) => {
-        const m = world.manifests[String(key).split('.').pop() as string];
+      kv: async (_nc: unknown, _bucket: string, _o: unknown, jsOpts: any) => ({ get: async (key: string) => {
+        const m = world.view(jsOpts?.domain).manifests[String(key).split('.').pop() as string];
         return m ? { operation: 'PUT', value: new TextEncoder().encode(JSON.stringify(m)) } : null;
       } }),
-      objectStore: async () => ({}),
+      objectStore: async (_nc: unknown, _bucket: string, jsOpts: any) => ({
+        info: async (name: string) => {
+          const o = world.view(jsOpts?.domain).objects.get(name);
+          return o ? { size: o.length, deleted: false } : null;
+        },
+      }),
       jetstreamManager: async () => ({ streams: { info: async (name: string) => {
         const st = world.streams[name];
         if (!st) throw new Error(`no stream ${name}`);
@@ -119,7 +127,7 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
       } } }),
     },
     jsOpts: () => ({ domain: 'hub' }), appendLog: (_t: string, m: string) => { log.push(m); },
-    objectBlob: async (_os: unknown, _bucket: string, name: string) => { await world.hold?.(name); return world.objects.get(name) ?? null; },
+    objectBlob: async (_os: unknown, _bucket: string, name: string, jsOpts?: any) => { await world.hold?.(name); return world.view(jsOpts?.domain).objects.get(name) ?? null; },
     seedProgress: () => {}, triggerChange: () => {}, reapplyPending: async () => {}, drainPending: async () => {},
     subscribeStreams: async () => { passes.push(1); }, reach: () => {},
   });
@@ -484,24 +492,89 @@ test('an on-demand table on the route does not count as a dependent', async () =
   });
 });
 
-test('a fence is not taken from a leaf\'s chain: refused, nothing prepared, the hub is asked', async () => {
+/// A client behind a seeding leaf: the leaf's mirrors hold `leafCut`'s chain (note `leaf`), the hub a
+/// newer one (note `hub`). Records which domain every read went to.
+function behindLeaf(path: string, leafCut: number, hubCut = 450) {
+  const w = new World();
+  w.leaf = new World();
+  w.leaf.publish(2, 5, leafCut);
+  w.publish(5, 4, hubCut);
+  follower(path, w);
+  const t = client(path, w);
+  t.c.config.seedDomain = 'leaf';
+  t.c.config.jsDomain = 'hub';
+  const seen: string[] = [];
+  const real = t.c.transport.kv;
+  t.c.transport.kv = async (nc: unknown, bucket: string, o: unknown, jsOpts: any) => { seen.push(jsOpts?.domain ?? 'hub'); return real(nc, bucket, o, jsOpts); };
+  return { w, t, seen };
+}
+
+test('a fence is taken from a seeding leaf\'s chain: the leaf\'s objects, the hub\'s proofs, the hub never asked for the chain', async () => {
+  await withDir(async (path) => {
+    const { t, seen } = behindLeaf(path, 300);
+    try {
+      assert.equal(await t.c.applyGenerations('item'), true);
+      assert.deepEqual(seen, ['leaf'], 'only the leaf was asked for a manifest');
+      assert.deepEqual(rows(t.db), wanted(2, 5), 'the leaf\'s rows, though the hub has a newer chain (an older generation on a leaf stays usable)');
+      assert.equal(pos(t.db, OWN), 300, 'the cursor is at the LEAF chain\'s cut: the events after it replay from the hub');
+      assert.deepEqual({ ...anchor(t.db) }, { seed_seq: 300, seed_stream: OWN, shared_seed_seq: 40 });
+      assert.equal(owed(t.db), 0);
+      assert.ok(t.log.some((m) => /fence prepared — chain g2 cut at 300.*\[from the seeding leaf\]/.test(m)));
+    } finally { t.close(); }
+  });
+});
+
+test('a leaf whose manifest is ahead of its objects: nothing is prepared, the hub\'s chain is fenced', async () => {
+  await withDir(async (path) => {
+    const { w, t, seen } = behindLeaf(path, 300);
+    try {
+      w.leaf!.objects.clear(); // the manifest mirrored, the objects not yet
+      assert.equal(await t.c.applyGenerations('item'), true);
+      assert.deepEqual(seen.slice(0, 2), ['leaf', 'hub']);
+      assert.ok(t.log.some((m) => /the seeding leaf's manifest names item-i1-g2-full, which its cache does not hold yet/.test(m)));
+      assert.ok(!t.log.some((m) => /\[from the seeding leaf\]/.test(m)));
+      assert.deepEqual(rows(t.db), wanted(5, 4), 'the hub\'s chain');
+      assert.equal(pos(t.db, OWN), 450);
+      assert.equal(owed(t.db), 0);
+    } finally { t.close(); }
+  });
+});
+
+test('a leaf chain whose suffix the hub no longer holds is not fenced: the hub\'s chain is', async () => {
+  await withDir(async (path) => {
+    const { w, t } = behindLeaf(path, 300);
+    try {
+      w.streams[OWN]!.first = 400; // the hub's retention is past the leaf's cut + 1; the hub's own cut (450) is fine
+      assert.equal(await t.c.applyGenerations('item'), true);
+      assert.ok(!t.log.some((m) => /\[from the seeding leaf\]/.test(m)), 'no fence prepared from the stale leaf chain');
+      assert.deepEqual(rows(t.db), wanted(5, 4));
+      assert.equal(pos(t.db, OWN), 450);
+    } finally { t.close(); }
+  });
+});
+
+test('a fence from a leaf interrupted after a chunk is owed: the reopened client recovers it, from the leaf', async () => {
   await withDir(async (path) => {
     const w = new World();
-    w.publish(2, 5, 300);
+    w.leaf = new World();
+    w.leaf.publish(2, 5, 300);
+    w.publish(5, 4, 450);
     follower(path, w);
-    const t = client(path, w);
+    const first = client(path, w, { hook: crash('after_chunk') });
+    first.c.config.seedDomain = 'leaf'; first.c.config.jsDomain = 'hub';
     try {
-      t.c.config.seedDomain = 'leaf';
-      t.c.config.jsDomain = 'hub';
-      const seen: string[] = [];
-      const real = t.c.transport.kv;
-      t.c.transport.kv = async (nc: unknown, bucket: string, o: unknown, jsOpts: any) => { seen.push(jsOpts?.domain ?? 'hub'); return real(nc, bucket, o, jsOpts); };
-      assert.equal(await t.c.applyGenerations('item'), true, 'the leaf attempt is refused, the hub attempt is fenced');
-      assert.deepEqual(seen.slice(0, 2), ['leaf', 'hub']);
-      assert.ok(t.log.some((m) => /not fencing from a leaf's chain/.test(m)));
-      assert.equal(owed(t.db), 0);
-      assert.deepEqual(rows(t.db), wanted(2, 5));
-    } finally { t.close(); }
+      await assert.rejects(() => first.c.applyGenerations('item'), /crash at after_chunk/);
+      assert.equal(owed(first.db), 1);
+      assert.equal(pos(first.db, OWN), 300);
+    } finally { first.close(); }
+    const second = client(path, w);
+    second.c.config.seedDomain = 'leaf'; second.c.config.jsDomain = 'hub';
+    try {
+      assert.equal(await second.c.applyGenerations('item'), true, 'the retry is a fence again, with every proof');
+      assert.equal(owed(second.db), 0);
+      assert.deepEqual(rows(second.db), wanted(2, 5));
+      assert.equal(pos(second.db, OWN), 300);
+    } finally { second.close(); }
   });
 });
 
