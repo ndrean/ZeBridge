@@ -64,14 +64,14 @@ Priority after the GC floor: a deployment security audit and a real backup/resto
 
 The first `zb_client_sync` of a libzb client answers `PrepareFailed` (no detail) on the private stacks, with the tenant mapping and the schema both published; the next polls seed normally. `multi_bridge.py` shows the same on unmodified `main`, so it predates the GC-floor work. The private-stack scenarios ignore that first answer (as `recreate_recovery.py`'s worker always did); worth finding which SQLite statement fails and why, since a host that treats a sync error as fatal would stop there.
 
-## Defects found while writing the troubleshooting reference (measured 2026-10-26, private stack)
+## Walls: fixed 2026-10-27, and what is left
 
-Details and the measurements are in [CLAUDE.md](CLAUDE.md#troubleshooting-when-a-fixed-limit-is-the-cause). Not fixed; each is its own increment.
+The four defects of the troubleshooting reference are fixed on `walls-fixes` (NOTES "A bridge that could not return, and the limits it hit"; `scripts/scenarios/walls.py` A–G, `http_server.zig` and `batch_publisher.zig` unit tests, each shown to fail without its fix). Left, deliberately:
 
-1. **An error that escapes `main` leaves a live, silent, dead bridge.** The `errdefer should_stop.store(true)` after `wal_mon.start` runs after the later `defer` joins in unwinding order. Boot errors leave the process in the HTTP accept loop (one request releases it); an error in the replication loop leaves `main` in `MutationListener.join`, which neither a request nor SIGTERM releases. The supervisor never restarts it and no log line says why. Fix: set `should_stop` in each join's own defer (or register the errdefer after the last thread start), and a regression scenario that provokes an error in the loop and expects exit 1 with the error line.
-2. **A tenant id longer than the subject buffer allows** (`len(tenant) + len(table) > 115`) takes the bridge down as in 1 (the insert prong returns `NoSpaceLeft`); from 93 characters the generation producer already fails every cadence with `InvalidSubject` and clients never seed. `isSubjectToken` admits 128. Fix at the door: one maximum for the tenant id, enforced where the mapping is written (`zebridge_user_tenants`, enrollment) and by the preflight, derived from the longest table and the 255-character subject limit.
-3. **A table name of about 40+ characters** stops the bridge at boot with `MsgIdTooLong` (boot schema id `schema-boot-<table>-<lsn>-e<epoch>` in the 64-byte slot id; the limit falls as the WAL position gains digits). Fix: widen `msg_id_buf`, or refuse the table at `zebridge_enable` and in the preflight with the number.
-4. The quarantine line for a tenant value that is not a subject token blames the replica identity.
+- Rows dropped for an unusable tenant or an overlong subject are **log lines only**, not a metric. A counter (like `bridge_refused_events_dropped_total`) and a `--diagnose` finding would let an operator see them without reading the log.
+- Nothing scans existing data at enable time for tenant values over 92 characters; the first row or the producer's first build says so. A check in `zebridge_enable`/`--diagnose` (`WHERE length(tenant) > 92`) would say it before the first row.
+- The 128-byte subject buffer is still shorter than the longest legal subject (92 + 62 + prefix); the check turns that into a loud drop, not a larger buffer (every ring slot would grow).
+- Not replayed on the native stack: only the private stack (`walls.py`).
 
 ## Open decisions and ideas
 

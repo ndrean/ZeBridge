@@ -54,6 +54,7 @@ bridge) and drops it.
 - `rls_visibility.py` — the RLS guard (a policy that hides rows blocks publication, visible in metrics and `--diagnose`).
 - `leaf_fence.py` — a fence taken from a seeding leaf's chain (hub + leaf nats-servers, no auth).
 - `gc_isolation.py` — the GC floor: competing sweepers, lock-owner failure, rollback and retention increase, a delayed write racing with reaping (private stack).
+- `walls.py` — the fixed limits at their edge (long table / tenant / subject refused loudly, an error escaping the loop ends the process, SIGTERM on an idle bridge); case E needs the bridge fault build (`-Dtest-faults=true -p zig-out-faults`, hook `ZB_TEST_LOOP_ERROR`).
 - `scripts/scenarios/run.py {offline|live|owns|all}` sequences the groups; `--list` shows them.
 
 **Fault-hook builds.** Crash and timing points are compiled in only with `-Dtest-faults=true` (libzb) and exist as env
@@ -128,26 +129,21 @@ Where to look, in order: the bridge's log (stdout and stderr; `error(` and `🔴
 `SELECT * FROM zebridge_suspensions`, `SELECT * FROM zebridge_check_all()`, `nats stream ls` / `nats kv ls`. In a scenario's
 private stack the bridge log is `/tmp/zb_rr<tag>_<label>.log`.
 
-### A bridge that stops without saying why
+### A bridge that is up but silent
 
-Zig prints `error: <Name>` and a return trace **only when `main` returns**, and `main` cannot return while a `defer` join waits
-for a thread that is still running. Measured on the scenarios' private stack (2026-10-26), an error that escapes `main` leaves
-the process **alive with replication dead**: the walsender still `streaming`, the slot still `active` (its `confirmed_flush`
-behind the walsender's `sent` position), the last log line an ordinary `info`. Two shapes:
+Fixed 2026-10-27, and kept here because the same shape can return from a new `return err`. Zig prints `error: <Name>` and a return
+trace only when `main` returns, and `main` cannot return while a `defer` join waits for a thread that is still running. Two
+things used to hold it: the `errdefer` that sets `should_stop` ran *after* the mutation listener's join in unwinding order (an
+error in the replication loop left `main` in `MutationListener.join`: alive, replication dead, SIGTERM ignored, no `error:`
+line), and `Server.stop()` *closed* the HTTP listener, which on Linux does not wake a thread blocked in `accept` (an idle
+bridge told to stop exited only when the next HTTP request arrived). Both are covered by `scripts/scenarios/walls.py` (E, F)
+and `http_server.zig`'s "stop wakes an accept" test.
 
-- the error escapes during boot, before the mutation listener starts: the process waits in the HTTP accept loop. **One request
-  (`curl -s localhost:<port>/health`) releases it**; it exits 1 and the real `error:` line is in the log;
-- the error escapes in the replication loop, after the listener started: `main` waits in `MutationListener.join`, and neither an
-  HTTP request nor SIGTERM releases it (80 s and a SIGTERM measured). Only SIGKILL ends it, and the error is never printed. The
-  `errdefer` that sets `should_stop` (`bridge.zig`, after `wal_mon.start`) runs *after* the later `defer` joins in unwinding
-  order, so the join it should have released has already begun. This is the source's reading of the frame list from `gdb -p`
-  (`bridge.main` → `MutationListener.join`); the error value itself was not captured.
-
-So: **a bridge that is up but silent** (no new `info` line, `bridge_wal_confirmed_lag_bytes` rising or the CDC stream not
-growing) is dead until proven otherwise. Check the walsender position against `pg_current_wal_lsn()`, take
-`gdb -p <pid> -batch -ex 'thread apply all bt 12'`, send one HTTP request, then kill it and read the log. Two causes found this
-way are in the table below (table name, tenant id). They are defects of the walls and of the unwind order, not of the
-operator; `HANDOFF.md` lists the fix.
+If a bridge is up but silent (no new `info` line, `bridge_wal_confirmed_lag_bytes` rising or the CDC stream not growing):
+compare the walsender's `sent` position (`pg_stat_replication`) with the slot's `confirmed_flush_lsn`, take
+`gdb -p <pid> -batch -ex 'thread apply all bt 12'` (`bridge.main` under a `join` means `main` has already returned an error),
+send one HTTP request, then SIGKILL it and read the log. Register any new thread's `errdefer should_stop.store(true)` *after*
+its `defer join`, never before.
 
 ### Walls
 
@@ -155,10 +151,10 @@ operator; `HANDOFF.md` lists the fix.
 
 | Where it hurts | You see | The wall | Confirm | Way out |
 |---|---|---|---|---|
-| A table name of about 40+ characters (PostgreSQL allows 63) | Bridge boots, publishes the first boot schemas, stops; the log ends on `Boot schema published to KV for …` (the first table that fits); `error: MsgIdTooLong` appears only once the process is released (see above). Measured: 20, 30 and 35 characters boot, 40 and 50 do not | The slot-resident message id is `[64]u8` (`batch_publisher.zig`, `msg_id_buf`); the boot schema id is `schema-boot-<table>-<lsn in decimal>-e<epoch>`, so the limit is `64 - 25 - (digits of the LSN - 9)`: **it falls by one for each extra digit as the WAL position grows**, so a table that booted last year can stop the bridge at a later restart (derived from the source, consistent with the measure). Event ids `<lsn in hex>-<table>-<op>` allow up to 40 | `error: MsgIdTooLong` at `bridge.zig` `publishBootSchemas`; length of the longest published table | Rename the table. Not recoverable by configuration |
-| A tenant id of 93+ characters (with an 8-character table) | Rows are published (CDC stream has them), but **no generation is ever built** for that tenant: `generation build failed for '<tenant>'/'<table>': error.InvalidSubject — next cadence retries`, every cadence; no manifest, so clients never seed. Measured with an 8-character table: 92 builds, 93 does not | A subject over NATS's 255-character limit (`nats.zig/src/validation.zig`); the tenant is part of it more than once (not traced to the exact subject). The limit therefore also shrinks with the table name | the `InvalidSubject` line; `nats kv get generations <key>` has no entry | Shorter tenant ids. Keep them under ~64 |
-| `len(tenant) + len(table) > 115` (a 108-character tenant id with an 8-character table; less with an `.<suffix>`) | The row is **lost**, the bridge is dead and does not say so: `CDC_<tenant>` stays empty, no error line, process alive, SIGTERM ignored (previous section). Measured: tenant 107 publishes, 108 does not, with table `rr_items`. The generation failure above is also present | The CDC subject `cdc.<tenant>.<table>.<op>[.<suffix>]` is built in a `[128]u8` (`Config.Buffers.subject_buffer_size`) with a sentinel byte, so `4 + T + 1 + L + 1 + 6 + 1 ≤ 128`; `std.fmt.bufPrintSentinel` returns `NoSpaceLeft` and the insert prong does `else => return err` (from the source; the error value was not captured live) | Walsender `sent` ahead of the slot's `confirmed_flush`, CDC stream not growing, `gdb` shows `MutationListener.join` under `bridge.main`. Compute the subject length yourself | Shorter tenant ids. `isSubjectToken` (`utils.zig`, `max_subject_token_len = 128`) admits ids this buffer cannot hold |
-| A tenant id with `.`, `*`, `>`, whitespace, empty, or over 128 characters | `🔴 Quarantining insert on '<table>' to '.unrouted': the catalogue names tenant column '…' but this event carries no value for it. Check that the replica identity still covers it.` The row is **dropped** (counted, never published) | `utils.isSubjectToken`. The log text blames the replica identity; the value is present and merely unusable as a subject token | The quarantine line for each such row; the tenant value in PostgreSQL | Fix the data. The message misleads: check the value before the replica identity |
+| A table name of 63 characters (PostgreSQL's maximum) | `zebridge_enable` fails with `table name … is 63 characters: the replica-identity index name derived from it … is cut to the table's own name`. Before 2026-10-27 it failed with `"<table>" is not an index`. Measured | The tenant replica-identity index is `<table>_zb_ri` in a `name` (63 bytes): a 63-character table cuts the suffix off and the "index" is the table (`init.core.template.sql`, `zebridge_tenant_replica_identity`) | the `zebridge_enable` error | Rename to at most 62 characters, or put the tenant into the replica identity yourself. Tables of 40–62 characters work: the slot's message id is `Config.Buffers.msg_id_buffer_size` (128), it was 64 and a 40-character table stopped the bridge at boot with `MsgIdTooLong` |
+| A tenant id of 93+ characters (or empty, or with `.`, `*`, `>`, whitespace) | The row is **dropped**, not published: `🔴 Dropping insert on '<table>': its tenant value (93 characters, column '…') cannot be a subject token …`; the producer says `no generation is built — the tenant id … cannot be a subject token`. Log lines only, **not a metric**. Before 2026-10-27: rows published, every generation build failed with a bare `InvalidSubject`, clients never seeded. Measured: 92 builds and publishes, 93 does not | `utils.max_subject_token_len = 92`: a generation build creates a consumer on the object-store stream whose API subject carries the tenant twice (`$JS.API.CONSUMER.CREATE.OBJ_gen-<tenant>.<name>.$O.gen-<tenant>.C.>`) against NATS's 255-character limit (derived from the arithmetic and the measured boundary, not traced in nats.zig) | the two log lines; `SELECT DISTINCT tenant_id FROM t WHERE length(tenant_id) > 92` | Fix the data. Keep tenant ids short (a uuid is 36) |
+| A CDC subject longer than its buffer (`3 + 1 + tenant + 1 + table + 1 + op [+ 1 + suffix] + 1 > 128`, e.g. a 90-character tenant with a 40-character table) | The row is dropped: `🔴 Dropping insert on '<table>': its subject (tenant N characters, table M) does not fit the 128-byte subject buffer`; the bridge goes on. Log line only, **not a metric**. Before 2026-10-27 `NoSpaceLeft` escaped `main` and the bridge died silently (measured: tenant 107 published, 108 did not, with table `rr_items`) | `Config.Buffers.subject_buffer_size` (128), `utils.cdcSubjectFits` | the log line; compute the length | Shorter tenant id or table name; or raise the buffer (it is inside every ring slot) |
+| A tenant column that is NULL, or missing from the event | `🔴 Quarantining insert on '<table>' to '.unrouted': the catalogue names tenant column '…' but this event carries no value for it. Check that the replica identity still covers it.` The row is dropped (counted nowhere but the log) | The event carries no tenant value; this text is for that case only since 2026-10-27 (a value that is present but unusable has its own line, above) | the quarantine line | Check the replica identity: [OPERATIONS](OPERATIONS.md#suspended-tables) |
 | A row wider than the event buffer | One table is suspended (`row_too_large`); its events are dropped and counted; others flow | `BASE_BUF` (default 12 → 4 KB per event slot, ceiling `BASE_BUF_MAX`); also bounded by the server's `max_payload` minus `payload_envelope_margin_bytes` (16 KiB) | `zebridge_suspensions`; the boot sizing lines; `--diagnose` | [Sizing the ring](OPERATIONS.md#sizing-the-ring); `BASE_BUF` up |
 | A migration adds columns | `too_many_columns` suspension on that table | `MAX_COLUMNS`: auto-detected at boot as the widest table doubled and rounded to a multiple of 8, floor/ceiling in `Config.Batch` (`default_max_columns` 128, `absolute_max_columns` 1600) | the boot line `MAX_COLUMNS=… (auto-detected …)` | Restart re-detects; or set `MAX_COLUMNS` |
 | More than 256 writable tables, or more than 64 refused tables in one bridge | `WritableRegistryFull` / `RefusalRegistryFull`; later tables are not registered | `writable_tables.max_tables = 256`, `refused_tables.max_refused = 64`; fixed arrays, a concurrent reader scans them | source | Split the publication across bridges, or fix the refusals (64 refused tables is already a misconfiguration) |
@@ -170,14 +166,14 @@ operator; `HANDOFF.md` lists the fix.
 | A write is refused after a long offline period | `PredatesGcWatermark` | The database's GC floor, which never goes down ([PROTOCOL](PROTOCOL.md#the-floor-one-per-database-and-it-never-goes-down)) | `SELECT * FROM zebridge_gc_watermark` | Intended; the client must resync. Do not lower the floor to make a write pass |
 | `GcFloorUnavailable` on every write | Mutation lanes retry forever | The write path takes the floor under a shared lock; the init SQL was not re-applied after an upgrade (`zebridge_gc_floor_acquire()` missing) | `--diagnose`; `\df zebridge_gc_*` | Re-apply `--init-sql` as the administrator |
 | A client back from a pause re-seeds, or says `chain predates the stream` | | The CDC window (default 3 × cadence) against the chain depth and the GC retention (7 d); `CDC_MAX_AGE_SECONDS`, `CDC_MAX_BYTES`, `CDC_MAX_MSGS` | `bridge_cdc_window_short`, the boot line `CDC window: streams keep …` | [OPERATIONS Troubleshooting](OPERATIONS.md#troubleshooting) |
-| The TypeScript client drops events and logs `events held while waiting for a chain that never came` | | `UNSEEDED_HOLD_MAX = 50_000` (`libzb.ts`); after it, further events for the unseeded table are dropped | the client log | Fix why no chain exists (see the 93-character tenant row), then reconnect |
-| A client waits 90 s at connect for a table | `no generation chain yet — waiting up to 90s` | `GENERATION_WAIT_MS` (`libzb.ts`), same in libzb | the client log | A followed table without a chain: enable it, or remove the stale `schemas` key. A tenant id of 93+ characters never gets one |
+| The TypeScript client drops events and logs `events held while waiting for a chain that never came` | | `UNSEEDED_HOLD_MAX = 50_000` (`libzb.ts`); after it, further events for the unseeded table are dropped | the client log | Fix why no chain exists (see the tenant-id row), then reconnect |
+| A client waits 90 s at connect for a table | `no generation chain yet — waiting up to 90s` | `GENERATION_WAIT_MS` (`libzb.ts`), same in libzb | the client log | A followed table without a chain: enable it, or remove the stale `schemas` key. A tenant id of 93+ characters never gets one (the producer says so) |
 
 ### Rules for adding to this list
 
 - Reproduce it first (private stack, `scripts/scenarios/recreate_recovery.Stack`; `bridge_up` then a row), and write "measured"
   or "source" honestly. An unconfirmed cause stays out of the table.
-- A wall whose symptom names something else (the quarantine text that blames the replica identity, a silent stop, a
+- A wall whose symptom names something else (a quarantine text that blames the wrong cause, a silent stop, a
   generation failure for a tenant whose CDC works) is the reason this section exists: record the **symptom first**.
 - If the fix is a validation at the door (enable time, enrollment, preflight), say so in `HANDOFF.md` rather than documenting the
   limit as permanent.

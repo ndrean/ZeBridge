@@ -279,9 +279,33 @@ pub fn isSubjectToken(s: []const u8) bool {
     return true;
 }
 
-/// Bounded so one hostile value cannot push a subject past what the subject buffer or the
-/// server will accept. Generous next to a tenant id or a uuid-based msg_id.
-pub const max_subject_token_len: usize = 128;
+/// Bounded so one hostile value cannot push a subject past what the server will accept.
+/// Generous next to a tenant id or a uuid-based msg_id.
+///
+/// 92 is the measured and derived ceiling for a tenant: a generation build creates a consumer
+/// on the tenant's object-store stream, and that API subject carries the tenant twice
+/// (`$JS.API.CONSUMER.CREATE.OBJ_gen-<tenant>.<name>.$O.gen-<tenant>.C.>`) against NATS's
+/// 255-character subject limit. Measured 2026-10-26 on a private stack: a 92-character tenant
+/// builds, 93 fails every cadence with `InvalidSubject` and no client ever seeds. (It used to be
+/// 128, which admitted ids the rest of the system could not carry.)
+pub const max_subject_token_len: usize = 92;
+
+/// Whether `cdc.<tenant>.<table>.<op>[.<suffix>]` plus the sentinel fits `capacity` bytes.
+/// Pure, so the bound the event path enforces is testable without a running bridge.
+pub fn cdcSubjectFits(capacity: usize, prefix: usize, tenant: ?usize, table: usize, op: usize, suffix: ?usize) bool {
+    const need = prefix + 1 + (if (tenant) |t| t + 1 else 0) + table + 1 + op + (if (suffix) |s| s + 1 else 0) + 1;
+    return need <= capacity;
+}
+
+test "cdcSubjectFits: the measured boundary of the 128-byte subject buffer" {
+    // Measured 2026-10-26: with table `rr_items` a 107-character tenant publishes, 108 does not.
+    try std.testing.expect(cdcSubjectFits(128, 3, 107, 8, 6, null));
+    try std.testing.expect(!cdcSubjectFits(128, 3, 108, 8, 6, null));
+    // A suffix takes its dot and its length out of the same buffer.
+    try std.testing.expect(!cdcSubjectFits(128, 3, 107, 8, 6, 4));
+    // No tenant token: the bare `cdc.<table>.<op>` shape.
+    try std.testing.expect(cdcSubjectFits(128, 3, null, 63, 6, null));
+}
 
 test "isSubjectToken: the values the bridge actually interpolates" {
     try std.testing.expect(isSubjectToken("acme"));

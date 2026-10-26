@@ -26,7 +26,11 @@ const topology_mod = @import("topology.zig");
 // order to get wrong by hand, and request parsing over a fixed 2048-byte buffer.
 //
 // `std.Io` gives the same cancellation for free: `AcceptError.SocketNotListening` is
-// documented as the shutdown mechanism — closing the listener wakes a blocked `accept`.
+// documented as the shutdown mechanism — `shutdown` on the listener wakes a blocked
+// `accept`. ⚠️ Closing it does not, on Linux: a thread blocked in `accept(2)` stays blocked
+// when another thread `close`s the descriptor (macOS wakes it, which is why this passed on
+// the development machine). Measured 2026-10-26: an idle bridge told to stop exited only
+// when the next HTTP request arrived.
 
 pub const log = std.log.scoped(.http_server);
 
@@ -73,8 +77,8 @@ pub const Server = struct {
     port: u16,
     bind: []const u8 = "127.0.0.1",
     io: std.Io,
-    /// The live listener, so `stop()` can close it and wake a blocked `accept`. Valid only
-    /// while `run` is on the stack.
+    /// The live listener, so `stop()` can shut it down and wake a blocked `accept`. Valid
+    /// only while `run` is on the stack; `run` closes it, never `stop()`.
     server: ?*std.Io.net.Server = null,
     /// Connections currently being served. Bounded by `Config.Http.max_connections`.
     open_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -177,17 +181,21 @@ pub const Server = struct {
     ///
     /// ⚠️ Setting `should_stop` is not enough on its own. The loop checks it between
     /// accepts, and `accept` blocks indefinitely — the old C implementation only got away
-    /// with a flag because it wrapped every accept in a 100ms `poll`. Closing the listener
-    /// is the documented replacement: std says `SocketNotListening` is returned when
-    /// "shutdown was called (possibly while this call was blocking). This allows shutdown
-    /// to be used as a concurrent cancellation mechanism."
+    /// with a flag because it wrapped every accept in a 100ms `poll`. `shutdown` on the
+    /// listener is the documented replacement: std says `SocketNotListening` is returned
+    /// when "shutdown was called (possibly while this call was blocking). This allows
+    /// shutdown to be used as a concurrent cancellation mechanism." It must be `shutdown`,
+    /// not `close`: on Linux closing a descriptor leaves another thread's `accept` blocked,
+    /// so a bridge told to stop (or one whose `main` returned an error) waited for the next
+    /// HTTP request to exit. `run` owns the descriptor and closes it on the way out.
     ///
     /// Safe to call when `run` is not on the stack, and safe to call twice.
     pub fn stop(self: *Server) void {
         self.should_stop.store(true, .seq_cst);
-        if (self.server) |srv| {
-            self.server = null;
-            srv.deinit(self.io);
+        if (@atomicLoad(?*std.Io.net.Server, &self.server, .acquire)) |srv| {
+            self.io.vtable.netShutdown(self.io.userdata, srv.socket.handle, .both) catch |err| {
+                log.warn("could not shut the listener down ({s}); the accept loop exits at the next connection", .{@errorName(err)});
+            };
         }
     }
 
@@ -219,12 +227,14 @@ pub const Server = struct {
             log.err("🔴 Could not listen on {s}:{d}: {s}", .{ self.bind, self.port, @errorName(err) });
             return error.BindFailed;
         };
-        self.server = &server;
-        // `stop()` may have closed and cleared it already; only clean up if it did not.
-        defer if (self.server != null) {
-            self.server = null;
+        @atomicStore(?*std.Io.net.Server, &self.server, &server, .release);
+        // Cleared before the descriptor closes, so a late `stop()` never touches a closed one.
+        defer {
+            @atomicStore(?*std.Io.net.Server, &self.server, null, .release);
             server.deinit(self.io);
-        };
+        }
+        // `stop()` may have run before the pointer was published: the flag is then the only signal.
+        if (self.should_stop.load(.seq_cst)) return;
 
         log.info("✅ HTTP server listening on http://{s}:{d}", .{ self.bind, self.port });
         if (std.mem.eql(u8, self.bind, "0.0.0.0")) {
@@ -1116,4 +1126,39 @@ test "enrollment policy diagnosis refuses mixed security and wrong transports" {
     try std.testing.expectError(error.InvalidEnrollmentEndpoint, Server.validateEndpointPair("wss://leaf", "tls://hub", false));
     try std.testing.expectError(error.InvalidEnrollmentEndpoint, Server.validateEndpointPair("tls://", null, false));
     try std.testing.expectError(error.InvalidEnrollmentEndpoint, Server.validateEndpointPair("tls://leaf,,tls://hub", null, false));
+}
+
+test "stop wakes an accept that is blocked, and run returns" {
+    // Regression: `stop()` closed the listener, which on Linux leaves another thread's
+    // `accept(2)` blocked, so a bridge told to stop waited for the next HTTP request.
+    // The watchdog turns a hang into a failure instead of a stuck test run.
+    var stop_flag = std.atomic.Value(bool).init(false);
+    var srv = try Server.init(std.testing.allocator, std.testing.io, "127.0.0.1", 0, &stop_flag, null, null);
+    const Runner = struct {
+        fn go(s: *Server, done: *std.atomic.Value(bool)) void {
+            s.run() catch {};
+            done.store(true, .seq_cst);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const t = try std.Thread.spawn(.{}, Runner.go, .{ &srv, &done });
+
+    var waited: usize = 0;
+    while (@atomicLoad(?*std.Io.net.Server, &srv.server, .acquire) == null and waited < 200) : (waited += 1) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(@atomicLoad(?*std.Io.net.Server, &srv.server, .acquire) != null);
+    // Let the thread reach `accept`.
+    std.Io.sleep(std.testing.io, .fromMilliseconds(200), .awake) catch {};
+
+    srv.stop();
+    waited = 0;
+    while (!done.load(.seq_cst) and waited < 300) : (waited += 1) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    if (!done.load(.seq_cst)) {
+        t.detach();
+        return error.AcceptNotWoken;
+    }
+    t.join();
 }

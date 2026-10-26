@@ -414,7 +414,7 @@ The bridge pre-allocates the ring at startup, in **three parts**:
 ```txt
 ring = ( 2^BASE_BUF  +  sizeof(CDCEvent)  +  MAX_COLUMNS × sizeof(ColumnView) )  ×  RING_BUFFER_COUNT
          ^ data:          ^ metadata:          ^ columns:                          ^ number of events
-           max bytes        fixed, 328 B         8 B × MAX_COLUMNS — resolved        buffered ahead
+           max bytes        fixed, 392 B         8 B × MAX_COLUMNS — resolved        buffered ahead
            for ONE row      per event            at boot, not a compile constant     of NATS
 ```
 
@@ -485,8 +485,8 @@ Both failures are silent and late if left to runtime, so the bridge refuses to s
 | **`BASE_BUF` vs `max_payload`** | `2^BASE_BUF + envelope` exceeds what the NATS server advertises | a row that size packs successfully and is then **rejected at publish time**, with nothing in the data path saying why. That is not a tuning choice, it is a configuration that cannot work |
 
 ```txt
-🔴 The ring would be 15176 MB — 2048 MB of data (BASE_BUF=11 → 2 KB × RING_BUFFER_COUNT=
-   1048576) plus 328 MB of per-event metadata (328 B each) plus 12800 MB of column
+🔴 The ring would be 15240 MB — 2048 MB of data (BASE_BUF=11 → 2 KB × RING_BUFFER_COUNT=
+   1048576) plus 392 MB of per-event metadata (392 B each) plus 12800 MB of column
    descriptors (MAX_COLUMNS=1600 × 8 B × RING_BUFFER_COUNT) — against a 16384 MB memory
    limit. … Halve RING_BUFFER_COUNT for each step you raise BASE_BUF.
 
