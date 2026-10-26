@@ -116,6 +116,16 @@ pub const Options = struct {
 
 const SeedAnchor = struct { stream: []const u8, seq: u64, lsn: i64 };
 
+/// The applied frontier of one table on one route (the recovery model's §1): the highest
+/// sequence of `stream` the table had applied, or had covered, when a fence rewound the
+/// route for ANOTHER table. The route's position certifies every table on it, so a rewind
+/// would replay events a table already holds; replay skips its events at or below the
+/// frontier. Version guards alone cannot do that: an insert at 11 and a tombstone at 12
+/// applied, a rewind to 10 — the insert at 11 recreates a row no surviving version rejects.
+/// Kept in `_zbz_frontier` with the identity of the stream it was taken on (R4), and dropped
+/// as soon as the route's position passes it.
+const Frontier = struct { stream: []const u8, seq: u64 };
+
 /// §10jc: what this client applies from one stream stays IN STREAM ORDER. A pull
 /// consumer can lose a delivery in transit (a reset link, a phone killed mid-fetch) and
 /// hand it over again only after `ack_wait`, out of order; the position (highest seq
@@ -194,6 +204,9 @@ const TableState = struct {
     /// already applied. §10fn: a tenant-scoped table has one chain per tenant, each
     /// on its own stream, so the gate is per stream.
     anchors: std.ArrayList(SeedAnchor) = .empty,
+    /// The applied frontiers (`_zbz_frontier`): see `Frontier`. Written by a fence for the
+    /// tables it leaves untouched, gone once the route's position passes them.
+    frontiers: std.ArrayList(Frontier) = .empty,
     /// The catalogue's seed_epoch the descriptor carried (§10df).
     seed_epoch: i64 = 0,
 };
@@ -549,6 +562,8 @@ pub const SyncClient = struct {
     outbox_ready: bool = false,
     /// Events the seed gate dropped, for the trace.
     gated: usize = 0,
+    /// Events skipped because a fence's applied frontier already covers them (`Frontier`).
+    frontier_gated: usize = 0,
     /// §10iz: what kept each table unseeded — the error name of its last failed seed,
     /// by table; an entry leaves when the table seeds. `zb_client_sync` and
     /// `zb_client_poll` report it as `unseeded`, so a host never calls a replica
@@ -885,25 +900,54 @@ pub const SyncClient = struct {
         return std.mem.eql(u8, std.mem.span(v), point);
     }
 
-    /// The fence's scope rule: is (table, tenant) the only followed pair riding any of
-    /// `streams` (its own route, its shared route)? A rewind replays a stream's events to
-    /// every pair on it; until each pair's applied frontier is kept, only a sole pair may
-    /// be rewound. An empty name matches nothing; on-demand tables ride no tail.
-    fn soleDependent(self: *SyncClient, a: std.mem.Allocator, table: []const u8, tenant: []const u8, streams: []const []const u8) !bool {
+    /// ZB_TEST_SCHEMA_PAUSE_FILE: see pollInner. Never set outside a test.
+    fn schemaPaused() bool {
+        if (comptime !test_faults) return false;
+        const v = std.c.getenv("ZB_TEST_SCHEMA_PAUSE_FILE") orelse return false;
+        return std.c.access(v, 0) == 0;
+    }
+
+    /// A table left untouched by a fence, with the route whose events it already holds.
+    const Untouched = struct { table: []const u8, stream: []const u8 };
+    const FenceScope = struct { untouched: []const Untouched = &.{}, refused: ?[]const u8 = null };
+
+    /// The fence's scope rule (the recovery model's §3, R3): which OTHER pairs ride any of
+    /// `streams`, and can they stay untouched? A rewind replays a stream's events to every
+    /// pair on it; each table other than the fenced one keeps its rows and gets an applied
+    /// frontier (`Frontier`) at the route's current position, so replay skips what it holds.
+    /// That needs its coverage to be KNOWN, and its rows to be its own:
+    ///   * a table with no anchor has no certified coverage: refused;
+    ///   * another tenant of the SAME table shares the fenced pair's open-tenant rows,
+    ///     which the fence replaces: refused.
+    /// An empty name matches nothing; on-demand tables ride no tail.
+    fn fenceScope(self: *SyncClient, a: std.mem.Allocator, table: []const u8, tenant: []const u8, streams: []const []const u8) !FenceScope {
+        var out: std.ArrayList(Untouched) = .empty;
         for (self.followed) |t| {
             if (self.isOnDemand(t)) continue;
             const st = self.states.get(t) orelse continue;
             for (self.tenantsFor(st)) |tn| {
                 if (std.mem.eql(u8, t, table) and std.mem.eql(u8, tn, tenant)) continue;
                 const own = try self.routeFor(a, tn);
-                for (streams) |s| {
-                    if (s.len == 0) continue;
-                    if (std.mem.eql(u8, own, s)) return false;
-                    if (st.shared_route) |sr| if (std.mem.eql(u8, sr, s)) return false;
+                for (streams) |s_| {
+                    if (s_.len == 0) continue;
+                    const rides = std.mem.eql(u8, own, s_) or (if (st.shared_route) |sr| std.mem.eql(u8, sr, s_) else false);
+                    if (!rides) continue;
+                    if (std.mem.eql(u8, t, table)) {
+                        return .{ .refused = try std.fmt.allocPrint(a, "another tenant of {s} rides {s}, and its open-tenant rows are the fenced pair's too", .{ t, s_ }) };
+                    }
+                    const seeded = try self.st.query(a, "SELECT 1 FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = t }, .{ .text = tn } });
+                    if (seeded.len == 0) {
+                        return .{ .refused = try std.fmt.allocPrint(a, "{s} is not seeded, so its coverage on {s} is unknown", .{ t, s_ }) };
+                    }
+                    var dup = false;
+                    for (out.items) |u| if (std.mem.eql(u8, u.table, t) and std.mem.eql(u8, u.stream, s_)) {
+                        dup = true;
+                    };
+                    if (!dup) try out.append(a, .{ .table = t, .stream = s_ });
                 }
             }
         }
-        return true;
+        return .{ .untouched = out.items };
     }
 
     /// §10fn: the routes of a table under the current membership. Client arena.
@@ -1329,6 +1373,11 @@ pub const SyncClient = struct {
         // included — after PREPARE the cursor sits AT the cut, so "the full predates the
         // cursor" no longer says so. Written in PREPARE, deleted with the anchor.
         try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_fence (tbl TEXT NOT NULL, tenant TEXT NOT NULL, PRIMARY KEY (tbl, tenant))");
+        // The applied frontiers (see `Frontier`): one row per table and route, with the
+        // identity (`created`) of the stream the sequence was taken on. Written in a fence's
+        // PREPARE for every table it leaves untouched, deleted when the route's position
+        // passes it, when the stream restarts, or when the table is replaced by a full.
+        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_frontier (tbl TEXT NOT NULL, stream TEXT NOT NULL, created TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (tbl, stream))");
     }
 
     /// One descriptor onto one table: migrate the physical table and refresh the
@@ -1443,6 +1492,7 @@ pub const SyncClient = struct {
             // §10jc: the anchors of the chains this replica already applied, back from the
             // replica — a relaunch after a re-seed keeps its seed gate.
             try self.loadAnchors(a, table);
+            try self.loadFrontiers(a, table);
             // Born under the live watch (enabled after this client connected): it has
             // no watermark and nothing asked for its seed — the next poll does.
             self.reseed_pending = true;
@@ -1462,6 +1512,59 @@ pub const SyncClient = struct {
             };
             if (!replaced) try st.anchors.append(self.aa(), .{ .stream = try self.aa().dupe(u8, r[0].text), .seq = @intCast(r[1].integer), .lsn = lsn });
         }
+    }
+
+    /// The applied frontiers of `table`, back from the replica: only those taken on the
+    /// stream identity the stored position carries now (R4). A row on another identity —
+    /// the stream was recreated since — is dead and deleted.
+    fn loadFrontiers(self: *SyncClient, a: std.mem.Allocator, table: []const u8) !void {
+        const st = self.states.getPtr(table) orelse return;
+        st.frontiers.clearRetainingCapacity();
+        const rows = self.st.query(a, "SELECT f.stream, f.seq FROM _zbz_frontier f JOIN _zbz_stream_seq s ON s.stream = f.stream AND s.created = f.created WHERE f.tbl = ?", &.{.{ .text = table }}) catch return;
+        for (rows) |r| {
+            if (r.len < 2 or r[0] != .text or r[1] != .integer or r[1].integer <= 0) continue;
+            try st.frontiers.append(self.aa(), .{ .stream = try self.aa().dupe(u8, r[0].text), .seq = @intCast(r[1].integer) });
+        }
+        _ = self.st.query(a, "DELETE FROM _zbz_frontier WHERE tbl = ? AND NOT EXISTS (SELECT 1 FROM _zbz_stream_seq s WHERE s.stream = _zbz_frontier.stream AND s.created = _zbz_frontier.created)", &.{.{ .text = table }}) catch {};
+    }
+
+    /// The position of `stream` moved to `seq`: every frontier on it at or below `seq` is
+    /// spent — replay has passed what those tables already held. Dropped in memory and, in
+    /// the caller's transaction, from the replica.
+    fn frontiersPassed(self: *SyncClient, stream: []const u8, seq: u64) !void {
+        var spent = false;
+        var it = self.states.iterator();
+        while (it.next()) |e| {
+            const fr = &e.value_ptr.frontiers;
+            var k: usize = 0;
+            while (k < fr.items.len) {
+                if (std.mem.eql(u8, fr.items[k].stream, stream) and fr.items[k].seq <= seq) {
+                    _ = fr.orderedRemove(k);
+                    spent = true;
+                } else k += 1;
+            }
+        }
+        if (!spent) return;
+        var qa = std.heap.ArenaAllocator.init(self.a);
+        defer qa.deinit();
+        _ = try self.st.query(qa.allocator(), "DELETE FROM _zbz_frontier WHERE stream = ? AND seq <= ?", &.{ .{ .text = stream }, .{ .integer = @intCast(seq) } });
+        log.info("{s}: replay passed the applied frontiers at {d} — {d} event(s) skipped so far for the tables that already held them", .{ stream, seq, self.frontier_gated });
+    }
+
+    /// The stream was recreated or its numbering restarted (or a reconciliation replays it
+    /// from 0): no frontier taken on it means anything now.
+    fn dropFrontiers(self: *SyncClient, stream: []const u8) void {
+        var it = self.states.iterator();
+        while (it.next()) |e| {
+            const fr = &e.value_ptr.frontiers;
+            var k: usize = 0;
+            while (k < fr.items.len) {
+                if (std.mem.eql(u8, fr.items[k].stream, stream)) _ = fr.orderedRemove(k) else k += 1;
+            }
+        }
+        var qa = std.heap.ArenaAllocator.init(self.a);
+        defer qa.deinit();
+        _ = self.st.query(qa.allocator(), "DELETE FROM _zbz_frontier WHERE stream = ?", &.{.{ .text = stream }}) catch {};
     }
 
     /// §10df: the descriptor's seed_epoch is above the one this replica seeded at —
@@ -1496,6 +1599,7 @@ pub const SyncClient = struct {
         try execSql(&self.st, a, try std.fmt.allocPrint(a, "DROP TABLE IF EXISTS \"{s}\";", .{table}));
         _ = self.states.orderedRemove(table);
         _ = self.st.query(a, "DELETE FROM _zbz_fence WHERE tbl = ?", &.{.{ .text = table }}) catch {};
+        _ = self.st.query(a, "DELETE FROM _zbz_frontier WHERE tbl = ?", &.{.{ .text = table }}) catch {};
         log.warn("{s}: dropped locally — the table was dropped upstream", .{table});
     }
 
@@ -1600,6 +1704,7 @@ pub const SyncClient = struct {
         var qa = std.heap.ArenaAllocator.init(self.a);
         defer qa.deinit();
         _ = try self.st.query(qa.allocator(), "INSERT INTO _zbz_stream_seq (stream, last_seq) VALUES (?, ?) ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq", &.{ .{ .text = stream }, .{ .integer = @intCast(seq) } });
+        try self.frontiersPassed(stream, seq);
     }
 
     /// §10jc: the stream's `Flow`.
@@ -1725,6 +1830,7 @@ pub const SyncClient = struct {
                         log.warn("{s}: stream restarted (position {d} beyond last_seq {d}) — position reset", .{ stream, stored, last });
                     }
                     try self.persistSeq(stream, 0);
+                    self.dropFrontiers(stream);
                     if (!self.restarted.contains(stream)) try self.restarted.put(self.aa(), try self.aa().dupe(u8, stream), {});
                     // The tail's consumer died with the old stream; `tailFor` would keep
                     // handing back the cached, dead one and every fetch would answer
@@ -2535,16 +2641,25 @@ pub const SyncClient = struct {
         // A fence interrupted before its anchor's commit (`_zbz_fence`) is still owed: the
         // retry is a fence too, with every proof, though its cursor now sits at the cut.
         var fence = false;
+        // The tables the fence leaves untouched, each with the route it rewinds: they get
+        // an applied frontier in PREPARE.
+        var untouched: std.ArrayList(Untouched) = .empty;
         const predates = core.fullPredatesReplica(man, plan.array, pos);
         const pending = (try self.st.query(a, "SELECT 1 FROM _zbz_fence WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } })).len > 0;
         if (predates or pending) {
             if (from_seed) return error.SeedStale;
-            // A rewind of the own route (the chain behind the cursor) needs the sole-pair
-            // scope; a pending retry already at or before this cut rewinds nothing there.
-            if (predates and !try self.soleDependent(a, table, tenant, &.{ cdc_stream, shared_stream_m })) {
-                log.warn("{s}: chain predates replica — refusing the full (D2): other tables ride {s}, and a rewind would replay their events", .{ table, cdc_stream });
-                if (pending) self.reseed_pending = true;
-                return;
+            // A rewind of the own route (the chain behind the cursor) replays its events to
+            // every table on it: the others are left untouched (each keeps an applied
+            // frontier) when their coverage is known; a pending retry already at or before
+            // this cut rewinds nothing there.
+            if (predates) {
+                const sc = try self.fenceScope(a, table, tenant, &.{cdc_stream});
+                if (sc.refused) |why| {
+                    log.warn("{s}: chain predates replica — refusing the full (D2): {s}", .{ table, why });
+                    if (pending) self.reseed_pending = true;
+                    return;
+                }
+                try untouched.appendSlice(a, sc.untouched);
             }
             fence = true;
         }
@@ -2647,11 +2762,13 @@ pub const SyncClient = struct {
                 return;
             }
             if (@as(i64, @intCast(try self.storedSeq(sr))) > q) {
-                if (!try self.soleDependent(a, table, tenant, &.{sr})) {
-                    log.warn("{s}: chain predates replica — refusing the full (D2): other tables ride {s}, and its rewind would replay their events", .{ table, sr });
+                const sc = try self.fenceScope(a, table, tenant, &.{sr});
+                if (sc.refused) |why| {
+                    log.warn("{s}: chain predates replica — refusing the full (D2): {s}", .{ table, why });
                     self.reseed_pending = true;
                     return;
                 }
+                try untouched.appendSlice(a, sc.untouched);
                 shared_rewind = q;
             }
         };
@@ -2664,6 +2781,25 @@ pub const SyncClient = struct {
         // replaced rows under the old cursor. The in-memory anchors on those routes go with
         // it: an old gate above the cut would drop the very events that must replay.
         if (fence) {
+            // The applied frontiers of the tables left untouched: at each rewound route's
+            // CURRENT position, which certifies them (R2). Their stream identity is the one
+            // the chain's cut was proven on (R4): the stored identity must be that same one.
+            const FrontierWrite = struct { table: []const u8, stream: []const u8, created: []const u8, seq: i64 };
+            var writes: std.ArrayList(FrontierWrite) = .empty;
+            const shared_pos: i64 = if (shared_rewind != null) @intCast(try self.storedSeq(shared_stream_m)) else 0;
+            const shared_created_p: []const u8 = if (man.object.get("shared_cdc_stream_created")) |v| (if (v == .string) v.string else "") else "";
+            for (untouched.items) |u| {
+                const is_own = std.mem.eql(u8, u.stream, cdc_stream);
+                const created: []const u8 = if (is_own) man_created else shared_created_p;
+                const at: i64 = if (is_own) pos else shared_pos;
+                const stored_created = try self.storedCreated(a, u.stream);
+                if (created.len == 0 or stored_created == null or !std.mem.eql(u8, stored_created.?, created)) {
+                    log.warn("{s}: chain predates replica — refusing the full (D2): {s} stays untouched on {s} only if its position and the chain's cut were taken on the same stream incarnation, and that is not settled", .{ table, u.table, u.stream });
+                    self.reseed_pending = true;
+                    return;
+                }
+                try writes.append(a, .{ .table = u.table, .stream = u.stream, .created = created, .seq = at });
+            }
             const Prep = struct {
                 client: *SyncClient,
                 a: std.mem.Allocator,
@@ -2673,14 +2809,26 @@ pub const SyncClient = struct {
                 own_seq: i64,
                 shared: ?[]const u8,
                 shared_seq: i64,
+                frontiers: []const FrontierWrite,
                 fn apply(cx: @This(), s: *storage.Storage) !void {
                     _ = try s.query(cx.a, "DELETE FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = cx.table }, .{ .text = cx.tenant } });
                     _ = try s.query(cx.a, "INSERT INTO _zbz_fence (tbl, tenant) VALUES (?, ?) ON CONFLICT (tbl, tenant) DO NOTHING", &.{ .{ .text = cx.table }, .{ .text = cx.tenant } });
+                    // The fenced table is replaced: what it held before is no frontier of its own.
+                    _ = try s.query(cx.a, "DELETE FROM _zbz_frontier WHERE tbl = ?", &.{.{ .text = cx.table }});
                     try cx.client.persistSeq(cx.own, @intCast(cx.own_seq));
                     if (cx.shared) |sh| try cx.client.persistSeq(sh, @intCast(cx.shared_seq));
+                    // After the cursors: a frontier is only ever above the position it guards.
+                    // Monotone on the same stream identity (an earlier, interrupted fence may
+                    // have written a higher one), replaced on another.
+                    for (cx.frontiers) |w| {
+                        _ = try s.query(cx.a, "INSERT INTO _zbz_frontier (tbl, stream, created, seq) VALUES (?, ?, ?, ?) ON CONFLICT (tbl, stream) DO UPDATE SET seq = CASE WHEN _zbz_frontier.created = excluded.created AND _zbz_frontier.seq > excluded.seq THEN _zbz_frontier.seq ELSE excluded.seq END, created = excluded.created", &.{ .{ .text = w.table }, .{ .text = w.stream }, .{ .text = w.created }, .{ .integer = w.seq } });
+                    }
                 }
             };
-            try self.st.transaction(Prep{ .client = self, .a = a, .table = table, .tenant = tenant, .own = cdc_stream, .own_seq = @min(pos, cutoff_seq), .shared = if (shared_rewind != null) shared_stream_m else null, .shared_seq = shared_rewind orelse 0 }, Prep.apply);
+            try self.st.transaction(Prep{ .client = self, .a = a, .table = table, .tenant = tenant, .own = cdc_stream, .own_seq = @min(pos, cutoff_seq), .shared = if (shared_rewind != null) shared_stream_m else null, .shared_seq = shared_rewind orelse 0, .frontiers = writes.items }, Prep.apply);
+            // The durable state is the truth: the untouched tables' frontiers back from it.
+            st.frontiers.clearRetainingCapacity();
+            for (writes.items) |w| try self.loadFrontiers(a, w.table);
             var k: usize = 0;
             while (k < st.anchors.items.len) {
                 const s_ = st.anchors.items[k].stream;
@@ -2692,7 +2840,7 @@ pub const SyncClient = struct {
                 self.dropTail(shared_stream_m);
                 self.resetFlow(shared_stream_m);
             }
-            log.warn("{s}: fence prepared — chain g{d} cut at {d} on {s} behind position {d}: anchor cleared, cursor at the cut{s}; replacing the rows", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, cdc_stream, pos, if (shared_rewind != null) " (the shared route too)" else "" });
+            log.warn("{s}: fence prepared — chain g{d} cut at {d} on {s} behind position {d}: anchor cleared, cursor at the cut{s}; replacing the rows{s}", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, cdc_stream, pos, if (shared_rewind != null) " (the shared route too)" else "", if (writes.items.len > 0) " — the other tables on the route keep their applied frontier" else "" });
         }
         const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, tenant });
         var applied: usize = 0;
@@ -2705,6 +2853,16 @@ pub const SyncClient = struct {
         // seed, the default back after — the replica's steady state is small.
         self.st.execSimple("PRAGMA cache_size = -131072") catch {};
         defer self.st.execSimple("PRAGMA cache_size = -2000") catch {};
+        // The chain's steps put rows back as of ITS cut: a delta's upsert re-inserts a row this
+        // table has since deleted (no version rejects an insert onto nothing). Whatever applied
+        // frontier the table held (a fence on another table left it) no longer describes its
+        // rows, so the events up to it must replay for this table too. Dropped BEFORE the
+        // first step: a crash between a step and the commit must not leave rows from the
+        // cut under a frontier that skips the events that correct them.
+        if (plan.array.items.len > 0 and st.frontiers.items.len > 0) {
+            _ = try self.st.query(a, "DELETE FROM _zbz_frontier WHERE tbl = ?", &.{.{ .text = table }});
+            st.frontiers.clearRetainingCapacity();
+        }
         for (plan.array.items) |step| {
             // Per-step: `raw`, `blob` and `doc` are three copies of the same seed at
             // their largest; freeing them per step bounds the peak at one step's worth.
@@ -2840,20 +2998,31 @@ pub const SyncClient = struct {
         // The COMMIT. Under the fence the cursors moved in PREPARE; this makes the pair
         // seeded. Only then the in-memory anchor below: published before, a failed commit
         // would leave a gate the durable state does not have.
+        // A full replaces the table's rows: a frontier it held on a route (events up to there
+        // already in the OLD rows) says nothing about the NEW ones, whose state is the chain's
+        // cut. Deleted with the anchor.
+        var replaced_by_full = false;
+        for (plan.array.items) |step_| if (step_.object.get("kind")) |kv| {
+            if (kv == .string and std.mem.eql(u8, kv.string, "full")) replaced_by_full = true;
+        };
         const Commit = struct {
             a: std.mem.Allocator,
             args: []const storage.Value,
             key: []const storage.Value,
+            drop_frontier: bool,
             fn apply(cx: @This(), s: *storage.Storage) !void {
                 _ = try s.query(cx.a, "INSERT INTO _zbz_generations (tbl, tenant, watermark, cutoff_lsn, seed_epoch, anchor_stream, anchor_seq, shared_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tbl, tenant) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch, anchor_stream = excluded.anchor_stream, anchor_seq = excluded.anchor_seq, shared_seq = excluded.shared_seq", cx.args);
                 _ = try s.query(cx.a, "DELETE FROM _zbz_fence WHERE tbl = ? AND tenant = ?", cx.key);
+                if (cx.drop_frontier) _ = try s.query(cx.a, "DELETE FROM _zbz_frontier WHERE tbl = ?", &.{cx.key[0]});
             }
         };
         try self.st.transaction(Commit{
+            .drop_frontier = replaced_by_full,
             .a = a,
             .args = &.{ .{ .text = table }, .{ .text = tenant }, .{ .text = cv }, .{ .integer = seed_lsn }, .{ .integer = st.seed_epoch }, .{ .text = cdc_stream }, .{ .integer = anchor_seq }, if (shared_seq) |q| .{ .integer = q } else .null },
             .key = &.{ .{ .text = table }, .{ .text = tenant } },
         }, Commit.apply);
+        if (replaced_by_full) st.frontiers.clearRetainingCapacity();
         if (fence) log.warn("{s}: fenced — chain g{d} cut at {d} on {s} replaced the rows; the position moved back from {d}, the events after the cut replay{s}", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, cdc_stream, pos, if (shared_rewind != null) " (the shared route too)" else "" });
 
         // Anchors (findings 7 + 10): the ONE place the gate may anchor to — per
@@ -4391,7 +4560,10 @@ pub const SyncClient = struct {
         var seeded_map: std.array_hash_map.String(void) = .empty;
 
         // Schema first: a row in a new shape must find its table already moved.
-        self.drainSchemaWatch(report_a, &changed_map, &seeded_map) catch |err| log.info("schema watch: {s}", .{@errorName(err)});
+        // ZB_TEST_SCHEMA_PAUSE_FILE=<path> (recreate_recovery.py check 13): while the file
+        // exists the schema watch is not drained, so the tails keep applying while a chain
+        // sits ready — the position runs ahead of its cut by as long as the test waits.
+        if (!schemaPaused()) self.drainSchemaWatch(report_a, &changed_map, &seeded_map) catch |err| log.info("schema watch: {s}", .{@errorName(err)});
         // Then the writes answered `indeterminate`, before any route is tailed.
         self.reconcile(report_a, &seeded_map) catch |err| log.warn("reconcile: {s} — retried at the next pass", .{@errorName(err)});
         // An automatic reconnect, this handle alive: the backlog it left behind may be
@@ -4656,6 +4828,13 @@ pub const SyncClient = struct {
                     return;
                 }
             };
+            // The applied frontier (`Frontier`): a fence rewound this route for another table,
+            // and this one already holds everything up to its frontier.
+            for (st.frontiers.items) |fr| if (seq <= fr.seq and std.mem.eql(u8, fr.stream, stream)) {
+                self.gated += 1;
+                self.frontier_gated += 1;
+                return;
+            };
         } else if (st.anchors.items.len > 0) {
             var floor: i64 = std.math.maxInt(i64);
             for (st.anchors.items) |an| floor = @min(floor, an.lsn);
@@ -4816,6 +4995,10 @@ pub const SyncClient = struct {
                     var gate: u64 = 0;
                     for (st.anchors.items) |an| if (std.mem.eql(u8, an.stream, m.metadata.stream) and an.seq > gate) {
                         gate = an.seq;
+                    };
+                    // …and the applied frontier on it (`Frontier`), which gates the same way.
+                    for (st.frontiers.items) |fr| if (std.mem.eql(u8, fr.stream, m.metadata.stream) and fr.seq > gate) {
+                        gate = fr.seq;
                     };
                     if (gate > 0) {
                         var av: std.json.ObjectMap = .empty;
@@ -5727,6 +5910,7 @@ pub const SyncClient = struct {
                 }
             };
             try self.st.transaction(Ctx{ .client = self, .a = a, .marks = marks.items, .rewind = rewind.keys() }, Ctx.apply);
+            for (rewind.keys()) |route| self.dropFrontiers(route);
             for (rewind.keys()) |route| {
                 self.dropTail(route);
                 try self.reconciling.put(self.aa(), try self.aa().dupe(u8, route), {});
@@ -6369,6 +6553,7 @@ pub const SyncClient = struct {
             } else k += 1;
         }
         _ = try self.st.query(a, "DELETE FROM _zbz_stream_seq WHERE stream = ?", &.{.{ .text = route }});
+        self.dropFrontiers(route);
         _ = self.dark.fetchOrderedRemove(route);
         log.info("tenant: left {s} ({d} membership(s) left)", .{ tenant, self.tenants.len });
     }
@@ -6682,6 +6867,170 @@ test "measurement: isolated replay counts committed outcomes and excludes events
     try std.testing.expectEqual(@as(i64, 6), rows[1][0].integer);
     const held = try client.st.query(a, "SELECT count(*) FROM _zbz_inbox", &.{});
     try std.testing.expectEqual(@as(i64, 1), held[0][0].integer);
+}
+
+/// A client with storage and routes only, for the frontier tests: no NATS, no tails.
+fn frontierClient(a: std.mem.Allocator) !SyncClient {
+    var client: SyncClient = undefined;
+    client.a = a;
+    client.arena = std.heap.ArenaAllocator.init(a);
+    client.st = try storage.Storage.open(":memory:");
+    client.states = .empty;
+    client.rebase = .empty;
+    client.gated = 0;
+    client.frontier_gated = 0;
+    client.opts.ondemand = &.{};
+    client.followed = &.{};
+    client.tenants = &.{"acme"};
+    client.open_tenant = "_default";
+    client.open_tenants = &.{"_default"};
+    client.cdc_public = "CDC_PUBLIC";
+    client.cdc_prefix = "CDC_";
+    try client.st.execSimple("CREATE TABLE _zbz_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL, created TEXT)");
+    try client.ensureGenerations();
+    return client;
+}
+
+fn tenantState(routes: []const []const u8, shared: ?[]const u8) TableState {
+    return .{ .pk = &.{"id"}, .cols = &.{ "id", "value" }, .version_col = null, .tenant_col = "tenant_id", .tombstone_col = null, .routes = routes, .shared_route = shared };
+}
+
+test "applied frontier: a table that already holds the events skips them, one that does not applies them" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var client = try frontierClient(a);
+    defer client.st.close();
+    // No version column on either: nothing but the frontier stands between a replayed
+    // older image and the newer row it would overwrite.
+    try client.st.execSimple("CREATE TABLE held (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
+    try client.st.execSimple("CREATE TABLE fenced (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
+    try client.st.execSimple("INSERT INTO held VALUES (1, 'newer')");
+    try client.st.execSimple("INSERT INTO fenced VALUES (1, 'newer')");
+    try ensureInbox(&client.st);
+    var held_state: TableState = .{ .pk = &.{"id"}, .cols = &.{ "id", "value" }, .version_col = null, .tenant_col = null, .tombstone_col = null, .routes = &.{"CDC_acme"} };
+    try held_state.frontiers.append(a, .{ .stream = "CDC_acme", .seq = 10 });
+    // A frontier on ANOTHER route says nothing about this one.
+    try held_state.frontiers.append(a, .{ .stream = "CDC_PUBLIC", .seq = 1000 });
+    try client.states.put(a, "held", held_state);
+    try client.states.put(a, "fenced", .{ .pk = &.{"id"}, .cols = &.{ "id", "value" }, .version_col = null, .tenant_col = null, .tombstone_col = null, .routes = &.{"CDC_acme"} });
+    // The stream replays from a rewound cursor: seq 9 and 10 carry an OLDER image of row 1,
+    // seq 11 a newer one. `held` stood at 10 when the rewind began.
+    const evs = [_][]const u8{
+        \\{"table":"held","operation":"INSERT","data":{"id":1,"value":"older-9"}}
+        ,
+        \\{"table":"fenced","operation":"INSERT","data":{"id":1,"value":"older-9"}}
+        ,
+        \\{"table":"held","operation":"INSERT","data":{"id":1,"value":"older-10"}}
+        ,
+        \\{"table":"held","operation":"INSERT","data":{"id":1,"value":"live-11"}}
+    };
+    const seqs = [_]u64{ 9, 9, 10, 11 };
+    var raw: [4]@import("nats").Message = undefined;
+    var messages: [4]@import("nats").JetStreamMessage = undefined;
+    var ptrs: [4]*@import("nats").JetStreamMessage = undefined;
+    for (evs, 0..) |e, i| {
+        raw[i].data = try encodeMsgpack(a, (try std.json.parseFromSlice(Value, a, e, .{})).value);
+        messages[i] = .{ .msg = &raw[i], .nc = undefined, .metadata = .{ .stream = "CDC_acme", .sequence = .{ .stream = seqs[i] } } };
+        ptrs[i] = &messages[i];
+    }
+    var target: MeasureTarget = .{ .target = 1000 };
+    var counts: MeasureCounts = .{};
+    var position: u64 = 0;
+    var offered: usize = 0;
+    // The first three: the replay of the window the frontier covers.
+    try client.applyBatchIsolated(null, "CDC_acme", ptrs[0..3], &position, null, &offered, &target, &counts);
+    const held_rows = try client.st.query(a, "SELECT value FROM held", &.{});
+    try std.testing.expectEqualStrings("newer", held_rows[0][0].text); // untouched: both replayed images skipped
+    const fenced_rows = try client.st.query(a, "SELECT value FROM fenced", &.{});
+    try std.testing.expectEqualStrings("older-9", fenced_rows[0][0].text); // the fenced table replays: no frontier
+    try std.testing.expectEqual(@as(usize, 2), client.frontier_gated);
+    // Past the frontier the table follows again.
+    var counts2: MeasureCounts = .{};
+    try client.applyBatchIsolated(null, "CDC_acme", ptrs[3..4], &position, null, &offered, &target, &counts2);
+    const after = try client.st.query(a, "SELECT value FROM held", &.{});
+    try std.testing.expectEqualStrings("live-11", after[0][0].text);
+    try std.testing.expectEqual(@as(usize, 2), client.frontier_gated);
+}
+
+test "applied frontier: only the identity it was taken on counts, it survives a reopen, and the position spends it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var client = try frontierClient(a);
+    defer client.st.close();
+    try client.states.put(a, "a", tenantState(&.{"CDC_acme"}, "CDC_PUBLIC"));
+    try client.states.put(a, "b", tenantState(&.{"CDC_acme"}, "CDC_PUBLIC"));
+    try client.st.execSimple("INSERT INTO _zbz_stream_seq VALUES ('CDC_acme', 300, 'inc-2'), ('CDC_PUBLIC', 40, 'pub-1')");
+    // a: taken on the stream's current identity (kept). b: on a previous one (dead).
+    try client.st.execSimple("INSERT INTO _zbz_frontier VALUES ('a', 'CDC_acme', 'inc-2', 500), ('a', 'CDC_PUBLIC', 'pub-1', 90), ('b', 'CDC_acme', 'inc-1', 500)");
+    try client.loadFrontiers(a, "a");
+    try client.loadFrontiers(a, "b");
+    try std.testing.expectEqual(@as(usize, 2), client.states.getPtr("a").?.frontiers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), client.states.getPtr("b").?.frontiers.items.len);
+    const dead = try client.st.query(a, "SELECT count(*) FROM _zbz_frontier WHERE tbl = 'b'", &.{});
+    try std.testing.expectEqual(@as(i64, 0), dead[0][0].integer); // deleted, not just ignored
+    // The position moves, still below the frontier: it stays. Past it: spent, in memory and on disk.
+    try client.persistSeq("CDC_acme", 499);
+    try std.testing.expectEqual(@as(usize, 2), client.states.getPtr("a").?.frontiers.items.len);
+    try client.persistSeq("CDC_acme", 500);
+    try std.testing.expectEqual(@as(usize, 1), client.states.getPtr("a").?.frontiers.items.len);
+    try std.testing.expectEqualStrings("CDC_PUBLIC", client.states.getPtr("a").?.frontiers.items[0].stream);
+    const left = try client.st.query(a, "SELECT stream FROM _zbz_frontier ORDER BY stream", &.{});
+    try std.testing.expectEqual(@as(usize, 1), left.len);
+    try std.testing.expectEqualStrings("CDC_PUBLIC", left[0][0].text);
+    // A stream that restarts or is recreated: nothing taken on it means anything now.
+    client.dropFrontiers("CDC_PUBLIC");
+    try std.testing.expectEqual(@as(usize, 0), client.states.getPtr("a").?.frontiers.items.len);
+    const none = try client.st.query(a, "SELECT count(*) FROM _zbz_frontier", &.{});
+    try std.testing.expectEqual(@as(i64, 0), none[0][0].integer);
+}
+
+test "fence scope: other tables stay untouched when their coverage is known, and the rest refuses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var client = try frontierClient(a);
+    defer client.st.close();
+    try client.states.put(a, "orders", tenantState(&.{"CDC_acme"}, "CDC_PUBLIC"));
+    try client.states.put(a, "items", tenantState(&.{"CDC_acme"}, "CDC_PUBLIC"));
+    try client.states.put(a, "memo", .{ .pk = &.{"id"}, .cols = &.{"id"}, .version_col = null, .tenant_col = null, .tombstone_col = null, .routes = &.{"CDC_PUBLIC"} });
+    client.followed = &.{ "orders", "items", "memo" };
+    // Nothing is seeded: the other tables' coverage is unknown.
+    var sc = try client.fenceScope(a, "orders", "acme", &.{"CDC_acme"});
+    try std.testing.expect(sc.refused != null);
+    try std.testing.expect(std.mem.indexOf(u8, sc.refused.?, "items is not seeded") != null);
+    // Seeded: the own route's other table is untouched. A public table rides CDC_PUBLIC only.
+    try client.st.execSimple("INSERT INTO _zbz_generations (tbl, tenant, watermark, seed_epoch) VALUES ('items', 'acme', 'w', 0), ('memo', '_default', 'w', 0)");
+    sc = try client.fenceScope(a, "orders", "acme", &.{"CDC_acme"});
+    try std.testing.expect(sc.refused == null);
+    try std.testing.expectEqual(@as(usize, 1), sc.untouched.len);
+    try std.testing.expectEqualStrings("items", sc.untouched[0].table);
+    try std.testing.expectEqualStrings("CDC_acme", sc.untouched[0].stream);
+    // The shared route carries every table's open-tenant rows: items AND memo.
+    sc = try client.fenceScope(a, "orders", "acme", &.{"CDC_PUBLIC"});
+    try std.testing.expect(sc.refused == null);
+    try std.testing.expectEqual(@as(usize, 2), sc.untouched.len);
+    // A table alone on its streams has nothing to leave untouched.
+    client.followed = &.{"orders"};
+    sc = try client.fenceScope(a, "orders", "acme", &.{ "CDC_acme", "CDC_PUBLIC" });
+    try std.testing.expect(sc.refused == null);
+    try std.testing.expectEqual(@as(usize, 0), sc.untouched.len);
+    // Another tenant of the SAME table shares the open-tenant rows the fence replaces.
+    client.followed = &.{"orders"};
+    client.tenants = &.{ "acme", "globex" };
+    sc = try client.fenceScope(a, "orders", "acme", &.{"CDC_PUBLIC"});
+    try std.testing.expect(sc.refused != null);
+    try std.testing.expect(std.mem.indexOf(u8, sc.refused.?, "another tenant of orders") != null);
+    // …but not on a route only the fenced tenant rides.
+    sc = try client.fenceScope(a, "orders", "acme", &.{"CDC_acme"});
+    try std.testing.expect(sc.refused == null);
+    // An on-demand table rides no tail and does not count.
+    client.tenants = &.{"acme"};
+    client.followed = &.{ "orders", "items" };
+    client.opts.ondemand = &.{"items"};
+    sc = try client.fenceScope(a, "orders", "acme", &.{"CDC_acme"});
+    try std.testing.expectEqual(@as(usize, 0), sc.untouched.len);
 }
 
 test "inbox: a held event survives closing the database, and a seed past it prunes it" {

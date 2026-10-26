@@ -45,6 +45,16 @@ so then c > p and D2 (`fullPredatesReplica`: c < p) cannot refuse it.
              environment for them, and the check fails if it does. No PostgreSQL-storage cases:
              that is libzb's `dbUrl`.
 
+  --check 13 the applied frontier: two tables ride one tenant route, a seed-epoch move on ONE of
+             them, the load running on both. The fence must be taken (the old refusal, D2,
+             left the table unseeded while writes went on) and the other table, which already
+             holds the events the rewind replays, must stay exact: an insert and its later
+             tombstone replayed over a row the table has already deleted would bring it back
+             (no surviving version rejects an insert the tombstone followed). Live: the fence
+             is taken, both tables exact, events skipped through the frontier. Crash after a
+             committed chunk: the frontier is durable (position at the cut, frontier above it),
+             and reopened the replay skips what the table holds. Fault build, as check 4.
+
   --check 5  check 1 with the bridge down during the recreate: PostgreSQL observes it (the
              DDL triggers), the restarted bridge publishes it — one transition, one epoch
              move, every pair's chain within --first-chain-s of the restart.
@@ -286,7 +296,8 @@ class Stack:
 class Load:
     """3 inserts, 1 update, 1 tombstone per tick in one tenant, each statement its own
     transaction (many small CDC messages)."""
-    def __init__(self, stack, tenant, prefix, interval):
+    def __init__(self, stack, tenant, prefix, interval, table=None):
+        self.table = table or T
         self.stop, self.ticks = threading.Event(), 0
         self.p = subprocess.Popen([*stack.psql, "-d", stack.name, "-v", "ON_ERROR_STOP=0"], stdin=subprocess.PIPE,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
@@ -298,9 +309,9 @@ class Load:
         i, w = 0, self.p.stdin.write
         while not self.stop.is_set():
             t0 = time.monotonic()
-            w(f"INSERT INTO public.{T} (id, tenant_id, note) VALUES " + ", ".join(f"('{self.prefix}-{i + k:06d}', '{self.tenant}', 'n{i}')" for k in range(3)) + ";\n")
-            if i >= 3: w(f"UPDATE public.{T} SET note = 'u{i}', updated_at = now() WHERE id = '{self.prefix}-{i - 2:06d}';\n")
-            if i >= 6: w(f"UPDATE public.{T} SET deleted_at = now(), updated_at = now() WHERE id = '{self.prefix}-{i - 6:06d}';\n")
+            w(f"INSERT INTO public.{self.table} (id, tenant_id, note) VALUES " + ", ".join(f"('{self.prefix}-{i + k:06d}', '{self.tenant}', 'n{i}')" for k in range(3)) + ";\n")
+            if i >= 3: w(f"UPDATE public.{self.table} SET note = 'u{i}', updated_at = now() WHERE id = '{self.prefix}-{i - 2:06d}';\n")
+            if i >= 6: w(f"UPDATE public.{self.table} SET deleted_at = now(), updated_at = now() WHERE id = '{self.prefix}-{i - 6:06d}';\n")
             self.p.stdin.flush()
             i += 3; self.ticks += 1
             left = self.interval - (time.monotonic() - t0)
@@ -367,6 +378,7 @@ class Client:
         the db path then only names the process's stop file."""
         self.stack, self.name, self.principal, self.tenant, self.chunk_rows = stack, name, principal, tenant, chunk_rows
         self.lib, self.pg_url = str(lib or LIBRARY), pg_url
+        self.tables = [T]   # the tables this client follows (the applied-frontier scenario follows two)
         self.db = f"/tmp/zb-rr{stack.tag}-{name}.sqlite3"
         self.log = stack.log(name)
         for s in ("", "-wal", "-shm", ".stop"): pathlib.Path(self.db + s).unlink(missing_ok=True)
@@ -378,7 +390,7 @@ class Client:
         """`env`: test hooks for this process only (ZB_TEST_FENCE_*)."""
         pathlib.Path(self.db + ".stop").unlink(missing_ok=True)
         opts = dict(natsUrl=self.stack.url, credsPath=self.stack.creds[self.principal], principal=self.principal, jsDomain="hub",
-                    clientId=f"rr-{self.name}", dbPath=self.db, tables=[T], heartbeatMs=0,
+                    clientId=f"rr-{self.name}", dbPath=self.db, tables=self.tables, heartbeatMs=0,
                     **({"seedChunkRows": self.chunk_rows} if self.chunk_rows else {}),
                     **({"dbUrl": self.pg_url} if self.pg_url else {}))
         self.p = subprocess.Popen([sys.executable, __file__, "--worker", json.dumps(opts), "--lib", self.lib], stdout=subprocess.DEVNULL,
@@ -753,7 +765,7 @@ async def check4(a, tmp, ts=False):
     """The fence's crash and retention boundaries, one client per case, the load running.
     A seed-epoch move (zebridge_reseed) gives a prompt chain cut behind a live follower.
     ts: the same cases with a zb-client-ts client (check 12)."""
-    hooks = (b"ZB_TEST_FENCE_ABORT", b"ZB_TEST_FENCE_SLEEP_MS", b"ZB_TEST_SHARED_UNREADABLE")
+    hooks = (b"ZB_TEST_FENCE_ABORT", b"ZB_TEST_FENCE_SLEEP_MS", b"ZB_TEST_SHARED_UNREADABLE", b"ZB_TEST_SCHEMA_PAUSE_FILE")
     if ts:
         # The fault points belong to the harness: the library reads no environment for them.
         lib_src = (zb.ROOT / "zb-client-ts/src/libzb.ts").read_bytes()
@@ -884,6 +896,159 @@ async def check4(a, tmp, ts=False):
         await js.close()
     finally:
         s.stop()
+
+
+T2 = "rr_items2"
+
+
+async def check13(a, tmp):
+    """The applied frontier, live: two tables on one tenant route, one of them fenced."""
+    hooks = (b"ZB_TEST_FENCE_ABORT", b"ZB_TEST_FENCE_SLEEP_MS", b"ZB_TEST_SHARED_UNREADABLE", b"ZB_TEST_SCHEMA_PAUSE_FILE")
+    if not check(f"check 13 runs on a fault-hook build ({FAULT_LIBRARY})", FAULT_LIBRARY.exists() and all(h in FAULT_LIBRARY.read_bytes() for h in hooks)):
+        note(f"build it: {FAULT_BUILD}")
+        return
+    s = Stack(tmp, "13", a.cadence, {})
+    try:
+        s.start({"pa": "t_a"})
+        s.create_table({"t_a": a.rows}, "a")
+        s.sql(f"CREATE TABLE public.{T2} (id text PRIMARY KEY, tenant_id text NOT NULL, note text, "
+              f"updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz);"
+              f"SELECT count(*) FROM zebridge_enable('public.{T2}'::regclass, writable => true, tenant_col => 'tenant_id', "
+              f"version_col => 'updated_at', tombstone_col => 'deleted_at', publication => 'rr_pub', dry_run => false);"
+              f"INSERT INTO public.{T2} (id, tenant_id, note) SELECT 'bt_a-' || lpad(i::text, 6, '0'), 't_a', repeat(md5(i::text), 4) "
+              f"FROM generate_series(1, {a.rows}) i;")
+        s.bridge_up()
+        js = await Js().open(s)
+        check("tenant mappings published before any client connects", await js.tenants_ready(s.creds))
+        async def manifests():
+            return all([await js.kv(js.gen, f"t_a.{t}") for t in (T, T2)])
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < a.cadence + 60 and not await manifests(): await asyncio.sleep(1)
+        check(f"a chain for each table ({round(time.monotonic() - t0, 1)} s)", await manifests())
+        base = {T: {k for k in s.truth("t_a") if k.startswith("at_a-")}}
+
+        def table_rows(c, table):
+            return dict(c._q(f"SELECT id, note FROM {table} WHERE tenant_id = ?", (c.tenant,)) or [])
+
+        def truth_of(table):
+            rows = {}
+            for line in s.sql(f"SELECT id, coalesce(note, E'\\\\N') FROM public.{table} WHERE tenant_id = 't_a' AND deleted_at IS NULL").splitlines():
+                k, v = line.split("|", 1)
+                rows[k] = None if v == "\\N" else v
+            return rows
+
+        async def until(pred, timeout):
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < timeout:
+                r = pred()
+                if asyncio.iscoroutine(r): r = await r
+                if r: return round(time.monotonic() - t0, 1)
+                await asyncio.sleep(1)
+            return None
+
+        def seeded(c):
+            held = {r[0] for r in (c._q("SELECT tbl FROM _zbz_generations") or [])}
+            return held == {T, T2}
+
+        async def recovered(c):
+            ok, _ = await anchor_state(c, js, {"t_a"})
+            return ok and seeded(c) and base[T] <= table_rows(c, T).keys()
+
+        def frontier_rows(c):
+            return c._q("SELECT tbl, stream, seq FROM _zbz_frontier") or []
+
+        def skipped(c):
+            m = re.findall(r"(\d+) event\(s\) skipped so far", c.text())
+            return int(m[-1]) if m else 0
+
+        def exact(c):
+            return all(digest(table_rows(c, t)) == digest(truth_of(t)) for t in (T, T2))
+
+        def fence_cut(c):
+            m = re.findall(r"fence prepared — chain g\d+ cut at (\d+)", c.text())
+            return int(m[-1]) if m else None
+
+        def reseed():
+            s.sql(f"SELECT count(*) FROM zebridge_reseed('public.{T}'::regclass)")
+
+        clients = []
+        # CDC_PUBLIC is empty at first, and a stream the client has never read a message of is
+        # "gapped" for ever (stored 0): every pass then re-seeds each table with a shared route,
+        # so the table that gets a chain in the fence's own pass loses its frontier — the first
+        # case runs that way (exact, no skip expected). One open-tenant row gives CDC_PUBLIC a
+        # message before the others, and only the fenced table is touched.
+        for name, env in (("frontier_reseeded", {}), ("frontier_live", {}), ("frontier_crash", {"ZB_TEST_FENCE_ABORT": "after_chunk"})):
+            if name == "frontier_live":
+                s.sql(f"INSERT INTO public.{T2} (id, tenant_id, note) VALUES ('pub-1', '_default', 'open')")
+            # One client and one load per case: a client left running would follow the next case's
+            # epoch move too. The two tables together write about what check 4's one does.
+            loads = [Load(s, "t_a", "c", 2 * a.interval_ms / 1000, table=T), Load(s, "t_a", "d", 2 * a.interval_ms / 1000, table=T2)]
+            c = Client(s, name, "pa", "t_a", chunk_rows=200, lib=FAULT_LIBRARY)
+            c.tables = [T, T2]
+            clients.append(c)
+            c.start()
+            check(f"{name}: both tables seeded and anchored before the case ({await until(lambda: recovered(c), 150)} s)", await recovered(c))
+            c.stop()
+            # The schema watch is held while the test says so: the chain under the new epoch is
+            # ready before this client looks at it, and the tails go on applying meanwhile — its
+            # position runs ahead of the chain's cut by as long as the hold lasts.
+            pause = pathlib.Path(f"/tmp/zb-rr13-{name}.pause")
+            pause.unlink(missing_ok=True)
+            c.start(dict(env, ZB_TEST_SCHEMA_PAUSE_FILE=str(pause)))
+            await asyncio.sleep(5)   # caught up with the load again
+            pause.touch()
+            epoch0 = await js.epoch()
+            reseed()
+            async def new_chain():
+                m = await js.kv(js.gen, f"t_a.{T}") or {}
+                ep = await js.epoch()
+                return ep is not None and ep > epoch0 and m.get("seed_epoch") == ep
+            note(f"{name}: the chain under the new epoch after {await until(new_chain, 90)} s")
+            await asyncio.sleep(4)
+            check(f"{name}: held back, the client has not acted on it ({c.count('seed epoch [0-9]+ -> [0-9]+')} epoch notices)",
+                  c.count("seed epoch [0-9]+ -> [0-9]+") == 0)
+            pause.unlink(missing_ok=True)
+            if name != "frontier_crash":
+                took = await until(lambda: fence_cut(c) is not None, 90)
+                check(f"{name}: the fence is taken with {T2} on the same route ({took} s, cut {fence_cut(c)}) — not refused: refusals {c.count('refusing the full')}",
+                      took is not None and c.count("refusing the full") == 0)
+                check(f"{name}: the log says {T2} keeps its applied frontier", "keep their applied frontier" in c.text())
+                secs = await until(lambda: recovered(c), 120)
+                check(f"{name}: {T} recovered under a current anchor while writes continue ({secs} s)", secs is not None)
+            else:
+                rc = await until(lambda: c.exited() is not None, 90)
+                cut = fence_cut(c)
+                fr = frontier_rows(c)
+                pos = c.position("CDC_t_a")
+                check(f"{name}: the client aborted after a chunk ({c.exited()}); position {pos} at the cut {cut}, fence owed {c.fence_pending()}",
+                      rc is not None and cut is not None and pos == cut and c.fence_pending())
+                check(f"{name}: the frontier is durable — {fr}",
+                      len(fr) == 1 and fr[0][0] == T2 and fr[0][1] == "CDC_t_a" and fr[0][2] > pos)
+                c.p = None
+                c.start()
+                secs = await until(lambda: recovered(c), 120)
+                check(f"{name}: reopened — {T} recovered while writes continue ({secs} s)", secs is not None)
+            for l in loads: l.end()
+            ok = await until(lambda: exact(c), 150)
+            check(f"{name}: BOTH tables exact against PostgreSQL ({ok} s) — {T}: {len(table_rows(c, T))} of {len(truth_of(T))}, "
+                  f"{T2}: {len(table_rows(c, T2))} of {len(truth_of(T2))}", ok is not None)
+            if ok is None:
+                for t in (T, T2):
+                    have, want = table_rows(c, t), truth_of(t)
+                    note(f"{t}: missing {sorted(want.keys() - have.keys())[:5]}, extra {sorted(have.keys() - want.keys())[:5]}, "
+                         f"differing {sorted(k for k in want.keys() & have.keys() if want[k] != have[k])[:5]}")
+            if name == "frontier_reseeded":
+                # Its own chain replaced the table's rows in the same pass: no frontier survives it
+                # (the events up to it replay), and the rows are exact all the same.
+                check(f"{name}: {T2} got a chain in the fence's pass and kept no frontier ({frontier_rows(c)})", frontier_rows(c) == [])
+            else:
+                check(f"{name}: events were skipped through the frontier ({skipped(c)}) and it is spent ({frontier_rows(c)})",
+                      skipped(c) > 0 and frontier_rows(c) == [])
+            c.stop()
+        await js.close()
+    finally:
+        s.stop()
+
 
 
 BRIDGE_HOOKS = (b"ZB_TEST_OBSERVE_SLEEP_MS", b"ZB_TEST_PRUNE_SLEEP_MS", b"ZB_TEST_BOOT_PRUNE_SLEEP_MS")
@@ -1220,7 +1385,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker")
     ap.add_argument("--lib")
-    ap.add_argument("--check", default="1,2,3,4,5,6,7,8,9,10,11,12")
+    ap.add_argument("--check", default="1,2,3,4,5,6,7,8,9,10,11,12,13")
     ap.add_argument("--cadence", type=int, default=120)
     ap.add_argument("--max-msgs", type=int, default=1000, help="CDC_MAX_MSGS for checks 2 and 3 (the bridge's minimum is 1000)")
     ap.add_argument("--rows", type=int, default=2000)
@@ -1237,7 +1402,7 @@ def main():
                 asyncio.run({1: check1, 2: check2, 3: check3, 4: check4,
                              5: lambda a_, d_: check1(a_, d_, "restart"), 6: lambda a_, d_: check1(a_, d_, "backstop"),
                              7: check7, 8: check8, 9: check9, 10: check10, 11: check11,
-                             12: lambda a_, d_: check4(a_, d_, ts=True)}[n](a, pathlib.Path(d)))
+                             12: lambda a_, d_: check4(a_, d_, ts=True), 13: check13}[n](a, pathlib.Path(d)))
             except Exception as e:
                 check(f"check {n} raised: {type(e).__name__}: {str(e)[:400]}", False)
     print(f"  · logs: /tmp/zb_rr<check>_*.log; {'FAILED ' + str(failed) + ' check(s)' if failed else 'clean'}")
