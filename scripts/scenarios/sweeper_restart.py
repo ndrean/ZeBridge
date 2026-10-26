@@ -56,9 +56,9 @@ def ensure_pg_up() -> None:
 
 
 def seed(n: int, tag: str) -> None:
+    ripe = zb.ago_ms(zb.gc_retention_ms() + 2 * 3600 * 1000)   # past the stack's own retention
     zb.psql(f"INSERT INTO public.{FIX} (uid, some_text, inserted_at, updated_at, deleted_at) "
-            f"SELECT gen_random_uuid(), '{tag}', now(), now() - interval '2 hours', "
-            f"now() - interval '2 hours' FROM generate_series(1, {n})")
+            f"SELECT gen_random_uuid(), '{tag}', now(), {ripe}, {ripe} FROM generate_series(1, {n})")
 
 
 def live_tombstones() -> int:
@@ -84,11 +84,12 @@ def main() -> int:
         if "ERROR" in out:
             zb.bad(f"could not enable the fixture: {out[:140]}"); return 1
 
+        zb.require_sweeper_free()
         seed(4, "pre-restart")
-        env = dict(os.environ)
-        env["SWEEP_ONLY_TABLES"] = FIX
-        env["GC_THRESHOLD_MS"] = "3600000"   # 1 h; the tombstones are 2 h old — ripe
-        env["GC_INTERVAL_MS"] = "1500"       # a daemon, sweeping continuously
+        # The stack's own retention, never a shorter one (a pass moves the GC floor for good); the
+        # tombstones are two hours past it — ripe.
+        env = zb.sweeper_env(SWEEP_ONLY_TABLES=FIX, GC_THRESHOLD_MS=zb.gc_retention_ms(),
+                             GC_INTERVAL_MS=1500)   # a daemon, sweeping continuously
         logf = open(LOG, "w")
         proc = subprocess.Popen([str(SWEEPER)], env=env, stdout=logf, stderr=subprocess.STDOUT)
 

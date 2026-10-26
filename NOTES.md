@@ -19434,10 +19434,16 @@ teardown must never do is lower it. So: `restore_gc_watermark()` is gone; the re
 `tombstone_children.py` that needed the short sweeper) is `gc_isolation.py` §7 on a disposable database; and
 `gc_resurrect.py`, which staged a floor behind a deletion on the shared database and put it back, now runs on its own
 stack too. Staging a floor with the trigger disabled is the operator's break-glass, and now only ever happens on a
-database that exists for the scenario. Still on the shared dev database, and raising its floor rather than lowering it:
-the scenarios that run a short-retention sweeper there (`incremental.py` at five seconds, `sweeper.py`, `reaps.py`,
-`sweeper_restart.py`, `sweeper_catalogue.py`, `drip.py` at an hour). Their floor stays where they left it, which refuses
-older writes on that database until time passes; they are the next ones to move.
+database that exists for the scenario. The scenarios that ran a short-retention sweeper on the shared dev database (`sweeper.py` and
+`sweeper_catalogue.py` at an hour, `sweeper_restart.py`, `reaps.py` at an hour, `drip.py`'s hourly pass) are not moved to
+private stacks: they did not need a short retention, only tombstones older than it. They sweep at the STACK's own retention
+(`GC_THRESHOLD_MS`, else the sweeper's seven days: `zb.gc_retention_ms()`, `zb.sweeper_env()`) and age their fixtures around
+it (`zb.ago_ms()`), which is the floor the stack's own daemon would set anyway, so a run leaves the database as it found it.
+`zb.require_sweeper_free()` says so when another sweeper holds the lock, instead of a reap that never comes. A scenario that
+needs a short retention (`gc_isolation`, `gc_resurrect`) runs on a disposable database. `incremental.py` is the one left: its
+away-past-the-floor case needs a floor beyond a client's watermark within seconds, five of them, on a shared stack with a live
+producer and clients. It runs there with `GC_ALLOW_SHORT_THRESHOLD` and so moves that database's floor for good; moving it to a
+private stack is its own piece of work.
 
 **Zero retention disabled the checkpoint guard after really reaping.** `GC_THRESHOLD_MS=0` with
 `GC_ALLOW_SHORT_THRESHOLD=1` reaped every tombstone and stored `threshold_ms = 0`, which the producer's checkpoint guard

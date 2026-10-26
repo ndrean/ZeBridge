@@ -134,6 +134,7 @@ def main():
             if r.status != 200: raise RuntimeError(r.status)
     except Exception as e:
         sys.exit(f"no bridge answers at {zb.http_base()}/health ({e}) — the wasp stings a LIVE stack; start it first")
+    if a.sweep_every: zb.require_sweeper_free()   # one sweeper per database: ours would idle behind another's lock
     err = open(EMITTER_ERR, "w"); os.dup2(err.fileno(), 2)   # libzb's prints, for the verdict grep
     fresh_sqlite(EMITTER_DB); fresh_sqlite(WATCHER_DB)
     em = Lib(EMITTER_DB, [T], "py-drip", principal=a.emitter)
@@ -194,7 +195,7 @@ def main():
 
         if time.monotonic() >= next_sweep:
             next_sweep = time.monotonic() + a.sweep_every
-            r = subprocess.run([str(zb.SWEEPER), "--once"], capture_output=True, text=True, env={**os.environ, "GC_THRESHOLD_MS": os.environ.get("GC_THRESHOLD_MS", "3600000")}, timeout=600)
+            r = subprocess.run([str(zb.SWEEPER), "--once"], capture_output=True, text=True, env=zb.sweeper_env(), timeout=600)   # the stack's own retention: a pass moves the GC floor for good
             reaped = [l for l in (r.stdout + r.stderr).splitlines() if "reaped" in l]
             wm = zb.psql("SELECT watermark FROM zebridge_gc_watermark", quiet=True).strip()
             check(f"sweeper --once ran: {'; '.join(reaped) or 'nothing to reap'}; watermark {last_watermark} → {wm}", r.returncode == 0 and wm != last_watermark)

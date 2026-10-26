@@ -28,6 +28,8 @@ the floor read under a shared lock inside each write's transaction. NOTES "One f
 `gc_isolation.py` the acceptance gate. Per-publication floors were rejected (publications overlap); independent retention
 would be per-table floors, not built. Scenarios that run `bridge_sweeper --once` need no sweeper daemon on the same database.
 
+**To replay once PR gc-floor-followups is in:** every scenario, as the batteries do. What was run here and what was not: `gc_isolation.py` (49 checks) and `gc_resurrect.py` (10) on private stacks; `sweeper.py` and `sweeper_catalogue.py` on a local PostgreSQL at the default retention. Not run (they need the dev stack, the `nats` CLI, macOS or a Homebrew PostgreSQL): `sweeper_restart.py`, `reaps.py`, `drip.py`, `tombstone_children.py`, `incremental.py` (which still runs a five-second sweeper on the shared database), `multi_bridge.py`'s sync check fails on `main` here too.
+
 Outstanding proof obligations (not yet turned into scenarios): snapshot boundaries / overlap replay, pending writes across
 a recreate, clients connecting before tenant mappings arrive. Also not live-tested: the ordering "own route behind its cut,
 shared route past its" (unit tests only, #17) and a download paused while CDC advances (unit test only, #16).
