@@ -134,6 +134,7 @@ GROUPS = {
         "race":          ("bridge", "24 writers against ingress"),
         "adversarial":   ("bridge", "fuzz the two untrusted entry points"),
         "chaos":         ("bridge", "broker kill, backend kill, socket exhaustion"),
+        "outage_matrix": ("none", "what an outage of one component does, as the README states it, on a private stack with admission on and a real libzb client: the bridge down (changes stop, a write is queued and not executed), mutation admission down (a write cannot enter, CDC flows, the outbox keeps it), the sweeper down (cleanup pauses), the hub NATS down (the replica reads locally, the write waits, the bridge survives); each time the replica equals PostgreSQL and the outbox is empty when the component is back (own database, nats-server and bridge, needs nats-server)"),
         "gc_isolation": ("none", "one database, one GC floor, one sweeper: the database refuses a lower floor, a delete and a truncate and a re-applied init keeps it; a zero or sub-second retention is refused even with the override; a second, a shorter-retention and a --once sweeper idle while the owner works; the owner's backend is terminated and one session holds the lock again, the floor never decreasing; a retention increase leaves the floor, a decrease moves it and reaps; a stale write held in a trigger after passing the guard makes the advance wait and the deleted row stays gone, and the same interleaving without the floor lock resurrects it; a tombstoned family is reaped children first in bounded batches and the streams hear nothing (own database, nats-server and bridge, needs nats-server)"),
         "rls_visibility": ("none", "the reader's row-level-security policies cannot shrink a snapshot silently: USING (false) after startup, no reader policy and a restrictive policy each block the pair, keep the previous chain, leave an unrelated table publishing, show in log, /metrics and --diagnose, and resume when repaired; a policy change while a build is parked; an empty table still publishes an empty full (own NATS and scoped probe bridge, needs nats-server)"),
         "nats_outage":   ("bridge", "broker down past the retry budget: bridge stops, resumes, nothing lost"),
@@ -243,6 +244,7 @@ def main() -> int:
     ap.add_argument("group", nargs="?", choices=[*GROUPS, "all"], default="offline")
     ap.add_argument("-k", action="append", default=[], help="only scenarios whose name contains this")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--no-preflight", action="store_true", help="skip the check that the database has the GC-floor functions")
     ap.add_argument("--logs", default=os.environ.get("TMPDIR", "/tmp"), help="where per-scenario logs go")
     a = ap.parse_args()
     if a.list:
@@ -264,6 +266,32 @@ def main() -> int:
                        cwd=HERE, env=env_for("bridge"), capture_output=True)
     if a.group == "manual":
         print("manual scenarios are listed, not run: see --list"); return 0
+
+    def preflight() -> bool:
+        """Before a group that touches the stack: the init SQL on this database is the one the binaries
+        expect. The bridge reads the GC floor inside every write's transaction through
+        `zebridge_gc_floor_acquire()` and refuses writes (`GcFloorUnavailable`) while it is missing, and the
+        sweeper needs the other two: a database whose init was not re-applied after the GC-floor change would
+        fail every writing scenario for a reason none of them names."""
+        want = ("zebridge_gc_floor_acquire()", "zebridge_gc_advance(double precision,bigint,integer)", "zebridge_gc_sweeper_lock()")
+        code = ("import zb; " + "; ".join(
+            f"print('{w}', zb.psql(\"SELECT to_regprocedure('public.{w}') IS NOT NULL\", quiet=True))" for w in want))
+        out = subprocess.run([PY, "-c", code], cwd=HERE, env=env_for("bridge"), capture_output=True, text=True).stdout
+        missing = [l.rsplit(" ", 1)[0] for l in out.splitlines() if l.strip() and l.rsplit(" ", 1)[-1] != "t"]
+        if missing or not out.strip():
+            print("preflight: the database does not have the GC-floor functions (" + (", ".join(missing) or "could not ask") + ").\n"
+                  "  Re-apply init.core.template.sql and init.write.template.sql (bridge --init-sql), then run again.\n"
+                  "  --no-preflight skips this check.")
+            return False
+        holders = subprocess.run([PY, "-c", "import zb; print(zb.psql(\"SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=23106 "
+                                  "AND objid=1 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())\", quiet=True))"],
+                                 cwd=HERE, env=env_for("bridge"), capture_output=True, text=True).stdout.strip()
+        if holders not in ("", "0"):
+            print("preflight: a sweeper holds the database's sweeper lock. Scenarios that start a sweeper of their own "
+                  "(sweeper*, reaps, drip, tombstone ones) refuse to run beside it; stop it for the run if you want them.")
+        return True
+    if any(g != "offline" for g in groups) and not a.no_preflight and not preflight():
+        return 2
     results = []
     for g in groups:
         if g != "offline":

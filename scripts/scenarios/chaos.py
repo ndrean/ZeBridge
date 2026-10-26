@@ -15,7 +15,10 @@ the bridge either recovers by itself or exits by contract, never limps.
      write must flow;
   3  PG loss: pg_terminate_backend on every bridge_reader/bridge_writer
      backend (walsender included) — pg reconnect machinery re-attaches, the
-     slot resumes, and both a CDC write and a mutation round-trip land after;
+     slot resumes, and both a CDC write and a mutation round-trip land after.
+     The mutation reads the GC floor inside its own transaction now (NOTES
+     "One floor, one sweeper"), so the round-trip also proves that read
+     re-attached; and the floor row itself is intact and did not go down;
   4  HTTP exhaustion (the probe's port, zb.http_base(probe=True)): hold
      max_connections idle sockets — scrapes fail while
      held, then the receive watchdog reaps them and /metrics answers again
@@ -205,6 +208,8 @@ async def main():
 
           # ── 3. PG loss ────────────────────────────────────────────────────────
           before_pg = status("pg_reconnect_count") or 0
+          floor_q = "SELECT extract(epoch FROM watermark) FROM public.zebridge_gc_watermark WHERE id = 1"
+          floor_before = zb.psql(floor_q, quiet=True).strip()
           zb.psql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
                   "WHERE usename IN ('bridge_reader','bridge_writer')", quiet=True)
           deadline = time.time() + 40
@@ -237,6 +242,12 @@ async def main():
                     "CDC write AND mutation round-trip land after — reader and writer both re-attached")
           else:
               zb.bad(f"PG loss not absorbed: reconnects {before_pg}→{pg_after}, cdc={flowed}, mutation={mut_ok}")
+              failed += 1
+          floor_after = zb.psql(floor_q, quiet=True).strip()
+          if floor_before and floor_after and float(floor_after) >= float(floor_before):
+              zb.ok("PG loss: the GC floor row is intact and did not go down")
+          else:
+              zb.bad(f"PG loss: the GC floor went from {floor_before!r} to {floor_after!r}")
               failed += 1
 
           # ── 4. HTTP exhaustion on the probe's port, recovery unassisted ───────

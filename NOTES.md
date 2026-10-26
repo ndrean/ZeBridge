@@ -19440,10 +19440,10 @@ private stacks: they did not need a short retention, only tombstones older than 
 (`GC_THRESHOLD_MS`, else the sweeper's seven days: `zb.gc_retention_ms()`, `zb.sweeper_env()`) and age their fixtures around
 it (`zb.ago_ms()`), which is the floor the stack's own daemon would set anyway, so a run leaves the database as it found it.
 `zb.require_sweeper_free()` says so when another sweeper holds the lock, instead of a reap that never comes. A scenario that
-needs a short retention (`gc_isolation`, `gc_resurrect`) runs on a disposable database. `incremental.py` is the one left: its
-away-past-the-floor case needs a floor beyond a client's watermark within seconds, five of them, on a shared stack with a live
-producer and clients. It runs there with `GC_ALLOW_SHORT_THRESHOLD` and so moves that database's floor for good; moving it to a
-private stack is its own piece of work.
+needs a short retention (`gc_isolation`, `gc_resurrect`) runs on a disposable database. `incremental.py` already does:
+it builds its own scratch database and nats-server and rewrites both connection URLs to it, so its five-second sweeper
+(`GC_ALLOW_SHORT_THRESHOLD`) moves that scratch database's floor and nothing else's. (An earlier version of this paragraph
+said it ran on the shared dev database; it does not.)
 
 **Zero retention disabled the checkpoint guard after really reaping.** `GC_THRESHOLD_MS=0` with
 `GC_ALLOW_SHORT_THRESHOLD=1` reaped every tombstone and stored `threshold_ms = 0`, which the producer's checkpoint guard

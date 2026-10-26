@@ -474,6 +474,8 @@ The bridge accepts runtime env var configuration:
 - `DATABASE_READER_URL`, `DATABASE_WRITER_URL`, `NATS_URL` — the connection strings.
 - `NATS_JS_DOMAIN` — optional: the JetStream domain, when JetStream is reached across a leaf link. The bridge then addresses `$JS.<domain>.API.`, and `/enroll` hands the name to every client as `js_domain` (they pass it as `jsDomain`). Generate the matching server conf and grants with `--init-nats operator --js-domain <name>`.
 
+### Running more than one bridge
+
 For example, a second instance next to the one in `.env.bridge`, on its own publication, slot and port, with a smaller buffer:
 
 ```sh

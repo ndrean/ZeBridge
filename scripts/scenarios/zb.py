@@ -352,6 +352,14 @@ def leaks_available() -> bool:
     return sys.platform == "darwin" and shutil.which("leaks") is not None
 
 
+# The cluster the restart scenarios (pg_restart, sweeper_restart, matrix) stop and start. The native macOS
+# stack by default; any other host says where its own is. `ZB_PG_CTL` may be a wrapper script (a Linux
+# CI runs pg_ctl as the postgres user, which root cannot).
+PG_CTL = os.environ.get("ZB_PG_CTL", "/opt/homebrew/opt/postgresql@18/bin/pg_ctl")
+PG_DATA = os.environ.get("ZB_PGDATA", str(ROOT / "postgres-data"))
+PG_LOG = os.environ.get("ZB_PG_LOG", str(ROOT / "scripts" / "native" / "postgres.log"))
+
+
 def pg_opts(port: str | int | None = None) -> str:
     """The flags `scripts/native/up.sh` starts PostgreSQL with — READ FROM IT, never
     copied.
@@ -369,6 +377,8 @@ def pg_opts(port: str | int | None = None) -> str:
     exists. That is why this must never silently fall back to a shorter list: it raises.
     """
     import re
+    if os.environ.get("ZB_PG_OPTS"):   # a host that is not the native stack gives its own flags (wal_level=logical among them)
+        return os.environ["ZB_PG_OPTS"]
     text = (ROOT / "scripts" / "native" / "up.sh").read_text()
     m = re.search(r"^PG_FLAGS=\(\s*$(.*?)^\)\s*$", text, re.S | re.M)
     if not m:

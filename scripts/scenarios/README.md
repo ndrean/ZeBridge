@@ -137,6 +137,7 @@ on the way out, but they will disrupt anything live meanwhile.
 | `race.py` | 24 writers against ingress, through a broker restart |
 | `adversarial.py` | fuzz the two untrusted entry points (mutation payloads, `/enroll`) — survive, refuse once, no bad state |
 | `chaos.py` | broker kill, backend kill, socket exhaustion — and `leaks` reports 0 on the survivor |
+| `outage_matrix.py` | what an outage of one component does, as the root README's availability table states it: the bridge down (PostgreSQL changes stop reaching the client; a write it sends is queued, not executed), mutation admission down (a write cannot enter the queue and no PubAck comes; CDC still flows; the client's outbox keeps the write), the sweeper down (cleanup pauses, a ripe tombstone stays, nothing else is affected), the hub NATS down (the replica reads locally, the write waits, the bridge survives); after each, the replica equals PostgreSQL and the outbox is empty. Own database, nats-server and bridge with admission on, a real libzb client. How LONG a component may stay down (queue retention, storage limits) is not shown here |
 | `gc_isolation.py` | the GC floor is one per database and never goes down: the database refuses a lower watermark, a `DELETE` and a `TRUNCATE` (admin and writer role) and a re-applied init keeps it; a second sweeper, a shorter-retention one and a `--once` run idle while the lock owner works (`--once` exits 2); the owner's backend is terminated and exactly one session holds the lock again, the floor never decreasing; a retention increase (1 h → 7 d) leaves the floor and a decrease moves it and reaps; a zero or sub-second retention is refused even with the override; a stale write held in a trigger after passing the bridge's guard makes the sweeper's advance wait, is judged against the tombstone and the deleted row stays gone — and, as the control, the same interleaving without the floor lock resurrects it; a tombstoned family is reaped children first in bounded batches and the streams hear nothing (moved here from `tombstone_children.py`: a short-retention sweeper moves a database's floor for good, so it never runs on a shared one). Its own database, nats-server and bridge, real sweepers; needs `nats-server` on PATH and `zig-out/bin/bridge_sweeper`. Needs no sweeper daemon of your own on the same database |
 | `rls_visibility.py` | the reader's row-level-security policies cannot shrink a snapshot silently: `ALTER POLICY … USING (false)` after startup, no reader policy, and a restrictive policy hiding some rows each block the pair (`hidden` / `unverifiable`), keep the previous chain, leave an unrelated control table publishing, show in the log, `/metrics` and `--diagnose`, and publish again with the rows written meanwhile once repaired; a build parked between its policy check and its content while the policy changes; an empty table still publishes an empty full. Boots its own NATS and a scoped probe bridge; needs `nats-server` on PATH |
 
@@ -149,6 +150,28 @@ on the way out, but they will disrupt anything live meanwhile.
 | `leaksoak.py` | macOS `leaks` + RSS drift over a churn window (`SOAK_SECONDS`, `ZB_RSS_DRIFT_MB`) |
 | `objstore_race.py` | a 40 MB get/put race against the object store |
 | `tls.py` | `nats.zig` speaks TLS, JetStream included — optional: the colocated topology does not use it. Standalone, provisions its own `nats-server` |
+
+## Outages and reconnections: what to replay, and what changed under them
+
+The outage scenarios stop, kill or cut one component under a running stack and assert that nothing is lost and nothing limps afterwards. They are the replay list after any change to the write path, the sweeper, the recovery model or the bridge's connections. Group `owns` unless noted; each starts its own probe bridge.
+
+| Scenario | What it takes away | What it asserts |
+| --- | --- | --- |
+| `pg_restart` | the whole PostgreSQL cluster, idle and then under write load | the bridge waits patiently with `connected=0`, resumes from the same slot, no gap, aborted writes stay aborted; **the GC floor row survives both restarts and does not go down** |
+| `sweeper_restart` | PostgreSQL under a running sweeper, then the sweeper itself (SIGKILL) | the reconnect re-arms statements, principal and UTC; **the sweeper lock goes with the dead session and the reconnected one takes it again (one holder), the floor does not go down, a replacement after a SIGKILL takes the lock and reaps** |
+| `chaos` | the broker (killed and restarted), every bridge backend, HTTP sockets | reconnect counters move, writes flow, a mutation round-trip lands (it reads the GC floor inside its own transaction); **the floor row is intact and did not go down** |
+| `nats_outage`, `stream_full`, `stream_wipe` | the broker past the retry budget; a full stream; a deleted stream | the bridge stops or resumes by contract, nothing lost, the client resets and converges |
+| `downtime`, `txn_kill`, `chain_kill` | the bridge, killed (also mid-transaction, mid-chain-build) | slot resume, the unacked transaction replays whole, a manifest never names a missing object |
+| `client_kill`, `rebuild_kill`, `write_stale` | the client host mid-seed, mid-rebuild; writes queued while the bridge is down | the SQLite file survives and converges; verdicts, reverts, no ghost rows |
+| `churn` | 65 reconnect cycles (50 NATS, 15 PostgreSQL) | RSS, fds and threads flat, one client converges |
+| `outage_matrix`, `hub_fallback`, `outbox_recovery`, `mutation_admission`, `nats_move` (group `none`, own stacks) | the bridge, admission, the sweeper or the hub NATS in turn; a hub or leaf, the admission queue, the bridge moved to another NATS | ordered failover, durable outboxes and receipts, quotas, a forced full per chain |
+
+Before replaying them (`run.py` checks the first two itself):
+
+1. **Re-apply the init SQL** (`bridge --init-sql`, both templates) on the stack's database. The bridge now reads the GC floor with `zebridge_gc_floor_acquire()` inside every write's transaction and refuses writes (`GcFloorUnavailable`, retried) while it is missing; the sweeper needs `zebridge_gc_advance()` and `zebridge_gc_sweeper_lock()`.
+2. **Rebuild `bridge`, `bridge_sweeper` and libzb** (`zig build -Doptimize=ReleaseFast`, and `libzb` with `-Dtest-faults=true -p zig-out-faults` for the fault checks).
+3. **Stop any sweeper daemon of the stack** for the scenarios that start their own (`sweeper*`, `reaps`, `drip`): one sweeper per database, a second idles on the lock and `--once` exits 2.
+4. A host that is not the native macOS stack says where its PostgreSQL is: `ZB_PG_CTL` (a wrapper script is fine), `ZB_PGDATA`, `ZB_PG_LOG`, `ZB_PG_OPTS` (the flags, `wal_level=logical` among them) — `pg_restart`, `sweeper_restart` and `matrix` read them.
 
 ## Prerequisites for the ingress scripts
 

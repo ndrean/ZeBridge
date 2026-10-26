@@ -114,7 +114,7 @@ The hub runs NATS and three ZeBridge processes. They have separate responsibilit
 | --- | --- |
 | Bridge (`bridge`) | Reads PostgreSQL changes, builds snapshots, manages enrollment, and applies admitted mutations to PostgreSQL. |
 | Mutation admission (`bridge --mutation-ingress`) | Validates incoming mutation requests and enforces per-principal queue budgets before storing them for the bridge to process. |
-| Sweeper (`bridge_sweeper`) | Reaps old tombstones under the configured recovery policy. |
+| Sweeper (`bridge_sweeper`) | Advances the database's GC floor, then reaps the tombstones older than it. One active sweeper per database. |
 
 ```mermaid
 flowchart LR
@@ -134,7 +134,7 @@ flowchart LR
 - **Changes:** the bridge reads PostgreSQL's logical replication feed and publishes schemas and changes to NATS JetStream. Connected clients apply those changes to their local databases.
 - **Seeding and recovery:** the bridge builds compressed snapshot chains per table and tenant: fulls and deltas. Clients fetch these from NATS and follow CDC after the chain's cut. Eligible reconnects can use deltas to replace a larger CDC backlog.
 - **Writes:** clients publish mutation requests to NATS. The separate admission process validates them and bounds each principal's queued work. The bridge consumes admitted writes, applies them to PostgreSQL and records durable receipts with their outcomes. Matching retries reuse the receipt rather than committing the mutation again.
-- **Housekeeping:** the sweeper reaps old tombstones under the configured recovery policy.
+- **Housekeeping:** the sweeper holds a database-wide lock, advances the GC floor (a watermark that never goes down: a write stamped before it is refused, not replayed) and then reaps tombstones older than it, under one retention (`GC_THRESHOLD_MS`) for the whole database. A second sweeper idles. See [the floor](PROTOCOL.md#the-floor-one-per-database-and-it-never-goes-down).
 - **Services:** responders answer requests over NATS, using their own replica or an external service. A routing responder can wrap Valhalla; an analytics responder can query DuckDB.
 
 Devices seed from shared snapshot objects rather than querying PostgreSQL individually. This keeps a connection storm from becoming a snapshot-query storm on the primary database. PostgreSQL still carries mutation execution and the bridge's snapshot-building work.
@@ -156,6 +156,7 @@ You need PostgreSQL with logical replication and the privileges needed to instal
 | Hub with Docker Compose | [Compose deployment](deploy/compose/README.md) |
 | Hub on a Debian VPS with systemd | [Ansible deployment](deploy/ansible/README.md) |
 | Manual installation and managed PostgreSQL | [DEPLOYMENT](DEPLOYMENT.md) |
+| A managed PostgreSQL, from an empty project (Supabase) | [SUPABASE_TEST](SUPABASE_TEST.md) |
 | Optional regional leaves | [LEAF_NODES](LEAF_NODES.md) |
 
 The setup establishes NATS identities and TLS, installs the database functions and roles, enables the tables, starts admission, the bridge and the sweeper, and issues device invites. Follow the selected deployment guide rather than combining initialization commands from different layouts.
@@ -177,6 +178,23 @@ Writable tables need deliberate choices about keys, versions, tenants and delete
 
 See [database schema requirements](SECURITY.md#13-postgresql-what-the-schema-must-satisfy), [migrations](MIGRATIONS.md), and [configuration and sizing](OPERATIONS.md#configuration).
 
+## Scaling and availability
+
+The supported architecture is offline-capable clients, optional regional seeding leaves, and **a single active hub** (PostgreSQL, NATS, the bridge, mutation admission and the sweeper) under supervised restart. It is not automatic high availability, and running duplicate containers would not make it one safely. Offline operation buys time; it does not remove the retention and storage limits below.
+
+**One bridge deployment per database is the recommended setup.** More than one is a constrained configuration, for what it does buy: different table sets, isolated workloads or deployment lifecycles, or separate NATS deployments from one PostgreSQL database. It is not HA, a second bridge following the same tables adds no useful throughput, and every extra bridge adds replication, snapshot and coordination cost. The constraints (one shared GC policy and one sweeper per database, one publication per table) are in [DEPLOYMENT](DEPLOYMENT.md#running-more-than-one-bridge).
+
+What an outage of one component does (each row is played by `scripts/scenarios/outage_matrix.py`: the effect while the component is down, and that the hub converges when it is back; how *long* it may stay down depends on queue retention and storage limits that are still to be verified under load):
+
+| Unavailable | Expected effect |
+| --- | --- |
+| Bridge | PostgreSQL changes stop reaching clients; mutation execution and generation building pause. |
+| Admission | New mutations cannot enter the queue; clients keep them locally and retry. |
+| Sweeper | Cleanup pauses; storage pressure grows with the length of the outage. |
+| Hub NATS | Hub CDC and mutation transport stop. Leaves can serve cached seeds and reachable regional responders, within the trust-staleness policy ([LEAF_NODES](LEAF_NODES.md)). |
+
+A supported deployment means restart policies and health monitoring (the Compose file sets `restart: unless-stopped`; the Ansible route runs under systemd), disk alerts, durable NATS volumes and preserved credentials, PostgreSQL backups with point-in-time recovery suited to the deployment, and a documented procedure to rebuild the hub on another machine with its recovery time measured and the data a restore can lose stated ([hub checkpoints and recovery](OPERATIONS.md#hub-checkpoints-and-recovery)). Restarting a process handles a crash; rebuilding elsewhere handles losing the server, and a drilled restore from a real backup is still open work. Automatic failover would need NATS clustering, PostgreSQL availability and explicit coordination of bridge ownership and background work; it can come if users need recovery in seconds rather than an operator-led restoration. Leaves add seeding capacity, not hub availability.
+
 ## Fit and boundaries
 
 ZeBridge fits mobile apps, intermittently connected devices, field equipment and services that benefit from local SQL reads. The [depot example](examples/14-depot/README.md) uses trucks, shared plans and routing; the same pattern applies to equipment working through periods of poor connectivity.
@@ -184,7 +202,7 @@ ZeBridge fits mobile apps, intermittently connected devices, field equipment and
 - **Replication is tenant-based.** A followed table brings the tenant's rows into the replica. A local SQL `WHERE` clause filters what the app reads, not what the device receives. One tenant per consumer at B2C scale is outside the intended topology.
 - **PostgreSQL is the authority.** Offline writes are provisional until judged by the server. This is not peer-to-peer or multi-master replication.
 - **Conflict semantics are explicit.** Ordinary writes use last-writer-wins. Cooperative editing can merge per-field registers; it is not collaborative text editing. See [COOPERATIVE_EDITING](COOPERATIVE_EDITING.md).
-- **Recovery has retention requirements.** CDC retention, chain availability, tombstone GC and mutation receipt retention serve different purposes. An offline duration that permits reads to recover does not automatically permit every old pending write to execute. See [catching up](OPERATIONS.md#catching-up-the-chain-and-the-stream) and [indeterminate write recovery](PROTOCOL.md#74c-reconciling-an-indeterminate-write).
+- **Recovery has retention requirements.** CDC retention, chain availability, tombstone GC and mutation receipt retention serve different purposes. An offline duration that permits reads to recover does not automatically permit every old pending write to execute: a write stamped before the GC floor is refused, because the tombstone that would have overruled it may be gone. See [catching up](OPERATIONS.md#catching-up-the-chain-and-the-stream) and [indeterminate write recovery](PROTOCOL.md#74c-reconciling-an-indeterminate-write).
 - **Local persistence matters.** Deleting a replica or reinstalling an app can destroy unsent writes. Protect device identity and storage as application data.
 - **Operate NATS and PostgreSQL deliberately.** Credentials, replication slots, disk budgets, backups and restore procedures are part of the deployment.
 
@@ -207,7 +225,7 @@ See [SCOPE](SCOPE.md) for the boundaries and [SECURITY](SECURITY.md) for tenant 
 
 [TEST_SCENARIOS](TEST_SCENARIOS.md) describes the scenarios and what each checks. The repository includes client fixtures, database and authorization checks, recovery scenarios, and load harnesses. Consult the code and tests when a reference document disagrees with the implementation.
 
-Measure CDC distribution, snapshot download/apply, mutation commits and outbox recovery separately. They have different bottlenecks. Results depend on the build, database latency, disk, lane count, principal count and recovery load; a historical peak is not a deployment capacity guarantee. The [event ramp](examples/09-event/README.md) and [storm harness](storm/README.md) provide starting points for evaluating your topology.
+Measure CDC distribution, snapshot download/apply, mutation commits and outbox recovery separately. They have different bottlenecks. Results depend on the build, database latency, disk, lane count, principal count and recovery load; a historical peak is not a deployment capacity guarantee. The [event ramp](examples/09-event/README.md) and [storm harness](storm/README.md) provide starting points for evaluating your topology; [SPEED_TEST](SPEED_TEST.md) is one measured example, with its machine and load stated.
 
 ## Documentation
 
@@ -221,12 +239,14 @@ Measure CDC distribution, snapshot download/apply, mutation commits and outbox r
 | Add regional caches and responders | [LEAF_NODES](LEAF_NODES.md) |
 | Change schemas and datasets | [MIGRATIONS](MIGRATIONS.md) |
 | Configure metrics and logs | [OBSERVABILITY_TELEMETRY](OBSERVABILITY_TELEMETRY.md) |
-| Understand the wire and recovery contracts | [PROTOCOL](PROTOCOL.md) |
+| Understand the wire and recovery contracts | [PROTOCOL](PROTOCOL.md), [GENERATION](GENERATION.md) (a client's position on the tenant and public streams) |
 | Check platform artifacts and packaging | [DISTRIBUTION](DISTRIBUTION.md) |
 | Assess scope and tested behavior | [SCOPE](SCOPE.md), [TEST_SCENARIOS](TEST_SCENARIOS.md) |
+| Edit one record from several places | [COOPERATIVE_EDITING](COOPERATIVE_EDITING.md) |
+| Read the design log (numbered `§` sections that code comments cite) | [NOTES](NOTES.md) |
 
 ## Build from source
 
-Published packages and images are the simplest starting point. To work on the implementation, use the repository's Zig 0.17 toolchain requirements and dependency pins in `build.zig.zon`. The NATS client is a submodule: the fork `ndrean/nats.zig`, branch `zebridge` (upstream plus our patches, one commit each); see [DISTRIBUTION](DISTRIBUTION.md) for platform builds and packaging.
+Published packages and images are the simplest starting point. To work on the implementation, use the repository's Zig 0.17 toolchain requirements and dependency pins in `build.zig.zon`. The NATS client is a submodule: the fork `ndrean/nats.zig`, branch `zebridge` (upstream plus our patches, one commit each); see [DISTRIBUTION](DISTRIBUTION.md) for platform builds and packaging, [PG](PG.md) for the `pgoutput` binary formats the bridge decodes, and [CLAUDE.md](CLAUDE.md) for a map of the tree, the build and test commands and the scenarios that act as the real tests.
 
 ZeBridge is licensed under [Apache 2.0](LICENSE).
