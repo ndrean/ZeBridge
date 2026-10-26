@@ -39,6 +39,12 @@ so then c > p and D2 (`fullPredatesReplica`: c < p) cannot refuse it.
              the check refuses to run without one, and fails if the ordinary library
              carries any hook.
 
+  --check 12 check 4 with a zb-client-ts client (scripts/scenarios/fence_client.mts): the same
+             cases, the same assertions, on the TypeScript replica's tables. The fault points
+             are the harness's (the library's `faultHook` option); the library reads no
+             environment for them, and the check fails if it does. No PostgreSQL-storage cases:
+             that is libzb's `dbUrl`.
+
   --check 5  check 1 with the bridge down during the recreate: PostgreSQL observes it (the
              DDL triggers), the restarted bridge publishes it — one transition, one epoch
              move, every pair's chain within --first-chain-s of the restart.
@@ -442,6 +448,41 @@ class Client:
         return len(re.findall(pattern, open(self.log, errors="replace").read()))
 
 
+HARNESS = zb.ROOT / "scripts/scenarios/fence_client.mts"
+
+
+class TsClient(Client):
+    """The same client from the scenario's side, a zb-client-ts process: its replica tables are
+    `_zebridge_*`, keyed by table alone (one tenant per table), and its answers are mapped onto
+    the names the checks read."""
+    def start(self, env=None):
+        pathlib.Path(self.db + ".stop").unlink(missing_ok=True)
+        args = ["node", "--experimental-strip-types", "--no-warnings", str(HARNESS), self.stack.url, self.stack.creds[self.principal],
+                self.db, self.principal, T, str(self.chunk_rows or 0)]
+        self.p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=open(self.log, "a"), env=dict(os.environ, **(env or {})),
+                                  cwd=zb.ROOT / "zb-client-ts")
+
+    def position(self, stream):
+        r = self._q("SELECT last_seq FROM _zebridge_stream_seq WHERE stream = ?", (stream,))
+        return r[0][0] if r else 0
+
+    def created(self, stream):
+        r = self._q("SELECT created FROM _zebridge_stream_seq WHERE stream = ?", (stream,))
+        return r[0][0] if r else None
+
+    def fence_pending(self):
+        r = self._q("SELECT count(*) FROM _zebridge_fence WHERE tbl = ?", (T,))
+        return bool(r and r[0][0])
+
+    def anchors(self):
+        # A TypeScript replica is seeded when its generations row exists. A chain cut on an empty
+        # stream ships no sequence (cut 0), and the replica then records neither a stream nor a
+        # sequence where libzb records the stream and 0: read as that, the cut is 0 on the own route.
+        r = self._q("SELECT seed_epoch, seed_stream, seed_seq, shared_seed_seq, watermark FROM _zebridge_generations WHERE tbl = ?", (T,))
+        return [dict(tenant=self.tenant, seed_epoch=e, anchor_stream=st or f"CDC_{self.tenant}", anchor_seq=sq if sq is not None else 0,
+                     shared_seq=sh, watermark=w) for e, st, sq, sh, w in r] if r else []
+
+
 def worker(opts_json, lib_path):
     opts = json.loads(opts_json)
     lib = ctypes.CDLL(lib_path or str(LIBRARY))
@@ -708,16 +749,25 @@ async def check3(a, tmp):
         s.stop()
 
 
-async def check4(a, tmp):
+async def check4(a, tmp, ts=False):
     """The fence's crash and retention boundaries, one client per case, the load running.
-    A seed-epoch move (zebridge_reseed) gives a prompt chain cut behind a live follower."""
+    A seed-epoch move (zebridge_reseed) gives a prompt chain cut behind a live follower.
+    ts: the same cases with a zb-client-ts client (check 12)."""
     hooks = (b"ZB_TEST_FENCE_ABORT", b"ZB_TEST_FENCE_SLEEP_MS", b"ZB_TEST_SHARED_UNREADABLE")
-    if not check(f"the ordinary library carries no fault hook ({LIBRARY})", LIBRARY.exists() and not any(h in LIBRARY.read_bytes() for h in hooks)):
-        return
-    if not check(f"check 4 runs on a fault-hook build ({FAULT_LIBRARY})", FAULT_LIBRARY.exists() and all(h in FAULT_LIBRARY.read_bytes() for h in hooks)):
-        note(f"build it: {FAULT_BUILD}")
-        return
-    s = Stack(tmp, "4", a.cadence, {})
+    if ts:
+        # The fault points belong to the harness: the library reads no environment for them.
+        lib_src = (zb.ROOT / "zb-client-ts/src/libzb.ts").read_bytes()
+        if not check("the TypeScript library reads no fault variable (its faultHook is a config option)", not any(h in lib_src for h in hooks) and b"ZB_TEST_FENCE" not in lib_src):
+            return
+        if not check(f"the harness exists ({HARNESS})", HARNESS.exists()):
+            return
+    else:
+        if not check(f"the ordinary library carries no fault hook ({LIBRARY})", LIBRARY.exists() and not any(h in LIBRARY.read_bytes() for h in hooks)):
+            return
+        if not check(f"check 4 runs on a fault-hook build ({FAULT_LIBRARY})", FAULT_LIBRARY.exists() and all(h in FAULT_LIBRARY.read_bytes() for h in hooks)):
+            note(f"build it: {FAULT_BUILD}")
+            return
+    s = Stack(tmp, "12" if ts else "4", a.cadence, {})
     try:
         s.start({"pa": "t_a"})
         s.create_table({"t_a": a.rows}, "a")
@@ -749,16 +799,19 @@ async def check4(a, tmp):
             s.sql(f"SELECT count(*) FROM zebridge_reseed('public.{T}'::regclass)")
 
         clients = []
-        for name, env in (("abort_chunk", {"ZB_TEST_FENCE_ABORT": "after_chunk"}),
-                          ("retry_overtaken", {"ZB_TEST_FENCE_ABORT": "after_chunk"}),
-                          ("abort_commit", {"ZB_TEST_FENCE_ABORT": "before_commit"}),
-                          ("overtaken", {"ZB_TEST_FENCE_SLEEP_MS": "8000"}),
-                          ("shared_unknown", {"ZB_TEST_SHARED_UNREADABLE": "1"}),
-                          ("pg_abort_commit", {"ZB_TEST_FENCE_ABORT": "before_commit"}),
-                          ("pg_retry_overtaken", {"ZB_TEST_FENCE_ABORT": "after_chunk"})):
-            # pg_*: the same cases on PostgreSQL storage (one database per case's client).
+        cases = (("abort_chunk", {"ZB_TEST_FENCE_ABORT": "after_chunk"}),
+                 ("retry_overtaken", {"ZB_TEST_FENCE_ABORT": "after_chunk"}),
+                 ("abort_commit", {"ZB_TEST_FENCE_ABORT": "before_commit"}),
+                 ("overtaken", {"ZB_TEST_FENCE_SLEEP_MS": "8000"}),
+                 ("shared_unknown", {"ZB_TEST_SHARED_UNREADABLE": "1"}),
+                 ("pg_abort_commit", {"ZB_TEST_FENCE_ABORT": "before_commit"}),
+                 ("pg_retry_overtaken", {"ZB_TEST_FENCE_ABORT": "after_chunk"}))
+        for name, env in cases:
+            # pg_*: the same cases on PostgreSQL storage (one database per case's client), libzb's `dbUrl`.
+            if ts and name.startswith("pg_"): continue
             pg = s.replica_url(name) if name.startswith("pg_") else None
-            c = Client(s, name, "pa", "t_a", chunk_rows=200, lib=FAULT_LIBRARY, pg_url=pg)
+            c = (TsClient(s, name, "pa", "t_a", chunk_rows=200) if ts
+                 else Client(s, name, "pa", "t_a", chunk_rows=200, lib=FAULT_LIBRARY, pg_url=pg))
             clients.append(c)
             c.start()
             check(f"{name}: seeded and anchored before the case ({await until(lambda: recovered(c), 120)} s)", await recovered(c))
@@ -1167,7 +1220,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker")
     ap.add_argument("--lib")
-    ap.add_argument("--check", default="1,2,3,4,5,6,7,8,9,10,11")
+    ap.add_argument("--check", default="1,2,3,4,5,6,7,8,9,10,11,12")
     ap.add_argument("--cadence", type=int, default=120)
     ap.add_argument("--max-msgs", type=int, default=1000, help="CDC_MAX_MSGS for checks 2 and 3 (the bridge's minimum is 1000)")
     ap.add_argument("--rows", type=int, default=2000)
@@ -1183,7 +1236,8 @@ def main():
             try:
                 asyncio.run({1: check1, 2: check2, 3: check3, 4: check4,
                              5: lambda a_, d_: check1(a_, d_, "restart"), 6: lambda a_, d_: check1(a_, d_, "backstop"),
-                             7: check7, 8: check8, 9: check9, 10: check10, 11: check11}[n](a, pathlib.Path(d)))
+                             7: check7, 8: check8, 9: check9, 10: check10, 11: check11,
+                             12: lambda a_, d_: check4(a_, d_, ts=True)}[n](a, pathlib.Path(d)))
             except Exception as e:
                 check(f"check {n} raised: {type(e).__name__}: {str(e)[:400]}", False)
     print(f"  · logs: /tmp/zb_rr<check>_*.log; {'FAILED ' + str(failed) + ' check(s)' if failed else 'clean'}")
