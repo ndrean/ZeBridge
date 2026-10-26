@@ -58,7 +58,11 @@ A snapshot of the six hardening findings, to be turned into a deployment audit a
 | 5. Revocation needed manual leaf updates | signed trust refresh propagates revocations and rotations; tests cover disconnect, reconnect refusal, stale-trust shutdown | verify the supervisor, refresh endpoint and alerts in production; Compose stops NATS after 300 s without a verified refresh |
 | 6. Destructive reconciliation, untested recovery | mirror discovery no longer authorizes deletion; checkpoint/restore scenarios cover receipts, policy and replacement-hub recovery | an operator restore drill from a real deployed backup; backup scheduling, retention, off-host storage |
 
-Priority after the GC floor: a deployment security audit and a real backup/restore drill (rebuild the hub on another machine, measure the recovery time, state what a restore can lose), alongside the recovery proof obligations above. Also to verify, because the README now states them as design intent: what each component's outage does (bridge, admission, sweeper, hub NATS), above all queue retention and storage limits.
+Priority after the GC floor: a deployment security audit and a real backup/restore drill (rebuild the hub on another machine, measure the recovery time, state what a restore can lose), alongside the recovery proof obligations above. The README's outage table is played by `outage_matrix.py` (passes on a private stack); what is still to verify is how LONG each component may stay down: CDC max age and bytes, the admission queue's per-principal and stream caps, the object store.
+
+## Observed, not investigated
+
+The first `zb_client_sync` of a libzb client answers `PrepareFailed` (no detail) on the private stacks, with the tenant mapping and the schema both published; the next polls seed normally. `multi_bridge.py` shows the same on unmodified `main`, so it predates the GC-floor work. The private-stack scenarios ignore that first answer (as `recreate_recovery.py`'s worker always did); worth finding which SQLite statement fails and why, since a host that treats a sync error as fatal would stop there.
 
 ## Open decisions and ideas
 

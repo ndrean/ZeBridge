@@ -206,6 +206,7 @@ Each claim of the README and its companions, the tests behind it, and how far th
 | data travels three ways (changes, snapshots, writes) | `stamp`, `churn`; `speed`, `burst` by hand | the rates are measurements, read by a person; `stamp` and `churn` judge that they hold steady |
 | standby read replica (DEPLOYMENT) | `standby` | the whole path: slot on the standby, seed, live change, write to the primary |
 | `--revoke --purge` deletes the local replica | `revoke_purge` | both libraries, connected and on return, at reconnection and at renewal |
+| a component of the hub is unavailable (README, Scaling and availability) | `outage_matrix` | bridge, admission, sweeper, hub NATS in turn: the documented effect while down, convergence when back |
 | multiple instances, a constrained configuration (DEPLOYMENT) | `multi_bridge`, `gc_isolation` | two bridges, one database, one NATS; one GC policy, one sweeper, a floor that never goes down, a write that cannot outrun a reap |
 | the JWT renews itself | `jwt_renew`, `revoke_purge` (F), `jwt_expiry`; real iPhone JWT renewal testing in `scripts/phone/renew` | both libraries keep working past two JWT lifetimes, and through a device clock 2 h off either way; a revoked device's renewal gets the purge answer; on an iPhone 12, libzb renews on the bridge's schedule with the clock moved by hand, open or closed |
 | TLS in transit (DEPLOYMENT) | `tls`, `burst_tls` | the certificate is checked; the cost is measured |
