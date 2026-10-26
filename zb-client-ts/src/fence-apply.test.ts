@@ -381,30 +381,127 @@ test('a chain object pruned under the fence: the manifest is re-read and its pro
   });
 });
 
-test('PREPARE is one transaction: a failure in it leaves the cursor, the anchor and the rows as they were', async () => {
-  await withDir(async (path) => {
+test('PREPARE is one transaction: a failure in it leaves the cursor, the anchor, the rows and the routes as they were', async () => {
+  for (const inPass of [false, true]) await withDir(async (path) => {
     const w = new World();
     w.publish(2, 5, 300);
     follower(path, w);
     const t = client(path, w);
     // The cursor write fails inside PREPARE.
     const run = t.c.run;
+    let failing = true;
     t.c.transaction = async (fn: any) => {
       t.db.exec('BEGIN');
       try {
         await fn(async (sql: string, ...args: any[]) => {
-          if (/INSERT INTO _zebridge_stream_seq/.test(sql)) throw new Error('disk full');
+          if (failing && /INSERT INTO _zebridge_stream_seq/.test(sql)) throw new Error('disk full');
           return run(sql, ...args);
         });
         t.db.exec('COMMIT');
       } catch (e) { t.db.exec('ROLLBACK'); throw e; }
     };
+    const stops: string[] = [];
+    for (const s of [OWN, PUB]) t.c.tailStops.set(s, async () => { stops.push(s); });
     try {
-      await assert.rejects(() => t.c.applyGenerations('item'), /disk full/);
+      await assert.rejects(() => t.c.applyGenerations('item', inPass), /disk full/);
       assert.equal(owed(t.db), 0, 'no obligation without the rest of PREPARE');
       assert.equal((anchor(t.db) as any).seed_seq, 480, 'the anchor is still there');
       assert.equal(pos(t.db, OWN), 500);
       assert.deepEqual(rows(t.db), ['91:old', '92:old', '93:old']);
+      // The memory the transaction does not own: no route is left parked for a fence that
+      // was never prepared, the in-memory position and anchor are untouched, and the
+      // tails that were stopped for it come back (a pass reopens its own in its step 2).
+      assert.equal(t.c.fenced.size, 0, 'no route stays parked');
+      assert.equal(t.c.globalSyncState.seq[OWN], 500);
+      assert.equal(t.c.syncedTables.get('item').unseeded, undefined, 'the table was not marked unseeded');
+      assert.deepEqual([...stops].sort(), [OWN, PUB].sort(), 'the tails were stopped for the PREPARE');
+      assert.equal(t.passes.length, inPass ? 0 : 1, 'a poll loop\'s failed PREPARE asks for the tails to be reopened');
+      // And the next attempt, the disk fixed, is the fence it was meant to be.
+      failing = false;
+      assert.equal(await t.c.applyGenerations('item', inPass), true);
+      assert.deepEqual(rows(t.db), wanted(2, 5));
+      assert.equal(pos(t.db, OWN), 300);
+      assert.equal(owed(t.db), 0);
+      assert.equal(t.c.fenced.size, 0);
+    } finally { t.close(); }
+  });
+});
+
+test('a failed PREPARE gives back a parking an earlier fence of the table still holds', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 300);
+    follower(path, w);
+    const t = client(path, w);
+    // An earlier fence of this table, interrupted: the own route is parked for it.
+    t.c.fenced.set(OWN, 'item');
+    t.c.transaction = async () => { throw new Error('disk full'); };
+    try {
+      await assert.rejects(() => t.c.applyGenerations('item', true), /disk full/);
+      assert.deepEqual([...t.c.fenced], [[OWN, 'item']], 'its parking stays; only this attempt\'s own is undone');
+    } finally { t.close(); }
+  });
+});
+
+/// A deferred, to hold a step at a chosen point.
+const deferred = () => { let go!: () => void; const p = new Promise<void>((r) => { go = r; }); return { p, go }; };
+const within = <T>(ms: number, p: Promise<T>, what: string) =>
+  Promise.race([p, new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`deadlock: ${what} still pending after ${ms} ms`)), ms))]);
+
+test('a stream pass that waits for a background fence does not deadlock on the stream queue (the op reaches PREPARE after the pass joined it)', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 300);
+    follower(path, w);
+    const t = client(path, w);
+    try {
+      // The background op (a poll loop's applyGenerations) is held just before its decision.
+      const atDecision = deferred();
+      const release = deferred();
+      const owedOrig = t.c.fenceOwed;
+      t.c.fenceOwed = async (tb: string) => { atDecision.go(); await release.p; return owedOrig.call(t.c, tb); };
+      const background = t.c.applyGenerations('item');
+      await atDecision.p;
+      // A pass now holds the stream queue and wants the same table seeded: it joins the op.
+      const pass = t.c.changeStreams(async () => { assert.equal(await t.c.applyGenerations('item', true), true); });
+      await new Promise((r) => setImmediate(r));
+      release.go();
+      await within(2000, pass, 'the pass');
+      assert.equal(await within(2000, background, 'the background op'), true);
+      assert.deepEqual(rows(t.db), wanted(2, 5));
+      assert.equal(pos(t.db, OWN), 300);
+      assert.equal(owed(t.db), 0);
+      assert.equal(t.c.fenced.size, 0);
+    } finally { t.close(); }
+  });
+});
+
+test('a stream pass that joins a background fence already queued for PREPARE lends it the queue', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 300);
+    follower(path, w);
+    const t = client(path, w);
+    try {
+      // The pass holds the queue first (busy with something else), and the background op
+      // reaches PREPARE meanwhile: it queues behind the pass.
+      const joinNow = deferred();
+      const pass = t.c.changeStreams(async () => {
+        await joinNow.p;
+        assert.equal(await t.c.applyGenerations('item', true), true);
+      });
+      const background = t.c.applyGenerations('item');
+      // Let the background op get as far as its queued PREPARE (it needs nothing the pass holds before that).
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(typeof t.c.seedInFlight.get('item')?.run.lend, 'function', 'the op waits in the queue for its turn');
+      assert.equal(owed(t.db), 0, 'the fence is still waiting for the queue: nothing prepared yet');
+      joinNow.go();
+      await within(2000, pass, 'the pass');
+      assert.equal(await within(2000, background, 'the background op'), true);
+      assert.deepEqual(rows(t.db), wanted(2, 5));
+      assert.equal(pos(t.db, OWN), 300);
+      assert.equal(owed(t.db), 0);
+      assert.equal(t.c.fenced.size, 0);
     } finally { t.close(); }
   });
 });
