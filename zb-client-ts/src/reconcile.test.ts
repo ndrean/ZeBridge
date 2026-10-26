@@ -35,7 +35,7 @@ function fixture(path = ':memory:') {
   Object.assign(c, {
     outboxInitPromise: Promise.resolve(), reconcileLoaded: false, streamWork: Promise.resolve(),
     globalSyncState: { seq }, hubOnly: new Set(), healedRoutes: new Set(),
-    tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(), frontiers: new Map(), frontierGated: 0, streamsSubscribed: false, measure: new Measure(() => {}), applyingByChoice: new Set(), syncedTables: new Map([['item', {}]]), ondemandSet: new Set(),
+    tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(), replacing: new Map(), frontiers: new Map(), frontierGated: 0, streamsSubscribed: false, measure: new Measure(() => {}), applyingByChoice: new Set(), syncedTables: new Map([['item', {}]]), ondemandSet: new Set(),
     streamCreated: new Map([['CDC_acme', 'same']]), restarted: new Set(), failed: new Set(), nc: {},
     transport: {
       jetstreamManager: async () => ({ streams: { info: async () => ({ state: { last_seq: 12 } }) } }),
@@ -278,7 +278,7 @@ test('a route parked by a fence gets no tail until the fence commits; a stale pa
       c.globalSyncState.seq.CDC_acme = 10;
       db.exec("INSERT INTO _zebridge_stream_seq VALUES ('CDC_acme', 10, 'same')");
       // 'item''s fence has the route; or a table that is no longer followed does.
-      c.fenced.set('CDC_acme', owner);
+      c.fenced.set('CDC_acme', new Set([owner]));
       let added = 0;
       c.transport.jetstreamManager = async () => ({
         streams: { info: async () => ({ created: 'same', state: { first_seq: 1, last_seq: 11 } }) },
@@ -289,7 +289,7 @@ test('a route parked by a fence gets no tail until the fence commits; a stale pa
       if (owner === 'item') {
         assert.equal(added, 0, 'no consumer on a parked route');
         assert.equal(c.tailFilters.has('CDC_acme'), false);
-        assert.equal(c.fenced.get('CDC_acme'), 'item', 'the parking stays until the fence commits');
+        assert.deepEqual([...c.fenced.get('CDC_acme')], ['item'], 'the parking stays until the fence commits');
       } else {
         assert.equal(added, 1, 'a parking whose table is gone does not hold the route');
         assert.equal(c.fenced.has('CDC_acme'), false);

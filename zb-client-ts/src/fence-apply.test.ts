@@ -27,6 +27,11 @@ class World {
     [PUB]: { created: 'pub-1', first: 1, last: 200 },
   };
   objects = new Map<string, Uint8Array>();
+  /// A seeding leaf's mirrors, when the test has one: its own manifests and objects.
+  leaf: World | null = null;
+  view(domain?: string): World { return domain === 'leaf' && this.leaf ? this.leaf : this; }
+  /// A chain object read waits for this (a slow download), per object name.
+  hold?: (name: string) => Promise<void> | undefined;
   manifests: Record<string, any> = {};
   /// The `item` table's manifest (most tests have only that table).
   get manifest(): any { return this.manifests.item ?? null; }
@@ -92,7 +97,7 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
   const passes: number[] = [];
   Object.assign(c, {
     nc: {}, tenantValue: 'acme', syncedTables, ondemandSet: new Set(), seedInFlight: new Map(),
-    globalSyncState: { seq }, tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(),
+    globalSyncState: { seq }, tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(), replacing: new Map(),
     streamWork: Promise.resolve(), streamsSubscribed: true, restarted: new Set(), failed: new Set(), hubOnly: new Set(),
     applyingByChoice: new Set(), healedRoutes: new Set(), streamCreated, fkHeld: [], hlcFloor: '', frontiers: new Map(), frontierGated: 0,
     pendingWrites: new Map(), rebase: new Map(), bulkStats: { single: 0, statements: 0, bulked: 0, fallbacks: 0 },
@@ -105,11 +110,16 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
       },
     },
     transport: {
-      kv: async () => ({ get: async (key: string) => {
-        const m = world.manifests[String(key).split('.').pop() as string];
+      kv: async (_nc: unknown, _bucket: string, _o: unknown, jsOpts: any) => ({ get: async (key: string) => {
+        const m = world.view(jsOpts?.domain).manifests[String(key).split('.').pop() as string];
         return m ? { operation: 'PUT', value: new TextEncoder().encode(JSON.stringify(m)) } : null;
       } }),
-      objectStore: async () => ({}),
+      objectStore: async (_nc: unknown, _bucket: string, jsOpts: any) => ({
+        info: async (name: string) => {
+          const o = world.view(jsOpts?.domain).objects.get(name);
+          return o ? { size: o.length, deleted: false } : null;
+        },
+      }),
       jetstreamManager: async () => ({ streams: { info: async (name: string) => {
         const st = world.streams[name];
         if (!st) throw new Error(`no stream ${name}`);
@@ -117,7 +127,7 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
       } } }),
     },
     jsOpts: () => ({ domain: 'hub' }), appendLog: (_t: string, m: string) => { log.push(m); },
-    objectBlob: async (_os: unknown, _bucket: string, name: string) => world.objects.get(name) ?? null,
+    objectBlob: async (_os: unknown, _bucket: string, name: string, jsOpts?: any) => { await world.hold?.(name); return world.view(jsOpts?.domain).objects.get(name) ?? null; },
     seedProgress: () => {}, triggerChange: () => {}, reapplyPending: async () => {}, drainPending: async () => {},
     subscribeStreams: async () => { passes.push(1); }, reach: () => {},
   });
@@ -261,7 +271,7 @@ test('retention overtaking a staged fence: not committed, still owed, parked; a 
       assert.equal(owed(t.db), 1, 'the fence is still owed');
       assert.equal(pos(t.db, OWN), 300, 'the cursor stays at the cut');
       assert.equal(t.c.syncedTables.get('item').unseeded, true, 'its events are held');
-      assert.equal(t.c.fenced.get(OWN), 'item', 'the route stays parked: no tail meanwhile');
+      assert.deepEqual([...t.c.fenced.get(OWN)], ['item'], 'the route stays parked: no tail meanwhile');
       // The old chain is now behind the stream: nothing to do but wait for a newer one.
       assert.equal(await t.c.applyGenerations('item'), false);
       assert.ok(t.log.some((m) => /predates the stream/.test(m)));
@@ -482,24 +492,89 @@ test('an on-demand table on the route does not count as a dependent', async () =
   });
 });
 
-test('a fence is not taken from a leaf\'s chain: refused, nothing prepared, the hub is asked', async () => {
+/// A client behind a seeding leaf: the leaf's mirrors hold `leafCut`'s chain (note `leaf`), the hub a
+/// newer one (note `hub`). Records which domain every read went to.
+function behindLeaf(path: string, leafCut: number, hubCut = 450) {
+  const w = new World();
+  w.leaf = new World();
+  w.leaf.publish(2, 5, leafCut);
+  w.publish(5, 4, hubCut);
+  follower(path, w);
+  const t = client(path, w);
+  t.c.config.seedDomain = 'leaf';
+  t.c.config.jsDomain = 'hub';
+  const seen: string[] = [];
+  const real = t.c.transport.kv;
+  t.c.transport.kv = async (nc: unknown, bucket: string, o: unknown, jsOpts: any) => { seen.push(jsOpts?.domain ?? 'hub'); return real(nc, bucket, o, jsOpts); };
+  return { w, t, seen };
+}
+
+test('a fence is taken from a seeding leaf\'s chain: the leaf\'s objects, the hub\'s proofs, the hub never asked for the chain', async () => {
+  await withDir(async (path) => {
+    const { t, seen } = behindLeaf(path, 300);
+    try {
+      assert.equal(await t.c.applyGenerations('item'), true);
+      assert.deepEqual(seen, ['leaf'], 'only the leaf was asked for a manifest');
+      assert.deepEqual(rows(t.db), wanted(2, 5), 'the leaf\'s rows, though the hub has a newer chain (an older generation on a leaf stays usable)');
+      assert.equal(pos(t.db, OWN), 300, 'the cursor is at the LEAF chain\'s cut: the events after it replay from the hub');
+      assert.deepEqual({ ...anchor(t.db) }, { seed_seq: 300, seed_stream: OWN, shared_seed_seq: 40 });
+      assert.equal(owed(t.db), 0);
+      assert.ok(t.log.some((m) => /fence prepared — chain g2 cut at 300.*\[from the seeding leaf\]/.test(m)));
+    } finally { t.close(); }
+  });
+});
+
+test('a leaf whose manifest is ahead of its objects: nothing is prepared, the hub\'s chain is fenced', async () => {
+  await withDir(async (path) => {
+    const { w, t, seen } = behindLeaf(path, 300);
+    try {
+      w.leaf!.objects.clear(); // the manifest mirrored, the objects not yet
+      assert.equal(await t.c.applyGenerations('item'), true);
+      assert.deepEqual(seen.slice(0, 2), ['leaf', 'hub']);
+      assert.ok(t.log.some((m) => /the seeding leaf's manifest names item-i1-g2-full, which its cache does not hold yet/.test(m)));
+      assert.ok(!t.log.some((m) => /\[from the seeding leaf\]/.test(m)));
+      assert.deepEqual(rows(t.db), wanted(5, 4), 'the hub\'s chain');
+      assert.equal(pos(t.db, OWN), 450);
+      assert.equal(owed(t.db), 0);
+    } finally { t.close(); }
+  });
+});
+
+test('a leaf chain whose suffix the hub no longer holds is not fenced: the hub\'s chain is', async () => {
+  await withDir(async (path) => {
+    const { w, t } = behindLeaf(path, 300);
+    try {
+      w.streams[OWN]!.first = 400; // the hub's retention is past the leaf's cut + 1; the hub's own cut (450) is fine
+      assert.equal(await t.c.applyGenerations('item'), true);
+      assert.ok(!t.log.some((m) => /\[from the seeding leaf\]/.test(m)), 'no fence prepared from the stale leaf chain');
+      assert.deepEqual(rows(t.db), wanted(5, 4));
+      assert.equal(pos(t.db, OWN), 450);
+    } finally { t.close(); }
+  });
+});
+
+test('a fence from a leaf interrupted after a chunk is owed: the reopened client recovers it, from the leaf', async () => {
   await withDir(async (path) => {
     const w = new World();
-    w.publish(2, 5, 300);
+    w.leaf = new World();
+    w.leaf.publish(2, 5, 300);
+    w.publish(5, 4, 450);
     follower(path, w);
-    const t = client(path, w);
+    const first = client(path, w, { hook: crash('after_chunk') });
+    first.c.config.seedDomain = 'leaf'; first.c.config.jsDomain = 'hub';
     try {
-      t.c.config.seedDomain = 'leaf';
-      t.c.config.jsDomain = 'hub';
-      const seen: string[] = [];
-      const real = t.c.transport.kv;
-      t.c.transport.kv = async (nc: unknown, bucket: string, o: unknown, jsOpts: any) => { seen.push(jsOpts?.domain ?? 'hub'); return real(nc, bucket, o, jsOpts); };
-      assert.equal(await t.c.applyGenerations('item'), true, 'the leaf attempt is refused, the hub attempt is fenced');
-      assert.deepEqual(seen.slice(0, 2), ['leaf', 'hub']);
-      assert.ok(t.log.some((m) => /not fencing from a leaf's chain/.test(m)));
-      assert.equal(owed(t.db), 0);
-      assert.deepEqual(rows(t.db), wanted(2, 5));
-    } finally { t.close(); }
+      await assert.rejects(() => first.c.applyGenerations('item'), /crash at after_chunk/);
+      assert.equal(owed(first.db), 1);
+      assert.equal(pos(first.db, OWN), 300);
+    } finally { first.close(); }
+    const second = client(path, w);
+    second.c.config.seedDomain = 'leaf'; second.c.config.jsDomain = 'hub';
+    try {
+      assert.equal(await second.c.applyGenerations('item'), true, 'the retry is a fence again, with every proof');
+      assert.equal(owed(second.db), 0);
+      assert.deepEqual(rows(second.db), wanted(2, 5));
+      assert.equal(pos(second.db, OWN), 300);
+    } finally { second.close(); }
   });
 });
 
@@ -581,11 +656,11 @@ test('a failed PREPARE gives back a parking an earlier fence of the table still 
     follower(path, w);
     const t = client(path, w);
     // An earlier fence of this table, interrupted: the own route is parked for it.
-    t.c.fenced.set(OWN, 'item');
+    t.c.fenced.set(OWN, new Set(['item']));
     t.c.transaction = async () => { throw new Error('disk full'); };
     try {
       await assert.rejects(() => t.c.applyGenerations('item', true), /disk full/);
-      assert.deepEqual([...t.c.fenced], [[OWN, 'item']], 'its parking stays; only this attempt\'s own is undone');
+      assert.deepEqual([...t.c.fenced].map(([k, v]) => [k, [...v]]), [[OWN, ['item']]], 'its parking stays; only this attempt\'s own is undone');
     } finally { t.close(); }
   });
 });
@@ -751,7 +826,7 @@ test('a PREPARE that committed but could not read its frontiers back leaves the 
       assert.equal(pos(t.db, OWN), 300);
       assert.equal(frontierRows(t.db).length, 2);
       assert.equal(t.c.syncedTables.get('item').unseeded, true);
-      assert.deepEqual([...t.c.fenced].sort(), [[OWN, 'item'], [PUB, 'item']].sort());
+      assert.deepEqual([...t.c.fenced].map(([k, v]) => [k, [...v]]).sort(), [[OWN, ['item']], [PUB, ['item']]].sort());
       assert.ok(t.log.some((m) => /could not be read back/.test(m)));
       // The retry (the fence is still owed) reads them, completes, and releases the routes.
       failing = false;
@@ -780,6 +855,112 @@ test('dropping a table\'s frontier fails closed: the chain is not applied over a
       assert.deepEqual(rows(t.db), ['91:old', '92:old', '93:old'], 'no step ran');
       assert.deepEqual(t.c.frontiers.get('item'), [{ stream: OWN, seq: 520 }], 'memory and replica still agree');
       assert.equal(frontierRows(t.db).length, 1);
+    } finally { t.close(); }
+  });
+});
+
+/// Two chain replacements on one route whose downloads and commits overlap: while either is still
+/// writing rows, no consumer may reopen on the route — a live event applied now is deleted by the
+/// full, and the cursor, already past it, never replays it (a permanent hole).
+for (const inPass of [false, true]) {
+  const how = inPass ? 'in a pass' : 'background';
+  const setup = async (path: string, plainFirst: boolean) => {
+    const w = new World();
+    // The fence: item cut at 100, behind the position 500. The other: a full that is a plain seed,
+    // cut at 200 (decided after the fence moved the cursor to 100) or at 600 (ahead of the position).
+    w.publish(2, 5, 100, 40, 'item');
+    w.publish(2, 4, plainFirst ? 600 : 200, 40, 'orders');
+    follower(path, w, ['orders']);
+    const slow = deferred();
+    w.hold = (name) => (name.startsWith('orders') ? slow.p : undefined); // its download stays paused
+    let arrived = 0;
+    const both = deferred();
+    const t = client(path, w, { others: ['orders'], hook: async (point) => {
+      if (point !== 'before_decision') return;
+      if (++arrived === 2) both.go();
+      await both.p;
+    } });
+    return { w, t, slow };
+  };
+  /// A real stream pass (step 2 opens the tails) against a stubbed hub: how many consumers it opened.
+  const consumersOpenedBy = async (t: any) => {
+    let added = 0;
+    const real = t.c.transport.jetstreamManager;
+    t.c.transport.jetstreamManager = async (...a: any[]) => ({
+      ...(await real(...a)),
+      consumers: { add: async () => { added++; return { name: 'x', num_pending: 0 }; } },
+    });
+    t.c.transport.deliverPolicy = { byStartSequence: 'by_start_sequence', all: 'all' };
+    t.c.transport.jetstream = () => ({ consumers: { get: async () => ({ consume: async () => ({ [Symbol.asyncIterator]() { return this; }, next: () => new Promise(() => {}), stop() {} }) }) } });
+    t.c.subscribeStreamsOnce = (ZeBridge.prototype as any).subscribeStreamsOnce;
+    await t.c.subscribeStreamsOnce();
+    for (const stream of [...t.c.tailStops.keys()]) await t.c.stopTail(stream);
+    return added;
+  };
+  const parkedBy = (t: any, stream: string) => [...(t.c.fenced.get(stream) ?? [])].sort();
+
+  test(`a fence that finishes while another chain replacement is still downloading does not release the route (${how}, the replacement converted to a plain seed)`, async () => {
+    await withDir(async (path) => {
+      const { t, slow } = await setup(path, false);
+      try {
+        const fence = t.c.applyGenerations('item', inPass);
+        const plain = t.c.applyGenerations('orders', inPass);
+        assert.equal(await within(5000, fence, 'the fence'), true, 'the fence is through: rows replaced, anchored');
+        // orders is a plain seed now (its cut 200 is past the cursor 100 the fence left), its download paused.
+        for (let i = 0; i < 50 && !t.c.replacing.get(OWN)?.has('orders'); i++) await new Promise((r) => setImmediate(r));
+        assert.ok(t.c.replacing.get(OWN)?.has('orders'), 'the plain seed is recorded on the route');
+        assert.equal(t.c.routeParked(OWN), true, 'the route stays parked: a consumer reopening at 101 would apply the live event the full then deletes');
+        assert.deepEqual(parkedBy(t, OWN), ['orders']);
+        assert.equal(t.c.routeParked(PUB), true, 'the shared route too');
+        assert.equal(pos(t.db, OWN), 100);
+        // A pass now — the poll loop's, the reconnect's — finds no consumer to open on either route.
+        assert.equal(await consumersOpenedBy(t), 0, 'no consumer opens while the replacement writes rows');
+        // The download completes: the replacement ends and only then the route opens (a poll loop asks for the tails).
+        const before = t.passes.length;
+        slow.go();
+        assert.equal(await within(5000, plain, 'the plain seed'), true);
+        assert.equal(t.c.fenced.size, 0, 'released with the last owner');
+        assert.ok((await consumersOpenedBy(t)) > 0, 'and a pass then opens the consumers (the stub is not what held them back)');
+        assert.equal(t.c.replacing.get(OWN)?.size ?? 0, 0);
+        assert.equal(t.passes.length - before, inPass ? 0 : 1, 'the tails are asked for when the route opens');
+        assert.equal(pos(t.db, OWN), 100, 'the cursor is still at the lower cut: nothing moved it meanwhile');
+        assert.deepEqual(rows(t.db), wanted(2, 5));
+      } finally { slow.go(); t.close(); }
+    });
+  });
+
+  test(`a plain seed already downloading when a fence parks and commits on its route keeps the parking (${how})`, async () => {
+    await withDir(async (path) => {
+      const { t, slow } = await setup(path, true);
+      try {
+        const plain = t.c.applyGenerations('orders', inPass); // first: decided plain (cut 600, ahead of the position)
+        const fence = t.c.applyGenerations('item', inPass);
+        assert.equal(await within(5000, fence, 'the fence'), true);
+        assert.equal(t.c.routeParked(OWN), true, 'the fence committed, the plain seed is still writing');
+        assert.deepEqual(parkedBy(t, OWN), ['orders']);
+        assert.equal(await consumersOpenedBy(t), 0, 'no consumer opens while the replacement writes rows');
+        assert.equal(pos(t.db, OWN), 100);
+        slow.go();
+        assert.equal(await within(5000, plain, 'the plain seed'), true);
+        assert.equal(t.c.fenced.size, 0);
+        assert.equal(pos(t.db, OWN), 100);
+      } finally { slow.go(); t.close(); }
+    });
+  });
+}
+
+test('a plain seed that is refused or fails leaves the routes it held', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 600); // a plain seed ...
+    follower(path, w);
+    w.objects.delete(w.manifest.full.object); // ... whose chain object is gone: no step ever applies
+    const t = client(path, w);
+    try {
+      t.c.fenced.set(OWN, new Set(['orders'])); // another table's fence holds the route
+      assert.equal(await t.c.applyGenerations('item'), false);
+      assert.equal(t.c.replacing.get(OWN)?.size ?? 0, 0);
+      assert.deepEqual([...t.c.fenced.get(OWN)], ['orders'], 'the parking the other owner holds is not this one\'s to release; this one joined it and left it');
     } finally { t.close(); }
   });
 });

@@ -683,9 +683,9 @@ The bound on a click is one poll's `wait_ms`: commands are served between two po
 
 ### Code examples
 
-- [App.tsx](/examples/05-tables/web-consumer/src/App.tsx) (browser, live),
-- [Flutter](/examples/05-tables/flutter) example,
-- [DuckDB over a synced replica](/examples/07-duckdb/analyze.py): PostgreSQL → SQLite → DuckDB, an analytical job that never touches PostgreSQL,
+- [App.tsx](examples/05-tables/web-consumer/src/App.tsx) (browser, live),
+- [Flutter](examples/05-tables/flutter) example,
+- [DuckDB over a synced replica](examples/07-duckdb/analyze.py): PostgreSQL → SQLite → DuckDB, an analytical job that never touches PostgreSQL,
 - a Node service on zb-client-ts (`examples/04-node-consumer`), and a Python service on libzb answering questions from a DuckDB replica (`examples/09-event`).
 
 A device gets its identity from an invite, once; the library does the rest. See [Users: invites](AUTHENTICATION.md#users-invites).
