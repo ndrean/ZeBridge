@@ -13,7 +13,10 @@ So the sweeper has two ways to be wrong, and only one of them is visible:
   * reaping **too early** — a client still inside its allowed offline window loses the
     tombstone that protects it. Nothing errors; a deleted row comes back weeks later.
 
-This seeds tombstones either side of the threshold and asserts exactly which survive.
+This seeds tombstones either side of the threshold and asserts exactly which survive. The threshold
+is the STACK's (GC_THRESHOLD_MS, else 7 days) and the fixtures are aged around it: a pass moves the
+database's GC floor for good, so a shorter retention of this scenario's would leave the shared database
+refusing every older write.
 
 ⚠️ It also asserts the sweeper's *sources*: the table and its tombstone column come from
 `zebridge_catalogue` — written by `zebridge_enable` in the same transaction as the
@@ -44,7 +47,8 @@ import sys
 import zb
 
 FIX = "zb_sweeper_probe"      # a table this scenario owns: created, enabled, dropped
-THRESHOLD_MS = 3_600_000      # 1 hour
+THRESHOLD_MS = zb.gc_retention_ms()   # the stack's own retention (7 days unless GC_THRESHOLD_MS says otherwise)
+MINUTE = 60_000
 MARK = "sweeper-scenario"
 
 
@@ -76,6 +80,7 @@ async def main():
     if not os.environ.get("DATABASE_WRITER_URL"):
         sys.exit("DATABASE_WRITER_URL is not set.\n  set -a && . ./.env.bridge && set +a")
 
+    zb.require_sweeper_free()
     setup_fixture()
     try:
         return await run()
@@ -91,14 +96,18 @@ async def run():
     # Ages chosen around the boundary rather than far from it: a sweeper that compares the
     # wrong column, or the right column against the wrong clock, still passes a test whose
     # rows are days apart.
+    # Around the stack's own retention, never a shorter one of this scenario's: a pass advances the
+    # database's floor for good (zb.py, "The sweeper, on a database somebody keeps").
+    if THRESHOLD_MS < 5 * MINUTE:
+        sys.exit(f"the stack's retention is {THRESHOLD_MS} ms: too short to put a fixture either side of it with a minute to spare")
     seeds = [
-        ("well past", "3 hours", False),
-        ("just past", "61 minutes", False),
-        ("just inside", "59 minutes", True),
+        ("well past", THRESHOLD_MS + 120 * MINUTE, False),
+        ("just past", THRESHOLD_MS + MINUTE, False),
+        ("just inside", THRESHOLD_MS - MINUTE, True),
         ("live row", None, True),
     ]
     for label, age, _ in seeds:
-        ts = "NULL" if age is None else f"now() - interval '{age}'"
+        ts = "NULL" if age is None else zb.ago_ms(age)
         zb.psql(
             f"INSERT INTO public.{FIX} (uid, some_text, inserted_at, {version}, {tombstone}) "
             f"VALUES (gen_random_uuid(), '{MARK}: {label}', now(), now(), {ts})",
@@ -112,12 +121,12 @@ async def run():
             "  Fix the fixture before reading anything below as a sweeper verdict."
         )
 
-    print(f"seeded {len(seeds)} rows in '{FIX}' (threshold {THRESHOLD_MS // 60000} min)\n")
+    print(f"seeded {len(seeds)} rows in '{FIX}' (retention {THRESHOLD_MS // MINUTE} min)\n")
 
-    env = dict(os.environ)
-    env["SWEEP_ONLY_TABLES"] = FIX  # ⚠️ the scope: nothing else is swept
-    env["GC_THRESHOLD_MS"] = str(THRESHOLD_MS)
-    env["GC_INTERVAL_MS"] = "999999999"  # one pass, then it sleeps
+    # The stack's own retention, explicit; nothing shorter (see above).
+    env = zb.sweeper_env(SWEEP_ONLY_TABLES=FIX,  # ⚠️ the scope: nothing else is swept
+                         GC_THRESHOLD_MS=THRESHOLD_MS,
+                         GC_INTERVAL_MS="999999999")  # one pass, then it sleeps
     # The sweeper is a daemon: one pass, then it sleeps for GC_INTERVAL_MS. Timing out is
     # the expected end of a single-pass run, not a failure — the work is already done and
     # the output is on the pipe.

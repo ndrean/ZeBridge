@@ -122,8 +122,9 @@ async def main():
     await asyncio.sleep(2.5)
 
     # Aged past any sane threshold, so one sweep takes it.
+    # Past the STACK's retention (a pass moves the GC floor for good: no shorter one of our own).
     zb.psql(
-        f"UPDATE public.{SOFT} SET {tombstone_col} = now() - interval '2 hours', "
+        f"UPDATE public.{SOFT} SET {tombstone_col} = {zb.ago_ms(zb.gc_retention_ms() + 2 * 3600 * 1000)}, "
         f"{version_col} = now() WHERE uid = '{uid}'"
     )
     await asyncio.sleep(3)
@@ -143,9 +144,8 @@ async def main():
     if not sweeper.exists():
         sys.exit(f"{sweeper} not built — run `zig build`")
 
-    env = dict(os.environ)
-    env["GC_THRESHOLD_MS"] = "3600000"
-    env["GC_INTERVAL_MS"] = "999999999"
+    zb.require_sweeper_free()
+    env = zb.sweeper_env(GC_THRESHOLD_MS=zb.gc_retention_ms(), GC_INTERVAL_MS="999999999")
     try:
         subprocess.run([str(sweeper)], env=env, capture_output=True, text=True, timeout=12)
     except subprocess.TimeoutExpired:

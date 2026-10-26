@@ -52,10 +52,10 @@ async def main():
 
     drop_fixture()
     zb.forget_table(FIX)
-    env = dict(os.environ)
-    env["SWEEP_ONLY_TABLES"] = FIX  # ⚠️ the scope: nothing else is swept
-    env["GC_THRESHOLD_MS"] = "3600000"
-    env["GC_INTERVAL_MS"] = str(INTERVAL_MS)
+    zb.require_sweeper_free()
+    # The stack's own retention, never a shorter one: a pass moves the database's GC floor for good.
+    env = zb.sweeper_env(SWEEP_ONLY_TABLES=FIX,  # ⚠️ the scope: nothing else is swept
+                         GC_THRESHOLD_MS=zb.gc_retention_ms(), GC_INTERVAL_MS=INTERVAL_MS)
 
     log = tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False)
     proc = subprocess.Popen([str(zb.SWEEPER)], env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -80,7 +80,7 @@ async def main():
                 public_reason => 'sweeper catalogue scenario fixture',
                 publication => '{zb.publication()}', dry_run => false);
             INSERT INTO public.{FIX} (uid, some_text, updated_at, deleted_at) VALUES
-                (gen_random_uuid(), '{MARK}: old tombstone', now(), now() - interval '3 hours'),
+                (gen_random_uuid(), '{MARK}: old tombstone', now(), {zb.ago_ms(zb.gc_retention_ms() + 3 * 3600 * 1000)}),
                 (gen_random_uuid(), '{MARK}: live row', now(), NULL);
         """)
         if "catalogue:done" not in out:

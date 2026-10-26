@@ -14,7 +14,9 @@ Both clients (libzb, zb-client-ts in Node), the DBA's psql path, and the sweeper
   §3  the children first, then the parent → applied on both, equal to PostgreSQL
   §4  enabling a tombstone table under a cascade → preflight ERROR
   §5  adding a cascade to an enabled tombstone table → the migration is rejected
-  §6  the sweeper reaps the family, children then parent; no replica hears about it
+  (the reap of a tombstoned family — children then parent, bounded batches, nothing on the streams — is
+   gc_isolation.py §7: a short-retention sweeper moves a database's GC floor for good, so it runs on a
+   disposable database, never on this one)
 """
 import os, subprocess, sys, time, uuid
 import zb
@@ -107,33 +109,6 @@ def main():
             r = subprocess.run(zb.PSQL.split() + ["-tA", "-c", f"ALTER TABLE {C} ADD CONSTRAINT {C}_cascade FOREIGN KEY (parent_id) REFERENCES {P}(uid) ON DELETE CASCADE"], capture_output=True, text=True)
             check(f"§5 ALTER TABLE adding a cascade to the enabled tombstone table is rejected: {r.stderr.strip()[:100]!r}", r.returncode != 0 and "migration rejected" in r.stderr)
 
-            # ── 6. the reap: children then parent, in bounded batches, and no replica hears it ──
-            # 2,500 more tombstoned children of p2's family, tombstoned in PostgreSQL directly
-            # (a batch of soft deletes an application might do) — then the sweeper must reap
-            # them in batches of 1000, three batches, one pass.
-            zb.psql(f"INSERT INTO {C} (uid, parent_id, note, tenant_id, deleted_at) SELECT gen_random_uuid(), '{p2}', 'bulk' || g, '{tenant}', now() FROM generate_series(1, 2500) g")
-            before = (live(py, P), live(py, C), live(nd, P), live(nd, C))
-            # the sweeper refuses a sub-minute window unless told it is meant (a guard of its own)
-            env = dict(os.environ, GC_THRESHOLD_MS="1000", GC_INTERVAL_MS="999999999", GC_ALLOW_SHORT_THRESHOLD="1", GC_BATCH_ROWS="1000")
-            time.sleep(2)
-            passes = 0; remaining = None; sweep_out = ""
-            for i in range(3):
-                try:
-                    r = subprocess.run([str(zb.SWEEPER)], env=env, capture_output=True, text=True, timeout=12)
-                    sweep_out += (r.stdout or "") + (r.stderr or "")
-                except subprocess.TimeoutExpired as e:
-                    sweep_out += (e.stdout or b"").decode(errors="replace") + (e.stderr or b"").decode(errors="replace")
-                passes += 1
-                remaining = zb.psql(f"SELECT (SELECT count(*) FROM {P} WHERE deleted_at IS NOT NULL) || '/' || (SELECT count(*) FROM {C} WHERE deleted_at IS NOT NULL)").strip()
-                if remaining == "0/0": break
-            zb.restore_gc_watermark()   # the 1 s threshold must not outlive this section
-            time.sleep(3); py.poll()
-            after = (live(py, P), live(py, C), live(nd, P), live(nd, C))
-            batch_lines = [l for l in sweep_out.splitlines() if "batch(es)" in l]
-            check(f"§6 the sweeper reaped the tombstoned family in {passes} pass(es), children first, in bounded batches (tombstones left parent/child: {remaining}; {'; '.join(l.split('GC: ')[-1] for l in batch_lines)[:160]}); the replicas did not move: {before} → {after}",
-                  remaining == "0/0" and before == after and any("3 batch(es)" in l for l in batch_lines))
-            if remaining != "0/0":
-                print("  · sweeper said: " + " | ".join(l for l in sweep_out.splitlines() if "GC" in l or "ERROR" in l)[-600:])
             py.close(); nd.close(); py = nd = None
             teardown()
     finally:

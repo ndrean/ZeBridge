@@ -1184,6 +1184,14 @@ DECLARE
     v_cut   timestamptz;
     v_floor timestamptz;
 BEGIN
+    -- A zero or sub-second retention reaps every tombstone, and `threshold_ms = 0` is how the producer
+    -- reads "the sweeper has never run" (its checkpoint guard is then off): refused here, whoever calls,
+    -- the override of the sweeper's own minute-floor included.
+    IF p_threshold_ms IS NULL OR p_threshold_ms < 1000 OR p_retention_secs IS NULL OR p_retention_secs < 1 THEN
+        RAISE EXCEPTION 'zebridge_gc_advance: a retention below one second is refused (threshold_ms %, % s)', p_threshold_ms, p_retention_secs
+            USING ERRCODE = 'invalid_parameter_value',
+                  HINT = 'Zero would reap every tombstone and read as "never swept"; GC_THRESHOLD_MS is the offline window clients are promised.';
+    END IF;
     PERFORM set_config('lock_timeout', p_lock_ms::text || 'ms', true);
     PERFORM pg_advisory_xact_lock(23106, 2);
     v_cut := now() - make_interval(secs => p_retention_secs);

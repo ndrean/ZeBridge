@@ -162,6 +162,46 @@ def require_rules(table: str, *needed: str) -> dict:
     return r
 
 
+# ─── The sweeper, on a database somebody keeps ─────────────────────────────────────
+#
+# A sweeper pass advances the database's GC floor, and the floor never goes down (a trigger refuses
+# it: NOTES "One floor, one sweeper"). So a scenario that sweeps a database that is not its own must
+# sweep at THAT database's retention — what its daemon would do anyway — and age its fixtures past
+# it, never override it with a short one: the floor would stay there for good and refuse every write
+# older than the override until time passed. A scenario that needs a short retention (gc_isolation,
+# gc_resurrect) runs on a disposable database.
+
+DEFAULT_GC_RETENTION_MS = 7 * 24 * 3600 * 1000   # the sweeper's own default
+
+
+def gc_retention_ms() -> int:
+    """The retention the stack's sweeper runs with: GC_THRESHOLD_MS, else the sweeper's default."""
+    return int(os.environ.get("GC_THRESHOLD_MS") or DEFAULT_GC_RETENTION_MS)
+
+
+def sweeper_env(**extra) -> dict:
+    """The environment for a sweeper process: the stack's own, with no short-retention override."""
+    env = {k: v for k, v in os.environ.items() if k != "GC_ALLOW_SHORT_THRESHOLD"}
+    env.update({k: str(v) for k, v in extra.items()})
+    return env
+
+
+def ago_ms(ms: int) -> str:
+    """SQL for the instant `ms` milliseconds before the server's now()."""
+    return f"now() - interval '{int(ms)} milliseconds'"
+
+
+def require_sweeper_free() -> None:
+    """One sweeper per database: while another process holds the sweeper lock, a sweeper started here
+    idles and a scenario that waits for its reap would fail without saying why. Say it."""
+    held = psql("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND classid = 23106 AND objid = 1 "
+                "AND objsubid = 2 AND granted AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+                quiet=True)
+    if held and held != "0":
+        sys.exit("another sweeper holds this database's sweeper lock (a daemon of the stack?) — a sweeper started by this\n"
+                 "  scenario would idle, and its reap would never come. Stop that sweeper for the run.")
+
+
 def publication() -> str:
     """The publication under test — named, never guessed.
 
@@ -286,24 +326,6 @@ BRIDGE = ROOT / "zig-out" / "bin" / "bridge"
 SWEEPER = ROOT / "zig-out" / "bin" / "bridge_sweeper"
 
 
-def restore_gc_watermark() -> None:
-    """One sweeper pass at the stack's own GC threshold, after a scenario swept with a
-    short one. Every pass sets the watermark to now() - threshold: a 1 s sweep leaves any
-    write stamped more than a second ago refused (PredatesGcWatermark) until the next
-    normal pass, and a scenario run next that stamps its writes minutes back (recent_version)
-    then fails for no reason of its own. The floor is put back by hand first (it never goes down on its own),
-    then the normal pass publishes the stack's own."""
-    short = ("GC_THRESHOLD_MS", "GC_ALLOW_SHORT_THRESHOLD", "GC_INTERVAL_MS", "GC_BATCH_ROWS", "GC_DRY_RUN")
-    env = {k: v for k, v in os.environ.items() if k not in short}
-    # The floor never goes down (the database refuses it: NOTES "One floor, one sweeper"), so the normal
-    # pass can no longer put it back by itself. A scenario database has no history worth keeping; the
-    # trigger is stepped around, by name, the way an operator restoring from a backup would.
-    psql("ALTER TABLE public.zebridge_gc_watermark DISABLE TRIGGER zebridge_gc_watermark_monotone; "
-         "UPDATE public.zebridge_gc_watermark SET watermark = now() - interval '7 days' WHERE id = 1 AND watermark > now() - interval '7 days'; "
-         "ALTER TABLE public.zebridge_gc_watermark ENABLE TRIGGER zebridge_gc_watermark_monotone;", quiet=True)
-    r = subprocess.run([str(SWEEPER), "--once"], env=env, capture_output=True, text=True, timeout=300)
-    if r.returncode != 0:
-        print(f"  ⚠️  the restoring sweep failed (rc={r.returncode}): the GC watermark may still trail now() by seconds")
 # `--pub` comes from BRIDGE_CDC_PUBLICATION (publication(), no default): the literal
 # `my_pub` this used to carry was the very defaulting the bridge stopped doing.
 BRIDGE_ARGS = os.environ.get("ZB_BRIDGE_ARGS", "--slot zb_probe --port 9096").split()
@@ -536,7 +558,10 @@ def forget_table(*tables: str) -> None:
     it only ever existed for a test.
     """
     for t in tables:
-        nats_cli("kv", "del", kv_bucket("schemas"), t, "-f")
+        try:
+            nats_cli("kv", "del", kv_bucket("schemas"), t, "-f")
+        except FileNotFoundError:
+            return   # no `nats` CLI here, no broker to keep tidy: a psql-only run
 
 
 def wait_for_schema(*tables: str, timeout: float = 30) -> list[str]:

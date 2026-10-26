@@ -93,7 +93,7 @@ Each row: something that could go wrong, what the test shows instead, and the te
 | --- | --- | --- |
 | an old write, sent by a device that was offline, overwrites newer data | it is refused as `stale`; a write that really is newer still lands | `offline.py`, `mutate.py` |
 | an old write brings back a deleted row | the row stays deleted | `offline.py` |
-| an old write brings back a deleted row after the sweeper removed its tombstone | the bridge refuses the write (`PredatesGcWatermark`); without that guard the same write does bring the row back, which the test also shows | `gc_resurrect.py` |
+| an old write brings back a deleted row after the sweeper removed its tombstone | the bridge refuses the write (`PredatesGcWatermark`); without that guard (a floor staged behind the deletion, on a disposable database) the same write does bring the row back, which the test also shows | `gc_resurrect.py` |
 | two writes carry the same version | the tiebreak column picks the same winner everywhere | `tiebreak.py` |
 | a device's clock is fast or slow | a fast clock wins only until real time catches up; a slow clock can still write | `clockskew.py` |
 | a device's clock is far in the future | the version is cut back to the server's time, and the answer says so | `clamp.py` |
@@ -122,7 +122,7 @@ Each row: something that could go wrong, what the test shows instead, and the te
 | a migration grows a table past `MAX_COLUMNS` and crashes the bridge | the table is suspended, the bridge stays up, and a restart re-detects it and re-seeds both clients | `column_flood.py` |
 | two parent tables re-keyed in one transaction break a child that references both | one re-seed each, and both clients converge | `rekey_two_parents.py` |
 | a client killed in the middle of a local rebuild or a re-key is left broken | every leftover state converges when it reopens, in both clients | `rebuild_kill.py` |
-| a parent is deleted while live children still reference it | its tombstone is refused until the children go; a cascade into a tombstone table is refused at enable and at migration | `tombstone_children.py` |
+| a parent is deleted while live children still reference it | its tombstone is refused until the children go; a cascade into a tombstone table is refused at enable and at migration; the reap of a tombstoned family goes children first in bounded batches and publishes nothing (`gc_isolation.py` §7, on a disposable database) | `tombstone_children.py`, `gc_isolation.py` |
 | a two-level cascade delete meets rows held in a client's inbox | no ghost row and no orphan: both replicas equal PostgreSQL | `cascade_held.py` |
 | `zebridge_enable` accepts a table it should not, or refuses one it should take | a read-only tenant table enables, a dry run changes nothing, a nullable tenant column and an unscoped table are refused | `enable_scoping.py` |
 
