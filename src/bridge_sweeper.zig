@@ -274,6 +274,20 @@ pub fn main(init: std.process.Init) !void {
     }
     if (dry_run) log.info("DRY RUN — counting only, nothing will be deleted", .{});
 
+    // ⚠️ Not even the override reaches below one second. Zero reaps every tombstone there is, and the
+    // row then says `threshold_ms = 0`, which the producer reads as "the sweeper has never run" and
+    // switches its checkpoint guard off — after the history was actually gone. A retention under a
+    // second is no offline window anyone chose, and `zebridge_gc_advance` refuses it as well.
+    const hard_min_threshold_ms: u64 = 1000;
+    if (threshold_ms < hard_min_threshold_ms) {
+        log.err(
+            "GC_THRESHOLD_MS={d} is below {d}ms and is refused even with GC_ALLOW_SHORT_THRESHOLD: a zero or sub-second " ++
+                "retention reaps every tombstone, and a stored 0 reads as 'never swept' to the checkpoint guard.",
+            .{ threshold_ms, hard_min_threshold_ms },
+        );
+        std.process.exit(1);
+    }
+
     const min_threshold_ms: u64 = 60_000; // one minute
     if (threshold_ms < min_threshold_ms) {
         log.err(
@@ -573,7 +587,7 @@ pub fn main(init: std.process.Init) !void {
         // is told to reload slightly early, never to resurrect a row.
         var cutoff: ?[:0]const u8 = null;
         if (!dry_run) {
-            const secs_f = try utils.allocPrintZ(aa, "{d}", .{threshold_ms / 1000});
+            const secs_f = try utils.allocPrintZ(aa, "{d}.{d:0>3}", .{ threshold_ms / 1000, threshold_ms % 1000 });
             const ms_f = try utils.allocPrintZ(aa, "{d}", .{threshold_ms});
             const adv_params = [_]?[*:0]const u8{ secs_f.ptr, ms_f.ptr };
             const adv = c.PQexecPrepared(pg_conn, "gc_advance", 2, &adv_params[0], null, null, 0);
@@ -608,7 +622,7 @@ pub fn main(init: std.process.Init) !void {
             // the only safe way to change a threshold on a live database is to see what the
             // new one would take first.
             const stmt_name = try utils.allocPrintZ(aa, "gc_sweep_{d}", .{i});
-            const secs = try utils.allocPrintZ(aa, "{d}", .{threshold_ms / 1000});
+            const secs = try utils.allocPrintZ(aa, "{d}.{d:0>3}", .{ threshold_ms / 1000, threshold_ms % 1000 });
             const batch_z = try utils.allocPrintZ(aa, "{d}", .{batch_rows});
             const param_vals = [_]?[*:0]const u8{ if (dry_run) secs.ptr else cutoff.?.ptr, batch_z.ptr };
             var res = c.PQexecPrepared(pg_conn, stmt_name.ptr, if (dry_run) 1 else 2, &param_vals[0], null, null, 0);

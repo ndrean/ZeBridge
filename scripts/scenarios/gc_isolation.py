@@ -17,6 +17,9 @@ stack (a disposable database, its own nats-server, its own bridge), with real sw
      itself, or a standby), the floor never decreasing meanwhile;
   4. RETENTION INCREASE: 1 h to 7 days leaves the floor exactly where it is (deleted history does
      not come back); the retention then shortened moves it forward and reaps what it now covers;
+  4b. A ZERO (or sub-second) RETENTION is refused, the sweeper's override of its minute-floor
+     included, and by `zebridge_gc_advance` whoever calls it: zero reaps every tombstone and a stored
+     `threshold_ms = 0` reads as "never swept", which switches the producer's checkpoint guard off;
   5. THE ORDER: the floor is advanced before anything is reaped (a tombstone older than the floor
      is gone only after the floor said so);
   6. A DELAYED MUTATION RACING WITH REAPING. A stale INSERT (older than the row's tombstone, newer
@@ -25,6 +28,10 @@ stack (a disposable database, its own nats-server, its own bridge), with real sw
      the tombstone still there — and the write is judged against the tombstone. Control: with the
      floor lock taken out of the mutation's side, the same interleaving reaps the tombstone while
      the write waits and the write then brings the deleted row back. That is the hole.
+
+  7. A TOMBSTONED FAMILY (tombstone_children.py's reap, moved here: a short-retention pass moves a
+     database's floor for good, so it never runs on a shared one) is reaped children first, in bounded
+     batches of 1000, and the streams hear nothing.
 
 Usage:  python scripts/scenarios/gc_isolation.py
 Needs PostgreSQL superuser at 127.0.0.1:5432, nats-server, zig-out/bin/bridge and bridge_sweeper.
@@ -44,10 +51,10 @@ ADVANCE_LOCK = "classid = 23106 AND objid = 2 AND objsubid = 2"  # the floor
 
 class Sweeper:
     """A bridge_sweeper process, its log in a file."""
-    def __init__(self, stack, label, retention_ms, interval_ms=500, once=False):
+    def __init__(self, stack, label, retention_ms, interval_ms=500, once=False, only=T, batch=None):
         self.stack, self.label, self.once = stack, label, once
         env = dict(stack.env, GC_THRESHOLD_MS=str(retention_ms), GC_INTERVAL_MS=str(interval_ms), GC_ALLOW_SHORT_THRESHOLD="1",
-                   SWEEP_ONLY_TABLES=T, LOG_LEVEL="debug")
+                   SWEEP_ONLY_TABLES=only, LOG_LEVEL="debug", **({"GC_BATCH_ROWS": str(batch)} if batch else {}))
         self.path = f"/tmp/zb_gc_{label}.log"
         self.p = subprocess.Popen([str(SWEEPER), *(["--once"] if once else [])], env=env, stdout=open(self.path, "w"), stderr=subprocess.STDOUT)
 
@@ -134,14 +141,17 @@ class Writer:
             try: self.verdicts[m.subject.rsplit(".", 1)[-1]] = zb.decode(m.data)
             except Exception: pass
 
-    async def insert(self, rid, version):
+    async def send(self, op, rid, version, deleted=False, note="stale client write"):
         msg_id = f"gciso-{uuid.uuid4().hex[:16]}"
-        data = {"id": rid, "tenant_id": TENANT, "note": "stale client write", "updated_at": version, "deleted_at": None}
+        data = {"id": rid, "tenant_id": TENANT, "note": note, "updated_at": version, "deleted_at": version if deleted else None}
         payload = {"key": {"id": rid}, "data": data, "version": version, "client_id": "c-gciso"}
-        subject = zb.subject(zb.TOPOLOGY["subjects"]["mutations_prefix"], PRINCIPAL, T) + ".insert"
+        subject = zb.subject(zb.TOPOLOGY["subjects"]["mutations_prefix"], PRINCIPAL, T) + "." + op
         import msgpack
         await self.js.publish(subject, msgpack.packb(payload), headers={"Nats-Msg-Id": msg_id})
         return msg_id
+
+    async def insert(self, rid, version):
+        return await self.send("insert", rid, version)
 
     async def verdict(self, msg_id, timeout=20):
         end = time.monotonic() + timeout
@@ -209,6 +219,59 @@ async def race(stack, writer, rid, label, expect_lock):
     v = await writer.verdict(msg_id)
     await wait_until(lambda: sw.p.poll() is not None, 30)
     return dict(f0=f0, f_mid=f_mid, gone_mid=gone_mid, waiting=waiting, done_early=done_early, verdict=v, sweeper=sw, live=live(stack, rid), present=present(stack, rid), floor_end=floor(stack))
+
+
+FAM_P, FAM_C = "gc_fam_p", "gc_fam_c"
+
+
+async def family_reap(stack):
+    """What tombstone_children.py §6 checked on the shared database with a one-second sweeper, here on a
+    disposable one (a short-retention pass moves the floor for good): a tombstoned family is reaped
+    children first, in bounded batches, and the streams hear nothing of it (the bridge forwards no
+    physical DELETE of a tombstone table)."""
+    common = ("tenant_id varchar(255) NOT NULL, last_writer varchar(255), inserted_at timestamptz NOT NULL DEFAULT now(), "
+              "updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz")
+    stack.sql(f"CREATE TABLE public.{FAM_P} (uid uuid PRIMARY KEY, title text, {common});"
+              f"CREATE TABLE public.{FAM_C} (uid uuid PRIMARY KEY, parent_id uuid NOT NULL REFERENCES public.{FAM_P}(uid), note text, {common});")
+    for t in (FAM_P, FAM_C):
+        stack.sql(f"SELECT count(*) FROM zebridge_enable('public.{t}'::regclass, writable => true, tenant_col => 'tenant_id', "
+                  "version_col => 'updated_at', tombstone_col => 'deleted_at', tiebreak_col => 'last_writer', publication => 'rr_pub', dry_run => false)")
+    old = "now() - interval '5 minutes'"
+    p1, p2 = str(uuid.uuid4()), str(uuid.uuid4())
+    stack.sql(f"INSERT INTO public.{FAM_P} (uid, title, tenant_id, deleted_at) VALUES ('{p1}', 'p1', '{TENANT}', {old}), ('{p2}', 'p2', '{TENANT}', NULL);"
+              f"INSERT INTO public.{FAM_C} (uid, parent_id, note, tenant_id, deleted_at) VALUES "
+              f"(gen_random_uuid(), '{p1}', 'c1a', '{TENANT}', {old}), (gen_random_uuid(), '{p1}', 'c1b', '{TENANT}', {old}), "
+              f"(gen_random_uuid(), '{p2}', 'c2', '{TENANT}', NULL);"
+              f"INSERT INTO public.{FAM_C} (uid, parent_id, note, tenant_id, deleted_at) "
+              f"SELECT gen_random_uuid(), '{p2}', 'bulk' || g, '{TENANT}', {old} FROM generate_series(1, 2500) g;")
+    js = await rr.Js().open(stack)
+    async def heard():
+        n = {}
+        for name in ("CDC_" + TENANT, "CDC_PUBLIC"):
+            n[name] = (await js.stream(name)).get("messages")
+        return n
+    # The inserts above reach the streams on their own; read the counts when they have stopped moving.
+    prev = None
+    for _ in range(40):
+        cur = await heard()
+        if cur == prev: break
+        prev = cur
+        await asyncio.sleep(1.5)
+    before = prev
+    left = lambda: stack.sql(f"SELECT (SELECT count(*) FROM {FAM_P} WHERE deleted_at IS NOT NULL) || '/' || (SELECT count(*) FROM {FAM_C} WHERE deleted_at IS NOT NULL)")
+    check("the family is tombstoned: 1 parent, 2502 children", left() == "1/2502")
+    sw = Sweeper(stack, "family", 1000, once=True, only=f"{FAM_P},{FAM_C}", batch=1000)
+    sw.p.wait(timeout=120)
+    check("the sweeper pass completes", sw.p.returncode == 0)
+    check("it reaped the whole family: no tombstone left in either table", left() == "0/0")
+    check("the 2500+ children went in bounded batches of 1000 (3 batches)", "3 batch(es)" in sw.text())
+    check("the live parent and child were left alone", stack.sql(f"SELECT (SELECT count(*) FROM {FAM_P}) || '/' || (SELECT count(*) FROM {FAM_C})") == "1/1")
+    await asyncio.sleep(4)
+    after = await heard()
+    # CDC_PUBLIC also carries the watermark row itself: the pass's two row changes (the advance, the report).
+    check(f"nothing was published for the reaped rows: {before} -> {after}",
+          after["CDC_" + TENANT] == before["CDC_" + TENANT] and 0 <= after["CDC_PUBLIC"] - before["CDC_PUBLIC"] <= 2)
+    await js.close()
 
 
 async def run(tmp):
@@ -295,6 +358,20 @@ async def run(tmp):
         check("7 days to 10 minutes: the floor moves forward", floor(stack) > f1 and abs(time.time() - floor(stack) - 600) < 30)
         check("and reaps what it now covers", not present(stack, "y2"))
 
+        # ── 4b. a zero retention ─────────────────────────────────────────────────────────────
+        print("── 4b. a zero (or sub-second) retention is refused, even with the override", flush=True)
+        plant(stack, "z1", "10 minutes")
+        f_z, th_z = floor(stack), row_value(stack, "threshold_ms")
+        for ms in ("0", "500"):
+            zero = Sweeper(stack, f"zero{ms}", int(ms), once=True)
+            zero.p.wait(timeout=30)
+            check(f"GC_THRESHOLD_MS={ms} with GC_ALLOW_SHORT_THRESHOLD exits 1 and says why", zero.p.returncode == 1 and "refused even with GC_ALLOW_SHORT_THRESHOLD" in zero.text())
+        check("nothing was reaped, the floor and the stored retention are untouched",
+              present(stack, "z1") and floor(stack) == f_z and row_value(stack, "threshold_ms") == th_z)
+        check("zebridge_gc_advance(0, 0) refuses it too (the writer role, whoever calls)", expect_error(stack, "SELECT * FROM public.zebridge_gc_advance(0, 0);", "below one second", role=w_role))
+        check("and a retention that would round to zero seconds", expect_error(stack, "SELECT * FROM public.zebridge_gc_advance(0.4, 400);", "below one second", role=w_role))
+        check("the row still says a real retention (the checkpoint guard stays on)", int(row_value(stack, "threshold_ms")) > 0)
+
         # ── 5 and 6. the delayed mutation ────────────────────────────────────────────────────
         print("── 6. a delayed mutation racing with reaping", flush=True)
         r = await race(stack, writer, "race1", "race", expect_lock=True)
@@ -313,6 +390,9 @@ async def run(tmp):
         check("control: the sweeper did not wait (it finished while the write was stalled)", c["done_early"] and c["gone_mid"])
         check("control: the stale INSERT then lands and brings the deleted row back — the hole", c["live"])
         stack.sql(init_sql)   # the real function back
+
+        print("── 7. a tombstoned family: children then parent, bounded batches, nothing on the streams", flush=True)
+        await family_reap(stack)
     finally:
         for s in sweepers: s.stop()
         if writer:

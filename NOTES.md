@@ -19415,9 +19415,33 @@ the floor lock taken out of the mutation's side the sweeper finishes while the w
 tombstone, and the write brings the deleted row back. The stall is a trigger waiting on an advisory lock,
 not a row lock, because a row lock would hold the sweeper's DELETE of that row as well.
 
-**Consequences for the rest of the tree.** `zb.restore_gc_watermark()` and `gc_resurrect.py` stage a floor
-by stepping around the trigger by name (a scenario database has no history worth keeping). Scenarios that run
+**Consequences for the rest of the tree.** (superseded by the next section: no scenario lowers the floor of a shared database.)
+`gc_resurrect.py` staged a floor by stepping around the trigger by name. Scenarios that run
 `bridge_sweeper --once` need no sweeper daemon holding the lock on the same database: with one it exits 2.
 Upgrading is re-applying `init.core` and `init.write`; until `zebridge_gc_floor_acquire()` exists the bridge
 refuses writes rather than let them through unchecked. Not done: per-table floors; a bridge-side
 `--diagnose` line for "no sweeper holds the lock".
+
+## The floor of a shared database is never lowered; zero retention is refused (2026-10-28)
+
+Two gaps in "One floor, one sweeper", found in review.
+
+**Test teardown lowered a shared floor.** `zb.restore_gc_watermark()` disabled the monotone trigger and moved the floor
+back seven days after `tombstone_children.py` ran a one-second sweeper against the shared dev database. Restoring the
+number does not restore reaped tombstones: the sweeper had really reaped, so a floor put back behind them lets a late
+write resurrect a row. A short-retention pass moves a database's floor for good, and the one thing a shared stack's
+teardown must never do is lower it. So: `restore_gc_watermark()` is gone; the reap of a tombstoned family (the part of
+`tombstone_children.py` that needed the short sweeper) is `gc_isolation.py` §7 on a disposable database; and
+`gc_resurrect.py`, which staged a floor behind a deletion on the shared database and put it back, now runs on its own
+stack too. Staging a floor with the trigger disabled is the operator's break-glass, and now only ever happens on a
+database that exists for the scenario. Still on the shared dev database, and raising its floor rather than lowering it:
+the scenarios that run a short-retention sweeper there (`incremental.py` at five seconds, `sweeper.py`, `reaps.py`,
+`sweeper_restart.py`, `sweeper_catalogue.py`, `drip.py` at an hour). Their floor stays where they left it, which refuses
+older writes on that database until time passes; they are the next ones to move.
+
+**Zero retention disabled the checkpoint guard after really reaping.** `GC_THRESHOLD_MS=0` with
+`GC_ALLOW_SHORT_THRESHOLD=1` reaped every tombstone and stored `threshold_ms = 0`, which the producer's checkpoint guard
+reads as "the sweeper has never run" and switches itself off; an older window was then accepted over history that was
+gone. The sweeper now refuses a threshold under one second even with the override (exit 1), and `zebridge_gc_advance`
+refuses it too, whoever calls it, as does a retention that rounds to zero seconds. The sweeper also passes the retention
+in exact seconds (`1.500`), not truncated to whole ones.
