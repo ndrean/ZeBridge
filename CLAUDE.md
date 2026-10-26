@@ -13,6 +13,8 @@ fully current — **Zig is 0.17** everywhere, and any mention of 0.16 is stale.
 | `libzb/` | The native client (Zig, C ABI, shared library `libzbcore`): `client.zig` (sync, seed, tail, fence, frontiers), `core.zig` (pure decisions, shared with TypeScript), `transport.zig`, `capi.zig`. Wrappers: `zb-python/`, `zb-dart/`, `zb-android/`, `zb-react-native/`, Swift in `examples/`. |
 | `zb-client-ts/` | The TypeScript client (`src/libzb.ts` is the whole shell; `src/fence.ts` the pure fence decision; `src/core.ts` wraps `wasm/zb_core.wasm`, built from libzb's `core.zig`). |
 | `scripts/scenarios/` | The functional tests that matter. Python scenarios that start real Postgres databases, nats-servers and bridges. `README.md` there, `run.py` sequences groups. |
+| `nats.zig/` | Git submodule: the fork `ndrean/nats.zig`, branch `zebridge` (upstream plus our patches, one commit each; ledger `NATS_ZIG_NOTES.md` in the fork). Nothing is applied at build time; `nats.zig-patch/` is a retired README. |
+| `HANDOFF.md` | A dated snapshot of open work and blockers; read it first if it exists, delete it when its items close. |
 | `NOTES.md` | The design log, numbered (`§10xx`); code comments cite it. `PROTOCOL.md`, `GENERATION.md`, `SCOPE.md`, `OPERATIONS.md`, `LEAF_NODES.md`, `SECURITY.md`, `AUTHENTICATION.md` carry the contracts. |
 
 The two clients are twins: **a behaviour change belongs in both** (libzb `client.zig` and `zb-client-ts/src/libzb.ts`),
@@ -47,7 +49,8 @@ bridge) and drops it.
 
 - `recreate_recovery.py --check N` — the recovery model, one stack per check. 1–3 recreate/gap, 4 the fence's crash and
   retention boundaries (libzb fault build), 12 the same with a zb-client-ts client, 13/14 two tables on one route
-  (applied frontiers; libzb / TS), 5–11 incarnation, epoch and cleanup barriers. Takes minutes; run one check at a time.
+  (applied frontiers; libzb / TS), 15/16 a plain full that crashes after its first chunk (libzb / TS), 5–11 incarnation,
+  epoch and cleanup barriers. Takes minutes; run one check at a time.
 - `rls_visibility.py` — the RLS guard (a policy that hides rows blocks publication, visible in metrics and `--diagnose`).
 - `leaf_fence.py` — a fence taken from a seeding leaf's chain (hub + leaf nats-servers, no auth).
 - `scripts/scenarios/run.py {offline|live|owns|all}` sequences the groups; `--list` shows them.
@@ -68,6 +71,9 @@ from the same variables by `scripts/scenarios/fence_client.mts`. A scenario fail
   refusing, the **fence** takes it: PREPARE (one transaction: anchor cleared, cursors moved *back* to the cut — never
   forward —, an owed record), replace the rows, VERIFY (fresh stream facts: same incarnation, event after the cut still
   retained), COMMIT (anchor + owed removal). An interrupted fence stays owed; its retry is a fence too.
+- **Every full is destructive**, fence or plain seed: once the object is in hand and before its first chunk, the client
+  writes an owed record and clears the anchor (`oweReplacement`), so a crash mid-replace is retried as a fence, never
+  trusted as a seeded table.
 - **Applied frontiers** (`_zbz_frontier` / `_zebridge_frontier`): other seeded tables on a rewound route keep their rows and
   skip replay up to the position they held; spent when the position passes, dropped on stream restart/recreate, replay from
   0, table drop, or when a chain is applied to that table. Loading them **fails closed**.
@@ -76,7 +82,8 @@ from the same variables by `scripts/scenarios/fence_client.mts`. A scenario fail
   `prepareExclusive` — never trust positions read before it. libzb is single-threaded in `poll`, so this cannot overlap there.
 - **Leaves:** a seeding leaf mirrors manifests and objects; it never mints cuts, incarnations or epochs. Clients prove
   everything against the **hub's** stream and may fence from the leaf's chain; a leaf with a missing object sends the client
-  to the hub before anything changes.
+  to the hub before anything changes. There is no age bound on a leaf chain by design; its age and CDC backlog are
+  reported (`cut_age_ms`, `cdc_behind`).
 - **RLS guard:** the producer reads as the reader role, so a policy that hides rows would publish an empty full. The guard
   classifies the reader's policies from the catalog; `normalize` keeps quoted identifiers distinct from keywords.
 
