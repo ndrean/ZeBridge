@@ -109,6 +109,7 @@ made by `--init-nats operator`, and checks what each role may and may not do.
 | of which `reading()` alone (subject split, `json.loads`, metadata) | 78–81k/s | 12–13 µs |
 | a batched pull, `fetch(5000)`, no decoding (the most nats-py can deliver) | 46–48k/s | |
 | flush: JSON lines → DuckDB → Parquet (zstd), a warm process | 140–300k rows/s | 0.35–0.7 s per 100,000 rows |
+| the upload and the size check of that file, to a local SeaweedFS 4.51 on loopback | 30–280 ms (the first is the slowest) | 3–13% of a flush, for files of 1 MB (100,000 rows) to 5 MB (500,000) |
 
 What it says:
 
@@ -116,7 +117,8 @@ What it says:
 - **A flush stops the loop** (the archiver reads and writes in turn): 0.35–0.7 s per default batch of 100,000. The stream holds the readings meanwhile, and its retention is checked at start against two flushes plus the S3 outage.
 - **Most of the ingest cost is Python**, not the work: even a batched pull stops near 48k/s. A client in another language would be the way past about 40k readings/s; that has not been built or measured, so the figure to beat is the table above.
 - **The flush has little to gain.** Writing the JSON lines to disk and reading them back is the larger part of it, but replacing them with CSV gained 25–40% in a same-process comparison and was not adopted: it changes how strings, empty values and NaN are parsed for a stage that is not the limit. DuckDB writing Parquet from columns already in memory is an order of magnitude faster, which only matters if the rows were produced in columnar form to begin with.
-- **Not measured:** the S3 upload (R2, SeaweedFS), real sensor traffic and its shapes (many sensors, wide payloads), a stream that has fallen behind (catch-up reads), memory (`rows` holds a whole batch as Python dicts), and the responder.
+- **The upload is small next to the rest** on loopback, and says nothing about a remote bucket: against R2 it is the network and the round trip, which this run does not have. A flush of 100,000 rows made 0.46–0.92 s in all, 0.03–0.28 s of it S3.
+- **Not measured:** a remote S3 (R2), real sensor traffic and its shapes (many sensors, wide payloads), a stream that has fallen behind (catch-up reads), memory (`rows` holds a whole batch as Python dicts), and the responder.
 
 For scale, a bulk export of table rows to Parquet is a different workload: it reads a table in blocks and writes columns, with no per-message round trip. That is where figures in the millions of rows per second belong; the archiver pays one stream message per reading.
 
