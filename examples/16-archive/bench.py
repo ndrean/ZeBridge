@@ -83,6 +83,20 @@ async def main():
         print(f"1c. pull fetch(5000) only: {got2 / t_pull:>8,.0f} msg/s  (no decoding)")
         await nc.close()
 
+        # 1d. the native reader (bridge_readings_fetch), as `archiver.py --reader native` runs it
+        fetch = pathlib.Path(os.environ.get("ZB_READINGS_FETCH", ARCH.parents[1] / "zig-out" / "bin" / "bridge_readings_fetch"))
+        csv_out = tmp + "/native.csv"
+        if fetch.exists():
+            for run in range(3):
+                t0 = time.monotonic()
+                r = subprocess.run([str(fetch), "--tenant", TENANT, "--from", "1", "--max", str(N), "--out", csv_out],
+                                   env=dict(os.environ, NATS_URL=f"nats://127.0.0.1:{PORT}"), capture_output=True, text=True)
+                t = time.monotonic() - t0
+                summary = json.loads(r.stdout) if r.returncode == 0 else r.stderr[-200:]
+                print(f"1d. native reader, run {run + 1}/3: {N / t:>10,.0f} msg/s  ({t:.2f}s with the process start; a ReleaseFast build) {summary if run == 0 else ''}")
+        else:
+            print(f"1d. native reader: skipped, {fetch} is missing (zig build -Doptimize=ReleaseFast)")
+
         # 2. flush, as archiver.flush() does it (without S3)
         import duckdb
         lst = list(rows.values())
@@ -104,6 +118,16 @@ async def main():
                     size = os.path.getsize(out)
                 print(f"2. flush  : {len(part):>9,} rows, run {rep + 1}/3: json lines {t_json:.2f}s + duckdb COPY {t_copy:.2f}s = {len(part) / (t_json + t_copy):,.0f} rows/s ({size / 1e6:.1f} MB parquet)")
 
+        if fetch.exists():
+            for rep in range(3):
+                pq = tmp + "/native.parquet"
+                t0 = time.monotonic()
+                duckdb.sql(f"COPY ({common.SELECT_ROWS} FROM read_csv('{csv_out}', header=false, allow_quoted_nulls=false, "
+                           f"columns={{tenant:'VARCHAR', sensor_id:'VARCHAR', kind:'VARCHAR', value:'DOUBLE', sensor_ms:'BIGINT', received_ms:'BIGINT', stream_seq:'BIGINT'}}) "
+                           f"QUALIFY row_number() OVER (PARTITION BY sensor_id, kind, sensor_ms ORDER BY stream_seq DESC) = 1 "
+                           f"ORDER BY sensor_ts) TO '{pq}' (FORMAT parquet, COMPRESSION zstd)")
+                t = time.monotonic() - t0
+                print(f"2b. flush from the native CSV, run {rep + 1}/3: {N / t:>9,.0f} rows/s ({t:.2f}s: DuckDB CSV -> dedupe in SQL -> Parquet)")
     finally:
         srv.terminate()
         shutil.rmtree(tmp, ignore_errors=True)

@@ -40,6 +40,22 @@ flowchart LR
   When the manifest moves, the new files join and the hot rows they cover leave. A reading
   sent twice (same sensor, kind and sensor time) counts once.
 
+## The payload
+
+A reading is a message on `sensors.<tenant>.<sensor>.<kind>` (exactly four tokens) whose payload is:
+
+- a JSON number: the value, taken at the time the stream received it; or
+- `{"value": <number>, "ts_ms": <integer | float | null>}`, both keys present: the value and the sensor's own
+  time in milliseconds (`null` takes the stream's time). A time before 1970 or after the year 9999 is no time.
+
+Anything else is **skipped**, not guessed and not a crash, and the archive's position moves past it: a
+quoted number (`"21.5"`), a boolean, `NaN` or `Infinity`, a number that overflows (`1e999`), an object missing
+`ts_ms` or repeating a key, a byte-order mark or UTF-16. The rules are the same in
+[`common.reading()`](common.py) (the responder's hot tail and `--reader python`) and in
+[`src/readings_decode.zig`](../../src/readings_decode.zig) (`--reader native`), so a reading is archived
+exactly when it is counted. [`scripts/scenarios/readings_fetch.py`](../../scripts/scenarios/readings_fetch.py) feeds
+both the same awkward and generated payloads and compares them, row by row.
+
 ## Run it
 
 You need the dev stack's NATS, a local S3 and Python with `nats-py`, `boto3` and `duckdb`.
@@ -74,6 +90,19 @@ must exist. Against R2: `S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com`
 `S3_BUCKET=zb-events`, and an R2 API token's keys: read and write for the archiver, read only
 for the responder.
 
+**Two readers.** `--reader python` (the default) reads the stream with nats-py in the archiver's own process.
+`--reader native` runs `bridge_readings_fetch`, built with the bridge (`zig build`, or `zig build readings-fetch`
+for it alone; it needs no PostgreSQL library), which writes a range of the stream as CSV; DuckDB then makes the
+Parquet, dropping resent readings in SQL. Same files, same manifest, same rules, about ten times the throughput
+(see Measured). Put the binary on the PATH or pass `--fetch-bin` (or `ZB_READINGS_FETCH`):
+
+```sh
+python3 examples/16-archive/archiver.py --tenant acme --reader native --fetch-bin zig-out/bin/bridge_readings_fetch
+```
+
+The default stays `python` until the native reader has run on your stack: the container image
+([deploy/archiver.Dockerfile](../../deploy/archiver.Dockerfile)) does not carry the binary yet.
+
 Readings come from anything that publishes on `sensors.<tenant>.<sensor>.<kind>`: a sensor
 with `--mint-sensor` creds, over NATS or MQTT (its JWT as the password), or 09-event's
 `mqtt_sensors.py` for the tenant `globex`.
@@ -95,32 +124,46 @@ responder and archiver grants do not include readings: give both the bridge's cr
 `scripts/scenarios/archive.py` runs the failure cases: every reading archived once, a kill
 between upload and manifest, two archivers at once, the stream pruned past the archive, and
 the responder counting each reading once while the boundary moves.
+`scripts/scenarios/readings_fetch.py` runs the native reader on a bare nats-server: the same payloads through
+both decoders, chunks that cover the stream with no gap, the empty range, a missing stream, a pruned one, the
+dedupe, and (with a local S3) the whole archiver with each reader leaving the same rows.
 `scripts/scenarios/readings_roles.py` runs both programs with their own credentials on a stack
 made by `--init-nats operator`, and checks what each role may and may not do.
 
 ## Measured
 
-`python3 examples/16-archive/bench.py` (needs `nats-server` on the PATH, `nats-py` and `duckdb`) runs the archiver's own code on a local stream and times each stage, S3 left out. One run, on a 4-core sandbox with NATS on loopback, 500,000 readings of about 100 bytes (DuckDB 1.5.5, nats-py 2.16, nats-server 2.15.1; the container pins nats-py 2.15.0), numbers rounded:
+`python3 examples/16-archive/bench.py` (needs `nats-server` on the PATH, `nats-py` and `duckdb`, and for the native
+rows a `ReleaseFast` `bridge_readings_fetch`) runs the archiver's own code on a local stream and times each stage, S3
+left out. Ranges over several runs on a 4-core sandbox with NATS on loopback, 500,000 readings of about 100 bytes
+(DuckDB 1.5.5, nats-py 2.16, nats-server 2.15.1; the container pins nats-py 2.15.0), rounded. The machine is shared
+and noisy: read the ratios, not the digits.
 
-| stage | rate | per unit |
+| stage | `--reader python` | `--reader native` |
 | --- | --- | --- |
-| ingest: `next_msg` + `common.reading()` + the dict (the archiver's loop) | 24–28k readings/s | 36–42 µs |
-| of which `next_msg` alone | 39–40k/s | 25 µs |
-| of which `reading()` alone (subject split, `json.loads`, metadata) | 78–81k/s | 12–13 µs |
-| a batched pull, `fetch(5000)`, no decoding (the most nats-py can deliver) | 46–48k/s | |
-| flush: JSON lines → DuckDB → Parquet (zstd), a warm process | 140–300k rows/s | 0.35–0.7 s per 100,000 rows |
-| the upload and the size check of that file, to a local SeaweedFS 4.51 on loopback | 30–280 ms (the first is the slowest) | 3–13% of a flush, for files of 1 MB (100,000 rows) to 5 MB (500,000) |
+| read the stream and decode each reading | 22–28k readings/s (36–45 µs each) | 370–560k readings/s (the whole process, start included, 1.1–1.4 s for 500,000) |
+| of which `next_msg` alone / a batched pull with no decoding | 39–41k/s / 40–48k/s | |
+| turn them into Parquet (zstd) and drop resent readings | 125–300k rows/s (JSON lines through DuckDB) | 1.4–1.7M rows/s (the CSV through DuckDB, dedupe in SQL) |
+| upload and size check of that file, to a local SeaweedFS 4.51 on loopback | 30–280 ms (the first is the slowest), 3–13% of a flush | the same |
+
+`archiver.py` end to end, 500,000 readings, a real S3 (SeaweedFS), `--flush-s 1`: **26.8 s with `--reader python`, 3.0 s with
+`--reader native`** (about 9 times faster by wall clock, 13 times on rows per second without the 1 s idle exit). The native
+run wrote 5 files (a chunk is 100,000 messages), the Python one 22 (a flush every second).
 
 What it says:
 
-- **Ingestion is the limit**, about 8 times the cost of the flush: 500,000 readings take about 20 s to read and 2–3 s to write. One archiver serves one tenant, and 25k readings/s sustained is over two billion readings a day, so this is not a bottleneck for a plausible sensor fleet.
-- **A flush stops the loop** (the archiver reads and writes in turn): 0.35–0.7 s per default batch of 100,000. The stream holds the readings meanwhile, and its retention is checked at start against two flushes plus the S3 outage.
-- **Most of the ingest cost is Python**, not the work: even a batched pull stops near 48k/s. A client in another language would be the way past about 40k readings/s; that has not been built or measured, so the figure to beat is the table above.
-- **The flush has little to gain.** Writing the JSON lines to disk and reading them back is the larger part of it, but replacing them with CSV gained 25–40% in a same-process comparison and was not adopted: it changes how strings, empty values and NaN are parsed for a stage that is not the limit. DuckDB writing Parquet from columns already in memory is an order of magnitude faster, which only matters if the rows were produced in columnar form to begin with.
-- **The upload is small next to the rest** on loopback, and says nothing about a remote bucket: against R2 it is the network and the round trip, which this run does not have. A flush of 100,000 rows made 0.46–0.92 s in all, 0.03–0.28 s of it S3.
-- **Not measured:** a remote S3 (R2), real sensor traffic and its shapes (many sensors, wide payloads), a stream that has fallen behind (catch-up reads), memory (`rows` holds a whole batch as Python dicts), and the responder.
+- **The read was the limit**: 8 times the cost of the flush with nats-py, and most of it is Python itself (even a batched pull stops
+  near 48k/s). Natively, decoding costs about 5% over a bare pull, and the read and the Parquet are of the same order.
+- **The rest is DuckDB and S3.** After the change a 100,000-message chunk is read in about 0.25 s and written in about 0.1 s. A remote
+  bucket adds its round trip, which loopback does not show.
+- **A cycle stops the loop**, as before: it reads a chunk, writes it, uploads it, writes the manifest, and only then reads again. The stream
+  holds the readings meanwhile; its retention is checked at start against two flushes plus the S3 outage.
+- **Not measured:** a remote S3 (R2), real sensor traffic and its shapes (many sensors, wide payloads), a stream that has fallen far behind
+  (catch-up reads), the memory of a large chunk, the container image (it does not carry the binary yet), and the responder.
+- The flush with CSV in place of JSON lines, tried alone while the reader was still nats-py, gained only 25–40% and was not worth changing;
+  with the native reader the CSV comes for free.
 
-For scale, a bulk export of table rows to Parquet is a different workload: it reads a table in blocks and writes columns, with no per-message round trip. That is where figures in the millions of rows per second belong; the archiver pays one stream message per reading.
+For scale, a bulk export of table rows to Parquet is a different workload: it reads a table in blocks and writes columns, with no per-message
+round trip. That is where figures in the millions of rows per second belong; the archiver pays one stream message per reading.
 
 ## Not yet
 

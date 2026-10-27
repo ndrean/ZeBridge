@@ -163,6 +163,24 @@ pub fn build(b: *std.Build) void {
     // dependencies of every image built to run the sidecar alone.
     b.installArtifact(gc_exe);
 
+    // The readings archiver's reader (examples/16-archive): pulls a range of a readings stream
+    // into a CSV file, an order of magnitude faster than nats-py. Needs only the NATS client —
+    // no libpq, no zstd — so the archiver's image carries one small binary.
+    const fetch_exe = b.addExecutable(.{
+        .name = "bridge_readings_fetch",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bridge_readings_fetch.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nats", .module = nats_mod },
+            },
+        }),
+    });
+    b.installArtifact(fetch_exe);
+    const fetch_step = b.step("readings-fetch", "Build only bridge_readings_fetch (the archiver's stream reader)");
+    fetch_step.dependOn(&b.addInstallArtifact(fetch_exe, .{}).step);
+
     // `zig build sweeper` — the sidecar alone. The default step installs both binaries
     // and `run-gc` depends on the whole install, so a loop that only touches
     // src/bridge_sweeper.zig was paying for the bridge's compile every time.

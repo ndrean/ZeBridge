@@ -3059,6 +3059,8 @@ test {
     _ = @import("admin_revoke.zig");
     _ = @import("array.zig");
     _ = @import("batch_publisher.zig");
+    _ = @import("bridge_readings_fetch.zig");
+    _ = @import("readings_decode.zig");
     _ = @import("catalog_epoch.zig");
     _ = @import("config.zig");
     _ = @import("diagnose_live.zig");

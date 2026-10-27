@@ -54,6 +54,7 @@ bridge) and drops it.
 - `rls_visibility.py` — the RLS guard (a policy that hides rows blocks publication, visible in metrics and `--diagnose`).
 - `leaf_fence.py` — a fence taken from a seeding leaf's chain (hub + leaf nats-servers, no auth).
 - `gc_isolation.py` — the GC floor: competing sweepers, lock-owner failure, rollback and retention increase, a delayed write racing with reaping (private stack).
+- `readings_fetch.py` — the archiver's native reader (`bridge_readings_fetch`) against `common.reading()`: same payload contract, chunks, empty/missing/pruned stream, and the whole archiver with each reader (bare nats-server; a local SeaweedFS for the last case). `readings_roles.py` P3 runs it inside the real archiver grants.
 - `scripts/scenarios/run.py {offline|live|owns|all}` sequences the groups; `--list` shows them.
 
 **Fault-hook builds.** Crash and timing points are compiled in only with `-Dtest-faults=true` (libzb) and exist as env

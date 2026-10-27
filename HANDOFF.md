@@ -64,6 +64,10 @@ Priority after the GC floor: a deployment security audit and a real backup/resto
 
 The first `zb_client_sync` of a libzb client answers `PrepareFailed` (no detail) on the private stacks, with the tenant mapping and the schema both published; the next polls seed normally. `multi_bridge.py` shows the same on unmodified `main`, so it predates the GC-floor work. The private-stack scenarios ignore that first answer (as `recreate_recovery.py`'s worker always did); worth finding which SQLite statement fails and why, since a host that treats a sync error as fatal would stop there.
 
+## The archiver's native reader (branch `readings-fetch`)
+
+`bridge_readings_fetch` + `archiver.py --reader native` (NOTES "The archiver's reader is a binary of the bridge's build"). Verified here: unit tests, `readings_fetch.py` (A-I, with SeaweedFS), `readings_roles.py` P3 (real operator-mode grants), 500,000 readings end to end 26.8 s -> 3.0 s. Still to do on a real stack: `archive.py` (dev stack), the container image (copy the binary in, then `--reader native` in the image's command), `build-linux.sh`/`package-linux.sh` (edited, not run), and switching the default reader once it has run on yours.
+
 ## Open decisions and ideas
 
 - **Stale leaf chains:** no age bound by design (an arbitrary cutoff would send a storm back to the hub). Age

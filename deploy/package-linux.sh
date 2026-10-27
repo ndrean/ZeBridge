@@ -60,7 +60,7 @@ EOF
 # ── zebridge: the bridge and the sweeper ──────────────────────────────────────────
 z="$stage/zebridge-$version-linux-$arch"
 mkdir -p "$z/bin" "$z/examples"
-cp "$bin/bridge" "$bin/bridge_sweeper" "$z/bin/"
+cp "$bin/bridge" "$bin/bridge_sweeper" "$bin/bridge_readings_fetch" "$z/bin/"
 cp "$root/LICENSE" "$z/"
 unit "PostgreSQL to NATS" /usr/bin/bridge "network-online.target nats.service" 5 > "$z/examples/zebridge.service"
 unit "tombstone sweeper" /usr/bin/bridge_sweeper "zebridge.service" 30 > "$z/examples/zebridge-sweeper.service"
@@ -109,7 +109,7 @@ done
 triplet="$arch-linux-gnu"
 zd="$stage/deb-zebridge"
 mkdir -p "$zd/DEBIAN" "$zd/usr/bin" "$zd/usr/share/doc/zebridge/examples"
-cp "$z/bin/bridge" "$z/bin/bridge_sweeper" "$zd/usr/bin/"
+cp "$z/bin/bridge" "$z/bin/bridge_sweeper" "$z/bin/bridge_readings_fetch" "$zd/usr/bin/"
 cp "$z/examples/"*.service "$zd/usr/share/doc/zebridge/examples/"
 cp "$root/LICENSE" "$zd/usr/share/doc/zebridge/copyright"
 cp "$z/README.txt" "$zd/usr/share/doc/zebridge/"

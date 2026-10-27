@@ -20,7 +20,7 @@ SeaweedFS's identity file, or {"access_key_id", "secret_access_key"}).
 """
 from __future__ import annotations
 
-import base64, json, os, pathlib
+import base64, calendar, json, math, os, pathlib
 
 STREAM_PREFIX = "READINGS_"
 KV = "time_manifests"
@@ -118,22 +118,80 @@ async def stream_when_there(js, tenant: str, every_s: float = 10):
             await asyncio.sleep(every_s)
 
 
+# 9999-12-31T23:59:59.999Z, the last day datetime can name (readings_decode.zig, max_sensor_ms)
+MAX_SENSOR_MS = 253_402_300_799_999
+
+
+def _reject_constant(name):
+    raise ValueError(name)   # NaN, Infinity, -Infinity: not JSON, and not a reading
+
+
+def _object(pairs):
+    """A JSON object, but a repeated key is not a reading: RFC 8259 leaves the value unpredictable."""
+    d = dict(pairs)
+    if len(d) != len(pairs):
+        raise ValueError("duplicate key")
+    return d
+
+
+def stream_ms(msg) -> int:
+    """The stream's timestamp in whole milliseconds, truncated — the native reader's rule exactly.
+    The ack subject ends `…<timestamp in ns>.<pending>`; nats-py turns the nanoseconds into a
+    datetime through a float and is off by a millisecond often enough to matter, so read them."""
+    try:
+        return int(msg.reply.split(".")[-2]) // 1_000_000
+    except (AttributeError, ValueError, IndexError):
+        t = msg.metadata.timestamp
+        return calendar.timegm(t.utctimetuple()) * 1000 + t.microsecond // 1000
+
+
 def reading(msg) -> dict | None:
-    """One stream message as a row; None for a subject or payload that is not a reading."""
+    """One stream message as a row; None for a subject or payload that is not a reading.
+
+    The payload contract (the same rules as src/readings_decode.zig, which the native reader
+    applies; scripts/scenarios/readings_fetch.py feeds both the same payloads):
+    a JSON number, or {"value": <number>, "ts_ms": <integer, float or null>} with BOTH keys,
+    the time between 1970 and the year 9999.
+    A quoted number, a boolean, NaN/Infinity, a number that overflows to infinity and an
+    object without ts_ms are not readings. Skipped, never a crash: a message the archiver
+    cannot read must not stop the archive of the ones behind it."""
     parts = msg.subject.split(".")
     if len(parts) != 4:
         return None
     try:
-        body = json.loads(msg.data)
-        value, ts_ms = (body["value"], body["ts_ms"]) if isinstance(body, dict) else (body, None)
+        # Decoded as UTF-8 here, not by json.loads(bytes): that one sniffs UTF-16/32 and a BOM.
+        body = json.loads(msg.data.decode("utf-8"), parse_constant=_reject_constant, object_pairs_hook=_object)
+    except (ValueError, RecursionError):   # UnicodeDecodeError and JSONDecodeError are ValueErrors
+        return None
+    if isinstance(body, dict):
+        if "value" not in body or "ts_ms" not in body:
+            return None
+        value, ts_ms = body["value"], body["ts_ms"]
+        if ts_ms is not None:
+            if isinstance(ts_ms, bool) or not isinstance(ts_ms, (int, float)):
+                return None
+            if isinstance(ts_ms, int):
+                if not -2**63 <= ts_ms < 2**63:
+                    return None
+            elif not (math.isfinite(ts_ms) and abs(ts_ms) < 9.2e18):
+                return None
+    else:
+        value, ts_ms = body, None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
         value = float(value)
-    except (ValueError, KeyError, TypeError):
+    except OverflowError:
+        return None
+    if not math.isfinite(value):
         return None
     meta = msg.metadata
-    received_ms = int(meta.timestamp.timestamp() * 1000)
+    received_ms = stream_ms(msg)
+    sensor_ms = int(ts_ms) if ts_ms is not None else received_ms
+    if not 0 <= sensor_ms <= MAX_SENSOR_MS:   # no day to name a file after: not a time
+        return None
     return {"tenant": parts[1], "sensor_id": parts[2], "kind": parts[3], "value": value,
-            "sensor_ms": int(ts_ms) if ts_ms is not None else received_ms,
-            "received_ms": received_ms, "stream_seq": meta.sequence.stream}
+            "sensor_ms": sensor_ms, "received_ms": received_ms, "stream_seq": meta.sequence.stream}
 
 
 SELECT_ROWS = ("SELECT tenant, sensor_id, kind, value, make_timestamp(sensor_ms * 1000)::TIMESTAMPTZ AS sensor_ts, "

@@ -94,6 +94,7 @@ Each row: something that could go wrong, what the test shows instead, and the te
 | an old write, sent by a device that was offline, overwrites newer data | it is refused as `stale`; a write that really is newer still lands | `offline.py`, `mutate.py` |
 | an old write brings back a deleted row | the row stays deleted | `offline.py` |
 | an old write brings back a deleted row after the sweeper removed its tombstone | the bridge refuses the write (`PredatesGcWatermark`); without that guard (a floor staged behind the deletion, on a disposable database) the same write does bring the row back, which the test also shows | `gc_resurrect.py` |
+| the archiver's native reader and the responder's Python decoder disagree on what a reading is, so a reading is archived but not counted (or the reverse) | both decode ~80 awkward and 4,000 generated payloads and the rows are compared; the whole archiver run with each reader leaves the same Parquet | `readings_fetch.py` |
 | two writes carry the same version | the tiebreak column picks the same winner everywhere | `tiebreak.py` |
 | a device's clock is fast or slow | a fast clock wins only until real time catches up; a slow clock can still write | `clockskew.py` |
 | a device's clock is far in the future | the version is cut back to the server's time, and the answer says so | `clamp.py` |
