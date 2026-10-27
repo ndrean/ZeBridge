@@ -58,6 +58,13 @@ if [ -z "${BRIDGE_CDC_PUBLICATION:-}" ]; then
 fi
 psql_c() { dc exec -T postgres psql -v ON_ERROR_STOP=1 -U postgres -d postgres "$@"; }
 
+# The native NATS has a TLS listener and the env file is written for it (tls://); this server is
+# plain. A tls:// URL against it ends in `TlsRecordOverflow`: the server answers the ClientHello
+# with the plain-text `-ERR 'Authentication Error'`, which the TLS client reads as an enormous record.
+case "${NATS_URL:-}" in
+  tls://*) echo "[dev] note: the env file's NATS_URL is tls://, this NATS is plain — use the nats:// URL printed below" >&2 ;;
+esac
+
 echo "[dev] applying the init SQL"
 "$BRIDGE" --init-sql | psql_c -q >/dev/null
 
@@ -78,6 +85,7 @@ Once (the scenarios' Python environment: nats-py, nkeys, msgpack, duckdb, boto3)
 Every terminal (reprovision.py and run.py are run by the venv's Python, so activate it):
   source scripts/scenarios/.venv/bin/activate
   set -a && . ./.env.bridge && set +a && export BRIDGE_CDC_PUBLICATION=$BRIDGE_CDC_PUBLICATION
+  export NATS_URL=nats://127.0.0.1:4222         # after the line above: this NATS has no TLS (tls:// gives TlsRecordOverflow)
 
 Then:
   scripts/reprovision.py                       # the baseline tables, catalogue rows and tenant mappings

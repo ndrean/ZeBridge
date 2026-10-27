@@ -32,6 +32,7 @@ scripts/scenarios/.venv/bin/pip install -r scripts/scenarios/requirements.txt
 # every terminal: reprovision.py and run.py are run by the venv's Python, so activate it
 source scripts/scenarios/.venv/bin/activate
 set -a && . ./.env.bridge && set +a && export BRIDGE_CDC_PUBLICATION=zb_pub   # the name given to up.sh
+export NATS_URL=nats://127.0.0.1:4222   # after the line above, which may bring a tls:// URL: this NATS is plain
 
 scripts/reprovision.py                  # baseline tables, catalogue rows and tenant mappings
 zig-out/bin/bridge --pub $BRIDGE_CDC_PUBLICATION   # in its own terminal: the long-running bridge on :27434, for the `live` group
@@ -56,7 +57,10 @@ is enough. The bridge creates its own streams and KV buckets at boot; nothing he
 
 ## Not covered
 
-TLS and the leaf listener (7422) of `nats-server-jwt.conf`, so the leaf scenarios (`leaf_*`, `hub_fallback`) and
+TLS and the leaf listener (7422) of `nats-server-jwt.conf`. The server is plain, so `NATS_URL` must be `nats://`:
+the `tls://` URL that the native stack's `.env.bridge` may carry makes the bridge fail with `TlsRecordOverflow`
+(the server answers the TLS handshake with the plain-text `-ERR 'Authentication Error'`, and its log shows
+`authentication error`). Because of both, so the leaf scenarios (`leaf_*`, `hub_fallback`) and
 anything that needs a leaf link are not served by this stack; SeaweedFS for `archive.py` and `readings_roles.py`
 (`:8333`); the standby (`standby.py` starts its own server).
 
