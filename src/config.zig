@@ -581,9 +581,6 @@ pub const Retry = struct {
 
 /// Buffer sizes
 pub const Buffers = struct {
-    /// Subject buffer size (for formatting NATS subjects)
-    pub const subject_buffer_size = 128;
-
     /// Message ID buffer size
     pub const msg_id_buffer_size = 128;
 

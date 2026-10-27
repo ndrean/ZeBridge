@@ -8,19 +8,19 @@ Delete this file once the open items below are closed.
 
 `main` is at `b134a28` (PR #17 merged) plus whatever the open increment below has. Everything listed is on `main`.
 
-| # | Increment | PR |
-|---|---|---|
-| 1 | RLS visibility safety (guard) | #6 |
-| 2 | TS fence parity | #7 |
-| — | Review fixes: RLS quoted identifiers, fence/pass deadlock, failed-PREPARE parking | #8 |
-| 3 | Applied frontiers (both clients) | #9 |
-| — | Frontier hardening: fail-closed load, overlapping TS fences, route protection | #10 |
-| 4 | Leaf-sourced recovery (fence from a leaf's chain, hub fallback, age/backlog reported) | #11 |
-| — | `CLAUDE.md` | #12 |
-| — | Every full is destructive: owed record + cleared anchor before the first chunk; leaf refusals fall back to the hub | #13 |
-| — | nats.zig becomes a fork submodule | #14 |
-| — | A plain full is decided again before its first chunk (CDC overtaking the download); the chain waits survive a throwing attempt | #16 |
-| — | The shared route is judged on its own cut (a full is a fence when CDC_PUBLIC alone is past its cut) | #17 |
+| #   | Increment                                                                                                                      | PR  |
+| --- | ------------------------------------------------------------------------------------------------------------------------------ | --- |
+| 1   | RLS visibility safety (guard)                                                                                                  | #6  |
+| 2   | TS fence parity                                                                                                                | #7  |
+| —   | Review fixes: RLS quoted identifiers, fence/pass deadlock, failed-PREPARE parking                                              | #8  |
+| 3   | Applied frontiers (both clients)                                                                                               | #9  |
+| —   | Frontier hardening: fail-closed load, overlapping TS fences, route protection                                                  | #10 |
+| 4   | Leaf-sourced recovery (fence from a leaf's chain, hub fallback, age/backlog reported)                                          | #11 |
+| —   | `CLAUDE.md`                                                                                                                    | #12 |
+| —   | Every full is destructive: owed record + cleared anchor before the first chunk; leaf refusals fall back to the hub             | #13 |
+| —   | nats.zig becomes a fork submodule                                                                                              | #14 |
+| —   | A plain full is decided again before its first chunk (CDC overtaking the download); the chain waits survive a throwing attempt | #16 |
+| —   | The shared route is judged on its own cut (a full is a fence when CDC_PUBLIC alone is past its cut)                            | #17 |
 
 **5. GC floor (branch `gc-watermark-isolation`, PR to be opened):** decided with the maintainer — one database-wide
 retention policy, one lock-enforced sweeper, a floor that never decreases (enforced in the database), advance-then-reap, and
@@ -49,14 +49,14 @@ Open decision: `build.zig.zon` still has `.nats = .{ .path = "nats.zig" }` (the 
 
 A snapshot of the six hardening findings, to be turned into a deployment audit and a restore drill. Nothing below certifies a rollout: the deployed servers have not been re-inspected.
 
-| Finding | Status in the tree | What remains |
-| --- | --- | --- |
-| 1. Mirror credentials administer the hub | separate link/keeper identities, connection restrictions, tenant-scoped grants; security scenarios test direct hub login and upstream deletion refusals | rotate legacy credentials; verify every deployed leaf uses the restricted identities |
-| 2. `/renew` integer-overflow crash | wider arithmetic, boundary unit tests, renewal scenarios | ensure deployed bridge binaries include the fix |
-| 3. Backlog isolation bypass | admission puts each principal's mutations on one private queue subject, with count/size limits | verify admission is on everywhere, direct ingress cannot bypass it, production limits suit the workload; shared storage stays a finite fleet-wide resource |
-| 4. Leaf tenant selection was only caching configuration | tenant lists constrain authorization, manifest projections and admission; scoped principals prevent cross-leaf impersonation | audit deployed tenant lists and credentials; a compromised leaf still exposes its authorized tenants' cached data |
-| 5. Revocation needed manual leaf updates | signed trust refresh propagates revocations and rotations; tests cover disconnect, reconnect refusal, stale-trust shutdown | verify the supervisor, refresh endpoint and alerts in production; Compose stops NATS after 300 s without a verified refresh |
-| 6. Destructive reconciliation, untested recovery | mirror discovery no longer authorizes deletion; checkpoint/restore scenarios cover receipts, policy and replacement-hub recovery | an operator restore drill from a real deployed backup; backup scheduling, retention, off-host storage |
+| Finding                                                 | Status in the tree                                                                                                                                      | What remains                                                                                                                                               |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. Mirror credentials administer the hub                | separate link/keeper identities, connection restrictions, tenant-scoped grants; security scenarios test direct hub login and upstream deletion refusals | rotate legacy credentials; verify every deployed leaf uses the restricted identities                                                                       |
+| 2. `/renew` integer-overflow crash                      | wider arithmetic, boundary unit tests, renewal scenarios                                                                                                | ensure deployed bridge binaries include the fix                                                                                                            |
+| 3. Backlog isolation bypass                             | admission puts each principal's mutations on one private queue subject, with count/size limits                                                          | verify admission is on everywhere, direct ingress cannot bypass it, production limits suit the workload; shared storage stays a finite fleet-wide resource |
+| 4. Leaf tenant selection was only caching configuration | tenant lists constrain authorization, manifest projections and admission; scoped principals prevent cross-leaf impersonation                            | audit deployed tenant lists and credentials; a compromised leaf still exposes its authorized tenants' cached data                                          |
+| 5. Revocation needed manual leaf updates                | signed trust refresh propagates revocations and rotations; tests cover disconnect, reconnect refusal, stale-trust shutdown                              | verify the supervisor, refresh endpoint and alerts in production; Compose stops NATS after 300 s without a verified refresh                                |
+| 6. Destructive reconciliation, untested recovery        | mirror discovery no longer authorizes deletion; checkpoint/restore scenarios cover receipts, policy and replacement-hub recovery                        | an operator restore drill from a real deployed backup; backup scheduling, retention, off-host storage                                                      |
 
 Priority after the GC floor: a deployment security audit and a real backup/restore drill (rebuild the hub on another machine, measure the recovery time, state what a restore can lose), alongside the recovery proof obligations above. The README's outage table is played by `outage_matrix.py` (passes on a private stack); what is still to verify is how LONG each component may stay down: CDC max age and bytes, the admission queue's per-principal and stream caps, the object store.
 
@@ -67,6 +67,15 @@ The first `zb_client_sync` of a libzb client answers `PrepareFailed` (no detail)
 ## The archiver's native reader (branch `readings-fetch`)
 
 `bridge_readings_fetch` + `archiver.py --reader native` (NOTES "The archiver's reader is a binary of the bridge's build"). Verified here: unit tests, `readings_fetch.py` (A-I, with SeaweedFS), `readings_roles.py` P3 (real operator-mode grants), 500,000 readings end to end 26.8 s -> 3.0 s. Still to do on a real stack: `archive.py` (dev stack), the container image (copy the binary in, then `--reader native` in the image's command), `build-linux.sh`/`package-linux.sh` (edited, not run), and switching the default reader once it has run on yours.
+
+## Walls: fixed 2026-10-27 (PR 21), reviewed, and what is left
+
+NOTES "A bridge that could not return, and the limits it hit" and "Identifiers are measured in bytes, and the limits do not drop rows". `scripts/scenarios/walls.py` A–G and I, unit tests in `limits.zig`, `drops.zig`, `http_server.zig`, `batch_publisher.zig`.
+
+- The fork patch is in: ndrean/nats.zig `zebridge 42` (`315fb29`, tag `zebridge/b8ffdd9-2`) is pinned, so the tenant limit is 128 bytes (`bridge --limits`). Verified here on both library states (46 and 128) and on the maintainer's machine (128).
+- A deployment built against upstream nats.zig (no `max_subject_len`) gets the 46-byte limit: tenants of 47 to 92 bytes that worked with short tables are refused on new rows and found by `--diagnose`. Counters restart at 0 on a bridge restart; `bridge_table_degraded` means "dropped since boot", not "inconsistent": `zebridge_reseed` is what makes it consistent.
+- Not done: the per-table health is a metric and a `/dropped` list; there is no persisted "table needs reseed" flag in PostgreSQL (`zebridge_suspensions` holds suspensions only).
+- Not replayed on the native dev stack: only private stacks (`walls.py`).
 
 ## Open decisions and ideas
 
@@ -101,7 +110,7 @@ nats-server ≥ 2.15, Zig 0.17, a venv at `/opt/zenv` with `nats-py nkeys msgpac
    "uncommitted changes" stop hook.
 3. **PostgreSQL.** A throwaway server with `wal_level=logical`, trust auth, user `postgres` (CREATEDB):
 
-   ```
+   ```sh
    initdb -D /var/lib/zbtest/pgdata -U postgres --auth=trust       # as the postgres OS user
    pg_ctl -D /var/lib/zbtest/pgdata -o '-p 5432 -c wal_level=logical -c max_replication_slots=10 \
           -c max_wal_senders=10 -c listen_addresses=127.0.0.1 -c unix_socket_directories=/tmp' start
@@ -109,11 +118,12 @@ nats-server ≥ 2.15, Zig 0.17, a venv at `/opt/zenv` with `nats-py nkeys msgpac
 
    Then apply `init.core.template.sql` and `init.write.template.sql` through `envsubst` with the variables
    from `.env.admin` / `.env.bridge` (and `scripts/zb-derive-env.py`), and create the publication named by
-   `BRIDGE_CDC_PUBLICATION` with `public.zebridge_create_publication(...)`. Read the variable *names* only; the
+   `BRIDGE_CDC_PUBLICATION` with `public.zebridge_create_publication(...)`. Read the variable _names_ only; the
    tool hook blocks commands that print secrets. Write such scripts with the editor tools.
+
 4. **Run a check.**
 
-   ```
+   ```sh
    zig build -Doptimize=ReleaseFast
    (cd libzb && zig build -Doptimize=ReleaseFast && zig build -Doptimize=ReleaseFast -Dtest-faults=true -p zig-out-faults)
    export ZB_PGBIN=/usr/lib/postgresql/16/bin PATH=$ZB_PGBIN:$PATH
@@ -133,6 +143,6 @@ nats-server ≥ 2.15, Zig 0.17, a venv at `/opt/zenv` with `nats-py nkeys msgpac
   (that is why `ZB_TEST_SCHEMA_PAUSE_FILE` exists); the TS client takes the same hold through `faultHook`.
 - libzb never reading a message of `CDC_PUBLIC` counts as a gap for ever (`streamHasGap` with stored 0), so a
   table with a shared route re-seeds every pass; scenarios write one open-tenant row first.
-- Reviews of merged PRs have found real P1s each time. Before calling an increment done, probe the *failure* paths
+- Reviews of merged PRs have found real P1s each time. Before calling an increment done, probe the _failure_ paths
   (a refused PREPARE, a crash after the first chunk, a conversion fence → plain seed) and the overlap of two
   passes, not just the happy path; and prove each regression test fails without its fix.

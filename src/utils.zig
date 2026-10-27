@@ -266,9 +266,10 @@ fn toHexDigit(d: u8) u8 {
 ///
 /// Rejects: empty, `.` (splits the token), `*` and `>` (wildcards, which are literal on
 /// publish but match broadly on subscribe), whitespace and control characters (a space
-/// ends the subject in the wire protocol), and anything over `max_subject_token_len`.
-pub fn isSubjectToken(s: []const u8) bool {
-    if (s.len == 0 or s.len > max_subject_token_len) return false;
+/// ends the subject in the wire protocol), and anything over `max_bytes`: the BYTE length, so a
+/// multi-byte character counts for each of its bytes (`limits.max_tenant_bytes` for a tenant).
+pub fn isSubjectToken(s: []const u8, max_bytes: usize) bool {
+    if (s.len == 0 or s.len > max_bytes) return false;
     for (s) |ch| {
         switch (ch) {
             '.', '*', '>' => return false,
@@ -279,46 +280,44 @@ pub fn isSubjectToken(s: []const u8) bool {
     return true;
 }
 
-/// Bounded so one hostile value cannot push a subject past what the subject buffer or the
-/// server will accept. Generous next to a tenant id or a uuid-based msg_id.
-pub const max_subject_token_len: usize = 128;
+const test_max: usize = 128;
 
 test "isSubjectToken: the values the bridge actually interpolates" {
-    try std.testing.expect(isSubjectToken("acme"));
-    try std.testing.expect(isSubjectToken("tenant_42"));
-    try std.testing.expect(isSubjectToken("01a0138f-3e62-70b0-a2ca-a0f936923665"));
-    try std.testing.expect(isSubjectToken("c-1234567890123456-orders-1787034564"));
+    try std.testing.expect(isSubjectToken("acme", test_max));
+    try std.testing.expect(isSubjectToken("tenant_42", test_max));
+    try std.testing.expect(isSubjectToken("01a0138f-3e62-70b0-a2ca-a0f936923665", test_max));
+    try std.testing.expect(isSubjectToken("c-0000000000000000-orders-0000000000", test_max));
 }
 
 test "isSubjectToken: a dot silently reshapes the subject" {
     // The measured case: `cdc.orders.insert.evil.acme` is five tokens, so a subscriber on
     // `cdc.*.*.acme` never receives it and the row vanishes from its own tenant's feed.
-    try std.testing.expect(!isSubjectToken("evil.acme"));
-    try std.testing.expect(!isSubjectToken("a.b"));
-    try std.testing.expect(!isSubjectToken("."));
+    try std.testing.expect(!isSubjectToken("evil.acme", test_max));
+    try std.testing.expect(!isSubjectToken("a.b", test_max));
+    try std.testing.expect(!isSubjectToken(".", test_max));
 }
 
 test "isSubjectToken: wildcards publish as literals and must not be accepted" {
-    try std.testing.expect(!isSubjectToken("*"));
-    try std.testing.expect(!isSubjectToken(">"));
-    try std.testing.expect(!isSubjectToken("acme>"));
-    try std.testing.expect(!isSubjectToken("*acme"));
+    try std.testing.expect(!isSubjectToken("*", test_max));
+    try std.testing.expect(!isSubjectToken(">", test_max));
+    try std.testing.expect(!isSubjectToken("acme>", test_max));
+    try std.testing.expect(!isSubjectToken("*acme", test_max));
 }
 
 test "isSubjectToken: whitespace and control characters end the subject on the wire" {
-    try std.testing.expect(!isSubjectToken("two words"));
-    try std.testing.expect(!isSubjectToken("acme\n"));
-    try std.testing.expect(!isSubjectToken("acme\r"));
-    try std.testing.expect(!isSubjectToken("acme\t"));
-    try std.testing.expect(!isSubjectToken("acme\x00"));
+    try std.testing.expect(!isSubjectToken("two words", test_max));
+    try std.testing.expect(!isSubjectToken("acme\n", test_max));
+    try std.testing.expect(!isSubjectToken("acme\r", test_max));
+    try std.testing.expect(!isSubjectToken("acme\t", test_max));
+    try std.testing.expect(!isSubjectToken("acme\x00", test_max));
 }
 
 test "isSubjectToken: empty and over-long are refused" {
-    try std.testing.expect(!isSubjectToken(""));
-    const long: []const u8 = &@as([max_subject_token_len + 1]u8, @splat('a'));
-    try std.testing.expect(!isSubjectToken(long));
-    const at_limit: []const u8 = &@as([max_subject_token_len]u8, @splat('a'));
-    try std.testing.expect(isSubjectToken(at_limit));
+    try std.testing.expect(!isSubjectToken("", test_max));
+    const long: []const u8 = &@as([test_max + 1]u8, @splat('a'));
+    try std.testing.expect(!isSubjectToken(long, test_max));
+    const at_limit: []const u8 = &@as([test_max]u8, @splat('a'));
+    try std.testing.expect(isSubjectToken(at_limit, test_max));
 }
 
 /// A spin lock for snapshot registries (wal_monitor.SlotRegistry, fleet_monitor.Registry):
@@ -336,3 +335,10 @@ pub const SpinLock = struct {
         self.locked.store(false, .release);
     }
 };
+
+/// Seconds since the Unix epoch (the wall clock).
+pub fn nowUnix() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    return @as(i64, ts.sec);
+}

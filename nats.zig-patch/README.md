@@ -7,3 +7,5 @@ submodule pins a commit of that branch; nothing is applied at build time. See `.
 
 The patches, `check-series.sh` and `new-patch.sh` are in this directory's git history before the
 commit that retired them.
+
+Nothing is pending: `zebridge 42` (a subject may be longer than 255 bytes) is on the fork's `zebridge` branch (`315fb29`, tag `zebridge/b8ffdd9-2`).

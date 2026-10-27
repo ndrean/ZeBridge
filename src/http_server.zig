@@ -6,6 +6,8 @@ const jwt_mint = @import("jwt_mint.zig");
 const c = @import("c_imports.zig").c;
 const nats = @import("nats");
 const refused_tables = @import("refused_tables.zig");
+const drops_mod = @import("drops.zig");
+const limits = @import("limits.zig");
 const rls_guard = @import("rls_guard.zig");
 const rate_limit = @import("rate_limit.zig");
 const pg_health = @import("pg_health.zig");
@@ -26,7 +28,11 @@ const topology_mod = @import("topology.zig");
 // order to get wrong by hand, and request parsing over a fixed 2048-byte buffer.
 //
 // `std.Io` gives the same cancellation for free: `AcceptError.SocketNotListening` is
-// documented as the shutdown mechanism — closing the listener wakes a blocked `accept`.
+// documented as the shutdown mechanism — `shutdown` on the listener wakes a blocked
+// `accept`. ⚠️ Closing it does not, on Linux: a thread blocked in `accept(2)` stays blocked
+// when another thread `close`s the descriptor (macOS wakes it, which is why this passed on
+// the development machine). Measured 2026-10-26: an idle bridge told to stop exited only
+// when the next HTTP request arrived.
 
 pub const log = std.log.scoped(.http_server);
 
@@ -73,8 +79,8 @@ pub const Server = struct {
     port: u16,
     bind: []const u8 = "127.0.0.1",
     io: std.Io,
-    /// The live listener, so `stop()` can close it and wake a blocked `accept`. Valid only
-    /// while `run` is on the stack.
+    /// The live listener, so `stop()` can shut it down and wake a blocked `accept`. Valid
+    /// only while `run` is on the stack; `run` closes it, never `stop()`.
     server: ?*std.Io.net.Server = null,
     /// Connections currently being served. Bounded by `Config.Http.max_connections`.
     open_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -84,6 +90,8 @@ pub const Server = struct {
     /// Set after construction, like nats_publisher. Only its atomic summaries are read
     /// here — the map belongs to the replication thread (see refused_tables.zig).
     refused: ?*const refused_tables.Registry = null,
+    /// Rows dropped before publication, by table and reason (drops.zig).
+    drops: ?*const drops_mod.Registry = null,
     /// The pairs whose chain the row-level-security guard is not publishing (rls_guard.zig).
     rls: ?*rls_guard.Registry = null,
     /// §10fk: the ingress rate limit, declared on /status so the operator tool can
@@ -177,17 +185,21 @@ pub const Server = struct {
     ///
     /// ⚠️ Setting `should_stop` is not enough on its own. The loop checks it between
     /// accepts, and `accept` blocks indefinitely — the old C implementation only got away
-    /// with a flag because it wrapped every accept in a 100ms `poll`. Closing the listener
-    /// is the documented replacement: std says `SocketNotListening` is returned when
-    /// "shutdown was called (possibly while this call was blocking). This allows shutdown
-    /// to be used as a concurrent cancellation mechanism."
+    /// with a flag because it wrapped every accept in a 100ms `poll`. `shutdown` on the
+    /// listener is the documented replacement: std says `SocketNotListening` is returned
+    /// when "shutdown was called (possibly while this call was blocking). This allows
+    /// shutdown to be used as a concurrent cancellation mechanism." It must be `shutdown`,
+    /// not `close`: on Linux closing a descriptor leaves another thread's `accept` blocked,
+    /// so a bridge told to stop (or one whose `main` returned an error) waited for the next
+    /// HTTP request to exit. `run` owns the descriptor and closes it on the way out.
     ///
     /// Safe to call when `run` is not on the stack, and safe to call twice.
     pub fn stop(self: *Server) void {
         self.should_stop.store(true, .seq_cst);
-        if (self.server) |srv| {
-            self.server = null;
-            srv.deinit(self.io);
+        if (@atomicLoad(?*std.Io.net.Server, &self.server, .acquire)) |srv| {
+            self.io.vtable.netShutdown(self.io.userdata, srv.socket.handle, .both) catch |err| {
+                log.warn("could not shut the listener down ({s}); the accept loop exits at the next connection", .{@errorName(err)});
+            };
         }
     }
 
@@ -219,12 +231,14 @@ pub const Server = struct {
             log.err("🔴 Could not listen on {s}:{d}: {s}", .{ self.bind, self.port, @errorName(err) });
             return error.BindFailed;
         };
-        self.server = &server;
-        // `stop()` may have closed and cleared it already; only clean up if it did not.
-        defer if (self.server != null) {
-            self.server = null;
+        @atomicStore(?*std.Io.net.Server, &self.server, &server, .release);
+        // Cleared before the descriptor closes, so a late `stop()` never touches a closed one.
+        defer {
+            @atomicStore(?*std.Io.net.Server, &self.server, null, .release);
             server.deinit(self.io);
-        };
+        }
+        // `stop()` may have run before the pointer was published: the flag is then the only signal.
+        if (self.should_stop.load(.seq_cst)) return;
 
         log.info("✅ HTTP server listening on http://{s}:{d}", .{ self.bind, self.port });
         if (std.mem.eql(u8, self.bind, "0.0.0.0")) {
@@ -388,6 +402,8 @@ pub const Server = struct {
             try self.handleHealth(req);
         } else if (method == .GET and std.mem.eql(u8, target, "/status")) {
             try self.handleStatus(req);
+        } else if (method == .GET and std.mem.eql(u8, target, "/dropped")) {
+            try self.handleDropped(req);
         } else if (method == .GET and std.mem.eql(u8, target, "/metrics")) {
             try self.handleMetrics(req);
         } else if (method == .GET and (std.mem.eql(u8, target, "/nats-account") or std.mem.startsWith(u8, target, "/nats-account?"))) {
@@ -810,6 +826,19 @@ pub const Server = struct {
         try respond(req, .ok, "application/json", "{\"status\":\"ok\"}\n");
     }
 
+    /// The rows dropped before publication, by table and reason (drops.zig): what `bridge --diagnose`
+    /// reads. Separate from /status, whose body is a fixed-size buffer and which this list can outgrow.
+    fn handleDropped(self: *Server, req: *std.http.Server.Request) !void {
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try aw.writer.print("{{\"limits\":{{\"tenant_bytes\":{d},\"table_bytes\":{d},\"subject_buffer_bytes\":{d},\"max_prefix_bytes\":{d}}},\"dropped\":", .{
+            limits.max_tenant_bytes, limits.max_table_bytes, limits.subject_buffer_bytes, limits.max_prefix_bytes,
+        });
+        if (self.drops) |d| try d.writeJson(&aw.writer) else try aw.writer.print("[]", .{});
+        try aw.writer.print("}}\n", .{});
+        try respond(req, .ok, "application/json", aw.written());
+    }
+
     fn handleStatus(self: *Server, req: *std.http.Server.Request) !void {
         const status_cpu_ns = utils.cpuTimeNanos();
         if (self.metrics) |m| {
@@ -840,7 +869,10 @@ pub const Server = struct {
                 \\  "gc_last_sweep_time": {d},
                 \\  "ingress_rate_per_principal": {d},
                 \\  "ingress_rate_burst": {d},
-                \\  "ingress_rate_limited_total": {d}
+                \\  "ingress_rate_limited_total": {d},
+                \\  "dropped_events": {d},
+                \\  "degraded_tables": {d},
+                \\  "limits": {{"tenant_bytes": {d}, "table_bytes": {d}, "subject_buffer_bytes": {d}, "max_prefix_bytes": {d}}}
                 \\}}
             , .{
                 if (snap.is_connected) "connected" else "disconnected",
@@ -866,6 +898,12 @@ pub const Server = struct {
                 if (self.limiter) |l| @as(u64, @intFromFloat(l.rate_per_s)) else 0,
                 if (self.limiter) |l| @as(u64, @intFromFloat(l.burst)) else 0,
                 if (self.limiter) |l| l.limited_total.load(.monotonic) else 0,
+                if (self.drops) |d| d.total() else 0,
+                if (self.drops) |d| d.degradedTables() else 0,
+                limits.max_tenant_bytes,
+                limits.max_table_bytes,
+                limits.subject_buffer_bytes,
+                limits.max_prefix_bytes,
             });
 
             try respond(req, .ok, "application/json", body);
@@ -1004,6 +1042,7 @@ pub const Server = struct {
             // own exposition text so the metric names stay next to the thing counting.
             var w = std.Io.Writer.fixed(buf[body.len..]);
             if (self.refused) |r| try r.writePrometheus(&w);
+            if (self.drops) |d| try d.writePrometheus(&w);
             if (self.rls) |r| try r.writePrometheus(&w);
             if (self.slots) |s| try s.writePrometheus(&w);
             if (self.fleet) |f| try f.writePrometheus(&w);
@@ -1116,4 +1155,39 @@ test "enrollment policy diagnosis refuses mixed security and wrong transports" {
     try std.testing.expectError(error.InvalidEnrollmentEndpoint, Server.validateEndpointPair("wss://leaf", "tls://hub", false));
     try std.testing.expectError(error.InvalidEnrollmentEndpoint, Server.validateEndpointPair("tls://", null, false));
     try std.testing.expectError(error.InvalidEnrollmentEndpoint, Server.validateEndpointPair("tls://leaf,,tls://hub", null, false));
+}
+
+test "stop wakes an accept that is blocked, and run returns" {
+    // Regression: `stop()` closed the listener, which on Linux leaves another thread's
+    // `accept(2)` blocked, so a bridge told to stop waited for the next HTTP request.
+    // The watchdog turns a hang into a failure instead of a stuck test run.
+    var stop_flag = std.atomic.Value(bool).init(false);
+    var srv = try Server.init(std.testing.allocator, std.testing.io, "127.0.0.1", 0, &stop_flag, null, null);
+    const Runner = struct {
+        fn go(s: *Server, done: *std.atomic.Value(bool)) void {
+            s.run() catch {};
+            done.store(true, .seq_cst);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const t = try std.Thread.spawn(.{}, Runner.go, .{ &srv, &done });
+
+    var waited: usize = 0;
+    while (@atomicLoad(?*std.Io.net.Server, &srv.server, .acquire) == null and waited < 200) : (waited += 1) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(@atomicLoad(?*std.Io.net.Server, &srv.server, .acquire) != null);
+    // Let the thread reach `accept`.
+    std.Io.sleep(std.testing.io, .fromMilliseconds(200), .awake) catch {};
+
+    srv.stop();
+    waited = 0;
+    while (!done.load(.seq_cst) and waited < 300) : (waited += 1) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    if (!done.load(.seq_cst)) {
+        t.detach();
+        return error.AcceptNotWoken;
+    }
+    t.join();
 }

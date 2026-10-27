@@ -1180,7 +1180,7 @@ row of `zebridge_user_tenants` for the principal (`tenant:<t>`, one tag each) an
 per tag — so a `client` principal joins by being re-enrolled after a row is added,
 and a wildcard never works inside a tag: NATS wildcards are whole tokens, so
 `tenant:r_*` expands to no valid subject and grants nothing. A tenant value is a
-subject token, and `zebridge_user_tenants` and `zebridge_invites` refuse `.`, `*`, `>` and space.
+subject token, and `zebridge_user_tenants` and `zebridge_invites` refuse `.`, `*`, `>` and space. A tenant value is also at most `tenant_bytes` BYTES (`bridge --limits`: 128 with the pinned client library, 46 against one without the fork's subject-length patch; not characters, and no control character), refused by the tenant guard trigger in the database; a legacy row that gets past it is dropped by the bridge, counted (`bridge_dropped_events_total`), and builds no chain ([CLAUDE.md](CLAUDE.md#walls)).
 
 A write must name its tenant when the principal belongs to several: the tenant guard
 fills an omitted value only from a single membership and refuses the ambiguous case

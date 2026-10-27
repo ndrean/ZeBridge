@@ -20,6 +20,7 @@
 //! empty string — `CREATE USER  WITH PASSWORD ''` was envsubst's failure mode.
 const std = @import("std");
 const topology_mod = @import("topology.zig");
+const limits = @import("limits.zig");
 
 const core_template = @embedFile("init_core_sql");
 const write_template = @embedFile("init_write_sql");
@@ -60,6 +61,8 @@ pub fn run(io: std.Io, init: *const std.process.Init) u8 {
         return 1;
     };
     const open_tenant = owned.topology.open_tenant;
+    // The one source of the tenant limit is limits.zig; the SQL guards quote it.
+    const max_tenant_bytes_text = std.fmt.allocPrint(a, "{d}", .{limits.max_tenant_bytes}) catch return 1;
 
     var vars = [_]Var{
         .{ .name = "POSTGRES_READER_USER", .value = reader.user },
@@ -68,6 +71,7 @@ pub fn run(io: std.Io, init: *const std.process.Init) u8 {
         .{ .name = "POSTGRES_WRITER_PASSWORD", .value = if (writer) |w| (quoteDoubled(a, w.password) catch return 1) else "" },
         .{ .name = "TARGET_DB", .value = target_db },
         .{ .name = "OPEN_TENANT", .value = open_tenant },
+        .{ .name = "MAX_TENANT_BYTES", .value = max_tenant_bytes_text },
         .{ .name = "LEAF_PREFIX", .value = owned.topology.leaf_prefix },
         .{ .name = "RECEIPT_COMPLETION_GUARD", .value = if (@import("build_options").receipt_guard) "true" else "false" },
     };
@@ -232,7 +236,7 @@ test "render substitutes, quotes passwords, and refuses a leftover" {
 }
 
 test "both embedded templates name only known variables" {
-    const known = [_][]const u8{ "POSTGRES_READER_USER", "POSTGRES_READER_PASSWORD", "POSTGRES_WRITER_USER", "POSTGRES_WRITER_PASSWORD", "TARGET_DB", "OPEN_TENANT", "LEAF_PREFIX", "RECEIPT_COMPLETION_GUARD" };
+    const known = [_][]const u8{ "POSTGRES_READER_USER", "POSTGRES_READER_PASSWORD", "POSTGRES_WRITER_USER", "POSTGRES_WRITER_PASSWORD", "TARGET_DB", "OPEN_TENANT", "MAX_TENANT_BYTES", "LEAF_PREFIX", "RECEIPT_COMPLETION_GUARD" };
     for ([_][]const u8{ core_template, write_template }) |t| {
         var i: usize = 0;
         while (std.mem.findPos(u8, t, i, "${")) |start| {

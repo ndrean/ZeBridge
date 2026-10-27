@@ -113,6 +113,14 @@ BEGIN
     col_list := quote_ident(tenant_col) || ', ' ||
                 (SELECT string_agg(quote_ident(c), ', ') FROM unnest(pk_cols) c);
     IF NOT dry_run THEN
+        -- `name` keeps 63 bytes, so the suffix of a 63-character table is cut off and the
+        -- "index" is the table itself: CREATE ... IF NOT EXISTS skips it, and the ALTER below
+        -- fails with '"<table>" is not an index', which names nothing to do (measured
+        -- 2026-10-26). Say what is wrong while there is still nothing to undo.
+        IF idx_name = (SELECT relname FROM pg_class WHERE oid = tbl) THEN
+            RAISE EXCEPTION 'table name % is % bytes: the replica-identity index name derived from it (<table>_zb_ri) is cut to the table''s own name. Rename the table to at most 62 bytes, or make the tenant part of the replica identity yourself (a unique index on (%, primary key) and ALTER TABLE ... REPLICA IDENTITY USING INDEX)',
+                tbl, octet_length(idx_name), tenant_col;
+        END IF;
         EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %s (%s)', idx_name, tbl, col_list);
         EXECUTE format('ALTER TABLE %s REPLICA IDENTITY USING INDEX %I', tbl, idx_name);
         RAISE NOTICE 'replica identity of % moved to (%) so its rows route by tenant', tbl, col_list;

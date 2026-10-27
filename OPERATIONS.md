@@ -132,6 +132,7 @@ bridge --diagnose            # or: bridge --diagnose --pub my_pub --slot my_slot
 What it checks, in order:
 
 - **The configuration**, as the boot would decide it: the init SQL applied, the publication, each table's verdict (primary key, writable or not, tenant scoping), whether the stored rows fit `BASE_BUF` and the smallest value that would, whether the buffer would shrink since the last boot, cascades against tombstones, the CDC window against the chain's cadence.
+- **The identifiers**, in bytes ([CLAUDE.md](CLAUDE.md#walls)): the subject prefix against the subject buffer, each tenant-scoped table's name, and every tenant value already stored in a tenant-scoped table (a full scan, bounded to 120 s each): the ones that cannot be subject tokens (empty, over the tenant limit, a `.`, `*`, `>`, space or control character) and the NULLs, with a sample and the recovery. With the bridge running, what it has dropped since it started (`GET /dropped`).
 - **The catalogue**: `zebridge_check_all()`, every catalogued table against its own catalogue row; tenant-scoped tables whose writes nothing bounds; tenants the sweeper cannot reach; bridge instances with an empty publication, or disagreeing on the row budget.
 - **The slots**: an invalidated slot, an inactive one holding WAL, and this bridge's own.
 - **The bridge**: if it answers on its port, whether it is connected to NATS, its suspended tables, its reconnects. If not, the checks that need a running bridge are skipped, and said to be.
@@ -414,7 +415,7 @@ The bridge pre-allocates the ring at startup, in **three parts**:
 ```txt
 ring = ( 2^BASE_BUF  +  sizeof(CDCEvent)  +  MAX_COLUMNS × sizeof(ColumnView) )  ×  RING_BUFFER_COUNT
          ^ data:          ^ metadata:          ^ columns:                          ^ number of events
-           max bytes        fixed, 328 B         8 B × MAX_COLUMNS — resolved        buffered ahead
+           max bytes        fixed, 392 B         8 B × MAX_COLUMNS — resolved        buffered ahead
            for ONE row      per event            at boot, not a compile constant     of NATS
 ```
 
@@ -485,8 +486,8 @@ Both failures are silent and late if left to runtime, so the bridge refuses to s
 | **`BASE_BUF` vs `max_payload`** | `2^BASE_BUF + envelope` exceeds what the NATS server advertises | a row that size packs successfully and is then **rejected at publish time**, with nothing in the data path saying why. That is not a tuning choice, it is a configuration that cannot work |
 
 ```txt
-🔴 The ring would be 15176 MB — 2048 MB of data (BASE_BUF=11 → 2 KB × RING_BUFFER_COUNT=
-   1048576) plus 328 MB of per-event metadata (328 B each) plus 12800 MB of column
+🔴 The ring would be 15240 MB — 2048 MB of data (BASE_BUF=11 → 2 KB × RING_BUFFER_COUNT=
+   1048576) plus 392 MB of per-event metadata (392 B each) plus 12800 MB of column
    descriptors (MAX_COLUMNS=1600 × 8 B × RING_BUFFER_COUNT) — against a 16384 MB memory
    limit. … Halve RING_BUFFER_COUNT for each step you raise BASE_BUF.
 
