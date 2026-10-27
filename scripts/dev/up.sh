@@ -50,7 +50,12 @@ set -a
 # shellcheck disable=SC1091
 . "$ROOT/.env.bridge"
 set +a
-: "${BRIDGE_CDC_PUBLICATION:?set BRIDGE_CDC_PUBLICATION in .env.bridge — there is no default}"
+if [ -z "${BRIDGE_CDC_PUBLICATION:-}" ]; then
+  # Not in the env file: the publication is named by whoever runs, never guessed (NOTES §10ad).
+  echo "[dev] BRIDGE_CDC_PUBLICATION is not set — there is no default. Pass the name:" >&2
+  echo "        BRIDGE_CDC_PUBLICATION=zb_pub scripts/dev/up.sh" >&2
+  exit 1
+fi
 psql_c() { dc exec -T postgres psql -v ON_ERROR_STOP=1 -U postgres -d postgres "$@"; }
 
 echo "[dev] applying the init SQL"
@@ -64,9 +69,10 @@ fi
 cat <<EOF
 
 [dev] up. PostgreSQL 127.0.0.1:5432, NATS 127.0.0.1:4222 (operator mode), credentials in scripts/native/creds/.
-Next, from this directory, with .env.bridge sourced and the scenarios' venv:
+Next, from the repository root, with the scenarios' venv active:
+  set -a && . ./.env.bridge && set +a && export BRIDGE_CDC_PUBLICATION=$BRIDGE_CDC_PUBLICATION
   scripts/reprovision.py                       # the baseline tables, catalogue rows and tenant mappings
-  zig-out/bin/bridge                           # the long-running bridge on :27434 (the live group)
-  scripts/scenarios/run.py all
-Stop with scripts/dev/down.sh.
+  zig-out/bin/bridge --pub \$BRIDGE_CDC_PUBLICATION   # the long-running bridge on :27434 (the live group), in its own terminal
+  scripts/scenarios/run.py all                 # in another terminal, same environment
+Stop with scripts/dev/down.sh (--clean wipes the volumes, the keys and the credentials).
 EOF

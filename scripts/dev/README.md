@@ -11,17 +11,19 @@ Containers add a virtualization layer. Do not take speed measurements here; `scr
 
 ```sh
 zig build -Doptimize=ReleaseFast        # up.sh applies the bridge's own --init-sql
-scripts/dev/up.sh                       # first run pulls the images and mints the NATS credentials
+BRIDGE_CDC_PUBLICATION=zb_pub scripts/dev/up.sh   # first run pulls the images and mints the NATS credentials
 scripts/dev/down.sh                     # stop; the data stays in the Docker volumes
 scripts/dev/down.sh --clean             # also delete the volumes, the keys and the credentials
 ```
 
-Needs Docker with the compose plugin (OrbStack is fine) and `.env.bridge` with `DATABASE_READER_URL`,
-`DATABASE_WRITER_URL` and `BRIDGE_CDC_PUBLICATION` pointing at `127.0.0.1:5432`. Nothing else may listen on 5432,
+Needs Docker with the compose plugin (OrbStack is fine) and `.env.bridge` with `DATABASE_READER_URL` and
+`DATABASE_WRITER_URL` pointing at `127.0.0.1:5432`. The publication has no default and is not in `.env.bridge`:
+pass its name, as in the first command above. Nothing else may listen on 5432,
 4222, 8222, 8080 or 1883: stop a Homebrew PostgreSQL first (`brew services stop postgresql@18`, and any
 `scripts/native/up.sh` stack with `scripts/native/down.sh`).
 
-`up.sh` ends by printing the next steps. In short, with the scenarios' venv and `.env.bridge` sourced:
+`up.sh` ends by printing the next steps. In short, from the repository root, with the scenarios' venv, `.env.bridge` sourced and the same
+`BRIDGE_CDC_PUBLICATION` exported:
 
 ```sh
 scripts/reprovision.py                  # baseline tables, catalogue rows and tenant mappings
