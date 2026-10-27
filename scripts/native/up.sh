@@ -60,8 +60,15 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
   "$PGBIN/initdb" -D "$PGDATA" -U postgres --auth=trust >/dev/null
 fi
 
-echo "[native] starting postgres on :$PGPORT"
-"$PGBIN/pg_ctl" -D "$PGDATA" -l "$PG_LOG" -o "-p $PGPORT ${PG_FLAGS[*]}" start
+# Idempotent means a second run finds it running: `pg_ctl start` on a live data directory
+# fails ("lock file postmaster.pid already exists") and `set -e` ended the script there,
+# before NATS. `pg_ctl status` exits 0 when the postmaster of this directory is alive.
+if "$PGBIN/pg_ctl" -D "$PGDATA" status >/dev/null 2>&1; then
+  echo "[native] postgres already running on :$PGPORT"
+else
+  echo "[native] starting postgres on :$PGPORT"
+  "$PGBIN/pg_ctl" -D "$PGDATA" -l "$PG_LOG" -o "-p $PGPORT ${PG_FLAGS[*]}" start
+fi
 "$PGBIN/pg_isready" -h 127.0.0.1 -p "$PGPORT" >/dev/null
 # ⚠️ Not a `-c` flag: a command-line setting beats postgresql.auto.conf, so nothing
 # short of a restart could change it — scripts/scenarios/slot_loss.py lowers it with
@@ -113,9 +120,16 @@ if [ ! -d "$NATSDATA/jetstream" ]; then
 fi
 
 mkdir -p "$NATSDATA"
-echo "[native] starting nats-server on :4222"
-nohup nats-server -js -c "$NATSCONF" > "$NATS_LOG" 2>&1 &
-echo $! > "$ROOT/scripts/native/nats-server.pid"
+# A second nats-server would fail to bind and its PID would overwrite the pid file of the
+# live one, which down.sh could then no longer stop.
+NATS_PIDFILE="$ROOT/scripts/native/nats-server.pid"
+if [ -f "$NATS_PIDFILE" ] && kill -0 "$(cat "$NATS_PIDFILE")" 2>/dev/null; then
+  echo "[native] nats-server already running (pid $(cat "$NATS_PIDFILE"))"
+else
+  echo "[native] starting nats-server on :4222"
+  nohup nats-server -js -c "$NATSCONF" > "$NATS_LOG" 2>&1 &
+  echo $! > "$NATS_PIDFILE"
+fi
 for _ in $(seq 1 30); do
   curl -s -o /dev/null localhost:8222/varz && break
   sleep 0.5
