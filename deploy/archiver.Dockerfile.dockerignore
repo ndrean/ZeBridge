@@ -1,5 +1,10 @@
-# The archiver image (archiver.Dockerfile) sends only what it copies; the root
-# .dockerignore is the bridge image's.
-*
+**
+!deploy/
+!deploy/archiver.Dockerfile
+!dist/
+!dist/*/
+!dist/*/zebridge_*.deb
+!examples/
+!examples/16-archive/
 !examples/16-archive/archiver.py
 !examples/16-archive/common.py

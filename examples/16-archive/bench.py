@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""How fast is archiver.py, stage by stage (S3 left out). Needs nats-server on PATH, nats-py and duckdb.
+"""Native archive stages compared with the former Python path (S3 left out). Needs nats-server on PATH, nats-py and duckdb.
 
     python3 examples/16-archive/bench.py [readings, default 500000]
 
 
-  1. ingest : the archiver's own loop: ordered consumer, next_msg(), common.reading(), dict insert
-  2. flush  : its own flush(): JSON lines on disk -> DuckDB read_json -> COPY ... parquet zstd
+  1. ingest : former Python baseline: ordered consumer, next_msg(), common.reading(), dict insert
+  2. flush  : former Python baseline: JSON lines on disk -> DuckDB read_json -> COPY ... parquet zstd
 """
 import asyncio, json, os, subprocess, sys, tempfile, time, pathlib, shutil, random
 
@@ -48,7 +48,7 @@ async def main():
         info = await js.stream_info(common.stream_for(TENANT))
         print(f"stream holds {info.state.messages:,} messages, {info.state.bytes / 1e6:.1f} MB")
 
-        # 1. ingest, as archiver.py does it
+        # 1. former Python ingest baseline
         sub = await js.subscribe(common.subject_filter(TENANT), stream=common.stream_for(TENANT), ordered_consumer=True,
                                  config=ConsumerConfig(deliver_policy=DeliverPolicy.BY_START_SEQUENCE, opt_start_seq=1))
         rows, got = {}, 0
@@ -83,7 +83,7 @@ async def main():
         print(f"1c. pull fetch(5000) only: {got2 / t_pull:>8,.0f} msg/s  (no decoding)")
         await nc.close()
 
-        # 1d. the native reader (bridge_readings_fetch), as `archiver.py --reader native` runs it
+        # 1d. the native reader (bridge_readings_fetch), as archiver.py runs it
         fetch = pathlib.Path(os.environ.get("ZB_READINGS_FETCH", ARCH.parents[1] / "zig-out" / "bin" / "bridge_readings_fetch"))
         csv_out = tmp + "/native.csv"
         if fetch.exists():
@@ -97,7 +97,7 @@ async def main():
         else:
             print(f"1d. native reader: skipped, {fetch} is missing (zig build -Doptimize=ReleaseFast)")
 
-        # 2. flush, as archiver.flush() does it (without S3)
+        # 2. former JSON-lines flush baseline (without S3)
         import duckdb
         lst = list(rows.values())
         for batch in (100_000, len(lst)):

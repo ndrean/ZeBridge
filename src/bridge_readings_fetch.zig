@@ -144,16 +144,19 @@ fn run(init: std.process.Init) !u8 {
     io.random(&rnd);
     const cname = try std.fmt.bufPrint(&name_buf, "rf{x}", .{rnd});
 
-    const sub = js.pullSubscribe(null, cname, .{ .stream = stream, .config = .{
-        .name = cname,
-        .durable_name = cname,
-        .ack_policy = .none,
-        .filter_subject = filter,
-        .deliver_policy = .by_start_sequence,
-        .opt_start_seq = a.from,
-        // The server reaps it: the archiver's grants do not include CONSUMER.DELETE.
-        .inactive_threshold = 30 * std.time.ns_per_s,
-    } }) catch |err| {
+    const sub = js.pullSubscribe(null, cname, .{
+        .stream = stream,
+        .config = .{
+            .name = cname,
+            .durable_name = cname,
+            .ack_policy = .none,
+            .filter_subject = filter,
+            .deliver_policy = .by_start_sequence,
+            .opt_start_seq = a.from,
+            // The server reaps it: the archiver's grants do not include CONSUMER.DELETE.
+            .inactive_threshold = 30 * std.time.ns_per_s,
+        },
+    }) catch |err| {
         if (err == error.StreamNotFound) {
             std.debug.print("🔴 the stream {s} does not exist\n", .{stream});
             return 2;
@@ -191,8 +194,15 @@ fn run(init: std.process.Init) !u8 {
         _ = arena_state.reset(.retain_capacity);
         const arena = arena_state.allocator();
         for (batch.messages) |m| {
-            messages += 1;
             const seq = m.metadata.sequence.stream;
+            // The first sequence reports a prefix already pruned before this read. A hole
+            // AFTER it is different: never certify the missing messages as covered, even
+            // when retention advances while a multi-batch fetch is running.
+            if (messages != 0 and (last_seq == std.math.maxInt(u64) or seq != last_seq + 1)) {
+                std.debug.print("🔴 readings sequence gap: after {d}, received {d}; the CSV is incomplete and must not advance the archive manifest\n", .{ last_seq, seq });
+                return error.SequenceGap;
+            }
+            messages += 1;
             if (first_seq == 0) first_seq = seq;
             last_seq = seq;
             const received_ms = m.metadata.timestamp.toMilliseconds();

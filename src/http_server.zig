@@ -82,6 +82,9 @@ pub const Server = struct {
     /// The live listener, so `stop()` can shut it down and wake a blocked `accept`. Valid
     /// only while `run` is on the stack; `run` closes it, never `stop()`.
     server: ?*std.Io.net.Server = null,
+    // An atomic pointer alone does not keep run's stack or socket alive after stop loads
+    // it. Serialize stop's descriptor access with publication and close.
+    listener_lock: std.Io.Mutex = .init,
     /// Connections currently being served. Bounded by `Config.Http.max_connections`.
     open_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     should_stop: *std.atomic.Value(bool),
@@ -191,15 +194,46 @@ pub const Server = struct {
     /// shutdown to be used as a concurrent cancellation mechanism." It must be `shutdown`,
     /// not `close`: on Linux closing a descriptor leaves another thread's `accept` blocked,
     /// so a bridge told to stop (or one whose `main` returned an error) waited for the next
-    /// HTTP request to exit. `run` owns the descriptor and closes it on the way out.
+    /// HTTP request to exit. macOS instead reports SocketUnconnected for a listening
+    /// socket: connect locally to wake accept there. `run` owns and closes the descriptor.
     ///
     /// Safe to call when `run` is not on the stack, and safe to call twice.
     pub fn stop(self: *Server) void {
         self.should_stop.store(true, .seq_cst);
-        if (@atomicLoad(?*std.Io.net.Server, &self.server, .acquire)) |srv| {
-            self.io.vtable.netShutdown(self.io.userdata, srv.socket.handle, .both) catch |err| {
-                log.warn("could not shut the listener down ({s}); the accept loop exits at the next connection", .{@errorName(err)});
+        var wake: ?std.Io.net.IpAddress = null;
+        {
+            self.listener_lock.lockUncancelable(self.io);
+            defer self.listener_lock.unlock(self.io);
+            if (@atomicLoad(?*std.Io.net.Server, &self.server, .acquire)) |srv| {
+                self.io.vtable.netShutdown(self.io.userdata, srv.socket.handle, .both) catch |err| {
+                    if (err == error.SocketUnconnected) {
+                        wake = srv.socket.address;
+                    } else {
+                        log.warn("could not shut the listener down ({s}); the accept loop exits at the next connection", .{@errorName(err)});
+                    }
+                };
+            }
+        }
+        if (wake) |*address| {
+            // Dial after releasing the lock: if accept has already returned, run
+            // must remain free to close the listener (including a full backlog).
+            // Only the bound address is copied, never a pointer into run's stack.
+            switch (address.*) {
+                .ip4 => |*ip| if (std.mem.allEqual(u8, &ip.bytes, 0)) {
+                    ip.bytes = .{ 127, 0, 0, 1 };
+                },
+                .ip6 => |*ip| if (std.mem.allEqual(u8, &ip.bytes, 0)) {
+                    ip.bytes[15] = 1;
+                },
+            }
+            const stream = address.connect(self.io, .{ .mode = .stream }) catch |err| {
+                // run may have finished before the dial; no wake-up is then owed.
+                self.listener_lock.lockUncancelable(self.io);
+                defer self.listener_lock.unlock(self.io);
+                if (self.server != null) log.warn("could not wake the HTTP listener ({s}); the accept loop exits at the next connection", .{@errorName(err)});
+                return;
             };
+            stream.close(self.io);
         }
     }
 
@@ -231,9 +265,13 @@ pub const Server = struct {
             log.err("🔴 Could not listen on {s}:{d}: {s}", .{ self.bind, self.port, @errorName(err) });
             return error.BindFailed;
         };
+        self.listener_lock.lockUncancelable(self.io);
         @atomicStore(?*std.Io.net.Server, &self.server, &server, .release);
+        self.listener_lock.unlock(self.io);
         // Cleared before the descriptor closes, so a late `stop()` never touches a closed one.
         defer {
+            self.listener_lock.lockUncancelable(self.io);
+            defer self.listener_lock.unlock(self.io);
             @atomicStore(?*std.Io.net.Server, &self.server, null, .release);
             server.deinit(self.io);
         }
@@ -251,9 +289,9 @@ pub const Server = struct {
         log.info("  GET  /grammar        - the embedded wire grammar (+ X-Grammar-Hash)", .{});
 
         // No poll timer. `accept` blocks until a client arrives *or* the listener is
-        // closed — std documents `SocketNotListening` as exactly that: "shutdown was
+        // shut down — std documents `SocketNotListening` as exactly that: "shutdown was
         // called (possibly while this call was blocking). This allows shutdown to be used
-        // as a concurrent cancellation mechanism." `stop()` closes it.
+        // as a concurrent cancellation mechanism." macOS needs the wake-up dial in stop().
         // Tasks serving connections. Awaited on the way out, so a response in flight is
         // not cut off by shutdown.
         var conns: std.Io.Group = .init;
@@ -276,6 +314,11 @@ pub const Server = struct {
                     break;
                 },
             };
+
+            if (self.should_stop.load(.seq_cst)) {
+                stream.close(self.io);
+                break;
+            }
 
             // The cap. Checked before spawning, so a flood costs one accept and one close
             // rather than a thread — and the counter is decremented by `serviceStream`
@@ -1158,11 +1201,40 @@ test "enrollment policy diagnosis refuses mixed security and wrong transports" {
 }
 
 test "stop wakes an accept that is blocked, and run returns" {
+    try expectStopWakes("127.0.0.1", false);
+    try expectStopWakes("0.0.0.0", false);
+}
+
+test "stop wakes a listener when shutdown reports SocketUnconnected" {
+    // Exercise macOS's path on Linux too, rather than only checking the fallback
+    // on a developer's Mac. Every other operation still uses the real test runtime.
+    try expectStopWakes("127.0.0.1", true);
+    try expectStopWakes("0.0.0.0", true);
+}
+
+test "stop before run and repeated stop leave no listener" {
+    var stop_flag = std.atomic.Value(bool).init(false);
+    var srv = try Server.init(std.testing.allocator, std.testing.io, "127.0.0.1", 0, &stop_flag, null, null);
+    srv.stop();
+    srv.stop();
+    try srv.run();
+    try std.testing.expect(@atomicLoad(?*std.Io.net.Server, &srv.server, .acquire) == null);
+    srv.stop();
+}
+
+fn expectStopWakes(bind: []const u8, force_unconnected: bool) !void {
     // Regression: `stop()` closed the listener, which on Linux leaves another thread's
     // `accept(2)` blocked, so a bridge told to stop waited for the next HTTP request.
     // The watchdog turns a hang into a failure instead of a stuck test run.
     var stop_flag = std.atomic.Value(bool).init(false);
-    var srv = try Server.init(std.testing.allocator, std.testing.io, "127.0.0.1", 0, &stop_flag, null, null);
+    var vtable = std.testing.io.vtable.*;
+    if (force_unconnected) vtable.netShutdown = struct {
+        fn unconnected(_: ?*anyopaque, _: std.Io.net.Socket.Handle, _: std.Io.net.ShutdownHow) std.Io.net.ShutdownError!void {
+            return error.SocketUnconnected;
+        }
+    }.unconnected;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var srv = try Server.init(std.testing.allocator, io, bind, 0, &stop_flag, null, null);
     const Runner = struct {
         fn go(s: *Server, done: *std.atomic.Value(bool)) void {
             s.run() catch {};
@@ -1190,4 +1262,5 @@ test "stop wakes an accept that is blocked, and run returns" {
         return error.AcceptNotWoken;
     }
     t.join();
+    srv.stop(); // after run returned: no stale stack pointer or closed descriptor
 }

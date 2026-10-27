@@ -55,7 +55,7 @@ bridge) and drops it.
 - `leaf_fence.py` — a fence taken from a seeding leaf's chain (hub + leaf nats-servers, no auth).
 - `gc_isolation.py` — the GC floor: competing sweepers, lock-owner failure, rollback and retention increase, a delayed write racing with reaping (private stack).
 
-- `readings_fetch.py` — the archiver's native reader (`bridge_readings_fetch`) against `common.reading()`: same payload contract, chunks, empty/missing/pruned stream, and the whole archiver with each reader (bare nats-server; a local SeaweedFS for the last case). `readings_roles.py` P3 runs it inside the real archiver grants.
+- `readings_fetch.py` — the archiver's native reader (`bridge_readings_fetch`) against `common.reading()`: same payload contract, chunks, empty/missing/pruned stream, and the native-only archiver across chunk sizes (bare nats-server; a local SeaweedFS for the last case). `readings_roles.py` P1 runs it inside the real archiver grants.
 
 - `walls.py` — the fixed limits at their edge, in bytes (the longest supported tenant and table, a tenant over the limit refused by the database / dropped and counted, `--diagnose` on stored values, an error escaping the loop ends the process, SIGTERM on an idle bridge); case E needs the bridge fault build (`-Dtest-faults=true -p zig-out-faults`, hook `ZB_TEST_LOOP_ERROR`).
 

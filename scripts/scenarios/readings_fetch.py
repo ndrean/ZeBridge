@@ -15,10 +15,10 @@ message by message, or the same reading is archived but not counted (or counted 
   E  an empty range is an answer, not an error; so is a start beyond the end;
   F  a stream that does not exist exits 2;
   G  a stream pruned past `--from` reports `first_seq` above it (the archiver refuses to go on);
+     a hole inside a chunk, including across pull batches, fails instead of certifying coverage;
   H  the dedupe done in SQL keeps what the archiver's Python dict kept (the latest arrival).
 
-  I  the whole archiver: `archiver.py --reader native` and `--reader python` on the same readings leave
-     the same rows in the same Parquet (needs a local S3, SeaweedFS on 127.0.0.1:8333, and boto3; skipped
+  I  the whole native archiver with two chunk sizes leaves the same logical readings in Parquet (needs a local S3, SeaweedFS on 127.0.0.1:8333, and boto3; skipped
      with a note without one).
 
 Needs nats-server on the PATH, nats-py and duckdb, and `zig build` (zig-out/bin/bridge_readings_fetch,
@@ -173,14 +173,19 @@ async def archive_e2e(nc, js, url, tmp):
         elif k < 0.7:
             items.append((f"{sensor}.temp", json.dumps({"value": i, "ts_ms": base_ms + (i // 7)}).encode()))   # resent: the same key again
         elif k < 0.8:
-            items.append((f"{sensor}.hum", str(rnd.randint(0, 100)).encode()))
+            # A bare value uses THIS stream's receipt time. Distinct test streams
+            # can group same-sensor arrivals into different milliseconds, causing
+            # different legitimate dedupe results. Keep these sensor ids unique;
+            # the explicit-time readings above still exercise resent readings.
+            items.append((f"bare{i}.hum", str(rnd.randint(0, 100)).encode()))
         elif k < 0.9:
             items.append((f"{sensor}.hum", rnd.choice([b"junk", b'{"value": 1}', b'"3"', b"NaN", b"[]"])))
         else:
             items.append((f"{rnd.choice(['a,b', 'c\"d'])}.k", json.dumps({"value": i, "ts_ms": base_ms + i}).encode()))
     items.append(("s1.temp", b'{"value": 99, "ts_ms": 1700000000999}'))   # the last message is a reading
     results = {}
-    for t, reader in (("ea", "python"), ("eb", "native")):
+    for t, batch_size in (("ea", 100), ("eb", 5000)):
+        label = f"batch {batch_size}"
         await js.add_stream(StreamConfig(name=common.stream_for(t), subjects=[common.subject_filter(t)], max_age=86400))
         await common.reset_tenant(js, t)
         for suffix, body in items:
@@ -189,16 +194,30 @@ async def archive_e2e(nc, js, url, tmp):
         for _ in range(200):
             if (await js.stream_info(common.stream_for(t))).state.last_seq >= len(items): break
             await asyncio.sleep(0.05)
-        cmd = [sys.executable, str(REPO / "examples" / "16-archive" / "archiver.py"), "--tenant", t, "--flush-s", "1", "--batch", "100",
-               "--exit-when-idle", "3", "--outage-s", "60", "--reader", reader, "--fetch-bin", str(FETCH)]
+        cmd = [sys.executable, str(REPO / "examples" / "16-archive" / "archiver.py"), "--tenant", t, "--flush-s", "1", "--batch", str(batch_size),
+               "--exit-when-idle", "3", "--outage-s", "60", "--fetch-bin", str(FETCH)]
         env = dict(os.environ, NATS_URL=url)
         env.pop("NATS_CREDS", None)
         r = subprocess.run(cmd, env=env, capture_output=True, text=True, errors="replace", timeout=180)
-        check(f"I. archiver.py --reader {reader} exits 0", r.returncode == 0)
+        check(f"I. archiver.py ({label}) exits 0", r.returncode == 0)
         if r.returncode:
             print(r.stdout[-600:], r.stderr[-600:])
         manifest, _ = await common.read_manifest(nc, t)
         results[t] = manifest
+        # A trailing chunk with no readings still has durable coverage. Reopening
+        # must not re-read it, and no empty Parquet object belongs in the manifest.
+        files_before = list(manifest["files"])
+        for payload in (b"junk", b'{"value": 1}'):
+            await js.publish(f"sensors.{t}.s1.temp", payload)
+        again = subprocess.run(cmd, env=env, capture_output=True, text=True, errors="replace", timeout=180)
+        skipped_manifest, _ = await common.read_manifest(nc, t)
+        check(f"I. {label} commits a skipped-only tail without a Parquet file",
+              again.returncode == 0 and skipped_manifest["covers_up_to"] == len(items) + 2
+              and skipped_manifest["files"] == files_before)
+        reopened = subprocess.run(cmd, env=env, capture_output=True, text=True, errors="replace", timeout=180)
+        after_reopen, _ = await common.read_manifest(nc, t)
+        check(f"I. {label} reopens beyond the skipped tail with the manifest unchanged",
+              reopened.returncode == 0 and after_reopen == skipped_manifest)
     import duckdb
     rows = {}
     for t, m in results.items():
@@ -221,10 +240,10 @@ async def archive_e2e(nc, js, url, tmp):
     # The sensor time of a bare number is the stream's own, which differs between the two streams.
     strip = lambda rs: [(sid, kind, value, seq) for sid, kind, value, ts, seq in rs]
     same_readings = strip(rows["ea"][0]) == strip(rows["eb"][0])
-    check(f"I. both archives hold the same readings: {len(rows['ea'][0])} (python) and {len(rows['eb'][0])} (native), "
+    check(f"I. both archives hold the same readings: {len(rows['ea'][0])} (batch 100) and {len(rows['eb'][0])} (batch 5000), "
           f"{len(want)} distinct keys sent", same_readings and len(rows["eb"][0]) == len(want))
     check("I. each covers the stream to its last message", rows["ea"][2]["covers_up_to"] == len(items) == rows["eb"][2]["covers_up_to"])
-    check(f"I. files written: {len(rows['ea'][2]['files'])} (python), {len(rows['eb'][2]['files'])} (native), rows in them {rows['ea'][1]} and {rows['eb'][1]}",
+    check(f"I. files written: {len(rows['ea'][2]['files'])} (batch 100), {len(rows['eb'][2]['files'])} (batch 5000), rows in them {rows['ea'][1]} and {rows['eb'][1]}",
           len(rows["eb"][2]["files"]) >= 1)
 
 
@@ -340,6 +359,18 @@ async def main(tmp):
         rc, s, err = fetch(url, TENANT, 1, out)
         check(f"G. a stream pruned below the start reports first_seq {s and s['first_seq']} above --from 1 (the archiver refuses to go on)",
               rc == 0 and s["first_seq"] == cut and s["first_seq"] > 1)
+        # A prefix check cannot see an internal hole. Use a separate stream so both a
+        # single pull and a later pull in the same fetch must detect the missing event.
+        gap_tenant = "gap"
+        gap_stream = common.stream_for(gap_tenant)
+        await js.add_stream(StreamConfig(name=gap_stream, subjects=[common.subject_filter(gap_tenant)]))
+        for i in range(3):
+            await js.publish(f"sensors.{gap_tenant}.s1.temp", json.dumps({"value": i, "ts_ms": 1000 + i}).encode())
+        await js.delete_msg(gap_stream, 2)
+        for batch in (1, 5000):
+            rc, s, err = fetch(url, gap_tenant, 1, tmp / f"gap-{batch}.csv", extra=("--batch", str(batch)))
+            check(f"G. an internal sequence hole fails (pull batch {batch}); no successful coverage summary",
+                  rc != 0 and s is None and "SequenceGap" in err and "after 1, received 3" in err)
         await archive_e2e(nc, js, url, tmp)
         await nc.close()
     finally:

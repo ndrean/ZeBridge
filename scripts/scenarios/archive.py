@@ -27,7 +27,7 @@ Needs: the dev stack (NATS), local S3 (SeaweedFS on 127.0.0.1:8333, keys in
 
 Usage:  scripts/scenarios/.venv/bin/python scripts/scenarios/archive.py
 """
-import asyncio, json, os, pathlib, subprocess, sys, time
+import argparse, asyncio, json, os, pathlib, subprocess, sys, time
 
 import nats
 import zb
@@ -40,12 +40,13 @@ import common  # noqa: E402
 TENANT = "_default"
 NC: list = []
 PY = sys.executable
+ARCHIVER_OPTIONS = []
 ENV = dict(os.environ, NATS_URL=zb.nats_server(), NATS_CREDS=zb.creds_for("bridge"),
            PYTHONPATH=str(REPO / "zb-python" / "src"))
 
 
 def archiver(*extra, wait=True):
-    cmd = [PY, str(EX / "archiver.py"), "--tenant", TENANT, "--flush-s", "1", "--exit-when-idle", "3", *extra]
+    cmd = [PY, str(EX / "archiver.py"), "--tenant", TENANT, "--flush-s", "1", "--exit-when-idle", "3", *ARCHIVER_OPTIONS, *extra]
     if not wait:
         return subprocess.Popen(cmd, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     r = subprocess.run(cmd, env=ENV, capture_output=True, text=True, timeout=120)
@@ -73,7 +74,7 @@ async def parquet_rows() -> int:
         return 0
     files = common.fetch_files(m["files"], pathlib.Path("/private/tmp/claude-501/archive-check"))
     import duckdb
-    return duckdb.sql(f"SELECT count(*) FROM read_parquet({[str(f) for f in files]!r})").fetchone()[0]
+    return duckdb.execute(f"SELECT count(*) FROM read_parquet({[str(f) for f in files]!r})").fetchone()[0]
 
 
 async def main() -> int:
@@ -237,5 +238,18 @@ async def main() -> int:
     return 0 if ok else 1
 
 
+def configure_archive(argv=None):
+    """Pass the native fetcher to every subprocess, including the crash and competing writers."""
+    global ARCHIVER_OPTIONS
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--fetch-bin", help="path to bridge_readings_fetch (or set ZB_READINGS_FETCH)")
+    args = parser.parse_args(argv)
+    ARCHIVER_OPTIONS = []
+    if args.fetch_bin:
+        ARCHIVER_OPTIONS += ["--fetch-bin", args.fetch_bin]
+    return args
+
+
 if __name__ == "__main__":
+    configure_archive()
     sys.exit(asyncio.run(main()))

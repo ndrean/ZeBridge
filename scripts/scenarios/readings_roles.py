@@ -12,8 +12,8 @@ and a responder, and tries what each may and may not do:
      tenant's stream and manifest, and any stream admin, are refused;
   R  a RESPONDER reads its tenant's stream and manifest, and cannot write the manifest;
   P  the real examples/16-archive programs inside those grants: archiver.py with an
-     archiver credential archives every reading to S3 (read by nats-py, P1, and by
-     bridge_readings_fetch, P3), and responder.py with a responder credential answers the
+     archiver credential archives every reading to S3 using bridge_readings_fetch, and
+     responder.py with a responder credential answers the
      count from Parquet (needs local S3, boto3 and duckdb);
   U  an operator.store from before these roles: `--init-nats --update` adds the two keys,
      keeps every other line, and a sensor minted afterwards works.
@@ -228,6 +228,10 @@ async def programs(tmp, js, arch, resp):
         await js.publish(f"sensors.acme.s{i % 4}.temperature", json.dumps({"value": i, "ts_ms": 1_700_000_000_000 + i}).encode())
     env = dict(os.environ, NATS_URL=URL, PYTHONPATH=str(zb.ROOT / "zb-python" / "src"))
     env.pop("NATS_CREDS", None)
+    fetch = pathlib.Path(os.environ.get("ZB_READINGS_FETCH", zb.ROOT / "zig-out/bin/bridge_readings_fetch"))
+    if not fetch.is_file():
+        raise RuntimeError(f"native archiver requires {fetch}: zig build readings-fetch, or set ZB_READINGS_FETCH")
+    env["ZB_READINGS_FETCH"] = str(fetch)
     r = subprocess.run([sys.executable, str(ex / "archiver.py"), "--tenant", "acme", "--flush-s", "1", "--exit-when-idle", "3",
                         "--outage-s", "60"], env=dict(env, NATS_CREDS=str(arch)), capture_output=True, text=True, timeout=120)
     m = (await common.read_manifest(await common.connect(str(arch)), "acme"))[0]
@@ -258,24 +262,6 @@ async def programs(tmp, js, arch, resp):
     if answer.get("rows") != 200:
         print(out[-1500:])
 
-    # P3: the same archive read by bridge_readings_fetch, inside the same grants. The native reader
-    # makes its own pull consumer and needs its reply inbox to be the credential's own.
-    fetch = zb.ROOT / "zig-out" / "bin" / "bridge_readings_fetch"
-    if not fetch.exists():
-        print(f"  · P3 skipped: {fetch} is missing (zig build)")
-        return
-    await common.reset_tenant(js, "acme")
-    for i in range(200):
-        await js.publish(f"sensors.acme.s{i % 4}.temperature", json.dumps({"value": i, "ts_ms": 1_700_000_000_000 + i}).encode())
-    r = subprocess.run([sys.executable, str(ex / "archiver.py"), "--tenant", "acme", "--flush-s", "1", "--exit-when-idle", "3",
-                        "--outage-s", "60", "--reader", "native", "--fetch-bin", str(fetch)],
-                       env=dict(env, NATS_CREDS=str(arch)), capture_output=True, text=True, timeout=120)
-    m = (await common.read_manifest(await common.connect(str(arch)), "acme"))[0]
-    got = sum(f["rows"] for f in m["files"]) if m else 0
-    check(r.returncode == 0 and got == 200,
-          f"P3 archiver.py --reader native with the archiver credential: exit {r.returncode}, {got} rows archived for 200")
-    if r.returncode != 0:
-        print(r.stdout[-800:], r.stderr[-800:])
 
 
 def update_old_store(tmp: pathlib.Path):

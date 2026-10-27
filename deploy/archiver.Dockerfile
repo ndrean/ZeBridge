@@ -2,9 +2,9 @@
 # its stream READINGS_<tenant> to Parquet files in S3 (Cloudflare R2, or any S3). One
 # container per tenant, next to the NATS server that holds the stream (the hub).
 #
-# Build from the repository's root:
+# Build from the repository's root with the current release's .deb in dist/<version>/:
 #
-#   docker build -f deploy/archiver.Dockerfile -t zb-archiver .
+#   docker build -f deploy/archiver.Dockerfile --build-arg VERSION=<version> -t zb-archiver .
 #
 # Run it with an archiver's creds (bridge --mint-archiver --tenant acme) mounted, the NATS
 # server and the S3 settings. It holds no state: its position is the manifest in NATS KV, so
@@ -22,8 +22,20 @@
 # (the stream keeps readings too briefly, another archiver runs for this tenant, readings were
 # lost) — Docker restarts those too, so watch bridge_archive_lag_messages and the logs.
 
+# Extract only the fetcher; the archiver does not need PostgreSQL or the bridge service.
+FROM debian:13-slim AS fetcher
+ARG VERSION
+ARG TARGETARCH
+COPY dist/${VERSION}/zebridge_${VERSION}_${TARGETARCH}.deb /tmp/zebridge.deb
+RUN dpkg-deb -x /tmp/zebridge.deb /extract \
+ && test -x /extract/usr/bin/bridge_readings_fetch
+
 FROM python:3.13-slim
-RUN pip install --no-cache-dir nats-py[nkeys]==2.15.0 nkeys==0.2.1 duckdb==1.5.5 boto3==1.43.112 \
+COPY --from=fetcher /extract/usr/bin/bridge_readings_fetch /usr/local/bin/bridge_readings_fetch
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && pip install --no-cache-dir nats-py[nkeys]==2.15.0 nkeys==0.2.1 duckdb==1.5.5 boto3==1.43.112 \
  && useradd --system --uid 10001 --no-create-home zbarchiver
 COPY examples/16-archive/archiver.py examples/16-archive/common.py /opt/zb-archiver/
 USER zbarchiver
