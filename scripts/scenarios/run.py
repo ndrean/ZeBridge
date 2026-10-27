@@ -338,10 +338,10 @@ def main() -> int:
         return 2
     results = []
     floor = gc_floor() if any(g != "offline" for g in groups) else None
-    if floor and floor[1] < 1800:
-        # The floor never goes down, and the scenarios stamp their writes a few minutes behind now
-        # (mutate, replies, offline, intclamp ...): with the floor this close, the bridge refuses them
-        # all as PredatesGcWatermark and each scenario fails for a reason it does not name.
+    if floor and floor[1] < 2700:
+        # The floor never goes down, and the scenarios stamp their writes minutes behind now (mutate 10,
+        # replies and intclamp a few, offline up to 40): with the floor this close, the bridge refuses them
+        # as PredatesGcWatermark and each scenario fails for a reason it does not name.
         print(f"\n  ⚠️  the GC floor is at {floor[0]}, only {floor[1] // 60} min behind now. Writes older than that are "
               "refused (PredatesGcWatermark), so scenarios that write 'a few minutes ago' will fail. The floor cannot be "
               "lowered: reset the database (scripts/dev/down.sh --clean) and do not run a sweeper with a short "

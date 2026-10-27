@@ -92,7 +92,7 @@ bridge with `ZB_FEED_RESTART=1`; it creates a new slot, and the next start needs
 **The GC floor never goes down.** `zebridge_gc_watermark` is the oldest version the bridge still accepts. If anything
 moves it close to now, every scenario that writes "a few minutes ago" (`mutate`, `replies`, `offline`, `intclamp`)
 fails with `PredatesGcWatermark`, and nothing short of resetting the database (`scripts/dev/down.sh --clean`) undoes it.
-`run.py` warns at the start when the floor is less than 30 minutes behind now, and prints `GC floor moved: …` after the
+`run.py` warns at the start when the floor is less than 45 minutes behind now (`offline` stamps writes up to 40 minutes back), and prints `GC floor moved: …` after the
 scenario that moved it.
 
 **Reading the bridge's errors.** The long-running bridge logs one stream for every `live` scenario, without timestamps, and
