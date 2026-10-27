@@ -1,0 +1,109 @@
+From 9d1c12a3a8d49888b53368725f94e21ffd9bcc43 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 08:43:37 +0000
+Subject: [PATCH] zebridge 42: a subject may be longer than 255 bytes
+
+validateSubject applied the 255 of the NAME rules (ADR-6: stream, consumer
+and bucket names) to subjects. A subject has no such limit on the wire:
+nats-server 2.15.1 delivers a core subject of 3000 bytes and serves
+JetStream API subjects of 550 bytes. The new bound is 1024 bytes
+(max_subject_len), a quarter of the server's default control line; names
+keep 255. NATS_ZIG_NOTES.md: entry 43.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CgAinffWunUm8ZN9kzJyG3
+---
+ NATS_ZIG_NOTES.md  |  8 ++++++++
+ src/root.zig       |  1 +
+ src/validation.zig | 34 +++++++++++++++++++++++++++++++++-
+ 3 files changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/NATS_ZIG_NOTES.md b/NATS_ZIG_NOTES.md
+index af3da7a..bf294fd 100644
+--- a/NATS_ZIG_NOTES.md
++++ b/NATS_ZIG_NOTES.md
+@@ -1330,3 +1330,11 @@ green over 37.
+ **Change** (`41-nats.zig-zig-017.patch`, 8 files, 12 hunks): `build.zig` (`std.zon.parse.fromSlice` with its options struct), `src/net_util.zig` (`writeVec` through `io.operate(.net_write)`, `Io.VTable.netWrite` is gone), `src/nuid.zig` (`mutexLockUncancelable`), `src/root.zig`, `src/timestamp.zig`, `src/validation.zig`, `src/inbox.zig` (`**` → `@splat`), `test_runner.zig`. Cut as the diff of those files between upstream plus patches 01–40 and the working tree: `new-patch.sh` cuts `src/` and `tests/` only, and this patch also touches `build.zig` and `test_runner.zig`. The xsync patch the parked branch carried is gone: patch 39 pins xsync v1.0.1, which builds on both.
+ 
+ **Verified on 0.17.0:** nats.zig `test-unit` 143/143, the bridge 410/410, libzb 48 passed and 2 skipped. `check-series.sh` green over 40 files, and a clean apply reproduces `build.zig`, `build.zig.zon` and `test_runner.zig` byte for byte. The switch is a clean break: this patch does not build on 0.16.
++
++## 43. Patch 42: a subject may be longer than 255 bytes (2026-10-27)
++
++**How it appeared.** ZeBridge's troubleshooting work (a tenant id of 93 bytes got rows on its CDC stream and no generation chain ever) traced to `$JS.API.CONSUMER.CREATE.OBJ_gen-<tenant>.<name>.$O.gen-<tenant>.C.>`, which carries the tenant twice and passed 255 bytes. The limit was nats.zig's, not the server's: `validateSubject` applied the 255 of the NAME rules (ADR-6: stream, consumer and bucket names) to subjects.
++
++**Measured against nats-server 2.15.1** (nats-py, an isolated server): a core subject of 3000 bytes is delivered; an object store with a 240-byte tenant (bucket `gen-<tenant>`) puts and gets; a named consumer created with a 547-byte API subject is created. The server bounds the protocol line by `max_control_line` (4096 by default).
++
++**Change** (`src/validation.zig`, `src/root.zig`): `max_subject_len = 1024` (exported, so a caller can derive its own limits from it) replaces the literal 255 in `validateSubject`; names keep 255. A test pins a 300-byte subject, the consumer-create subject for a 128-byte tenant, and the bound itself.
+diff --git a/src/root.zig b/src/root.zig
+index d7d203e..ef2734c 100644
+--- a/src/root.zig
++++ b/src/root.zig
+@@ -70,6 +70,7 @@ pub const KVError = @import("jetstream_kv.zig").KVError;
+ pub const validateStreamName = @import("validation.zig").validateStreamName;
+ pub const validateConsumerName = @import("validation.zig").validateConsumerName;
+ pub const validateSubject = @import("validation.zig").validateSubject;
++pub const max_subject_len = @import("validation.zig").max_subject_len;
+ pub const validateQueueName = @import("validation.zig").validateQueueName;
+ pub const validateKVBucketName = @import("validation.zig").validateKVBucketName;
+ pub const validateKVKeyName = @import("validation.zig").validateKVKeyName;
+diff --git a/src/validation.zig b/src/validation.zig
+index 04a35a0..182c9db 100644
+--- a/src/validation.zig
++++ b/src/validation.zig
+@@ -103,13 +103,28 @@ pub fn validateQueueName(name: []const u8) !void {
+     }
+ }
+ 
++/// The longest subject the client sends, in bytes.
++///
++/// ⚠️ This was 255, borrowed from the NAME rules above (stream, consumer and bucket names are
++/// limited to 255 by ADR-6). A subject has no such limit on the wire: nats-server bounds the whole
++/// protocol line by `max_control_line` (4096 by default), and nats.go checks no length at all.
++/// Measured against nats-server 2.15.1: a core subject of 3000 bytes is delivered, and
++/// JetStream's API subjects of 550 bytes are served (an object store whose bucket name is 240
++/// bytes, a named consumer created with its filter in the subject). The old limit refused
++/// ZeBridge's own `$JS.API.CONSUMER.CREATE.OBJ_gen-<tenant>.<name>.$O.gen-<tenant>.C.>` for a tenant
++/// of 93 bytes, which the server would have served, long before it mattered.
++///
++/// 1024 keeps a quarter of the default control line free for the reply subject and the sizes.
++/// A server configured with a smaller `max_control_line` still refuses what it cannot take.
++pub const max_subject_len: usize = 1024;
++
+ /// Validate subject according to ADR-6: term (dot term | asterisk)* (dot gt)?
+ pub fn validateSubject(subject: []const u8) !void {
+     if (subject.len == 0) {
+         return error.InvalidSubject;
+     }
+ 
+-    if (subject.len > 255) {
++    if (subject.len > max_subject_len) {
+         return error.InvalidSubject;
+     }
+ 
+@@ -354,6 +369,23 @@ test "validateSubject" {
+     try std.testing.expectError(error.InvalidSubject, validateSubject("foo\nbar"));
+ }
+ 
++test "validateSubject: a subject is not a name, so 255 bytes is not its limit" {
++    const long: [300]u8 = @splat('a');
++    var buf: [1100]u8 = undefined;
++    // 300 bytes in two tokens
++    const two = try std.fmt.bufPrint(&buf, "{s}.{s}", .{ long[0..149], long[0..149] });
++    try validateSubject(two);
++    // The consumer-create subject for a 128-byte tenant: 300+ bytes
++    const api = try std.fmt.bufPrint(&buf, "$JS.API.CONSUMER.CREATE.OBJ_gen-{s}.zbz0123456789abcdef.$O.gen-{s}.C.>", .{ long[0..128], long[0..128] });
++    try std.testing.expect(api.len > 300);
++    try validateSubject(api);
++    // the bound itself
++    const at: [max_subject_len]u8 = @splat('a');
++    try validateSubject(&at);
++    const over: [max_subject_len + 1]u8 = @splat('a');
++    try std.testing.expectError(error.InvalidSubject, validateSubject(&over));
++}
++
+ test "validateKVBucketName" {
+     // Valid bucket names (restricted-term)
+     try validateKVBucketName("valid_bucket-name");
+-- 
+2.43.0
+

@@ -4,32 +4,36 @@
 Found 2026-10-26 (CLAUDE.md, "Troubleshooting: when a fixed limit is the cause"): an error that
 escaped `main` left a bridge that was alive, silent and dead (the `errdefer` that sets
 `should_stop` ran after the join it should have released; the HTTP listener was closed, which on
-Linux does not wake a blocked `accept`), and three limits reached it:
+Linux does not wake a blocked `accept`), and three limits reached it. Reviewed 2026-10-27: a row
+the bridge drops is missing from every replica, so no SUPPORTED identifier may reach the drop, the
+database refuses new unsupported tenants, `--diagnose` finds the old ones, and a drop is counted.
 
-  1. a table name of 40+ characters   → `MsgIdTooLong` at boot (the slot's id buffer was 64 bytes)
-  2. a tenant id of 93+ characters    → no generation was ever built (`InvalidSubject`)
-  3. len(tenant) + len(table) > 115   → the CDC subject overflowed its buffer: `NoSpaceLeft`
-                                        escaped `main` and killed the bridge without a line
+Limits are in BYTES and are read from `bridge --limits` (the tenant limit follows the client
+library: 92 under the pinned nats.zig, 128 with the fork's `zebridge 42`). Each case is its own stack:
 
-What must hold now (each case is its own private stack):
-
-  A. a 62-character table boots, publishes its rows and builds a chain
-  B. a 92-character tenant (the ceiling) publishes and builds a chain
-  C. a 93-character tenant is refused with a line that says why, the bridge lives on, and
-     another tenant's rows still flow
-  D. a subject too long for its buffer drops that row with a line that says why, the bridge
-     lives on, and another tenant's rows still flow
+  A. a 62-byte table boots, publishes its rows and builds a chain
+  B. a tenant of the longest supported length, with the longest supported table, publishes and
+     builds a chain: no accepted combination loses CDC
+  C. a tenant over the limit: the tenant guard refuses it in the DATABASE (counted in bytes, not
+     characters); with the guard off (a legacy row), the bridge drops it, counts it by table and
+     reason (/metrics, /dropped), marks the table degraded, lives on, and another tenant still
+     flows; fixing the value publishes the UPDATE but does not replay the INSERT, and
+     zebridge_reseed is what puts the row on the replicas
+  D. a 90-byte tenant with a 40-byte table (the combination that overflowed the old 128-byte
+     buffer) publishes and builds a chain
   E. an error that escapes the replication loop ends the process (exit 1, `error:` in the log)
      instead of leaving it alive: needs the fault build (ZB_TEST_LOOP_ERROR)
   F. SIGTERM ends an idle bridge without any HTTP request arriving
-  G. zebridge_enable refuses a 63-character table (its derived index name is the table's own)
+  G. zebridge_enable refuses a 63-byte table (its derived index name is the table's own)
      with an instruction, instead of '"<table>" is not an index'
+  I. `bridge --diagnose` finds the tenant values already in a table that cannot be subject tokens
+     and says what to do; once they are fixed it says the identifiers are fine
 
 Usage:  python scripts/scenarios/walls.py [--only A,C]
 Needs PostgreSQL superuser at 127.0.0.1:5432, nats-server, zig-out/bin/bridge, and for E the
 fault build:  zig build -Doptimize=ReleaseFast -Dtest-faults=true -p zig-out-faults
 """
-import asyncio, pathlib, re, signal, sys, tempfile, time
+import asyncio, json, os, pathlib, re, signal, subprocess, sys, tempfile, time, urllib.request
 
 import zb
 from recreate_recovery import Stack, check, note, T
@@ -45,6 +49,25 @@ def table_sql(name):
 
 def insert(stack, name, tenant, rid):
     stack.sql(f"INSERT INTO public.{name} (id, tenant_id, note) VALUES ('{rid}', '{tenant}', 'probe')")
+
+
+def bridge_limits():
+    out = subprocess.run([str(zb.ROOT / "zig-out" / "bin" / "bridge"), "--limits"], capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+LIMITS = bridge_limits()
+TMAX = LIMITS["tenant_bytes"]
+
+
+def http(stack, label, path):
+    p = stack.procs[label]
+    port = p.args[p.args.index("--port") + 1]
+    return urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5).read().decode()
+
+
+def dropped(stack, label):
+    return json.loads(http(stack, label, "/dropped"))["dropped"]
 
 
 def log_text(stack, label):
@@ -94,69 +117,101 @@ async def case_a(tmp):
 
 
 async def case_b(tmp):
-    tenant = "t" * 92
+    tenant, name = "t" * TMAX, "b" * LIMITS["tenant_scoped_table_bytes"]
     stack = Stack(tmp, "wallsb", 120, {})
     try:
         stack.start({"wp": tenant})
-        stack.create_table({tenant: 1}, "b")
+        stack.sql(table_sql(name))
         label = stack.bridge_up()
-        insert(stack, T, tenant, "b-live")
+        insert(stack, name, tenant, "b-live")
         js = await rr.Js().open(stack)
         n = await until(lambda: messages(js, "CDC_" + tenant), 30)
-        check("B. a 92-character tenant publishes its rows", n >= 1)
-        man = await until(lambda: js.manifest(tenant), 90)
-        check("B. ... and gets a generation chain (93 did not, with InvalidSubject)", man is not None)
-        check("B. ... and the bridge is alive", alive(stack, label))
+        check(f"B. a {TMAX}-byte tenant with a {len(name)}-byte table (the longest supported pair) publishes its row", n >= 1)
+        man = await until(lambda: js.kv(js.gen, f"{tenant}.{name}"), 90)
+        check("B. ... and gets a generation chain", man is not None)
+        check("B. ... nothing was dropped and the bridge is alive", alive(stack, label) and dropped(stack, label) == [])
         await js.close()
     finally:
         stack.stop()
 
 
-async def two_tenants(stack, big, name, tag, preexisting=False):
-    """`big` is the tenant that must be refused, `acme` the one that must keep flowing."""
-    stack.start({"wp": big, "wq": "acme"})
-    stack.sql(table_sql(name))
-    if preexisting: insert(stack, name, big, f"{tag}-pre")   # in the table before the bridge starts: its first build sees it
-    label = stack.bridge_up()
-    insert(stack, name, "acme", f"{tag}-0")
-    js = await rr.Js().open(stack)
-    first = await until(lambda: messages(js, "CDC_acme"), 30)
-    return label, js, first
-
-
 async def case_c(tmp):
-    big = "t" * 93
+    over = "t" * (TMAX + 1)
     stack = Stack(tmp, "wallsc", 120, {})
     try:
-        label, js, first = await two_tenants(stack, big, T, "c", preexisting=True)
-        check("C. control: the ordinary tenant's row is published", first >= 1)
-        built = await until(lambda: "no generation is built" in log_text(stack, label), 60)
-        check("C. ... and the producer says why it builds no chain for it (it used to fail every cadence with a bare InvalidSubject)", bool(built))
-        insert(stack, T, big, "c-big")
-        said = await until(lambda: re.search(r"Dropping insert on '%s': its tenant value \(93 characters" % T, log_text(stack, label)), 30)
-        check("C. a 93-character tenant is dropped with a line that names the length", bool(said))
-        check("C. ... and does not blame the replica identity",
-              "replica identity" not in "".join(l for l in log_text(stack, label).splitlines() if "93 characters" in l))
-        insert(stack, T, "acme", "c-1")
+        stack.start({"wp": "acme"})
+        stack.sql(table_sql(T))
+        # 1. the DATABASE refuses a new unsupported tenant, in bytes
+        try:
+            insert(stack, T, over, "c-over"); why = ""
+        except RuntimeError as e:
+            why = str(e)
+        check(f"C. the tenant guard refuses {TMAX + 1} bytes in the database and says so in bytes", f"is {TMAX + 1} bytes" in why and f"at most {TMAX} bytes" in why)
+        wide = "é" * (TMAX // 2 + 1)    # fewer characters than the limit, more bytes
+        try:
+            insert(stack, T, wide, "c-wide"); why = ""
+        except RuntimeError as e:
+            why = str(e)
+        check(f"C. {len(wide)} two-byte characters ({len(wide.encode())} bytes) are refused: the limit is bytes, not characters", f"is {len(wide.encode())} bytes" in why)
+        try:
+            insert(stack, T, "a.b", "c-dot"); why = ""
+        except RuntimeError as e:
+            why = str(e)
+        check("C. a dot is still refused", "metacharacter" in why)
+        # 2. a legacy row that got past it (guard off): the bridge drops it, counts it, lives on
+        stack.sql(f"ALTER TABLE public.{T} DISABLE TRIGGER zebridge_guard_tenant_t")
+        label = stack.bridge_up()
+        js = await rr.Js().open(stack)
+        insert(stack, T, "acme", "c-ok-0")
+        first = await until(lambda: messages(js, "CDC_acme"), 30)
+        check("C. control: an ordinary tenant's row is published", first >= 1)
+        insert(stack, T, over, "c-bad")
+        said = await until(lambda: re.search(r"Dropping insert on '%s' \(#1 since boot\): its tenant value \(%d bytes" % (T, TMAX + 1), log_text(stack, label)), 30)
+        check("C. the bridge drops the legacy row with a line that names the bytes and the remedy", bool(said))
+        check("C. ... and does not blame the replica identity", "replica identity" not in "".join(l for l in log_text(stack, label).splitlines() if f"{TMAX + 1} bytes" in l))
+        d = await until(lambda: dropped(stack, label), 10)
+        check("C. /dropped counts it by table and reason, with the fix",
+              len(d) == 1 and d[0]["table"] == T and d[0]["reason"] == "tenant_unusable" and d[0]["dropped"] == 1 and "zebridge_reseed" in d[0]["fix"])
+        metrics = http(stack, label, "/metrics")
+        check("C. /metrics has the counter and marks the table degraded",
+              f'bridge_dropped_events_total{{table="{T}",reason="tenant_unusable"}} 1' in metrics and f'bridge_table_degraded{{table="{T}"}} 1' in metrics)
+        status = json.loads(http(stack, label, "/status"))
+        check("C. /status carries the count, the degraded tables and the limits",
+              status["dropped_events"] == 1 and status["degraded_tables"] == 1 and status["limits"]["tenant_bytes"] == TMAX)
+        insert(stack, T, "acme", "c-ok-1")
         n = await until(lambda: count_at_least(js, "CDC_acme", 2), 30)
-        check("C. ... the bridge lives on and the other tenant's next row is published", bool(n) and alive(stack, label))
+        check("C. the bridge lives on and the other tenant's next row is published", bool(n) and alive(stack, label))
+        # 3. recovery: the fix flows as an UPDATE; the dropped INSERT is not replayed; reseed re-publishes
+        before = await messages(js, "CDC_acme")
+        stack.sql(f"UPDATE public.{T} SET tenant_id = 'acme' WHERE id = 'c-bad'")
+        n = await until(lambda: count_at_least(js, "CDC_acme", before + 1), 30)
+        check("C. recovery: correcting the value publishes the UPDATE (the dropped INSERT is not replayed)", bool(n))
+        epoch0 = int(stack.sql(f"SELECT seed_epoch FROM public.zebridge_catalogue WHERE tbl = '{T}'"))
+        stack.sql(f"SELECT zebridge_reseed('{T}')")
+        epoch1 = int(stack.sql(f"SELECT seed_epoch FROM public.zebridge_catalogue WHERE tbl = '{T}'"))
+        check(f"C. ... and zebridge_reseed bumps the seed epoch ({epoch0} -> {epoch1}) so every replica re-seeds from a fresh full", epoch1 == epoch0 + 1)
         await js.close()
     finally:
         stack.stop()
 
 
 async def case_d(tmp):
-    big, name = "x" * 90, "n" * 40
+    # The review's example: 90 + 40 bytes. Under the library's old 255-byte subject check the tenant
+    # limit is lower (limits.zig), so the case runs at the longest tenant the build supports.
+    t_len = min(90, TMAX)
+    if t_len < 90: note(f"D at {t_len} bytes: this build's tenant limit is {TMAX}; 90 needs the patched nats.zig (NATS_ZIG_NOTES 43)")
+    tenant, name = "x" * t_len, "n" * 40
     stack = Stack(tmp, "wallsd", 120, {})
     try:
-        label, js, first = await two_tenants(stack, big, name, "d")
-        check("D. control: the ordinary tenant's row is published", first >= 1)
-        insert(stack, name, big, "d-big")
-        said = await until(lambda: "does not fit the 128-byte subject buffer" in log_text(stack, label), 30)
-        check("D. a subject that does not fit is dropped with a line that says so", bool(said))
-        insert(stack, name, "acme", "d-1")
-        n = await until(lambda: count_at_least(js, "CDC_acme", 2), 30)
-        check("D. ... the bridge lives on and the other tenant's next row is published", bool(n) and alive(stack, label))
+        stack.start({"wp": tenant})
+        stack.sql(table_sql(name))
+        label = stack.bridge_up()
+        insert(stack, name, tenant, "d-1")
+        js = await rr.Js().open(stack)
+        n = await until(lambda: messages(js, "CDC_" + tenant), 30)
+        check(f"D. a {t_len}-byte tenant with a 40-byte table ({3 + 1 + t_len + 1 + 40 + 1 + 6} bytes of subject; at 90 the old 128-byte buffer dropped this) publishes", n >= 1)
+        man = await until(lambda: js.kv(js.gen, f"{tenant}.{name}"), 90)
+        check("D. ... builds a chain, drops nothing, and the bridge is alive", man is not None and dropped(stack, label) == [] and alive(stack, label))
         await js.close()
     finally:
         stack.stop()
@@ -218,12 +273,39 @@ async def case_g(tmp):
         except RuntimeError as e:
             said = str(e)
         check("G. zebridge_enable refuses a 63-character table and says what to do "
-              "(it used to fail with '\"<table>\" is not an index')", "63 characters" in said and "Rename the table" in said)
+              "(it used to fail with '\"<table>\" is not an index')", "63 bytes" in said and "Rename the table" in said)
     finally:
         stack.stop()
 
 
-CASES = {"A": case_a, "B": case_b, "C": case_c, "D": case_d, "E": case_e, "F": case_f, "G": case_g}
+async def case_i(tmp):
+    over = "t" * (TMAX + 1)
+    stack = Stack(tmp, "wallsi", 120, {})
+    try:
+        stack.start({"wp": "acme"})
+        stack.sql(table_sql(T))
+        stack.sql(f"ALTER TABLE public.{T} DISABLE TRIGGER zebridge_guard_tenant_t")
+        insert(stack, T, "acme", "i-ok")
+        insert(stack, T, over, "i-bad-1")
+        insert(stack, T, "a b", "i-bad-2")
+        stack.sql(f"INSERT INTO public.{T} (id, tenant_id) VALUES ('i-bad-3', '')")
+        argv = [str(stack.bridge_bin), "--diagnose", "--pub", "rr_pub", "--slot", stack.name + "_slot", "--port", str(rr.port())]
+        def diagnose():
+            r = subprocess.run(argv, env=stack.env, capture_output=True, text=True, errors="replace", timeout=120)
+            return r.returncode, r.stdout + r.stderr
+        rc, out = diagnose()
+        check("I. --diagnose finds the 3 rows whose tenant cannot be a subject token and exits 1",
+              rc == 1 and f"table '{T}': 3 row(s) hold a tenant value" in out)
+        check("I. ... names the limit in bytes, a sample, and the recovery (re-seed)",
+              f"longer than {TMAX} bytes" in out and "e.g. " in out and f"zebridge_reseed('{T}')" in out)
+        stack.sql(f"UPDATE public.{T} SET tenant_id = 'acme' WHERE id LIKE 'i-bad-%'")
+        rc, out = diagnose()
+        check("I. once the values are fixed it says the identifiers are fine", "identifiers: tenant values of 1 tenant-scoped table(s)" in out and "hold a tenant value" not in out)
+    finally:
+        stack.stop()
+
+
+CASES = {"A": case_a, "B": case_b, "C": case_c, "D": case_d, "E": case_e, "F": case_f, "G": case_g, "I": case_i}
 
 
 def main():

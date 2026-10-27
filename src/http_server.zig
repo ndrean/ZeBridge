@@ -6,6 +6,8 @@ const jwt_mint = @import("jwt_mint.zig");
 const c = @import("c_imports.zig").c;
 const nats = @import("nats");
 const refused_tables = @import("refused_tables.zig");
+const drops_mod = @import("drops.zig");
+const limits = @import("limits.zig");
 const rls_guard = @import("rls_guard.zig");
 const rate_limit = @import("rate_limit.zig");
 const pg_health = @import("pg_health.zig");
@@ -88,6 +90,8 @@ pub const Server = struct {
     /// Set after construction, like nats_publisher. Only its atomic summaries are read
     /// here — the map belongs to the replication thread (see refused_tables.zig).
     refused: ?*const refused_tables.Registry = null,
+    /// Rows dropped before publication, by table and reason (drops.zig).
+    drops: ?*const drops_mod.Registry = null,
     /// The pairs whose chain the row-level-security guard is not publishing (rls_guard.zig).
     rls: ?*rls_guard.Registry = null,
     /// §10fk: the ingress rate limit, declared on /status so the operator tool can
@@ -398,6 +402,8 @@ pub const Server = struct {
             try self.handleHealth(req);
         } else if (method == .GET and std.mem.eql(u8, target, "/status")) {
             try self.handleStatus(req);
+        } else if (method == .GET and std.mem.eql(u8, target, "/dropped")) {
+            try self.handleDropped(req);
         } else if (method == .GET and std.mem.eql(u8, target, "/metrics")) {
             try self.handleMetrics(req);
         } else if (method == .GET and (std.mem.eql(u8, target, "/nats-account") or std.mem.startsWith(u8, target, "/nats-account?"))) {
@@ -820,6 +826,19 @@ pub const Server = struct {
         try respond(req, .ok, "application/json", "{\"status\":\"ok\"}\n");
     }
 
+    /// The rows dropped before publication, by table and reason (drops.zig): what `bridge --diagnose`
+    /// reads. Separate from /status, whose body is a fixed-size buffer and which this list can outgrow.
+    fn handleDropped(self: *Server, req: *std.http.Server.Request) !void {
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try aw.writer.print("{{\"limits\":{{\"tenant_bytes\":{d},\"table_bytes\":{d},\"subject_buffer_bytes\":{d},\"max_prefix_bytes\":{d}}},\"dropped\":", .{
+            limits.max_tenant_bytes, limits.max_table_bytes, limits.subject_buffer_bytes, limits.max_prefix_bytes,
+        });
+        if (self.drops) |d| try d.writeJson(&aw.writer) else try aw.writer.print("[]", .{});
+        try aw.writer.print("}}\n", .{});
+        try respond(req, .ok, "application/json", aw.written());
+    }
+
     fn handleStatus(self: *Server, req: *std.http.Server.Request) !void {
         const status_cpu_ns = utils.cpuTimeNanos();
         if (self.metrics) |m| {
@@ -850,7 +869,10 @@ pub const Server = struct {
                 \\  "gc_last_sweep_time": {d},
                 \\  "ingress_rate_per_principal": {d},
                 \\  "ingress_rate_burst": {d},
-                \\  "ingress_rate_limited_total": {d}
+                \\  "ingress_rate_limited_total": {d},
+                \\  "dropped_events": {d},
+                \\  "degraded_tables": {d},
+                \\  "limits": {{"tenant_bytes": {d}, "table_bytes": {d}, "subject_buffer_bytes": {d}, "max_prefix_bytes": {d}}}
                 \\}}
             , .{
                 if (snap.is_connected) "connected" else "disconnected",
@@ -876,6 +898,12 @@ pub const Server = struct {
                 if (self.limiter) |l| @as(u64, @intFromFloat(l.rate_per_s)) else 0,
                 if (self.limiter) |l| @as(u64, @intFromFloat(l.burst)) else 0,
                 if (self.limiter) |l| l.limited_total.load(.monotonic) else 0,
+                if (self.drops) |d| d.total() else 0,
+                if (self.drops) |d| d.degradedTables() else 0,
+                limits.max_tenant_bytes,
+                limits.max_table_bytes,
+                limits.subject_buffer_bytes,
+                limits.max_prefix_bytes,
             });
 
             try respond(req, .ok, "application/json", body);
@@ -1014,6 +1042,7 @@ pub const Server = struct {
             // own exposition text so the metric names stay next to the thing counting.
             var w = std.Io.Writer.fixed(buf[body.len..]);
             if (self.refused) |r| try r.writePrometheus(&w);
+            if (self.drops) |d| try d.writePrometheus(&w);
             if (self.rls) |r| try r.writePrometheus(&w);
             if (self.slots) |s| try s.writePrometheus(&w);
             if (self.fleet) |f| try f.writePrometheus(&w);

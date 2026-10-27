@@ -335,10 +335,21 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    IF val ~ '[.*> ]' THEN
+    -- A tenant is a NATS subject token, measured in BYTES (octet_length, not length): no `.`, `*`,
+    -- `>`, space or control character, and at most ${MAX_TENANT_BYTES} bytes. The bridge drops a row
+    -- that gets past this (counted: bridge_dropped_events_total{reason="tenant_unusable"}), so this
+    -- trigger is what keeps the replica from silently missing it. Existing rows are not rechecked by
+    -- a trigger; `bridge --diagnose` lists them.
+    IF val ~ '[\x01-\x20\x7f.*>]' THEN
         RAISE EXCEPTION 'tenant %=% on % contains a NATS subject metacharacter '
-            '(. * > or space); it would route to a subject no consumer receives',
+            '(. * > space or a control character); it would route to a subject no consumer receives',
             col, quote_literal(val), TG_TABLE_NAME USING ERRCODE = 'check_violation';
+    END IF;
+    IF octet_length(val) > ${MAX_TENANT_BYTES} THEN
+        RAISE EXCEPTION 'tenant %=% on % is % bytes; a tenant is at most ${MAX_TENANT_BYTES} bytes '
+            '(measured in bytes, not characters)',
+            col, quote_literal(left(val, 24) || '…'), TG_TABLE_NAME, octet_length(val)
+            USING ERRCODE = 'check_violation';
     END IF;
 
     RETURN NEW;
@@ -456,7 +467,7 @@ BEGIN
             'CREATE TRIGGER zebridge_guard_tenant_t BEFORE INSERT OR UPDATE ON %s '
             'FOR EACH ROW EXECUTE FUNCTION public.zebridge_guard_tenant(%L)', t, tenant_col
         );
-        RAISE NOTICE 'tenant guard on %: % filled from the writer''s tenant when omitted (fail-closed if unmapped), malformed refused', t, tenant_col;
+        RAISE NOTICE 'tenant guard on %: % filled from the writer''s tenant when omitted (fail-closed if unmapped), malformed or longer than ${MAX_TENANT_BYTES} bytes refused', t, tenant_col;
     END IF;
 END;
 $$ LANGUAGE plpgsql;
@@ -711,11 +722,11 @@ CREATE TABLE IF NOT EXISTS public.zebridge_user_tenants (
     -- application-table guard checks a row's value, this checks the roster's, and
     -- the invite below the DBA's, so a wildcard can never become a stream name, a
     -- KV entry or a JWT tag.
-    tenant_id text NOT NULL CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]'),
+    tenant_id text NOT NULL CHECK (tenant_id <> '' AND tenant_id !~ '[\x01-\x20\x7f.*>]' AND octet_length(tenant_id) <= ${MAX_TENANT_BYTES}),
     PRIMARY KEY (principal, tenant_id)
 );
 ALTER TABLE public.zebridge_user_tenants DROP CONSTRAINT IF EXISTS zebridge_user_tenants_tenant_id_check;
-ALTER TABLE public.zebridge_user_tenants ADD CONSTRAINT zebridge_user_tenants_tenant_id_check CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]');
+ALTER TABLE public.zebridge_user_tenants ADD CONSTRAINT zebridge_user_tenants_tenant_id_check CHECK (tenant_id <> '' AND tenant_id !~ '[\x01-\x20\x7f.*>]' AND octet_length(tenant_id) <= ${MAX_TENANT_BYTES});
 GRANT SELECT ON public.zebridge_user_tenants TO ${POSTGRES_READER_USER}, ${POSTGRES_WRITER_USER};
 
 -- A restricted leaf owns a principal namespace <leaf_id>.<device>. Register
@@ -839,7 +850,7 @@ CREATE TRIGGER zebridge_refuse_revoked_mapping_t
 CREATE TABLE IF NOT EXISTS public.zebridge_invites (
     code       text PRIMARY KEY DEFAULT replace(gen_random_uuid()::text, '-', ''),
     principal  text NOT NULL CHECK (principal ~ '^[A-Za-z0-9_-]+$'),
-    tenant_id  text NOT NULL CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]'),
+    tenant_id  text NOT NULL CHECK (tenant_id <> '' AND tenant_id !~ '[\x01-\x20\x7f.*>]' AND octet_length(tenant_id) <= ${MAX_TENANT_BYTES}),
     created_at timestamptz NOT NULL DEFAULT now(),
     expires_at timestamptz NOT NULL DEFAULT now() + interval '1 days',
     used_at    timestamptz
@@ -855,7 +866,7 @@ CREATE TRIGGER zebridge_guard_leaf_membership_t BEFORE INSERT OR UPDATE OF princ
     FOR EACH ROW EXECUTE FUNCTION public.zebridge_guard_leaf_membership();
 ALTER TABLE public.zebridge_invites DROP COLUMN IF EXISTS role;
 ALTER TABLE public.zebridge_invites DROP CONSTRAINT IF EXISTS zebridge_invites_tenant_id_check;
-ALTER TABLE public.zebridge_invites ADD CONSTRAINT zebridge_invites_tenant_id_check CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]');
+ALTER TABLE public.zebridge_invites ADD CONSTRAINT zebridge_invites_tenant_id_check CHECK (tenant_id <> '' AND tenant_id !~ '[\x01-\x20\x7f.*>]' AND octet_length(tenant_id) <= ${MAX_TENANT_BYTES});
 -- The defaults too: CREATE TABLE IF NOT EXISTS leaves an older table as it was, and an
 -- invite inserted without a code then failed ("null value in column code").
 ALTER TABLE public.zebridge_invites ALTER COLUMN code SET DEFAULT replace(gen_random_uuid()::text, '-', '');

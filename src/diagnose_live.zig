@@ -17,6 +17,7 @@ const Conf = @import("config.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const topology_mod = @import("topology.zig");
 const rls_guard = @import("rls_guard.zig");
+const limits = @import("limits.zig");
 const Http = @import("http_server.zig").Server;
 
 const log = std.log.scoped(.diagnose);
@@ -45,6 +46,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, in: Inputs) usize {
 
     if (in.core_ok) findings += catalogueChecks(a, in.conn);
     if (in.core_ok) findings += rlsChecks(a, in.conn, in.topo.open_tenant);
+    if (in.core_ok) findings += identifierChecks(a, in.conn, in.topo);
     const running = bridgeStatus(a, io, in.bridge_port, &findings);
     findings += slotChecks(a, in.conn, in.slot_name, running);
 
@@ -158,6 +160,79 @@ fn catalogueChecks(a: std.mem.Allocator, conn: *c.PGconn) usize {
     for (groups.items) |g| printGroup(a, g);
     if (errors == 0) log.info("✅ catalogue: every table matches its catalogue row ({d} warning(s) above)", .{warnings});
     return errors + crossTableAudits(a, conn);
+}
+
+/// The identifier limits (limits.zig, in BYTES) against what is there: each table's name, the
+/// subject prefix, and every tenant value already stored in a tenant-scoped table. The tenant guard
+/// trigger stops NEW unusable values; the rows written before it, or by a session that disabled it,
+/// are found here. A row whose tenant cannot be a subject token is dropped by the bridge (counted
+/// in `bridge_dropped_events_total`) and is missing from every replica until the value is fixed
+/// and the table re-seeded.
+fn identifierChecks(a: std.mem.Allocator, conn: *c.PGconn, topo: *const topology_mod.Topology) usize {
+    var findings: usize = 0;
+    const prefix = topo.subject_cdc_prefix.len;
+    if (prefix > limits.max_prefix_bytes) {
+        findings += 1;
+        log.err("🔴 the CDC subject prefix '{s}' is {d} bytes: the subject buffer holds supported identifiers only up to {d} bytes of prefix, and the bridge refuses to start. Shorten subjects.cdc_prefix in grammar.json.", .{ topo.subject_cdc_prefix, prefix, limits.max_prefix_bytes });
+    }
+    const res = c.PQexec(conn, "SELECT tbl, tenant_col::text, octet_length(tbl) FROM public.zebridge_catalogue ORDER BY tbl");
+    defer c.PQclear(res);
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+        log.warn("⚠️ identifier checks skipped: the catalogue could not be read ({s})", .{std.mem.span(c.PQresultErrorMessage(res))});
+        return findings;
+    }
+    // A scan of a large table takes a while: bounded, and said when it did not finish.
+    _ = c.PQclear(c.PQexec(conn, "SET statement_timeout = '120s'"));
+    defer _ = c.PQclear(c.PQexec(conn, "RESET statement_timeout"));
+    var scanned: usize = 0;
+    const n: usize = @intCast(c.PQntuples(res));
+    for (0..n) |i| {
+        const row: c_int = @intCast(i);
+        const tbl = std.mem.span(c.PQgetvalue(res, row, 0));
+        const scoped = c.PQgetisnull(res, row, 1) == 0;
+        const name_bytes = std.fmt.parseInt(usize, std.mem.span(c.PQgetvalue(res, row, 2)), 10) catch 0;
+        if (scoped and name_bytes > limits.max_tenant_scoped_table_bytes) {
+            findings += 1;
+            log.err("🔴 table '{s}' is {d} bytes: a tenant-scoped table is at most {d} (its replica-identity index <table>_zb_ri is cut to a 63-byte name). Rename it.", .{ tbl, name_bytes, limits.max_tenant_scoped_table_bytes });
+        }
+        if (!scoped) continue;
+        const col = std.mem.span(c.PQgetvalue(res, row, 1));
+        const q_tbl = c.PQescapeIdentifier(conn, tbl.ptr, tbl.len) orelse continue;
+        defer c.PQfreemem(q_tbl);
+        const q_col = c.PQescapeIdentifier(conn, col.ptr, col.len) orelse continue;
+        defer c.PQfreemem(q_col);
+        // octet_length, not length: the limit is in bytes. The character class is the one
+        // isSubjectToken and the tenant guard use: NUL..space, DEL, '.', '*', '>'.
+        const bad = std.fmt.allocPrint(a, "(octet_length(t.v) > {d} OR t.v = '' OR t.v ~ '[\\x01-\\x20\\x7f.*>]')", .{limits.max_tenant_bytes}) catch continue;
+        const sql = std.fmt.allocPrintSentinel(a,
+            \\SELECT count(*) FILTER (WHERE t.v IS NOT NULL AND {s}),
+            \\       count(*) FILTER (WHERE t.v IS NULL),
+            \\       (SELECT string_agg(left(x.v, 24) || ' (' || octet_length(x.v) || ' bytes)', ', ')
+            \\          FROM (SELECT DISTINCT s.v FROM (SELECT {s}::text AS v FROM public.{s}) s
+            \\                 WHERE s.v IS NOT NULL AND {s} ORDER BY 1 LIMIT 3) x)
+            \\  FROM (SELECT {s}::text AS v FROM public.{s}) t
+        , .{ bad, q_col, q_tbl, std.mem.replaceOwned(u8, a, bad, "t.v", "s.v") catch bad, q_col, q_tbl }, 0) catch continue;
+        const r2 = c.PQexec(conn, sql.ptr);
+        defer c.PQclear(r2);
+        if (c.PQresultStatus(r2) != c.PGRES_TUPLES_OK or c.PQntuples(r2) != 1) {
+            log.warn("⚠️ '{s}': its tenant values could not be scanned ({s})", .{ tbl, std.mem.trim(u8, std.mem.span(c.PQresultErrorMessage(r2)), "\n ") });
+            continue;
+        }
+        scanned += 1;
+        const unusable = std.fmt.parseInt(u64, std.mem.span(c.PQgetvalue(r2, 0, 0)), 10) catch 0;
+        const nulls = std.fmt.parseInt(u64, std.mem.span(c.PQgetvalue(r2, 0, 1)), 10) catch 0;
+        if (unusable > 0) {
+            findings += 1;
+            const sample = if (c.PQgetisnull(r2, 0, 2) == 0) std.mem.span(c.PQgetvalue(r2, 0, 2)) else "";
+            log.err("🔴 table '{s}': {d} row(s) hold a tenant value ({s}.{s}) that cannot be a subject token: empty, longer than {d} bytes, or with '.', '*', '>', whitespace or a control character. e.g. {s}. The bridge drops their events (bridge_dropped_events_total{{reason=\"tenant_unusable\"}}) and replicas lack them. Fix the values, then SELECT zebridge_reseed('{s}').", .{ tbl, unusable, tbl, col, limits.max_tenant_bytes, sample, tbl });
+        }
+        if (nulls > 0) {
+            findings += 1;
+            log.err("🔴 table '{s}': {d} row(s) have a NULL {s}: no tenant to route them to. Fill it, then SELECT zebridge_reseed('{s}').", .{ tbl, nulls, col, tbl });
+        }
+    }
+    if (findings == 0) log.info("✅ identifiers: tenant values of {d} tenant-scoped table(s) are subject tokens of at most {d} bytes; subject prefix {d} bytes (limit {d})", .{ scanned, limits.max_tenant_bytes, prefix, limits.max_prefix_bytes });
+    return findings;
 }
 
 /// What the generation producer's row-level-security guard would say about each
@@ -407,10 +482,41 @@ fn bridgeStatus(a: std.mem.Allocator, io: std.Io, port: u16, findings: *usize) b
     }
     const refused = flag.int(o, "refused_tables");
     if (refused > 0) log.warn("⚠️ {d} table(s) suspended by the bridge ({d} event(s) dropped): their clients are frozen; the reason is in $KV.schemas.<table> and the bridge log", .{ refused, flag.int(o, "refused_events_dropped") });
+    findings.* += droppedChecks(a, io, port);
     const pg_rc = flag.int(o, "pg_reconnect_count");
     const nats_rc = flag.int(o, "nats_reconnect_count");
     if (pg_rc > 0 or nats_rc > 0) log.warn("⚠️ reconnects since boot: PostgreSQL {d}, NATS {d}", .{ pg_rc, nats_rc });
     return true;
+}
+
+/// What the running bridge has dropped since it started (drops.zig, GET /dropped): rows that never
+/// reached NATS. Each (table, reason) is a finding, with the remedy and the recovery it needs.
+fn droppedChecks(a: std.mem.Allocator, io: std.Io, port: u16) usize {
+    const url = std.fmt.allocPrint(a, "http://127.0.0.1:{d}/dropped", .{port}) catch return 0;
+    var client: std.http.Client = .{ .allocator = a, .io = io };
+    defer client.deinit();
+    var body: std.Io.Writer.Allocating = .init(a);
+    const res = client.fetch(.{ .location = .{ .url = url }, .response_writer = &body.writer, .keep_alive = false }) catch return 0;
+    if (res.status != .ok) {
+        log.warn("⚠️ this bridge has no /dropped (an older build): the rows it dropped are only in its log", .{});
+        return 0;
+    }
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, body.written(), .{}) catch return 0;
+    if (parsed != .object) return 0;
+    const list = parsed.object.get("dropped") orelse return 0;
+    if (list != .array) return 0;
+    var findings: usize = 0;
+    for (list.array.items) |item| {
+        if (item != .object) continue;
+        const table = if (item.object.get("table")) |v| (if (v == .string) v.string else "?") else "?";
+        const reason = if (item.object.get("reason")) |v| (if (v == .string) v.string else "?") else "?";
+        const fix = if (item.object.get("fix")) |v| (if (v == .string) v.string else "") else "";
+        const count = if (item.object.get("dropped")) |v| (if (v == .integer) v.integer else 0) else 0;
+        findings += 1;
+        log.err("🔴 the bridge has dropped {d} row(s) of '{s}' since it started ({s}); every replica lacks them. Remedy: {s}. Fixing the cause does not replay what was dropped: re-seed the table.", .{ count, table, reason, fix });
+    }
+    if (findings == 0) log.info("✅ the bridge has dropped no row since it started", .{});
+    return findings;
 }
 
 /// The tenants that have a principal mapped to them: the ones with CDC streams and
