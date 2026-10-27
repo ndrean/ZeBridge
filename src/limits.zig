@@ -12,13 +12,13 @@
 //!     in init.write.template.sql), `--diagnose` finds what is already there, and the event path
 //!     drops what still arrives (counted, by reason: `bridge_dropped_events_total`).
 //!   * The client library's: nats.zig refuses to SEND a subject longer than its `max_subject_len`.
-//!     The pinned library (before the fork's `zebridge 42`) said 255, which is not a NATS limit:
+//!     Upstream nats.zig (and the fork before `zebridge 42`) says 255, which is not a NATS limit:
 //!     nats-server 2.15.1 delivers a core subject of 3000 bytes and serves JetStream API subjects
 //!     of 550 bytes (NATS_ZIG_NOTES.md, entry 43). Under 255, what bounds a chain read is the
 //!     direct get of an object's meta record,
 //!     `$JS.API.DIRECT.GET.OBJ_gen-<tenant>.$O.gen-<tenant>.M.<base64(<table>-i<n>-g<n>-full)>`:
 //!     38 bytes + twice the tenant + the base64 of the object name, which carries the TABLE and
-//!     two counters that grow. So under 255 the tenant limit depends on the table, and a limit
+//!     two counters that grow. (The pinned fork has the patch, so this describes upstream.) So under 255 the tenant limit depends on the table, and a limit
 //!     that holds for every table is 46 bytes (`legacy_tenant_bytes`, derived below, 63-byte table
 //!     and 10-digit counters). 92 was measured with an 8-byte table and is NOT that limit: a 62-byte
 //!     table with a 92-byte tenant never got a chain (walls.py, 2026-10-27).
@@ -46,7 +46,8 @@ fn base64Bytes(n: usize) usize {
 pub const legacy_tenant_bytes: usize = (255 - 38 - base64Bytes(max_table_bytes + "-i-g-full".len + 20)) / 2;
 
 /// The tenant id: 128 bytes once the client library accepts the subjects that follow from it
-/// (fork patch `zebridge 42`, which exports `max_subject_len`), `legacy_tenant_bytes` before.
+/// (the fork's `zebridge 42`, which exports `max_subject_len`: the pinned library), `legacy_tenant_bytes`
+/// against a library without it.
 pub const max_tenant_bytes: usize = if (@hasDecl(nats, "max_subject_len")) 128 else legacy_tenant_bytes;
 
 /// `insert`, `update`, `delete`.
