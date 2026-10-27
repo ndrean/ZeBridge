@@ -214,6 +214,20 @@ def derived_env() -> dict:
     return out
 
 
+def bridge_answering() -> bool:
+    """Whether something answers HTTP on the long-running bridge's port (BRIDGE_PORT, 27434)."""
+    import urllib.error
+    import urllib.request
+    port = os.environ.get("BRIDGE_PORT", "27434")
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=2).close()
+        return True
+    except urllib.error.HTTPError:
+        return True   # it answered
+    except (urllib.error.URLError, OSError):
+        return False
+
+
 DERIVED = None
 
 
@@ -296,6 +310,15 @@ def main() -> int:
         return 2
     results = []
     for g in groups:
+        if g == "owns" and bridge_answering():
+            # Each owns scenario starts a probe bridge and refuses to run beside another, so with the
+            # long-running bridge up the group is ~50 identical failures ("another bridge is running").
+            # `run.py all` is offline + live + owns in one go: the live group needs the bridge, this one
+            # must not have it.
+            print(f"\n  ✗ owns: a bridge answers on :{os.environ.get('BRIDGE_PORT', '27434')}. These scenarios start their own and "
+                  "refuse to run beside another one: stop it, then `run.py owns`.", flush=True)
+            results.append((g, "(group not run)", 1, 0.0, "-"))
+            continue
         if g != "offline":
             drop_probe_slot()
         for name, (role, note) in GROUPS[g].items():

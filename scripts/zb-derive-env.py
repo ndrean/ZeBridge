@@ -27,7 +27,7 @@ import pathlib
 import shlex
 import subprocess
 import sys
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -67,6 +67,13 @@ def derive_into(env) -> dict:
             if value and not env.get(key):
                 env[key] = value
                 out[key] = value
+    # The database the roles may CONNECT to is the one the reader URL already names. Only
+    # .env.admin carried it, so a run with just the bridge's environment (what run.py documents)
+    # left `GRANT CONNECT ON DATABASE ` empty and render.py stopped on "unset: TARGET_DB".
+    if not env.get("TARGET_DB") and env.get("DATABASE_READER_URL"):
+        database = unquote(urlparse(env["DATABASE_READER_URL"]).path.lstrip("/"))
+        if database:
+            env["TARGET_DB"] = out["TARGET_DB"] = database
     # The wire grammar owns the open tenant; .env.admin used to carry a copy,
     # and check.py exists partly to catch the two disagreeing.
     if not env.get("OPEN_TENANT"):

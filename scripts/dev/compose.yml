@@ -26,6 +26,7 @@ services:
       # postgres:18+ wants the mount at /var/lib/postgresql (a version-specific subdirectory below it)
       - pgdata:/var/lib/postgresql
       - ./postgres-init.sql:/docker-entrypoint-initdb.d/00-zebridge.sql:ro
+      - ./postgres-init.sh:/docker-entrypoint-initdb.d/01-replication-hba.sh:ro
     # The flags of scripts/native/up.sh. max_slot_wal_keep_size is NOT here: a command-line
     # setting beats ALTER SYSTEM, and slot_loss.py lowers it live (postgres-init.sql sets it).
     command:

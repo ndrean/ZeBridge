@@ -186,6 +186,7 @@ def main():
                  f"VALUES ('zb_sweeper','{t}') ON CONFLICT DO NOTHING")
 
     # 6. ensure the base tables are enabled with the canonical params
+    refused = []
     for t in BASE_TABLES:
         v, tomb, tie, ten = ENABLE[t]
         args = [f"'public.{t}'", "writable => true", f"version_col => '{v}'"]
@@ -197,12 +198,22 @@ def main():
             args.append(f"tiebreak_col => '{tie}'")
         if ten:
             args.append(f"tenant_col => '{ten}'")
+        if not ten:
+            # zebridge_publication_guard refuses a table published unscoped without a recorded
+            # reason. The refusal is a result row (status ERROR), not a SQL error: this script
+            # used to print "ensure enabled" and leave the table out of the catalogue, which only
+            # shows on a database that never had it (one enabled before the guard kept its row).
+            args.append(f"public_reason => 'scenario fixture: readable by every consumer'")
         args += [f"publication => '{pub}'", "dry_run => false"]
         note(f"ensure enabled: {t}")
         if not DRY:
-            out = psql(f"SELECT 1 FROM zebridge_enable({', '.join(args)})")
-            if "error" in out.lower():
-                print(f"  ⚠️ enable {t}: {out}", file=sys.stderr)
+            out = psql(f"SELECT step || ': ' || detail FROM zebridge_enable({', '.join(args)}) WHERE status = 'ERROR'")
+            if out:
+                print(f"  ✗ enable {t} was refused: {out}", file=sys.stderr)
+                refused.append(t)
+    if refused:
+        print(f"\n{len(refused)} base table(s) not enabled: {', '.join(refused)}", file=sys.stderr)
+        return 1
 
     print(f"\n{'DRY RUN — ' if DRY else ''}{changed} change(s). "
           "Start the live bridge fresh; boot republishes all schemas clean.")
