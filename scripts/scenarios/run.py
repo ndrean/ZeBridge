@@ -214,6 +214,18 @@ def derived_env() -> dict:
     return out
 
 
+def gc_floor() -> tuple[str, int] | None:
+    """(the GC floor, seconds behind now()) of the database the scenarios use, or None if unreadable."""
+    code = ("import zb; print(zb.psql(\"SELECT watermark || '|' || extract(epoch FROM now() - watermark)::bigint "
+            "FROM public.zebridge_gc_watermark\", quiet=True))")
+    out = subprocess.run([PY, "-c", code], cwd=HERE, env=env_for("bridge"), capture_output=True, text=True).stdout.strip()
+    try:
+        stamp, behind = out.rsplit("|", 1)
+        return stamp, int(behind)
+    except ValueError:
+        return None
+
+
 def bridge_answering() -> bool:
     """Whether something answers HTTP on the long-running bridge's port (BRIDGE_PORT, 27434)."""
     import urllib.error
@@ -313,6 +325,15 @@ def main() -> int:
     if any(g != "offline" for g in groups) and not a.no_preflight and not preflight():
         return 2
     results = []
+    floor = gc_floor() if any(g != "offline" for g in groups) else None
+    if floor and floor[1] < 1800:
+        # The floor never goes down, and the scenarios stamp their writes a few minutes behind now
+        # (mutate, replies, offline, intclamp ...): with the floor this close, the bridge refuses them
+        # all as PredatesGcWatermark and each scenario fails for a reason it does not name.
+        print(f"\n  ⚠️  the GC floor is at {floor[0]}, only {floor[1] // 60} min behind now. Writes older than that are "
+              "refused (PredatesGcWatermark), so scenarios that write 'a few minutes ago' will fail. The floor cannot be "
+              "lowered: reset the database (scripts/dev/down.sh --clean) and do not run a sweeper with a short "
+              "GC_THRESHOLD_MS against it.\n", flush=True)
     for g in groups:
         if g == "owns" and bridge_answering():
             # Each owns scenario starts a probe bridge and refuses to run beside another, so with the
@@ -337,6 +358,12 @@ def main() -> int:
             dt = time.monotonic() - t0
             results.append((g, name, rc, dt, log))
             print(f"  {'✓' if rc == 0 else '✗'} {g}/{name:18s} rc={rc:<3d} {dt:6.1f}s  {log}", flush=True)
+            if floor and g != "offline":
+                after = gc_floor()
+                if after and after[0] != floor[0]:
+                    print(f"      GC floor moved: {floor[0]} → {after[0]} ({after[1] // 60} min behind now). It never goes down; "
+                          "the scenarios after this one that stamp older versions are refused (PredatesGcWatermark)", flush=True)
+                    floor = after
             if log_from is not None and bridge_log.exists():
                 with open(bridge_log, "rb") as bf:
                     bf.seek(log_from)

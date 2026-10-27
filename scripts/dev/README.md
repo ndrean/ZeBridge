@@ -49,6 +49,18 @@ scripts/scenarios/run.py owns
 
 `run.py all` is these three in a row, so it cannot work with the long-running bridge up: it now says so and skips `owns`.
 
+**After `owns`, the bridge's replication slot is lost.** `slot_loss.py` lowers `max_slot_wal_keep_size`, which is
+cluster-wide, so every inactive slot that is behind is invalidated, including the long-running bridge's (it is stopped
+while `owns` runs). Starting that bridge again then stops at once with `SlotInvalidated`. Recover once:
+`bridge --drop-slot <slot>` (or `SELECT pg_drop_replication_slot('<slot>')`), run `scripts/reprovision.py`, and start the
+bridge with `ZB_FEED_RESTART=1`; it creates a new slot, and the next start needs no flag.
+
+**The GC floor never goes down.** `zebridge_gc_watermark` is the oldest version the bridge still accepts. If anything
+moves it close to now, every scenario that writes "a few minutes ago" (`mutate`, `replies`, `offline`, `intclamp`)
+fails with `PredatesGcWatermark`, and nothing short of resetting the database (`scripts/dev/down.sh --clean`) undoes it.
+`run.py` warns at the start when the floor is less than 30 minutes behind now, and prints `GC floor moved: …` after the
+scenario that moved it.
+
 **Reading the bridge's errors.** The long-running bridge logs one stream for every `live` scenario, without timestamps, and
 many scenarios provoke errors on purpose (a refused write, a killed process, a dropped row, an outage). With
 `--bridge-log`, `run.py` saves what the bridge wrote during each scenario to `zb-scenario-<name>.bridge.log` beside
