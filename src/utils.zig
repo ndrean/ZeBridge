@@ -286,7 +286,7 @@ test "isSubjectToken: the values the bridge actually interpolates" {
     try std.testing.expect(isSubjectToken("acme", test_max));
     try std.testing.expect(isSubjectToken("tenant_42", test_max));
     try std.testing.expect(isSubjectToken("01a0138f-3e62-70b0-a2ca-a0f936923665", test_max));
-    try std.testing.expect(isSubjectToken("c-1234567890123456-orders-1787034564", test_max));
+    try std.testing.expect(isSubjectToken("c-0000000000000000-orders-0000000000", test_max));
 }
 
 test "isSubjectToken: a dot silently reshapes the subject" {
