@@ -9,7 +9,7 @@ the bridge drops is missing from every replica, so no SUPPORTED identifier may r
 database refuses new unsupported tenants, `--diagnose` finds the old ones, and a drop is counted.
 
 Limits are in BYTES and are read from `bridge --limits` (the tenant limit follows the client
-library: 92 under the pinned nats.zig, 128 with the fork's `zebridge 42`). Each case is its own stack:
+library: 128 with the fork's `zebridge 42` (the pinned one), 46 without it). Each case is its own stack:
 
   A. a 62-byte table boots, publishes its rows and builds a chain
   B. a tenant of the longest supported length, with the longest supported table, publishes and
@@ -199,7 +199,7 @@ async def case_d(tmp):
     # The review's example: 90 + 40 bytes. Under the library's old 255-byte subject check the tenant
     # limit is lower (limits.zig), so the case runs at the longest tenant the build supports.
     t_len = min(90, TMAX)
-    if t_len < 90: note(f"D at {t_len} bytes: this build's tenant limit is {TMAX}; 90 needs the patched nats.zig (NATS_ZIG_NOTES 43)")
+    if t_len < 90: note(f"D at {t_len} bytes: this build's tenant limit is {TMAX}; 90 needs a nats.zig with the fork's zebridge 42 (NATS_ZIG_NOTES 43)")
     tenant, name = "x" * t_len, "n" * 40
     stack = Stack(tmp, "wallsd", 120, {})
     try:

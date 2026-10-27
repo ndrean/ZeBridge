@@ -68,8 +68,8 @@ The first `zb_client_sync` of a libzb client answers `PrepareFailed` (no detail)
 
 NOTES "A bridge that could not return, and the limits it hit" and "Identifiers are measured in bytes, and the limits do not drop rows". `scripts/scenarios/walls.py` A–G and I, unit tests in `limits.zig`, `drops.zig`, `http_server.zig`, `batch_publisher.zig`.
 
-- **Before release: apply the fork patch.** `nats.zig-patch/pending/42-nats.zig-subject-length.patch` (README there) makes the tenant limit 128 bytes instead of 46; it could not be pushed from the session that wrote it. Verified both ways here: the patched library (`walls.py` A–I, tenants of 128 bytes with a 62-byte table, a 90-byte tenant with a 40-byte table) and the pinned one (limit 46).
-- A deployment with tenants of 47 to 92 bytes that worked with short tables is refused on new rows (guard) and found by `--diagnose` until the patch is applied. Counters restart at 0 on a bridge restart; `bridge_table_degraded` means "dropped since boot", not "inconsistent": `zebridge_reseed` is what makes it consistent.
+- The fork patch is in: ndrean/nats.zig `zebridge 42` (`315fb29`, tag `zebridge/b8ffdd9-2`) is pinned, so the tenant limit is 128 bytes (`bridge --limits`). Verified here on both library states (46 and 128) and on the maintainer's machine (128).
+- A deployment built against upstream nats.zig (no `max_subject_len`) gets the 46-byte limit: tenants of 47 to 92 bytes that worked with short tables are refused on new rows and found by `--diagnose`. Counters restart at 0 on a bridge restart; `bridge_table_degraded` means "dropped since boot", not "inconsistent": `zebridge_reseed` is what makes it consistent.
 - Not done: the per-table health is a metric and a `/dropped` list; there is no persisted "table needs reseed" flag in PostgreSQL (`zebridge_suspensions` holds suspensions only).
 - Not replayed on the native dev stack: only private stacks (`walls.py`).
 
