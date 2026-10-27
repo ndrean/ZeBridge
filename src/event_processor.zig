@@ -636,6 +636,7 @@ pub const EventProcessor = struct {
         // safe failure is silence: publishing to `cdc.<table>.<op>` with no tenant token
         // would deliver the row to a subject no tenant grant covers, but an operator
         // subscribed to `cdc.>` would receive it.
+        var unusable_tenant_len: ?usize = null;
         const tenant: ?[]const u8 = blk: {
             const rule = self.tenant_rules.get(rel.name) orelse break :blk null;
             if (rule.len == 0) break :blk null;
@@ -656,7 +657,11 @@ pub const EventProcessor = struct {
                 //
                 // Quarantined rather than sanitised: rewriting the value would route the
                 // row to a tenant that does not exist, which is worse than not routing it.
-                break :blk if (raw) |v| (if (utils.isSubjectToken(v)) v else null) else null;
+                if (raw) |v| {
+                    if (utils.isSubjectToken(v)) break :blk v;
+                    unusable_tenant_len = v.len;
+                }
+                break :blk null;
             }
             break :blk null;
         };
@@ -678,10 +683,20 @@ pub const EventProcessor = struct {
                 (if (r.len > 0) r[0] else "?")
             else
                 "?";
-            log.err(
-                "🔴 Quarantining {s} on '{s}' to '.unrouted': the catalogue names tenant column '{s}' but this event carries no value for it. Check that the replica identity still covers it.",
-                .{ operation_lower, rel.name, named },
-            );
+            if (unusable_tenant_len) |n| {
+                // The value is there; it cannot be a subject token. Say so, instead of sending
+                // the operator to the replica identity (measured 2026-10-26: that text for a
+                // 93-character tenant).
+                log.err(
+                    "🔴 Dropping {s} on '{s}': its tenant value ({d} characters, column '{s}') cannot be a subject token — it is empty, contains '.', '*', '>', whitespace or a control character, or is longer than {d}. The row is not published; fix the value in PostgreSQL.",
+                    .{ operation_lower, rel.name, n, named, utils.max_subject_token_len },
+                );
+            } else {
+                log.err(
+                    "🔴 Quarantining {s} on '{s}' to '.unrouted': the catalogue names tenant column '{s}' but this event carries no value for it. Check that the replica identity still covers it.",
+                    .{ operation_lower, rel.name, named },
+                );
+            }
             // ⚠️ Not published, even quarantined: no stream binds an `unrouted` subject, so
             // a JetStream publish to it gets no response, the publisher reads that as a
             // lost connection, and the batch publisher stops the bridge — every table's
@@ -718,6 +733,25 @@ pub const EventProcessor = struct {
 
         // Create NATS subject
         var subject_buf: [Config.Buffers.subject_buffer_size]u8 = undefined;
+        // ⚠️ A subject that does not fit the buffer used to return `NoSpaceLeft` from here, which
+        // the caller passes up as `else => return err`: `main` returned, and the bridge (with its
+        // joins) stopped without a word. The row cannot be published whatever is done to the
+        // bridge, so it is dropped loudly — same fate as an unusable tenant value — and
+        // replication goes on.
+        if (!utils.cdcSubjectFits(
+            subject_buf.len,
+            self.topology.subject_cdc_prefix.len,
+            if (routed) |t| t.len else null,
+            rel.name.len,
+            operation_lower.len,
+            if (suffix) |s| s.len else null,
+        )) {
+            log.err(
+                "🔴 Dropping {s} on '{s}': its subject (tenant {d} characters, table {d}) does not fit the {d}-byte subject buffer. The row is not published; shorten the table name or the tenant id.",
+                .{ operation_lower, rel.name, if (routed) |t| t.len else 0, rel.name.len, subject_buf.len },
+            );
+            return error.EventDropped;
+        }
         // ⚠️ The tenant goes **immediately after the prefix**, not at the end:
         //
         //     cdc.<tenant>.<table>.<operation>[.<suffix>]

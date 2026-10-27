@@ -1674,6 +1674,13 @@ pub fn main(init: std.process.Init) !void {
     }
     defer for (mut_listeners.items) |m| m.deinit();
     defer for (mut_listeners.items) |m| m.join();
+    // ⚠️ Registered AFTER the joins above, so on an error it runs BEFORE them: errdefers and
+    // defers unwind in reverse order. The `errdefer should_stop.store(true)` further up ran
+    // after `m.join()` had begun, and a listener only leaves its loop when `should_stop` is
+    // set — an error escaping the replication loop (a subject that does not fit, a failed
+    // reload) hung `main` in the join, with no exit and no `error:` line. A bridge that is
+    // up but dead is the worst failure for a supervisor: it never restarts it.
+    errdefer should_stop.store(true, .seq_cst);
 
     log.info("ℹ️ CDC subject pattern: \x1b[1m {s}.<table>.<operation> \x1b[0m", .{runtime_config.topology.subject_cdc_prefix});
 
@@ -2072,6 +2079,18 @@ pub fn main(init: std.process.Init) !void {
                             },
                             .insert => |ins| {
                                 if (relation_map.get(ins.relation_id)) |rel| {
+                                    // Test-only fault (compiled in only with `-Dtest-faults=true`): an error
+                                    // escaping the replication loop, the shape that used to leave a live bridge
+                                    // that had stopped (scripts/scenarios/walls.py). ZB_TEST_LOOP_ERROR names
+                                    // the table whose next INSERT raises it; the line below is asserted.
+                                    if (comptime @import("build_options").test_faults) {
+                                        if (std.c.getenv("ZB_TEST_LOOP_ERROR")) |want| {
+                                            if (std.mem.eql(u8, rel.name, std.mem.span(want))) {
+                                                log.warn("ZB_TEST_LOOP_ERROR fired on '{s}'", .{rel.name});
+                                                return error.TestLoopError;
+                                            }
+                                        }
+                                    }
                                     if (tx_slots_count >= tx_slots_buf.len) {
                                         // Long transaction: hand this batch over so the publisher can drain
                                         // and slots return to the pool. The LSN is still acked at .commit.

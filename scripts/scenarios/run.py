@@ -82,6 +82,7 @@ GROUPS = {
         "replies":       ("client", "every write gets a verdict"),
         "offline":       ("client", "outbox replay by version"),
         "gc_resurrect":  ("none", "a write from before the GC floor cannot resurrect a reaped row: refused by the bridge, PredatesGcWatermark (§10km); the control, with the floor staged behind the deletion, shows the resurrection (own database, nats-server and bridge, needs nats-server)"),
+        "walls":         ("none", "the bridge's fixed limits at their edge: a 62-character table, a 92-character tenant, a 93-character tenant and an overlong subject are refused with a line that says why and never stop the bridge; an error escaping the replication loop ends the process (fault build); SIGTERM ends an idle bridge without an HTTP request (own database, nats-server and bridge)"),
         "tiebreak":      ("client", "equal versions resolved by the tiebreak column"),
         "clamp":         ("client", "future versions clamped"),
         "intclamp":      ("client", "an integer version column cannot be frozen by one write: a fresh row stores at most 1, an update or a delete at most stored + 1, the verdict says what was stored; the tombstone takes now() (§10fj)"),

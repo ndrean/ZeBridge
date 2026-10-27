@@ -2661,6 +2661,13 @@ pub const GenerationProducer = struct {
     /// Returns false when the build itself failed (the pair is unchanged in NATS);
     /// true when a generation was published, spliceable or not.
     fn buildWithRetry(self: *GenerationProducer, alloc: std.mem.Allocator, pgc: *c.PGconn, bkc: *c.PGconn, js: *nats.JetStream, table: []const u8, tenant: []const u8, vcol: []const u8, tcol: []const u8, tenant_col: []const u8, guarded: bool, force_cut: bool) bool {
+        // A tenant that cannot be a subject token has no CDC stream the bridge will fill (the event
+        // path drops its rows) and no object-store subject that fits NATS's 255 characters. Building
+        // anyway failed every cadence with a bare `InvalidSubject` (measured at 93 characters).
+        if (!utils.isSubjectToken(tenant)) {
+            log.err("🧬 '{s}'/'{s}': no generation is built — the tenant id ({d} characters) cannot be a subject token (empty, '.', '*', '>', whitespace, or longer than {d}); its rows are not published either", .{ tenant, table, tenant.len, utils.max_subject_token_len });
+            return false;
+        }
         // §10gf: one build of a pair at a time, the full lane's snapshot and attach included.
         self.pairAcquire(tenant, table);
         defer self.pairRelease(tenant, table);

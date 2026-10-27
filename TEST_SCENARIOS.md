@@ -94,6 +94,7 @@ Each row: something that could go wrong, what the test shows instead, and the te
 | an old write, sent by a device that was offline, overwrites newer data | it is refused as `stale`; a write that really is newer still lands | `offline.py`, `mutate.py` |
 | an old write brings back a deleted row | the row stays deleted | `offline.py` |
 | an old write brings back a deleted row after the sweeper removed its tombstone | the bridge refuses the write (`PredatesGcWatermark`); without that guard (a floor staged behind the deletion, on a disposable database) the same write does bring the row back, which the test also shows | `gc_resurrect.py` |
+| a table name, tenant id or subject at the edge of a fixed limit | the row is refused with a log line that names the limit, a table of 63 characters is refused at `zebridge_enable`, the bridge goes on; an error escaping the replication loop ends the process instead of leaving it alive and dead; SIGTERM ends an idle bridge on its own | `walls.py` |
 | two writes carry the same version | the tiebreak column picks the same winner everywhere | `tiebreak.py` |
 | a device's clock is fast or slow | a fast clock wins only until real time catches up; a slow clock can still write | `clockskew.py` |
 | a device's clock is far in the future | the version is cut back to the server's time, and the answer says so | `clamp.py` |

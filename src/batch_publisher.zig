@@ -105,7 +105,7 @@ pub const CDCEvent = struct {
     operation_buf: [8]u8 = undefined, // INSERT, UPDATE, DELETE
     operation_len: u8 = 0,
 
-    msg_id_buf: [64]u8 = undefined,
+    msg_id_buf: [Config.Buffers.msg_id_buffer_size]u8 = undefined,
     msg_id_len: u8 = 0,
 
     relation_id: u32 = 0, // PostgreSQL relation OID (for schema version tracking)
@@ -1630,4 +1630,20 @@ test "TenantRouting.streamName: the stream a tenant's subjects belong to" {
     try std.testing.expectEqualStrings("CDC_acme", r.streamName(&buf, "acme").?);
     var tiny: [4]u8 = undefined;
     try std.testing.expect(r.streamName(&tiny, "acme") == null);
+}
+
+test "the slot's message id holds the longest id a 63-character table can produce" {
+    // Regression: the slot's id buffer was 64 bytes, and the boot schema id
+    // `schema-boot-<table>-<lsn>-e<epoch>` outgrew it at a 40-character table name (less as the
+    // LSN gains digits): publishBootSchemas returned MsgIdTooLong, `main` returned, and the
+    // bridge never started. PostgreSQL allows 63 characters; the id must hold them, a u64 LSN
+    // and an i64 epoch.
+    var ev: CDCEvent = .{};
+    var buf: [Config.Buffers.msg_id_buffer_size]u8 = undefined;
+    const table: []const u8 = &@as([63]u8, @splat('t'));
+    const id = try std.fmt.bufPrint(&buf, "schema-boot-{s}-{d}-e{d}", .{ table, std.math.maxInt(u64), std.math.maxInt(i64) });
+    try ev.setMsgId(id);
+    try std.testing.expectEqualStrings(id, ev.getMsgId());
+    const suspend_id = try std.fmt.bufPrint(&buf, "schema-suspend-boot-cols-{s}-{d}", .{ table, std.math.maxInt(u64) });
+    try ev.setMsgId(suspend_id);
 }
