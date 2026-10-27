@@ -35,9 +35,26 @@ set -a && . ./.env.bridge && set +a && export BRIDGE_CDC_PUBLICATION=zb_pub   # 
 export NATS_URL=nats://127.0.0.1:4222   # after the line above, which may bring a tls:// URL: this NATS is plain
 
 scripts/reprovision.py                  # baseline tables, catalogue rows and tenant mappings
-zig-out/bin/bridge --pub $BRIDGE_CDC_PUBLICATION   # in its own terminal: the long-running bridge on :27434, for the `live` group
-scripts/scenarios/run.py all            # in another terminal, same environment
+zig-out/bin/bridge --pub $BRIDGE_CDC_PUBLICATION 2>&1 | tee /tmp/zb-bridge.log   # own terminal: the long-running bridge on :27434
 ```
+
+In another terminal, same environment:
+
+```sh
+scripts/scenarios/run.py offline
+scripts/scenarios/run.py live --bridge-log /tmp/zb-bridge.log
+# stop the bridge (Ctrl-C): each `owns` scenario starts its own and refuses to run beside another
+scripts/scenarios/run.py owns
+```
+
+`run.py all` is these three in a row, so it cannot work with the long-running bridge up: it now says so and skips `owns`.
+
+**Reading the bridge's errors.** The long-running bridge logs one stream for every `live` scenario, without timestamps, and
+many scenarios provoke errors on purpose (a refused write, a killed process, a dropped row, an outage). With
+`--bridge-log`, `run.py` saves what the bridge wrote during each scenario to `zb-scenario-<name>.bridge.log` beside
+that scenario's log and prints how many error lines it holds. An error there is expected if the scenario's own
+description says it causes one (`run.py --list`); it is worth a look if the scenario passed without meaning to.
+The `owns` scenarios log their own probe bridge in `/tmp/zb_*.log`, named in each scenario's output.
 
 The scenarios drive `psql` from the host (`ZB_PGBIN`, or `ZB_PSQL`: see the scenarios' README). Only the client
 binaries are needed, not a running Homebrew server.

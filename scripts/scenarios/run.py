@@ -262,6 +262,10 @@ def main() -> int:
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--no-preflight", action="store_true", help="skip the check that the database has the GC-floor functions")
     ap.add_argument("--logs", default=os.environ.get("TMPDIR", "/tmp"), help="where per-scenario logs go")
+    ap.add_argument("--bridge-log", default=os.environ.get("ZB_BRIDGE_LOG"),
+                    help="the long-running bridge's log file: what it wrote during each scenario is saved beside that "
+                         "scenario's log (zb-scenario-<name>.bridge.log) and its error lines counted. Start the bridge with "
+                         "`2>&1 | tee FILE`. Many scenarios provoke errors on purpose; this says which one did")
     a = ap.parse_args()
     if a.list:
         for g, items in GROUPS.items():
@@ -325,12 +329,24 @@ def main() -> int:
             if a.k and not any(k in name for k in a.k):
                 continue
             log = pathlib.Path(a.logs) / f"zb-scenario-{name}.log"
+            bridge_log = pathlib.Path(a.bridge_log) if a.bridge_log else None
+            log_from = bridge_log.stat().st_size if bridge_log and bridge_log.exists() else None
             t0 = time.monotonic()
             with open(log, "w") as f:
                 rc = subprocess.run([PY, str(HERE / f"{name}.py")], env=env_for(role), stdout=f, stderr=subprocess.STDOUT, cwd=ROOT).returncode
             dt = time.monotonic() - t0
             results.append((g, name, rc, dt, log))
             print(f"  {'✓' if rc == 0 else '✗'} {g}/{name:18s} rc={rc:<3d} {dt:6.1f}s  {log}", flush=True)
+            if log_from is not None and bridge_log.exists():
+                with open(bridge_log, "rb") as bf:
+                    bf.seek(log_from)
+                    written = bf.read().decode("utf-8", "replace")
+                errors = sum(1 for line in written.splitlines() if "error(" in line or "🔴" in line)
+                if written:
+                    sliced = pathlib.Path(a.logs) / f"zb-scenario-{name}.bridge.log"
+                    sliced.write_text(written)
+                    print(f"      bridge log: {errors} error line(s), {len(written.splitlines())} line(s) → {sliced}" if errors
+                          else "      bridge log: no error lines", flush=True)
     if any(g != "offline" for g in groups):
         drop_probe_slot()
     failed = [r for r in results if r[2] != 0]

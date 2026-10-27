@@ -89,7 +89,12 @@ Every terminal (reprovision.py and run.py are run by the venv's Python, so activ
 
 Then:
   scripts/reprovision.py                       # the baseline tables, catalogue rows and tenant mappings
-  zig-out/bin/bridge --pub \$BRIDGE_CDC_PUBLICATION   # the long-running bridge on :27434 (the live group), in its own terminal
-  scripts/scenarios/run.py all                 # in another terminal, same environment
+  zig-out/bin/bridge --pub \$BRIDGE_CDC_PUBLICATION 2>&1 | tee /tmp/zb-bridge.log   # the long-running bridge on :27434, in its own terminal
+
+In another terminal, same environment:
+  scripts/scenarios/run.py offline
+  scripts/scenarios/run.py live --bridge-log /tmp/zb-bridge.log   # needs the bridge; saves what it logged during each scenario
+Then stop the bridge (Ctrl-C) and run the group that starts its own bridge per scenario:
+  scripts/scenarios/run.py owns                # refuses to run while a bridge answers on :27434 ('all' = the three in a row cannot)
 Stop with scripts/dev/down.sh (--clean wipes the volumes, the keys and the credentials).
 EOF
