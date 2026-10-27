@@ -1,0 +1,109 @@
+# The scenarios' stack in containers: PostgreSQL (logical replication) and NATS (operator mode)
+# on the host's ports, the credentials minted by nsc inside a container. Replaces
+# scripts/native/up.sh + jwt-bootstrap.sh for anyone without Homebrew PostgreSQL, nsc and
+# nats-server. The bridge, the sweeper and the scenarios run from the host build and connect
+# over the published ports, exactly as they do against the native stack.
+#
+#   scripts/dev/up.sh      # start, mint creds on first run, apply the init SQL
+#   scripts/dev/down.sh    # stop (--clean also removes the volumes and the minted keys)
+#
+# Not for speed measurements: the containers add a virtualization layer (scripts/native/README.md).
+name: zebridge-dev
+
+services:
+  postgres:
+    image: postgres:18.6-alpine3.24
+    container_name: zb-dev-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      # The scenarios connect as `postgres` from the host without a password, as against the
+      # native stack (pg_hba `trust`). A development stack bound to loopback.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "127.0.0.1:${ZB_DEV_PG_PORT:-5432}:5432"
+    volumes:
+      # postgres:18+ wants the mount at /var/lib/postgresql (a version-specific subdirectory below it)
+      - pgdata:/var/lib/postgresql
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/00-zebridge.sql:ro
+    # The flags of scripts/native/up.sh. max_slot_wal_keep_size is NOT here: a command-line
+    # setting beats ALTER SYSTEM, and slot_loss.py lowers it live (postgres-init.sql sets it).
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+      - -c
+      - wal_sender_timeout=300s
+      - -c
+      - logical_decoding_work_mem=256MB
+      - -c
+      - wal_buffers=64MB
+      - -c
+      - commit_delay=1000
+      - -c
+      - commit_siblings=5
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - wal_compression=zstd
+    shm_size: 1gb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: runs scripts/native/jwt-bootstrap.sh with nsc from the nats-box image. The keys and the
+  # resolver fragment go to scripts/dev/state/ (untracked), the .creds files to scripts/native/creds/
+  # where run.py reads them. Idempotent: an existing store is reused, the creds are written again.
+  nats-bootstrap:
+    image: natsio/nats-box:latest
+    container_name: zb-dev-nats-bootstrap
+    working_dir: /work
+    environment:
+      ZB_STATE_DIR: /work/scripts/dev/state
+      OWNER: "${ZB_DEV_UID:-0}:${ZB_DEV_GID:-0}"   # up.sh exports your uid:gid
+    volumes:
+      - ../..:/work
+    # nats-box is Alpine and the script wants bash. Root (for apk), then the files it wrote are
+    # handed back to whoever runs compose, so down.sh --clean can remove them.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        apk add --no-cache bash >/dev/null &&
+        mkdir -p /work/scripts/dev/state /work/scripts/native/creds &&
+        bash /work/scripts/native/jwt-bootstrap.sh &&
+        chown -R "$$OWNER" /work/scripts/dev/state /work/scripts/native/creds
+    restart: "no"
+
+  nats:
+    image: nats:2.15-alpine
+    container_name: zb-dev-nats
+    depends_on:
+      nats-bootstrap:
+        condition: service_completed_successfully
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    ports:
+      - "127.0.0.1:${ZB_DEV_NATS_PORT:-4222}:4222"
+      - "127.0.0.1:8222:8222"   # monitoring
+      - "127.0.0.1:8080:8080"   # websocket
+      - "127.0.0.1:1883:1883"   # MQTT
+    volumes:
+      - ./nats-server.conf:/etc/nats/nats-server.conf:ro
+      - ./state:/etc/nats/state:ro
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz >/dev/null || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  pgdata:
+  natsdata:

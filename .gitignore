@@ -141,3 +141,6 @@ dist/
 # Flutter/Dart local overrides (e.g. an example pointed at the local zb-dart): never committed,
 # an app with one cannot build against pub.dev.
 pubspec_overrides.yaml
+
+# scripts/dev/compose.yml: the nsc keys and the resolver fragment it mints (secrets, never committed)
+scripts/dev/state/
