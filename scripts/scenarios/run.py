@@ -82,6 +82,7 @@ GROUPS = {
         "replies":       ("client", "every write gets a verdict"),
         "offline":       ("client", "outbox replay by version"),
         "gc_resurrect":  ("none", "a write from before the GC floor cannot resurrect a reaped row: refused by the bridge, PredatesGcWatermark (§10km); the control, with the floor staged behind the deletion, shows the resurrection (own database, nats-server and bridge, needs nats-server)"),
+        "readings_fetch": ("none", "the native reader of a readings stream (bridge_readings_fetch) against common.reading(): the same awkward and generated payloads decode the same way, chunks cover the stream, an empty range or a missing or pruned stream is reported, and archiver.py leaves the same rows with either reader (a bare nats-server; the last case needs a local S3)"),
         "walls":         ("none", "the bridge's fixed limits at their edge, in bytes: the longest supported tenant and table publish and build a chain, a tenant over the limit is refused by the database and, as a legacy row, dropped counted and visible in /metrics, /dropped and --diagnose; an error escaping the replication loop ends the process (fault build); SIGTERM ends an idle bridge without an HTTP request (own database, nats-server and bridge)"),
         "tiebreak":      ("client", "equal versions resolved by the tiebreak column"),
         "clamp":         ("client", "future versions clamped"),

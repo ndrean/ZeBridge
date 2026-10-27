@@ -1,8 +1,8 @@
 # ZeBridge — working notes
 
 Accumulated findings, decisions, and open questions. Companion to
-`COPY_BINARY_PLAN.md` (which holds the forward plan); this file holds *why things
-are the way they are* and *what is still undecided*.
+`COPY_BINARY_PLAN.md` (which holds the forward plan); this file holds _why things
+are the way they are_ and _what is still undecided_.
 
 ---
 
@@ -13,7 +13,7 @@ are the way they are* and *what is still undecided*.
 ZeBridge imposes requirements on tables; before preflight existed none were enforced
 at startup, and two failures were silent:
 
-- **No single-column PK** → snapshots fail *late*, at request time, per table
+- **No single-column PK** → snapshots fail _late_, at request time, per table
   (`getTablePrimaryKey` requires `array_length(i.indkey,1) = 1` and returns
   `error.NoPrimaryKey`). CDC still works, so the problem only shows up when a
   client tries to bootstrap.
@@ -27,18 +27,18 @@ these can be deliberate choices.
 
 Severity is discriminated, which matters (mechanism in 3.3):
 
-| table shape | verdict |
-| --- | --- |
-| no PK + DEFAULT/NOTHING | **error** — PostgreSQL rejects UPDATE/DELETE outright |
-| no PK + FULL | warning — writes work (whole row is the identity), snapshots do not |
-| `TRANSITION_RULES` + not FULL | warning — transitions can never fire |
+| table shape                   | verdict                                                             |
+| ----------------------------- | ------------------------------------------------------------------- |
+| no PK + DEFAULT/NOTHING       | **error** — PostgreSQL rejects UPDATE/DELETE outright               |
+| no PK + FULL                  | warning — writes work (whole row is the identity), snapshots do not |
+| `TRANSITION_RULES` + not FULL | warning — transitions can never fire                                |
 
 Verified against deliberately-broken tables: `t_nopk` (error + warning),
 `t_nopk_full` (warning only — FULL rescued writes), and `users` with rules on a
 DEFAULT table. `t_composite` used to warn here; since pagination compares the whole
 key as a row value, a composite key is no longer a finding at all.
 
-The migration is the right place to *make* these decisions (the Elixir emitter
+The migration is the right place to _make_ these decisions (the Elixir emitter
 migration already sets `REPLICA IDENTITY` per table). Preflight is what makes a
 wrong decision visible rather than invisible.
 
@@ -71,7 +71,7 @@ trigger) joins `information_schema.columns` to `pg_attribute` **by name**
 (`a.attname = c.column_name`) and publishes `name`/`type`/`nullable`/
 `has_default`/`required`/`oid`/`typtype` — never `attnum`. But `attnum` is
 exactly what survives a rename: Postgres renames a column by updating
-`pg_attribute.attname` alone, never `attnum` — which is *why* the rename is
+`pg_attribute.attname` alone, never `attnum` — which is _why_ the rename is
 metadata-only in the first place. Add `'attnum', a.attnum` to that same
 `jsonb_build_object`, and a rename becomes a plain diff — same `attnum`,
 different `name`, between this `zebridge_ddl_events` row and the table's
@@ -89,7 +89,7 @@ this properly once that exists.
 **Built 2026-08-24, exactly as sketched above.** Three pieces, one per layer:
 
 - **Trigger** (`init.core.template.sql`): the columns capture gains `'attnum',
-  a.attnum` (bridge-facing, like `oid`/`typtype` — never forwarded to clients).
+a.attnum` (bridge-facing, like `oid`/`typtype` — never forwarded to clients).
   Where `last_def` is already in hand for the dedup check, a
   `jsonb_to_recordset` self-join on attnum with differing names produces
   `'renamed': {"new_name": "old_name"}`, merged into `schema_def`. The dedup
@@ -101,7 +101,7 @@ this properly once that exists.
 - **Bridge** (`event_processor.zig`): `renamed` passes through at the payload
   root, next to `table` (PROTOCOL.md, schema payload). Boot schemas never carry
   it; absent means nothing renamed.
-- **Client** (`App.tsx` `applySchema`): the add/drop diff is computed *as if*
+- **Client** (`App.tsx` `applySchema`): the add/drop diff is computed _as if_
   the renames had already happened, and the honoured pairs (old name present
   locally, new name not) run as `ALTER TABLE … RENAME COLUMN` — after the view
   drop (§1.17), before the add/drop loops and the copy-based fallback, both of
@@ -113,12 +113,12 @@ the next one produced `{"name": "full_name"}` in `zebridge_ddl_events`, the KV
 payload carried `"renamed":{"name":"full_name"}` at the root, and the client
 logged `~[full_name→name] via ALTER (rows preserved)` with no error. Value
 survival is SQLite's own RENAME COLUMN guarantee once that path is taken; what
-the hint changes is *which* path is taken.
+the hint changes is _which_ path is taken.
 
 ### 1.3 CLOSED — RING_BUFFER_COUNT settled at 32768
 
 The original rationale (in `config.zig`) was: 32768 slots ≈ 1092 ms at 30K events/s,
-which *covered* one NATS reconnect interval when that was 1000 ms. Reconciling the
+which _covered_ one NATS reconnect interval when that was 1000 ms. Reconciling the
 hardcoded 2000 ms into config broke that invariant — the buffer now covers about half
 a reconnect.
 
@@ -127,7 +127,7 @@ never dropped. Restoring the old property would mean `RING_BUFFER_COUNT=131072`
 (≈2184 ms), doubling memory.
 
 **Settled: leave it at 32768.** Metrics show PG reconnects dominate and NATS
-reconnects are rare — and on a *Postgres* loss the producer stops, so the ring
+reconnects are rare — and on a _Postgres_ loss the producer stops, so the ring
 **drains** rather than fills; ring size does nothing for that failure mode, the
 slot and WAL retention cover it. So the sizing only ever mattered for the rarer
 failure, and the cost of doubling is real: 65536 × 4096 B (`BASE_BUF=12`) ≈
@@ -145,7 +145,7 @@ tables, a different table set and a different problem).
 **Why it needs pruning at all, confirmed by checking every call site:** nothing in
 the bridge ever `SELECT`s this table. The bridge only ever consumes it by decoding
 its INSERTs off the WAL in real time (`event_processor.zig`), and a reconnecting
-client gets the *current* schema from `$KV.schemas` (last-value KV) — neither path
+client gets the _current_ schema from `$KV.schemas` (last-value KV) — neither path
 touches the table's own rows. Logical decoding replays from the WAL itself on a
 bridge restart too, not by re-reading the table, so a pruned row affects nothing
 functional either way. The table exists only so the DDL event trigger has
@@ -186,14 +186,14 @@ path, §10p; the per-stream gap rule that replaced them is PROTOCOL §6.)
 with `deliver_policy: last > 0 ? StartSequence : All, opt_start_seq: last > 0 ? last
 
 - 1 : undefined`. A client connecting after the fact replays from its own persisted
-`_zebridge_stream_seq`, not just live traffic. The same call runs again on
-reconnect (§1.6a below), so a dropped connection resumes rather than silently
-missing events.
+`\_zebridge_stream_seq`, not just live traffic. The same call runs again on
+  reconnect (§1.6a below), so a dropped connection resumes rather than silently
+  missing events.
 
 Stale-descriptor handling is covered separately (§1.12, "A cached descriptor has
 no expiry of its own"). One gap that check still cannot see: it catches the CDC
 stream aging out from under a descriptor, not a policy change (§2.18's RLS fix)
-that makes the *rows themselves* wrong without moving any LSN — those six
+that makes the _rows themselves_ wrong without moving any LSN — those six
 descriptors had to be purged by hand.
 
 #### 1.6b Reconnect now re-syncs CDC, not just the outbox
@@ -225,7 +225,7 @@ optimistically applied the write.
 
 That is the worst shape of the §1.9 gap (a permanently-rejected write with no
 echo to correct it): suspension drops every CDC event for the table at the
-source, so the optimistic guess would never be confirmed *or* corrected — not
+source, so the optimistic guess would never be confirmed _or_ corrected — not
 until an operator fixes the shape, which could be indefinite, and it would affect
 every write to that table, not one bad payload.
 
@@ -236,15 +236,15 @@ says writes are refused, not just reads frozen.
 **Verified this is table quarantine's only trigger — a bad payload cannot cause
 it.** `refused_tables.refuse()` is called from exactly two places,
 `event_processor.zig` and `snapshot_listener.zig`, both reacting to a table's
-*shape* from the DDL/CDC/snapshot path. `mutation_listener.zig` — the per-write
+_shape_ from the DDL/CDC/snapshot path. `mutation_listener.zig` — the per-write
 path — never calls it. A write PostgreSQL refuses (bad constraint, wrong type, a
 client bug that will fail identically every retry) ends at
 `publishVerdict(..., "rejected", …)` on `mutation_ack.<principal>.<msg_id>`,
 addressed to that one sender only; the table and every other client are
 untouched. The mutation listener's own oversized-payload guard (line ~1205,
 `error.RowTooLargeToReplicate`) is built on exactly this principle and says so in
-its own comment: *"a bad write should cost its sender a verdict, not cost every
-reader a table."* So a client with a deterministic bug in its write path
+its own comment: _"a bad write should cost its sender a verdict, not cost every
+reader a table."_ So a client with a deterministic bug in its write path
 penalizes only itself — other, correct clients keep writing to the same table
 without disruption.
 
@@ -252,8 +252,8 @@ without disruption.
 
 - **`cdc_events_published` undercounts — resolved sideways (2026-08-24).** The counter
   increments only in the row-event branches, so DDL/SCHEMA publishes were invisible.
-  Folding them in was the wrong fix: that counter's value is *trusted to equal row
-  events delivered* — the README burst method and `speed.py` both poll it for exact row
+  Folding them in was the wrong fix: that counter's value is _trusted to equal row
+  events delivered_ — the README burst method and `speed.py` both poll it for exact row
   counts, and rare schema traffic mixed in would skew exactly those measurements. So
   schema publishes now have their own counter, `bridge_schema_events_published_total`
   (DDL schemas, suspensions, drop tombstones), incremented at the same
@@ -302,10 +302,12 @@ second gap rule (a sequence jump on a filtered tail is not a gap). The owner cal
 forgotten point on 2026-10-01; the README describes the two built shapes only.
 
 ### 1.10 OPEN — `brew install zebridge`, `apt install zebridge` (2026-10-04)
+
 Today a server is set up from binaries built on a Mac (deploy/build-linux.sh) and copied,
 or by the Ansible playbook (deploy/ansible); a developer builds libzb from source. The
 owner wants the usual one-line installs, which also answer "Zig is < 1.0": nobody who
 installs a package ever meets the compiler.
+
 - **apt:** a `zebridge` .deb per architecture (amd64, arm64): `bridge` and
   `bridge_sweeper` in /usr/bin, `Depends: libpq5 (>= 14), libzstd1`, the `nats` and
   `zebridge` users, the systemd units, an empty /etc/zebridge — what the playbook's base,
@@ -322,9 +324,11 @@ installs a package ever meets the compiler.
   for it. Not proposed publicly yet (DISTRIBUTION.md lists the client artifacts only).
 
 ### 1.11 OPEN — one client core, or two (2026-10-04)
+
 Today two cores, pinned identical by the fixtures (39 groups): libzb (Zig, C ABI: Python,
 Kotlin, Dart, Swift, React Native's native module) and zb-client-ts (TypeScript: the
 browser, Node, React Native's JS). The owner is not settled:
+
 - **Keep zb-client-ts.** Stable against Zig's churn (a Zig release cannot break the
   browser client) — but double work on every protocol change (the fixtures catch drift,
   not effort), and slower where it matters: seeding the large table (3 M rows, 1 GB)
@@ -337,11 +341,11 @@ browser, Node, React Native's JS). The owner is not settled:
   plans, merges, versions — what the fixtures pin) as WebAssembly inside zb-client-ts,
   the I/O staying TypeScript. Removes the second implementation of the rules without
   porting the I/O; first measure the cost of a WASM call in the per-event CDC path.
-Packaging (§1.10, client side) waits for this.
+  Packaging (§1.10, client side) waits for this.
 
 ## 2. Bugs found — with the mechanism, so they are not reintroduced
 
-### 2.1 Heterogeneous batches published under one subject  ← worst of the session
+### 2.1 Heterogeneous batches published under one subject ← worst of the session
 
 `batch_publisher.zig` built the subject from **the first event in the batch**:
 
@@ -377,16 +381,16 @@ contained exactly 2 INSERTs and no DELETE; `cdc.users.delete` carried
 `{"id":1, name:null, …}` — PK populated, everything else null, as
 `REPLICA IDENTITY DEFAULT` dictates.
 
-*Method note:* checking `nats stream subjects` alone was **not** sufficient — that
+_Method note:_ checking `nats stream subjects` alone was **not** sufficient — that
 reads the subject index (names and counts), not payloads. The bug was only truly
 confirmed by base64-decoding the message data and walking the msgpack.
 
 ### 2.2 DDL schema was queried at processing time, not captured at the LSN
 
 `packDdlToSlot` opened a Postgres connection and queried `information_schema` when it
-*processed* the event — reading the catalog as of "now", not as of that LSN.
+_processed_ the event — reading the catalog as of "now", not as of that LSN.
 
-Two failure modes: a burst of ALTERs makes every event report the *latest* schema;
+Two failure modes: a burst of ALTERs makes every event report the _latest_ schema;
 and on restart, replaying old WAL reports **today's** schema for a historical event.
 That defeats the exact ordering guarantee the DDL design exists for.
 
@@ -403,7 +407,7 @@ reported 6.
 
 `nats_publisher.zig` built `nats://user:pass@host`, split on `@` to find the host, and
 **discarded the credentials** — never passing them to `JS.CONNECT`. The server
-required auth, so the client hung with no error surfaced. Present in *both* `connect`
+required auth, so the client hung with no error surfaced. Present in _both_ `connect`
 and `reconnect`. Same defect commit `141a00e` fixed in the snapshot listener, never
 applied here. Also stopped logging `nats_url`, which embeds the password (those logs
 ship to Loki).
@@ -440,7 +444,7 @@ Found only because 38 of 51 tests were never running (see 4.1).
 0.15's `getEnvVarOwned()` returned owned memory; 0.16's `getPosix()` **borrows** from
 the environ block, which outlives the process. The call sites were migrated, the
 ownership model was not — the code kept duping and freeing. The tell: NATS vars in the
-*same function* were already assigned directly. Removing the dupes let `parseArgs`
+_same function_ were already assigned directly. Removing the dupes let `parseArgs`
 drop its allocator entirely and deleted `RuntimeConfig.deinit`, along with its
 fragile compare-pointers-against-defaults logic.
 
@@ -488,7 +492,7 @@ for the server.
 ⚠️ **It is not deterministic, which is why it survived several green suite runs.** The
 misalignment only becomes a block once a particular sequence of statement shapes lines up,
 so a short scenario can pass with the connection already in a bad state. That is the
-lesson: a passing write-path scenario says nothing about whether the *connection* is still
+lesson: a passing write-path scenario says nothing about whether the _connection_ is still
 usable afterwards.
 
 Fixed by draining to null after the sync, and by checking `PQexitPipelineMode` — logging
@@ -498,7 +502,7 @@ and a reset is cheaper than a listener that looks alive and accepts nothing.
 Guarded by a soak in `scripts/scenarios/replies.py`: a run of mutations must produce a
 verdict for **every** one, which is what a wedged connection cannot do.
 
-### 2.10 A `u16` column offset silently corrupted wide rows  ← worst failure mode
+### 2.10 A `u16` column offset silently corrupted wide rows ← worst failure mode
 
 `CDCEvent.ColumnView.name_offset` was `u16`, and it indexes into `data_buffer`, whose size
 is `2^BASE_BUF`. At the 16 KB default that is unreachable. At `BASE_BUF=19` the buffer is
@@ -541,24 +545,24 @@ snapshotting the same wide fixture, which has a perfectly good `bigint PRIMARY K
 The registry knew the reason and simply had no getter; `refused_tables.reasonFor()` now
 exposes it, and both the log and the payload carry the real reason plus its `fixHint()`.
 
-### 2.9 One `PQconsumeInput` per message made bursts quadratic  ← biggest win
+### 2.9 One `PQconsumeInput` per message made bursts quadratic ← biggest win
 
 `receiveMessage` called `PQconsumeInput` before **every** `PQgetCopyData`. That is the
-wrong side of a libpq detail: `PQconsumeInput` → `pqReadData` slides the *unread
-remainder* of `conn->inBuffer` back to the front of the buffer. During a burst that
+wrong side of a libpq detail: `PQconsumeInput` → `pqReadData` slides the _unread
+remainder_ of `conn->inBuffer` back to the front of the buffer. During a burst that
 buffer holds megabytes of WAL, so the memmove cost is proportional to the backlog —
 O(backlog) per message, **O(n²) overall**.
 
 The libpq idiom is the opposite: consume once, then call `PQgetCopyData` repeatedly
 until it returns 0. One `needs_input` flag on the stream implements it.
 
-| same load, same build, only `wal_stream.zig` changed | before | after |
-| --- | --- | --- |
-| `recv_ms` of a 15 000 ms interval | 14 884 (99.2%) | 130 (0.9%) |
-| `proc_ms` (decode + pack) | 112 | 1 191 |
-| `idle` iterations | 0 | 10 790 |
-| throughput | ~1.2k msg/s | 1.44M events in one interval |
-| CPU | 100% of a core | 31% while draining |
+| same load, same build, only `wal_stream.zig` changed | before         | after                        |
+| ---------------------------------------------------- | -------------- | ---------------------------- |
+| `recv_ms` of a 15 000 ms interval                    | 14 884 (99.2%) | 130 (0.9%)                   |
+| `proc_ms` (decode + pack)                            | 112            | 1 191                        |
+| `idle` iterations                                    | 0              | 10 790                       |
+| throughput                                           | ~1.2k msg/s    | 1.44M events in one interval |
+| CPU                                                  | 100% of a core | 31% while draining           |
 
 **Why it survived nine months** (the line dates from 2025-11-28) is the instructive
 part, and all three reasons are about measurement, not code:
@@ -570,7 +574,7 @@ part, and all three reasons are about measurement, not code:
    1000-rows-per-transaction burst made it appear instantly — and self-reinforcing:
    behind → slower → further behind.
 2. **The one "is it backed up?" gauge pointed the wrong way.** `queue_usage_percent`
-   watches the *flush* side; it read 0% precisely **because** the starved main thread
+   watches the _flush_ side; it read 0% precisely **because** the starved main thread
    never filled the queue. The healthiest-looking number was a symptom.
 3. **The WAL loop had no instrumentation at all.** The bug lived in the only path with
    no metric on it, which is not a coincidence: unmeasured code is where bugs last
@@ -611,7 +615,7 @@ removed, readers hold name slices safely). Two writers populate it:
   (`DbAllocatedKey`). The published fact has to be what a client can actually rely
   on, not just what the schema shape permits.
 - **Runtime**: `reportTable`, called from `event_processor.reportEdgeWritability` on a
-  `CREATE TABLE` DDL event, now runs the *same* grant + key-allocation query the boot
+  `CREATE TABLE` DDL event, now runs the _same_ grant + key-allocation query the boot
   path does — it used to hardcode `granted: true` ("no privilege lookup in hand"),
   which would have reported a table as writable that the writer has no grant on. Fixed
   by threading `writer_role` through instead of assuming.
@@ -621,7 +625,7 @@ removed, readers hold name slices safely). Two writers populate it:
 report landed — never guessed either way. `PROTOCOL.md` §3 now documents the field.
 
 ⚠️ **Found live, extending `writable.py` into a drift check against this field**: a
-*suspended* table's payload never went through `appendWriteContract` at all —
+_suspended_ table's payload never went through `appendWriteContract` at all —
 `publishSuspension` (both copies, `event_processor.zig` and `snapshot_listener.zig`)
 builds a smaller, separate payload (`{table, suspended, reason, lsn}`) on a different
 code path, so `writable` was silently absent rather than `false`, even though preflight
@@ -629,7 +633,7 @@ had already concluded `false` for it. Not wrong exactly — the client's `suspen
 (§1.6c) already blocks writes to it independent of `writable` — but a client checking
 `writable` alone, without also checking `suspended`, would have read the missing field
 as "unknown, might be writable." Fixed: both `publishSuspension` copies now hardcode
-`"writable":false` (never read from the registry — a suspended table is *always*
+`"writable":false` (never read from the registry — a suspended table is _always_
 unwritable, regardless of grant, since no CDC event will ever confirm or correct an
 optimistic write to it).
 
@@ -643,7 +647,7 @@ of `{name_len: u8, name_offset: u24, value_tag (u8-backed), value_len: u24}` —
 Both of this section's original claims aged badly, in instructive ways:
 
 - **"A packed struct puts a shift+mask on every column access"** — only when fields
-  straddle byte boundaries. These widths were *chosen* so every field starts at a bit
+  straddle byte boundaries. These widths were _chosen_ so every field starts at a bit
   offset that is a multiple of 8, and access compiles to a load plus at most one
   register shift / hardware bitfield-insert — verified by disassembly (the struct's own
   doc comment). Now enforced by a `comptime` block asserting the 64-bit size and the
@@ -711,12 +715,12 @@ excluded.col`, an unconditional overwrite. Ordering is what makes this correct:
   resume-bookkeeping block). If it did, every later real CDC event for that table
   would compare `< MAX_SAFE_INTEGER` and never apply again.
 - When the real CDC event for that write arrives, its real `lsn` is still `>
-  state.lsn` (untouched by the optimistic write), so it passes the gate normally
+state.lsn` (untouched by the optimistic write), so it passes the gate normally
   and runs the same upsert — overwriting the optimistic guess with whatever
   Postgres actually holds. Accepted-unchanged: a no-op. LWW picked a different
   winner: the guess is silently replaced.
 - The echo is also what clears `pendingWrites` and pops the outbox row (matched
-  on primary key, not on `msg_id` — so *someone else's* echo of the same row
+  on primary key, not on `msg_id` — so _someone else's_ echo of the same row
   correctly clears our entry too, since the row reached an observable state and
   LWW already decided whose write that was).
 
@@ -738,14 +742,14 @@ The two verdicts revert to different truths, not the same one:
 - **`rejected`** — the write never applied, so the correct state is whatever was
   there **before** it. Restore `before` (or delete the row, if `before` is
   null — the write was an INSERT that never happened).
-- **`row_deleted`** — the row is *confirmed gone* server-side. Restoring
+- **`row_deleted`** — the row is _confirmed gone_ server-side. Restoring
   `before` would resurrect data that no longer exists anywhere; the only correct
   local state is "no row", regardless of what `before` says.
 
 ⚠️ **Guarded, not unconditional.** Something can touch the row between the
 optimistic apply and the verdict arriving — a real CDC event from another
 client, or a second optimistic write from this same client (a double-click).
-Reverting blind would clobber state that is *more* correct than what's about to
+Reverting blind would clobber state that is _more_ correct than what's about to
 be written. So the revert only fires if the row still shows exactly what this
 write's own optimistic apply produced (compared against the outbox's stored
 `payload`, not re-derived); otherwise it just drops the outbox entry and leaves
@@ -771,8 +775,8 @@ Writes are authorized by the DBA's grants and RLS, and the bridge enforces nothi
 a write is a statement and the DBA's rules apply to statements. Reads have no equivalent:
 every client subscribed to `cdc.>` receives every published table's changes.
 
-That asymmetry is the same property seen from two sides. The write path is safe *because*
-it goes through the database; the read path is unscoped *because* it does not. Two PostgreSQL features look like the answer and each rules the other out.
+That asymmetry is the same property seen from two sides. The write path is safe _because_
+it goes through the database; the read path is unscoped _because_ it does not. Two PostgreSQL features look like the answer and each rules the other out.
 
 **RLS is not one of them.** It is evaluated against `current_user` at query time, and
 logical decoding has no query and no user. Measured: a table with `USING (owner='alice')`
@@ -780,7 +784,7 @@ returned **1 row** to a `SELECT` by `bridge_reader` and emitted **2 INSERT recor
 WAL, bob's included. So RLS filters the snapshot and is bypassed by CDC — the two paths
 describe different tables, and the snapshot is the one that obeys.
 
-What pgoutput *does* honour is the publication's **column list** and **row filter**. Both
+What pgoutput _does_ honour is the publication's **column list** and **row filter**. Both
 are DBA-authored, both live in the database, and the snapshot path now applies them too
 (`getTableColumns` reads `prattrs`; the chunk loop ANDs in `pg_get_expr(prqual, prrelid)`).
 Before that the snapshot shipped rows the change feed would never mention again — no
@@ -789,29 +793,29 @@ update, no delete, no tombstone — so they sat in the replica permanently, unco
 ⚠️ **But the two filters exclude each other on any table that is written to**, and
 PostgreSQL enforces it at the source rather than leaving the bridge to cope:
 
-| configuration | UPDATE / DELETE |
-| --- | --- |
-| RI `DEFAULT` + row filter on a non-key column | **refused** — *"Column used in the publication WHERE expression is not part of the replica identity"* |
-| RI `FULL` + column list omitting any column | **refused** — *"Column list used by the publication does not cover the replica identity"* |
-| RI `FULL` + row filter, no column list | permitted |
+| configuration                                 | UPDATE / DELETE                                                                                       |
+| --------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| RI `DEFAULT` + row filter on a non-key column | **refused** — _"Column used in the publication WHERE expression is not part of the replica identity"_ |
+| RI `FULL` + column list omitting any column   | **refused** — _"Column list used by the publication does not cover the replica identity"_             |
+| RI `FULL` + row filter, no column list        | permitted                                                                                             |
 
 So hiding a column forces `DEFAULT`, which restricts row filters to key columns; filtering
 by an owner column forces `FULL`, which forbids hiding anything. And the failure is loud in
-the worst way — adding a publication filter can stop the *application's* own writes, not
+the worst way — adding a publication filter can stop the _application's_ own writes, not
 merely the bridge's.
 
 #### ✅ Unless the tenant column is part of the key — then all of it works
 
-The exclusion above is a consequence of the filter column sitting *outside* the replica
+The exclusion above is a consequence of the filter column sitting _outside_ the replica
 identity. Put it inside and every constraint dissolves at once. Measured, with
 `PRIMARY KEY (tenant_id, uid)` and RI `DEFAULT`:
 
-| | result |
-| --- | --- |
-| `WHERE (tenant_id = 'a')` on the publication | UPDATE and DELETE **permitted** — the column is in the replica identity |
-| column list `(tenant_id, uid, note)`, omitting `secret` | **accepted** — it covers the replica identity |
-| DELETE payload | **carries `tenant_id`** — it carries the key, so the delete is routable |
-| moving a row between tenants | a **key change**, so CDC emits `old.tenant_id` as well |
+|                                                         | result                                                                  |
+| ------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `WHERE (tenant_id = 'a')` on the publication            | UPDATE and DELETE **permitted** — the column is in the replica identity |
+| column list `(tenant_id, uid, note)`, omitting `secret` | **accepted** — it covers the replica identity                           |
+| DELETE payload                                          | **carries `tenant_id`** — it carries the key, so the delete is routable |
+| moving a row between tenants                            | a **key change**, so CDC emits `old.tenant_id` as well                  |
 
 That last row matters more than it looks: the "row leaves the bucket" case — where one WAL
 record has to become a removal for the old owner and an insert for the new — needs the old
@@ -850,7 +854,7 @@ Two ways to use it, and they trade differently:
   pass through the bridge, so isolation is the bridge's correctness rather than the
   database's.
 
-The second scales; the first is defence in depth. They compose: filter per tenant *and*
+The second scales; the first is defence in depth. They compose: filter per tenant _and_
 tag the subject, if the tenant count stays small enough to afford the slots.
 
 `FULL` also has a standing cost: every UPDATE and DELETE writes the entire old row to WAL,
@@ -860,17 +864,17 @@ and every CDC event carries `old.*` for every column, which is per-event buffer 
 **Why `FULL` is nonetheless the only basis for per-row routing.** Under `DEFAULT` the
 bridge cannot evaluate an ownership rule on the events that matter:
 
-| event | payload under `DEFAULT` | can the bridge route it? |
-| --- | --- | --- |
-| INSERT | full new tuple | yes |
-| UPDATE, key unchanged | new tuple only | new owner yes; **old owner unknown** |
-| UPDATE, key changed | new tuple + old key | same, plus the old key |
-| DELETE | **old key only** | **no** — zero owner attributes |
+| event                 | payload under `DEFAULT` | can the bridge route it?             |
+| --------------------- | ----------------------- | ------------------------------------ |
+| INSERT                | full new tuple          | yes                                  |
+| UPDATE, key unchanged | new tuple only          | new owner yes; **old owner unknown** |
+| UPDATE, key changed   | new tuple + old key     | same, plus the old key               |
+| DELETE                | **old key only**        | **no** — zero owner attributes       |
 
 A delete carries no tenant column at all, so it cannot be addressed to the principal who
 held the row. `FULL` supplies the old tuple and closes both gaps.
 
-⚠️ Even then, an UPDATE that *moves* a row between owners needs the bridge to emit two
+⚠️ Even then, an UPDATE that _moves_ a row between owners needs the bridge to emit two
 events — a removal to the old owner, an insert to the new — because one WAL record has to
 become two subjects. Nothing in PostgreSQL does that; it is bridge work, and it is the
 same "row leaves the bucket" problem PowerSync solves with bucket membership.
@@ -882,25 +886,25 @@ tenants**, with no principal to resolve — so every RLS-protected table snapsho
 rows** while CDC ships everything. The reader therefore has to be exempted somehow, and the
 two ways are not equivalent:
 
-| | `shop` (should replicate) | `payroll` (should never be read) |
-| --- | --- | --- |
-| `ALTER ROLE bridge_reader BYPASSRLS` | 2 rows ✓ | **1 row ✗** |
-| `CREATE POLICY reader_all ON shop FOR SELECT TO bridge_reader USING (true)` | 2 rows ✓ | **0 rows ✓** |
+|                                                                             | `shop` (should replicate) | `payroll` (should never be read) |
+| --------------------------------------------------------------------------- | ------------------------- | -------------------------------- |
+| `ALTER ROLE bridge_reader BYPASSRLS`                                        | 2 rows ✓                  | **1 row ✗**                      |
+| `CREATE POLICY reader_all ON shop FOR SELECT TO bridge_reader USING (true)` | 2 rows ✓                  | **0 rows ✓**                     |
 
-`BYPASSRLS` is a *role attribute*: it applies to every table in the database. Combined with
+`BYPASSRLS` is a _role attribute_: it applies to every table in the database. Combined with
 the blanket `GRANT SELECT ON ALL TABLES IN SCHEMA public` this file already issues — plus
 the matching `ALTER DEFAULT PRIVILEGES` — it means the bridge process can read every table
 that exists or ever will. A per-table permissive policy is the same capability scoped to
 the tables actually replicated, and it **fails closed** for anything nobody considered.
 
-⚠️ Either way the reader ends up able to see every *row* of the tables it replicates, so
+⚠️ Either way the reader ends up able to see every _row_ of the tables it replicates, so
 read confidentiality becomes the bridge's correctness (does the snapshot apply `prqual`?)
 rather than the database's. The write path keeps the opposite property: `bridge_writer`
 must never hold `BYPASSRLS`, and with RLS in place a fully compromised bridge still cannot
 write outside a principal's tenant. **A bridge bug can leak reads; it cannot forge writes.**
 
 ⚠️ And RLS guards only the snapshot door. A table accidentally added to the publication is
-shipped by pgoutput whatever its policies say — *not publishing it* is the only control
+shipped by pgoutput whatever its policies say — _not publishing it_ is the only control
 that reaches CDC.
 
 #### The subject invariant: `<stream>.<identity>.<everything that varies>`
@@ -915,28 +919,28 @@ PROTOCOL.md is therefore safe, and opaque tenant ids buy no security.
 
 The reason is that **grants stay stable under schema change**. One grant, `cdc.acme.>`,
 covers every table, every operation, and every suffix — including ones that do not exist
-yet. Measured the hard way: with the identity *last*, batching appended `.batch`
+yet. Measured the hard way: with the identity _last_, batching appended `.batch`
 (`batch_publisher.zig`) and turned `cdc.orders.insert.acme` into
 `cdc.orders.insert.acme.batch`, which no tenant grant matched. A tenant's rows arrived
 under light load and stopped under heavy load — a leak-adjacent bug whose trigger is
-*volume*. Identity-first absorbed the new suffix with no permission change.
+_volume_. Identity-first absorbed the new suffix with no permission change.
 
 So the property is: **adding a table, an operation or a suffix can never widen or break a
 grant.** That is what makes it a safety guard rather than a naming convention.
 
 Where the invariant holds today — 3 of 9:
 
-| pattern | identity-first |
-| --- | --- |
-| `cdc.<tenant>.<table>.<op>` (when TENANT_RULES is set) | ✅ tenant |
-| `mutation.<principal>.<table>.<operation>` | ✅ principal |
-| `mutation_ack.<principal>.<msg_id>` | ✅ principal |
-| `cdc.<table>.<op>` (unscoped) | ❌ no identity at all |
-| `mutation_error.<table>` | ❌ keyed by table |
-| `init.snap.<table>.<snapshot_id>.<chunk>` | ❌ keyed by table |
-| `snapshot.request.<table>` | ❌ no identity |
-| `$KV.schemas.<table>` | ❌ every client reads every table's columns |
-| `$KV.snapshots.<table>` | ❌ no identity |
+| pattern                                                | identity-first                              |
+| ------------------------------------------------------ | ------------------------------------------- |
+| `cdc.<tenant>.<table>.<op>` (when TENANT_RULES is set) | ✅ tenant                                   |
+| `mutation.<principal>.<table>.<operation>`             | ✅ principal                                |
+| `mutation_ack.<principal>.<msg_id>`                    | ✅ principal                                |
+| `cdc.<table>.<op>` (unscoped)                          | ❌ no identity at all                       |
+| `mutation_error.<table>`                               | ❌ keyed by table                           |
+| `init.snap.<table>.<snapshot_id>.<chunk>`              | ❌ keyed by table                           |
+| `snapshot.request.<table>`                             | ❌ no identity                              |
+| `$KV.schemas.<table>`                                  | ❌ every client reads every table's columns |
+| `$KV.snapshots.<table>`                                | ❌ no identity                              |
 
 The snapshot rows are what increment 2 must change: `init.snap.<tenant>.<table>.…` and
 `snapshot.request.<principal>.<table>`.
@@ -944,8 +948,8 @@ The snapshot rows are what increment 2 must change: `init.snap.<tenant>.<table>.
 **What the invariant does not cover**, and should not be claimed to:
 
 - **A stolen credential.** Full access to that identity; subject shape is irrelevant. This
-  is JWT's job — not obscurity, but *binding* (a scoped signing key derives the grant from
-  the identity with `{{name()}}`, so the two cannot drift apart) and *expiry* (a leak has a
+  is JWT's job — not obscurity, but _binding_ (a scoped signing key derives the grant from
+  the identity with `{{name()}}`, so the two cannot drift apart) and _expiry_ (a leak has a
   bounded window).
 - **A publisher bug.** NATS enforces who may subscribe; nothing verifies that the bridge
   tagged a row with the right tenant. That is model B's residual risk and no grammar closes
@@ -956,20 +960,20 @@ The snapshot rows are what increment 2 must change: `init.snap.<tenant>.<table>.
 
 A tenant-scoped read path means one snapshot per (table, tenant) rather than per table.
 That sounds like N× the work and mostly is not: each row belongs to exactly one tenant, so
-the N snapshots *partition* the table — summed, they carry one snapshot's worth of rows.
+the N snapshots _partition_ the table — summed, they carry one snapshot's worth of rows.
 It is also demand-driven, so N is the number of tenants that actually connect.
 
 ⚠️ **The I/O, though, depends entirely on physical layout.** Measured on 200k rows across
 20 tenants, 6,250 blocks total:
 
-| | heap blocks read for one tenant |
-| --- | --- |
-| rows interleaved (the natural insert order) | **6,250** — the whole table |
-| after `CLUSTER t USING t_zb_ri` | **313** — its own 1/20th |
+|                                             | heap blocks read for one tenant |
+| ------------------------------------------- | ------------------------------- |
+| rows interleaved (the natural insert order) | **6,250** — the whole table     |
+| after `CLUSTER t USING t_zb_ri`             | **313** — its own 1/20th        |
 
 Unclustered, every tenant's snapshot scans nearly the entire heap, so N tenants really do
 cost N full scans. Clustered on the tenant-leading index, the N snapshots together cost
-about *one* scan — which is what a single shared snapshot would have cost anyway.
+about _one_ scan — which is what a single shared snapshot would have cost anyway.
 
 The index required for the replica identity (`(tenant_id, <pk>)`) is exactly the right
 cluster key, so it is one more line in the same migration. ⚠️ `CLUSTER` takes an
@@ -992,23 +996,23 @@ That path requires `REPLICA IDENTITY FULL` on any table it applies to.
 
 ### 1.12 Snapshot reach must equal subscribe reach — the tenant axis is half-built
 
-§1.8 answers "what can the *publication* filter". This is the other half: what each
+§1.8 answers "what can the _publication_ filter". This is the other half: what each
 **transport path** can be restricted to, and where they disagree.
 
 The rule worth adopting: **a client must not be able to dump what it cannot subscribe to.**
 A snapshot obtainable for a feed you have no grant on is not a convenience, it is the CDC
 authorization bypassed with extra steps.
 
-| axis | discloses | CDC path | snapshot path |
-| --- | --- | --- | --- |
-| schema | the *shape* of a table | `$KV.schemas.>` — wholesale | same bucket, same grant |
-| table | that rows exist, and their content | grant `cdc.*.<t>.>` instead of `cdc.>` | grant `init.snap.<t>.>` + `snapshot.request.<t>` |
-| column | which columns | publication column list (§1.8) | same list — `snapshot_listener.zig:470` |
-| row / tenant | which rows | tenant is a **subject token**: `cdc.<tenant>.>` | ✅ **built and measured** — see "The design, in three parts" below |
+| axis         | discloses                          | CDC path                                        | snapshot path                                                      |
+| ------------ | ---------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------ |
+| schema       | the _shape_ of a table             | `$KV.schemas.>` — wholesale                     | same bucket, same grant                                            |
+| table        | that rows exist, and their content | grant `cdc.*.<t>.>` instead of `cdc.>`          | grant `init.snap.<t>.>` + `snapshot.request.<t>`                   |
+| column       | which columns                      | publication column list (§1.8)                  | same list — `snapshot_listener.zig:470`                            |
+| row / tenant | which rows                         | tenant is a **subject token**: `cdc.<tenant>.>` | ✅ **built and measured** — see "The design, in three parts" below |
 
 Two of these are already solved and simply unused. **Column** scoping works on both paths
 through the publication column list. **Table** scoping is expressible on both paths today —
-every subject carries the table — and is a *configuration* gap, not an architecture one:
+every subject carries the table — and is a _configuration_ gap, not an architecture one:
 the shipped conf grants `cdc.>`, `init.>` and `snapshot.request.>` wholesale. Tightening it
 is a conf edit and no code, and the invariant above is what makes it checkable: for every
 table, the `init.snap.<t>.>` grant must match the `cdc.*.<t>.>` grant.
@@ -1034,10 +1038,10 @@ denied both `INIT_ACME`'s stream info and `$KV.snapshots.acme.test_types`'s desc
 The cleanest statement of L2. Note the last column: it is the one that decides how much
 discipline the deployment needs.
 
-| | CDC | SNAP | coherence |
-| --- | --- | --- | --- |
-| **T2L2-single** | PG — publication row filter | PG — the same filter, read back via `pg_get_expr(prqual)` | **structural**: one predicate serves both paths, so they cannot disagree |
-| **T2L2-multi** | bridge routes by subject + NATS grants | PG — RLS via `zb.tenant`, taken from that same subject | **structural**, once one token drives both: the tenant is granted by NATS, routed on, and filtered by — see part 2 |
+|                 | CDC                                    | SNAP                                                      | coherence                                                                                                          |
+| --------------- | -------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| **T2L2-single** | PG — publication row filter            | PG — the same filter, read back via `pg_get_expr(prqual)` | **structural**: one predicate serves both paths, so they cannot disagree                                           |
+| **T2L2-multi**  | bridge routes by subject + NATS grants | PG — RLS via `zb.tenant`, taken from that same subject    | **structural**, once one token drives both: the tenant is granted by NATS, routed on, and filtered by — see part 2 |
 
 ⚠️ In the multi shape PostgreSQL enforces **nothing** on the CDC path — the WAL carries every
 tenant's rows and the split happens in the subject. The snapshot path is still a Postgres
@@ -1058,7 +1062,7 @@ the **audience**. Doing only the first gives correctly-filtered dumps published 
 wrong tenant can read them. The third makes the client's own tenant authoritative instead of
 guessed.
 
-1. **Contents — in PostgreSQL, not in the bridge.** ✅ BUILT. The snapshot opens its *own*
+1. **Contents — in PostgreSQL, not in the bridge.** ✅ BUILT. The snapshot opens its _own_
    connection (`snapshot_listener.zig`, `generateIncrementalSnapshot`), separate from
    replication. `zb.tenant` is set on it from the authenticated request subject — the same
    `set_config(…, is_local => true)` the mutation listener already uses for `zb.principal` —
@@ -1074,9 +1078,9 @@ guessed.
    subject instead. The bridge builds no predicate — it relays a token and PostgreSQL decides
    the rows.
 
-   ⚠️ **`zb.tenant`, not `zb.principal` resolved through `zebridge_user_tenants`.** Both would filter correctly in isolation, but only one cannot disagree with the subject the chunks are published on — see part 2. Resolving the principal through the mapping table is a *second* derivation of the tenant, and two derivations of one fact eventually differ. The read path therefore never touches `zebridge_user_tenants`; that table is the write path's.
+   ⚠️ **`zb.tenant`, not `zb.principal` resolved through `zebridge_user_tenants`.** Both would filter correctly in isolation, but only one cannot disagree with the subject the chunks are published on — see part 2. Resolving the principal through the mapping table is a _second_ derivation of the tenant, and two derivations of one fact eventually differ. The read path therefore never touches `zebridge_user_tenants`; that table is the write path's.
 
-   ⚠️ This does **not** touch `zb_reader_all USING (true)`. That policy exists so the *replication* connection sees every tenant; a change feed bounded by RLS goes silently incomplete rather than correctly partitioned. Different connection, different policy.
+   ⚠️ This does **not** touch `zb_reader_all USING (true)`. That policy exists so the _replication_ connection sees every tenant; a change feed bounded by RLS goes silently incomplete rather than correctly partitioned. Different connection, different policy.
 
    ⚠️ If `zb.tenant` is unset the predicate is NULL and **every** row is excluded — the same fail-closed shape the write path has, where a missing `zb.principal` refuses every write.
    Silent emptiness is the correct failure here, but it looks exactly like an empty table, so it needs to be distinguishable in the descriptor (see the closed filter-vs-refuse question).
@@ -1090,18 +1094,18 @@ guessed.
        cdc.<tenant>.>                           grant: cdc.acme.>      (already exists)
 ```
 
-   ⚠️ **The tenant in the subject is granted, not asserted.** A client cannot name a tenant it does not hold, because NATS refuses the subject — the same thing that makes `mutation.<principal>.…` trustworthy. This is why it is safe to route on it.
+⚠️ **The tenant in the subject is granted, not asserted.** A client cannot name a tenant it does not hold, because NATS refuses the subject — the same thing that makes `mutation.<principal>.…` trustworthy. This is why it is safe to route on it.
 
-   ⚠️ **The predicate uses the SAME token.** The bridge sets `zb.tenant` from the authenticated subject and the read policy filters on `current_setting('zb.tenant')` — *not* on `zb.principal` resolved through `zebridge_user_tenants`. That distinction is the whole design. Two derivations of one fact can disagree: subject says `acme`, mapping says `globex`, and globex rows are published on acme's subject. One token cannot disagree with itself, so the coherence is **structural** rather than conventional — the property that
-   made the single-tenant shape safe, obtained here without a bridge per tenant.
+⚠️ **The predicate uses the SAME token.** The bridge sets `zb.tenant` from the authenticated subject and the read policy filters on `current_setting('zb.tenant')` — _not_ on `zb.principal` resolved through `zebridge_user_tenants`. That distinction is the whole design. Two derivations of one fact can disagree: subject says `acme`, mapping says `globex`, and globex rows are published on acme's subject. One token cannot disagree with itself, so the coherence is **structural** rather than conventional — the property that
+made the single-tenant shape safe, obtained here without a bridge per tenant.
 
-   ⚠️ **The descriptor must be keyed too, not just the chunks.** `$KV.snapshots` is `max_msgs_per_subject=1`; keyed by table alone the second requester's descriptor overwrites the first's and a client resolves someone else's `snapshot_id` and `lsn`.
+⚠️ **The descriptor must be keyed too, not just the chunks.** `$KV.snapshots` is `max_msgs_per_subject=1`; keyed by table alone the second requester's descriptor overwrites the first's and a client resolves someone else's `snapshot_id` and `lsn`.
 
-   Chosen over principal-keyed (`init.snap.<principal>.…`) because dumps are **shared across a tenant's principals**. Principal-keyed makes the serialized snapshot worker run once per principal per table — a connection storm every time a fleet restarts — for no correctness gain once N-1 removes the ambiguity argument. The read path needs no mapping lookup either way; `zebridge_user_tenants` is left to the write path.
+Chosen over principal-keyed (`init.snap.<principal>.…`) because dumps are **shared across a tenant's principals**. Principal-keyed makes the serialized snapshot worker run once per principal per table — a connection storm every time a fleet restarts — for no correctness gain once N-1 removes the ambiguity argument. The read path needs no mapping lookup either way; `zebridge_user_tenants` is left to the write path.
 
-   Residual drift, for `zbctl check` rather than for the design: the NATS conf defines read scope and `zebridge_user_tenants` defines write scope, and under N-1 they should name the
-   same tenant. A disagreement gives a principal inconsistent read/write reach — worth catching, but **not** a cross-tenant leak, because reads are filtered by the token they
-   are routed by.
+Residual drift, for `zbctl check` rather than for the design: the NATS conf defines read scope and `zebridge_user_tenants` defines write scope, and under N-1 they should name the
+same tenant. A disagreement gives a principal inconsistent read/write reach — worth catching, but **not** a cross-tenant leak, because reads are filtered by the token they
+are routed by.
 
 1. **Identity — a `tenants` bucket, so the client stops guessing.** `$KV.tenants.<principal>`
    → the tenant, published by a trigger on `zebridge_user_tenants` and propagated exactly as
@@ -1130,7 +1134,7 @@ guessed.
    one — first checked against the wrong client.** The `nats` Go CLI (`nats kv get`)
    stayed on Direct Get with no fallback, which is what the claim above was based on.
    The actual consumer — `@nats-io/kv`'s `Kvm.open()`, used by `App.tsx` — does not:
-   `Bucket.bind()` (the code path `open()` uses to attach to an *existing* bucket) never
+   `Bucket.bind()` (the code path `open()` uses to attach to an _existing_ bucket) never
    asks the server whether the stream has `allow_direct` set; it trusts whatever
    `opts.allow_direct` was passed and **defaults to `false`** when omitted.
    `resolveTenant()` calling `kvm.open(topology.kv.tenants)` with no options therefore
@@ -1165,7 +1169,7 @@ guessed.
    ⚠️ **Key order is `principal` → `tenant`, not the inverse, and that is a security
    decision rather than a naming one.** `$KV.tenants.<principal>` is an exact key: the grant
    `$KV.tenants.alice` has nothing to wildcard into. Invert it to
-   `$KV.tenants.<tenant>.<principal>` and the *natural* grant becomes `$KV.tenants.acme.>`,
+   `$KV.tenants.<tenant>.<principal>` and the _natural_ grant becomes `$KV.tenants.acme.>`,
    which enumerates every principal in the tenant — a membership roster handed out by
    convenience rather than by decision. Same rule the conf already states for
    `mutation_ack.<principal>.<msg_id>`: an identity token is only a useful grant if
@@ -1186,7 +1190,7 @@ guessed.
    cannot.
 
    ⚠️ It also settles part 2's open question cheaply: if the bridge resolves principal→tenant
-   to build `init.snap.<tenant>.…`, that lookup and this bucket publish the *same fact*. Build
+   to build `init.snap.<tenant>.…`, that lookup and this bucket publish the _same fact_. Build
    the bucket and the routing token is already computed.
 
 #### Cardinality: N-1 for clients, N for infrastructure
@@ -1202,17 +1206,17 @@ rather than a list, `init.snap.<principal>.<table>` is unambiguous, and there ar
 `acme ∪ globex` dumps that silently go stale when one mapping is removed.
 
 ⚠️ **But the schema must stay N-capable, and the exception is not an oversight.**
-`zb_sweeper` is mapped to every tenant it may reap, and that N-ness *is* the audit
+`zb_sweeper` is mapped to every tenant it may reap, and that N-ness _is_ the audit
 mechanism — `zebridge_audit_sweeper()` answers "which tenants will never have their
 tombstones reaped?" by reading exactly those rows. `bridge_sweeper.zig` records that the
 alternative was tried and rejected: a policy exempting principal-less sessions
-(`USING (current_setting('zb.principal', true) IS NULL)`) made *forgetting* to set a
+(`USING (current_setting('zb.principal', true) IS NULL)`) made _forgetting_ to set a
 principal the unsafe default — backwards — and made the sweeper's reach invisible to
 `SELECT * FROM zebridge_user_tenants`. A named principal fails closed on omission (0 rows)
 and stays auditable in the same table as every other writer.
 
 So N-1 is **a checked rule, not a constraint**, and deliberately so: the constraint one
-actually wants — "no *client* principal has more than one tenant" — cannot be expressed as a
+actually wants — "no _client_ principal has more than one tenant" — cannot be expressed as a
 primary key, because a key cannot know which principals are clients and which are
 infrastructure. Making it a `zbctl check` assertion renders it visible instead of implicit.
 
@@ -1234,22 +1238,22 @@ of them sharing. The schema now carries `tenant_column` (the bridge already had 
 `TENANT_RULES` for CDC routing, `EventProcessor.tenant_rules`; it just wasn't told to
 clients), and `App.tsx`'s `effectiveTenantFor(table)` uses it: the client's own tenant for a
 table with a real `tenant_column`, `topology.open_tenant` for one without. Measured live:
-`alice` (acme) and `bob` (globex) ended up with the *identical* `snapshot_id` for `users`
+`alice` (acme) and `bob` (globex) ended up with the _identical_ `snapshot_id` for `users`
 after this fix, and correctly different ones for `test_types` — so the multiplier below is
 now bounded to the tables that genuinely need it, which for most schemas is a small
 fraction.
 
-| stream | limit today | effect |
-| --- | --- | --- |
-| `INIT` | `max_age=604800s`, `max_msgs_per_subject=-1` | chunk bytes × tenants, hard 7-day ceiling |
-| `KV_snapshots` | `max_msgs_per_subject=1`, `max_age=0` | one descriptor per (table, tenant) — stays tiny |
-| `REQUESTS` | `max_msgs_per_subject=1`, `max_age=60s` | window becomes per-principal-per-table |
+| stream         | limit today                                  | effect                                          |
+| -------------- | -------------------------------------------- | ----------------------------------------------- |
+| `INIT`         | `max_age=604800s`, `max_msgs_per_subject=-1` | chunk bytes × tenants, hard 7-day ceiling       |
+| `KV_snapshots` | `max_msgs_per_subject=1`, `max_age=0`        | one descriptor per (table, tenant) — stays tiny |
+| `REQUESTS`     | `max_msgs_per_subject=1`, `max_age=60s`      | window becomes per-principal-per-table          |
 
 Storage is bounded by time and small. The sharper pressure is that **snapshots run one at a
 time**: N tenants means N sequential dumps of the same table, so `SNAP_RET_SECONDS` stops
 being optional — a request queued behind a long snapshot expires unread at 60s.
 
-⚠️ Note the multiplication is a consequence of *filtering at all*, not of where the rule
+⚠️ Note the multiplication is a consequence of _filtering at all_, not of where the rule
 lives. Putting the filter in PostgreSQL keeps the bridge stateless; it does not make the
 dumps shareable again.
 
@@ -1259,21 +1263,22 @@ dumps shareable again.
 cost above no longer exists; chains are built once per cadence and shared.)
 
 - ~~Filtered snapshot or refusal?~~ **CLOSED: filtered.** Not merely because it mirrors CDC,
-  but because the invariant forces it. A client whose *feed* is filtered and whose *dump* is
+  but because the invariant forces it. A client whose _feed_ is filtered and whose _dump_ is
   refused can never bootstrap the rows it is entitled to see, so it holds a permanently
   incomplete replica while receiving updates for rows it does not have — worse than either
   extreme, and undetectable from inside the client.
 
   The auditability objection stands and is answered rather than dismissed: a filtered
-  snapshot *is* indistinguishable from a small table, so make the filtering **visible**. The
+  snapshot _is_ indistinguishable from a small table, so make the filtering **visible**. The
   descriptor already carries `row_count`; it should also record the principal the filter was
   applied for, so "did this client get a subset, and whose?" is answerable from the
   descriptor alone instead of by inference.
+
 - Schema disclosure stays wholesale. Defensible — knowing `orders` has a `price` column is a
   far smaller disclosure than its rows — but it is currently a default, not a decision, and
   it invites targeted probing. What must then be **proved** is not that a probe is denied but
-  that it is denied *definitively and once*: silence means the client retries forever (§7.1),
-  which turns ingress into a treadmill at no cost to the prober, while *repetition* makes the
+  that it is denied _definitively and once_: silence means the client retries forever (§7.1),
+  which turns ingress into a treadmill at no cost to the prober, while _repetition_ makes the
   broker amplify one probe into many. `writable.py` already covers the refusal's **reason**
   (row absent, verdict present, right SQLSTATE); `probe.py` covers its **cardinality** and the
   disclosure premise itself — measured: `alice` reads all 5 columns of `users`, writes to it,
@@ -1282,15 +1287,15 @@ cost above no longer exists; chains are built once per cadence and shared.)
 #### A cached descriptor has no expiry of its own — found live, fixed
 
 A client accepted **any** existing `$KV.snapshots` descriptor unconditionally, however old —
-the only trigger for a fresh generation was *no* descriptor existing at all
+the only trigger for a fresh generation was _no_ descriptor existing at all
 (`App.tsx`'s snapshot-request block: `if (entry) { desc = decode(...) }`, no further check).
 Nothing tied a cached descriptor's validity to whether the relevant CDC stream still covers
 the gap back to its own LSN watermark.
 
 Measured live: `users`' descriptor sat at a stale 1-row watermark while Postgres held 4 rows,
 because a `CDC_PUBLIC` purge (routine dev-environment cleanup — itself safe by the gap-check
-design above, which is exactly what should have caught a client whose *own* `local` seq fell
-off the stream) orphaned a descriptor a *different* client had already cached, with nothing
+design above, which is exactly what should have caught a client whose _own_ `local` seq fell
+off the stream) orphaned a descriptor a _different_ client had already cached, with nothing
 tying the two together. The client had no way to tell the cached watermark could no longer be
 bridged to "now."
 
@@ -1308,7 +1313,7 @@ alone cannot tell them apart. Verified via a deliberate reproduction: purged `CD
 reconnected, and watched all five affected tables correctly log
 `Cached snapshot for <table> is orphaned … requesting a fresh one instead` and regenerate.
 
-This is the same *shape* of problem the Object Store race below is about — a cached read has
+This is the same _shape_ of problem the Object Store race below is about — a cached read has
 to know when it stops being safe to trust — solved here inside the current architecture
 (compare against live stream state) rather than via Object Store's own signals. Worth keeping
 in mind for whoever eventually does that work: the mechanism would need re-deriving, not
@@ -1335,7 +1340,7 @@ ever held. Against that: this is not a small change. It removes `INIT_<TENANT>`/
 `$KV.snapshots`, and four of the five `subjects.snapshot_*_pattern` entries in `topology.json`,
 and touches `snapshot_listener.zig`, every stream-creation script, and `App.tsx`'s replay block
 — roughly the footprint of the INIT split just finished. And crosstenant.py's finding (a
-JetStream consumer's `filter_subject` is reader-chosen, not ACL-checked — the *stream* is the
+JetStream consumer's `filter_subject` is reader-chosen, not ACL-checked — the _stream_ is the
 real boundary) presumably applies to Object Store buckets the same way, which would mean
 per-tenant buckets, not per-tenant keys inside one shared bucket — **unverified** then,
 verified since: `scripts/scenarios/objgrants.py`, and the chains live in `gen-<tenant>`
@@ -1346,7 +1351,7 @@ check whether an exact-key grant on `$O.<bucket>.C.>`/`$O.<bucket>.M.>` scopes t
 **Separately**, a reseed-on-cadence "leaf" (build it up to date, drop the TTL, replay only the
 CDC since the leaf's own cutoff) changes something the current design gets for free: today a
 snapshot is immutable at birth — a new generation gets a new `snapshot_id`, the old one's
-chunks stay valid and complete under their *own* subject until they separately age out, so a
+chunks stay valid and complete under their _own_ subject until they separately age out, so a
 client mid-fetch is never affected by a new generation starting elsewhere. There is no shared
 mutable identity for two writers to race on. A leaf reintroduces exactly that: the object name
 is now reused across every refresh, so a client's `get()` can race a `put()` of the next
@@ -1359,19 +1364,19 @@ run with `put()` fired exactly 0.5 s into the transfer and a 20 s wait after): a
 `nats-py`'s `put()`/`get()` source confirms every `put()` writes its chunks under a brand-new
 nuid-keyed subject and only swaps a single ROLLUP meta message once they're all written; `get()`
 resolves the nuid once, up front, and reads only that nuid's chunks for its whole transfer, so a
-byte published under a different nuid can never reach an in-flight reader. What *does* happen,
+byte published under a different nuid can never reach an in-flight reader. What _does_ happen,
 every single time a `put()` lands while a `get()` is still receiving chunks (20/20, including
 the deliberate 0.5 s-in case): **the in-flight reader hangs forever** — still unresolved 20 s
-after the race, not merely slow. `put()`'s last step purges the *old* nuid's chunks once the new
+after the race, not merely slow. `put()`'s last step purges the _old_ nuid's chunks once the new
 object is fully written; a reader still subscribed to that now-purged subject is left waiting on
 an `OBJ_NO_PENDING` marker that will never arrive, and nothing times it out. The store itself is
 unaffected — a fresh `get()` issued right after a hung one returns the new revision cleanly — so
 this is a per-reader liveness bug, not a data-integrity one. No torn reads is the right guarantee
 to have needed proof of; the hang is the one a leaf design has to plan around, not assume away.
 
-**Also measured**: the hang only afflicts a reader already mid-transfer *before* the swap —
+**Also measured**: the hang only afflicts a reader already mid-transfer _before_ the swap —
 one that instead watches first and only reads after being told a fresh revision exists never
-hits it. `ObjectStore.watch()` is a JetStream consumer on the object's *meta* subject alone
+hits it. `ObjectStore.watch()` is a JetStream consumer on the object's _meta_ subject alone
 (never the chunk data), and that meta message is published exactly once per `put()`, only
 after every chunk is already durably written — an atomic, native "available" signal, not
 something to hand-roll as a separate flag key. 5/5 rounds of watch-then-`get()` (wait for the
@@ -1381,14 +1386,14 @@ machinery either — it is the exact shape `App.tsx` already runs today, `kv.wat
 in `waitForDescriptor` against `$KV.snapshots`, just Object Store providing the same signal one
 level down, on the object itself instead of a separate descriptor.
 
-That narrows the risk rather than removing it: a *watching* reader is still exposed if its own
-read overlaps the *next* refresh after the one it just watched for — now a function of refresh
+That narrows the risk rather than removing it: a _watching_ reader is still exposed if its own
+read overlaps the _next_ refresh after the one it just watched for — now a function of refresh
 cadence versus realistic read duration, not something every read risks. Two ways to close that
 residual gap, and they compose rather than compete. Cheap: keep reading straight off the one
 leaf key, discipline every call site to watch-then-fetch (never hold a `get()` open across an
 unbounded wait), and size the refresh cadence so it's comfortably longer than the slowest
 realistic read. Unconditional: still don't overwrite in place — keep a tiny KV entry per
-tenant/table naming the *current* object key (`snapshots.acme.test_types` →
+tenant/table naming the _current_ object key (`snapshots.acme.test_types` →
 `test_types-gen-042`, mirroring `$KV.snapshots` today), have the refresh job `put()` the new
 generation under a **new** key, and swap the pointer last, itself watchable the same way. A
 reader that resolved the pointer keeps reading an object nothing will ever overwrite, so the
@@ -1411,7 +1416,7 @@ boundary, and "which chunks am I missing" means nothing across generations. The
 partial-last-chunk worry is a symptom of that instability, not a special case to solve.
 
 **Not by on-demand delta either, and the reason is the storm.** A delta query
-(`WHERE version > my_max_version`) is keyed by *client state*, not by (table, tenant).
+(`WHERE version > my_max_version`) is keyed by _client state_, not by (table, tenant).
 The full-snapshot path survives a thousand simultaneous arrivals because they collapse —
 `REQUESTS` is `max_msgs_per_subject=1`, one request enters the window, everyone reuses
 the result (`stampede.py`). A thousand clients each carrying their own `max_version` ask
@@ -1455,7 +1460,7 @@ arbitrarily stale without ever taking a full object.
   with `lsn ≤ cutoff_lsn` (every event carries `lsn`; no stream-seq coordinate is
   needed, and over-replay is free under the guarded upsert anyway).
 - **Delta apply MUST be a version-guarded upsert** (`… DO UPDATE WHERE
-  excluded.version >= current.version`), not the CDC path's arrival-order LWW: a
+excluded.version >= current.version`), not the CDC path's arrival-order LWW: a
   client that tailed CDC past a delta's cutoff and then applies that delta would
   otherwise regress rows to older values. The guard makes overlap in either
   direction free — double-applied deltas are no-ops, CDC-fresher rows survive —
@@ -1463,7 +1468,7 @@ arbitrarily stale without ever taking a full object.
 - **Producer state lives in PG, not read back from NATS**: a restarted bridge must
   know the last cutoff, and "the bridge never reads its own output back" is a
   founding invariant — so `zebridge_generations (tenant, tbl, gen, cutoff_version,
-  cutoff_lsn, built_at)`, append-only, pruned past chain depth k, doubling as the
+cutoff_lsn, built_at)`, append-only, pruned past chain depth k, doubling as the
   audit trail.
 - **Cutoffs need a clock-skew margin**: versions are timestamps writers may supply
   themselves (within the clamp tolerance), so a row committed inside generation N's
@@ -1473,7 +1478,7 @@ arbitrarily stale without ever taking a full object.
   `REPEATABLE READ` transaction so cutoff and content agree.
 - **The table is BUILT and contract-tested (2026-08-24)** —
   `zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn pg_lsn,
-  built_at)` in `init.core.template.sql`, applied live, proven by
+built_at)` in `init.core.template.sql`, applied live, proven by
   `scripts/scenarios/generations.py` (7/7): invisible to clients (internal-listed,
   unpublished, no KV key), the reader runs the full LSN-before-snapshot recipe on
   its **single deliberate write grant** (INSERT+DELETE, no UPDATE — append-only by
@@ -1513,7 +1518,7 @@ arbitrarily stale without ever taking a full object.
   2026-08-24): alice, granted only `OBJ_genacme`-named API subjects, reads her
   bucket byte-for-byte and is refused `genglobex` by the broker
   (`permissions violation for publish to "$JS.API.STREAM.INFO.OBJ_genglobex"`) —
-  the bucket is the boundary, same as CDC_/INIT_. One client-library finding rode
+  the bucket is the boundary, same as CDC*/INIT*. One client-library finding rode
   along: nats-py's `obj.get()` resolves subject→stream via `$JS.API.STREAM.NAMES`
   before subscribing, so a nats-py consumer needs that grant (names-only metadata
   leak) — a client that binds the stream explicitly (nats.zig can) needs no such
@@ -1549,14 +1554,14 @@ arbitrarily stale without ever taking a full object.
 
 - **Milestone 3 BUILT and live-tested (2026-08-24): deltas and the chain.** Every
   generation after the first ships a **delta** — `WHERE version > prev_cutoff −
-  margin`, same predicate as skip-if-unchanged, so a built delta is never empty —
+margin`, same predicate as skip-if-unchanged, so a built delta is never empty —
   and a **full** is built at g1 then refreshed whenever the last one would age out
   of the kept window (`gen − F ≥ depth − 1` keeps the jump-in point always inside
   `gen > N − depth`). Objects: `<tbl>-g<N>-delta` / `<tbl>-g<N>-full`, msgpack
   `{columns, rows, gen, kind, cutoff, prev_cutoff}` — self-describing, bounds
   carried in-band. The KV pointer is now the **chain manifest**, swapped last:
   `{gen, bucket, cutoff_version, cutoff_lsn, full: {gen, object, cutoff},
-  deltas: [{gen, object, prev_cutoff, cutoff}…]}`. The client contract stays
+deltas: [{gen, object, prev_cutoff, cutoff}…]}`. The client contract stays
   watermark-based, never gen numbers: apply, in order, every delta whose cutoff is
   past your watermark, provided the oldest reaches back to it; otherwise full +
   the deltas after it; a 404 mid-walk (pruned under you) means re-read the
@@ -1565,8 +1570,8 @@ arbitrarily stale without ever taking a full object.
   bound names a row that is gone) and `has_full`; template + idempotent ALTERs.
   Prune deletes PG rows first (the authority), then both object names per gen —
   the kind that never existed 404s quietly; a deleted object leaves an ADR-20
-  tombstone (zero-size meta) that `list()` still shows, which is a *client-library
-  listing detail*, not surviving data (the scenario's first FAIL was exactly that
+  tombstone (zero-size meta) that `list()` still shows, which is a _client-library
+  listing detail_, not surviving data (the scenario's first FAIL was exactly that
   misread). The retention check found its home at producer wiring in `bridge.zig`:
   depth × cadence is computed and logged at boot, compared against
   `GC_THRESHOLD_MS` when that is visible in the bridge env, warned loudly when the
@@ -1581,7 +1586,7 @@ arbitrarily stale without ever taking a full object.
 - **Names centralized, grants real (2026-08-24).** The KV bucket and object-bucket
   prefix moved out of `config.Generations` into topology.json
   (`"generations": {"kv": "generations", "bucket_prefix": "gen-"}`) — one file,
-  three readers, parsed in `topology.zig` as an *optional* section (cdc_streams
+  three readers, parsed in `topology.zig` as an _optional_ section (cdc_streams
   style: absent means the defaults, not an error) and injected into the producer at
   wiring. Only pacing (`GENERATION_CADENCE_SECONDS`, `GENERATION_CHAIN_DEPTH`)
   stays in config/env. The manifest KV is now pre-created centrally
@@ -1610,12 +1615,12 @@ arbitrarily stale without ever taking a full object.
   back (`prev_cutoff ≤ watermark`), else full + the deltas after it; a 404
   mid-walk re-reads the manifest once and restarts from ITS full. Rows land
   through a version-GUARDED upsert (`… DO UPDATE SET … WHERE excluded.v >
-  local.v`) — unlike the CDC applier's plain upsert, because delta overlap is
+local.v`) — unlike the CDC applier's plain upsert, because delta overlap is
   deliberate (margin rule) and the guard makes re-delivery free; the guard
   column arrives IN-BAND (`version_column` in manifest and payloads — added
   because the schema descriptor still lacks it, the noted client gap). The full's
   `DELETE FROM` shares the apply transaction. After apply, `state.lsn =
-  cutoff_lsn` (hex `pg_lsn` → number) so the CDC gate skips pre-cutoff events.
+cutoff_lsn` (hex `pg_lsn` → number) so the CDC gate skips pre-cutoff events.
   Object reads use `@nats-io/obj` (added via pnpm — npm's arborist crashes on
   this pnpm layout): `getBlob` rides `STREAM.MSG.GET` + a consumer, both already
   granted; no `STREAM.NAMES` needed, as intended. The main bridge now runs the
@@ -1779,7 +1784,7 @@ Side effects handled: `zebridge_user_tenants` added to the internal list (the
 roster-leak door derivation would have opened — its schema/snapshot egress doors
 remain queued), and `genproducer.py` now owns the only bridge (every enabled
 bridge derives the full set and would race a probe's cadence). Verified live:
-first derived tick, zero errors, manifests exactly {_default.{users, orders,
+first derived tick, zero errors, manifests exactly {\_default.{users, orders,
 counter_public, zebridge_gc_watermark}, acme/globex/dynten.test_types}. ⚠️ Drift
 note: the LIVE database's `zebridge_enable` predates the width-guard and
 generations steps (template has both) — refresh it from the template before the
@@ -1848,7 +1853,7 @@ same schema with ZERO tango rows: isolation by stream, as designed. It forced
 one real CLIENT fix: `cdcStreams`/`initStream`/`cdcStreamForTenant` gated tenant
 streams on topology.json's tenant LIST, silently ignoring runtime-born tenants —
 now they trust `$KV.tenants` as the runtime truth and special-case only the open
-tenant (the list-gate's one legitimate job, avoiding the CDC__DEFAULT ghost).
+tenant (the list-gate's one legitimate job, avoiding the CDC\_\_DEFAULT ghost).
 Two findings + demo-state notes: (1) **JetStream storage reservations**: each
 stream's max-bytes counts against the server cap, so runtime tenant provisioning
 at up.sh sizes was refused ("insufficient storage resources") — INIT_TANGO landed
@@ -1864,13 +1869,13 @@ the winning pattern, six-for-six today: PG functions hold the rules, CDC carries
 the news, the broker gets edited by the bridge, and the file keeps only what
 never moves.
 
-| static surface today | runtime source (successor) | mechanism |
-| --- | --- | --- |
-| ~~GENERATION_RULES~~ | the publication | derived per tick — DONE |
-| ~~topology.tenants (runtime role)~~ | the data (`zebridge_tenants_of`) + `$KV.tenants` | runtime streams (dyntenant), client trusts KV — DONE |
-| ~~`topology.public_tables`~~ | **the catalogue's public rows** (`tenant_col IS NULL`) — `zebridge_public_tables` itself was a projection and is DROPPED | bridge derives untenanted routability from the TABLE, and EDITS `CDC_PUBLIC`'s subject filter itself at runtime when a public table is born — the same move it already makes creating `CDC_<TENANT>`. One migration then does everything: publish, guard, chain, route, stream subject. **Mechanically closes finding (3b)**: a live-born table gains its subject instead of publishing into the void and FATALing. `topology.public_tables` demotes to up.sh's fresh-boot seed, like `tenants` |
+| static surface today                                                            | runtime source (successor)                                                                                                                                                                                      | mechanism                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ~~GENERATION_RULES~~                                                            | the publication                                                                                                                                                                                                 | derived per tick — DONE                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ~~topology.tenants (runtime role)~~                                             | the data (`zebridge_tenants_of`) + `$KV.tenants`                                                                                                                                                                | runtime streams (dyntenant), client trusts KV — DONE                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ~~`topology.public_tables`~~                                                    | **the catalogue's public rows** (`tenant_col IS NULL`) — `zebridge_public_tables` itself was a projection and is DROPPED                                                                                        | bridge derives untenanted routability from the TABLE, and EDITS `CDC_PUBLIC`'s subject filter itself at runtime when a public table is born — the same move it already makes creating `CDC_<TENANT>`. One migration then does everything: publish, guard, chain, route, stream subject. **Mechanically closes finding (3b)**: a live-born table gains its subject instead of publishing into the void and FATALing. `topology.public_tables` demotes to up.sh's fresh-boot seed, like `tenants`                                                                                                                                                   |
 | ~~`SYNC_RULES` / `TENANT_RULES` env~~ (was the last hand-worker reconciliation) | **`zebridge_table_rules`**, written by `zebridge_enable` in the SAME transaction as the guards it already installs with those very columns — the env var is a hand-copied duplicate of a fact the catalog holds | the bridge consumes it through the meta-cache + epoch-invalidation machinery it already has (invalidate.py's plumbing): the mutation listener's per-table meta read gains the rule columns, the sweeper and producer read the table they already query, decode-time tenant_col arrives at relation first-sight/DDL. Both T3 MANUAL rows vanish; "verified before migration" dissolves because rules+guards+publication commit atomically and nothing CAN disagree; env demotes to bootstrap/override with a boot-time disagreement warning during transition. Clients unaffected — the descriptor already carries version_column/tombstone_column |
-| ~~NATS per-principal conf grants~~ (LANDED 2026-08-25) | **operator/JWT with a scoped signing key** | the permission shape is written ONCE on the signing key (`mutation.{{name()}}.>` etc.); every user JWT inherits it at mint time; a new principal or tenant is an auth-server event, not a conf edit + SIGHUP. The nina/tango grant block was the last manual rehearsal of what the signing key automates |
+| ~~NATS per-principal conf grants~~ (LANDED 2026-08-25)                          | **operator/JWT with a scoped signing key**                                                                                                                                                                      | the permission shape is written ONCE on the signing key (`mutation.{{name()}}.>` etc.); every user JWT inherits it at mint time; a new principal or tenant is an auth-server event, not a conf edit + SIGHUP. The nina/tango grant block was the last manual rehearsal of what the signing key automates                                                                                                                                                                                                                                                                                                                                          |
 
 **The JWT cutover (2026-08-25, evening): the endgame table is EMPTY.** Operator
 mode is live on the native stack. `scripts/native/jwt-bootstrap.sh` builds the
@@ -1965,13 +1970,13 @@ client once wedged the whole server that way — plus a receive watchdog and a
 outage). What /enroll uniquely burns is not HTTP threads but PG WRITER
 connections, so the bounds are layered where each resource lives:
 
-| layer | bound | enforced by |
-| --- | --- | --- |
-| enroll concurrency | 4, then 503 | bridge (`enroll_in_flight` permit pool, refuse-fast) |
-| a hung PG dial | 3s | libpq (`connect_timeout=3` on the enroll conninfo) |
-| `bridge_writer` total | **8** | **PG**: `ALTER ROLE … CONNECTION LIMIT` — mutation listener 1 + sweeper 1 + enrolls ≤4 + margin |
-| `bridge_reader` total | **10** | **PG** — producer, snapshot worker, boot bursts; the replication stream rides a walsender slot |
-| everyone | 100 | PG `max_connections` |
+| layer                 | bound       | enforced by                                                                                     |
+| --------------------- | ----------- | ----------------------------------------------------------------------------------------------- |
+| enroll concurrency    | 4, then 503 | bridge (`enroll_in_flight` permit pool, refuse-fast)                                            |
+| a hung PG dial        | 3s          | libpq (`connect_timeout=3` on the enroll conninfo)                                              |
+| `bridge_writer` total | **8**       | **PG**: `ALTER ROLE … CONNECTION LIMIT` — mutation listener 1 + sweeper 1 + enrolls ≤4 + margin |
+| `bridge_reader` total | **10**      | **PG** — producer, snapshot worker, boot bursts; the replication stream rides a walsender slot  |
+| everyone              | 100         | PG `max_connections`                                                                            |
 
 "Match" here means CAP MINUS WHAT WE ALREADY NEED: the bridge may claim at most
 18 of the default 100 BY CONSTRUCTION, leaving 82 for operators, psql and the
@@ -2009,14 +2014,14 @@ until acked-after-apply — a second buffer inside the bridge would double-queue
 the same bytes with worse semantics. Everything else is idempotent and cheap to
 retry from where the "is it still worth it" knowledge lives: the caller.
 
-| ceiling hit | the symptom | who retries | what is never lost |
-| --- | --- | --- | --- |
-| HTTP cap (16) | accept-then-CLOSE: the 17th connection gets no HTTP response at all (coarser than a 503, by design — writing a response would itself cost a slot) | the scraper's own schedule; the browser's fetch error | nothing was in flight |
-| enroll permits (4) | explicit `503 busy — retry shortly` | the human re-clicks / the app backs off | the invite row is untouched — a refused attempt consumes nothing |
-| writer role limit (8) via enroll | libpq `too many connections for role` inside the 3s dial → `503 backend unavailable` | same | same |
-| writer role limit via the mutation listener's reconnect | reconnect refused → its own backoff loop | the bridge retries; meanwhile mutations WAIT in JetStream (unacked → redelivered) and in client outboxes | edge writes — this is the flow the whole design protects |
-| writer limit via the sweeper | one cron run fails to connect | the next systemctl tick | tombstones reaped a cycle later; the watermark stays conservative (older = safe) |
-| cluster max_connections (100), eaten by OTHERS | the bridge's long-lived conns (walsender, listener) HOLD their slots; only reconnects and per-tick conns fail | bridge backoff / next tick | WAL — the replication slot retains it, the same §2.19 guarantee as any reader outage |
+| ceiling hit                                             | the symptom                                                                                                                                       | who retries                                                                                              | what is never lost                                                                   |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| HTTP cap (16)                                           | accept-then-CLOSE: the 17th connection gets no HTTP response at all (coarser than a 503, by design — writing a response would itself cost a slot) | the scraper's own schedule; the browser's fetch error                                                    | nothing was in flight                                                                |
+| enroll permits (4)                                      | explicit `503 busy — retry shortly`                                                                                                               | the human re-clicks / the app backs off                                                                  | the invite row is untouched — a refused attempt consumes nothing                     |
+| writer role limit (8) via enroll                        | libpq `too many connections for role` inside the 3s dial → `503 backend unavailable`                                                              | same                                                                                                     | same                                                                                 |
+| writer role limit via the mutation listener's reconnect | reconnect refused → its own backoff loop                                                                                                          | the bridge retries; meanwhile mutations WAIT in JetStream (unacked → redelivered) and in client outboxes | edge writes — this is the flow the whole design protects                             |
+| writer limit via the sweeper                            | one cron run fails to connect                                                                                                                     | the next systemctl tick                                                                                  | tombstones reaped a cycle later; the watermark stays conservative (older = safe)     |
+| cluster max_connections (100), eaten by OTHERS          | the bridge's long-lived conns (walsender, listener) HOLD their slots; only reconnects and per-tick conns fail                                     | bridge backoff / next tick                                                                               | WAL — the replication slot retains it, the same §2.19 guarantee as any reader outage |
 
 One honest asymmetry, named: the role limits guarantee the bridge cannot starve
 the cluster, NOT that the cluster cannot starve the bridge — a CONNECTION LIMIT
@@ -2028,25 +2033,25 @@ arrives), and everything transient degrades into the retry shapes above.
 daemon is long-running, so the leak that matters is the one that GROWS — and the
 detectors compose because they see different allocators:
 
-  1. **DebugAllocator exit audit** (Zig's world — mmap-backed, invisible to
-     malloc tools): only speaks on paths that terminate, which makes early-exit
-     paths its best witness. A bad-nkey boot found exactly one leak this way —
-     `catalogue.Load`'s publics/tenants lists, allocated "for the life of the
-     process" (a euphemism for never freed). Fixed with `Load.deinit` deferred in
-     main (LIFO order puts it after every thread join that reads the aliased
-     topology slices) plus frees on the loop's partial-failure branches. The
-     repro now exits with ZERO reports — keeping failure exits audit-clean is
-     what keeps this detector trustworthy.
-  2. **macOS `leaks`** (the malloc zones — libpq's world, where a forgotten
-     PQclear is the classic daemon drip): 0 leaks on the live process, every
-     sample.
-  3. **`leaksoak.py`** (drift over time, the recorded policy): two `leaks`+RSS
-     samples around a churn window grinding the REAL verb matrix — three CDC
-     verbs public AND tenant-scoped, refused enrolls every round plus successful
-     mints every 10th (writer CTE + JWT signing + the user_tenants CDC
-     diversion), snapshot-worker requests, mutation-listener round-trips (real
-     msgpack envelopes, applied and verdicted — the counter's `last_writer`
-     said `c-soak` afterwards), one sweeper pass, /metrics + /status renders.
+1. **DebugAllocator exit audit** (Zig's world — mmap-backed, invisible to
+   malloc tools): only speaks on paths that terminate, which makes early-exit
+   paths its best witness. A bad-nkey boot found exactly one leak this way —
+   `catalogue.Load`'s publics/tenants lists, allocated "for the life of the
+   process" (a euphemism for never freed). Fixed with `Load.deinit` deferred in
+   main (LIFO order puts it after every thread join that reads the aliased
+   topology slices) plus frees on the loop's partial-failure branches. The
+   repro now exits with ZERO reports — keeping failure exits audit-clean is
+   what keeps this detector trustworthy.
+2. **macOS `leaks`** (the malloc zones — libpq's world, where a forgotten
+   PQclear is the classic daemon drip): 0 leaks on the live process, every
+   sample.
+3. **`leaksoak.py`** (drift over time, the recorded policy): two `leaks`+RSS
+   samples around a churn window grinding the REAL verb matrix — three CDC
+   verbs public AND tenant-scoped, refused enrolls every round plus successful
+   mints every 10th (writer CTE + JWT signing + the user_tenants CDC
+   diversion), snapshot-worker requests, mutation-listener round-trips (real
+   msgpack envelopes, applied and verdicted — the counter's `last_writer`
+   said `c-soak` afterwards), one sweeper pass, /metrics + /status renders.
 
 Three 240s soaks, measured: naive churn +7 MB RSS, 0 leaks; full CDC matrix
 **exactly flat** — 2205→2205 malloc nodes, 7360→7360 KB, +1 MB RSS over 113
@@ -2079,106 +2084,106 @@ in the bridge's OWN logic, neither in NATS or libpq, exactly where the weak poin
 was predicted to be.** Memory was never the problem (0 leaks through every phase);
 the two failures were both in error-handling DECISIONS:
 
-  1. **WAL `StreamEnded` conflation → silent CDC death** (chaos.py, PG-loss).
-     `pg_terminate_backend` on the walsender surfaces as `error.StreamEnded`,
-     which the main loop treated as a GRACEFUL end and `break`ed the replication
-     loop forever — process alive, /health green, mutation listener reconnected,
-     CDC gone with `pg_reconnects` still 0. A `StreamEnded` is graceful ONLY when
-     WE requested the shutdown (`should_stop`); otherwise the server severed it
-     and it is reconnectable like any other loss. Fixed in bridge.zig.
-  2. **`EndOfStream` retry storm → poison-pill DoS** (adversarial.py). A
-     truncated/garbage msgpack payload raised `error.EndOfStream`, which fell
-     through to the TRANSIENT-retry branch and was redelivered
-     `mutation_max_deliver` (15) times with ack_wait between each — a handful of
-     malformed messages stalled the single-consumer queue long enough to block
-     legitimate writes behind them. An attacker with one lane could DoS a
-     tenant's ingress with truncated bytes. Fixed: a decode failure is PERMANENT
-     by nature (same bytes fail forever) → dead-letter on first delivery, except
-     OutOfMemory which stays transient. Applied at the decode call site, so any
-     error the msgpack lib ever adds is permanent by construction.
-  3. **`for … else` sleep → ingress capped at ~10 writes/s** (race.py). The
-     mutation pull loop's 100 ms pause was written as a `for … else` meant as
-     "sleep on fetch timeout" — but Zig runs the else on every NORMAL completion,
-     so the listener slept after EVERY message, throttling the whole ingress
-     lane to ~10 msg/s regardless of backlog. Invisible to every single-write
-     scenario (their cadence sits under the cap — which is also why their PASS
-     verdicts were honest); 24 concurrent writers exposed it in one run: every
-     key stalled at round 2 of 5 inside the check window. Fixed in
-     mutation_listener.zig — sleep only when the fetch is empty
-     (`Config.Nats.mutation_pull_idle_ms`).
-  4. **Replication resumed from the WAL HEAD, not the slot → silent permanent
-     data loss** (found while validating the Node consumer, 2026-08-26). Both
-     `initReplicationStream` and the reconnect path called
-     `wal_monitor.getCurrentLSN()` and passed it to `START_REPLICATION`. That
-     tells PostgreSQL "start here", so **every change committed while the bridge
-     was down, or while its walsender was severed, was skipped and never
-     published**. The replication slot was doing its job — retaining the WAL —
-     and the bridge stepped over it on every start. Nothing errored; replicas
-     simply diverged from Postgres forever. Measured, reproducibly: stop the
-     bridge → `DELETE FROM memo WHERE txt='fixtest'` → restart → the delete never
-     reached CDC (`cdc.memo.delete` frozen at 193), while PG no longer had the
-     row. Fixed by DELETING the parameter: `startStreaming()` now takes no
-     position at all, and the `0/0` sentinel ("resume from this slot's
-     confirmed_flush_lsn" — not "from the beginning") is written literally into
-     the `START_REPLICATION` command in wal_stream.zig, where the protocol lives.
-     Verified: the same delete now replays.
+1. **WAL `StreamEnded` conflation → silent CDC death** (chaos.py, PG-loss).
+   `pg_terminate_backend` on the walsender surfaces as `error.StreamEnded`,
+   which the main loop treated as a GRACEFUL end and `break`ed the replication
+   loop forever — process alive, /health green, mutation listener reconnected,
+   CDC gone with `pg_reconnects` still 0. A `StreamEnded` is graceful ONLY when
+   WE requested the shutdown (`should_stop`); otherwise the server severed it
+   and it is reconnectable like any other loss. Fixed in bridge.zig.
+2. **`EndOfStream` retry storm → poison-pill DoS** (adversarial.py). A
+   truncated/garbage msgpack payload raised `error.EndOfStream`, which fell
+   through to the TRANSIENT-retry branch and was redelivered
+   `mutation_max_deliver` (15) times with ack_wait between each — a handful of
+   malformed messages stalled the single-consumer queue long enough to block
+   legitimate writes behind them. An attacker with one lane could DoS a
+   tenant's ingress with truncated bytes. Fixed: a decode failure is PERMANENT
+   by nature (same bytes fail forever) → dead-letter on first delivery, except
+   OutOfMemory which stays transient. Applied at the decode call site, so any
+   error the msgpack lib ever adds is permanent by construction.
+3. **`for … else` sleep → ingress capped at ~10 writes/s** (race.py). The
+   mutation pull loop's 100 ms pause was written as a `for … else` meant as
+   "sleep on fetch timeout" — but Zig runs the else on every NORMAL completion,
+   so the listener slept after EVERY message, throttling the whole ingress
+   lane to ~10 msg/s regardless of backlog. Invisible to every single-write
+   scenario (their cadence sits under the cap — which is also why their PASS
+   verdicts were honest); 24 concurrent writers exposed it in one run: every
+   key stalled at round 2 of 5 inside the check window. Fixed in
+   mutation_listener.zig — sleep only when the fetch is empty
+   (`Config.Nats.mutation_pull_idle_ms`).
+4. **Replication resumed from the WAL HEAD, not the slot → silent permanent
+   data loss** (found while validating the Node consumer, 2026-08-26). Both
+   `initReplicationStream` and the reconnect path called
+   `wal_monitor.getCurrentLSN()` and passed it to `START_REPLICATION`. That
+   tells PostgreSQL "start here", so **every change committed while the bridge
+   was down, or while its walsender was severed, was skipped and never
+   published**. The replication slot was doing its job — retaining the WAL —
+   and the bridge stepped over it on every start. Nothing errored; replicas
+   simply diverged from Postgres forever. Measured, reproducibly: stop the
+   bridge → `DELETE FROM memo WHERE txt='fixtest'` → restart → the delete never
+   reached CDC (`cdc.memo.delete` frozen at 193), while PG no longer had the
+   row. Fixed by DELETING the parameter: `startStreaming()` now takes no
+   position at all, and the `0/0` sentinel ("resume from this slot's
+   confirmed_flush_lsn" — not "from the beginning") is written literally into
+   the `START_REPLICATION` command in wal_stream.zig, where the protocol lives.
+   Verified: the same delete now replays.
 
-     The first attempt at this fix put `0/0` in `Config` and passed it at both
-     sites. Wrong, and the review caught it: **`Config` is for tunables an
-     operator may legitimately change; this is a protocol invariant with exactly
-     one correct value.** Naming it in config invites the very edit that caused
-     the bug. The parameter itself was the defect — it let two call sites express
-     a wrong position, and both did — so removing it makes the mistake
-     unrepresentable rather than merely discouraged. Same lesson as the timestamp
-     and publication guards: a rule that lives only in prose is a rule that bites.
-     (The boot path's `getCurrentLSN` call went too: once it no longer feeds
-     `START_REPLICATION` it was a Postgres round-trip serving one log line, and a
-     `current_lsn` in scope beside that call is precisely how it got passed for so
-     long. Lag reporting belongs to wal_monitor, which measures it against the
-     slot — the number that means something.)
+   The first attempt at this fix put `0/0` in `Config` and passed it at both
+   sites. Wrong, and the review caught it: **`Config` is for tunables an
+   operator may legitimately change; this is a protocol invariant with exactly
+   one correct value.** Naming it in config invites the very edit that caused
+   the bug. The parameter itself was the defect — it let two call sites express
+   a wrong position, and both did — so removing it makes the mistake
+   unrepresentable rather than merely discouraged. Same lesson as the timestamp
+   and publication guards: a rule that lives only in prose is a rule that bites.
+   (The boot path's `getCurrentLSN` call went too: once it no longer feeds
+   `START_REPLICATION` it was a Postgres round-trip serving one log line, and a
+   `current_lsn` in scope beside that call is precisely how it got passed for so
+   long. Lag reporting belongs to wal_monitor, which measures it against the
+   slot — the number that means something.)
 
-     **Guarded by `downtime.py`** (new, 2026-08-26), which is the answer to "why
-     did nothing catch this?": every existing scenario spins a FRESH probe slot,
-     and for a new slot the WAL head and `confirmed_flush_lsn` are the same
-     position — the two behaviours are literally identical, so the bug was
-     invisible by construction. The scenarios that restart or sever a bridge
-     (chaos.py) write and check AFTER the event, testing the *after* and never the
-     *during*. And the browser demo takes a fresh OPFS database on every load, so
-     accumulated drift was erased before anyone could see it. `downtime.py`
-     deliberately does the one thing none of them do: reuse ONE slot across two
-     bridge lifetimes and commit all three verbs into the gap between them.
-     Verified both ways — RED on the pre-fix binary (INSERT, UPDATE and DELETE all
-     lost: the window ate everything, not just deletes), GREEN on the fixed one.
-     It also covers `kill -9`, because a crash and a clean stop are different paths:
-     SIGKILL runs no handler and sends no final status update, so only what
-     PostgreSQL already holds survives.
+   **Guarded by `downtime.py`** (new, 2026-08-26), which is the answer to "why
+   did nothing catch this?": every existing scenario spins a FRESH probe slot,
+   and for a new slot the WAL head and `confirmed_flush_lsn` are the same
+   position — the two behaviours are literally identical, so the bug was
+   invisible by construction. The scenarios that restart or sever a bridge
+   (chaos.py) write and check AFTER the event, testing the _after_ and never the
+   _during_. And the browser demo takes a fresh OPFS database on every load, so
+   accumulated drift was erased before anyone could see it. `downtime.py`
+   deliberately does the one thing none of them do: reuse ONE slot across two
+   bridge lifetimes and commit all three verbs into the gap between them.
+   Verified both ways — RED on the pre-fix binary (INSERT, UPDATE and DELETE all
+   lost: the window ate everything, not just deletes), GREEN on the fixed one.
+   It also covers `kill -9`, because a crash and a clean stop are different paths:
+   SIGKILL runs no handler and sends no final status update, so only what
+   PostgreSQL already holds survives.
 
-     **Where the resume position actually lives, since the naming invites
-     confusion.** Three different quantities wear the word "LSN":
-       - `pg_current_wal_lsn()` — the SERVER's WAL head. Only wal_monitor should
-         ever read it (lag arithmetic). Using it as a start position was the bug.
-       - `metrics.last_ack_lsn` — what the bridge has RECEIVED
-         (`metrics.updateLsn(wal_msg.wal_end)`); observability only. Note it is
-         RENAMED 2026-08-26 to `last_ack_lsn` in the Snapshot and on `/status`; it
-         used to be `current_lsn`, which read exactly like the first one — the same
-         conflation that made the bug natural to write.
-       - the CLIENT's `lsn` — `_zebridge_sync.global_last_lsn` and per-table
-         `state.lsn`, taken from `ev.lsn` inside each CDC payload, driving the seed
-         gate. It never reads the bridge's metrics.
+   **Where the resume position actually lives, since the naming invites
+   confusion.** Three different quantities wear the word "LSN":
+   - `pg_current_wal_lsn()` — the SERVER's WAL head. Only wal_monitor should
+     ever read it (lag arithmetic). Using it as a start position was the bug.
+   - `metrics.last_ack_lsn` — what the bridge has RECEIVED
+     (`metrics.updateLsn(wal_msg.wal_end)`); observability only. Note it is
+     RENAMED 2026-08-26 to `last_ack_lsn` in the Snapshot and on `/status`; it
+     used to be `current_lsn`, which read exactly like the first one — the same
+     conflation that made the bug natural to write.
+   - the CLIENT's `lsn` — `_zebridge_sync.global_last_lsn` and per-table
+     `state.lsn`, taken from `ev.lsn` inside each CDC payload, driving the seed
+     gate. It never reads the bridge's metrics.
      None of these is the durable position. **That one belongs to PostgreSQL**: the
      bridge sends `sendStatusUpdate(batch_pub.getLastConfirmedLsn())` — strictly
      what JetStream has confirmed, never the WAL it merely received — and PG stores
      it as the slot's `confirmed_flush_lsn`. The bridge keeps nothing across a
      restart, which is exactly why `kill -9` is safe.
 
-     The trade this accepts, deliberately: a restart may REPUBLISH events it
-     already published (at-least-once instead of the previous at-most-once).
-     That is safe by construction — msg ids are LSN-derived, so JetStream dedups
-     inside its window and the client applier is idempotent (LWW upsert + LSN
-     gate). A duplicate is recoverable; a missing delete is not. This is also the
-     bug that made the earlier memo divergence (PG 4 rows, every replica 11)
-     read like a client bug: the client was applying faithfully, and the DELETE
-     events for those rows did not exist anywhere in CDC.
+   The trade this accepts, deliberately: a restart may REPUBLISH events it
+   already published (at-least-once instead of the previous at-most-once).
+   That is safe by construction — msg ids are LSN-derived, so JetStream dedups
+   inside its window and the client applier is idempotent (LWW upsert + LSN
+   gate). A duplicate is recoverable; a missing delete is not. This is also the
+   bug that made the earlier memo divergence (PG 4 rows, every replica 11)
+   read like a client bug: the client was applying faithfully, and the DELETE
+   events for those rows did not exist anywhere in CDC.
 
 What the adversarial pass CLEARED (17 hostile mutation shapes): no crash, no
 injection (column-name and value both neutralized — allowlist + `$N` params +
@@ -2192,109 +2197,109 @@ msgpack + /enroll fuzz), `race.py` (concurrent writers, poison interleaved with
 legit, leaks under contention). All were RED when they found the bugs — a test
 that cannot fail proves nothing.
 
-  1. **One large transaction wedges the bridge PERMANENTLY** (found 2026-08-26 while
-     measuring the pgoutput ceiling — by accident, writing a burst as a single `DO`
-     block instead of 2000 separate transactions). The WAL loop buffers a whole
-     transaction's ring slots and releases them to the publisher only at `.commit`.
-     When the tracker fills it logs, discards the in-flight transaction, and
-     `return error.TransactionOverflow` — which propagates out of the loop and
-     **kills the process**:
+1.  **One large transaction wedges the bridge PERMANENTLY** (found 2026-08-26 while
+    measuring the pgoutput ceiling — by accident, writing a burst as a single `DO`
+    block instead of 2000 separate transactions). The WAL loop buffers a whole
+    transaction's ring slots and releases them to the publisher only at `.commit`.
+    When the tracker fills it logs, discards the in-flight transaction, and
+    `return error.TransactionOverflow` — which propagates out of the loop and
+    **kills the process**:
 
-         Ring buffer capacity: 32768 slots, transaction row limit: 32767
-         Transaction overflow: exceeds 32767 row limit — discarding entire in-flight transaction
-         error: TransactionOverflow
+        Ring buffer capacity: 32768 slots, transaction row limit: 32767
+        Transaction overflow: exceeds 32767 row limit — discarding entire in-flight transaction
+        error: TransactionOverflow
 
-     The transaction is still unacked in the slot, so the next boot replays it and
-     dies again. Measured: two consecutive restarts, both dead. The bridge was
-     **unstartable** until an operator ran `pg_replication_slot_advance` — which
-     silently discards those changes, so every replica then diverges from Postgres
-     permanently and invisibly. Same end state as finding 4, reached through
-     ORDINARY APPLICATION BEHAVIOUR rather than a bridge restart: a bulk import, a
-     migration backfill, a `COPY`, a `DELETE FROM big_table` — any single
-     transaction over `RING_BUFFER_COUNT` rows.
+    The transaction is still unacked in the slot, so the next boot replays it and
+    dies again. Measured: two consecutive restarts, both dead. The bridge was
+    **unstartable** until an operator ran `pg_replication_slot_advance` — which
+    silently discards those changes, so every replica then diverges from Postgres
+    permanently and invisibly. Same end state as finding 4, reached through
+    ORDINARY APPLICATION BEHAVIOUR rather than a bridge restart: a bulk import, a
+    migration backfill, a `COPY`, a `DELETE FROM big_table` — any single
+    transaction over `RING_BUFFER_COUNT` rows.
 
-     ⚠️ Lowering `RING_BUFFER_COUNT` lowers this cliff with it. The default moved
-     65536 → 32768 the same day, halving the threshold to ~32.7k rows, which an
-     ordinary migration reaches without trying.
+    ⚠️ Lowering `RING_BUFFER_COUNT` lowers this cliff with it. The default moved
+    65536 → 32768 the same day, halving the threshold to ~32.7k rows, which an
+    ordinary migration reaches without trying.
 
-     **Why nothing caught it**: every scenario writes in small transactions, and
-     speed.py deliberately uses 2000 × 1000 — so the suite drives 2M rows through
-     the bridge routinely and never once in one transaction. The guard's own
-     comment shows the limit was understood as a deadlock backstop (cap the tracker
-     one below the pool so `acquireAndFillSlot` cannot spin on an empty queue); what
-     was not considered is what the process should DO when it fires.
+    **Why nothing caught it**: every scenario writes in small transactions, and
+    speed.py deliberately uses 2000 × 1000 — so the suite drives 2M rows through
+    the bridge routinely and never once in one transaction. The guard's own
+    comment shows the limit was understood as a deadlock backstop (cap the tracker
+    one below the pool so `acquireAndFillSlot` cannot spin on an empty queue); what
+    was not considered is what the process should DO when it fires.
 
-     **The cap is a backstop for a SELF-INFLICTED deadlock.** Back-pressure already
-     exists and is well built: `acquireAndFillSlot` spins for a free slot with a
-     fatal-error check and a 30 s watchdog, so a producer outrunning the publisher
-     simply blocks until slots come back. What defeats it is the all-or-nothing
-     hold — during one transaction NOTHING reaches the publisher, so its queue is
-     empty, no slot can ever return, and the wait would be infinite. The cap fires
-     before that. It is not a sizing decision; it prevents a starvation the hold
-     itself creates, by killing the process.
+    **The cap is a backstop for a SELF-INFLICTED deadlock.** Back-pressure already
+    exists and is well built: `acquireAndFillSlot` spins for a free slot with a
+    fatal-error check and a 30 s watchdog, so a producer outrunning the publisher
+    simply blocks until slots come back. What defeats it is the all-or-nothing
+    hold — during one transaction NOTHING reaches the publisher, so its queue is
+    empty, no slot can ever return, and the wait would be infinite. The cap fires
+    before that. It is not a sizing decision; it prevents a starvation the hold
+    itself creates, by killing the process.
 
-     **Fix — release incrementally, ack at commit.** The all-or-nothing
-     hold is unnecessary: `proto_version '1'` has no streaming, so PostgreSQL sends
-     a transaction's changes only AFTER it commits — everything the loop receives is
-     already committed, and there is no abort to roll back. So when the tracker
-     fills, release the buffered slots to the publisher, reset the counter, and keep
-     going; ack the LSN only at `.commit`, exactly as now. Then:
-       - the row limit disappears — a transaction of any size streams through,
-         bounded by the ring buffer and its existing back-pressure;
-       - the deadlock the cap defends against cannot occur, because releasing gives
-         the publisher work, so slots keep returning and the EXISTING back-pressure
-         wait behaves normally — nothing new is built; `max_tx_rows`, the overflow
-         branch and `error.TransactionOverflow` are all DELETED;
-       - a crash mid-transaction publishes a PARTIAL transaction, and the unacked
-         LSN makes PostgreSQL replay the whole thing on restart. That is safe by the
-         same property finding 4 relies on: msg ids are LSN-derived, so JetStream
-         dedups inside its window and the client applier is idempotent (LWW upsert +
-         LSN gate). A duplicate is recoverable; a crash loop is not.
-     The cost is that consumers can transiently observe a partial transaction, where
-     today they observe none of it. Set against a permanently unstartable bridge and
-     operator-forced data loss, that is the right trade — and it is the same
-     at-least-once bargain the whole pipeline already makes.
+    **Fix — release incrementally, ack at commit.** The all-or-nothing
+    hold is unnecessary: `proto_version '1'` has no streaming, so PostgreSQL sends
+    a transaction's changes only AFTER it commits — everything the loop receives is
+    already committed, and there is no abort to roll back. So when the tracker
+    fills, release the buffered slots to the publisher, reset the counter, and keep
+    going; ack the LSN only at `.commit`, exactly as now. Then:
+    - the row limit disappears — a transaction of any size streams through,
+      bounded by the ring buffer and its existing back-pressure;
+    - the deadlock the cap defends against cannot occur, because releasing gives
+      the publisher work, so slots keep returning and the EXISTING back-pressure
+      wait behaves normally — nothing new is built; `max_tx_rows`, the overflow
+      branch and `error.TransactionOverflow` are all DELETED;
+    - a crash mid-transaction publishes a PARTIAL transaction, and the unacked
+      LSN makes PostgreSQL replay the whole thing on restart. That is safe by the
+      same property finding 4 relies on: msg ids are LSN-derived, so JetStream
+      dedups inside its window and the client applier is idempotent (LWW upsert +
+      LSN gate). A duplicate is recoverable; a crash loop is not.
+      The cost is that consumers can transiently observe a partial transaction, where
+      today they observe none of it. Set against a permanently unstartable bridge and
+      operator-forced data loss, that is the right trade — and it is the same
+      at-least-once bargain the whole pipeline already makes.
 
-     Rejected alternative: quarantine the transaction (suspend its tables, ack past
-     it) — that stops the crash loop but KEEPS the silent divergence, which is the
-     worse half of the bug. PostgreSQL's `streaming` option (proto v2, PG14+) would
-     also solve it and is the "proper" answer, but it means handling STREAM
-     START/STOP/ABORT and a protocol bump for a case incremental release already
-     covers.
+    Rejected alternative: quarantine the transaction (suspend its tables, ack past
+    it) — that stops the crash loop but KEEPS the silent divergence, which is the
+    worse half of the bug. PostgreSQL's `streaming` option (proto v2, PG14+) would
+    also solve it and is the "proper" answer, but it means handling STREAM
+    START/STOP/ABORT and a protocol bump for a case incremental release already
+    covers.
 
-  2. **Schema generation omits FOREIGN KEYS, so PROTOCOL §4 is unimplementable**
-     (found 2026-08-26 while asking whether a split transaction could break FK
-     ordering client-side). `pg_constraint` appears ZERO times in the whole Zig
-     source: the schema builder assembles `pg`/`sqlite` columns, `pk`,
-     `pk_columns`, `replica_identity`, the write contract and `lsn`, and never asks
-     PostgreSQL about foreign keys. Measured on `$KV.schemas.orders` — no
-     `foreign`, `references`, `fkey` or `constraint` key anywhere in the payload.
+2.  **Schema generation omits FOREIGN KEYS, so PROTOCOL §4 is unimplementable**
+    (found 2026-08-26 while asking whether a split transaction could break FK
+    ordering client-side). `pg_constraint` appears ZERO times in the whole Zig
+    source: the schema builder assembles `pg`/`sqlite` columns, `pk`,
+    `pk_columns`, `replica_identity`, the write contract and `lsn`, and never asks
+    PostgreSQL about foreign keys. Measured on `$KV.schemas.orders` — no
+    `foreign`, `references`, `fkey` or `constraint` key anywhere in the payload.
 
-     Downstream everything then behaves correctly on wrong information: the client
-     generates `CREATE TABLE orders ("uid" TEXT NOT NULL PRIMARY KEY, "user_id"
-     INTEGER, ...)` — columns and a PK, nothing else — and `foreign_key_list(orders)`
-     comes back empty. So `PRAGMA defer_foreign_keys = ON` in the CDC apply path
-     guards a constraint that CANNOT EXIST, and §4's deferral rule has nothing to
-     defer. `orders` is declared in the migration as the FK-ordering demo
-     ("FK-ordering demo: child of users, PROTOCOL.md §4", a real
-     `references(:users, on_delete: :delete_all)`), and the demo cannot fire.
+    Downstream everything then behaves correctly on wrong information: the client
+    generates `CREATE TABLE orders ("uid" TEXT NOT NULL PRIMARY KEY, "user_id"
+INTEGER, ...)` — columns and a PK, nothing else — and `foreign_key_list(orders)`
+    comes back empty. So `PRAGMA defer_foreign_keys = ON` in the CDC apply path
+    guards a constraint that CANNOT EXIST, and §4's deferral rule has nothing to
+    defer. `orders` is declared in the migration as the FK-ordering demo
+    ("FK-ordering demo: child of users, PROTOCOL.md §4", a real
+    `references(:users, on_delete: :delete_all)`), and the demo cannot fire.
 
-     ⚠️ **The consequence for finding 5**: a transaction split across batches cannot
-     break FK ordering on a client TODAY — but by accident, not by design. Measured:
-     one transaction of 15,000 users + 15,000 orders interleaved, ring 4096 so it
-     split across ~8 releases, 30,000/30,000 events published, bridge alive, zero
-     drops. That test passes because there is no constraint to violate, so it does
-     NOT establish that the ordering is correct. The moment a consumer mirrors FKs
-     (a PGlite replica, a hand-written binding following §4) the question becomes
-     live, and the metadata to answer it never arrives.
+    ⚠️ **The consequence for finding 5**: a transaction split across batches cannot
+    break FK ordering on a client TODAY — but by accident, not by design. Measured:
+    one transaction of 15,000 users + 15,000 orders interleaved, ring 4096 so it
+    split across ~8 releases, 30,000/30,000 events published, bridge alive, zero
+    drops. That test passes because there is no constraint to violate, so it does
+    NOT establish that the ordering is correct. The moment a consumer mirrors FKs
+    (a PGlite replica, a hand-written binding following §4) the question becomes
+    live, and the metadata to answer it never arrives.
 
-     **Fix**: query `pg_constraint WHERE contype='f'` in the schema builder, emit the
-     referenced table and columns, and let the client add `REFERENCES` to its
-     generated DDL. Sequencing matters — adding FKs client-side CREATES the
-     cross-batch risk that today does not exist, so the metadata and the applier's
-     FK hold/retry must land together, and the 30k split test must then be re-run
-     WITH constraints present, where it becomes a real test rather than a vacuous
-     pass.
+    **Fix**: query `pg_constraint WHERE contype='f'` in the schema builder, emit the
+    referenced table and columns, and let the client add `REFERENCES` to its
+    generated DDL. Sequencing matters — adding FKs client-side CREATES the
+    cross-batch risk that today does not exist, so the metadata and the applier's
+    FK hold/retry must land together, and the 30k split test must then be re-run
+    WITH constraints present, where it becomes a real test rather than a vacuous
+    pass.
 
 Finding 4 is the one that argues loudest for the [[test-escalation]] topic: no
 single-fault scenario could see it. Every scenario spins a FRESH probe slot, so
@@ -2388,7 +2393,7 @@ had `last_writer` as its tombstone column and no tiebreak at all, silently, sinc
 the counters were born; `.env.bridge`'s comment promised a semantics the parser
 never had, and catalogue.zig inherited the collapse faithfully (a catalogue
 tiebreak with a NULL tombstone slid into slot 1). Invisible because `last_writer`
-stayed NULL — nothing ever *looked* soft-deleted — and tiebreak.py only exercises
+stayed NULL — nothing ever _looked_ soft-deleted — and tiebreak.py only exercises
 the all-three-columns shape. Fixed everywhere position is the meaning: the parser
 keeps empty fields as empty strings, catalogue.zig writes an empty placeholder in
 slot 1 when only the tiebreak is set, and all five consumers (mutation listener,
@@ -2488,7 +2493,7 @@ next batch. Confirmed by reading the code, not assumed — `doPublish`'s own com
 directly ("the publish calls below are synchronous").
 
 The idea: while NATS is acking the batch just sent, the flush thread could already be
-draining and encoding the *next* batch, so it is ready to send the instant the ack for the
+draining and encoding the _next_ batch, so it is ready to send the instant the ack for the
 current one lands, instead of only starting then. The size of the win depends on what the
 ack wait actually is. It is not network RTT — the bridge and `nats-server` are colocated on
 one VPS (§0 elsewhere in this file), so that part is already small. It is plausibly disk
@@ -2508,11 +2513,11 @@ iters delta, not by intuition about which side "must" be slow.
 
 **Checked against the code (2026-08-24), because the design depends on it:**
 
-- The flush thread drains the ring *indiscriminately* (up to 5000 events / 256 KB /
+- The flush thread drains the ring _indiscriminately_ (up to 5000 events / 256 KB /
   500 ms), and only `doPublish` splits the run: KV/schema events publish individually
   inline (flushing pending CDC first, for order), CDC events group **by subject** —
   `cdc.[tenant.]<table>.<operation>` — in first-appearance order. So batching is per
-  (table × verb), and yes: a mixed flush run *has* to publish once per distinct
+  (table × verb), and yes: a mixed flush run _has_ to publish once per distinct
   subject group, serialized, each paying its own PubAck wait. T tables × V verbs
   active in one flush = up to T×V sequential ack waits per cycle. A homogeneous burst
   collapses to one group per flush (one ack per ~256 KB); a mixed workload of many
@@ -2559,19 +2564,19 @@ iters delta, not by intuition about which side "must" be slow.
   foreign-key rule")**: both engines support deferral (PostgreSQL `DEFERRABLE
   INITIALLY DEFERRED`; SQLite the same in DDL, or `PRAGMA defer_foreign_keys` per
   transaction), and the lsn field already carries commit order — no wire change.
-**BUILT and verified (2026-08-24), as planned below.** `PublishWindow` in
-`nats_publisher.zig` (per-window reply inbox, in-flight list, `drain` fails the whole
-window into `flushBatch`'s retry; per-ack latency feeds the same metric); lane-aware
-grouping in `publishCDCSubBatch` (per-lane verb-runs, cross-lane coalescing, window
-only when every group is a distinct lane). Live mixed-matrix run — `users` (public)
-plus `test_types` under `acme` and `globex`, all three verbs, three transactions —
-hit all three paths by design: "3 groups with a lane verb-alternation — publishing
-sequentially" (the §1.18 case, client ends CORRECT), "3 distinct lanes — async PubAck
-window" (one ack wait for three streams' worth of messages), and the sequential
-fallback for a mixed-verb lane. Stream counts, PG truth, and the alice client all
-agree; zero errors. What remains of the original idea is only the measurement-driven
-question of whether MORE overlap (encode-ahead across flush batches) ever pays —
-revisit after a burst-load reading of the ack counters.
+  **BUILT and verified (2026-08-24), as planned below.** `PublishWindow` in
+  `nats_publisher.zig` (per-window reply inbox, in-flight list, `drain` fails the whole
+  window into `flushBatch`'s retry; per-ack latency feeds the same metric); lane-aware
+  grouping in `publishCDCSubBatch` (per-lane verb-runs, cross-lane coalescing, window
+  only when every group is a distinct lane). Live mixed-matrix run — `users` (public)
+  plus `test_types` under `acme` and `globex`, all three verbs, three transactions —
+  hit all three paths by design: "3 groups with a lane verb-alternation — publishing
+  sequentially" (the §1.18 case, client ends CORRECT), "3 distinct lanes — async PubAck
+  window" (one ack wait for three streams' worth of messages), and the sequential
+  fallback for a mixed-verb lane. Stream counts, PG truth, and the alice client all
+  agree; zero errors. What remains of the original idea is only the measurement-driven
+  question of whether MORE overlap (encode-ahead across flush batches) ever pays —
+  revisit after a burst-load reading of the ack counters.
 
 **Measured under burst (2026-08-24, native PG+NATS on the host, ReleaseFast,
 OrbStack stopped):**
@@ -2599,12 +2604,12 @@ OrbStack stopped):**
   SQL text, metric polling, spawner (bash vs python, parent alive vs dead), QoS
   clamping, E-cores, pipes. The tell that finally cracked it — after the user asked
   whether the test was even measuring the same thing — was a mid-drain `sample` of a
-  "107 % CPU" bridge showing it mostly *blocked*, with the call graph pointing at
+  "107 % CPU" bridge showing it mostly _blocked_, with the call graph pointing at
   `acquireAndFillSlot → Io.Writer → writev`: the hot path was **writing per-event
   debug log lines**. The slow runs' stderr files were **632 MB / 10 million debug
   lines** (5 per event); the fast runs' 12 KB. `LOG_LEVEL=debug` had leaked in from
   the sourced dev env (`.env.bridge` carries it), and `speed.py`'s
-  `setdefault("LOG_LEVEL", "info")` *respects* an inherited value — every harness
+  `setdefault("LOG_LEVEL", "info")` _respects_ an inherited value — every harness
   wrapper that happened to `export LOG_LEVEL=info` measured fast, every one that
   didn't measured the logger. Fixed: `speed.py` now **forces** info
   (`SPEED_LOG_LEVEL` to override deliberately).
@@ -2625,10 +2630,10 @@ OrbStack stopped):**
   (shared_buffers=2GB, max_wal_size=16GB) + fresh NATS, one bridge, warm-up then
   test)**:
 
-  | run | end-to-end | PG write | drain tail | bridge CPU |
-  | --- | --- | --- | --- | --- |
-  | canonical 2M INSERT | **236k ev/s** | 2.4 s (~830k rows/s) | 6.1 s | 6.96 s (**3.5 µs/event**, 82 % of one core) |
-  | mixed 2M (50 % INS / 30 % UPD / 20 % DEL, id-keyed) | **245k ev/s** | 2.4 s | 5.7 s | 7.03 s (3.5 µs/event) |
+  | run                                                 | end-to-end    | PG write             | drain tail | bridge CPU                                  |
+  | --------------------------------------------------- | ------------- | -------------------- | ---------- | ------------------------------------------- |
+  | canonical 2M INSERT                                 | **236k ev/s** | 2.4 s (~830k rows/s) | 6.1 s      | 6.96 s (**3.5 µs/event**, 82 % of one core) |
+  | mixed 2M (50 % INS / 30 % UPD / 20 % DEL, id-keyed) | **245k ev/s** | 2.4 s                | 5.7 s      | 7.03 s (3.5 µs/event)                       |
 
   Above the README's 200k+ record, and **mixed verbs cost the same per event as
   inserts** (an earlier 27k mixed figure was the stale composite-PK table: its
@@ -2638,13 +2643,13 @@ OrbStack stopped):**
   bottleneck at ~830k rows/s ingest.
 
   Two durable lessons: **a benchmark run at debug measures the logger, not the
-  bridge** — check the log file's *size* first when a number looks wrong; and
+  bridge** — check the log file's _size_ first when a number looks wrong; and
   `iters` alone cannot catch this class of slowdown (it counts loop trips, not the
   cost inside each) — pair it with CPU-per-event from `bridge_cpu_seconds_total`.
 
 **Where the ceiling actually lives (instrumented 2026-08-24):** a per-second timeline
 of the clean 2M burst shows the ring at 0–1 % throughout, Σ PubAck wait 0.61 s of a
-6.2 s drain (0.20 ms mean), and the WAL loop *idle in 34 % of its iterations* with
+6.2 s drain (0.20 ms mean), and the WAL loop _idle in 34 % of its iterations_ with
 `recv_ms` (waiting on libpq) at 2.5 s against `proc_ms` 1.0 s — the bridge is starved
 by **PostgreSQL's walsender/pgoutput**, which delivers ~320k ev/s on this machine.
 NATS ingestion is the least-loaded stage by an order of magnitude. WAL retention under
@@ -2700,7 +2705,7 @@ missing piece.
 **The plan (2026-08-24), settled after the lane discussion — executed above:**
 
 1. **Verb-run grouping.** `publishCDCSubBatch` stops coalescing a subject's events
-   across the whole run and instead cuts a group at every subject *change* —
+   across the whole run and instead cuts a group at every subject _change_ —
    `INSERT(1), DELETE(2), INSERT(3)` on one table becomes three messages in arrival
    order, not `insert[1,3]` + `delete[2]`. This alone closes §1.18 by construction.
 2. **One connection, one writer, an in-flight PubAck window.** The flush thread writes
@@ -2739,7 +2744,7 @@ The leak's mechanism, confirmed in `@nats-io/jetstream` 3.4.0 and reproduced liv
 - `kv.js`'s `_buildCC` returns a config carrying `filter_subject` and `deliver_policy`.
   `getPushConsumer(stream, cc)` (`jsmstream_api.js:62`) is overloaded on its second
   argument: a string binds an existing consumer, an object that satisfies
-  `isOrderedPushConsumerOptions` (`types.js:22` — true for *any* object with
+  `isOrderedPushConsumerOptions` (`types.js:22` — true for _any_ object with
   `filter_subject`/`deliver_policy`/`headers_only`…) goes to `getOrderedPushConsumer`.
   So every KV watch is an **ordered** consumer. The `KV_WATCHER_<nuid>` name `kv.js` sets
   is overwritten with `oc_<nuid>_1` (`jsmstream_api.js:115`), and the 5s
@@ -2756,7 +2761,7 @@ The leak's mechanism, confirmed in `@nats-io/jetstream` 3.4.0 and reproduced liv
   so a flow-control reply would also be a Publish Violation. Not the trigger on an idle
   bucket, but the same shape of problem: the library assumes grants the server withholds.
 
-What *starts* the resets was not reproduced this session: the probe ran 110s idle
+What _starts_ the resets was not reproduced this session: the probe ran 110s idle
 (three heartbeats on time, no reset), then across a bridge restart (nine KV puts,
 `dseq 10–18` in order, no reset); the browser tab in the foreground ran 6 minutes on
 one consumer. Last session's observation was made while watching the server log in a
@@ -2797,7 +2802,7 @@ scenario. The script registered its fixture in two places (Postgres:
 third, so its own bridge dropped every event at the source
 (`REFUSING 'decode_fixture': not ... in topology.json's public_tables`). Fixed
 scenario-side, since the bridge is behaving exactly as §2.19 intends: the script hands
-*its own* bridge a temp topology (the repo's file plus the fixture) via
+_its own_ bridge a temp topology (the repo's file plus the fixture) via
 `TOPOLOGY_PATH`, never touching the deployed one. Onboarding a public table takes three
 registrations, not two — worth remembering next time a fixture table "publishes fine"
 into nothing.
@@ -2814,7 +2819,7 @@ table: main.users`. The `ADD COLUMN` half of the same round-trip applies cleanly
 SQLite's `ALTER TABLE … DROP COLUMN` re-validates every schema object that references
 the table, and `users_view` is one; the copy-based `rebuildPreservingData` fallback
 takes the `DROP TABLE` + `RENAME` route with the view still defined, which is where the
-"no such table" comes from. Fix: drop `<table>_view` *before* the
+"no such table" comes from. Fix: drop `<table>_view` _before_ the
 alteration; the recreate after it was already there, just too late. Verified in Chrome:
 the same `ADD COLUMN` / `DROP COLUMN` round-trip now applies both halves via ALTER with
 rows preserved. Found while verifying §1.14.
@@ -2861,7 +2866,7 @@ operator fault, including `DbAllocatedKey`, which is a key-shape problem — now
 deferring to the reason already logged by `tableMeta`.
 
 Lesson, the same one as §2.19 and `mutate.py`'s own comment: a scenario that fails on
-"the client cannot tell X from Y" should first check the bridge log for the *subject*
+"the client cannot tell X from Y" should first check the bridge log for the _subject_
 it published. A malformed subject produces exactly the symptoms of a write-path bug,
 and two unrelated-looking failures from one message are a hint that the message never
 got as far as the code under test.
@@ -2872,11 +2877,11 @@ Found while checking §1.13's grouping claims (2026-08-24), by reading, not yet
 reproduced. `publishCDCSubBatch` groups a flush run by subject and emits groups in
 **first-appearance** order. Its own comment proves the two-event case: INSERT then
 DELETE of one row lands as insert-group before delete-group — correct. But coalescing
-puts *every* event of a subject into that subject's one group, so a three-event
+puts _every_ event of a subject into that subject's one group, so a three-event
 alternation on the same key inside one run (≤500 ms / 5000 events) breaks:
 
 - `INSERT(1), DELETE(2), INSERT(3)` → groups `insert[1,3]`, then `delete[2]` — the
-  client applies the re-insert *before* the delete and ends with the row gone while
+  client applies the re-insert _before_ the delete and ends with the row gone while
   PostgreSQL has it.
 - `DELETE(1), INSERT(2), DELETE(3)` → the mirror image: row survives client-side,
   gone upstream.
@@ -2889,7 +2894,7 @@ succession; client-minted uuid keys rarely recur, `bigserial` never). Soft-delet
 tables are immune — their deletes are UPDATEs, one subject.
 
 Fix directions, not yet chosen, and in tension with §1.13: fully order-safe grouping
-means breaking a group at every subject *change* (coalesce only consecutive runs),
+means breaking a group at every subject _change_ (coalesce only consecutive runs),
 which turns verb alternation into one publish per flip — exactly the context-switch
 cost coalescing exists to avoid — and is the strongest argument for the async
 publish-window (§1.13): with no per-publish ack wait, run-level grouping becomes
@@ -2912,19 +2917,19 @@ with the row PRESENT, where the old coalescing left it deleted.
 ### 2.13 A wildcard inbox made every pull request spawn another
 
 `jetstream.zig` `fetch` mints a unique reply subject per request but reads from a
-**wildcard** subscription (`<prefix>.*`), so it also receives replies to *earlier*
+**wildcard** subscription (`<prefix>.*`), so it also receives replies to _earlier_
 fetches still parked on the server until their `expires`.
 
-A late 408 therefore ended the *current* fetch. The caller re-fetched at once, leaving
+A late 408 therefore ended the _current_ fetch. The caller re-fetched at once, leaving
 another request parked, which produced another late 408 — self-sustaining, settling at
 `expires / period` parked pulls.
 
 Measured on a completely idle stream: 500 ms expiry, a new fetch every 48 ms,
-`num_waiting=10`, ~21 pull requests/sec. Two consumers made ~17 msg/s in *and* out with
+`num_waiting=10`, ~21 pull requests/sec. Two consumers made ~17 msg/s in _and_ out with
 nothing to deliver. Unchanged by log level, which is what ruled out debug output.
 
 Fix: ignore any **status frame** whose subject is not this fetch's reply subject, and keep
-waiting. Status frames only — JetStream delivers a *data* message with its original subject
+waiting. Status frames only — JetStream delivers a _data_ message with its original subject
 (routed by subscription id), so matching those against the inbox drops every real message.
 `test-e2e` caught exactly that (`jetstream_pull_test`, "basic fetch": expected 2, got 0).
 
@@ -2946,8 +2951,7 @@ spawned a Python interpreter per message.
 
 ### 2.15 `Kvm.open()` on `$KV.snapshots` was missing `allow_direct` — same bug class as §1.12's `$KV.tenants` fix, never applied to the second bucket
 
-`resolveTenant()`'s `kvm.open(topology.kv.tenants, { allow_direct: true })` fix (§1.12 part
-3) was never mirrored onto the snapshot-replay code's own `kvm.open(topology.kv.snapshots)`
+`resolveTenant()`'s `kvm.open(topology.kv.tenants, { allow_direct: true })` fix (§1.12 part 3) was never mirrored onto the snapshot-replay code's own `kvm.open(topology.kv.snapshots)`
 call — it opened the bucket with no options, defaulting `allow_direct` to `false`.
 
 `$KV.schemas` tolerates this silently, because it is deliberately wholesale-granted
@@ -3003,7 +3007,7 @@ database-level default has to be present in `data`, or the statement is rejected
 
 A correctly-written partial update (`{some_text, updated_at}` only, deliberately omitting
 every unchanged column — exactly what `PROTOCOL.md` §4's UPDATE omission rule already asks a
-*reader* to expect) against a table whose `inserted_at` is `NOT NULL` with no default failed
+_reader_ to expect) against a table whose `inserted_at` is `NOT NULL` with no default failed
 `23502`, reproduced live via two different principals' own Update-button presses through the
 UI. This was `PROTOCOL.md` §7.2's documented "item 2" limitation ("`data` omits a NOT NULL
 column that has no DEFAULT. The INSERT fails, forever") — but that limitation only makes
@@ -3039,7 +3043,7 @@ zb.tenant`, nothing else.
 
 CDC doesn't apply RLS (it isn't a query), so the open tenant's rows already reached every
 client correctly via `CDC_PUBLIC`'s wildcard subject — audience was right. But a snapshot
-*is* a query, gated by this exact policy, and a non-open-tenant client's snapshot connection
+_is_ a query, gated by this exact policy, and a non-open-tenant client's snapshot connection
 never had `zb.tenant` equal to the open value, so the policy never matched — contents was
 wrong. A client's local copy of an open-tenant row ended up depending on whether a live CDC
 write for it happened to arrive while connected, not on what its own snapshot returned:
@@ -3088,7 +3092,7 @@ CDC_PUBLIC`/`CDC_GLOBEX` confirmed no stream's filter matched that subject at al
 
 This is the empirical version of the risk SECURITY.md §1.4's migration checklist
 already named ("a new public table needs one `nats stream edit CDC_PUBLIC` subject
-addition") — what was missing was *what happens if that step is skipped*, and the
+addition") — what was missing was _what happens if that step is skipped_, and the
 answer turned out to be far worse than "no CDC for that table."
 
 **Fixed at the source, not by making publishing more resilient.** A new
@@ -3111,7 +3115,7 @@ optimistic writes to it.
 ⚠️ **`zebridge_user_tenants` is exempt, not `isInternalTable`.** Its row changes
 never touch `cdc.<table>.<op>` at all — a dedicated path transforms them into
 `$KV.tenants.<principal>` instead, deliberately, so the tenant roster is never
-broadcast (§1.12). It still needs every *other* preflight check (no-PK, version
+broadcast (§1.12). It still needs every _other_ preflight check (no-PK, version
 columns, writability), so it isn't globally internal — just excluded from this
 one, by name, in both call sites.
 
@@ -3131,7 +3135,7 @@ reverted (`git diff` confirmed clean before continuing): a table created with no
 psql overhead included) instead of blocking, and `bridge_nats_reconnects_total`
 stays at `0` throughout. `invalidate.py`'s act 3 updated to match the new,
 correct behavior: `SCRATCH`'s `no_primary_key` refusal still lifts without a
-restart, but it now correctly *stays* suspended afterward, for `no_cdc_subject`
+restart, but it now correctly _stays_ suspended afterward, for `no_cdc_subject`
 — it was never declared routable, and making it fully resume would need
 `topology.json` changed and the bridge restarted, defeating the "no restart
 needed" point that act is actually making (about the no-PK refusal, not about
@@ -3140,7 +3144,7 @@ CDC routing).
 ### 2.20 Boot schemas could not change shape across a quick restart, and composite keys never survived boot at all
 
 Found while verifying the root-only `pk` move (§1.7): the new bridge booted, logged
-"Boot schema published to KV" for every table — and the KV kept the *previous* boot's
+"Boot schema published to KV" for every table — and the KV kept the _previous_ boot's
 payload. Not a race, not a stale binary (checked: process younger than the binary, new
 SQL present in `strings`): the boot publisher's `Nats-Msg-Id` was `schema-boot-<table>`,
 identical on every boot, so any restart inside the stream's duplicate window had its
@@ -3180,7 +3184,7 @@ Everything released within 14 ms of the first transaction committing, strictly i
 order (A → ALTER → C).
 
 **The subtle part is C.** Two concurrent INSERTs never conflict — `RowExclusiveLock`
-is self-compatible — yet C was blocked by the *ALTER*, not by A. Postgres queues lock
+is self-compatible — yet C was blocked by the _ALTER_, not by A. Postgres queues lock
 requests, so once an `AccessExclusiveLock` is waiting, everything behind it waits too.
 A 13 ms metadata-only migration stalled an unrelated writer for **8 seconds** purely
 because one slow transaction held the table.
@@ -3189,7 +3193,7 @@ because one slow transaction held the table.
 migration, but to stop it becoming a queue head that blocks every emitter.
 
 Consequence for CDC: **there is no such thing as an old-shape row arriving after the
-DDL event.** A writer that omits the new column produces a valid *new*-schema row
+DDL event.** A writer that omits the new column produces a valid _new_-schema row
 taking the default. Verified in the WAL: `INSERT id=6` (pre-ALTER) → DDL event →
 `INSERT id=7` (post-ALTER).
 
@@ -3197,10 +3201,10 @@ taking the default. Verified in the WAL: `INSERT id=6` (pre-ALTER) → DDL event
 
 Measured on the same table, same update:
 
-| `relreplident` | UPDATE payload |
-| --- | --- |
-| `d` (default) | `[demo_col, email, id, inserted_at, name, updated_at]` — **no `old.*`** |
-| `f` (full) | adds `old.id`, `old.name`, `old.email_address`, … |
+| `relreplident` | UPDATE payload                                                          |
+| -------------- | ----------------------------------------------------------------------- |
+| `d` (default)  | `[demo_col, email, id, inserted_at, name, updated_at]` — **no `old.*`** |
+| `f` (full)     | adds `old.id`, `old.name`, `old.email_address`, …                       |
 
 pgoutput emits an old tuple only for FULL (always, `'O'`), or for DEFAULT **when the
 key changed** (`'K'`, key columns only). Updating a non-key column on a DEFAULT table
@@ -3238,18 +3242,18 @@ of downstream handling helps. (INSERTs are unaffected: they need no identity.)
 `REPLICA IDENTITY FULL` fixes this because the entire row becomes the identity, so
 there is always something to identify the old tuple by.
 
-| PK | identity | UPDATE/DELETE | snapshots |
-| --- | --- | --- | --- |
-| single column | DEFAULT | ✅ key-only old tuple | ✅ |
-| single column | FULL | ✅ full old tuple | ✅ |
-| none | DEFAULT / NOTHING | ❌ **PostgreSQL rejects the write** | ❌ |
-| none | FULL | ✅ | ❌ |
-| composite | either | ✅ | ✅ |
+| PK            | identity          | UPDATE/DELETE                       | snapshots |
+| ------------- | ----------------- | ----------------------------------- | --------- |
+| single column | DEFAULT           | ✅ key-only old tuple               | ✅        |
+| single column | FULL              | ✅ full old tuple                   | ✅        |
+| none          | DEFAULT / NOTHING | ❌ **PostgreSQL rejects the write** | ❌        |
+| none          | FULL              | ✅                                  | ❌        |
+| composite     | either            | ✅                                  | ✅        |
 
 **The asymmetry is the point: FULL rescues CDC, it does not rescue snapshots.**
-Snapshot chunking uses keyset pagination, so it needs an *ordering*, which only a key
+Snapshot chunking uses keyset pagination, so it needs an _ordering_, which only a key
 provides — no replica identity setting can substitute, because the constraint is about
-*ordering for pagination*, not about *identifying a row*. The number of key columns is
+_ordering for pagination_, not about _identifying a row_. The number of key columns is
 not part of that constraint: pagination compares the whole key as a row value
 (`("a","b") > (…) ORDER BY "a","b"`), so composite keys page like any other.
 
@@ -3335,7 +3339,7 @@ code that Zig's lazy analysis had hidden because the bridge never called it.
   mistaken for a metrics bug.
 - **A host Postgres shadows the container.** It binds `[::1]:5432` and
   `127.0.0.1:5432`; those specific bindings beat Docker's wildcard, so `localhost`
-  reaches the *host* server (→ confusing "role bridge_reader does not exist"). Hence
+  reaches the _host_ server (→ confusing "role bridge_reader does not exist"). Hence
   `PG_PUBLISH_PORT` and using `127.0.0.1` explicitly.
 - The `nats:latest` image is **distroless** — no `sh`, no `wget`, so `CMD-SHELL`
   healthchecks can never pass.
@@ -3345,14 +3349,14 @@ code that Zig's lazy analysis had hidden because the bridge never called it.
 Added after 2.9, where three plausible-looking numbers all failed to locate a 300×
 regression. Each of these exists because a question could not be answered without it.
 
-| metric | question it answers |
-| --- | --- |
-| `bridge_wal_confirmed_lag_bytes` | **Is the bridge behind?** WAL past `confirmed_flush_lsn`, which moves on every ACK. |
-| `bridge_wal_lag_bytes` | **Will the disk fill?** WAL past `restart_lsn`, which PostgreSQL only advances at checkpoints — so it plateaus at a few MB on a perfectly healthy bridge and can never answer the first question. Confusing the two cost an afternoon. |
-| `bridge_queue_usage_percent` | Is the **flush** side backed up? Silent about the reader. |
-| `bridge_cpu_seconds_total` | How busy is the process, across all threads? `rate(...[1m])` = cores used. A single-threaded reader at `1.0` is *by definition* the bottleneck. |
-| `bridge_max_rss_bytes` | Is memory what was configured? Should sit near `2^BASE_BUF × RING_BUFFER_COUNT` + ~400 MB metadata, since the slab is pre-allocated, not grown. |
-| `bridge_refused_tables` | Is any table suspended — no PK, undecodable column, oversized row? Alert on `> 0`; the log line says which and why. |
+| metric                           | question it answers                                                                                                                                                                                                                    |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bridge_wal_confirmed_lag_bytes` | **Is the bridge behind?** WAL past `confirmed_flush_lsn`, which moves on every ACK.                                                                                                                                                    |
+| `bridge_wal_lag_bytes`           | **Will the disk fill?** WAL past `restart_lsn`, which PostgreSQL only advances at checkpoints — so it plateaus at a few MB on a perfectly healthy bridge and can never answer the first question. Confusing the two cost an afternoon. |
+| `bridge_queue_usage_percent`     | Is the **flush** side backed up? Silent about the reader.                                                                                                                                                                              |
+| `bridge_cpu_seconds_total`       | How busy is the process, across all threads? `rate(...[1m])` = cores used. A single-threaded reader at `1.0` is _by definition_ the bottleneck.                                                                                        |
+| `bridge_max_rss_bytes`           | Is memory what was configured? Should sit near `2^BASE_BUF × RING_BUFFER_COUNT` + ~400 MB metadata, since the slab is pre-allocated, not grown.                                                                                        |
+| `bridge_refused_tables`          | Is any table suspended — no PK, undecodable column, oversized row? Alert on `> 0`; the log line says which and why.                                                                                                                    |
 
 And the `LOOP` line next to `METRICS` every 15 s, which is the reader's profile:
 
@@ -3360,13 +3364,13 @@ And the `LOOP` line next to `METRICS` every 15 s, which is the reader's profile:
 LOOP iters=1407805 idle=10274 recv_ms=139 proc_ms=1494 cpu=31%
 ```
 
-| field | reading |
-| --- | --- |
-| `iters` | WAL loop iterations in the interval |
-| `idle` | iterations that found nothing and slept 1 ms — **high `idle` is good**: the bridge is waiting on PostgreSQL, not struggling |
-| `recv_ms` | ms inside `receiveMessage` (libpq + framing) |
-| `proc_ms` | ms decoding tuples and packing them into the ring buffer |
-| `cpu` | process CPU over the interval, all threads |
+| field     | reading                                                                                                                     |
+| --------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `iters`   | WAL loop iterations in the interval                                                                                         |
+| `idle`    | iterations that found nothing and slept 1 ms — **high `idle` is good**: the bridge is waiting on PostgreSQL, not struggling |
+| `recv_ms` | ms inside `receiveMessage` (libpq + framing)                                                                                |
+| `proc_ms` | ms decoding tuples and packing them into the ring buffer                                                                    |
+| `cpu`     | process CPU over the interval, all threads                                                                                  |
 
 The failure signature to recognise: **`recv_ms` approaching the interval length with
 `idle=0` and `cpu≈100%`** — a reader that cannot drain its socket. The healthy shape is
@@ -3386,7 +3390,7 @@ capability assembled from four places, and half of it is not SQL at all.**
 
 #### Two times, because a function cannot scope a table that does not exist
 
-The templates *define* functions. The DBA *invokes* them — afterwards, once the
+The templates _define_ functions. The DBA _invokes_ them — afterwards, once the
 application's own migrations have created the tables. Nothing in
 `init.{core,write}.template.sql` applies itself to anything: every mention of
 `zebridge_grant_edge_writes`, `zebridge_install_write_guards`,
@@ -3408,11 +3412,11 @@ T4  NATS conf + reload  (reload NATS, not the bridge)
 
 #### Four places, per layer
 
-| layer | SQL @T0 | SQL @T2, per table | bridge env @T3 | NATS conf @T4 |
-| --- | --- | --- | --- | --- |
-| **1** full read | core: reader role, publication, DDL triggers | `ALTER PUBLICATION … ADD TABLE t` | — | `cdc.>`, `init.>` |
-| **2** scoped read | + `zebridge_user_tenants` | tenant column exists; `ALTER PUBLICATION … (cols)` for column rights | `TENANT_RULES=t:col` ⟵ **restart** | `cdc.<tenant>.>` per principal |
-| **3** write | write file: writer role, guards | `grant_edge_writes(t)`, `install_write_guards(t,…)`, `scope_writes_by_tenant(t,col)` | `SYNC_RULES=t:…` ⟵ **restart** | `mutation.<principal>.>`, `mutation_ack.<principal>.>` |
+| layer             | SQL @T0                                      | SQL @T2, per table                                                                   | bridge env @T3                     | NATS conf @T4                                          |
+| ----------------- | -------------------------------------------- | ------------------------------------------------------------------------------------ | ---------------------------------- | ------------------------------------------------------ |
+| **1** full read   | core: reader role, publication, DDL triggers | `ALTER PUBLICATION … ADD TABLE t`                                                    | —                                  | `cdc.>`, `init.>`                                      |
+| **2** scoped read | + `zebridge_user_tenants`                    | tenant column exists; `ALTER PUBLICATION … (cols)` for column rights                 | `TENANT_RULES=t:col` ⟵ **restart** | `cdc.<tenant>.>` per principal                         |
+| **3** write       | write file: writer role, guards              | `grant_edge_writes(t)`, `install_write_guards(t,…)`, `scope_writes_by_tenant(t,col)` | `SYNC_RULES=t:…` ⟵ **restart**     | `mutation.<principal>.>`, `mutation_ack.<principal>.>` |
 
 ⚠️ **Only the env vars need a bridge restart.** Granting a principal a tenant
 (`INSERT INTO zebridge_user_tenants`) is resolved per statement inside the RLS policy and
@@ -3421,16 +3425,16 @@ Conflating these three is what makes the workflow feel clumsier than it is (SECU
 
 #### Multi vs single tenant are alternatives, not a nesting
 
-This is the distinction that keeps collapsing. They are two different ways to *be* layer 2,
+This is the distinction that keeps collapsing. They are two different ways to _be_ layer 2,
 and they exclude each other:
 
-| | scoped by | shape | CDC | snapshot |
-| --- | --- | --- | --- | --- |
-| **multi-tenant** | the **subject** — `TENANT_RULES` + per-tenant NATS grants | one bridge, N tenants | ✅ | ❌ (§1.12) |
-| **single-tenant** | the **publication row filter** — `zebridge_scope_publication_to_one_tenant(t, col, value, pub)` at T2 | one bridge **per tenant** | ✅ | ✅ |
+|                   | scoped by                                                                                             | shape                     | CDC | snapshot   |
+| ----------------- | ----------------------------------------------------------------------------------------------------- | ------------------------- | --- | ---------- |
+| **multi-tenant**  | the **subject** — `TENANT_RULES` + per-tenant NATS grants                                             | one bridge, N tenants     | ✅  | ❌ (§1.12) |
+| **single-tenant** | the **publication row filter** — `zebridge_scope_publication_to_one_tenant(t, col, value, pub)` at T2 | one bridge **per tenant** | ✅  | ✅         |
 
 The single-tenant shape is coherent across both paths for one reason: the filter lives in
-the publication, and *both* CDC and the snapshot read the publication
+the publication, and _both_ CDC and the snapshot read the publication
 (`snapshot_listener.zig:1584`). The multi-tenant shape scopes CDC by subject, which the
 snapshot has no equivalent of — that is §1.12.
 
@@ -3441,7 +3445,7 @@ The principal→tenant decision is enforced by NATS grants (`alice` holds `cdc.a
 by PostgreSQL. Tenant-scoped **read-only** CDC is therefore reachable with the core file
 alone, plus a tenant column, `TENANT_RULES`, and conf.
 
-Only layer 2's *snapshot* half needs `zebridge_user_tenants`, for the reader RLS policy —
+Only layer 2's _snapshot_ half needs `zebridge_user_tenants`, for the reader RLS policy —
 which is why that table belongs in **core** rather than the write file if §1.12 is ever
 built. The split boundary is read-vs-write **capability**, not which tables are involved.
 
@@ -3466,7 +3470,7 @@ SELECT * FROM zebridge_enable('public.orders',
 ⚠️ **`dry_run` defaults to TRUE.** It grants, guards and enables RLS in one statement;
 showing the plan first is the cheap half of that trade.
 
-It returns a `(step, status, detail)` plan covering T2 *and* the T3/T4 lines it can never
+It returns a `(step, status, detail)` plan covering T2 _and_ the T3/T4 lines it can never
 set — `TENANT_RULES=…`, `SYNC_RULES=…`, and the NATS grants — because those live outside the
 database and always will.
 
@@ -3474,7 +3478,7 @@ Three things it enforces that a remembered sequence did not:
 
 - **Scoping before publication.** `zebridge_publication_guard` refuses
   `ALTER PUBLICATION … ADD TABLE` on a table with neither a row filter nor RLS, so grants,
-  guards and RLS run *first* and the publication last. Discovered by writing it in the wrong
+  guards and RLS run _first_ and the publication last. Discovered by writing it in the wrong
   order and being refused mid-apply — which is exactly the half-applied activation the
   preflight now predicts with an ERROR row instead.
 - **A scoping decision is mandatory.** Publishing unscoped is refused up front, naming the
@@ -3507,8 +3511,8 @@ The protocol that makes the guarantee hold end to end:
 2. If no → **hold** it (do not drop, do not write partially).
 3. Schema arrives → migrate → **drain** the held events.
 
-**Gate on the column set, not on the LSN.** The LSN tells you *where you are*; the
-column set tells you *whether you can proceed*. Comparing `ev.lsn > schema.lsn` would
+**Gate on the column set, not on the LSN.** The LSN tells you _where you are_; the
+column set tells you _whether you can proceed_. Comparing `ev.lsn > schema.lsn` would
 stall during quiet periods, since most rows legitimately have LSNs newer than the last
 DDL. The `lsn` field earns its place as the ordering key and staleness marker, not as
 the gate.
@@ -3563,16 +3567,16 @@ zig build test-nats
 
 #### Server-Side Tables (`init.*.sql`)
 
-| Table Name | Role / Description |
-| :--- | :--- |
-| `zebridge_ddl_events` | The DDL transport mechanism. Because PostgreSQL's logical replication (WAL) natively ignores DDL statements (like `ALTER TABLE`), ZeBridge relies on event triggers (`zebridge_ddl_trigger_fn` and `zebridge_drop_trigger_fn`) to intercept schema changes and log them as `INSERT`s in this table. These `INSERT`s *are* emitted via the WAL, allowing the bridge to read schema changes in strict stream order with CDC data and publish them to NATS KV. |
-| `zebridge_catalogue` | **THE catalogue — one row per replicated table, the single source the bridge, the sweeper and the generation producer read.** `tenant_col NULL` = public (the CHECK forces a recorded `public_reason`, so an unscoped, unjustified row is unrepresentable), NOT NULL = tenant-scoped; `version_col`/`tombstone_col`/`tiebreak_col` are the LWW columns; `generations` opts a table out of chain building. UPSERTed by `zebridge_enable` in the same transaction as the guards it installs, loaded by the bridge at boot (rule maps, the public set for CDC_PUBLIC's subject reconciliation) and by the producer per tick. Absorbed and replaced `zebridge_public_tables` and `zebridge_generation_overrides` — both were projections of it. `SYNC_RULES`/`TENANT_RULES` env demoted to per-table emergency overrides. Since §10cf also the **ban dump**: `suspended boolean` + `suspended_reason text`, mirrored by the bridge on every refusal transition through `zebridge_set_suspended()` and pruned wholesale at boot by `zebridge_clear_suspensions()` — the psql answer to "which tables are refused?" (`SELECT tbl, suspended_reason FROM zebridge_catalogue WHERE suspended;`). A projection of the in-memory registry, never a source: live truth while the bridge runs, a stale dump when it is off, honest again at boot. `seed_epoch` (§10df): the re-seed lever — `zebridge_reseed(t)` bumps it for `t` and its FK closure, the DDL trigger bumps it on a re-key or a re-type, the bridge bumps it when a suspension that dropped events lifts; producer, descriptor, manifest and every replica's watermark carry it. |
-| `zebridge_gc_watermark` | Tracks the oldest standing tombstone. Read by clients (via CDC) to determine the maximum allowed offline window before their soft-deleted rows are completely swept and discarded. |
-| `zebridge_user_tenants` | Maps NATS principals to their corresponding PostgreSQL tenant IDs. Used by RLS policies and triggers to ensure edge writes correspond to the principal's tenant and route deletes correctly. |
-| `zebridge_principal_keys` | The nkeys principals enrolled with (§10cl): `user_pubkey PK, principal, tenant_id, enrolled_at`, written by the /enroll CTE in the redemption's own transaction. One-to-many (each device its own pair). The future hard kill — NATS's account `revocations` map — is keyed by pubkey, and a key never recorded can never be revoked. Survives `bridge --revoke` on purpose: audit trail + the list's input. |
-| `zebridge_generations` | The delta-generation producer's own memory (§1.13): one row per built generation of a (tenant, table) pair — `gen`, `cutoff_version`, `cutoff_lsn` (`pg_lsn`), `prev_cutoff` (the delta's lower bound; stored, not derived — pruning removes the row it would be derived from), `has_full` (this gen also shipped a `-full` object, the chain's jump-in point), `built_at`, PK `(tenant, tbl, gen)`. Read back on restart instead of the NATS pointer ("the bridge never reads its own output back"); doubles as the audit trail; pruned past chain depth. Internal-listed and unpublished — clients never replicate producer bookkeeping. Carries the read role's **single** write grant: `INSERT`+`DELETE`, never `UPDATE` (append-only by privilege), because the content query must run as the reader and the bookkeeping row must share its transaction. Contract proven by `scripts/scenarios/generations.py`. Since §10bb also `row_count` (tenant-scoped `count(*)` inside the build's snapshot) and `del_count` (`pg_stat_user_tables.n_tup_del`, cumulative) at the cutoff: a hard delete is invisible to the version predicate, so the producer skips a tick only when the version predicate, the count AND the delete count all held; either moving forces a full, because only a full can carry an absence. NULL on rows from before the columns → built once. Since §10df/§10dg also `seed_epoch` (the catalogue epoch the build ran under — a move forces a full) and `col_shape` (`name:type,…` at the build — a move forces a full, so no chain object names a column the replica lacks). Rows of a (tenant, table) that left the publication are swept with their objects and manifest. |
-| `zebridge_suspensions` | The refusal registry's projection (§10cy): `tbl PK, reason, since`, one row per table the bridge currently refuses (`no_primary_key`, `row_too_large`, `too_many_columns`, …), written through the SECURITY DEFINER `zebridge_set_suspended()`, wiped at every boot because the registry is memory. Its own unpublished table, so a refusal transition is no longer a catalogue move (§10cy's self-echo). Read at boot BEFORE the wipe (§10dh): a `too_many_columns` / `row_too_large` row means rows were dropped while the last bridge ran, and this boot asks for a re-seed. |
-| `zebridge_limits` | One row per INSTANCE (`slot` PK, `publication`, `max_row_bytes`, `updated_at`), registered by each bridge at boot from its own `2^BASE_BUF` via `zebridge_register_limits()` — never maintained by hand; rows whose slot has left `pg_replication_slots` are GC'd on the next boot. ⚠️ NOT read at write time: a table's budget (MIN over the instances whose publication carries it, via the `pg_publication_tables` join) is BAKED as a literal into its `zebridge_width_guard_<tbl>` body — §10b measured the literal free vs +4.81µs/row for a lookup and +22µs/row for the join — and re-derived at every bridge boot and at every `zebridge_enable` (§10l finding 8). The table is the source; the trigger body is the cache. |
+| Table Name                | Role / Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| :------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `zebridge_ddl_events`     | The DDL transport mechanism. Because PostgreSQL's logical replication (WAL) natively ignores DDL statements (like `ALTER TABLE`), ZeBridge relies on event triggers (`zebridge_ddl_trigger_fn` and `zebridge_drop_trigger_fn`) to intercept schema changes and log them as `INSERT`s in this table. These `INSERT`s _are_ emitted via the WAL, allowing the bridge to read schema changes in strict stream order with CDC data and publish them to NATS KV.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `zebridge_catalogue`      | **THE catalogue — one row per replicated table, the single source the bridge, the sweeper and the generation producer read.** `tenant_col NULL` = public (the CHECK forces a recorded `public_reason`, so an unscoped, unjustified row is unrepresentable), NOT NULL = tenant-scoped; `version_col`/`tombstone_col`/`tiebreak_col` are the LWW columns; `generations` opts a table out of chain building. UPSERTed by `zebridge_enable` in the same transaction as the guards it installs, loaded by the bridge at boot (rule maps, the public set for CDC_PUBLIC's subject reconciliation) and by the producer per tick. Absorbed and replaced `zebridge_public_tables` and `zebridge_generation_overrides` — both were projections of it. `SYNC_RULES`/`TENANT_RULES` env demoted to per-table emergency overrides. Since §10cf also the **ban dump**: `suspended boolean` + `suspended_reason text`, mirrored by the bridge on every refusal transition through `zebridge_set_suspended()` and pruned wholesale at boot by `zebridge_clear_suspensions()` — the psql answer to "which tables are refused?" (`SELECT tbl, suspended_reason FROM zebridge_catalogue WHERE suspended;`). A projection of the in-memory registry, never a source: live truth while the bridge runs, a stale dump when it is off, honest again at boot. `seed_epoch` (§10df): the re-seed lever — `zebridge_reseed(t)` bumps it for `t` and its FK closure, the DDL trigger bumps it on a re-key or a re-type, the bridge bumps it when a suspension that dropped events lifts; producer, descriptor, manifest and every replica's watermark carry it.                                                                      |
+| `zebridge_gc_watermark`   | Tracks the oldest standing tombstone. Read by clients (via CDC) to determine the maximum allowed offline window before their soft-deleted rows are completely swept and discarded.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `zebridge_user_tenants`   | Maps NATS principals to their corresponding PostgreSQL tenant IDs. Used by RLS policies and triggers to ensure edge writes correspond to the principal's tenant and route deletes correctly.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `zebridge_principal_keys` | The nkeys principals enrolled with (§10cl): `user_pubkey PK, principal, tenant_id, enrolled_at`, written by the /enroll CTE in the redemption's own transaction. One-to-many (each device its own pair). The future hard kill — NATS's account `revocations` map — is keyed by pubkey, and a key never recorded can never be revoked. Survives `bridge --revoke` on purpose: audit trail + the list's input.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `zebridge_generations`    | The delta-generation producer's own memory (§1.13): one row per built generation of a (tenant, table) pair — `gen`, `cutoff_version`, `cutoff_lsn` (`pg_lsn`), `prev_cutoff` (the delta's lower bound; stored, not derived — pruning removes the row it would be derived from), `has_full` (this gen also shipped a `-full` object, the chain's jump-in point), `built_at`, PK `(tenant, tbl, gen)`. Read back on restart instead of the NATS pointer ("the bridge never reads its own output back"); doubles as the audit trail; pruned past chain depth. Internal-listed and unpublished — clients never replicate producer bookkeeping. Carries the read role's **single** write grant: `INSERT`+`DELETE`, never `UPDATE` (append-only by privilege), because the content query must run as the reader and the bookkeeping row must share its transaction. Contract proven by `scripts/scenarios/generations.py`. Since §10bb also `row_count` (tenant-scoped `count(*)` inside the build's snapshot) and `del_count` (`pg_stat_user_tables.n_tup_del`, cumulative) at the cutoff: a hard delete is invisible to the version predicate, so the producer skips a tick only when the version predicate, the count AND the delete count all held; either moving forces a full, because only a full can carry an absence. NULL on rows from before the columns → built once. Since §10df/§10dg also `seed_epoch` (the catalogue epoch the build ran under — a move forces a full) and `col_shape` (`name:type,…` at the build — a move forces a full, so no chain object names a column the replica lacks). Rows of a (tenant, table) that left the publication are swept with their objects and manifest. |
+| `zebridge_suspensions`    | The refusal registry's projection (§10cy): `tbl PK, reason, since`, one row per table the bridge currently refuses (`no_primary_key`, `row_too_large`, `too_many_columns`, …), written through the SECURITY DEFINER `zebridge_set_suspended()`, wiped at every boot because the registry is memory. Its own unpublished table, so a refusal transition is no longer a catalogue move (§10cy's self-echo). Read at boot BEFORE the wipe (§10dh): a `too_many_columns` / `row_too_large` row means rows were dropped while the last bridge ran, and this boot asks for a re-seed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `zebridge_limits`         | One row per INSTANCE (`slot` PK, `publication`, `max_row_bytes`, `updated_at`), registered by each bridge at boot from its own `2^BASE_BUF` via `zebridge_register_limits()` — never maintained by hand; rows whose slot has left `pg_replication_slots` are GC'd on the next boot. ⚠️ NOT read at write time: a table's budget (MIN over the instances whose publication carries it, via the `pg_publication_tables` join) is BAKED as a literal into its `zebridge_width_guard_<tbl>` body — §10b measured the literal free vs +4.81µs/row for a lookup and +22µs/row for the join — and re-derived at every bridge boot and at every `zebridge_enable` (§10l finding 8). The table is the source; the trigger body is the cache.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 #### Client-Side Tables (`zb-client-ts/src/libzb.ts` — the extracted package; web-consumer and the Node consumer both import it)
 
@@ -3581,15 +3585,15 @@ Created by the shell through the storage adapter's dialect (`zb-client-ts/src/di
 `INTEGER PRIMARY KEY AUTOINCREMENT`; on PostgreSQL (PGlite) they are `BIGINT`, `BYTEA`, `BIGSERIAL` — the same
 tables, one definition, two spellings.
 
-| Table Name | Role / Description |
-| :--- | :--- |
-| `_zebridge_outbox` | Holds optimistic edge writes sent by the client that are pending a confirmation/verdict from NATS and the bridge. |
-| `_zebridge_sync` | Stores the `global_last_lsn` (PostgreSQL WAL position) successfully applied by the consumer, allowing it to discard already-seen CDC events. (Contains a legacy `global_last_seq` column). |
-| `_zebridge_stream_seq` | One durable position per stream (`last_seq`). The gap check compares it against the stream's `first_seq` on reconnect. Advanced per delivered BATCH, not per applied event (§10m D1): an applied event is in the tables, a gated one is provably in the seeded chain, a held one is durably in the inbox — all three account for the message. |
-| `_zebridge_inbox` | Durable FK hold (§10h): events whose parent row has not arrived yet (cross-table/cross-stream ordering is not guaranteed) are parked here in the same transaction that failed them, and replayed bulk-first after later batches. Pruned when a seed covers them (`lsn <= watermark`) or the table is dropped — never by age. |
-| `_zebridge_dicts` | The §10x dictionary cache (`name PK, bytes`): a delta names the zstd dictionary it was compressed with; fetched once from the generation bucket and kept, since a dictionary is immutable by name. Best-effort — absent on an older replica, refetched. |
-| `_zebridge_generations` | Per-table generation WATERMARK (`tbl PK, watermark, cutoff_lsn`) — the client tracks cutoffs, never gen numbers (a gen is an object-naming detail; the cutoff is what deltas chain on). On reconnect the chain walk applies only deltas whose `cutoff` exceeds the stored watermark. Also `seed_epoch` (§10df): the catalogue epoch the replica seeded at; a descriptor above it drops the row and re-seeds. |
-| `_zebridge_shape` | The shape the replica BUILT each table with (§10dg): `tbl PK, key_shape, type_shape` — canonical JSON from `core.keyShape` (pk columns in pk order with their dialect type) and `core.typeShape` (every column, sorted). The next descriptor is compared with it: a moved key shape is a re-key (rebuilt empty, re-seeded), a moved column type a re-type. Its own record, never a physical introspection — engines spell types differently, and a false positive here would empty a table. libzb keeps the same tables under `_zbz_`: `_zbz_generations`, `_zbz_shape`, `_zbz_inbox`, `_zbz_stream_seq`. |
+| Table Name              | Role / Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| :---------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `_zebridge_outbox`      | Holds optimistic edge writes sent by the client that are pending a confirmation/verdict from NATS and the bridge.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `_zebridge_sync`        | Stores the `global_last_lsn` (PostgreSQL WAL position) successfully applied by the consumer, allowing it to discard already-seen CDC events. (Contains a legacy `global_last_seq` column).                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `_zebridge_stream_seq`  | One durable position per stream (`last_seq`). The gap check compares it against the stream's `first_seq` on reconnect. Advanced per delivered BATCH, not per applied event (§10m D1): an applied event is in the tables, a gated one is provably in the seeded chain, a held one is durably in the inbox — all three account for the message.                                                                                                                                                                                                                                                             |
+| `_zebridge_inbox`       | Durable FK hold (§10h): events whose parent row has not arrived yet (cross-table/cross-stream ordering is not guaranteed) are parked here in the same transaction that failed them, and replayed bulk-first after later batches. Pruned when a seed covers them (`lsn <= watermark`) or the table is dropped — never by age.                                                                                                                                                                                                                                                                              |
+| `_zebridge_dicts`       | The §10x dictionary cache (`name PK, bytes`): a delta names the zstd dictionary it was compressed with; fetched once from the generation bucket and kept, since a dictionary is immutable by name. Best-effort — absent on an older replica, refetched.                                                                                                                                                                                                                                                                                                                                                   |
+| `_zebridge_generations` | Per-table generation WATERMARK (`tbl PK, watermark, cutoff_lsn`) — the client tracks cutoffs, never gen numbers (a gen is an object-naming detail; the cutoff is what deltas chain on). On reconnect the chain walk applies only deltas whose `cutoff` exceeds the stored watermark. Also `seed_epoch` (§10df): the catalogue epoch the replica seeded at; a descriptor above it drops the row and re-seeds.                                                                                                                                                                                              |
+| `_zebridge_shape`       | The shape the replica BUILT each table with (§10dg): `tbl PK, key_shape, type_shape` — canonical JSON from `core.keyShape` (pk columns in pk order with their dialect type) and `core.typeShape` (every column, sorted). The next descriptor is compared with it: a moved key shape is a re-key (rebuilt empty, re-seeded), a moved column type a re-type. Its own record, never a physical introspection — engines spell types differently, and a false positive here would empty a table. libzb keeps the same tables under `_zbz_`: `_zbz_generations`, `_zbz_shape`, `_zbz_inbox`, `_zbz_stream_seq`. |
 
 <br>
 
@@ -3597,69 +3601,69 @@ tables, one definition, two spellings.
 
 The functions are divided into read-only configurations, edge-write guard configurations, and composition helpers.
 
-| Function | Usage / Role |
-| :--- | :--- |
-| **Helpers / Entry Points** | |
-| `zebridge_enable()` | The main orchestration entry point: grants, write guards, RLS, the width guard, the `zebridge_catalogue` UPSERT (tenant/version/tombstone/`tiebreak_col`/generations — the declaration itself, atomic with the guards), the publication ADD, and a post-publication width-guard re-bake (finding 8, §10l). Can dry-run to print its plan. Its T3/T4 rows name the only remaining manual steps: one bridge restart, and the NATS grants. ⚠️ **Tombstone gate** (§10k): `writable => true` without `tombstone_col` is REFUSED — chains are the only seed path and a physical DELETE is inexpressible in an upsert-only delta, so hard-deleted rows resurrect on fresh seeds (measured, §10i). Escape hatch `allow_physical_deletes => true` passes with a WARNING row: mechanical refusal + recorded intent, same pattern as the timestamp and publication guards. |
-| `zebridge_is_internal_table()` | Checks if a table belongs to ZeBridge (or standard migration tools) to hide it from schema publications and avoid pointless client-side syncing. |
-| `zebridge_set_suspended()` / `zebridge_clear_suspensions()` | The ban dump's writers (§10cf): SECURITY DEFINER on the `zebridge_register_limits` pattern — the bridge's reader role executes a narrow setter, never holds `UPDATE` on the catalogue. `set(tbl, reason)` flips `suspended`/`suspended_reason` on a refusal transition (`reason NULL` = lifted); `clear_suspensions()` is the boot prune, because the registry is memory and a restart forgot — a surviving `true` would lie the other way. |
-| **Read/CDC Operations** | |
-| `zebridge_scope_reads_by_tenant()` | Enables RLS on a table so the reader's `SELECT`s — today that means the generation producer's content queries, which stamp `zb.tenant` per tenant — are scoped to the session's tenant. |
-| `zebridge_tenants_of()` | The generation producer's per-tick tenant set for a tenant-scoped table: `SELECT DISTINCT <tenant_col>` from the DATA, UNION the tenants of `zebridge_user_tenants` (`to_regclass`-guarded so the read-only profile, which lacks that table, still works). The union is what produces an EXPLICIT EMPTY manifest for a known tenant with no rows yet — a client can then distinguish "empty" from "no chain built" (§10i). SECURITY DEFINER, because the reader's own RLS would scope the DISTINCT to one tenant — PG functions hold the rules. |
-| `zebridge_publication_guard()` | Event trigger function protecting against unscoped `ALTER PUBLICATION ... ADD TABLE`. Rejects publications of tables without row-filters or RLS unless the catalogue marks them public (`tenant_col IS NULL`). |
-| `zebridge_timestamp_guard()` | Event trigger function refusing any `CREATE`/`ALTER TABLE` in `public` that introduces a `timestamp without time zone` column — §7.2's wire format and version clamping need absolute instants. `zebridge_is_internal_table` names are exempt (Ecto's `schema_migrations` is naive by design). |
-| `zebridge_audit_publications()` | Audits the database to ensure no tables are published without appropriate tenant scoping. |
-| `zebridge_ddl_trigger_fn()` | Event trigger running on `ddl_command_end` to capture modified table schemas directly from the catalog and log them as `INSERT`s into `zebridge_ddl_events`. The schema carries the portage payload (§10c): plain non-partial, non-expression secondary `indexes`, and `foreign_keys` filtered to parents that are themselves replicated with the referenced key PK-or-ported-unique — so a replica can enforce what it can actually satisfy. |
-| `zebridge_drop_trigger_fn()` | Event trigger running on `sql_drop` to inform clients when tables are permanently deleted by logging the event into `zebridge_ddl_events`. |
-| `zebridge_prune_ddl_events()` | TTL function that deletes events older than 2 days from `zebridge_ddl_events` to bound table growth. |
-| `zebridge_widest_row()` | Scans a table's data types to evaluate its byte size floor, ensuring it fits inside NATS message ceilings. |
-| `zebridge_oversized_defaults()` | Detects column default values that would break the NATS message size budget. |
-| **Write/Ingress Operations** | |
-| `zebridge_grant_edge_writes()` | Grants `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on a table to the `bridge_writer` role to permit edge mutations. |
-| `zebridge_install_write_guards()` | Helper function that sets up triggers for `bump_version`, `soft_delete`, and `guard_tenant` on a table. |
-| `zebridge_register_limits(slot, publication, max_row_bytes)` | **SECURITY DEFINER**, and the only writer of `zebridge_limits`. Called by every bridge at boot over its READER connection (the reader holds `EXECUTE` and no table write privilege — which is what lets a read-only deployment register at all). Three steps: GC rows whose `slot` has left `pg_replication_slots` (a retired instance must stop constraining everyone else), upsert this instance's one row with `2^BASE_BUF`, then RE-BAKE every width guard its publication carries via `zebridge_rebudget_width_guard` — a registration that did not update the baked literals would be a lie until the next enable. The bridge then runs at `min(own buffer, effective MIN across instances)`. Replaces the hand-maintained global row that SECURITY.md flagged and that was duly forgotten the first time `BASE_BUF` moved. ⚠️ Must run AFTER the slot exists, or the GC deletes what the upsert writes. |
-| `zebridge_rebudget_width_guard(tbl)` | Re-derives one table's budget and `CREATE OR REPLACE`s the guard FUNCTION BODY only — the trigger object is untouched, so no `ACCESS EXCLUSIVE` on the table (measured: ~203ms body swap vs >6s blocking behind a long transaction for DROP/CREATE TRIGGER). The boot re-bake loop and `zebridge_enable`'s post-publication re-bake both call this. |
-| `zebridge_install_width_guard()` | Builds and installs the per-table `zebridge_width_guard_<tbl>` trigger: a static body summing the table's unbounded columns (text/unbounded varchar/bytea/json/jsonb/xml/arrays) against a budget BAKED AS A LITERAL — `MIN(max_row_bytes)` over the instances whose publication carries the table (schema-qualified `format('%I.%I',…)::regclass` join through `pg_publication_tables`), default 16384 — raising SQLSTATE 23514 at write time, the same class-23 code the edge-write path treats as a permanent rejection, so both doors (consumer and psql) are guarded by one trigger with zero listener code. No-op on tables without unbounded columns. ⚠️ At `zebridge_enable` time the publication join is EMPTY for the newborn (the guard installs before the publication ADD, by required order), so enable re-bakes AFTER the publication step — finding 8, §10l. The drop trigger reaps `zebridge_width_guard_<tbl>()` with the table. |
-| `zebridge_remove_write_guards()` | Clears the write guard triggers, useful when an admin needs to perform physical cleanups on a table that is restricted to soft-deletes. |
-| `zebridge_bump_version()` | Write trigger ensuring that any write omitting the version column (e.g., `updated_at`) gets appropriately stamped with the current timestamp. |
-| `zebridge_soft_delete()` | Write trigger converting physical `DELETE` statements on tables with a tombstone column into soft-deleting `UPDATE` operations. |
-| `zebridge_guard_tenant()` | Write trigger on tenant-routed tables. An absent/empty tenant is resolved through `zebridge_user_tenants` by `zb.principal` — and **fails closed** (raises) when the principal is unset or unmapped, rather than leaving a row unroutable. A tenant containing a NATS subject metacharacter (`.` `*` `>` or space) is rejected outright: it would route to a subject no consumer receives. |
-| `zebridge_scope_writes_by_tenant()` | Multi-tenant configuration for edge writes. Sets up RLS and forces the creation of a unique `REPLICA IDENTITY` index (combining PK and tenant) so PostgreSQL routes `DELETE`s properly over CDC. |
-| `zebridge_scope_publication_to_one_tenant()` | Single-tenant alternative that uses a PostgreSQL publication row filter (`WHERE tenant = 'acme'`) to pin an entire publication to a specific tenant value. |
-| `zebridge_audit_write_guards()` | Audits all tables and reports which ones possess ZeBridge's write guard triggers. |
-| `zebridge_audit_sweeper()` | Checks if the internal sweeper principal (`zb_sweeper`) has any unreachable tenants, thereby helping track tenants whose tombstones won't get collected. |
+| Function                                                     | Usage / Role                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| :----------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Helpers / Entry Points**                                   |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `zebridge_enable()`                                          | The main orchestration entry point: grants, write guards, RLS, the width guard, the `zebridge_catalogue` UPSERT (tenant/version/tombstone/`tiebreak_col`/generations — the declaration itself, atomic with the guards), the publication ADD, and a post-publication width-guard re-bake (finding 8, §10l). Can dry-run to print its plan. Its T3/T4 rows name the only remaining manual steps: one bridge restart, and the NATS grants. ⚠️ **Tombstone gate** (§10k): `writable => true` without `tombstone_col` is REFUSED — chains are the only seed path and a physical DELETE is inexpressible in an upsert-only delta, so hard-deleted rows resurrect on fresh seeds (measured, §10i). Escape hatch `allow_physical_deletes => true` passes with a WARNING row: mechanical refusal + recorded intent, same pattern as the timestamp and publication guards.                                                                                   |
+| `zebridge_is_internal_table()`                               | Checks if a table belongs to ZeBridge (or standard migration tools) to hide it from schema publications and avoid pointless client-side syncing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `zebridge_set_suspended()` / `zebridge_clear_suspensions()`  | The ban dump's writers (§10cf): SECURITY DEFINER on the `zebridge_register_limits` pattern — the bridge's reader role executes a narrow setter, never holds `UPDATE` on the catalogue. `set(tbl, reason)` flips `suspended`/`suspended_reason` on a refusal transition (`reason NULL` = lifted); `clear_suspensions()` is the boot prune, because the registry is memory and a restart forgot — a surviving `true` would lie the other way.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| **Read/CDC Operations**                                      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `zebridge_scope_reads_by_tenant()`                           | Enables RLS on a table so the reader's `SELECT`s — today that means the generation producer's content queries, which stamp `zb.tenant` per tenant — are scoped to the session's tenant.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `zebridge_tenants_of()`                                      | The generation producer's per-tick tenant set for a tenant-scoped table: `SELECT DISTINCT <tenant_col>` from the DATA, UNION the tenants of `zebridge_user_tenants` (`to_regclass`-guarded so the read-only profile, which lacks that table, still works). The union is what produces an EXPLICIT EMPTY manifest for a known tenant with no rows yet — a client can then distinguish "empty" from "no chain built" (§10i). SECURITY DEFINER, because the reader's own RLS would scope the DISTINCT to one tenant — PG functions hold the rules.                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `zebridge_publication_guard()`                               | Event trigger function protecting against unscoped `ALTER PUBLICATION ... ADD TABLE`. Rejects publications of tables without row-filters or RLS unless the catalogue marks them public (`tenant_col IS NULL`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `zebridge_timestamp_guard()`                                 | Event trigger function refusing any `CREATE`/`ALTER TABLE` in `public` that introduces a `timestamp without time zone` column — §7.2's wire format and version clamping need absolute instants. `zebridge_is_internal_table` names are exempt (Ecto's `schema_migrations` is naive by design).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `zebridge_audit_publications()`                              | Audits the database to ensure no tables are published without appropriate tenant scoping.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `zebridge_ddl_trigger_fn()`                                  | Event trigger running on `ddl_command_end` to capture modified table schemas directly from the catalog and log them as `INSERT`s into `zebridge_ddl_events`. The schema carries the portage payload (§10c): plain non-partial, non-expression secondary `indexes`, and `foreign_keys` filtered to parents that are themselves replicated with the referenced key PK-or-ported-unique — so a replica can enforce what it can actually satisfy.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `zebridge_drop_trigger_fn()`                                 | Event trigger running on `sql_drop` to inform clients when tables are permanently deleted by logging the event into `zebridge_ddl_events`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `zebridge_prune_ddl_events()`                                | TTL function that deletes events older than 2 days from `zebridge_ddl_events` to bound table growth.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `zebridge_widest_row()`                                      | Scans a table's data types to evaluate its byte size floor, ensuring it fits inside NATS message ceilings.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `zebridge_oversized_defaults()`                              | Detects column default values that would break the NATS message size budget.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **Write/Ingress Operations**                                 |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `zebridge_grant_edge_writes()`                               | Grants `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on a table to the `bridge_writer` role to permit edge mutations.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `zebridge_install_write_guards()`                            | Helper function that sets up triggers for `bump_version`, `soft_delete`, and `guard_tenant` on a table.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `zebridge_register_limits(slot, publication, max_row_bytes)` | **SECURITY DEFINER**, and the only writer of `zebridge_limits`. Called by every bridge at boot over its READER connection (the reader holds `EXECUTE` and no table write privilege — which is what lets a read-only deployment register at all). Three steps: GC rows whose `slot` has left `pg_replication_slots` (a retired instance must stop constraining everyone else), upsert this instance's one row with `2^BASE_BUF`, then RE-BAKE every width guard its publication carries via `zebridge_rebudget_width_guard` — a registration that did not update the baked literals would be a lie until the next enable. The bridge then runs at `min(own buffer, effective MIN across instances)`. Replaces the hand-maintained global row that SECURITY.md flagged and that was duly forgotten the first time `BASE_BUF` moved. ⚠️ Must run AFTER the slot exists, or the GC deletes what the upsert writes.                                     |
+| `zebridge_rebudget_width_guard(tbl)`                         | Re-derives one table's budget and `CREATE OR REPLACE`s the guard FUNCTION BODY only — the trigger object is untouched, so no `ACCESS EXCLUSIVE` on the table (measured: ~203ms body swap vs >6s blocking behind a long transaction for DROP/CREATE TRIGGER). The boot re-bake loop and `zebridge_enable`'s post-publication re-bake both call this.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `zebridge_install_width_guard()`                             | Builds and installs the per-table `zebridge_width_guard_<tbl>` trigger: a static body summing the table's unbounded columns (text/unbounded varchar/bytea/json/jsonb/xml/arrays) against a budget BAKED AS A LITERAL — `MIN(max_row_bytes)` over the instances whose publication carries the table (schema-qualified `format('%I.%I',…)::regclass` join through `pg_publication_tables`), default 16384 — raising SQLSTATE 23514 at write time, the same class-23 code the edge-write path treats as a permanent rejection, so both doors (consumer and psql) are guarded by one trigger with zero listener code. No-op on tables without unbounded columns. ⚠️ At `zebridge_enable` time the publication join is EMPTY for the newborn (the guard installs before the publication ADD, by required order), so enable re-bakes AFTER the publication step — finding 8, §10l. The drop trigger reaps `zebridge_width_guard_<tbl>()` with the table. |
+| `zebridge_remove_write_guards()`                             | Clears the write guard triggers, useful when an admin needs to perform physical cleanups on a table that is restricted to soft-deletes.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `zebridge_bump_version()`                                    | Write trigger ensuring that any write omitting the version column (e.g., `updated_at`) gets appropriately stamped with the current timestamp.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `zebridge_soft_delete()`                                     | Write trigger converting physical `DELETE` statements on tables with a tombstone column into soft-deleting `UPDATE` operations.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `zebridge_guard_tenant()`                                    | Write trigger on tenant-routed tables. An absent/empty tenant is resolved through `zebridge_user_tenants` by `zb.principal` — and **fails closed** (raises) when the principal is unset or unmapped, rather than leaving a row unroutable. A tenant containing a NATS subject metacharacter (`.` `*` `>` or space) is rejected outright: it would route to a subject no consumer receives.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `zebridge_scope_writes_by_tenant()`                          | Multi-tenant configuration for edge writes. Sets up RLS and forces the creation of a unique `REPLICA IDENTITY` index (combining PK and tenant) so PostgreSQL routes `DELETE`s properly over CDC.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `zebridge_scope_publication_to_one_tenant()`                 | Single-tenant alternative that uses a PostgreSQL publication row filter (`WHERE tenant = 'acme'`) to pin an entire publication to a specific tenant value.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `zebridge_audit_write_guards()`                              | Audits all tables and reports which ones possess ZeBridge's write guard triggers.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `zebridge_audit_sweeper()`                                   | Checks if the internal sweeper principal (`zb_sweeper`) has any unreachable tenants, thereby helping track tenants whose tombstones won't get collected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
 ### Event triggers (the objects the functions above are wired to)
 
-| Trigger | Fires on | Function |
-| :--- | :--- | :--- |
-| `zebridge_ddl_trigger` | `ddl_command_end` | `zebridge_ddl_trigger_fn()` — captures the schema inside the DDL transaction |
-| `zebridge_drop_trigger` | `sql_drop` | `zebridge_drop_trigger_fn()` — drops never reach `ddl_command_end` |
-| `zebridge_publication_guard_t` | `ddl_command_end`, tag `ALTER PUBLICATION` | `zebridge_publication_guard()` |
-| `zebridge_timestamp_guard_t` | `ddl_command_end`, tags `CREATE TABLE`/`CREATE TABLE AS`/`ALTER TABLE` | `zebridge_timestamp_guard()` |
+| Trigger                        | Fires on                                                               | Function                                                                     |
+| :----------------------------- | :--------------------------------------------------------------------- | :--------------------------------------------------------------------------- |
+| `zebridge_ddl_trigger`         | `ddl_command_end`                                                      | `zebridge_ddl_trigger_fn()` — captures the schema inside the DDL transaction |
+| `zebridge_drop_trigger`        | `sql_drop`                                                             | `zebridge_drop_trigger_fn()` — drops never reach `ddl_command_end`           |
+| `zebridge_publication_guard_t` | `ddl_command_end`, tag `ALTER PUBLICATION`                             | `zebridge_publication_guard()`                                               |
+| `zebridge_timestamp_guard_t`   | `ddl_command_end`, tags `CREATE TABLE`/`CREATE TABLE AS`/`ALTER TABLE` | `zebridge_timestamp_guard()`                                                 |
 
 ### Table triggers (installed per guarded table by `zebridge_install_write_guards()`)
 
-These are the trigger *objects* the write-guard functions run as — one set per table,
+These are the trigger _objects_ the write-guard functions run as — one set per table,
 which is why `zebridge_audit_write_guards()` exists to report which tables actually
 carry them:
 
-| Trigger | Timing | Behaviour |
-| :--- | :--- | :--- |
-| `zebridge_bump_version_t` | `BEFORE UPDATE` | stamps the version column when a writer leaves it untouched |
-| `zebridge_soft_delete_t` | `BEFORE DELETE` | converts a physical DELETE into a tombstoning UPDATE — **except** when `zb.principal = 'zb_sweeper'`, the carve-out that lets the sweeper actually reap |
-| `zebridge_guard_tenant_t` | `BEFORE INSERT OR UPDATE` | `zebridge_guard_tenant()` — see the functions table |
+| Trigger                   | Timing                    | Behaviour                                                                                                                                               |
+| :------------------------ | :------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `zebridge_bump_version_t` | `BEFORE UPDATE`           | stamps the version column when a writer leaves it untouched                                                                                             |
+| `zebridge_soft_delete_t`  | `BEFORE DELETE`           | converts a physical DELETE into a tombstoning UPDATE — **except** when `zb.principal = 'zb_sweeper'`, the carve-out that lets the sweeper actually reap |
+| `zebridge_guard_tenant_t` | `BEFORE INSERT OR UPDATE` | `zebridge_guard_tenant()` — see the functions table                                                                                                     |
 
 ### Roles & policies
 
-| Object | Kind | Role / Description |
-| :--- | :--- | :--- |
-| `bridge_reader` (`POSTGRES_BRIDGE_USER`) | PG role | REPLICATION + SELECT everywhere. The read path — unable to write anything a client reads, with one deliberate exception: `INSERT`+`DELETE` (no `UPDATE`) on `zebridge_generations`, its own bookkeeping. The generation producer's content queries are scoped by `zb_reader_all` when the connection sets `zb.tenant`; RLS never touches CDC (logical decoding has no query). |
-| `bridge_writer` (`POSTGRES_WRITER_USER`) | PG role | Ingress. Created with **no table privileges** — tables open one at a time via `zebridge_grant_edge_writes()`. Writes are tenant-bounded by `zb_tenant_write` reading `zb.principal`. |
-| `zb_sweeper` | **not** a PG role | A `zb.principal` GUC value plus `zebridge_user_tenants` rows (one per tenant, or its reaps see nothing under RLS). Set by the bridge's own sweeper (`src/gc.zig`); recognised by `zebridge_soft_delete_t`'s bypass so tombstones can actually be removed. `zebridge_audit_sweeper()` reports tenants it cannot reach. |
-| `postgres` (admin) | PG role | Init/render and migrations only. The bridge never reads its credentials (`args.zig` rejects the PG_* fallback by design). |
-| `zb_reader_all` | RLS policy | On tenant-read-scoped tables, for `bridge_reader`: everything when `zb.tenant` is unset, that tenant plus the open tenant when set. |
-| `zb_tenant_write` | RLS policy | On tenant-write-scoped tables, for `bridge_writer`: the row's tenant must match the one derived from `zb.principal` — fail-closed when underivable. |
+| Object                                   | Kind              | Role / Description                                                                                                                                                                                                                                                                                                                                                            |
+| :--------------------------------------- | :---------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bridge_reader` (`POSTGRES_BRIDGE_USER`) | PG role           | REPLICATION + SELECT everywhere. The read path — unable to write anything a client reads, with one deliberate exception: `INSERT`+`DELETE` (no `UPDATE`) on `zebridge_generations`, its own bookkeeping. The generation producer's content queries are scoped by `zb_reader_all` when the connection sets `zb.tenant`; RLS never touches CDC (logical decoding has no query). |
+| `bridge_writer` (`POSTGRES_WRITER_USER`) | PG role           | Ingress. Created with **no table privileges** — tables open one at a time via `zebridge_grant_edge_writes()`. Writes are tenant-bounded by `zb_tenant_write` reading `zb.principal`.                                                                                                                                                                                          |
+| `zb_sweeper`                             | **not** a PG role | A `zb.principal` GUC value plus `zebridge_user_tenants` rows (one per tenant, or its reaps see nothing under RLS). Set by the bridge's own sweeper (`src/gc.zig`); recognised by `zebridge_soft_delete_t`'s bypass so tombstones can actually be removed. `zebridge_audit_sweeper()` reports tenants it cannot reach.                                                         |
+| `postgres` (admin)                       | PG role           | Init/render and migrations only. The bridge never reads its credentials (`args.zig` rejects the PG\_\* fallback by design).                                                                                                                                                                                                                                                   |
+| `zb_reader_all`                          | RLS policy        | On tenant-read-scoped tables, for `bridge_reader`: everything when `zb.tenant` is unset, that tenant plus the open tenant when set.                                                                                                                                                                                                                                           |
+| `zb_tenant_write`                        | RLS policy        | On tenant-write-scoped tables, for `bridge_writer`: the row's tenant must match the one derived from `zb.principal` — fail-closed when underivable.                                                                                                                                                                                                                           |
 
 ---
 
@@ -3736,7 +3740,7 @@ The consumer-code problem, named honestly: App.tsx is ~2700 lines, and the hard 
 - `onChange(table, cb)` — the doorbell; the app re-queries.
 
 **The one rule, made mechanical** ("the ones that only live in prose are the ones that bite" — third occurrence of the pattern after the timestamp and publication guards): direct writes to the replica bypass the outbox and diverge silently, so:
-❇️  `libzb` keeps its read-write connection PRIVATE and
+❇️ `libzb` keeps its read-write connection PRIVATE and
 ❇️ hands the app a second connection opened `SQLITE_OPEN_READONLY` (WAL: readers never block the applier).
 
 A stray UPDATE is an error at the call site, not a violated convention. In the browser tier (one sqlocal connection, OPFS sync handles are exclusive) the package instead simply exports no write path except `mutate()`; the raw handle stays for the SQL console, labeled.
@@ -3770,7 +3774,7 @@ Verified live as its own regression test: fresh load seeded `users` from chain g
 
 **Extraction step 2 LANDED (2026-08-26): the `zb-client-ts` package.** `zb-client-ts/` at the repo root (source package: `exports` point at `src/index.ts`, no build step), `libzb.ts` moved in via `git mv`, web-consumer consumes it as `"zb-client-ts": "link:../zb-client-ts"` — consumer #1, unchanged but for one import line. Verified live as the regression §10 promised: fresh load through the package → connected as pia (JWT from sessionStorage, tenant kilo) → 8 tables migrated → chain-first seed (memo g18, counter_public g38, watermark g8; snapshot fallback for the chainless) → CDC caught up (831+825) live → button write round-tripped MUTATION OUT (seq 3122) → verdict accepted → row in PG under kilo.
 
-One real lesson, recorded in `vite.config.ts` where it bit: a **linked package's deps resolve inside its own node_modules and are served over `/@fs/` URLs — and vite does not resolve extensionless requests there**. sqlocal spawns its worker with `new Worker(new URL('./worker', import.meta.url))`; under `/node_modules/` vite resolves `worker` → `worker.js`, under `/@fs/` it fell through to the SPA fallback and served **index.html with a 200**. The worker parsed HTML, died silently, and every DB call hung forever — no error in any console, no socket ever dialed, because `connect()`'s first await is `initSyncState()`. Diagnosed by racing `SELECT 1` against a timeout, then fetching both worker URLs and comparing content-types. Fix: `resolve.dedupe` for sqlocal and the shared runtime deps (@nats-io/*, msgpack, uuid) so the linked package uses the consumer's copies. The same class of hazard awaits any host that embeds the library: **the storage adapter owns a worker, and the worker's URL resolution is the host bundler's problem** — an argument for making the storage seam explicit (step 3) instead of letting sqlocal's spawn hide inside the core.
+One real lesson, recorded in `vite.config.ts` where it bit: a **linked package's deps resolve inside its own node_modules and are served over `/@fs/` URLs — and vite does not resolve extensionless requests there**. sqlocal spawns its worker with `new Worker(new URL('./worker', import.meta.url))`; under `/node_modules/` vite resolves `worker` → `worker.js`, under `/@fs/` it fell through to the SPA fallback and served **index.html with a 200**. The worker parsed HTML, died silently, and every DB call hung forever — no error in any console, no socket ever dialed, because `connect()`'s first await is `initSyncState()`. Diagnosed by racing `SELECT 1` against a timeout, then fetching both worker URLs and comparing content-types. Fix: `resolve.dedupe` for sqlocal and the shared runtime deps (@nats-io/\*, msgpack, uuid) so the linked package uses the consumer's copies. The same class of hazard awaits any host that embeds the library: **the storage adapter owns a worker, and the worker's URL resolution is the host bundler's problem** — an argument for making the storage seam explicit (step 3) instead of letting sqlocal's spawn hide inside the core.
 
 **Extraction step 3 LANDED (2026-08-26): the seams, and consumer #2.** The core no
 longer names a driver or a transport. `src/storage.ts` declares the seam (`Exec`,
@@ -3785,18 +3789,18 @@ verdict, outbox drained, and every table's row count matched Postgres exactly.
 Four things the second consumer taught, none of which a single host could have:
 
 - **Node's ESM resolver needs explicit extensions.** Vite tolerated `from './libzb'`;
-    Node does not. All internal specifiers now carry `.ts`.
+  Node does not. All internal specifiers now carry `.ts`.
 - **Type-only imports must say `import type`.** Node strips types syntactically,
-    without analysis, so a value-position type import is a runtime SyntaxError.
-    `verbatimModuleSyntax: true` is now on, so tsc catches the whole class.
+  without analysis, so a value-position type import is a runtime SyntaxError.
+  `verbatimModuleSyntax: true` is now on, so tsc catches the whole class.
 - **The storage contract was implicit.** The core drives several lanes at once (a
-    CDC consumer per stream + the write path) and calls `transaction()` concurrently.
-    sqlocal satisfied that invisibly — one worker, one queue — so nobody had to say it.
-    better-sqlite3 does not, and interleaved BEGINs dropped whole 100-event batches
-    (`cannot start a transaction within a transaction`). The rule is now WRITTEN in
-    storage.ts and honoured by a promise chain in node.ts.
+  CDC consumer per stream + the write path) and calls `transaction()` concurrently.
+  sqlocal satisfied that invisibly — one worker, one queue — so nobody had to say it.
+  better-sqlite3 does not, and interleaved BEGINs dropped whole 100-event batches
+  (`cannot start a transaction within a transaction`). The rule is now WRITTEN in
+  storage.ts and honoured by a promise chain in node.ts.
 - **A host bundler can silently serve HTML as a worker.** (Step 2's lesson; the
-    reason the storage adapter belongs to the host, not the core.)
+  reason the storage adapter belongs to the host, not the core.)
 
 Next: carve the sans-I/O eater boundary inside the package, capturing the tricky
 cases as golden fixtures AS THEY ARE WRITTEN (clamp, tiebreak, pruned-mid-walk,
@@ -3823,12 +3827,12 @@ for both.
 **Shape, chosen by measurement.** The guard fires on every insert/update, so the
 budget lookup is hot-path. Timed against the live DB, 2000 iterations each:
 
-| lookup | us/row |
-| --- | --- |
-| old single global row | 2.19 |
-| resolve publication per row (`pg_publication_tables` join + slot liveness) | 22.14 |
-| slot-liveness only | 4.35 |
-| **per-(table,slot) indexed, liveness GC'd at boot** | **3.01** |
+| lookup                                                                     | us/row   |
+| -------------------------------------------------------------------------- | -------- |
+| old single global row                                                      | 2.19     |
+| resolve publication per row (`pg_publication_tables` join + slot liveness) | 22.14    |
+| slot-liveness only                                                         | 4.35     |
+| **per-(table,slot) indexed, liveness GC'd at boot**                        | **3.01** |
 
 Resolving the publication inside the trigger costs 10x — a 100k-row bulk insert
 would pay ~2s of pure guard overhead. So the COLD path resolves and the HOT path
@@ -3877,16 +3881,16 @@ The client builds its local tables from `$KV.schemas.<table>`, so whatever the
 schema generator does not emit simply does not exist on the edge. Taking stock of
 what a PG table declares against what actually lands:
 
-| feature | status | consequence of the gap |
-| --- | --- | --- |
-| column types | ✅ ported | two dialects, `pg` and `sqlite` |
-| PRIMARY KEY | ✅ ported | `pk` + `pk_columns` (composite-safe) |
-| **NOT NULL** | ✅ ported 2026-08-26 | was computed then dropped; the replica accepted rows PG refused |
-| **indexes** | ✅ ported 2026-08-26 | root-level and dialect-neutral; partial/expression/non-btree excluded |
-| **FOREIGN KEY** | ✅ ported 2026-08-26 | was finding 6; needed pragma parity + an order-tolerant applier (§10d, §10e) |
+| feature            | status               | consequence of the gap                                                                                                                                                                 |
+| ------------------ | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| column types       | ✅ ported            | two dialects, `pg` and `sqlite`                                                                                                                                                        |
+| PRIMARY KEY        | ✅ ported            | `pk` + `pk_columns` (composite-safe)                                                                                                                                                   |
+| **NOT NULL**       | ✅ ported 2026-08-26 | was computed then dropped; the replica accepted rows PG refused                                                                                                                        |
+| **indexes**        | ✅ ported 2026-08-26 | root-level and dialect-neutral; partial/expression/non-btree excluded                                                                                                                  |
+| **FOREIGN KEY**    | ✅ ported 2026-08-26 | was finding 6; needed pragma parity + an order-tolerant applier (§10d, §10e)                                                                                                           |
 | UNIQUE constraints | ✅ ported 2026-08-26 | via the index port — PG backs them with a unique index and SQLite implements them AS one, so enforcement is identical; verified `UNIQUE constraint failed: users.email` on the replica |
-| DEFAULT values | ❌ | a client must supply every column on an insert |
-| CHECK constraints | ❌ | includes PG enums, which arrive as bare TEXT |
+| DEFAULT values     | ❌                   | a client must supply every column on an insert                                                                                                                                         |
+| CHECK constraints  | ❌                   | includes PG enums, which arrive as bare TEXT                                                                                                                                           |
 
 Deliberately NOT ported, and correctly so: sequences and identity columns (the
 `DbAllocatedKey` rule refuses server-allocated keys on writable tables — a client
@@ -3916,29 +3920,29 @@ locally was already published and thrown away.
 
 **Ordering, by payoff over cost:**
 
-  1. ~~NOT NULL~~ — DONE 2026-08-26. `required` now travels in both dialects and
-     the client emits it. Verified: the replica refuses locally with `NOT NULL
-     constraint failed: orders.user_id`, where before the write applied and came
-     back a 23502 verdict.
-  2. ~~indexes~~ (and UNIQUE with them) — DONE 2026-08-26. Root-level,
-     dialect-neutral; only btree, non-partial, non-expression indexes travel,
-     since anything excluded costs a scan and never a wrong row. Verified:
-     `EXPLAIN QUERY PLAN` reports `SEARCH orders USING INDEX orders_user_id_idx`.
-     The client syncs on the identical-schema path too — adding an index upstream
-     changes no COLUMN, so that is exactly where its republish lands.
-  3. ~~FOREIGN KEY~~ — DONE 2026-08-26, and it needed all of §10d: pragma parity
-     across the adapters, a detector that knows SQLite's THREE FK messages, and an
-     order-tolerant applier. Porting the constraint made §10e's cross-table
-     reordering visible for the first time — it had always been there.
-  4. ~~UNIQUE~~ — DONE with the index port. A PG UNIQUE constraint is backed by a
-     unique index, SQLite implements UNIQUE AS an index, so shipping the index
-     ships the enforcement. Verified end to end.
-  5. **Remaining, both low value**: DEFAULT values and CHECK constraints (including
-     PG enums, which arrive as bare TEXT). A replica receives COMPLETE rows, so
-     defaults matter only for local optimistic inserts, and a CHECK the server
-     already enforced cannot be violated by a row the server accepted. Neither is
-     a correctness gap for replication; both would only fail a bad local write
-     slightly earlier.
+1. ~~NOT NULL~~ — DONE 2026-08-26. `required` now travels in both dialects and
+   the client emits it. Verified: the replica refuses locally with `NOT NULL
+constraint failed: orders.user_id`, where before the write applied and came
+   back a 23502 verdict.
+2. ~~indexes~~ (and UNIQUE with them) — DONE 2026-08-26. Root-level,
+   dialect-neutral; only btree, non-partial, non-expression indexes travel,
+   since anything excluded costs a scan and never a wrong row. Verified:
+   `EXPLAIN QUERY PLAN` reports `SEARCH orders USING INDEX orders_user_id_idx`.
+   The client syncs on the identical-schema path too — adding an index upstream
+   changes no COLUMN, so that is exactly where its republish lands.
+3. ~~FOREIGN KEY~~ — DONE 2026-08-26, and it needed all of §10d: pragma parity
+   across the adapters, a detector that knows SQLite's THREE FK messages, and an
+   order-tolerant applier. Porting the constraint made §10e's cross-table
+   reordering visible for the first time — it had always been there.
+4. ~~UNIQUE~~ — DONE with the index port. A PG UNIQUE constraint is backed by a
+   unique index, SQLite implements UNIQUE AS an index, so shipping the index
+   ships the enforcement. Verified end to end.
+5. **Remaining, both low value**: DEFAULT values and CHECK constraints (including
+   PG enums, which arrive as bare TEXT). A replica receives COMPLETE rows, so
+   defaults matter only for local optimistic inserts, and a CHECK the server
+   already enforced cannot be violated by a row the server accepted. Neither is
+   a correctness gap for replication; both would only fail a bad local write
+   slightly earlier.
 
 **A rule this pair established, worth keeping**: there are TWO schema paths — the
 DDL trigger and the boot-time query — and a field added to only one gives it to
@@ -3974,8 +3978,8 @@ parent table exists will fail at apply time.
 
 **3. Two failure messages, neither of which says "FOREIGN KEY constraint
 failed".** Measured:
-    parent table missing        -> `no such table: main.nosuch`
-    parent column not unique    -> `foreign key mismatch - "c4" referencing "parent"`
+parent table missing -> `no such table: main.nosuch`
+parent column not unique -> `foreign key mismatch - "c4" referencing "parent"`
 The applier's `isForeignKeyFailure` matches only /FOREIGN KEY constraint failed/,
 so both of those would be classified as permanent and DROPPED rather than held.
 The detector has to broaden before FKs travel, or the hold/retry silently becomes
@@ -3998,15 +4002,15 @@ treating later constraint changes as the rare, costly case they are.
 
 **Order to build it, given the above:**
 
-  1. pragma parity in the storage seam (`foreign_keys = ON` in both adapters) —
-     needed regardless, and it is what makes the browser and Node agree;
-  2. broaden the FK-failure detector to the two messages above, so the applier's
-     hold/retry actually holds instead of dropping;
-  3. emit FKs from BOTH schema paths, filtered to parent keys that are the PK or
-     have a ported unique index, and have the client declare them inside
-     `CREATE TABLE`;
-  4. re-run the 30k interleaved split test WITH constraints present, where it
-     stops being a vacuous pass (§10c, finding 6).
+1. pragma parity in the storage seam (`foreign_keys = ON` in both adapters) —
+   needed regardless, and it is what makes the browser and Node agree;
+2. broaden the FK-failure detector to the two messages above, so the applier's
+   hold/retry actually holds instead of dropping;
+3. emit FKs from BOTH schema paths, filtered to parent keys that are the PK or
+   have a ported unique index, and have the client declare them inside
+   `CREATE TABLE`;
+4. re-run the 30k interleaved split test WITH constraints present, where it
+   stops being a vacuous pass (§10c, finding 6).
 
 ⚠️ Enabling enforcement makes the replica STRICTER than it is today: a local
 optimistic write that violates an FK starts failing where it used to succeed.
@@ -4211,25 +4215,25 @@ exist. The demo table was there; the metadata that would make it a demo was not.
 ### What porting it actually required (all measured, §10d)
 
 - **`foreign_keys` is per-connection, OFF by default, and our adapters
-    DISAGREED** — better-sqlite3 turns it on at open, sqlocal never sets it. Port
-    FKs and they would be ENFORCED in Node and IGNORED in the browser: the same
-    core, the same data, different integrity per consumer. Now part of the storage
-    contract, with the line drawn at PERFORMANCE pragmas (an adapter's business)
-    versus SEMANTIC ones (the seam's).
+  DISAGREED** — better-sqlite3 turns it on at open, sqlocal never sets it. Port
+  FKs and they would be ENFORCED in Node and IGNORED in the browser: the same
+  core, the same data, different integrity per consumer. Now part of the storage
+  contract, with the line drawn at PERFORMANCE pragmas (an adapter's business)
+  versus SEMANTIC ones (the seam's).
 - **SQLite reports THREE different failures** and only one says what you expect:
-    `FOREIGN KEY constraint failed` (missing parent ROW), `no such table:
-    main.<parent>` (missing parent TABLE — resolution is lazy at DDL, strict at
-    DML), and `foreign key mismatch` (parent key is not the PK and has no UNIQUE
-    index). The applier matched only the first, so the other two would have been
-    classed permanent and DROPPED — the hold/retry would silently have become a
-    delete.
+  `FOREIGN KEY constraint failed` (missing parent ROW), `no such table:
+  main.<parent>` (missing parent TABLE — resolution is lazy at DDL, strict at
+  DML), and `foreign key mismatch` (parent key is not the PK and has no UNIQUE
+  index). The applier matched only the first, so the other two would have been
+  classed permanent and DROPPED — the hold/retry would silently have become a
+  delete.
 - **The parent key must be the PK or carry a UNIQUE index**, reproduced both
-    ways. The §10c index port ships unique btree indexes, so most PG unique
-    constraints arrive already satisfied — but a parent key unique only under a
-    PARTIAL or EXPRESSION index is unique to PostgreSQL and unsatisfiable here, so
-    the filter checks for an index we ACTUALLY PORT.
+  ways. The §10c index port ships unique btree indexes, so most PG unique
+  constraints arrive already satisfied — but a parent key unique only under a
+  PARTIAL or EXPRESSION index is unique to PostgreSQL and unsatisfiable here, so
+  the filter checks for an index we ACTUALLY PORT.
 - **No `ALTER TABLE ADD CONSTRAINT` in SQLite**, so an FK change forces a table
-    rebuild where an index change is a cheap CREATE/DROP.
+  rebuild where an index change is a cheap CREATE/DROP.
 
 ### What it EXPOSED: the wire does not order across tables (§10e)
 
@@ -4284,17 +4288,17 @@ regardless — a stamp would make holds rarer, never unnecessary.
 
 ### The applier, in layers
 
-  1. batch apply inside one transaction with `defer_foreign_keys` — handles a child
-     before its parent WITHIN a batch (PROTOCOL §4's rule, and the common case);
-  2. on batch failure, ISOLATED replay one event at a time, so one bad row cannot
-     discard 99 innocent ones (it used to log and ack anyway: ~600 events were lost
-     that way during the Node-consumer work);
-  3. missing-parent failures are HELD and retried after each later batch —
-     bulk-first in ONE transaction, since per-event retry after every batch is
-     O(held x batches) and measured at ~765,000 transactions for 15,000 held,
-     which never converged and starved the batches carrying the parents;
-  4. holds are DURABLE (`_zebridge_inbox`) — in memory alone they were lost on
-     restart while already ACKed, so JetStream would never redeliver them.
+1. batch apply inside one transaction with `defer_foreign_keys` — handles a child
+   before its parent WITHIN a batch (PROTOCOL §4's rule, and the common case);
+2. on batch failure, ISOLATED replay one event at a time, so one bad row cannot
+   discard 99 innocent ones (it used to log and ack anyway: ~600 events were lost
+   that way during the Node-consumer work);
+3. missing-parent failures are HELD and retried after each later batch —
+   bulk-first in ONE transaction, since per-event retry after every batch is
+   O(held x batches) and measured at ~765,000 transactions for 15,000 held,
+   which never converged and starved the batches carrying the parents;
+4. holds are DURABLE (`_zebridge_inbox`) — in memory alone they were lost on
+   restart while already ACKed, so JetStream would never redeliver them.
 
 Verified: 15,000 users + 15,000 orders interleaved in one transaction, ring 4096
 so it split across ~8 releases, FK live — 7,212 held, 7,212 resolved, 0 dropped,
@@ -4306,14 +4310,14 @@ on restart, drained to 15,000/15,000.
 Chasing "`orders` silently fails to seed", THREE hypotheses were pursued and code
 was changed on each:
 
-  1. **the ported FK** — plausible, since orders is the only table with one. Wrong.
-  2. **concurrent bulk-load ordering** — seeding runs every table in parallel, so a
-     child's rows could hit the constraint before its parent's landed. Wrong as the
-     cause, though the fix (FK enforcement OFF during the bulk load, re-armed with
-     `foreign_key_check` after) is correct and kept: a seed is a bulk load of an
-     already-consistent snapshot.
-  3. **an empty chain object** — disproved by the object store: `orders-g3-delta`
-     was 165 KiB and the manifest well-formed.
+1. **the ported FK** — plausible, since orders is the only table with one. Wrong.
+2. **concurrent bulk-load ordering** — seeding runs every table in parallel, so a
+   child's rows could hit the constraint before its parent's landed. Wrong as the
+   cause, though the fix (FK enforcement OFF during the bulk load, re-armed with
+   `foreign_key_check` after) is correct and kept: a seed is a bulk load of an
+   already-consistent snapshot.
+3. **an empty chain object** — disproved by the object store: `orders-g3-delta`
+   was 165 KiB and the manifest well-formed.
 
 The actual cause was in none of them: the seeding loop awaited each table's whole
 request/retry cycle INLINE, so `test_types` — orphaned and throttled, sitting
@@ -4370,10 +4374,10 @@ the tenant scoping held (none of acme's rows leaked into kilo's chain).
 
 - the monotonic stamp + per-scope checkpoint (§10f) — designed, not built;
 - the per-table DATA watermark (§10g) — still wanted for CDC-side safety even
-    with snapshot replay retired;
+  with snapshot replay retired;
 - bridge-side retirement (snapshot listener, REQUESTS/SNAP_RET, INIT streams) —
-    deliberately untouched so old consumers and the scenario suite keep working;
-    remove once no consumer asks.
+  deliberately untouched so old consumers and the scenario suite keep working;
+  remove once no consumer asks.
 
 ## 10i. Finding 7: the LSN seed gate LOSES in-flight transactions (2026-08-27)
 
@@ -4390,18 +4394,18 @@ CDC stream carries both events; a FRESH replica seeding from g3 ends with only
 
 **The mechanism, three layers deep:**
 
-  1. A's row lsn (2/8F3A6C8) is BELOW g3's cutoff_lsn (2/8F3E740) — it wrote
-     early, committed late. The client anchors `state.lsn` to the chain cutoff and
-     gates `ev.lsn < state.lsn -> drop`, so A's CDC event is discarded as
-     "already in the snapshot" when it is precisely NOT in the snapshot.
-  2. The DELTA filter shares the defect in a different coordinate: deltas select
-     `version > prev cutoff_version`, and `now()` is TRANSACTION-START time — A's
-     updated_at (10:44:18) predates every later cutoff, so A is excluded from all
-     future deltas too.
-  3. Only a future FULL (whole-table scan, sees committed A) rescues fresh
-     clients — so with chain depth 6, every client seeding between g3 and the
-     next full misses the row. Clients already live before g3 got A normally,
-     which makes the divergence maddeningly inconsistent across replicas.
+1. A's row lsn (2/8F3A6C8) is BELOW g3's cutoff_lsn (2/8F3E740) — it wrote
+   early, committed late. The client anchors `state.lsn` to the chain cutoff and
+   gates `ev.lsn < state.lsn -> drop`, so A's CDC event is discarded as
+   "already in the snapshot" when it is precisely NOT in the snapshot.
+2. The DELTA filter shares the defect in a different coordinate: deltas select
+   `version > prev cutoff_version`, and `now()` is TRANSACTION-START time — A's
+   updated_at (10:44:18) predates every later cutoff, so A is excluded from all
+   future deltas too.
+3. Only a future FULL (whole-table scan, sees committed A) rescues fresh
+   clients — so with chain depth 6, every client seeding between g3 and the
+   next full misses the row. Clients already live before g3 got A normally,
+   which makes the divergence maddeningly inconsistent across replicas.
 
 Measured on the wire, the general shape (delivery is COMMIT order, lsn is WRITE
 position):
@@ -4416,9 +4420,9 @@ decode order, decode is commit order (§10f), and the client already persists
 cutoff:
 
 - the producer records, per manifest, the CDC stream's last_seq AT BUILD TIME
-    (`cutoff_seq`), alongside the existing cutoff_lsn/version;
+  (`cutoff_seq`), alongside the existing cutoff_lsn/version;
 - the client anchors its gate on `msg.seq <= cutoff_seq -> drop` instead of
-    the lsn comparison.
+  the lsn comparison.
 
 Correctness: a transaction visible to the snapshot AND published before capture
 has seq <= cutoff_seq (dropped, correct); one invisible to the snapshot commits
@@ -4449,16 +4453,16 @@ the lsn gate the same shape was silently lost.
 ⚠️ Residuals:
 
 - the chain path should verify CDC still covers its cutoff_seq (the snapshot
-    path had `descriptorStillFresh` for exactly this) — a chain whose cutoff_seq
-    has aged out of CDC retention is an orphan;
+  path had `descriptorStillFresh` for exactly this) — a chain whose cutoff_seq
+  has aged out of CDC retention is an orphan;
 - `seedSeq` is anchored in memory only — a durable replica that resumes from
-    its stored per-stream seq never replays old events, so persistence is not
-    needed for correctness today, but re-seeding paths should re-anchor;
+  its stored per-stream seq never replays old events, so persistence is not
+  needed for correctness today, but re-seeding paths should re-anchor;
 - observed during verification, PRE-EXISTING and documented: a tombstone-less
-    table (memo) resurrected a hard-DELETEd row (`trigger-B`) because old chain
-    deltas still carry it and the delete event sits below any cutoff — the
-    documented weaker guarantee of physical deletes, amplified by chain windows.
-    The answer remains "give the table a tombstone column"; no gate can fix it.
+  table (memo) resurrected a hard-DELETEd row (`trigger-B`) because old chain
+  deltas still carry it and the delete event sits below any cutoff — the
+  documented weaker guarantee of physical deletes, amplified by chain windows.
+  The answer remains "give the table a tombstone column"; no gate can fix it.
 
 ## 10j. The cross-STREAM FK test — and the two client defects it exposed (2026-08-27)
 
@@ -4474,13 +4478,13 @@ review insisted on keeping) had never actually been exercised. Built live:
 **The approval doors verified themselves on the way:**
 
 - First attempt used `tenant_col` WITHOUT `writable` — zebridge_enable REFUSED
-    it: "would be published unscoped, which zebridge_publication_guard refuses",
-    with the three legal options in the error. The migration door works.
+  it: "would be published unscoped, which zebridge_publication_guard refuses",
+  with the three legal options in the error. The migration door works.
 - After the correct enable, the RUNNING bridge still published the schema from
-    its boot-time catalogue view (tenant_column None, no FK) — the T3 restart
-    law, stated by zebridge_enable's own output. After one restart the schema
-    carried tenant_column, writable, AND the ported FK; the client's local DDL
-    had `FOREIGN KEY (user_id) REFERENCES users(id)`.
+  its boot-time catalogue view (tenant_column None, no FK) — the T3 restart
+  law, stated by zebridge_enable's own output. After one restart the schema
+  carried tenant_column, writable, AND the ported FK; the client's local DDL
+  had `FOREIGN KEY (user_id) REFERENCES users(id)`.
 
 **What worked:** fresh cross-stream seed (750 users via CDC_PUBLIC chain, 750
 kilo salaries via gen-kilo chain, zero orphans, FK live); the over-ring 3000-pair
@@ -4491,20 +4495,20 @@ independent consumers. The core cross-stream FK machinery works.
 **What it exposed — two OPEN client defects, found because the durable client
 was reconnected repeatedly:**
 
-  1. **CDC_kilo's position is never persisted when every event on it was HELD.**
-     `_zebridge_stream_seq` held only CDC_PUBLIC after runs whose kilo traffic
-     was 100% FK-held. A stream whose seq is never recorded reads as a GAP on the
-     next connect, which triggers a full RE-SEED on every reconnect — turning the
-     durable client into a permanently fresh one for that stream.
-  2. **A chain-full re-seed DESTROYS rows the chain lacks.** applyPlan's full
-     step is `DELETE FROM <table>` + insert the full's rows; the settle pass
-     re-seeded salaries from a chain reporting 3000 rows while PG held 4500, and
-     the 750 CDC-arrived rows were wiped (replica 3750, then 3000). The replica
-     ended MISSING the 750 cx users as well. Same DELETE-then-replay destruction
-     class as the retired snapshot path (§10g) — the chain path inherited it.
-     The chain-full row count itself (3000 of 4500 present at build time) also
-     needs explaining — full-scan vs bookkeeping mismatch, or my reading of an
-     interleaved log; NOT yet diagnosed.
+1. **CDC_kilo's position is never persisted when every event on it was HELD.**
+   `_zebridge_stream_seq` held only CDC_PUBLIC after runs whose kilo traffic
+   was 100% FK-held. A stream whose seq is never recorded reads as a GAP on the
+   next connect, which triggers a full RE-SEED on every reconnect — turning the
+   durable client into a permanently fresh one for that stream.
+2. **A chain-full re-seed DESTROYS rows the chain lacks.** applyPlan's full
+   step is `DELETE FROM <table>` + insert the full's rows; the settle pass
+   re-seeded salaries from a chain reporting 3000 rows while PG held 4500, and
+   the 750 CDC-arrived rows were wiped (replica 3750, then 3000). The replica
+   ended MISSING the 750 cx users as well. Same DELETE-then-replay destruction
+   class as the retired snapshot path (§10g) — the chain path inherited it.
+   The chain-full row count itself (3000 of 4500 present at build time) also
+   needs explaining — full-scan vs bookkeeping mismatch, or my reading of an
+   interleaved log; NOT yet diagnosed.
 
 RESOLVED 2026-08-27: defect 1 is D1, fixed in §10m; defect 2's data losses
 (vanished cx users, 3750-of-4500) were finding 9 (§10m), not the chain path —
@@ -4526,44 +4530,44 @@ replication correctness.
 
 Decided in review, recorded here so a session break loses nothing:
 
-  1. **Restart policy** — promoted to README ("Restart rules"). The compressed
-     law: the catalogue governs it -> migration + restart; data governs it ->
-     live. Roadmap: extend `catalog_epoch` refresh (which the mutation listener
-     already uses) to the CDC routing map, so mid-flight enables stop needing a
-     restart at all.
+1. **Restart policy** — promoted to README ("Restart rules"). The compressed
+   law: the catalogue governs it -> migration + restart; data governs it ->
+   live. Roadmap: extend `catalog_epoch` refresh (which the mutation listener
+   already uses) to the CDC routing map, so mid-flight enables stop needing a
+   restart at all.
 
-  2. **Tombstone gate — BUILT.** `zebridge_enable(writable => true)` now REFUSES
-     a table without `tombstone_col`: with snapshots retired, chains are the only
-     seed path and a physical DELETE is inexpressible in an upsert-only delta, so
-     hard-deleted rows resurrect on fresh seeds (measured, §10i). Escape hatch
-     `allow_physical_deletes => true` passes with a WARNING row — mechanical
-     refusal + recorded intent, same pattern as the timestamp and publication
-     guards. Old 11-arg signature dropped; livebirth's tombstone-less fixture now
-     opts out explicitly. Residual: psql deletes on READ-ONLY tombstone-less
-     tables share the hole; candidate mitigation is a producer-forced FULL
-     rebuild on seeing a DELETE event for such a table (caps resurrection at one
-     cadence). Not built. → Built 2026-08-29 (§10bb): the producer forces a full when
-     the row count or `n_tup_del` moved since the last cutoff.
+2. **Tombstone gate — BUILT.** `zebridge_enable(writable => true)` now REFUSES
+   a table without `tombstone_col`: with snapshots retired, chains are the only
+   seed path and a physical DELETE is inexpressible in an upsert-only delta, so
+   hard-deleted rows resurrect on fresh seeds (measured, §10i). Escape hatch
+   `allow_physical_deletes => true` passes with a WARNING row — mechanical
+   refusal + recorded intent, same pattern as the timestamp and publication
+   guards. Old 11-arg signature dropped; livebirth's tombstone-less fixture now
+   opts out explicitly. Residual: psql deletes on READ-ONLY tombstone-less
+   tables share the hole; candidate mitigation is a producer-forced FULL
+   rebuild on seeing a DELETE event for such a table (caps resurrection at one
+   cadence). Not built. → Built 2026-08-29 (§10bb): the producer forces a full when
+   the row count or `n_tup_del` moved since the last cutoff.
 
-  3. **Cross-tenant FK is NOT forbiddable** (public parent, tenant child is the
-     product's own shape) and mobile makes RECONNECTION THE COMMON PATH — which
-     promotes §10j's two defects to core correctness work, in this order:
-       D1. Persist the stream position when an event is HELD: the inbox row
-           already carries the event durably (with its seq and stream), so
-           holding IS accounting for it — advance `_zebridge_stream_seq` at hold
-           time. Kills the perpetual-gap -> re-seed-on-every-reconnect loop that
-           a 100%-held stream currently causes.
-       D2. Make re-seeding SCOPED and NON-DESTRUCTIVE: a gap on CDC_kilo must
-           re-seed only kilo-routed tables, and no chain-full may DELETE FROM a
-           table holding newer CDC-applied data — the per-table data watermark
-           (§10g residual) becomes mandatory. Clean-room the two §10j anomalies
-           first (the chain-full row-count mismatch and the vanished cx users)
-           per §10h's lesson: establish what ran before theorising.
-     After D1+D2 (done, §10o): strip the legacy snapshot dependencies from the scenario suite
-     (inventory in the 2026-08-27 discussion: snapshot.py, stampede.py, wide.py,
-     decode_integrity.py, faults.py, plus lighter references in check.py,
-     crosstenant.py, envcheck.py, leaksoak.py, objstore_race.py, tls.py,
-     tenant_kv.py, endpoint.py) so the bridge-side snapshot code can come out.
+3. **Cross-tenant FK is NOT forbiddable** (public parent, tenant child is the
+   product's own shape) and mobile makes RECONNECTION THE COMMON PATH — which
+   promotes §10j's two defects to core correctness work, in this order:
+   D1. Persist the stream position when an event is HELD: the inbox row
+   already carries the event durably (with its seq and stream), so
+   holding IS accounting for it — advance `_zebridge_stream_seq` at hold
+   time. Kills the perpetual-gap -> re-seed-on-every-reconnect loop that
+   a 100%-held stream currently causes.
+   D2. Make re-seeding SCOPED and NON-DESTRUCTIVE: a gap on CDC_kilo must
+   re-seed only kilo-routed tables, and no chain-full may DELETE FROM a
+   table holding newer CDC-applied data — the per-table data watermark
+   (§10g residual) becomes mandatory. Clean-room the two §10j anomalies
+   first (the chain-full row-count mismatch and the vanished cx users)
+   per §10h's lesson: establish what ran before theorising.
+   After D1+D2 (done, §10o): strip the legacy snapshot dependencies from the scenario suite
+   (inventory in the 2026-08-27 discussion: snapshot.py, stampede.py, wide.py,
+   decode_integrity.py, faults.py, plus lighter references in check.py,
+   crosstenant.py, envcheck.py, leaksoak.py, objstore_race.py, tls.py,
+   tenant_kv.py, endpoint.py) so the bridge-side snapshot code can come out.
 
 ## 10l. Finding 8: the newborn width-guard budget, and the workflow consolidated (2026-08-27)
 
@@ -4580,22 +4584,22 @@ tombstone gate — the fix is a post-publication re-bake inside `zebridge_enable
 
 **The width-guard workflow, in one place** (the state after §10b, findings 7-8):
 
-  1. the bridge reads env `BASE_BUF` (env ONLY — there is no `--buf` CLI flag;
-     the CLI carries --slot/--pub/--port/--top and everything else is env.
-     OPEN: whether per-instance sizing deserves a CLI option);
-  2. at boot it calls `zebridge_register_limits(slot, publication, 2^BASE_BUF)`
-     over the READER connection (SECURITY DEFINER; EXECUTE-only grant) — one row
-     per instance in `zebridge_limits` (slot PK), dead-slot GC, and a re-bake of
-     every guard its publication carries;
-  3. `zebridge_install_width_guard` (at enable) and the boot re-bake both derive
-     the budget as MIN over instances whose publication carries the table,
-     via the schema-qualified `format('%I.%I', ...)::regclass = tbl` join,
-     defaulting 16384 — and `zebridge_enable` re-bakes AFTER the publication step
-     (finding 8). The enable re-bake originally compared `pt.tablename = short`
-     (name-only, over-matches across schemas) — unified to the regclass form the
-     day it was found, in review;
-  4. the guard BODY reads nothing at write time: the budget is a baked literal
-     (§10b's measurement: literal free, lookup +4.81us/row, join +22us/row).
+1. the bridge reads env `BASE_BUF` (env ONLY — there is no `--buf` CLI flag;
+   the CLI carries --slot/--pub/--port/--top and everything else is env.
+   OPEN: whether per-instance sizing deserves a CLI option);
+2. at boot it calls `zebridge_register_limits(slot, publication, 2^BASE_BUF)`
+   over the READER connection (SECURITY DEFINER; EXECUTE-only grant) — one row
+   per instance in `zebridge_limits` (slot PK), dead-slot GC, and a re-bake of
+   every guard its publication carries;
+3. `zebridge_install_width_guard` (at enable) and the boot re-bake both derive
+   the budget as MIN over instances whose publication carries the table,
+   via the schema-qualified `format('%I.%I', ...)::regclass = tbl` join,
+   defaulting 16384 — and `zebridge_enable` re-bakes AFTER the publication step
+   (finding 8). The enable re-bake originally compared `pt.tablename = short`
+   (name-only, over-matches across schemas) — unified to the regclass form the
+   day it was found, in review;
+4. the guard BODY reads nothing at write time: the budget is a baked literal
+   (§10b's measurement: literal free, lookup +4.81us/row, join +22us/row).
 
 ## 10m. Finding 9: every reconnect dropped every table — and D1 closed (2026-08-27)
 
@@ -4635,14 +4639,14 @@ bookkeeping, which made every symptom look like a seeding bug.
 
 **Fix (two parts, both in libzb.ts):**
 
-  1. Existence comes from the DATABASE: when `syncedTables` misses, read
-     `PRAGMA table_info` and reconstruct the existing-table state (columns +
-     pk order) from the physical schema. "First sight" now means the table is
-     genuinely absent.
-  2. `rebuildPreservingData` (the legitimate drop/recreate path) wraps itself
-     in `PRAGMA foreign_keys OFF/ON`: with FK ON, SQLite refuses the DROP of a
-     referenced parent outright (measured — the [ERROR] line above). The data
-     is copied, not changed, so the surgery is FK-safe by construction.
+1. Existence comes from the DATABASE: when `syncedTables` misses, read
+   `PRAGMA table_info` and reconstruct the existing-table state (columns +
+   pk order) from the physical schema. "First sight" now means the table is
+   genuinely absent.
+2. `rebuildPreservingData` (the legitimate drop/recreate path) wraps itself
+   in `PRAGMA foreign_keys OFF/ON`: with FK ON, SQLite refuses the DROP of a
+   referenced parent outright (measured — the [ERROR] line above). The data
+   is copied, not changed, so the surgery is FK-safe by construction.
 
 Verified together: fresh seed then two reconnects -> `users=8 salaries=8` all
 three runs, `created (first sight)` 9 tables on run 1 and ZERO on reconnects,
@@ -4692,13 +4696,13 @@ SURVIVED. GREEN: position repaired — `Seeded salaries from generation chain g6
 **Residuals, stated so they are not lost:**
 
 - A chain can be newer than the stored position yet still short of the
-    stream's `first_seq` after aggressive pruning — events between its cutoff
-    and `first_seq` are lost with no warning. The chain-orphan check (§10k
-    discussion: verify CDC covers the manifest's cutoff_seq at seed time) is
-    designed, not built. Retention >= cadence makes it structurally rare.
+  stream's `first_seq` after aggressive pruning — events between its cutoff
+  and `first_seq` are lost with no warning. The chain-orphan check (§10k
+  discussion: verify CDC covers the manifest's cutoff_seq at seed time) is
+  designed, not built. Retention >= cadence makes it structurally rare.
 - The retired snapshot path's replay still begins with an ungated
-    `DELETE FROM` — acceptable only because the path is behind
-    `LEGACY_SNAPSHOT_SEEDING = false`; delete it rather than gate it.
+  `DELETE FROM` — acceptable only because the path is behind
+  `LEGACY_SNAPSHOT_SEEDING = false`; delete it rather than gate it.
 
 With D1 (§10m) + D2, §10k's plan is down to its last item: strip the legacy
 snapshot dependencies from the scenario suite, then remove the bridge-side
@@ -4711,16 +4715,16 @@ path): snapshot.py (request/replay/verify), stampede.py (request hammering),
 wide.py (width discipline via the snapshot working set — the width guard itself
 is covered by widthguard.py and livebirth.py), faults.py (snapshot-listener
 fault regressions; the listener leaves with the path). EDITED: check.py (§4
-init.snap.* grant-symmetry check retired in place), crosstenant.py (probe D),
+init.snap.\* grant-symmetry check retired in place), crosstenant.py (probe D),
 tenant_kv.py (§4 audience/contents), leaksoak.py (the every-30th snapshot
 request op), decode_integrity.py (now CDC-only; the COPY-binary decode half
 leaves with pg_copy_binary.zig), envcheck.py (SNAP_RET_SECONDS out of the known
 set). Comment-only mentions in tls.py, objstore_race.py, endpoint.py, speed.py,
 generations.py, zb.py stay — they are history or generations terminology.
 
-Nothing in scripts/scenarios references snapshot_request, init.snap.*, or the
+Nothing in scripts/scenarios references snapshot*request, init.snap.\*, or the
 $KV.snapshots bucket any more. The bridge-side snapshot code (listener, worker,
-pg_copy_binary.zig, the INIT_* publish path, SNAP_RET_SECONDS and friends) is
+pg_copy_binary.zig, the INIT*\* publish path, SNAP_RET_SECONDS and friends) is
 now unreferenced by the suite and can come out; .env/.conf cleanup rides with
 that removal.
 
@@ -4730,10 +4734,10 @@ The cleanup §10o cleared the way for. Removed in one pass, verified live:
 
 **Bridge**: `snapshot_listener.zig`, `pg_copy_binary.zig`, `streaming_encoder.zig`
 (used only by those two) deleted; the listener thread, its allocator, the
-snapshot half of the max_payload budget log, and `Config.Snapshot` excised;
-`reconcileCdcStreams` now creates only `CDC_<TENANT>` (the whole INIT family is
-gone — with `init.schema` already retired, INIT carried nothing but snapshot
-chunks). Boot log now reads `Streams: CDC, MUTATIONS`.
+snapshot half of the max*payload budget log, and `Config.Snapshot` excised;
+`reconcileCdcStreams` now creates only `CDC*<TENANT>`(the whole INIT family is
+gone — with`init.schema`already retired, INIT carried nothing but snapshot
+chunks). Boot log now reads`Streams: CDC, MUTATIONS`.
 
 **Topology/grammar**: `streams.init`, `streams.requests`, `init_streams`, every
 `snapshot_*` subject, `subjects.init_prefix`, and `kv.snapshots` are out of
@@ -4745,7 +4749,7 @@ corrupted the parse test's embedded JSON. Lesson repeated: after a mechanical
 line-filter, run BOTH `zig build` and `zig build test`, and reinstall the exe
 before restarting anything.
 
-**NATS**: REQUESTS stream, KV_snapshots, and every INIT_* stream deleted from
+**NATS**: REQUESTS stream, KV*snapshots, and every INIT*\* stream deleted from
 the live server; nats-init (compose + up.sh), both server confs (218 grant
 lines), and jwt-bootstrap.sh no longer create or grant any of it.
 `SNAP_RET_SECONDS` is gone from .env.admin.
@@ -4803,7 +4807,7 @@ dominance. The open hole is the SLOW clock losing its own edits.
 from CDC events' version column and chain cutoff_version.** Measured live: a
 row stamped 30s in the future arrived via CDC and the client's next version
 landed one microsecond above it while its wall clock sat 22s below. The
-original sketch:**
+original sketch:\*\*
 `version = max(wall_clock, newest_version_seen_via_CDC + 1us)`. A device that
 has seen the current row can never stamp below it; no schema, protocol, or
 bridge change. Bridge arrival time stays interesting only as an audit column,
@@ -4826,16 +4830,16 @@ end to end (mutate/tiebreak/poison/invalidate/replies/offline).
 **Environmental, not code** — the harness lessons:
 
 - zb.py's psql defaults to `docker exec` — the native stack needs
-    `ZB_PSQL="psql <url>"` exported, or every scenario fails on the OrbStack
-    socket while looking like product breakage.
+  `ZB_PSQL="psql <url>"` exported, or every scenario fails on the OrbStack
+  socket while looking like product breakage.
 - python-consumer/.venv lacked `nkeys`; with NATS_CREDS exported, nats-py
-    takes its JWT path and imports it. Installed (uv pip).
+  takes its JWT path and imports it. Installed (uv pip).
 - sizing's test 1 failed only inside the battery: its bridge contended for
-    the walsender the just-killed main bridge still held, and stalled before
-    the payload check. Solo on a probe slot: all green, including
-    EventBufferExceedsMaxPayload firing (direct repro confirmed the guard).
+  the walsender the just-killed main bridge still held, and stalled before
+  the payload check. Solo on a probe slot: all green, including
+  EventBufferExceedsMaxPayload firing (direct repro confirmed the guard).
 - envcheck's port findings are the native-vs-compose declaration mismatch,
-    pre-existing.
+  pre-existing.
 
 **Still red, one class**: objgrants (edits the password conf, not the JWT one),
 credentials (password principals), clamp and keys' write half (no verdict, no
@@ -5199,22 +5203,22 @@ build, not a phase the producer occupies.
 **The flow, per (tenant, table):**
 
 - **At every FULL build** (the existing chain-roll, no new knob): train a
-    fresh dictionary from THAT full's own msgpack bytes (split into 2 KiB
-    delta-sized samples; skipped when the full is < 16 KiB / < 8 samples —
-    dictionaries earn nothing on tiny corpora and ZDICT refuses them). Store
-    it as one more object (`<table>-g<N>-dict`) AND persist the bytes on the
-    full's `zebridge_generations` row (`dict bytea`). PG is the producer's
-    memory — the LAW: deltas built ticks later (across restarts) read the
-    dictionary back from HERE, never from NATS.
+  fresh dictionary from THAT full's own msgpack bytes (split into 2 KiB
+  delta-sized samples; skipped when the full is < 16 KiB / < 8 samples —
+  dictionaries earn nothing on tiny corpora and ZDICT refuses them). Store
+  it as one more object (`<table>-g<N>-dict`) AND persist the bytes on the
+  full's `zebridge_generations` row (`dict bytea`). PG is the producer's
+  memory — the LAW: deltas built ticks later (across restarts) read the
+  dictionary back from HERE, never from NATS.
 - **At every DELTA build** in that era: read the current full's dictionary
-    from PG, compress the delta WITH it, and record `dict_object` on the
-    delta's row + a `"dict":"<name>"` field on the delta's manifest entry.
+  from PG, compress the delta WITH it, and record `dict_object` on the
+  delta's row + a `"dict":"<name>"` field on the delta's manifest entry.
 - **Next full**: trains a NEW dictionary from scratch. Nothing carries
-    across eras — the full IS the best corpus, and incremental cross-era
-    learning is the exact history-state the law forbids.
+  across eras — the full IS the best corpus, and incremental cross-era
+  learning is the exact history-state the law forbids.
 - **Prune**: a dictionary object outlives its full's row — it is deleted
-    only when NO remaining row still references it (`SELECT DISTINCT
-    dict_object`). Lifecycle = chain lifecycle, GC'd by the chain window.
+  only when NO remaining row still references it (`SELECT DISTINCT
+  dict_object`). Lifecycle = chain lifecycle, GC'd by the chain window.
 
 **Client side.** A manifest's delta window can straddle two eras, so the dict
 reference lives PER DELTA, not per manifest. `core.planFromManifest` carries
@@ -5249,8 +5253,8 @@ commit — the user's own in-progress edits live there.)
 The roadmap's "one command, one verdict" checker, built as `scripts/zbdoctor.py`.
 Five gates: **A** the bridge is alive (`/health`, `/status`), **B** PostgreSQL is
 wired (the three `zebridge_audit_*()` functions + slots), **C** NATS carries the
-topology (CDC streams, KV buckets, retired snapshot-era leftovers), **D** *a
-fresh client can connect, seed and follow* (schemas published, tenants
+topology (CDC streams, KV buckets, retired snapshot-era leftovers), **D** _a
+fresh client can connect, seed and follow_ (schemas published, tenants
 resolvable, and for every `(tenant, table)`: a chain manifest whose full object
 is actually FETCHABLE — the two-sided-cleanup failure of §10r caught
 mechanically), **E** declared-vs-actual drift (delegates to `check.py`).
@@ -5275,15 +5279,15 @@ answer for a deployment shape this one does not use, and a naive wrapper turns
 them into noise the operator learns to ignore:
 
 - `zebridge_audit_publications()` reports 'CDC UNSCOPED' for every
-    tenant-scoped table, because it assumes the publication row filter is the
-    boundary. Here the per-tenant STREAM is the boundary (crosstenant.py
-    measures exactly that), so 'CDC UNSCOPED' with RLS on is EXPECTED; what is
-    never expected is PASS-THROUGH or 'WRITES UNSCOPED' on a tenant-scoped
-    table. Catalogue-public tables are exempt BY DECLARATION.
+  tenant-scoped table, because it assumes the publication row filter is the
+  boundary. Here the per-tenant STREAM is the boundary (crosstenant.py
+  measures exactly that), so 'CDC UNSCOPED' with RLS on is EXPECTED; what is
+  never expected is PASS-THROUGH or 'WRITES UNSCOPED' on a tenant-scoped
+  table. Catalogue-public tables are exempt BY DECLARATION.
 - `zebridge_audit_write_guards()` reports every table; guards are only owed
-    by EDGE-WRITABLE ones, and "writable" means what SECURITY.md says — the
-    writer role holds INSERT. An outbound-only table (`users`) legitimately
-    declares a version column with no trigger.
+  by EDGE-WRITABLE ones, and "writable" means what SECURITY.md says — the
+  writer role holds INSERT. An outbound-only table (`users`) legitimately
+  declares a version column with no trigger.
 
 **The auditor principal, and the grant that shaped the tool.** zbdoctor runs as
 its own least-privilege identity — `bridge_reader` on Postgres (measured: every
@@ -5291,18 +5295,18 @@ gate passes, no permission degradation) and a dedicated `zbdoctor` NATS user
 minted by jwt-bootstrap.sh. Two things had to be right:
 
 - It is signed by the account IDENTITY key, not by a signing key. Both of
-    this account's signing keys are ROLE-SCOPED, and a scoped signing key
-    REPLACES the user JWT's own permissions — a narrow auditor minted under
-    the service key would silently inherit `>` and be able to read everything.
+  this account's signing keys are ROLE-SCOPED, and a scoped signing key
+  REPLACES the user JWT's own permissions — a narrow auditor minted under
+  the service key would silently inherit `>` and be able to read everything.
 - The grant set was narrowed by measurement (remove one, re-run, see what
-    goes red), landing at: `$JS.API.INFO`, `STREAM.NAMES`, `STREAM.INFO.>`,
-    `DIRECT.GET.>`, and sub `_INBOX.>`.
+  goes red), landing at: `$JS.API.INFO`, `STREAM.NAMES`, `STREAM.INFO.>`,
+  `DIRECT.GET.>`, and sub `_INBOX.>`.
 
 ⚠️ **The narrowing changed the TOOL, not just the grant.** `nats kv ls` needs
 CONSUMER.CREATE — and a credential that can create a consumer can READ that
 stream, so listing keys would have forced the auditor to hold the very power it
-exists to verify nobody has. But zbdoctor never needs to know *what keys
-exist*, only *whether key X does* — every question is per-key. Gate D now does
+exists to verify nobody has. But zbdoctor never needs to know _what keys
+exist_, only _whether key X does_ — every question is per-key. Gate D now does
 per-key GETs, which needs nothing beyond DIRECT.GET, the same shape a tenant
 client uses. Verified negatively as well as positively: with these creds the
 tool passes all five gates, and `nats pub` is refused ("Permissions Violation")
@@ -5326,17 +5330,17 @@ shared dev stack is the operator's call, and the checker's job is to say so.
 **Two bugs in the checker itself, both caught by verifying findings against
 ground truth rather than trusting the output** — the discipline §10h named:
 
-  1. `active::text` renders `true`/`false`, while a RAW boolean column renders
-     `t`/`f` through `psql -tA`. Comparing against one form mis-read the other:
-     the tool called a demonstrably streaming slot INACTIVE (six samples said
-     `true`, `pg_stat_replication` said `streaming`), and — far worse — read
-     `generations::text` as false for every table, so **gate D silently skipped
-     every chain check and reported green by not looking**. A checker that
-     passes by omission is worse than no checker. One `truthy()` helper now
-     accepts both forms, and gate D really verifies 21 (tenant, table) chains.
-  2. Gate E doubled `check.py`'s ✗ because its lines carry ANSI escapes, so
-     `lstrip('✗ ')` never reached the glyph. Stripped properly, which also
-     keeps `--json` text clean.
+1. `active::text` renders `true`/`false`, while a RAW boolean column renders
+   `t`/`f` through `psql -tA`. Comparing against one form mis-read the other:
+   the tool called a demonstrably streaming slot INACTIVE (six samples said
+   `true`, `pg_stat_replication` said `streaming`), and — far worse — read
+   `generations::text` as false for every table, so **gate D silently skipped
+   every chain check and reported green by not looking**. A checker that
+   passes by omission is worse than no checker. One `truthy()` helper now
+   accepts both forms, and gate D really verifies 21 (tenant, table) chains.
+2. Gate E doubled `check.py`'s ✗ because its lines carry ANSI escapes, so
+   `lstrip('✗ ')` never reached the glyph. Stripped properly, which also
+   keeps `--json` text clean.
 
 ## 10z. DATABASE_URL -> DATABASE_READER_URL, and the admin half (2026-08-28)
 
@@ -5385,16 +5389,16 @@ that third one).
 **The shape now:**
 
 - **`.env.bridge`** — the bridge, complete. The role URLs (canonical: the
-    passwords live here and nowhere else), the publication, the slot, its NATS
-    credential. `./zig-out/bin/bridge` with NO FLAGS now boots from this file
-    alone — `--pub`/`--slot` became overrides, reading
-    `BRIDGE_CDC_PUBLICATION`/`BRIDGE_CDC_SLOT` when absent.
+  passwords live here and nowhere else), the publication, the slot, its NATS
+  credential. `./zig-out/bin/bridge` with NO FLAGS now boots from this file
+  alone — `--pub`/`--slot` became overrides, reading
+  `BRIDGE_CDC_PUBLICATION`/`BRIDGE_CDC_SLOT` when absent.
 - **`.env.admin`** — the DBA's scope only: the superuser connection, the
-    target database, the published port. Eight variables, down from twenty-two.
+  target database, the published port. Eight variables, down from twenty-two.
 - **`.env.docker`** — the compose stack, SELF-CONTAINED by design. It repeats
-    values on purpose: every address there is a container name
-    (`postgres-primary:5432`), not `127.0.0.1:55432`. One file, so no
-    cross-file drift is possible within that deployment either.
+  values on purpose: every address there is a container name
+  (`postgres-primary:5432`), not `127.0.0.1:55432`. One file, so no
+  cross-file drift is possible within that deployment either.
 
 **`scripts/zb-derive-env.py`** closes the loop: init.sql needs the role
 credentials in parts, so they are DERIVED from the canonical URLs (and
@@ -5533,12 +5537,12 @@ and "not in the catalogue" is an accident, not a control.
 **The fix, three layers, because one is a check and one is a grant and one is a name:**
 
 - `isForbiddenTable()` now refuses all three bridge-owned tables by name, before a
-    byte of payload is decoded — this is the control.
+  byte of payload is decoded — this is the control.
 - `zebridge_grant_edge_writes()` refuses to GRANT on all three (it already refused
-    the DDL table) — defence in depth against a future hand-grant.
+  the DDL table) — defence in depth against a future hand-grant.
 - zbdoctor exempts the three by name, keyed EXPLICITLY to that refusal, with a
-    comment that the exemption is only valid while the refusal exists — the check that
-    found this must not become the check that hides it.
+  comment that the exemption is only valid while the refusal exists — the check that
+  found this must not become the check that hides it.
 
 **Proof it is closed.** Restored the row, rebuilt the bridge container, replayed the
 identical envelope from the same principal:
@@ -5656,10 +5660,10 @@ the panic was the visible half of a bigger hole, and the invisible half was wors
     self.t = try transport.Transport.connect(…);
 
 - `Storage.open` sits INSIDE the struct literal while its `errdefer` comes after, so
-    a database that will not open leaks the struct.
+  a database that will not open leaks the struct.
 - A failure in `loadGrammar` or `connect` runs `a.destroy(self)` and nothing else —
-    **the SQLite handle stays open and the arena is never freed**. A leaked database
-    handle is exactly what bites a host that retries `open` after a failure.
+  **the SQLite handle stays open and the arena is never freed**. A leaked database
+  handle is exactly what bites a host that retries `open` after a failure.
 
 Fixed by a rule rather than by patching the three cases: **one acquire per statement,
 its `errdefer` on the next line, in the same order `deinit` releases in reverse.**
@@ -5747,30 +5751,30 @@ was left alive** — which is the whole property. All 132 survivors read
 **Three real defects found by tightening the loop**, none of which the 30 s version
 would have reached:
 
-  1. **The ingress accepts SCALARS ONLY.** `payloadToString` handles
-     nil/bool/int/uint/float/str and answers `UnsupportedPayloadType` for anything
-     else, so `text[]`, `int[][]` and `jsonb` must be sent as their PostgreSQL TEXT
-     form. Sending real msgpack arrays got every INSERT rejected — while the soak
-     still counted a verdict for each, which is why a one-cycle smoke test that reads
-     PostgreSQL back is worth more than a counter.
+1. **The ingress accepts SCALARS ONLY.** `payloadToString` handles
+   nil/bool/int/uint/float/str and answers `UnsupportedPayloadType` for anything
+   else, so `text[]`, `int[][]` and `jsonb` must be sent as their PostgreSQL TEXT
+   form. Sending real msgpack arrays got every INSERT rejected — while the soak
+   still counted a verdict for each, which is why a one-cycle smoke test that reads
+   PostgreSQL back is worth more than a counter.
 
-     ⚠️ Worth being exact, because `test_types` exists to carry awkward types and IS
-     mutated from the browser: web-consumer sends only its SCALARS
-     (`uid, some_text, age, is_true, tenant_id, updated_at, inserted_at`). The exotic
-     columns had been exercised INBOUND only (PG → bridge → client, `decode_integrity`).
-     Nothing had ever sent them OUTBOUND. Verified afterwards on a survivor:
-     `{soak,cycle-355}`, `{{355,710}}`, `{"cycle": 355, …}`, `1234.56789012`, `36.6`.
+   ⚠️ Worth being exact, because `test_types` exists to carry awkward types and IS
+   mutated from the browser: web-consumer sends only its SCALARS
+   (`uid, some_text, age, is_true, tenant_id, updated_at, inserted_at`). The exotic
+   columns had been exercised INBOUND only (PG → bridge → client, `decode_integrity`).
+   Nothing had ever sent them OUTBOUND. Verified afterwards on a survivor:
+   `{soak,cycle-355}`, `{{355,710}}`, `{"cycle": 355, …}`, `1234.56789012`, `36.6`.
 
-  2. **A partial UPDATE payload fails the LOCAL apply.** The optimistic apply is an
-     upsert, so SQLite evaluates the INSERT arm first and a payload missing a NOT NULL
-     column violates it before the conflict is ever resolved — PROTOCOL §7's asymmetry,
-     which is exactly why the wire carries full rows. It surfaced as a bare
-     `StepFailed`; `applyOptimistic` now carries SQLite's own message out with it.
+2. **A partial UPDATE payload fails the LOCAL apply.** The optimistic apply is an
+   upsert, so SQLite evaluates the INSERT arm first and a payload missing a NOT NULL
+   column violates it before the conflict is ever resolved — PROTOCOL §7's asymmetry,
+   which is exactly why the wire carries full rows. It surfaced as a bare
+   `StepFailed`; `applyOptimistic` now carries SQLite's own message out with it.
 
-  3. **A failed optimistic apply means the mutation is never published at all** — the
-     apply precedes the outbox write. Correct (do not send what you could not apply),
-     but it made the failure quiet: `upd=N` counted attempts while nothing reached the
-     wire. Reading PostgreSQL is what caught it.
+3. **A failed optimistic apply means the mutation is never published at all** — the
+   apply precedes the outbox write. Correct (do not send what you could not apply),
+   but it made the failure quiet: `upd=N` counted attempts while nothing reached the
+   wire. Reading PostgreSQL is what caught it.
 
 **And the `reaped` counter question from §10aw is answered**: per-pass, not cumulative.
 142 on the last pass against 340 reaped overall.
@@ -5799,31 +5803,32 @@ Verified end to end on a short run: 4 cycles → 4 inserted, 4 deleted, **8 verd
 **Three preconditions, and each fails SILENTLY if missed** — this is the real content
 of this section:
 
-  1. **The write guards must be installed on the table** — and on the native database
-     they were not: `test_types` carried only `zebridge_width_guard`, so a DELETE
-     removed the row PHYSICALLY and left no tombstone to reap.
+1. **The write guards must be installed on the table** — and on the native database
+   they were not: `test_types` carried only `zebridge_width_guard`, so a DELETE
+   removed the row PHYSICALLY and left no tombstone to reap.
 
-     ⚠️ **This is NOT a defect in the migrations, and saying so was my error.**
-     Checked afterwards on a fresh database: `20260810120000` + `20260810130000` alone
-     produce all four triggers (`zebridge_bump_version_t`, `zebridge_guard_tenant_t`,
-     `zebridge_soft_delete_t`, `zebridge_width_guard`) — the second migration's
-     `zebridge_enable(..., tombstone_col => 'deleted_at', writable => true, …)` does
-     exactly what it claims. The NATIVE database has **no `schema_migrations` table at
-     all**: those migrations never ran there. Its `test_types` came from somewhere else
-     and drifted, and `zebridge_enable` re-run by hand is what repaired it.
+   ⚠️ **This is NOT a defect in the migrations, and saying so was my error.**
+   Checked afterwards on a fresh database: `20260810120000` + `20260810130000` alone
+   produce all four triggers (`zebridge_bump_version_t`, `zebridge_guard_tenant_t`,
+   `zebridge_soft_delete_t`, `zebridge_width_guard`) — the second migration's
+   `zebridge_enable(..., tombstone_col => 'deleted_at', writable => true, …)` does
+   exactly what it claims. The NATIVE database has **no `schema_migrations` table at
+   all**: those migrations never ran there. Its `test_types` came from somewhere else
+   and drifted, and `zebridge_enable` re-run by hand is what repaired it.
 
-     The lesson is about the environment, not the code: a long-lived dev database is
-     not what the migrations would build today, and zbdoctor comparing DECLARED against
-     ACTUAL is the thing that notices.
-  2. **`zb_sweeper` must be mapped to the soak's tenant.** It was mapped to `globex`
-     and `acme`, not `kilo`. RLS scopes its DELETEs, so it reaped nothing — while
-     still advancing the watermark, which is what makes this silent: the watermark
-     moving looks exactly like the sweeper working. One row in
-     `zebridge_user_tenants` fixed it, and the same 4 tombstones then reaped on the
-     next pass. zbdoctor reports this as an amber ("UNREAPED — zb_sweeper is not
-     mapped to it") and it was right.
-  3. **`GC_THRESHOLD_MS` must be SHORTER than the soak.** It defaults to one hour, so
-     a one-hour run at the default reaps nothing.
+   The lesson is about the environment, not the code: a long-lived dev database is
+   not what the migrations would build today, and zbdoctor comparing DECLARED against
+   ACTUAL is the thing that notices.
+
+2. **`zb_sweeper` must be mapped to the soak's tenant.** It was mapped to `globex`
+   and `acme`, not `kilo`. RLS scopes its DELETEs, so it reaped nothing — while
+   still advancing the watermark, which is what makes this silent: the watermark
+   moving looks exactly like the sweeper working. One row in
+   `zebridge_user_tenants` fixed it, and the same 4 tombstones then reaped on the
+   next pass. zbdoctor reports this as an amber ("UNREAPED — zb_sweeper is not
+   mapped to it") and it was right.
+3. **`GC_THRESHOLD_MS` must be SHORTER than the soak.** It defaults to one hour, so
+   a one-hour run at the default reaps nothing.
 
 **A bug the soak found immediately**: `SyncClient.deinit()` destroyed the transport
 with the verdict subscription still live, and nats.zig panics on exactly that ("call
@@ -5846,8 +5851,8 @@ reach it.
 ⚠️ **The hazard is for the direction this library is going — and it is entirely OURS.**
 
 I first wrote that nats.zig "panics on a lifecycle mistake instead of returning an
-error", which was asked about and does not survive the question *what error would you
-want instead?* Nothing. The panic is the right design, and its own comment argues it:
+error", which was asked about and does not survive the question _what error would you
+want instead?_ Nothing. The panic is the right design, and its own comment argues it:
 
 > Subscriptions are owned by their creator, not by the connection, so anything still
 > alive here is a reference the caller never released. Destroying the connection under
@@ -5893,27 +5898,27 @@ itself needed nothing.
 **Four bugs the live run found that compiling never would.** Recording them because
 each is a shape, not a typo:
 
-  1. **Zig analyses lazily, so an unreferenced `pub fn` is never type-checked.** The
-     whole write path "built" clean while containing three compile errors. They
-     appeared the moment `demo.zig` CALLED it. Same lesson as the Linux-only branches
-     a macOS build switches out (§10ai) — and the fix is the same: reference it from
-     something that runs.
-  2. **`std.time` has no timestamp functions in 0.16** — no `nanoTimestamp`, no
-     `milliTimestamp`. libc is linked, so `std.c.clock_gettime(.REALTIME, …)` is the
-     one that exists, and REALTIME is required: this stamp is compared across machines.
-  3. **The verdict's msg id is in the SUBJECT, not the body**
-     (`mutation_ack.<principal>.<msg_id>`), and the body is **JSON, not msgpack** —
-     CDC and mutations are msgpack, a verdict is not. Reading the body for a `msg_id`
-     silently settled zero verdicts while the row was already in PostgreSQL. The wire
-     statuses are `accepted` / `stale` / `row_deleted` / `rejected` / `failed`, and
-     only the last stays queued. `stale` does not revert: the authoritative row is
-     already on its way over CDC, and restoring a before-image could undo it.
-  4. **A core subscription must be open BEFORE the write.** Subscribing inside
-     `drainVerdicts` meant the verdict had already been published and was gone.
-     `subscribeVerdicts()` is separate now. ⚠️ This bounds what the Zig client
-     promises: verdicts are ALSO stored in MUTATIONS so an offline client can collect
-     them on reconnect, and a core subscription cannot do that. A JetStream consumer
-     filtered to the subject is the durable form — the follow-up.
+1. **Zig analyses lazily, so an unreferenced `pub fn` is never type-checked.** The
+   whole write path "built" clean while containing three compile errors. They
+   appeared the moment `demo.zig` CALLED it. Same lesson as the Linux-only branches
+   a macOS build switches out (§10ai) — and the fix is the same: reference it from
+   something that runs.
+2. **`std.time` has no timestamp functions in 0.16** — no `nanoTimestamp`, no
+   `milliTimestamp`. libc is linked, so `std.c.clock_gettime(.REALTIME, …)` is the
+   one that exists, and REALTIME is required: this stamp is compared across machines.
+3. **The verdict's msg id is in the SUBJECT, not the body**
+   (`mutation_ack.<principal>.<msg_id>`), and the body is **JSON, not msgpack** —
+   CDC and mutations are msgpack, a verdict is not. Reading the body for a `msg_id`
+   silently settled zero verdicts while the row was already in PostgreSQL. The wire
+   statuses are `accepted` / `stale` / `row_deleted` / `rejected` / `failed`, and
+   only the last stays queued. `stale` does not revert: the authoritative row is
+   already on its way over CDC, and restoring a before-image could undo it.
+4. **A core subscription must be open BEFORE the write.** Subscribing inside
+   `drainVerdicts` meant the verdict had already been published and was gone.
+   `subscribeVerdicts()` is separate now. ⚠️ This bounds what the Zig client
+   promises: verdicts are ALSO stored in MUTATIONS so an offline client can collect
+   them on reconnect, and a core subscription cannot do that. A JetStream consumer
+   filtered to the subject is the durable form — the follow-up.
 
 **And the one that mattered, found by the test rather than by reading.** The watermark
 gate lived in `flushOutbox`, but `mutate` published DIRECTLY — so a write's first send
@@ -5946,10 +5951,10 @@ were written for TypeScript and the Zig port had to satisfy them without amendme
 Two details the port had to get right, and the fixtures are what enforce them:
 
 - `std.mem.order(u8, nv, m) != .gt` is the `<=` — a mutation stamped exactly at the
-    watermark is refused, because the watermark is the oldest STANDING tombstone.
+  watermark is refused, because the watermark is the oldest STANDING tombstone.
 - `normalizeVersion` on BOTH sides before comparing. PG trims trailing fractional
-    zeros, so `.5Z` vs `.50001Z` orders wrongly as raw text; two fixtures cover that
-    pair in both directions and a port that skipped the normalize would fail them.
+  zeros, so `.5Z` vs `.50001Z` orders wrongly as raw text; two fixtures cover that
+  pair in both directions and a port that skipped the normalize would fail them.
 
 **Verified the group actually runs**, rather than trusting a pass count: corrupted one
 expectation in the shared fixture file and the Zig runner reported exactly one failure
@@ -6299,8 +6304,7 @@ for wanting it, not about reachability.
 
 **3. The ports were hardcoded in TWO files, and the second one is the one that
 mattered.** `App.tsx` named `ws://localhost:8080`, and `vite.config.ts` proxied
-`/bridge` to `http://127.0.0.1:9090`. Compose published those services on 8081 and
-9098. Measured while diagnosing: **8080 and 9090 were both FREE** while the services
+`/bridge` to `http://127.0.0.1:9090`. Compose published those services on 8081 and 9098. Measured while diagnosing: **8080 and 9090 were both FREE** while the services
 ran one number away — which is the whole failure, and a browser can say nothing
 about it beyond "connection refused".
 
@@ -6387,7 +6391,7 @@ comment behind. One `fi` too many:
 
     sh: syntax error: unexpected "fi"     -> exit 2
 
-`up -d` reports the container as *started* either way, so nothing said a word —
+`up -d` reports the container as _started_ either way, so nothing said a word —
 and the MUTATIONS stream and all three KV buckets were never created. Only the
 NATIVE installer (`scripts/native/up.sh`) does that work too, which is why three
 days passed. Verified after the fix: MUTATIONS + `KV_schemas`, `KV_tenants`,
@@ -6416,7 +6420,7 @@ Fixed with `std.posix.openat` + `std.posix.system.close` for the cgroup read, an
 `/proc/meminfo`'s `MemTotal` for physical RAM. ⚠️ **Alpine is the deployment
 target**, so these were not cosmetic — the image could not be built.
 
-*Method worth keeping*: `zig build-obj -target x86_64-linux-musl` on a scratch file
+_Method worth keeping_: `zig build-obj -target x86_64-linux-musl` on a scratch file
 containing just the function compiles the Linux branch **on the host**, in a second,
 with no Docker round trip. That is how the second error was found and fixed.
 
@@ -6443,24 +6447,24 @@ work, and until the container ran they were an untested guess.
 already-migrated native database):
 
 - `mix ecto.migrate` could not complete on a FRESH database.
-    `20260810140000_setup_no_pk_table` declares `timestamps(type: :utc_datetime_usec)`,
-    which Ecto renders as `timestamp(6) WITHOUT time zone` — refused outright by
-    `zebridge_timestamp_guard`. The fixture's point is the missing primary key, not
-    the column type; it is `:timestamptz` now.
+  `20260810140000_setup_no_pk_table` declares `timestamps(type: :utc_datetime_usec)`,
+  which Ecto renders as `timestamp(6) WITHOUT time zone` — refused outright by
+  `zebridge_timestamp_guard`. The fixture's point is the missing primary key, not
+  the column type; it is `:timestamptz` now.
 - `counter_public` and `counter_tenant` were silently left UNPUBLISHED. The
-    2026-08-27 tombstone gate refuses writable-without-tombstone, and it does so with
-    an ERROR **row** — which `PERFORM * FROM zebridge_enable(...)` discards, so
-    `mix ecto.migrate` reported success and the demo tables were simply absent from
-    the publication. `allow_physical_deletes => true` records the acceptance (a
-    counter is never deleted). ⚠️ **The general problem stands**: every emitter
-    migration uses `PERFORM * FROM`, so any ERROR row is invisible. The fix is to
-    `SELECT ... WHERE status = 'ERROR'` into a variable and `RAISE` when it is not
-    null — same reasoning that made `zebridge_enable` raise rather than return a row
-    for a missing publication (§10ad). Not done.
+  2026-08-27 tombstone gate refuses writable-without-tombstone, and it does so with
+  an ERROR **row** — which `PERFORM * FROM zebridge_enable(...)` discards, so
+  `mix ecto.migrate` reported success and the demo tables were simply absent from
+  the publication. `allow_physical_deletes => true` records the acceptance (a
+  counter is never deleted). ⚠️ **The general problem stands**: every emitter
+  migration uses `PERFORM * FROM`, so any ERROR row is invisible. The fix is to
+  `SELECT ... WHERE status = 'ERROR'` into a variable and `RAISE` when it is not
+  null — same reasoning that made `zebridge_enable` raise rather than return a row
+  for a missing publication (§10ad). Not done.
 - Two more publication fallbacks the §10ad sweep missed, both in fixture
-    migrations that hand-roll `ALTER PUBLICATION` instead of calling
-    `zebridge_enable`: `System.get_env("BRIDGE_CDC_PUBLICATION", "my_pub")` in
-    `setup_no_pk_table` (written twice, one line apart) and `setup_exotic_types`.
+  migrations that hand-roll `ALTER PUBLICATION` instead of calling
+  `zebridge_enable`: `System.get_env("BRIDGE_CDC_PUBLICATION", "my_pub")` in
+  `setup_no_pk_table` (written twice, one line apart) and `setup_exotic_types`.
 
 ## 10ag. speed.py is not a benchmark on a shared machine — WITHDRAWN (2026-08-28)
 
@@ -6484,32 +6488,32 @@ half of the same rule. All green on the native stack.
 
 **The bridge** (`--port 9097`, each case a fresh process, killed after it speaks):
 
-| # | environment | argv | outcome |
-| --- | --- | --- | --- |
-| 1a | — | — | `🔴 no replication slot named` — names `--slot` AND `BRIDGE_CDC_SLOT`, and `cdc_slot` appears nowhere |
-| 1b | `BRIDGE_CDC_SLOT` | — | `🔴 no publication named` — same shape, no `cdc_pub` |
-| 2 | — | `--slot s --pub` | `🔴 --pub requires a value` — the missing value never reaches the resolver |
-| 3 | — | `--slot s --pub ''` | `🔴 Publication '' not found` — an empty name is a name, refused where names are checked |
-| 4 | — | `--pub zb_ghost_flag` | `Publication 'zb_ghost_flag' not found` |
-| 5a | `…=zb_ghost_env` | — | `Publication 'zb_ghost_env' not found` |
-| 6 | `…=zb_ghost_env` | `--pub zb_ghost_flag` | `…'zb_ghost_flag' not found`, and `zb_ghost_env` is absent from the log |
-| 7 | (case 6's run) | | that refusal is `🔴` and fatal — not a bridge that streams nothing |
-| 5b | `…=my_pub`, own slot | — | `✅ Replication started successfully` — the flagless `.env.bridge` boot, all the way through |
+| #   | environment          | argv                  | outcome                                                                                               |
+| --- | -------------------- | --------------------- | ----------------------------------------------------------------------------------------------------- |
+| 1a  | —                    | —                     | `🔴 no replication slot named` — names `--slot` AND `BRIDGE_CDC_SLOT`, and `cdc_slot` appears nowhere |
+| 1b  | `BRIDGE_CDC_SLOT`    | —                     | `🔴 no publication named` — same shape, no `cdc_pub`                                                  |
+| 2   | —                    | `--slot s --pub`      | `🔴 --pub requires a value` — the missing value never reaches the resolver                            |
+| 3   | —                    | `--slot s --pub ''`   | `🔴 Publication '' not found` — an empty name is a name, refused where names are checked              |
+| 4   | —                    | `--pub zb_ghost_flag` | `Publication 'zb_ghost_flag' not found`                                                               |
+| 5a  | `…=zb_ghost_env`     | —                     | `Publication 'zb_ghost_env' not found`                                                                |
+| 6   | `…=zb_ghost_env`     | `--pub zb_ghost_flag` | `…'zb_ghost_flag' not found`, and `zb_ghost_env` is absent from the log                               |
+| 7   | (case 6's run)       |                       | that refusal is `🔴` and fatal — not a bridge that streams nothing                                    |
+| 5b  | `…=my_pub`, own slot | —                     | `✅ Replication started successfully` — the flagless `.env.bridge` boot, all the way through          |
 
 The trick that makes 4/5a/6 one-line assertions: every ghost name is one PostgreSQL
-does not have, so the not-found error *reports what the bridge resolved*. One run
+does not have, so the not-found error _reports what the bridge resolved_. One run
 proves both which channel won and that a wrong name stops the boot.
 
 **The SQL** (a scratch database, both templates rendered fresh):
 
-  8a. after init.core, `pg_publication` is EMPTY — the name left the templates
-  8b. `zebridge_create_publication('p_probe')` on the readonly profile: created,
-      two internal tables added, `ABSENT` reported for `zebridge_user_tenants`
-  8c. applying init.write afterwards backfills it — install order does not matter
-  8d. `zebridge_enable(...)` with no publication → raises, naming both channels
-  8e. with an unknown publication → raises rather than creating it
-  8f. with `create_publication => true` → the publication carries the user table
-      AND all three internal tables
+8a. after init.core, `pg_publication` is EMPTY — the name left the templates
+8b. `zebridge_create_publication('p_probe')` on the readonly profile: created,
+two internal tables added, `ABSENT` reported for `zebridge_user_tenants`
+8c. applying init.write afterwards backfills it — install order does not matter
+8d. `zebridge_enable(...)` with no publication → raises, naming both channels
+8e. with an unknown publication → raises rather than creating it
+8f. with `create_publication => true` → the publication carries the user table
+AND all three internal tables
 
 **Also fixed on the way**: `scripts/scenarios/render.py` had an unterminated string
 literal (an unescaped `"` inside a hint added in 174d952) and could not be imported
@@ -6531,11 +6535,11 @@ is gained by hoisting it.
 not used once — it is used to attach THREE internal tables that every consuming
 bridge needs:
 
-- `zebridge_ddl_events`   (init.core) — the DDL transport. Without it a bridge
-    never learns a schema changed.
+- `zebridge_ddl_events` (init.core) — the DDL transport. Without it a bridge
+  never learns a schema changed.
 - `zebridge_gc_watermark` (init.core) — the offline-window watermark clients read.
 - `zebridge_user_tenants` (init.write) — the roster diverted to `$KV.tenants`;
-    without it PROTOCOL Step 0 fails for every client of that bridge.
+  without it PROTOCOL Step 0 fails for every client of that bridge.
 
 So the multi-publication recipe recorded earlier — `CREATE PUBLICATION pub_x;`
 then `zebridge_enable(..., publication => 'pub_x')` — is INCOMPLETE. A second
@@ -6581,22 +6585,22 @@ Asked and answered from the code, not memory — three layers, and they were
 already mostly there:
 
 - **Missing publication → FATAL.** `replication_setup.zig` returns
-    `error.PublicationNotFound` with the `CREATE PUBLICATION` hint; the bridge
-    refuses to start. Seen live while testing the flagless boot: a wrong
-    `BRIDGE_CDC_PUBLICATION` stopped it dead rather than streaming nothing.
+  `error.PublicationNotFound` with the `CREATE PUBLICATION` hint; the bridge
+  refuses to start. Seen live while testing the flagless boot: a wrong
+  `BRIDGE_CDC_PUBLICATION` stopped it dead rather than streaming nothing.
 - **Empty publication → one warning at boot**, and nothing else. That is the
-    quietest failure in the system: the bridge finds the publication, verifies
-    it, logs `⚠️ Publication 'x' exists but has no tables` once, and then
-    delivers nothing forever while /health, /status and every consumer look
-    fine. zbdoctor now reports it as RED, keyed off `zebridge_limits` — what
-    the RUNNING bridge registered, not what an env file claims. RED/GREEN
-    verified with a throwaway empty publication.
+  quietest failure in the system: the bridge finds the publication, verifies
+  it, logs `⚠️ Publication 'x' exists but has no tables` once, and then
+  delivers nothing forever while /health, /status and every consumer look
+  fine. zbdoctor now reports it as RED, keyed off `zebridge_limits` — what
+  the RUNNING bridge registered, not what an env file claims. RED/GREEN
+  verified with a throwaway empty publication.
 - **A typo'd publication name cannot create anything.** `zebridge_enable`
-    only ever runs `ALTER PUBLICATION`, so `publication => 'typo_pub'` fails
-    loudly in PostgreSQL. That is the argument for keeping `CREATE PUBLICATION`
-    in `init.core` rather than teaching enable to create on demand: creating
-    implicitly would turn a typo into a silent, empty, perfectly healthy-looking
-    second publication.
+  only ever runs `ALTER PUBLICATION`, so `publication => 'typo_pub'` fails
+  loudly in PostgreSQL. That is the argument for keeping `CREATE PUBLICATION`
+  in `init.core` rather than teaching enable to create on demand: creating
+  implicitly would turn a typo into a silent, empty, perfectly healthy-looking
+  second publication.
 
 **Does `CREATE PUBLICATION` belong in init.core?** Yes, and it already behaves:
 the statement is wrapped in `IF NOT EXISTS`, so the script stays idempotent, and
@@ -6617,21 +6621,21 @@ ARRAY[...])` already emits the column list, so the SQL half exists.
 
 **Never tested, and blocked by two things — both measured today, not guessed:**
 
-  1. **The msg_id collapses the slices.** A CDC message's id is
-     `"{wal_end:x}-{table}-{operation}"` (event_processor.zig) — no publication,
-     no slot, no column set. Two bridges slicing the same row produce the SAME
-     id on the SAME subject, so JetStream's duplicate window (2 min) drops the
-     second slice SILENTLY. The client gets one slice and cannot know the other
-     existed. Fixing it means putting the publication (or slot) in the id, and
-     deciding whether the slices should even share a subject.
-  2. **The width guard is per-TABLE, not per-projection.** It sums every
-     unbounded column of the table (`WHERE a.attrelid = tbl`) and the bake takes
-     `MIN(max_row_bytes)` joined on `pg_publication_tables` while ignoring
-     `attnames`. So the narrow bridge's budget constrains writes to a column it
-     does not even carry — which defeats the whole point of slicing, since the
-     write is refused before any feed sees it. Making it projection-aware is
-     expressible (bake one clause per distinct projection: `sum(cols_A) >=
-     budget_A OR sum(cols_B) >= budget_B`), just not built.
+1. **The msg_id collapses the slices.** A CDC message's id is
+   `"{wal_end:x}-{table}-{operation}"` (event_processor.zig) — no publication,
+   no slot, no column set. Two bridges slicing the same row produce the SAME
+   id on the SAME subject, so JetStream's duplicate window (2 min) drops the
+   second slice SILENTLY. The client gets one slice and cannot know the other
+   existed. Fixing it means putting the publication (or slot) in the id, and
+   deciding whether the slices should even share a subject.
+2. **The width guard is per-TABLE, not per-projection.** It sums every
+   unbounded column of the table (`WHERE a.attrelid = tbl`) and the bake takes
+   `MIN(max_row_bytes)` joined on `pg_publication_tables` while ignoring
+   `attnames`. So the narrow bridge's budget constrains writes to a column it
+   does not even carry — which defeats the whole point of slicing, since the
+   write is refused before any feed sees it. Making it projection-aware is
+   expressible (bake one clause per distinct projection: `sum(cols_A) >=
+budget_A OR sum(cols_B) >= budget_B`), just not built.
 
 Two smaller mismatches to remember if this is ever picked up: the schema in
 `$KV.schemas.<table>` is the FULL table shape (the DDL trigger does not know
@@ -6925,17 +6929,17 @@ contract.
 
 **Three things measured on the way.**
 
-  1. ⚠️ SQLite's INTEGER is 64-bit, PostgreSQL's is 32-bit. The bookkeeping tables
-     store LSNs (~1e10) and millisecond times (~1.7e12) in "INTEGER"; the dialect
-     names `int64` (BIGINT there) and the adapter parses int8 to Number — a BigInt
-     would break `JSON.stringify` of the sync state.
-  2. ⚠️ PGlite's constructor is `(dataDir?, options?)` but its body does `typeof
-     dataDir == "string" ? … : options = dataDir` — `new PGlite(undefined, opts)`
-     silently discards opts. Every timestamptz came back a Date with the text parser
-     "in place" until the call became `new PGlite(opts)`.
-  3. `session_replication_role = replica` is the FK toggle for the bulk seed, and
-     unlike SQLite there is no cheap post-load check; the log says so
-     (`foreignKeyViolations` answers -1).
+1. ⚠️ SQLite's INTEGER is 64-bit, PostgreSQL's is 32-bit. The bookkeeping tables
+   store LSNs (~1e10) and millisecond times (~1.7e12) in "INTEGER"; the dialect
+   names `int64` (BIGINT there) and the adapter parses int8 to Number — a BigInt
+   would break `JSON.stringify` of the sync state.
+2. ⚠️ PGlite's constructor is `(dataDir?, options?)` but its body does `typeof
+dataDir == "string" ? … : options = dataDir` — `new PGlite(undefined, opts)`
+   silently discards opts. Every timestamptz came back a Date with the text parser
+   "in place" until the call became `new PGlite(opts)`.
+3. `session_replication_role = replica` is the FK toggle for the bulk seed, and
+   unlike SQLite there is no cheap post-load check; the log says so
+   (`foreignKeyViolations` answers -1).
 
 **Results, same stack, same tenant, minutes apart.** Fresh PGlite replica: every
 count equal to the SQLite replica (27 / 1 / 2 / 3 / 0 / 0 / 9 / 1 / 1), four phase
@@ -6958,38 +6962,38 @@ no-op today in the browser too. Full rows, or an UPDATE-shaped local plan.
 
 **Same day, the three follow-ups.**
 
-  1. **The optimistic UPDATE applies as an UPDATE.** `core.planUpdate` (only the
-     columns sent, full key in the WHERE) and `core.planExists` (`SELECT 1 … LIMIT 1`),
-     eleven fixture cases, both cores; the shells probe existence and apply the
-     UPDATE-shaped plan when the row is there, the upsert otherwise — TS `applyEvent`
-     and libzb `applyEvent`/`applyOptimistic` alike. Measured after: the browser
-     `UP` is visible locally at 150 ms on SQLite and on PGlite, no `SQLITE ERROR`,
-     the echo confirms the same text. (Note for the eye: SQLite then stores the
-     echo's `tags` in PostgreSQL's canonical quoted form `{"web","push-3143",…}`,
-     while the local write wrote `{web,push-3143,…}` — same array, two spellings;
-     PostgreSQL parses both.)
+1. **The optimistic UPDATE applies as an UPDATE.** `core.planUpdate` (only the
+   columns sent, full key in the WHERE) and `core.planExists` (`SELECT 1 … LIMIT 1`),
+   eleven fixture cases, both cores; the shells probe existence and apply the
+   UPDATE-shaped plan when the row is there, the upsert otherwise — TS `applyEvent`
+   and libzb `applyEvent`/`applyOptimistic` alike. Measured after: the browser
+   `UP` is visible locally at 150 ms on SQLite and on PGlite, no `SQLITE ERROR`,
+   the echo confirms the same text. (Note for the eye: SQLite then stores the
+   echo's `tags` in PostgreSQL's canonical quoted form `{"web","push-3143",…}`,
+   while the local write wrote `{web,push-3143,…}` — same array, two spellings;
+   PostgreSQL parses both.)
 
-  2. **Persistence on PGlite**: `makePgliteStorage({ persist })` → `idb://<dbName>`
-     (PGlite's IndexedDB filesystem; the OPFS access-handle pool needs a worker),
-     wired to the same `durable` switch as the SQLite file, `?durable=1` now also
-     on the URL. Verified: IndexedDB `/pglite/zebridge_omar.sqlite3`, positions
-     CDC_kilo 2505 / CDC_PUBLIC 80805 and every count identical across a reload.
-     `deleteDatabaseFile` closes and drops the IndexedDB database.
+2. **Persistence on PGlite**: `makePgliteStorage({ persist })` → `idb://<dbName>`
+   (PGlite's IndexedDB filesystem; the OPFS access-handle pool needs a worker),
+   wired to the same `durable` switch as the SQLite file, `?durable=1` now also
+   on the URL. Verified: IndexedDB `/pglite/zebridge_omar.sqlite3`, positions
+   CDC_kilo 2505 / CDC_PUBLIC 80805 and every count identical across a reload.
+   `deleteDatabaseFile` closes and drops the IndexedDB database.
 
-  3. **A real FK check on PostgreSQL**: `postgresDialect.foreignKeyViolations` reads
-     every FK from `pg_constraint` and counts children with no parent, one anti-join
-     per constraint — the answer SQLite's `foreign_key_check` gives, for the seed
-     path's post-load verification.
+3. **A real FK check on PostgreSQL**: `postgresDialect.foreignKeyViolations` reads
+   every FK from `pg_constraint` and counts children with no parent, one anti-join
+   per constraint — the answer SQLite's `foreign_key_check` gives, for the seed
+   path's post-load verification.
 
-  And a fourth, found by the first: **the optimistic INSERT on PGlite failed on
-  arrays** — `cdcValue` JSON-encodes a JS array, `text[]` wants `{a,b}`:
-  `malformed array literal: ["web","push-3029",…]`, the row appearing only with the
-  echo. `core.pgArrayLiteral` (eight fixture cases, both cores: quoting for commas,
-  braces, quotes, backslashes, whitespace, empty and the word NULL; nested arrays;
-  `t`/`f`) and `core.pgEngineValues` encode a LOCAL write's payload for a PostgreSQL
-  engine; CDC events, already in PostgreSQL text form, are untouched. Measured
-  after: INS visible locally at 150 ms with typed `text[]`/nested/jsonb values.
-  Conformance: 126 cases, TS and Zig.
+And a fourth, found by the first: **the optimistic INSERT on PGlite failed on
+arrays** — `cdcValue` JSON-encodes a JS array, `text[]` wants `{a,b}`:
+`malformed array literal: ["web","push-3029",…]`, the row appearing only with the
+echo. `core.pgArrayLiteral` (eight fixture cases, both cores: quoting for commas,
+braces, quotes, backslashes, whitespace, empty and the word NULL; nested arrays;
+`t`/`f`) and `core.pgEngineValues` encode a LOCAL write's payload for a PostgreSQL
+engine; CDC events, already in PostgreSQL text form, are untouched. Measured
+after: INS visible locally at 150 ms with typed `text[]`/nested/jsonb values.
+Conformance: 126 cases, TS and Zig.
 
 **The counter demo, caught by PGlite (same day).** `+1` then `-1` on
 `counter_public` were accepted and the shown value never moved; the verdicts named
@@ -7021,13 +7025,13 @@ emits, so the text compare needs no engine branch. The shell prefers
 
 Driven live on `memo`, DDL in PostgreSQL, the descriptor republished by the DDL
 trigger each time, the replica checked after each step:
-  PGlite  `ADD COLUMN note text` → column present, view intact, rows 2.
-          `CREATE INDEX` + `ADD COLUMN user_id` + `ADD CONSTRAINT … REFERENCES users`
-          → index `memo_txt_idx`, column, FK `FOREIGN KEY (user_id) REFERENCES
+PGlite `ADD COLUMN note text` → column present, view intact, rows 2.
+`CREATE INDEX` + `ADD COLUMN user_id` + `ADD CONSTRAINT … REFERENCES users`
+→ index `memo_txt_idx`, column, FK `FOREIGN KEY (user_id) REFERENCES
           users(id) DEFERRABLE` — added in place. Then all four dropped upstream →
-          back to `uid, txt, updated_at`, `memo_pkey` only, no FK, view intact, rows 2.
-  SQLite  the same forward sequence → the rebuild path, stored DDL now carrying the
-          FOREIGN KEY, column and index present, rows 2; reverted → original shape.
+back to `uid, txt, updated_at`, `memo_pkey` only, no FK, view intact, rows 2.
+SQLite the same forward sequence → the rebuild path, stored DDL now carrying the
+FOREIGN KEY, column and index present, rows 2; reverted → original shape.
 **The Node consumer on PGlite (same day).** `examples/04-node-consumer` gained
 `ZB_ENGINE=pglite`: `makePgliteStorage({ persist: true, dataDir: '/tmp' })` — in Node
 PGlite persists to a plain directory (`<dataDir>/<dbName>`), so the adapter now picks
@@ -7059,26 +7063,26 @@ against the code or the running stack, and every claim that was history removed 
 than narrated — the document describes what is, NOTES keeps what was. The ledger:
 
 - Fourteen past claims gone: "there is deliberately no SDK" (the libraries exist and are
-    §10 now); the 🚧 convention with no sections left; `pk` "inside `sqlite`" (it is at the
-    root, and has been); "two reasons exist" over a five-row table; §4's single `CDC`
-    stream and un-tenanted subjects; "jsonb arrives as a nested object in MessagePack mode,
-    a string in JSON mode" (no JSON mode; it is a string); "the reference SQLite clients
-    declare no foreign keys" (they port, defer and hold); §5's "no rename hint" (§3 has
-    `renamed`); §6's "the CDC path does not have this guard yet" (`decodeTuple` takes the
-    registry at four call sites); §7.0's separate-table optimistic design (neither client
-    does it — the practised rule is `before` + revert + echo, now stated); the GUC
-    `zebridge.principal` (it is `zb.principal`, 17 to 0); "three bookkeeping tables" (six);
-    the space-separated `version` example; "`client_id` accepted but not yet compared"
-    (tiebreak is live); §7.4's "a client cannot discover which columns are required"
-    (`required`); the "update now answers row-not-found — this changed" narrative; §10's
-    "nkey auth" and "an Elixir client is planned".
+  §10 now); the 🚧 convention with no sections left; `pk` "inside `sqlite`" (it is at the
+  root, and has been); "two reasons exist" over a five-row table; §4's single `CDC`
+  stream and un-tenanted subjects; "jsonb arrives as a nested object in MessagePack mode,
+  a string in JSON mode" (no JSON mode; it is a string); "the reference SQLite clients
+  declare no foreign keys" (they port, defer and hold); §5's "no rename hint" (§3 has
+  `renamed`); §6's "the CDC path does not have this guard yet" (`decodeTuple` takes the
+  registry at four call sites); §7.0's separate-table optimistic design (neither client
+  does it — the practised rule is `before` + revert + echo, now stated); the GUC
+  `zebridge.principal` (it is `zb.principal`, 17 to 0); "three bookkeeping tables" (six);
+  the space-separated `version` example; "`client_id` accepted but not yet compared"
+  (tiebreak is live); §7.4's "a client cannot discover which columns are required"
+  (`required`); the "update now answers row-not-found — this changed" narrative; §10's
+  "nkey auth" and "an Elixir client is planned".
 - Six omissions filled: the `tenants` KV and `mutation_error` in §2 (the count is six,
-    not five); `indexes`/`foreign_keys`/`max_row_bytes` and the `pg` block's consumer in
-    §3; eight of fifteen ingress errors in §7.2; the verdict's `write` field; the client's
-    own tombstone rule in §7.5; thirteen objects in §8b's DBA inventory; the library, the
-    Node example, libzb and the Python example in §10.
+  not five); `indexes`/`foreign_keys`/`max_row_bytes` and the `pg` block's consumer in
+  §3; eight of fifteen ingress errors in §7.2; the verdict's `write` field; the client's
+  own tombstone rule in §7.5; thirteen objects in §8b's DBA inventory; the library, the
+  Node example, libzb and the Python example in §10.
 - Left in the ledger, not the doc: `grammar.json`'s `streams.cdc` is read only for a boot
-    log line (the doc now says so; the key itself can go with the parser field).
+  log line (the doc now says so; the key itself can go with the parser field).
 
 **And one defect the reread found by reading §6's convergence claim against a replica.**
 "The one shape difference is timestamptz" — booleans were another. The producer's
@@ -7101,16 +7105,16 @@ or the stack, plus §1, §3–§9 and the §10 plan sections read in full. The l
 the session scratchpad; what it changed:
 
 - Fourteen notes annotated in place with "→ closed in §X" (the outbox watermark gate,
-    the object-store grant test, the width-guard trio, the `zebridge_user_tenants`
-    egress door, the first-sight routability refusal, the async publish window, D2,
-    the producer-forced full, the compose verification, the snapshot-era closures now
-    superseded by §10p). Four pieces of stale guidance fixed (§9's `INIT_<TENANT>`
-    step, §6's `source .env`, §1.1's opening, §5's heading).
+  the object-store grant test, the width-guard trio, the `zebridge_user_tenants`
+  egress door, the first-sight routability refusal, the async publish window, D2,
+  the producer-forced full, the compose verification, the snapshot-era closures now
+  superseded by §10p). Four pieces of stale guidance fixed (§9's `INIT_<TENANT>`
+  step, §6's `source .env`, §1.1's opening, §5's heading).
 - Still open, recorded here so they stop hiding: `$KV.tenants` on DELETE (§1.12);
-    libzb's C ABI has no query/mutate (§10's index card exists only in the demo/soak
-    binaries — closed in §10bg); libzb's live tailing and alter/rebuild path (§10v); the `catalog_epoch`
-    → CDC-routing roadmap (§10k, §11 still says "one restart"); §10ab's column
-    slicing; sixteen orphan constants in `config.zig` (§8; three snapshot ones are gone).
+  libzb's C ABI has no query/mutate (§10's index card exists only in the demo/soak
+  binaries — closed in §10bg); libzb's live tailing and alter/rebuild path (§10v); the `catalog_epoch`
+  → CDC-routing roadmap (§10k, §11 still says "one restart"); §10ab's column
+  slicing; sixteen orphan constants in `config.zig` (§8; three snapshot ones are gone).
 
 **Closed 1 — libzb's HLC floor was half-built.** `seen_floor` was declared, read by
 `hlcVersion`, and never assigned (§10q says "BUILT" — for the TS client). Now fed from
@@ -7321,7 +7325,7 @@ alone at its stored position, all gone (`NoResponders`) re-opened together.
 The Zig client is still single-threaded and host-driven; only the wait changed shape.
 
 **Where the 13 ms went — and why it is 3 now.** "200 000 events/s" is 5 µs per event
-*amortised* over a batch; a single event pays every hop's round trip once. Measured
+_amortised_ over a batch; a single event pays every hop's round trip once. Measured
 on the native stack: PG `clock_timestamp()` at commit → the message stored in
 JetStream (`stream info` `last_ts`): 3.5–4.4 ms, and that includes Postgres's own
 commit fsync and overlaps psql's exit (the bench's clock starts after psql returns).
@@ -7520,7 +7524,7 @@ TLS" claim (it has — `tls.py` proves it; the bridge's `tls://` refusal is a gu
 - `mutate` pinned its delete to 2026-08-16: the tombstone was 13 days old and the
   running sweeper reaped it before the read. The delete is `now()` — newer than the
   three pinned writes is all LWW needs.
-- `crosstenant` scored a *denied* `CONSUMER.CREATE` (a timeout) as "created but empty".
+- `crosstenant` scored a _denied_ `CONSUMER.CREATE` (a timeout) as "created but empty".
   A timeout from the create is the grant holding; only one from a later fetch is a reach.
 - `livebirth` waited with a blocking `time.sleep` inside the event loop, so the NATS
   callback that collects CDC never ran: "declared, keyed, published, yet unrouted"
@@ -7599,16 +7603,16 @@ published, so a client resuming by position would miss them silently. Built:
   when the chain continues from the watermark, wrong when it was rebuilt after it (a
   fresh `g1` full, no deltas). Reachable now means the first applicable delta starts at
   or before the watermark, or the full itself is not newer than it.
-Live: slot invalidated with the probe down → boot refused (exit 1) → slot dropped →
-`ZB_FEED_RESTART=1` → `CDC_kilo` recreated → fresh chain → the client at position 1
-takes the gap and re-seeds: 3/3 hole rows, 24 = 24 live rows.
-Two things the run also produced: `max_slot_wal_keep_size` moved off `up.sh`'s
-postmaster command line (a `-c` flag beats ALTER SYSTEM; it is `ALTER SYSTEM` at start
-now, so a test or an operator can change it with a reload) — and the setting is
-cluster-wide, so a stopped long-running bridge's slot is lost with the probe's; the
-scenario says so and prints the recovery. The dev feed was recovered that way, twice.
-Also an early-exit leak on the FATAL path: the enroll conninfo lived forever
-(main-scope `defer` now).
+  Live: slot invalidated with the probe down → boot refused (exit 1) → slot dropped →
+  `ZB_FEED_RESTART=1` → `CDC_kilo` recreated → fresh chain → the client at position 1
+  takes the gap and re-seeds: 3/3 hole rows, 24 = 24 live rows.
+  Two things the run also produced: `max_slot_wal_keep_size` moved off `up.sh`'s
+  postmaster command line (a `-c` flag beats ALTER SYSTEM; it is `ALTER SYSTEM` at start
+  now, so a test or an operator can change it with a reload) — and the setting is
+  cluster-wide, so a stopped long-running bridge's slot is lost with the probe's; the
+  scenario says so and prints the recovery. The dev feed was recovered that way, twice.
+  Also an early-exit leak on the FATAL path: the enroll conninfo lived forever
+  (main-scope `defer` now).
 
 **3. `client_gap.py` — the CLIENT away past retention.** libzb through the C ABI:
 sync (position P), stop; five rows written and captured by the producer; the tenant
@@ -7646,7 +7650,7 @@ writer.print("NATS_BRIDGE_NKEY_PUB={s}\n…", .{ public, seed }) catch unreachab
 It worked perfectly — into `buffer`. A **fixed writer's sink IS the array**: it formats
 and stops, there is no file descriptor anywhere in it (you would read the bytes back
 with `writer.buffered()`). Then the frame ended and the keys went with it. 0.16 split
-the two roles on purpose — a `Writer` is a formatting front-end over *some* sink;
+the two roles on purpose — a `Writer` is a formatting front-end over _some_ sink;
 `fixed` makes that sink memory, `File.writerStreaming(io, &buf)` makes it an fd plus a
 buffer that `flush()` drains. `std.debug.print` is neither: it takes stderr, locks, and
 writes, which is why it "just worked".
@@ -7660,7 +7664,7 @@ with the warning left on stderr. That makes the command pipe, which was the poin
 
 **What the crypto actually is** (asked, worth writing down): the keys are std's, the
 FORMAT is nats.zig's. `Ed25519.KeyPair.generate` draws 32 random bytes; in Ed25519 that
-seed *is* the private key, the public key being derived from it — which is exactly why
+seed _is_ the private key, the public key being derived from it — which is exactly why
 the seed is the credential. `nkeys.encodeSeed` generates nothing: it renders those same
 bytes as `base32(prefix || seed || crc16)`, where the prefix is two bytes because `'S'`
 (seed) and the type `'U'` (user) are packed across them, so every user seed reads `SU…`
@@ -7712,12 +7716,12 @@ untouched (zstd still linked, still needed for the chains), 264/264 unit tests, 
 trimmed binary swept `test_types` against the live database.
 
 ⚠️ **Two translation units are fine BECAUSE they are two binaries.** `c_includes.h`'s
-one-unit rule is about modules inside a *single* binary sharing one set of C types (two
+one-unit rule is about modules inside a _single_ binary sharing one set of C types (two
 `@cImport`s once produced two incompatible `PGconn` types). It is a per-binary
 invariant, not a per-repo one — said in the new header so nobody unifies them back.
 
 **A second `build.zig` would have been the wrong instrument.** It is possible
-(`zig build --build-file …`), but the sweeper never needed a separate build *graph* —
+(`zig build --build-file …`), but the sweeper never needed a separate build _graph_ —
 it needed its own module and one fewer `linkSystemLibrary`, both of which are per-
 artifact already. A second file would have duplicated `linkLibpq`, the Homebrew/Alpine
 prefix detection and the target/optimize plumbing, and the two copies would drift.
@@ -7764,7 +7768,7 @@ the drop accounting (270 total).
 **Provoking it took four attempts, and each dead end is a fact about the product.**
 
 - Planting a wide row with the guard disabled needs `ALTER TABLE … DISABLE/ENABLE
-  TRIGGER` — that is DDL, and the DDL path treats DDL as "the migration that fixed it",
+TRIGGER` — that is DDL, and the DDL path treats DDL as "the migration that fixed it",
   so the suspension lifted moments after being raised.
 - Touching a stored wide row is refused by the width guard itself (23514).
 - Running the probe at a smaller `BASE_BUF` does not open a window: **every bridge boot
@@ -7773,7 +7777,7 @@ the drop accounting (270 total).
   at the source. (And the baked literal outlives the probe: a stale 2048 held the LIVE
   stack until something re-baked it — `suspension_lift.py` now re-bakes in setup and
   cleanup.)
-- What works is the hazard preflight already warns about — *lowering* the buffer below
+- What works is the hazard preflight already warns about — _lowering_ the buffer below
   what is already stored. The row is written while the guard is the live bridge's 4 KB;
   the probe boots at 2 KB and replays it.
 
@@ -7808,7 +7812,7 @@ tests 270/270.
 
 **A tail this fix grew, found only in sequence.** Restoring the write guards means a
 plain `DELETE` is rewritten into a soft delete — so `suspension_lift`'s teardown
-*tombstoned* its oversized bait instead of removing it, the row stayed stored, and the
+_tombstoned_ its oversized bait instead of removing it, the row stayed stored, and the
 next run counted it as a leftover and refused to start. Worse in principle: the
 tombstoning `UPDATE` carries the oversized row into CDC and would re-suspend the table
 on the way out. The teardown narrows the column and tombstones in one statement now, so
@@ -7870,14 +7874,14 @@ itself — they appeared only because something else had run first.
 
 **Crossings (each was a correct mechanism meeting another correct mechanism):**
 
-| what crossed what | what it produced |
-| --- | --- |
-| a suspension × the DDL path | `ALTER TABLE` is "the migration that fixed it", so disabling the width guard to plant a bait lifted the suspension moments after raising it (§10bp) |
-| a lost slot × JetStream's numbering | WAL never published leaves no hole in the stream, so a client resumed *past* the gap; the fix is the third shape of the gap rule and a feed restart (§10bm) |
-| a tenant-scoped table × two CDC streams | its shared rows ride CDC_PUBLIC while the table names CDC_&lt;tenant&gt;, so a gap on the first left half the table stale forever (§10bq) |
-| the width guard × the bridge's own boot | every boot bakes the guard to `MIN(zebridge_limits)`, so a probe at a smaller BASE_BUF silently lowered the ceiling for the LIVE stack, and its baked literal outlived the probe (§10bp) |
-| a tombstoned table × a physical DELETE | suppressed as a sweeper reap, so a hard delete reaches no client at all and the row lives on in every replica (§10bm, §10bq) |
-| the publisher's reconnect × the retry budget | "exhausted retries" is for a publish that FAILS, not for a broker that is GONE — the documented FATAL never fires in an outage (§10bm) |
+| what crossed what                            | what it produced                                                                                                                                                                         |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| a suspension × the DDL path                  | `ALTER TABLE` is "the migration that fixed it", so disabling the width guard to plant a bait lifted the suspension moments after raising it (§10bp)                                      |
+| a lost slot × JetStream's numbering          | WAL never published leaves no hole in the stream, so a client resumed _past_ the gap; the fix is the third shape of the gap rule and a feed restart (§10bm)                              |
+| a tenant-scoped table × two CDC streams      | its shared rows ride CDC*PUBLIC while the table names CDC*&lt;tenant&gt;, so a gap on the first left half the table stale forever (§10bq)                                                |
+| the width guard × the bridge's own boot      | every boot bakes the guard to `MIN(zebridge_limits)`, so a probe at a smaller BASE_BUF silently lowered the ceiling for the LIVE stack, and its baked literal outlived the probe (§10bp) |
+| a tombstoned table × a physical DELETE       | suppressed as a sweeper reap, so a hard delete reaches no client at all and the row lives on in every replica (§10bm, §10bq)                                                             |
+| the publisher's reconnect × the retry budget | "exhausted retries" is for a publish that FAILS, not for a broker that is GONE — the documented FATAL never fires in an outage (§10bm)                                                   |
 
 **Visible only in sequence.** These passed standalone, sometimes repeatedly, and failed
 only when the battery ran in order:
@@ -7899,7 +7903,7 @@ only when the battery ran in order:
 **Two consequences, both now habits.**
 
 1. **Run the battery whole and in order, not scenario by scenario.** A green scenario is
-   not evidence; a green *sequence* is. `run.py` exists for that and the groups are
+   not evidence; a green _sequence_ is. `run.py` exists for that and the groups are
    ordered deliberately.
 2. **A scenario must leave the stack as it found it — measured, not assumed.** Restoring
    what you removed (guards), dropping what you created (slots, budgets, streams),
@@ -7957,8 +7961,8 @@ drain"), precisely so one huge transaction cannot exhaust the ring. Part of it I
 wire before the commit is seen. What holds the line is the LSN, acked only at `.commit`:
 kill the bridge mid-delivery and PostgreSQL replays the WHOLE transaction from the slot.
 
-So the contract is the one the producer's header states — *"duplicates are absorbed by
-the client's version-guarded upsert, gaps are unrecoverable"* — and `txn_kill.py` (owns)
+So the contract is the one the producer's header states — _"duplicates are absorbed by
+the client's version-guarded upsert, gaps are unrecoverable"_ — and `txn_kill.py` (owns)
 asserts both halves against a 30 000-row single transaction, with a client connected
 throughout:
 
@@ -8149,16 +8153,16 @@ unpicking a wrong migration. So: a dry run that says everything and changes noth
 `bridge --diagnose` (alias `--run-diagnose`) runs the checks in the order a first
 installation actually fails, and exits 0/1 (CI-able):
 
-  0. is init applied at ALL — the headline when it is not, with the fix, instead of a
-     cascade of "function does not exist" from every later probe (core and write
-     reported separately: read-only replication runs without init.write, edge writes
-     do not);
-  1. the publication exists and carries tables;
-  2. the SAME preflight the boot runs — pk, writability trio, tenant scoping, DDL
-     pipeline — so the doctor can never drift from what the bridge will decide;
-  3. the width scan against THIS BASE_BUF, plus the number the operator actually
-     wants: the minimum BASE_BUF the stored data needs (widest row + envelope margin);
-  4. the §10bx shrink pre-check, as a FINDING instead of a boot-time surprise.
+0. is init applied at ALL — the headline when it is not, with the fix, instead of a
+   cascade of "function does not exist" from every later probe (core and write
+   reported separately: read-only replication runs without init.write, edge writes
+   do not);
+1. the publication exists and carries tables;
+2. the SAME preflight the boot runs — pk, writability trio, tenant scoping, DDL
+   pipeline — so the doctor can never drift from what the bridge will decide;
+3. the width scan against THIS BASE_BUF, plus the number the operator actually
+   wants: the minimum BASE_BUF the stored data needs (widest row + envelope margin);
+4. the §10bx shrink pre-check, as a FINDING instead of a boot-time surprise.
 
 **Read-only by construction, which took a boot reorder.** The slot init ran before the
 config was even fully parsed, so a dry run's fork point either created slots or came
@@ -9524,8 +9528,8 @@ hardened them AGAINST each other. Where they differ:
 3. Table set: every schema key (TS) vs an explicit list (libzb) — the ghost hazard.
 4. Missing chain: libzb retries next sync, TS excludes for life (§10cq item 3, open).
 5. Neither has the chain-orphan check (§10n residual).
-Also corrected on the way: §10cp's "libzb's caller supplies the version" is stale —
-libzb stamps an HLC version itself now, same as the TS client.
+   Also corrected on the way: §10cp's "libzb's caller supplies the version" is stale —
+   libzb stamps an HLC version itself now, same as the TS client.
 
 **Coverage, stated.** The chaos program drives libzb; the TS client has `objstore_race`,
 the swarm workers and the Node example. Nothing kills a TS host mid-seed, nothing
@@ -9554,14 +9558,14 @@ the current-state copy; this section keeps the history.
 
 The restart rules, as they stand today
 
-|  Change  |  What's needed.  |
-|----------| -----------------|
-| New table (public or tenant-scoped)  | one zebridge_enable(...) migration, NO restart since §10bj — the catalogue row arrives through the WAL and the bridge reloads rules, CDC_PUBLIC's filter, refusals and the schema itself. (Until 2026-08-29: + one restart.) |
-| Changed rule on an existing table (version/tombstone/tiebreak/tenant_col)  | zebridge_enable re-run, NO restart since §10bj (the write path reads the catalogue on the epoch the row bumps; the sweeper still re-reads on its own restart) |
-| New tenant | zero bridge restarts: backend creates CDC_<T>/INIT_<T>, inserts the zebridge_user_tenants row (propagates live to $KV.tenants) — plus the NATS grant block + SIGHUP (reload, not restart) until the JWT signing key |
-| New user on an existing tenant    | conf grant + SIGHUP only  |
-| DROP TABLE   | nothing for the bridge — but purge the four ghost sources (chain, descriptor, INIT chunks, CDC retention) or resh clients resurrect rows |
-| Generations on/off, tenant set growth    | nothing — the producer reads the catalogue and the data per tick |
+| Change                                                                    | What's needed.                                                                                                                                                                                                               |
+| ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| New table (public or tenant-scoped)                                       | one zebridge_enable(...) migration, NO restart since §10bj — the catalogue row arrives through the WAL and the bridge reloads rules, CDC_PUBLIC's filter, refusals and the schema itself. (Until 2026-08-29: + one restart.) |
+| Changed rule on an existing table (version/tombstone/tiebreak/tenant_col) | zebridge_enable re-run, NO restart since §10bj (the write path reads the catalogue on the epoch the row bumps; the sweeper still re-reads on its own restart)                                                                |
+| New tenant                                                                | zero bridge restarts: backend creates CDC*<T>/INIT*<T>, inserts the zebridge_user_tenants row (propagates live to $KV.tenants) — plus the NATS grant block + SIGHUP (reload, not restart) until the JWT signing key          |
+| New user on an existing tenant                                            | conf grant + SIGHUP only                                                                                                                                                                                                     |
+| DROP TABLE                                                                | nothing for the bridge — but purge the four ghost sources (chain, descriptor, INIT chunks, CDC retention) or resh clients resurrect rows                                                                                     |
+| Generations on/off, tenant set growth                                     | nothing — the producer reads the catalogue and the data per tick                                                                                                                                                             |
 
 ## 12. Host settings (the native dev stack, as running on 2026-08-29)
 
@@ -9703,16 +9707,16 @@ Proof: `migrate_reseed.py` — the NULLs become PostgreSQL's timestamps ~5 s aft
 
 **Three bugs found on the way, in the order they bit.**
 
-1. *The producer's forced full was decided too late.* First placed after the
+1. _The producer's forced full was decided too late._ First placed after the
    full-building blocks, the epoch check only flipped the `has_full` label: bookkeeping
    and manifest named a full that was never written, and a client fetched a tombstone.
    Then the "unchanged since gN — skipped" early return ignored it. `epoch_moved` is
    computed right after `build_full` is first set and joins the skip predicate.
-2. *A manifest can predate the re-seed.* Descriptor (epoch N+1) and full arrive on
+2. _A manifest can predate the re-seed._ Descriptor (epoch N+1) and full arrive on
    independent clocks; a client seeding from the g(N) full would record epoch N+1 over
    old data. Both clients now refuse a manifest whose `seed_epoch` is below the
    descriptor's ("chain gN predates the re-seed — waiting for the producer's full").
-3. *nats.zig double release.* libzb's host aborted at close after a failed seed:
+3. _nats.zig double release._ libzb's host aborted at close after a failed seed:
    `ObjectStore.get`/`infoIncludingDeleted` released the meta message once explicitly and
    once through `errdefer` when the object was deleted. Found with
    `lldb -o "breakpoint set -n malloc_error_break"`; fixed with an owned flag. A malformed
@@ -9758,12 +9762,12 @@ epoch through `zebridge_reseed` (FK closure included), ONCE per table per transa
 (a transaction-local `set_config` remembers): a changed `zebridge_key_shape` (pk names
 
 - types), or any same-name column whose type changed. On a role that may not touch the
-catalogue the bump degrades to a WARNING naming the manual call — the DDL itself never
-fails. Two measured traps: `pk` is the JSON scalar `null` on a keyless table and
-`jsonb_array_elements_text` RAISES on a scalar, which inside an event trigger refused a
-CREATE TABLE; and the old pk takes the REPLICA IDENTITY (`_zb_ri`) with it — re-running
-the idempotent `zebridge_enable` is the last step of every re-key, or the next UPDATE is
-refused by PostgreSQL.
+  catalogue the bump degrades to a WARNING naming the manual call — the DDL itself never
+  fails. Two measured traps: `pk` is the JSON scalar `null` on a keyless table and
+  `jsonb_array_elements_text` RAISES on a scalar, which inside an event trigger refused a
+  CREATE TABLE; and the old pk takes the REPLICA IDENTITY (`_zb_ri`) with it — re-running
+  the idempotent `zebridge_enable` is the last step of every re-key, or the next UPDATE is
+  refused by PostgreSQL.
 
 **The producer forces a full on any column-shape move.** A chain object names its
 columns; a full built before a DROP/RENAME/re-type asks the replica for a column it no
@@ -9936,13 +9940,13 @@ build each one by hand on a closed replica and reopen the client on it:
 DROP, killed before the RENAME (rows sitting in `<table>__migrating`), killed after the
 watermark went, the shape record missing altogether. 10/10 after three rules:
 
-1. *A table that does not exist cannot be seeded.* First sight now drops the watermark
+1. _A table that does not exist cannot be seeded._ First sight now drops the watermark
    too: killed after the DROP, a fresh empty table used to inherit the old watermark
    and follow CDC empty — silent loss, and for a migration that moves no epoch nothing
    would ever have corrected it.
-2. *Finish the rename.* `<table>__migrating` present and `<table>` absent means the
+2. _Finish the rename._ `<table>__migrating` present and `<table>` absent means the
    rows are right there: adopt them, do not start from nothing.
-3. *No record, the physical key decides.* With no shape record (a replica from before
+3. _No record, the physical key decides._ With no shape record (a replica from before
    §10dg, or a record lost) the physical pk column NAMES are compared with the
    descriptor's — names only, never the engine's type text — so a re-key is still a
    re-key. Without it a seed under the new key hit "ON CONFLICT does not match any
@@ -10105,12 +10109,12 @@ Two rules, both enforced by PostgreSQL on our behalf, none of them a schema prop
 2. **No physical cascade into a table that keeps tombstones.** Refused by
    `zebridge_enable`'s preflight (a `preflight ERROR` row naming the constraint) and by
    the DDL guard when the constraint arrives later (`migration rejected`).
-Mixed pairs are fine; the contradiction is a cascade and a tombstone on the same key.
-The sweeper reaps children before parents now, ordered by the depth of the foreign-key
-chain above each table, so a family costs one pass rather than one failed pass per
-level. `scripts/scenarios/tombstone_children.py` (owns) proves all of it with both
-clients and the sweeper, 11/11 — after learning that the sweeper refuses a sub-minute
-window unless `GC_ALLOW_SHORT_THRESHOLD=1` says it is meant, a guard of its own.
+   Mixed pairs are fine; the contradiction is a cascade and a tombstone on the same key.
+   The sweeper reaps children before parents now, ordered by the depth of the foreign-key
+   chain above each table, so a family costs one pass rather than one failed pass per
+   level. `scripts/scenarios/tombstone_children.py` (owns) proves all of it with both
+   clients and the sweeper, 11/11 — after learning that the sweeper refuses a sub-minute
+   window unless `GC_ALLOW_SHORT_THRESHOLD=1` says it is meant, a guard of its own.
 
 **Bounded batches, and the doctor.** The reap was one statement per table — a million
 expired tombstones, one transaction, one lock, one WAL spike: the cascade storm this
@@ -10863,15 +10867,15 @@ the conversation that followed had three candidates: the query, the MessagePack
 encode, the compression. Every generation line now prints its breakdown. The
 75,000-row full of `test_types` on globex, full alone (the delta had no rows):
 
-| phase | level 9 | level 3 |
-| --- | --- | --- |
-| query (libpq text result, 19 MB) | 116 ms | 117 ms |
-| MessagePack encode | 31 ms | 31 ms |
-| dictionary (kept from the last era) | 6 ms | 5 ms |
-| zstd of the full | 138 ms | 24 ms |
-| upload, 21 chunks | 9 ms | 9 ms |
-| the build | 327 ms | 214 ms |
-| the object | 2,721,578 B | 2,716,134 B |
+| phase                               | level 9     | level 3     |
+| ----------------------------------- | ----------- | ----------- |
+| query (libpq text result, 19 MB)    | 116 ms      | 117 ms      |
+| MessagePack encode                  | 31 ms       | 31 ms       |
+| dictionary (kept from the last era) | 6 ms        | 5 ms        |
+| zstd of the full                    | 138 ms      | 24 ms       |
+| upload, 21 chunks                   | 9 ms        | 9 ms        |
+| the build                           | 327 ms      | 214 ms      |
+| the object                          | 2,721,578 B | 2,716,134 B |
 
 So: the encode is 0.4 µs a row and "drop MessagePack, zstd compresses anyway" buys
 nothing; the compression level was the single largest cost and bought no bytes — the
@@ -10900,12 +10904,12 @@ takes no parameters.
 
 **Measured, the 75,000-row full on globex, one build:**
 
-| | text, zstd 9 (morning) | text, zstd 3 | COPY, zstd 3 |
-| --- | --- | --- | --- |
-| rows stage | 116 + 31 ms | 117 + 31 ms | 115 ms |
-| zstd | 138 ms | 24 ms | 24 ms |
-| build | 327 ms | 214 ms | 185 ms |
-| object | 2,721,578 B | 2,716,134 B | 2,659,399 B |
+|            | text, zstd 9 (morning) | text, zstd 3 | COPY, zstd 3 |
+| ---------- | ---------------------- | ------------ | ------------ |
+| rows stage | 116 + 31 ms            | 117 + 31 ms  | 115 ms       |
+| zstd       | 138 ms                 | 24 ms        | 24 ms        |
+| build      | 327 ms                 | 214 ms       | 185 ms       |
+| object     | 2,721,578 B            | 2,716,134 B  | 2,659,399 B  |
 
 Less than the text parsing alone promised: the row stage is now the decoder's
 per-value allocations, the encoder's value tree and 75,000 `PQgetCopyData` calls,
@@ -11109,7 +11113,7 @@ RING_BUFFER_COUNT 32768; the table started at 75,000 live rows.
 
 **Two things the run surfaced.**
 
-1. *A chain on a quiet table can fall off a stream that never pruned by size.* At the
+1. _A chain on a quiet table can fall off a stream that never pruned by size._ At the
    wasp's start, before the firehose, both clients found "chain g331 predates the
    stream (cutoff seq 1259212 < first 1259214)". test_types had been quiet, so
    skip-if-unchanged kept g331 as the chain; its cut pointed at the stream's last
@@ -11122,7 +11126,7 @@ RING_BUFFER_COUNT 32768; the table started at 75,000 live rows.
    stream that is PRUNING and the age valve prunes an idle stream in one step. Fixed
    in §10ev: the scan re-cuts a cut that already sits below the floor, and one whose
    age approaches the stream's max_age while messages exist after it.
-2. *A table dropped in PostgreSQL leaves its cut in the producer's memory.* late_t
+2. _A table dropped in PostgreSQL leaves its cut in the producer's memory._ late_t
    (the §10et test's residue) had left the publication, so the tick no longer derived
    it and the departure sweep took its chain — but the edge watch keeps its own map
    of cuts, and that pair's cut sat below the floor forever: a forced cut every
@@ -11130,7 +11134,7 @@ RING_BUFFER_COUNT 32768; the table started at 75,000 live rows.
    (212 lines). A fresh process does not have the entry. §10ev holds a pair whose
    forced cut failed for a minute before asking again. The catalogue row survives
    the drop and should go by hand (`DELETE FROM zebridge_catalogue WHERE tbl =
-   'late_t'`); `--diagnose` could name a catalogue row whose table is gone. The
+'late_t'`); `--diagnose` could name a catalogue row whose table is gone. The
    sweeper met the same row later that evening and died on it — a sweep prepared
    against a table that does not exist fails, and the sidecar exited before reaping
    anything anywhere. It leaves such rows out now, and a failed prepare names the
@@ -11385,12 +11389,12 @@ the job fired on demand.
 A fresh libzb replica of test_types (3,055,002 rows, one 102 MB chain object) took 105 s in the DuckDB example and 56 s alone — 29,000 to 55,000 rows a second, a tenth of what SQLite inserts in one transaction.
 Phase timers on the seed (fetch, inflate, decode, apply) said where it went, and four changes, each measured alone on the same seed, took it to 17.7 s:
 
-| step | fetch | inflate | decode | apply | total |
-| --- | --- | --- | --- | --- | --- |
-| as found | 114 ms | 4,180 ms | 2,873 ms | 47,509 ms | 56.0 s |
-| page cache 128 MB for the seed | 86 | 4,163 | 1,755 | 26,036 | 33.3 s |
-| + libzstd for the plain frame, a plain INSERT for a full, a per-row arena | 84 | 291 | 1,858 | 27,203 | 30.7 s |
-| + rows inserted in primary-key order | 90 | 291 | 1,789 | 14,033 | 17.7 s |
+| step                                                                      | fetch  | inflate  | decode   | apply     | total  |
+| ------------------------------------------------------------------------- | ------ | -------- | -------- | --------- | ------ |
+| as found                                                                  | 114 ms | 4,180 ms | 2,873 ms | 47,509 ms | 56.0 s |
+| page cache 128 MB for the seed                                            | 86     | 4,163    | 1,755    | 26,036    | 33.3 s |
+| + libzstd for the plain frame, a plain INSERT for a full, a per-row arena | 84     | 291      | 1,858    | 27,203    | 30.7 s |
+| + rows inserted in primary-key order                                      | 90     | 291      | 1,789    | 14,033    | 17.7 s |
 
 What each one was. SQLite's default page cache is 2 MB; a seed inserts millions of random uuid keys into a growing b-tree and every insert touched a cold page — `PRAGMA cache_size` at 128 MB for the seed, the default back after, halved the apply by itself.
 The plain frame (a full, no dictionary) went through `std.compress.zstd`, which inflated 102 MB in 4.2 s; libzstd, already linked for the dictionary path, does it in 0.3 s.
@@ -11422,10 +11426,10 @@ starts with the DELETE; a delta re-applied is idempotent.
 
 **Measured**, the same 3,055,002-row seed of test_types:
 
-| | fetch | inflate | index + sort | apply | total |
-| --- | --- | --- | --- | --- | --- |
-| §10ez (trees, one transaction) | 90 ms | 291 | 1,789 | 14,033 | 17.7 s |
-| §10fa (cursor, chunks of 50,000) | 89 | 291 | 1,203 | 8,174 | 11.1 s |
+|                                  | fetch | inflate | index + sort | apply  | total  |
+| -------------------------------- | ----- | ------- | ------------ | ------ | ------ |
+| §10ez (trees, one transaction)   | 90 ms | 291     | 1,789        | 14,033 | 17.7 s |
+| §10fa (cursor, chunks of 50,000) | 89    | 291     | 1,203        | 8,174  | 11.1 s |
 
 2.7 µs a row in the apply, 374,000 rows a second; 56 s when the day started. The
 replica holds 3,055,002 rows with no duplicate key, thirty random rows compared cell
@@ -11484,11 +11488,11 @@ so does PGlite. The wire is untouched: msgpack plus zstd, one shape for both pat
 
 **Measured**, the Node worker seeding every table of globex:
 
-| | ready after |
-| --- | --- |
-| the morning's baseline | 109.8 s |
-| §10fb: sorted, chunked, page cache | 52.3 s |
-| §10fc: one statement per chunk | 26.0 s |
+|                                    | ready after |
+| ---------------------------------- | ----------- |
+| the morning's baseline             | 109.8 s     |
+| §10fb: sorted, chunked, page cache | 52.3 s      |
+| §10fc: one statement per chunk     | 26.0 s      |
 
 The seeded columns are typed as the binds typed them (`typeof`: integer for
 booleans and ints, text for numerics), the count is the table's live count, the
@@ -11570,10 +11574,10 @@ Tombstones keep their per-row DELETE. The chunk's text buffer is freed per chunk
 
 **Measured**, test_types into the replica database:
 
-| | apply | total |
-| --- | --- | --- |
-| §10fd, one INSERT per row | 99.2 s | 102 s |
-| §10fe, COPY per chunk | 14.6 s | 17.1 s |
+|                           | apply  | total  |
+| ------------------------- | ------ | ------ |
+| §10fd, one INSERT per row | 99.2 s | 102 s  |
+| §10fe, COPY per chunk     | 14.6 s | 17.1 s |
 
 3,055,002 rows, no duplicate key, the booleans split as the fixture has them, the
 scenario's seven checks green on the COPY path (a delta's CDC row, the client's
@@ -12491,9 +12495,9 @@ so the insert was measured in Node, where the download works: a script following
 `test_types` as bob, a fresh replica, the client's own log with elapsed seconds, peak RSS
 sampled every 250 ms (scratchpad `seed-bench.ts`, not in the tree).
 
-| engine (TS client, Node) | result |
-| --- | --- |
-| SQLite (better-sqlite3) | 3,055,002 rows, live at 24.2 s, peak RSS 2.6 GB |
+| engine (TS client, Node)   | result                                                                                                         |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| SQLite (better-sqlite3)    | 3,055,002 rows, live at 24.2 s, peak RSS 2.6 GB                                                                |
 | PGlite (persisted, NODEFS) | stopped at 29 min 35 s: 850,000 rows committed, 1,176 MB for that table, about 480 rows/s, one CPU core pinned |
 
 At that pace the whole table is about 1 h 45 min and over 4 GB. Two side effects: the
@@ -12520,17 +12524,17 @@ object of 102 MB (msgpack + zstd, about 33 bytes a row on the wire). Stored unco
 it is about 1 GB everywhere: PostgreSQL 931 MB of data plus 317 MB of indexes, the libzb
 SQLite replica 993 MB.
 
-| client | engine | where it ran | result | memory | status |
-| --- | --- | --- | --- | --- | --- |
-| libzb | SQLite, whole object | Flutter app on the Mac (§10fh) | about 10–11 s | about 1.1 GB | works |
-| libzb | SQLite, streaming seed | Flutter app on the Mac (§10fh) | about 22 s | about 330 MB | works |
-| libzb | DuckDB | `zb sync --once` on the Mac (§10fl) | 32 s, 462 MB file | 1.09 GB | works |
-| TS client | SQLite (better-sqlite3) | Node on the Mac (§10fv) | live at 24.2 s | 2.6 GB | works |
-| TS client | PGlite (NODEFS) | Node on the Mac (§10fv) | 850,000 rows in 29.5 min, about 480 rows/s; about 1 h 45 min projected | 2.2 GB, 3.1 GB on disk at the stop | inserts correct, unusably slow: one INSERT per row, no bulk path; blocks the thread |
-| TS client | SQLite (OPFS) | Chrome, normal profile (§10fu) | download never completes | | broken: object reader gives up after 30 s |
-| TS client | SQLite (OPFS) | Chrome, incognito (this section) | download never completes; storage quota exceeded | | broken, and the table cannot fit |
-| TS client | PGlite (IndexedDB) | browser | not measured | | would hit both the download and the per-row insert |
-| libzb | SQLite | a real phone | not measured | | the Mac numbers are the only ones |
+| client    | engine                  | where it ran                        | result                                                                 | memory                             | status                                                                              |
+| --------- | ----------------------- | ----------------------------------- | ---------------------------------------------------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------- |
+| libzb     | SQLite, whole object    | Flutter app on the Mac (§10fh)      | about 10–11 s                                                          | about 1.1 GB                       | works                                                                               |
+| libzb     | SQLite, streaming seed  | Flutter app on the Mac (§10fh)      | about 22 s                                                             | about 330 MB                       | works                                                                               |
+| libzb     | DuckDB                  | `zb sync --once` on the Mac (§10fl) | 32 s, 462 MB file                                                      | 1.09 GB                            | works                                                                               |
+| TS client | SQLite (better-sqlite3) | Node on the Mac (§10fv)             | live at 24.2 s                                                         | 2.6 GB                             | works                                                                               |
+| TS client | PGlite (NODEFS)         | Node on the Mac (§10fv)             | 850,000 rows in 29.5 min, about 480 rows/s; about 1 h 45 min projected | 2.2 GB, 3.1 GB on disk at the stop | inserts correct, unusably slow: one INSERT per row, no bulk path; blocks the thread |
+| TS client | SQLite (OPFS)           | Chrome, normal profile (§10fu)      | download never completes                                               |                                    | broken: object reader gives up after 30 s                                           |
+| TS client | SQLite (OPFS)           | Chrome, incognito (this section)    | download never completes; storage quota exceeded                       |                                    | broken, and the table cannot fit                                                    |
+| TS client | PGlite (IndexedDB)      | browser                             | not measured                                                           |                                    | would hit both the download and the per-row insert                                  |
+| libzb     | SQLite                  | a real phone                        | not measured                                                           |                                    | the Mac numbers are the only ones                                                   |
 
 **What the browser does meanwhile, from the user's console (incognito, bob).** The 102 MB
 object read fails every 30 s at a different point (441, 322, 113, 158, 166, 324 of 785
@@ -12657,11 +12661,11 @@ JetStream stream the way the bridge does, one acknowledged publish at a time, ag
 nats-server 2.14.6 instances on localhost that differ only in TLS (the submodule's test
 certificates). Median of three runs, on the Mac:
 
-| message | plain | TLS | TLS / plain (time, probe CPU, server CPU) |
-| --- | --- | --- | --- |
-| 400 B (one event), 60,000 | 18,432 msg/s, 7.4 MB/s | 17,793 msg/s, 7.1 MB/s | ×1.04, ×1.03, ×1.05 |
-| 16 KB (a batch), 12,000 | 15,284 msg/s, 245 MB/s | 13,139 msg/s, 210 MB/s | ×1.16, ×1.21, ×1.12 |
-| 256 KB, 1,500 | 4,814 msg/s, 1,233 MB/s | 3,152 msg/s, 807 MB/s | ×1.53, ×3.50, ×1.66 |
+| message                   | plain                   | TLS                    | TLS / plain (time, probe CPU, server CPU) |
+| ------------------------- | ----------------------- | ---------------------- | ----------------------------------------- |
+| 400 B (one event), 60,000 | 18,432 msg/s, 7.4 MB/s  | 17,793 msg/s, 7.1 MB/s | ×1.04, ×1.03, ×1.05                       |
+| 16 KB (a batch), 12,000   | 15,284 msg/s, 245 MB/s  | 13,139 msg/s, 210 MB/s | ×1.16, ×1.21, ×1.12                       |
+| 256 KB, 1,500             | 4,814 msg/s, 1,233 MB/s | 3,152 msg/s, 807 MB/s  | ×1.53, ×3.50, ×1.66                       |
 
 For small messages the acknowledgement round trip dominates and TLS costs 4%; the cost
 grows with message size because encryption then dominates, but even the 256 KB case moves
@@ -12697,9 +12701,9 @@ SPEED_TEST load of 2,000 × 1,000 rows. The dev bridge was stopped for the runs 
 restarted after; nothing of the dev stack was written. Two pairs of runs:
 
 | run | plain events/s | TLS events/s | bridge CPU TLS/plain | NATS CPU TLS/plain | chain upload plain → TLS |
-| --- | --- | --- | --- | --- | --- |
-| 1 | 201,765 | 207,493 | ×1.01 | ×1.41 | 188 → 239 ms |
-| 2 | 219,093 | 207,705 | ×1.08 | ×1.25 | 183 → 238 ms |
+| --- | -------------- | ------------ | -------------------- | ------------------ | ------------------------ |
+| 1   | 201,765        | 207,493      | ×1.01                | ×1.41              | 188 → 239 ms             |
+| 2   | 219,093        | 207,705      | ×1.08                | ×1.25              | 183 → 238 ms             |
 
 TLS moves the event rate by less than plain moves between its own runs. The full chain of
 the 2M rows (57.8 MB) builds in about 2.5 s either way, its upload a tenth of that: the
@@ -12726,14 +12730,14 @@ updated, for 180 s, cadence 60 s, the stream's byte cap small so it prunes all a
 second it samples the stream's oldest sequence and the newest manifest's cutoff:
 margin = cutoff + 1 − oldest, negative is the hole. Plain then TLS, identical otherwise.
 
-| cap | link | cuts (early) | fell off (log) | build ms median / max | upload ms median / max | margin min, negative samples |
-| --- | --- | --- | --- | --- | --- | --- |
-| 256 MiB | plain | 11 (7) | 0 | 432 / 1,911 | 12 / 77 | 639, 0 of 136 |
-| 256 MiB | TLS | 11 (7) | 0 | 484 / 1,939 | 16 / 89 | 636, 0 of 136 |
-| 64 MiB | plain | 33 (30) | 0 | 262 / 2,666 | 6 / 110 | 65, 0 of 136 |
-| 64 MiB | TLS | 34 (31) | 0 | 254 / 2,495 | 7 / 122 | 40, 0 of 135 |
-| 32 MiB | plain | 58 (55) | 0 for the table, 2 for `zebridge_gc_watermark` | 224 / 2,645 | 5 / 103 | −14, 3 of 134 |
-| 32 MiB | TLS | 58 (55) | 2 | 214 / 2,569 | 6 / 123 | −15, 8 of 136 |
+| cap     | link  | cuts (early) | fell off (log)                                 | build ms median / max | upload ms median / max | margin min, negative samples |
+| ------- | ----- | ------------ | ---------------------------------------------- | --------------------- | ---------------------- | ---------------------------- |
+| 256 MiB | plain | 11 (7)       | 0                                              | 432 / 1,911           | 12 / 77                | 639, 0 of 136                |
+| 256 MiB | TLS   | 11 (7)       | 0                                              | 484 / 1,939           | 16 / 89                | 636, 0 of 136                |
+| 64 MiB  | plain | 33 (30)      | 0                                              | 262 / 2,666           | 6 / 110                | 65, 0 of 136                 |
+| 64 MiB  | TLS   | 34 (31)      | 0                                              | 254 / 2,495           | 7 / 122                | 40, 0 of 135                 |
+| 32 MiB  | plain | 58 (55)      | 0 for the table, 2 for `zebridge_gc_watermark` | 224 / 2,645           | 5 / 103                | −14, 3 of 134                |
+| 32 MiB  | TLS   | 58 (55)      | 2                                              | 214 / 2,569           | 6 / 123                | −15, 8 of 136                |
 
 **What it says.** The upload is a few milliseconds of a cut that takes a quarter of a second
 (COPY, encode and zstd are the cut), so TLS leaves the producer's behaviour unchanged: the
@@ -12776,10 +12780,10 @@ the previous second's updated, 180 s, cap 64 MiB, cadence 60 s — with 20 consu
 over TLS in both: to nats-server in topology 2, to HAProxy (TCP mode, TLS-first) in
 topology 1. One run each, on the Mac.
 
-| | nats-server CPU | HAProxy CPU | server side total | bridge CPU | consumers CPU | cuts (early) | margin min, holes |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| topology 2 | 42.4 s | — | 42.4 s | 36.4 s | 38.6 s | 35 (33) | 65, 0 of 139 |
-| topology 1 | 20.6 s | 44.4 s | 65.0 s | 36.0 s | 46.8 s | 34 (32) | 38, 0 of 139 |
+|            | nats-server CPU | HAProxy CPU | server side total | bridge CPU | consumers CPU | cuts (early) | margin min, holes |
+| ---------- | --------------- | ----------- | ----------------- | ---------- | ------------- | ------------ | ----------------- |
+| topology 2 | 42.4 s          | —           | 42.4 s            | 36.4 s     | 38.6 s        | 35 (33)      | 65, 0 of 139      |
+| topology 1 | 20.6 s          | 44.4 s      | 65.0 s            | 36.0 s     | 46.8 s        | 34 (32)      | 38, 0 of 139      |
 
 **What it says.** Terminating in HAProxy halves nats-server's CPU but costs HAProxy twice
 what nats-server saved: 65 CPU-seconds on the server side against 42, because HAProxy does
@@ -12974,10 +12978,10 @@ a nearer start.
 **Measured** (SPEED_TEST.md, "The routine full in the background"): 64 MiB, 2M static rows
 
 - the firehose, four runs in the order async, sync, sync, async. Holes 0/3/3/0 samples,
-smallest margin 131/−77/−77/132, CPU equal. `firehose_tls.py --verify` seeds each final
-chain in Python by the clients' plan rule and compares with PostgreSQL: 3,800,000 rows,
-0 missing, 0 extra, 0 wrong, for all four, and replaying every kept delta changes nothing.
-A depth-3 smoke run attached three background fulls (3.4–4.2 s) with the same check.
+  smallest margin 131/−77/−77/132, CPU equal. `firehose_tls.py --verify` seeds each final
+  chain in Python by the clients' plan rule and compares with PostgreSQL: 3,800,000 rows,
+  0 missing, 0 extra, 0 wrong, for all four, and replaying every kept delta changes nothing.
+  A depth-3 smoke run attached three background fulls (3.4–4.2 s) with the same check.
 
 **Not covered.** No real client (libzb, zb-client-ts) seeded a chain with a background full;
 the Python check follows their rule, it is not their code. A client seeding from a deferred
@@ -13068,10 +13072,10 @@ binary now links libzstd.
 After §10gi the 50k events/s run still showed about 1 GB of RSS at peak. Traced on the Mac
 with `vmmap -summary` every 20 s (`ZB_VMMAP=1`) and a run with the producer off (`nogen`).
 
-| run (50k events/s, 300 s) | RSS median | RSS max |
-| --- | --- | --- |
-| generations off | 179 MiB | 180 MiB, flat |
-| generations on | 413 MiB | 1,011 MiB |
+| run (50k events/s, 300 s) | RSS median | RSS max       |
+| ------------------------- | ---------- | ------------- |
+| generations off           | 179 MiB    | 180 MiB, flat |
+| generations on            | 413 MiB    | 1,011 MiB     |
 
 **Live memory stays flat.** With generations on, the malloc blocks in use (`MALLOC_LARGE`)
 are 150–194 MiB in every snapshot: the 128 MiB ring slab and the rest of the CDC path. The
@@ -13132,16 +13136,16 @@ Not fixed; the lower bound is decided first.
 checkpoints forced by WAL volume, client backends doing 104M of the 119M relation writes).
 Same command, `RING_BUFFER_COUNT=132000`:
 
-| | initdb defaults, ring 32,768 | sized, ring 132,000 |
-| --- | --- | --- |
-| load (300 s script) | 933 s | 302 s |
-| events published | 32,042/s | 99,007/s |
-| WAL written | 58.2 GiB | 15.7 GiB |
-| slot lag median / max | 85 MiB / 8,852 MiB | 28 MiB / 79 MiB |
-| ring full | 33,704 times | 0 |
-| holes | 18 of 870 | 16 of 247; min margin −1,598 |
-| bridge CPU / NATS CPU | 345 s / 81 s | 299 s / 73 s |
-| RSS median / max | 1,708 / 2,336 MiB | 1,470 / 4,016 MiB (ring 589 MB of it) |
+|                       | initdb defaults, ring 32,768 | sized, ring 132,000                   |
+| --------------------- | ---------------------------- | ------------------------------------- |
+| load (300 s script)   | 933 s                        | 302 s                                 |
+| events published      | 32,042/s                     | 99,007/s                              |
+| WAL written           | 58.2 GiB                     | 15.7 GiB                              |
+| slot lag median / max | 85 MiB / 8,852 MiB           | 28 MiB / 79 MiB                       |
+| ring full             | 33,704 times                 | 0                                     |
+| holes                 | 18 of 870                    | 16 of 247; min margin −1,598          |
+| bridge CPU / NATS CPU | 345 s / 81 s                 | 299 s / 73 s                          |
+| RSS median / max      | 1,708 / 2,336 MiB            | 1,470 / 4,016 MiB (ring 589 MB of it) |
 
 The CDC path holds 100k events a second on the Mac. The chain does not, at a 128 MiB cap:
 the margin logged before each cut is about 1 s. The holes come from three things, in
@@ -13179,14 +13183,14 @@ was invisible after 19 s), so it cannot replace the count where hard deletes hap
 
 **100k again** (same command, ring 132,000; the firehose table now has the delete guard):
 
-| | before | floor, no count |
-| --- | --- | --- |
-| delta rows, median | 400,000 | 150,000 |
-| delta build, median / max | 834 / 4,682 ms | 250 / 1,000 ms |
-| holes | 16 | 1 (g2's size-rule full in the build path, 12 s) |
-| bridge RSS median / max | 1,470 / 4,016 MiB | 864 / 1,668 MiB |
-| bridge CPU | 299 s | 277 s |
-| events published | 99,007/s | 99,118/s |
+|                           | before            | floor, no count                                 |
+| ------------------------- | ----------------- | ----------------------------------------------- |
+| delta rows, median        | 400,000           | 150,000                                         |
+| delta build, median / max | 834 / 4,682 ms    | 250 / 1,000 ms                                  |
+| holes                     | 16                | 1 (g2's size-rule full in the build path, 12 s) |
+| bridge RSS median / max   | 1,470 / 4,016 MiB | 864 / 1,668 MiB                                 |
+| bridge CPU                | 299 s             | 277 s                                           |
+| events published          | 99,007/s          | 99,118/s                                        |
 
 Cuts still come every 2.1 s: the early-cut trigger waits for the cut to be a second old.
 The one hole left is the size rule's full, still built with the delta. Preflight's boot
@@ -13222,17 +13226,17 @@ than a seed of it), or the incremental fulls' base, replaced rarely.
 
 **150k, 256 MiB cap** (`--rate 75000`, `RING_BUFFER_COUNT=200000`, `BASE_BUF=11`):
 
-| | 100k, 128 MiB | 150k, 256 MiB |
-| --- | --- | --- |
-| load (300 s script) | 302 s | 353 s |
-| events published | 99,012/s | 127,089/s |
-| slot lag median / max | 27 / 92 MiB | 65 / 140 MiB |
-| ring full | 0 | 0 |
-| delta rows / build, median | 150,000 / 249 ms | 300,000 / 449 ms |
-| holes | 2 | 1 (g2's size-rule full, 14 s) |
-| background fulls | 9–21 s | 16–31 s |
-| bridge CPU / NATS CPU | 260 / 70 s | 387 / 108 s |
-| bridge RSS median / max | 782 / 1,700 MiB | 1,016 / 2,533 MiB |
+|                            | 100k, 128 MiB    | 150k, 256 MiB                 |
+| -------------------------- | ---------------- | ----------------------------- |
+| load (300 s script)        | 302 s            | 353 s                         |
+| events published           | 99,012/s         | 127,089/s                     |
+| slot lag median / max      | 27 / 92 MiB      | 65 / 140 MiB                  |
+| ring full                  | 0                | 0                             |
+| delta rows / build, median | 150,000 / 249 ms | 300,000 / 449 ms              |
+| holes                      | 2                | 1 (g2's size-rule full, 14 s) |
+| background fulls           | 9–21 s           | 16–31 s                       |
+| bridge CPU / NATS CPU      | 260 / 70 s       | 387 / 108 s                   |
+| bridge RSS median / max    | 782 / 1,700 MiB  | 1,016 / 2,533 MiB             |
 
 The bridge followed PostgreSQL (lag under 140 MiB); PostgreSQL did not follow the script:
 one psql session ran 75k inserts and 75k updates a second in 353 s instead of 300, so the
@@ -13315,13 +13319,13 @@ from the mid-load 100k run, where the client was re-seeding a 17M-row table and 
 prune at the same time. Measured properly — `--client-at 5` on a 60 s load, no preload, so
 the client only follows CDC (it seeds 0 rows from the boot chain):
 
-| load | events published | the client |
-| --- | --- | --- |
-| 10k/s | 595,000 | keeps up, caught up 71.7 s, 300,000 rows, 60/60 batches |
-| 20k/s | 1,190,000 | keeps up, 71.8 s, 600,000 rows, all right |
-| 40k/s | 2,380,000 | keeps up, 72.1 s, 1,200,000 rows, all right |
-| 60k/s | 3,569,869 | keeps up, 73.2 s, 1,800,000 rows, all right; no prune |
-| 100k/s | 5,869,886 | falls behind: 3 then 97 messages pruned under the drain, two re-seeds, caught up 106.7 s — 3,000,000 rows, all right |
+| load   | events published | the client                                                                                                           |
+| ------ | ---------------- | -------------------------------------------------------------------------------------------------------------------- |
+| 10k/s  | 595,000          | keeps up, caught up 71.7 s, 300,000 rows, 60/60 batches                                                              |
+| 20k/s  | 1,190,000        | keeps up, 71.8 s, 600,000 rows, all right                                                                            |
+| 40k/s  | 2,380,000        | keeps up, 72.1 s, 1,200,000 rows, all right                                                                          |
+| 60k/s  | 3,569,869        | keeps up, 73.2 s, 1,800,000 rows, all right; no prune                                                                |
+| 100k/s | 5,869,886        | falls behind: 3 then 97 messages pruned under the drain, two re-seeds, caught up 106.7 s — 3,000,000 rows, all right |
 
 So libzb on SQLite (this Mac, 13-column rows) follows **60,000 events a second** live and
 breaks somewhere below 100,000. The apply path is still per-event — a `planExists` probe on
@@ -13346,13 +13350,13 @@ The run is `plain:` because nats.js upgrades to TLS whenever the server offers i
 scratch certificate is self-signed for `localhost` while the follower connects by address
 (Node resolves `localhost` to ::1 first, which the server does not listen on).
 
-| load | zb-client-ts | libzb, same load |
-| --- | --- | --- |
-| 10k/s | keeps up, caught up 70.7 s, 300,000 rows right, 0 gaps | keeps up, 71.7 s |
-| 20k/s | keeps up, 70.6 s, 600,000 rows right, 0 gaps | keeps up, 71.8 s |
-| 40k/s | **3,737 gaps, 3,738 re-seeds**, 76.8 s | keeps up, 72.1 s, no gap |
-| 60k/s | **6,829 gaps**, 85.2 s | keeps up, 73.2 s, no gap |
-| 100k/s | **7,550 gaps**, 115.8 s | falls behind, 2 re-seeds, 106.7 s |
+| load   | zb-client-ts                                           | libzb, same load                  |
+| ------ | ------------------------------------------------------ | --------------------------------- |
+| 10k/s  | keeps up, caught up 70.7 s, 300,000 rows right, 0 gaps | keeps up, 71.7 s                  |
+| 20k/s  | keeps up, 70.6 s, 600,000 rows right, 0 gaps           | keeps up, 71.8 s                  |
+| 40k/s  | **3,737 gaps, 3,738 re-seeds**, 76.8 s                 | keeps up, 72.1 s, no gap          |
+| 60k/s  | **6,829 gaps**, 85.2 s                                 | keeps up, 73.2 s, no gap          |
+| 100k/s | **7,550 gaps**, 115.8 s                                | falls behind, 2 re-seeds, 106.7 s |
 
 Every run ended equal to PostgreSQL. What the counters say, though, is that above 20k the
 TS client is not following at all — it is looping:
@@ -13391,10 +13395,10 @@ client kept re-seeding — proves nothing and leaves the stream blocked until th
 cuts a newer one. A blocked stream now also backs off (250 ms doubling to 5 s) instead of
 re-opening the tail into the same hole.
 
-| load | before | heal without coverage | heal with coverage |
-| --- | --- | --- | --- |
-| 40k/s | 3,737 gaps, correct | 10 gaps, correct | 9 gaps, 1,200,000 rows, correct |
-| 60k/s | 6,829 gaps, correct | 13 gaps, **32 batches wrong** | 13 gaps, 1,800,000 rows, correct |
+| load   | before              | heal without coverage         | heal with coverage               |
+| ------ | ------------------- | ----------------------------- | -------------------------------- |
+| 40k/s  | 3,737 gaps, correct | 10 gaps, correct              | 9 gaps, 1,200,000 rows, correct  |
+| 60k/s  | 6,829 gaps, correct | 13 gaps, **32 batches wrong** | 13 gaps, 1,800,000 rows, correct |
 | 100k/s | 7,550 gaps, correct | 67 gaps, **53 batches wrong** | 15 gaps, 3,000,000 rows, correct |
 
 So both clients now behave the same way under a firehose they cannot follow: they fall
@@ -13434,10 +13438,10 @@ SQL on every `db.prepare`, and the Node adapter called it per statement — whil
 handful of statements, one per (table, operation, column set), thousands of times a second.
 A `Map<string, Statement>` in `nodeStorage`, cleared wholesale past 512:
 
-| zb-client-ts, 60 s loads | before | with the cache |
-| --- | --- | --- |
-| 40k events/s | 11,939 rows/s, 9 gaps, caught up 77.1 s | **19,391 rows/s, 0 gaps, 70.5 s** |
-| 60k events/s | 13 gaps, correct | 11 gaps, correct, 83.7 s |
+| zb-client-ts, 60 s loads | before                                  | with the cache                    |
+| ------------------------ | --------------------------------------- | --------------------------------- |
+| 40k events/s             | 11,939 rows/s, 9 gaps, caught up 77.1 s | **19,391 rows/s, 0 gaps, 70.5 s** |
+| 60k events/s             | 13 gaps, correct                        | 11 gaps, correct, 83.7 s          |
 
 So the TS client follows 40,000 events a second live where it followed 20,000, and its
 ceiling moved to between 40k and 60k. libzb still follows 60k. Both remain per-event
@@ -13492,14 +13496,14 @@ for the pair, which serves the same purpose — either way nothing is built inli
 
 **Measured**, 300 s at 100k events/s on 2M preloaded rows, against the same run before:
 
-| | before | now |
-| --- | --- | --- |
-| holes | 1 (of 249) | **0 of 251** |
-| smallest margin | −1,436 | **+75** |
-| cuts | 143 delta, 1 delta+full | 143 delta, no delta+full |
-| background fulls | 5 (9.3–20.7 s) | 7 (7.6–20.5 s) |
-| events published | 97,730/s | 99,213/s |
-| bridge RSS median / max | 842 / 1,576 MiB | 1,656 / 3,074 MiB |
+|                         | before                  | now                      |
+| ----------------------- | ----------------------- | ------------------------ |
+| holes                   | 1 (of 249)              | **0 of 251**             |
+| smallest margin         | −1,436                  | **+75**                  |
+| cuts                    | 143 delta, 1 delta+full | 143 delta, no delta+full |
+| background fulls        | 5 (9.3–20.7 s)          | 7 (7.6–20.5 s)           |
+| events published        | 97,730/s                | 99,213/s                 |
+| bridge RSS median / max | 842 / 1,576 MiB         | 1,656 / 3,074 MiB        |
 
 The memory is the price: two more fulls in the lane's lifetime, and the retirement grace
 (§10gq) keeping four windows of objects. Deltas are still built in memory (§10gj) and remain
@@ -13593,11 +13597,11 @@ the fixtures say a checkpoint is.
 
 That manifest, put back through the Zig core:
 
-| the client's state | the plan |
-| --- | --- |
-| fresh | full + 3 checkpoints + 4 deltas |
+| the client's state               | the plan                            |
+| -------------------------------- | ----------------------------------- |
+| fresh                            | full + 3 checkpoints + 4 deltas     |
 | at the first checkpoint's cutoff | 3 deltas, no base and no checkpoint |
-| older than the gc watermark | the full again |
+| older than the gc watermark      | the full again                      |
 
 The middle row is the point of the whole design: a client that was away a little pays for a
 few deltas, not for the table. The last row is §10gs's first rule doing its job.
@@ -13679,9 +13683,9 @@ Step 3, and the point of the whole design. Retention no longer counts generation
 
 - the newest **base** is kept, and everything older than it goes;
 - **checkpoints** are kept from that base on — they are how a returning client walks the
-    distance the deltas no longer cover;
+  distance the deltas no longer cover;
 - a **delta** is kept only above the newest checkpoint: below it the checkpoint carries
-    the same rows in one object.
+  the same rows in one object.
 
 A pair whose lane has STALLED keeps its deltas: with no checkpoint above the base, the
 checkpoint mark IS the base and nothing between them is pruned. Pruning deltas down to a
@@ -13701,20 +13705,20 @@ checkpoint, not how many generations have passed.
 
 **Measured, 300 s at 100k events/s, 2M preloaded rows, checkpoints every 30 s:**
 
-| | depth rotation (§10gr) | valve on count | valve on a stalled lane |
-| --- | --- | --- | --- |
-| whole-table fulls | 7 | 6 | **2** (the outweigh rule) |
-| "built at the limit" | 48 | 46 | **0** |
-| holes | 0 of 251 | 0 of 252 | 0 of 250, margin +83 |
-| events published | 99,213/s | 98,983/s | 99,734/s |
-| bridge RSS median / max | 1,656 / 3,074 MiB | 999 / 2,136 MiB | 1,445 / 2,728 MiB |
+|                         | depth rotation (§10gr) | valve on count  | valve on a stalled lane   |
+| ----------------------- | ---------------------- | --------------- | ------------------------- |
+| whole-table fulls       | 7                      | 6               | **2** (the outweigh rule) |
+| "built at the limit"    | 48                     | 46              | **0**                     |
+| holes                   | 0 of 251               | 0 of 252        | 0 of 250, margin +83      |
+| events published        | 99,213/s               | 98,983/s        | 99,734/s                  |
+| bridge RSS median / max | 1,656 / 3,074 MiB      | 999 / 2,136 MiB | 1,445 / 2,728 MiB         |
 
 And what a returning client now fetches, from `incremental.py` (12/12):
 
-| the client | before step 3 | after |
-| --- | --- | --- |
+| the client              | before step 3                                     | after                               |
+| ----------------------- | ------------------------------------------------- | ----------------------------------- |
 | away past the old chain | `['full', 'checkpoint', 'checkpoint', 'delta'×6]` | `['full', 'checkpoint', 'delta'×3]` |
-| past the gc watermark | `['full', 'checkpoint'×2, 'delta'×8]` | `['full', 'checkpoint', 'delta'×4]` |
+| past the gc watermark   | `['full', 'checkpoint'×2, 'delta'×8]`             | `['full', 'checkpoint', 'delta'×4]` |
 
 The case that used to prove "away past the chain → the base" no longer can: with checkpoints
 the same client is carried incrementally, which is the improvement. It now drives the base
@@ -13740,13 +13744,13 @@ happened. The lane now fetches it first, like the delta.
 
 **Measured, 300 s at 100k events/s, 2M preloaded rows:**
 
-| | in-memory deltas | streamed |
-| --- | --- | --- |
-| bridge RSS median / max | 1,445 / 2,728 MiB | **587 / 597 MiB** |
-| spread between them | 1,283 MiB | **10 MiB** |
-| holes | 0 of 250 | 0 of 252, margin +86 |
-| events published | 99,734/s | 99,150/s |
-| delta build, median | 242 ms | 213 ms |
+|                         | in-memory deltas  | streamed             |
+| ----------------------- | ----------------- | -------------------- |
+| bridge RSS median / max | 1,445 / 2,728 MiB | **587 / 597 MiB**    |
+| spread between them     | 1,283 MiB         | **10 MiB**           |
+| holes                   | 0 of 250          | 0 of 252, margin +86 |
+| events published        | 99,734/s          | 99,150/s             |
+| delta build, median     | 242 ms            | 213 ms               |
 
 The ring buffer is 586 MB of that 587 (200,000 slots at BASE_BUF=11), so everything the
 bridge does besides holding its ring now fits in about ten megabytes — at a hundred
@@ -13814,7 +13818,7 @@ not the bridge. What must be true before a result means anything, in the order i
    `scripts/native/up.sh` now (`zb.pg_opts()`), where they used to carry their own stale
    copy and left the cluster on 128 MB of shared_buffers for everything after. Verify
    with `SELECT name, setting, source FROM pg_settings WHERE name IN ('shared_buffers',
-   'max_wal_size', 'wal_compression')` — `source = command line`, 4 GB / 16 GB / zstd.
+'max_wal_size', 'wal_compression')` — `source = command line`, 4 GB / 16 GB / zstd.
 
 4. **The slots.** `owns` runs with the long-running bridge stopped, and an idle
    `my_slot` does not survive an hour of battery WAL under up.sh's deliberate
@@ -13842,7 +13846,7 @@ not the bridge. What must be true before a result means anything, in the order i
    file goes stale after `chaos`/`nats_outage`/`matrix` restart the server
    (`revoke_midseed` verifies the pid is alive, else finds it). A publication column
    list is changed with `DROP TABLE` + `ADD TABLE t (cols)` — `ALTER PUBLICATION … SET
-   TABLE t (cols)` REPLACES the whole table list, which emptied `my_pub` and voided a
+TABLE t (cols)` REPLACES the whole table list, which emptied `my_pub` and voided a
    full run. `import`ing a scenario module runs it — check syntax with `py_compile`. And
    never wait on a scenario with `pgrep -f <its file name>`: a `bash -c "…"` whose
    command line names the file is itself a match, so a waiter sees the scenario as
@@ -13984,15 +13988,15 @@ was the cost.
 **On a copy of the replica** (1.2M rows, random UUID text keys, 347 MB), 86,000 random
 upserts, better-sqlite3:
 
-| shape | rows/s |
-| --- | --- |
-| `json_each` multi-row upsert, one 430-row message per transaction | 16,000 |
-| prepared per-row upsert, same | **24,000** |
-| the same two on new rows (INSERT) | 20,000 / 27,000 |
-| upsert from a staging table (no JSON parsing) | 18,000 |
-| page cache 2 MB → 128 MB, rows sorted by key | ±7%, nothing |
-| prepared per-row, 10 messages per transaction | 31,000 |
-| prepared per-row, **50 messages per transaction** | **59,000** |
+| shape                                                             | rows/s          |
+| ----------------------------------------------------------------- | --------------- |
+| `json_each` multi-row upsert, one 430-row message per transaction | 16,000          |
+| prepared per-row upsert, same                                     | **24,000**      |
+| the same two on new rows (INSERT)                                 | 20,000 / 27,000 |
+| upsert from a staging table (no JSON parsing)                     | 18,000          |
+| page cache 2 MB → 128 MB, rows sorted by key                      | ±7%, nothing    |
+| prepared per-row, 10 messages per transaction                     | 31,000          |
+| prepared per-row, **50 messages per transaction**                 | **59,000**      |
 
 So the multi-row `INSERT … SELECT … ON CONFLICT` is slower than a prepared VALUES upsert on
 SQLite — it materializes the SELECT first — and the chain's ~90,000 rows/s (§10fc) comes
@@ -14034,12 +14038,12 @@ load — and it lags above that without falling off a 60 s stream.
 **Where the client thread goes** (macOS `sample` of the harness process, 20 s inside the
 100k load, 16,989 samples in the client thread):
 
-| | share |
-| --- | --- |
-| `applyEvent` — plan the SQL per event, probe, bind, step | 32% |
-| decode — msgpack → payload map → JSON value tree, an arena per event | ~25% |
-| COMMIT: the automatic WAL checkpoint (`fsync` of the main file every 1,000 WAL pages + the page copy) | 17% |
-| COMMIT: the WAL frames and the commit's own `fsync` (`synchronous` defaults to FULL) | 6% |
+|                                                                                                       | share |
+| ----------------------------------------------------------------------------------------------------- | ----- |
+| `applyEvent` — plan the SQL per event, probe, bind, step                                              | 32%   |
+| decode — msgpack → payload map → JSON value tree, an arena per event                                  | ~25%  |
+| COMMIT: the automatic WAL checkpoint (`fsync` of the main file every 1,000 WAL pages + the page copy) | 17%   |
+| COMMIT: the WAL frames and the commit's own `fsync` (`synchronous` defaults to FULL)                  | 6%    |
 
 **Pragmas, measured.** `synchronous = NORMAL` + `wal_autocheckpoint = 10000` in both storage
 layers: libzb 60k 23,356 rows/s (was 23,447), 100k 23,863 (was 23,094); zb-client-ts 100k
@@ -14049,13 +14053,13 @@ times larger, the same bytes. A random row rewritten is a 4 KB page written to t
 again into the main file; the cost is the bytes, not the syscall count. On a copy of the
 replica, per-row upserts, 172,000 rows, checkpoints inside the wall time:
 
-| | rows/s |
-| --- | --- |
-| page 4096, FULL, checkpoint every 1,000 pages (the defaults) | 25,300 |
-| page 4096, NORMAL, 1,000 | 25,900 |
-| page 4096, NORMAL, 10,000 | **34,300** |
-| page 1024, NORMAL, 1,000 / 10,000 | 28,200 / 34,800 |
-| page 4096, **OFF**, 1,000 | **68,300** |
+|                                                              | rows/s          |
+| ------------------------------------------------------------ | --------------- |
+| page 4096, FULL, checkpoint every 1,000 pages (the defaults) | 25,300          |
+| page 4096, NORMAL, 1,000                                     | 25,900          |
+| page 4096, NORMAL, 10,000                                    | **34,300**      |
+| page 1024, NORMAL, 1,000 / 10,000                            | 28,200 / 34,800 |
+| page 4096, **OFF**, 1,000                                    | **68,300**      |
 
 So the interval is worth a third when the row's CPU is small, the page size nothing, and
 the `fsync` is the whole I/O story: `synchronous = OFF` (no fsync at all) is 2.7× — at the
@@ -14138,10 +14142,10 @@ declared array dimensions to match the data.
 
 **Measured**, 60 s loads, libzb on DuckDB (`ZB_CLIENT_ENGINE=duckdb`):
 
-| load | applied through the load | caught up after the load ended | gaps healed | batches wrong |
-| --- | --- | --- | --- | --- |
-| 60k events/s | 17,844 inserts/s (~36k events/s) | 39 s | 28 | **0** of 60 |
-| 100k events/s | 23,500 inserts/s | 62 s | 23 | **0** of 60 |
+| load          | applied through the load         | caught up after the load ended | gaps healed | batches wrong |
+| ------------- | -------------------------------- | ------------------------------ | ----------- | ------------- |
+| 60k events/s  | 17,844 inserts/s (~36k events/s) | 39 s                           | 28          | **0** of 60   |
+| 100k events/s | 23,500 inserts/s                 | 62 s                           | 23          | **0** of 60   |
 
 So DuckDB stays live to about 36k events/s of this load and converges above it, through the
 chain: the scratch stream's 256 MiB window prunes under a lagging client, libzb takes the
@@ -14186,7 +14190,7 @@ three of them in libzb and two of them not DuckDB's at all:
 1. **`execSimple` executed a statement TWICE.** It tried a 256-byte stack buffer first and,
    on OutOfMemory, ran the statement again through an arena — but the buffer can run out
    while the RESULT is read, after the statement executed. A seed's `INSERT … SELECT FROM
-   _zbz_copy` just under 256 bytes ran twice on DuckDB and the second run raised a duplicate
+_zbz_copy` just under 256 bytes ran twice on DuckDB and the second run raised a duplicate
    key on every composite-key table; the firehose's longer statements ran out of buffer
    BEFORE executing and never showed it; on SQLite the pattern was only ever saved by
    idempotent statements. Found with `ZB_DEBUG_SQL=1` (kept), which printed every DuckDB
@@ -14291,11 +14295,11 @@ query waited behind it (841 ms, then 53).
 
 **Measured**, `examples/08-map/poi_phone.py` (libzb through ctypes, `ondemandTables`):
 
-| ask | answer | round trip | in the service |
-| --- | --- | --- | --- |
-| Nantes centre, 600 m, limit 2,000 | 2,000 rows, cut | 126 ms first, 59 ms again | 119 / 53 ms |
-| Paris centre, 2 km, shops only | 2,000 rows, cut | 71 ms | 61 ms |
-| Nantes centre, 250 m | 516 rows, complete | 100 ms | 98 ms |
+| ask                               | answer             | round trip                | in the service |
+| --------------------------------- | ------------------ | ------------------------- | -------------- |
+| Nantes centre, 600 m, limit 2,000 | 2,000 rows, cut    | 126 ms first, 59 ms again | 119 / 53 ms    |
+| Paris centre, 2 km, shops only    | 2,000 rows, cut    | 71 ms                     | 61 ms          |
+| Nantes centre, 250 m              | 516 rows, complete | 100 ms                    | 98 ms          |
 
 Then the loop that is the point: a `UPDATE` renaming a pharmacy and a soft-delete of a
 waste basket in PostgreSQL — the service's replica applied both within seconds (`cdc: 2
@@ -14454,12 +14458,12 @@ service key. The hub's conf gained `leafnodes { port: 7422 }` — a reload does 
 it, a restart does. Every answer now carries `answered_by`, the instance's `--label`,
 and `leaf/who_answers.py` tallies fifty asks:
 
-| phone connected to | responders up | answered by | median |
-| --- | --- | --- | --- |
-| leaf | both | leaf, 50 of 50 | 136 ms |
-| hub | both | hub, 50 of 50 | 133 ms |
-| leaf | hub only | hub, 50 of 50, across the link | 133 ms |
-| leaf | both again | leaf, 50 of 50 | 133 ms |
+| phone connected to | responders up | answered by                    | median |
+| ------------------ | ------------- | ------------------------------ | ------ |
+| leaf               | both          | leaf, 50 of 50                 | 136 ms |
+| hub                | both          | hub, 50 of 50                  | 133 ms |
+| leaf               | hub only      | hub, 50 of 50, across the link | 133 ms |
+| leaf               | both again    | leaf, 50 of 50                 | 133 ms |
 
 Queue-group locality does exactly what the claim needs: a request is served on the
 server it was published on when a member is there, crosses the link only when none is,
@@ -14532,13 +14536,13 @@ clients means no reply ever arrives, the clients without the grant changes nothi
 
 Measured after the reload:
 
-| probe | result |
-| --- | --- |
-| `omar` subscribes `_INBOX.>` | refused |
-| `omar` subscribes `_INBOX.alice.>` | refused |
-| `omar` subscribes `_INBOX.omar.>` | allowed |
-| the inbox libzb generates | `_INBOX.omar.<nuid>` |
-| a JetStream reply under the narrowed grant | arrives |
+| probe                                      | result               |
+| ------------------------------------------ | -------------------- |
+| `omar` subscribes `_INBOX.>`               | refused              |
+| `omar` subscribes `_INBOX.alice.>`         | refused              |
+| `omar` subscribes `_INBOX.omar.>`          | allowed              |
+| the inbox libzb generates                  | `_INBOX.omar.<nuid>` |
+| a JetStream reply under the narrowed grant | arrives              |
 
 `scripts/scenarios/inbox_sniff.py` is those five, in the `client` group. The stack on top
 of them: both POI services reconnected with zero violations, the phone probe seeded and
@@ -14799,7 +14803,7 @@ is no longer exercised by the map by accident — `serve.py` exercises it on pur
 `osm_pois` was dropped the same day, on the owner's word. One `DROP TABLE`, and the
 bridge did the rest in one line of its log: "drop prune for 'osm_pois': 2 stream
 purge(s), 7 chain object(s), 1 KV key(s)", then the tombstone `{"dropped": true}` that
-makes every replica drop its copy. The next boot swept the chain — "'_default'/'osm_pois'
+makes every replica drop its copy. The next boot swept the chain — "'\_default'/'osm_pois'
 left the publication — chain swept; a table reborn under this name starts at g1" — and
 said nothing else about it. Its catalogue row survives the drop, deliberately: the
 declaration outlives the table, so a table reborn under the same name is the same
@@ -14918,12 +14922,12 @@ travels unchanged in both.
 
 With one clock, from Nantes, `limit` 2000, five asks per row:
 
-| radius | via | rows | answer bytes | wire (med) | fetch (med) | service (med) |
-| --- | --- | --- | --- | --- | --- | --- |
-| 5 km | inline | 18 | 6,883 | 111 ms | 0 ms | 9.0 ms |
-| 50 km | inline | 306 | 114,239 | 120 ms | 0 ms | 15.6 ms |
-| 100 km | object | 914 | 360,547 | 122 ms | 2 ms | 17.8 ms |
-| 300 km | object | 2,000 | 813,821 | 126 ms | 2 ms | 22.0 ms |
+| radius | via    | rows  | answer bytes | wire (med) | fetch (med) | service (med) |
+| ------ | ------ | ----- | ------------ | ---------- | ----------- | ------------- |
+| 5 km   | inline | 18    | 6,883        | 111 ms     | 0 ms        | 9.0 ms        |
+| 50 km  | inline | 306   | 114,239      | 120 ms     | 0 ms        | 15.6 ms       |
+| 100 km | object | 914   | 360,547      | 122 ms     | 2 ms        | 17.8 ms       |
+| 300 km | object | 2,000 | 813,821      | 126 ms     | 2 ms        | 22.0 ms       |
 
 Two findings, and the second is the one that matters.
 
@@ -15055,11 +15059,11 @@ vertices do. With `step = W/2` the same synthetic 15 km route holds 96.8% of ful
 Re-measured on the real road, on the service's own DuckDB replica, 92.39 km and 1,948
 shape points:
 
-| corridor | anchors | widest gap | width held | along the road | time |
-| --- | --- | --- | --- | --- | --- |
-| 2 km | 159 | 1,416 m | 93.5% | 65 | 12 ms |
-| 5 km | 68 | 1,921 m | 98.1% | 132 | 5 ms |
-| 10 km | 34 | 3,427 m | 98.5% | 208 | 4 ms |
+| corridor | anchors | widest gap | width held | along the road | time  |
+| -------- | ------- | ---------- | ---------- | -------------- | ----- |
+| 2 km     | 159     | 1,416 m    | 93.5%      | 65             | 12 ms |
+| 5 km     | 68      | 1,921 m    | 98.1%      | 132            | 5 ms  |
+| 10 km    | 34      | 3,427 m    | 98.5%      | 208            | 4 ms  |
 
 The 2 km row found 65 points where the subsampling version found 62: the three it missed
 were in the scalloped dips. The residual gap comes from thinning the densified list at
@@ -15124,11 +15128,11 @@ would throw away rows a phone legitimately holds for other views.
 
 Measured, Nantes to Angers, 92.39 km:
 
-| corridor | anchors | chargers | stations | service | wire |
-| --- | --- | --- | --- | --- | --- |
-| 2 km | 94 | 65 | 3 | 218 ms | inline 75 KB |
-| 5 km | 38 | 133 | 15 | 75 ms | inline 106 KB |
-| 10 km | 20 | 208 | — | 79 ms | inline 134 KB |
+| corridor | anchors | chargers | stations | service | wire          |
+| -------- | ------- | -------- | -------- | ------- | ------------- |
+| 2 km     | 94      | 65       | 3        | 218 ms  | inline 75 KB  |
+| 5 km     | 38      | 133      | 15       | 75 ms   | inline 106 KB |
+| 10 km    | 20      | 208      | —        | 79 ms   | inline 134 KB |
 
 And where it gets big, the large-answer path takes over with no special handling:
 Nantes to Le Mans at 20 km wide is 377 chargers and 192 stations in a 286 KB object
@@ -15206,11 +15210,11 @@ Dart and TypeScript rather than in SQL, and draw it.
 
 Measured on a client running the new flow, three asks of growing radius:
 
-| ask | answer | drawn | local table |
-| --- | --- | --- | --- |
-| 5 km | 18 | 18 | 0 rows |
-| 50 km | 306 | 306 | 0 rows |
-| 150 km | 1,620 | 1,620 | 0 rows |
+| ask    | answer | drawn | local table |
+| ------ | ------ | ----- | ----------- |
+| 5 km   | 18     | 18    | 0 rows      |
+| 50 km  | 306    | 306   | 0 rows      |
+| 150 km | 1,620  | 1,620 | 0 rows      |
 
 What is on screen is what was just asked for, so panning back shows the same thing as
 arriving the first time.
@@ -15252,12 +15256,12 @@ Removed. The radius cap and `limit` are the bounds; a third one that silently em
 screen is not. Measured after, from Nantes, `limit` 2000 — the phone now reaches what the
 browser reaches, and crosses into the large-answer path between 55 and 89 km:
 
-| radius | points | bytes | via | wire | fetch |
-| --- | --- | --- | --- | --- | --- |
-| 55 km | 365 | 136,867 | inline | 96 ms | 0 ms |
-| 89 km | 765 | 299,337 | object | 127 ms | 2 ms |
-| 110 km | 1,061 | 423,592 | object | 124 ms | 2 ms |
-| 150 km | 1,620 | 661,824 | object | 128 ms | 3 ms |
+| radius | points | bytes   | via    | wire   | fetch |
+| ------ | ------ | ------- | ------ | ------ | ----- |
+| 55 km  | 365    | 136,867 | inline | 96 ms  | 0 ms  |
+| 89 km  | 765    | 299,337 | object | 127 ms | 2 ms  |
+| 110 km | 1,061  | 423,592 | object | 124 ms | 2 ms  |
+| 150 km | 1,620  | 661,824 | object | 128 ms | 3 ms  |
 
 The owner's browser reported 781 points at 89 km and 1,707 at 150 km from a slightly
 different centre, and 297 KB and 664 KB: the same curve. The phone's "inline ~132 KB"
@@ -15282,12 +15286,12 @@ tenancy, and a phone that can write.
 
 Measured before removing it, Nantes to Angers:
 
-| | road | straight |
-| --- | --- | --- |
-| distance | 92.39 km | 80.02 km |
-| charge points in a 5 km corridor | 133 | 113 |
-| found by both | 97 | 97 |
-| only this one finds | 36 | 16 |
+|                                  | road     | straight |
+| -------------------------------- | -------- | -------- |
+| distance                         | 92.39 km | 80.02 km |
+| charge points in a 5 km corridor | 133      | 113      |
+| found by both                    | 97       | 97       |
+| only this one finds              | 36       | 16       |
 
 So the straight line gets about three quarters of it right and offers 16 points nobody
 would drive past. Real for a driver, nothing for the architecture.
@@ -15322,11 +15326,11 @@ Alternating is GONE from both, not merely overridable — keeping it as the fall
 left the phone alternating in practice, which is what the owner saw. One rule now, the
 same in Dart and TypeScript:
 
-| state | a tap on the map moves |
-| --- | --- |
-| nothing placed | `start` |
-| only `start` placed | `end` |
-| both placed, one held | the held one |
+| state                  | a tap on the map moves           |
+| ---------------------- | -------------------------------- |
+| nothing placed         | `start`                          |
+| only `start` placed    | `end`                            |
+| both placed, one held  | the held one                     |
 | both placed, none held | the NEAREST, which it then holds |
 
 The last two rows are the point. Whatever a tap moves becomes the held end, so the next
@@ -15414,12 +15418,12 @@ needs no native build at all.
 same service with the same queries and sharing the same route row as the Flutter app and
 the browser. What it needed:
 
-| gap | filled by | size |
-| --- | --- | --- |
-| SQLite | `expo-sqlite` behind the library's `Storage` contract | 90 lines |
-| `crypto.randomUUID`, `subtle.digest` | `expo-crypto` | a shim |
-| `crypto.getRandomValues` | `react-native-get-random-values` | an import |
-| zstd | `fzstd`, as the `zstdDecompress` option | one function |
+| gap                                  | filled by                                             | size         |
+| ------------------------------------ | ----------------------------------------------------- | ------------ |
+| SQLite                               | `expo-sqlite` behind the library's `Storage` contract | 90 lines     |
+| `crypto.randomUUID`, `subtle.digest` | `expo-crypto`                                         | a shim       |
+| `crypto.getRandomValues`             | `react-native-get-random-values`                      | an import    |
+| zstd                                 | `fzstd`, as the `zstdDecompress` option               | one function |
 
 **The zstd one would have been a wall and was not.** The library's last-resort
 decompressor is a WebAssembly module, and React Native's engine cannot run WebAssembly.
@@ -15585,8 +15589,8 @@ Two complaints, one root each.
 
 **"Not all the expected charger markers appear."** The app drew each point as a
 `MarkerView`, which mounts a REACT VIEW per marker. The library's own documentation says
-not to: *"If you have static view consider using PointAnnotation or SymbolLayer they'll
-offer much better performance"*. With dozens on screen it silently drew a subset — the
+not to: _"If you have static view consider using PointAnnotation or SymbolLayer they'll
+offer much better performance"_. With dozens on screen it silently drew a subset — the
 status line said 77 and the map showed fewer, which is why comparing against the browser
 is what exposed it. The browser never had the problem because Leaflet's circle markers
 are canvas primitives, not DOM-per-point.
@@ -15614,11 +15618,11 @@ and a viewport as available the moment its container mounts. Neither holds.
 The React Native map went through the same bug three times, in three costumes, and the
 owner found each one by comparing against the browser.
 
-| what | symptom | cause |
-| --- | --- | --- |
-| charger markers | the count said 77, the map drew fewer | `MarkerView`, a React view per point |
+| what              | symptom                                             | cause                                                                     |
+| ----------------- | --------------------------------------------------- | ------------------------------------------------------------------------- |
+| charger markers   | the count said 77, the map drew fewer               | `MarkerView`, a React view per point                                      |
 | fuel price badges | "some appear, but not all"; then empty orange boxes | `MarkerView`, then `PointAnnotation` rasterising before its text laid out |
-| route ends | "the route appears but I cannot move the edges" | `MarkerView` + `Pressable` never receiving the tap |
+| route ends        | "the route appears but I cannot move the edges"     | `MarkerView` + `Pressable` never receiving the tap                        |
 
 The last one is the clearest evidence, because everything AROUND it provably worked. The
 log shows the phone's own mutation going out and coming back `"status":"accepted"`, and
@@ -15692,10 +15696,10 @@ column-oriented JSON with the same 24 field names on every row, so they compress
 
 Measured on the live stack, before and after:
 
-| radius | rows | before | after |
-| --- | --- | --- | --- |
-| 5 km | 18 | 6,884 inline | 2,588 inline |
-| 20 km | 116 | 43,467 inline | 13,148 inline |
+| radius | rows  | before             | after              |
+| ------ | ----- | ------------------ | ------------------ |
+| 5 km   | 18    | 6,884 inline       | 2,588 inline       |
+| 20 km  | 116   | 43,467 inline      | 13,148 inline      |
 | 150 km | 1,620 | 661,824 **object** | 162,133 **inline** |
 | 300 km | 2,000 | 813,821 **object** | 200,600 **inline** |
 
@@ -15764,7 +15768,7 @@ Four things had to be learnt, each one error at a time:
    `addCSourceFile`, so zstd failed on `'string.h' file not found` with the sysroot
    already given. The module needs `<sysroot>/usr/include` explicitly.
 2. **And the libc to LINK against**, or it stops at `unable to find libSystem system
-   library`. ⚠️ That path must be RELATIVE — Zig prepends the sysroot itself, and passing
+library`. ⚠️ That path must be RELATIVE — Zig prepends the sysroot itself, and passing
    the absolute one produced `<sdk>/<sdk>/usr/lib`.
 3. **`zig build lib`, a new step.** The default also builds `zb`, `zb-demo` and
    `zb-soak`: developer tools that make no sense on a phone.
@@ -15783,11 +15787,11 @@ sqlite nor zstd.
 symbols, unstripped, and the linker pulls only what the app references. Dylib to dylib is
 the honest comparison:
 
-| build | size |
-| --- | --- |
-| dynamic, system libraries | 2,256,848 |
-| dynamic, vendored | 4,066,288 |
-| static archive | 22,469,624 |
+| build                     | size       |
+| ------------------------- | ---------- |
+| dynamic, system libraries | 2,256,848  |
+| dynamic, vendored         | 4,066,288  |
+| static archive            | 22,469,624 |
 
 So sqlite and zstd cost about **1.8 MB**, not twenty. The real app cost is lower again,
 since the linker drops unreferenced sqlite features and an archived build is stripped.
@@ -15795,13 +15799,13 @@ since the linker drops unreferenced sqlite features and an archived build is str
 Which build for which host — the line is not phone versus server, it is whether you
 control what is installed:
 
-| host | build |
-| --- | --- |
-| Swift on iOS, Kotlin on Android | vendored, static |
-| Flutter on a phone | vendored, static |
-| Flutter or Python on a desktop | either; system libraries are fine |
+| host                              | build                                    |
+| --------------------------------- | ---------------------------------------- |
+| Swift on iOS, Kotlin on Android   | vendored, static                         |
+| Flutter on a phone                | vendored, static                         |
+| Flutter or Python on a desktop    | either; system libraries are fine        |
 | a service on a server you control | system libraries, since you install them |
-| React Native | neither — the TypeScript client |
+| React Native                      | neither — the TypeScript client          |
 
 ⚠️ **`-Dvendor` does not imply `-Dduckdb`.** Measuring these sizes left a vendored dylib
 with no DuckDB where the map service expects one — the same trap as §10hw, one flag
@@ -15818,11 +15822,11 @@ path shipped first.
 `-Dvendor=true` now cross-compiles for BOTH phones. The linkage default follows each
 platform's own convention rather than a blanket "static when cross-compiling":
 
-| host | artefact | why |
-| --- | --- | --- |
-| iOS (Swift) | static `.a` | apps link archives or frameworks IN; a shared build also wants `__dyld_get_image_header_containing_address`, which the simulator SDK does not export |
-| Android (Kotlin) | static `.a` | shared LOOKS native there, but Zig cannot synthesise Android's libc and stops at "unable to provide libc"; the app's own JNI shim is the `.so` and libzb links into it |
-| desktop (Python, Dart, Flutter) | shared `.dylib` | ctypes and dart:ffi LOAD a library |
+| host                            | artefact        | why                                                                                                                                                                    |
+| ------------------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| iOS (Swift)                     | static `.a`     | apps link archives or frameworks IN; a shared build also wants `__dyld_get_image_header_containing_address`, which the simulator SDK does not export                   |
+| Android (Kotlin)                | static `.a`     | shared LOOKS native there, but Zig cannot synthesise Android's libc and stops at "unable to provide libc"; the app's own JNI shim is the `.so` and libzb links into it |
+| desktop (Python, Dart, Flutter) | shared `.dylib` | ctypes and dart:ffi LOAD a library                                                                                                                                     |
 
     # iOS
     zig build lib -Doptimize=ReleaseFast -Dvendor=true -Dlibpq=false \
@@ -15849,10 +15853,10 @@ Two lessons, each learnt twice — once per platform:
 
 The Flutter DESKTOP app needs neither libpq nor DuckDB — it stores in SQLite. They are in its library only because ONE dylib serves both the app and the map service, and the service needs DuckDB. Built for the app alone it depends on nothing at all:
 
-| build | size | system libraries |
-| --- | --- | --- |
-| app only, vendored, no libpq | 4,062,960 | none |
-| shared with the service | 4,125,824 | libpq, DuckDB |
+| build                        | size      | system libraries |
+| ---------------------------- | --------- | ---------------- |
+| app only, vendored, no libpq | 4,062,960 | none             |
+| shared with the service      | 4,125,824 | libpq, DuckDB    |
 
 63 KB apart — the libpq client glue. DuckDB adds nothing to the library, being linked rather than embedded, so its 47 MB lands on whoever runs the service.
 
@@ -15864,14 +15868,14 @@ The leaf-node dead ends of §10hl left two real options; the cheaper is a JetStr
 
 Where the prefix lived, and what changed:
 
-| side | before | now |
-| --- | --- | --- |
-| nats.zig | `default_api_prefix` hard-coded at three sites | `JetStreamOptions.domain`; `JetStream.apiSubject` builds every API subject (`nats.zig-jetstream-domain.patch`, NATS_ZIG_NOTES §15) |
-| bridge | seven `jetstream(.{})` contexts | `Endpoint.js_domain` from `NATS_JS_DOMAIN`, passed at all seven |
-| `--init-nats` | 36 grant lines with a literal `$JS.API.` | `roleAllows(…, js_api)`; `--js-domain NAME` renders the conf's `jetstream { domain }`, the grants and `.env.bridge` |
-| `/enroll` | jwt, principal, grammar_hash, grammar | `+ js_domain`, only when set |
-| libzb | — | `js_domain` on Options, `"jsDomain"` in the C ABI's open JSON, `--js-domain` on `zb sync` |
-| zb-client-ts | four factories with no options | `config.jsDomain` → `JetStreamOpts` on every factory of the seam (15 call sites); Kvm/Objm get the domain by taking the JetStream client instead of the connection |
+| side          | before                                         | now                                                                                                                                                                |
+| ------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| nats.zig      | `default_api_prefix` hard-coded at three sites | `JetStreamOptions.domain`; `JetStream.apiSubject` builds every API subject (`nats.zig-jetstream-domain.patch`, NATS_ZIG_NOTES §15)                                 |
+| bridge        | seven `jetstream(.{})` contexts                | `Endpoint.js_domain` from `NATS_JS_DOMAIN`, passed at all seven                                                                                                    |
+| `--init-nats` | 36 grant lines with a literal `$JS.API.`       | `roleAllows(…, js_api)`; `--js-domain NAME` renders the conf's `jetstream { domain }`, the grants and `.env.bridge`                                                |
+| `/enroll`     | jwt, principal, grammar_hash, grammar          | `+ js_domain`, only when set                                                                                                                                       |
+| libzb         | —                                              | `js_domain` on Options, `"jsDomain"` in the C ABI's open JSON, `--js-domain` on `zb sync`                                                                          |
+| zb-client-ts  | four factories with no options                 | `config.jsDomain` → `JetStreamOpts` on every factory of the seam (15 call sites); Kvm/Objm get the domain by taking the JetStream client instead of the connection |
 
 Measured, against a server generated by `--init-nats operator --js-domain hub` (ports moved to 14222/18080/18222, run with `-DV`):
 
@@ -15880,9 +15884,9 @@ Measured, against a server generated by `--init-nats operator --js-domain hub` (
 - zb-client-ts, `jetstreamManager(nc, {domain:'hub'}).getAccountInfo()` → `domain: hub`;
   with `other` → "jetstream is not enabled" (nats.js's name for no responder);
 - libzb, `zb sync --js-domain hub` → the hub answers `stream not found` (a real API reply, no streams exist); `--js-domain other` → `NATS/1.0 503`, `Nats-Subject:
-  $JS.other.API.STREAM.INFO.KV_tenants` — the server names the subject the client asked;
+$JS.other.API.STREAM.INFO.KV_tenants` — the server names the subject the client asked;
 - the server trace has the raw publishes: cid 8 (nats.zig) `PUB
-  $JS.hub.API.STREAM.INFO.KV_tenants`, `ts-hub` `PUB $JS.hub.API.INFO`, and the `other` twins under `$JS.other.API.`.
+$JS.hub.API.STREAM.INFO.KV_tenants`, `ts-hub` `PUB $JS.hub.API.INFO`, and the `other` twins under `$JS.other.API.`.
 
 One thing the proof needed: a plain `nats sub '$JS.>'` shows **`$JS.API.INFO`** for a request sent to `$JS.hub.API.INFO` — the server maps its own domain's prefix onto the
 plain one before subscribers see it. So a subject log cannot tell the two apart; only the
@@ -15913,10 +15917,10 @@ Proven against the §10is hub (`domain: hub`, `leafnodes { port: 17422 }` append
 The `account:` key is not optional in operator mode — without it the leaf refuses to start
 ("operator mode requires account nkeys in remotes"); that was the only gotcha.
 
-| client, on the leaf | with `hub` | without a domain |
-| --- | --- | --- |
-| zb-client-ts (ws :19080) | `getAccountInfo` → `domain: hub`, 3.4 ms | "jetstream is not enabled" (no responder) |
-| libzb `zb sync` (tcp :15222) | the hub answers `stream not found` | `503`, `Nats-Subject: $JS.API.STREAM.INFO.KV_tenants`, NoResponders |
+| client, on the leaf          | with `hub`                               | without a domain                                                    |
+| ---------------------------- | ---------------------------------------- | ------------------------------------------------------------------- |
+| zb-client-ts (ws :19080)     | `getAccountInfo` → `domain: hub`, 3.4 ms | "jetstream is not enabled" (no responder)                           |
+| libzb `zb sync` (tcp :15222) | the hub answers `stream not found`       | `503`, `Nats-Subject: $JS.API.STREAM.INFO.KV_tenants`, NoResponders |
 
 The hub's `-DV` trace shows what crossed the link: `LMSG $JS.hub.API.INFO` ×2 and `LMSG $JS.hub.API.STREAM.INFO.KV_tenants`. The plain-prefix requests never reached the hub — the link denies `$JS.API.>` once a domain is set, which is the documented isolation rule and exactly the §10hl symptom, now explained: the client spoke the one prefix the link drops.
 With the domain carried by the client and named in the grants, nothing is mapped and nothing is extended.
@@ -15964,13 +15968,13 @@ advertised its LAN address, so the leaf dropped the tunnelled link and retried
 **Measured**, one probe process holding a warm connection (the `nats` CLI's per-process
 startup is ±20 ms and swamps this):
 
-| | hub, loopback | through the VPS leaf |
-| --- | --- | --- |
-| core RTT | 0–1 ms | 19–21 ms |
-| account info | 0.4 ms | 41.2 ms |
-| stream info | 0.5 ms | 39.9 ms |
-| consumer create (2 calls) | 4 ms | 84.7 ms |
-| one-message pull | 1.9 ms | 41.4 ms |
+|                           | hub, loopback | through the VPS leaf |
+| ------------------------- | ------------- | -------------------- |
+| core RTT                  | 0–1 ms        | 19–21 ms             |
+| account info              | 0.4 ms        | 41.2 ms              |
+| stream info               | 0.5 ms        | 39.9 ms              |
+| consumer create (2 calls) | 4 ms          | 84.7 ms              |
+| one-message pull          | 1.9 ms        | 41.4 ms              |
 
 41 ms is exactly 2 × RTT: the tunnel sends every call laptop → VPS → laptop. Put the client
 in the leaf's region and it is **one** hop — so a JetStream call through a T1 leaf costs one
@@ -16003,22 +16007,22 @@ five minutes of the leaf starting; the box has no firewall installed at all.
 
 ## §10iv — one vocabulary for both client libraries (2026-09-24)
 
-The owner's objection, and it was right: *"Both libraries must behave and name things in
+The owner's objection, and it was right: _"Both libraries must behave and name things in
 a very similar way. Otherwise no one will buy this, as no one is willing to learn a new
-DSL, nor will LLMs understand how this is built."* The audit that followed: of 21 C
+DSL, nor will LLMs understand how this is built."_ The audit that followed: of 21 C
 exports and ~30 zb-client-ts members, **seven names agreed** — `close` `query` `mutate`
 `ingest` `request` `serve` `wipe`. The rest had drifted or existed on one side only.
 
 The C ABI now follows zb-client-ts's names, since those read better and the TS surface is
 the one an app author meets first.
 
-| | zb-client-ts | libzb |
-| --- | --- | --- |
-| make the enrolment keypair | `createUser()` | `zb_create_user()` |
-| assemble the `.creds` | `credsFileText(jwt, seed)` | `zb_creds_file_text(jwt, seed)` |
-| start | `new ZeBridge(cfg)` + `connect()` | `zb_client_connect()` ⟵ `zb_client_open` |
-| send the outbox | `flushOutbox()` | `zb_client_flush_outbox()` ⟵ `zb_client_flush` |
-| was I banned | `revoked` | `zb_client_revoked(h)` — 1 / 0 / −1 |
+|                            | zb-client-ts                      | libzb                                          |
+| -------------------------- | --------------------------------- | ---------------------------------------------- |
+| make the enrolment keypair | `createUser()`                    | `zb_create_user()`                             |
+| assemble the `.creds`      | `credsFileText(jwt, seed)`        | `zb_creds_file_text(jwt, seed)`                |
+| start                      | `new ZeBridge(cfg)` + `connect()` | `zb_client_connect()` ⟵ `zb_client_open`       |
+| send the outbox            | `flushOutbox()`                   | `zb_client_flush_outbox()` ⟵ `zb_client_flush` |
+| was I banned               | `revoked`                         | `zb_client_revoked(h)` — 1 / 0 / −1            |
 
 Three differences remain and all three are the C ABI, not a choice: `zb_free` (no GC),
 `zb_abi_version`, and `zb_client_poll` where TS has `onChange` (a C ABI cannot take a
@@ -16096,24 +16100,24 @@ path — the existing figures (libzb ~24k inserts/s, zb-client-ts ~60k events/s,
 **The same seed through zb-client-ts, and it is faster.** Node 26, `nodeStorage`
 (better-sqlite3), same tenant, same object, same machine, minutes apart:
 
-| | libzb (Zig, native) | zb-client-ts (Node) |
-| --- | --- | --- |
-| rows | 3,055,002 | 3,055,002 |
-| wall | 67.6 s | **38.9 s** |
-| rate | ~45k rows/s | **~78k rows/s** |
-| user / sys | 49.5 / 6.9 s | 25.4 / 4.7 s |
-| peak RSS | **317 MB** | **2.54 GB** (peak footprint 3.34 GB) |
-| replica | 1.042 GB | 1.024 GB |
+|            | libzb (Zig, native) | zb-client-ts (Node)                  |
+| ---------- | ------------------- | ------------------------------------ |
+| rows       | 3,055,002           | 3,055,002                            |
+| wall       | 67.6 s              | **38.9 s**                           |
+| rate       | ~45k rows/s         | **~78k rows/s**                      |
+| user / sys | 49.5 / 6.9 s        | 25.4 / 4.7 s                         |
+| peak RSS   | **317 MB**          | **2.54 GB** (peak footprint 3.34 GB) |
+| replica    | 1.042 GB            | 1.024 GB                             |
 
 Identical row counts and near-identical replicas, so both applied the same data. Two
 findings, and neither was the expected one:
 
-* **TS is 1.7× faster than the native library.** `better-sqlite3` is a thin binding over
+- **TS is 1.7× faster than the native library.** `better-sqlite3` is a thin binding over
   the same SQLite, so the difference is the apply path, not the engine: the TS client
   runs prepared per-row upserts in 20k-row transactions (§10hd) and libzb's seed path
   does not match it. That inverts the usual assumption and is worth chasing on the libzb
   side rather than accepting.
-* **TS costs 8× the memory.** 2.54 GB against 317 MB. libzb's streaming seed applies the
+- **TS costs 8× the memory.** 2.54 GB against 317 MB. libzb's streaming seed applies the
   base in chunks and never holds the table; the TS client materialises far more of it.
   Invisible on a desktop, fatal on a phone — and React Native runs this same client. A
   real constraint on zb-client-ts that nobody had measured.
@@ -16178,12 +16182,12 @@ the whole table (libzb: "runs of ordered keys instead of one") scattered every w
 inserts across the entire b-tree. The sweep, all exact against PostgreSQL
 (3,055,002 / 3,055,002 distinct / sum(age) 138,916,285):
 
-| window | wall | user / sys | peak RSS |
-| --- | --- | --- | --- |
-| 50k | 141.6 s | 34.1 / **38.6 s** | 570 MB |
-| 250k | 58.9 s | 29.6 / 11.6 s | 1.11 GB |
-| 1M | 41.7 s | 28.7 / 6.6 s | 2.41 GB |
-| buffered | 38.9 s | 25.4 / 4.7 s | 2.54 GB |
+| window   | wall    | user / sys        | peak RSS |
+| -------- | ------- | ----------------- | -------- |
+| 50k      | 141.6 s | 34.1 / **38.6 s** | 570 MB   |
+| 250k     | 58.9 s  | 29.6 / 11.6 s     | 1.11 GB  |
+| 1M       | 41.7 s  | 28.7 / 6.6 s      | 2.41 GB  |
+| buffered | 38.9 s  | 25.4 / 4.7 s      | 2.54 GB  |
 
 `sys` is the scatter: a working set the size of the tree, through a 128 MB cache, into
 kernel I/O. Window size trades time for memory linearly and cannot give both.
@@ -16198,11 +16202,11 @@ effects, both good: no `sortRowsByKey` in JS at all, and the table stays intact 
 final transaction — a reader never sees it empty, and a kill leaves the old rows with no
 watermark, safe by the existing rule. Tombstoned rows are simply not staged.
 
-| path | wall | sys | peak RSS | db after checkpoint |
-| --- | --- | --- | --- | --- |
-| buffered | 38.9 s | 4.7 s | 2.54 GB | 1.02 GB |
-| **streamed, staged, 50k** | **43.2 s** | **5.6 s** | **786 MB** | **1.04 GB** |
-| libzb, streamed | 67.6 s | 6.9 s | 317 MB | 1.04 GB |
+| path                      | wall       | sys       | peak RSS   | db after checkpoint |
+| ------------------------- | ---------- | --------- | ---------- | ------------------- |
+| buffered                  | 38.9 s     | 4.7 s     | 2.54 GB    | 1.02 GB             |
+| **streamed, staged, 50k** | **43.2 s** | **5.6 s** | **786 MB** | **1.04 GB**         |
+| libzb, streamed           | 67.6 s     | 6.9 s     | 317 MB     | 1.04 GB             |
 
 Within 11% of the buffered speed at 3.2× less memory, still faster than libzb, and the
 same compact 1.04 GB tree libzb builds.
@@ -16255,11 +16259,11 @@ Measured, both in a Node process SHAPED like the host (fzstd + js-sha256 instead
 node:zlib + node:crypto, `spillsTemp` forced), 50k-row windows, all exact vs PostgreSQL
 (3,055,002 / 3,055,002 / 138,916,285), 62 progress events each:
 
-| shape | zstd / digest | path | wall | sys | peak RSS | WAL peak |
-| --- | --- | --- | --- | --- | --- | --- |
-| Node, native | node:zlib / node:crypto | staged | 43.2 s | 5.6 s | 786 MB | 1.05 GB |
-| **RN-shaped** | fzstd / js-sha256 | staged | **48.2 s** | 6.3 s | **838 MB** | 1.05 GB |
-| **browser-shaped** | fzstd / js-sha256 | per-window | **140.4 s** | 37.4 s | **663 MB** | **0.27 GB** |
+| shape              | zstd / digest           | path       | wall        | sys    | peak RSS   | WAL peak    |
+| ------------------ | ----------------------- | ---------- | ----------- | ------ | ---------- | ----------- |
+| Node, native       | node:zlib / node:crypto | staged     | 43.2 s      | 5.6 s  | 786 MB     | 1.05 GB     |
+| **RN-shaped**      | fzstd / js-sha256       | staged     | **48.2 s**  | 6.3 s  | **838 MB** | 1.05 GB     |
+| **browser-shaped** | fzstd / js-sha256       | per-window | **140.4 s** | 37.4 s | **663 MB** | **0.27 GB** |
 
 Two readings. The JS zstd and digest cost 5 s (12%) — the hooks are not the problem.
 And the per-window number is the first cut's 141.6 s again, to within noise: the whole
@@ -16324,15 +16328,15 @@ sets the pragma and says `spillsTemp: true`, and the storage.ts comment that a w
 temp store "is not known to reach the disk" is retired. The run, Chrome 153, exact
 against PostgreSQL (3,055,002 / 3,055,002 / 138,916,285):
 
-| | |
-| --- | --- |
-| stage filled (3,055,002 rows appended) | ~60 s, ~65k rows/s |
-| sort + sequential insert (the bar at 100%, `done` false) | ~95 s |
-| seed, first window → `done` | **155.8 s → 19,613 rows/s** |
-| connect → CDC active | 188.6 s |
-| replica | 988 MB |
-| OPFS peak | ~2.3 GB: replica + TEMP database (665 MB) + sorter spill (641 MB) |
-| JS heap peak | 264 MB (the wasm heap is not in it) |
+|                                                          |                                                                   |
+| -------------------------------------------------------- | ----------------------------------------------------------------- |
+| stage filled (3,055,002 rows appended)                   | ~60 s, ~65k rows/s                                                |
+| sort + sequential insert (the bar at 100%, `done` false) | ~95 s                                                             |
+| seed, first window → `done`                              | **155.8 s → 19,613 rows/s**                                       |
+| connect → CDC active                                     | 188.6 s                                                           |
+| replica                                                  | 988 MB                                                            |
+| OPFS peak                                                | ~2.3 GB: replica + TEMP database (665 MB) + sorter spill (641 MB) |
+| JS heap peak                                             | 264 MB (the wasm heap is not in it)                               |
 
 Two things a host should know. The bar sits at 100% for a minute and a half during the
 sort: that is why `done` exists, and why the page says "the last stretch at 100% is the
@@ -16372,12 +16376,12 @@ named this wall for `charge_points` and dodged it because that table is on-deman
 **Measured before deciding.** The real `test_types` full (668 MB of msgpack), slices
 compressed with and without its trained dictionary, `zstd -3`:
 
-| input | plain | with dictionary | gain |
-| --- | --- | --- | --- |
-| 4 KB | 1,057 B | 497 B | 53% |
-| 64 KB | 9,964 B | 9,615 B | 4% |
-| 1 MB | 141,926 B | 138,913 B | 3% |
-| 16 MB | 2.33 MB | 2.28 MB | 3% |
+| input | plain     | with dictionary | gain |
+| ----- | --------- | --------------- | ---- |
+| 4 KB  | 1,057 B   | 497 B           | 53%  |
+| 64 KB | 9,964 B   | 9,615 B         | 4%   |
+| 1 MB  | 141,926 B | 138,913 B       | 3%   |
+| 16 MB | 2.33 MB   | 2.28 MB         | 3%   |
 
 The dictionary earns its keep on inputs of a few KB — a handful of rows — where the
 absolute saving is a few hundred bytes; from 64 KB up zstd finds the repetition by
@@ -16386,17 +16390,17 @@ catalogue, which is why the logs made it look valuable: it measured a granularit
 never ships. A per-table `dictionary` flag in `zebridge_enable` was the first idea;
 the numbers say the whole feature is a 3% one. So it is gone, from everywhere:
 
-* producer: step 3b (the probe, keep/retrain, `trainDict`, the `-dict` upload), the
+- producer: step 3b (the probe, keep/retrain, `trainDict`, the `-dict` upload), the
   manifest's `dict` field, the sampler that fed the corpus (a byte counter now); every
   object — full, delta, checkpoint — is one plain frame at level 3 through the same
   streamed cctx;
-* schema: `dict`, `dict_object`, `dict_ratio`, `full_dict_object`, `ckpt_dict_object`
+- schema: `dict`, `dict_object`, `dict_ratio`, `full_dict_object`, `ckpt_dict_object`
   dropped, the reader's column-level `UPDATE` grant narrowed to what is left;
-* libzb: the dictionary cache, `ZSTD_decompress_usingDict`, `StreamInflate`'s dict;
-* zb-client-ts: `dictCache`, `_zebridge_dicts` (dropped at migrate), `zstdDecompress`
+- libzb: the dictionary cache, `ZSTD_decompress_usingDict`, `StreamInflate`'s dict;
+- zb-client-ts: `dictCache`, `_zebridge_dicts` (dropped at migrate), `zstdDecompress`
   and `zstdDecompressStream` lose their `dict` argument, `zstdStreamDictionaries` is
   no more, `PlanStep.dict` is gone from core and the fixture;
-* the four hosts' fzstd hooks lose their "plain frames only" throws — there is nothing
+- the four hosts' fzstd hooks lose their "plain frames only" throws — there is nothing
   else to decode now; chain_audit, chain_kill, firehose_tls and genproducer likewise.
 
 **The clean break.** The migration retires every era that carried a dictionary (all of
@@ -16477,11 +16481,11 @@ a bare `0` — the reason on a stderr no phone shows — and `zb_client_sync` re
 `{tenant, first}` after a seed that had failed, the failure being one printed line. A
 host cannot be honest with what it cannot read.
 
-* `zb_last_error()`: the words behind the last `0` or `NULL` this thread got,
+- `zb_last_error()`: the words behind the last `0` or `NULL` this thread got,
   `errno`-style — set by the call that failed (`zb_client_connect failed: <error>`),
   cleared by the next success, `NULL` otherwise. The Dart wrappers (05-tables and
   06-large-table) put it in the exception.
-* `unseeded: [{table, reason}]` in `zb_client_sync`'s report — always there, empty when
+- `unseeded: [{table, reason}]` in `zb_client_sync`'s report — always there, empty when
   every followed table is in the replica — and in `zb_client_poll`'s while any is. The
   client keeps one entry per table (`rememberUnseeded`, the error name of the last
   failed seed), removed when the table seeds. The worker isolate passes it up; the
@@ -16527,11 +16531,11 @@ added by hand. Open.
 
 **Seeds, Node, one full of ~3.1–3.7M rows, all exact against PostgreSQL:**
 
-| zb-client-ts | random, heap order | v7 ceiling | v7 churned | **random, producer-sorted** |
-| --- | --- | --- | --- | --- |
-| one window at a time | 114.5 s (34 s sys) | 21.2 s | 25.6 s | **26.3 s (2.7 s sys)** |
-| staged | 32.0 s | 28.2 s | 30.5 s | 34.2 s |
-| libzb (staged, ReleaseFast) | 21.7 s | 21.8 s | 24.0 s | 24.9 s |
+| zb-client-ts                | random, heap order | v7 ceiling | v7 churned | **random, producer-sorted** |
+| --------------------------- | ------------------ | ---------- | ---------- | --------------------------- |
+| one window at a time        | 114.5 s (34 s sys) | 21.2 s     | 25.6 s     | **26.3 s (2.7 s sys)**      |
+| staged                      | 32.0 s             | 28.2 s     | 30.5 s     | 34.2 s                      |
+| libzb (staged, ReleaseFast) | 21.7 s             | 21.8 s     | 24.0 s     | 24.9 s                      |
 
 Sorted arrival turns the simple path into the fastest one — no TEMP table, no final sort,
 no 3× disk, no temp files — and it does not need v7: the producer's sort gives it to
@@ -16552,10 +16556,10 @@ sit together. With time-ordered keys key order is time order and nothing is lost
 **Live apply — the everyday cost.** 300,000 inserts into ~3.7M-row replicas, drained as
 CDC, exact, healthy disk:
 
-| | random keys | v7 | |
-| --- | --- | --- | --- |
-| libzb | 77.5 s (12.6 s CPU) | 6.7 s | 11.5× |
-| zb-client-ts (Node) | 21.2 s | 5.5 s | 3.9× |
+|                     | random keys         | v7    |       |
+| ------------------- | ------------------- | ----- | ----- |
+| libzb               | 77.5 s (12.6 s CPU) | 6.7 s | 11.5× |
+| zb-client-ts (Node) | 21.2 s              | 5.5 s | 3.9×  |
 
 This is where v7 pays regardless of how fulls are cut: every live insert on a big
 replica appends instead of scattering. libzb on random keys waits on I/O (77 s wall on
@@ -16595,12 +16599,12 @@ step keeps the old path. No migration: old and new chains coexist.
 
 test_types (random v4 keys, 3,055,002 rows, a sorted full), all rows and sums checked:
 
-| client | before (unsorted, staged) | sorted, direct |
-| --- | --- | --- |
-| zb-client-ts, Node, Mac | — | 21.9 s |
-| libzb ReleaseFast, Mac | — | 24.2 s (apply 11.9 s) |
-| Flutter/libzb, iPhone 12 | 70.8 / 62.9 s | 34.7 / 39.1 s |
-| RN/zb-client-ts, iPhone 12 | 725 s (Debug) | 518 s (Release) |
+| client                     | before (unsorted, staged) | sorted, direct        |
+| -------------------------- | ------------------------- | --------------------- |
+| zb-client-ts, Node, Mac    | —                         | 21.9 s                |
+| libzb ReleaseFast, Mac     | —                         | 24.2 s (apply 11.9 s) |
+| Flutter/libzb, iPhone 12   | 70.8 / 62.9 s             | 34.7 / 39.1 s         |
+| RN/zb-client-ts, iPhone 12 | 725 s (Debug)             | 518 s (Release)       |
 
 The iPhone halves for libzb: staging cost an extra 1 GB write and read that the Mac's
 SSD hid. RN gains 29 %, but the RN row mixes two changes (Debug → Release, staged →
@@ -16757,13 +16761,13 @@ whole-object seed 11.6 s at 1,052 MB — sorted objects stream as fast as they l
 ~5 µs an event, a chain build at ~2.4 µs a row with its ORDER BY — twice as fast, so a
 table at 50k–100k events/s keeps its chain. Measured, on the producer fixed below:
 
-| `--rate` | events/s reached | holes (negative margin samples) | min margin | cuts (early) | largest background full | slot lag max |
-| --- | --- | --- | --- | --- | --- | --- |
-| spike (burst_tls, 2M rows) | 185,702 — 5.4 µs/event | — | — | — | — | — |
-| 25,000 | 49,778 | 0 of 122 | +567 | 21 (18) | 0.6 s | 26 MiB |
-| 37,500 | 74,673 | 0 of 126 | +380 | 31 (29) | 10.9 s, ~4.5M rows | 33 MiB |
-| 50,000 | 88,964 | 0 of 141 | +368 | 44 (42) | 14.6 s, ~6M rows | 85 MiB |
-| 75,000 | 116,210 (PostgreSQL's one session: 153 s for a 120 s load) | 2 of 162 | −383 | 67 (65), 1 fell off before a cut | 21.9 s, ~9M rows (2.4 µs/row) | 171 MiB |
+| `--rate`                   | events/s reached                                           | holes (negative margin samples) | min margin | cuts (early)                     | largest background full       | slot lag max |
+| -------------------------- | ---------------------------------------------------------- | ------------------------------- | ---------- | -------------------------------- | ----------------------------- | ------------ |
+| spike (burst_tls, 2M rows) | 185,702 — 5.4 µs/event                                     | —                               | —          | —                                | —                             | —            |
+| 25,000                     | 49,778                                                     | 0 of 122                        | +567       | 21 (18)                          | 0.6 s                         | 26 MiB       |
+| 37,500                     | 74,673                                                     | 0 of 126                        | +380       | 31 (29)                          | 10.9 s, ~4.5M rows            | 33 MiB       |
+| 50,000                     | 88,964                                                     | 0 of 141                        | +368       | 44 (42)                          | 14.6 s, ~6M rows              | 85 MiB       |
+| 75,000                     | 116,210 (PostgreSQL's one session: 153 s for a 120 s load) | 2 of 162                        | −383       | 67 (65), 1 fell off before a cut | 21.9 s, ~9M rows (2.4 µs/row) | 171 MiB      |
 
 Up to ~90k events/s the chain has no hole; at ~116k it loses the race for two seconds.
 `--verify` exact at every rate.
@@ -16853,13 +16857,13 @@ code.
 
 Two random b-trees per insert, then one; 4 KB leaves, then 16 KB:
 
-| 300k random-key inserts, drained | cold file | warm file |
-| --- | --- | --- |
-| as measured (two indexes, 4 KB pages) | 42.7 s | 14.2 s |
-| without the mirrored `(tenant, pk)` index | 22.7 s | 10.4 s |
+| 300k random-key inserts, drained              | cold file | warm file |
+| --------------------------------------------- | --------- | --------- |
+| as measured (two indexes, 4 KB pages)         | 42.7 s    | 14.2 s    |
+| without the mirrored `(tenant, pk)` index     | 22.7 s    | 10.4 s    |
 | … and 16 KB pages (fresh replica, 4.55M rows) | **9.8 s** | **8.9 s** |
 
-* **The descriptor no longer names the tenant replica identity.** `<t>_zb_ri` is the
+- **The descriptor no longer names the tenant replica identity.** `<t>_zb_ri` is the
   UNIQUE `(tenant, pk)` index the bridge requires of a tenant-scoped table (preflight).
   A replica holds one tenant, so on the client it says nothing the primary key does not,
   and every live insert paid a second random leaf read and a second dirty page for it.
@@ -16868,13 +16872,13 @@ Two random b-trees per insert, then one; 4 KB leaves, then 16 KB:
   columns; a public table's indexes are untouched. Clients drop an index the descriptor
   stopped naming (`indexSyncPlan`, both clients): libzb dropped it on its first sync,
   the trace showed 2.1 page misses a row become 1.8, and the cold drain halved.
-* **16 KB pages for a replica the client creates** (libzb `storage.open`, zb-client-ts
+- **16 KB pages for a replica the client creates** (libzb `storage.open`, zb-client-ts
   Node and Expo; a no-op on an existing file, which keeps its own; the browser's OPFS
   build left alone). A random-key insert reads one leaf per probe, and a leaf four times
   larger holds four times the keys: a quarter of the cold reads. Python first (16 KB:
   6.3 s cold twice against 11.5–15.2 at 4 KB; 8 KB was oddly worse both times), then
   libzb: 22.7 → 9.8 s cold, 10.4 → 8.9 s warm, the seed unchanged at ~5 µs a row.
-* **The trace counts the page cache.** With `ZB_TAIL_TRACE=1` every applied batch prints
+- **The trace counts the page cache.** With `ZB_TAIL_TRACE=1` every applied batch prints
   SQLite's `hit / miss / written` (`sqlite3_db_status`, reset per batch) with its wall
   time: one line said "one miss per index probe" where two days of guessing had not.
 
@@ -16891,12 +16895,12 @@ tables dropped.)
 The capacity question of §10ja, asked from the client's side. Two shapes, both in
 `firehose_tls.py` now: **A, cold arrival** — a 2M-row burst (1,000-row transactions, as
 fast as PostgreSQL goes), then the sustained load, the clients opened 30 s in; **B, live
-client** — a replica of 1M rows, seeded and drained *before* anything happens, then a 5 s
+client** — a replica of 1M rows, seeded and drained _before_ anything happens, then a 5 s
 burst at PostgreSQL's rate, then the sustained load. The load is N inserts plus N updates a
 second (2N events/s) for 120 s; CDC cap 256 MiB, cadence 60 s, `RING_BUFFER_COUNT=200000
 BASE_BUF=11`. Everything on one Mac: PostgreSQL, nats-server, the bridge, both clients and
 the harness. Lag is the replica's row count every 2 s against PostgreSQL's own timeline
-(psql echoes every commit); *live* is within three seconds of inserts. `--verify` seeded a
+(psql echoes every commit); _live_ is within three seconds of inserts. `--verify` seeded a
 fresh replica from the final chain in every run: exact, every time.
 
 **What PostgreSQL gives for a burst**: 101k–143k rows/s in 1,000-row transactions. The
@@ -16905,20 +16909,20 @@ back-pressure the WAL reader, not drop — `acquireAndFillSlot`).
 
 **A — cold arrival** (clients opened at 30 s, converged = exact against PostgreSQL):
 
-| rows/s | events/s | chain holes | libzb: converged, re-seeds | zb-client-ts: converged, re-seeds |
-| --- | --- | --- | --- | --- |
-| 25,000 | 59k | 1 sample (−266, during the 134k rows/s burst) | 163 s, 5 | 131 s, 6 |
-| 50,000 | 90k | 0 | 294 s, 29 | 253 s, 6 |
+| rows/s | events/s | chain holes                                   | libzb: converged, re-seeds | zb-client-ts: converged, re-seeds |
+| ------ | -------- | --------------------------------------------- | -------------------------- | --------------------------------- |
+| 25,000 | 59k      | 1 sample (−266, during the 134k rows/s burst) | 163 s, 5                   | 131 s, 6                          |
+| 50,000 | 90k      | 0                                             | 294 s, 29                  | 253 s, 6                          |
 
 **B — live client** (back live: seconds after the burst ended; lag p50/p90 over the
 sustained phase, in seconds of inserts; live samples; re-seeds; converged):
 
-| rows/s | events/s | libzb | zb-client-ts |
-| --- | --- | --- | --- |
-| 15,000 | 33k | back in 6.4 s; 0 / 0.6 s; 59 of 65 live; 0 re-seeds | back in 13.0 s; 0.2 / 1.0 s; 54 of 62; 0 |
-| 25,000 | 52k | back in 6.5–12.8 s; 1.0 / 3.9 s; 46–50 of 64; 0 | never; 5.6–7.9 / 18–22 s; 1–2 of 62; 2 |
-| 37,500 | 74k | never; 6.4 / 8.0 s; 4 of 64; 17 (154 s) | never; 8.5 / 12 s; 1 of 62; 15 (153 s) |
-| 50,000 | 94–100k | never; 5.0 / 7.0 s; 14 of 77; 34 (212 s) | never; 18 / 29 s; 1 of 75; 10 (220 s) |
+| rows/s | events/s | libzb                                               | zb-client-ts                             |
+| ------ | -------- | --------------------------------------------------- | ---------------------------------------- |
+| 15,000 | 33k      | back in 6.4 s; 0 / 0.6 s; 59 of 65 live; 0 re-seeds | back in 13.0 s; 0.2 / 1.0 s; 54 of 62; 0 |
+| 25,000 | 52k      | back in 6.5–12.8 s; 1.0 / 3.9 s; 46–50 of 64; 0     | never; 5.6–7.9 / 18–22 s; 1–2 of 62; 2   |
+| 37,500 | 74k      | never; 6.4 / 8.0 s; 4 of 64; 17 (154 s)             | never; 8.5 / 12 s; 1 of 62; 15 (153 s)   |
+| 50,000 | 94–100k  | never; 5.0 / 7.0 s; 14 of 77; 34 (212 s)            | never; 18 / 29 s; 1 of 75; 10 (220 s)    |
 
 Reading it. The bridge side is PostgreSQL-bound and the chain held without a hole at every
 sustained rate; the one negative sample was a 2M-row burst at 134k rows/s, past the ~90k
@@ -16958,13 +16962,13 @@ live at 10k events/s (lag p50 0 s, back live 23 s after a 5 s burst at 85k rows/
 applies ~12k events/s, converges 98 s after a load at 20k, falls off the 1 GiB stream and
 re-seeds at 40k and converges ~285 s after it. On the way:
 
-* **Memory kills (2.1 GB) were the example app, not libzb**: expo-file-system's
+- **Memory kills (2.1 GB) were the example app, not libzb**: expo-file-system's
   `getInfoAsync` MD5s the whole file whenever the `md5` key is present, and the Swift layer
   always passes it — asking a 1.8 GB replica for its size (or existence) read it into
   memory, at every launch. Size from SQLite, existence from a directory listing (ef15b12).
-* **zb-client-ts's tail consumer had the server's 5 s ephemeral default**; a phone applying
+- **zb-client-ts's tail consumer had the server's 5 s ephemeral default**; a phone applying
   one batch spends longer between pulls, and the consumer was deleted every ~50 s (92a3df9).
-* **Lost updates and missing rows, both clients.** A pull consumer can lose a delivery in
+- **Lost updates and missing rows, both clients.** A pull consumer can lose a delivery in
   transit (a reset link, a killed process) and re-send it only after `ack_wait`, out of
   order. The clients kept position = highest sequence applied, so a consumer gone before
   the redelivery (a drain's end, a kill) left the message unread for ever: 25,914 rows
@@ -17024,27 +17028,26 @@ burst at a few thousand events/s on an iPhone 12.
 (32-bit ARM, whatever the CPU), three u64/usize casts; libzb itself needed no change, the
 32-bit build names its CPU (`-Dcpu=cortex_a7`). Then, in order:
 
-* **A fresh seed failed with NoResponders**: the chain-object reader's consumer idled 30 s
+- **A fresh seed failed with NoResponders**: the chain-object reader's consumer idled 30 s
   while the phone applied one window on eMMC, and the server reaped it. The reader now
   resumes at the next chunk's stream sequence and idles 5 min (44ad312). 3,245,000 rows in
   534 s, exact, the app at ~250 MB throughout (a 1.5 GB replica, streamed a window at a time).
-* **Slow-consumer disconnects again, a different limit**: "WriteDeadline of 10s exceeded
+- **Slow-consumer disconnects again, a different limit**: "WriteDeadline of 10s exceeded
   with 16 MB" — nats-server gives a client 10 s to take its queue, and two 8 MB requests in
   flight did not fit the e20's under-1.6 MB/s. 2 MB per request (3b0cc1d): a slow link holds
   down to ~0.4 MB/s, a fast one loses nothing (at a 75 ms round trip a few MB/s need well
   under 1 MB in flight).
-* Kill test (`scripts/scenarios/android_kill.sh`, `am force-stop` + relaunch over adb): 5 s
+- Kill test (`scripts/scenarios/android_kill.sh`, `am force-stop` + relaunch over adb): 5 s
   burst + 90 s at 5k events/s, four kills, 0 disconnects, exact (4,552,000 rows, sum
   204,649,720 — the app's check against PostgreSQL; a release build's files cannot be
   copied out), converged 774 s after the load.
-* **RN + zb-client-ts on the e20** (65e54f4): it runs. Two fixes first. A release build
+- **RN + zb-client-ts on the e20** (65e54f4): it runs. Two fixes first. A release build
   refused `ws://` ("CLEARTEXT communication not permitted"); a config plugin allows it on
   the dev LAN. And the TS object reader pulled 64 chunks (8 MiB) at a time: the JS thread,
   busy applying, left the WebSocket undrained for 10 s and nats-server cut it. 16 chunks
   (2 MiB), libzb's bound, and it held. A 200k-row seed took 10.3 s, exact; an 836k-row seed
   was too slow in JS on this phone to wait for, so no TS kill test here. On a budget
   Android phone the heavy path belongs to libzb.
-
 
 ## §10jd — sensor events on a DuckDB replica, the ingress ramp, and a writer budget that follows the lanes (2026-09-27)
 
@@ -17130,12 +17133,13 @@ deduplication with a verdict, and joins with business data. A JetStream stream a
 the order and the deduplication; for readings nobody edits that is most of it.
 
 **The direction: split by the kind of data.**
-* Business data (sensors, tenants, thresholds — edited, small) stays on PostgreSQL + the
+
+- Business data (sensors, tenants, thresholds — edited, small) stays on PostgreSQL + the
   bridge, as today.
-* Readings (append-only) go MQTT/NATS → a JetStream stream kept for hours → DuckDB services
+- Readings (append-only) go MQTT/NATS → a JetStream stream kept for hours → DuckDB services
   that consume it in order, append in bulk, and roll Parquet files to object storage. A new
   copy loads the Parquet archive, then follows the stream.
-* The DuckDB service holds both — the replicated registry and the streamed readings — so one
+- The DuckDB service holds both — the replicated registry and the streamed readings — so one
   query joins them ("alarms for the sensors of building 7").
 
 **To build**: a libzb mode that follows a raw subject instead of CDC (ordered, deduplicated
@@ -17147,22 +17151,23 @@ it keeps PostgreSQL on the hot path and its write ceiling.
 **Refined the same day (the owner's design): no PostgreSQL round trip at all for readings.**
 Sensor → NATS (MQTT :1883 or :4222) → a JetStream stream → DuckDB services. PostgreSQL leaves
 the telemetry path; the chain's pattern (periodic snapshot + live stream) moves to Parquet:
-* A background ARCHIVER (one writer: a durable consumer or a leader) rolls the stream into
+
+- A background ARCHIVER (one writer: a durable consumer or a leader) rolls the stream into
   Parquet every ~10 s into an S3/R2 bucket, under `tenant=/date=/hour=` prefixes, each file
   named with its stream-sequence range. A compaction job merges them hourly, then daily
   (10 s files are 8,640 per tenant per day). Bucket credentials stay with the archiver.
-* A REGISTRY entry per time table — `time_tables: [{"table": "sensor_events", "url":
-  "https://r2…", "schema": …, "archived_to_seq": N}]`, in a NATS KV bucket or a catalogue
+- A REGISTRY entry per time table — `time_tables: [{"table": "sensor_events", "url":
+"https://r2…", "schema": …, "archived_to_seq": N}]`, in a NATS KV bucket or a catalogue
   row — tells a starting service where the history is.
-* A starting SERVICE loads the Parquet up to sequence N, then follows the stream from N+1:
+- A starting SERVICE loads the Parquet up to sequence N, then follows the stream from N+1:
   no gap, no duplicate, the chain's cutoff rule. The stream must keep more than a few
   archive periods (the "window ≥ 2 × cadence" inequality again).
-* Authorization moves wholly to NATS subjects (a device publishes only its tenant's
+- Authorization moves wholly to NATS subjects (a device publishes only its tenant's
   subject — proven over MQTT in §10jf); the consumer validates payloads and dead-letters
   bad ones, since no PostgreSQL constraint is left to refuse them.
-* The live path shrinks from five hops (sensor, NATS, bridge, PostgreSQL, CDC) to two.
-Business data (sensor registry, tenants, thresholds) stays on PostgreSQL + the bridge, and
-the DuckDB service joins the two.
+- The live path shrinks from five hops (sensor, NATS, bridge, PostgreSQL, CDC) to two.
+  Business data (sensor registry, tenants, thresholds) stays on PostgreSQL + the bridge, and
+  the DuckDB service joins the two.
 
 **Its process shape (the owner's): another daemon, two processes, one library.** A NATS
 server, plus (1) a slow UPLOADER and (2) a long-running QUERY process, both on libzb with
@@ -17179,23 +17184,24 @@ seed. PostgreSQL + the bridge join only when business data is replicated alongsi
 
 **Prior art (a web search the same day; READMEs and summaries read, no code run — a map,
 not a verdict).** The UPLOADER half exists several times over:
-* garm-ai/sink (github.com/garm-ai/sink) — NATS JetStream drained into micro-batched ZSTD
+
+- garm-ai/sink (github.com/garm-ai/sink) — NATS JetStream drained into micro-batched ZSTD
   Parquet on S3-compatible storage, hive-partitioned so DuckDB reads it as is; batches of
   250,000 rows or five minutes (ours: ~10 s).
-* Redpanda Connect, formerly Benthos (github.com/redpanda-data/connect) — a `nats_jetstream`
+- Redpanda Connect, formerly Benthos (github.com/redpanda-data/connect) — a `nats_jetstream`
   input, a `parquet_encode` processor with a declared schema, an `aws_s3` output.
-* Cloudflare Pipelines (developers.cloudflare.com/pipelines) — managed, on R2, Parquet or
+- Cloudflare Pipelines (developers.cloudflare.com/pipelines) — managed, on R2, Parquet or
   Iceberg with SQL transforms; ingests over HTTP or Workers, not NATS.
-Around the QUERY side:
-* ingestr (getbruin.com/docs/ingestr/supported-sources/nats.html) — copies a JetStream
+  Around the QUERY side:
+- ingestr (getbruin.com/docs/ingestr/supported-sources/nats.html) — copies a JetStream
   subject into a DuckDB file; batch ingestion, not a live-updating service.
-* Arc (news.ycombinator.com/item?id=45505407) — a time-series warehouse with DuckDB
+- Arc (news.ycombinator.com/item?id=45505407) — a time-series warehouse with DuckDB
   analytics and its own ingest API; a central server, not an embedded library.
-Not found: one component that follows the live stream in exact order, seeds from the
-Parquet archive up to sequence N and continues from N+1, and answers operator-defined
-queries over NATS with tenancy enforced by subject permissions — the part libzb already
-mostly has. garm-ai/sink or Redpanda Connect could stand in for the uploader meanwhile,
-or serve as the comparison when ours is built.
+  Not found: one component that follows the live stream in exact order, seeds from the
+  Parquet archive up to sequence N and continues from N+1, and answers operator-defined
+  queries over NATS with tenancy enforced by subject permissions — the part libzb already
+  mostly has. garm-ai/sink or Redpanda Connect could stand in for the uploader meanwhile,
+  or serve as the comparison when ours is built.
 
 **Shipping the files: DuckDB makes them, plain HTTPS ships them (checked the same day).**
 `parquet` is built into DuckDB (STATICALLY_LINKED); `httpfs` is NOT in the Homebrew
@@ -17274,7 +17280,7 @@ PostgreSQL data the bridge owns, no health of PostgreSQL itself, and the dashboa
 behind (no panel for the fleet, slots, CDC window, ingress; three NATS panels on exporter
 metrics the native stack does not run, one querying a `CDC` stream renamed long ago).
 
-* `src/pg_health.zig`: one pass every 60 s on the reader connection, seven independent
+- `src/pg_health.zig`: one pass every 60 s on the reader connection, seven independent
   queries, snapshot-swapped like the slot inventory; a query the reader cannot run leaves
   its section out. The chain per tenant and table (latest live generation, when it was
   built, live generations, rows), the catalogue (tables, tenant-scoped, public, with
@@ -17282,13 +17288,13 @@ metrics the native stack does not run, one querying a `CDC` stream renamed long 
   against its CONNECTION LIMIT, server sessions against max_connections, the oldest open
   transaction (`zebridge_oldest_open_xact()`, which existed and was never exported), and
   each published table's size, live and dead rows. All as the reader: no new grant.
-* `src/verdict_stats.zig`: `bridge_mutation_verdicts_total{status}` and
+- `src/verdict_stats.zig`: `bridge_mutation_verdicts_total{status}` and
   `bridge_mutation_rate_limited_total`, counted where every verdict passes
   (`publishVerdictExtra`); process-wide atomics, nothing threaded through the listener.
-* One catch, fixed: `pg_stat_activity` hides other roles' `backend_type` from the reader,
+- One catch, fixed: `pg_stat_activity` hides other roles' `backend_type` from the reader,
   so the first count of client sessions read 1 with three bridge connections open; it now
   counts sessions with a user whose type is `client backend` or hidden (3, close estimate).
-* telemetry/dashboard.json: the NATS panels read the bridge's own `bridge_cdc_stream_*`
+- telemetry/dashboard.json: the NATS panels read the bridge's own `bridge_cdc_stream_*`
   and fleet lag (no exporter), plus four rows — clients, write path, chain, PostgreSQL —
   32 panels. OBSERVABILITY_TELEMETRY.md: the two new families, four alert rows, a
   Dashboard section.
@@ -17376,14 +17382,14 @@ themselves unavailable; SQLite is unaffected.
 
 `zb-android/` builds an AAR for Kotlin and Java apps, the gap DISTRIBUTION.md named:
 
-* **One `libzb.so` per CPU** (arm64-v8a, armeabi-v7a, x86_64 for the emulator): libzb's
+- **One `libzb.so` per CPU** (arm64-v8a, armeabi-v7a, x86_64 for the emulator): libzb's
   static archive and `src/main/cpp/zb_jni.c`, linked by the NDK's clang with
   `--exclude-libs,ALL --gc-sections -s` and 16 KB pages. It exports only the 20 JNI
   functions: 3.8 MB on arm64, against 25.8 MB for Flutter's unstripped whole-archive `.so`.
-* **Strings cross as UTF-8 byte arrays, never `jstring`.** JNI's string functions speak
+- **Strings cross as UTF-8 byte arrays, never `jstring`.** JNI's string functions speak
   modified UTF-8, which turns an emoji (outside the BMP) into two surrogates; libzb speaks
   standard UTF-8. Kotlin encodes and decodes with `Charsets.UTF_8`.
-* **`dev.zebridge.ZeBridge` owns the thread.** libzb drives a handle from one thread and
+- **`dev.zebridge.ZeBridge` owns the thread.** libzb drives a handle from one thread and
   keeps `zb_last_error` per thread, so the class runs connect, sync, every call and the
   poll loop on one single-thread executor. A call from any thread is queued behind the
   poll in progress (250 ms by default); the next poll is queued behind it. A listener
@@ -17391,7 +17397,7 @@ themselves unavailable; SQLite is unaffected.
   in place. Revocation stops the loop. `tenants` comes from the first sync. The same
   option names as the other clients; with a `Context`, the replica defaults to the app's
   database directory.
-* **Gradle only packages.** No CMake: `scripts/build.sh` prebuilds the `.so` files into
+- **Gradle only packages.** No CMake: `scripts/build.sh` prebuilds the `.so` files into
   `src/main/jniLibs/` and runs `assembleRelease` (AGP 9.1, built-in Kotlin, the JDK from
   Android Studio). `ZB_ABI = 2` in ZeBridge.kt is checked by libzb/python/abi_check.py.
 
@@ -17437,16 +17443,16 @@ print, every 5 s, where applyBatch's time goes (decode, plan, shape, append, ups
 single, commit/rest, acks), from the monotonic clock. 09-event, one DuckDB service,
 sensors at three rates, one ingress lane:
 
-| load | batches/s | events/batch avg / max | ms/batch | decode | upsert | commit/rest | busy |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1,000/s | 160 | 6 / 46 | 2.49 | 0.01 | 1.12 | 0.99 | ~40% |
-| 5,000/s | 152 | 33 / 446 | 2.87 | 0.04 | 1.33 | 1.07 | ~44% |
-| 8,000/s | 142 | 56 / 576 | 3.20 | 0.07 | 1.45 | 1.17 | ~45% |
+| load    | batches/s | events/batch avg / max | ms/batch | decode | upsert | commit/rest | busy |
+| ------- | --------- | ---------------------- | -------- | ------ | ------ | ----------- | ---- |
+| 1,000/s | 160       | 6 / 46                 | 2.49     | 0.01   | 1.12   | 0.99        | ~40% |
+| 5,000/s | 152       | 33 / 446               | 2.87     | 0.04   | 1.33   | 1.07        | ~44% |
+| 8,000/s | 142       | 56 / 576               | 3.20     | 0.07   | 1.45   | 1.17        | ~45% |
 
-* Batches already size themselves: each poll takes what has arrived, so 8× the load gave
+- Batches already size themselves: each poll takes what has arrived, so 8× the load gave
   9× the batch at the same batch rate — group commit, latency about one batch (~3 ms),
   never N ÷ rate. No batch waits to fill.
-* The cost is fixed per batch: the temp table, the set-based upsert, the drop and the
+- The cost is fixed per batch: the temp table, the set-based upsert, the drop and the
   commit; a row adds ~0.013 ms. Decoding is 0.01–0.07 ms, ~2%: overlapping it with the
   write (the double buffer) could save that 2%, and the stream is already the buffer
   that waits (JetStream holds the backlog; a pull is the swap). Host-provided memory
@@ -17460,11 +17466,11 @@ batch redelivered between commit and ack — makes the appender refuse ("Duplica
 violates primary key constraint"), DuckDB aborts the transaction, and the second pass
 takes the temp-table upsert as before.
 
-| load | ms/batch before → after | busy before → after |
-| --- | --- | --- |
-| 1,000/s | 2.49 → 1.21 | ~40% → ~24% |
-| 5,000/s | 2.87 → 1.38 | ~44% → ~27% |
-| 8,000/s | 3.20 → 1.53 | ~45% → ~25% |
+| load    | ms/batch before → after | busy before → after |
+| ------- | ----------------------- | ------------------- |
+| 1,000/s | 2.49 → 1.21             | ~40% → ~24%         |
+| 5,000/s | 2.87 → 1.38             | ~44% → ~27%         |
+| 8,000/s | 3.20 → 1.53             | ~45% → ~25%         |
 
 What remains is the commit and the position write (~1 ms). Fallback proved by moving the
 stored CDC_globex position back 3,000 messages and restarting: each redelivered batch
@@ -17494,7 +17500,7 @@ the case its `firstSeq`. Now live, on the dev stack, with a libzb follower (omar
 
 1. Caught up at CDC_kilo 25962, the stream's end (max-age had emptied it); stopped.
 2. Five rows written in PostgreSQL (seq 25963–25967), then `nats stream purge CDC_kilo
-   --seq=25968` — what max-age or max-bytes does while a client is away — then three more
+--seq=25968` — what max-age or max-bytes does while a client is away — then three more
    rows (25968–25970).
 3. Restarted. libzb said: chain g33 predates the stream (cutoff 25962 < first 25968),
    waiting for the next generation; the drain saw "5 message(s) pruned under the drain
@@ -17522,25 +17528,25 @@ before the client's own deadline, so the 408s end the fetch inside its wait.
 
 `scripts/reprovision.py` (§10cv, 2026-09-05) defined residue as "every public table that
 is not a base fixture". A `--list` on today's stack showed what that had grown into: it
-would have dropped PostGIS's own `spatial_ref_sys`, every example table (05's app_*,
-06's fire_types, 08's pois, routes, fuel_* and charge_points), the LIVE bridge's
+would have dropped PostGIS's own `spatial_ref_sys`, every example table (05's app*\*,
+06's fire_types, 08's pois, routes, fuel*\* and charge_points), the LIVE bridge's
 `my_slot`, and deleted the events/mqttgw mappings — a revocation with a ban (§10dm).
 Its tenant check also read memberships into a dict, one tenant per principal, a
 leftover of before §10fn made them sets.
 
 Now:
 
-* **Tables:** dropped only when recognised as a scenario probe (zb_*, *_t type fixtures,
-  mig_*, crazy_N, tzguard_*, ro_*/rw_*, sw_*, test_types_vN and a few one-offs, from
+- **Tables:** dropped only when recognised as a scenario probe (zb**, *\_t type fixtures,
+  mig*_, crazy*N, tzguard*_, ro*\*/rw*_, sw\__, test_types_vN and a few one-offs, from
   scripts/scenarios); anything else is printed as kept, and `--drop-unknown` opts in.
   A table an extension owns (pg_depend 'e') is never a candidate.
-* **Slots:** an active slot is never dropped; the bridge's own ($BRIDGE_CDC_SLOT, default
+- **Slots:** an active slot is never dropped; the bridge's own ($BRIDGE_CDC_SLOT, default
   my_slot) only with `--drop-bridge-slot`. (psql prints a boolean as `t`, but cast to
   text it is `true` — the first check never matched; it says `active`/`idle` now.)
-* **Mappings:** only the fixture principals (alice, bob, mary, nina, omar), compared as
+- **Mappings:** only the fixture principals (alice, bob, mary, nina, omar), compared as
   sets; the canonical mapping is inserted before an extra one is deleted, so none passes
   through zero memberships. Other principals are the examples' and are left alone.
-* **Publication:** $BRIDGE_CDC_PUBLICATION, else the database's only publication.
+- **Publication:** $BRIDGE_CDC_PUBLICATION, else the database's only publication.
 
 Dry run on the same stack: 4 probe tables (crazy_1–4), the fixtures truncated and
 re-enabled; 9 example tables kept, my_slot kept (active), spatial_ref_sys not listed.
@@ -17637,11 +17643,12 @@ changes only keep honest clients inside the tighter grants.
 
 Asked on the way (answered, not built): a tenant needing other permissions is a ROLE —
 its own signing key and template, loaded into the server (memory resolver: conf splice
-+ SIGHUP; full resolver: nsc push) — and `zebridge_invites.role` already exists for it,
-though the mint signs everything with the one client key today. And encryption at rest
-is a separate question: grants stop a connected client, JetStream's `cipher` stops
-someone holding the disk or a backup; the CDC streams, the gen-<tenant> objects,
-MUTATIONS and VERDICTS are what it would protect.
+
+- SIGHUP; full resolver: nsc push) — and `zebridge_invites.role` already exists for it,
+  though the mint signs everything with the one client key today. And encryption at rest
+  is a separate question: grants stop a connected client, JetStream's `cipher` stops
+  someone holding the disk or a backup; the CDC streams, the gen-<tenant> objects,
+  MUTATIONS and VERDICTS are what it would protect.
 
 ## §10js — a tenant is born with its first mapping: its stream is created on the spot (2026-09-28)
 
@@ -17865,6 +17872,7 @@ and the revoked device's unexpired JWT (24 h) worked until it expired. Without t
 the ban (2 h) would only have shortened that window.
 
 Two layers now:
+
 - **The door.** `zebridge_refuse_revoked_mapping_t`, BEFORE INSERT OR UPDATE OF principal
   on `zebridge_user_tenants`: a principal with a revoked key cannot be mapped, with the
   hint "invite the person under a new principal". The same test `/enroll` applies to an
@@ -17942,7 +17950,7 @@ Stricter than envsubst: role, database and publication names must be plain ident
 unknown `${…}` is an error and so is an empty value in SQL (an empty one in a `--`
 comment is kept as written: init.core's own comment names ${POSTGRES_WRITER_USER}).
 Compared with the envsubst route on the dev env: identical except 12 spots where envsubst
-had eaten `$KV` (it replaces bare `$word` too): 11 comments and one message string, now
+had eaten `$KV`(it replaces bare`$word` too): 11 comments and one message string, now
 as the template says.
 
 Checked on scratch databases: read/write with new roles and a password holding `'` and
@@ -18041,10 +18049,10 @@ warnings (stream pressure, or a cut already lost).
 
 **Tenants with rows and no stream.** The producer takes its tenants from the data
 (`zebridge_tenants_of`), streams exist for mapped tenants (§10js). Test leftovers
-(`dynten` in test_types, the 08-map grid's `c_gbq*` in pois) had rows and no mapping:
-every tick built their chains and warned `stream info for CDC_<t> failed
-(StreamNotFound)` — 1,032 times for dynten. The same happens in production when a
-tenant's last principal goes and its rows stay. `buildOne` now skips a pair whose
+(`dynten` in test*types, the 08-map grid's `c_gbq*` in pois) had rows and no mapping:
+every tick built their chains and warned `stream info for CDC*<t> failed
+(StreamNotFound)`— 1,032 times for dynten. The same happens in production when a
+tenant's last principal goes and its rows stay.`buildOne` now skips a pair whose
 tenant stream does not exist (before the snapshot's transaction), says so once per
 tenant at info, and once more when the stream appears (a principal mapped).
 
@@ -18261,9 +18269,9 @@ warning in either log, so any bridge sharing the database is checked too.
 What holds (all ✓): each boots on its own publication; one INSERT reaches NATS once, from
 its own bridge; each builds snapshots for its own table only, and neither chain is
 rebuilt; one libzb client enrolled at A seeds both tables, receives a live row in each,
-and its writes to both land; one ALTER on mb_a stores ONE new schema revision (counted
+and its writes to both land; one ALTER on mb*a stores ONE new schema revision (counted
 as stored KV revisions; a core subscription also sees the duplicates JetStream drops by
-message id). Reported: both bridges serve `bridge_fleet_*`, so a dashboard sum double
+message id). Reported: both bridges serve `bridge_fleet*\*`, so a dashboard sum double
 counts. Not exercised: `ZB_FEED_RESTART=1` on one bridge deletes the other's CDC streams.
 
 Also: `init_sql`'s render test printed its two refusals to stderr, and Zig then echoes
@@ -18298,6 +18306,7 @@ minutes off was refused every renewal, its JWT expired, and it stayed out. A clo
 ahead would also have renewed on every check; hours behind, never before expiry.
 
 Now, in libzb and zb-client-ts alike:
+
 - the identity keeps `clock_offset` = the bridge's clock minus the device's, taken from
   each JWT's `iat` on arrival (enroll and renew); `renewDue` and the `/renew` stamp use
   `local now + offset`. The quarter-of-the-life threshold is unchanged;
@@ -18335,6 +18344,7 @@ error"), libzb reported `ConnectionClosed` (not AuthExpired: the verdict was los
 reconnects), and the app's reopen renewed on NATS's refusal. Recovered, with one drop.
 
 Now:
+
 - libzb anchors the bridge's time at open (stored offset) and at each renewal it makes
   (the new JWT's `iat`), and counts from there on `steadySeconds` (Apple's
   CLOCK_MONOTONIC, which counts sleep; Linux/Android BOOTTIME). Renewal timing, the
@@ -18415,10 +18425,10 @@ not run yet, it needs the dev stack (stopped to spare memory).
 3. `--port`, `--http-port`, `--ws-port` (defaults 4222, 8222, 8080), checked distinct; the
    client port also goes into NATS_URL. init_nats.py uses them instead of rewriting the
    conf, and checks `.env.nats` carries no database setting: 10/10.
-Quickstart from scratch (`down -v`, `up --build`, bridge on 27444 beside the Supabase
-one): all services up, init printed the links, the bridge loaded both files, a throwaway
-invite enrolled (tenant tag, mapping published). Supabase bridge restarted on the two
-files.
+   Quickstart from scratch (`down -v`, `up --build`, bridge on 27444 beside the Supabase
+   one): all services up, init printed the links, the bridge loaded both files, a throwaway
+   invite enrolled (tenant tag, mapping published). Supabase bridge restarted on the two
+   files.
 
 ## §10kv — one doctor: `bridge --diagnose`, bridge stopped or running; the catalogue is the intent (2026-10-02)
 
@@ -18428,15 +18438,15 @@ ERROR. The JSON intent form is dropped (a second source of truth beside the migr
 
 `--diagnose` keeps its pre-boot checks and adds `src/diagnose_live.zig`, read-only:
 6 the catalogue (`zebridge_check_all()`, plus zbdoctor's cross-table audits: tenant tables
-  with unbounded writes, tenants the sweeper cannot reach, an instance whose publication is
-  empty, instances disagreeing on the budget);
+with unbounded writes, tenants the sweeper cannot reach, an instance whose publication is
+empty, instances disagreeing on the budget);
 7 the slots (invalidated = finding; this bridge's own inactive = note when stopped, finding
-  when it answers; others inactive = warning);
+when it answers; others inactive = warning);
 8 the bridge: GET /status on 127.0.0.1:<its port>; nothing answering = "stopped";
 9 NATS through the bridge's own publisher (connect creates nothing): streams and buckets
-  (missing = note when stopped, finding when running), MUTATIONS cap, VERDICTS policy;
+(missing = note when stopped, finding when running), MUTATIONS cap, VERDICTS policy;
 10 with the bridge running: a schema per catalogue table, a tenant entry per principal, a
-  chain manifest whose full object exists per (mapped tenant with rows, table).
+chain manifest whose full object exists per (mapped tenant with rows, table).
 `scripts/zbdoctor.py` removed; its auditor principal stays (read-only grants fit).
 
 Supabase: all clear running (catalogue 3 tables, 2 accepted-delete warnings; 7 streams; 3
@@ -18534,6 +18544,7 @@ nodes add servers near the clients, with JetStream at the hub (the domain option
 README's multi-bridge section states the constraint.
 
 The plan, if separate NATS servers per bridge ever become a layout:
+
 - `zebridge_generations` gets `publication text NOT NULL`; the key becomes
   `(publication, tenant, tbl, gen)`;
 - every producer query on it adds `AND publication = $pub` (about 20), as do
@@ -18621,6 +18632,7 @@ REVOKE FROM PUBLIC would have broken the bridge; revoking from anon alone does n
 since anon inherits PUBLIC.
 
 Now, at the end of each template (idempotent, re-run on every init):
+
 - every `zebridge_*` function gets `search_path = pg_catalog, public` unless it has one,
   and the existing ones moved from `public, pg_catalog` to `pg_catalog, public` (a
   built-in cannot be shadowed by a function created in `public`);
@@ -18629,15 +18641,15 @@ Now, at the end of each template (idempotent, re-run on every init):
   views and sequences revoked from them;
 - the policies use `(SELECT current_setting(…))`, evaluated once per query; existing
   `zb_reader_all`/`zb_tenant_write` policies are rewritten in place (ALTER POLICY).
-`zebridge_check` gains "api roles" (an application table open to them with RLS off:
-WARNING); `zebridge_check_all` reports ZeBridge's own tables open to them and definer
-functions open to PUBLIC (ERROR). Dev database: 0 open definer functions, 0 functions
-without search_path, reader and writer can run every function, 23 policies rewritten;
-applied twice, the second a no-op. Scenarios green on it: mutate, tiebreak, crdt,
-crosstenant, widthguard, reaps, sweeper, writable, route_crdt, and the offline group
-(render and pubname failed on environment only: no .env.admin, NATS stopped). check and
-diagnose fail on dev-database residue that predates this (dropped tables still
-catalogued, fire_types unscoped), none from the new checks.
+  `zebridge_check` gains "api roles" (an application table open to them with RLS off:
+  WARNING); `zebridge_check_all` reports ZeBridge's own tables open to them and definer
+  functions open to PUBLIC (ERROR). Dev database: 0 open definer functions, 0 functions
+  without search_path, reader and writer can run every function, 23 policies rewritten;
+  applied twice, the second a no-op. Scenarios green on it: mutate, tiebreak, crdt,
+  crosstenant, widthguard, reaps, sweeper, writable, route_crdt, and the offline group
+  (render and pubname failed on environment only: no .env.admin, NATS stopped). check and
+  diagnose fail on dev-database residue that predates this (dropped tables still
+  catalogued, fire_types unscoped), none from the new checks.
 
 ## §10lf — a stored identity yields to an invite when it cannot be used; "not enrolled" said plainly (2026-10-03)
 
@@ -18668,6 +18680,7 @@ should be cheap.
 
 What 0.17.0 changes that touches us (release notes, "C Translation Moving to External
 Package" and the removals):
+
 - `@cImport` is removed: we have none left (only comments mention it).
 - `std.Build.Step.TranslateC` / `b.addTranslateC` is DEPRECATED, not removed: build.zig
   (2) and libzb/build.zig (2) keep working; the replacement is the ZSF package
@@ -18684,6 +18697,7 @@ Package" and the removals):
   are the likely surprises; only a compile tells.
 
 The order:
+
 1. zig-msgpack first, still on 0.16: its README (2026-10-04) says the current version
    supports 0.16.0 and 0.17.0-dev, CI tracking Zig master. We pin a `main` tarball by
    hash (build.zig.zon, zig-pkg/zig_msgpack-0.0.14…, 24 array multiplications and 5
@@ -18694,7 +18708,7 @@ The order:
 3. A trial compile beside 0.16 without switching: `zvm i 0.17.0`, then
    `~/.zvm/0.17.0/zig build` and `zig build test` in the root and in libzb/; fix ours.
 4. The batteries: zig build test (both), the offline and live scenario groups, libzb's
-   ABI check, the iOS xcframework and the Android .so (tool/build-libzb-*.sh), and
+   ABI check, the iOS xcframework and the Android .so (tool/build-libzb-\*.sh), and
    deploy/build-linux.sh (it downloads Zig by version: bump it there too).
 5. Then switch the default (`zvm use 0.17.0`) and the CI/Dockerfiles' Zig URLs
    (Dockerfile.bridge, Dockerfile.sweeper, deploy/build-linux.sh, the build-libzb
@@ -18728,12 +18742,12 @@ NATS after it (a JetStream setting), then the bridge.
 
 Measured locally, a stream with one message, a responder as the client:
 
-| | plain prefix | domain prefix |
-| --- | --- | --- |
-| live stack, before `--update` | ok | refused (no domain) |
-| after `--update --js-domain hub` + restart | ok, message kept | ok |
+|                                                | plain prefix                | domain prefix               |
+| ---------------------------------------------- | --------------------------- | --------------------------- |
+| live stack, before `--update`                  | ok                          | refused (no domain)         |
+| after `--update --js-domain hub` + restart     | ok, message kept            | ok                          |
 | new stack `--js-domain hub`, client on the hub | ok (refused before the fix) | ok (refused before the fix) |
-| client on a JetStream-less leaf | refused (the link) | ok, over the link |
+| client on a JetStream-less leaf                | refused (the link)          | ok, over the link           |
 
 Not generated: the hub's `leafnodes { port: 7422; no_advertise: true; tls {…} }` and the
 leaf's conf (the hub's operator and resolver_preload, a remote with the bridge's creds and
@@ -18822,6 +18836,7 @@ their `STREAM.CREATE.OBJ_res-…` would become "create any stream"; a leaf that 
 needs a flag later.
 
 Two NATS rules, each found by a broken phone:
+
 - A wildcard is a whole token. Replacing the template inside `CDC_{{tag(tenant)}}` gave
   `CDC_*`, a literal stream name to NATS: every consumer call from the leaf was refused.
   A token that holds a template now becomes `*` (reads open to any stream).
@@ -18853,6 +18868,7 @@ are off the leaf.
 work through the hub and through the leaf.
 
 What the dry runs found:
+
 - `--check` skips `command`, `shell` and `uri`, so whatever they register is empty and the
   next step fails. The steps that only read (Cloudflare's lists, `nats-server --version`,
   `--diagnose`) run with `check_mode: false`.
@@ -18995,9 +19011,9 @@ deploy/airports-responder.Dockerfile: Debian 13 slim, python3, ca-certificates, 
 (build-linux.sh), DuckDB's release library, zb-python and the service — 223 MB. Debian, not
 Alpine: libzbcore.so and DuckDB's release are glibc builds, musl would need both rebuilt.
 Its own `.Dockerfile.dockerignore` (the root one is the bridge image's, and excludes
-examples/, libzb/ and *.py); the scratch `zig-out/*/repack` folders had to go, Docker's walk
-for the `!` exceptions stopped on an unreadable `__.SYMDEF`. airport_service.py gains
-`--js-domain` (behind a leaf) and `--name`, said in every answer as `by`.
+examples/, libzb/ and _.py); the scratch `zig-out/_/repack`folders had to go, Docker's walk
+for the`!`exceptions stopped on an unreadable`\_\_.SYMDEF`. airport_service.py gains
+`--js-domain`(behind a leaf) and`--name`, said in every answer as `by`.
 
 On leaf1 (2 vCPU, 3.8 GB), with a responder identity (`--mint-responder --name
 airports-leaf`, ten years, no daily renewal) and a volume for the DuckDB replica: seeded 9,253
@@ -19102,28 +19118,30 @@ applied 42 on CDC_acme) — waiting for a newer build`.
 
 A tenant table's open-tenant rows ride CDC_PUBLIC (§10bq), so its client watches that stream
 too. In zb-client-ts:
-  * the heal after a seed moves the position only `if (stored0 > 0)`: a client that joins after
-    CDC_PUBLIC has pruned keeps position 0 there for good, and `core.caughtUpPosition` refuses
-    to move it (`firstSeq > pos + 1`). Every connect reads a gap and re-seeds — cheap, unnoticed
-    (Bob, Carol);
-  * when the replica is newer than the newest chain, the re-seed is refused (D2) and `connect()`
-    waits for the producer's next cut — minutes at a 300 s cadence (Alice, the most up to date);
-  * the coverage guard compares the table's `seedSeq` (its cut on CDC_<tenant>) with
-    CDC_PUBLIC's `first_seq`: two streams, so a tenant table is never "covered" on the shared
-    route even when the heal runs.
-libzb escapes it: it sets the position at its first seed and drains every poll; it counts the
-shared route covered when any chain of the table applies — looser than the guard zb-client-ts
-got after a measured loss (1,081,522 of 1,800,000 rows at 60k events/s), so not the one to copy.
+
+- the heal after a seed moves the position only `if (stored0 > 0)`: a client that joins after
+  CDC_PUBLIC has pruned keeps position 0 there for good, and `core.caughtUpPosition` refuses
+  to move it (`firstSeq > pos + 1`). Every connect reads a gap and re-seeds — cheap, unnoticed
+  (Bob, Carol);
+- when the replica is newer than the newest chain, the re-seed is refused (D2) and `connect()`
+  waits for the producer's next cut — minutes at a 300 s cadence (Alice, the most up to date);
+- the coverage guard compares the table's `seedSeq` (its cut on CDC\_<tenant>) with
+  CDC_PUBLIC's `first_seq`: two streams, so a tenant table is never "covered" on the shared
+  route even when the heal runs.
+  libzb escapes it: it sets the position at its first seed and drains every poll; it counts the
+  shared route covered when any chain of the table applies — looser than the guard zb-client-ts
+  got after a measured loss (1,081,522 of 1,800,000 rows at 60k events/s), so not the one to copy.
 
 Measured with `scripts/scenarios/gen_follow.py` (manual; scratch database and nats-server; an
 emitter inserts counted ids into a tenant table while a public table prunes CDC_PUBLIC; the
 oracle is count = count(DISTINCT id) = max − min + 1 against PostgreSQL), producer cadence 20 s,
 CDC window 60 s, 40,000 ids:
-  * four libzb clients (fresh, offline 30 s, offline 120 s, longest-online): reconnect
-    0.01–0.06 s, caught up ~0.5 s; the 120 s one healed its 2 real gaps from chains;
-  * zb-client-ts joining after the prune: `ts_bob` a false gap and a re-seed at each reconnect
-    (0.31 s); `ts_alice` 10.32 s — the false gap, the refusal, the wait for a cut;
-  * all six equal PostgreSQL at the end: 40,000 ids, no hole, no double. Time, not data.
+
+- four libzb clients (fresh, offline 30 s, offline 120 s, longest-online): reconnect
+  0.01–0.06 s, caught up ~0.5 s; the 120 s one healed its 2 real gaps from chains;
+- zb-client-ts joining after the prune: `ts_bob` a false gap and a re-seed at each reconnect
+  (0.31 s); `ts_alice` 10.32 s — the false gap, the refusal, the wait for a cut;
+- all six equal PostgreSQL at the end: 40,000 ids, no hole, no double. Time, not data.
 
 The fix, approved: (1) the producer writes `shared_cutoff_seq` — CDC_PUBLIC's last sequence,
 read with `cutoff_seq` — in a tenant table's manifest; (2) the clients judge shared-route
@@ -19138,16 +19156,17 @@ The fixtures keep the two clients' pure functions identical (D2, §10hn); the st
 is not covered, and that is where the two differ. The direction: one source, libzb.
 
 All of libzb in the browser is not one step:
-  * the network — libzb speaks NATS over TCP (nats.zig); a browser has WebSockets only. Either
-    nats.zig gains a WebSocket transport over functions imported from JS, or JS keeps its NATS
-    connection and hands libzb the bytes. A new layer either way, under 33 local patches;
-  * threads — libzb has a reader thread and a poll; WASM threads need SharedArrayBuffer (the
-    pages already send COOP/COEP for OPFS) and Zig's are still rough. The host-driven poll
-    (2026-08-29) is the way: the host calls, libzb never waits on its own;
-  * storage — SQLite on OPFS goes through the official WASM build's JS VFS; libzb's own SQLite
-    would have to be wired to it, and seeds of a million rows are where the cost shows.
-Easy: the pure code (rules, merges, chain plans, msgpack, zstd) builds for wasm32; TLS is the
-browser's (`wss://`); a module of a few MB is in line with today's bundle.
+
+- the network — libzb speaks NATS over TCP (nats.zig); a browser has WebSockets only. Either
+  nats.zig gains a WebSocket transport over functions imported from JS, or JS keeps its NATS
+  connection and hands libzb the bytes. A new layer either way, under 33 local patches;
+- threads — libzb has a reader thread and a poll; WASM threads need SharedArrayBuffer (the
+  pages already send COOP/COEP for OPFS) and Zig's are still rough. The host-driven poll
+  (2026-08-29) is the way: the host calls, libzb never waits on its own;
+- storage — SQLite on OPFS goes through the official WASM build's JS VFS; libzb's own SQLite
+  would have to be wired to it, and seeds of a million rows are where the cost shows.
+  Easy: the pure code (rules, merges, chain plans, msgpack, zstd) builds for wasm32; TLS is the
+  browser's (`wss://`); a module of a few MB is in line with today's bundle.
 
 Decided: the CORE first. libzb's pure functions compiled to wasm32 (no I/O, no threads), called
 by zb-client-ts, which keeps the browser's own idioms — the NATS WebSocket, SQLite on OPFS
@@ -19273,13 +19292,14 @@ registers — and moved onto the kit: `onVerdict` and `pending()` replace the fo
 the README's timeline with three Node editors and an outsider, on columns and on registers.
 
 It found two bugs:
-* the BRIDGE: in a batch, the stale-vs-deleted probe (`classifyRound`) ran after the commit
+
+- the BRIDGE: in a batch, the stale-vs-deleted probe (`classifyRound`) ran after the commit
   without `zb.principal`, so on a tenant-scoped table RLS hid the row and every stale write was
   answered `row_deleted` — the client put its local copy back instead of reporting the edit lost.
   Any reconnect that flushes two or more queued writes takes that path (rebase_stale's reconnects
   flush one). Fixed: a transaction-local set_config before each probe (the pipeline's statements
   up to the sync share one implicit transaction).
-* zb-client-ts: `onVerdict` reported verdicts for other devices of the same principal (the ack
+- zb-client-ts: `onVerdict` reported verdicts for other devices of the same principal (the ack
   subject is the principal's). Now only a write in this client's outbox or sent this session.
 
 ## Durable indeterminate reconciliation — compatibility history (2026-10-21)
@@ -19375,26 +19395,26 @@ two are a constrained configuration (DEPLOYMENT.md).
 
 **The contract**, in one place (PROTOCOL §7.5 says it for clients, OPERATIONS → Sweeper for operators):
 
-- *One active sweeper.* `zebridge_gc_sweeper_lock()` is a session-level advisory lock (class 23106, objid 1)
+- _One active sweeper._ `zebridge_gc_sweeper_lock()` is a session-level advisory lock (class 23106, objid 1)
   taken on the sweeper's working connection. The sweeper asks `zebridge_gc_sweeper_holds()` (a `pg_locks`
   look) at the start of every pass, so a reset connection, or a pooler that swaps the server session, is seen
   as not holding and the lock is taken again before anything is reaped; without it the sweeper idles and says
   so (`--once` exits 2). A dry run needs none.
-- *Monotone in the database.* A `BEFORE UPDATE` trigger refuses a lower `watermark`; a statement trigger
+- _Monotone in the database._ A `BEFORE UPDATE` trigger refuses a lower `watermark`; a statement trigger
   refuses `DELETE` and `TRUNCATE`; `INSERT … ON CONFLICT DO NOTHING` is all a re-applied init does. A raise,
   not a clamp: whoever tried should know. Break glass is `DISABLE TRIGGER zebridge_gc_watermark_monotone`.
-- *Advance, then reap.* `zebridge_gc_advance(retention, threshold_ms)` moves the floor to `GREATEST(floor,
-  now() − retention)` under the exclusive floor lock (class 23106, objid 2, `lock_timeout` 5 s: a pass is
+- _Advance, then reap._ `zebridge_gc_advance(retention, threshold_ms)` moves the floor to `GREATEST(floor,
+now() − retention)` under the exclusive floor lock (class 23106, objid 2, `lock_timeout` 5 s: a pass is
   skipped, never forced) and returns the boundary `reap_before ≤ floor`. The reap statements take that
   boundary as a parameter instead of reading `now()` a moment later. Then the pass reports its count in a
   row change of its own that leaves the floor alone. So at every committed state, reaped ⊆ older than the
   advertised floor; the price is that for one pass writes in the band between the old floor and the new one
   are refused while their tombstones still exist (a reload slightly early, never a resurrection).
-- *A longer retention cannot restore history.* 30 days to 180 leaves the floor where it is and it moves
+- _A longer retention cannot restore history._ 30 days to 180 leaves the floor where it is and it moves
   again when time catches up; `threshold_ms` in the row is what the sweeper was configured with, the floor is
   what was done. The producer's checkpoint guard compares a window's opening with the floor now, not with
   `now() − threshold`: the configured number would have said a longer retention made old windows complete.
-- *Every write is checked against the same floor inside its own transaction.* The mutation listener calls
+- _Every write is checked against the same floor inside its own transaction._ The mutation listener calls
   `zebridge_gc_floor_acquire()` after `BEGIN` and the claim (single path: after the claim; batch: between the
   claim round and the writes), which takes the floor lock shared and then reads the row as a statement of
   its own (a snapshot taken before the wait could miss the advance that just committed). The sweeper's
@@ -19473,3 +19493,17 @@ A review of the entry above found three things wrong with how it handled identif
 **The 92 was measured with an 8-byte table.** Under the old 255, what bounds a chain read is the direct get of an object's meta record, `$JS.API.DIRECT.GET.OBJ_gen-<T>.$O.gen-<T>.M.<base64(<table>-i<n>-g<n>-full)>`: 38 bytes, twice the tenant, and the base64 of a name that carries the TABLE and two counters that grow. A 62-byte table with a 92-byte tenant never got a chain (walls.py), nor a 40-byte table with a 90-byte tenant. The limit that holds for every table and every counter is 46 bytes; the pinned library therefore says 46, which refuses tenants of 47 to 92 bytes that worked with short tables. With the pinned fork the same code says 128; against upstream nats.zig it says 46.
 
 **Bytes, everywhere.** Messages, SQL (`octet_length`) and documents say bytes; a tenant of 47 two-byte characters is 94 bytes.
+
+## The archiver's reader is a binary of the bridge's build, not a library (2026-10-27)
+
+The archiver (examples/16-archive) read its tenant's stream with nats-py at 22-28k readings/s, about 40 µs per reading, most of it nats-py and the per-message decode; a batched pull in Python stops near 48k/s. A Zig pull consumer on the nats.zig fork reads the same stream at 370-560k/s with the decoding done, so the read, not the Parquet, was the limit.
+
+**Where the reader lives.** Not in libzb: libzb is the client of a replica (positions, anchors, fences, a SQLite file) that ships to phones through five wrappers, and a stream reader shares only the NATS connection with it; a new C function would be kept stable on every platform, and the TypeScript twin would have no equivalent. Not in a new library either: one more artifact with its own ABI, wrappers and releases. It is `bridge_readings_fetch`, a third executable of the bridge's `build.zig` next to `bridge_sweeper`, which needs no PostgreSQL library: `--tenant T --from SEQ --max N --out PATH` reads a range into a CSV and prints one JSON line (`messages`, `rows`, `skipped`, `first_seq`, `first_row_seq`, `last_seq`, `first_ms`). The archiver stays Python (DuckDB, S3, the manifest) and runs it once per chunk; the dedupe of resent readings moved into the SQL (`QUALIFY row_number() OVER (PARTITION BY sensor_id, kind, sensor_ms ORDER BY stream_seq DESC) = 1`, the latest arrival, as the dict kept). `--reader python` stays the default until it has run on a real stack.
+
+**One contract, two decoders.** The responder counts its hot tail with `common.reading()` while the archive is made by the Zig decoder, so they must agree on what a reading is or a reading is archived and not counted. `readings_fetch.py` feeds both the same ~80 awkward and 4,000 generated payloads and compares row by row. It found, before this was written down, what Python was doing by accident: it accepted a quoted number (`"21.5"`), a boolean, `NaN`/`Infinity`, a repeated key (last wins) and a UTF-8 BOM or UTF-16 payload (`json.loads` on bytes sniffs them); it crashed the archiver on `10**400` (`OverflowError`, not caught) and on a sensor time beyond the year 9999 (`ValueError` naming the day of the file); and it took the stream time through a float (`int(ts.timestamp() * 1000)`), a millisecond off now and then. The contract (examples/16-archive/README.md, "The payload") is now: a JSON number, or an object with both `value` and `ts_ms`; anything else is skipped with the position moving past it; the time is between 1970 and the year 9999; the stream time is read from the ack subject's nanoseconds. Tightening `common.reading()` changes what the responder counts for a sensor that sends quoted numbers or booleans; no scenario or example did.
+
+**Grants.** The archiver credential may create a consumer on its stream (`CONSUMER.CREATE.READINGS_<t>.>`), pull from it, and subscribe to `_INBOX.<its name>.>` only. The reader makes a named pull consumer (nats.zig requires one) with `ack_policy none` and an inactive threshold, so the server reaps it (the grants include `CONSUMER.DELETE`, but a crash would leave it), and takes `--inbox-prefix _INBOX.<name>` from `archiver.py`, which reads the name from the creds. Without the prefix the reader fails with a permissions violation on `_INBOX.<nuid>.*`; `readings_roles.py` P3 shows both.
+
+**A hole is now noticed during the run.** The reader reports the first message's sequence; the archiver stops with exit 4 when it is not `--from` (readings pruned between two chunks), where the ordered consumer of the Python loop would have started silently at the new first sequence.
+
+**Not done.** The container image (`deploy/archiver.Dockerfile`) does not carry the binary; `build-linux.sh` and `package-linux.sh` now build and ship it with the bridge, but that was not run here (no Docker), only cross-compiled for x86_64 and aarch64. `archive.py` (the failure cases on the dev stack) was not run.

@@ -1,6 +1,6 @@
 #!/bin/sh
 # The Linux builds a server needs, from a Mac (or any Docker host):
-#   zig-out/linux-<arch>/bin/{bridge,bridge_sweeper}   — link the system's libpq and zstd
+#   zig-out/linux-<arch>/bin/{bridge,bridge_sweeper,bridge_readings_fetch}   — the first two link the system's libpq and zstd
 #   libzb/zig-out/linux-<arch>/lib/libzbcore.so        — SQLite and zstd compiled in
 #   libzb/zig-out/linux-<arch>/bin/zb-respond          — the native responder, the same way
 #
@@ -39,7 +39,7 @@ if [ \"\$(/cache/zig/zig version 2>/dev/null)\" != $zig ]; then
 fi
 cd /src
 # The global cache through the environment: Zig 0.17 has no --global-cache-dir flag.
-ZIG_GLOBAL_CACHE_DIR=/cache/global /cache/zig/zig build bridge sweeper -Dtarget=$arch-linux-gnu.2.35 -Doptimize=ReleaseSafe \
+ZIG_GLOBAL_CACHE_DIR=/cache/global /cache/zig/zig build bridge sweeper readings-fetch -Dtarget=$arch-linux-gnu.2.35 -Doptimize=ReleaseSafe \
   -p /src/zig-out/linux-$arch --cache-dir /cache/local-$arch
 "
 
