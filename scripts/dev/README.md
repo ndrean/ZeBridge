@@ -7,38 +7,65 @@ the published ports, so a code change needs `zig build`, not an image rebuild.
 
 Containers add a virtualization layer. Do not take speed measurements here; `scripts/native` is for those.
 
-## Use
+## Setup, in this order
+
+Everything runs from the repository root. Needs Docker with the compose plugin (OrbStack is fine) and the
+`.env.bridge` of the repository, with `DATABASE_READER_URL` and `DATABASE_WRITER_URL` pointing at `127.0.0.1:5432`.
+Nothing else may listen on 5432, 4222, 8222, 8080 or 1883: stop a Homebrew PostgreSQL first
+(`brew services stop postgresql@18`, and any `scripts/native/up.sh` stack with `scripts/native/down.sh`).
+The one-time installs of [the table below](#once-before-the-scenarios) come first.
+
+**1. Build** what the stack and the scenarios run:
 
 ```sh
-zig build -Doptimize=ReleaseFast        # up.sh applies the bridge's own --init-sql
-BRIDGE_CDC_PUBLICATION=zb_pub scripts/dev/up.sh   # first run pulls the images and mints the NATS credentials
-scripts/dev/down.sh                     # stop; the data stays in the Docker volumes
-scripts/dev/down.sh --clean             # also delete the volumes, the keys and the credentials
+zig build -Doptimize=ReleaseFast
+(cd libzb && zig build -Doptimize=ReleaseFast)
 ```
 
-Needs Docker with the compose plugin (OrbStack is fine) and `.env.bridge` with `DATABASE_READER_URL` and
-`DATABASE_WRITER_URL` pointing at `127.0.0.1:5432`. The publication has no default and is not in `.env.bridge`:
-pass its name, as in the first command above. Nothing else may listen on 5432,
-4222, 8222, 8080 or 1883: stop a Homebrew PostgreSQL first (`brew services stop postgresql@18`, and any
-`scripts/native/up.sh` stack with `scripts/native/down.sh`).
-
-`up.sh` ends by printing the next steps. From the repository root:
+**2. Start the stack.** The publication has no default and is not in `.env.bridge`: pass a name and use the same one
+everywhere below. The first run pulls the images and mints the NATS credentials.
 
 ```sh
-# once: the scenarios' Python environment (nats-py, nkeys, msgpack, duckdb, boto3)
+BRIDGE_CDC_PUBLICATION=zb_pub scripts/dev/up.sh
+```
+
+**3. Python environment, once:**
+
+```sh
 python3 -m venv scripts/scenarios/.venv
 scripts/scenarios/.venv/bin/pip install -r scripts/scenarios/requirements.txt
-
-# every terminal: reprovision.py and run.py are run by the venv's Python, so activate it
-source scripts/scenarios/.venv/bin/activate
-set -a && . ./.env.bridge && set +a && export BRIDGE_CDC_PUBLICATION=zb_pub   # the name given to up.sh
-export NATS_URL=nats://127.0.0.1:4222   # after the line above, which may bring a tls:// URL: this NATS is plain
-
-scripts/reprovision.py                  # baseline tables, catalogue rows and tenant mappings
-zig-out/bin/bridge --pub $BRIDGE_CDC_PUBLICATION 2>&1 | tee /tmp/zb-bridge.log   # own terminal: the long-running bridge on :27434
 ```
 
-In another terminal, same environment:
+**4. In every terminal you use for the next steps** (they are run by the venv's Python, so it must be active):
+
+```sh
+source scripts/scenarios/.venv/bin/activate
+set -a && . ./.env.bridge && set +a
+export BRIDGE_CDC_PUBLICATION=zb_pub               # the name given to up.sh
+export NATS_URL=nats://127.0.0.1:4222              # after the line above, which may bring a tls:// URL: this NATS is plain
+```
+
+**5. Provision the baseline. Required, once per database.** `up.sh` creates an empty database; the scenarios assume
+the eight fixture tables (`test_types`, `users`, …), their catalogue rows and the principals' tenants
+(`alice→acme … omar→kilo`), and `reprovision.py` is what creates them:
+
+```sh
+scripts/reprovision.py; echo "exit $?"      # exit 0, and no line starting with ✗
+```
+
+Without it the scenarios fail in dozens of places that do not name the cause (`relation public.test_types does not
+exist`, `no tenant for a write … principal 'omar' is unset`). Do it again after `down.sh --clean`, and after anything
+that drops the fixtures. `run.py` checks for the table and for `omar`'s tenant before it starts, and stops with
+exit 2 if either is missing.
+
+**6. Start the bridge, after step 5** (it publishes every schema at boot, so a bridge started before the tables
+existed has to be restarted). Its own terminal, steps 4 repeated there:
+
+```sh
+zig-out/bin/bridge --pub $BRIDGE_CDC_PUBLICATION 2>&1 | tee /tmp/zb-bridge.log     # :27434
+```
+
+**7. Run**, in another terminal with step 4 repeated:
 
 ```sh
 scripts/scenarios/run.py offline
@@ -47,7 +74,14 @@ scripts/scenarios/run.py live --bridge-log /tmp/zb-bridge.log
 scripts/scenarios/run.py owns
 ```
 
-`run.py all` is these three in a row, so it cannot work with the long-running bridge up: it now says so and skips `owns`.
+`run.py all` is these three in a row, so it cannot work with the long-running bridge up: it says so and skips `owns`.
+
+**Stop and reset:**
+
+```sh
+scripts/dev/down.sh                     # stop; the data stays in the Docker volumes
+scripts/dev/down.sh --clean             # also delete the volumes, the keys and the credentials: redo steps 2, 5 and 6
+```
 
 **After `owns`, the bridge's replication slot is lost.** `slot_loss.py` lowers `max_slot_wal_keep_size`, which is
 cluster-wide, so every inactive slot that is behind is invalidated, including the long-running bridge's (it is stopped

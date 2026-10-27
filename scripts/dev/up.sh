@@ -76,22 +76,26 @@ fi
 cat <<EOF
 
 [dev] up. PostgreSQL 127.0.0.1:5432, NATS 127.0.0.1:4222 (operator mode), credentials in scripts/native/creds/.
-Next, from the repository root.
+The database is EMPTY: the scenarios' fixture tables and the principals' tenants do not exist yet. Next, from the
+repository root, in this order (scripts/dev/README.md has the same list with the reasons):
 
-Once (the scenarios' Python environment: nats-py, nkeys, msgpack, duckdb, boto3):
-  python3 -m venv scripts/scenarios/.venv
-  scripts/scenarios/.venv/bin/pip install -r scripts/scenarios/requirements.txt
+3. Once - the scenarios' Python environment (nats-py, nkeys, msgpack, duckdb, boto3):
+     python3 -m venv scripts/scenarios/.venv
+     scripts/scenarios/.venv/bin/pip install -r scripts/scenarios/requirements.txt
 
-Every terminal (reprovision.py and run.py are run by the venv's Python, so activate it):
-  source scripts/scenarios/.venv/bin/activate
-  set -a && . ./.env.bridge && set +a && export BRIDGE_CDC_PUBLICATION=$BRIDGE_CDC_PUBLICATION
-  export NATS_URL=nats://127.0.0.1:4222         # after the line above: this NATS has no TLS (tls:// gives TlsRecordOverflow)
+4. Every terminal you use below - the scripts are run by the venv's Python, so activate it:
+     source scripts/scenarios/.venv/bin/activate
+     set -a && . ./.env.bridge && set +a && export BRIDGE_CDC_PUBLICATION=$BRIDGE_CDC_PUBLICATION
+     export NATS_URL=nats://127.0.0.1:4222      # after the line above: this NATS has no TLS (tls:// gives TlsRecordOverflow)
 
-Then:
-  scripts/reprovision.py                       # the baseline tables, catalogue rows and tenant mappings
-  zig-out/bin/bridge --pub \$BRIDGE_CDC_PUBLICATION 2>&1 | tee /tmp/zb-bridge.log   # the long-running bridge on :27434, in its own terminal
+5. REQUIRED - the baseline tables, catalogue rows and tenant mappings (exit 0, no line starting with a cross):
+     scripts/reprovision.py; echo "exit \$?"
 
-In another terminal, same environment:
+6. THEN the long-running bridge on :27434, in its own terminal with step 4 repeated (it publishes its schemas at
+   boot, so it must start after step 5):
+     zig-out/bin/bridge --pub \$BRIDGE_CDC_PUBLICATION 2>&1 | tee /tmp/zb-bridge.log
+
+7. In another terminal, step 4 repeated:
   scripts/scenarios/run.py offline
   scripts/scenarios/run.py live --bridge-log /tmp/zb-bridge.log   # needs the bridge; saves what it logged during each scenario
 Then stop the bridge (Ctrl-C) and run the group that starts its own bridge per scenario:
