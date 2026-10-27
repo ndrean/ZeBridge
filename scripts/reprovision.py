@@ -215,6 +215,23 @@ def main():
             if out:
                 print(f"  ✗ enable {t} was refused: {out}", file=sys.stderr)
                 refused.append(t)
+    # 7. the GC floor. init.core inserts it as (now(), threshold 0): a database starts with its floor at its
+    # own creation time, and the floor never goes down. The scenarios stamp writes 10 to 60 minutes into
+    # the past (mutate, offline, replies, intclamp), which the bridge refuses (PredatesGcWatermark) until
+    # the database is that old - so on every fresh database the first hour of the battery failed, and every
+    # reset restarted the clock. A new database has reaped nothing, so a floor in the past is true; it is
+    # staged back the way the init SQL documents for a test (the monotone trigger off, the UPDATE, on),
+    # to where a 7-day sweeper pass would leave it. A floor already older than two days is left alone.
+    if psql("SELECT watermark > now() - interval '2 days' FROM public.zebridge_gc_watermark WHERE id = 1") == "t":
+        note("stage the GC floor back to 7 days ago (a new database starts it at its creation time)")
+        if not DRY:
+            psql("ALTER TABLE public.zebridge_gc_watermark DISABLE TRIGGER zebridge_gc_watermark_monotone; "
+                 "UPDATE public.zebridge_gc_watermark SET watermark = now() - interval '7 days' WHERE id = 1; "
+                 "ALTER TABLE public.zebridge_gc_watermark ENABLE TRIGGER zebridge_gc_watermark_monotone")
+            if psql("SELECT watermark > now() - interval '2 days' FROM public.zebridge_gc_watermark WHERE id = 1") != "f":
+                print("  ✗ the GC floor could not be staged back: scenarios that write minutes into the past will be refused",
+                      file=sys.stderr)
+                refused.append("(gc floor)")
     if refused:
         print(f"\n{len(refused)} base table(s) not enabled: {', '.join(refused)}", file=sys.stderr)
         return 1
