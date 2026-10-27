@@ -59,7 +59,11 @@ async def main():
     names = attnames()
     check(f"the publication's column list has neither fts nor secret: {names}", names == "uid,body,tenant_id,inserted_at,updated_at,deleted_at")
     zb.psql(f"INSERT INTO {T} (body, secret, tenant_id) VALUES ('the quick brown fox', 'hush', '{TENANT}')", quiet=True)
-    time.sleep(3)
+    # The bridge publishes the descriptor after it has read the catalogue row, which takes as long as the bridge
+    # is busy (a fixed 3 s read an empty descriptor from a bridge still working through other tables).
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and not json.loads(zb.kv_get("schemas", T) or "{}").get("sqlite", {}).get("columns"):
+        time.sleep(1)
 
     desc = json.loads(zb.kv_get("schemas", T) or "{}")
     dcols = [c["name"] for c in desc.get("sqlite", {}).get("columns", [])]
