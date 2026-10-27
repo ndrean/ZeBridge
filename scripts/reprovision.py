@@ -52,6 +52,10 @@ BASE_TABLES = ["test_types", "orders", "users", "salaries", "memo", "note_t",
 # principal -> tenant. zb_sweeper maps to every tenant (the sidecar's identity).
 TENANTS = {"alice": "acme", "bob": "globex", "mary": "globex", "nina": "tango", "omar": "kilo"}
 SWEEPER_TENANTS = ["acme", "globex", "tango", "kilo"]
+# The outbound-only fixture (writable.py: "test_types (writable) vs users (outbound-only)"): published,
+# never granted INSERT. Its key is serial, so a writable `users` is also an error in --diagnose
+# (DbAllocatedKey: the write path would refuse every mutation for it).
+OUTBOUND_ONLY = {"users"}
 # enable params per table: (version, tombstone, tiebreak, tenant), captured from
 # the known-good catalogue. Empty string = not set.
 ENABLE = {
@@ -189,7 +193,7 @@ def main():
     refused = []
     for t in BASE_TABLES:
         v, tomb, tie, ten = ENABLE[t]
-        args = [f"'public.{t}'", "writable => true", f"version_col => '{v}'"]
+        args = [f"'public.{t}'", f"writable => {'false' if t in OUTBOUND_ONLY else 'true'}", f"version_col => '{v}'"]
         if tomb:
             args.append(f"tombstone_col => '{tomb}'")
         else:
