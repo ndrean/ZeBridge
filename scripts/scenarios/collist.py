@@ -56,6 +56,18 @@ async def main():
                  f"columns => ARRAY['uid', 'body', 'fts', 'tenant_id', 'inserted_at', 'updated_at', 'deleted_at']::name[], "
                  f"version_col => 'updated_at', tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => '{zb.publication()}', dry_run => false)", quiet=True)
     check(f"zebridge_enable left the tsvector out: {[l for l in en.splitlines() if l.startswith('columns')]}", "columns: 1 column(s) left out" in en and "fts" in en)
+    # zebridge_enable reports a refusal as a result row (status ERROR), not as a SQL error, and the check above
+    # only looks for the "columns" line: without the catalogue row the bridge refuses the table ("not
+    # tenant-scoped and no catalogue row marks it public"), builds no chain, and this scenario would wait two
+    # minutes for a manifest that cannot come. Say so now, with everything zebridge_enable returned.
+    if zb.psql(f"SELECT count(*) FROM public.zebridge_catalogue WHERE tbl = '{T}'", quiet=True).strip() != "1":
+        check("zebridge_enable wrote the catalogue row", False)
+        print("  zebridge_enable returned:\n    " + "\n    ".join(zb.psql(
+            f"SELECT step || ' [' || status || ']: ' || detail FROM public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', "
+            f"writable => true, columns => ARRAY['uid', 'body', 'fts', 'tenant_id', 'inserted_at', 'updated_at', 'deleted_at']::name[], "
+            f"version_col => 'updated_at', tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => '{zb.publication()}', "
+            f"dry_run => true)", quiet=True).splitlines()))
+        return 1
     names = attnames()
     check(f"the publication's column list has neither fts nor secret: {names}", names == "uid,body,tenant_id,inserted_at,updated_at,deleted_at")
     zb.psql(f"INSERT INTO {T} (body, secret, tenant_id) VALUES ('the quick brown fox', 'hush', '{TENANT}')", quiet=True)
