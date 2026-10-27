@@ -66,6 +66,8 @@ REQUIRED_VARS = [
     "OPEN_TENANT",
     "LEAF_PREFIX",
     "RECEIPT_COMPLETION_GUARD",
+    # The tenant guard's byte limit (zb-derive-env.py reads it from `bridge --limits`).
+    "MAX_TENANT_BYTES",
 ]
 
 ADMIN_URL = os.environ.get(

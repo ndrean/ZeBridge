@@ -1403,6 +1403,17 @@ pub const SyncClient = struct {
         defer sa.deinit();
         const a = sa.allocator();
         if (self.opts.follow_all) try self.refreshFollowed(a);
+        // The stream's identity beside its position (§10bm's third shape, made exact): a
+        // position is only meaningful on the stream it was taken on, and `stored >
+        // last_seq` can only notice a restart while the new stream is still shorter
+        // than the old position.
+        //
+        // Created BEFORE the first descriptor: `applyDescriptor` loads the table's anchors and
+        // frontiers from these on its first sight of the table, and the frontier load fails
+        // closed — on a fresh replica it read `_zbz_frontier` before it existed and the very
+        // first sync answered PrepareFailed ("no such table: _zbz_frontier").
+        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL, created TEXT)");
+        try self.ensureGenerations();
         for (self.followed) |table| {
             const bytes = (try self.t.kvGet(a, self.kv_schemas, table)) orelse {
                 log.info("schema missing for {s}", .{table});
@@ -1411,13 +1422,7 @@ pub const SyncClient = struct {
             const val = (try std.json.parseFromSlice(Value, a, bytes, .{})).value;
             try self.applyDescriptor(a, table, val);
         }
-        // The stream's identity beside its position (§10bm's third shape, made exact): a
-        // position is only meaningful on the stream it was taken on, and `stored >
-        // last_seq` can only notice a restart while the new stream is still shorter
-        // than the old position.
-        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL, created TEXT)");
         try ensureInbox(&self.st);
-        try self.ensureGenerations();
         try ensureShape(&self.st);
         // A schema that just moved may be what a held event was waiting for.
         self.retryHeld(null, null);

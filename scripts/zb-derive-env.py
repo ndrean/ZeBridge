@@ -25,6 +25,7 @@ import json
 import os
 import pathlib
 import shlex
+import subprocess
 import sys
 from urllib.parse import unquote
 
@@ -37,6 +38,19 @@ def _split(url: str) -> tuple[str, str]:
     creds = rest.rsplit("@", 1)[0] if "@" in rest else ""
     user, _, password = creds.partition(":")
     return unquote(user), unquote(password)
+
+
+def _tenant_limit(env) -> str:
+    """`bridge --limits` -> tenant_bytes. It exits before reading any configuration."""
+    binary = env.get("ZB_BRIDGE_BIN") or str(ROOT / "zig-out" / "bin" / "bridge")
+    try:
+        res = subprocess.run([binary, "--limits"], capture_output=True, text=True, timeout=10, check=True)
+        return str(int(json.loads(res.stdout)["tenant_bytes"]))
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError) as e:
+        raise ValueError(
+            f"MAX_TENANT_BYTES: `{binary} --limits` failed ({e}) — build the bridge (zig build), "
+            "or set ZB_BRIDGE_BIN, or set MAX_TENANT_BYTES yourself"
+        ) from e
 
 
 def derive_into(env) -> dict:
@@ -67,6 +81,11 @@ def derive_into(env) -> dict:
         grammar = json.loads((ROOT / "src" / "grammar.json").read_text())
         env["LEAF_PREFIX"] = grammar.get("leaf_prefix", "lf-")
         out["LEAF_PREFIX"] = env["LEAF_PREFIX"]
+    # The tenant guard's length limit is the build's (src/limits.zig: 128 with the pinned
+    # client library, 46 without), so it is read from the bridge, not copied here. Empty
+    # renders `octet_length(x) <= ` — init.write.template.sql does not apply.
+    if not env.get("MAX_TENANT_BYTES"):
+        env["MAX_TENANT_BYTES"] = out["MAX_TENANT_BYTES"] = _tenant_limit(env)
     # Legacy envsubst installs enable the guard by default. An explicit override
     # can set false; bridge --init-sql uses its own build option instead.
     if not env.get("RECEIPT_COMPLETION_GUARD"):
