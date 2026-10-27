@@ -51,7 +51,7 @@ async def main():
             f"meta jsonb, tile bytea, geom geometry(Point, 4326), note text, tenant_id text NOT NULL, inserted_at timestamptz NOT NULL DEFAULT now(), "
             f"updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)", quiet=True)
     zb.psql(f"SELECT public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', writable => true, version_col => 'updated_at', "
-            f"tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => 'my_pub', dry_run => false)", quiet=True)
+            f"tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => '{zb.publication()}', dry_run => false)", quiet=True)
     zb.ok(f"{T} created and enabled on the master")
     zb.psql(f"INSERT INTO {T} (n, price, ok, tags, matrix, meta, tile, geom, note, tenant_id) VALUES "
             f"(7, 12.5000, true, ARRAY['a', 'b c'], ARRAY[[1, 2], [3, 4]], '{{\"src\": \"seed\", \"k\": 1}}', decode('00ff10', 'hex'), ST_SetSRID(ST_MakePoint(2.3522, 48.8566), 4326), 'seed', '{TENANT}')", quiet=True)

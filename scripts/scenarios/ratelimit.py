@@ -48,7 +48,7 @@ async def main():
     zb.psql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), note text, tenant_id text NOT NULL, "
             f"inserted_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)", quiet=True)
     zb.psql(f"SELECT public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', writable => true, version_col => 'updated_at', "
-            f"tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => 'my_pub', dry_run => false)", quiet=True)
+            f"tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => '{zb.publication()}', dry_run => false)", quiet=True)
 
     with zb.Bridge("/tmp/zb_ratelimit_bridge.log", MUTATION_RATE_PER_PRINCIPAL=str(RATE), MUTATION_RATE_BURST=str(BURST)) as br:
         await asyncio.sleep(8)

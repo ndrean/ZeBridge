@@ -34,7 +34,7 @@ def check(msg, cond):
 
 
 def attnames():
-    return zb.psql(f"SELECT array_to_string(attnames, ',') FROM pg_publication_tables WHERE pubname = 'my_pub' AND tablename = '{T}'", quiet=True).strip()
+    return zb.psql(f"SELECT array_to_string(attnames, ',') FROM pg_publication_tables WHERE pubname = '{zb.publication()}' AND tablename = '{T}'", quiet=True).strip()
 
 
 async def main():
@@ -54,7 +54,7 @@ async def main():
     zb.psql(f"CREATE PUBLICATION col_stray FOR TABLE public.{T} (uid, tenant_id, secret)", quiet=True)
     en = zb.psql(f"SELECT step || ': ' || detail FROM public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', writable => true, "
                  f"columns => ARRAY['uid', 'body', 'fts', 'tenant_id', 'inserted_at', 'updated_at', 'deleted_at']::name[], "
-                 f"version_col => 'updated_at', tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => 'my_pub', dry_run => false)", quiet=True)
+                 f"version_col => 'updated_at', tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => '{zb.publication()}', dry_run => false)", quiet=True)
     check(f"zebridge_enable left the tsvector out: {[l for l in en.splitlines() if l.startswith('columns')]}", "columns: 1 column(s) left out" in en and "fts" in en)
     names = attnames()
     check(f"the publication's column list has neither fts nor secret: {names}", names == "uid,body,tenant_id,inserted_at,updated_at,deleted_at")
@@ -106,7 +106,7 @@ async def main():
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline and not zb.kv_get("generations", f"{TENANT}.{T}"): time.sleep(2)
     import os, subprocess
-    a = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--tenant", TENANT, "--table", T, "--pub", "my_pub", "--no-replay"], capture_output=True, text=True)
+    a = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--tenant", TENANT, "--table", T, "--pub", zb.publication(), "--no-replay"], capture_output=True, text=True)
     check("the audit finds the chain exact over the published columns", "✓ the chain mirrors PostgreSQL" in a.stdout)
     if "✓ the chain mirrors PostgreSQL" not in a.stdout: print(a.stdout[-800:])
 
@@ -114,7 +114,7 @@ async def main():
     zb.psql(f"ALTER TABLE {T} ADD COLUMN extra int", quiet=True)
     before = attnames()
     en2 = zb.psql(f"SELECT step || ': ' || detail FROM public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', writable => true, "
-                  f"version_col => 'updated_at', tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => 'my_pub', dry_run => false)", quiet=True)
+                  f"version_col => 'updated_at', tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => '{zb.publication()}', dry_run => false)", quiet=True)
     after = attnames()
     check(f"ADD COLUMN, then zebridge_enable again: the list refreshed ({before} → {after})", "extra" not in before and "extra" in after and "fts" not in after)
     zb.psql(f"DROP TABLE public.{T}", quiet=True)

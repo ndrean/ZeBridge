@@ -49,7 +49,7 @@ async def main():
     zb.psql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), note text, ver bigint NOT NULL DEFAULT 1, tenant_id text NOT NULL, "
             f"inserted_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)", quiet=True)
     en = zb.psql(f"SELECT step || ': ' || detail FROM public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', writable => true, version_col => 'ver', "
-                 f"tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => 'my_pub', dry_run => false)", quiet=True)
+                 f"tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => '{zb.publication()}', dry_run => false)", quiet=True)
     enabled = "publication:" in en and ("ADD TABLE" in en or "already" in en)
     check(f"{T} enabled with a bigint version column", enabled)
     if not enabled: print(en)
