@@ -38,6 +38,10 @@ const usage =
     \\                              refused, and devices renew on their own. Then restart the
     \\                              bridge. Takes --dir and --store like --update
     \\
+    \\  --limits        The identifier limits of this build, in bytes, as JSON on stdout: the
+    \\                  longest tenant id and table name, and the subject buffer (CLAUDE.md,
+    \\                  "Troubleshooting"). Reads nothing.
+    \\
     \\  --init-sql      The init SQL for this database, on stdout (pipe it to psql). Reads
     \\                  DATABASE_READER_URL, DATABASE_WRITER_URL, BRIDGE_CDC_PUBLICATION
     \\
@@ -213,7 +217,7 @@ pub const gen_nkey_flag = "--gen-nkey";
 
 /// Flags that REPLACE the program instead of configuring it: they read no environment,
 /// open nothing, and their whole output IS the answer.
-pub const EarlyExit = enum { help, version, gen_nkey, init_nats, init_sql, mint_responder, mint_archiver, mint_sensor, mint_leaf, mutation_ingress, invite, demo_invites, revoke, view_slots, view_slot, drop_slot };
+pub const EarlyExit = enum { help, version, limits, gen_nkey, init_nats, init_sql, mint_responder, mint_archiver, mint_sensor, mint_leaf, mutation_ingress, invite, demo_invites, revoke, view_slots, view_slot, drop_slot };
 
 /// Answered from argv by `main` BEFORE the log level is resolved and before anything
 /// else prints — boot noise on stderr is noise in a command meant to be piped
@@ -230,6 +234,7 @@ pub fn earlyExit(init: *const std.process.Init) ?EarlyExit {
             if (std.mem.eql(u8, arg, flag)) return .help;
         }
         if (std.mem.eql(u8, arg, "--version")) return .version;
+        if (std.mem.eql(u8, arg, "--limits")) return .limits;
         if (std.mem.eql(u8, arg, gen_nkey_flag)) return .gen_nkey;
         if (std.mem.eql(u8, arg, "--init-nats")) return .init_nats;
         if (std.mem.eql(u8, arg, "--mint-responder")) return .mint_responder;

@@ -118,8 +118,8 @@ BEGIN
         -- fails with '"<table>" is not an index', which names nothing to do (measured
         -- 2026-10-26). Say what is wrong while there is still nothing to undo.
         IF idx_name = (SELECT relname FROM pg_class WHERE oid = tbl) THEN
-            RAISE EXCEPTION 'table name % is % characters: the replica-identity index name derived from it (<table>_zb_ri) is cut to the table''s own name. Rename the table to at most 62 characters, or make the tenant part of the replica identity yourself (a unique index on (%, primary key) and ALTER TABLE ... REPLICA IDENTITY USING INDEX)',
-                tbl, length(idx_name), tenant_col;
+            RAISE EXCEPTION 'table name % is % bytes: the replica-identity index name derived from it (<table>_zb_ri) is cut to the table''s own name. Rename the table to at most 62 bytes, or make the tenant part of the replica identity yourself (a unique index on (%, primary key) and ALTER TABLE ... REPLICA IDENTITY USING INDEX)',
+                tbl, octet_length(idx_name), tenant_col;
         END IF;
         EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %s (%s)', idx_name, tbl, col_list);
         EXECUTE format('ALTER TABLE %s REPLICA IDENTITY USING INDEX %I', tbl, idx_name);

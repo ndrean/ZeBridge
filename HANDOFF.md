@@ -64,14 +64,14 @@ Priority after the GC floor: a deployment security audit and a real backup/resto
 
 The first `zb_client_sync` of a libzb client answers `PrepareFailed` (no detail) on the private stacks, with the tenant mapping and the schema both published; the next polls seed normally. `multi_bridge.py` shows the same on unmodified `main`, so it predates the GC-floor work. The private-stack scenarios ignore that first answer (as `recreate_recovery.py`'s worker always did); worth finding which SQLite statement fails and why, since a host that treats a sync error as fatal would stop there.
 
-## Walls: fixed 2026-10-27, and what is left
+## Walls: fixed 2026-10-27 (PR 21), reviewed, and what is left
 
-The four defects of the troubleshooting reference are fixed on `walls-fixes` (NOTES "A bridge that could not return, and the limits it hit"; `scripts/scenarios/walls.py` A–G, `http_server.zig` and `batch_publisher.zig` unit tests, each shown to fail without its fix). Left, deliberately:
+NOTES "A bridge that could not return, and the limits it hit" and "Identifiers are measured in bytes, and the limits do not drop rows". `scripts/scenarios/walls.py` A–G and I, unit tests in `limits.zig`, `drops.zig`, `http_server.zig`, `batch_publisher.zig`.
 
-- Rows dropped for an unusable tenant or an overlong subject are **log lines only**, not a metric. A counter (like `bridge_refused_events_dropped_total`) and a `--diagnose` finding would let an operator see them without reading the log.
-- Nothing scans existing data at enable time for tenant values over 92 characters; the first row or the producer's first build says so. A check in `zebridge_enable`/`--diagnose` (`WHERE length(tenant) > 92`) would say it before the first row.
-- The 128-byte subject buffer is still shorter than the longest legal subject (92 + 62 + prefix); the check turns that into a loud drop, not a larger buffer (every ring slot would grow).
-- Not replayed on the native stack: only the private stack (`walls.py`).
+- **Before release: apply the fork patch.** `nats.zig-patch/pending/42-nats.zig-subject-length.patch` (README there) makes the tenant limit 128 bytes instead of 46; it could not be pushed from the session that wrote it. Verified both ways here: the patched library (`walls.py` A–I, tenants of 128 bytes with a 62-byte table, a 90-byte tenant with a 40-byte table) and the pinned one (limit 46).
+- A deployment with tenants of 47 to 92 bytes that worked with short tables is refused on new rows (guard) and found by `--diagnose` until the patch is applied. Counters restart at 0 on a bridge restart; `bridge_table_degraded` means "dropped since boot", not "inconsistent": `zebridge_reseed` is what makes it consistent.
+- Not done: the per-table health is a metric and a `/dropped` list; there is no persisted "table needs reseed" flag in PostgreSQL (`zebridge_suspensions` holds suspensions only).
+- Not replayed on the native dev stack: only private stacks (`walls.py`).
 
 ## Open decisions and ideas
 

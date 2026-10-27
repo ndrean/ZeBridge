@@ -49,6 +49,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const pg_conn = @import("pg_conn.zig");
 const utils = @import("utils.zig");
+const limits = @import("limits.zig");
 const encoder_mod = @import("encoder.zig");
 const pgoutput = @import("pgoutput.zig");
 const nats = @import("nats");
@@ -2664,8 +2665,8 @@ pub const GenerationProducer = struct {
         // A tenant that cannot be a subject token has no CDC stream the bridge will fill (the event
         // path drops its rows) and no object-store subject that fits NATS's 255 characters. Building
         // anyway failed every cadence with a bare `InvalidSubject` (measured at 93 characters).
-        if (!utils.isSubjectToken(tenant)) {
-            log.err("🧬 '{s}'/'{s}': no generation is built — the tenant id ({d} characters) cannot be a subject token (empty, '.', '*', '>', whitespace, or longer than {d}); its rows are not published either", .{ tenant, table, tenant.len, utils.max_subject_token_len });
+        if (!utils.isSubjectToken(tenant, limits.max_tenant_bytes)) {
+            log.err("🧬 '{s}'/'{s}': no generation is built — the tenant id ({d} characters) cannot be a subject token (empty, '.', '*', '>', whitespace, or longer than {d}); its rows are not published either", .{ tenant, table, tenant.len, limits.max_tenant_bytes });
             return false;
         }
         // §10gf: one build of a pair at a time, the full lane's snapshot and attach included.

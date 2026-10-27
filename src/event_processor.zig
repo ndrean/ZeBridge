@@ -11,6 +11,8 @@ const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
 const utils = @import("utils.zig");
+const limits = @import("limits.zig");
+const Drops = @import("drops.zig");
 const Config = @import("config.zig");
 const RefusedTables = @import("refused_tables.zig");
 const WritableTables = @import("writable_tables.zig");
@@ -202,6 +204,8 @@ pub const EventProcessor = struct {
     /// Same role `writable`'s verdicts were checked against, so a table appearing after
     /// boot is graded by the same grant `preflight.run` used.
     writer_role: ?[]const u8,
+    /// Rows dropped before publication, by table and reason (`/metrics`, `/status`, `--diagnose`).
+    drops: *Drops.Registry,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -218,6 +222,7 @@ pub const EventProcessor = struct {
         event_buf_bytes: usize,
         writable: *WritableTables.Registry,
         writer_role: ?[]const u8,
+        drops: *Drops.Registry,
     ) EventProcessor {
         return .{
             .allocator = allocator,
@@ -233,6 +238,7 @@ pub const EventProcessor = struct {
             .event_buf_bytes = event_buf_bytes,
             .writable = writable,
             .writer_role = writer_role,
+            .drops = drops,
         };
     }
 
@@ -658,7 +664,7 @@ pub const EventProcessor = struct {
                 // Quarantined rather than sanitised: rewriting the value would route the
                 // row to a tenant that does not exist, which is worse than not routing it.
                 if (raw) |v| {
-                    if (utils.isSubjectToken(v)) break :blk v;
+                    if (utils.isSubjectToken(v, limits.max_tenant_bytes)) break :blk v;
                     unusable_tenant_len = v.len;
                 }
                 break :blk null;
@@ -686,15 +692,17 @@ pub const EventProcessor = struct {
             if (unusable_tenant_len) |n| {
                 // The value is there; it cannot be a subject token. Say so, instead of sending
                 // the operator to the replica identity (measured 2026-10-26: that text for a
-                // 93-character tenant).
-                log.err(
-                    "🔴 Dropping {s} on '{s}': its tenant value ({d} characters, column '{s}') cannot be a subject token — it is empty, contains '.', '*', '>', whitespace or a control character, or is longer than {d}. The row is not published; fix the value in PostgreSQL.",
-                    .{ operation_lower, rel.name, n, named, utils.max_subject_token_len },
+                // 93-byte tenant).
+                const count = self.drops.record(rel.name, .tenant_unusable, utils.nowUnix());
+                if (Drops.Registry.shouldLog(count)) log.err(
+                    "🔴 Dropping {s} on '{s}' (#{d} since boot): its tenant value ({d} bytes, column '{s}') cannot be a subject token — it is empty, contains '.', '*', '>', whitespace or a control character, or is longer than {d} bytes. The row is not published and is missing from every replica until: {s}.",
+                    .{ operation_lower, rel.name, count, n, named, limits.max_tenant_bytes, Drops.Reason.tenant_unusable.fixHint() },
                 );
             } else {
-                log.err(
-                    "🔴 Quarantining {s} on '{s}' to '.unrouted': the catalogue names tenant column '{s}' but this event carries no value for it. Check that the replica identity still covers it.",
-                    .{ operation_lower, rel.name, named },
+                const count = self.drops.record(rel.name, .tenant_missing, utils.nowUnix());
+                if (Drops.Registry.shouldLog(count)) log.err(
+                    "🔴 Quarantining {s} on '{s}' to '.unrouted' (#{d} since boot): the catalogue names tenant column '{s}' but this event carries no value for it. Check that the replica identity still covers it.",
+                    .{ operation_lower, rel.name, count, named },
                 );
             }
             // ⚠️ Not published, even quarantined: no stream binds an `unrouted` subject, so
@@ -732,23 +740,22 @@ pub const EventProcessor = struct {
         }
 
         // Create NATS subject
-        var subject_buf: [Config.Buffers.subject_buffer_size]u8 = undefined;
-        // ⚠️ A subject that does not fit the buffer used to return `NoSpaceLeft` from here, which
-        // the caller passes up as `else => return err`: `main` returned, and the bridge (with its
-        // joins) stopped without a word. The row cannot be published whatever is done to the
-        // bridge, so it is dropped loudly — same fate as an unusable tenant value — and
-        // replication goes on.
-        if (!utils.cdcSubjectFits(
-            subject_buf.len,
+        var subject_buf: [limits.subject_buffer_bytes]u8 = undefined;
+        // The buffer is sized for the longest SUPPORTED tenant, table, operation and suffix
+        // (limits.zig), and the prefix is checked at boot, so this cannot fire for them. It is the
+        // backstop: `NoSpaceLeft` from the formatting below used to leave `main` through
+        // `else => return err`, and the bridge died without a word (2026-10-26).
+        if (!limits.fits(
             self.topology.subject_cdc_prefix.len,
             if (routed) |t| t.len else null,
             rel.name.len,
             operation_lower.len,
             if (suffix) |s| s.len else null,
         )) {
-            log.err(
-                "🔴 Dropping {s} on '{s}': its subject (tenant {d} characters, table {d}) does not fit the {d}-byte subject buffer. The row is not published; shorten the table name or the tenant id.",
-                .{ operation_lower, rel.name, if (routed) |t| t.len else 0, rel.name.len, subject_buf.len },
+            const count = self.drops.record(rel.name, .subject_too_long, utils.nowUnix());
+            if (Drops.Registry.shouldLog(count)) log.err(
+                "🔴 Dropping {s} on '{s}' (#{d} since boot): its subject (tenant {d} bytes, table {d} bytes, prefix {d} bytes) does not fit the {d}-byte subject buffer. The row is not published and is missing from every replica until: {s}.",
+                .{ operation_lower, rel.name, count, if (routed) |t| t.len else 0, rel.name.len, self.topology.subject_cdc_prefix.len, subject_buf.len, Drops.Reason.subject_too_long.fixHint() },
             );
             return error.EventDropped;
         }

@@ -39,6 +39,8 @@ const c = c_imports.c;
 const utils = @import("utils.zig");
 const preflight = @import("preflight.zig");
 const refused_tables = @import("refused_tables.zig");
+const drops_mod = @import("drops.zig");
+const ident_limits = @import("limits.zig");
 const rls_guard = @import("rls_guard.zig");
 const writable_tables = @import("writable_tables.zig");
 const type_registry = @import("type_registry.zig");
@@ -744,6 +746,13 @@ pub fn main(init: std.process.Init) !void {
     if (args.earlyExit(&init)) |what| switch (what) {
         .help => return args.printUsage(init.io),
         .version => return std.Io.File.stdout().writeStreamingAll(init.io, "bridge " ++ @import("build_options").version ++ "\n"),
+        .limits => {
+            var buf: [256]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{{\"tenant_bytes\":{d},\"table_bytes\":{d},\"tenant_scoped_table_bytes\":{d},\"subject_buffer_bytes\":{d},\"max_prefix_bytes\":{d}}}\n", .{
+                ident_limits.max_tenant_bytes, ident_limits.max_table_bytes, ident_limits.max_tenant_scoped_table_bytes, ident_limits.subject_buffer_bytes, ident_limits.max_prefix_bytes,
+            }) catch return error.NoSpaceLeft;
+            return std.Io.File.stdout().writeStreamingAll(init.io, text);
+        },
         .gen_nkey => return nkey_gen.genNkey(init.io),
         .init_nats => return std.process.exit(nats_init.run(init.io, &init)),
         .mint_responder => return std.process.exit(nats_init.mintResponder(init.io, &init)),
@@ -1030,6 +1039,8 @@ pub fn main(init: std.process.Init) !void {
     // has no primary key, and the mutation path must honour either verdict.
     var refused = refused_tables.Registry.init(allocator);
     defer refused.deinit();
+    // Rows dropped before publication, by table and reason (drops.zig): /metrics, /status, /dropped.
+    var drops_reg = drops_mod.Registry{};
     // The pairs the generation producer is not publishing because the reader's row-level
     // security may hide rows (rls_guard.zig); rendered on /metrics.
     var rls_blocked = rls_guard.Registry.init(allocator);
@@ -1287,6 +1298,19 @@ pub fn main(init: std.process.Init) !void {
         std.fmt.parseInt(i64, v, 10) catch 5000
     else
         5000;
+    // The slot's subject buffer is sized for the longest supported tenant, table, operation and
+    // suffix PLUS the grammar's subject prefix (limits.zig). A prefix beyond that would make
+    // supported identifiers overflow it, so refuse to start rather than drop rows later.
+    if (runtime_config.topology.subject_cdc_prefix.len > ident_limits.max_prefix_bytes) {
+        log.err("🔴 the CDC subject prefix '{s}' is {d} bytes; the subject buffer holds supported identifiers only up to {d} bytes of prefix. Shorten subjects.cdc_prefix in grammar.json.", .{
+            runtime_config.topology.subject_cdc_prefix, runtime_config.topology.subject_cdc_prefix.len, ident_limits.max_prefix_bytes,
+        });
+        return error.SubjectPrefixTooLong;
+    }
+    log.info("Identifier limits (bytes): tenant {d}, table {d}; CDC subject buffer {d} (the longest supported subject takes {d})", .{
+        ident_limits.max_tenant_bytes, ident_limits.max_table_bytes, ident_limits.subject_buffer_bytes, ident_limits.longestCdcSubjectBytes(runtime_config.topology.subject_cdc_prefix.len),
+    });
+
     ensureBaseTopology(allocator, &publisher, &runtime_config.topology, backlog_per_principal, if (admission_filter != null) try mutation_admission.Limits.fromEnv(&init) else null) catch |err| {
         log.err("🔴 FATAL: could not ensure the MUTATIONS / VERDICTS streams and the KV buckets ({s}) — refusing to start.", .{@errorName(err)});
         should_stop.store(true, .seq_cst);
@@ -1306,6 +1330,7 @@ pub fn main(init: std.process.Init) !void {
     // Make publisher available to HTTP server for stream management
     http_srv.nats_publisher = &publisher;
     http_srv.refused = &refused;
+    http_srv.drops = &drops_reg;
 
     // Initialize schema cache for tracking relation_id changes
     log.debug("Schema cache initialized\n", .{});
@@ -1558,6 +1583,7 @@ pub fn main(init: std.process.Init) !void {
         @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2),
         &writable,
         writer_role,
+        &drops_reg,
     );
     defer event_proc.deinit();
     event_proc.cat = &cat; // §10df: the descriptor carries each table's seed_epoch
@@ -3081,6 +3107,8 @@ test {
     _ = @import("catalog_epoch.zig");
     _ = @import("config.zig");
     _ = @import("diagnose_live.zig");
+    _ = @import("drops.zig");
+    _ = @import("limits.zig");
     _ = @import("encoder.zig");
     _ = @import("event_processor.zig");
     _ = @import("fleet_monitor.zig");

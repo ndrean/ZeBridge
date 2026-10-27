@@ -13,6 +13,7 @@ const msgpack = @import("msgpack");
 const pgoutput = @import("pgoutput.zig");
 const SPSCQueue = @import("spsc_queue.zig").SPSCQueue;
 const Config = @import("config.zig");
+const limits = @import("limits.zig");
 const hot_streams = @import("hot_streams.zig");
 const encoder_mod = @import("encoder.zig");
 const Metrics = @import("metrics.zig").Metrics;
@@ -96,7 +97,7 @@ pub const per_event_envelope_bytes: usize = 256;
 
 pub const CDCEvent = struct {
     // Fixed-size buffers for metadata (inline storage, no heap allocation)
-    subject_buf: [128]u8 = undefined,
+    subject_buf: [limits.subject_buffer_bytes]u8 = undefined,
     subject_len: u8 = 0,
 
     table_buf: [64]u8 = undefined,
