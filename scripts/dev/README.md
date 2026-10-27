@@ -59,6 +59,20 @@ The `owns` scenarios log their own probe bridge in `/tmp/zb_*.log`, named in eac
 The scenarios drive `psql` from the host (`ZB_PGBIN`, or `ZB_PSQL`: see the scenarios' README). Only the client
 binaries are needed, not a running Homebrew server.
 
+## Once, before the scenarios
+
+Found by running the whole battery on a clean machine; none of it is in the scenarios' own setup text.
+
+| need | for | how |
+| -- | -- | -- |
+| the TypeScript client's dependencies | `outbox_*`, `reconcile`, `hub_fallback`, `jwt_renew` (`ERR_MODULE_NOT_FOUND: better-sqlite3`) | `cd zb-client-ts && pnpm install` |
+| the Node worker's dependencies | `migrate_both`, `column_flood`, `rekey_*`, `offline_migrate`, `cascade_held`, `tombstone_children`, `suspension_reasons`, `rebuild_kill` (`node worker did not come up`: it cannot resolve `@zebridge/client`, a `link:` dependency of an example outside the workspace) | `cd examples/04-node-consumer && pnpm install` |
+| the `zstd` command | `shared_gap` | `brew install zstd` |
+| the demo `routes` table | `route_crdt` (`no such table: routes`) | `python examples/08-map/load_routes.py --create` (set `ZB_PSQL` if your `psql` is not Homebrew's) |
+| Python 3.14 for the venv | `serve` (`from compression import zstd`) | `brew install python@3.14`, then `python3.14 -m venv …` |
+| SeaweedFS S3 on `:8333` | `readings_roles`, `archive`, the S3 case of `readings_fetch` | start it yourself |
+| the `zebridge-leaf-nats:2.15.0-security` image | `leaf_security` | no documented command builds it |
+
 ## What runs
 
 | service | image | host ports | what |
