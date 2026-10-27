@@ -315,6 +315,18 @@ def main() -> int:
                   "  Re-apply init.core.template.sql and init.write.template.sql (bridge --init-sql), then run again.\n"
                   "  --no-preflight skips this check.")
             return False
+        # The baseline the scenarios assume: the fixture tables and the principals' tenants. They come from
+        # scripts/reprovision.py (neither up.sh nor the init SQL creates them), and without them the first
+        # scenarios fail on "relation public.test_types does not exist" and, in the bridge log, "no tenant for
+        # a write … principal 'omar' is unset or not in zebridge_user_tenants" - one cause, many scenarios.
+        base = subprocess.run([PY, "-c", "import zb; print(zb.psql(\"SELECT (to_regclass('public.test_types') IS NOT NULL) || ',' || "
+                               "(SELECT count(*) FROM public.zebridge_user_tenants WHERE principal = 'omar')\", quiet=True))"],
+                              cwd=HERE, env=env_for("bridge"), capture_output=True, text=True).stdout.strip()
+        if base and base.split(",")[0] != "true" or base.endswith(",0"):
+            print("preflight: the baseline is missing (" + ("no public.test_types table" if not base.startswith("true") else "no tenant mapping for 'omar'") +
+                  ").\n  Run scripts/reprovision.py, then restart the bridge: it republishes every schema at boot.\n"
+                  "  --no-preflight skips this check.")
+            return False
         holders = subprocess.run([PY, "-c", "import zb; print(zb.psql(\"SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=23106 "
                                   "AND objid=1 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())\", quiet=True))"],
                                  cwd=HERE, env=env_for("bridge"), capture_output=True, text=True).stdout.strip()
