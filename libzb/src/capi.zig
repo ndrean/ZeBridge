@@ -1078,7 +1078,12 @@ export fn zb_client_sync(handle: u64) ?[*:0]u8 {
     defer arena.deinit();
     const out = syncJson(arena.allocator(), b) catch |err| {
         if (purgeIfAsked(handle, b)) return errJson("Revoked");
-        return errJson(@errorName(err));
+        // Like the query path: the name alone ("PrepareFailed") does not say which statement
+        // the replica refused; SQLite's message names the table, the column or the syntax.
+        return switch (err) {
+            error.PrepareFailed, error.BindFailed, error.StepFailed => errJsonDetail(@errorName(err), b.c.st.errMsg()),
+            else => errJson(@errorName(err)),
+        };
     };
     return dupeZ(out);
 }
