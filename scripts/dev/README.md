@@ -22,13 +22,20 @@ pass its name, as in the first command above. Nothing else may listen on 5432,
 4222, 8222, 8080 or 1883: stop a Homebrew PostgreSQL first (`brew services stop postgresql@18`, and any
 `scripts/native/up.sh` stack with `scripts/native/down.sh`).
 
-`up.sh` ends by printing the next steps. In short, from the repository root, with the scenarios' venv, `.env.bridge` sourced and the same
-`BRIDGE_CDC_PUBLICATION` exported:
+`up.sh` ends by printing the next steps. From the repository root:
 
 ```sh
+# once: the scenarios' Python environment (nats-py, nkeys, msgpack, duckdb, boto3)
+python3 -m venv scripts/scenarios/.venv
+scripts/scenarios/.venv/bin/pip install -r scripts/scenarios/requirements.txt
+
+# every terminal: reprovision.py and run.py are run by the venv's Python, so activate it
+source scripts/scenarios/.venv/bin/activate
+set -a && . ./.env.bridge && set +a && export BRIDGE_CDC_PUBLICATION=zb_pub   # the name given to up.sh
+
 scripts/reprovision.py                  # baseline tables, catalogue rows and tenant mappings
-zig-out/bin/bridge                      # the long-running bridge on :27434, for the `live` group
-scripts/scenarios/run.py all
+zig-out/bin/bridge --pub $BRIDGE_CDC_PUBLICATION   # in its own terminal: the long-running bridge on :27434, for the `live` group
+scripts/scenarios/run.py all            # in another terminal, same environment
 ```
 
 The scenarios drive `psql` from the host (`ZB_PGBIN`, or `ZB_PSQL`: see the scenarios' README). Only the client

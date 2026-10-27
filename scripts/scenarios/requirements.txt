@@ -5,3 +5,7 @@ nkeys>=0.2
 msgpack>=1.0
 # examples/09-event MQTT devices (mqtt_sensors.py): the plain MQTT client a device would use.
 paho-mqtt>=2.1
+# examples/16-archive (archiver.py, responder.py) and the scenarios that run them (readings_fetch,
+# readings_roles, archive): Parquet through DuckDB, the S3 sink through boto3.
+duckdb>=1.0
+boto3>=1.34

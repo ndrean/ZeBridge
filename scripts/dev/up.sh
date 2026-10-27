@@ -69,8 +69,17 @@ fi
 cat <<EOF
 
 [dev] up. PostgreSQL 127.0.0.1:5432, NATS 127.0.0.1:4222 (operator mode), credentials in scripts/native/creds/.
-Next, from the repository root, with the scenarios' venv active:
+Next, from the repository root.
+
+Once (the scenarios' Python environment: nats-py, nkeys, msgpack, duckdb, boto3):
+  python3 -m venv scripts/scenarios/.venv
+  scripts/scenarios/.venv/bin/pip install -r scripts/scenarios/requirements.txt
+
+Every terminal (reprovision.py and run.py are run by the venv's Python, so activate it):
+  source scripts/scenarios/.venv/bin/activate
   set -a && . ./.env.bridge && set +a && export BRIDGE_CDC_PUBLICATION=$BRIDGE_CDC_PUBLICATION
+
+Then:
   scripts/reprovision.py                       # the baseline tables, catalogue rows and tenant mappings
   zig-out/bin/bridge --pub \$BRIDGE_CDC_PUBLICATION   # the long-running bridge on :27434 (the live group), in its own terminal
   scripts/scenarios/run.py all                 # in another terminal, same environment
