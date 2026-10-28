@@ -99,7 +99,7 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
     nc: {}, tenantValue: 'acme', syncedTables, ondemandSet: new Set(), seedInFlight: new Map(),
     globalSyncState: { seq }, tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(), replacing: new Map(),
     streamWork: Promise.resolve(), streamsSubscribed: true, restarted: new Set(), failed: new Set(), hubOnly: new Set(),
-    applyingByChoice: new Set(), healedRoutes: new Set(), streamCreated, fkHeld: [], hlcFloor: '', frontiers: new Map(), frontierGated: 0,
+    applyingByChoice: new Set(), healedRoutes: new Set(), streamCreated, streamBornEmpty: new Set(), fkHeld: [], hlcFloor: '', frontiers: new Map(), frontierGated: 0,
     lateSeeds: new Set<string>(), reseedKicks: new Map(), fkHolds: 0, scheduleRecount: () => {},
     waits: [] as string[], waitForChain(tb: string) { (this as any).waits.push(tb); }, pendingWrites: new Map(), rebase: new Map(), bulkStats: { single: 0, statements: 0, bulked: 0, fallbacks: 0 },
     measure: new Measure(() => {}), dialect: sqliteDialect, storage: {}, platform: {},

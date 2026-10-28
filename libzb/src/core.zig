@@ -1344,8 +1344,18 @@ pub fn fullPredatesReplica(man: Value, plan: std.json.Array, stored_seq: i64) bo
 /// replication slot seen from a client (NOTES §10bm): WAL the bridge never saw leaves
 /// no hole in the numbering, so the bridge recreates the CDC streams on a new slot and
 /// this is the only trace a client can read. `last_seq < 0` = unknown (not checked).
-pub fn streamHasGap(first_seq: i64, stored: i64, last_seq: i64) bool {
-    if (stored == 0) return true;
+///
+/// One exception to the first shape, `born_empty`: the client recorded this stream's identity while the stream had
+/// never held a message (`first_seq` 0 and `last_seq` 0: JetStream numbers from 1, and a stream that held messages and
+/// lost them reads `first_seq == last_seq + 1`), it is the same stream, and it is still empty. A position of 0 is then
+/// the whole truth: there is nothing a client could have missed. Without the exception a quiet CDC_PUBLIC (a fresh
+/// stack, a deployment with no open-tenant rows yet) counted as gapped at every connect, and each connect re-seeded
+/// every table with a shared route, through a fence where the table was already seeded.
+/// ⚠️ `born_empty` is the CLIENT's durable word, set only on the first sight of an empty stream and cleared by every
+/// reset of a position (a restart, a recreation): a bare "the stream is empty now" is also what a stream recreated
+/// after a lost slot looks like, and that one must stay a gap until its tables are re-seeded.
+pub fn streamHasGap(first_seq: i64, stored: i64, last_seq: i64, born_empty: bool) bool {
+    if (stored == 0) return !(born_empty and first_seq == 0 and last_seq == 0);
     if (first_seq > 0 and stored < first_seq - 1) return true;
     if (last_seq >= 0 and stored > last_seq) return true;
     return false;
@@ -1363,7 +1373,11 @@ pub fn scopeSeeding(a: std.mem.Allocator, streams: Value, tables: Value) !Value 
             const first_seq = getInt(e.value_ptr.*, "firstSeq") orelse 0;
             const last_seq = getInt(e.value_ptr.*, "lastSeq") orelse -1;
             const stored = getInt(e.value_ptr.*, "stored") orelse 0;
-            if (streamHasGap(first_seq, stored, last_seq)) try gapped.append(.{ .string = e.key_ptr.* });
+            const born_empty = if (e.value_ptr.* == .object)
+                (if (e.value_ptr.object.get("bornEmpty")) |b| (b == .bool and b.bool) else false)
+            else
+                false;
+            if (streamHasGap(first_seq, stored, last_seq, born_empty)) try gapped.append(.{ .string = e.key_ptr.* });
         }
     }
     var to_seed = std.json.Array.init(a);
@@ -1523,6 +1537,23 @@ pub fn strictMissing(ddl: []const u8) bool {
     t = std.mem.trimEnd(u8, t, " \t\r\n");
     if (t.len < 6) return true;
     return !std.ascii.eqlIgnoreCase(t[t.len - 6 ..], "STRICT");
+}
+
+test "streamHasGap: a position of 0 is a gap, except on a stream recorded as born empty that still is" {
+    // never read, the stream has history: the first shape
+    try std.testing.expect(streamHasGap(863, 0, 900, false));
+    try std.testing.expect(streamHasGap(863, 0, 900, true));
+    // nothing recorded about the stream: the strict rule, empty or not
+    try std.testing.expect(streamHasGap(0, 0, 0, false));
+    // recorded as born empty, same stream, still empty: nothing to have missed
+    try std.testing.expect(!streamHasGap(0, 0, 0, true));
+    // ... but not when the stream has messages now, or when its last_seq is unknown
+    try std.testing.expect(streamHasGap(1, 0, 4, true));
+    try std.testing.expect(streamHasGap(0, 0, -1, true));
+    // the other shapes do not look at it
+    try std.testing.expect(streamHasGap(0, 7, 0, true)); // a position beyond the stream: restarted
+    try std.testing.expect(streamHasGap(100, 98, 120, true)); // the tail retained away
+    try std.testing.expect(!streamHasGap(100, 99, 120, true));
 }
 
 test "strictMissing: only a trailing STRICT counts (§10fi)" {

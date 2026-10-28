@@ -19507,3 +19507,39 @@ The archiver (examples/16-archive) read its tenant's stream with nats-py at 22-2
 **A hole is now noticed during the run.** The reader reports the first message's sequence; the archiver stops with exit 4 when it is not `--from` (readings pruned between two chunks), where the ordered consumer of the Python loop would have started silently at the new first sequence.
 
 **Not done.** The container image (`deploy/archiver.Dockerfile`) does not carry the binary; `build-linux.sh` and `package-linux.sh` now build and ship it with the bridge, but that was not run here (no Docker), only cross-compiled for x86_64 and aarch64. `archive.py` (the failure cases on the dev stack) was not run.
+
+## A stream that has never held a message is not a gap (2026-10-28)
+
+**What happened.** `core.streamHasGap` called a position of 0 a gap on any stream ("never here"). On a fresh stack `CDC_PUBLIC` is empty
+until somebody writes an open-tenant row, so a client that had connected a hundred times still found it gapped at every connect, and every
+connect re-seeded each table with a shared route (a tenant table has one: its open-tenant rows ride `CDC_PUBLIC`, §10bq), through a fence
+where the table was already seeded. CLAUDE.md carried it as a pitfall, and `recreate_recovery.py` check 13 leaned on it ("the first case
+runs that way"). It surfaced when `rebase_stale.py` §D reconnected a Node client with a queued edit on a fresh compose stack: the re-seed
+was in the way and a disjoint-column edit came back `lost` where `rebased` was expected.
+
+**The rule.** The first shape of the gap keeps its meaning and gains one exception, `born_empty`: the client recorded this stream's
+identity (`created`) at a time when the stream had never held a message (`first_seq` 0 and `last_seq` 0; JetStream numbers from 1, and a
+stream that held messages and lost them reads `first_seq == last_seq + 1`), it is the same stream, and it is still empty. Then a position
+of 0 is the whole truth and nothing is re-seeded. Anything else is as before: messages now (`last_seq` > 0), an unknown `last_seq`, an
+identity that changed.
+
+**Why a recorded flag and not "the stream is empty now".** An empty stream is also what a stream recreated after a lost slot looks like
+(§10bm), and that one must stay a gap until its tables are re-seeded. The restart branch resets the position to 0 and, until now, relied on
+that 0 being a gap on the next connect too if the client died before it had re-seeded anything. `born_empty` is written once, on the first
+sight of an empty stream with no position of its own, and cleared by every reset of a position (a restart, a recreation; a recreated
+stream never counts as born empty, whatever it looks like). A replica from before the column reads NULL as false: the strict rule.
+`_zbz_stream_seq` / `_zebridge_stream_seq` gain `born_empty INTEGER`, added by `ALTER TABLE` to an older replica.
+
+**Both clients.** libzb passes `born_empty and not recreated` to `core.streamHasGap`; zb-client-ts passes `bornEmpty` in the streams it hands
+to `core.scopeSeeding` (wasm rebuilt: `pnpm wasm`). `bornEmpty` absent is false, so every other caller and every older fixture behaves as
+before. The shared fixture gained six cases (`scope:`), the Zig test `streamHasGap: a position of 0 is a gap, except on a stream recorded as
+born empty that still is` pins the rule.
+
+**What the scenarios said.** `recreate_recovery.py` checks 17 (libzb) and 18 (zb-client-ts): on a fresh stack the client reopens twice with
+nothing re-seeded, then re-seeds when the stream has a message it never read. Without the fix check 18 saw 3 seeds at the first connect and
+one more at every reopen. Check 13/14's first case had the other table re-seeded by the quirk; it now asks for it (`zebridge_reseed` on both
+tables).
+
+**Not done.** A client that connected while `CDC_PUBLIC` was empty and never had a position row records nothing until it first sees the
+stream, as before. The bridge could publish a marker so that `CDC_PUBLIC` is never empty; that would be a protocol change and is not needed
+for this.
