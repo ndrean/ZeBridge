@@ -374,8 +374,12 @@ def main() -> int:
             if floor and g != "offline":
                 after = gc_floor()
                 if after and after[0] != floor[0]:
-                    print(f"      GC floor moved: {floor[0]} → {after[0]} ({after[1] // 60} min behind now). It never goes down; "
-                          "the scenarios after this one that stamp older versions are refused (PredatesGcWatermark)", flush=True)
+                    if after[1] < 2700:
+                        print(f"      ⚠️  GC floor moved: {floor[0]} → {after[0]} ({after[1] // 60} min behind now). It never goes down; "
+                              "the scenarios after this one that stamp older versions are refused (PredatesGcWatermark)", flush=True)
+                    else:
+                        # a sweeper pass at its normal retention: forward by minutes, still days behind now
+                        print(f"      GC floor moved forward to {after[0]}, still {after[1] // 60} min behind now: harmless", flush=True)
                     floor = after
             if log_from is not None and bridge_log.exists():
                 with open(bridge_log, "rb") as bf:
