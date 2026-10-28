@@ -52,10 +52,13 @@ def nats_pid() -> int:
         return pid
     except (OSError, ValueError):
         pass
-    # By the config it runs (the dev server is started with or without `-js`; the config
-    # enables JetStream either way).
-    r = subprocess.run(["pgrep", "-f", f"nats-server.*{CONF.name}"], capture_output=True, text=True)
-    pids = [int(x) for x in r.stdout.split()]
+    # By the process name first: `pgrep -f nats-server.*<conf>` also matches any command line that merely mentions the
+    # two (a shell, a wrapper), and a SIGHUP to one of those ends it - the hard revocation then never reaches the server.
+    # Then by the config it runs (the dev server is started with or without `-js`; the config enables JetStream either way).
+    pids = [int(x) for x in subprocess.run(["pgrep", "-x", "nats-server"], capture_output=True, text=True).stdout.split()]
+    if not pids:
+        r = subprocess.run(["pgrep", "-f", f"nats-server.*{CONF.name}"], capture_output=True, text=True)
+        pids = [int(x) for x in r.stdout.split()]
     if not pids:
         raise RuntimeError(f"no nats-server running with {CONF.name} — cannot SIGHUP it")
     return pids[0]

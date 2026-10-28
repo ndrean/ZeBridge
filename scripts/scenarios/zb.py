@@ -400,11 +400,14 @@ def jwt_stack() -> dict:
     the operator's and the scoped client signing key's private halves, and the conf whose account JWT a
     hard revocation amends. Native: scripts/native (the conf is nats-server-jwt.conf). Compose
     (ZB_NATS_CONTAINER set): scripts/dev/state (the conf is resolver.conf, which the container's server
-    includes). The public ids are read from resolver.conf, which `nsc generate config` writes in both
+    includes). ZB_JWT_STATE names a state directory of that second layout. The public ids are read from resolver.conf, which `nsc generate config` writes in both
     stacks: the operator's JWT and the ZEBRIDGE account's, whose signing keys name the client key. Nothing
     is written into the scenarios, because every store mints keys of its own."""
     import re
-    state = ROOT / "scripts" / ("dev/state" if NATS_CONTAINER else "native")
+    # ZB_JWT_STATE: a stack whose state directory is elsewhere (scripts/linux/up.sh, a plain-process stack with the
+    # compose stack's layout: resolver.conf beside the store, included by the server).
+    custom = os.environ.get("ZB_JWT_STATE")
+    state = pathlib.Path(custom) if custom else ROOT / "scripts" / ("dev/state" if NATS_CONTAINER else "native")
 
     def key_file(pub: str) -> pathlib.Path:
         # nsc names the file after the public key; where under the store depends on its version and on
@@ -435,7 +438,7 @@ def jwt_stack() -> dict:
         "account_pub": account_pub,
         "client_sk_file": key_file(client_pub) if client_pub else state / "no-client-signing-key-in-resolver.conf",
         "operator_file": key_file(operator_pub) if operator_pub else state / "no-operator-in-resolver.conf",
-        "conf": state / ("resolver.conf" if NATS_CONTAINER else "nats-server-jwt.conf"),
+        "conf": state / ("resolver.conf" if NATS_CONTAINER or custom else "nats-server-jwt.conf"),
     }
 
 

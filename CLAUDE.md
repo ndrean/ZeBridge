@@ -47,6 +47,11 @@ bridge (`zig-out/bin/bridge`), libzb, and a Python venv with `nats-py`, `nkeys`,
 PostgreSQL binaries. Each scenario builds a **private stack** (own database and replication slot, own nats-server, own
 bridge) and drops it.
 
+**Where the shared stack comes from** (the `live` and `owns` groups, `run.py`): `scripts/dev/up.sh` (Docker Compose; macOS or
+anywhere with Docker), `scripts/linux/up.sh` (plain processes, no Docker: a sandbox, CI, a Linux workstation) or
+`scripts/native/up.sh` (Homebrew, for speed measurements). `scripts/dev/README.md` has the steps after `up.sh`; the Linux README
+lists only what differs.
+
 - `recreate_recovery.py --check N` — the recovery model, one stack per check. 1–3 recreate/gap, 4 the fence's crash and
   retention boundaries (libzb fault build), 12 the same with a zb-client-ts client, 13/14 two tables on one route
   (applied frontiers; libzb / TS), 15/16 a plain full that crashes after its first chunk (libzb / TS), 5–11 incarnation,

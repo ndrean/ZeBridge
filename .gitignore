@@ -144,3 +144,4 @@ pubspec_overrides.yaml
 
 # scripts/dev/compose.yml: the nsc keys and the resolver fragment it mints (secrets, never committed)
 scripts/dev/state/
+scripts/linux/state/
