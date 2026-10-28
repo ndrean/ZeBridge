@@ -151,6 +151,11 @@ by reading `state/resolver.conf` (the operator's JWT and the account's, whose si
 amend that file, which the container includes.
 Unset, every one of these scenarios behaves as before, against the native stack.
 
+`up.sh` re-runs the bootstrap every time, which adds a signing key and rewrites `state/resolver.conf`, and then reloads the
+running NATS (`docker kill -s HUP zb-dev-nats`) so that it knows the newest key. Without that, `GET /enroll` signs with a key the
+server has not loaded and the enrolled client is refused with `AuthorizationViolation`; after a manual bootstrap run the same
+command does it.
+
 A stack bootstrapped before 2026-10-28 has no private keys in `state/` (`nsc` wrote them inside the bootstrap container, because
 the `nats-box` image presets `NKEYS_PATH`): `jwt_expiry` and `revoke_midseed` stop with "not in the nsc store". While
 `zb-dev-nats-bootstrap` still exists, copy them out:

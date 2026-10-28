@@ -43,6 +43,11 @@ if [ "$(docker inspect -f '{{.State.ExitCode}}' zb-dev-nats-bootstrap 2>/dev/nul
   exit 1
 fi
 wait_healthy zb-dev-nats
+# The bootstrap runs on every `up` and adds a signing key to the account each time, then rewrites state/resolver.conf.
+# A NATS server that was already running keeps the account JWT it loaded at its start, so it would refuse the user
+# JWTs that GET /enroll signs with the newest key (AuthorizationViolation). A reload reads the conf again; on a server
+# that has just started it changes nothing.
+docker kill -s HUP zb-dev-nats >/dev/null
 
 # The init SQL is the bridge's own (--init-sql, from the same environment the bridge will read),
 # applied through the container's psql: nothing but Docker is needed on this machine for it.
