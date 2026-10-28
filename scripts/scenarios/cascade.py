@@ -31,7 +31,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import zb  # noqa: E402
-from chaos import running_nats, nats_conf_and_log  # noqa: E402
+from chaos import running_nats, nats_conf_and_log, nats_alive, nats_stop  # noqa: E402
 sys.path.insert(0, str(zb.ROOT / "libzb" / "python"))
 import _env  # noqa: E402
 
@@ -63,10 +63,10 @@ class Nats:
         _, self.log = nats_conf_and_log(self.argv)
 
     def stop(self):
-        subprocess.run(["kill", self.pid], check=True)
+        nats_stop(self.pid)
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            if subprocess.run(["kill", "-0", self.pid], capture_output=True).returncode != 0:
+            if not nats_alive(self.pid):
                 return
             time.sleep(0.3)
         raise RuntimeError("nats-server did not die")

@@ -34,9 +34,9 @@ sys.path.insert(0, str(zb.ROOT / "libzb" / "python"))
 import _env  # noqa: E402
 
 BRIDGE = zb.ROOT / "zig-out" / "bin" / "bridge"
-SK_FILE = zb.ROOT / ("scripts/native/nsc-store/data/nats/nsc/keys/keys/A/BG/"
-                     "ABGOGUGNFMBG47I2NTHPQFX4G3YUP23ENMNEM7ZUURFKIBGUK743WPND.nk")
-ACCOUNT_PUB = "ABSDAXPW56ON5USFCTUQSWSQWTNLZL3DDDVZAPUH3244HU4NM7QFQD5L"
+_JWT = zb.jwt_stack()   # native store, or the compose stack's (ZB_NATS_CONTAINER)
+SK_FILE = _JWT["client_sk_file"]
+ACCOUNT_PUB = _JWT["account_pub"]
 PRINCIPAL = "ttl_probe"
 TENANT = "kilo"
 TTL_S = 10

@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# A `pg_ctl` for the PostgreSQL container of scripts/dev/compose.yml, so the restart scenarios
+# (pg_restart, matrix, churn, sweeper_restart) stop and start the container the way they stop
+# and start the native cluster:
+#
+#   export ZB_PG_CTL="$PWD/scripts/dev/pg_ctl"
+#
+# It understands exactly what the scenarios call: `status`, `stop -m fast|immediate`, `start`.
+# `-D`, `-o`, `-l` and `-t` are accepted and ignored: the container keeps its own data volume,
+# its own flags (compose.yml `command`, wal_level=logical among them) and its own log
+# (`docker logs zb-dev-postgres`). Exit codes follow pg_ctl: status 0 = running, 3 = not.
+set -uo pipefail
+
+NAME="${ZB_DEV_PG_CONTAINER:-zb-dev-postgres}"
+
+running() { [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" = true ]; }
+ready() { docker exec "$NAME" pg_isready -q -U postgres >/dev/null 2>&1; }
+
+verb="" mode="fast"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -D | -o | -l | -t | -w | -s) [ "$1" = -w ] || [ "$1" = -s ] || shift ;;
+    -m) mode="$2"; shift ;;
+    status | stop | start) verb="$1" ;;
+  esac
+  shift
+done
+
+case "$verb" in
+  status)
+    # pg_ctl's own answer: 0 running, 3 not running. A container that is up but still recovering
+    # counts as running, as a postmaster in recovery does.
+    running && exit 0
+    exit 3
+    ;;
+  stop)
+    running || { echo "pg_ctl: PID file does not exist (container $NAME is not running)" >&2; exit 1; }
+    case "$mode" in
+      immediate)
+        # SIGQUIT is the postmaster's immediate shutdown: no checkpoint, crash recovery on the next start.
+        docker kill -s QUIT "$NAME" >/dev/null || exit 1
+        ;;
+      *)
+        # The image's stop signal is SIGINT, the postmaster's fast shutdown.
+        docker stop -t 90 "$NAME" >/dev/null || exit 1
+        ;;
+    esac
+    # SIGQUIT ends the container asynchronously: wait for it to be gone.
+    for _ in $(seq 1 90); do running || exit 0; sleep 1; done
+    echo "pg_ctl: $NAME did not stop" >&2
+    exit 1
+    ;;
+  start)
+    running && { echo "pg_ctl: another server might be running (container $NAME is up)" >&2; exit 1; }
+    docker start "$NAME" >/dev/null || exit 1
+    # pg_ctl start -w: return when the server accepts connections (crash recovery included).
+    for _ in $(seq 1 90); do ready && exit 0; sleep 1; done
+    echo "pg_ctl: $NAME did not become ready" >&2
+    exit 1
+    ;;
+  *)
+    echo "pg_ctl (container wrapper): supports status | stop -m fast|immediate | start" >&2
+    exit 2
+    ;;
+esac

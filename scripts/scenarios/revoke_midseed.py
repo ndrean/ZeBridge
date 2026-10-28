@@ -22,11 +22,19 @@ import zb
 from clients import Lib, Node, both, fresh_sqlite
 
 BRIDGE = zb.ROOT / "zig-out" / "bin" / "bridge"
-SK_FILE = zb.ROOT / "scripts/native/nsc-store/data/nats/nsc/keys/keys/A/BG/ABGOGUGNFMBG47I2NTHPQFX4G3YUP23ENMNEM7ZUURFKIBGUK743WPND.nk"
-OP_FILE = zb.ROOT / "scripts/native/nsc-store/data/nats/nsc/keys/keys/O/CZ/OCZZMCIKTYIW5RWDOOMNBFPXKPP4LMKQLUQSI2FFFHUYQ54WSEGGNR4P.nk"
-ACCOUNT_PUB = "ABSDAXPW56ON5USFCTUQSWSQWTNLZL3DDDVZAPUH3244HU4NM7QFQD5L"
-CONF = zb.ROOT / "scripts/native/nats-server-jwt.conf"
+_JWT = zb.jwt_stack()   # native store, or the compose stack's (ZB_NATS_CONTAINER)
+SK_FILE, OP_FILE = _JWT["client_sk_file"], _JWT["operator_file"]
+ACCOUNT_PUB = _JWT["account_pub"]
+CONF = _JWT["conf"]
 PID_FILE = zb.ROOT / "scripts/native/nats-server.pid"
+
+
+def reload_nats() -> None:
+    """SIGHUP to the broker: it re-reads the account JWT the hammer amended (or restored)."""
+    if zb.NATS_CONTAINER:
+        subprocess.run(["docker", "kill", "-s", "HUP", zb.NATS_CONTAINER], check=True, capture_output=True)
+    else:
+        os.kill(nats_pid(), 1)
 
 
 def nats_pid() -> int:
@@ -98,7 +106,7 @@ def revoke(principal, hard):
     r = subprocess.run(args, env=env, capture_output=True, text=True)
     out = r.stdout + r.stderr
     if hard and r.returncode == 0:
-        os.kill(nats_pid(), 1)   # SIGHUP: the server reloads the amended JWT
+        reload_nats()   # SIGHUP: the server reloads the amended JWT
     return r.returncode, out
 
 
@@ -126,7 +134,7 @@ def wait_full(epoch, budget=40):
 def main():
     if zb.another_bridge_running():
         sys.exit("another bridge is already running — this scenario owns the only bridge")
-    if not (SK_FILE.exists() and OP_FILE.exists() and CONF.exists() and PID_FILE.exists()):
+    if not (SK_FILE.exists() and OP_FILE.exists() and CONF.exists() and (zb.NATS_CONTAINER or PID_FILE.exists())):
         sys.exit("the dev JWT stack (nsc store, conf, pid) is not where jwt-bootstrap.sh puts it")
     failed = 0
     def check(label, cond):
@@ -272,7 +280,7 @@ def main():
             except Exception: pass
         # the dev server gets its pre-scenario account JWT back, and reloads it
         CONF.write_text(conf_backup)
-        try: os.kill(int(PID_FILE.read_text().strip()), 1)
+        try: reload_nats()
         except Exception: pass
         cleanup([SOFT, HARD])
     return failed

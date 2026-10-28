@@ -49,6 +49,9 @@ import zb
 
 HTTP = zb.http_base(probe=True)   # the probe's --port, from zb.BRIDGE_ARGS
 NATS_PID_FILE = zb.ROOT / "scripts" / "native" / "nats-server.pid"
+# The compose stack (scripts/dev) runs nats-server in a container; the scenarios stop and start it
+# through Docker instead of signalling a process. Empty = the native stack, as before.
+NATS_CONTAINER = zb.NATS_CONTAINER
 GRACE = int(os.environ.get("ZB_HTTP_RECV_GRACE", "8"))
 LOG = str(pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_chaos_bridge.log")
 MUT = zb.TOPOLOGY["subjects"]["mutations_prefix"]
@@ -59,7 +62,15 @@ def running_nats() -> tuple[str, list[str]]:
     """(pid, argv) of the live nats-server. The conf it was started with is read
     from ITS argv (`ps -o args=`), never hardcoded: up.sh historically started
     nats-server.conf and the JWT stack runs nats-server-jwt.conf — restarting with
-    the wrong one would turn phase 2 into an auth test."""
+    the wrong one would turn phase 2 into an auth test.
+
+    With ZB_NATS_CONTAINER (the compose stack) the "pid" is the container's name and the "argv" is
+    `docker start <name>`: callers stop with nats_stop(), poll with nats_alive() and start by running
+    that argv, so they do not know which stack they are on."""
+    if NATS_CONTAINER:
+        if not nats_alive(NATS_CONTAINER):
+            sys.exit(f"container {NATS_CONTAINER} is not running — phase 2 restarts it and cannot")
+        return NATS_CONTAINER, ["docker", "start", NATS_CONTAINER]
     pid = ""
     if NATS_PID_FILE.exists():
         pid = NATS_PID_FILE.read_text().strip()
@@ -76,7 +87,11 @@ def running_nats() -> tuple[str, list[str]]:
 
 def nats_conf_and_log(argv: list[str]) -> tuple[pathlib.Path, pathlib.Path]:
     """The conf from `-c <path>` in the running argv (relative to zb.ROOT, which is
-    where up.sh runs it), and the log named after it (`<stem>.log` beside it)."""
+    where up.sh runs it), and the log named after it (`<stem>.log` beside it). A container logs to
+    Docker (`docker logs`); `docker start` prints only its name, which goes to a file under TMPDIR."""
+    if NATS_CONTAINER:
+        return (zb.ROOT / "scripts" / "dev" / "nats-server.conf",
+                pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_nats_container.log")
     conf = None
     for i, a in enumerate(argv):
         if a in ("-c", "--config") and i + 1 < len(argv):
@@ -86,6 +101,22 @@ def nats_conf_and_log(argv: list[str]) -> tuple[pathlib.Path, pathlib.Path]:
     if not conf.is_absolute():
         conf = zb.ROOT / conf
     return conf, conf.with_suffix(".log")
+
+
+def nats_alive(pid: str) -> bool:
+    """Is the nats-server `running_nats()` returned still up (a pid, or the container's name)?"""
+    if NATS_CONTAINER:
+        r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", pid], capture_output=True, text=True)
+        return r.stdout.strip() == "true"
+    return subprocess.run(["kill", "-0", pid], capture_output=True).returncode == 0
+
+
+def nats_stop(pid: str) -> None:
+    """SIGTERM to the server, as `kill <pid>` does; `docker stop` sends the same signal (and waits)."""
+    if NATS_CONTAINER:
+        subprocess.run(["docker", "stop", "-t", "15", pid], check=True, capture_output=True)
+    else:
+        subprocess.run(["kill", pid], check=True)
 
 
 def status(field):
@@ -180,15 +211,16 @@ async def main():
           before_rc = status("nats_reconnect_count") or 0
           nats_pid, nats_argv = running_nats()
           conf, nats_log = nats_conf_and_log(nats_argv)
-          subprocess.run(["kill", nats_pid])
+          nats_stop(nats_pid)
           # wait for the port to actually free, bounded, instead of a fixed sleep
           deadline = time.time() + 15
-          while time.time() < deadline and subprocess.run(["kill", "-0", nats_pid], capture_output=True).returncode == 0:
+          while time.time() < deadline and nats_alive(nats_pid):
               time.sleep(0.2)
           with open(nats_log, "a") as lg:
               # the SAME argv the server was running with (conf included), from zb.ROOT as up.sh does
               p = subprocess.Popen(nats_argv, cwd=zb.ROOT, stdout=lg, stderr=lg)
-          NATS_PID_FILE.write_text(str(p.pid))
+          if not NATS_CONTAINER:
+              NATS_PID_FILE.write_text(str(p.pid))
           deadline = time.time() + 40
           while time.time() < deadline and (status("nats_reconnect_count") or 0) <= before_rc:
               time.sleep(1)

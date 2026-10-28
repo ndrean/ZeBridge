@@ -391,6 +391,45 @@ def pg_opts(port: str | int | None = None) -> str:
     return f"-p {port or os.environ.get('NATIVE_PG_PORT', '5432')} " + " ".join(flags)
 
 
+# The compose stack (scripts/dev) runs nats-server in a container. Set to its name (`zb-dev-nats`) and the
+# scenarios that kill, restart or reload the broker go through Docker instead of signalling a process.
+NATS_CONTAINER = os.environ.get("ZB_NATS_CONTAINER", "")
+
+# What the native stack's store held when these scenarios stopped hard-coding it; a store minted before
+# jwt-bootstrap.sh wrote its id file still gets these.
+_LEGACY_JWT_IDS = {
+    "ZB_OPERATOR_PUB": "OCZZMCIKTYIW5RWDOOMNBFPXKPP4LMKQLUQSI2FFFHUYQ54WSEGGNR4P",
+    "ZB_ACCOUNT_PUB": "ABSDAXPW56ON5USFCTUQSWSQWTNLZL3DDDVZAPUH3244HU4NM7QFQD5L",
+    "ZB_CLIENT_SK_PUB": "ABGOGUGNFMBG47I2NTHPQFX4G3YUP23ENMNEM7ZUURFKIBGUK743WPND",
+}
+
+
+def jwt_stack() -> dict:
+    """Where jwt_expiry and revoke_midseed find the JWT stack: the account's public key, the files holding
+    the operator's and the scoped client signing key's private halves, and the conf whose account JWT a
+    hard revocation amends. Native: scripts/native (the conf is nats-server-jwt.conf). Compose
+    (ZB_NATS_CONTAINER set): scripts/dev/state (the conf is resolver.conf, which the container's server
+    includes). The public ids come from the file jwt-bootstrap.sh writes beside the store."""
+    state = ROOT / "scripts" / ("dev/state" if NATS_CONTAINER else "native")
+    ids = dict(_LEGACY_JWT_IDS)
+    f = state / "ids.env"
+    if f.exists():
+        for ln in f.read_text().splitlines():
+            k, _, v = ln.partition("=")
+            if k in ids and v.strip():
+                ids[k] = v.strip()
+
+    def key_file(pub: str) -> pathlib.Path:
+        return state / "nsc-store/data/nats/nsc/keys/keys" / pub[0] / pub[1:3] / f"{pub}.nk"
+
+    return {
+        "account_pub": ids["ZB_ACCOUNT_PUB"],
+        "client_sk_file": key_file(ids["ZB_CLIENT_SK_PUB"]),
+        "operator_file": key_file(ids["ZB_OPERATOR_PUB"]),
+        "conf": state / ("resolver.conf" if NATS_CONTAINER else "nats-server-jwt.conf"),
+    }
+
+
 def another_bridge_running() -> bool:
     # The pattern must exclude `zig-out/bin/bridge_sweeper`, which is always running and
     # is not a bridge — unanchored, every owns-group scenario refused to start (measured

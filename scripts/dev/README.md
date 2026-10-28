@@ -43,6 +43,9 @@ source scripts/scenarios/.venv/bin/activate
 set -a && . ./.env.bridge && set +a
 export BRIDGE_CDC_PUBLICATION=zb_pub               # the name given to up.sh
 export NATS_URL=nats://127.0.0.1:4222              # after the line above, which may bring a tls:// URL: this NATS is plain
+# so the outage scenarios (chaos, nats_outage, matrix, cascade, churn, pg_restart, sweeper_restart, jwt_expiry,
+# revoke_midseed) stop, start and reload the containers instead of looking for a Homebrew server and a pid file:
+export ZB_PG_CTL="$PWD/scripts/dev/pg_ctl" ZB_NATS_CONTAINER=zb-dev-nats
 ```
 
 **5. Provision the baseline. Required, once per database.** `up.sh` creates an empty database; the scenarios assume
@@ -139,6 +142,14 @@ is enough. The bridge creates its own streams and KV buckets at boot; nothing he
 
 ## Not covered
 
+**Restarting the containers.** `scripts/dev/pg_ctl` answers `status`, `stop -m fast|immediate` and `start` with
+`docker stop`, `docker kill -s QUIT` and `docker start`, and waits for `pg_isready`; the data stays in the volume, the
+flags are the container's own (so `ZB_PGDATA` and `ZB_PG_LOG` are ignored; the log is `docker logs zb-dev-postgres`).
+With `ZB_NATS_CONTAINER` set the broker is stopped with `docker stop`, started with `docker start` and reloaded with
+`docker kill -s HUP`. `jwt_expiry` and `revoke_midseed` find the keys of the store that `jwt-bootstrap.sh` minted
+through `state/ids.env` (the public ids it writes) and amend `state/resolver.conf`, which the container includes.
+Unset, every one of these scenarios behaves as before, against the native stack.
+
 TLS and the leaf listener (7422) of `nats-server-jwt.conf`. The server is plain, so `NATS_URL` must be `nats://`:
 the `tls://` URL that the native stack's `.env.bridge` may carry makes the bridge fail with `TlsRecordOverflow`
 (the server answers the TLS handshake with the plain-text `-ERR 'Authentication Error'`, and its log shows
@@ -148,7 +159,8 @@ anything that needs a leaf link are not served by this stack; SeaweedFS for `arc
 
 ## Status
 
-Written on a machine without a Docker daemon. Checked there: `docker compose config`, `jwt-bootstrap.sh` run with
+Written on a machine without a Docker daemon. `pg_ctl` was run against a stand-in for `docker`; the NATS restarts and the
+JWT scenarios on the containers have not run. Checked there: `docker compose config`, `jwt-bootstrap.sh` run with
 `nsc`, and a `nats-server` booted on this configuration (`include` resolved, JetStream on, the minted creds
 accepted, a credless connection refused). **Not run:** the containers themselves. Report what `up.sh` prints if a
 step fails.
