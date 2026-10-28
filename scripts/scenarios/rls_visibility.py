@@ -389,6 +389,13 @@ async def main():
                         hold.release()
                     check(table is not None, "a build is parked between its policy check and its content")
                     if table is None:
+                        # The temp directory (and the probe bridge's log) vanishes when this function returns:
+                        # say now what the bridge was doing and what the reader role's sessions were waiting on.
+                        print("  the probe bridge's log, last lines:\n    " +
+                              "\n    ".join((tmp / "bridge.log").read_text(errors="replace").splitlines()[-25:]))
+                        print("  the reader role's sessions:\n    " + zb.psql(
+                            f"SELECT pid || ' ' || coalesce(state, '') || ' wait=' || coalesce(wait_event_type, '-') || ' ' || left(query, 110) "
+                            f"FROM pg_stat_activity WHERE usename = '{role}'", quiet=True).replace("\n", "\n    "))
                         return
                     tenants = [t for t in (TA, TB) if gens(table, t)]
                     before = {t: top(table, t) for t in tenants}
