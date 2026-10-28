@@ -93,7 +93,9 @@ repository root, in this order (scripts/dev/README.md has the same list with the
 
 6. THEN the long-running bridge on :27434, in its own terminal with step 4 repeated (it publishes its schemas at
    boot, so it must start after step 5):
-     zig-out/bin/bridge --pub \$BRIDGE_CDC_PUBLICATION 2>&1 | tee /tmp/zb-bridge.log
+     zig-out/bin/bridge --pub \$BRIDGE_CDC_PUBLICATION > /tmp/zb-bridge.log 2>&1
+   Watch it with "tail -f /tmp/zb-bridge.log" in another terminal. Do not pipe it into tee: Ctrl-C then also
+   kills tee, and the bridge's graceful stop (it waits for in-flight batches) turns abrupt.
 
 7. In another terminal, step 4 repeated:
   scripts/scenarios/run.py offline

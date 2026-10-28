@@ -62,8 +62,12 @@ exit 2 if either is missing.
 existed has to be restarted). Its own terminal, steps 4 repeated there:
 
 ```sh
-zig-out/bin/bridge --pub $BRIDGE_CDC_PUBLICATION 2>&1 | tee /tmp/zb-bridge.log     # :27434
+zig-out/bin/bridge --pub $BRIDGE_CDC_PUBLICATION > /tmp/zb-bridge.log 2>&1     # :27434
 ```
+
+Watch it with `tail -f /tmp/zb-bridge.log` in another terminal. **Do not pipe the bridge into `tee`**: Ctrl-C goes to every
+program of a pipeline, so it also kills `tee`, and the bridge's graceful stop (it waits for its in-flight batches) turns
+into an abrupt one. Redirect to a file instead, as above; Ctrl-C then reaches only the bridge.
 
 **7. Run**, in another terminal with step 4 repeated:
 

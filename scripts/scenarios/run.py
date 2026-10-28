@@ -277,7 +277,8 @@ def main() -> int:
     ap.add_argument("--bridge-log", default=os.environ.get("ZB_BRIDGE_LOG"),
                     help="the long-running bridge's log file: what it wrote during each scenario is saved beside that "
                          "scenario's log (zb-scenario-<name>.bridge.log) and its error lines counted. Start the bridge with "
-                         "`2>&1 | tee FILE`. Many scenarios provoke errors on purpose; this says which one did")
+                         "`> FILE 2>&1` (not a pipe into tee: Ctrl-C would kill tee too and cut the bridge's graceful stop short). "
+                         "Many scenarios provoke errors on purpose; this says which one did")
     a = ap.parse_args()
     if a.list:
         for g, items in GROUPS.items():
