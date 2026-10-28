@@ -37,7 +37,6 @@ LOG = "/tmp/zb_rebase_stale_bridge.log"
 PY_ERR, NODE_LOG = "/tmp/zb_rebase_stale_py.log", "/tmp/zb_rebase_stale_node.log"
 T = "mig_rb"
 PUB = zb.publication()
-OPEN = zb.TOPOLOGY["open_tenant"]
 COMMON = ("tenant_id varchar(255) NOT NULL, last_writer varchar(255), inserted_at timestamptz NOT NULL DEFAULT now(), "
           "updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz")
 ENABLE = ("tenant_col => 'tenant_id', writable => true, version_col => 'updated_at', tombstone_col => 'deleted_at', "
@@ -130,11 +129,6 @@ def main():
                 zb.bad("bridge never started its producer"); print(bridge.text()[-1500:]); return 1
             out = zb.psql(f"SELECT string_agg(step || ':' || status, ' ') FROM zebridge_enable('public.{T}', {ENABLE})")
             check(f"zebridge_enable({T}) live: {out.strip()[:50]}…", "error" not in out.lower())
-            # A client that has never read a message of CDC_PUBLIC finds it "gapped" at every connect (core.streamHasGap, stored 0)
-            # and re-seeds each table with a shared route. §D reconnects Node: with the stream empty (a fresh stack) it re-seeds
-            # mig_rb through a fence, the queued edit is judged against the re-seeded row, and a disjoint-column edit comes back
-            # 'lost' instead of 'rebased'. One open-tenant row gives the stream a message, as recreate_recovery does (CLAUDE.md).
-            zb.psql(f"INSERT INTO {T} (uid, title, status, tenant_id) VALUES (gen_random_uuid(), 'Open', 'Open', '{OPEN}')", quiet=True)
             py = Lib(PY_DB, [T], "py-rebase")
             nd = Node(NODE_DB, NODE_LOG)
             tenant = py.tenant
