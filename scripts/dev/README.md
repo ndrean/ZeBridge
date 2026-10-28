@@ -151,6 +151,12 @@ by reading `state/resolver.conf` (the operator's JWT and the account's, whose si
 amend that file, which the container includes.
 Unset, every one of these scenarios behaves as before, against the native stack.
 
+A stack bootstrapped before 2026-10-28 has no private keys in `state/` (`nsc` wrote them inside the bootstrap container, because
+the `nats-box` image presets `NKEYS_PATH`): `jwt_expiry` and `revoke_midseed` stop with "not in the nsc store". While
+`zb-dev-nats-bootstrap` still exists, copy them out:
+`docker cp zb-dev-nats-bootstrap:/nsc/nkeys/. scripts/dev/state/nsc-store/data/nats/nsc/keys/`; otherwise
+`down.sh --clean` and the setup steps again.
+
 TLS and the leaf listener (7422) of `nats-server-jwt.conf`. The server is plain, so `NATS_URL` must be `nats://`:
 the `tls://` URL that the native stack's `.env.bridge` may carry makes the bridge fail with `TlsRecordOverflow`
 (the server answers the TLS handshake with the plain-text `-ERR 'Authentication Error'`, and its log shows

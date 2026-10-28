@@ -20,6 +20,10 @@ STATE="${ZB_STATE_DIR:-$ROOT/scripts/native}"
 export NSC_HOME="$STATE/nsc-store"                        # keys + JWTs live here
 export XDG_DATA_HOME="$NSC_HOME/data"
 export XDG_CONFIG_HOME="$NSC_HOME/config"
+# nsc keeps the private keys where NKEYS_PATH says, and the natsio/nats-box image presets it (/nsc/nkeys): in the
+# compose bootstrap the keys then stayed inside the container, never reached $STATE, and the scenarios that sign
+# with them (jwt_expiry, revoke_midseed) found nothing. Pinned to the place nsc picks by itself under XDG_DATA_HOME.
+export NKEYS_PATH="$XDG_DATA_HOME/nats/nsc/keys"
 CREDS="$ROOT/scripts/native/creds"
 mkdir -p "$CREDS"
 

@@ -407,7 +407,12 @@ def jwt_stack() -> dict:
     state = ROOT / "scripts" / ("dev/state" if NATS_CONTAINER else "native")
 
     def key_file(pub: str) -> pathlib.Path:
-        return state / "nsc-store/data/nats/nsc/keys/keys" / pub[0] / pub[1:3] / f"{pub}.nk"
+        # nsc names the file after the public key; where under the store depends on its version and on
+        # XDG_DATA_HOME, so look for the name and keep the usual place for the error message
+        usual = state / "nsc-store/data/nats/nsc/keys/keys" / pub[0] / pub[1:3] / f"{pub}.nk"
+        if usual.exists():
+            return usual
+        return next(iter((state / "nsc-store").glob(f"**/{pub}.nk")), usual)
 
     def claims(jwt: str) -> dict:
         body = jwt.split(".")[1]
