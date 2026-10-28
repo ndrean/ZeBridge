@@ -994,14 +994,13 @@ async def check13(a, tmp, ts=False):
             s.sql(f"SELECT count(*) FROM zebridge_reseed('public.{T}'::regclass)")
 
         clients = []
-        # CDC_PUBLIC is empty at first, and a stream the client has never read a message of is
-        # "gapped" for ever (stored 0): every pass then re-seeds each table with a shared route,
-        # so the table that gets a chain in the fence's own pass loses its frontier — the first
-        # case runs that way (exact, no skip expected). One open-tenant row gives CDC_PUBLIC a
-        # message before the others, and only the fenced table is touched.
-        for name, env in (("frontier_reseeded", {}), ("frontier_live", {}), ("frontier_crash", {"ZB_TEST_FENCE_ABORT": "after_chunk"})):
-            if name == "frontier_live":
-                s.sql(f"INSERT INTO public.{T2} (id, tenant_id, note) VALUES ('pub-1', '_default', 'open')")
+        # There used to be a first case here, "frontier_reseeded": a CDC_PUBLIC the client had never read a message of
+        # counted as gapped for ever (stored 0), so every pass re-seeded each table with a shared route and the other
+        # table got a chain in the fence's own pass and lost its frontier (exact, no skip expected). A stream recorded
+        # as born empty is not a gap any more (core.streamHasGap, NOTES 2026-10-28), so that case would have been the
+        # next one; the frontier that a chain drops is pinned by fence-apply.test.ts. Re-seeding both tables on purpose
+        # is another matter: HANDOFF.md. CDC_PUBLIC stays empty here: the cases run on a quiet stream.
+        for name, env in (("frontier_live", {}), ("frontier_crash", {"ZB_TEST_FENCE_ABORT": "after_chunk"})):
             # One client and one load per case: a client left running would follow the next case's
             # epoch move too. The two tables together write about what check 4's one does.
             loads = [Load(s, "t_a", "c", 2 * a.interval_ms / 1000, table=T), Load(s, "t_a", "d", 2 * a.interval_ms / 1000, table=T2)]
@@ -1060,15 +1059,8 @@ async def check13(a, tmp, ts=False):
                     have, want = table_rows(c, t), truth_of(t)
                     note(f"{t}: missing {sorted(want.keys() - have.keys())[:5]}, extra {sorted(have.keys() - want.keys())[:5]}, "
                          f"differing {sorted(k for k in want.keys() & have.keys() if want[k] != have[k])[:5]}")
-            if name == "frontier_reseeded":
-                # libzb: its own chain replaced the table's rows in the same pass (a stream it has never read
-                # a message of is gapped for ever): no frontier survives it (the events up to it replay), and
-                # the rows are exact all the same. The TypeScript client has no such quirk: only exactness.
-                if not ts:
-                    check(f"{name}: {T2} got a chain in the fence's pass and kept no frontier ({frontier_rows(c)})", frontier_rows(c) == [])
-            else:
-                check(f"{name}: events were skipped through the frontier ({skipped(c)}) and it is spent ({frontier_rows(c)})",
-                      skipped(c) > 0 and frontier_rows(c) == [])
+            check(f"{name}: events were skipped through the frontier ({skipped(c)}) and it is spent ({frontier_rows(c)})",
+                  skipped(c) > 0 and frontier_rows(c) == [])
             c.stop()
         await js.close()
     finally:
@@ -1137,6 +1129,65 @@ async def check15(a, tmp, ts=False):
         load.end()
         g = grade(s, [c], 2 * a.cadence + 60)
         await report(c, g[c.name], js, {"t_a"})
+        await js.close()
+    finally:
+        s.stop()
+
+
+async def check17(a, tmp, ts=False):
+    """A stream that has never held a message is not a gap (core.streamHasGap, `born_empty`). CDC_PUBLIC of a fresh stack
+    is empty; a client that records it at its first sight and reopens must not re-seed its tables because its position
+    on it is 0. A message the client has not read is still a gap: the rule gives up nothing but the empty case."""
+    if ts and not check(f"the harness exists ({HARNESS})", HARNESS.exists()):
+        return
+    s = Stack(tmp, "18" if ts else "17", a.cadence, {})
+    seeds = lambda c: len(re.findall(r"seeded \d+ row\(s\) from chain|Seeded \S+ from generation chain", c.text()))
+    try:
+        s.start({"pa": "t_a"})
+        s.create_table({"t_a": a.rows // 10}, "a")
+        s.bridge_up()
+        js = await Js().open(s)
+        check("tenant mappings published before any client connects", await js.tenants_ready(s.creds))
+        check(f"a chain ({await wait_manifests(js, ['t_a'], a.cadence + 60)} s)", await js.manifest("t_a") is not None)
+        pub = await js.stream("CDC_PUBLIC")
+        check(f"CDC_PUBLIC has never held a message ({pub})", bool(pub) and pub.get("last") == 0)
+
+        async def until(pred, timeout):
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < timeout:
+                r = pred()
+                if asyncio.iscoroutine(r): r = await r
+                if r: return round(time.monotonic() - t0, 1)
+                await asyncio.sleep(1)
+            return None
+
+        async def seeded(c):
+            ok, _ = await anchor_state(c, js, {"t_a"})
+            return ok
+
+        c = TsClient(s, "quiet", "pa", "t_a") if ts else Client(s, "quiet", "pa", "t_a")
+        c.start()
+        check(f"seeded and anchored ({await until(lambda: seeded(c), 120)} s)", await seeded(c))
+        n1 = seeds(c)
+        c.stop(); c.p = None
+        for k in range(2):
+            c.start()
+            await until(lambda: seeded(c), 60)
+            await asyncio.sleep(10)   # the gap pass runs at connect
+            check(f"reopen {k + 1}: nothing re-seeded because a stream that never held a message has position 0 (seeds {n1} -> {seeds(c)})", seeds(c) == n1)
+            c.stop(); c.p = None
+        # now the stream holds a message the client has not read: the position 0 is a gap again
+        s.sql(f"INSERT INTO public.{T} (id, tenant_id, note) VALUES ('pub-1', '_default', 'open')")
+        for _ in range(30):
+            pub = await js.stream("CDC_PUBLIC")
+            if pub.get("last", 0) > 0: break
+            await asyncio.sleep(1)
+        check(f"the open-tenant row reached CDC_PUBLIC ({pub})", pub.get("last", 0) > 0)
+        c.start()
+        await until(lambda: seeded(c), 60)
+        await asyncio.sleep(10)
+        check(f"reopened with a message the client never read: it re-seeds, as it always did (seeds {n1} -> {seeds(c)})", seeds(c) > n1)
+        c.stop()
         await js.close()
     finally:
         s.stop()
@@ -1476,7 +1527,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker")
     ap.add_argument("--lib")
-    ap.add_argument("--check", default="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16")
+    ap.add_argument("--check", default="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18")
     ap.add_argument("--cadence", type=int, default=120)
     ap.add_argument("--max-msgs", type=int, default=1000, help="CDC_MAX_MSGS for checks 2 and 3 (the bridge's minimum is 1000)")
     ap.add_argument("--rows", type=int, default=2000)
@@ -1495,7 +1546,8 @@ def main():
                              7: check7, 8: check8, 9: check9, 10: check10, 11: check11,
                              12: lambda a_, d_: check4(a_, d_, ts=True), 13: check13,
                              14: lambda a_, d_: check13(a_, d_, ts=True), 15: check15,
-                             16: lambda a_, d_: check15(a_, d_, ts=True)}[n](a, pathlib.Path(d)))
+                             16: lambda a_, d_: check15(a_, d_, ts=True),
+                             17: check17, 18: lambda a_, d_: check17(a_, d_, ts=True)}[n](a, pathlib.Path(d)))
             except Exception as e:
                 check(f"check {n} raised: {type(e).__name__}: {str(e)[:400]}", False)
     print(f"  · logs: /tmp/zb_rr<check>_*.log; {'FAILED ' + str(failed) + ' check(s)' if failed else 'clean'}")

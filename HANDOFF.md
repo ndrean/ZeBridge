@@ -128,6 +128,14 @@ nats-server ≥ 2.15, Zig 0.17, a venv at `/opt/zenv` with `nats-py nkeys msgpac
 
    One check at a time; each takes minutes. `leaf_fence.py` and `rls_visibility.py` run the same way.
 
+## Observed, not investigated
+
+- Two tables on one route both re-seeded (`zebridge_reseed` on each) while the replica's position is past both cuts: every
+  pass refuses both fences ("chain predates replica — refusing the full (D2): <other> is not seeded, so its coverage on
+  CDC_t_a is unknown"), 1794 times in 90 s with `recreate_recovery.py` check 13's first case modified to reseed both, and
+  the replica never recovers in that window. Each fence waits for the other table to be seeded. Not reachable by the
+  scenarios as they are; reachable by an operator who reseeds two tables of one tenant together.
+
 ## Gotchas that cost time
 
 - Hooks block shell text that looks like secrets or env access; put it in a file written with Write/Edit.
@@ -137,8 +145,9 @@ nats-server ≥ 2.15, Zig 0.17, a venv at `/opt/zenv` with `nats-py nkeys msgpac
   to `fence-apply.test.ts`, `reconcile.test.ts`, `measure.test.ts`.
 - libzb is single-threaded in `poll`: a timing hook that sleeps cannot hold a fence open while another pass runs
   (that is why `ZB_TEST_SCHEMA_PAUSE_FILE` exists); the TS client takes the same hold through `faultHook`.
-- libzb never reading a message of `CDC_PUBLIC` counts as a gap for ever (`streamHasGap` with stored 0), so a
-  table with a shared route re-seeds every pass; scenarios write one open-tenant row first.
+- A position of 0 is a gap (`streamHasGap`), except on a stream the client recorded as `born_empty` that is still
+  empty (NOTES "A stream that has never held a message is not a gap"). A client's FIRST sight of an empty
+  `CDC_PUBLIC` is still a gap once; a scenario that needs a message on it writes one open-tenant row first.
 - Reviews of merged PRs have found real P1s each time. Before calling an increment done, probe the _failure_ paths
   (a refused PREPARE, a crash after the first chunk, a conversion fence → plain seed) and the overlap of two
   passes, not just the happy path; and prove each regression test fails without its fix.

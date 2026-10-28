@@ -121,8 +121,9 @@ from the same variables by `scripts/scenarios/fence_client.mts`. A scenario fail
 - nats-server must be recent (the generated configs use `default_max_consumers`; v2.15 works, 2.11 does not).
 - PostgreSQL 16: `ALTER POLICY` waits for a running snapshot that holds the table; do not run it from the same session as a
   parked build.
-- `CDC_PUBLIC` that a client has never read a message of counts as gapped for ever in libzb (`streamHasGap` with stored 0):
-  every pass re-seeds each table with a shared route. Scenarios that need a quiet route write one open-tenant row first.
+- A stream that has never held a message is not a gap (`streamHasGap`, `born_empty`: NOTES "A stream that has never held a message is
+  not a gap"), but a position of 0 on a stream that has messages still is, and so is one a client has not recorded as born empty.
+  A scenario that needs a message on `CDC_PUBLIC` writes one open-tenant row first.
 
 ## Troubleshooting: when a fixed limit is the cause
 

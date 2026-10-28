@@ -196,6 +196,15 @@ fn identifierChecks(a: std.mem.Allocator, conn: *c.PGconn, topo: *const topology
             log.err("🔴 table '{s}' is {d} bytes: a tenant-scoped table is at most {d} (its replica-identity index <table>_zb_ri is cut to a 63-byte name). Rename it.", .{ tbl, name_bytes, limits.max_tenant_scoped_table_bytes });
         }
         if (!scoped) continue;
+        // A catalogue row outlives its table on purpose (a table reborn under the name keeps its rules): a dropped
+        // table has no values to scan, and `--diagnose` lists it once, in the info block about dropped tables.
+        const lit = c.PQescapeLiteral(conn, tbl.ptr, tbl.len) orelse continue;
+        defer c.PQfreemem(lit);
+        const exists_sql = std.fmt.allocPrintSentinel(a, "SELECT to_regclass(format('%I.%I', 'public', {s})) IS NOT NULL", .{std.mem.span(lit)}, 0) catch continue;
+        const ex = c.PQexec(conn, exists_sql.ptr);
+        defer c.PQclear(ex);
+        // Unknown is "exists": the scan below then runs and says what went wrong.
+        if (c.PQresultStatus(ex) == c.PGRES_TUPLES_OK and c.PQntuples(ex) == 1 and c.PQgetvalue(ex, 0, 0)[0] == 'f') continue;
         const col = std.mem.span(c.PQgetvalue(res, row, 1));
         const q_tbl = c.PQescapeIdentifier(conn, tbl.ptr, tbl.len) orelse continue;
         defer c.PQfreemem(q_tbl);

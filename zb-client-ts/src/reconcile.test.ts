@@ -36,7 +36,7 @@ function fixture(path = ':memory:') {
     outboxInitPromise: Promise.resolve(), reconcileLoaded: false, streamWork: Promise.resolve(),
     globalSyncState: { seq }, hubOnly: new Set(), healedRoutes: new Set(),
     tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(), replacing: new Map(), frontiers: new Map(), frontierGated: 0, streamsSubscribed: false, measure: new Measure(() => {}), applyingByChoice: new Set(), syncedTables: new Map([['item', {}]]), ondemandSet: new Set(),
-    streamCreated: new Map([['CDC_acme', 'same']]), restarted: new Set(), failed: new Set(), nc: {},
+    streamCreated: new Map([['CDC_acme', 'same']]), streamBornEmpty: new Set(), restarted: new Set(), failed: new Set(), nc: {},
     transport: {
       jetstreamManager: async () => ({ streams: { info: async () => ({ state: { last_seq: 12 } }) } }),
       deliverPolicy: { byStartSequence: 'by_start_sequence', all: 'all' },

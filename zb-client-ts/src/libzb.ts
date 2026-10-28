@@ -698,6 +698,9 @@ export class ZeBridge {
   /// different one under the same name is a recreated stream — a restart whatever the
   /// sequence numbers say (`stored > last_seq` misses it once the new stream is longer).
   private streamCreated = new Map<string, string>();
+  /// The streams whose identity this replica recorded while they had never held a message (core.streamHasGap's
+  /// `born_empty`): a position of 0 on one of them that still is empty is not a gap. Cleared by every restart.
+  private streamBornEmpty = new Set<string>();
 
   private tenantValue = '';
   /// Per instance, like the replica (see App.tsx's CLIENT_ID history): the LWW
@@ -1575,6 +1578,7 @@ export class ZeBridge {
     // A replica from before §10df: the column is added; refused, harmlessly, on one that has it.
     try { await this.run(`ALTER TABLE _zebridge_generations ADD COLUMN seed_epoch INTEGER NOT NULL DEFAULT 0`); } catch { /* present */ }
     try { await this.run(`ALTER TABLE _zebridge_stream_seq ADD COLUMN created TEXT`); } catch { /* present */ }
+    try { await this.run(`ALTER TABLE _zebridge_stream_seq ADD COLUMN born_empty INTEGER`); } catch { /* present */ }
     // §10jc: the seed gate persisted with its watermark (it died with the process: a
     // client killed after a re-seed re-applied, on relaunch, what its chain already
     // carried in newer versions).
@@ -1582,7 +1586,10 @@ export class ZeBridge {
     try { await this.run(`ALTER TABLE _zebridge_generations ADD COLUMN seed_stream TEXT`); } catch { /* present */ }
     try { await this.run(`ALTER TABLE _zebridge_generations ADD COLUMN shared_seed_seq ${this.dialect.int64}`); } catch { /* present */ }
 
-    for (const r of await this.run(`SELECT stream, created FROM _zebridge_stream_seq WHERE created IS NOT NULL`)) this.streamCreated.set(String(r.stream), String(r.created));
+    for (const r of await this.run(`SELECT stream, created, born_empty FROM _zebridge_stream_seq WHERE created IS NOT NULL`)) {
+      this.streamCreated.set(String(r.stream), String(r.created));
+      if (Number(r.born_empty) === 1) this.streamBornEmpty.add(String(r.stream));
+    }
     // §10dg: the shape this replica BUILT each table with (core.keyShape/typeShape) —
     // the record a re-key or a re-type is detected against.
     await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_shape (tbl TEXT PRIMARY KEY, key_shape TEXT NOT NULL, type_shape TEXT NOT NULL)`);
@@ -4267,7 +4274,7 @@ export class ZeBridge {
     // 1. Gap detection — asked of EVERY stream this client reads: a gap in any of
     // them means missing rows, and checking only one looks like an empty table.
     try {
-      const streamGaps: Record<string, { firstSeq: number; stored: number; lastSeq: number }> = {};
+      const streamGaps: Record<string, { firstSeq: number; stored: number; lastSeq: number; bornEmpty?: boolean }> = {};
       for (const streamName of this.cdcStreams()) {
         const info = await jsm.streams.info(streamName);
         streamGaps[streamName] = {
@@ -4279,7 +4286,11 @@ export class ZeBridge {
         const knownCreated = this.streamCreated.get(streamName);
         const recreated = !!knownCreated && created !== '' && knownCreated !== created;
         if (recreated) this.appendLog('SYNC', `${streamName}: stream recreated (created ${created}, was ${knownCreated}) — position ${streamGaps[streamName].stored} reset`);
-        if (recreated || streamGaps[streamName].stored > info.state.last_seq) {
+        const restartedNow = recreated || streamGaps[streamName].stored > info.state.last_seq;
+        // core.streamHasGap's exception: the identity was recorded on a stream that had never held a message, and it is
+        // that stream still. Never after a restart, whatever the stream looks like now.
+        streamGaps[streamName].bornEmpty = !restartedNow && !!knownCreated && this.streamBornEmpty.has(streamName);
+        if (restartedNow) {
           // The feed restarted under us: the position is meaningless in the new
           // numbering. Reset it, or fullPredates reads the fresh chain's small
           // cutoff_seq as "older than where I am" and skips the full this gap needs.
@@ -4288,14 +4299,20 @@ export class ZeBridge {
           this.globalSyncState.seq[streamName] = 0;
           this.restarted.add(streamName);
           await this.transaction(async (txExec) => {
-            await txExec(`UPDATE _zebridge_stream_seq SET last_seq = 0 WHERE stream = ?`, streamName);
+            await txExec(`UPDATE _zebridge_stream_seq SET last_seq = 0, born_empty = 0 WHERE stream = ?`, streamName);
             await txExec(`DELETE FROM _zebridge_frontier WHERE stream = ?`, streamName);
           });
+          this.streamBornEmpty.delete(streamName);
           this.forgetFrontiers(streamName);
         }
         if (created !== '' && (!knownCreated || recreated)) {
           this.streamCreated.set(streamName, created);
-          await this.run(`INSERT INTO _zebridge_stream_seq (stream, last_seq, created) VALUES (?, 0, ?) ON CONFLICT(stream) DO UPDATE SET created = excluded.created`, streamName, created);
+          // Born empty: the FIRST sight of a stream that has never held a message, with no position of its own. A
+          // restarted stream never is (its tables must be re-seeded before it counts as quiet).
+          const bornEmpty = !knownCreated && !restartedNow && streamGaps[streamName].stored === 0
+            && info.state.first_seq === 0 && info.state.last_seq === 0;
+          if (bornEmpty) this.streamBornEmpty.add(streamName); else this.streamBornEmpty.delete(streamName);
+          await this.run(`INSERT INTO _zebridge_stream_seq (stream, last_seq, created, born_empty) VALUES (?, 0, ?, ?) ON CONFLICT(stream) DO UPDATE SET created = excluded.created, born_empty = excluded.born_empty`, streamName, created, bornEmpty ? 1 : 0);
         }
       }
 

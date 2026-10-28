@@ -39,8 +39,11 @@ def main() -> int:
     zb.psql(f"DROP TABLE IF EXISTS public.{TABLE}", quiet=True)
     zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{TABLE}'", quiet=True)
     try:
-        zb.psql(f"CREATE TABLE public.{TABLE} (id bigint PRIMARY KEY, note text, updated_at timestamptz NOT NULL DEFAULT now())")
-        zb.psql(f"SELECT step FROM public.zebridge_enable('public.{TABLE}'::regclass, public_reason => 'doctor scenario', "
+        # Tenant-scoped, not public: the preflight's line about catalogue rows without a table walks the tenant rules only,
+        # so a public table is listed by --diagnose and never counted there. The scenario used to see that line because
+        # other scenarios left tenant-scoped rows of dropped tables behind; they clean up after themselves now.
+        zb.psql(f"CREATE TABLE public.{TABLE} (id bigint PRIMARY KEY, tenant_id text NOT NULL, note text, updated_at timestamptz NOT NULL DEFAULT now())")
+        zb.psql(f"SELECT step FROM public.zebridge_enable('public.{TABLE}'::regclass, tenant_col => 'tenant_id', "
                 f"publication => '{PUB}', dry_run => false)", quiet=True)
         zb.psql(f"DROP TABLE public.{TABLE}")
         kept = zb.psql(f"SELECT count(*) FROM public.zebridge_catalogue WHERE tbl = '{TABLE}'", quiet=True).strip()
