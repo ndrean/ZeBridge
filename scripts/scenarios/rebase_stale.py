@@ -214,6 +214,13 @@ def main():
             nd.connect()
             dt = wait_pg(uid, ("Meanwhile", "Queued"))
             check(f"§D reconnected: the queued edit was judged stale, rebased and landed: PostgreSQL {pg_row(uid)} ({dt} s)", dt is not None)
+            if dt is None:
+                # Said where the verdict came from: "held for a rebase" then "rebased"/"edit LOST" is the rebase decision, "dropping
+                # this edit" is a stale verdict that found no outbox row to rebase from. Node's log is overwritten by the next run.
+                with open(NODE_LOG, "rb") as lf:
+                    lf.seek(log_mark); lines = lf.read().decode(errors="replace").splitlines()
+                print("  Node's log since the reconnect (outbox, verdict, rebase lines):\n    " + "\n    ".join(
+                    ln[:300] for ln in lines if any(k in ln for k in ("OUTBOX", "VERDICT", "rebase", "LOST", "newer version", "echo")))[:6000])
             check("§D Node said so: 'rebased status onto the newer row'", said(NODE_LOG, "rebased status onto the newer row"))
             v = verdict(d_ver)
             check(f"§D onVerdict: {v}", v is not None and v["outcome"] == "rebased" and v["columns"] == ["status"])
