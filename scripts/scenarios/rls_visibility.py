@@ -372,6 +372,12 @@ async def main():
                     """Park a build between its policy check and its content, then change the policy."""
                     nonlocal failed
                     print("\n── the policy changes while a build is parked between its check and its content")
+                    # EMPTY has served its checks. Left in, a build of it can be the first to reach the held lock: the
+                    # lane is serial and takes its pairs in one fixed order, so every attempt parks behind the same
+                    # table, which has nothing to publish and is not one parked_table() looks for (this step passed on one
+                    # probe bridge and failed on the next, on the same database, with a build parked and not recognised).
+                    zb.psql(f"DROP TABLE IF EXISTS public.{EMPTY} CASCADE", quiet=True)
+                    zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{EMPTY}'", quiet=True)
                     table = None
                     hold = None
                     for _ in range(4):
@@ -386,16 +392,30 @@ async def main():
                             table = parked_table(role)
                         if table:
                             break
+                        # Taken while the lock is STILL held: after the release every session looks idle.
+                        held_view = (
+                            f"hold session {'exited' if hold.p.poll() is not None else 'alive'}; every session by role and wait, "
+                            "with the locks on the watermark table:\n    " + zb.psql(
+                                "SELECT a.pid || ' ' || coalesce(a.usename, '-') || ' ' || coalesce(a.state, '') || ' wait=' || "
+                                "coalesce(a.wait_event_type, '-') || '/' || coalesce(a.wait_event, '-') || ' ' || left(a.query, 90) "
+                                "FROM pg_stat_activity a WHERE a.backend_type = 'client backend' AND a.pid <> pg_backend_pid() "
+                                "ORDER BY a.pid", quiet=True).replace("\n", "\n    ") +
+                            "\n  pg_locks on public.zebridge_gc_watermark:\n    " + zb.psql(
+                                "SELECT pid || ' ' || mode || ' granted=' || granted FROM pg_locks "
+                                "WHERE relation = 'public.zebridge_gc_watermark'::regclass ORDER BY granted DESC, pid", quiet=True).replace("\n", "\n    ") +
+                            "\n  the locks held by the sessions waiting on it:\n    " + zb.psql(
+                                "SELECT l.pid || ' ' || coalesce(c.relname, l.locktype) || ' ' || l.mode || ' granted=' || l.granted "
+                                "FROM pg_locks l LEFT JOIN pg_class c ON c.oid = l.relation WHERE l.locktype IN ('relation', 'transactionid') "
+                                "AND l.pid IN (SELECT pid FROM pg_locks WHERE NOT granted AND relation = 'public.zebridge_gc_watermark'::regclass) "
+                                "ORDER BY l.pid, 2", quiet=True).replace("\n", "\n    "))
                         hold.release()
                     check(table is not None, "a build is parked between its policy check and its content")
                     if table is None:
                         # The temp directory (and the probe bridge's log) vanishes when this function returns:
-                        # say now what the bridge was doing and what the reader role's sessions were waiting on.
+                        # say now what the bridge was doing and what the sessions were waiting on.
                         print("  the probe bridge's log, last lines:\n    " +
                               "\n    ".join((tmp / "bridge.log").read_text(errors="replace").splitlines()[-25:]))
-                        print("  the reader role's sessions:\n    " + zb.psql(
-                            f"SELECT pid || ' ' || coalesce(state, '') || ' wait=' || coalesce(wait_event_type, '-') || ' ' || left(query, 110) "
-                            f"FROM pg_stat_activity WHERE usename = '{role}'", quiet=True).replace("\n", "\n    "))
+                        print("  the last attempt, " + held_view)
                         return
                     tenants = [t for t in (TA, TB) if gens(table, t)]
                     before = {t: top(table, t) for t in tenants}
