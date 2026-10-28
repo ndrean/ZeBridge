@@ -83,7 +83,7 @@ export function mergeRegisters(a: Record<string, Register>, b: Record<string, Re
 }
 
 /// A stream's span against the position a client stored (the gap rule, D2, §10n).
-export type StreamGap = { firstSeq: number; stored: number; lastSeq?: number };
+export type StreamGap = { firstSeq: number; stored: number; lastSeq?: number; bornEmpty?: boolean };
 
 /// Seeding is SCOPED: a gap on one stream re-seeds only the tables routed to it (a
 /// tenant table's open-tenant rows ride `sharedRoute`, CDC_PUBLIC), plus tables never

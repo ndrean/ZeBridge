@@ -1412,7 +1412,9 @@ pub const SyncClient = struct {
         // frontiers from these on its first sight of the table, and the frontier load fails
         // closed — on a fresh replica it read `_zbz_frontier` before it existed and the very
         // first sync answered PrepareFailed ("no such table: _zbz_frontier").
-        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL, created TEXT)");
+        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL, created TEXT, born_empty INTEGER)");
+        // A replica made before `born_empty` (core.streamHasGap): the column is added; refused, harmlessly, on one that has it.
+        execDdl(&self.st, "ALTER TABLE _zbz_stream_seq ADD COLUMN born_empty INTEGER") catch {};
         try self.ensureGenerations();
         for (self.followed) |table| {
             const bytes = (try self.t.kvGet(a, self.kv_schemas, table)) orelse {
@@ -1798,10 +1800,20 @@ pub const SyncClient = struct {
         return rows[0][0].text;
     }
 
-    fn persistCreated(self: *SyncClient, stream: []const u8, created: []const u8) !void {
+    /// Whether this client recorded the stream's identity while the stream had never held a message
+    /// (core.streamHasGap's `born_empty`). NULL — a row from before the column, or a position row that never
+    /// had an identity written — is false: the strict rule.
+    fn storedBornEmpty(self: *SyncClient, stream: []const u8) !bool {
         var qa = std.heap.ArenaAllocator.init(self.a);
         defer qa.deinit();
-        _ = try self.st.query(qa.allocator(), "INSERT INTO _zbz_stream_seq (stream, last_seq, created) VALUES (?, 0, ?) ON CONFLICT(stream) DO UPDATE SET created = excluded.created", &.{ .{ .text = stream }, .{ .text = created } });
+        const rows = try self.st.query(qa.allocator(), "SELECT born_empty FROM _zbz_stream_seq WHERE stream = ?", &.{.{ .text = stream }});
+        return rows.len > 0 and rows[0][0] == .integer and rows[0][0].integer == 1;
+    }
+
+    fn persistCreated(self: *SyncClient, stream: []const u8, created: []const u8, born_empty: bool) !void {
+        var qa = std.heap.ArenaAllocator.init(self.a);
+        defer qa.deinit();
+        _ = try self.st.query(qa.allocator(), "INSERT INTO _zbz_stream_seq (stream, last_seq, created, born_empty) VALUES (?, 0, ?, ?) ON CONFLICT(stream) DO UPDATE SET created = excluded.created, born_empty = excluded.born_empty", &.{ .{ .text = stream }, .{ .text = created }, .{ .integer = @intFromBool(born_empty) } });
     }
 
     fn persistSeq(self: *SyncClient, stream: []const u8, seq: u64) !void {
@@ -1921,7 +1933,9 @@ pub const SyncClient = struct {
             const created: []const u8 = info.created;
             const known_created = try self.storedCreated(a, stream);
             const recreated = if (known_created) |kc| (created.len > 0 and !std.mem.eql(u8, kc, created)) else false;
-            if (core.streamHasGap(first, stored, last) or recreated) {
+            // The identity was recorded on a stream that had never held a message, and it is that stream still.
+            const born_empty = known_created != null and !recreated and try self.storedBornEmpty(stream);
+            if (core.streamHasGap(first, stored, last, born_empty) or recreated) {
                 try gapped.put(a, stream, first);
                 // The feed restarted under us (position beyond last_seq): the position is
                 // meaningless in the new numbering. Reset it, or `fullPredates` reads the
@@ -1938,7 +1952,7 @@ pub const SyncClient = struct {
                         a: std.mem.Allocator,
                         stream: []const u8,
                         fn apply(cx: @This(), s_: *storage.Storage) !void {
-                            _ = try s_.query(cx.a, "INSERT INTO _zbz_stream_seq (stream, last_seq) VALUES (?, 0) ON CONFLICT(stream) DO UPDATE SET last_seq = 0", &.{.{ .text = cx.stream }});
+                            _ = try s_.query(cx.a, "INSERT INTO _zbz_stream_seq (stream, last_seq) VALUES (?, 0) ON CONFLICT(stream) DO UPDATE SET last_seq = 0, born_empty = 0", &.{.{ .text = cx.stream }});
                             _ = try s_.query(cx.a, "DELETE FROM _zbz_frontier WHERE stream = ?", &.{.{ .text = cx.stream }});
                         }
                     };
@@ -1951,7 +1965,11 @@ pub const SyncClient = struct {
                     self.dropTail(stream);
                 }
             }
-            if (created.len > 0 and (known_created == null or recreated)) try self.persistCreated(stream, created);
+            // Born empty: the FIRST sight of a stream that has never held a message, with no position of its own.
+            // A recreated stream never is (its tables must be re-seeded before it counts as quiet), whatever it
+            // looks like now.
+            if (created.len > 0 and (known_created == null or recreated))
+                try self.persistCreated(stream, created, known_created == null and !recreated and stored == 0 and first == 0 and last == 0);
         }
         // Seed with foreign_keys OFF — the standard bulk-load shape, and the same
         // one the TS client uses (dialect.deferForeignKeys + foreignKeyViolations).

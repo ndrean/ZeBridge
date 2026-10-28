@@ -1014,6 +1014,140 @@
       ]
     },
     {
+      "name": "born empty and still empty: a position of 0 is not a gap (a quiet CDC_PUBLIC)",
+      "streams": {
+        "CDC_PUBLIC": {
+          "firstSeq": 0,
+          "stored": 0,
+          "lastSeq": 0,
+          "bornEmpty": true
+        }
+      },
+      "tables": {
+        "users": {
+          "route": "CDC_PUBLIC",
+          "seeded": true
+        }
+      },
+      "gapped": [],
+      "tablesToSeed": []
+    },
+    {
+      "name": "born empty, still empty, a never-seeded table still seeds",
+      "streams": {
+        "CDC_PUBLIC": {
+          "firstSeq": 0,
+          "stored": 0,
+          "lastSeq": 0,
+          "bornEmpty": true
+        }
+      },
+      "tables": {
+        "users": {
+          "route": "CDC_PUBLIC",
+          "seeded": true
+        },
+        "newborn": {
+          "route": "CDC_PUBLIC",
+          "seeded": false
+        }
+      },
+      "gapped": [],
+      "tablesToSeed": [
+        "newborn"
+      ]
+    },
+    {
+      "name": "an empty stream whose identity was NOT recorded as born empty stays a gap (a reset position, a recreated stream)",
+      "streams": {
+        "CDC_PUBLIC": {
+          "firstSeq": 0,
+          "stored": 0,
+          "lastSeq": 0
+        }
+      },
+      "tables": {
+        "users": {
+          "route": "CDC_PUBLIC",
+          "seeded": true
+        }
+      },
+      "gapped": [
+        "CDC_PUBLIC"
+      ],
+      "tablesToSeed": [
+        "users"
+      ]
+    },
+    {
+      "name": "born empty, but the stream holds messages now: position 0 is a gap",
+      "streams": {
+        "CDC_PUBLIC": {
+          "firstSeq": 1,
+          "stored": 0,
+          "lastSeq": 4,
+          "bornEmpty": true
+        }
+      },
+      "tables": {
+        "users": {
+          "route": "CDC_PUBLIC",
+          "seeded": true
+        }
+      },
+      "gapped": [
+        "CDC_PUBLIC"
+      ],
+      "tablesToSeed": [
+        "users"
+      ]
+    },
+    {
+      "name": "born empty, last_seq unknown: stays a gap (nothing proves the stream is empty)",
+      "streams": {
+        "CDC_PUBLIC": {
+          "firstSeq": 0,
+          "stored": 0,
+          "bornEmpty": true
+        }
+      },
+      "tables": {
+        "users": {
+          "route": "CDC_PUBLIC",
+          "seeded": true
+        }
+      },
+      "gapped": [
+        "CDC_PUBLIC"
+      ],
+      "tablesToSeed": [
+        "users"
+      ]
+    },
+    {
+      "name": "born empty does not excuse a position beyond the stream (a restart): still a gap",
+      "streams": {
+        "CDC_kilo": {
+          "firstSeq": 0,
+          "stored": 7,
+          "lastSeq": 0,
+          "bornEmpty": true
+        }
+      },
+      "tables": {
+        "salaries": {
+          "route": "CDC_kilo",
+          "seeded": true
+        }
+      },
+      "gapped": [
+        "CDC_kilo"
+      ],
+      "tablesToSeed": [
+        "salaries"
+      ]
+    },
+    {
       "name": "an empty recreated stream (last_seq 0) with a position is a gap too",
       "streams": {
         "CDC_kilo": {
