@@ -193,6 +193,15 @@ class Hold:
         self.p.stdin.write("BEGIN;\nLOCK TABLE public.zebridge_gc_watermark IN ACCESS EXCLUSIVE MODE;\n")
         self.p.stdin.flush()
 
+    def bounce(self):
+        """Let a build parked EARLY (on its publication-columns query, before it has checked the policy) run on, and
+        take the lock again at once: it is a few round trips from the read this lock is meant to catch."""
+        try:
+            self.p.stdin.write("ROLLBACK;\nBEGIN;\nLOCK TABLE public.zebridge_gc_watermark IN ACCESS EXCLUSIVE MODE;\n")
+            self.p.stdin.flush()
+        except OSError:
+            pass
+
     def release(self):
         try:
             self.p.stdin.write("ROLLBACK;\n\\q\n")
@@ -205,10 +214,21 @@ class Hold:
             self.p.kill()
 
 
+def waiter(role):
+    """The pid of a session of `role` waiting for the held lock, or None."""
+    return zb.psql("SELECT a.pid FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+                   f"WHERE NOT l.granted AND l.relation = 'public.zebridge_gc_watermark'::regclass AND a.usename = '{role}' LIMIT 1",
+                   quiet=True) or None
+
+
 def parked_table(role):
-    """The fixture table whose build is parked on the held lock, or None."""
-    pid = zb.psql(f"SELECT pid FROM pg_stat_activity WHERE usename = '{role}' AND wait_event_type = 'Lock' "
-                  "AND query ILIKE '%zebridge_gc_watermark%' LIMIT 1", quiet=True)
+    """The fixture table whose build is parked on the held lock AFTER its policy check, or None.
+
+    ⚠️ A waiter is not enough. Every build starts with a query on pg_publication_tables, which opens each published
+    table, the watermark's among them, so the held lock parks a build there first, before it has read a policy. Only
+    a build that already holds ACCESS SHARE on one of the fixture tables has passed that point (the snapshot
+    transaction locks the table, then checks the policy, then reads the watermark)."""
+    pid = waiter(role)
     if not pid:
         return None
     names = ",".join(f"'{t}'" for t in (OK, BAD, TOMB))
@@ -372,12 +392,6 @@ async def main():
                     """Park a build between its policy check and its content, then change the policy."""
                     nonlocal failed
                     print("\n── the policy changes while a build is parked between its check and its content")
-                    # EMPTY has served its checks. Left in, a build of it can be the first to reach the held lock: the
-                    # lane is serial and takes its pairs in one fixed order, so every attempt parks behind the same
-                    # table, which has nothing to publish and is not one parked_table() looks for (this step passed on one
-                    # probe bridge and failed on the next, on the same database, with a build parked and not recognised).
-                    zb.psql(f"DROP TABLE IF EXISTS public.{EMPTY} CASCADE", quiet=True)
-                    zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{EMPTY}'", quiet=True)
                     table = None
                     hold = None
                     for _ in range(4):
@@ -390,6 +404,8 @@ async def main():
                         while time.time() < deadline and table is None:
                             await asyncio.sleep(0.3)
                             table = parked_table(role)
+                            if table is None and waiter(role):
+                                hold.bounce()   # parked before its policy check: let it run on, lock again
                         if table:
                             break
                         # Taken while the lock is STILL held: after the release every session looks idle.
