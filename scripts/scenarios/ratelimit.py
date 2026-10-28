@@ -45,6 +45,10 @@ async def main():
         sys.exit("another bridge is running — this scenario owns the only one (stop it first)")
     zb.psql(f"DROP TABLE IF EXISTS public.{T}", quiet=True)
     zb.forget_table(T)  # the schema key too — a DROP after the probe bridge exits tombstones nobody
+    # The catalogue row outlives the DROP (a dropped table keeps its rules on purpose), and the chain builder
+    # tries a chain for every row at every cadence: an error line per tenant for ever once the table is gone.
+    zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{T}'", quiet=True)
+    zb.psql(f"DELETE FROM public.zebridge_generations WHERE tbl = '{T}'", quiet=True)
     zb.psql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), note text, tenant_id text NOT NULL, "
             f"inserted_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)", quiet=True)
     zb.psql(f"SELECT public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', writable => true, version_col => 'updated_at', "
@@ -184,6 +188,10 @@ async def main():
                 tk.cancel(); await nc.close()
 
     zb.psql(f"DROP TABLE public.{T}", quiet=True)
+    # The catalogue row outlives the DROP (a dropped table keeps its rules on purpose), and the chain builder
+    # tries a chain for every row at every cadence: an error line per tenant for ever once the table is gone.
+    zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{T}'", quiet=True)
+    zb.psql(f"DELETE FROM public.zebridge_generations WHERE tbl = '{T}'", quiet=True)
     fresh_sqlite(db)
     return 1 if FAILED else 0
 
