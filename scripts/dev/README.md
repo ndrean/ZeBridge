@@ -1,18 +1,16 @@
 # The scenario stack in containers
 
-PostgreSQL and NATS (operator mode) in Docker Compose, started and stopped with one command. Replaces
-[`scripts/native`](../native/README.md) for running the scenarios: no Homebrew PostgreSQL, no `nats-server`,
-no `nsc` on the host. The bridge, the sweeper and the scenarios still run from the host build and connect over
-the published ports, so a code change needs `zig build`, not an image rebuild.
+PostgreSQL and NATS (operator mode) in Docker Compose, started and stopped with one command.
+Replaces [`scripts/native`](../native/README.md) for running the scenarios: no Homebrew PostgreSQL, no `nats-server`, no `nsc` on the host.
+The bridge, the sweeper and the scenarios still run from the host build and connect over the published ports, so a code change needs `zig build`, not an image rebuild.
 
-Containers add a virtualization layer. Do not take speed measurements here; `scripts/native` is for those.
+❗️ Containers add a virtualization layer. Do not take speed measurements here; `scripts/native` is for those.
 
 ## Setup, in this order
 
-Everything runs from the repository root. Needs Docker with the compose plugin (OrbStack is fine) and the
-`.env.bridge` of the repository, with `DATABASE_READER_URL` and `DATABASE_WRITER_URL` pointing at `127.0.0.1:5432`.
-Nothing else may listen on 5432, 4222, 8222, 8080 or 1883: stop a Homebrew PostgreSQL first
-(`brew services stop postgresql@18`, and any `scripts/native/up.sh` stack with `scripts/native/down.sh`).
+Everything runs from the repository root. Needs Docker with the compose plugin (OrbStack is fine) and the `.env.bridge` of the repository, with `DATABASE_READER_URL` and `DATABASE_WRITER_URL` pointing at `127.0.0.1:5432`.
+Nothing else may listen on 5432, 4222, 8222, 8080 or 1883: stop a Homebrew PostgreSQL first (`brew services stop postgresql@18`, and any `scripts/native/up.sh` stack with `scripts/native/down.sh`).
+
 The one-time installs of [the table below](#once-before-the-scenarios) come first.
 
 **1. Build** what the stack and the scenarios run:
@@ -22,8 +20,7 @@ zig build -Doptimize=ReleaseFast
 (cd libzb && zig build -Doptimize=ReleaseFast)
 ```
 
-**2. Start the stack.** The publication has no default and is not in `.env.bridge`: pass a name and use the same one
-everywhere below. The first run pulls the images and mints the NATS credentials.
+**2. Start the stack.** The publication has no default and is not in `.env.bridge`: pass a name and use the same one everywhere below. The first run pulls the images and mints the NATS credentials.
 
 ```sh
 BRIDGE_CDC_PUBLICATION=zb_pub scripts/dev/up.sh
@@ -48,37 +45,29 @@ export NATS_URL=nats://127.0.0.1:4222              # after the line above, which
 export ZB_PG_CTL="$PWD/scripts/dev/pg_ctl" ZB_NATS_CONTAINER=zb-dev-nats
 ```
 
-**5. Provision the baseline. Required, once per database.** `up.sh` creates an empty database; the scenarios assume
-the eight fixture tables (`test_types`, `users`, …), their catalogue rows and the principals' tenants
-(`alice→acme … omar→kilo`), and `reprovision.py` is what creates them:
+**5. Provision the baseline. Required, once per database**: `up.sh` creates an empty database; the scenarios assume the eight fixture tables (`test_types`, `users`, …), their catalogue rows and the principals' tenants (`alice→acme … omar→kilo`), and `reprovision.py` is what creates them:
 
 ```sh
-scripts/reprovision.py; echo "exit $?"      # exit 0, and no line starting with ✗
+python3 scripts/reprovision.py; echo "exit $?"      # exit 0, and no line starting with ✗
 ```
 
-Without it the scenarios fail in dozens of places that do not name the cause (`relation public.test_types does not
-exist`, `no tenant for a write … principal 'omar' is unset`). Do it again after `down.sh --clean`, and after anything
-that drops the fixtures. `run.py` checks for the table and for `omar`'s tenant before it starts, and stops with
-exit 2 if either is missing.
+⚠️ Do it again after `down.sh --clean`, and after anything that drops the fixtures. `run.py` checks for the table and for `omar`'s tenant before it starts, and stops with exit 2 if either is missing.
 
-**6. Start the bridge, after step 5** (it publishes every schema at boot, so a bridge started before the tables
-existed has to be restarted). Its own terminal, steps 4 repeated there:
+**6. Start the bridge, after step 5** (it publishes every schema at boot, so a bridge started before the tables existed has to be restarted). Its own terminal, ❗️ steps 4 repeated there:
 
 ```sh
 zig-out/bin/bridge --pub $BRIDGE_CDC_PUBLICATION > /tmp/zb-bridge.log 2>&1     # :27434
 ```
 
-Watch it with `tail -f /tmp/zb-bridge.log` in another terminal. **Do not pipe the bridge into `tee`**: Ctrl-C goes to every
-program of a pipeline, so it also kills `tee`, and the bridge's graceful stop (it waits for its in-flight batches) turns
-into an abrupt one. Redirect to a file instead, as above; Ctrl-C then reaches only the bridge.
+Watch it with `tail -f /tmp/zb-bridge.log` in another terminal. **Do not pipe the bridge into `tee`**: Ctrl-C goes to every program of a pipeline, so it also kills `tee`, and the bridge's graceful stop (it waits for its in-flight batches) turns into an abrupt one. Redirect to a file instead, as above; Ctrl-C then reaches only the bridge.
 
-**7. Run**, in another terminal with step 4 repeated:
+**7. Run**, in another terminal ❗️ with step 4 repeated:
 
 ```sh
-scripts/scenarios/run.py offline
-scripts/scenarios/run.py live --bridge-log /tmp/zb-bridge.log
+python3 scripts/scenarios/run.py offline
+python3 scripts/scenarios/run.py live --bridge-log /tmp/zb-bridge.log
 # stop the bridge (Ctrl-C): each `owns` scenario starts its own and refuses to run beside another
-scripts/scenarios/run.py owns
+python3 scripts/scenarios/run.py owns
 ```
 
 `run.py all` is these three in a row, so it cannot work with the long-running bridge up: it says so and skips `owns`.
@@ -90,50 +79,43 @@ scripts/dev/down.sh                     # stop; the data stays in the Docker vol
 scripts/dev/down.sh --clean             # also delete the volumes, the keys and the credentials: redo steps 2, 5 and 6
 ```
 
-**After `owns`, the bridge's replication slot is lost.** `slot_loss.py` lowers `max_slot_wal_keep_size`, which is
-cluster-wide, so every inactive slot that is behind is invalidated, including the long-running bridge's (it is stopped
-while `owns` runs). Starting that bridge again then stops at once with `SlotInvalidated`. Recover once:
-`bridge --drop-slot <slot>` (or `SELECT pg_drop_replication_slot('<slot>')`), run `scripts/reprovision.py`, and start the
-bridge with `ZB_FEED_RESTART=1`; it creates a new slot, and the next start needs no flag.
+**After `owns`, the bridge's replication slot is lost.** `slot_loss.py` lowers `max_slot_wal_keep_size`, which is cluster-wide, so every inactive slot that is behind is invalidated, including the long-running bridge's (it is stopped while `owns` runs). Starting that bridge again then stops at once with `SlotInvalidated`. Recover once:
 
-**The GC floor never goes down.** `zebridge_gc_watermark` is the oldest version the bridge still accepts. If anything
-moves it close to now, every scenario that writes "a few minutes ago" (`mutate`, `replies`, `offline`, `intclamp`)
-fails with `PredatesGcWatermark`, and nothing short of resetting the database (`scripts/dev/down.sh --clean`) undoes it.
-`run.py` warns at the start when the floor is less than 45 minutes behind now (`offline` stamps writes up to 40 minutes back), and prints `GC floor moved: …` after the
-scenario that moved it.
+`bridge --drop-slot <slot>`
 
-**Reading the bridge's errors.** The long-running bridge logs one stream for every `live` scenario, without timestamps, and
-many scenarios provoke errors on purpose (a refused write, a killed process, a dropped row, an outage). With
-`--bridge-log`, `run.py` saves what the bridge wrote during each scenario to `zb-scenario-<name>.bridge.log` beside
-that scenario's log and prints how many error lines it holds. An error there is expected if the scenario's own
-description says it causes one (`run.py --list`); it is worth a look if the scenario passed without meaning to.
-The `owns` scenarios log their own probe bridge in `/tmp/zb_*.log`, named in each scenario's output.
+(or `SELECT pg_drop_replication_slot('<slot>')`), run `scripts/reprovision.py`
 
-The scenarios drive `psql` from the host (`ZB_PGBIN`, or `ZB_PSQL`: see the scenarios' README). Only the client
-binaries are needed, not a running Homebrew server.
+and start the bridge with `ZB_FEED_RESTART=1`; it creates a new slot, and the next start needs no flag.
+
+**The GC floor never goes down.** `zebridge_gc_watermark` is the oldest version the bridge still accepts. If anything moves it close to now, every scenario that writes "a few minutes ago" (`mutate`, `replies`, `offline`, `intclamp`) fails with `PredatesGcWatermark`, and nothing short of resetting the database (`scripts/dev/down.sh --clean`) undoes it.
+`run.py` warns at the start when the floor is less than 45 minutes behind now (`offline` stamps writes up to 40 minutes back), and prints `GC floor moved: …` after the scenario that moved it.
+
+**Reading the bridge's errors.** The long-running bridge logs one stream for every `live` scenario, without timestamps, and many scenarios provoke errors on purpose (a refused write, a killed process, a dropped row, an outage). With `--bridge-log`, `run.py` saves what the bridge wrote during each scenario to `zb-scenario-<name>.bridge.log` beside that scenario's log and prints how many error lines it holds. An error there is expected if the scenario's own description says it causes one (`run.py --list`); it is worth a look if the scenario passed without meaning to. The `owns` scenarios log their own probe bridge in `/tmp/zb_*.log`, named in each scenario's output.
+
+The scenarios drive `psql` from the host (`ZB_PGBIN`, or `ZB_PSQL`: see the scenarios' README). Only the client binaries are needed, not a running Homebrew server.
 
 ## Once, before the scenarios
 
 Found by running the whole battery on a clean machine; none of it is in the scenarios' own setup text.
 
-| need | for | how |
-| -- | -- | -- |
-| the TypeScript client's dependencies | `outbox_*`, `reconcile`, `hub_fallback`, `jwt_renew` (`ERR_MODULE_NOT_FOUND: better-sqlite3`) | `cd zb-client-ts && pnpm install` |
-| the Node worker's dependencies | `migrate_both`, `column_flood`, `rekey_*`, `offline_migrate`, `cascade_held`, `tombstone_children`, `suspension_reasons`, `rebuild_kill` (`node worker did not come up`: it cannot resolve `@zebridge/client`, a `link:` dependency of an example outside the workspace) | `cd examples/04-node-consumer && pnpm install` |
-| the `zstd` command | `shared_gap` | `brew install zstd` |
-| the demo `routes` table | `route_crdt` (`no such table: routes`) | `python examples/08-map/load_routes.py --create` (set `ZB_PSQL` if your `psql` is not Homebrew's) |
-| Python 3.14 for the venv | `serve` (`from compression import zstd`) | `brew install python@3.14`, then `python3.14 -m venv …` |
-| SeaweedFS S3 on `:8333` | `readings_roles`, `archive`, the S3 case of `readings_fetch` | start it yourself |
-| the `zebridge-leaf-nats:2.15.0-security` image | `leaf_security` | no documented command builds it |
-| a database created with the `C` locale | `standby` (`invalid value for parameter "lc_messages": "en_US.utf8"`: it starts a copy of the container's database with your Mac's PostgreSQL, and the container's default locale name is Linux's) | `compose.yml` now creates it that way; a volume made before needs `scripts/dev/down.sh --clean`, then steps 2, 5, 6 again |
+| need                                           | for                                                                                                                                                                                                                                                                      | how                                                                                                                       |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| the TypeScript client's dependencies           | `outbox_*`, `reconcile`, `hub_fallback`, `jwt_renew` (`ERR_MODULE_NOT_FOUND: better-sqlite3`)                                                                                                                                                                            | `cd zb-client-ts && pnpm install`                                                                                         |
+| the Node worker's dependencies                 | `migrate_both`, `column_flood`, `rekey_*`, `offline_migrate`, `cascade_held`, `tombstone_children`, `suspension_reasons`, `rebuild_kill` (`node worker did not come up`: it cannot resolve `@zebridge/client`, a `link:` dependency of an example outside the workspace) | `cd examples/04-node-consumer && pnpm install`                                                                            |
+| the `zstd` command                             | `shared_gap`                                                                                                                                                                                                                                                             | `brew install zstd`                                                                                                       |
+| the demo `routes` table                        | `route_crdt` (`no such table: routes`)                                                                                                                                                                                                                                   | `python examples/08-map/load_routes.py --create` (set `ZB_PSQL` if your `psql` is not Homebrew's)                         |
+| Python 3.14 for the venv                       | `serve` (`from compression import zstd`)                                                                                                                                                                                                                                 | `brew install python@3.14`, then `python3.14 -m venv …`                                                                   |
+| SeaweedFS S3 on `:8333`                        | `readings_roles`, `archive`, the S3 case of `readings_fetch`                                                                                                                                                                                                             | start it yourself                                                                                                         |
+| the `zebridge-leaf-nats:2.15.0-security` image | `leaf_security`                                                                                                                                                                                                                                                          | no documented command builds it                                                                                           |
+| a database created with the `C` locale         | `standby` (`invalid value for parameter "lc_messages": "en_US.utf8"`: it starts a copy of the container's database with your Mac's PostgreSQL, and the container's default locale name is Linux's)                                                                       | `compose.yml` now creates it that way; a volume made before needs `scripts/dev/down.sh --clean`, then steps 2, 5, 6 again |
 
 ## What runs
 
-| service | image | host ports | what |
-| -- | -- | -- | -- |
-| `postgres` | `postgres:18.6-alpine3.24` | 5432 | the flags of `scripts/native/up.sh` (`wal_level=logical`, ten slots); `trust` for the host, loopback only |
-| `nats-bootstrap` | `natsio/nats-box` | none | one shot: runs [`jwt-bootstrap.sh`](../native/jwt-bootstrap.sh) with `nsc`, then exits |
-| `nats` | `nats:2.15-alpine` | 4222, 8222 (monitoring), 8080 (websocket), 1883 (MQTT) | [`nats-server.conf`](nats-server.conf), after the bootstrap |
+| service          | image                      | host ports                                             | what                                                                                                      |
+| ---------------- | -------------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| `postgres`       | `postgres:18.6-alpine3.24` | 5432                                                   | the flags of `scripts/native/up.sh` (`wal_level=logical`, ten slots); `trust` for the host, loopback only |
+| `nats-bootstrap` | `natsio/nats-box`          | none                                                   | one shot: runs [`jwt-bootstrap.sh`](../native/jwt-bootstrap.sh) with `nsc`, then exits                    |
+| `nats`           | `nats:2.15-alpine`         | 4222, 8222 (monitoring), 8080 (websocket), 1883 (MQTT) | [`nats-server.conf`](nats-server.conf), after the bootstrap                                               |
 
 The bootstrap writes the `nsc` keys and the resolver fragment to `scripts/dev/state/` (untracked: the keys sign
 every credential) and the `.creds` files to `scripts/native/creds/`, where `run.py` reads them. The server
