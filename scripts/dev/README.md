@@ -122,6 +122,7 @@ Found by running the whole battery on a clean machine; none of it is in the scen
 | Python 3.14 for the venv | `serve` (`from compression import zstd`) | `brew install python@3.14`, then `python3.14 -m venv …` |
 | SeaweedFS S3 on `:8333` | `readings_roles`, `archive`, the S3 case of `readings_fetch` | start it yourself |
 | the `zebridge-leaf-nats:2.15.0-security` image | `leaf_security` | no documented command builds it |
+| a database created with the `C` locale | `standby` (`invalid value for parameter "lc_messages": "en_US.utf8"`: it starts a copy of the container's database with your Mac's PostgreSQL, and the container's default locale name is Linux's) | `compose.yml` now creates it that way; a volume made before needs `scripts/dev/down.sh --clean`, then steps 2, 5, 6 again |
 
 ## What runs
 

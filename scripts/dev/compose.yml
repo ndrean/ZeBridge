@@ -20,6 +20,12 @@ services:
       # The scenarios connect as `postgres` from the host without a password, as against the
       # native stack (pg_hba `trust`). A development stack bound to loopback.
       POSTGRES_HOST_AUTH_METHOD: trust
+      # The locale is written into postgresql.conf and into the database itself. The image's default,
+      # `en_US.utf8`, is Linux's spelling (macOS says `en_US.UTF-8`), and standby.py starts a COPY of this
+      # database with the host's PostgreSQL: it refused with "invalid value for parameter lc_messages". Alpine's
+      # C library has no locale data and sorts bytewise whatever the name, so `C` changes nothing here and is a
+      # name every system knows. Only a new data volume takes it (initdb runs once): down.sh --clean.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
     ports:
       - "127.0.0.1:${ZB_DEV_PG_PORT:-5432}:5432"
     volumes:
