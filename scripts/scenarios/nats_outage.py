@@ -30,7 +30,7 @@ import uuid
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import zb  # noqa: E402
-from chaos import running_nats, nats_conf_and_log  # noqa: E402
+from chaos import running_nats, nats_conf_and_log, nats_alive, nats_stop  # noqa: E402
 
 TABLE = "memo"
 N = 12
@@ -70,9 +70,9 @@ async def main() -> int:
         await nc.close()
 
         # ── 2. broker down, writes keep committing ────────────────────────────
-        subprocess.run(["kill", pid], check=True)
+        nats_stop(pid)
         for _ in range(50):
-            if subprocess.run(["kill", "-0", pid], capture_output=True).returncode != 0: break
+            if not nats_alive(pid): break
             time.sleep(0.2)
         outage = [f"{base}-{i:02d}" for i in range(N)]
         t0 = time.monotonic()

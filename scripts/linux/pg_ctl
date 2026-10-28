@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# A `pg_ctl` for the cluster scripts/linux/up.sh started, for the restart scenarios (pg_restart, matrix, churn,
+# sweeper_restart):
+#
+#   export ZB_PG_CTL="$PWD/scripts/linux/pg_ctl"
+#
+# It understands what the scenarios call: `status`, `stop -m fast|immediate`, `start`. The data directory, the
+# server flags, the log and the operating-system user are those up.sh recorded in state/pg.env; `-D`, `-o`, `-l`
+# and `-t` of the caller are accepted and ignored. Exit codes are pg_ctl's own.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE="${ZB_LINUX_STATE:-$HERE/state}"
+[ -r "$STATE/pg.env" ] || { echo "pg_ctl: $STATE/pg.env is missing — scripts/linux/up.sh writes it" >&2; exit 2; }
+# shellcheck disable=SC1091
+. "$STATE/pg.env"
+
+as_pg() { if [ -n "$PG_OS_USER" ]; then runuser -u "$PG_OS_USER" -- "$@"; else "$@"; fi; }
+
+verb="" mode="fast"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -D | -o | -l | -t) shift ;;
+    -m) mode="$2"; shift ;;
+    status | stop | start) verb="$1" ;;
+  esac
+  shift
+done
+
+case "$verb" in
+  status) as_pg "$PGBIN/pg_ctl" -D "$PGDATA" status >/dev/null 2>&1; exit $? ;;
+  stop) as_pg "$PGBIN/pg_ctl" -D "$PGDATA" -m "$mode" -t 90 -w stop >/dev/null; exit $? ;;
+  start) as_pg "$PGBIN/pg_ctl" -D "$PGDATA" -l "$PG_LOG" -o "$PG_OPTS" -t 90 -w start >/dev/null; exit $? ;;
+  *) echo "pg_ctl (scripts/linux): supports status | stop -m fast|immediate | start" >&2; exit 2 ;;
+esac

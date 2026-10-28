@@ -35,6 +35,10 @@ def teardown():
     zb.forget_table(C, P)  # the schema keys too — a DROP after the probe bridge exits tombstones nobody
     for sql in (f"DROP TABLE IF EXISTS public.{C}", f"DROP TABLE IF EXISTS public.{P}",
                 f"DELETE FROM public.zebridge_catalogue WHERE tbl IN ('{P}','{C}')",
+                # The identity and seed epoch of a table survive its DROP (a re-created table keeps its
+                # incarnation, by design). §M1/§M2 assert ABSOLUTE epochs (0,0 then 1,0), so a row left by
+                # an earlier run - even a failed one - made every later run start above 0 and fail.
+                f"DELETE FROM public.zebridge_incarnations WHERE tbl IN ('{P}','{C}')",
                 f"DELETE FROM public.zebridge_generations WHERE tbl IN ('{P}','{C}')"):
         zb.psql(sql, quiet=True)
 

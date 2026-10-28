@@ -13,9 +13,17 @@
 # never upper-cased. The bridge's reconciler and the conf were changed together.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-export NSC_HOME="$ROOT/scripts/native/nsc-store"          # keys + JWTs live here
+# Keys, JWTs and the resolver fragment live in STATE: scripts/native by default, or wherever
+# ZB_STATE_DIR points (scripts/dev/compose.yml keeps them out of the tracked files). The creds
+# stay in scripts/native/creds, which is where the scenarios read them.
+STATE="${ZB_STATE_DIR:-$ROOT/scripts/native}"
+export NSC_HOME="$STATE/nsc-store"                        # keys + JWTs live here
 export XDG_DATA_HOME="$NSC_HOME/data"
 export XDG_CONFIG_HOME="$NSC_HOME/config"
+# nsc keeps the private keys where NKEYS_PATH says, and the natsio/nats-box image presets it (/nsc/nkeys): in the
+# compose bootstrap the keys then stayed inside the container, never reached $STATE, and the scenarios that sign
+# with them (jwt_expiry, revoke_midseed) found nothing. Pinned to the place nsc picks by itself under XDG_DATA_HOME.
+export NKEYS_PATH="$XDG_DATA_HOME/nats/nsc/keys"
 CREDS="$ROOT/scripts/native/creds"
 mkdir -p "$CREDS"
 
@@ -42,6 +50,7 @@ echo "service signing key: $SK_SERVICE"
 # on VERDICTS is NOT granted: MSG.NEXT cannot be scoped below the stream, so one
 # principal could pull another's verdicts by guessing a consumer name.
 SK_CLIENT=$(nsc edit account ZEBRIDGE --sk generate 2>&1 | grep -o 'A[A-Z0-9]\{55\}' | tail -1)
+# §10hq: the answer bucket of a tenant — an answer too large for one message.  (a comment cannot sit inside the continued command below)
 nsc edit signing-key --account ZEBRIDGE --sk "$SK_CLIENT" --role client \
     --allow-pub "mutation.{{name()}}.>" \
     --allow-pub "\$KV.live.{{tag(tenant)}}.{{name()}}" \
@@ -81,7 +90,6 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_CLIENT" --role client \
     --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_gen-_default.>" \
     --allow-pub "\$JS.API.CONSUMER.INFO.OBJ_gen-_default.>" \
     --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-_default.>" \
-    # §10hq: the answer bucket of a tenant — an answer too large for one message.
     --allow-pub "\$JS.API.STREAM.INFO.OBJ_res-{{tag(tenant)}}" \
     --allow-pub "\$JS.API.STREAM.INFO.OBJ_res-_default" \
     --allow-pub "\$JS.API.DIRECT.GET.OBJ_res-{{tag(tenant)}}.>" \
@@ -113,6 +121,7 @@ echo "client signing key:  $SK_CLIENT"
 # replies to any inbox. NOT granted: mutations, the heartbeat key, asking. A service
 # that answers from a replica cannot write to PostgreSQL through the bridge.
 SK_RESPONDER=$(nsc edit account ZEBRIDGE --sk generate 2>&1 | grep -o 'A[A-Z0-9]\{55\}' | tail -1)
+# §10hq: the answer bucket of a tenant — an answer too large for one message.  (a comment cannot sit inside the continued command below)
 nsc edit signing-key --account ZEBRIDGE --sk "$SK_RESPONDER" --role responder \
     --allow-pub "\$JS.API.INFO" \
     --allow-pub "\$JS.API.CONSUMER.CREATE.CDC_{{tag(tenant)}}" \
@@ -149,7 +158,6 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_RESPONDER" --role responder \
     --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_gen-_default.>" \
     --allow-pub "\$JS.API.CONSUMER.INFO.OBJ_gen-_default.>" \
     --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-_default.>" \
-    # §10hq: the answer bucket of a tenant — an answer too large for one message.
     --allow-pub "\$JS.API.STREAM.INFO.OBJ_res-{{tag(tenant)}}" \
     --allow-pub "\$JS.API.STREAM.INFO.OBJ_res-_default" \
     --allow-pub "\$JS.API.DIRECT.GET.OBJ_res-{{tag(tenant)}}.>" \
@@ -246,7 +254,7 @@ done
 chmod 600 "$CREDS"/*.creds
 
 # ── the server side: operator + preloaded accounts, one fragment ─────────────
-nsc generate config --mem-resolver --config-file "$ROOT/scripts/native/resolver.conf" --force
+nsc generate config --mem-resolver --config-file "$STATE/resolver.conf" --force
 
 # ⚠️ The running server does NOT read resolver.conf: nats-server-jwt.conf carries its
 # own inline `resolver_preload`, pasted from an earlier generation. Editing a signing
@@ -254,9 +262,9 @@ nsc generate config --mem-resolver --config-file "$ROOT/scripts/native/resolver.
 # reports "Reloaded: accounts" while enforcing the old template (measured 2026-08-29:
 # a new DIRECT.GET grant was refused for 20 minutes after a successful reload).
 # Splice the fresh ZEBRIDGE JWT in when the file exists, then reload the server (`nats-server --signal reload`).
-JWTCONF="$ROOT/scripts/native/nats-server-jwt.conf"
+JWTCONF="$STATE/nats-server-jwt.conf"
 if [ -f "$JWTCONF" ]; then
-  python3 - "$ROOT/scripts/native/resolver.conf" "$JWTCONF" <<'PY'
+  python3 - "$STATE/resolver.conf" "$JWTCONF" <<'PY'
 import re, sys
 res, conf = open(sys.argv[1]).read(), open(sys.argv[2]).read()
 for acc, jwt in re.findall(r'([A-Z2-7]{56}):\s*(ey[A-Za-z0-9_.\-]+)', res):

@@ -6,6 +6,8 @@ Exists because that virtualization layer is not free: measured on this project, 
 
 Configured identically to `docker-compose.full.yml`'s `postgres-primary` and the `nats-config-gen`/`nats-init` services — same PostgreSQL flags, same `nats-server.conf.template` rendering, same MUTATIONS/REQUESTS streams and KV buckets from `grammar.json` (the bridge creates and reconciles the CDC/INIT stream family itself at boot, from `zebridge_catalogue`) — so a native run and a Docker run differ only in the virtualization layer, nothing else.
 
+> No Homebrew PostgreSQL, `nats-server` or `nsc` on this machine, or you only run the scenarios? [`scripts/dev`](../dev/README.md) starts the same stack in Docker Compose. This directory remains the one for speed measurements.
+
 ## Usage
 
 ```bash

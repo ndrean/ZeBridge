@@ -11,7 +11,7 @@ different reasons and should read as different things.
 
 ## Setup
 
-The stack is the native one (`scripts/native/up.sh`: Postgres on 127.0.0.1:5432, NATS on
+The stack is either Docker Compose (`scripts/dev/up.sh`, [README](../dev/README.md)) or the native one (`scripts/native/up.sh`: Postgres on 127.0.0.1:5432, NATS on
 127.0.0.1:4222 with JWT/operator auth). `scripts/native/jwt-bootstrap.sh` mints the creds
 files the scenarios connect with: `bridge.creds` (the bridge's own identity) and one per
 client principal — alice (acme), bob (globex), mary (globex), nina (tango), omar (kilo).

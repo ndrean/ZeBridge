@@ -391,6 +391,57 @@ def pg_opts(port: str | int | None = None) -> str:
     return f"-p {port or os.environ.get('NATIVE_PG_PORT', '5432')} " + " ".join(flags)
 
 
+# The compose stack (scripts/dev) runs nats-server in a container. Set to its name (`zb-dev-nats`) and the
+# scenarios that kill, restart or reload the broker go through Docker instead of signalling a process.
+NATS_CONTAINER = os.environ.get("ZB_NATS_CONTAINER", "")
+
+def jwt_stack() -> dict:
+    """Where jwt_expiry and revoke_midseed find the JWT stack: the account's public key, the files holding
+    the operator's and the scoped client signing key's private halves, and the conf whose account JWT a
+    hard revocation amends. Native: scripts/native (the conf is nats-server-jwt.conf). Compose
+    (ZB_NATS_CONTAINER set): scripts/dev/state (the conf is resolver.conf, which the container's server
+    includes). ZB_JWT_STATE names a state directory of that second layout. The public ids are read from resolver.conf, which `nsc generate config` writes in both
+    stacks: the operator's JWT and the ZEBRIDGE account's, whose signing keys name the client key. Nothing
+    is written into the scenarios, because every store mints keys of its own."""
+    import re
+    # ZB_JWT_STATE: a stack whose state directory is elsewhere (scripts/linux/up.sh, a plain-process stack with the
+    # compose stack's layout: resolver.conf beside the store, included by the server).
+    custom = os.environ.get("ZB_JWT_STATE")
+    state = pathlib.Path(custom) if custom else ROOT / "scripts" / ("dev/state" if NATS_CONTAINER else "native")
+
+    def key_file(pub: str) -> pathlib.Path:
+        # nsc names the file after the public key; where under the store depends on its version and on
+        # XDG_DATA_HOME, so look for the name and keep the usual place for the error message
+        usual = state / "nsc-store/data/nats/nsc/keys/keys" / pub[0] / pub[1:3] / f"{pub}.nk"
+        if usual.exists():
+            return usual
+        return next(iter((state / "nsc-store").glob(f"**/{pub}.nk")), usual)
+
+    def claims(jwt: str) -> dict:
+        body = jwt.split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+
+    resolver = state / "resolver.conf"
+    text = resolver.read_text() if resolver.exists() else ""
+    op = re.search(r"^operator:\s*(ey\S+)", text, re.M)
+    operator_pub = claims(op.group(1))["sub"] if op else ""
+    account_pub = client_pub = ""
+    for acc, jwt in re.findall(r"([A-Z2-7]{56}):\s*(ey[A-Za-z0-9_.\-]+)", text):
+        c = claims(jwt)
+        if c.get("name") != "ZEBRIDGE":
+            continue
+        account_pub = acc
+        # a bootstrap run again adds another client key: the newest one whose seed is in the store
+        keys = [k["key"] for k in c.get("nats", {}).get("signing_keys", []) if isinstance(k, dict) and k.get("role") == "client"]
+        client_pub = next((k for k in reversed(keys) if key_file(k).exists()), keys[-1] if keys else "")
+    return {
+        "account_pub": account_pub,
+        "client_sk_file": key_file(client_pub) if client_pub else state / "no-client-signing-key-in-resolver.conf",
+        "operator_file": key_file(operator_pub) if operator_pub else state / "no-operator-in-resolver.conf",
+        "conf": state / ("resolver.conf" if NATS_CONTAINER or custom else "nats-server-jwt.conf"),
+    }
+
+
 def another_bridge_running() -> bool:
     # The pattern must exclude `zig-out/bin/bridge_sweeper`, which is always running and
     # is not a bridge — unanchored, every owns-group scenario refused to start (measured

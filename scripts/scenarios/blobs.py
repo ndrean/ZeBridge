@@ -52,7 +52,7 @@ async def main():
     zb.psql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), tile bytea, geom geometry(Point, 4326), note text, "
             f"tenant_id text NOT NULL, inserted_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)", quiet=True)
     en = zb.psql(f"SELECT string_agg(step || ':' || status, ' ') FROM public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', writable => true, "
-                 f"version_col => 'updated_at', tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => 'my_pub', dry_run => false)", quiet=True)
+                 f"version_col => 'updated_at', tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => '{zb.publication()}', dry_run => false)", quiet=True)
     zb.ok(f"{T} created and enabled ({'error' not in en and 'refused' not in en})")
     # Three rows: a 1,500-byte tile of a repeating pattern, every byte value once, an empty
     # tile. Sized for the change-feed budget: the width guard measures the TEXT form of a row
@@ -130,7 +130,7 @@ async def main():
     nd.close(); em.close()
 
     # ── the objects themselves ──────────────────────────────────────────────────
-    r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--pub", "my_pub", "--tenant", TENANT, "--table", T, "--no-replay"], capture_output=True, text=True)
+    r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--pub", zb.publication(), "--tenant", TENANT, "--table", T, "--no-replay"], capture_output=True, text=True)
     check("the chain audit finds the full and deltas exact (bytea as \\x hex, geometry as EWKB hex)", "✓ the chain mirrors PostgreSQL" in r.stdout)
     if "✓ the chain mirrors PostgreSQL" not in r.stdout: print(r.stdout[-1500:])
     zb.psql(f"DROP TABLE public.{T}", quiet=True)

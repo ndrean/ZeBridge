@@ -34,9 +34,9 @@ sys.path.insert(0, str(zb.ROOT / "libzb" / "python"))
 import _env  # noqa: E402
 
 BRIDGE = zb.ROOT / "zig-out" / "bin" / "bridge"
-SK_FILE = zb.ROOT / ("scripts/native/nsc-store/data/nats/nsc/keys/keys/A/BG/"
-                     "ABGOGUGNFMBG47I2NTHPQFX4G3YUP23ENMNEM7ZUURFKIBGUK743WPND.nk")
-ACCOUNT_PUB = "ABSDAXPW56ON5USFCTUQSWSQWTNLZL3DDDVZAPUH3244HU4NM7QFQD5L"
+_JWT = zb.jwt_stack()   # native store, or the compose stack's (ZB_NATS_CONTAINER)
+SK_FILE = _JWT["client_sk_file"]
+ACCOUNT_PUB = _JWT["account_pub"]
 PRINCIPAL = "ttl_probe"
 TENANT = "kilo"
 TTL_S = 10
@@ -55,7 +55,9 @@ def main() -> int:
     if zb.another_bridge_running():
         sys.exit("another bridge is already running — this scenario owns the only bridge")
     if not SK_FILE.exists():
-        sys.exit("the scoped client signing key is not in the nsc store — run jwt-bootstrap.sh once")
+        sys.exit(f"the scoped client signing key is not in the nsc store — looked for {SK_FILE} "
+                 f"({'compose stack, ZB_NATS_CONTAINER=' + zb.NATS_CONTAINER if zb.NATS_CONTAINER else 'native stack: ZB_NATS_CONTAINER is not set'}); "
+                 f"run jwt-bootstrap.sh once")
     failed = 0
     creds_path = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_ttl_probe.creds"
     db = f"/tmp/zb-jwt-expiry-{os.getpid()}.sqlite3"

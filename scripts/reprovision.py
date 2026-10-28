@@ -52,6 +52,10 @@ BASE_TABLES = ["test_types", "orders", "users", "salaries", "memo", "note_t",
 # principal -> tenant. zb_sweeper maps to every tenant (the sidecar's identity).
 TENANTS = {"alice": "acme", "bob": "globex", "mary": "globex", "nina": "tango", "omar": "kilo"}
 SWEEPER_TENANTS = ["acme", "globex", "tango", "kilo"]
+# The outbound-only fixture (writable.py: "test_types (writable) vs users (outbound-only)"): published,
+# never granted INSERT. Its key is serial, so a writable `users` is also an error in --diagnose
+# (DbAllocatedKey: the write path would refuse every mutation for it).
+OUTBOUND_ONLY = {"users"}
 # enable params per table: (version, tombstone, tiebreak, tenant), captured from
 # the known-good catalogue. Empty string = not set.
 ENABLE = {
@@ -186,9 +190,10 @@ def main():
                  f"VALUES ('zb_sweeper','{t}') ON CONFLICT DO NOTHING")
 
     # 6. ensure the base tables are enabled with the canonical params
+    refused = []
     for t in BASE_TABLES:
         v, tomb, tie, ten = ENABLE[t]
-        args = [f"'public.{t}'", "writable => true", f"version_col => '{v}'"]
+        args = [f"'public.{t}'", f"writable => {'false' if t in OUTBOUND_ONLY else 'true'}", f"version_col => '{v}'"]
         if tomb:
             args.append(f"tombstone_col => '{tomb}'")
         else:
@@ -197,12 +202,39 @@ def main():
             args.append(f"tiebreak_col => '{tie}'")
         if ten:
             args.append(f"tenant_col => '{ten}'")
+        if not ten:
+            # zebridge_publication_guard refuses a table published unscoped without a recorded
+            # reason. The refusal is a result row (status ERROR), not a SQL error: this script
+            # used to print "ensure enabled" and leave the table out of the catalogue, which only
+            # shows on a database that never had it (one enabled before the guard kept its row).
+            args.append(f"public_reason => 'scenario fixture: readable by every consumer'")
         args += [f"publication => '{pub}'", "dry_run => false"]
         note(f"ensure enabled: {t}")
         if not DRY:
-            out = psql(f"SELECT 1 FROM zebridge_enable({', '.join(args)})")
-            if "error" in out.lower():
-                print(f"  ⚠️ enable {t}: {out}", file=sys.stderr)
+            out = psql(f"SELECT step || ': ' || detail FROM zebridge_enable({', '.join(args)}) WHERE status = 'ERROR'")
+            if out:
+                print(f"  ✗ enable {t} was refused: {out}", file=sys.stderr)
+                refused.append(t)
+    # 7. the GC floor. init.core inserts it as (now(), threshold 0): a database starts with its floor at its
+    # own creation time, and the floor never goes down. The scenarios stamp writes 10 to 60 minutes into
+    # the past (mutate, offline, replies, intclamp), which the bridge refuses (PredatesGcWatermark) until
+    # the database is that old - so on every fresh database the first hour of the battery failed, and every
+    # reset restarted the clock. A new database has reaped nothing, so a floor in the past is true; it is
+    # staged back the way the init SQL documents for a test (the monotone trigger off, the UPDATE, on),
+    # to where a 7-day sweeper pass would leave it. A floor already older than two days is left alone.
+    if psql("SELECT watermark > now() - interval '2 days' FROM public.zebridge_gc_watermark WHERE id = 1") == "t":
+        note("stage the GC floor back to 7 days ago (a new database starts it at its creation time)")
+        if not DRY:
+            psql("ALTER TABLE public.zebridge_gc_watermark DISABLE TRIGGER zebridge_gc_watermark_monotone; "
+                 "UPDATE public.zebridge_gc_watermark SET watermark = now() - interval '7 days' WHERE id = 1; "
+                 "ALTER TABLE public.zebridge_gc_watermark ENABLE TRIGGER zebridge_gc_watermark_monotone")
+            if psql("SELECT watermark > now() - interval '2 days' FROM public.zebridge_gc_watermark WHERE id = 1") != "f":
+                print("  ✗ the GC floor could not be staged back: scenarios that write minutes into the past will be refused",
+                      file=sys.stderr)
+                refused.append("(gc floor)")
+    if refused:
+        print(f"\n{len(refused)} base table(s) not enabled: {', '.join(refused)}", file=sys.stderr)
+        return 1
 
     print(f"\n{'DRY RUN — ' if DRY else ''}{changed} change(s). "
           "Start the live bridge fresh; boot republishes all schemas clean.")

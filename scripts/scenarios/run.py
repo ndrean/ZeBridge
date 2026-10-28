@@ -214,6 +214,32 @@ def derived_env() -> dict:
     return out
 
 
+def gc_floor() -> tuple[str, int] | None:
+    """(the GC floor, seconds behind now()) of the database the scenarios use, or None if unreadable."""
+    code = ("import zb; print(zb.psql(\"SELECT watermark || '|' || extract(epoch FROM now() - watermark)::bigint "
+            "FROM public.zebridge_gc_watermark\", quiet=True))")
+    out = subprocess.run([PY, "-c", code], cwd=HERE, env=env_for("bridge"), capture_output=True, text=True).stdout.strip()
+    try:
+        stamp, behind = out.rsplit("|", 1)
+        return stamp, int(behind)
+    except ValueError:
+        return None
+
+
+def bridge_answering() -> bool:
+    """Whether something answers HTTP on the long-running bridge's port (BRIDGE_PORT, 27434)."""
+    import urllib.error
+    import urllib.request
+    port = os.environ.get("BRIDGE_PORT", "27434")
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=2).close()
+        return True
+    except urllib.error.HTTPError:
+        return True   # it answered
+    except (urllib.error.URLError, OSError):
+        return False
+
+
 DERIVED = None
 
 
@@ -248,6 +274,11 @@ def main() -> int:
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--no-preflight", action="store_true", help="skip the check that the database has the GC-floor functions")
     ap.add_argument("--logs", default=os.environ.get("TMPDIR", "/tmp"), help="where per-scenario logs go")
+    ap.add_argument("--bridge-log", default=os.environ.get("ZB_BRIDGE_LOG"),
+                    help="the long-running bridge's log file: what it wrote during each scenario is saved beside that "
+                         "scenario's log (zb-scenario-<name>.bridge.log) and its error lines counted. Start the bridge with "
+                         "`> FILE 2>&1` (not a pipe into tee: Ctrl-C would kill tee too and cut the bridge's graceful stop short). "
+                         "Many scenarios provoke errors on purpose; this says which one did")
     a = ap.parse_args()
     if a.list:
         for g, items in GROUPS.items():
@@ -285,6 +316,18 @@ def main() -> int:
                   "  Re-apply init.core.template.sql and init.write.template.sql (bridge --init-sql), then run again.\n"
                   "  --no-preflight skips this check.")
             return False
+        # The baseline the scenarios assume: the fixture tables and the principals' tenants. They come from
+        # scripts/reprovision.py (neither up.sh nor the init SQL creates them), and without them the first
+        # scenarios fail on "relation public.test_types does not exist" and, in the bridge log, "no tenant for
+        # a write … principal 'omar' is unset or not in zebridge_user_tenants" - one cause, many scenarios.
+        base = subprocess.run([PY, "-c", "import zb; print(zb.psql(\"SELECT (to_regclass('public.test_types') IS NOT NULL) || ',' || "
+                               "(SELECT count(*) FROM public.zebridge_user_tenants WHERE principal = 'omar')\", quiet=True))"],
+                              cwd=HERE, env=env_for("bridge"), capture_output=True, text=True).stdout.strip()
+        if base and base.split(",")[0] != "true" or base.endswith(",0"):
+            print("preflight: the baseline is missing (" + ("no public.test_types table" if not base.startswith("true") else "no tenant mapping for 'omar'") +
+                  ").\n  Run scripts/reprovision.py, then restart the bridge: it republishes every schema at boot.\n"
+                  "  --no-preflight skips this check.")
+            return False
         holders = subprocess.run([PY, "-c", "import zb; print(zb.psql(\"SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=23106 "
                                   "AND objid=1 AND objsubid=2 AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())\", quiet=True))"],
                                  cwd=HERE, env=env_for("bridge"), capture_output=True, text=True).stdout.strip()
@@ -295,19 +338,59 @@ def main() -> int:
     if any(g != "offline" for g in groups) and not a.no_preflight and not preflight():
         return 2
     results = []
+    floor = gc_floor() if any(g != "offline" for g in groups) else None
+    if floor and floor[1] < 2700:
+        # The floor never goes down, and the scenarios stamp their writes minutes behind now (mutate 10,
+        # replies and intclamp a few, offline up to 40): with the floor this close, the bridge refuses them
+        # as PredatesGcWatermark and each scenario fails for a reason it does not name.
+        print(f"\n  ⚠️  the GC floor is at {floor[0]}, only {floor[1] // 60} min behind now. Writes older than that are "
+              "refused (PredatesGcWatermark), so scenarios that write 'a few minutes ago' will fail. The floor cannot be "
+              "lowered: reset the database (scripts/dev/down.sh --clean) and do not run a sweeper with a short "
+              "GC_THRESHOLD_MS against it.\n", flush=True)
     for g in groups:
+        if g == "owns" and bridge_answering():
+            # Each owns scenario starts a probe bridge and refuses to run beside another, so with the
+            # long-running bridge up the group is ~50 identical failures ("another bridge is running").
+            # `run.py all` is offline + live + owns in one go: the live group needs the bridge, this one
+            # must not have it.
+            print(f"\n  ✗ owns: a bridge answers on :{os.environ.get('BRIDGE_PORT', '27434')}. These scenarios start their own and "
+                  "refuse to run beside another one: stop it, then `run.py owns`.", flush=True)
+            results.append((g, "(group not run)", 1, 0.0, "-"))
+            continue
         if g != "offline":
             drop_probe_slot()
         for name, (role, note) in GROUPS[g].items():
             if a.k and not any(k in name for k in a.k):
                 continue
             log = pathlib.Path(a.logs) / f"zb-scenario-{name}.log"
+            bridge_log = pathlib.Path(a.bridge_log) if a.bridge_log else None
+            log_from = bridge_log.stat().st_size if bridge_log and bridge_log.exists() else None
             t0 = time.monotonic()
             with open(log, "w") as f:
                 rc = subprocess.run([PY, str(HERE / f"{name}.py")], env=env_for(role), stdout=f, stderr=subprocess.STDOUT, cwd=ROOT).returncode
             dt = time.monotonic() - t0
             results.append((g, name, rc, dt, log))
             print(f"  {'✓' if rc == 0 else '✗'} {g}/{name:18s} rc={rc:<3d} {dt:6.1f}s  {log}", flush=True)
+            if floor and g != "offline":
+                after = gc_floor()
+                if after and after[0] != floor[0]:
+                    if after[1] < 2700:
+                        print(f"      ⚠️  GC floor moved: {floor[0]} → {after[0]} ({after[1] // 60} min behind now). It never goes down; "
+                              "the scenarios after this one that stamp older versions are refused (PredatesGcWatermark)", flush=True)
+                    else:
+                        # a sweeper pass at its normal retention: forward by minutes, still days behind now
+                        print(f"      GC floor moved forward to {after[0]}, still {after[1] // 60} min behind now: harmless", flush=True)
+                    floor = after
+            if log_from is not None and bridge_log.exists():
+                with open(bridge_log, "rb") as bf:
+                    bf.seek(log_from)
+                    written = bf.read().decode("utf-8", "replace")
+                errors = sum(1 for line in written.splitlines() if "error(" in line or "🔴" in line)
+                if written:
+                    sliced = pathlib.Path(a.logs) / f"zb-scenario-{name}.bridge.log"
+                    sliced.write_text(written)
+                    print(f"      bridge log: {errors} error line(s), {len(written.splitlines())} line(s) → {sliced}" if errors
+                          else "      bridge log: no error lines", flush=True)
     if any(g != "offline" for g in groups):
         drop_probe_slot()
     failed = [r for r in results if r[2] != 0]

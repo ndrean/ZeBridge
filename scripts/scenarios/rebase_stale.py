@@ -37,6 +37,7 @@ LOG = "/tmp/zb_rebase_stale_bridge.log"
 PY_ERR, NODE_LOG = "/tmp/zb_rebase_stale_py.log", "/tmp/zb_rebase_stale_node.log"
 T = "mig_rb"
 PUB = zb.publication()
+OPEN = zb.TOPOLOGY["open_tenant"]
 COMMON = ("tenant_id varchar(255) NOT NULL, last_writer varchar(255), inserted_at timestamptz NOT NULL DEFAULT now(), "
           "updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz")
 ENABLE = ("tenant_col => 'tenant_id', writable => true, version_col => 'updated_at', tombstone_col => 'deleted_at', "
@@ -129,6 +130,11 @@ def main():
                 zb.bad("bridge never started its producer"); print(bridge.text()[-1500:]); return 1
             out = zb.psql(f"SELECT string_agg(step || ':' || status, ' ') FROM zebridge_enable('public.{T}', {ENABLE})")
             check(f"zebridge_enable({T}) live: {out.strip()[:50]}…", "error" not in out.lower())
+            # A client that has never read a message of CDC_PUBLIC finds it "gapped" at every connect (core.streamHasGap, stored 0)
+            # and re-seeds each table with a shared route. §D reconnects Node: with the stream empty (a fresh stack) it re-seeds
+            # mig_rb through a fence, the queued edit is judged against the re-seeded row, and a disjoint-column edit comes back
+            # 'lost' instead of 'rebased'. One open-tenant row gives the stream a message, as recreate_recovery does (CLAUDE.md).
+            zb.psql(f"INSERT INTO {T} (uid, title, status, tenant_id) VALUES (gen_random_uuid(), 'Open', 'Open', '{OPEN}')", quiet=True)
             py = Lib(PY_DB, [T], "py-rebase")
             nd = Node(NODE_DB, NODE_LOG)
             tenant = py.tenant
@@ -210,13 +216,25 @@ def main():
             py.mutate(T, "UPDATE", {"uid": uid}, {"title": "Meanwhile"}); py.flush(5000)
             dt = wait_pg(uid, ("Meanwhile", "Again"))
             check(f"§D libzb's edit landed meanwhile: PostgreSQL {pg_row(uid)} ({dt} s)", dt is not None)
+            log_mark = os.path.getsize(NODE_LOG)   # what Node logs from the reconnect on
             nd.connect()
             dt = wait_pg(uid, ("Meanwhile", "Queued"))
             check(f"§D reconnected: the queued edit was judged stale, rebased and landed: PostgreSQL {pg_row(uid)} ({dt} s)", dt is not None)
+            if dt is None:
+                # Said where the verdict came from: "held for a rebase" then "rebased"/"edit LOST" is the rebase decision, "dropping
+                # this edit" is a stale verdict that found no outbox row to rebase from. Node's log is overwritten by the next run.
+                with open(NODE_LOG, "rb") as lf:
+                    lf.seek(log_mark); lines = lf.read().decode(errors="replace").splitlines()
+                print("  Node's log since the reconnect (outbox, verdict, rebase lines):\n    " + "\n    ".join(
+                    ln[:300] for ln in lines if any(k in ln for k in ("OUTBOX", "VERDICT", "rebase", "LOST", "newer version", "echo")))[:6000])
             check("§D Node said so: 'rebased status onto the newer row'", said(NODE_LOG, "rebased status onto the newer row"))
             v = verdict(d_ver)
             check(f"§D onVerdict: {v}", v is not None and v["outcome"] == "rebased" and v["columns"] == ["status"])
-            check("§D the winner's row was NOT taken for the queued write's echo", "confirmed by CDC echo" not in open(NODE_LOG).read().split("replaying 1 unconfirmed")[-1].split("rebased status")[0])
+            # (until 2026-10-28 this cut the log at "replaying 1 unconfirmed", a line the client no longer writes: the
+            # whole log was searched, and §A's honest "confirmed by CDC echo" failed the check)
+            with open(NODE_LOG, "rb") as lf:
+                lf.seek(log_mark); since_reconnect = lf.read().decode(errors="replace")
+            check("§D the winner's row was NOT taken for the queued write's echo", "confirmed by CDC echo" not in since_reconnect.split("rebased status")[0])
             dt = both(py, nd, lambda c: local(c, uid) == ("Meanwhile", "Queued"), 60)
             check(f"§D both replicas at {{Meanwhile, Queued}} ({dt} s): py {local(py, uid)}, node {local(nd, uid)}", dt is not None)
             turn(py, 2, lambda: False)

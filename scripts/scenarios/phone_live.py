@@ -72,7 +72,7 @@ def setup(preload: int):
     psql(f"VACUUM ANALYZE public.{TABLE}")
     mark = BRIDGE_LOG.stat().st_size
     out = psql(f"SELECT step || ' ' || status FROM zebridge_enable('public.{TABLE}'::regclass, tenant_col => 'tenant_id', "
-               f"version_col => 'updated_at', tombstone_col => 'deleted_at', publication => 'my_pub', dry_run => false) WHERE status = 'ERROR'")
+               f"version_col => 'updated_at', tombstone_col => 'deleted_at', publication => '{zb.publication()}', dry_run => false) WHERE status = 'ERROR'")
     if out:
         sys.exit(f"zebridge_enable refused: {out}")
     print(f"{TABLE}: {preload:,} rows on {TENANT}, enabled; waiting for its first chain…", flush=True)

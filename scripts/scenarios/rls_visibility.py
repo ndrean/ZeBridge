@@ -193,6 +193,15 @@ class Hold:
         self.p.stdin.write("BEGIN;\nLOCK TABLE public.zebridge_gc_watermark IN ACCESS EXCLUSIVE MODE;\n")
         self.p.stdin.flush()
 
+    def bounce(self):
+        """Let a build parked EARLY (on its publication-columns query, before it has checked the policy) run on, and
+        take the lock again at once: it is a few round trips from the read this lock is meant to catch."""
+        try:
+            self.p.stdin.write("ROLLBACK;\nBEGIN;\nLOCK TABLE public.zebridge_gc_watermark IN ACCESS EXCLUSIVE MODE;\n")
+            self.p.stdin.flush()
+        except OSError:
+            pass
+
     def release(self):
         try:
             self.p.stdin.write("ROLLBACK;\n\\q\n")
@@ -205,10 +214,21 @@ class Hold:
             self.p.kill()
 
 
+def waiter(role):
+    """The pid of a session of `role` waiting for the held lock, or None."""
+    return zb.psql("SELECT a.pid FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+                   f"WHERE NOT l.granted AND l.relation = 'public.zebridge_gc_watermark'::regclass AND a.usename = '{role}' LIMIT 1",
+                   quiet=True) or None
+
+
 def parked_table(role):
-    """The fixture table whose build is parked on the held lock, or None."""
-    pid = zb.psql(f"SELECT pid FROM pg_stat_activity WHERE usename = '{role}' AND wait_event_type = 'Lock' "
-                  "AND query ILIKE '%zebridge_gc_watermark%' LIMIT 1", quiet=True)
+    """The fixture table whose build is parked on the held lock AFTER its policy check, or None.
+
+    ⚠️ A waiter is not enough. Every build starts with a query on pg_publication_tables, which opens each published
+    table, the watermark's among them, so the held lock parks a build there first, before it has read a policy. Only
+    a build that already holds ACCESS SHARE on one of the fixture tables has passed that point (the snapshot
+    transaction locks the table, then checks the policy, then reads the watermark)."""
+    pid = waiter(role)
     if not pid:
         return None
     names = ",".join(f"'{t}'" for t in (OK, BAD, TOMB))
@@ -384,11 +404,34 @@ async def main():
                         while time.time() < deadline and table is None:
                             await asyncio.sleep(0.3)
                             table = parked_table(role)
+                            if table is None and waiter(role):
+                                hold.bounce()   # parked before its policy check: let it run on, lock again
                         if table:
                             break
+                        # Taken while the lock is STILL held: after the release every session looks idle.
+                        held_view = (
+                            f"hold session {'exited' if hold.p.poll() is not None else 'alive'}; every session by role and wait, "
+                            "with the locks on the watermark table:\n    " + zb.psql(
+                                "SELECT a.pid || ' ' || coalesce(a.usename, '-') || ' ' || coalesce(a.state, '') || ' wait=' || "
+                                "coalesce(a.wait_event_type, '-') || '/' || coalesce(a.wait_event, '-') || ' ' || left(a.query, 90) "
+                                "FROM pg_stat_activity a WHERE a.backend_type = 'client backend' AND a.pid <> pg_backend_pid() "
+                                "ORDER BY a.pid", quiet=True).replace("\n", "\n    ") +
+                            "\n  pg_locks on public.zebridge_gc_watermark:\n    " + zb.psql(
+                                "SELECT pid || ' ' || mode || ' granted=' || granted FROM pg_locks "
+                                "WHERE relation = 'public.zebridge_gc_watermark'::regclass ORDER BY granted DESC, pid", quiet=True).replace("\n", "\n    ") +
+                            "\n  the locks held by the sessions waiting on it:\n    " + zb.psql(
+                                "SELECT l.pid || ' ' || coalesce(c.relname, l.locktype) || ' ' || l.mode || ' granted=' || l.granted "
+                                "FROM pg_locks l LEFT JOIN pg_class c ON c.oid = l.relation WHERE l.locktype IN ('relation', 'transactionid') "
+                                "AND l.pid IN (SELECT pid FROM pg_locks WHERE NOT granted AND relation = 'public.zebridge_gc_watermark'::regclass) "
+                                "ORDER BY l.pid, 2", quiet=True).replace("\n", "\n    "))
                         hold.release()
                     check(table is not None, "a build is parked between its policy check and its content")
                     if table is None:
+                        # The temp directory (and the probe bridge's log) vanishes when this function returns:
+                        # say now what the bridge was doing and what the sessions were waiting on.
+                        print("  the probe bridge's log, last lines:\n    " +
+                              "\n    ".join((tmp / "bridge.log").read_text(errors="replace").splitlines()[-25:]))
+                        print("  the last attempt, " + held_view)
                         return
                     tenants = [t for t in (TA, TB) if gens(table, t)]
                     before = {t: top(table, t) for t in tenants}

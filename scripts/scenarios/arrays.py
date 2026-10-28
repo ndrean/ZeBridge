@@ -38,7 +38,7 @@ async def main():
     zb.psql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), tags text[], matrix int[][], flags bool[], prices numeric[], note text, "
             f"tenant_id text NOT NULL, inserted_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)", quiet=True)
     en = zb.psql(f"SELECT string_agg(step || ':' || status, ' ') FROM public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', writable => true, "
-                 f"version_col => 'updated_at', tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => 'my_pub', dry_run => false)", quiet=True)
+                 f"version_col => 'updated_at', tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => '{zb.publication()}', dry_run => false)", quiet=True)
     zb.ok(f"{T} created and enabled")
     insert("seed globex", "globex"); insert("seed acme", "acme")
     time.sleep(2)
@@ -99,7 +99,7 @@ async def main():
 
     # ── the objects ─────────────────────────────────────────────────────────────
     import subprocess
-    a = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--pub", "my_pub", "--tenant", "globex", "--table", T, "--no-replay"], capture_output=True, text=True)
+    a = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--pub", zb.publication(), "--tenant", "globex", "--table", T, "--no-replay"], capture_output=True, text=True)
     check("the chain audit finds the objects exact (arrays against PostgreSQL's to_json)", "✓ the chain mirrors PostgreSQL" in a.stdout)
     if "✓ the chain mirrors PostgreSQL" not in a.stdout: print(a.stdout[-1200:])
     zb.psql(f"DROP TABLE public.{T}", quiet=True)

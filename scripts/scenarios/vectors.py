@@ -57,7 +57,7 @@ async def main():
     zb.psql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), emb vector(3), half halfvec(3), sv sparsevec(5), bits bit(8), b3 bit(3), vb varbit(12), "
             f"note text, tenant_id text NOT NULL, inserted_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)", quiet=True)
     en = zb.psql(f"SELECT step || ': ' || detail FROM public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', writable => true, version_col => 'updated_at', "
-                 f"tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => 'my_pub', dry_run => false)", quiet=True)
+                 f"tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => '{zb.publication()}', dry_run => false)", quiet=True)
     check(f"{T} enabled on the master (pgvector types, bit, varbit)", "publication" in en and "columns:" not in en)
     zb.psql(f"INSERT INTO {T} (emb, half, sv, bits, b3, vb, note, tenant_id) VALUES "
             f"('[1,2,3]', '[0.5,-1,1.5]', '{{2:1.5,5:-0.25}}/5', B'10100101', B'101', B'1010', 'seed', '{TENANT}')", quiet=True)
@@ -117,7 +117,7 @@ async def main():
     # ── the audit: the chain mirrors PostgreSQL, vectors compared in pgvector's text ──
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline and not zb.kv_get("generations", f"{TENANT}.{T}"): time.sleep(2)
-    a = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--tenant", TENANT, "--table", T, "--pub", "my_pub"], capture_output=True, text=True)
+    a = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--tenant", TENANT, "--table", T, "--pub", zb.publication()], capture_output=True, text=True)
     check("the audit finds the chain exact, replay included", "✓ the chain mirrors PostgreSQL" in a.stdout)
     if "✓ the chain mirrors PostgreSQL" not in a.stdout: print(a.stdout[-1200:])
 

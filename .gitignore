@@ -36,7 +36,8 @@ src/test_files/
 docs/
 /zold/
 zz-changes/
-
+consumer/
+test.json
 examples/01-micro_vm-nodejs/node_modules/
 examples/02-micro_vm-python/__pycache__/
 examples/03-browser-python-django/venv/
@@ -141,3 +142,7 @@ dist/
 # Flutter/Dart local overrides (e.g. an example pointed at the local zb-dart): never committed,
 # an app with one cannot build against pub.dev.
 pubspec_overrides.yaml
+
+# scripts/dev/compose.yml: the nsc keys and the resolver fragment it mints (secrets, never committed)
+scripts/dev/state/
+scripts/linux/state/

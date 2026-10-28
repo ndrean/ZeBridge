@@ -86,8 +86,20 @@ def main() -> int:
         check((s1, s2, s3) == (200, 404, 405), f"B /health 200, another path 404, POST 405 ({s1}, {s2}, {s3})")
 
         # C
+        # The server serves at most Config.Http.max_connections (16) connections at once and closes any beyond
+        # that, so 20 visitors who arrive at the same instant get all 20 invites only if requests finish fast
+        # enough not to overlap past 16 - which depends on the database's latency (a container's is higher).
+        # A refused visitor tries again, as a browser or a load balancer does; the claim stays "20 visitors,
+        # 20 different invites".
+        def visit(_):
+            for attempt in range(10):
+                try:
+                    return get("/demo")
+                except (http.client.RemoteDisconnected, ConnectionError):
+                    time.sleep(0.05 * (attempt + 1))
+            return get("/demo")
         with concurrent.futures.ThreadPoolExecutor(20) as ex:
-            got = list(ex.map(lambda _: get("/demo"), range(20)))
+            got = list(ex.map(visit, range(20)))
         codes = {re.search(r"invite=([0-9a-f]{32})", loc).group(1) for st, loc, _ in got if st == 302}
         check(len(codes) == 20, f"C 20 visitors at once, 20 different invites ({len(codes)})")
 
