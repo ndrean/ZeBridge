@@ -43,6 +43,8 @@ export NATS_URL=nats://127.0.0.1:4222              # after the line above, which
 # so the outage scenarios (chaos, nats_outage, matrix, cascade, churn, pg_restart, sweeper_restart, jwt_expiry,
 # revoke_midseed) stop, start and reload the containers instead of looking for a Homebrew server and a pid file:
 export ZB_PG_CTL="$PWD/scripts/dev/pg_ctl" ZB_NATS_CONTAINER=zb-dev-nats
+# the S3 of archive, readings_roles and readings_fetch: the keys up.sh generated for SeaweedFS (not needed with ZB_DEV_S3=0)
+export S3_KEYS="$PWD/scripts/dev/state/s3.json"
 ```
 
 **5. Provision the baseline. Required, once per database**: `up.sh` creates an empty database; the scenarios assume the eight fixture tables (`test_types`, `users`, …), their catalogue rows and the principals' tenants (`alice→acme … omar→kilo`), and `reprovision.py` is what creates them:
@@ -71,6 +73,23 @@ python3 scripts/scenarios/run.py owns
 ```
 
 `run.py all` is these three in a row, so it cannot work with the long-running bridge up: it says so and skips `owns`.
+
+**The write path through admission (optional, the production path).** `MUTATION_ADMISSION` defaults to 0: the long-running bridge
+reads writes from the legacy public queue, and everything above runs that way. Production runs `bridge --mutation-ingress` as a
+separate process and sets `MUTATION_ADMISSION=1` on the bridge (OPERATIONS, "Mutation admission cutover"). To run the `live`
+group through it, start admission first and the bridge after it, on a stack whose bridge has never started: the first start
+decides the queue's layout.
+
+```sh
+MUTATION_ADMISSION=1 zig-out/bin/bridge --mutation-ingress > /tmp/zb-admission.log 2>&1       # wait for "mutation admission ready"
+MUTATION_ADMISSION=1 zig-out/bin/bridge --pub $BRIDGE_CDC_PUBLICATION > /tmp/zb-bridge.log 2>&1
+```
+
+Measured on the Linux stack: `mutate`, `replies`, `offline` and `writable` pass this way. It is a switch for the whole stack, not
+per scenario: the queue is then `$ZB.mutation.>`, and an `owns` scenario that publishes straight to `mutation.<principal>.…` with
+no admission process running gets `NoStreamResponseError` (`ratelimit` did). Go back with `scripts/dev/down.sh --clean` and the setup
+steps. Admission itself is covered by `mutation_admission`, `hub_fallback`, `outage_matrix` and `receipt_faults`, which build their
+own stacks; this mode is for the scenarios that write through the shared one.
 
 **Stop and reset:**
 
@@ -103,10 +122,11 @@ Found by running the whole battery on a clean machine; none of it is in the scen
 | the TypeScript client's dependencies           | `outbox_*`, `reconcile`, `hub_fallback`, `jwt_renew` (`ERR_MODULE_NOT_FOUND: better-sqlite3`)                                                                                                                                                                            | `cd zb-client-ts && pnpm install`                                                                                         |
 | the Node worker's dependencies                 | `migrate_both`, `column_flood`, `rekey_*`, `offline_migrate`, `cascade_held`, `tombstone_children`, `suspension_reasons`, `rebuild_kill` (`node worker did not come up`: it cannot resolve `@zebridge/client`, a `link:` dependency of an example outside the workspace) | `cd examples/04-node-consumer && pnpm install`                                                                            |
 | the `zstd` command                             | `shared_gap`                                                                                                                                                                                                                                                             | `brew install zstd`                                                                                                       |
-| the demo `routes` table                        | `route_crdt` (`no such table: routes`)                                                                                                                                                                                                                                   | `python examples/08-map/load_routes.py --create` (set `ZB_PSQL` if your `psql` is not Homebrew's)                         |
+| the demo `routes` table                        | `route_crdt` (`no such table: routes`)                                                                                                                                                                                                                                   | `scripts/reprovision.py` (step 5) creates it; nothing to do |
 | Python 3.14 for the venv                       | `serve` (`from compression import zstd`)                                                                                                                                                                                                                                 | `brew install python@3.14`, then `python3.14 -m venv …`                                                                   |
-| SeaweedFS S3 on `:8333`                        | `readings_roles`, `archive`, the S3 case of `readings_fetch`                                                                                                                                                                                                             | start it yourself                                                                                                         |
-| the `zebridge-leaf-nats:2.15.0-security` image | `leaf_security`                                                                                                                                                                                                                                                          | no documented command builds it                                                                                           |
+| SeaweedFS S3 on `:8333`                        | `readings_roles`, `archive`, the S3 case of `readings_fetch`                                                                                                                                                                                                             | `up.sh` starts it (`ZB_DEV_S3=0` leaves it out) and `export S3_KEYS=…` of step 4 |
+| the native endpoint probe | `hub_fallback` ("Build the native pool probe first") | `cd libzb && zig build endpoint-probe` |
+| the `zebridge-leaf-nats:2.15.0-security` image | `leaf_security`                                                                                                                                                                                                                                                          | `docker build -t zebridge-leaf-nats:2.15.0-security deploy/compose/leaf` (that directory's Dockerfile and `compose.yml` name this tag) |
 | a database created with the `C` locale         | `standby` (`invalid value for parameter "lc_messages": "en_US.utf8"`: it starts a copy of the container's database with your Mac's PostgreSQL, and the container's default locale name is Linux's)                                                                       | `compose.yml` now creates it that way; a volume made before needs `scripts/dev/down.sh --clean`, then steps 2, 5, 6 again |
 
 ## What runs
@@ -147,9 +167,9 @@ the `nats-box` image presets `NKEYS_PATH`): `jwt_expiry` and `revoke_midseed` st
 TLS and the leaf listener (7422) of `nats-server-jwt.conf`. The server is plain, so `NATS_URL` must be `nats://`:
 the `tls://` URL that the native stack's `.env.bridge` may carry makes the bridge fail with `TlsRecordOverflow`
 (the server answers the TLS handshake with the plain-text `-ERR 'Authentication Error'`, and its log shows
-`authentication error`). Because of both, so the leaf scenarios (`leaf_*`, `hub_fallback`) and
-anything that needs a leaf link are not served by this stack; SeaweedFS for `archive.py` and `readings_roles.py`
-(`:8333`); the standby (`standby.py` starts its own server).
+`authentication error`). Because of both, the leaf scenarios (`leaf_*`, `hub_fallback`) do not use this stack's NATS: they start
+their own hub and leaf on the host (they need `nats-server` there), and `leaf_security` runs containers itself from the image
+in the table above. The standby (`standby.py`) starts its own server too.
 
 ## Status
 

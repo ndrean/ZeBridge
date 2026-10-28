@@ -46,6 +46,9 @@ DROP_BRIDGE_SLOT = "--drop-bridge-slot" in sys.argv
 # never reaches this test), the migration probes, inject.py's crazy_N, and one-offs.
 PROBE = re.compile(r"^(zb_.+|[a-z]+_t|mig_.+|crazy_\d+|tzguard_.+|ro_.+|rw_.+|sw_.+|test_types_v\d+"
                    r"|widgets|bench_users|decode_fixture|inc_rows)$")
+# A table a scenario of the battery needs that is not part of the base: examples/08-map's shared route (route_crdt). Its
+# DDL and its enable call are the example's own (load_routes.py), loaded rather than copied.
+EXAMPLE_ROUTES = os.path.join(HERE, "..", "examples", "08-map", "load_routes.py")
 # The canonical baseline the scenarios assume.
 BASE_TABLES = ["test_types", "orders", "users", "salaries", "memo", "note_t",
                "counter_tenant", "counter_public"]
@@ -215,6 +218,28 @@ def main():
             if out:
                 print(f"  ✗ enable {t} was refused: {out}", file=sys.stderr)
                 refused.append(t)
+    # 6b. the shared route of examples/08-map, which route_crdt edits from two clients ("no such table: routes" on a
+    # database that never ran load_routes.py --create). Created once, enabled the way the example enables it, and its
+    # demo row emptied of registers each time: the scenario's edits are residue for the next run.
+    if os.path.exists(EXAMPLE_ROUTES):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("load_routes", EXAMPLE_ROUTES)
+        lr = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lr)
+        note("ensure the routes fixture (route_crdt): table, catalogue row, demo row with no registers")
+        if not DRY:
+            psql(lr.DDL)
+            if psql("SELECT count(*) FROM zebridge_catalogue WHERE tbl = 'routes'") == "0":
+                out = psql("SELECT step || ': ' || detail FROM zebridge_enable('public.routes'::regclass, writable => true, "
+                           "version_col => 'updated_at', tombstone_col => 'deleted_at', tiebreak_col => 'last_writer', "
+                           "register_cols => ARRAY['doc']::name[], public_reason => 'a shared route, the cooperative-editing demo', "
+                           f"publication => '{pub}', dry_run => false) WHERE status = 'ERROR'")
+                if out:
+                    print(f"  ✗ enable routes was refused: {out}", file=sys.stderr)
+                    refused.append("routes")
+            psql(f"INSERT INTO public.routes (id, name, doc) VALUES ('{lr.ROUTE_ID}', 'demo', '{{}}'::jsonb) "
+                 "ON CONFLICT (id) DO UPDATE SET doc = '{}'::jsonb, deleted_at = NULL")
+        changed += 1
     # 7. the GC floor. init.core inserts it as (now(), threshold 0): a database starts with its floor at its
     # own creation time, and the floor never goes down. The scenarios stamp writes 10 to 60 minutes into
     # the past (mutate, offline, replies, intclamp), which the bridge refuses (PredatesGcWatermark) until

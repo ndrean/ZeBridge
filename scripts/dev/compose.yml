@@ -111,6 +111,26 @@ services:
       timeout: 3s
       retries: 30
 
+  # S3 for archive.py, readings_roles.py and the S3 case of readings_fetch.py (examples/16-archive): SeaweedFS with the one
+  # identity up.sh generates into state/s3.json, the file the scenarios read through S3_KEYS. A profile: ZB_DEV_S3=0 leaves it out.
+  # The archiver creates its bucket itself.
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    container_name: zb-dev-seaweedfs
+    profiles: ["s3"]
+    command: ["server", "-s3", "-s3.config=/etc/seaweedfs/s3.json", "-dir=/data"]
+    ports:
+      - "127.0.0.1:8333:8333"
+    volumes:
+      - ./state/s3.json:/etc/seaweedfs/s3.json:ro
+      - seaweed:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9333/cluster/status >/dev/null || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
 volumes:
   pgdata:
   natsdata:
+  seaweed:

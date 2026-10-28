@@ -14,9 +14,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
 if [ "${1:-}" = "--clean" ]; then
-  docker compose -f "$HERE/compose.yml" down -v --remove-orphans
+  docker compose -f "$HERE/compose.yml" --profile s3 down -v --remove-orphans
   echo "[dev] removing scripts/dev/state/ and scripts/native/creds/ — the next up.sh mints new ones"
   rm -rf "$HERE/state" "$ROOT/scripts/native/creds"
 else
-  docker compose -f "$HERE/compose.yml" down --remove-orphans
+  docker compose -f "$HERE/compose.yml" --profile s3 down --remove-orphans
 fi

@@ -22,8 +22,20 @@ docker info >/dev/null 2>&1 || { echo "[dev] the Docker daemon is not reachable"
 export ZB_DEV_UID="$(id -u)" ZB_DEV_GID="$(id -g)"
 mkdir -p "$HERE/state" "$ROOT/scripts/native/creds"
 
+# S3 for archive, readings_roles and the S3 case of readings_fetch: SeaweedFS, on by default, ZB_DEV_S3=0 leaves it out.
+# Its one identity is generated here, once, into the file the scenarios read through S3_KEYS (SeaweedFS's own identity format).
+S3=()
+if [ "${ZB_DEV_S3:-1}" != 0 ]; then
+  S3=(--profile s3)
+  if [ ! -s "$HERE/state/s3.json" ]; then
+    printf '{"identities":[{"name":"dev","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List","Tagging"]}]}\n' \
+      "$(openssl rand -hex 8)" "$(openssl rand -hex 16)" > "$HERE/state/s3.json"
+    chmod 600 "$HERE/state/s3.json"
+  fi
+fi
+
 echo "[dev] starting postgres and nats (first run: pulls images, mints the NATS credentials)"
-dc up -d
+dc ${S3[@]+"${S3[@]}"} up -d
 
 # `up --wait` treats the one-shot bootstrap that exits 0 as a failure on some compose versions,
 # so wait for the two servers by their health, and report the bootstrap by its exit code.
@@ -43,6 +55,7 @@ if [ "$(docker inspect -f '{{.State.ExitCode}}' zb-dev-nats-bootstrap 2>/dev/nul
   exit 1
 fi
 wait_healthy zb-dev-nats
+[ "${#S3[@]}" = 0 ] || wait_healthy zb-dev-seaweedfs
 # The bootstrap runs on every `up` and adds a signing key to the account each time, then rewrites state/resolver.conf.
 # A NATS server that was already running keeps the account JWT it loaded at its start, so it would refuse the user
 # JWTs that GET /enroll signs with the newest key (AuthorizationViolation). A reload reads the conf again; on a server
@@ -93,6 +106,7 @@ repository root, in this order (scripts/dev/README.md has the same list with the
      set -a && . ./.env.bridge && set +a && export BRIDGE_CDC_PUBLICATION=$BRIDGE_CDC_PUBLICATION
      export NATS_URL=nats://127.0.0.1:4222      # after the line above: this NATS has no TLS (tls:// gives TlsRecordOverflow)
      export ZB_PG_CTL="\$PWD/scripts/dev/pg_ctl" ZB_NATS_CONTAINER=zb-dev-nats   # the outage scenarios restart the containers
+     export S3_KEYS="\$PWD/scripts/dev/state/s3.json"   # SeaweedFS's keys, for archive / readings_roles (ZB_DEV_S3=0: not needed)
 
 5. REQUIRED - the baseline tables, catalogue rows and tenant mappings (exit 0, no line starting with a cross):
      scripts/reprovision.py; echo "exit \$?"
