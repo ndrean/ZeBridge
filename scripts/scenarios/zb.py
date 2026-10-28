@@ -395,37 +395,41 @@ def pg_opts(port: str | int | None = None) -> str:
 # scenarios that kill, restart or reload the broker go through Docker instead of signalling a process.
 NATS_CONTAINER = os.environ.get("ZB_NATS_CONTAINER", "")
 
-# What the native stack's store held when these scenarios stopped hard-coding it; a store minted before
-# jwt-bootstrap.sh wrote its id file still gets these.
-_LEGACY_JWT_IDS = {
-    "ZB_OPERATOR_PUB": "OCZZMCIKTYIW5RWDOOMNBFPXKPP4LMKQLUQSI2FFFHUYQ54WSEGGNR4P",
-    "ZB_ACCOUNT_PUB": "ABSDAXPW56ON5USFCTUQSWSQWTNLZL3DDDVZAPUH3244HU4NM7QFQD5L",
-    "ZB_CLIENT_SK_PUB": "ABGOGUGNFMBG47I2NTHPQFX4G3YUP23ENMNEM7ZUURFKIBGUK743WPND",
-}
-
-
 def jwt_stack() -> dict:
     """Where jwt_expiry and revoke_midseed find the JWT stack: the account's public key, the files holding
     the operator's and the scoped client signing key's private halves, and the conf whose account JWT a
     hard revocation amends. Native: scripts/native (the conf is nats-server-jwt.conf). Compose
     (ZB_NATS_CONTAINER set): scripts/dev/state (the conf is resolver.conf, which the container's server
-    includes). The public ids come from the file jwt-bootstrap.sh writes beside the store."""
+    includes). The public ids are read from resolver.conf, which `nsc generate config` writes in both
+    stacks: the operator's JWT and the ZEBRIDGE account's, whose signing keys name the client key. Nothing
+    is written into the scenarios, because every store mints keys of its own."""
+    import re
     state = ROOT / "scripts" / ("dev/state" if NATS_CONTAINER else "native")
-    ids = dict(_LEGACY_JWT_IDS)
-    f = state / "ids.env"
-    if f.exists():
-        for ln in f.read_text().splitlines():
-            k, _, v = ln.partition("=")
-            if k in ids and v.strip():
-                ids[k] = v.strip()
 
     def key_file(pub: str) -> pathlib.Path:
         return state / "nsc-store/data/nats/nsc/keys/keys" / pub[0] / pub[1:3] / f"{pub}.nk"
 
+    def claims(jwt: str) -> dict:
+        body = jwt.split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+
+    resolver = state / "resolver.conf"
+    text = resolver.read_text() if resolver.exists() else ""
+    op = re.search(r"^operator:\s*(ey\S+)", text, re.M)
+    operator_pub = claims(op.group(1))["sub"] if op else ""
+    account_pub = client_pub = ""
+    for acc, jwt in re.findall(r"([A-Z2-7]{56}):\s*(ey[A-Za-z0-9_.\-]+)", text):
+        c = claims(jwt)
+        if c.get("name") != "ZEBRIDGE":
+            continue
+        account_pub = acc
+        # a bootstrap run again adds another client key: the newest one whose seed is in the store
+        keys = [k["key"] for k in c.get("nats", {}).get("signing_keys", []) if isinstance(k, dict) and k.get("role") == "client"]
+        client_pub = next((k for k in reversed(keys) if key_file(k).exists()), keys[-1] if keys else "")
     return {
-        "account_pub": ids["ZB_ACCOUNT_PUB"],
-        "client_sk_file": key_file(ids["ZB_CLIENT_SK_PUB"]),
-        "operator_file": key_file(ids["ZB_OPERATOR_PUB"]),
+        "account_pub": account_pub,
+        "client_sk_file": key_file(client_pub) if client_pub else state / "no-client-signing-key-in-resolver.conf",
+        "operator_file": key_file(operator_pub) if operator_pub else state / "no-operator-in-resolver.conf",
         "conf": state / ("resolver.conf" if NATS_CONTAINER else "nats-server-jwt.conf"),
     }
 

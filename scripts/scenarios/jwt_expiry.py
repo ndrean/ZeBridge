@@ -55,7 +55,9 @@ def main() -> int:
     if zb.another_bridge_running():
         sys.exit("another bridge is already running — this scenario owns the only bridge")
     if not SK_FILE.exists():
-        sys.exit("the scoped client signing key is not in the nsc store — run jwt-bootstrap.sh once")
+        sys.exit(f"the scoped client signing key is not in the nsc store — looked for {SK_FILE} "
+                 f"({'compose stack, ZB_NATS_CONTAINER=' + zb.NATS_CONTAINER if zb.NATS_CONTAINER else 'native stack: ZB_NATS_CONTAINER is not set'}); "
+                 f"run jwt-bootstrap.sh once")
     failed = 0
     creds_path = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_ttl_probe.creds"
     db = f"/tmp/zb-jwt-expiry-{os.getpid()}.sqlite3"

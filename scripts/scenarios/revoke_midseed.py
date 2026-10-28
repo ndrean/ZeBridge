@@ -135,7 +135,10 @@ def main():
     if zb.another_bridge_running():
         sys.exit("another bridge is already running — this scenario owns the only bridge")
     if not (SK_FILE.exists() and OP_FILE.exists() and CONF.exists() and (zb.NATS_CONTAINER or PID_FILE.exists())):
-        sys.exit("the dev JWT stack (nsc store, conf, pid) is not where jwt-bootstrap.sh puts it")
+        mode = f"compose stack, ZB_NATS_CONTAINER={zb.NATS_CONTAINER}" if zb.NATS_CONTAINER else "native stack: ZB_NATS_CONTAINER is not set"
+        sys.exit(f"the dev JWT stack is not where jwt-bootstrap.sh puts it ({mode}); missing: "
+                 + ", ".join(str(f) for f in (SK_FILE, OP_FILE, CONF) if not f.exists())
+                 + ("" if zb.NATS_CONTAINER or PID_FILE.exists() else f", {PID_FILE}"))
     failed = 0
     def check(label, cond):
         nonlocal failed

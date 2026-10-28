@@ -147,7 +147,8 @@ is enough. The bridge creates its own streams and KV buckets at boot; nothing he
 flags are the container's own (so `ZB_PGDATA` and `ZB_PG_LOG` are ignored; the log is `docker logs zb-dev-postgres`).
 With `ZB_NATS_CONTAINER` set the broker is stopped with `docker stop`, started with `docker start` and reloaded with
 `docker kill -s HUP`. `jwt_expiry` and `revoke_midseed` find the keys of the store that `jwt-bootstrap.sh` minted
-through `state/ids.env` (the public ids it writes) and amend `state/resolver.conf`, which the container includes.
+by reading `state/resolver.conf` (the operator's JWT and the account's, whose signing keys name the client key), and
+amend that file, which the container includes.
 Unset, every one of these scenarios behaves as before, against the native stack.
 
 TLS and the leaf listener (7422) of `nats-server-jwt.conf`. The server is plain, so `NATS_URL` must be `nats://`:

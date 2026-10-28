@@ -269,15 +269,5 @@ open(sys.argv[2], 'w').write(conf)
 print('nats-server-jwt.conf: account JWTs refreshed — reload the server (nats-server --signal reload)')
 PY
 fi
-# The PUBLIC ids of what the scenarios that revoke or expire a token must find in the store (jwt_expiry,
-# revoke_midseed): a store minted here has keys of its own, so they cannot be written into the scenarios.
-# Public keys only; the seeds stay in the store, in files named after these ids.
-pubof() { grep -o '"sub": *"[A-Z0-9]*"' | head -1 | grep -o '[A-Z0-9]\{56\}' || true; }
-{
-  echo "ZB_OPERATOR_PUB=$(nsc describe operator --json 2>/dev/null | pubof)"
-  echo "ZB_ACCOUNT_PUB=$(nsc describe account ZEBRIDGE --json 2>/dev/null | pubof)"
-  echo "ZB_CLIENT_SK_PUB=$SK_CLIENT"
-} > "$STATE/ids.env"
-
 echo; echo "── store ──"; nsc describe account ZEBRIDGE | head -30
 echo "── creds ──"; ls -la "$CREDS"

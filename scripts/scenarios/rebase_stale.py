@@ -210,13 +210,18 @@ def main():
             py.mutate(T, "UPDATE", {"uid": uid}, {"title": "Meanwhile"}); py.flush(5000)
             dt = wait_pg(uid, ("Meanwhile", "Again"))
             check(f"§D libzb's edit landed meanwhile: PostgreSQL {pg_row(uid)} ({dt} s)", dt is not None)
+            log_mark = os.path.getsize(NODE_LOG)   # what Node logs from the reconnect on
             nd.connect()
             dt = wait_pg(uid, ("Meanwhile", "Queued"))
             check(f"§D reconnected: the queued edit was judged stale, rebased and landed: PostgreSQL {pg_row(uid)} ({dt} s)", dt is not None)
             check("§D Node said so: 'rebased status onto the newer row'", said(NODE_LOG, "rebased status onto the newer row"))
             v = verdict(d_ver)
             check(f"§D onVerdict: {v}", v is not None and v["outcome"] == "rebased" and v["columns"] == ["status"])
-            check("§D the winner's row was NOT taken for the queued write's echo", "confirmed by CDC echo" not in open(NODE_LOG).read().split("replaying 1 unconfirmed")[-1].split("rebased status")[0])
+            # (until 2026-10-28 this cut the log at "replaying 1 unconfirmed", a line the client no longer writes: the
+            # whole log was searched, and §A's honest "confirmed by CDC echo" failed the check)
+            with open(NODE_LOG, "rb") as lf:
+                lf.seek(log_mark); since_reconnect = lf.read().decode(errors="replace")
+            check("§D the winner's row was NOT taken for the queued write's echo", "confirmed by CDC echo" not in since_reconnect.split("rebased status")[0])
             dt = both(py, nd, lambda c: local(c, uid) == ("Meanwhile", "Queued"), 60)
             check(f"§D both replicas at {{Meanwhile, Queued}} ({dt} s): py {local(py, uid)}, node {local(nd, uid)}", dt is not None)
             turn(py, 2, lambda: False)
