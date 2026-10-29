@@ -1067,6 +1067,158 @@ async def check13(a, tmp, ts=False):
         s.stop()
 
 
+T3 = "rr_items3"
+
+
+async def check19(a, tmp, ts=False):
+    """The joint fence, live: two tables of one tenant route reseeded together while the replica's position is past both
+    chains' cuts, and a third table untouched (it takes inserts, updates and tombstones throughout). Each table's anchor
+    goes with the epoch move, so neither fence can stay the other's untouched table: before the joint fence they refused
+    each other for ever (HANDOFF "Observed, not investigated"). Cases: both orders of the two reseeds; the client aborts
+    after a chunk and reopens; the second table's full is deleted from the object store before the client acts, so its
+    replacement is unavailable until it is reseeded again. Always: no refusal, every table exact against PostgreSQL.
+    ts: the same cases with a zb-client-ts client (check 20)."""
+    hooks = (b"ZB_TEST_FENCE_ABORT", b"ZB_TEST_FENCE_SLEEP_MS", b"ZB_TEST_SHARED_UNREADABLE", b"ZB_TEST_SCHEMA_PAUSE_FILE")
+    if ts:
+        if not check(f"the harness exists ({HARNESS})", HARNESS.exists()):
+            return
+    elif not check(f"check 19 runs on a fault-hook build ({FAULT_LIBRARY})", FAULT_LIBRARY.exists() and all(h in FAULT_LIBRARY.read_bytes() for h in hooks)):
+        note(f"build it: {FAULT_BUILD}")
+        return
+    s = Stack(tmp, "20" if ts else "19", a.cadence, {})
+    tables = [T, T2, T3]
+    try:
+        s.start({"pa": "t_a"})
+        s.create_table({"t_a": a.rows}, "a")
+        for extra in (T2, T3):
+            s.sql(f"CREATE TABLE public.{extra} (id text PRIMARY KEY, tenant_id text NOT NULL, note text, "
+                  f"updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz);"
+                  f"SELECT count(*) FROM zebridge_enable('public.{extra}'::regclass, writable => true, tenant_col => 'tenant_id', "
+                  f"version_col => 'updated_at', tombstone_col => 'deleted_at', publication => 'rr_pub', dry_run => false);"
+                  f"INSERT INTO public.{extra} (id, tenant_id, note) SELECT 'bt_a-' || lpad(i::text, 6, '0'), 't_a', repeat(md5(i::text), 4) "
+                  f"FROM generate_series(1, {a.rows}) i;")
+        s.bridge_up()
+        js = await Js().open(s)
+        check("tenant mappings published before any client connects", await js.tenants_ready(s.creds))
+
+        async def manifests():
+            return all([await js.kv(js.gen, f"t_a.{t}") for t in tables])
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < a.cadence + 60 and not await manifests(): await asyncio.sleep(1)
+        check(f"a chain for each table ({round(time.monotonic() - t0, 1)} s)", await manifests())
+        base = {k for k in s.truth("t_a") if k.startswith("at_a-")}
+
+        def table_rows(c, table):
+            return dict(c._q(f"SELECT id, note FROM {table} WHERE tenant_id = ?", (c.tenant,)) or [])
+
+        def truth_of(table):
+            rows = {}
+            for line in s.sql(f"SELECT id, coalesce(note, E'\\\\N') FROM public.{table} WHERE tenant_id = 't_a' AND deleted_at IS NULL").splitlines():
+                k, v = line.split("|", 1)
+                rows[k] = None if v == "\\N" else v
+            return rows
+
+        async def until(pred, timeout):
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < timeout:
+                r = pred()
+                if asyncio.iscoroutine(r): r = await r
+                if r: return round(time.monotonic() - t0, 1)
+                await asyncio.sleep(1)
+            return None
+
+        def anchored(c):
+            return {r[0] for r in (c._q(f"SELECT tbl FROM {'_zebridge_generations' if ts else '_zbz_generations'}") or [])}
+
+        async def recovered(c):
+            ok, _ = await anchor_state(c, js, {"t_a"})
+            return ok and anchored(c) == set(tables) and base <= table_rows(c, T).keys()
+
+        def exact(c):
+            return all(digest(table_rows(c, t)) == digest(truth_of(t)) for t in tables)
+
+        async def seed_epoch(table):
+            d = await js.kv(js.schemas, table)
+            return d.get("seed_epoch", 0) if isinstance(d, dict) else None
+
+        def reseed(table):
+            s.sql(f"SELECT count(*) FROM zebridge_reseed('public.{table}'::regclass)")
+
+        async def new_chain(table, epoch0):
+            m = await js.kv(js.gen, f"t_a.{table}") or {}
+            ep = await seed_epoch(table)
+            return ep is not None and ep > epoch0 and m.get("seed_epoch") == ep
+
+        clients = []
+        cases = (("joint_live", [T, T2], {}, False), ("joint_swapped", [T2, T], {}, False),
+                 ("joint_crash", [T, T2], {"ZB_TEST_FENCE_ABORT": "after_chunk"}, False), ("joint_unavailable", [T, T2], {}, True))
+        for name, order, env, unavailable in cases:
+            loads = [Load(s, "t_a", p, 2 * a.interval_ms / 1000, table=t) for p, t in zip("cde", tables)]
+            c = (TsClient(s, name, "pa", "t_a", chunk_rows=200) if ts
+                 else Client(s, name, "pa", "t_a", chunk_rows=200, lib=FAULT_LIBRARY))
+            c.tables = tables
+            clients.append(c)
+            c.start()
+            check(f"{name}: all three tables seeded and anchored before the case ({await until(lambda: recovered(c), 150)} s)", await recovered(c))
+            c.stop()
+            # Held back while the test says so: both chains under the new epochs are ready before this client looks at
+            # them, and the tails go on applying meanwhile — its position runs ahead of both cuts.
+            pause = pathlib.Path(f"/tmp/zb-rr19-{name}.pause")
+            pause.unlink(missing_ok=True)
+            c.start(dict(env, **{"ZB_TEST_FENCE_HOLD_FILE" if ts else "ZB_TEST_SCHEMA_PAUSE_FILE": str(pause)}))
+            await asyncio.sleep(5)
+            pause.touch()
+            before = {t: await seed_epoch(t) for t in order}
+            for t in order:
+                reseed(t)
+                await asyncio.sleep(2)   # the second table's cut is taken later than the first's: different cuts
+            got = [await until(lambda t=t: new_chain(t, before[t]), 90) for t in order]
+            note(f"{name}: the chains under the new epochs after {got} s")
+            await asyncio.sleep(4)
+            check(f"{name}: held back, the client has not acted on them ({c.count('seed epoch [0-9]+ -> [0-9]+')} epoch notices)",
+                  c.count("seed epoch [0-9]+ -> [0-9]+") == 0)
+            if unavailable:
+                m = await js.kv(js.gen, f"t_a.{T2}") or {}
+                try:
+                    store = await js.js.object_store(m["bucket"])
+                    await store.delete(m["full"]["object"])
+                    note(f"{name}: {T2}'s full {m['full']['object']} deleted from {m['bucket']}")
+                except Exception as e:
+                    check(f"{name}: could not delete {T2}'s full: {e}", False)
+            pos_before = c.position("CDC_t_a")
+            pause.unlink(missing_ok=True)
+            if unavailable:
+                await asyncio.sleep(25)
+                # Two safe states: nothing was touched, or what was is owed. Either way the pair is not trusted (an anchor
+                # is only written when its chain was applied) and the third table is.
+                check(f"{name}: {T2}'s replacement is unavailable: the pair is not trusted (anchors {sorted(anchored(c))}; recovery owed: {c.fence_pending()})",
+                      anchored(c) != set(tables) and T3 in anchored(c))
+                reseed(T2)   # a new full under a new epoch
+                note(f"{name}: {T2} reseeded again")
+            elif env:
+                rc = await until(lambda: c.exited() is not None, 90)
+                pos = c.position("CDC_t_a")
+                check(f"{name}: the client aborted after a chunk ({c.exited()}); position {pos} moved back from {pos_before}, recovery owed {c.fence_pending()}",
+                      rc is not None and pos is not None and pos_before is not None and pos < pos_before and c.fence_pending())
+                c.p = None
+                c.start()
+            secs = await until(lambda: recovered(c), 150)
+            check(f"{name}: all three recovered under current anchors while writes continue ({secs} s)", secs is not None)
+            check(f"{name}: no table was refused for another's missing coverage ({c.count('refusing the full')} refusal(s))",
+                  c.count("refusing the full") == 0 or unavailable)
+            for l in loads: l.end()
+            ok = await until(lambda: exact(c), 150)
+            check(f"{name}: ALL tables exact against PostgreSQL ({ok} s) — " + ", ".join(f"{t}: {len(table_rows(c, t))} of {len(truth_of(t))}" for t in tables), ok is not None)
+            if ok is None:
+                for t in tables:
+                    have, want = table_rows(c, t), truth_of(t)
+                    note(f"{t}: missing {sorted(want.keys() - have.keys())[:5]}, extra {sorted(have.keys() - want.keys())[:5]}, "
+                         f"differing {sorted(k for k in want.keys() & have.keys() if want[k] != have[k])[:5]}")
+            c.stop()
+        await js.close()
+    finally:
+        s.stop()
+
 
 async def check15(a, tmp, ts=False):
     """A destructive plain replacement that fails after its first chunk is durably owed."""
@@ -1547,7 +1699,8 @@ def main():
                              12: lambda a_, d_: check4(a_, d_, ts=True), 13: check13,
                              14: lambda a_, d_: check13(a_, d_, ts=True), 15: check15,
                              16: lambda a_, d_: check15(a_, d_, ts=True),
-                             17: check17, 18: lambda a_, d_: check17(a_, d_, ts=True)}[n](a, pathlib.Path(d)))
+                             17: check17, 18: lambda a_, d_: check17(a_, d_, ts=True),
+                             19: check19, 20: lambda a_, d_: check19(a_, d_, ts=True)}[n](a, pathlib.Path(d)))
             except Exception as e:
                 check(f"check {n} raised: {type(e).__name__}: {str(e)[:400]}", False)
     print(f"  · logs: /tmp/zb_rr<check>_*.log; {'FAILED ' + str(failed) + ' check(s)' if failed else 'clean'}")

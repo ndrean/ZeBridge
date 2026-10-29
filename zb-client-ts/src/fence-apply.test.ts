@@ -1298,3 +1298,176 @@ test('a delta-only plan writes no owed record: it is not destructive', async () 
     } finally { t.close(); }
   });
 });
+
+// ── The joint fence: several tables of one route reseeded together ────────────────────────────────────
+//
+// A seed-epoch move drops each table's anchor as its descriptor arrives, so reseeding two tables of one tenant
+// leaves BOTH unseeded while the position is past both chains' cuts. Each fence needs the other table seeded (its
+// coverage is what the applied frontier certifies), so each refuses the other for as long as it goes on
+// (HANDOFF "Observed, not investigated"). The joint fence replaces the participants together: every unseeded table
+// the rewound routes carry takes part, the routes stay parked and the participants durably owed until all of them
+// completed and the hub's proofs still hold, each is anchored at ITS OWN cut while the cursors go to the smallest,
+// and the seeded tables stay untouched under applied frontiers. These are the cases the mechanism must pass;
+// they are written against the per-table entry point a pass uses, so they do not name the coordination.
+
+const ordersRows = (db: DatabaseSync) => db.prepare('SELECT id, note FROM orders ORDER BY id').all().map((r) => `${r.id}:${r.note}`);
+const catalogueRows = (db: DatabaseSync) => db.prepare('SELECT id, note FROM catalogue ORDER BY id').all().map((r) => `${r.id}:${r.note}`);
+const anchorOf = (db: DatabaseSync, tbl: string) => db.prepare('SELECT seed_seq, seed_stream, shared_seed_seq FROM _zebridge_generations WHERE tbl = ?').get(tbl);
+const seededTbl = (db: DatabaseSync, tbl: string) => anchorOf(db, tbl) !== undefined;
+const wantedOrders = (gen: number, n: number) => Array.from({ length: n }, (_, i) => `${i + 1}:new-${gen}`);
+
+/// item and orders both lost their anchor (the epoch move), the position (500 / 90) is past every cut, and
+/// catalogue is seeded: it holds row 1, and row 7 was inserted at 410 and deleted at 420 on the own route.
+function pairFollower(path: string, world: World) {
+  const t = client(path, world, { others: ['orders', 'catalogue'] });
+  t.db.exec(`
+    INSERT INTO item VALUES (91,'acme','old','${VERSION(1)}'),(92,'acme','old','${VERSION(1)}'),(93,'acme','old','${VERSION(1)}');
+    INSERT INTO orders VALUES (81,'acme','old-o','${VERSION(1)}'),(82,'acme','old-o','${VERSION(1)}');
+    INSERT INTO catalogue VALUES (1,'acme','kept','${VERSION(1)}');
+    INSERT INTO _zebridge_stream_seq VALUES ('${OWN}', 500, 'own-1'), ('${PUB}', 90, 'pub-1');
+    INSERT INTO _zebridge_generations VALUES ('catalogue', '${VERSION(1)}', 1, 0, 470, '${OWN}', 70);
+  `);
+  t.close();
+}
+
+/// What a pass does with unseeded tables: each asks for its chain, again while any progress was made.
+async function seedPair(t: ReturnType<typeof client>, tables = ['item', 'orders']) {
+  for (let round = 0; round < 4 && !tables.every((x) => seededTbl(t.db, x)); round++) {
+    let progress = false;
+    for (const x of tables) if (!seededTbl(t.db, x) && await t.c.applyGenerations(x, true)) progress = true;
+    if (!progress) break;
+  }
+}
+
+/// The end state of a recovered pair, whatever the order of the cuts or the road taken.
+function assertJoint(t: ReturnType<typeof client>, cuts: { item: number; orders: number }, shared: { item: number; orders: number }) {
+  assert.deepEqual(rows(t.db), wanted(2, 5), 'item replaced');
+  assert.deepEqual(ordersRows(t.db), wantedOrders(2, 4), 'orders replaced');
+  assert.deepEqual(catalogueRows(t.db), ['1:kept'], 'catalogue untouched');
+  assert.equal(pos(t.db, OWN), Math.min(cuts.item, cuts.orders), 'the own cursor at the smallest cut');
+  assert.equal(pos(t.db, PUB), Math.min(shared.item, shared.orders), 'the shared cursor at the smallest cut');
+  assert.deepEqual({ ...anchorOf(t.db, 'item') }, { seed_seq: cuts.item, seed_stream: OWN, shared_seed_seq: shared.item }, 'item anchored at its own cut');
+  assert.deepEqual({ ...anchorOf(t.db, 'orders') }, { seed_seq: cuts.orders, seed_stream: OWN, shared_seed_seq: shared.orders }, 'orders anchored at its own cut');
+  assert.equal(owed(t.db), 0, 'nothing owed');
+  assert.equal(t.c.fenced.size, 0, 'the routes are released');
+  assert.deepEqual(frontierRows(t.db).map((r) => `${r.tbl}:${r.stream}:${r.seq}`), [`catalogue:${PUB}:90`, `catalogue:${OWN}:500`], 'only the untouched table has frontiers, at the positions it held');
+}
+
+const orderings: [string, { item: number; orders: number }, { item: number; orders: number }][] = [
+  ['item cut first', { item: 300, orders: 350 }, { item: 40, orders: 60 }],
+  ['orders cut first', { item: 350, orders: 300 }, { item: 60, orders: 40 }],
+];
+
+test('two tables reseeded together are fenced together: each at its own cut, the cursors at the smallest, a third table untouched', async () => {
+  for (const [name, cuts, shared] of orderings) await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    const t = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await seedPair(t);
+      assert.ok(!t.log.some((m) => /refusing the full \(D2\)/.test(m)), `${name}: no mutual refusal`);
+      assertJoint(t, cuts, shared);
+      // The untouched table's insert at 410 (row 7, deleted at 420) replays from the smallest cut: its frontier skips it.
+      await t.c.applyEvent('catalogue', ev('catalogue', 7, OWN, 410, 'resurrected'));
+      assert.deepEqual(catalogueRows(t.db), ['1:kept'], `${name}: the row deleted at 420 is not recreated by the replay of its insert`);
+      await t.c.applyEvent('catalogue', ev('catalogue', 8, OWN, 501, 'new'));
+      assert.deepEqual(catalogueRows(t.db), ['1:kept', '8:new'], 'past its frontier the table takes events');
+    } finally { t.close(); }
+  });
+});
+
+test('the second replacement cannot be had: nothing is released, the recovery stays durably incomplete, and a later attempt completes it', async () => {
+  for (const missing of ['item', 'orders']) await withDir(async (path) => {
+    const w = new World();
+    const cuts = { item: 300, orders: 350 }, shared = { item: 40, orders: 60 };
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    const gone = w.objects.get(`${missing}-i1-g2-full`)!;
+    w.objects.delete(`${missing}-i1-g2-full`);
+    const t = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await seedPair(t);
+      assert.ok(!(seededTbl(t.db, 'item') && seededTbl(t.db, 'orders')), 'not both anchored');
+      // Two safe states: nothing was changed (the participants' objects were checked before PREPARE), or what was
+      // changed is recorded as incomplete and the routes stay parked. Nothing in between.
+      const untouched = Number(pos(t.db, OWN)) === 500 && Number(pos(t.db, PUB)) === 90 && rows(t.db).join() === '91:old,92:old,93:old' && ordersRows(t.db).join() === '81:old-o,82:old-o' && owed(t.db) === 0;
+      assert.ok(untouched || (owed(t.db) >= 1 && t.c.fenced.size > 0), `${missing} unavailable: untouched, or durably incomplete with the routes parked`);
+      assert.ok(Number(pos(t.db, OWN)) <= 500, 'the cursor never moved forward');
+      assert.equal(catalogueRows(t.db).join(), '1:kept', 'the untouched table kept its rows');
+    } finally { t.close(); }
+    w.objects.set(`${missing}-i1-g2-full`, gone);
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await seedPair(r);
+      assertJoint(r, cuts, shared);
+    } finally { r.close(); }
+  });
+});
+
+test('a crash at any point of a joint fence — before a verify, before a commit, after a chunk of the second table — recovers on restart', async () => {
+  const points: [string, number][] = [['after_chunk', 1], ['after_chunk', 4], ['after_chunk', 5], ['before_verify', 1], ['before_verify', 2], ['before_commit', 1], ['before_commit', 2]];
+  for (const [ordering, cuts, shared] of orderings) for (const [point, nth] of points) await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    let seen = 0;
+    const crashed = client(path, w, { others: ['orders', 'catalogue'], hook: (p) => { if (p === point && ++seen === nth) throw new Error(`crash at ${p} #${nth}`); } });
+    try {
+      await seedPair(crashed).catch(() => {});
+      // Whatever was done: never a table anchored while the other still holds its old rows under a cursor past its cut.
+      if (seen >= nth) {
+        assert.ok(owed(crashed.db) >= 1 || (seededTbl(crashed.db, 'item') && seededTbl(crashed.db, 'orders')), `${ordering} / ${point} #${nth}: incomplete is recorded, or complete`);
+        assert.ok(Number(pos(crashed.db, OWN)) <= 500, 'the cursor never moved forward');
+      }
+    } finally { crashed.close(); }
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await seedPair(r);
+      assertJoint(r, cuts, shared);
+    } finally { r.close(); }
+  });
+});
+
+test('the retention overtaking a cut before the release keeps every participant unreleased; restored, the restart completes', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    const cuts = { item: 300, orders: 350 }, shared = { item: 40, orders: 60 };
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    let verifies = 0;
+    const t = client(path, w, { others: ['orders', 'catalogue'], hook: (p) => { if (p === 'before_verify' && ++verifies === 2) w.streams[OWN]!.first = 400; } });
+    try {
+      await seedPair(t);
+      assert.ok(owed(t.db) >= 1, 'recovery is durably incomplete: the stream no longer holds the events after the cuts');
+      assert.ok(t.c.fenced.size > 0, 'no route is released');
+      assert.ok(!(seededTbl(t.db, 'item') && seededTbl(t.db, 'orders')), 'the pair is not trusted');
+    } finally { t.close(); }
+    w.streams[OWN]!.first = 1;
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await seedPair(r);
+      assertJoint(r, cuts, shared);
+    } finally { r.close(); }
+  });
+});
+
+test('a table with no chain cannot take part: the refusal stands and nothing changes', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 300, 40, 'item');
+    pairFollower(path, w); // orders has no manifest: a promised replacement is not coverage
+    const t = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      assert.equal(await t.c.applyGenerations('item'), false);
+      assert.ok(t.log.some((m) => /refusing the full \(D2\): orders is not seeded/.test(m)));
+      assert.equal(owed(t.db), 0);
+      assert.deepEqual(rows(t.db), ['91:old', '92:old', '93:old']);
+      assert.equal(pos(t.db, OWN), 500);
+    } finally { t.close(); }
+  });
+});
