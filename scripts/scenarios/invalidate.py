@@ -165,8 +165,9 @@ async def main():
             headers={"Nats-Msg-Id": msg_id},
         )
         await asyncio.sleep(3.0)
-        # Through mutation admission the first write after a quiet spell is answered a few seconds later (the queue's idle
-        # poll backs off): 3.6 s measured, so the verdict is waited for, not assumed to be there after a fixed pause.
+        # A verdict is occasionally slow through mutation admission (3.7 s measured once, on the first write after a fresh
+        # start; admission pauses at most 20 ms and the lane about 0.6 s, so the cause is not found): the verdict is waited
+        # for, not assumed to be there after a fixed pause.
         for _ in range(48):
             if msg_id in verdicts:
                 break
