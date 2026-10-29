@@ -107,11 +107,11 @@ These are not bugs of the stack. Each is fixed by the install line or the build 
 | `migrate_both`, `column_flood`, `rekey_*`, `offline_migrate`, `cascade_held`, `tombstone_children`, `suspension_reasons`, `rebuild_kill` | the Node worker's dependencies (`node worker did not come up`) | install checklist |
 | `serve` | a venv on Python 3.14 or newer | install checklist |
 | `shared_gap` | the `zstd` command | install checklist |
-| `standby` | the PostgreSQL binaries (`ZB_PGBIN`) | install checklist, step 3 |
+| `standby` | `ZB_PGBIN` exported (it finds `pg_ctl` and `pg_basebackup` there; Ubuntu keeps them off `PATH`), and a user other than root | step 3 |
 | `archive`, `readings_roles`, the S3 case of `readings_fetch` | SeaweedFS (S3 on :8333), which only the compose stack provides | not covered here |
 | `leaf_security` | Docker and the image `zebridge-leaf-nats:2.15.0-security` | not covered here |
 
-If a scenario outside this table fails, its log (`run.py` prints the path) is what to send. Open: with admission on, `reconcile` ends with `a write that never committed is answered indeterminate, then reconciled (['indeterminate'])`, on this stack and on the compose one; the cause is not found yet.
+If a scenario outside this table fails, its log (`run.py` prints the path) is what to send.
 
 ## Where things are
 
@@ -131,4 +131,4 @@ As any other user it lives in `scripts/linux/state/pgdata`. `ZB_PGDATA` moves it
 ## Status
 
 Run on Debian with PostgreSQL 16 as root: `up.sh` from nothing, `down.sh --clean`, `scripts/reprovision.py`, and the scenarios that restart or reload the servers (`pg_restart`, `nats_outage`, `jwt_expiry`, `revoke_midseed`).
-Run by the owner on Ubuntu with PostgreSQL 16 and Python 3.15: `offline` 9/9 and `live` 53/66 before the fault builds and the Node installs of the checklist were done. Which of the 13 failures those fix, and which remain, is not yet confirmed: `outbox_recovery`, `outbox_backlog`, `revoke_purge`, `jwt_renew`, `standby`, `serve` and `shared_cut` have not been re-run since.
+Run by the owner on Ubuntu with PostgreSQL 16 and Python 3.15: `offline` 9/9 and `live` 53/66 before the fault builds and the Node installs of the checklist were done. Re-run in the Debian sandbox on a fresh stack in admission mode: `reconcile` (fixed, a real regression), `outbox_recovery`, `outbox_backlog`, `jwt_renew`, `revoke_purge` and `shared_cut` (it needed a row of its own) pass. `standby` now finds its tools through `ZB_PGBIN` but cannot run as root, so it is not verified there. `serve` needs Python 3.14, which the sandbox lacks, so it is not verified either.

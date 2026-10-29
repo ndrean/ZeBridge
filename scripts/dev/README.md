@@ -107,8 +107,6 @@ Two rules of the admission path matter to scenario authors: a publisher's reply 
 Measured on the Linux stack: `mutate`, `replies`, `offline`, `writable` and `invalidate` pass this way.
 Admission itself is covered by `mutation_admission`, `hub_fallback`, `outage_matrix` and `receipt_faults`, which build their own stacks; this mode is for the scenarios that write through the shared one.
 
-**Open:** with admission on, `reconcile` ends with `a write that never committed is answered indeterminate, then reconciled (['indeterminate'])` on this stack and on the Linux one. The cause is not found yet; it is the one admission-mode failure that is not explained.
-
 ## Stop and reset
 
 ```sh
@@ -178,5 +176,5 @@ The standby (`standby.py`) starts its own server too.
 
 ## Status
 
-The Compose stack is run by the owner on a Mac (OrbStack): `offline`, `live` and `owns` pass except the items under "Open" above and the items that need the extra builds of the checklist.
+The Compose stack is run by the owner on a Mac (OrbStack): `offline`, `live` and `owns` pass except the items that need the extra builds or installs of the checklist.
 The sandbox this file was last edited in has no Docker daemon, so the containers themselves are not exercised there; the same scenarios run against [`scripts/linux`](../linux/README.md) instead.
