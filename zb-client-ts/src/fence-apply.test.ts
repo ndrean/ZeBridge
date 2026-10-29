@@ -97,7 +97,7 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
   const passes: number[] = [];
   Object.assign(c, {
     nc: {}, tenantValue: 'acme', syncedTables, ondemandSet: new Set(), seedInFlight: new Map(),
-    globalSyncState: { seq }, tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(), replacing: new Map(),
+    globalSyncState: { seq }, tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(), replacing: new Map(), jointDone: new Map(),
     streamWork: Promise.resolve(), streamsSubscribed: true, restarted: new Set(), failed: new Set(), hubOnly: new Set(),
     applyingByChoice: new Set(), healedRoutes: new Set(), streamCreated, streamBornEmpty: new Set(), fkHeld: [], hlcFloor: '', frontiers: new Map(), frontierGated: 0,
     lateSeeds: new Set<string>(), reseedKicks: new Map(), fkHolds: 0, scheduleRecount: () => {},
@@ -1469,5 +1469,72 @@ test('a table with no chain cannot take part: the refusal stands and nothing cha
       assert.deepEqual(rows(t.db), ['91:old', '92:old', '93:old']);
       assert.equal(pos(t.db, OWN), 500);
     } finally { t.close(); }
+  });
+});
+
+test('between participants the routes stay parked and the tails stay closed; the last commit releases them', async () => {
+  for (const [name, cuts, shared] of orderings) await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    const t = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      assert.equal(await t.c.applyGenerations('item'), true);
+      assert.ok(seededTbl(t.db, 'item') && !seededTbl(t.db, 'orders'), `${name}: the first participant is anchored, the second is not`);
+      assert.equal(owed(t.db), 1, `${name}: the second participant is still owed`);
+      assert.ok(t.c.fenced.get(OWN)?.has('orders'), `${name}: the route is parked for the participant still to come`);
+      assert.ok(t.c.routeParked(OWN) && t.c.routeParked(PUB), `${name}: both routes are parked: no pass opens a tail on them`);
+      assert.deepEqual(ordersRows(t.db), ['81:old-o', '82:old-o'], 'its rows are untouched until its turn');
+      assert.equal(await t.c.applyGenerations('orders'), true);
+      assertJoint(t, cuts, shared);
+    } finally { t.close(); }
+  });
+});
+
+test('a joint fence is not prepared over a chain that cannot be applied: nothing changes', async () => {
+  for (const missing of ['item', 'orders']) await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 300, 40, 'item');
+    w.publish(2, 4, 350, 60, 'orders');
+    pairFollower(path, w);
+    w.objects.delete(`${missing}-i1-g2-full`);
+    const t = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      const other = missing === 'item' ? 'orders' : 'item';
+      assert.equal(await t.c.applyGenerations(other), false);
+      assert.equal(owed(t.db), 0, `${missing} missing: no obligation was created`);
+      assert.equal(pos(t.db, OWN), 500);
+      assert.equal(pos(t.db, PUB), 90);
+      assert.equal(t.c.fenced.size, 0);
+      assert.equal(frontierRows(t.db).length, 0);
+    } finally { t.close(); }
+  });
+});
+
+test('a participant whose cut the retention overtook while the others finished is owed again, and nothing is released', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    const cuts = { item: 300, orders: 350 }, shared = { item: 40, orders: 60 };
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    let verifies = 0;
+    // item commits first (its verify is the first); the stream then drops the events after item's cut but keeps orders'.
+    const t = client(path, w, { others: ['orders', 'catalogue'], hook: (p) => { if (p === 'before_verify' && ++verifies === 2) w.streams[OWN]!.first = 330; } });
+    try {
+      await seedPair(t);
+      assert.ok(seededTbl(t.db, 'orders'), 'orders committed: its own cut is still retained');
+      assert.ok(!seededTbl(t.db, 'item'), 'item is owed again: the events after its cut are gone');
+      assert.ok(owed(t.db) >= 1);
+      assert.ok(t.c.fenced.size > 0, 'the routes are not released');
+      assert.ok(t.log.some((m) => /item.*no longer holds the events after (its|the) cut/.test(m)), 'it says why');
+    } finally { t.close(); }
+    w.streams[OWN]!.first = 1;
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await seedPair(r);
+      assertJoint(r, cuts, shared);
+    } finally { r.close(); }
   });
 });

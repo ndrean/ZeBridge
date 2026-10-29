@@ -130,20 +130,26 @@ test('fenceScope: the other tables on a route stay untouched when seeded; an uns
   const of = (t: string) => routes[t] ?? null;
   const all = () => true;
   // orders rewinds CDC_acme: items rides it, and keeps its rows.
-  assert.deepEqual(fenceScope('orders', ['CDC_acme'], tables, of, all), { refused: null, untouched: [{ table: 'items', stream: 'CDC_acme' }] });
+  assert.deepEqual(fenceScope('orders', ['CDC_acme'], tables, of, all), { refused: null, untouched: [{ table: 'items', stream: 'CDC_acme' }], unseeded: [] });
   // CDC_PUBLIC: items and elsewhere share it, prices rides it; each is listed once.
   const pub = fenceScope('orders', ['CDC_PUBLIC'], tables, of, all);
   assert.equal(pub.refused, null);
   assert.deepEqual(pub.untouched.map((u) => u.table).sort(), ['elsewhere', 'items', 'prices']);
   // A table alone on its stream, or with nothing else near: nothing to leave untouched.
-  assert.deepEqual(fenceScope('elsewhere', ['CDC_globex'], tables, of, all), { refused: null, untouched: [] });
-  assert.deepEqual(fenceScope('notes', ['CDC_acme'], ['notes'], of, all), { refused: null, untouched: [] });
+  assert.deepEqual(fenceScope('elsewhere', ['CDC_globex'], tables, of, all), { refused: null, untouched: [], unseeded: [] });
+  assert.deepEqual(fenceScope('notes', ['CDC_acme'], ['notes'], of, all), { refused: null, untouched: [], unseeded: [] });
   // Empty stream names match nothing.
-  assert.deepEqual(fenceScope('orders', ['', ''], tables, of, all), { refused: null, untouched: [] });
+  assert.deepEqual(fenceScope('orders', ['', ''], tables, of, all), { refused: null, untouched: [], unseeded: [] });
   // An unseeded table's coverage is unknown: the fence is refused, whichever route it rides.
   const refused = fenceScope('orders', ['CDC_acme'], tables, of, (t) => t !== 'items');
   assert.match(refused.refused ?? '', /items is not seeded, so its coverage on CDC_acme is unknown/);
   assert.deepEqual(refused.untouched, []);
+  // The joint fence asks for the unseeded tables instead of refusing: they come back as participants, each once per
+  // route, and the seeded ones are still untouched.
+  const joint = fenceScope('orders', ['CDC_acme', 'CDC_PUBLIC'], tables, of, (t) => t !== 'items', 'collect');
+  assert.equal(joint.refused, null);
+  assert.deepEqual(joint.unseeded, [{ table: 'items', stream: 'CDC_acme' }, { table: 'items', stream: 'CDC_PUBLIC' }]);
+  assert.deepEqual(joint.untouched.map((u) => `${u.table}:${u.stream}`).sort(), ['elsewhere:CDC_PUBLIC', 'prices:CDC_PUBLIC']);
   // A table that is not followed is not asked about at all.
   assert.equal(fenceScope('orders', ['CDC_acme'], ['orders', 'notes'], of, () => false).refused, null);
 });
