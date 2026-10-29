@@ -43,6 +43,7 @@ def check(msg, cond):
 async def main():
     if zb.another_bridge_running():
         sys.exit("another bridge is running — this scenario owns the only one (stop it first)")
+    run_tag = "rl_" + uuid.uuid4().hex
     zb.psql(f"DROP TABLE IF EXISTS public.{T}", quiet=True)
     zb.forget_table(T)  # the schema key too — a DROP after the probe bridge exits tombstones nobody
     # The catalogue row outlives the DROP (a dropped table keeps its rules on purpose), and the chain builder
@@ -55,7 +56,19 @@ async def main():
             f"tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => '{zb.publication()}', dry_run => false)", quiet=True)
 
     with zb.Bridge("/tmp/zb_ratelimit_bridge.log", MUTATION_RATE_PER_PRINCIPAL=str(RATE), MUTATION_RATE_BURST=str(BURST)) as br:
-        await asyncio.sleep(8)
+        # A previous failed run can leave deliveries in flight. The listener waits
+        # an ack interval before pulling them; that startup wait is not rate-limit
+        # latency. Never start the measured load before the listener is ready.
+        deadline = time.monotonic() + 60
+        while "Ready! Pulling mutations from JetStream" not in br.text() and time.monotonic() < deadline:
+            if br.proc.poll() is not None:
+                break
+            await asyncio.sleep(0.2)
+        ready = "Ready! Pulling mutations from JetStream" in br.text()
+        check("the mutation listener is ready before the measured load", ready)
+        if not ready:
+            print(br.text()[-4000:])
+            return 1
         check("the probe bridge announces the limit", "ingress rate limit" in br.text())
 
         async def lane(who):
@@ -77,7 +90,7 @@ async def main():
                 uid = str(uuid.uuid4()); now = time.strftime("%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime())
                 msg_id = f"rl-{who}-{uuid.uuid4().hex[:10]}"
                 await js.publish(zb.subject(zb.TOPOLOGY["subjects"]["mutations_prefix"], who, T, "insert"),
-                                 msgpack.packb({"key": {"uid": uid}, "data": {"uid": uid, "note": note, "tenant_id": tenant, "updated_at": now}, "version": now, "client_id": f"c-{who}"}),
+                                 msgpack.packb({"key": {"uid": uid}, "data": {"uid": uid, "note": f"{run_tag} {note}", "tenant_id": tenant, "updated_at": now}, "version": now, "client_id": f"c-{who}"}),
                                  headers={"Nats-Msg-Id": msg_id})
                 return msg_id
             return nc, verdicts, task, send
@@ -120,7 +133,7 @@ async def main():
               missing == 0 and dup == 0 and not others and accepted == taken and taken > BURST and expect_s * 0.7 <= served_s <= expect_s * 1.5 + 3)
         redeliveries = sum(1 for l in br.text().splitlines() if "rate limited" in l)
         check(f"the bridge refused and rescheduled rather than dropping ({redeliveries} log line(s))", redeliveries >= 1)
-        landed = int(zb.psql(f"SELECT count(*) FROM {T} WHERE tenant_id = 'globex'", quiet=True).strip() or 0)
+        landed = int(zb.psql(f"SELECT count(*) FROM {T} WHERE tenant_id = 'globex' AND note LIKE '{run_tag} flood %'", quiet=True).strip() or 0)
         check(f"the master holds every write the stream took ({landed})", landed == taken)
         av = alice_v.get(alice_id, [None])[0]
         check(f"alice's write during the flood: {av.get('status') if av else 'no verdict'} in {((alice_done - alice_at) * 1000) if alice_done else -1:.0f} ms",
@@ -134,10 +147,11 @@ async def main():
         db = "/tmp/zb-ratelimit.sqlite3"; fresh_sqlite(db)
         em = Lib(db, [T], "py-ratelimit", principal="bob")
         n = 60
+        t1 = time.monotonic()
         for i in range(n):
             u = str(uuid.uuid4())
-            em.mutate(T, "insert", {"uid": u}, {"uid": u, "note": f"libzb {i}", "tenant_id": "globex"})
-        t1 = time.monotonic(); held = 0; last = None
+            em.mutate(T, "insert", {"uid": u}, {"uid": u, "note": f"{run_tag} libzb {i}", "tenant_id": "globex"})
+        held = 0; last = None
         deadline = time.monotonic() + 40
         while time.monotonic() < deadline:
             last = em.flush(500)
@@ -147,8 +161,8 @@ async def main():
             em.poll(200)
         elapsed = time.monotonic() - t1
         vc = (last or {}).get("verdicts", {})
-        landed2 = int(zb.psql(f"SELECT count(*) FROM {T} WHERE note LIKE 'libzb %'", quiet=True).strip() or 0)
-        check(f"libzb landed all {n} writes in {elapsed:.1f} s (about {(n - BURST) / RATE:.0f} s at the rate), outbox empty, verdicts {vc}, {held} empty flush(es)",
+        landed2 = int(zb.psql(f"SELECT count(*) FROM {T} WHERE tenant_id = 'globex' AND note LIKE '{run_tag} libzb %'", quiet=True).strip() or 0)
+        check(f"libzb landed {landed2}/{n} writes in {elapsed:.1f} s (about {(n - BURST) / RATE:.0f} s at the rate), outbox pending {pending}, verdicts {vc}, {held} empty flush(es)",
               landed2 == n and pending == 0 and vc.get("rate_limited", 0) == 0 and vc.get("accepted", 0) == n and elapsed >= (n - BURST) / RATE * 0.7)
         em.close()
 

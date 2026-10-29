@@ -112,7 +112,7 @@ async def main():
     ).strip()
     if not who:
         sys.exit("no principal to write as: set ZB_PRINCIPAL, or map one in zebridge_user_tenants")
-    nc = await zb.connect()
+    nc = await zb.connect(inbox_as=who)   # replies come to _INBOX.<who>.…, which mutation admission requires
     js = nc.jetstream()
 
     required = [
@@ -165,6 +165,12 @@ async def main():
             headers={"Nats-Msg-Id": msg_id},
         )
         await asyncio.sleep(3.0)
+        # Through mutation admission the first write after a quiet spell is answered a few seconds later (the queue's idle
+        # poll backs off): 3.6 s measured, so the verdict is waited for, not assumed to be there after a fixed pause.
+        for _ in range(48):
+            if msg_id in verdicts:
+                break
+            await asyncio.sleep(0.25)
         return verdicts.get(msg_id)
 
     def base_row(text: str) -> dict:

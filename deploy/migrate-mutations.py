@@ -14,6 +14,7 @@ import pathlib
 import subprocess
 
 import nats
+from nats.js.errors import NotFoundError
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -21,7 +22,16 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 async def migrate(nc, wanted, apply=False, domain=None):
     js = nc.jetstream(domain=domain)
     stream = wanted["name"]
-    current = await js.stream_info(stream)
+    try:
+        current = await js.stream_info(stream)
+    except NotFoundError as err:
+        if err.err_code != 10059:  # Only an absent stream, never an unrelated API failure.
+            raise
+        print(json.dumps({"stream": stream, "status": "absent", "apply": apply, "changed": False}))
+        print(f"{stream} does not exist: no legacy queue to migrate; no changes made. "
+              "Start admission (--mutation-ingress) first; it creates the private stream. "
+              "Then start the bridge with MUTATION_ADMISSION=1.")
+        return
     secure_subjects = wanted["subjects"]
     print(json.dumps({"stream": stream, "messages": current.state.messages,
                       "subjects_before": current.config.subjects, "subjects_after": secure_subjects,

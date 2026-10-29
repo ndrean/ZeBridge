@@ -32,6 +32,13 @@ import uuid
 import zb
 from multi_bridge import BRIDGE, NATS_URL, lib, start_stack, take, wait_log
 
+
+def pgtool(name):
+    """A PostgreSQL client or server tool: from ZB_PGBIN when set (a distribution package keeps pg_ctl and pg_basebackup out
+    of PATH), else the one on PATH."""
+    pgbin = os.environ.get("ZB_PGBIN")
+    return os.path.join(pgbin, name) if pgbin else name
+
 PRIMARY = "postgres://postgres@127.0.0.1:5432/postgres"
 SB_PORT = 15433
 PHYS_SLOT = "zb_standby_phys"
@@ -40,7 +47,7 @@ RUN = uuid.uuid4().hex[:8]
 
 
 def on_standby(sql: str) -> str:
-    out = subprocess.run(["psql", "-h", "127.0.0.1", "-p", str(SB_PORT), "-U", "postgres", "-d", zb_db(), "-Atc", sql],
+    out = subprocess.run([pgtool("psql"), "-h", "127.0.0.1", "-p", str(SB_PORT), "-U", "postgres", "-d", zb_db(), "-Atc", sql],
                          capture_output=True, text=True)
     return out.stdout.strip()
 
@@ -83,17 +90,17 @@ def teardown_db(principal: str):
 
 
 def primary_admin(sql: str) -> str:
-    return subprocess.run(["psql", PRIMARY, "-Atc", sql], capture_output=True, text=True).stdout.strip()
+    return subprocess.run([pgtool("psql"), PRIMARY, "-Atc", sql], capture_output=True, text=True).stdout.strip()
 
 
 def start_standby(datadir: str, log: str) -> bool:
     primary_admin(f"SELECT pg_drop_replication_slot('{PHYS_SLOT}') WHERE EXISTS "
                   f"(SELECT 1 FROM pg_replication_slots WHERE slot_name = '{PHYS_SLOT}')")
-    subprocess.run(["pg_basebackup", "-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-D", datadir,
+    subprocess.run([pgtool("pg_basebackup"), "-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-D", datadir,
                     "-R", "-C", "-S", PHYS_SLOT, "-X", "stream", "-c", "fast"], check=True, capture_output=True)
     # wal_level comes from the primary's command line in dev, not from a file the copy takes.
     opts = f"-p {SB_PORT} -c wal_level=logical -c hot_standby=on -c hot_standby_feedback=on -c archive_mode=off"
-    started = subprocess.run(["pg_ctl", "-D", datadir, "-o", opts, "-l", log, "-w", "start"], capture_output=True, text=True)
+    started = subprocess.run([pgtool("pg_ctl"), "-D", datadir, "-o", opts, "-l", log, "-w", "start"], capture_output=True, text=True)
     if started.returncode != 0:
         # check=True used to raise here with the command line and nothing else: the reason is in pg_ctl's
         # own output and the server log, so say it.
@@ -112,7 +119,7 @@ def start_standby(datadir: str, log: str) -> bool:
 
 
 def stop_standby(datadir: str):
-    subprocess.run(["pg_ctl", "-D", datadir, "-m", "fast", "-w", "stop"], capture_output=True)
+    subprocess.run([pgtool("pg_ctl"), "-D", datadir, "-m", "fast", "-w", "stop"], capture_output=True)
     primary_admin(f"SELECT pg_drop_replication_slot('{PHYS_SLOT}') WHERE EXISTS "
                   f"(SELECT 1 FROM pg_replication_slots WHERE slot_name = '{PHYS_SLOT}')")
 

@@ -18,7 +18,7 @@ function fixture(path = ':memory:') {
       targets TEXT DEFAULT '', data TEXT, since INTEGER);
     CREATE TABLE IF NOT EXISTS _zebridge_generations (tbl TEXT);
     CREATE TABLE IF NOT EXISTS _zebridge_frontier (tbl TEXT NOT NULL, stream TEXT NOT NULL, created TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (tbl, stream));
-    CREATE TABLE IF NOT EXISTS _zebridge_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER, created TEXT);
+    CREATE TABLE IF NOT EXISTS _zebridge_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER, created TEXT, born_empty INTEGER);
     CREATE TABLE IF NOT EXISTS item (id INTEGER, value TEXT);
   `);
   const c: any = Object.create(ZeBridge.prototype);
@@ -118,7 +118,7 @@ test('on-demand and unfollowed markers stay unresolved, including older empty-ro
     const { db, c, outcomes, mark } = fixture();
     try {
       mark(state, routes, state === 'healed' ? 'CDC_acme:12' : ''); c.ondemandSet.add('item');
-      db.exec("INSERT INTO _zebridge_stream_seq VALUES ('CDC_acme', 0, 'same')");
+      db.exec("INSERT INTO _zebridge_stream_seq (stream, last_seq, created) VALUES ('CDC_acme', 0, 'same')");
       db.exec("INSERT INTO item VALUES (1, 'optimistic')");
       await c.reconcileRewind(); await c.reconcileClear(); await c.reconcileClear();
       assert.equal(db.prepare('SELECT count(*) AS n FROM _zebridge_reconcile').get()!.n, 1);
@@ -128,9 +128,16 @@ test('on-demand and unfollowed markers stay unresolved, including older empty-ro
       await c.reconcileRewind(); await c.reconcileClear();
       assert.equal(outcomes.length, 0);
       c.syncedTables.set('item', {});
+      // The route was recorded as born empty: the rewind resets its position, so the flag goes with it (core.streamHasGap),
+      // or the empty route at 0 is no gap, nothing reseeds and the marker never heals.
+      if (state === 'pending') { db.exec('UPDATE _zebridge_stream_seq SET born_empty = 1'); c.streamBornEmpty.add('CDC_acme'); }
       await c.reconcileRewind();
       assert.equal(db.prepare('SELECT state FROM _zebridge_reconcile').get()!.state, 'rewound');
       assert.equal(db.prepare('SELECT last_seq FROM _zebridge_stream_seq').get()!.last_seq, 0);
+      if (state === 'pending') {
+        assert.equal(db.prepare('SELECT born_empty FROM _zebridge_stream_seq').get()!.born_empty, 0);
+        assert.equal(c.streamBornEmpty.has('CDC_acme'), false);
+      }
       assert.equal(c.hubOnly.has('CDC_acme'), true);
     } finally { db.close(); }
   }
@@ -143,7 +150,7 @@ test('pending, rewound and healed reconciliation states survive a database reope
       const path = join(dir, 'replica.sqlite3');
       let f = fixture(path);
       f.mark(state, state === 'pending' ? '' : 'CDC_acme', state === 'healed' ? 'CDC_acme:12' : '');
-      f.db.prepare('INSERT INTO _zebridge_stream_seq VALUES (?, ?, ?)').run('CDC_acme', state === 'pending' ? 10 : state === 'rewound' ? 0 : 11, 'same');
+      f.db.prepare('INSERT INTO _zebridge_stream_seq (stream, last_seq, created) VALUES (?, ?, ?)').run('CDC_acme', state === 'pending' ? 10 : state === 'rewound' ? 0 : 11, 'same');
       f.db.close();
       f = fixture(path);
       try {
@@ -169,7 +176,7 @@ test('a new marker cannot reuse a route heal that preceded its watermark removal
   const { db, c, mark } = fixture();
   try {
     mark('pending', '');
-    db.exec("INSERT INTO _zebridge_stream_seq VALUES ('CDC_acme', 11, 'same')");
+    db.exec("INSERT INTO _zebridge_stream_seq (stream, last_seq, created) VALUES ('CDC_acme', 11, 'same')");
     c.globalSyncState.seq.CDC_acme = 11;
     c.hubOnly.add('CDC_acme'); c.healedRoutes.add('CDC_acme');
     await c.reconcileRewind();
@@ -191,7 +198,7 @@ test('rewind fences buffered timers and waits for active flushes and idle checks
     const { db, c, mark } = fixture();
     try {
       c.syncedTables.clear(); c.globalSyncState.seq.CDC_acme = 10;
-      db.exec("INSERT INTO _zebridge_stream_seq VALUES ('CDC_acme', 10, 'same')");
+      db.exec("INSERT INTO _zebridge_stream_seq (stream, last_seq, created) VALUES ('CDC_acme', 10, 'same')");
       let wake: ((r: IteratorResult<any>) => void) | undefined;
       let sent = idle;
       const iter = {
@@ -252,7 +259,7 @@ test('a stream with no followed table gets no tail consumer', async () => {
     c.cdcFilters = ZeBridge.prototype['cdcFilters' as keyof ZeBridge];
     c.ondemandSet.add('item');
     c.globalSyncState.seq.CDC_acme = 10;
-    db.exec("INSERT INTO _zebridge_stream_seq VALUES ('CDC_acme', 10, 'same')");
+    db.exec("INSERT INTO _zebridge_stream_seq (stream, last_seq, created) VALUES ('CDC_acme', 10, 'same')");
     let added = 0;
     c.transport.jetstreamManager = async () => ({
       streams: { info: async () => ({ created: 'same', state: { first_seq: 1, last_seq: 11 } }) },
@@ -276,7 +283,7 @@ test('a route parked by a fence gets no tail until the fence commits; a stale pa
       c.tenantValue = 'acme';
       c.cdcStreams = () => ['CDC_acme'];
       c.globalSyncState.seq.CDC_acme = 10;
-      db.exec("INSERT INTO _zebridge_stream_seq VALUES ('CDC_acme', 10, 'same')");
+      db.exec("INSERT INTO _zebridge_stream_seq (stream, last_seq, created) VALUES ('CDC_acme', 10, 'same')");
       // 'item''s fence has the route; or a table that is no longer followed does.
       c.fenced.set('CDC_acme', new Set([owner]));
       let added = 0;
@@ -315,7 +322,7 @@ test('a reseed caused by a shared-stream gap rewinds the table\'s own stream to 
     c.syncedTables = new Map([['item', { tenantColumn: 'tenant_id', pkCols: ['id'] }]]);
     c.streamCreated = new Map([['CDC_acme', 'same'], ['CDC_PUBLIC', 'same']]);
     c.globalSyncState.seq = { CDC_acme: 20, CDC_PUBLIC: 5 };
-    db.exec("INSERT INTO _zebridge_stream_seq VALUES ('CDC_acme', 20, 'same'), ('CDC_PUBLIC', 5, 'same')");
+    db.exec("INSERT INTO _zebridge_stream_seq (stream, last_seq, created) VALUES ('CDC_acme', 20, 'same'), ('CDC_PUBLIC', 5, 'same')");
     db.exec("INSERT INTO _zebridge_generations VALUES ('item')");
     c.dialect = { setForeignKeys: async () => {}, foreignKeyViolations: async () => 0 };
     // The chain: its cut on CDC_acme (12) is older than the stored position (20).

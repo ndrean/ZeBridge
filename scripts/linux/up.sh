@@ -37,6 +37,20 @@ if [ -z "$PGBIN" ]; then
   else PGBIN="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1 || true)"; fi
 fi
 [ -n "$PGBIN" ] && [ -x "$PGBIN/pg_ctl" ] || die "no PostgreSQL server binaries — install the postgresql package or set ZB_PGBIN"
+pg_major() { "$1/pg_ctl" --version 2>/dev/null | grep -oE '[0-9]+' | head -1 || true; }
+# The first pg_ctl on PATH can be an old one (a Homebrew postgresql@14 beside the distribution's 16): unless ZB_PGBIN said which,
+# a PATH server older than 15 gives way to the newest distribution install that is not.
+if [ -z "${ZB_PGBIN:-}" ] && [ "$(pg_major "$PGBIN")" -lt 15 ] 2>/dev/null; then
+  alt="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1 || true)"
+  if [ -n "$alt" ] && [ -x "$alt/pg_ctl" ] && [ "$(pg_major "$alt")" -ge 15 ] 2>/dev/null; then
+    echo "[linux] the pg_ctl on PATH is PostgreSQL $(pg_major "$PGBIN"); using $alt instead"
+    PGBIN="$alt"
+  fi
+fi
+# The init SQL reads pg_publication_rel.prqual (row filters), which PostgreSQL 15 added: an older server fails half way through
+# the SQL with "column pr.prqual does not exist". The first pg_ctl on PATH is not always the newest installed.
+PG_MAJOR="$(pg_major "$PGBIN")"
+[ "${PG_MAJOR:-0}" -ge 15 ] || die "PostgreSQL ${PG_MAJOR:-?} at $PGBIN is too old (15 or newer): set ZB_PGBIN to a newer one, e.g. ZB_PGBIN=/usr/lib/postgresql/16/bin, and run down.sh --clean"
 # PostgreSQL refuses to run as root: its data directory then belongs to the `postgres` user, and (that user
 # cannot traverse most home directories) lives outside the repository.
 PG_OS_USER=""
@@ -136,8 +150,8 @@ fi
 cat <<EOF
 
 [linux] up. PostgreSQL 127.0.0.1:$PGPORT ($PGBIN), NATS 127.0.0.1:4222 (operator mode), credentials in scripts/native/creds/.
-The database is EMPTY. The steps are those of scripts/dev/README.md from step 3 (the Python environment, the fixtures, the
-bridge, the groups); only step 4's exports differ. In every terminal, after the lines of that step:
+The database is EMPTY. The next steps (the exports, reprovision.py, the bridge, the groups) are in scripts/linux/README.md,
+from its step 3. In every terminal, after the activation and env-file lines of that step:
 
      export NATS_URL=nats://127.0.0.1:4222
      export ZB_PGBIN="$PGBIN" ZB_PG_CTL="$HERE/pg_ctl" ZB_JWT_STATE="$STATE"

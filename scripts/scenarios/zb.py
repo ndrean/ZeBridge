@@ -18,6 +18,7 @@ import base64
 import json
 import os
 import pathlib
+import shlex
 import subprocess
 import sys
 
@@ -225,7 +226,7 @@ def tenants() -> list[str]:
     return [t for t in out.splitlines() if t]
 
 
-async def connect():
+async def connect(inbox_as: str | None = None):
     """Connect with the credential in `NATS_CREDS` — the JWT/operator stack's one shape.
 
     `scripts/native/creds/bridge.creds` is the bridge's own identity (inspect streams,
@@ -242,7 +243,10 @@ async def connect():
     if creds:
         if not pathlib.Path(creds).exists():
             sys.exit(f"NATS_CREDS={creds} does not exist")
-        who = pathlib.Path(creds).stem  # <principal>.creds — §10hm, its own inbox space
+        # <principal>.creds — §10hm, its own inbox space. `inbox_as`: the inbox of the principal a scenario WRITES AS while
+        # connected under other credentials (the bridge's): mutation admission refuses a request whose reply inbox is not
+        # `_INBOX.<the subject's principal>.…` (InvalidReplyInbox, and the publisher sees only a timeout).
+        who = inbox_as or pathlib.Path(creds).stem
         return await nats.connect(nats_server(), user_credentials=creds, inbox_prefix=f"_INBOX.{who}".encode())
     if "@" in NATS_URL.split("://", 1)[-1]:
         return await nats.connect(NATS_URL)
@@ -452,7 +456,24 @@ def another_bridge_running() -> bool:
     # drank from one workqueue). `( |$)` matches the bridge with or without arguments and
     # still stops at the sweeper's `_`.
     r = subprocess.run(["pgrep", "-f", r"zig-out/bin/bridge( |$)"], capture_output=True, text=True)
-    return bool(r.stdout.strip())
+    pids = r.stdout.split()
+    if not pids:
+        return False
+    # Admission is a gateway, not a worker consuming the mutation workqueue. An
+    # admission-mode stack needs it while the scenario owns the worker bridge.
+    # Inspect complete argv on macOS and Linux; never exempt a worker merely
+    # because an admission process is also present.
+    processes = subprocess.run(["ps", "-ww", "-p", ",".join(pids), "-o", "args="], capture_output=True, text=True)
+    if processes.returncode != 0:
+        return True  # cannot establish that every matching process is admission
+    for command in processes.stdout.splitlines():
+        try:
+            args = shlex.split(command)
+        except ValueError:
+            return True
+        if args and "--mutation-ingress" not in args:
+            return True
+    return False
 
 
 def bridge_env(**overrides) -> dict:

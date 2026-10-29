@@ -254,6 +254,11 @@ def env_for(role: str) -> dict:
     env = dict(os.environ)
     for k, v in DERIVED.items():
         env.setdefault(k, v)
+    # The S3 keys scripts/dev/up.sh generated for its SeaweedFS (archive, readings_roles, readings_fetch read them through
+    # S3_KEYS): found here, so that running the group needs no export. A key file of the user's own wins.
+    s3_keys = ROOT / "scripts" / "dev" / "state" / "s3.json"
+    if s3_keys.exists():
+        env.setdefault("S3_KEYS", str(s3_keys))
     # ⚠️ `info`, overriding whatever .env.bridge carries. At debug the bridge warns that
     # per-event hot-path logging costs ~4x CPU (so any timing a scenario measures is
     # invalid), and the client dumps raw payloads — a 5.4 MiB compressed chain object
