@@ -99,7 +99,9 @@ def start_standby(datadir: str, log: str) -> bool:
     subprocess.run([pgtool("pg_basebackup"), "-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-D", datadir,
                     "-R", "-C", "-S", PHYS_SLOT, "-X", "stream", "-c", "fast"], check=True, capture_output=True)
     # wal_level comes from the primary's command line in dev, not from a file the copy takes.
-    opts = f"-p {SB_PORT} -c wal_level=logical -c hot_standby=on -c hot_standby_feedback=on -c archive_mode=off"
+    # Distribution defaults may put sockets in /var/run/postgresql, which an ordinary test user cannot write.
+    opts = (f"-p {SB_PORT} -c unix_socket_directories=/tmp -c wal_level=logical "
+            "-c hot_standby=on -c hot_standby_feedback=on -c archive_mode=off")
     started = subprocess.run([pgtool("pg_ctl"), "-D", datadir, "-o", opts, "-l", log, "-w", "start"], capture_output=True, text=True)
     if started.returncode != 0:
         # check=True used to raise here with the command line and nothing else: the reason is in pg_ctl's

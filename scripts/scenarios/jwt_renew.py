@@ -277,7 +277,8 @@ def main() -> int:
         h = 0
         r = node(ts_db, None, 1)
         check("B. zb-client-ts", r.get("connected") is True and jwt_of(ts_db) != before[1] and abs(identity(ts_db).get("clock_offset", 99)) <= 5,
-              f"renewed and connected, offset back to {identity(ts_db).get('clock_offset')} s ({r.get('error') or 'ok'})")
+              f"renewed and connected, offset back to {identity(ts_db).get('clock_offset')} s "
+              f"(connected={r.get('connected')}, jwt_changed={jwt_of(ts_db) != before[1]}, {r.get('error') or 'ok'})")
         refusals = open(blog, errors="replace").read().count("off the bridge's clock") - refusals0
         check("B. bridge", refusals >= 2, f"refused {refusals} stamp(s) 2 h off and answered with its time")
 
