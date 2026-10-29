@@ -162,7 +162,7 @@ export interface ZeBridgeConfig {
   /// replacement committed), `before_verify`, `before_commit`, and `shared_lookup` (the
   /// shared route's stream lookup; a throw there makes the route unreadable). A harness
   /// crashes the process, sleeps while it prunes the stream, or throws. Never set in an app.
-  faultHook?: (point: 'before_decision' | 'after_chunk' | 'before_verify' | 'before_commit' | 'shared_lookup') => void | Promise<void>;
+  faultHook?: (point: 'before_decision' | 'after_chunk' | 'before_verify' | 'before_commit' | 'after_commit' | 'shared_lookup') => void | Promise<void>;
   /// §10ix (libzb: same name): apply a chain step AS IT ARRIVES — chunks inflated and
   /// decoded into windows of `seedChunkRows`, never the whole document. Measured on a
   /// 3M-row base: 2.5 GB peak when the document was materialised whole (§10iw).
@@ -4123,9 +4123,11 @@ export class ZeBridge {
           }
         }
       });
+      await this.fault('after_commit');
       setAnchor();
       state.unseeded = false;
       for (const l of lapsed) this.lapseJoint(l);
+      if (joint && othersOwed === 0 && !lapsed.length) this.appendLog('SYS', 'joint fence complete — its routes are open again', 'INFO');
       // The routes' parking ends with the fence, or with the last participant of a joint fence (none lapsed): their tails
       // reopen from the cursors it set. A lapsed participant keeps it.
       this.releaseFence(table);
@@ -4430,7 +4432,7 @@ export class ZeBridge {
   }
 
   /// The test harness's fault point (config.faultHook); nothing in an app.
-  private async fault(point: 'before_decision' | 'after_chunk' | 'before_verify' | 'before_commit' | 'shared_lookup'): Promise<void> {
+  private async fault(point: 'before_decision' | 'after_chunk' | 'before_verify' | 'before_commit' | 'after_commit' | 'shared_lookup'): Promise<void> {
     await this.config.faultHook?.(point);
   }
 

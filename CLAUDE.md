@@ -93,7 +93,9 @@ from the same variables by `scripts/scenarios/fence_client.mts`. A scenario fail
   anchor at once), and a fence refuses a neighbour it cannot certify. The unseeded tables of the rewound routes therefore take part:
   each is read from the hub, proven and its objects checked first; one PREPARE owes them all, writes the untouched tables' frontiers
   and moves the cursors to the smallest cut; the routes stay parked until the last has committed, which proves the earlier ones
-  again; each is anchored at its own cut (NOTES "The joint fence"). A table with no usable chain keeps the old refusal.
+  again before its own commit; each is anchored at its own cut. The group is durable (`joint` on the owed record, proofs in
+  `*_joint_done`) and `ensureJointRestored` parks the routes again after a restart, before any consumer opens (NOTES "The joint
+  fence"). A table with no usable chain keeps the old refusal.
 - **Route protection (TS):** `fenced` (route → owner tables) parks a route's tails; `replacing` records every chain
   replacement; a fence that commits hands the parking to replacements still running. Fence decisions are taken again inside
   `prepareExclusive` — never trust positions read before it. libzb is single-threaded in `poll`, so this cannot overlap there.

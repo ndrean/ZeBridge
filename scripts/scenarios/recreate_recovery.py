@@ -1150,9 +1150,13 @@ async def check19(a, tmp, ts=False):
             return ep is not None and ep > epoch0 and m.get("seed_epoch") == ep
 
         clients = []
-        cases = (("joint_live", [T, T2], {}, False), ("joint_swapped", [T2, T], {}, False),
-                 ("joint_crash", [T, T2], {"ZB_TEST_FENCE_ABORT": "after_chunk"}, False), ("joint_unavailable", [T, T2], {}, True))
-        for name, order, env, unavailable in cases:
+        cases = (("joint_live", [T, T2], {}, False, False), ("joint_swapped", [T2, T], {}, False, False),
+                 ("joint_crash", [T, T2], {"ZB_TEST_FENCE_ABORT": "after_chunk"}, False, False), ("joint_unavailable", [T, T2], {}, True, False),
+                 # The client dies right after the FIRST participant committed; the stream then drops the events after the first
+                 # cut(s) while it is down. The group has to come back from the replica: the routes parked before any tail, the
+                 # earlier participant proven again before they open.
+                 ("joint_restart", [T, T2], {"ZB_TEST_FENCE_ABORT": "after_commit"}, False, True))
+        for name, order, env, unavailable, restart in cases:
             loads = [Load(s, "t_a", p, 2 * a.interval_ms / 1000, table=t) for p, t in zip("cde", tables)]
             c = (TsClient(s, name, "pa", "t_a", chunk_rows=200) if ts
                  else Client(s, name, "pa", "t_a", chunk_rows=200, lib=FAULT_LIBRARY))
@@ -1198,12 +1202,30 @@ async def check19(a, tmp, ts=False):
             elif env:
                 rc = await until(lambda: c.exited() is not None, 90)
                 pos = c.position("CDC_t_a")
-                check(f"{name}: the client aborted after a chunk ({c.exited()}); position {pos} moved back from {pos_before}, recovery owed {c.fence_pending()}",
-                      rc is not None and pos is not None and pos_before is not None and pos < pos_before and c.fence_pending())
+                what = "after the first participant committed" if restart else "after a chunk"
+                owed_any = int((c._q(f"SELECT count(*) FROM {'_zebridge_fence' if ts else '_zbz_fence'}") or [[0]])[0][0])
+                check(f"{name}: the client aborted {what} ({c.exited()}); position {pos} moved back from {pos_before}, owed records {owed_any}",
+                      rc is not None and pos is not None and pos_before is not None and pos < pos_before and owed_any > 0)
+                if restart:
+                    ms = [await js.kv(js.gen, f"t_a.{t}") or {} for t in tables[:2]]
+                    cuts = [m.get("cutoff_seq") for m in ms]
+                    if all(isinstance(x, int) for x in cuts):
+                        await js.js.purge_stream("CDC_t_a", seq=max(cuts))
+                        st = await js.stream("CDC_t_a") or {}
+                        note(f"{name}: purged CDC_t_a up to {max(cuts)} (cuts {cuts}): first {st.get('first')}")
+                    mark = len(c.text())
                 c.p = None
                 c.start()
             secs = await until(lambda: recovered(c), 150)
             check(f"{name}: all three recovered under current anchors while writes continue ({secs} s)", secs is not None)
+            if restart:
+                after = c.text()[mark:]
+                restored = after.find("joint fence unfinished")
+                decided = min([i for i in (after.find("joint fence complete"), after.find("joint fence not released")) if i >= 0] or [-1])
+                tail = after.find("tail consumer")
+                check(f"{name}: the restart parks the routes of the unfinished group before anything else ({restored >= 0}); "
+                      f"the group is decided (complete or an earlier participant owed again) before a tail opens (restore at {restored}, decided at {decided}, first tail at {tail})",
+                      restored >= 0 and decided >= 0 and (tail < 0 or restored < tail and decided < tail))
             check(f"{name}: no table was refused for another's missing coverage ({c.count('refusing the full')} refusal(s))",
                   c.count("refusing the full") == 0 or unavailable)
             for l in loads: l.end()

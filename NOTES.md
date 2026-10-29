@@ -19568,23 +19568,30 @@ retention can overtake its cut, a permission can fail, or the process can die fi
    The owed records are the durable list of participants. A participant's cut lowers only a cursor this fence rewinds, whose other tables the
    scope looked at; a participant that rides another route too rewinds it in its own turn, with its own scope.
 3. The routes stay parked until the last participant has committed (zb-client-ts: every participant is an owner in `fenced`; libzb: `joint_parked`,
-   which `tailFor` and the poll loop honour). Memory only, like the other parking: after a restart the owed records are what is left, the tails
-   replay from the cursor, a participant's events are held until its anchor, the untouched tables skip through their frontiers, and the next
-   pass replaces the participants one by one.
+   which `tailFor` and the poll loop honour). **The group is durable, not memory**: the owed record carries `joint` (`_zbz_fence.joint` /
+   `_zebridge_fence.joint`, added by `ALTER` to an older replica), and a participant that commits while others are still owed leaves its proofs (route,
+   cut, incarnation) in `_zbz_joint_done` / `_zebridge_joint_done`. `ensureJointRestored` runs once per process before any consumer opens or any chain is
+   applied, and parks the routes of the flagged owed records again (if it cannot read them, nothing opens). So a restart with one participant still
+   unavailable keeps the routes closed under it, and the earlier participants' proofs are still there for the last commit.
 4. Each participant is replaced by its own call through the existing path (download, chunked apply, VERIFY, COMMIT), anchored at **its own** cut.
    Its anchor gate then drops the events at or below that cut while the replay, which starts at the smallest cut, goes on for the others. There is
    no single large transaction. Its retry after a crash is the ordinary owed fence: the cursor is at or below its cut, so no scope is consulted.
-5. The last participant to commit proves every earlier one again on fresh facts (`releaseJoint` / `jointCommitted`): the same incarnation, the event
-   after the cut still retained. One that fails is owed again (anchor removed, owed record written), the routes stay parked for it, and the
-   recovery is durably incomplete until a newer chain replaces it.
+5. The last participant to commit proves every earlier one again on fresh facts (`jointLapsed`: the same incarnation, the event after the cut still
+   retained) **before its own commit**, and that commit's transaction either deletes the proofs (the group ends, the routes open) or owes a lapsed
+   participant again (anchor removed, owed record written with `joint`), the routes staying parked for it. A crash between the proofs and the commit
+   leaves the owed records, which are the group. In practice a lapse also shows as a gap on the stream (the cursor sits at the smallest cut), which
+   the gap rule would take on its own; this check is the second line, and the only one when the cut that went is not the cursor's.
 
-**Tests.** `fence-apply.test.ts` (eight cases, run against the per-table entry point a pass uses, so they do not name the coordination: both
+**Tests.** `fence-apply.test.ts` (ten cases, run against the per-table entry point a pass uses, so they do not name the coordination: both
 orders of unequal cuts, the third table's insert at 410 that a replay must not recreate after its delete at 420, the second replacement unavailable
 before or after the first, a crash after chunks 1, 4 and 5 and before the verify and the commit of either participant, the retention overtaking one
-cut before the release, parking between participants, nothing prepared over a missing object) and `recreate_recovery.py` checks 19 (libzb, fault
-build) and 20 (zb-client-ts): three tables under load, both reseed orders, an abort after a chunk and the reopen, and the second table's full
-deleted from the object store until it is reseeded again. Each rule was broken on purpose and a test failed: the minimum cursor, the owed records,
+cut before the release, parking between participants, nothing prepared over a missing object, and a restart with the second participant still
+unavailable and the first one's cut overtaken, through two restarts) and `recreate_recovery.py` checks 19 (libzb, fault
+build) and 20 (zb-client-ts): three tables under load, both reseed orders, an abort after a chunk and the reopen, the second table's full
+deleted from the object store until it is reseeded again, and a client that dies right after the first participant committed (`after_commit`
+fault point) while the stream is purged, whose restart must park the routes and decide the group before any tail opens. In that live case the two
+chains happened to share a cut, so the purge overtook nothing; the lapse itself is pinned by the unit test, in libzb only by `jointAfterCommit`'s test. Each rule was broken on purpose and a test failed: the minimum cursor, the owed records,
 the parking, the re-proof, the release at the first commit.
 
-**Not done.** A client that is restarted while a joint fence is incomplete does not park the routes (memory only); the participants' events are
-held, bounded as every unseeded table's are. The leaf's chain is not used to prove a participant: it is always the hub's.
+**Not done.** The leaf's chain is not used to prove a participant: it is always the hub's. The libzb lapse path (a participant owed again by the
+last commit) is not exercised live: a live run needs two chains with different cuts and a purge between them.
