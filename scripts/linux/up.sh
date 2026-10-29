@@ -37,6 +37,10 @@ if [ -z "$PGBIN" ]; then
   else PGBIN="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1 || true)"; fi
 fi
 [ -n "$PGBIN" ] && [ -x "$PGBIN/pg_ctl" ] || die "no PostgreSQL server binaries — install the postgresql package or set ZB_PGBIN"
+# The init SQL reads pg_publication_rel.prqual (row filters), which PostgreSQL 15 added: an older server fails half way through
+# the SQL with "column pr.prqual does not exist". The first pg_ctl on PATH is not always the newest installed.
+PG_MAJOR="$("$PGBIN/pg_ctl" --version | grep -oE '[0-9]+' | head -1)"
+[ "${PG_MAJOR:-0}" -ge 15 ] || die "PostgreSQL ${PG_MAJOR:-?} at $PGBIN is too old (15 or newer): set ZB_PGBIN to a newer one, e.g. ZB_PGBIN=/usr/lib/postgresql/16/bin, and run down.sh --clean"
 # PostgreSQL refuses to run as root: its data directory then belongs to the `postgres` user, and (that user
 # cannot traverse most home directories) lives outside the repository.
 PG_OS_USER=""

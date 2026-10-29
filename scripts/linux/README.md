@@ -48,6 +48,7 @@ files go to `scripts/native/creds/`, where `run.py` reads them.
 
 - `up.sh` runs the credential bootstrap every time, like `scripts/dev/up.sh`, and reloads a `nats-server` that is already up
   (`kill -HUP`), for the same reason: the account JWT it loaded does not know the newest signing key.
+- PostgreSQL 15 or newer (`up.sh` checks; the init SQL reads `pg_publication_rel.prqual`). With several installed, `ZB_PGBIN` chooses.
 - `wal_compression=on` instead of `zstd` (a server built without zstd refuses the latter).
 - Not covered, as in `scripts/dev`: TLS and the leaf listener, SeaweedFS. The write path through admission works the same way
   (the section of `scripts/dev/README.md` about it; measured on this stack).
