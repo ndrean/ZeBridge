@@ -284,7 +284,7 @@ fn runImpl(init: *const std.process.Init, a: std.mem.Allocator) !void {
     std.posix.sigaction(std.posix.SIG.TERM, &action, null);
     std.posix.sigaction(std.posix.SIG.INT, &action, null);
     log.info("mutation admission ready: {d} queued messages per principal, {d} byte budget", .{ try limits.count(), limits.principal_bytes });
-    var refused: u64 = 0;
+    var refusals: Refusals = .{};
     var last_warning: i64 = 0;
     var idle_ms: u64 = 0;
     while (!stopping.load(.acquire)) {
@@ -297,13 +297,10 @@ fn runImpl(init: *const std.process.Init, a: std.mem.Allocator) !void {
             activity = true;
             defer incoming.deinit();
             relay(conn, incoming, owned.topology.subject_mutations_prefix, owned.topology.leaf_prefix, limits) catch |err| {
-                refused +|= 1;
-                const now = std.Io.Clock.real.now(init.io).toSeconds();
-                if (now != last_warning) {
-                    log.warn("mutation admission refused {d} request(s), latest: {s}", .{ refused, @errorName(err) });
-                    last_warning = now;
-                    refused = 0;
-                }
+                refusals.note(err);
+                if (err == error.InvalidReplyInbox) if (incoming.reply) |reply| if (route(incoming.subject, owned.topology.subject_mutations_prefix, owned.topology.leaf_prefix)) |parsed| {
+                    refusals.noteInbox(parsed.principal, reply);
+                } else |_| {};
                 if (incoming.reply) |reply| {
                     // Never emit an error to an arbitrary caller-chosen subject.
                     const parsed = route(incoming.subject, owned.topology.subject_mutations_prefix, owned.topology.leaf_prefix) catch continue;
@@ -317,6 +314,15 @@ fn runImpl(init: *const std.process.Init, a: std.mem.Allocator) !void {
                 }
             };
         }
+        // At most one line a second, and the tail of a burst is not left unsaid until the next refusal.
+        if (refusals.pending()) {
+            const now = std.Io.Clock.real.now(init.io).toSeconds();
+            if (now != last_warning) {
+                var line_buf: [line_bytes]u8 = undefined;
+                log.warn("{s}", .{refusals.line(&line_buf)});
+                last_warning = now;
+            }
+        }
         // Polled, not blocked on: one wait would starve the other subscriptions (the
         // public subject and one per leaf). Idle, the pause grows to idle_sleep_max_ms:
         // a fixed 1 ms pause woke the loop 1,000 times a second, 1.4% of a core all day
@@ -326,6 +332,89 @@ fn runImpl(init: *const std.process.Init, a: std.mem.Allocator) !void {
         if (idle_ms > 0) try std.Io.sleep(init.io, .fromMilliseconds(@intCast(idle_ms)), .awake);
     }
 }
+
+/// Refusals by reason, for the operator. Bounded by construction: a fixed array indexed by a closed set of reasons, plus the
+/// last offender in two fixed buffers. Nothing here is keyed by anything a caller chose, so a flood of refusals costs the
+/// same memory as one.
+/// The log line of a window: the counters of six reasons and one hint that carries the principal three times.
+const line_bytes = 1024;
+
+const Refusals = struct {
+    const Reason = enum { invalid_reply_inbox, missing_message_id, invalid_message_id, message_too_large, bad_route, other };
+    /// A principal is at most 128 bytes (`leaf_scope.principalIn`): kept whole, since the line tells the operator to configure it.
+    const max_principal_bytes = 128;
+    const names = [_][]const u8{ "InvalidReplyInbox", "MissingMessageId", "InvalidMessageId", "MessageTooLarge", "BadRoute", "Other" };
+    since_start: [names.len]u64 = @splat(0),
+    window: [names.len]u64 = @splat(0),
+    /// The last InvalidReplyInbox: who wrote, and the inbox PREFIX it asked to be answered on (the first two tokens, not the
+    /// per-request token after them). A client's default prefix is `_INBOX.<random>`; a random identifier, not a secret.
+    principal: [max_principal_bytes]u8 = undefined,
+    principal_len: usize = 0,
+    inbox: [48]u8 = undefined,
+    inbox_len: usize = 0,
+
+    fn reasonOf(err: anyerror) Reason {
+        return switch (err) {
+            error.InvalidReplyInbox => .invalid_reply_inbox,
+            error.MissingMessageId => .missing_message_id,
+            error.InvalidMessageId => .invalid_message_id,
+            error.MessageTooLarge => .message_too_large,
+            error.MalformedSubject, error.UnknownOperation => .bad_route,
+            else => .other,
+        };
+    }
+
+    fn note(self: *Refusals, err: anyerror) void {
+        const i = @intFromEnum(reasonOf(err));
+        self.since_start[i] +|= 1;
+        self.window[i] +|= 1;
+    }
+
+    /// Remembers who sent a reply inbox the rule refuses.
+    fn noteInbox(self: *Refusals, principal: []const u8, reply: []const u8) void {
+        // Never a cut one: advice built on half a name would point the operator at the wrong inbox. (A parsed route
+        // cannot carry a longer one; if it ever did, the line would simply have no hint.)
+        if (principal.len > self.principal.len) {
+            self.principal_len = 0;
+            return;
+        }
+        self.principal_len = principal.len;
+        @memcpy(self.principal[0..self.principal_len], principal);
+        // `_INBOX.<prefix token>`: up to the second dot, so the per-request token is not printed.
+        var end = reply.len;
+        if (std.mem.indexOfScalar(u8, reply, '.')) |d| if (std.mem.indexOfScalarPos(u8, reply, d + 1, '.')) |d2| {
+            end = d2;
+        };
+        self.inbox_len = @min(end, self.inbox.len);
+        @memcpy(self.inbox[0..self.inbox_len], reply[0..self.inbox_len]);
+    }
+
+    fn pending(self: *const Refusals) bool {
+        for (self.window) |n| if (n > 0) return true;
+        return false;
+    }
+
+    /// The log line for the refusals of the last window, which is then cleared. `buf` is the caller's.
+    fn line(self: *Refusals, buf: []u8) []const u8 {
+        var w = std.Io.Writer.fixed(buf);
+        var total: u64 = 0;
+        for (self.window) |n| total +|= n;
+        w.print("mutation admission refused {d} request(s):", .{total}) catch return buf[0..0];
+        for (self.window, 0..) |n, i| if (n > 0) w.print(" {s} {d} (since start {d})", .{ names[i], n, self.since_start[i] }) catch break;
+        if (self.window[@intFromEnum(Reason.invalid_reply_inbox)] > 0 and self.principal_len > 0) {
+            const mark = w.end;
+            const who = self.principal[0..self.principal_len];
+            // All or nothing: a hint that does not fit is dropped whole, not cut in the middle of the prefix to set.
+            w.print("; latest InvalidReplyInbox: '{s}' asked to be answered on '{s}…', but its replies must come to '_INBOX.{s}.…': set the client's inbox prefix to '_INBOX.{s}'", .{
+                who, self.inbox[0..self.inbox_len], who, who,
+            }) catch {
+                w.end = mark;
+            };
+        }
+        self.window = @splat(0);
+        return w.buffered();
+    }
+};
 
 /// The admission loop's pause after a pass, in milliseconds: none after a pass that
 /// relayed something, then 1, 2, 4 … up to `idle_sleep_max_ms` while passes stay empty.
@@ -420,4 +509,53 @@ test "message IDs: zb1 IDs are strict, legacy IDs pass, nothing else does" {
         break :blk b;
     };
     try std.testing.expect(!validMessageId(&em_spaces)); // 513 bytes, 171 characters
+}
+
+test "refusals are counted by reason in fixed memory, and the inbox rule names what to set" {
+    var r: Refusals = .{};
+    r.note(error.InvalidReplyInbox);
+    r.note(error.InvalidReplyInbox);
+    r.note(error.MissingMessageId);
+    r.note(error.MalformedSubject);
+    r.note(error.OutOfMemory); // anything else is "Other", not a new bucket
+    r.noteInbox("alice", "_INBOX.tatajov82pvkmapghgmsnh.5");
+    try std.testing.expect(r.pending());
+    var buf: [line_bytes]u8 = undefined;
+    const first = r.line(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, first, "refused 5 request(s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "InvalidReplyInbox 2 (since start 2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "MissingMessageId 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "BadRoute 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "Other 1") != null);
+    // What the operator needs: who, the inbox prefix it used (its first two tokens, not the per-request one), and what to set.
+    try std.testing.expect(std.mem.indexOf(u8, first, "'alice' asked to be answered on '_INBOX.tatajov82pvkmapghgmsnh…'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "set the client's inbox prefix to '_INBOX.alice'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "replies must come to '_INBOX.alice.…'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, ".5") == null);
+    // The window is cleared, the totals are not.
+    try std.testing.expect(!r.pending());
+    r.note(error.InvalidReplyInbox);
+    const second = r.line(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, second, "InvalidReplyInbox 1 (since start 3)") != null);
+    // The longest supported principal (128 bytes) is kept whole, and the advice built on it fits the line.
+    var longest: [128]u8 = undefined;
+    @memset(&longest, 'p');
+    var long_inbox: [200]u8 = undefined;
+    @memset(&long_inbox, 'x');
+    r.note(error.InvalidReplyInbox);
+    r.noteInbox(&longest, &long_inbox);
+    const third = r.line(&buf);
+    try std.testing.expectEqual(@as(usize, 128), r.principal_len);
+    try std.testing.expectEqual(@as(usize, 48), r.inbox_len); // an inbox is cut: it is only shown, never configured
+    var want_buf: [256]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "set the client's inbox prefix to '_INBOX.{s}'", .{&longest});
+    try std.testing.expect(std.mem.indexOf(u8, third, want) != null);
+    // A principal that could not be kept whole gives no hint at all, never a cut one.
+    var too_long: [129]u8 = undefined;
+    @memset(&too_long, 'q');
+    r.note(error.InvalidReplyInbox);
+    r.noteInbox(&too_long, "_INBOX.z.1");
+    const fourth = r.line(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, fourth, "InvalidReplyInbox 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fourth, "set the client's inbox prefix") == null);
 }

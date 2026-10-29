@@ -567,6 +567,13 @@ pub const SyncClient = struct {
     /// Routes a fence prepared whose untouched tables' frontiers could not be read back: no tail
     /// opens on them until `restoreParked` (or the fence's retry) reads them.
     frontier_parked: std.array_hash_map.String(void) = .empty,
+    /// The routes of a joint fence in flight (several pairs replaced together, `Joiner`): no tail opens on them until every
+    /// participant has committed. The group itself is durable: `_zbz_fence.joint` marks the owed participants and
+    /// `_zbz_joint_done` keeps the proofs of the ones that already committed; `ensureJointRestored` parks the routes again
+    /// from them after a restart, before any consumer opens.
+    joint_parked: std.array_hash_map.String(void) = .empty,
+    /// The unfinished joint fences of a previous run were parked again.
+    joint_restored: bool = false,
     /// §10iz: what kept each table unseeded — the error name of its last failed seed,
     /// by table; an entry leaves when the table seeds. `zb_client_sync` and
     /// `zb_client_poll` report it as `unseeded`, so a host never calls a replica
@@ -975,7 +982,17 @@ pub const SyncClient = struct {
 
     /// A table left untouched by a fence, with the route whose events it already holds.
     const Untouched = struct { table: []const u8, stream: []const u8 };
-    const FenceScope = struct { untouched: []const Untouched = &.{}, refused: ?[]const u8 = null };
+    /// A (table, tenant) pair of a fence.
+    const PairKey = struct { table: []const u8, tenant: []const u8 };
+    /// A route, the cut a chain was taken at on it and the incarnation the cut was taken on.
+    const FenceRoute = struct { stream: []const u8, cut: i64, created: []const u8 };
+    /// A participant whose completion proof failed when the last one committed.
+    const Lapsed = struct { table: []const u8, tenant: []const u8, stream: []const u8, cut: i64 };
+    const JointMode = enum { none, more, clean, lapsed };
+    /// A pair the joint fence replaces together with the fenced one: not seeded, with a chain the hub's streams still
+    /// prove. `shared_cut` is null when its chain has no shared route.
+    const Joiner = struct { table: []const u8, tenant: []const u8, own_stream: []const u8, own_cut: i64, shared_stream: []const u8, shared_cut: ?i64 };
+    const FenceScope = struct { untouched: []const Untouched = &.{}, unseeded: []const PairKey = &.{}, refused: ?[]const u8 = null };
 
     /// The fence's scope rule (the recovery model's §3, R3): which OTHER pairs ride any of
     /// `streams`, and can they stay untouched? A rewind replays a stream's events to every
@@ -988,6 +1005,7 @@ pub const SyncClient = struct {
     /// An empty name matches nothing; on-demand tables ride no tail.
     fn fenceScope(self: *SyncClient, a: std.mem.Allocator, table: []const u8, tenant: []const u8, streams: []const []const u8) !FenceScope {
         var out: std.ArrayList(Untouched) = .empty;
+        var open: std.ArrayList(PairKey) = .empty;
         for (self.followed) |t| {
             if (self.isOnDemand(t)) continue;
             const st = self.states.get(t) orelse continue;
@@ -1003,7 +1021,14 @@ pub const SyncClient = struct {
                     }
                     const seeded = try self.st.query(a, "SELECT 1 FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = t }, .{ .text = tn } });
                     if (seeded.len == 0) {
-                        return .{ .refused = try std.fmt.allocPrint(a, "{s} is not seeded, so its coverage on {s} is unknown", .{ t, s_ }) };
+                        // Its coverage is unknown, so it cannot stay untouched: it is replaced WITH the fenced pair if its
+                        // own chain can be (`resolveJoiners`), and the fence is refused, as it always was, if not.
+                        var seen = false;
+                        for (open.items) |u| if (std.mem.eql(u8, u.table, t) and std.mem.eql(u8, u.tenant, tn)) {
+                            seen = true;
+                        };
+                        if (!seen) try open.append(a, .{ .table = t, .tenant = tn });
+                        continue;
                     }
                     var dup = false;
                     for (out.items) |u| if (std.mem.eql(u8, u.table, t) and std.mem.eql(u8, u.stream, s_)) {
@@ -1013,7 +1038,140 @@ pub const SyncClient = struct {
                 }
             }
         }
-        return .{ .untouched = out.items };
+        return .{ .untouched = out.items, .unseeded = open.items };
+    }
+
+    /// Can `pair`, which is not seeded, be replaced together with a fenced one? Its chain is read from the HUB and proven
+    /// as any chain is (same incarnation, the event after its cut still retained, on its own route and on the shared one),
+    /// and every object of its plan is there now: a joint fence moves the cursors for it and parks the routes until it
+    /// is done, so it is never promised on a chain that cannot be applied. A promise of a replacement is not coverage.
+    /// Strings from `a`.
+    const JoinResult = union(enum) { ok: Joiner, no: []const u8 };
+
+    fn jointCandidate(self: *SyncClient, a: std.mem.Allocator, pair: PairKey) !JoinResult {
+        const st = self.states.get(pair.table) orelse return .{ .no = "it is not followed" };
+        const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ pair.tenant, pair.table });
+        const man_bytes = (transport.Transport.kvGetIn(self.t.js, a, self.kv_generations, key) catch return .{ .no = "the hub's chain manifest is unreadable" }) orelse return .{ .no = "the hub holds no chain for it" };
+        const man = (std.json.parseFromSlice(Value, a, man_bytes, .{}) catch return .{ .no = "its manifest is unreadable" }).value;
+        if (man != .object) return .{ .no = "its manifest is unreadable" };
+        const man_epoch: i64 = if (man.object.get("seed_epoch")) |v| (if (v == .integer) v.integer else 0) else 0;
+        if (man_epoch < st.seed_epoch) return .{ .no = try std.fmt.allocPrint(a, "its chain predates its re-seed (epoch {d} < {d})", .{ man_epoch, st.seed_epoch }) };
+        const own_stream = if (man.object.get("cdc_stream")) |v| (if (v == .string) v.string else "") else "";
+        const created = if (man.object.get("cdc_stream_created")) |v| (if (v == .string) v.string else "") else "";
+        const own_cut: i64 = if (man.object.get("cutoff_seq")) |v| (if (v == .integer) v.integer else -1) else -1;
+        if (own_stream.len == 0 or own_cut < 0) return .{ .no = "its chain names no cut on a route" };
+        const own = self.streamFacts(own_stream) catch return .{ .no = try std.fmt.allocPrint(a, "{s} cannot be read", .{own_stream}) };
+        if (created.len == 0 or own.created.len == 0 or !std.mem.eql(u8, created, own.created)) return .{ .no = try std.fmt.allocPrint(a, "its cut on {s} was taken on another incarnation of the stream, or one that cannot be told", .{own_stream}) };
+        if (own_cut + 1 < @as(i64, @intCast(own.first_seq))) return .{ .no = try std.fmt.allocPrint(a, "{s} no longer holds the events after its cut {d}", .{ own_stream, own_cut }) };
+        var shared_stream: []const u8 = "";
+        var shared_cut: ?i64 = null;
+        if (man.object.get("shared_cutoff_seq")) |sv| if (sv == .integer and sv.integer >= 0) {
+            shared_stream = if (man.object.get("shared_cdc_stream")) |v| (if (v == .string) v.string else "") else "";
+            const screated = if (man.object.get("shared_cdc_stream_created")) |v| (if (v == .string) v.string else "") else "";
+            const sf = self.streamFacts(shared_stream) catch return .{ .no = try std.fmt.allocPrint(a, "{s} cannot be read", .{shared_stream}) };
+            if (shared_stream.len == 0 or screated.len == 0 or sf.created.len == 0 or !std.mem.eql(u8, screated, sf.created)) return .{ .no = try std.fmt.allocPrint(a, "its shared cut on {s} cannot be proven replayable", .{shared_stream}) };
+            if (sv.integer + 1 < @as(i64, @intCast(sf.first_seq))) return .{ .no = try std.fmt.allocPrint(a, "{s} no longer holds the events after its shared cut {d}", .{ shared_stream, sv.integer }) };
+            shared_cut = sv.integer;
+        };
+        const plan = core.planFromManifest(a, man, null) catch return .{ .no = "its plan cannot be read" };
+        const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, pair.tenant });
+        for (plan.array.items) |step| {
+            const name = if (step == .object) (if (step.object.get("name")) |v| (if (v == .string) v.string else "") else "") else "";
+            _ = transport.ObjectPull.sizeIn(self.t.js, a, bucket, name) catch return .{ .no = try std.fmt.allocPrint(a, "its chain object {s} is not in {s}", .{ name, bucket }) };
+        }
+        return .{ .ok = .{ .table = pair.table, .tenant = pair.tenant, .own_stream = own_stream, .own_cut = own_cut, .shared_stream = shared_stream, .shared_cut = shared_cut } };
+    }
+
+    /// The unseeded pairs a scope found, as participants of the fence: appended to `joiners`, or the reason one of them
+    /// cannot take part (the fence is then refused, in the old words).
+    fn resolveJoiners(self: *SyncClient, a: std.mem.Allocator, unseeded: []const PairKey, stream: []const u8, joiners: *std.ArrayList(Joiner)) !?[]const u8 {
+        for (unseeded) |u| {
+            var have = false;
+            for (joiners.items) |j| if (std.mem.eql(u8, j.table, u.table) and std.mem.eql(u8, j.tenant, u.tenant)) {
+                have = true;
+            };
+            if (have) continue;
+            switch (try self.jointCandidate(a, u)) {
+                .ok => |j| try joiners.append(a, j),
+                .no => |why| return try std.fmt.allocPrint(a, "{s} is not seeded, so its coverage on {s} is unknown, and it cannot be replaced with this table: {s}", .{ u.table, stream, why }),
+            }
+        }
+        return null;
+    }
+
+    /// The owed record of the pair says it belongs to a joint fence.
+    fn jointFlag(self: *SyncClient, a: std.mem.Allocator, table: []const u8, tenant: []const u8) !bool {
+        const rows = try self.st.query(a, "SELECT joint FROM _zbz_fence WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } });
+        return rows.len > 0 and rows[0][0] == .integer and rows[0][0].integer == 1;
+    }
+
+    /// The other participants of a joint fence still owed.
+    fn jointOwedOthers(self: *SyncClient, a: std.mem.Allocator, table: []const u8, tenant: []const u8) !usize {
+        const rows = try self.st.query(a, "SELECT count(*) FROM _zbz_fence WHERE joint = 1 AND NOT (tbl = ? AND tenant = ?)", &.{ .{ .text = table }, .{ .text = tenant } });
+        return if (rows.len > 0 and rows[0][0] == .integer) @intCast(rows[0][0].integer) else 0;
+    }
+
+    /// The participants that committed earlier (rows of `_zbz_joint_done`, so they survive a restart), proven again on fresh
+    /// facts: the same incarnation, and the event after each cut still retained. Those that fail, once each.
+    fn jointLapsed(self: *SyncClient, a: std.mem.Allocator, table: []const u8, tenant: []const u8) ![]const Lapsed {
+        const rows = try self.st.query(a, "SELECT tbl, tenant, stream, cut, created FROM _zbz_joint_done WHERE NOT (tbl = ? AND tenant = ?)", &.{ .{ .text = table }, .{ .text = tenant } });
+        var out: std.ArrayList(Lapsed) = .empty;
+        for (rows) |r| {
+            if (r[0] != .text or r[1] != .text or r[2] != .text or r[3] != .integer or r[4] != .text) continue;
+            var seen = false;
+            for (out.items) |l| if (std.mem.eql(u8, l.table, r[0].text) and std.mem.eql(u8, l.tenant, r[1].text)) {
+                seen = true;
+            };
+            if (seen) continue;
+            _ = self.pass_streams.remove(r[2].text);
+            const ok_route = if (self.streamFacts(r[2].text)) |f|
+                std.mem.eql(u8, f.created, r[4].text) and @as(i64, @intCast(f.first_seq)) <= r[3].integer + 1
+            else |_| false;
+            if (!ok_route) try out.append(a, .{ .table = r[0].text, .tenant = r[1].text, .stream = r[2].text, .cut = r[3].integer });
+        }
+        return out.items;
+    }
+
+    /// The commit's transaction has run: memory says what it made durable. A clean end of the group opens its routes; a
+    /// lapsed participant (already owed again in that transaction) loses its in-memory gates and the routes stay parked.
+    fn jointAfterCommit(self: *SyncClient, mode: JointMode, lapsed: []const Lapsed) void {
+        switch (mode) {
+            .none, .more => {},
+            .clean => {
+                self.joint_parked.clearRetainingCapacity();
+                log.info("joint fence complete — its routes are open again", .{});
+            },
+            .lapsed => for (lapsed) |l| {
+                if (self.states.getPtr(l.table)) |ds| {
+                    ds.frontiers.clearRetainingCapacity();
+                    ds.anchors.clearRetainingCapacity();
+                }
+                self.reseed_pending = true;
+                log.warn("{s}: joint fence not released — {s} no longer holds the events after its cut {d} on the incarnation the chain was cut on; it is owed again and the routes stay parked until it is replaced (recovery incomplete)", .{ l.table, l.stream, l.cut });
+            },
+        }
+    }
+
+    /// Once per process, before any consumer opens or any chain is applied: the joint fences a previous run left unfinished
+    /// park their routes again, from the durable owed records (`joint`). Without this a restart would open the tails under
+    /// participants still to be replaced. A read that fails is an error (nothing opens), never "no group".
+    fn ensureJointRestored(self: *SyncClient) !void {
+        if (self.joint_restored) return;
+        var qa = std.heap.ArenaAllocator.init(self.a);
+        defer qa.deinit();
+        const a = qa.allocator();
+        const rows = try self.st.query(a, "SELECT tbl, tenant FROM _zbz_fence WHERE joint = 1", &.{});
+        var n: usize = 0;
+        for (rows) |r| {
+            if (r[0] != .text or r[1] != .text) continue;
+            const st = self.states.get(r[0].text) orelse continue;
+            const own = try self.routeFor(a, r[1].text);
+            try self.joint_parked.put(self.aa(), try self.aa().dupe(u8, own), {});
+            if (st.shared_route) |sr| try self.joint_parked.put(self.aa(), try self.aa().dupe(u8, sr), {});
+            n += 1;
+        }
+        self.joint_restored = true;
+        if (n > 0) log.warn("joint fence unfinished: {d} participant(s) still owed — their routes stay parked until all have been replaced", .{n});
     }
 
     /// §10fn: the routes of a table under the current membership. Client arena.
@@ -1446,6 +1604,10 @@ pub const SyncClient = struct {
         // included — after PREPARE the cursor sits AT the cut, so "the full predates the
         // cursor" no longer says so. Written in PREPARE, deleted with the anchor.
         try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_fence (tbl TEXT NOT NULL, tenant TEXT NOT NULL, PRIMARY KEY (tbl, tenant))");
+        // `joint`: the owed record belongs to a joint fence (several pairs replaced together). With `_zbz_joint_done`, the
+        // proofs of the participants that already committed, it is the group, durably (NOTES "The joint fence").
+        execDdl(&self.st, "ALTER TABLE _zbz_fence ADD COLUMN joint INTEGER") catch {};
+        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_joint_done (tbl TEXT NOT NULL, tenant TEXT NOT NULL, stream TEXT NOT NULL, cut INTEGER NOT NULL, created TEXT NOT NULL, PRIMARY KEY (tbl, tenant, stream))");
         // The applied frontiers (see `Frontier`): one row per table and route, with the
         // identity (`created`) of the stream the sequence was taken on. Written in a fence's
         // PREPARE for every table it leaves untouched, deleted when the route's position
@@ -1896,6 +2058,7 @@ pub const SyncClient = struct {
     // ─── step 2: the gap rule (per stream) + scoped seeding (§10n) ──────────
 
     pub fn gapAndSeed(self: *SyncClient, report_a: ?std.mem.Allocator, seeded_map: ?*std.array_hash_map.String(void)) !void {
+        try self.ensureJointRestored();
         self.healed_routes.clearRetainingCapacity();
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
@@ -2791,6 +2954,8 @@ pub const SyncClient = struct {
         // The tables the fence leaves untouched, each with the route it rewinds: they get
         // an applied frontier in PREPARE.
         var untouched: std.ArrayList(Untouched) = .empty;
+        // The unseeded pairs of the routes this fence rewinds: replaced WITH it, never left untouched (the joint fence).
+        var joiners: std.ArrayList(Joiner) = .empty;
         const predates = core.fullPredatesReplica(man, plan.array, pos);
         const pending = (try self.st.query(a, "SELECT 1 FROM _zbz_fence WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } })).len > 0;
         if (predates or pending) {
@@ -2811,6 +2976,12 @@ pub const SyncClient = struct {
                     return;
                 }
                 try untouched.appendSlice(a, sc.untouched);
+                if (try self.resolveJoiners(a, sc.unseeded, cdc_stream, &joiners)) |why| {
+                    if (from_seed) return error.SeedStale; // the hub's chain is asked, and judged by the same proofs
+                    log.warn("{s}: chain predates replica — refusing the full (D2): {s}", .{ table, why });
+                    if (pending) self.reseed_pending = true;
+                    return;
+                }
             }
             fence = true;
         }
@@ -2944,6 +3115,12 @@ pub const SyncClient = struct {
                     return;
                 }
                 try untouched.appendSlice(a, sc.untouched);
+                if (try self.resolveJoiners(a, sc.unseeded, sr, &joiners)) |why| {
+                    if (from_seed) return error.SeedStale; // the hub's chain is asked, and judged by the same proofs
+                    log.warn("{s}: chain predates replica — refusing the full (D2): {s}", .{ table, why });
+                    self.reseed_pending = true;
+                    return;
+                }
                 shared_rewind = q;
             }
         };
@@ -2986,11 +3163,21 @@ pub const SyncClient = struct {
                 shared: ?[]const u8,
                 shared_seq: i64,
                 frontiers: []const FrontierWrite,
+                joiners: []const Joiner,
                 fn apply(cx: @This(), s: *storage.Storage) !void {
                     _ = try s.query(cx.a, "DELETE FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = cx.table }, .{ .text = cx.tenant } });
-                    _ = try s.query(cx.a, "INSERT INTO _zbz_fence (tbl, tenant) VALUES (?, ?) ON CONFLICT (tbl, tenant) DO NOTHING", &.{ .{ .text = cx.table }, .{ .text = cx.tenant } });
+                    if (cx.joiners.len > 0)
+                        _ = try s.query(cx.a, "INSERT INTO _zbz_fence (tbl, tenant, joint) VALUES (?, ?, 1) ON CONFLICT (tbl, tenant) DO UPDATE SET joint = 1", &.{ .{ .text = cx.table }, .{ .text = cx.tenant } })
+                    else
+                        _ = try s.query(cx.a, "INSERT INTO _zbz_fence (tbl, tenant) VALUES (?, ?) ON CONFLICT (tbl, tenant) DO NOTHING", &.{ .{ .text = cx.table }, .{ .text = cx.tenant } });
                     // The fenced table is replaced: what it held before is no frontier of its own.
                     _ = try s.query(cx.a, "DELETE FROM _zbz_frontier WHERE tbl = ?", &.{.{ .text = cx.table }});
+                    // The participants: owed like this pair, no anchor, no frontier of their own (they are replaced).
+                    for (cx.joiners) |j| {
+                        _ = try s.query(cx.a, "DELETE FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = j.table }, .{ .text = j.tenant } });
+                        _ = try s.query(cx.a, "INSERT INTO _zbz_fence (tbl, tenant, joint) VALUES (?, ?, 1) ON CONFLICT (tbl, tenant) DO UPDATE SET joint = 1", &.{ .{ .text = j.table }, .{ .text = j.tenant } });
+                        _ = try s.query(cx.a, "DELETE FROM _zbz_frontier WHERE tbl = ?", &.{.{ .text = j.table }});
+                    }
                     try cx.client.persistSeq(cx.own, @intCast(cx.own_seq));
                     if (cx.shared) |sh| try cx.client.persistSeq(sh, @intCast(cx.shared_seq));
                     // After the cursors: a frontier is only ever above the position it guards.
@@ -3001,7 +3188,35 @@ pub const SyncClient = struct {
                     }
                 }
             };
-            try self.st.transaction(Prep{ .client = self, .a = a, .table = table, .tenant = tenant, .own = cdc_stream, .own_seq = @min(pos, cutoff_seq), .shared = if (shared_rewind != null) shared_stream_m else null, .shared_seq = shared_rewind orelse 0, .frontiers = writes.items }, Prep.apply);
+            // The cursors go to the smallest cut among the participants, on the routes this fence rewinds (the ones whose
+            // other tables were looked at: a participant that rides another route too rewinds it in its own turn).
+            var own_to: i64 = @min(pos, cutoff_seq);
+            var shared_to: i64 = shared_rewind orelse 0;
+            for (joiners.items) |j| {
+                if (predates) {
+                    if (std.mem.eql(u8, j.own_stream, cdc_stream)) own_to = @min(own_to, j.own_cut);
+                    if (j.shared_cut != null and std.mem.eql(u8, j.shared_stream, cdc_stream)) own_to = @min(own_to, j.shared_cut.?);
+                }
+                if (shared_rewind != null) {
+                    if (std.mem.eql(u8, j.own_stream, shared_stream_m)) shared_to = @min(shared_to, j.own_cut);
+                    if (j.shared_cut != null and std.mem.eql(u8, j.shared_stream, shared_stream_m)) shared_to = @min(shared_to, j.shared_cut.?);
+                }
+            }
+            // Every object of THIS pair's plan too, before anything changes: a joint fence over a chain that cannot be
+            // applied would park the routes for nothing.
+            if (joiners.items.len > 0) {
+                const prebucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, tenant });
+                for (plan.array.items) |step| {
+                    const name = if (step == .object) (if (step.object.get("name")) |v| (if (v == .string) v.string else "") else "") else "";
+                    _ = transport.ObjectPull.sizeIn(src, a, prebucket, name) catch {
+                        if (from_seed) return error.SeedStale;
+                        log.warn("{s}: the joint fence needs {s}, which the object store does not hold: nothing prepared", .{ table, name });
+                        self.reseed_pending = true;
+                        return;
+                    };
+                }
+            }
+            try self.st.transaction(Prep{ .client = self, .a = a, .table = table, .tenant = tenant, .own = cdc_stream, .own_seq = own_to, .shared = if (shared_rewind != null) shared_stream_m else null, .shared_seq = shared_to, .frontiers = writes.items, .joiners = joiners.items }, Prep.apply);
             // Committed: the cursors, the unseeded pair and the owed record are durable, so memory says the same.
             var k: usize = 0;
             while (k < st.anchors.items.len) {
@@ -3013,6 +3228,23 @@ pub const SyncClient = struct {
             if (shared_rewind != null) {
                 self.dropTail(shared_stream_m);
                 self.resetFlow(shared_stream_m);
+            }
+            if (joiners.items.len > 0) {
+                // The participants are unseeded and owed from here: their in-memory gates and frontiers go (an old gate above
+                // the cut would drop the very events that must replay), and the routes open no tail until all of them
+                // have committed.
+                for (joiners.items) |j| {
+                    if (self.states.getPtr(j.table)) |js| {
+                        js.frontiers.clearRetainingCapacity();
+                        var kk: usize = 0;
+                        while (kk < js.anchors.items.len) {
+                            const sj = js.anchors.items[kk].stream;
+                            if (std.mem.eql(u8, sj, cdc_stream) or (shared_rewind != null and std.mem.eql(u8, sj, shared_stream_m))) _ = js.anchors.orderedRemove(kk) else kk += 1;
+                        }
+                    }
+                }
+                try self.joint_parked.put(self.aa(), try self.aa().dupe(u8, cdc_stream), {});
+                if (shared_rewind != null) try self.joint_parked.put(self.aa(), try self.aa().dupe(u8, shared_stream_m), {});
             }
             // The durable state is the truth: every table's frontiers back from it. If they cannot
             // be read, the routes STAY parked (no tail opens on them) until they can: the fence is
@@ -3034,6 +3266,11 @@ pub const SyncClient = struct {
             else
                 std.fmt.bufPrint(&where_buf, "(position {d}, not behind it): anchor cleared; only the shared route {s} is past its cut and goes back to it", .{ pos, shared_stream_m }) catch "(not behind it)";
             log.warn("{s}: fence prepared — chain g{d} cut at {d} on {s} {s}; replacing the rows{s}{s} (chain {d} s old, {d} CDC message(s) after its cut on the hub)", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, cdc_stream, where, if (writes.items.len > 0) " — the other tables on the route keep their applied frontier" else "", if (from_seed) " [from the seeding leaf]" else "", @divFloor(age_ms, 1000), if (own_last >= 0) own_last - cutoff_seq else -1 });
+            if (joiners.items.len > 0) {
+                var names: std.ArrayList(u8) = .empty;
+                for (joiners.items, 0..) |j, ji| try names.print(a, "{s}{s}", .{ if (ji > 0) ", " else "", j.table });
+                log.warn("{s}: fence prepared jointly with {s} (unseeded: owed too, the routes stay parked until all have committed)", .{ table, names.items });
+            }
         }
         const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, tenant });
         var applied: usize = 0;
@@ -3154,6 +3391,7 @@ pub const SyncClient = struct {
             if (measure_enabled) measureStep(table, tenant, step, is_full, raw.len, applied - applied0, step_t0, ph0, ph, false);
         }
 
+        var verified: std.ArrayList(FenceRoute) = .empty;
         // The fence's VERIFY, after staging and before the anchor: the proof taken before
         // the download may be stale — the stream can prune or restart while the rows are
         // replaced. Fresh facts (not this pass's cache) for every route the pair depends
@@ -3169,7 +3407,7 @@ pub const SyncClient = struct {
                 log.info("test: fence holding {d} ms before its verify", .{ms});
                 if (ms > 0) std.Io.sleep(self.t.conn.io, .fromMilliseconds(ms), .awake) catch {};
             };
-            const Route = struct { stream: []const u8, cut: i64, created: []const u8 };
+            const Route = FenceRoute;
             const shared_created_m = if (man.object.get("shared_cdc_stream_created")) |v| (if (v == .string) v.string else "") else "";
             const routes = [_]?Route{
                 .{ .stream = cdc_stream, .cut = cutoff_seq, .created = man_created },
@@ -3185,6 +3423,7 @@ pub const SyncClient = struct {
                     self.reseed_pending = true;
                     return;
                 }
+                try verified.append(a, r);
             };
             // ZB_TEST_FENCE_ABORT=before_commit: a crash with the rows replaced, the anchor not.
             if (testFenceAbort("before_commit")) std.process.exit(70);
@@ -3203,24 +3442,61 @@ pub const SyncClient = struct {
         for (plan.array.items) |step_| if (step_.object.get("kind")) |kv| {
             if (kv == .string and std.mem.eql(u8, kv.string, "full")) replaced_by_full = true;
         };
+        // A participant of a joint fence: while others are still owed it leaves its proofs in the replica (`_zbz_joint_done`);
+        // the LAST one proves every earlier participant again, on fresh facts, BEFORE its own commit, and the same
+        // transaction either ends the group (the proofs deleted) or owes a lapsed participant again. A crash anywhere in
+        // between leaves the owed records, which are the group.
+        var joint_mode: JointMode = .none;
+        var lapsed: []const Lapsed = &.{};
+        if (fence) if (try self.jointFlag(a, table, tenant)) {
+            if ((try self.jointOwedOthers(a, table, tenant)) > 0) {
+                joint_mode = .more;
+            } else {
+                lapsed = try self.jointLapsed(a, table, tenant);
+                joint_mode = if (lapsed.len == 0) .clean else .lapsed;
+            }
+        };
         const Commit = struct {
             a: std.mem.Allocator,
             args: []const storage.Value,
             key: []const storage.Value,
             drop_frontier: bool,
+            mode: JointMode,
+            routes: []const FenceRoute,
+            lapsed: []const Lapsed,
             fn apply(cx: @This(), s: *storage.Storage) !void {
                 _ = try s.query(cx.a, "INSERT INTO _zbz_generations (tbl, tenant, watermark, cutoff_lsn, seed_epoch, anchor_stream, anchor_seq, shared_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tbl, tenant) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch, anchor_stream = excluded.anchor_stream, anchor_seq = excluded.anchor_seq, shared_seq = excluded.shared_seq", cx.args);
                 _ = try s.query(cx.a, "DELETE FROM _zbz_fence WHERE tbl = ? AND tenant = ?", cx.key);
+                _ = try s.query(cx.a, "DELETE FROM _zbz_joint_done WHERE tbl = ? AND tenant = ?", cx.key);
                 if (cx.drop_frontier) _ = try s.query(cx.a, "DELETE FROM _zbz_frontier WHERE tbl = ?", &.{cx.key[0]});
+                switch (cx.mode) {
+                    .none => {},
+                    .more => for (cx.routes) |r| {
+                        _ = try s.query(cx.a, "INSERT INTO _zbz_joint_done (tbl, tenant, stream, cut, created) VALUES (?, ?, ?, ?, ?)", &.{ cx.key[0], cx.key[1], .{ .text = r.stream }, .{ .integer = r.cut }, .{ .text = r.created } });
+                    },
+                    .clean => _ = try s.query(cx.a, "DELETE FROM _zbz_joint_done", &.{}),
+                    .lapsed => for (cx.lapsed) |l| {
+                        _ = try s.query(cx.a, "DELETE FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = l.table }, .{ .text = l.tenant } });
+                        _ = try s.query(cx.a, "INSERT INTO _zbz_fence (tbl, tenant, joint) VALUES (?, ?, 1) ON CONFLICT (tbl, tenant) DO UPDATE SET joint = 1", &.{ .{ .text = l.table }, .{ .text = l.tenant } });
+                        _ = try s.query(cx.a, "DELETE FROM _zbz_frontier WHERE tbl = ?", &.{.{ .text = l.table }});
+                        _ = try s.query(cx.a, "DELETE FROM _zbz_joint_done WHERE tbl = ? AND tenant = ?", &.{ .{ .text = l.table }, .{ .text = l.tenant } });
+                    },
+                }
             }
         };
         try self.st.transaction(Commit{
             .drop_frontier = replaced_by_full,
+            .mode = joint_mode,
+            .routes = verified.items,
+            .lapsed = lapsed,
             .a = a,
             .args = &.{ .{ .text = table }, .{ .text = tenant }, .{ .text = cv }, .{ .integer = seed_lsn }, .{ .integer = st.seed_epoch }, .{ .text = cdc_stream }, .{ .integer = anchor_seq }, if (shared_seq) |q| .{ .integer = q } else .null },
             .key = &.{ .{ .text = table }, .{ .text = tenant } },
         }, Commit.apply);
         if (replaced_by_full) st.frontiers.clearRetainingCapacity();
+        self.jointAfterCommit(joint_mode, lapsed);
+        // ZB_TEST_FENCE_ABORT=after_commit: a crash with this participant committed, the others of a joint fence not.
+        if (testFenceAbort("after_commit")) std.process.exit(70);
         if (fence) log.warn("{s}: fenced — chain g{d} cut at {d} on {s} replaced the rows; the position moved back from {d}, the events after the cut replay{s}", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, cdc_stream, pos, if (shared_rewind != null) " (the shared route too)" else "" });
 
         // Anchors (findings 7 + 10): the ONE place the gate may anchor to — per
@@ -4476,6 +4752,7 @@ pub const SyncClient = struct {
 
     fn tailFor(self: *SyncClient, stream: []const u8) !*Tail {
         if (self.frontier_parked.contains(stream)) return error.FrontiersParked;
+        if (self.joint_parked.contains(stream)) return error.FrontiersParked; // a joint fence still has participants to replace
         for (self.tails.items) |*t| {
             if (std.mem.eql(u8, t.stream, stream)) return t;
         }
@@ -4759,6 +5036,7 @@ pub const SyncClient = struct {
         var changed_map: std.array_hash_map.String(void) = .empty;
         var seeded_map: std.array_hash_map.String(void) = .empty;
 
+        try self.ensureJointRestored();
         self.restoreParked();
         // Schema first: a row in a new shape must find its table already moved.
         // ZB_TEST_SCHEMA_PAUSE_FILE=<path> (recreate_recovery.py check 13): while the file
@@ -4814,7 +5092,7 @@ pub const SyncClient = struct {
         var live: std.ArrayList([]const u8) = .empty;
         var subs_list: std.ArrayList(*@import("nats").PullSubscription) = .empty;
         for (streams) |stream| {
-            if (self.isDark(stream) or self.frontier_parked.contains(stream)) continue;
+            if (self.isDark(stream) or self.frontier_parked.contains(stream) or self.joint_parked.contains(stream)) continue;
             const tl = self.tailFor(stream) catch |err| {
                 self.markDark(stream, err);
                 continue;
@@ -7087,6 +7365,8 @@ fn frontierClient(a: std.mem.Allocator) !SyncClient {
     client.gated = 0;
     client.frontier_gated = 0;
     client.frontier_parked = .empty;
+    client.joint_parked = .empty;
+    client.joint_restored = false;
     client.opts.ondemand = &.{};
     client.followed = &.{};
     client.tenants = &.{"acme"};
@@ -7234,7 +7514,7 @@ test "isoMs reads the producer's UTC timestamps" {
     try std.testing.expectEqual(@as(?i64, null), SyncClient.isoMs("not a timestamp at all"));
 }
 
-test "fence scope: other tables stay untouched when their coverage is known, and the rest refuses" {
+test "fence scope: other tables stay untouched when their coverage is known, and the rest are candidates for the joint fence" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -7244,15 +7524,21 @@ test "fence scope: other tables stay untouched when their coverage is known, and
     try client.states.put(a, "items", tenantState(&.{"CDC_acme"}, "CDC_PUBLIC"));
     try client.states.put(a, "memo", .{ .pk = &.{"id"}, .cols = &.{"id"}, .version_col = null, .tenant_col = null, .tombstone_col = null, .routes = &.{"CDC_PUBLIC"} });
     client.followed = &.{ "orders", "items", "memo" };
-    // Nothing is seeded: the other tables' coverage is unknown.
+    // Nothing is seeded: the other tables' coverage is unknown, so none can stay untouched. They are not refused here: they
+    // come back as candidates for the joint fence (`resolveJoiners` asks the hub whether each can be replaced with this
+    // one, and refuses in the old words if one cannot).
     var sc = try client.fenceScope(a, "orders", "acme", &.{"CDC_acme"});
-    try std.testing.expect(sc.refused != null);
-    try std.testing.expect(std.mem.indexOf(u8, sc.refused.?, "items is not seeded") != null);
+    try std.testing.expect(sc.refused == null);
+    try std.testing.expectEqual(@as(usize, 0), sc.untouched.len);
+    try std.testing.expectEqual(@as(usize, 1), sc.unseeded.len);
+    try std.testing.expectEqualStrings("items", sc.unseeded[0].table);
+    try std.testing.expectEqualStrings("acme", sc.unseeded[0].tenant);
     // Seeded: the own route's other table is untouched. A public table rides CDC_PUBLIC only.
     try client.st.execSimple("INSERT INTO _zbz_generations (tbl, tenant, watermark, seed_epoch) VALUES ('items', 'acme', 'w', 0), ('memo', '_default', 'w', 0)");
     sc = try client.fenceScope(a, "orders", "acme", &.{"CDC_acme"});
     try std.testing.expect(sc.refused == null);
     try std.testing.expectEqual(@as(usize, 1), sc.untouched.len);
+    try std.testing.expectEqual(@as(usize, 0), sc.unseeded.len);
     try std.testing.expectEqualStrings("items", sc.untouched[0].table);
     try std.testing.expectEqualStrings("CDC_acme", sc.untouched[0].stream);
     // The shared route carries every table's open-tenant rows: items AND memo.
@@ -8325,4 +8611,53 @@ test "outbox window: reservations survive reopening and only definitive removal 
     const retry = try reserveOutbox(&st, a, 1003);
     try std.testing.expectEqual(@as(usize, 2), retry.len); // id<window> is still reserved, unsent
     try std.testing.expectEqualStrings("id7", retry[0][0].text);
+}
+
+test "joint fence: the group is the owed records — a restart parks the routes of the flagged ones, before anything opens" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var client = try frontierClient(a);
+    defer client.st.close();
+    try client.states.put(a, "orders", tenantState(&.{"CDC_acme"}, "CDC_PUBLIC"));
+    try client.states.put(a, "items", tenantState(&.{"CDC_acme"}, "CDC_PUBLIC"));
+    try client.states.put(a, "memo", .{ .pk = &.{"id"}, .cols = &.{"id"}, .version_col = null, .tenant_col = null, .tombstone_col = null, .routes = &.{"CDC_PUBLIC"} });
+    client.followed = &.{ "orders", "items", "memo" };
+    // A plain owed record (an ordinary fence) is not a group: a restart parks nothing for it.
+    try client.st.execSimple("INSERT INTO _zbz_fence (tbl, tenant) VALUES ('memo', '_default')");
+    try client.ensureJointRestored();
+    try std.testing.expectEqual(@as(usize, 0), client.joint_parked.count());
+    // Two participants of a joint fence: their routes, own and shared, are parked again.
+    client.joint_restored = false;
+    try client.st.execSimple("INSERT INTO _zbz_fence (tbl, tenant, joint) VALUES ('orders', 'acme', 1), ('items', 'acme', 1)");
+    try client.ensureJointRestored();
+    try std.testing.expect(client.joint_parked.contains("CDC_acme"));
+    try std.testing.expect(client.joint_parked.contains("CDC_PUBLIC"));
+    try std.testing.expectEqual(@as(usize, 2), client.joint_parked.count());
+    // The questions the commit asks of the replica.
+    try std.testing.expect(try client.jointFlag(a, "orders", "acme"));
+    try std.testing.expect(!(try client.jointFlag(a, "memo", "_default")));
+    try std.testing.expectEqual(@as(usize, 1), try client.jointOwedOthers(a, "orders", "acme"));
+    try client.st.execSimple("DELETE FROM _zbz_fence WHERE tbl = 'items'");
+    try std.testing.expectEqual(@as(usize, 0), try client.jointOwedOthers(a, "orders", "acme"));
+    // A tail may not open on a parked route.
+    try std.testing.expectError(error.FrontiersParked, client.tailFor("CDC_acme"));
+}
+
+test "joint fence: a clean end opens the routes and a lapsed participant keeps them parked" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var client = try frontierClient(a);
+    defer client.st.close();
+    try client.states.put(a, "orders", tenantState(&.{"CDC_acme"}, "CDC_PUBLIC"));
+    try client.joint_parked.put(a, "CDC_acme", {});
+    try client.joint_parked.put(a, "CDC_PUBLIC", {});
+    client.jointAfterCommit(.more, &.{});
+    try std.testing.expectEqual(@as(usize, 2), client.joint_parked.count());
+    client.jointAfterCommit(.lapsed, &.{.{ .table = "orders", .tenant = "acme", .stream = "CDC_acme", .cut = 300 }});
+    try std.testing.expectEqual(@as(usize, 2), client.joint_parked.count());
+    try std.testing.expect(client.reseed_pending);
+    client.jointAfterCommit(.clean, &.{});
+    try std.testing.expectEqual(@as(usize, 0), client.joint_parked.count());
 }

@@ -35,6 +35,7 @@ const client = new ZeBridge({
     }
     if (point === 'after_chunk' && abortAt === 'after_chunk') process.exit(70);
     if (point === 'before_commit' && abortAt === 'before_commit') process.exit(70);
+    if (point === 'after_commit' && abortAt === 'after_commit') process.exit(70);
     if (point === 'before_verify' && holdMs > 0) {
       say(`test: fence holding ${holdMs} ms before its verify`);
       await sleep(holdMs);

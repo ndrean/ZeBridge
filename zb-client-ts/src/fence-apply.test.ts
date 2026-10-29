@@ -62,7 +62,8 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
   db.exec(`
     CREATE TABLE IF NOT EXISTS _zebridge_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL, created TEXT);
     CREATE TABLE IF NOT EXISTS _zebridge_generations (tbl TEXT PRIMARY KEY, watermark TEXT NOT NULL, cutoff_lsn INTEGER NOT NULL, seed_epoch INTEGER NOT NULL DEFAULT 0, seed_seq INTEGER, seed_stream TEXT, shared_seed_seq INTEGER);
-    CREATE TABLE IF NOT EXISTS _zebridge_fence (tbl TEXT PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS _zebridge_fence (tbl TEXT PRIMARY KEY, joint INTEGER);
+    CREATE TABLE IF NOT EXISTS _zebridge_joint_done (tbl TEXT NOT NULL, stream TEXT NOT NULL, cut INTEGER NOT NULL, created TEXT NOT NULL, PRIMARY KEY (tbl, stream));
     CREATE TABLE IF NOT EXISTS _zebridge_sync (id INTEGER PRIMARY KEY, global_last_lsn INTEGER, global_last_seq INTEGER);
     INSERT OR IGNORE INTO _zebridge_sync VALUES (1, 0, 0);
     CREATE TABLE IF NOT EXISTS _zebridge_frontier (tbl TEXT NOT NULL, stream TEXT NOT NULL, created TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (tbl, stream));
@@ -97,7 +98,7 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
   const passes: number[] = [];
   Object.assign(c, {
     nc: {}, tenantValue: 'acme', syncedTables, ondemandSet: new Set(), seedInFlight: new Map(),
-    globalSyncState: { seq }, tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(), replacing: new Map(),
+    globalSyncState: { seq }, tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(), replacing: new Map(), jointRestored: false,
     streamWork: Promise.resolve(), streamsSubscribed: true, restarted: new Set(), failed: new Set(), hubOnly: new Set(),
     applyingByChoice: new Set(), healedRoutes: new Set(), streamCreated, streamBornEmpty: new Set(), fkHeld: [], hlcFloor: '', frontiers: new Map(), frontierGated: 0,
     lateSeeds: new Set<string>(), reseedKicks: new Map(), fkHolds: 0, scheduleRecount: () => {},
@@ -1296,5 +1297,466 @@ test('a delta-only plan writes no owed record: it is not destructive', async () 
       assert.equal(await t.c.applyGenerations('item'), true);
       assert.equal(t.db.prepare('SELECT count(*) AS n FROM _zebridge_fence').get()?.n, 0);
     } finally { t.close(); }
+  });
+});
+
+// ── The joint fence: several tables of one route reseeded together ────────────────────────────────────
+//
+// A seed-epoch move drops each table's anchor as its descriptor arrives, so reseeding two tables of one tenant
+// leaves BOTH unseeded while the position is past both chains' cuts. Each fence needs the other table seeded (its
+// coverage is what the applied frontier certifies), so each refuses the other for as long as it goes on
+// (HANDOFF "Observed, not investigated"). The joint fence replaces the participants together: every unseeded table
+// the rewound routes carry takes part, the routes stay parked and the participants durably owed until all of them
+// completed and the hub's proofs still hold, each is anchored at ITS OWN cut while the cursors go to the smallest,
+// and the seeded tables stay untouched under applied frontiers. These are the cases the mechanism must pass;
+// they are written against the per-table entry point a pass uses, so they do not name the coordination.
+
+const ordersRows = (db: DatabaseSync) => db.prepare('SELECT id, note FROM orders ORDER BY id').all().map((r) => `${r.id}:${r.note}`);
+const catalogueRows = (db: DatabaseSync) => db.prepare('SELECT id, note FROM catalogue ORDER BY id').all().map((r) => `${r.id}:${r.note}`);
+const anchorOf = (db: DatabaseSync, tbl: string) => db.prepare('SELECT seed_seq, seed_stream, shared_seed_seq FROM _zebridge_generations WHERE tbl = ?').get(tbl);
+const seededTbl = (db: DatabaseSync, tbl: string) => anchorOf(db, tbl) !== undefined;
+const wantedOrders = (gen: number, n: number) => Array.from({ length: n }, (_, i) => `${i + 1}:new-${gen}`);
+
+/// item and orders both lost their anchor (the epoch move), the position (500 / 90) is past every cut, and
+/// catalogue is seeded: it holds row 1, and row 7 was inserted at 410 and deleted at 420 on the own route.
+function pairFollower(path: string, world: World) {
+  const t = client(path, world, { others: ['orders', 'catalogue'] });
+  t.db.exec(`
+    INSERT INTO item VALUES (91,'acme','old','${VERSION(1)}'),(92,'acme','old','${VERSION(1)}'),(93,'acme','old','${VERSION(1)}');
+    INSERT INTO orders VALUES (81,'acme','old-o','${VERSION(1)}'),(82,'acme','old-o','${VERSION(1)}');
+    INSERT INTO catalogue VALUES (1,'acme','kept','${VERSION(1)}');
+    INSERT INTO _zebridge_stream_seq VALUES ('${OWN}', 500, 'own-1'), ('${PUB}', 90, 'pub-1');
+    INSERT INTO _zebridge_generations VALUES ('catalogue', '${VERSION(1)}', 1, 0, 470, '${OWN}', 70);
+  `);
+  t.close();
+}
+
+/// What a pass does with unseeded tables: each asks for its chain, again while any progress was made.
+async function seedPair(t: ReturnType<typeof client>, tables = ['item', 'orders']) {
+  for (let round = 0; round < 4 && !tables.every((x) => seededTbl(t.db, x)); round++) {
+    let progress = false;
+    for (const x of tables) if (!seededTbl(t.db, x) && await t.c.applyGenerations(x, true)) progress = true;
+    if (!progress) break;
+  }
+}
+
+/// The end state of a recovered pair, whatever the order of the cuts or the road taken.
+function assertJoint(t: ReturnType<typeof client>, cuts: { item: number; orders: number }, shared: { item: number; orders: number }) {
+  assert.deepEqual(rows(t.db), wanted(2, 5), 'item replaced');
+  assert.deepEqual(ordersRows(t.db), wantedOrders(2, 4), 'orders replaced');
+  assert.deepEqual(catalogueRows(t.db), ['1:kept'], 'catalogue untouched');
+  assert.equal(pos(t.db, OWN), Math.min(cuts.item, cuts.orders), 'the own cursor at the smallest cut');
+  assert.equal(pos(t.db, PUB), Math.min(shared.item, shared.orders), 'the shared cursor at the smallest cut');
+  assert.deepEqual({ ...anchorOf(t.db, 'item') }, { seed_seq: cuts.item, seed_stream: OWN, shared_seed_seq: shared.item }, 'item anchored at its own cut');
+  assert.deepEqual({ ...anchorOf(t.db, 'orders') }, { seed_seq: cuts.orders, seed_stream: OWN, shared_seed_seq: shared.orders }, 'orders anchored at its own cut');
+  assert.equal(owed(t.db), 0, 'nothing owed');
+  assert.equal(t.c.fenced.size, 0, 'the routes are released');
+  assert.deepEqual(frontierRows(t.db).map((r) => `${r.tbl}:${r.stream}:${r.seq}`), [`catalogue:${PUB}:90`, `catalogue:${OWN}:500`], 'only the untouched table has frontiers, at the positions it held');
+}
+
+const orderings: [string, { item: number; orders: number }, { item: number; orders: number }][] = [
+  ['item cut first', { item: 300, orders: 350 }, { item: 40, orders: 60 }],
+  ['orders cut first', { item: 350, orders: 300 }, { item: 60, orders: 40 }],
+];
+
+test('two tables reseeded together are fenced together: each at its own cut, the cursors at the smallest, a third table untouched', async () => {
+  for (const [name, cuts, shared] of orderings) await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    const t = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await seedPair(t);
+      assert.ok(!t.log.some((m) => /refusing the full \(D2\)/.test(m)), `${name}: no mutual refusal`);
+      assertJoint(t, cuts, shared);
+      // The untouched table's insert at 410 (row 7, deleted at 420) replays from the smallest cut: its frontier skips it.
+      await t.c.applyEvent('catalogue', ev('catalogue', 7, OWN, 410, 'resurrected'));
+      assert.deepEqual(catalogueRows(t.db), ['1:kept'], `${name}: the row deleted at 420 is not recreated by the replay of its insert`);
+      await t.c.applyEvent('catalogue', ev('catalogue', 8, OWN, 501, 'new'));
+      assert.deepEqual(catalogueRows(t.db), ['1:kept', '8:new'], 'past its frontier the table takes events');
+    } finally { t.close(); }
+  });
+});
+
+test('the second replacement cannot be had: nothing is released, the recovery stays durably incomplete, and a later attempt completes it', async () => {
+  for (const missing of ['item', 'orders']) await withDir(async (path) => {
+    const w = new World();
+    const cuts = { item: 300, orders: 350 }, shared = { item: 40, orders: 60 };
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    const gone = w.objects.get(`${missing}-i1-g2-full`)!;
+    w.objects.delete(`${missing}-i1-g2-full`);
+    const t = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await seedPair(t);
+      assert.ok(!(seededTbl(t.db, 'item') && seededTbl(t.db, 'orders')), 'not both anchored');
+      // Two safe states: nothing was changed (the participants' objects were checked before PREPARE), or what was
+      // changed is recorded as incomplete and the routes stay parked. Nothing in between.
+      const untouched = Number(pos(t.db, OWN)) === 500 && Number(pos(t.db, PUB)) === 90 && rows(t.db).join() === '91:old,92:old,93:old' && ordersRows(t.db).join() === '81:old-o,82:old-o' && owed(t.db) === 0;
+      assert.ok(untouched || (owed(t.db) >= 1 && t.c.fenced.size > 0), `${missing} unavailable: untouched, or durably incomplete with the routes parked`);
+      assert.ok(Number(pos(t.db, OWN)) <= 500, 'the cursor never moved forward');
+      assert.equal(catalogueRows(t.db).join(), '1:kept', 'the untouched table kept its rows');
+    } finally { t.close(); }
+    w.objects.set(`${missing}-i1-g2-full`, gone);
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await seedPair(r);
+      assertJoint(r, cuts, shared);
+    } finally { r.close(); }
+  });
+});
+
+test('a crash at any point of a joint fence — before a verify, before a commit, after a chunk of the second table — recovers on restart', async () => {
+  const points: [string, number][] = [['after_chunk', 1], ['after_chunk', 4], ['after_chunk', 5], ['before_verify', 1], ['before_verify', 2], ['before_commit', 1], ['before_commit', 2]];
+  for (const [ordering, cuts, shared] of orderings) for (const [point, nth] of points) await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    let seen = 0;
+    const crashed = client(path, w, { others: ['orders', 'catalogue'], hook: (p) => { if (p === point && ++seen === nth) throw new Error(`crash at ${p} #${nth}`); } });
+    try {
+      await seedPair(crashed).catch(() => {});
+      // Whatever was done: never a table anchored while the other still holds its old rows under a cursor past its cut.
+      if (seen >= nth) {
+        assert.ok(owed(crashed.db) >= 1 || (seededTbl(crashed.db, 'item') && seededTbl(crashed.db, 'orders')), `${ordering} / ${point} #${nth}: incomplete is recorded, or complete`);
+        assert.ok(Number(pos(crashed.db, OWN)) <= 500, 'the cursor never moved forward');
+      }
+    } finally { crashed.close(); }
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await seedPair(r);
+      assertJoint(r, cuts, shared);
+    } finally { r.close(); }
+  });
+});
+
+test('the retention overtaking a cut before the release keeps every participant unreleased; restored, the restart completes', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    const cuts = { item: 300, orders: 350 }, shared = { item: 40, orders: 60 };
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    let verifies = 0;
+    const t = client(path, w, { others: ['orders', 'catalogue'], hook: (p) => { if (p === 'before_verify' && ++verifies === 2) w.streams[OWN]!.first = 400; } });
+    try {
+      await seedPair(t);
+      assert.ok(owed(t.db) >= 1, 'recovery is durably incomplete: the stream no longer holds the events after the cuts');
+      assert.ok(t.c.fenced.size > 0, 'no route is released');
+      assert.ok(!(seededTbl(t.db, 'item') && seededTbl(t.db, 'orders')), 'the pair is not trusted');
+    } finally { t.close(); }
+    w.streams[OWN]!.first = 1;
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await seedPair(r);
+      assertJoint(r, cuts, shared);
+    } finally { r.close(); }
+  });
+});
+
+test('a table with no chain cannot take part: the refusal stands and nothing changes', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 300, 40, 'item');
+    pairFollower(path, w); // orders has no manifest: a promised replacement is not coverage
+    const t = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      assert.equal(await t.c.applyGenerations('item'), false);
+      assert.ok(t.log.some((m) => /refusing the full \(D2\): orders is not seeded/.test(m)));
+      assert.equal(owed(t.db), 0);
+      assert.deepEqual(rows(t.db), ['91:old', '92:old', '93:old']);
+      assert.equal(pos(t.db, OWN), 500);
+    } finally { t.close(); }
+  });
+});
+
+test('between participants the routes stay parked and the tails stay closed; the last commit releases them', async () => {
+  for (const [name, cuts, shared] of orderings) await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    const t = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      assert.equal(await t.c.applyGenerations('item'), true);
+      assert.ok(seededTbl(t.db, 'item') && !seededTbl(t.db, 'orders'), `${name}: the first participant is anchored, the second is not`);
+      assert.equal(owed(t.db), 1, `${name}: the second participant is still owed`);
+      assert.ok(t.c.fenced.get(OWN)?.has('orders'), `${name}: the route is parked for the participant still to come`);
+      assert.ok(t.c.routeParked(OWN) && t.c.routeParked(PUB), `${name}: both routes are parked: no pass opens a tail on them`);
+      assert.deepEqual(ordersRows(t.db), ['81:old-o', '82:old-o'], 'its rows are untouched until its turn');
+      assert.equal(await t.c.applyGenerations('orders'), true);
+      assertJoint(t, cuts, shared);
+    } finally { t.close(); }
+  });
+});
+
+test('a joint fence is not prepared over a chain that cannot be applied: nothing changes', async () => {
+  for (const missing of ['item', 'orders']) await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 300, 40, 'item');
+    w.publish(2, 4, 350, 60, 'orders');
+    pairFollower(path, w);
+    w.objects.delete(`${missing}-i1-g2-full`);
+    const t = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      const other = missing === 'item' ? 'orders' : 'item';
+      assert.equal(await t.c.applyGenerations(other), false);
+      assert.equal(owed(t.db), 0, `${missing} missing: no obligation was created`);
+      assert.equal(pos(t.db, OWN), 500);
+      assert.equal(pos(t.db, PUB), 90);
+      assert.equal(t.c.fenced.size, 0);
+      assert.equal(frontierRows(t.db).length, 0);
+    } finally { t.close(); }
+  });
+});
+
+test('a participant whose cut the retention overtook while the others finished is owed again, and nothing is released', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    const cuts = { item: 300, orders: 350 }, shared = { item: 40, orders: 60 };
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    let verifies = 0;
+    // item commits first (its verify is the first); the stream then drops the events after item's cut but keeps orders'.
+    const t = client(path, w, { others: ['orders', 'catalogue'], hook: (p) => { if (p === 'before_verify' && ++verifies === 2) w.streams[OWN]!.first = 330; } });
+    try {
+      await seedPair(t);
+      assert.ok(seededTbl(t.db, 'orders'), 'orders committed: its own cut is still retained');
+      assert.ok(!seededTbl(t.db, 'item'), 'item is owed again: the events after its cut are gone');
+      assert.ok(owed(t.db) >= 1);
+      assert.ok(t.c.fenced.size > 0, 'the routes are not released');
+      assert.ok(t.log.some((m) => /item.*no longer holds the events after (its|the) cut/.test(m)), 'it says why');
+    } finally { t.close(); }
+    w.streams[OWN]!.first = 1;
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await seedPair(r);
+      assertJoint(r, cuts, shared);
+    } finally { r.close(); }
+  });
+});
+
+test('a joint fence survives a restart: A committed, B unavailable, the process restarts, retention overtakes A\'s cut — the routes stay parked and A is proven again before they are released', async () => {
+  for (const [name, cuts, shared] of orderings) await withDir(async (path) => {
+    // The one whose cut the stream will drop is the first to commit; the other is the one that fails.
+    const first = cuts.item < cuts.orders ? 'item' : 'orders', second = first === 'item' ? 'orders' : 'item';
+    const dropTo = Math.min(cuts.item, cuts.orders) + 30; // past the first's cut, not past the second's
+    const w = new World();
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    const gone = w.objects.get(`${second}-i1-g2-full`)!;
+    // The second one's object disappears after the joint PREPARE (its plan was checked before it): the first one commits, the
+    // second cannot be had.
+    let verifies = 0;
+    const t = client(path, w, { others: ['orders', 'catalogue'], hook: (p) => { if (p === 'before_verify' && ++verifies === 1) w.objects.delete(`${second}-i1-g2-full`); } });
+    try {
+      assert.equal(await t.c.applyGenerations(first, true), true, `${name}: ${first} commits`);
+      assert.equal(await t.c.applyGenerations(second, true), false, `${name}: ${second} cannot be had`);
+      assert.ok(seededTbl(t.db, first) && !seededTbl(t.db, second));
+      assert.equal(owed(t.db), 1);
+      assert.equal(Number((t.db.prepare('SELECT count(*) AS n FROM _zebridge_joint_done WHERE tbl = ?').get(first) as any).n) > 0, true, `${name}: ${first}'s proofs are in the replica`);
+    } finally { t.close(); }
+
+    // The process restarts. ${second} is still unavailable.
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await r.c.ensureJointRestored();
+      assert.ok(r.c.routeParked(OWN) && r.c.routeParked(PUB), `${name}: the restart parks the routes again, before anything else happens`);
+      assert.ok(r.c.fenced.get(OWN)?.has(second), `${name}: for the participant that is still owed`);
+      // Retention overtakes the first one's cut while the second is still unavailable.
+      w.streams[OWN]!.first = dropTo;
+      assert.equal(await r.c.applyGenerations(second, true), false);
+      assert.ok(r.c.routeParked(OWN), `${name}: still parked`);
+      // The second one comes back: it commits, and as the last participant proves the first again — which fails.
+      w.objects.set(`${second}-i1-g2-full`, gone);
+      assert.equal(await r.c.applyGenerations(second, true), true);
+      assert.ok(seededTbl(r.db, second), `${name}: ${second} committed`);
+      assert.ok(!seededTbl(r.db, first), `${name}: ${first} is owed again: the stream no longer holds the events after its cut`);
+      assert.equal(owed(r.db), 1);
+      assert.ok(r.c.routeParked(OWN), `${name}: nothing was released`);
+      assert.ok(r.log.some((m) => new RegExp(`${first}: joint fence not released`).test(m)));
+    } finally { r.close(); }
+
+    // Retention restored, one more restart: the owed one is replaced, the group ends.
+    w.streams[OWN]!.first = 1;
+    const q = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await q.c.ensureJointRestored();
+      assert.ok(q.c.routeParked(OWN), `${name}: parked again after the second restart`);
+      await seedPair(q);
+      assertJoint(q, cuts, shared);
+      assert.equal(Number((q.db.prepare('SELECT count(*) AS n FROM _zebridge_joint_done').get() as any).n), 0, `${name}: no proof is left behind`);
+    } finally { q.close(); }
+  });
+});
+
+test('a restart without the group would open the tails under the participant still owed: ensureJointRestored is what parks them', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 300, 40, 'item');
+    w.publish(2, 4, 350, 60, 'orders');
+    pairFollower(path, w);
+    const t = client(path, w, { others: ['orders', 'catalogue'], hook: (p) => { if (p === 'after_chunk') throw new Error('crash'); } });
+    try { await t.c.applyGenerations('item', true).catch(() => {}); } finally { t.close(); }
+    // Crashed after the joint PREPARE: both are owed and flagged; nothing else is recorded.
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      assert.equal(r.c.routeParked(OWN), false, 'a fresh process knows nothing yet');
+      await r.c.ensureJointRestored();
+      assert.ok(r.c.routeParked(OWN) && r.c.routeParked(PUB));
+      assert.deepEqual([...r.c.fenced.get(OWN)!].sort(), ['item', 'orders']);
+    } finally { r.close(); }
+  });
+});
+
+// ── Two participants complete at the same moment ──────────────────────────────────────────────────────
+//
+// The completion decision (is another participant still owed? then leave proofs; none? then prove the earlier ones again and end the
+// group) reads the owed records and writes them in separate steps. Run concurrently, two completions both saw the other still owed,
+// both committed as intermediate participants, nobody ran the final re-proof and the routes reopened with the proofs left behind.
+// The barrier below holds both at the commit point until both arrived, which is the interleaving that exposed it.
+
+/// Both participants wait at `before_commit` until both arrived; `onBoth` runs once, between the arrival of the second and the release.
+/// The smaller-cut table (`item`) is made to arrive first: the other one's download waits for it.
+function barrier(w: World, onBoth: () => void) {
+  let arrivals = 0;
+  let release!: () => void;
+  const all = new Promise<void>((r) => { release = r; });
+  let firstIn!: () => void;
+  const firstArrived = new Promise<void>((r) => { firstIn = r; });
+  w.hold = (name) => (name.startsWith('orders-') ? firstArrived : undefined);
+  const hook: Hook = async (point) => {
+    if (point !== 'before_commit') return;
+    arrivals++;
+    if (arrivals === 1) firstIn();
+    if (arrivals === 2) { onBoth(); release(); }
+    await all;
+  };
+  return { hook, arrivals: () => arrivals };
+}
+
+test('two participants completing at the same moment: one of them is the last, proves the other again, and ends the group', async () => {
+  for (const [name, cuts, shared] of orderings) await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    const b = barrier(w, () => {});
+    const t = client(path, w, { others: ['orders', 'catalogue'], hook: b.hook });
+    try {
+      let reproofs = 0;
+      const real = t.c.jointLapsed.bind(t.c);
+      t.c.jointLapsed = async (...a: unknown[]) => { reproofs++; return real(...a); };
+      const done = await Promise.all([t.c.applyGenerations('item', true), t.c.applyGenerations('orders', true)]);
+      assert.deepEqual(done, [true, true], `${name}: both committed`);
+      assert.equal(b.arrivals(), 2, `${name}: both really were at the commit point together`);
+      assert.equal(reproofs, 1, `${name}: exactly one completion was the last and proved the other again`);
+      assertJoint(t, cuts, shared);
+      assert.equal(Number((t.db.prepare('SELECT count(*) AS n FROM _zebridge_joint_done').get() as any).n), 0, `${name}: no proof left behind`);
+    } finally { t.close(); }
+  });
+});
+
+test('two participants completing at the same moment while retention overtakes the earlier one\'s cut: it is owed again and nothing is released', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    const cuts = { item: 300, orders: 350 }, shared = { item: 40, orders: 60 };
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    // item (cut 300) commits first, as an intermediate participant; the stream then drops the events after 300 but not after 350,
+    // after item's commit and before orders' turn (its own proof is refreshed in its turn and still holds: 350).
+    const b = barrier(w, () => {});
+    let afterCommits = 0;
+    const hook: Hook = async (point, c) => {
+      if (point === 'after_commit' && ++afterCommits === 1) w.streams[OWN]!.first = 330;
+      await b.hook(point, c);
+    };
+    const t = client(path, w, { others: ['orders', 'catalogue'], hook });
+    try {
+      await Promise.all([t.c.applyGenerations('item', true), t.c.applyGenerations('orders', true)]);
+      assert.equal(b.arrivals(), 2);
+      assert.ok(seededTbl(t.db, 'orders'), 'orders (the last) committed');
+      assert.ok(!seededTbl(t.db, 'item'), 'item is owed again: its cut is no longer retained');
+      assert.equal(owed(t.db), 1);
+      assert.ok(t.c.routeParked(OWN), 'nothing was released');
+      assert.ok(t.log.some((m) => /item: joint fence not released/.test(m)));
+    } finally { t.close(); }
+    w.streams[OWN]!.first = 1;
+    w.hold = undefined;
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await r.c.ensureJointRestored();
+      await seedPair(r);
+      assertJoint(r, cuts, shared);
+    } finally { r.close(); }
+  });
+});
+
+// ── The last participant's own proof is refreshed inside the section, not before the queue ───────────────
+
+/// `item` (the larger cut) completes first and holds the section; `orders` (the smaller cut) has passed its VERIFY and waits for it. While
+/// it waits, `overtake` makes the stream drop the events after orders' cut only. The proof orders took before queueing is stale by then.
+function waitingLast(w: World, overtake: () => void) {
+  let arrivals = 0;
+  let releaseItem!: () => void;
+  const itemHeld = new Promise<void>((r) => { releaseItem = r; });
+  let firstIn!: () => void;
+  const firstArrived = new Promise<void>((r) => { firstIn = r; });
+  w.hold = (name) => (name.startsWith('orders-') ? firstArrived : undefined);
+  let inSection = 0;
+  const hook: Hook = async (point) => {
+    if (point === 'before_commit') {
+      arrivals++;
+      if (arrivals === 1) firstIn();
+      if (arrivals === 2) { overtake(); releaseItem(); } // orders: VERIFY passed, the stream changes, item may finish
+      return;
+    }
+    if (point === 'after_commit') { // inside the section, after the commit of whoever is in it
+      inSection++;
+      if (inSection === 1) await itemHeld; // item holds the section until orders is waiting behind it
+    }
+  };
+  return { hook };
+}
+
+test('the last participant waits for the section and the retention overtakes only its cut: it stays owed, the routes stay parked — own route and shared route', async () => {
+  for (const [what, overtake] of [
+    ['its own route', (w: World) => { w.streams[OWN]!.first = 330; }],
+    ['its shared route', (w: World) => { w.streams[PUB]!.first = 50; }],
+  ] as const) await withDir(async (path) => {
+    const w = new World();
+    // orders has the smaller cut on both routes, item the larger: only orders' cut is overtaken.
+    const cuts = { item: 350, orders: 300 }, shared = { item: 60, orders: 40 };
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    const g = waitingLast(w, () => overtake(w));
+    const t = client(path, w, { others: ['orders', 'catalogue'], hook: g.hook });
+    try {
+      const done = await Promise.all([t.c.applyGenerations('item', true), t.c.applyGenerations('orders', true)]);
+      assert.equal(done[0], true, `${what}: item (the earlier one) committed`);
+      assert.equal(done[1], false, `${what}: orders (the last) did not: its proof was stale when its turn came`);
+      assert.ok(seededTbl(t.db, 'item') && !seededTbl(t.db, 'orders'), `${what}: only item is anchored`);
+      assert.equal(owed(t.db), 1, `${what}: orders is still owed`);
+      assert.ok(t.c.routeParked(OWN) && t.c.routeParked(PUB), `${what}: the routes stay parked`);
+      assert.ok(t.log.some((m) => /orders: fence not committed — /.test(m)), `${what}: it says why`);
+    } finally { t.close(); }
+    // The stream as it was, one restart: the group is rebuilt, orders is replaced, the group ends.
+    w.streams[OWN]!.first = 1;
+    w.streams[PUB]!.first = 1;
+    w.hold = undefined;
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await r.c.ensureJointRestored();
+      assert.ok(r.c.routeParked(OWN), `${what}: parked again after the restart`);
+      await seedPair(r);
+      assertJoint(r, cuts, shared);
+    } finally { r.close(); }
   });
 });

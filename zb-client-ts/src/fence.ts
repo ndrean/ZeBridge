@@ -151,28 +151,41 @@ export interface Untouched {
 
 /// The fence's scope rule (the recovery model's §3, R3): which OTHER tables ride any of
 /// `streams`, and can they stay untouched? Each gets an applied frontier at the route's
-/// position. That needs its coverage to be KNOWN: a table that is not seeded has none, and
-/// the fence is refused. `routesOf` gives a table's own route and its shared route
-/// (CDC_PUBLIC for a tenant table), null for a table not followed (on-demand, or no tenant
-/// for this principal), which rides nothing. An empty stream name matches nothing.
+/// position. That needs its coverage to be KNOWN: a table that is not seeded has none.
+/// `routesOf` gives a table's own route and its shared route (CDC_PUBLIC for a tenant
+/// table), null for a table not followed (on-demand, or no tenant for this principal), which
+/// rides nothing. An empty stream name matches nothing.
+///
+/// What happens to a table that is not seeded depends on `unseeded`:
+///   'refuse'  (the default) the fence is refused: its coverage is unknown;
+///   'collect' it is returned in `unseeded` instead, for the caller to take into the fence as
+///             a PARTICIPANT (the joint fence): replaced with the fenced table, never left
+///             untouched, and never trusted for what it holds now. The caller refuses if one
+///             of them cannot be replaced.
 export function fenceScope(
   table: string,
   streams: readonly string[],
   tables: Iterable<string>,
   routesOf: (t: string) => { route: string; sharedRoute?: string } | null,
   seeded: (t: string) => boolean,
-): { refused: string | null; untouched: Untouched[] } {
+  unseeded: 'refuse' | 'collect' = 'refuse',
+): { refused: string | null; untouched: Untouched[]; unseeded: Untouched[] } {
   const wanted = streams.filter((s) => s.length > 0);
   const untouched: Untouched[] = [];
+  const open: Untouched[] = [];
   for (const t of tables) {
     if (t === table) continue;
     const r = routesOf(t);
     if (!r) continue;
     for (const s of wanted) {
       if (r.route !== s && !(r.sharedRoute && r.sharedRoute === s)) continue;
-      if (!seeded(t)) return { refused: `${t} is not seeded, so its coverage on ${s} is unknown`, untouched: [] };
+      if (!seeded(t)) {
+        if (unseeded === 'refuse') return { refused: `${t} is not seeded, so its coverage on ${s} is unknown`, untouched: [], unseeded: [] };
+        if (!open.some((u) => u.table === t && u.stream === s)) open.push({ table: t, stream: s });
+        continue;
+      }
       if (!untouched.some((u) => u.table === t && u.stream === s)) untouched.push({ table: t, stream: s });
     }
   }
-  return { refused: null, untouched };
+  return { refused: null, untouched, unseeded: open };
 }

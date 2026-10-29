@@ -21,6 +21,7 @@ Delete this file once the open items below are closed.
 | —   | nats.zig becomes a fork submodule                                                                                              | #14 |
 | —   | A plain full is decided again before its first chunk (CDC overtaking the download); the chain waits survive a throwing attempt | #16 |
 | —   | The shared route is judged on its own cut (a full is a fence when CDC_PUBLIC alone is past its cut)                            | #17 |
+| —   | The joint fence: tables of one route reseeded together are replaced together (both clients)                                    | —   |
 
 **5. GC floor (branch `gc-watermark-isolation`, PR to be opened):** decided with the maintainer — one database-wide
 retention policy, one lock-enforced sweeper, a floor that never decreases (enforced in the database), advance-then-reap, and
@@ -130,11 +131,12 @@ nats-server ≥ 2.15, Zig 0.17, a venv at `/opt/zenv` with `nats-py nkeys msgpac
 
 ## Observed, not investigated
 
-- Two tables on one route both re-seeded (`zebridge_reseed` on each) while the replica's position is past both cuts: every
-  pass refuses both fences ("chain predates replica — refusing the full (D2): <other> is not seeded, so its coverage on
-  CDC_t_a is unknown"), 1794 times in 90 s with `recreate_recovery.py` check 13's first case modified to reseed both, and
-  the replica never recovers in that window. Each fence waits for the other table to be seeded. Not reachable by the
-  scenarios as they are; reachable by an operator who reseeds two tables of one tenant together.
+- While two tables of one tenant route refused each other (before the joint fence), the untouched third table of `recreate_recovery.py`
+  check 19 ended inexact in one of four cases: 5 rows missing, 1 extra, 5 differing against PostgreSQL after 150 s, after the load had
+  stopped (libzb, `joint_crash`, the ordinary build of that day). The other three cases were exact. Nothing explains it: the third
+  table was never reseeded. The joint fence removes the stuck state it was seen in, so the check no longer shows it, but that is not a
+  cause. To reproduce, run check 19 on a tree where the joint fence is disabled (make `fenceScope` refuse unseeded tables again) and
+  look at which events the third table's route dropped or held while the pair was stuck.
 
 ## Gotchas that cost time
 

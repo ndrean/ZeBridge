@@ -54,7 +54,8 @@ lists only what differs.
 
 - `recreate_recovery.py --check N` — the recovery model, one stack per check. 1–3 recreate/gap, 4 the fence's crash and
   retention boundaries (libzb fault build), 12 the same with a zb-client-ts client, 13/14 two tables on one route
-  (applied frontiers; libzb / TS), 15/16 a plain full that crashes after its first chunk (libzb / TS), 5–11 incarnation,
+  (applied frontiers; libzb / TS), 15/16 a plain full that crashes after its first chunk (libzb / TS), 19/20 the joint fence (two tables
+  reseeded together, a third untouched; libzb / TS), 5–11 incarnation,
   epoch and cleanup barriers. Takes minutes; run one check at a time.
 - `rls_visibility.py` — the RLS guard (a policy that hides rows blocks publication, visible in metrics and `--diagnose`).
 - `leaf_fence.py` — a fence taken from a seeding leaf's chain (hub + leaf nats-servers, no auth).
@@ -88,6 +89,13 @@ from the same variables by `scripts/scenarios/fence_client.mts`. A scenario fail
 - **Applied frontiers** (`_zbz_frontier` / `_zebridge_frontier`): other seeded tables on a rewound route keep their rows and
   skip replay up to the position they held; spent when the position passes, dropped on stream restart/recreate, replay from
   0, table drop, or when a chain is applied to that table. Loading them **fails closed**.
+- **Joint fence:** tables of one route reseeded together are all unseeded when the first fence looks (an epoch move drops each
+  anchor at once), and a fence refuses a neighbour it cannot certify. The unseeded tables of the rewound routes therefore take part:
+  each is read from the hub, proven and its objects checked first; one PREPARE owes them all, writes the untouched tables' frontiers
+  and moves the cursors to the smallest cut; the routes stay parked until the last has committed, which proves the earlier ones
+  again before its own commit; each is anchored at its own cut. The group is durable (`joint` on the owed record, proofs in
+  `*_joint_done`) and `ensureJointRestored` parks the routes again after a restart, before any consumer opens (NOTES "The joint
+  fence"). A table with no usable chain keeps the old refusal.
 - **Route protection (TS):** `fenced` (route → owner tables) parks a route's tails; `replacing` records every chain
   replacement; a fence that commits hands the parking to replacements still running. Fence decisions are taken again inside
   `prepareExclusive` — never trust positions read before it. libzb is single-threaded in `poll`, so this cannot overlap there.
