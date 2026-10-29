@@ -62,7 +62,8 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
   db.exec(`
     CREATE TABLE IF NOT EXISTS _zebridge_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL, created TEXT);
     CREATE TABLE IF NOT EXISTS _zebridge_generations (tbl TEXT PRIMARY KEY, watermark TEXT NOT NULL, cutoff_lsn INTEGER NOT NULL, seed_epoch INTEGER NOT NULL DEFAULT 0, seed_seq INTEGER, seed_stream TEXT, shared_seed_seq INTEGER);
-    CREATE TABLE IF NOT EXISTS _zebridge_fence (tbl TEXT PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS _zebridge_fence (tbl TEXT PRIMARY KEY, joint INTEGER);
+    CREATE TABLE IF NOT EXISTS _zebridge_joint_done (tbl TEXT NOT NULL, stream TEXT NOT NULL, cut INTEGER NOT NULL, created TEXT NOT NULL, PRIMARY KEY (tbl, stream));
     CREATE TABLE IF NOT EXISTS _zebridge_sync (id INTEGER PRIMARY KEY, global_last_lsn INTEGER, global_last_seq INTEGER);
     INSERT OR IGNORE INTO _zebridge_sync VALUES (1, 0, 0);
     CREATE TABLE IF NOT EXISTS _zebridge_frontier (tbl TEXT NOT NULL, stream TEXT NOT NULL, created TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (tbl, stream));
@@ -97,7 +98,7 @@ function client(path: string, world: World, opts: { hook?: Hook; others?: string
   const passes: number[] = [];
   Object.assign(c, {
     nc: {}, tenantValue: 'acme', syncedTables, ondemandSet: new Set(), seedInFlight: new Map(),
-    globalSyncState: { seq }, tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(), replacing: new Map(), jointDone: new Map(),
+    globalSyncState: { seq }, tailGen: new Map(), tailStops: new Map(), tailFilters: new Map(), fenced: new Map(), replacing: new Map(), jointRestored: false,
     streamWork: Promise.resolve(), streamsSubscribed: true, restarted: new Set(), failed: new Set(), hubOnly: new Set(),
     applyingByChoice: new Set(), healedRoutes: new Set(), streamCreated, streamBornEmpty: new Set(), fkHeld: [], hlcFloor: '', frontiers: new Map(), frontierGated: 0,
     lateSeeds: new Set<string>(), reseedKicks: new Map(), fkHolds: 0, scheduleRecount: () => {},
@@ -1535,6 +1536,80 @@ test('a participant whose cut the retention overtook while the others finished i
     try {
       await seedPair(r);
       assertJoint(r, cuts, shared);
+    } finally { r.close(); }
+  });
+});
+
+test('a joint fence survives a restart: A committed, B unavailable, the process restarts, retention overtakes A\'s cut — the routes stay parked and A is proven again before they are released', async () => {
+  for (const [name, cuts, shared] of orderings) await withDir(async (path) => {
+    // The one whose cut the stream will drop is the first to commit; the other is the one that fails.
+    const first = cuts.item < cuts.orders ? 'item' : 'orders', second = first === 'item' ? 'orders' : 'item';
+    const dropTo = Math.min(cuts.item, cuts.orders) + 30; // past the first's cut, not past the second's
+    const w = new World();
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    const gone = w.objects.get(`${second}-i1-g2-full`)!;
+    // The second one's object disappears after the joint PREPARE (its plan was checked before it): the first one commits, the
+    // second cannot be had.
+    let verifies = 0;
+    const t = client(path, w, { others: ['orders', 'catalogue'], hook: (p) => { if (p === 'before_verify' && ++verifies === 1) w.objects.delete(`${second}-i1-g2-full`); } });
+    try {
+      assert.equal(await t.c.applyGenerations(first, true), true, `${name}: ${first} commits`);
+      assert.equal(await t.c.applyGenerations(second, true), false, `${name}: ${second} cannot be had`);
+      assert.ok(seededTbl(t.db, first) && !seededTbl(t.db, second));
+      assert.equal(owed(t.db), 1);
+      assert.equal(Number((t.db.prepare('SELECT count(*) AS n FROM _zebridge_joint_done WHERE tbl = ?').get(first) as any).n) > 0, true, `${name}: ${first}'s proofs are in the replica`);
+    } finally { t.close(); }
+
+    // The process restarts. ${second} is still unavailable.
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await r.c.ensureJointRestored();
+      assert.ok(r.c.routeParked(OWN) && r.c.routeParked(PUB), `${name}: the restart parks the routes again, before anything else happens`);
+      assert.ok(r.c.fenced.get(OWN)?.has(second), `${name}: for the participant that is still owed`);
+      // Retention overtakes the first one's cut while the second is still unavailable.
+      w.streams[OWN]!.first = dropTo;
+      assert.equal(await r.c.applyGenerations(second, true), false);
+      assert.ok(r.c.routeParked(OWN), `${name}: still parked`);
+      // The second one comes back: it commits, and as the last participant proves the first again — which fails.
+      w.objects.set(`${second}-i1-g2-full`, gone);
+      assert.equal(await r.c.applyGenerations(second, true), true);
+      assert.ok(seededTbl(r.db, second), `${name}: ${second} committed`);
+      assert.ok(!seededTbl(r.db, first), `${name}: ${first} is owed again: the stream no longer holds the events after its cut`);
+      assert.equal(owed(r.db), 1);
+      assert.ok(r.c.routeParked(OWN), `${name}: nothing was released`);
+      assert.ok(r.log.some((m) => new RegExp(`${first}: joint fence not released`).test(m)));
+    } finally { r.close(); }
+
+    // Retention restored, one more restart: the owed one is replaced, the group ends.
+    w.streams[OWN]!.first = 1;
+    const q = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await q.c.ensureJointRestored();
+      assert.ok(q.c.routeParked(OWN), `${name}: parked again after the second restart`);
+      await seedPair(q);
+      assertJoint(q, cuts, shared);
+      assert.equal(Number((q.db.prepare('SELECT count(*) AS n FROM _zebridge_joint_done').get() as any).n), 0, `${name}: no proof is left behind`);
+    } finally { q.close(); }
+  });
+});
+
+test('a restart without the group would open the tails under the participant still owed: ensureJointRestored is what parks them', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, 300, 40, 'item');
+    w.publish(2, 4, 350, 60, 'orders');
+    pairFollower(path, w);
+    const t = client(path, w, { others: ['orders', 'catalogue'], hook: (p) => { if (p === 'after_chunk') throw new Error('crash'); } });
+    try { await t.c.applyGenerations('item', true).catch(() => {}); } finally { t.close(); }
+    // Crashed after the joint PREPARE: both are owed and flagged; nothing else is recorded.
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      assert.equal(r.c.routeParked(OWN), false, 'a fresh process knows nothing yet');
+      await r.c.ensureJointRestored();
+      assert.ok(r.c.routeParked(OWN) && r.c.routeParked(PUB));
+      assert.deepEqual([...r.c.fenced.get(OWN)!].sort(), ['item', 'orders']);
     } finally { r.close(); }
   });
 });

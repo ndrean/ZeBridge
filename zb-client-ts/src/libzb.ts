@@ -655,9 +655,8 @@ export class ZeBridge {
   /// The chain replacements in flight (a fence's, or a plain seed's) per route. A fence that
   /// commits hands the parking to the ones still running instead of releasing the route.
   private replacing = new Map<string, Set<string>>();
-  /// The participants of a fence that committed while a route stayed parked for the others (a joint fence), with the
-  /// routes and cuts they were proven on: proven again when the last participant releases the routes (releaseJoint).
-  private jointDone = new Map<string, FenceRoute[]>();
+  /// The unfinished joint fences of a previous run were parked again (ensureJointRestored).
+  private jointRestored = false;
   /// The applied frontiers (fence.ts), per table: from `_zebridge_frontier`, only those taken on
   /// the stream identity the stored position carries now. Written by a fence for the tables it
   /// leaves untouched, spent as the position passes them, gone when the table is replaced.
@@ -1582,6 +1581,10 @@ export class ZeBridge {
     `);
     // The fence's owed record (fence.ts): a row between its PREPARE and its anchor's commit.
     await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_fence (tbl TEXT PRIMARY KEY)`);
+    // `joint`: the owed record belongs to a joint fence (several tables replaced together). With `_zebridge_joint_done`, the
+    // proofs of the participants that already committed, it is the group, durably: a restart rebuilds the parking from it.
+    try { await this.run(`ALTER TABLE _zebridge_fence ADD COLUMN joint INTEGER`); } catch { /* present */ }
+    await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_joint_done (tbl TEXT NOT NULL, stream TEXT NOT NULL, cut ${this.dialect.int64} NOT NULL, created TEXT NOT NULL, PRIMARY KEY (tbl, stream))`);
     // The applied frontiers (fence.ts): the stream identity they were taken on rides with them.
     await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_frontier (tbl TEXT NOT NULL, stream TEXT NOT NULL, created TEXT NOT NULL, seq ${this.dialect.int64} NOT NULL, PRIMARY KEY (tbl, stream))`);
     // A replica from before §10df: the column is added; refused, harmlessly, on one that has it.
@@ -3420,6 +3423,7 @@ export class ZeBridge {
     if (!GEN || !this.nc) return false;
     const state = this.syncedTables.get(table);
     if (!state || !state.pkCols.length) return false;
+    await this.ensureJointRestored();
 
     const tenantForTable = this.effectiveTenantFor(table);
     if (tenantForTable === null) {
@@ -3888,13 +3892,14 @@ export class ZeBridge {
           const targets = new Map(streams.map((x) => [x, to(x)] as const));
           await this.transaction(async (txExec) => {
             await txExec(`DELETE FROM _zebridge_generations WHERE tbl = ?`, table);
-            await txExec(`INSERT INTO _zebridge_fence (tbl) VALUES (?) ON CONFLICT(tbl) DO NOTHING`, table);
+            if (joiners.length) await txExec(`INSERT INTO _zebridge_fence (tbl, joint) VALUES (?, 1) ON CONFLICT(tbl) DO UPDATE SET joint = 1`, table);
+            else await txExec(`INSERT INTO _zebridge_fence (tbl) VALUES (?) ON CONFLICT(tbl) DO NOTHING`, table);
             // The fenced table is replaced: what it held before is no frontier of its own.
             await txExec(`DELETE FROM _zebridge_frontier WHERE tbl = ?`, table);
-            // The participants: owed like this table, no anchor, no frontier of their own (they are replaced).
+            // The participants: owed like this table (and flagged as the same group), no anchor, no frontier of their own.
             for (const j of joiners) {
               await txExec(`DELETE FROM _zebridge_generations WHERE tbl = ?`, j.table);
-              await txExec(`INSERT INTO _zebridge_fence (tbl) VALUES (?) ON CONFLICT(tbl) DO NOTHING`, j.table);
+              await txExec(`INSERT INTO _zebridge_fence (tbl, joint) VALUES (?, 1) ON CONFLICT(tbl) DO UPDATE SET joint = 1`, j.table);
               await txExec(`DELETE FROM _zebridge_frontier WHERE tbl = ?`, j.table);
             }
             for (const x of streams) {
@@ -4094,16 +4099,36 @@ export class ZeBridge {
          seed_seq = excluded.seed_seq, seed_stream = excluded.seed_stream, shared_seed_seq = excluded.shared_seed_seq`;
     if (fenceRun) {
       await this.pruneInboxSeeded(table, seedLsn);
+      // A participant of a joint fence: while others are still owed it leaves its proofs in the replica; the LAST one proves
+      // every earlier participant again, on fresh facts, BEFORE its own commit, and the same transaction either ends the
+      // group or owes a lapsed participant again. A crash anywhere in between leaves the owed records, which are the group.
+      const joint = await this.jointFlag(table);
+      const othersOwed = joint ? await this.jointOwedOthers(table) : 0;
+      const lapsed = joint && othersOwed === 0 ? await this.jointLapsed(table) : [];
       await this.transaction(async (txExec) => {
         await txExec(upsert, table, manifest.cutoff_version, seedLsn, state.seedEpoch ?? 0,
           gated ? proof.gateSeq : null, gated ? manifest.cdc_stream : null, proof.sharedSeq);
         await txExec(`DELETE FROM _zebridge_fence WHERE tbl = ?`, table);
+        await txExec(`DELETE FROM _zebridge_joint_done WHERE tbl = ?`, table);
+        if (joint && othersOwed > 0) {
+          for (const r of verified ?? []) await txExec(`INSERT INTO _zebridge_joint_done (tbl, stream, cut, created) VALUES (?, ?, ?, ?)`, table, r.stream, r.cut, r.created);
+        } else if (joint && !lapsed.length) {
+          await txExec(`DELETE FROM _zebridge_joint_done`);
+        } else if (joint) {
+          for (const l of lapsed) {
+            await txExec(`DELETE FROM _zebridge_generations WHERE tbl = ?`, l.table);
+            await txExec(`INSERT INTO _zebridge_fence (tbl, joint) VALUES (?, 1) ON CONFLICT(tbl) DO UPDATE SET joint = 1`, l.table);
+            await txExec(`DELETE FROM _zebridge_frontier WHERE tbl = ?`, l.table);
+            await txExec(`DELETE FROM _zebridge_joint_done WHERE tbl = ?`, l.table);
+          }
+        }
       });
       setAnchor();
       state.unseeded = false;
-      // The routes' parking ends with the fence, or with the last participant of a joint fence: their tails
-      // reopen from the cursors it set.
-      await this.releaseJoint(table, verified);
+      for (const l of lapsed) this.lapseJoint(l);
+      // The routes' parking ends with the fence, or with the last participant of a joint fence (none lapsed): their tails
+      // reopen from the cursors it set. A lapsed participant keeps it.
+      this.releaseFence(table);
       if (!fenceRun.plain) this.appendLog('SYS', `${table}: fenced — chain g${manifest.gen} cut at ${manifest.cutoff_seq} on ${manifest.cdc_stream} replaced the rows; the position moved back from ${fenceRun.fromPos}, the events after the cut replay${fenceRun.shared ? ' (the shared route too)' : ''}`, 'WARNING');
       if (!run.inPass) void this.subscribeStreams().catch(() => {}); // the routes it held may be open now
       await this.drainPending(table); // the events held while the rows were replaced
@@ -4297,58 +4322,74 @@ export class ZeBridge {
     return now;
   }
 
-  /// The routes whose parking would end if `table` left it now: nobody else owns them, no chain replacement runs on them.
-  private routesEndingWith(table: string): string[] {
-    const out: string[] = [];
-    for (const [x, owners] of this.fenced) {
-      if (!owners.has(table)) continue;
-      const rest = new Set([...owners, ...(this.replacing.get(x) ?? [])]);
-      rest.delete(table);
-      if (!rest.size) out.push(x);
+  /// The owed record of `table` says it belongs to a joint fence.
+  private async jointFlag(table: string): Promise<boolean> {
+    try { return Number(((await this.run(`SELECT joint FROM _zebridge_fence WHERE tbl = ?`, table)) ?? [])[0]?.joint) === 1; } catch { return false; }
+  }
+
+  /// The other participants of a joint fence still owed.
+  private async jointOwedOthers(table: string): Promise<number> {
+    return Number(((await this.run(`SELECT count(*) AS n FROM _zebridge_fence WHERE joint = 1 AND tbl <> ?`, table)) ?? [])[0]?.n ?? 0);
+  }
+
+  /// The participants that committed earlier (rows of `_zebridge_joint_done`, so they survive a restart), proven again on
+  /// fresh facts: the same incarnation, and the event after each cut still retained. Those that fail.
+  private async jointLapsed(except: string): Promise<{ table: string; stream: string; cut: number }[]> {
+    const rows: any[] = (await this.run(`SELECT tbl, stream, cut, created FROM _zebridge_joint_done WHERE tbl <> ?`, except)) ?? [];
+    if (!rows.length) return [];
+    const facts = await this.routeFacts(rows.map((r) => String(r.stream)));
+    const byTable = new Map<string, FenceRoute[]>();
+    for (const r of rows) byTable.set(String(r.tbl), [...(byTable.get(String(r.tbl)) ?? []), { stream: String(r.stream), cut: Number(r.cut), created: String(r.created) }]);
+    const out: { table: string; stream: string; cut: number }[] = [];
+    for (const [t, routes] of byTable) {
+      const lost = verifyRoutes(routes, (x) => facts.get(x) ?? null);
+      if (lost) out.push({ table: t, stream: lost.stream, cut: lost.cut });
     }
     return out;
   }
 
-  /// `table`'s fence committed, proven on `routes` (null: a plain replacement, nothing to remember). In a joint fence
-  /// the parking goes on while a participant is still to commit, and what each earlier participant was proven on is
-  /// kept. The LAST participant releases the routes only after every one of them is proven again on fresh facts: a
-  /// stream that dropped the events after an earlier participant's cut, or was recreated, while the others were
-  /// replaced leaves that participant owed again (anchor removed), and the routes stay parked for it.
-  private async releaseJoint(table: string, routes: FenceRoute[] | null) {
-    const ending = this.routesEndingWith(table);
-    if (!ending.length) {
-      if (routes) this.jointDone.set(table, routes);
-      this.releaseFence(table);
-      return;
+  /// A participant was owed again by the last one's commit (its row is already durable): memory says the same, and the
+  /// routes it rides stay parked for it.
+  private lapseJoint(l: { table: string; stream: string; cut: number }) {
+    const st = this.syncedTables.get(l.table);
+    if (st) { st.seedSeq = undefined; st.seedStream = undefined; st.sharedSeedSeq = undefined; st.seedLsn = undefined; st.unseeded = true; }
+    this.frontiers.delete(l.table);
+    for (const x of this.jointRoutes(l.table)) {
+      if (!this.fenced.has(x)) this.fenced.set(x, new Set());
+      this.fenced.get(x)!.add(l.table);
     }
-    const earlier = [...this.jointDone].filter(([t, rs]) => t !== table && rs.some((r) => ending.includes(r.stream)));
-    const facts = await this.routeFacts(earlier.flatMap(([, rs]) => rs.map((r) => r.stream)));
-    const lapsed: { table: string; stream: string; cut: number }[] = [];
-    for (const [t, rs] of earlier) {
-      const lost = verifyRoutes(rs, (x) => facts.get(x) ?? null);
-      if (lost) lapsed.push({ table: t, stream: lost.stream, cut: lost.cut });
+    this.appendLog('SYS', `${l.table}: joint fence not released — ${l.stream} no longer holds the events after its cut ${l.cut} on the incarnation the chain was cut on; it is owed again and the routes stay parked until it is replaced (recovery incomplete)`, 'WARNING');
+    this.waitForChain(l.table);
+  }
+
+  /// The routes a table's chain replacement parks: its own, and the shared one.
+  private jointRoutes(table: string): string[] {
+    const tn = this.effectiveTenantFor(table);
+    if (tn === null || this.ondemandSet.has(table)) return [];
+    const own = this.cdcStreamForTenant(tn);
+    const pub = this.config.grammar.cdc_streams?.public;
+    return pub && own !== pub ? [own, pub] : [own];
+  }
+
+  /// Once per process, before any consumer opens or any chain is applied: the joint fences a previous run left unfinished
+  /// park their routes again, from the durable owed records (`joint`). The group does not live in memory alone: without
+  /// this a restart would open the tails under participants that are still to be replaced, and the proofs of the ones that
+  /// committed are in `_zebridge_joint_done`, read when the last one commits.
+  private async ensureJointRestored() {
+    if (this.jointRestored) return;
+    const rows: any[] = (await this.run(`SELECT tbl FROM _zebridge_fence WHERE joint = 1`)) ?? [];
+    for (const r of rows) {
+      const t = String(r.tbl);
+      if (!this.syncedTables.has(t)) continue;
+      const st = this.syncedTables.get(t);
+      if (st) st.unseeded = true;
+      for (const x of this.jointRoutes(t)) {
+        if (!this.fenced.has(x)) this.fenced.set(x, new Set());
+        this.fenced.get(x)!.add(t);
+      }
     }
-    this.jointDone.delete(table);
-    if (!lapsed.length) {
-      for (const [t] of earlier) this.jointDone.delete(t);
-      this.releaseFence(table);
-      return;
-    }
-    for (const l of lapsed) {
-      await this.transaction(async (txExec) => {
-        await txExec(`DELETE FROM _zebridge_generations WHERE tbl = ?`, l.table);
-        await txExec(`INSERT INTO _zebridge_fence (tbl) VALUES (?) ON CONFLICT(tbl) DO NOTHING`, l.table);
-        await txExec(`DELETE FROM _zebridge_frontier WHERE tbl = ?`, l.table);
-      });
-      const st = this.syncedTables.get(l.table);
-      if (st) { st.seedSeq = undefined; st.seedStream = undefined; st.sharedSeedSeq = undefined; st.seedLsn = undefined; st.unseeded = true; }
-      this.frontiers.delete(l.table);
-      this.jointDone.delete(l.table);
-      for (const x of ending) this.fenced.get(x)?.add(l.table);
-      this.appendLog('SYS', `${l.table}: joint fence not released — ${l.stream} no longer holds the events after its cut ${l.cut} on the incarnation the chain was cut on; it is owed again and the routes stay parked until it is replaced (recovery incomplete)`, 'WARNING');
-      this.waitForChain(l.table);
-    }
-    this.releaseFence(table); // the lapsed participants keep the parking
+    this.jointRestored = true;
+    if (rows.length) this.appendLog('SYS', `joint fence unfinished: ${rows.map((r) => r.tbl).join(', ')} still owed — their routes stay parked until all have been replaced`, 'WARNING');
   }
 
   /// A fence committed: its parking ends, unless a chain replacement is still running on the route
@@ -4412,6 +4453,11 @@ export class ZeBridge {
 
   private async subscribeStreamsOnce() {
     if (!this.nc) return;
+    try { await this.ensureJointRestored(); } catch (e) {
+      // Fail closed: no consumer opens under a group that could not be read; the next reconnect or pass asks again.
+      this.appendLog('SYS', `subscribeStreams: the unfinished joint fences could not be read (${e}) — no tail opens, the next pass retries`, 'ERROR');
+      return;
+    }
     // The tables a chain was applied to in this pass: each took the chain's state as of
     // its cut, which step 2 must replay from on every stream it rides.
     const seededThisPass = new Set<string>();
