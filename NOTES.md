@@ -19587,6 +19587,9 @@ retention can overtake its cut, a permission can fail, or the process can die fi
    themselves for an intermediate participant, nobody ran the final re-proof, and the routes reopened with the proofs left behind (found in
    review with a barrier at the commit point; `fence-apply.test.ts` has it, with and without retention overtaking the earlier cut). libzb
    completes one pair at a time in `poll`, so it cannot interleave.
+   The table's own proof is taken again as the first step of that section, on its own and its shared route: its VERIFY runs before the queue, and
+   what a completion waits behind is not short. This does not make the local commit atomic with the stream's retention (the gap rule stays
+   necessary); it removes the stale-proof window the queue itself introduced. libzb has no queue: its proofs are taken just before the commit.
 
 **Tests.** `fence-apply.test.ts` (ten cases, run against the per-table entry point a pass uses, so they do not name the coordination: both
 orders of unequal cuts, the third table's insert at 410 that a replay must not recreate after its delete at 420, the second replacement unavailable

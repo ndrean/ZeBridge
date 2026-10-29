@@ -1669,9 +1669,15 @@ test('two participants completing at the same moment while retention overtakes t
     w.publish(2, 5, cuts.item, shared.item, 'item');
     w.publish(2, 4, cuts.orders, shared.orders, 'orders');
     pairFollower(path, w);
-    // item (cut 300) commits first, as an intermediate participant; the stream then drops the events after 300 but not after 350.
-    const b = barrier(w, () => { w.streams[OWN]!.first = 330; });
-    const t = client(path, w, { others: ['orders', 'catalogue'], hook: b.hook });
+    // item (cut 300) commits first, as an intermediate participant; the stream then drops the events after 300 but not after 350,
+    // after item's commit and before orders' turn (its own proof is refreshed in its turn and still holds: 350).
+    const b = barrier(w, () => {});
+    let afterCommits = 0;
+    const hook: Hook = async (point, c) => {
+      if (point === 'after_commit' && ++afterCommits === 1) w.streams[OWN]!.first = 330;
+      await b.hook(point, c);
+    };
+    const t = client(path, w, { others: ['orders', 'catalogue'], hook });
     try {
       await Promise.all([t.c.applyGenerations('item', true), t.c.applyGenerations('orders', true)]);
       assert.equal(b.arrivals(), 2);
@@ -1686,6 +1692,69 @@ test('two participants completing at the same moment while retention overtakes t
     const r = client(path, w, { others: ['orders', 'catalogue'] });
     try {
       await r.c.ensureJointRestored();
+      await seedPair(r);
+      assertJoint(r, cuts, shared);
+    } finally { r.close(); }
+  });
+});
+
+// ── The last participant's own proof is refreshed inside the section, not before the queue ───────────────
+
+/// `item` (the larger cut) completes first and holds the section; `orders` (the smaller cut) has passed its VERIFY and waits for it. While
+/// it waits, `overtake` makes the stream drop the events after orders' cut only. The proof orders took before queueing is stale by then.
+function waitingLast(w: World, overtake: () => void) {
+  let arrivals = 0;
+  let releaseItem!: () => void;
+  const itemHeld = new Promise<void>((r) => { releaseItem = r; });
+  let firstIn!: () => void;
+  const firstArrived = new Promise<void>((r) => { firstIn = r; });
+  w.hold = (name) => (name.startsWith('orders-') ? firstArrived : undefined);
+  let inSection = 0;
+  const hook: Hook = async (point) => {
+    if (point === 'before_commit') {
+      arrivals++;
+      if (arrivals === 1) firstIn();
+      if (arrivals === 2) { overtake(); releaseItem(); } // orders: VERIFY passed, the stream changes, item may finish
+      return;
+    }
+    if (point === 'after_commit') { // inside the section, after the commit of whoever is in it
+      inSection++;
+      if (inSection === 1) await itemHeld; // item holds the section until orders is waiting behind it
+    }
+  };
+  return { hook };
+}
+
+test('the last participant waits for the section and the retention overtakes only its cut: it stays owed, the routes stay parked — own route and shared route', async () => {
+  for (const [what, overtake] of [
+    ['its own route', (w: World) => { w.streams[OWN]!.first = 330; }],
+    ['its shared route', (w: World) => { w.streams[PUB]!.first = 50; }],
+  ] as const) await withDir(async (path) => {
+    const w = new World();
+    // orders has the smaller cut on both routes, item the larger: only orders' cut is overtaken.
+    const cuts = { item: 350, orders: 300 }, shared = { item: 60, orders: 40 };
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    const g = waitingLast(w, () => overtake(w));
+    const t = client(path, w, { others: ['orders', 'catalogue'], hook: g.hook });
+    try {
+      const done = await Promise.all([t.c.applyGenerations('item', true), t.c.applyGenerations('orders', true)]);
+      assert.equal(done[0], true, `${what}: item (the earlier one) committed`);
+      assert.equal(done[1], false, `${what}: orders (the last) did not: its proof was stale when its turn came`);
+      assert.ok(seededTbl(t.db, 'item') && !seededTbl(t.db, 'orders'), `${what}: only item is anchored`);
+      assert.equal(owed(t.db), 1, `${what}: orders is still owed`);
+      assert.ok(t.c.routeParked(OWN) && t.c.routeParked(PUB), `${what}: the routes stay parked`);
+      assert.ok(t.log.some((m) => /orders: fence not committed — /.test(m)), `${what}: it says why`);
+    } finally { t.close(); }
+    // The stream as it was, one restart: the group is rebuilt, orders is replaced, the group ends.
+    w.streams[OWN]!.first = 1;
+    w.streams[PUB]!.first = 1;
+    w.hold = undefined;
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await r.c.ensureJointRestored();
+      assert.ok(r.c.routeParked(OWN), `${what}: parked again after the restart`);
       await seedPair(r);
       assertJoint(r, cuts, shared);
     } finally { r.close(); }

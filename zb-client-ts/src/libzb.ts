@@ -4103,7 +4103,17 @@ export class ZeBridge {
       // proofs of the earlier ones, the commit's transaction and the parking all depend on each other, and two completions that
       // read the owed records before either wrote them both took themselves for an intermediate participant — nobody proved
       // anybody again and the routes reopened with the proofs left behind. It waits for no seed and for no stream pass.
+      const stale: { lost: { stream: string; cut: number } | null } = { lost: null };
       await this.prepareExclusive(async () => {
+        // The table's OWN proof is taken again here, first: its VERIFY ran before the queue, and what it waited behind (another
+        // PREPARE, another completion, a download of theirs) is not short. The stream may have dropped the events after this cut,
+        // on its own route or on the shared one, meanwhile. Not atomic with the commit (the gap rule stays necessary), but no
+        // longer older than the queue.
+        if (verified) {
+          const facts = await this.routeFacts(verified.map((r) => r.stream));
+          const lost = verifyRoutes(verified, (x) => facts.get(x) ?? null);
+          if (lost) { stale.lost = { stream: lost.stream, cut: lost.cut }; return; }
+        }
         // A participant of a joint fence: while others are still owed it leaves its proofs in the replica; the LAST one proves
         // every earlier participant again, on fresh facts, BEFORE its own commit, and the same transaction either ends the
         // group or owes a lapsed participant again. A crash anywhere in between leaves the owed records, which are the group.
@@ -4137,6 +4147,10 @@ export class ZeBridge {
         // reopen from the cursors it set. A lapsed participant keeps it.
         this.releaseFence(table);
       });
+      if (stale.lost) {
+        this.appendLog('SYS', `${table}: fence not committed — ${stale.lost.stream} no longer holds the events after the cut ${stale.lost.cut} on the incarnation the chain was cut on; the table stays unseeded with its cursor at the cut (recovery incomplete)`, 'WARNING');
+        return false;
+      }
       if (!fenceRun.plain) this.appendLog('SYS', `${table}: fenced — chain g${manifest.gen} cut at ${manifest.cutoff_seq} on ${manifest.cdc_stream} replaced the rows; the position moved back from ${fenceRun.fromPos}, the events after the cut replay${fenceRun.shared ? ' (the shared route too)' : ''}`, 'WARNING');
       if (!run.inPass) void this.subscribeStreams().catch(() => {}); // the routes it held may be open now
       await this.drainPending(table); // the events held while the rows were replaced
