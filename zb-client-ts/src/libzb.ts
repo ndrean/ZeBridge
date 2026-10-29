@@ -5311,7 +5311,7 @@ export class ZeBridge {
     for (const m of marks) this.healedRoutes.delete(m.route);
     await this.transaction(async (txExec) => {
       for (const route of rewind) {
-        await txExec(`INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, 0) ON CONFLICT(stream) DO UPDATE SET last_seq = 0`, route);
+        await txExec(`INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, 0) ON CONFLICT(stream) DO UPDATE SET last_seq = 0, born_empty = 0`, route);
         await txExec(`DELETE FROM _zebridge_frontier WHERE stream = ?`, route); // replayed from 0: nothing taken on this numbering counts
       }
       for (const m of marks) {
@@ -5321,6 +5321,7 @@ export class ZeBridge {
     });
     for (const route of rewind) {
       this.globalSyncState.seq[route] = 0;
+      this.streamBornEmpty.delete(route); // a reset position is no longer "born empty" (core.streamHasGap)
       this.forgetFrontiers(route);
       this.hubOnly.add(route);
       this.appendLog('SYS', `${route}: rewound for reconciliation — reseeding from the hub`, 'WARNING');

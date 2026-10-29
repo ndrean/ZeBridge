@@ -150,8 +150,8 @@ fi
 cat <<EOF
 
 [linux] up. PostgreSQL 127.0.0.1:$PGPORT ($PGBIN), NATS 127.0.0.1:4222 (operator mode), credentials in scripts/native/creds/.
-The database is EMPTY. The steps are those of scripts/dev/README.md from step 3 (the Python environment, the fixtures, the
-bridge, the groups); only step 4's exports differ. In every terminal, after the lines of that step:
+The database is EMPTY. The next steps (the exports, reprovision.py, the bridge, the groups) are in scripts/linux/README.md,
+from its step 3. In every terminal, after the activation and env-file lines of that step:
 
      export NATS_URL=nats://127.0.0.1:4222
      export ZB_PGBIN="$PGBIN" ZB_PG_CTL="$HERE/pg_ctl" ZB_JWT_STATE="$STATE"

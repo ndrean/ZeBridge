@@ -6101,6 +6101,9 @@ pub const SyncClient = struct {
                 fn apply(cx: @This(), s: *storage.Storage) !void {
                     for (cx.rewind) |route| {
                         try cx.client.persistSeq(route, 0);
+                        // A reset position is no longer "born empty" (core.streamHasGap): left set, an empty route at 0 is
+                        // not a gap, nothing reseeds and the marker never heals.
+                        _ = try s.query(cx.a, "UPDATE _zbz_stream_seq SET born_empty = 0 WHERE stream = ?", &.{.{ .text = route }});
                         _ = try s.query(cx.a, "DELETE FROM _zbz_frontier WHERE stream = ?", &.{.{ .text = route }}); // replayed from 0: nothing taken on this numbering counts
                     }
                     for (cx.marks) |m| {
