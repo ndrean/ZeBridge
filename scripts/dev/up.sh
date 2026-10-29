@@ -106,7 +106,6 @@ repository root, in this order (scripts/dev/README.md has the same list with the
      set -a && . ./.env.bridge && set +a && export BRIDGE_CDC_PUBLICATION=$BRIDGE_CDC_PUBLICATION
      export NATS_URL=nats://127.0.0.1:4222      # after the line above: this NATS has no TLS (tls:// gives TlsRecordOverflow)
      export ZB_PG_CTL="\$PWD/scripts/dev/pg_ctl" ZB_NATS_CONTAINER=zb-dev-nats   # the outage scenarios restart the containers
-     export S3_KEYS="\$PWD/scripts/dev/state/s3.json"   # SeaweedFS's keys, for archive / readings_roles (ZB_DEV_S3=0: not needed)
 
 5. REQUIRED - the baseline tables, catalogue rows and tenant mappings (exit 0, no line starting with a cross):
      scripts/reprovision.py; echo "exit \$?"

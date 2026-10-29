@@ -225,7 +225,7 @@ def tenants() -> list[str]:
     return [t for t in out.splitlines() if t]
 
 
-async def connect():
+async def connect(inbox_as: str | None = None):
     """Connect with the credential in `NATS_CREDS` — the JWT/operator stack's one shape.
 
     `scripts/native/creds/bridge.creds` is the bridge's own identity (inspect streams,
@@ -242,7 +242,10 @@ async def connect():
     if creds:
         if not pathlib.Path(creds).exists():
             sys.exit(f"NATS_CREDS={creds} does not exist")
-        who = pathlib.Path(creds).stem  # <principal>.creds — §10hm, its own inbox space
+        # <principal>.creds — §10hm, its own inbox space. `inbox_as`: the inbox of the principal a scenario WRITES AS while
+        # connected under other credentials (the bridge's): mutation admission refuses a request whose reply inbox is not
+        # `_INBOX.<the subject's principal>.…` (InvalidReplyInbox, and the publisher sees only a timeout).
+        who = inbox_as or pathlib.Path(creds).stem
         return await nats.connect(nats_server(), user_credentials=creds, inbox_prefix=f"_INBOX.{who}".encode())
     if "@" in NATS_URL.split("://", 1)[-1]:
         return await nats.connect(NATS_URL)

@@ -43,8 +43,8 @@ export NATS_URL=nats://127.0.0.1:4222              # after the line above, which
 # so the outage scenarios (chaos, nats_outage, matrix, cascade, churn, pg_restart, sweeper_restart, jwt_expiry,
 # revoke_midseed) stop, start and reload the containers instead of looking for a Homebrew server and a pid file:
 export ZB_PG_CTL="$PWD/scripts/dev/pg_ctl" ZB_NATS_CONTAINER=zb-dev-nats
-# the S3 of archive, readings_roles and readings_fetch: the keys up.sh generated for SeaweedFS (not needed with ZB_DEV_S3=0)
-export S3_KEYS="$PWD/scripts/dev/state/s3.json"
+# run.py finds the S3 keys up.sh generated for SeaweedFS (archive, readings_roles, readings_fetch); to run one of those
+# scenarios directly, point S3_KEYS at them:  export S3_KEYS="$PWD/scripts/dev/state/s3.json"
 ```
 
 **5. Provision the baseline. Required, once per database**: `up.sh` creates an empty database; the scenarios assume the eight fixture tables (`test_types`, `users`, …), their catalogue rows and the principals' tenants (`alice→acme … omar→kilo`), and `reprovision.py` is what creates them:
@@ -85,7 +85,8 @@ MUTATION_ADMISSION=1 zig-out/bin/bridge --mutation-ingress > /tmp/zb-admission.l
 MUTATION_ADMISSION=1 zig-out/bin/bridge --pub $BRIDGE_CDC_PUBLICATION > /tmp/zb-bridge.log 2>&1
 ```
 
-Measured on the Linux stack: `mutate`, `replies`, `offline` and `writable` pass this way. It is a switch for the whole stack, not
+Measured on the Linux stack: `mutate`, `replies`, `offline`, `writable` and `invalidate` pass this way (the last needed two changes: a
+publisher's reply inbox must be `_INBOX.<principal>.…`, and the first write after a quiet spell is answered a few seconds later). It is a switch for the whole stack, not
 per scenario: the queue is then `$ZB.mutation.>`, and an `owns` scenario that publishes straight to `mutation.<principal>.…` with
 no admission process running gets `NoStreamResponseError` (`ratelimit` did). Go back with `scripts/dev/down.sh --clean` and the setup
 steps. Admission itself is covered by `mutation_admission`, `hub_fallback`, `outage_matrix` and `receipt_faults`, which build their
@@ -124,7 +125,7 @@ Found by running the whole battery on a clean machine; none of it is in the scen
 | the `zstd` command                             | `shared_gap`                                                                                                                                                                                                                                                             | `brew install zstd`                                                                                                       |
 | the demo `routes` table                        | `route_crdt` (`no such table: routes`)                                                                                                                                                                                                                                   | `scripts/reprovision.py` (step 5) creates it; nothing to do |
 | Python 3.14 for the venv                       | `serve` (`from compression import zstd`)                                                                                                                                                                                                                                 | `brew install python@3.14`, then `python3.14 -m venv …`                                                                   |
-| SeaweedFS S3 on `:8333`                        | `readings_roles`, `archive`, the S3 case of `readings_fetch`                                                                                                                                                                                                             | `up.sh` starts it (`ZB_DEV_S3=0` leaves it out) and `export S3_KEYS=…` of step 4 |
+| SeaweedFS S3 on `:8333`                        | `readings_roles`, `archive`, the S3 case of `readings_fetch`                                                                                                                                                                                                             | `up.sh` starts it (`ZB_DEV_S3=0` leaves it out); `run.py` finds its keys |
 | the native endpoint probe | `hub_fallback` ("Build the native pool probe first") | `cd libzb && zig build endpoint-probe` |
 | the `zebridge-leaf-nats:2.15.0-security` image | `leaf_security`                                                                                                                                                                                                                                                          | `docker build -t zebridge-leaf-nats:2.15.0-security deploy/compose/leaf` (that directory's Dockerfile and `compose.yml` name this tag) |
 | a database created with the `C` locale         | `standby` (`invalid value for parameter "lc_messages": "en_US.utf8"`: it starts a copy of the container's database with your Mac's PostgreSQL, and the container's default locale name is Linux's)                                                                       | `compose.yml` now creates it that way; a volume made before needs `scripts/dev/down.sh --clean`, then steps 2, 5, 6 again |
