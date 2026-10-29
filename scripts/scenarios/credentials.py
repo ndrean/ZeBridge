@@ -173,7 +173,8 @@ async def principal_is_enforced() -> int:
     failed = 0
 
     try:
-        await js.publish(f"mutation.{me}.test_types.insert", body, timeout=3)
+        await js.publish(f"mutation.{me}.test_types.insert", body, timeout=3,
+                         headers={"Nats-Msg-Id": f"credentials-{uuid.uuid4().hex}"})
         zb.ok(f"'{me}' may publish under its own principal")
     except Exception as exc:  # noqa: BLE001
         zb.bad(f"'{me}' could not publish as itself: {exc}")
@@ -181,7 +182,8 @@ async def principal_is_enforced() -> int:
 
     for impostor in ("bob", f"{me}x", "admin"):
         try:
-            await js.publish(f"mutation.{impostor}.test_types.insert", body, timeout=3)
+            await js.publish(f"mutation.{impostor}.test_types.insert", body, timeout=3,
+                             headers={"Nats-Msg-Id": f"credentials-{uuid.uuid4().hex}"})
             zb.bad(f"'{me}' published as '{impostor}' — the principal is not enforced")
             failed += 1
         except Exception:  # noqa: BLE001
@@ -204,7 +206,8 @@ async def principal_is_enforced() -> int:
         ("mutation_error.test_types", "a dead letter"),
     ):
         try:
-            await js.publish(subject, b"forged", timeout=3)
+            await js.publish(subject, b"forged", timeout=3,
+                             headers={"Nats-Msg-Id": f"credentials-{uuid.uuid4().hex}"})
             zb.bad(f"'{me}' forged {what} on '{subject}' — the reply channel is not trustworthy")
             failed += 1
         except Exception:  # noqa: BLE001

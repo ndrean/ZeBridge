@@ -97,8 +97,8 @@ cat <<EOF
 The database is EMPTY: the scenarios' fixture tables and the principals' tenants do not exist yet. Next, from the
 repository root, in this order (scripts/dev/README.md has the same list with the reasons):
 
-3. Once - the scenarios' Python environment (nats-py, nkeys, msgpack, duckdb, boto3):
-     python3 -m venv scripts/scenarios/.venv
+3. Once - the scenarios' Python 3.15 environment (minimum 3.14 for compression.zstd):
+     python3.15 -m venv scripts/scenarios/.venv
      scripts/scenarios/.venv/bin/pip install -r scripts/scenarios/requirements.txt
 
 4. Every terminal you use below - the scripts are run by the venv's Python, so activate it:

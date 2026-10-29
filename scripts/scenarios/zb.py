@@ -18,6 +18,7 @@ import base64
 import json
 import os
 import pathlib
+import shlex
 import subprocess
 import sys
 
@@ -455,7 +456,24 @@ def another_bridge_running() -> bool:
     # drank from one workqueue). `( |$)` matches the bridge with or without arguments and
     # still stops at the sweeper's `_`.
     r = subprocess.run(["pgrep", "-f", r"zig-out/bin/bridge( |$)"], capture_output=True, text=True)
-    return bool(r.stdout.strip())
+    pids = r.stdout.split()
+    if not pids:
+        return False
+    # Admission is a gateway, not a worker consuming the mutation workqueue. An
+    # admission-mode stack needs it while the scenario owns the worker bridge.
+    # Inspect complete argv on macOS and Linux; never exempt a worker merely
+    # because an admission process is also present.
+    processes = subprocess.run(["ps", "-ww", "-p", ",".join(pids), "-o", "args="], capture_output=True, text=True)
+    if processes.returncode != 0:
+        return True  # cannot establish that every matching process is admission
+    for command in processes.stdout.splitlines():
+        try:
+            args = shlex.split(command)
+        except ValueError:
+            return True
+        if args and "--mutation-ingress" not in args:
+            return True
+    return False
 
 
 def bridge_env(**overrides) -> dict:

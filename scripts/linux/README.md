@@ -14,7 +14,7 @@ Do these once per machine, in this order. Each line says what breaks when it is 
 - [ ] **`nats-server` 2.15 or newer** (2.11 lacks `default_max_consumers`), **`nats`** and **`nsc`**, from the releases of [nats-server](https://github.com/nats-io/nats-server/releases), [natscli](https://github.com/nats-io/natscli/releases) and [nsc](https://github.com/nats-io/nsc/releases), on `PATH`. Check with `nats-server --version`.
 - [ ] **The Zig toolchain (0.17)** on `PATH`.
 - [ ] **The submodule**: `git submodule update --init`. An empty `nats.zig/` makes the build stop with "unable to find nats".
-- [ ] **Python 3.14 or newer for the venv** (`serve` imports `compression.zstd`). Ubuntu's `python3` may be older, and that is fine: only the venv needs the new one. With `uv`: `uv venv --python 3.15 scripts/scenarios/.venv` (or `python3.15 -m venv …` if `ensurepip` is there), then `uv pip install --python scripts/scenarios/.venv/bin/python -r scripts/scenarios/requirements.txt`. Check with `scripts/scenarios/.venv/bin/python --version`.
+- [ ] **Python 3.15 for the scenario venv.** The minimum supported version is 3.14 because `serve` imports `compression.zstd`. Ubuntu's `python3` may be older, and that is fine: only the venv needs the new one. With `uv`: `uv venv --python 3.15 scripts/scenarios/.venv` (or `python3.15 -m venv scripts/scenarios/.venv` if `ensurepip` is there), then `uv pip install --python scripts/scenarios/.venv/bin/python -r scripts/scenarios/requirements.txt`. Check with `scripts/scenarios/.venv/bin/python --version`.
 - [ ] **Node and `pnpm`**, then `cd zb-client-ts && pnpm install` (builds `better-sqlite3`, which needs `build-essential`; for `outbox_*`, `reconcile`, `hub_fallback`, `jwt_renew`) and `cd examples/04-node-consumer && pnpm install` (the Node worker of `migrate_both`, `column_flood`, `rekey_*` and others).
 - [ ] **`zstd` command** (`sudo apt install zstd`), for `shared_gap`.
 - [ ] **`.env.bridge`** in the repository root, with `DATABASE_READER_URL` and `DATABASE_WRITER_URL` pointing at `127.0.0.1:5432`.
@@ -80,8 +80,7 @@ python3 scripts/scenarios/run.py live --bridge-log /tmp/zb-bridge.log
 python3 scripts/scenarios/run.py owns
 ```
 
-**Through mutation admission** (the production write path): start these two instead of step 5, in two terminals with step 3 repeated, on a stack whose bridge has never started (`down.sh --clean` and steps 2 to 4 otherwise).
-The details and the rules of this mode are in [the compose README](../dev/README.md#the-write-path-through-admission).
+**Through mutation admission** (the production write path): if you already ran step 5 **without admission**, first follow the migration procedure in [the compose README](../dev/README.md#the-write-path-through-admission); the same commands and credentials apply here. Otherwise, skip migration and run the commands below instead of step 5, in two terminals with step 3 repeated. Admission starts first and creates `MUTATIONS`, then the bridge starts. Running only the stack setup and reprovisioning does not require migration.
 
 ```sh
 MUTATION_ADMISSION=1 zig-out/bin/bridge --mutation-ingress > /tmp/zb-admission.log 2>&1       # wait for "mutation admission ready"

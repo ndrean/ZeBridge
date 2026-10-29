@@ -16,7 +16,7 @@ Do these once per machine, in this order. Each line says what breaks when it is 
 - [ ] The Zig toolchain (0.17) and `git submodule update --init` (the `nats.zig` submodule: an empty directory makes the build stop with "unable to find nats").
 - [ ] A PostgreSQL **client** on the host (`psql`, version 15 or newer) for the scenarios; no server is needed. `ZB_PGBIN` names the directory if it is not on `PATH`.
 - [ ] The `zstd` command (`brew install zstd`), for `shared_gap`.
-- [ ] Python 3.14 or newer, for the venv: `serve` imports `compression.zstd`. `brew install python@3.14`.
+- [ ] Python 3.15 for the scenario venv (`brew install python@3.15`). The minimum supported version is 3.14 because `serve` imports `compression.zstd`.
 - [ ] `pnpm` and Node, then `cd zb-client-ts && pnpm install` (for `outbox_*`, `reconcile`, `hub_fallback`, `jwt_renew`) and `cd examples/04-node-consumer && pnpm install` (the Node worker of `migrate_both`, `column_flood`, `rekey_*` and others).
 - [ ] The `.env.bridge` of the repository, with `DATABASE_READER_URL` and `DATABASE_WRITER_URL` pointing at `127.0.0.1:5432`.
 - [ ] Optional: the leaf image for `leaf_security`: `docker build -t zebridge-leaf-nats:2.15.0-security deploy/compose/leaf`.
@@ -44,7 +44,7 @@ BRIDGE_CDC_PUBLICATION=zb_pub scripts/dev/up.sh
 **3. Python environment, once:**
 
 ```sh
-python3.14 -m venv scripts/scenarios/.venv
+python3.15 -m venv scripts/scenarios/.venv
 scripts/scenarios/.venv/bin/pip install -r scripts/scenarios/requirements.txt
 ```
 
@@ -56,9 +56,10 @@ set -a && . ./.env.bridge && set +a
 export BRIDGE_CDC_PUBLICATION=zb_pub               # the name given to up.sh
 export NATS_URL=nats://127.0.0.1:4222              # after the line above, which may bring a tls:// URL: this NATS is plain
 export ZB_PG_CTL="$PWD/scripts/dev/pg_ctl" ZB_NATS_CONTAINER=zb-dev-nats
+export ZB_READINGS_FETCH="$PWD/zig-out/bin/bridge_readings_fetch"
 ```
 
-The last line makes the outage scenarios (`chaos`, `nats_outage`, `matrix`, `cascade`, `churn`, `pg_restart`, `sweeper_restart`, `jwt_expiry`, `revoke_midseed`) stop, start and reload the containers instead of looking for a Homebrew server and a pid file.
+`ZB_PG_CTL` and `ZB_NATS_CONTAINER` make the outage scenarios (`chaos`, `nats_outage`, `matrix`, `cascade`, `churn`, `pg_restart`, `sweeper_restart`, `jwt_expiry`, `revoke_midseed`) stop, start and reload the containers instead of looking for a Homebrew server and a pid file. `ZB_READINGS_FETCH` points the archive scenarios to the native reader built by `zig build`, without requiring it on PATH.
 `run.py` finds the S3 keys that `up.sh` generated for SeaweedFS by itself; to run `archive`, `readings_roles` or `readings_fetch` directly, add `export S3_KEYS="$PWD/scripts/dev/state/s3.json"`.
 
 **5. Provision the baseline. Required, once per database.** `up.sh` creates an empty database; the scenarios assume the fixture tables (`test_types`, `users`, `routes`, …), their catalogue rows and the principals' tenants (`alice→acme … omar→kilo`), and `reprovision.py` creates them:
@@ -93,16 +94,49 @@ python3 scripts/scenarios/run.py owns
 
 `MUTATION_ADMISSION` defaults to 0: the long-running bridge reads writes from the legacy public queue, and everything above runs that way.
 Production runs `bridge --mutation-ingress` as a separate process and sets `MUTATION_ADMISSION=1` on the bridge (OPERATIONS, "Mutation admission cutover").
-To run the `live` group through it, start admission first and the bridge after it, on a stack whose bridge has never started, because the first start decides the queue's layout.
-Both processes need step 4 repeated, each in its own terminal:
+If you already ran the setup above and started the bridge **without admission**, follow the migration procedure below before switching to admission. Otherwise, **skip migration and run the two commands directly**: admission starts first and creates the private queue, then the bridge starts. Running only `up.sh` and `reprovision.py` does not require migration. Repeat step 4 in each terminal:
 
 ```sh
-MUTATION_ADMISSION=1 zig-out/bin/bridge --mutation-ingress > /tmp/zb-admission.log 2>&1       # wait for "mutation admission ready"
+# Terminal 1: wait for "mutation admission ready" before starting terminal 2.
+MUTATION_ADMISSION=1 zig-out/bin/bridge --mutation-ingress > /tmp/zb-admission.log 2>&1
+
+# Terminal 2:
 MUTATION_ADMISSION=1 zig-out/bin/bridge --pub $BRIDGE_CDC_PUBLICATION > /tmp/zb-bridge.log 2>&1
 ```
 
-It is a switch for the whole stack, not per scenario: the queue becomes `$ZB.mutation.>`, and an `owns` scenario that publishes straight to `mutation.<principal>.…` with no admission process running gets `NoStreamResponseError` (`ratelimit` did).
-Go back with `scripts/dev/down.sh --clean` and the setup steps.
+In every terminal that runs tests against this admission-mode stack, repeat step 4 first, then export the mode below. The `MUTATION_ADMISSION=1` prefix on a bridge command applies only to that process; it does not set the mode for probes started later by the test runner.
+
+```sh
+export MUTATION_ADMISSION=1
+```
+
+Once both processes are ready, run the `live` group from step 7. Verify that a write reaches PostgreSQL, echoes to its client and clears its outbox. For `owns`, stop only the regular worker bridge and keep admission running, as described below; the probe workers inherit this exported mode.
+
+**Migration only if you previously started the bridge without admission.** That earlier run created a queue that captures client writes directly. Setting `MUTATION_ADMISSION=1` does not change it; admission refuses it with `LegacyMutationStreamNeedsMigration` because those writes would bypass admission.
+
+Pause publishing clients, let the old bridge drain all accepted writes, then stop that bridge. Keep admission and other stream-configuration tools stopped during the cutover. From the repository root, with step 4 loaded:
+
+```sh
+export NATS_URL=nats://127.0.0.1:4222
+export NATS_CREDS="$PWD/scripts/native/creds/bridge.creds"
+export NATS_JS_DOMAIN=hub
+
+# Review the queue and proposed changes:
+scripts/scenarios/.venv/bin/python deploy/migrate-mutations.py
+
+# Apply the reviewed cutover:
+scripts/scenarios/.venv/bin/python deploy/migrate-mutations.py --apply
+
+# Verify the admission configuration:
+zig-out/bin/bridge --mutation-ingress --check
+```
+
+The migration refuses a nonempty queue. Review or archive any legacy dead letters before proceeding; do not purge accepted writes to make the migration pass. It preserves the stream's identity and sequence history, changes capture to the private subjects, and removes only idle legacy consumers. This cutover does not require deleting the Docker volumes. After migration, start the two processes with the commands above, then resume publishing clients.
+
+If the migration reports `MUTATIONS does not exist`, there is nothing to migrate: use the fresh-stack commands above. Older versions of the helper print `NotFoundError: stream not found` for this same case. Do not start a direct-mode bridge just to create a stream for the migration.
+
+It is a switch for the whole stack, not per scenario: the queue becomes `$ZB.mutation.>`, and an `owns` scenario that publishes straight to `mutation.<principal>.…` with no admission process running gets `NoStreamResponseError` (`ratelimit` did). Before running `owns`, stop the regular worker bridge (`bridge --pub …`), keep `bridge --mutation-ingress` and the containers running, and export `MUTATION_ADMISSION=1` in the test terminal so the probe workers inherit it. The process guard permits admission but still refuses another worker bridge. Admission is a separate process during outage tests too; inspect its log if publishing does not resume after NATS restarts.
+To return to direct mode, use a fresh stack. `scripts/dev/down.sh --clean` deletes all development volumes and credentials; use it only for disposable test data, then repeat the setup steps. An ordinary stop/start preserves the admission queue layout.
 Two rules of the admission path matter to scenario authors: a publisher's reply inbox must be `_INBOX.<principal>.…` (otherwise the publisher only sees a timeout), and the first write after a quiet spell is answered a few seconds later.
 Measured on the Linux stack: `mutate`, `replies`, `offline`, `writable` and `invalidate` pass this way.
 Admission itself is covered by `mutation_admission`, `hub_fallback`, `outage_matrix` and `receipt_faults`, which build their own stacks; this mode is for the scenarios that write through the shared one.
@@ -133,10 +167,12 @@ The scenarios drive `psql` from the host (`ZB_PGBIN`, or `ZB_PSQL`: see the scen
 
 | symptom | cause | remedy |
 | -- | -- | -- |
+| `LegacyMutationStreamNeedsMigration` (`--mutation-ingress`) | `MUTATIONS` was created in direct mode and still captures public mutation subjects | drain it with the old bridge, stop that bridge, then follow [the admission migration](#the-write-path-through-admission); setting `MUTATION_ADMISSION=1` alone does not migrate it |
+| `MUTATIONS does not exist`, or `NotFoundError: stream not found` from an older migration helper | the fresh stack has no mutation stream yet | skip migration and start admission first using [the fresh-stack commands](#the-write-path-through-admission); admission creates the stream |
 | `NoCredentialsError: Unable to locate credentials` (`archive`, `readings_roles`, `readings_fetch`) | the S3 keys file is missing, or the scenario was run directly without `S3_KEYS` | `ls scripts/dev/state/s3.json`; if absent, run `up.sh` again (it generates it and starts SeaweedFS; `ZB_DEV_S3=0` leaves it out); for a direct run `export S3_KEYS="$PWD/scripts/dev/state/s3.json"` |
 | `ERR_MODULE_NOT_FOUND: better-sqlite3` (`outbox_*`, `reconcile`, `hub_fallback`, `jwt_renew`) | the TypeScript client's dependencies are not installed | `cd zb-client-ts && pnpm install` |
 | `node worker did not come up` | the Node worker cannot resolve `@zebridge/client` (a `link:` dependency of an example outside the workspace) | `cd examples/04-node-consumer && pnpm install` |
-| `from compression import zstd` fails (`serve`) | the venv is Python older than 3.14 | recreate it with `python3.14` |
+| `from compression import zstd` fails (`serve`) | the venv is Python older than 3.14 | recreate it with `python3.15` |
 | `Build the native pool probe first` (`hub_fallback`) | the probe is not built | `cd libzb && zig build endpoint-probe` |
 | a fault-hook scenario is refused (`receipt_faults`, `recreate_recovery` 4/13/15, `walls` E) | the ordinary build carries no hooks | build with `-Dtest-faults=true -p zig-out-faults` (step 1) |
 | `invalid value for parameter "lc_messages": "en_US.utf8"` (`standby`) | the database volume was made before the container used the `C` locale | `scripts/dev/down.sh --clean`, then steps 2, 5, 6 |

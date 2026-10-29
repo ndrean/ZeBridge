@@ -179,18 +179,28 @@ async def main():
             check(not false_ack, "loss of the storage stream never produces a successful PubAck")
             gateway.terminate()
             gateway.wait(timeout=15)
-            await js.add_stream(name="MUTATIONS", subjects=["mutation.>"], retention="workqueue",
-                                discard="new", max_bytes=1 << 20, max_msgs_per_subject=5000)
-            gateway, path = start_gateway()
-            gateway.wait(timeout=15)
-            check(gateway.returncode != 0 and "LegacyMutationStreamNeedsMigration" in path.read_text(),
-                  "a legacy public stream is refused without modifying or deleting it")
             spec = importlib.util.spec_from_file_location("migrate_mutations", zb.ROOT / "deploy/migrate-mutations.py")
             migration = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(migration)
             plan = subprocess.run([str(BRIDGE), "--mutation-ingress", "--print-config"], env=env,
                                   capture_output=True, text=True, check=True)
             wanted = json.loads(plan.stdout)
+            # A fresh stack has no queue until admission starts. Planning or applying
+            # a legacy cutover must leave that initial creation to admission.
+            for apply in (False, True):
+                await migration.migrate(admin, wanted, apply=apply)
+                try:
+                    await js.stream_info("MUTATIONS")
+                    absent = False
+                except nats.js.errors.NotFoundError:
+                    absent = True
+                check(absent, f"fresh-stack migration {'apply' if apply else 'plan'} succeeds without creating a stream")
+            await js.add_stream(name="MUTATIONS", subjects=["mutation.>"], retention="workqueue",
+                                discard="new", max_bytes=1 << 20, max_msgs_per_subject=5000)
+            gateway, path = start_gateway()
+            gateway.wait(timeout=15)
+            check(gateway.returncode != 0 and "LegacyMutationStreamNeedsMigration" in path.read_text(),
+                  "a legacy public stream is refused without modifying or deleting it")
             before = (await js.stream_info("MUTATIONS")).config.as_dict()
             await migration.migrate(admin, wanted)
             check((await js.stream_info("MUTATIONS")).config.as_dict() == before,
