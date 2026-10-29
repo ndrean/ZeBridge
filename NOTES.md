@@ -19552,7 +19552,7 @@ refusing both for as long as it ran: 1,794 refusals in 90 s (HANDOFF, "Observed,
 the change. A seed-epoch move drops each table's anchor as its descriptor arrives, before any replacement, so both tables were unseeded when
 the first fence looked at the other. The fence's scope rule (R3, the recovery model's §3) needs every other table on a rewound route to be
 *seeded*: its applied frontier is only meaningful over rows whose coverage is known. Each fence therefore waited for the other to be seeded.
-(In one of the four live cases the untouched third table also ended wrong while it ran: 5 rows missing, 1 extra, 5 differing after 150 s. Not investigated; with the joint fence none of the four cases shows it.)
+(In one of the four live cases the untouched third table also ended wrong while it ran: 5 rows missing, 1 extra, 5 differing after 150 s. That is an unresolved observation, recorded in HANDOFF: it did not repeat in the other three cases, no test catches it, and it not showing after the change does not say what caused it.)
 
 **The rule.** The unseeded tables of the routes a fence rewinds take part in it, as participants. Not sequentially (let the first fence ignore
 the unseeded one and rely on it being replaced next): a manifest can exist and still be unusable by then, since its objects can disappear,
