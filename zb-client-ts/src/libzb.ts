@@ -3876,7 +3876,10 @@ export class ZeBridge {
           // The tails are stopped: each route's position is final, and it certifies the
           // untouched tables (R2) — their frontier is that position, above the cursor it guards.
           // The cursors never move forward: the target is the cut or the position, whichever is lower.
-          const jointCut = (x: string) => Math.min(...joiners.map((j) => x === j.man.cdc_stream && typeof j.man.cutoff_seq === 'number' ? j.man.cutoff_seq
+          // A participant's cut lowers only a cursor this fence rewinds, whose other tables were looked at (the scope):
+          // a participant that rides another route too rewinds it in its own turn, with its own scope.
+          const scoped = new Set<string>([...(now.predates ? [man.cdc_stream as string] : []), ...(decision.sharedTo !== null && sharedRoute ? [sharedRoute] : [])]);
+          const jointCut = (x: string) => !scoped.has(x) ? Infinity : Math.min(...joiners.map((j) => x === j.man.cdc_stream && typeof j.man.cutoff_seq === 'number' ? j.man.cutoff_seq
             : x === j.man.shared_cdc_stream && j.pr.sharedSeq !== null ? j.pr.sharedSeq : Infinity));
           to = (x: string) => Math.min(this.globalSyncState.seq[x] ?? 0, x === man.cdc_stream ? (typeof man.cutoff_seq === 'number' ? man.cutoff_seq : 0) : (decision.sharedTo as number), jointCut(x));
           const writes = untouched
