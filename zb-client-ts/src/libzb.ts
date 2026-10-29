@@ -4099,38 +4099,44 @@ export class ZeBridge {
          seed_seq = excluded.seed_seq, seed_stream = excluded.seed_stream, shared_seed_seq = excluded.shared_seed_seq`;
     if (fenceRun) {
       await this.pruneInboxSeeded(table, seedLsn);
-      // A participant of a joint fence: while others are still owed it leaves its proofs in the replica; the LAST one proves
-      // every earlier participant again, on fresh facts, BEFORE its own commit, and the same transaction either ends the
-      // group or owes a lapsed participant again. A crash anywhere in between leaves the owed records, which are the group.
-      const joint = await this.jointFlag(table);
-      const othersOwed = joint ? await this.jointOwedOthers(table) : 0;
-      const lapsed = joint && othersOwed === 0 ? await this.jointLapsed(table) : [];
-      await this.transaction(async (txExec) => {
-        await txExec(upsert, table, manifest.cutoff_version, seedLsn, state.seedEpoch ?? 0,
-          gated ? proof.gateSeq : null, gated ? manifest.cdc_stream : null, proof.sharedSeq);
-        await txExec(`DELETE FROM _zebridge_fence WHERE tbl = ?`, table);
-        await txExec(`DELETE FROM _zebridge_joint_done WHERE tbl = ?`, table);
-        if (joint && othersOwed > 0) {
-          for (const r of verified ?? []) await txExec(`INSERT INTO _zebridge_joint_done (tbl, stream, cut, created) VALUES (?, ?, ?, ?)`, table, r.stream, r.cut, r.created);
-        } else if (joint && !lapsed.length) {
-          await txExec(`DELETE FROM _zebridge_joint_done`);
-        } else if (joint) {
-          for (const l of lapsed) {
-            await txExec(`DELETE FROM _zebridge_generations WHERE tbl = ?`, l.table);
-            await txExec(`INSERT INTO _zebridge_fence (tbl, joint) VALUES (?, 1) ON CONFLICT(tbl) DO UPDATE SET joint = 1`, l.table);
-            await txExec(`DELETE FROM _zebridge_frontier WHERE tbl = ?`, l.table);
-            await txExec(`DELETE FROM _zebridge_joint_done WHERE tbl = ?`, l.table);
+      // The completion DECISION is one exclusive section, on the chain the PREPARE uses: which participants are still owed, the
+      // proofs of the earlier ones, the commit's transaction and the parking all depend on each other, and two completions that
+      // read the owed records before either wrote them both took themselves for an intermediate participant — nobody proved
+      // anybody again and the routes reopened with the proofs left behind. It waits for no seed and for no stream pass.
+      await this.prepareExclusive(async () => {
+        // A participant of a joint fence: while others are still owed it leaves its proofs in the replica; the LAST one proves
+        // every earlier participant again, on fresh facts, BEFORE its own commit, and the same transaction either ends the
+        // group or owes a lapsed participant again. A crash anywhere in between leaves the owed records, which are the group.
+        const joint = await this.jointFlag(table);
+        const othersOwed = joint ? await this.jointOwedOthers(table) : 0;
+        const lapsed = joint && othersOwed === 0 ? await this.jointLapsed(table) : [];
+        await this.transaction(async (txExec) => {
+          await txExec(upsert, table, manifest.cutoff_version, seedLsn, state.seedEpoch ?? 0,
+            gated ? proof.gateSeq : null, gated ? manifest.cdc_stream : null, proof.sharedSeq);
+          await txExec(`DELETE FROM _zebridge_fence WHERE tbl = ?`, table);
+          await txExec(`DELETE FROM _zebridge_joint_done WHERE tbl = ?`, table);
+          if (joint && othersOwed > 0) {
+            for (const r of verified ?? []) await txExec(`INSERT INTO _zebridge_joint_done (tbl, stream, cut, created) VALUES (?, ?, ?, ?)`, table, r.stream, r.cut, r.created);
+          } else if (joint && !lapsed.length) {
+            await txExec(`DELETE FROM _zebridge_joint_done`);
+          } else if (joint) {
+            for (const l of lapsed) {
+              await txExec(`DELETE FROM _zebridge_generations WHERE tbl = ?`, l.table);
+              await txExec(`INSERT INTO _zebridge_fence (tbl, joint) VALUES (?, 1) ON CONFLICT(tbl) DO UPDATE SET joint = 1`, l.table);
+              await txExec(`DELETE FROM _zebridge_frontier WHERE tbl = ?`, l.table);
+              await txExec(`DELETE FROM _zebridge_joint_done WHERE tbl = ?`, l.table);
+            }
           }
-        }
+        });
+        await this.fault('after_commit');
+        setAnchor();
+        state.unseeded = false;
+        for (const l of lapsed) this.lapseJoint(l);
+        if (joint && othersOwed === 0 && !lapsed.length) this.appendLog('SYS', 'joint fence complete — its routes are open again', 'INFO');
+        // The routes' parking ends with the fence, or with the last participant of a joint fence (none lapsed): their tails
+        // reopen from the cursors it set. A lapsed participant keeps it.
+        this.releaseFence(table);
       });
-      await this.fault('after_commit');
-      setAnchor();
-      state.unseeded = false;
-      for (const l of lapsed) this.lapseJoint(l);
-      if (joint && othersOwed === 0 && !lapsed.length) this.appendLog('SYS', 'joint fence complete — its routes are open again', 'INFO');
-      // The routes' parking ends with the fence, or with the last participant of a joint fence (none lapsed): their tails
-      // reopen from the cursors it set. A lapsed participant keeps it.
-      this.releaseFence(table);
       if (!fenceRun.plain) this.appendLog('SYS', `${table}: fenced — chain g${manifest.gen} cut at ${manifest.cutoff_seq} on ${manifest.cdc_stream} replaced the rows; the position moved back from ${fenceRun.fromPos}, the events after the cut replay${fenceRun.shared ? ' (the shared route too)' : ''}`, 'WARNING');
       if (!run.inPass) void this.subscribeStreams().catch(() => {}); // the routes it held may be open now
       await this.drainPending(table); // the events held while the rows were replaced

@@ -1613,3 +1613,81 @@ test('a restart without the group would open the tails under the participant sti
     } finally { r.close(); }
   });
 });
+
+// ── Two participants complete at the same moment ──────────────────────────────────────────────────────
+//
+// The completion decision (is another participant still owed? then leave proofs; none? then prove the earlier ones again and end the
+// group) reads the owed records and writes them in separate steps. Run concurrently, two completions both saw the other still owed,
+// both committed as intermediate participants, nobody ran the final re-proof and the routes reopened with the proofs left behind.
+// The barrier below holds both at the commit point until both arrived, which is the interleaving that exposed it.
+
+/// Both participants wait at `before_commit` until both arrived; `onBoth` runs once, between the arrival of the second and the release.
+/// The smaller-cut table (`item`) is made to arrive first: the other one's download waits for it.
+function barrier(w: World, onBoth: () => void) {
+  let arrivals = 0;
+  let release!: () => void;
+  const all = new Promise<void>((r) => { release = r; });
+  let firstIn!: () => void;
+  const firstArrived = new Promise<void>((r) => { firstIn = r; });
+  w.hold = (name) => (name.startsWith('orders-') ? firstArrived : undefined);
+  const hook: Hook = async (point) => {
+    if (point !== 'before_commit') return;
+    arrivals++;
+    if (arrivals === 1) firstIn();
+    if (arrivals === 2) { onBoth(); release(); }
+    await all;
+  };
+  return { hook, arrivals: () => arrivals };
+}
+
+test('two participants completing at the same moment: one of them is the last, proves the other again, and ends the group', async () => {
+  for (const [name, cuts, shared] of orderings) await withDir(async (path) => {
+    const w = new World();
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    const b = barrier(w, () => {});
+    const t = client(path, w, { others: ['orders', 'catalogue'], hook: b.hook });
+    try {
+      let reproofs = 0;
+      const real = t.c.jointLapsed.bind(t.c);
+      t.c.jointLapsed = async (...a: unknown[]) => { reproofs++; return real(...a); };
+      const done = await Promise.all([t.c.applyGenerations('item', true), t.c.applyGenerations('orders', true)]);
+      assert.deepEqual(done, [true, true], `${name}: both committed`);
+      assert.equal(b.arrivals(), 2, `${name}: both really were at the commit point together`);
+      assert.equal(reproofs, 1, `${name}: exactly one completion was the last and proved the other again`);
+      assertJoint(t, cuts, shared);
+      assert.equal(Number((t.db.prepare('SELECT count(*) AS n FROM _zebridge_joint_done').get() as any).n), 0, `${name}: no proof left behind`);
+    } finally { t.close(); }
+  });
+});
+
+test('two participants completing at the same moment while retention overtakes the earlier one\'s cut: it is owed again and nothing is released', async () => {
+  await withDir(async (path) => {
+    const w = new World();
+    const cuts = { item: 300, orders: 350 }, shared = { item: 40, orders: 60 };
+    w.publish(2, 5, cuts.item, shared.item, 'item');
+    w.publish(2, 4, cuts.orders, shared.orders, 'orders');
+    pairFollower(path, w);
+    // item (cut 300) commits first, as an intermediate participant; the stream then drops the events after 300 but not after 350.
+    const b = barrier(w, () => { w.streams[OWN]!.first = 330; });
+    const t = client(path, w, { others: ['orders', 'catalogue'], hook: b.hook });
+    try {
+      await Promise.all([t.c.applyGenerations('item', true), t.c.applyGenerations('orders', true)]);
+      assert.equal(b.arrivals(), 2);
+      assert.ok(seededTbl(t.db, 'orders'), 'orders (the last) committed');
+      assert.ok(!seededTbl(t.db, 'item'), 'item is owed again: its cut is no longer retained');
+      assert.equal(owed(t.db), 1);
+      assert.ok(t.c.routeParked(OWN), 'nothing was released');
+      assert.ok(t.log.some((m) => /item: joint fence not released/.test(m)));
+    } finally { t.close(); }
+    w.streams[OWN]!.first = 1;
+    w.hold = undefined;
+    const r = client(path, w, { others: ['orders', 'catalogue'] });
+    try {
+      await r.c.ensureJointRestored();
+      await seedPair(r);
+      assertJoint(r, cuts, shared);
+    } finally { r.close(); }
+  });
+});

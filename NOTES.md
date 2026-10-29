@@ -19581,6 +19581,12 @@ retention can overtake its cut, a permission can fail, or the process can die fi
    participant again (anchor removed, owed record written with `joint`), the routes staying parked for it. A crash between the proofs and the commit
    leaves the owed records, which are the group. In practice a lapse also shows as a gap on the stream (the cursor sits at the smallest cut), which
    the gap rule would take on its own; this check is the second line, and the only one when the cut that went is not the cursor's.
+   In zb-client-ts the whole decision (is another participant still owed, the re-proof, the commit's transaction, the memory handover and the
+   release of the parking) is ONE exclusive section on the chain the PREPARE uses (`prepareExclusive`). Serializing the SQL transactions alone is
+   not enough, and it was missed once: two completions that read "one other participant owed" before either wrote its commit both took
+   themselves for an intermediate participant, nobody ran the final re-proof, and the routes reopened with the proofs left behind (found in
+   review with a barrier at the commit point; `fence-apply.test.ts` has it, with and without retention overtaking the earlier cut). libzb
+   completes one pair at a time in `poll`, so it cannot interleave.
 
 **Tests.** `fence-apply.test.ts` (ten cases, run against the per-table entry point a pass uses, so they do not name the coordination: both
 orders of unequal cuts, the third table's insert at 410 that a replay must not recreate after its delete at 420, the second replacement unavailable
