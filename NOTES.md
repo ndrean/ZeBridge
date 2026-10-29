@@ -19526,7 +19526,8 @@ identity that changed.
 **Why a recorded flag and not "the stream is empty now".** An empty stream is also what a stream recreated after a lost slot looks like
 (§10bm), and that one must stay a gap until its tables are re-seeded. The restart branch resets the position to 0 and, until now, relied on
 that 0 being a gap on the next connect too if the client died before it had re-seeded anything. `born_empty` is written once, on the first
-sight of an empty stream with no position of its own, and cleared by every reset of a position (a restart, a recreation; a recreated
+sight of an empty stream with no position of its own, and cleared by every reset of a position (a restart, a recreation, and the rewind of a reconciliation, which `reconcile.py` caught: left set, an empty
+route at 0 is no gap, nothing reseeds and the marker never heals; a recreated
 stream never counts as born empty, whatever it looks like). A replica from before the column reads NULL as false: the strict rule.
 `_zbz_stream_seq` / `_zebridge_stream_seq` gain `born_empty INTEGER`, added by `ALTER TABLE` to an older replica.
 
@@ -19543,3 +19544,47 @@ tables).
 **Not done.** A client that connected while `CDC_PUBLIC` was empty and never had a position row records nothing until it first sees the
 stream, as before. The bridge could publish a marker so that `CDC_PUBLIC` is never empty; that would be a protocol change and is not needed
 for this.
+
+## The joint fence (2026-10-29)
+
+**What happened.** `zebridge_reseed` on two tables of one tenant, with the replica's position past both new chains' cuts, left the client
+refusing both for as long as it ran: 1,794 refusals in 90 s (HANDOFF, "Observed, not investigated"), 3,792 in 150 s on the live check 19 before
+the change. A seed-epoch move drops each table's anchor as its descriptor arrives, before any replacement, so both tables were unseeded when
+the first fence looked at the other. The fence's scope rule (R3, the recovery model's §3) needs every other table on a rewound route to be
+*seeded*: its applied frontier is only meaningful over rows whose coverage is known. Each fence therefore waited for the other to be seeded.
+(In one of the four live cases the untouched third table also ended wrong while it ran: 5 rows missing, 1 extra, 5 differing after 150 s. Not investigated; with the joint fence none of the four cases shows it.)
+
+**The rule.** The unseeded tables of the routes a fence rewinds take part in it, as participants. Not sequentially (let the first fence ignore
+the unseeded one and rely on it being replaced next): a manifest can exist and still be unusable by then, since its objects can disappear,
+retention can overtake its cut, a permission can fail, or the process can die first, and a promise of a replacement is not coverage. So:
+
+1. A table is a participant only if its chain, read from the hub, is proven as any chain is (same incarnation, the event after its cut still
+   retained, on its own route and on the shared one) and every object of its plan is in the object store now. One that fails keeps the old
+   refusal, words included (`X is not seeded, so its coverage on S is unknown, and it cannot be replaced with this table: <why>`). A table with
+   no chain at all is therefore still D2's refusal. The fenced table's own plan objects are checked too: nothing is prepared over a chain that
+   cannot be applied.
+2. One PREPARE transaction owes every participant (anchor cleared, `_zbz_fence` / `_zebridge_fence`, own frontier dropped), writes the
+   frontiers of the seeded tables at the positions they held, and moves each rewound cursor to the **smallest cut** among the participants.
+   The owed records are the durable list of participants. A participant's cut lowers only a cursor this fence rewinds, whose other tables the
+   scope looked at; a participant that rides another route too rewinds it in its own turn, with its own scope.
+3. The routes stay parked until the last participant has committed (zb-client-ts: every participant is an owner in `fenced`; libzb: `joint_parked`,
+   which `tailFor` and the poll loop honour). Memory only, like the other parking: after a restart the owed records are what is left, the tails
+   replay from the cursor, a participant's events are held until its anchor, the untouched tables skip through their frontiers, and the next
+   pass replaces the participants one by one.
+4. Each participant is replaced by its own call through the existing path (download, chunked apply, VERIFY, COMMIT), anchored at **its own** cut.
+   Its anchor gate then drops the events at or below that cut while the replay, which starts at the smallest cut, goes on for the others. There is
+   no single large transaction. Its retry after a crash is the ordinary owed fence: the cursor is at or below its cut, so no scope is consulted.
+5. The last participant to commit proves every earlier one again on fresh facts (`releaseJoint` / `jointCommitted`): the same incarnation, the event
+   after the cut still retained. One that fails is owed again (anchor removed, owed record written), the routes stay parked for it, and the
+   recovery is durably incomplete until a newer chain replaces it.
+
+**Tests.** `fence-apply.test.ts` (eight cases, run against the per-table entry point a pass uses, so they do not name the coordination: both
+orders of unequal cuts, the third table's insert at 410 that a replay must not recreate after its delete at 420, the second replacement unavailable
+before or after the first, a crash after chunks 1, 4 and 5 and before the verify and the commit of either participant, the retention overtaking one
+cut before the release, parking between participants, nothing prepared over a missing object) and `recreate_recovery.py` checks 19 (libzb, fault
+build) and 20 (zb-client-ts): three tables under load, both reseed orders, an abort after a chunk and the reopen, and the second table's full
+deleted from the object store until it is reseeded again. Each rule was broken on purpose and a test failed: the minimum cursor, the owed records,
+the parking, the re-proof, the release at the first commit.
+
+**Not done.** A client that is restarted while a joint fence is incomplete does not park the routes (memory only); the participants' events are
+held, bounded as every unseeded table's are. The leaf's chain is not used to prove a participant: it is always the hub's.
