@@ -4,7 +4,7 @@ A snapshot for whoever (person or LLM session) picks the work up next. It is a l
 
 ## State of `main`
 
-`main` is at `c12c507` (PR #34 merged, after #35 and #36). Everything in the table is on `main`.
+`main` is at `2a8bd7c` (PR #41 merged: it carried #39 and #40, which had been merged into their stacked base branches, after #38). Everything in the table is on `main`. Open, not merged: #42 (the upgrade procedure in OPERATIONS and CLAUDE.md).
 
 | #   | Increment                                                                                                                      | PR  |
 | --- | ------------------------------------------------------------------------------------------------------------------------------ | --- |
@@ -32,6 +32,10 @@ A snapshot for whoever (person or LLM session) picks the work up next. It is a l
 | —   | One synchronization owner per file-backed replica (libzb and zb-client-ts, `ReplicaAlreadyInUse`)                              | #34 |
 | —   | The generation producer forgets the cuts of tables that are no longer derived (a dropped table no longer fails a build a minute) | #35 |
 | —   | `shared_cut` picks a tenant with a live row                                                                                    | #36 |
+| —   | Release 0.2.8 (every package at one version; published, smoke green)                                                          | #37 |
+| —   | The internal tables an upgrade creates (`zebridge_leaf_scopes` and two more) are internal; a test that a client cannot move the GC floor | #38 |
+| —   | `isForbiddenTable()` refuses the whole `zebridge_` namespace, not six names (case ignored)                                     | #39, via #41 |
+| —   | `zebridge_enable()` and `zebridge_grant_edge_writes()` refuse the `zebridge_` prefix, like `lf-` for principals               | #40, via #41 |
 
 The decisions behind the GC floor: one database-wide retention policy, one lock-enforced sweeper, a floor that never decreases (enforced in the database), advance-then-reap, the floor read under a shared lock inside each write's transaction. NOTES "One floor, one sweeper" is the record and `gc_isolation.py` the acceptance gate. Per-publication floors were rejected (publications overlap); independent retention would be per-table floors, not built. Scenarios that run `bridge_sweeper --once` need no sweeper daemon on the same database.
 
@@ -41,7 +45,7 @@ The owner runs `run.py offline|live|owns` on two stacks, each also in mutation-a
 
 Known to need more than the default build or install, by design, and documented in the two READMEs: `receipt_faults`, `recreate_recovery` 4/13/15/19/20 and `walls` E (fault-hook builds), `hub_fallback` (`zig build endpoint-probe`), `leaf_security` (the leaf image, Docker), `archive`, `readings_roles` and the S3 case of `readings_fetch` (SeaweedFS, Compose only), `serve` (Python 3.14 or newer).
 
-Reported green on the Docker Compose stack on 2026-10-30, with every binary rebuilt: `archive.py`, the sweeper scenarios and `shared_record.py`. `drip.py` ran for only three minutes, so it is not a full run: run it for its whole duration next time. `multi_bridge.py`'s sync check failed on `main` in the sandbox that built the GC floor and has not been reported since.
+Reported green on the Docker Compose stack on 2026-10-30, with every binary rebuilt: `archive.py`, the sweeper scenarios and `shared_record.py`. `drip.py` ran its whole 70 minutes clean (20,246 ticks; the stores agreed every minute, outboxes empty, no refused verdict, the bridge's allocation flat; the hourly sweeper reaped 0 because the GC floor is a week behind). On the Canada test hub, upgraded to 0.2.8 and driven from a Mac across the Atlantic (about 100 ms), the storm: 100 of 100 clients synced cold (median 13.2 s, slowest 14.7 s), warm in a median 1.7 s, and after a NATS restart in the marker window every client came back, longest gap 2.9 s, none lost. `multi_bridge.py`'s sync check failed on `main` in the sandbox that built the GC floor and has not been reported since.
 
 ## Outstanding proof obligations
 
@@ -84,12 +88,18 @@ NOTES "A bridge that could not return, and the limits it hit" and "Identifiers a
 
 - **A slow admission verdict** (judged an outlier by the owner on 2026-10-30; no action for now, which the owner is not happy with, so keep the log timestamps idea below ready). One verdict took 3.7 s: the first write after a fresh start of the Linux stack, after `reprovision.py`. It did not repeat in the ten or so further starts I tried (first writes 25 to 300 ms, later ones 20 to 50 ms after any quiet spell, a DDL change right before the write included). The admission loop sleeps at most 20 ms and the bridge's mutation lane at most about 0.6 s, so neither explains it. `scripts/scenarios/invalidate.py` waits for the verdict instead of sleeping a fixed time. If it shows up again, log timestamps in the lane (receipt, apply, verdict publish) before guessing.
 - **`shared_record.py`.** Failed once on 2026-10-28 (steps 4 to 10 on the Compose stack) and was never explained; green on 2026-10-30 after every binary was rebuilt, and again twice that day (alone and in `owns`). A stale binary or the empty-`CDC_PUBLIC` gap (fixed by #27) are the suspects, neither shown. If it fails again, keep the log before rebuilding anything.
+- **The libzb emitter's memory grows steadily under a steady write stream.** In the 70-minute `drip` run its resident size went from 45 MB to 107 MB in a straight line (about 9 MB per 3,000 ticks); the Node watcher stayed at 112 MB and the bridge at 8 MB. `drip.py` only reports it. It may be SQLite's page cache filling toward its cap or a slow leak in the emitter path; a longer run to see whether it flattens, or `leaksoak`, would tell. Not investigated.
+- **Connect time over a long link.** On the Canada hub (about 100 ms round trip) a libzb client enrolled in about 1.0 s and connected in about 1.3 to 1.9 s, roughly 13 sequential requests. The enrollment is mostly the bridge's fresh database connection per call (757 ms from the VPS to its Supabase database across the Atlantic, measured); the connect scales with the round trip. Fewer sequential requests in the connect path is the lever; not looked at.
+- **A refused client write may get no verdict.** In the floor probe (`zebridge_gc_watermark`, refused as a forbidden table) the libzb client saw no outcome for the write within 12 s. Whether it is told at all, or its outbox keeps it pending, was not checked.
+- **A table an older bridge already refused.** A hub upgraded with a bridge that predates #38 (0.2.8 is one) keeps `zebridge_leaf_scopes` in `zebridge_suspensions` and logs `REFUSED … (no_cdc_subject)` again and again (about 40 warnings in 10 minutes on the Canada hub). After moving to a bridge with the fix, check `zebridge_suspensions` for it; the expectation that it clears is not verified.
 - **DuckDB.** The DuckDB header is vendored (1.5.x); DuckDB 2.0 LTS is out and its API compatibility with the vendored header and the `libzb` DuckDB path has not been examined. Building with and without `-Dvendor=true` compiles; nothing was run against a 2.0 library.
 
 ## Open decisions and ideas
 
-- **Release 0.2.8.** #34 to #36 are in: `scripts/version.py`, one `v*` tag, then `smoke/run.sh 0.2.8` once the packages are public. The storm test (500 libzb clients against the 2-vCPU VPS) only means something against an upgraded hub: re-apply `--init-sql` as the administrator first (the GC floor added `zebridge_gc_floor_acquire()` and others; without them every write fails with `GcFloorUnavailable`), then upgrade. `drip.py` for its whole duration, not three minutes.
+- **Releases.** 0.2.8 is published (smoke green, run by the owner). `main` has since gained #38 to #41 (and #42 once merged): a 0.2.9 is the owner's call. The Canada test hub runs 0.2.8; **the production hub has not been upgraded**: follow OPERATIONS "Upgrading a hub and a client library to a release" (the init SQL first, then the packages), and rehearse on the scratch hub first. The London database's smoke artifacts (`smoke_items`, its chain rows, four unused invites) were removed on 2026-10-30.
 - **The replica lock covers file-backed replicas only.** PostgreSQL storage, the browser and PGlite have no owner check (NOTES "One synchronization owner per replica").
+- **The database's own refusal of client writes to bridge tables is not built.** Today the only thing standing between a client and `zebridge_gc_watermark` is `isForbiddenTable()` in the bridge (with it disabled a client moved the floor, `writable.py` step 4). A trigger on each bridge-owned table, attached in the init SQL next to its `CREATE TABLE`, that refuses a write when `zb.principal` is set to anything but `zb_sweeper` would make PostgreSQL refuse it too; it needs an audit of every path that writes those tables (enrollment, the sweeper, `--revoke`, receipts) for a leftover `zb.principal`.
+- **The internal-table lists can collapse to the prefix.** `zebridge_is_internal_table()` and its two Zig mirrors are still name lists; the rule "`zebridge_` except the deliberately public `zebridge_gc_watermark`" would replace them, but "internal" (never replicate) and "never client-writable" are two questions, and `zebridge_user_tenants` is exempt in `event_processor.zig` for its own reason: check every use first.
 - **Stale leaf chains:** no age bound by design (an arbitrary cutoff would send a storm back to the hub). Age (`cut_age_ms`) and backlog (`cdc_behind`) are reported in the fence log and the `chain` measure event; a cost-based fallback and a bound on waiting for a fresh leaf can be decided on that evidence. The joint fence proves its participants from the hub only, never from a leaf's chain.
 - **Parking for a single owed fence in libzb.** zb-client-ts keeps a failed fence's routes parked in memory; libzb does not for a single fence (the tail replays from the cursor meanwhile, by design of #9–#13), only for a joint one. Whether a restart should park the routes of any owed fence is open.
 - **A re-check right before the commit in libzb.** The joint re-proof runs between the VERIFY and the commit there, a few requests apart. zb-client-ts refreshes its own proof inside the completion section; the gap rule stays necessary in both.
@@ -97,11 +107,11 @@ NOTES "A bridge that could not return, and the limits it hit" and "Identifiers a
 - **Mutation throughput on a multi-core VPS.** `ZB_INGRESS_LANES` (1 to 8) is the knob; one lane applies about 8,500 writes/s, two about 14,000, four about 19,500 on one Mac (OPERATIONS). The admission process in front of the lanes was not measured; run `examples/09-event/ramp.sh` through it before sizing a host.
 - Documentation hook: the only remaining flags are vendored `zig-pkg/tls-*` readmes.
 
-## Baselines at `808354e` (the head of #30)
+## Baselines at `2a8bd7c` (the head of #41)
 
-- Bridge: `zig build test --summary all` — 480 of 482 tests pass, 2 skipped (need a live PostgreSQL).
-- libzb: `cd libzb && zig build test --summary all` clean (56 of 59, 3 skipped).
-- TS: `cd zb-client-ts && pnpm typecheck && pnpm test` — 418 pass.
+- Bridge: `zig build test --summary all` — 486 of 488 tests pass, 2 skipped (need a live PostgreSQL). A cached run prints no counts: pass `--seed` or change something to see them.
+- libzb: `cd libzb && zig build test --summary all` clean (59 of 61, 2 skipped).
+- TS: `cd zb-client-ts && pnpm typecheck && pnpm test` — 421 pass.
 - Live, in the sandbox: `recreate_recovery.py --check` 1, 2, 3, 4, 12, 13, 14, 15, 16, 19, 20 clean; `reconcile.py` 26 of 26; `leaf_fence.py` was last run on #17; `rls_visibility.py` passes on the owner's Compose stack. A claim about recovery is not done until the live scenario passes.
 
 ## Rebuilding the local environment (sandbox recipe)
@@ -123,6 +133,7 @@ Cloud containers are ephemeral and their processes die between turns: nothing su
 
 ## Gotchas that cost time
 
+- Learned on 2026-10-30 and kept where they belong (CLAUDE.md Conventions and Pitfalls, OPERATIONS "Upgrading a hub…"): stacked PRs merge into their base branch, not `main` (PR #41); which database an env file reaches (`system_identifier`); a bare `bridge` as root is iproute2's; the smoke client's 300 s live-row window wants a script.
 - `MUTATION_ADMISSION=1` exported in the test terminal (the dev stack's admission mode) breaks the scenarios that run a private NATS stack and no admission process, `standby` and `multi_bridge`: writes get `NoStreamResponse`. Run them with it unset.
 - An interrupted scenario run (a power cut, a killed terminal) leaves its replication slot behind (`zb_hf2_…` from `hub_fallback`), and `run.py live`'s `check` then reports the orphan. Drop it as a superuser (`docker exec zb-dev-postgres psql -U postgres`); the bridge's own role may not.
 - `psql` with `DATABASE_WRITER_URL` runs under row-level security and shows no `test_types` rows even when there are some. Inspect fixtures through the scenarios' admin connection (`zb.psql`); a diagnosis of `shared_cut` nearly went wrong on this.
