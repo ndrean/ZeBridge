@@ -387,6 +387,8 @@ class Js:
 # ── one libzb client per process ─────────────────────────────────────────────
 
 class Client:
+    STOP_WAIT = 30   # seconds a process gets to see its stop file before it is killed
+
     def __init__(self, stack, name, principal, tenant, chunk_rows=None, lib=None, pg_url=None):
         """`pg_url`: the replica on PostgreSQL storage (libzb's `dbUrl`) instead of SQLite;
         the db path then only names the process's stop file."""
@@ -426,8 +428,11 @@ class Client:
             self.p = None
             return
         pathlib.Path(self.db + ".stop").touch()
-        try: self.p.wait(timeout=30)
-        except subprocess.TimeoutExpired: self.p.kill()
+        try: self.p.wait(timeout=self.STOP_WAIT)
+        except subprocess.TimeoutExpired:
+            # A killed process still holds the replica until the kernel has reaped it: the replacement must not start before.
+            self.p.kill()
+            self.p.wait()
         self.p = None
 
     def _q(self, sql, args=()):
