@@ -785,6 +785,11 @@ fn isInternalTable(name: []const u8) bool {
         std.mem.eql(u8, name, "zebridge_suspensions") or
         // Table identities and seed-epoch floors: never published, same story.
         std.mem.eql(u8, name, "zebridge_incarnations") or
+        // Created by an upgrade after the DDL trigger exists, so the trigger published them
+        // (a fresh install creates them first and never did). Bridge-owned, never replicated.
+        std.mem.eql(u8, name, "zebridge_leaf_scopes") or
+        std.mem.eql(u8, name, "zebridge_principal_keys") or
+        std.mem.eql(u8, name, "zebridge_purges") or
         std.mem.eql(u8, name, "schema_migrations");
 }
 
@@ -1220,6 +1225,11 @@ test "isInternalTable" {
     try std.testing.expect(isInternalTable("schema_migrations"));
     try std.testing.expect(isInternalTable("zebridge_suspensions"));
     try std.testing.expect(isInternalTable("zebridge_incarnations"));
+    // The tables an upgrade creates after the DDL trigger exists (a fresh install does not publish them).
+    for ([_][]const u8{ "zebridge_leaf_scopes", "zebridge_principal_keys", "zebridge_purges" }) |t|
+        try std.testing.expect(isInternalTable(t));
+    // The GC floor is public on purpose ("every client needs it"): never internal.
+    try std.testing.expect(!isInternalTable("zebridge_gc_watermark"));
     try std.testing.expect(!isInternalTable("users"));
 }
 

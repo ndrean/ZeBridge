@@ -298,6 +298,13 @@ RETURNS boolean AS $$
         'zebridge_invites',      -- enrollment codes: bridge infrastructure, never replicated
         'zebridge_suspensions',  -- the refusal registry's psql mirror (§10cy): never replicated
         'zebridge_incarnations', -- table identities and seed-epoch floors: never replicated
+        -- The tables an UPGRADE creates after the DDL trigger exists: the trigger publishes any
+        -- new table, and the bridge then refused it (a suspended internal table, an error line).
+        -- A fresh install creates them before the trigger and never saw this. All bridge-owned,
+        -- never client-replicated. `zebridge_gc_watermark` is NOT here: it is public on purpose.
+        'zebridge_leaf_scopes',   -- which tenants a leaf may cache
+        'zebridge_principal_keys', -- the keys principals enrolled with (the revocation list's input)
+        'zebridge_purges',        -- --revoke --purge bookkeeping
         -- ⚠️ the principal→tenant roster: BRIDGE INPUT (its CDC feeds $KV.tenants),
         -- never client-replicated — replicating it would disclose the roster the
         -- per-key $KV.tenants grant exists to protect (NOTES.md §1.12 part 3).

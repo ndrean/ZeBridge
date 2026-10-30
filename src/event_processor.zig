@@ -82,7 +82,19 @@ fn isInternalTable(name: []const u8) bool {
         std.mem.eql(u8, name, "zebridge_suspensions") or
         // Table identities and seed-epoch floors: same story.
         std.mem.eql(u8, name, "zebridge_incarnations") or
+        // Created by an upgrade after the DDL trigger exists, so the trigger published them
+        // (a fresh install creates them first and never did). Bridge-owned, never replicated.
+        std.mem.eql(u8, name, "zebridge_leaf_scopes") or
+        std.mem.eql(u8, name, "zebridge_principal_keys") or
+        std.mem.eql(u8, name, "zebridge_purges") or
         std.mem.eql(u8, name, "schema_migrations");
+}
+
+test "isInternalTable: the tables an upgrade creates after the DDL trigger are internal; the public GC floor is not" {
+    for ([_][]const u8{ "zebridge_leaf_scopes", "zebridge_principal_keys", "zebridge_purges", "zebridge_invites", "schema_migrations" }) |t|
+        try std.testing.expect(isInternalTable(t));
+    try std.testing.expect(!isInternalTable("zebridge_gc_watermark"));
+    try std.testing.expect(!isInternalTable("users"));
 }
 
 /// Parse a PostgreSQL LSN in its text form ("1A/2B3C4D5E") into a u64, matching the
