@@ -120,10 +120,17 @@ from the same variables by `scripts/scenarios/fence_client.mts`. A scenario fail
 - Documentation follows one-fact-one-file: put a fact in the document that owns it and link from elsewhere.
 - Use `git ls-remote origin <branch>` to confirm a push; a clone that fetches only `main` shows no upstream for other
   branches — add `remote.origin.fetch` for the branch and `git branch -u origin/<branch>`.
+- Stacked PRs: merging one whose base is a feature branch lands in that branch, not in `main` (PR #41 had to carry #39 and #40).
+  Merge top-down, or only after GitHub has retargeted each to `main`; confirm with `git merge-base --is-ancestor origin/<head> origin/main`.
+- Upgrading a hub or a client library: follow OPERATIONS "Upgrading a hub and a client library to a release" (it owns the steps,
+  rehearsed on a scratch hub). Before sending invites or DDL to a server, prove which database an env file reaches
+  (`SELECT system_identifier FROM pg_control_system()`, compared with the server's own): two hubs, two env files, one mistake.
 
 ## Pitfalls
 
 - `pkill -f <pattern>` matches the shell running it; use `pgrep -x` or the `[p]attern` trick.
+- On a server, as root, a bare `bridge` is iproute2's (`/sbin/bridge`): call `/usr/bin/bridge`. A `psql` as the writer role is
+  filtered by row-level security and shows no tenant rows; inspect with the administrator connection.
 - A tool hook may block shell commands whose text mentions secrets (environment, credentials, `.env`). Put such text in files
   written with the editor tools, and never print secret values. Reading variable _names_ is fine.
 - nats-server must be recent (the generated configs use `default_max_consumers`; v2.15 works, 2.11 does not).
