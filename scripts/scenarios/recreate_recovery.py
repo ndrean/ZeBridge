@@ -387,6 +387,8 @@ class Js:
 # ── one libzb client per process ─────────────────────────────────────────────
 
 class Client:
+    STOP_WAIT = 30   # seconds a process gets to see its stop file before it is killed
+
     def __init__(self, stack, name, principal, tenant, chunk_rows=None, lib=None, pg_url=None):
         """`pg_url`: the replica on PostgreSQL storage (libzb's `dbUrl`) instead of SQLite;
         the db path then only names the process's stop file."""
@@ -401,14 +403,18 @@ class Client:
         stack.owned.append(self)
 
     def start(self, env=None):
-        """`env`: test hooks for this process only (ZB_TEST_FENCE_*)."""
+        """`env`: test hooks for this process only (ZB_TEST_FENCE_*). A previous process that did not exit (an abort
+        that never came) is stopped first: two clients applying the same stream to one replica interleave and leave it
+        inexact (NOTES "The joint fence": the third-table mismatch was that)."""
+        self.stop()
         pathlib.Path(self.db + ".stop").unlink(missing_ok=True)
         opts = dict(natsUrl=self.stack.url, credsPath=self.stack.creds[self.principal], principal=self.principal, jsDomain="hub",
                     clientId=f"rr-{self.name}", dbPath=self.db, tables=self.tables, heartbeatMs=0,
                     **({"seedChunkRows": self.chunk_rows} if self.chunk_rows else {}),
                     **({"dbUrl": self.pg_url} if self.pg_url else {}))
-        self.p = subprocess.Popen([sys.executable, __file__, "--worker", json.dumps(opts), "--lib", self.lib], stdout=subprocess.DEVNULL,
-                                  stderr=open(self.log, "a"), env=dict(os.environ, **(env or {})))
+        with open(self.log, "a") as log:   # the child keeps its own copy of the descriptor
+            self.p = subprocess.Popen([sys.executable, __file__, "--worker", json.dumps(opts), "--lib", self.lib], stdout=subprocess.DEVNULL,
+                                      stderr=log, env=dict(os.environ, **(env or {})))
 
     def exited(self):
         """The process ended on its own (a test abort): its return code, else None."""
@@ -423,8 +429,11 @@ class Client:
             self.p = None
             return
         pathlib.Path(self.db + ".stop").touch()
-        try: self.p.wait(timeout=30)
-        except subprocess.TimeoutExpired: self.p.kill()
+        try: self.p.wait(timeout=self.STOP_WAIT)
+        except subprocess.TimeoutExpired:
+            # A killed process still holds the replica until the kernel has reaped it: the replacement must not start before.
+            self.p.kill()
+            self.p.wait()
         self.p = None
 
     def _q(self, sql, args=()):
@@ -482,11 +491,13 @@ class TsClient(Client):
     `_zebridge_*`, keyed by table alone (one tenant per table), and its answers are mapped onto
     the names the checks read."""
     def start(self, env=None):
+        self.stop()   # never two processes on one replica (Client.start)
         pathlib.Path(self.db + ".stop").unlink(missing_ok=True)
         args = ["node", "--experimental-strip-types", "--no-warnings", str(HARNESS), self.stack.url, self.stack.creds[self.principal],
                 self.db, self.principal, ",".join(self.tables), str(self.chunk_rows or 0)]
-        self.p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=open(self.log, "a"), env=dict(os.environ, **(env or {})),
-                                  cwd=zb.ROOT / "zb-client-ts")
+        with open(self.log, "a") as log:
+            self.p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=log, env=dict(os.environ, **(env or {})),
+                                      cwd=zb.ROOT / "zb-client-ts")
 
     def position(self, stream):
         r = self._q("SELECT last_seq FROM _zebridge_stream_seq WHERE stream = ?", (stream,))
@@ -854,7 +865,6 @@ async def check4(a, tmp, ts=False):
                 check(f"{name}: attempt 1 aborted after a chunk ({c.exited()}): fence owed {c.fence_pending()}, anchors {c.anchors()}, "
                       f"position {c.position('CDC_t_a')}, cut {cut}",
                       rc is not None and c.fence_pending() and c.anchors() == [] and c.position("CDC_t_a") == cut)
-                c.p = None
                 held_before = c.text().count("fence holding")
                 c.start({"ZB_TEST_FENCE_SLEEP_MS": "8000"})
                 held = await until(lambda: c.text().count("fence holding") > held_before, 90)
@@ -876,7 +886,6 @@ async def check4(a, tmp, ts=False):
                 cut = fence_cut(c)
                 check(f"{name}: after the crash — unseeded, cursor at the cut: anchors {c.anchors()}, position {c.position('CDC_t_a')}, cut {cut}",
                       cut is not None and c.anchors() == [] and c.position("CDC_t_a") == cut)
-                c.p = None
                 c.start()
                 secs = await until(lambda: recovered(c), 90)
                 check(f"{name}: reopened — recovered with a current anchor while writes continue ({secs} s)", secs is not None)
@@ -1046,7 +1055,6 @@ async def check13(a, tmp, ts=False):
                       rc is not None and cut is not None and pos == cut and c.fence_pending())
                 check(f"{name}: the frontier is durable — {fr}",
                       len(fr) == 1 and fr[0][0] == T2 and fr[0][1] == "CDC_t_a" and fr[0][2] > pos)
-                c.p = None
                 c.start()
                 secs = await until(lambda: recovered(c), 120)
                 check(f"{name}: reopened — {T} recovered while writes continue ({secs} s)", secs is not None)
@@ -1074,7 +1082,7 @@ async def check19(a, tmp, ts=False):
     """The joint fence, live: two tables of one tenant route reseeded together while the replica's position is past both
     chains' cuts, and a third table untouched (it takes inserts, updates and tombstones throughout). Each table's anchor
     goes with the epoch move, so neither fence can stay the other's untouched table: before the joint fence they refused
-    each other for ever (HANDOFF "Observed, not investigated"). Cases: both orders of the two reseeds; the client aborts
+    each other for ever (NOTES "The joint fence"). Cases: both orders of the two reseeds; the client aborts
     after a chunk and reopens; the second table's full is deleted from the object store before the client acts, so its
     replacement is unavailable until it is reseeded again. Always: no refusal, every table exact against PostgreSQL.
     ts: the same cases with a zb-client-ts client (check 20)."""
@@ -1214,7 +1222,6 @@ async def check19(a, tmp, ts=False):
                         st = await js.stream("CDC_t_a") or {}
                         note(f"{name}: purged CDC_t_a up to {max(cuts)} (cuts {cuts}): first {st.get('first')}")
                     mark = len(c.text())
-                c.p = None
                 c.start()
             secs = await until(lambda: recovered(c), 150)
             check(f"{name}: all three recovered under current anchors while writes continue ({secs} s)", secs is not None)
@@ -1289,13 +1296,11 @@ async def check15(a, tmp, ts=False):
             m, ep = await js.manifest("t_a") or {}, await js.epoch()
             return ep is not None and ep > epoch0 and m.get("seed_epoch") == ep
         note(f"the chain under the new epoch after {await until(new_chain, 90)} s (its cut is ahead of the replica's position {pos0})")
-        c.p = None
         c.start({"ZB_TEST_FENCE_ABORT": "after_chunk"})
         rc = await until(lambda: c.exited() is not None, 90)
         check(f"the reopened replica aborted after the first chunk of the full ({c.exited()})", rc is not None and c.exited() == 70)
         check(f"it is durably incomplete: owed {c.fence_pending()}, anchors {c.anchors()}, position {c.position('CDC_t_a')} (was {pos0}, a plain seed moves no cursor)",
               c.fence_pending() and c.anchors() == [] and c.position("CDC_t_a") == pos0)
-        c.p = None
         c.start()
         secs = await until(lambda: recovered(c), 120)
         check(f"reopened: recovered under a current anchor while writes continue, nothing owed ({secs} s, owed {c.fence_pending()})",
