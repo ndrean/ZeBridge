@@ -37,7 +37,7 @@ The owner runs `run.py offline|live|owns` on two stacks, each also in mutation-a
 
 Known to need more than the default build or install, by design, and documented in the two READMEs: `receipt_faults`, `recreate_recovery` 4/13/15/19/20 and `walls` E (fault-hook builds), `hub_fallback` (`zig build endpoint-probe`), `leaf_security` (the leaf image, Docker), `archive`, `readings_roles` and the S3 case of `readings_fetch` (SeaweedFS, Compose only), `serve` (Python 3.14 or newer).
 
-Not replayed on a native dev stack: `sweeper_restart.py`, `reaps.py`, `drip.py`, `tombstone_children.py` were not run in the sandbox that built the GC floor, and the `multi_bridge.py` sync check failed on `main` there too. They are in the `live` group; check the owner's latest result before assuming they pass.
+Reported green on the owner's stack on 2026-10-30, with every binary rebuilt: `archive.py`, the sweeper scenarios and `shared_record.py`. `drip.py` ran for only three minutes, so it is not a full run: run it for its whole duration next time. `multi_bridge.py`'s sync check failed on `main` in the sandbox that built the GC floor and has not been reported since.
 
 ## Outstanding proof obligations
 
@@ -66,7 +66,7 @@ Priority: a deployment security audit and a real backup/restore drill (rebuild t
 
 ## The archiver's native reader (merged, #22)
 
-`bridge_readings_fetch` + `archiver.py --reader native` (NOTES "The archiver's reader is a binary of the bridge's build"). Verified in the sandbox: unit tests, `readings_fetch.py` (A-I, with SeaweedFS), `readings_roles.py` P3 (real operator-mode grants), 500,000 readings end to end 26.8 s to 3.0 s. Still to do on a real stack: `archive.py` on the Compose stack (SeaweedFS and its keys now come with `up.sh`), the container image (copy the binary in, then `--reader native` in the image's command), `build-linux.sh` and `package-linux.sh` (edited, not run), and switching the default reader once it has run on yours.
+`bridge_readings_fetch` + `archiver.py --reader native` (NOTES "The archiver's reader is a binary of the bridge's build"). Verified in the sandbox: unit tests, `readings_fetch.py` (A-I, with SeaweedFS), `readings_roles.py` P3 (real operator-mode grants), 500,000 readings end to end 26.8 s to 3.0 s. `archive.py` has run green on the owner's stack since (2026-10-30, binaries rebuilt). Still to do on a real stack: the container image (copy the binary in, then `--reader native` in the image's command), `build-linux.sh` and `package-linux.sh` (edited, not run), and switching the default reader once it has run on yours.
 
 ## Walls (merged, #21, #23, #24)
 
@@ -80,7 +80,7 @@ NOTES "A bridge that could not return, and the limits it hit" and "Identifiers a
 
 - **The untouched third table.** While two tables of one tenant route refused each other (before the joint fence), the untouched third table of `recreate_recovery.py` check 19 ended inexact in one of four cases: 5 rows missing, 1 extra, 5 differing against PostgreSQL after 150 s, after the load had stopped (libzb, `joint_crash`, the build of 2026-10-29). The other three cases were exact. Nothing explains it: the third table was never reseeded. The joint fence removes the stuck state it was seen in, so the check no longer shows it, but that is not a cause. To reproduce, run check 19 on a tree where the joint fence is disabled (make `fenceScope` refuse unseeded tables again) and look at which events the third table's route dropped or held while the pair was stuck.
 - **A slow admission verdict.** One verdict took 3.7 s: the first write after a fresh start of the Linux stack, after `reprovision.py`. It did not repeat in the ten or so further starts I tried (first writes 25 to 300 ms, later ones 20 to 50 ms after any quiet spell, a DDL change right before the write included). The admission loop sleeps at most 20 ms and the bridge's mutation lane at most about 0.6 s, so neither explains it. `scripts/scenarios/invalidate.py` waits for the verdict instead of sleeping a fixed time. If it shows up again, log timestamps in the lane (receipt, apply, verdict publish) before guessing.
-- **`shared_record.py`.** Reported once on 2026-10-28 (steps 4 to 10 failed on the Compose stack); not reproduced since and never explained. It may have been the empty-`CDC_PUBLIC` gap, fixed by #27, but that was not shown.
+- **`shared_record.py`.** Failed once on 2026-10-28 (steps 4 to 10 on the Compose stack) and was never explained; green on 2026-10-30 after every binary was rebuilt. A stale binary or the empty-`CDC_PUBLIC` gap (fixed by #27) are the suspects, neither shown. If it fails again, keep the log before rebuilding anything.
 - **DuckDB.** The DuckDB header is vendored (1.5.x); DuckDB 2.0 LTS is out and its API compatibility with the vendored header and the `libzb` DuckDB path has not been examined. Building with and without `-Dvendor=true` compiles; nothing was run against a 2.0 library.
 
 ## Open decisions and ideas
