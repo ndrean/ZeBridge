@@ -72,10 +72,10 @@ def main():
 
     # ── 2. an UPDATE in one tenant's rows cuts that pair's next generation ───────
     tenant = next((t for t in tenants
-                   if zb.psql(f"SELECT count(*) FROM public.test_types WHERE tenant_id = '{t}'", quiet=True).strip() not in ("", "0")), None)
+                   if zb.psql(f"SELECT count(*) FROM public.test_types WHERE tenant_id = '{t}' AND deleted_at IS NULL", quiet=True).strip() not in ("", "0")), None)
     if tenant is None and tenants:
-        # A fresh stack holds no test_types rows (other scenarios of the group happen to leave some): write one, and let the
-        # cut it causes land before the baseline is taken.
+        # No tenant holds a LIVE test_types row (a fresh stack, or only the tombstones other scenarios leave: the probe
+        # below updates a live row): write one, and let the cut it causes land before the baseline is taken.
         tenant = tenants[0]
         key = f"{tenant}.test_types"
         gen_seen = (manifest(key) or {}).get("gen")
