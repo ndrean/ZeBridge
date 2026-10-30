@@ -412,8 +412,9 @@ class Client:
                     clientId=f"rr-{self.name}", dbPath=self.db, tables=self.tables, heartbeatMs=0,
                     **({"seedChunkRows": self.chunk_rows} if self.chunk_rows else {}),
                     **({"dbUrl": self.pg_url} if self.pg_url else {}))
-        self.p = subprocess.Popen([sys.executable, __file__, "--worker", json.dumps(opts), "--lib", self.lib], stdout=subprocess.DEVNULL,
-                                  stderr=open(self.log, "a"), env=dict(os.environ, **(env or {})))
+        with open(self.log, "a") as log:   # the child keeps its own copy of the descriptor
+            self.p = subprocess.Popen([sys.executable, __file__, "--worker", json.dumps(opts), "--lib", self.lib], stdout=subprocess.DEVNULL,
+                                      stderr=log, env=dict(os.environ, **(env or {})))
 
     def exited(self):
         """The process ended on its own (a test abort): its return code, else None."""
@@ -494,8 +495,9 @@ class TsClient(Client):
         pathlib.Path(self.db + ".stop").unlink(missing_ok=True)
         args = ["node", "--experimental-strip-types", "--no-warnings", str(HARNESS), self.stack.url, self.stack.creds[self.principal],
                 self.db, self.principal, ",".join(self.tables), str(self.chunk_rows or 0)]
-        self.p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=open(self.log, "a"), env=dict(os.environ, **(env or {})),
-                                  cwd=zb.ROOT / "zb-client-ts")
+        with open(self.log, "a") as log:
+            self.p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=log, env=dict(os.environ, **(env or {})),
+                                      cwd=zb.ROOT / "zb-client-ts")
 
     def position(self, stream):
         r = self._q("SELECT last_seq FROM _zebridge_stream_seq WHERE stream = ?", (stream,))

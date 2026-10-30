@@ -19,7 +19,13 @@ class ClientLifecycleTests(unittest.TestCase):
         c.name, c.principal, c.tenant, c.chunk_rows, c.lib, c.pg_url = "c", "p", "t", None, "lib", None
         c.STOP_WAIT = 0.3
         self.c, self.spawned = c, []
-        self.addCleanup(lambda: [p.kill() for p in self.spawned if p.poll() is None])
+        self.addCleanup(self.reap)
+
+    def reap(self):
+        for p in self.spawned:
+            if p.poll() is None:
+                p.kill()
+            p.wait()
 
     def popen(self, *a, **kw):
         p = REAL_POPEN([sys.executable, "-c", STUBBORN])
