@@ -103,8 +103,9 @@ CREATE OR REPLACE FUNCTION public.zebridge_grant_edge_writes(tbl regclass)
 RETURNS void AS $$
 DECLARE
     tbl_name text := tbl::text;
+    rel_name text := (SELECT relname FROM pg_class WHERE oid = tbl);
 BEGIN
-    -- ⚠️ All THREE bridge-owned tables, not just the DDL transport. Each is a
+    -- ⚠️ Every bridge-owned table, not just the DDL transport. Each is a
     -- different escalation, and the second one was proven exploitable on 2026-08-28
     -- (NOTES §10aq) before the ingress path learned to refuse it by name:
     --
@@ -122,11 +123,10 @@ BEGIN
     -- This does not revoke what the BRIDGE itself needs (the sweeper writes the
     -- watermark as bridge_writer, and must keep that grant). It refuses to hand those
     -- tables to the EDGE, which is a different question and the one that was wrong.
-    IF tbl_name IN ('zebridge_leaf_scopes', 'public.zebridge_leaf_scopes',
-                    'zebridge_ddl_events',   'public.zebridge_ddl_events',
-                    'zebridge_gc_watermark', 'public.zebridge_gc_watermark',
-                    'zebridge_user_tenants', 'public.zebridge_user_tenants',
-                    'zebridge_invites',      'public.zebridge_invites') THEN
+    -- The whole zebridge_ namespace (zebridge_enable refuses a user table with that prefix), so a
+    -- table a later release adds is covered without anyone remembering a list: it used to be
+    -- five names, in both spellings of the regclass text.
+    IF lower(left(rel_name, 9)) = 'zebridge_' THEN
         RAISE EXCEPTION 'refusing to grant edge writes on %: this is a bridge-owned '
                         'table — a forged row here reaches every client', tbl_name;
     END IF;
