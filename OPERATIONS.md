@@ -6,6 +6,7 @@ The reference for running ZeBridge: the CLI, the doctor (`--diagnose`), what nee
 
 - [The CLI](#the-cli)
 - [Diagnose](#diagnose)
+- [Upgrading a hub and a client library to a release](#upgrading-a-hub-and-a-client-library-to-a-release)
 - [Upgrading mutation receipts](#upgrading-mutation-receipts)
   - [Client requirements for indeterminate recovery](#client-requirements-for-indeterminate-recovery)
 - [Restart rules](#restart-rules)
@@ -146,6 +147,36 @@ More in [Verify the wiring](DEPLOYMENT.md#7-verify-the-wiring).
 [⬆️](#table-of-contents)
 
 ---
+
+## Upgrading a hub and a client library to a release
+
+Rehearsed on 2026-10-30 (0.2.7 to 0.2.8, a package-installed hub on a VPS). Rehearse every release on a scratch hub first; the receipt-specific rules are in [Upgrading mutation receipts](#upgrading-mutation-receipts).
+
+**Order.** Clients may go before servers: a 0.2.8 client enrolled in, seeded from and followed a 0.2.7 hub, in both directions. A server never goes before the SQL that its release needs.
+
+### The bridge
+
+1. **Get the release and check it.** `gh release download v<V> -D dist/<V>`, then `shasum -a 256 -c SHA256SUMS`. Keep the previous `.deb`: a binary rollback is not a database rollback, because step 5 changes the schema.
+2. **Check you are on the right database.** Compare `SELECT system_identifier FROM pg_control_system()` for the database your env file points to with the one the server uses (`sudo -u zebridge … psql` on the server, or the bridge's own settings). Two env files for two hubs is easy to confuse, and a wrong one receives your invites, DDL and test tables (it happened).
+3. **Render the new init SQL with the NEW bridge**, for the target's reader and writer URLs and publication: `umask 077; bridge --init-sql > zebridge-upgrade.sql`. It carries role passwords: keep it private and delete it. Read it: nothing should `DROP TABLE` or `TRUNCATE`; the `DELETE FROM` lines are inside function bodies.
+4. **Stop the writers in order**: `zebridge-admission`, then `zebridge` (it drains), then `zebridge-sweeper`. NATS stays up. Clients keep unacknowledged writes in their outboxes.
+5. **Apply the SQL as the administrator, in one transaction**: `psql "$ADMIN_DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f zebridge-upgrade.sql`. On an error nothing is applied; start the old services again.
+6. **Check the database**: `to_regprocedure('zebridge_gc_floor_acquire()')` is not null, `zebridge_private.receipt_policy.completion_guard` is true, `zebridge_gc_watermark` has one row.
+7. **Install and start.** `sudo apt-get install ./zebridge_<V>_amd64.deb`. The package has no maintainer scripts, so nothing restarts: start `zebridge-admission` (wait for `mutation admission ready` in its journal), then `zebridge`, then `zebridge-sweeper`.
+8. **Verify.** `curl 127.0.0.1:27434/status` (`slot_active` can read false for the first 30 s), the journal for warnings, and the doctor, **by its full path**: `/usr/bin/bridge --pub <PUB> --slot <SLOT> --diagnose` with the server's env loaded. Run as root, a bare `bridge` finds iproute2's `/sbin/bridge` and answers `Option "-pub" is unknown`.
+9. **Smoke one client against it** ([smoke/README.md](smoke/README.md), "One client against a real server"). The live row must be inserted within 300 s of the client's `ready:` line, so script it rather than racing it. The bridge's HTTP side (`/enroll`) listens on `127.0.0.1:27434` only: reach it through `ssh -N -L <free port>:127.0.0.1:27434 <server>`.
+
+What you may see on the first start after an upgrade: chains swept and rebuilt (`the chain … was built under incarnation 0, the table is at 1 — sweeping`) and clients re-seeding from `g1`; and one internal table (`zebridge_leaf_scopes`) refused and suspended, an `error` line that repeats and is harmless (seen with 0.2.8; fixed on `main` after it, PR #38). Not exercised: a rollback.
+
+### A client library
+
+1. **One version.** Every package carries the release's number: `scripts/version.py set <V>` then `scripts/version.py check <V>`. `set` writes file by file and stops at the first entry whose pattern no longer matches (it did when a README lost its install line): fix `PLACES` and run it again, it is idempotent.
+2. **Keep the replica and the identity.** Upgrade the package, not the data: do not wipe the replica file or `<db>.identity` to upgrade. (The 0.2.8 rehearsal used fresh replicas: opening an older replica file with a newer library was not exercised there.)
+3. **One process per replica.** The new client takes a lock on `<replica>.lock` and a second owner gets `ReplicaAlreadyInUse`: stop the old process before the new one starts, in tests as well.
+4. **Native hosts rebuild libzb for each target** and check the C ABI: `zb_abi_version()` against the version your host was written for; `scripts/scenarios/run.py offline -k abi` fails until `abi.json` and `capi.zig` agree.
+5. **Verify with the smoke client** of the release (`smoke/run.sh <V>` for the published packages; the phones by hand, [smoke/README.md](smoke/README.md)).
+
+[⬆️](#table-of-contents)
 
 ## Upgrading mutation receipts
 
