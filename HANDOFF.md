@@ -129,15 +129,6 @@ nats-server ≥ 2.15, Zig 0.17, a venv at `/opt/zenv` with `nats-py nkeys msgpac
 
    One check at a time; each takes minutes. `leaf_fence.py` and `rls_visibility.py` run the same way.
 
-## Observed, not investigated
-
-- While two tables of one tenant route refused each other (before the joint fence), the untouched third table of `recreate_recovery.py`
-  check 19 ended inexact in one of four cases: 5 rows missing, 1 extra, 5 differing against PostgreSQL after 150 s, after the load had
-  stopped (libzb, `joint_crash`, the ordinary build of that day). The other three cases were exact. Nothing explains it: the third
-  table was never reseeded. The joint fence removes the stuck state it was seen in, so the check no longer shows it, but that is not a
-  cause. To reproduce, run check 19 on a tree where the joint fence is disabled (make `fenceScope` refuse unseeded tables again) and
-  look at which events the third table's route dropped or held while the pair was stuck.
-
 ## Gotchas that cost time
 
 - Hooks block shell text that looks like secrets or env access; put it in a file written with Write/Edit.
