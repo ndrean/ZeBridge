@@ -898,7 +898,7 @@ export class ZeBridge {
   }
 
   private async initializeStorage() {
-    if (this.storage) return; // already initialized
+    if (this.storage) { this.storage.reacquire?.(); return; } // already initialized (close() gave the replica lock up)
     if (!this.dbName) throw new Error('zb-client-ts: the replica is named after the principal, which enrollment gives — call connect() first');
     
     const factory = this.config.storage ?? await this.platform.storage({ dbPath: this.dbName, engine: this.config.engine });
@@ -1515,6 +1515,8 @@ export class ZeBridge {
     if (nc) await nc.close();
     await this.outboxWork?.catch(() => {});
     for (const route of this.tailStops.keys()) await this.stopTail(route);
+    // Last: nothing of this client applies to the replica any more. connect() takes the lock again.
+    this.storage?.release?.();
   }
 
   // ─── internals ────────────────────────────────────────────────────────────

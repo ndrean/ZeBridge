@@ -19604,3 +19604,26 @@ the parking, the re-proof, the release at the first commit.
 
 **Not done.** The leaf's chain is not used to prove a participant: it is always the hub's. The libzb lapse path (a participant owed again by the
 last commit) is not exercised live: a live run needs two chains with different cuts and a purge between them.
+
+## One synchronization owner per replica (2026-10-30)
+
+SQLite serializes a database's transactions; it does not coordinate two clients' cursors, seeds and in-memory state. Two clients applying the
+same streams to one file leave it inexact (the third-table mismatch of "The joint fence" was that, caused by the scenario harness restarting a
+client whose predecessor was still running). Both clients now refuse a second owner.
+
+**The lock.** A SQLite `BEGIN EXCLUSIVE` on the sidecar `<replica>.lock`, held for the client's lifetime and taken BEFORE the replica is opened
+(migrations included): libzb in `SyncClient.init` (`storage.ReplicaLock`, released after the last close), zb-client-ts in the Node storage factory
+(`replicaLock` in `node.ts`, released by `close()`, taken again by the next `connect()`). A second owner gets `ReplicaAlreadyInUse`
+(`zb_client_connect` returns 0 and `zb_last_error` says so; the TS `connect()` throws an error with that `code`). Why SQLite's own locking and
+not `flock` or a PID file: it is the one lock both implementations can take (better-sqlite3 is the same engine), it is nonblocking (busy timeout
+0), the OS drops it when the process dies, and a PID file outlives a crash and lies. The lock is a file of its own so the replica's WAL and
+the fcntl locks SQLite keeps on it are not disturbed, and so a reader never needs it: ordinary read access (the app's read-only connection, a
+`sqlite3` shell, a backup) is unrestricted; only a competing synchronizer is refused.
+
+**Scope.** File-backed replicas: SQLite, DuckDB. Not PostgreSQL storage (`dbUrl`), the browser (OPFS) or PGlite. The empty `.lock` file is left behind on
+purpose: the lock is on the open connection, and deleting the file would race a second owner. Limit: libzb and better-sqlite3 loaded into ONE
+process do not see each other (POSIX locks are per process); a host does not do that.
+
+**Tests.** `storage.zig`/`client.zig` ("a second owner of one replica is refused…", fails with the wiring in `init` removed); `replica-lock.test.ts`
+(same process, a reader, another process, a SIGKILLed owner); both directions between the libraries were run by hand (a TS owner refuses libzb, a
+libzb owner refuses TS, free again after `zb_client_close`).
