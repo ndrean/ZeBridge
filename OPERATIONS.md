@@ -202,6 +202,8 @@ What makes this safe is that `zebridge_enable()` is the gate: its own preflight 
 The running bridge never sees a rule it should refuse. What it does see it treats the way boot does — a table it cannot route (or that lost its row) is refused on the spot and its clients get a suspension, never a bare subject that blocks the publisher.
 `zebridge_enable()` prints the bridge side as its `T3 bridge` step and the NATS side as `T4 nats`: both say there is nothing to do, since a new table needs no grant.
 
+**Reserved names: do not call your tables `zebridge_*`.** Every table whose name starts with `zebridge_` (and every table in the schema `zebridge_private`) belongs to the bridge: its catalogue, invites, key roster, GC floor and receipts. The bridge refuses every client write to such a table, whatever its grants, and treats it as its own. `zebridge_enable()` therefore refuses a user table with that prefix, with `the zebridge_ prefix is reserved for the bridge's own tables`, dry run or not, and `zebridge_grant_edge_writes()` refuses it too. It is the same kind of rule as the `lf-` prefix for leaf principals, which `zebridge_invite()` refuses for anyone else. A convention is only as strong as its door: a table you create and add to the publication by hand, without `zebridge_enable()`, is not stopped at creation, it just stays unwritable from the edge and is never a table clients can use. Rename it.
+
 ### Checking a table / database against the bridge's rules
 
 After a migration, before (or without) a bridge, ask the database itself — the same
