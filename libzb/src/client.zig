@@ -391,6 +391,9 @@ pub const SyncClient = struct {
     a: std.mem.Allocator,
     arena: std.heap.ArenaAllocator, // client-lifetime allocations (states, grammar)
     t: *transport.Transport,
+    /// The replica's single synchronization owner (storage.ReplicaLock); null on PostgreSQL storage.
+    /// Taken before the first open and dropped after the last close.
+    replica_lock: ?storage.ReplicaLock = null,
     st: storage.Storage,
     /// The app's connection: the same file, opened read-only (NOTES §10). `query` runs
     /// here and nowhere else, so the replica cannot be written around `mutate`.
@@ -672,6 +675,10 @@ pub const SyncClient = struct {
         self.startup.start();
         errdefer self.arena.deinit();
 
+        // Before anything touches the file (migrations included): a second owner is refused here,
+        // while the first one's cursors and seeds are untouched.
+        if (opts.db_url == null) self.replica_lock = try storage.ReplicaLock.acquire(std.mem.span(opts.db_path));
+        errdefer if (self.replica_lock) |*l| l.release();
         self.st = if (opts.db_url) |url|
             try storage.Storage.openPostgres(url, false)
         else if (opts.engine == .duckdb)
@@ -735,6 +742,7 @@ pub const SyncClient = struct {
         self.outcomes.deinit(self.a);
         self.ro.close();
         self.st.close();
+        if (self.replica_lock) |*l| l.release();
         self.arena.deinit();
         self.a.destroy(self);
     }
@@ -8413,6 +8421,29 @@ test "init that cannot open the database leaks nothing" {
     try std.testing.expectError(storage.Error.OpenFailed, r);
 }
 
+test "a second owner of one replica is refused before it touches the file, and the lock is released on deinit" {
+    const path = "zbz-test-lock.sqlite3";
+    const opts = Options{ .url = "nats://127.0.0.1:1", .creds_path = "/nonexistent.creds", .db_path = path, .principal = "t", .tables = &.{} };
+    defer for ([_][*:0]const u8{ path, path ++ "-wal", path ++ "-shm", path ++ ".lock" }) |f| {
+        _ = std.c.unlink(f);
+    };
+    // No broker is needed: the lock is taken before the transport dials, so a first owner that gets
+    // that far fails at the dial (its lock then released), and a held one is told apart by its error.
+    var held = (try storage.ReplicaLock.acquire(path)).?;
+    try std.testing.expectError(storage.Error.ReplicaAlreadyInUse, SyncClient.init(std.testing.allocator, opts));
+    try std.testing.expectError(storage.Error.ReplicaAlreadyInUse, storage.ReplicaLock.acquire(path));
+    held.release();
+    // Free again: init now gets past the lock and fails on the unreachable broker, not on the lock.
+    if (SyncClient.init(std.testing.allocator, opts)) |cl| cl.deinit() else |err| try std.testing.expect(err != storage.Error.ReplicaAlreadyInUse);
+    var again = (try storage.ReplicaLock.acquire(path)).?;
+    again.release();
+}
+
+test "a replica with no file has no owner to exclude" {
+    try std.testing.expect((try storage.ReplicaLock.acquire(":memory:")) == null);
+    try std.testing.expect((try storage.ReplicaLock.acquire("")) == null);
+}
+
 test "init with another protocol's grammar hash refuses, and leaks nothing — including the open database" {
     // The database DOES open here, so this is the case that used to leave a live
     // SQLite handle behind: errdefer destroyed the struct and closed nothing.
@@ -8426,6 +8457,7 @@ test "init with another protocol's grammar hash refuses, and leaks nothing — i
     });
     try std.testing.expectError(error.GrammarMismatch, r);
     _ = std.c.unlink("zbz-test-ownership.sqlite3");
+    _ = std.c.unlink("zbz-test-ownership.sqlite3.lock");
 }
 
 test "the embedded grammar parses and its hash is the bridge's form" {

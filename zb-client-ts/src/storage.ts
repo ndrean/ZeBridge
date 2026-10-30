@@ -23,6 +23,12 @@ export interface Storage {
   /// node.ts).
   transaction(fn: (tx: Exec) => Promise<void>): Promise<void>;
   deleteDatabaseFile(): Promise<void>;
+  /// One synchronization owner per file-backed replica (libzb's `ReplicaLock`, the same SQLite lock on
+  /// `<replica>.lock`). The adapter takes it when it is built and throws `ReplicaAlreadyInUse` when
+  /// another owner holds it; `close()` gives it up, and a later `connect()` takes it again. Absent on
+  /// adapters with no file of their own (browser, PGlite).
+  release?(): void;
+  reacquire?(): void;
   /// What the engine speaks (dialect.ts). Absent means SQLite — the two adapters
   /// that predate the seam. An adapter over PostgreSQL (PGlite, a local server)
   /// MUST say so: the shell picks the descriptor's `pg` block, BIGINT bookkeeping

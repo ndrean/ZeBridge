@@ -7,7 +7,30 @@ import { bindEndpointTls } from './node-tls.ts';
 import { unlink } from 'node:fs/promises';
 import type { Exec, StorageFactory } from './storage.ts';
 
+/// The single-owner lock of a file-backed replica: a SQLite `BEGIN EXCLUSIVE` held on `<replica>.lock`,
+/// the same lock libzb takes (storage.zig `ReplicaLock`), so the two clients exclude each other.
+/// Nonblocking, dropped by the OS when the process dies, and never taken by a reader.
+export const replicaLock = (dbName: string) => {
+  let held: Database.Database | null = null;
+  return {
+    acquire() {
+      if (held || dbName === '' || dbName === ':memory:') return;
+      const l = new Database(`${dbName}.lock`, { timeout: 0 });
+      try { l.exec('BEGIN EXCLUSIVE'); }
+      catch (e: any) {
+        l.close();
+        if (e?.code !== 'SQLITE_BUSY' && e?.code !== 'SQLITE_LOCKED') throw e;
+        throw Object.assign(new Error(`ReplicaAlreadyInUse: ${dbName} is held by another synchronization owner`), { code: 'ReplicaAlreadyInUse' });
+      }
+      held = l;
+    },
+    release() { held?.close(); held = null; },
+  };
+};
+
 export const nodeStorage: StorageFactory = (dbName) => {
+  const lock = replicaLock(dbName);
+  lock.acquire();   // before the file is touched: a second owner is refused with the first one's state intact
   const db = new Database(dbName);
   // 16 KB pages for a replica THIS open creates (an existing file keeps its own; the
   // pragma is a no-op once in WAL mode). §10ja, 2026-09-26: a random-key live insert
@@ -102,9 +125,12 @@ export const nodeStorage: StorageFactory = (dbName) => {
       queue = run.catch(() => {});   // a failed transaction must not wedge the lane
       return run;
     },
+    release: () => lock.release(),
+    reacquire: () => lock.acquire(),
     deleteDatabaseFile: async () => {
       if (ro) { ro.close(); ro = null; }
       db.close();
+      lock.release();
       for (const f of [dbName, dbName + '-wal', dbName + '-shm']) {
         try { await unlink(f); } catch { /* absent is fine */ }
       }

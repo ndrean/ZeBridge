@@ -13,6 +13,8 @@ const c = @import("c");
 
 pub const Error = error{
     OpenFailed,
+    /// Another synchronization owner holds this replica (`ReplicaLock`).
+    ReplicaAlreadyInUse,
     PrepareFailed,
     BindFailed,
     StepFailed,
@@ -47,6 +49,47 @@ pub const SpinLock = struct {
     }
     pub fn unlock(self: *SpinLock) void {
         self.v.store(false, .release);
+    }
+};
+
+/// One synchronization owner per file-backed replica. SQLite serializes transactions, not two
+/// clients' independent cursors, seeds and in-memory state: two owners on one file apply the same
+/// streams past each other and leave it inexact (the third-table mismatch of NOTES "The joint
+/// fence" was that, from the scenario harness). The lock is a SQLite `BEGIN EXCLUSIVE` held on the
+/// sidecar `<replica>.lock` for the owner's lifetime. SQLite's own file locking is what makes it
+/// interoperable (zb-client-ts takes the same lock through better-sqlite3), nonblocking
+/// (busy timeout 0), released by the OS when the process dies, and independent of the replica
+/// itself: readers never take it. A PID file would survive a crash and lie.
+/// Limit: two SQLite copies in ONE process (libzb beside better-sqlite3) do not see each other,
+/// POSIX locks being per process; a host does not do that.
+pub const ReplicaLock = struct {
+    db: *c.sqlite3,
+
+    /// Null for a replica with no file (`:memory:`, an empty path): nothing to own.
+    pub fn acquire(path: []const u8) Error!?ReplicaLock {
+        if (path.len == 0 or std.mem.eql(u8, path, ":memory:")) return null;
+        var buf: [4096]u8 = undefined;
+        const n = (std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}.lock", .{path}) catch return Error.OpenFailed).len;
+        buf[n] = 0;
+        const lock_path: [*:0]const u8 = buf[0..n :0];
+        var db: ?*c.sqlite3 = null;
+        if (c.sqlite3_open_v2(lock_path, &db, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE, null) != c.SQLITE_OK) {
+            if (db) |d| _ = c.sqlite3_close(d);
+            return Error.OpenFailed;
+        }
+        const d = db.?;
+        _ = c.sqlite3_busy_timeout(d, 0);
+        const rc = c.sqlite3_exec(d, "BEGIN EXCLUSIVE", null, null, null);
+        if (rc != c.SQLITE_OK) {
+            _ = c.sqlite3_close(d);
+            return if (rc == c.SQLITE_BUSY or rc == c.SQLITE_LOCKED) Error.ReplicaAlreadyInUse else Error.OpenFailed;
+        }
+        return ReplicaLock{ .db = d };
+    }
+
+    /// Closing the connection rolls the transaction back, which drops the lock.
+    pub fn release(self: *ReplicaLock) void {
+        _ = c.sqlite3_close(self.db);
     }
 };
 
