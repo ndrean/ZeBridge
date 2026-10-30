@@ -4,7 +4,7 @@ A snapshot for whoever (person or LLM session) picks the work up next. It is a l
 
 ## State of `main`
 
-`main` is at `21289a2` (PR #30 merged). Everything in the table is on `main`.
+`main` is at `c12c507` (PR #34 merged, after #35 and #36). Everything in the table is on `main`.
 
 | #   | Increment                                                                                                                      | PR  |
 | --- | ------------------------------------------------------------------------------------------------------------------------------ | --- |
@@ -28,12 +28,16 @@ A snapshot for whoever (person or LLM session) picks the work up next. It is a l
 | —   | `--diagnose`: a dropped tenant-scoped table is not a warning                                                                   | #28 |
 | —   | Admission-mode dev stacks, repeatable fixtures; `scripts/linux` (the stack without Docker); READMEs rewritten with install checklists | #29 |
 | —   | The joint fence (both clients, durable across a restart) and the admission refusal counters                                    | #30 |
+| —   | Scenario harness: never two client processes on one replica (the third-table mismatch was this, not the recovery code)          | #32 |
+| —   | One synchronization owner per file-backed replica (libzb and zb-client-ts, `ReplicaAlreadyInUse`)                              | #34 |
+| —   | The generation producer forgets the cuts of tables that are no longer derived (a dropped table no longer fails a build a minute) | #35 |
+| —   | `shared_cut` picks a tenant with a live row                                                                                    | #36 |
 
 The decisions behind the GC floor: one database-wide retention policy, one lock-enforced sweeper, a floor that never decreases (enforced in the database), advance-then-reap, the floor read under a shared lock inside each write's transaction. NOTES "One floor, one sweeper" is the record and `gc_isolation.py` the acceptance gate. Per-publication floors were rejected (publications overlap); independent retention would be per-table floors, not built. Scenarios that run `bridge_sweeper --once` need no sweeper daemon on the same database.
 
 ## Where the scenario batteries stand
 
-The owner runs `run.py offline|live|owns` on two stacks, each also in mutation-admission mode (`bridge --mutation-ingress` plus `MUTATION_ADMISSION=1`): the Docker Compose stack (`scripts/dev`, macOS) and the plain-process stack (`scripts/linux`, Ubuntu with PostgreSQL 16). The last results reported to me, before the fixes of #29 and #30 were pulled there, were 62 of 66 on Compose (failures: `reconcile`, which was a real client regression fixed in `14ffad1`, and three S3 scenarios that lacked credentials, since fixed by generating `scripts/dev/state/s3.json`) and 53 of 66 on Linux (missing builds and installs, listed in `scripts/linux/README.md`, plus `reconcile`, `shared_cut` and `standby`, fixed). A rerun after those fixes has not been reported to me, so treat the numbers as stale.
+The owner runs `run.py offline|live|owns` on two stacks, each also in mutation-admission mode (`bridge --mutation-ingress` plus `MUTATION_ADMISSION=1`): the Docker Compose stack (`scripts/dev`, macOS) and the plain-process stack (`scripts/linux`, Ubuntu with PostgreSQL 16). Compose, 2026-10-30, every binary rebuilt, on the replica-lock branch (#34, since merged): `live` 62 of 66 on the first run and 66 of 66 after the explained reruns (`check`: an orphan slot left by an interrupted earlier run; `standby` and `multi_bridge`: `MUTATION_ADMISSION=1` was exported, and they run private NATS stacks with no admission process; `shared_cut`: its tenant picker, fixed in #36), and `owns` 47 of 47. Linux: the last numbers reported to me, 53 of 66 before the fixes of #29 and #30 were pulled there, are stale.
 
 Known to need more than the default build or install, by design, and documented in the two READMEs: `receipt_faults`, `recreate_recovery` 4/13/15/19/20 and `walls` E (fault-hook builds), `hub_fallback` (`zig build endpoint-probe`), `leaf_security` (the leaf image, Docker), `archive`, `readings_roles` and the S3 case of `readings_fetch` (SeaweedFS, Compose only), `serve` (Python 3.14 or newer).
 
@@ -78,13 +82,14 @@ NOTES "A bridge that could not return, and the limits it hit" and "Identifiers a
 
 ## Observed, not investigated
 
-- **The untouched third table** (under investigation by the owner since 2026-10-30; write the finding here when there is one). While two tables of one tenant route refused each other (before the joint fence), the untouched third table of `recreate_recovery.py` check 19 ended inexact in one of four cases: 5 rows missing, 1 extra, 5 differing against PostgreSQL after 150 s, after the load had stopped (libzb, `joint_crash`, the build of 2026-10-29). The other three cases were exact. Nothing explains it: the third table was never reseeded. The joint fence removes the stuck state it was seen in, so the check no longer shows it, but that is not a cause. To reproduce, run check 19 on a tree where the joint fence is disabled (make `fenceScope` refuse unseeded tables again) and look at which events the third table's route dropped or held while the pair was stuck.
 - **A slow admission verdict** (judged an outlier by the owner on 2026-10-30; no action for now, which the owner is not happy with, so keep the log timestamps idea below ready). One verdict took 3.7 s: the first write after a fresh start of the Linux stack, after `reprovision.py`. It did not repeat in the ten or so further starts I tried (first writes 25 to 300 ms, later ones 20 to 50 ms after any quiet spell, a DDL change right before the write included). The admission loop sleeps at most 20 ms and the bridge's mutation lane at most about 0.6 s, so neither explains it. `scripts/scenarios/invalidate.py` waits for the verdict instead of sleeping a fixed time. If it shows up again, log timestamps in the lane (receipt, apply, verdict publish) before guessing.
-- **`shared_record.py`.** Failed once on 2026-10-28 (steps 4 to 10 on the Compose stack) and was never explained; green on 2026-10-30 after every binary was rebuilt. A stale binary or the empty-`CDC_PUBLIC` gap (fixed by #27) are the suspects, neither shown. If it fails again, keep the log before rebuilding anything.
+- **`shared_record.py`.** Failed once on 2026-10-28 (steps 4 to 10 on the Compose stack) and was never explained; green on 2026-10-30 after every binary was rebuilt, and again twice that day (alone and in `owns`). A stale binary or the empty-`CDC_PUBLIC` gap (fixed by #27) are the suspects, neither shown. If it fails again, keep the log before rebuilding anything.
 - **DuckDB.** The DuckDB header is vendored (1.5.x); DuckDB 2.0 LTS is out and its API compatibility with the vendored header and the `libzb` DuckDB path has not been examined. Building with and without `-Dvendor=true` compiles; nothing was run against a 2.0 library.
 
 ## Open decisions and ideas
 
+- **Release 0.2.8.** #34 to #36 are in: `scripts/version.py`, one `v*` tag, then `smoke/run.sh 0.2.8` once the packages are public. The storm test (500 libzb clients against the 2-vCPU VPS) only means something against an upgraded hub: re-apply `--init-sql` as the administrator first (the GC floor added `zebridge_gc_floor_acquire()` and others; without them every write fails with `GcFloorUnavailable`), then upgrade. `drip.py` for its whole duration, not three minutes.
+- **The replica lock covers file-backed replicas only.** PostgreSQL storage, the browser and PGlite have no owner check (NOTES "One synchronization owner per replica").
 - **Stale leaf chains:** no age bound by design (an arbitrary cutoff would send a storm back to the hub). Age (`cut_age_ms`) and backlog (`cdc_behind`) are reported in the fence log and the `chain` measure event; a cost-based fallback and a bound on waiting for a fresh leaf can be decided on that evidence. The joint fence proves its participants from the hub only, never from a leaf's chain.
 - **Parking for a single owed fence in libzb.** zb-client-ts keeps a failed fence's routes parked in memory; libzb does not for a single fence (the tail replays from the cursor meanwhile, by design of #9–#13), only for a joint one. Whether a restart should park the routes of any owed fence is open.
 - **A re-check right before the commit in libzb.** The joint re-proof runs between the VERIFY and the commit there, a few requests apart. zb-client-ts refreshes its own proof inside the completion section; the gap rule stays necessary in both.
@@ -118,6 +123,9 @@ Cloud containers are ephemeral and their processes die between turns: nothing su
 
 ## Gotchas that cost time
 
+- `MUTATION_ADMISSION=1` exported in the test terminal (the dev stack's admission mode) breaks the scenarios that run a private NATS stack and no admission process, `standby` and `multi_bridge`: writes get `NoStreamResponse`. Run them with it unset.
+- An interrupted scenario run (a power cut, a killed terminal) leaves its replication slot behind (`zb_hf2_…` from `hub_fallback`), and `run.py live`'s `check` then reports the orphan. Drop it as a superuser (`docker exec zb-dev-postgres psql -U postgres`); the bridge's own role may not.
+- `psql` with `DATABASE_WRITER_URL` runs under row-level security and shows no `test_types` rows even when there are some. Inspect fixtures through the scenarios' admin connection (`zb.psql`); a diagnosis of `shared_cut` nearly went wrong on this.
 - Hooks block shell text that looks like secrets or env access; put it in a file written with Write/Edit.
 - `pkill -f` kills the shell running it. Use `pgrep -x` or the `[p]attern` trick, in a call of its own.
 - The Zig test runner fails a test that logs at `err`; use `log.warn` for conditions a test provokes. Zig 0.17 rejects `"x" ** 200` in a test body ("binary operator has whitespace on one side"): build such strings with `@memset`.
