@@ -26,7 +26,6 @@ PLACES = [
     ("zb-android/build.gradle.kts", rf'(coordinates\("eu\.zebridge", "zebridge-android", ")({V})("\))', 1),
     # The docs' install lines.
     ("zb-android/README.md", rf'(eu\.zebridge:zebridge-android:)({V})()', 1),
-    ("README.md", rf'(eu\.zebridge:zebridge-android:)({V})()', 1),
     # The images a deployment runs by default: the release's own.
     ("docker-compose.quickstart.yml", rf"(ZB_VERSION(?::-|=))({V})()", 4),
     ("deploy/compose/compose.yml", rf"(ZB_VERSION:-)({V})()", 1),
