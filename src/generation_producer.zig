@@ -100,7 +100,9 @@ pub const GenerationProducer = struct {
     /// that pair alone needs. Written by the builds — on worker threads when
     /// GENERATION_WORKERS > 1 (§10ev) — and read by the edge watch on the producer's
     /// thread: `cuts_lock` guards the map, held for a lookup. Keys and strings are
-    /// owned by `allocator` and live until deinit, so a copy of a Cut stays valid.
+    /// owned by `allocator` and live until deinit (or until `forgetUnpublishedCuts` drops the
+    /// pair, on the producer's own thread between ticks), so a copy of a Cut stays valid for
+    /// the edge check that took it.
     cuts: std.array_hash_map.String(Cut) = .empty,
     cuts_lock: utils.SpinLock = .{},
     /// The pairs whose publication the row-level-security guard is blocking (rls_guard.zig).
@@ -535,6 +537,11 @@ pub const GenerationProducer = struct {
         self.sweepDeparted(alloc, bkc, &js, published_lit.items) catch |err| {
             log.warn("🧬 departure sweep failed: {} — next cadence retries", .{err});
         };
+        {
+            const names = try alloc.alloc([]const u8, n_tables);
+            for (names, 0..) |*nm, i| nm.* = std.mem.span(c.PQgetvalue(derived, @intCast(i), 0));
+            self.forgetUnpublishedCuts(names);
+        }
         for (0..n_tables) |i| {
             if (self.should_stop.load(.acquire)) return;
             const table = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(derived, @intCast(i), 0)));
@@ -602,6 +609,28 @@ pub const GenerationProducer = struct {
         }
         self.runJobs(cs, jobs.items, false);
         log.debug("🧬 tick: {d} published table(s) derived, {d} (table, tenant) pair(s) built or checked", .{ n_tables, pairs });
+    }
+
+    /// A pair whose table is no longer derived (dropped, left the publication, opted out) has nothing
+    /// to cut. Its record in `cuts` used to live for the whole process: the edge watch kept asking for
+    /// the pair and every build failed ("relation does not exist"), once a minute per tenant, until a
+    /// restart. A table that comes back is recorded again by its next build.
+    fn forgetUnpublishedCuts(self: *GenerationProducer, published: []const []const u8) void {
+        self.cuts_lock.lock();
+        defer self.cuts_lock.unlock();
+        var i = self.cuts.count();
+        while (i > 0) {
+            i -= 1;
+            const cut = self.cuts.values()[i];
+            const listed = for (published) |name| {
+                if (std.mem.eql(u8, name, cut.table)) break true;
+            } else false;
+            if (listed) continue;
+            const key = self.cuts.keys()[i];
+            self.cuts.swapRemoveAt(i);   // before the frees: removing hashes the key
+            for ([_][]const u8{ cut.tenant, cut.table, cut.vcol, cut.tcol, cut.tenant_col, cut.stream }) |str| self.allocator.free(str);
+            self.allocator.free(key);
+        }
     }
 
     /// One (table, tenant) build for the pool: what `buildOne` needs, every string
@@ -2775,6 +2804,33 @@ const mp = struct {
         try out.appendSlice(a, b);
     }
 };
+
+test "forgetUnpublishedCuts: a dropped table's pairs leave the edge watch, a published table's stay" {
+    const a = std.testing.allocator;
+    var p: GenerationProducer = undefined;
+    p.allocator = a;
+    p.cuts = .empty;
+    p.cuts_lock = .{};
+    defer {
+        for (p.cuts.keys(), p.cuts.values()) |k, cut| {
+            for ([_][]const u8{ cut.tenant, cut.table, cut.vcol, cut.tcol, cut.tenant_col, cut.stream }) |str| a.free(str);
+            a.free(k);
+        }
+        p.cuts.deinit(a);
+    }
+    const pairs = [_][2][]const u8{ .{ "acme", "kept" }, .{ "kilo", "kept" }, .{ "acme", "dropped" }, .{ "kilo", "dropped" } };
+    for (pairs) |pr| {
+        try p.cuts.put(a, try std.fmt.allocPrint(a, "{s}.{s}", .{ pr[0], pr[1] }), .{
+            .tenant = try a.dupe(u8, pr[0]), .table = try a.dupe(u8, pr[1]), .vcol = try a.dupe(u8, "ver"), .tcol = try a.dupe(u8, ""),
+            .tenant_col = try a.dupe(u8, "tenant_id"), .guarded = false, .stream = try a.dupe(u8, "CDC_x"), .cutoff_seq = 1, .build_ms = 1,
+        });
+    }
+    p.forgetUnpublishedCuts(&.{"kept"});
+    try std.testing.expectEqual(@as(usize, 2), p.cuts.count());
+    try std.testing.expect(p.cuts.contains("acme.kept") and p.cuts.contains("kilo.kept"));
+    p.forgetUnpublishedCuts(&.{});
+    try std.testing.expectEqual(@as(usize, 0), p.cuts.count());
+}
 
 test "mp: the chain document's shapes decode as msgpack" {
     const a = std.testing.allocator;
