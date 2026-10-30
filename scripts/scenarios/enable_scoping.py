@@ -115,7 +115,22 @@ async def main():
             CREATE TABLE public.ro_indexed (uid uuid PRIMARY KEY, tenant_id text NOT NULL, v int, updated_at timestamptz NOT NULL);
             CREATE INDEX ro_indexed_mine ON public.ro_indexed (updated_at, uid);
             CREATE TABLE public.ro_optout (uid uuid PRIMARY KEY, tenant_id text NOT NULL, v int, updated_at timestamptz NOT NULL);
+            CREATE TABLE public.zebridge_notes (uid uuid PRIMARY KEY, tenant_id text NOT NULL, v int, updated_at timestamptz NOT NULL);
         """)
+
+        # 0. the zebridge_ prefix is the bridge's own, like lf- for principals: refused at the door, with the reason
+        r = sql(f"SELECT * FROM public.zebridge_enable('public.zebridge_notes'::regclass, tenant_col => 'tenant_id', "
+                f"publication => '{PUB}', dry_run => false)", stop=False)
+        check("0. a table named zebridge_* is refused by zebridge_enable, naming the reserved prefix, nothing applied",
+              r.returncode != 0 and "zebridge_ prefix is reserved" in r.stderr and not published("zebridge_notes") and not rls("zebridge_notes"),
+              r.stderr.strip()[:300])
+        r = sql(f"SELECT * FROM public.zebridge_enable('public.zebridge_notes'::regclass, tenant_col => 'tenant_id', "
+                f"publication => '{PUB}')", stop=False)   # dry_run by default
+        check("0b. …also as a dry run: the answer is the same, not a plan",
+              r.returncode != 0 and "zebridge_ prefix is reserved" in r.stderr, r.stderr.strip()[:300])
+        r = sql("SELECT public.zebridge_grant_edge_writes('public.zebridge_notes'::regclass)", stop=False)
+        check("0c. …and no edge write can be granted on it (the prefix, not a list of names)",
+              r.returncode != 0 and "bridge-owned" in r.stderr, r.stderr.strip()[-200:])
 
         # 1. read-only tenant table
         rows = enable("ro_tenant", f"tenant_col => 'tenant_id', publication => '{PUB}', dry_run => false")

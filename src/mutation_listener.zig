@@ -2300,13 +2300,15 @@ pub const MutationListener = struct {
     /// could change without anyone connecting it to this. `zebridge_gc_watermark` IS in
     /// the catalogue, which is the whole difference between the three, and it is the
     /// one that was actually exploited (§10aq).
+    ///
+    /// The rule is the NAMESPACE, not a list: every `zebridge_` table is the bridge's (the
+    /// catalogue, the invites, the GC floor, the key roster, the purges, whatever the next
+    /// release adds), and `schema_migrations` is the migration tool's. A list of names had to
+    /// be remembered at each new table (it was missing `zebridge_principal_keys` and
+    /// `zebridge_purges`, protected only by their absence from the catalogue). The case of the
+    /// client-chosen token is ignored. NOTES "Bridge-owned tables an upgrade creates".
     fn isForbiddenTable(table: []const u8) bool {
-        return std.mem.eql(u8, table, "zebridge_leaf_scopes") or
-            std.mem.eql(u8, table, "zebridge_ddl_events") or
-            std.mem.eql(u8, table, "zebridge_gc_watermark") or
-            std.mem.eql(u8, table, "zebridge_user_tenants") or
-            std.mem.eql(u8, table, "zebridge_invites") or
-            std.mem.eql(u8, table, "schema_migrations");
+        return std.ascii.startsWithIgnoreCase(table, "zebridge_") or std.ascii.eqlIgnoreCase(table, "schema_migrations");
     }
 
     /// Read a table's identifiers from the catalog, once, and remember them.
@@ -3884,6 +3886,18 @@ test "the bridge's own tables are never writable from the edge" {
     try testing.expect(MutationListener.isForbiddenTable("zebridge_ddl_events"));
     try testing.expect(MutationListener.isForbiddenTable("schema_migrations"));
     try testing.expect(!MutationListener.isForbiddenTable("users"));
+}
+
+test "the whole zebridge_ namespace is forbidden, not a list of names: a table added later is covered" {
+    // Reachable today only because they are not in the catalogue, which is not a control.
+    for ([_][]const u8{ "zebridge_principal_keys", "zebridge_purges", "zebridge_gc_watermark", "zebridge_a_table_added_next_year" }) |t|
+        try testing.expect(MutationListener.isForbiddenTable(t));
+    // A client chooses the table token: the case of the name must not get it past the check.
+    try testing.expect(MutationListener.isForbiddenTable("ZEBRIDGE_GC_WATERMARK"));
+    try testing.expect(MutationListener.isForbiddenTable("Schema_Migrations"));
+    // The prefix is the namespace, not a substring: a user table that merely contains it is theirs.
+    try testing.expect(!MutationListener.isForbiddenTable("my_zebridge_notes"));
+    try testing.expect(!MutationListener.isForbiddenTable("zebridge"));
 }
 
 test "identifiers are quoted, and an embedded quote cannot escape" {
