@@ -2111,6 +2111,21 @@ DECLARE
     r           record;
     ri_cols     text;
 BEGIN
+    -- ── the zebridge_ prefix is the bridge's own ──────────────────────────────
+    --
+    -- Every table named zebridge_* is the bridge's (the catalogue, the invites, the GC floor,
+    -- the key roster...), and the bridge refuses a client write to any of them by that prefix
+    -- (mutation_listener.isForbiddenTable). A user table with such a name would be silently
+    -- unreplicated and unwritable, so it is refused HERE, loudly, in the same shape as the
+    -- `lf-` prefix for principals (zebridge_invite). A RAISE, for the same reason as the
+    -- publication check below: the call is malformed, whatever dry_run says.
+    IF lower(left(short, 9)) = 'zebridge_'
+       OR (SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = tbl) = 'zebridge_private' THEN
+        RAISE EXCEPTION 'zebridge_enable(%): the zebridge_ prefix is reserved for the bridge''s own tables', tbl
+            USING HINT = 'Rename the table. Names starting with zebridge_ (and the zebridge_private schema) belong '
+                         'to the bridge: it never replicates them and never accepts a client write to them.';
+    END IF;
+
     -- ── the publication must be NAMED, and may only be created on request ─────
     --
     -- A RAISE, not one of this function's ERROR rows: an enable that does not name
