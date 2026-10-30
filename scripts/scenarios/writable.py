@@ -186,17 +186,17 @@ async def main():
 
     task = asyncio.create_task(collect())
 
-    async def send(table, key):
+    async def send(table, key, extra=None, op="insert"):
         v = version_now()
-        msg_id = f"scenario-{table}-{list(key.values())[0]}"
+        msg_id = f"scenario-{table}-{op}-{list(key.values())[0]}"
         payload = {
             "key": key,
-            "data": {**key, "updated_at": v},
+            "data": {**key, **(extra or {}), "updated_at": v},
             "version": v,
             "client_id": "scenario-writable",
         }
         subject = zb.subject(
-            zb.TOPOLOGY["subjects"]["mutations_prefix"], who, table, "insert"
+            zb.TOPOLOGY["subjects"]["mutations_prefix"], who, table, op
         )
         # The msg_id is the correlation token *and* becomes a subject token, so it must
         # avoid `.`, `*`, `>` and whitespace — a value carrying a dot silently changes the
@@ -269,6 +269,26 @@ async def main():
         elif v.get("sqlstate") != "42501":
             zb.bad(f"expected SQLSTATE 42501 (insufficient_privilege), got {v.get('sqlstate')!r}")
             failed += 1
+
+    # ── 4. a client cannot move the GC floor ─────────────────────────────────────
+    #
+    # `zebridge_gc_watermark` is public on purpose (every client reads the floor) and the bridge's
+    # writer holds UPDATE on it for the sweeper. A client write must still be refused: a forward
+    # move would make honest writes PredatesGcWatermark and let the sweeper reap early. One minute
+    # ahead, so a regression moves the floor by a harmless amount (it never goes back down).
+    floor_sql = "SELECT watermark FROM public.zebridge_gc_watermark"
+    floor_before = zb.psql(floor_sql).strip()
+    ahead = zb.psql("SELECT to_char(watermark + interval '1 minute', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') "
+                    "FROM public.zebridge_gc_watermark").strip()
+    print("\nsending an UPDATE that moves the GC floor one minute ahead (expected: refused)")
+    await send("zebridge_gc_watermark", {"id": 1}, {"watermark": ahead}, op="update")
+    await asyncio.sleep(4)
+    floor_after = zb.psql(floor_sql).strip()
+    if floor_after != floor_before:
+        zb.bad(f"a client moved the GC floor: {floor_before} -> {floor_after}")
+        failed += 1
+    else:
+        zb.ok("a client write to the GC floor is refused: the floor did not move")
 
     task.cancel()
     await nc.close()
