@@ -1,6 +1,6 @@
 [project]
 name = "zebridge"
-version = "0.2.7"
+version = "0.2.8"
 description = "ZeBridge client: a local replica of PostgreSQL through NATS, over libzb's C ABI"
 readme = "README.md"
 requires-python = ">=3.10"
