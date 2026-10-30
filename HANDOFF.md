@@ -37,7 +37,7 @@ The owner runs `run.py offline|live|owns` on two stacks, each also in mutation-a
 
 Known to need more than the default build or install, by design, and documented in the two READMEs: `receipt_faults`, `recreate_recovery` 4/13/15/19/20 and `walls` E (fault-hook builds), `hub_fallback` (`zig build endpoint-probe`), `leaf_security` (the leaf image, Docker), `archive`, `readings_roles` and the S3 case of `readings_fetch` (SeaweedFS, Compose only), `serve` (Python 3.14 or newer).
 
-Reported green on the owner's stack on 2026-10-30, with every binary rebuilt: `archive.py`, the sweeper scenarios and `shared_record.py`. `drip.py` ran for only three minutes, so it is not a full run: run it for its whole duration next time. `multi_bridge.py`'s sync check failed on `main` in the sandbox that built the GC floor and has not been reported since.
+Reported green on the Docker Compose stack on 2026-10-30, with every binary rebuilt: `archive.py`, the sweeper scenarios and `shared_record.py`. `drip.py` ran for only three minutes, so it is not a full run: run it for its whole duration next time. `multi_bridge.py`'s sync check failed on `main` in the sandbox that built the GC floor and has not been reported since.
 
 ## Outstanding proof obligations
 
@@ -66,7 +66,7 @@ Priority: a deployment security audit and a real backup/restore drill (rebuild t
 
 ## The archiver's native reader (merged, #22)
 
-`bridge_readings_fetch` + `archiver.py --reader native` (NOTES "The archiver's reader is a binary of the bridge's build"). Verified in the sandbox: unit tests, `readings_fetch.py` (A-I, with SeaweedFS), `readings_roles.py` P3 (real operator-mode grants), 500,000 readings end to end 26.8 s to 3.0 s. `archive.py` has run green on the owner's stack since (2026-10-30, binaries rebuilt). Still to do on a real stack: the container image (copy the binary in, then `--reader native` in the image's command), `build-linux.sh` and `package-linux.sh` (edited, not run), and switching the default reader once it has run on yours.
+`bridge_readings_fetch` + `archiver.py --reader native` (NOTES "The archiver's reader is a binary of the bridge's build"). Verified in the sandbox: unit tests, `readings_fetch.py` (A-I, with SeaweedFS), `readings_roles.py` P3 (real operator-mode grants), 500,000 readings end to end 26.8 s to 3.0 s. `archive.py` has run green on the Docker Compose stack since (2026-10-30, binaries rebuilt). Still to do on a real stack: the container image (copy the binary in, then `--reader native` in the image's command), `build-linux.sh` and `package-linux.sh` (edited, not run), and switching the default reader once it has run on yours.
 
 ## Walls (merged, #21, #23, #24)
 
