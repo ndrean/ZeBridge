@@ -35,6 +35,12 @@ pub const Inputs = struct {
     enroll: ?Http.EnrollCtx = null,
 };
 
+/// Whether the environment names any way to log in: a user (from the URL), a bare nkey seed, or a
+/// .creds file. The doctor's two NATS messages hang on this answer.
+fn hasNatsCredentials(endpoint: Conf.Nats.Endpoint) bool {
+    return endpoint.user != null or endpoint.seed != null or endpoint.creds != null;
+}
+
 /// Returns the number of findings. Warnings are printed and not counted.
 pub fn run(allocator: std.mem.Allocator, io: std.Io, in: Inputs) usize {
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -63,10 +69,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, in: Inputs) usize {
     defer publisher.deinit();
     publisher.connect() catch |err| {
         findings += 1;
-        if (endpoint.user == null and endpoint.seed == null) {
+        if (!hasNatsCredentials(endpoint)) {
             log.err("🔴 NATS refused at {s}:{d} ({s}): this environment carries no NATS credentials. NATS_CREDS is not set: load .env.nats in the same shell (sudo starts a clean environment, and the file is readable by its owner only).", .{ endpoint.host, endpoint.port, @errorName(err) });
         } else {
-            log.err("🔴 NATS is not reachable at {s}:{d} ({s}) with this environment's credentials: a bridge started now would not connect. Check NATS_URL and NATS_CREDS in .env.nats.", .{ endpoint.host, endpoint.port, @errorName(err) });
+            log.err("🔴 NATS is not reachable at {s}:{d} ({s}) with this environment's credentials: a bridge started now would not connect. Check NATS_URL and NATS_CREDS in .env.nats, that the creds file is readable by the user running this (it belongs to the service's user), and that the account allows one more connection.", .{ endpoint.host, endpoint.port, @errorName(err) });
         }
         return findings;
     };
@@ -300,6 +306,14 @@ fn printGroup(a: std.mem.Allocator, g: Group) void {
         .warn => log.warn("⚠️  {s}\n    {d} {s}: {s}", .{ g.text, g.items.items.len, what, names }),
         .info => log.info("ℹ️  {s}\n    {d} {s}: {s}", .{ g.text, g.items.items.len, what, names }),
     }
+}
+
+test "a creds-file login counts as credentials: the doctor must not say NATS_CREDS is not set when it is" {
+    try std.testing.expect(!hasNatsCredentials(.{}));
+    try std.testing.expect(hasNatsCredentials(.{ .user = "u", .pass = "p" }));
+    try std.testing.expect(hasNatsCredentials(.{ .seed = "SU..." }));
+    // The case that was reported: NATS_CREDS set, the connection refused for another reason.
+    try std.testing.expect(hasNatsCredentials(.{ .creds = "/etc/zebridge/creds/bridge.creds" }));
 }
 
 test "findings group by text, tables listed once per group" {
