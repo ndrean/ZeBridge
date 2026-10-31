@@ -35,6 +35,27 @@ pub const Inputs = struct {
     enroll: ?Http.EnrollCtx = null,
 };
 
+/// Whether the environment names any way to log in: a user (from the URL), a bare nkey seed, or a
+/// .creds file. The doctor's two NATS messages hang on this answer.
+fn hasNatsCredentials(endpoint: Conf.Nats.Endpoint) bool {
+    return endpoint.user != null or endpoint.seed != null or endpoint.creds != null;
+}
+
+/// Why `connect()` failed, as far as the environment can tell. `AccessDenied` here is the operating
+/// system's EACCES: the client reads the creds file BEFORE it talks to the server, so a user who may not
+/// open the file gets it. A server that rejects the login answers `AuthorizationViolation`. Both used to be
+/// reported as "NATS refused".
+const Refusal = enum { no_credentials, creds_file_unreadable, creds_file_missing, other };
+
+fn classifyRefusal(endpoint: Conf.Nats.Endpoint, err: anyerror) Refusal {
+    if (!hasNatsCredentials(endpoint)) return .no_credentials;
+    if (endpoint.creds != null) {
+        if (err == error.AccessDenied) return .creds_file_unreadable;
+        if (err == error.FileNotFound) return .creds_file_missing;
+    }
+    return .other;
+}
+
 /// Returns the number of findings. Warnings are printed and not counted.
 pub fn run(allocator: std.mem.Allocator, io: std.Io, in: Inputs) usize {
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -63,10 +84,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, in: Inputs) usize {
     defer publisher.deinit();
     publisher.connect() catch |err| {
         findings += 1;
-        if (endpoint.user == null and endpoint.seed == null) {
-            log.err("🔴 NATS refused at {s}:{d} ({s}): this environment carries no NATS credentials. NATS_CREDS is not set: load .env.nats in the same shell (sudo starts a clean environment, and the file is readable by its owner only).", .{ endpoint.host, endpoint.port, @errorName(err) });
-        } else {
-            log.err("🔴 NATS is not reachable at {s}:{d} ({s}) with this environment's credentials: a bridge started now would not connect. Check NATS_URL and NATS_CREDS in .env.nats.", .{ endpoint.host, endpoint.port, @errorName(err) });
+        switch (classifyRefusal(endpoint, err)) {
+            .no_credentials => log.err("🔴 NATS refused at {s}:{d} ({s}): this environment carries no NATS credentials. NATS_CREDS is not set: load .env.nats in the same shell (sudo starts a clean environment, and the file is readable by its owner only).", .{ endpoint.host, endpoint.port, @errorName(err) }),
+            .creds_file_unreadable => log.err("🔴 this user cannot read the NATS credentials file {s} ({s}): the file belongs to the bridge's own user, so NATS was never asked. Run the doctor as root or as that user (sudo sh -c '. the NATS env file; bridge --diagnose …', in one shell).", .{ endpoint.creds.?, @errorName(err) }),
+            .creds_file_missing => log.err("🔴 the NATS credentials file {s} does not exist ({s}): check NATS_CREDS.", .{ endpoint.creds.?, @errorName(err) }),
+            .other => log.err("🔴 NATS is not reachable at {s}:{d} ({s}) with this environment's credentials: a bridge started now would not connect. Check NATS_URL and NATS_CREDS in .env.nats, and that the account allows one more connection.", .{ endpoint.host, endpoint.port, @errorName(err) }),
         }
         return findings;
     };
@@ -300,6 +322,28 @@ fn printGroup(a: std.mem.Allocator, g: Group) void {
         .warn => log.warn("⚠️  {s}\n    {d} {s}: {s}", .{ g.text, g.items.items.len, what, names }),
         .info => log.info("ℹ️  {s}\n    {d} {s}: {s}", .{ g.text, g.items.items.len, what, names }),
     }
+}
+
+test "a creds-file login counts as credentials: the doctor must not say NATS_CREDS is not set when it is" {
+    try std.testing.expect(!hasNatsCredentials(.{}));
+    try std.testing.expect(hasNatsCredentials(.{ .user = "u", .pass = "p" }));
+    try std.testing.expect(hasNatsCredentials(.{ .seed = "SU..." }));
+    // The case that was reported: NATS_CREDS set, the connection refused for another reason.
+    try std.testing.expect(hasNatsCredentials(.{ .creds = "/etc/zebridge/creds/bridge.creds" }));
+}
+
+test "an unreadable creds file is not 'NATS refused': AccessDenied is the file's permission, not the server's answer" {
+    const creds: Conf.Nats.Endpoint = .{ .creds = "/etc/zebridge/creds/bridge.creds" };
+    // Run as a user who may not open the file: the OS says EACCES before any byte reaches the server.
+    try std.testing.expectEqual(Refusal.creds_file_unreadable, classifyRefusal(creds, error.AccessDenied));
+    try std.testing.expectEqual(Refusal.creds_file_missing, classifyRefusal(creds, error.FileNotFound));
+    // A server that rejects the login has its own name; so do other failures.
+    try std.testing.expectEqual(Refusal.other, classifyRefusal(creds, error.AuthorizationViolation));
+    try std.testing.expectEqual(Refusal.other, classifyRefusal(creds, error.ConnectionRefused));
+    // Nothing configured at all is still the original message.
+    try std.testing.expectEqual(Refusal.no_credentials, classifyRefusal(.{}, error.AccessDenied));
+    // A user and password in the URL are credentials too, and an AccessDenied there is not about a file.
+    try std.testing.expectEqual(Refusal.other, classifyRefusal(.{ .user = "u", .pass = "p" }, error.AccessDenied));
 }
 
 test "findings group by text, tables listed once per group" {
