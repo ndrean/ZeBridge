@@ -19620,7 +19620,7 @@ not `flock` or a PID file: it is the one lock both implementations can take (bet
 the fcntl locks SQLite keeps on it are not disturbed, and so a reader never needs it: ordinary read access (the app's read-only connection, a
 `sqlite3` shell, a backup) is unrestricted; only a competing synchronizer is refused.
 
-**Scope.** File-backed replicas: SQLite, DuckDB. Not PostgreSQL storage (`dbUrl`), the browser (OPFS) or PGlite. The empty `.lock` file is left behind on
+**Scope.** File-backed replicas: SQLite, DuckDB. Not PostgreSQL storage (`dbUrl`), the browser (OPFS) or PGlite. The lock's name comes from the replica's canonical location, not the path as given (fixed 2026-10-31 after a review reproduced it: one owner on `real.sqlite3`, a second on its symlink): a file that exists resolves whole with `realpath`, one not created yet resolves its directory and keeps its name, the same rule in both clients. Not unified: hardlinks, and names that differ only by case on a case-insensitive disk. zb-client-ts also gives the lock back when the open or a pragma throws: a failed open used to keep it, and the retry was refused by its own failed attempt. The empty `.lock` file is left behind on
 purpose: the lock is on the open connection, and deleting the file would race a second owner. Limit: libzb and better-sqlite3 loaded into ONE
 process do not see each other (POSIX locks are per process); a host does not do that.
 
