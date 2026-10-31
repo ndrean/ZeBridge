@@ -4,18 +4,34 @@
 import Database from 'better-sqlite3';
 import { connect as tcpConnect } from '@nats-io/transport-node';
 import { bindEndpointTls } from './node-tls.ts';
+import { realpathSync } from 'node:fs';
 import { unlink } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
 import type { Exec, StorageFactory } from './storage.ts';
 
 /// The single-owner lock of a file-backed replica: a SQLite `BEGIN EXCLUSIVE` held on `<replica>.lock`,
 /// the same lock libzb takes (storage.zig `ReplicaLock`), so the two clients exclude each other.
 /// Nonblocking, dropped by the OS when the process dies, and never taken by a reader.
+/// The lock's identity is the replica's canonical location, not the path as given: a symlink to the file,
+/// a symlinked directory or a relative spelling must reach the same `.lock` (one owner on real.sqlite3 and a
+/// second on its symlink were both let in). A file that exists resolves whole; one not created yet resolves
+/// its directory and keeps its name. The same rule as libzb's `ReplicaLock`, so the two clients still exclude
+/// each other. Not unified: hardlinks, and names that differ only by case on a case-insensitive disk.
+export const canonicalReplica = (p: string): string => {
+  try { return realpathSync.native(p); }
+  catch (e: any) {
+    if (e?.code !== 'ENOENT') throw e;
+    const abs = resolve(p);
+    return join(realpathSync.native(dirname(abs)), basename(abs));
+  }
+};
+
 export const replicaLock = (dbName: string) => {
   let held: Database.Database | null = null;
   return {
     acquire() {
       if (held || dbName === '' || dbName === ':memory:') return;
-      const l = new Database(`${dbName}.lock`, { timeout: 0 });
+      const l = new Database(`${canonicalReplica(dbName)}.lock`, { timeout: 0 });
       try { l.exec('BEGIN EXCLUSIVE'); }
       catch (e: any) {
         l.close();
@@ -28,26 +44,38 @@ export const replicaLock = (dbName: string) => {
   };
 };
 
+/// The replica's connection with the contract pragmas, closed again if one of them throws.
+const openConfigured = (dbName: string): Database.Database => {
+  const db = new Database(dbName);
+  try {
+    // 16 KB pages for a replica THIS open creates (an existing file keeps its own; the
+    // pragma is a no-op once in WAL mode). §10ja, 2026-09-26: a random-key live insert
+    // reads one index leaf per probe, and a 16 KB leaf holds four times the keys of a
+    // 4 KB one — libzb's cold 300k-insert drain into a 4.5M-row replica went 22.7 → 9.8 s.
+    db.pragma('page_size = 16384');
+    db.pragma('journal_mode = WAL');
+    // §10he: the commit's fsync and the automatic checkpoint every 1,000 WAL pages were a
+    // third of libzb's CDC thread on the firehose replica; the same defaults apply here.
+    // NORMAL in WAL mode stays consistent through a crash and may lose the last
+    // transactions, which a replica re-fetches from the stream.
+    db.pragma('synchronous = NORMAL');
+    db.pragma('wal_autocheckpoint = 10000');
+    // better-sqlite3 already defaults this ON, which is exactly why it is spelled
+    // out: an invariant that holds by a dependency's default is one upgrade away
+    // from not holding, and the browser adapter had the opposite default.
+    db.pragma('foreign_keys = ON');
+  } catch (e) { db.close(); throw e; }
+  return db;
+};
+
 export const nodeStorage: StorageFactory = (dbName) => {
   const lock = replicaLock(dbName);
   lock.acquire();   // before the file is touched: a second owner is refused with the first one's state intact
-  const db = new Database(dbName);
-  // 16 KB pages for a replica THIS open creates (an existing file keeps its own; the
-  // pragma is a no-op once in WAL mode). §10ja, 2026-09-26: a random-key live insert
-  // reads one index leaf per probe, and a 16 KB leaf holds four times the keys of a
-  // 4 KB one — libzb's cold 300k-insert drain into a 4.5M-row replica went 22.7 → 9.8 s.
-  db.pragma('page_size = 16384');
-  db.pragma('journal_mode = WAL');
-  // §10he: the commit's fsync and the automatic checkpoint every 1,000 WAL pages were a
-  // third of libzb's CDC thread on the firehose replica; the same defaults apply here.
-  // NORMAL in WAL mode stays consistent through a crash and may lose the last
-  // transactions, which a replica re-fetches from the stream.
-  db.pragma('synchronous = NORMAL');
-  db.pragma('wal_autocheckpoint = 10000');
-  // better-sqlite3 already defaults this ON, which is exactly why it is spelled
-  // out: an invariant that holds by a dependency's default is one upgrade away
-  // from not holding, and the browser adapter had the opposite default.
-  db.pragma('foreign_keys = ON');
+  // An open or a pragma that throws must give the replica up: the lock is held for this process, and a retry
+  // after the cause is fixed was told ReplicaAlreadyInUse by its own failed attempt.
+  let db: Database.Database;
+  try { db = openConfigured(dbName); }
+  catch (e) { lock.release(); throw e; }
 
   // §10gp: prepared statements, kept by their text. better-sqlite3 compiles the SQL on
   // every `prepare`, and the CDC path runs the same handful of statements — one per

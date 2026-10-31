@@ -2,11 +2,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
-import { nodeStorage } from './node.ts';
+import { nodeStorage, replicaLock } from './node.ts';
 
 const dir = mkdtempSync(join(tmpdir(), 'zb-lock-'));
 test.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -54,3 +54,30 @@ test('another process is refused while it owns the replica, and a crash releases
   await gone;
   nodeStorage(db).release!();
 });
+
+test('one owner per FILE, whatever the path: a symlink to the replica, or a symlinked directory', () => {
+  const real = join(dir, 'real.sqlite3');
+  const alias = join(dir, 'alias.sqlite3');
+  const first = nodeStorage(real);
+  symlinkSync(real, alias);
+  refused(() => nodeStorage(alias));
+  first.release!();
+  // A replica not created yet, reached through a symlinked directory: its directory is resolved.
+  const dirReal = join(dir, 'dir-real');
+  const dirAlias = join(dir, 'dir-alias');
+  mkdirSync(dirReal);
+  symlinkSync(dirReal, dirAlias);
+  const fresh = replicaLock(join(dirReal, 'new.sqlite3'));
+  fresh.acquire();
+  refused(() => replicaLock(join(dirAlias, 'new.sqlite3')).acquire());
+  fresh.release();
+});
+
+test('an open that fails gives the replica up: the next open is not refused', () => {
+  const db = join(dir, 'not-a-file.sqlite3');
+  mkdirSync(db);                    // a directory where the replica should be: SQLite cannot open it
+  assert.throws(() => nodeStorage(db), (e: any) => e?.code !== 'ReplicaAlreadyInUse');
+  rmdirSync(db);
+  nodeStorage(db).release!();       // was ReplicaAlreadyInUse: the failed open kept the lock
+});
+

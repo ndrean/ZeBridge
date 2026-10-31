@@ -69,9 +69,7 @@ pub const ReplicaLock = struct {
     pub fn acquire(path: []const u8) Error!?ReplicaLock {
         if (path.len == 0 or std.mem.eql(u8, path, ":memory:")) return null;
         var buf: [4096]u8 = undefined;
-        const n = (std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}.lock", .{path}) catch return Error.OpenFailed).len;
-        buf[n] = 0;
-        const lock_path: [*:0]const u8 = buf[0..n :0];
+        const lock_path = try lockPathOf(path, &buf);
         var db: ?*c.sqlite3 = null;
         if (c.sqlite3_open_v2(lock_path, &db, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE, null) != c.SQLITE_OK) {
             if (db) |d| _ = c.sqlite3_close(d);
@@ -87,11 +85,70 @@ pub const ReplicaLock = struct {
         return ReplicaLock{ .db = d };
     }
 
+    /// The lock's identity is the replica's canonical location, not the path as given: a symlink to the file,
+    /// a symlinked directory or a relative spelling must reach the same `.lock` (one owner on real.sqlite3 and
+    /// a second on its symlink were both let in). A file that exists resolves whole; one not created yet
+    /// resolves its directory and keeps its name. The same rule as zb-client-ts (`canonicalReplica` in
+    /// node.ts), so the two clients still exclude each other. Not unified: hardlinks, and names that differ
+    /// only by case on a case-insensitive disk.
+    fn lockPathOf(path: []const u8, out: *[4096]u8) Error![*:0]const u8 {
+        // realpath writes up to PATH_MAX bytes: 1024 on Darwin, 4096 on Linux.
+        var real: [4096]u8 = undefined;
+        var in: [4096]u8 = undefined;
+        const n = if (std.c.realpath(try zTerminated(&in, path), &real)) |r| blk: {
+            break :blk (std.fmt.bufPrint(out[0 .. out.len - 1], "{s}.lock", .{std.mem.span(r)}) catch return Error.OpenFailed).len;
+        } else blk: {
+            if (std.c._errno().* != @as(c_int, @intFromEnum(std.c.E.NOENT))) return Error.OpenFailed;
+            const slash = std.mem.findScalarLast(u8, path, '/');
+            const dir: []const u8 = if (slash) |i| (if (i == 0) "/" else path[0..i]) else ".";
+            const base = if (slash) |i| path[i + 1 ..] else path;
+            const rdir = std.mem.span(std.c.realpath(try zTerminated(&in, dir), &real) orelse return Error.OpenFailed);
+            const sep: []const u8 = if (rdir.len > 0 and rdir[rdir.len - 1] == '/') "" else "/";
+            break :blk (std.fmt.bufPrint(out[0 .. out.len - 1], "{s}{s}{s}.lock", .{ rdir, sep, base }) catch return Error.OpenFailed).len;
+        };
+        out[n] = 0;
+        return out[0..n :0];
+    }
+
+    fn zTerminated(buf: *[4096]u8, s: []const u8) Error![*:0]const u8 {
+        if (s.len >= buf.len) return Error.OpenFailed;
+        @memcpy(buf[0..s.len], s);
+        buf[s.len] = 0;
+        return buf[0..s.len :0];
+    }
+
     /// Closing the connection rolls the transaction back, which drops the lock.
     pub fn release(self: *ReplicaLock) void {
         _ = c.sqlite3_close(self.db);
     }
 };
+
+
+test "ReplicaLock: one owner per FILE, whatever the path to it: a symlink, or a symlinked directory" {
+    const real = "zbz-lock-real.sqlite3";
+    const alias = "zbz-lock-alias.sqlite3";
+    const dir_real = "zbz-lock-dir-real";
+    const dir_alias = "zbz-lock-dir-alias";
+    defer {
+        for ([_][*:0]const u8{ alias, real, real ++ "-wal", real ++ "-shm", real ++ ".lock", dir_alias, dir_real ++ "/new.sqlite3.lock" }) |f| _ = std.c.unlink(f);
+        _ = std.c.rmdir(dir_real);
+    }
+    // An existing replica and a symlink to it: the same file, so the same owner.
+    {
+        var st = try Storage.open(real);
+        st.close();
+    }
+    try std.testing.expectEqual(@as(c_int, 0), std.c.symlink(real, alias));
+    var first = (try ReplicaLock.acquire(real)).?;
+    try std.testing.expectError(Error.ReplicaAlreadyInUse, ReplicaLock.acquire(alias));
+    first.release();
+    // A replica not created yet, reached through a symlinked directory: its directory is resolved.
+    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdir(dir_real, 0o755));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.symlink(dir_real, dir_alias));
+    var second = (try ReplicaLock.acquire(dir_real ++ "/new.sqlite3")).?;
+    try std.testing.expectError(Error.ReplicaAlreadyInUse, ReplicaLock.acquire(dir_alias ++ "/new.sqlite3"));
+    second.release();
+}
 
 fn quietNotice(_: ?*anyopaque, _: [*c]const u8) callconv(.c) void {}
 
