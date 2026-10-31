@@ -223,6 +223,15 @@ async def main():
         check("10. version_index => false: enabled, step skipped, no index built",
               not errors and step and step[0][1] == "skipped" and version_indexes("ro_optout") == [] and published("ro_optout"),
               f"errors={errors} step={step} indexes={version_indexes('ro_optout')}")
+
+        # 11. the internal-table predicate is the namespace, not a list of names
+        rows = sql("SELECT string_agg(c.relname, ',' ORDER BY c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                   "WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname LIKE 'zebridge\\_%' "
+                   "AND NOT public.zebridge_is_internal_table(c.relname)").stdout.strip()
+        probe = sql("SELECT public.zebridge_is_internal_table('zebridge_a_table_added_next_year'), public.zebridge_is_internal_table('schema_migrations'), "
+                    "public.zebridge_is_internal_table('users'), public.zebridge_is_internal_table('my_zebridge_notes')").stdout.strip()
+        check("11. zebridge_is_internal_table() is the namespace: the GC floor is the only non-internal zebridge_ table, a future one is internal, a user table is not",
+              rows == "zebridge_gc_watermark" and probe == "t|t|f|f", f"non-internal={rows!r} probe={probe!r}")
     finally:
         sql(f"DROP DATABASE IF EXISTS {SCRATCH}", db=None, stop=False)
     return 1 if failed else 0

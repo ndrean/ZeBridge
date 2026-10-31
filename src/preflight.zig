@@ -770,27 +770,18 @@ pub fn reportTable(
     };
 }
 
-/// Tables that are ours or the migration tool's — mirrors zebridge_is_internal_table()
-/// in init.{core,write}.template.sql and isInternalTable() in event_processor.zig.
-fn isInternalTable(name: []const u8) bool {
-    return std.mem.eql(u8, name, "zebridge_ddl_events") or
-        // The catalogue rides the publication as a control signal (§10bj) — never
-        // routed, never published, so never "unrouted" either.
-        std.mem.eql(u8, name, "zebridge_catalogue") or
-        // Enrollment invites: pure bridge infrastructure, never published — but its
-        // CREATE fires the DDL trigger like any table, and without this line the DDL
-        // path refused it and left a suspended $KV.schemas key in every client.
-        std.mem.eql(u8, name, "zebridge_invites") or
-        // The refusal registry's psql mirror (§10cy): same story as the invites.
-        std.mem.eql(u8, name, "zebridge_suspensions") or
-        // Table identities and seed-epoch floors: never published, same story.
-        std.mem.eql(u8, name, "zebridge_incarnations") or
-        // Created by an upgrade after the DDL trigger exists, so the trigger published them
-        // (a fresh install creates them first and never did). Bridge-owned, never replicated.
-        std.mem.eql(u8, name, "zebridge_leaf_scopes") or
-        std.mem.eql(u8, name, "zebridge_principal_keys") or
-        std.mem.eql(u8, name, "zebridge_purges") or
-        std.mem.eql(u8, name, "schema_migrations");
+/// Tables that are the bridge's own or the migration tool's: they skip the checks and the schemas a user
+/// table gets. The rule is the namespace (OPERATIONS "Reserved names", `zebridge_enable` refuses the
+/// prefix): every `zebridge_` table, except the two the bridge publishes and checks like a user table —
+/// `zebridge_gc_watermark` (every client reads the floor) and `zebridge_user_tenants` (its rows become
+/// `$KV.tenants` through their own path, and it still needs the PK and version checks). A list of names had
+/// to be remembered at each new table and drifted three times. The SQL `zebridge_is_internal_table()`
+/// (init.core) asks "never replicate to clients", so the roster IS internal there. `init_sql.zig` tests this
+/// against every table the init SQL creates.
+pub fn isInternalTable(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "schema_migrations")) return true;
+    if (!std.mem.startsWith(u8, name, "zebridge_")) return false;
+    return !std.mem.eql(u8, name, "zebridge_gc_watermark") and !std.mem.eql(u8, name, "zebridge_user_tenants");
 }
 
 pub const Summary = struct {
@@ -1231,6 +1222,14 @@ test "isInternalTable" {
     // The GC floor is public on purpose ("every client needs it"): never internal.
     try std.testing.expect(!isInternalTable("zebridge_gc_watermark"));
     try std.testing.expect(!isInternalTable("users"));
+    // The rule is the namespace: a table a later release adds is internal without anyone remembering a list,
+    // and so are the bridge's tables the old list forgot.
+    for ([_][]const u8{ "zebridge_a_table_added_next_year", "zebridge_generations", "zebridge_limits" }) |t|
+        try std.testing.expect(isInternalTable(t));
+    // The roster rides the publication into $KV.tenants and still needs the PK and version checks.
+    try std.testing.expect(!isInternalTable("zebridge_user_tenants"));
+    // A user table that merely contains the prefix is the user's.
+    try std.testing.expect(!isInternalTable("my_zebridge_notes"));
 }
 
 test "version column - a timestamptz with default precision is unreservedly usable" {

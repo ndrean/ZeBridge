@@ -289,28 +289,16 @@ $$ LANGUAGE plpgsql STABLE;
 -- a table created before its name is listed enters the feed as an application table.
 CREATE OR REPLACE FUNCTION public.zebridge_is_internal_table(tbl text)
 RETURNS boolean AS $$
-    SELECT tbl = ANY (ARRAY[
-        'zebridge_ddl_events',   -- our own DDL tracker
-        'zebridge_generations',  -- generation producer bookkeeping (NOTES.md §1.13)
-        'zebridge_limits',       -- the change-feed width budget (one row)
-        'zebridge_generation_overrides',  -- superseded by zebridge_catalogue.generations
-        'zebridge_catalogue',    -- THE catalogue: one row per replicated table
-        'zebridge_invites',      -- enrollment codes: bridge infrastructure, never replicated
-        'zebridge_suspensions',  -- the refusal registry's psql mirror (§10cy): never replicated
-        'zebridge_incarnations', -- table identities and seed-epoch floors: never replicated
-        -- The tables an UPGRADE creates after the DDL trigger exists: the trigger publishes any
-        -- new table, and the bridge then refused it (a suspended internal table, an error line).
-        -- A fresh install creates them before the trigger and never saw this. All bridge-owned,
-        -- never client-replicated. `zebridge_gc_watermark` is NOT here: it is public on purpose.
-        'zebridge_leaf_scopes',   -- which tenants a leaf may cache
-        'zebridge_principal_keys', -- the keys principals enrolled with (the revocation list's input)
-        'zebridge_purges',        -- --revoke --purge bookkeeping
-        -- ⚠️ the principal→tenant roster: BRIDGE INPUT (its CDC feeds $KV.tenants),
-        -- never client-replicated — replicating it would disclose the roster the
-        -- per-key $KV.tenants grant exists to protect (NOTES.md §1.12 part 3).
-        'zebridge_user_tenants',
-        'schema_migrations'      -- Ecto / ActiveRecord migration bookkeeping
-    ]);
+    -- The namespace, not a list (OPERATIONS "Reserved names"; zebridge_enable refuses the prefix): every
+    -- zebridge_ table is the bridge's and is never client-replicated, except the GC floor, which every client
+    -- reads. That includes the principal->tenant roster, zebridge_user_tenants: BRIDGE INPUT (its CDC feeds
+    -- $KV.tenants), never client-replicated, since replicating it would disclose the roster the per-key
+    -- $KV.tenants grant exists to protect (NOTES.md §1.12 part 3). The bridge's own Zig rule
+    -- (preflight.isInternalTable) asks a different question and checks the roster like a user table.
+    -- A name list here had to be remembered at each new table and drifted; enable_scoping check 11 and
+    -- init_sql.zig test this against every table the init SQL creates.
+    -- schema_migrations is Ecto's / ActiveRecord's migration bookkeeping.
+    SELECT (left(tbl, 9) = 'zebridge_' AND tbl <> 'zebridge_gc_watermark') OR tbl = 'schema_migrations';
 $$ LANGUAGE sql IMMUTABLE;
 
 -- THE CATALOGUE comes first: the guard below and every registration in this file

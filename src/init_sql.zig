@@ -251,3 +251,32 @@ test "both embedded templates name only known variables" {
         }
     }
 }
+
+test "every zebridge_ table the init SQL creates is internal to the bridge, except the two it publishes on purpose" {
+    const Preflight = @import("preflight.zig");
+    // The two the bridge publishes and checks like a user table: the GC floor (every client reads it) and the
+    // roster (transformed into $KV.tenants). Each must exist in the templates, or this list has gone stale.
+    const published = [_][]const u8{ "zebridge_gc_watermark", "zebridge_user_tenants" };
+    var seen: [published.len]bool = @splat(false);
+    var count: usize = 0;
+    for ([_][]const u8{ core_template, write_template }) |sql| {
+        var it = std.mem.splitScalar(u8, sql, '\n');
+        while (it.next()) |line| {
+            const at = std.mem.find(u8, line, "CREATE TABLE IF NOT EXISTS public.zebridge_") orelse continue;
+            const name_start = at + "CREATE TABLE IF NOT EXISTS public.".len;
+            var end = name_start;
+            while (end < line.len and (std.ascii.isAlphanumeric(line[end]) or line[end] == '_')) end += 1;
+            const name = line[name_start..end];
+            count += 1;
+            var is_published = false;
+            for (published, 0..) |p, k| if (std.mem.eql(u8, p, name)) {
+                is_published = true;
+                seen[k] = true;
+            };
+            try std.testing.expectEqual(!is_published, Preflight.isInternalTable(name));
+        }
+    }
+    try std.testing.expect(count >= 10);
+    for (seen) |s| try std.testing.expect(s);
+}
+
