@@ -192,6 +192,7 @@ def main():
         # leaves behind, the next poll's sweep takes. The refusal counts are per flush
         # report either way, so nothing is lost, only deferred a tick.
         em.poll(0); last_flush = em.flush(20 if a.interval_ms >= 20 else 0)
+        em.outcomes.clear()     # verdicts are counted by the flush report; kept, they were the emitter's "growth"
 
         if time.monotonic() >= next_sweep:
             next_sweep = time.monotonic() + a.sweep_every
