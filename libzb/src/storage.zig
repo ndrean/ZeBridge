@@ -874,6 +874,22 @@ pub const Storage = struct {
 
 // ─── tests (offline; :memory:) ──────────────────────────────────────────────
 
+test "DuckDB engine: a result of several chunks is read whole, an empty one as no rows" {
+    if (!engines.duckdb.load()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var st = try Storage.openDuckdb(":memory:");
+    defer st.close();
+    // A chunk holds 2,048 rows: 5,000 is three chunks, the last one partial.
+    const rows = try st.query(a, "SELECT i, CASE WHEN i % 2 = 0 THEN NULL ELSE i END FROM range(5000) t(i) ORDER BY i", &.{});
+    try std.testing.expectEqual(@as(usize, 5000), rows.len);
+    for (rows, 0..) |r, i| try std.testing.expectEqual(@as(i64, @intCast(i)), r[0].integer);
+    try std.testing.expect(rows[4998][1] == .null);
+    try std.testing.expectEqual(@as(i64, 4999), rows[4999][1].integer);
+    try std.testing.expectEqual(@as(usize, 0), (try st.query(a, "SELECT 1 WHERE false", &.{})).len);
+}
+
 test "DuckDB engine: typed cells, bytes, lists from JSON text, the appender, BEGIN IMMEDIATE, a PRAGMA answers nothing (§10fl)" {
     if (!engines.duckdb.load()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

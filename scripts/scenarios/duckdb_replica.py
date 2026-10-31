@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """A DuckDB replica (§10fl): libzb with `engine: duckdb` — the micro-VM worker's store.
 
-  set -a && . ./.env.bridge && set +a
   scripts/scenarios/.venv/bin/python scripts/scenarios/duckdb_replica.py
 
-Needs a running bridge, PostGIS and pgvector on the master, libzb built (`cd libzb
-&& zig build -Doptimize=ReleaseFast`), DuckDB installed for the engine, and the
-`duckdb` Python package in the venv. A master table with every shape the wire
-carries — integers, numeric, boolean, text[] and int[][], jsonb, bytea, a PostGIS
-point, a vector(3), timestamptz — is created and enabled here and dropped at the end.
+Its master table needs PostGIS and pgvector, which the Compose dev image lacks, so it owns its
+stack like the `owns` scenarios (`recreate_recovery.Stack`): it builds `pg-ext.Dockerfile` if
+the image is missing, starts that PostgreSQL in a container on a free port, and runs its own
+database, nats-server and bridge against it; all of it is removed at the end. Needs Docker,
+libzb built (`cd libzb && zig build -Doptimize=ReleaseFast`), DuckDB installed for the engine,
+and the `duckdb` Python package in the venv. A master table with every shape the wire carries —
+integers, numeric, boolean, text[] and int[][], jsonb, bytea, a PostGIS point, a vector(3),
+timestamptz — is created and enabled here.
 
 What is checked: the replica table is created with DuckDB's types from the
 descriptor's `pg` block (VARCHAR[], JSON, BLOB, FLOAT[3], DECIMAL(12,4), TIMESTAMP
@@ -19,9 +21,12 @@ way; a write from the client with arrays, bytes and a vector lands in the master
 echoes back natively; then libzb closes and DuckDB itself opens the file — the
 worker's second act — for a group-by and a Parquet export that reads back whole.
 """
-import base64, os, struct, sys, time, uuid
+import base64, os, pathlib, struct, subprocess, sys, tempfile, time, uuid
 import zb
 from clients import Lib
+import recreate_recovery as rr
+
+IMAGE = "zb-pg-ext:18"
 
 T = "dk_t"
 TENANT = "globex"
@@ -41,23 +46,52 @@ def ewkb_point(lon, lat, srid=4326):
 def b64(b): return {"$bin": base64.b64encode(b).decode()}
 
 
+def postgres_with_extensions():
+    """A private PostgreSQL with PostGIS and pgvector: (container, port). The image is built once."""
+    if subprocess.run(["docker", "image", "inspect", IMAGE], capture_output=True).returncode:
+        subprocess.run(["docker", "build", "-q", "-t", IMAGE, "-f", str(pathlib.Path(__file__).with_name("pg-ext.Dockerfile")), str(pathlib.Path(__file__).parent)], check=True)
+    pg_port = rr.port()
+    name = "zb-dk-" + uuid.uuid4().hex[:8]
+    subprocess.run(["docker", "run", "-d", "--rm", "--name", name, "-p", f"127.0.0.1:{pg_port}:5432", "-e", "POSTGRES_HOST_AUTH_METHOD=trust",
+                    IMAGE, "-c", "wal_level=logical"], check=True, capture_output=True)
+    # The image's init runs on a socket only, so a TCP answer is the final server.
+    deadline = time.monotonic() + 90
+    while subprocess.run([zb._psql_binary(), "-X", "-h", "127.0.0.1", "-p", str(pg_port), "-U", "postgres", "-c", "SELECT 1"], capture_output=True).returncode:
+        if time.monotonic() > deadline: raise RuntimeError(f"{name}: PostgreSQL did not answer on {pg_port}")
+        time.sleep(0.5)
+    return name, pg_port
+
+
 async def main():
-    zb.psql(f"DROP TABLE IF EXISTS public.{T}", quiet=True)
-    zb.forget_table(T)  # the schema key too — a DROP after the probe bridge exits tombstones nobody
-    zb.psql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), n int, price numeric(12,4), ok boolean, tags text[], matrix int[][], "
-            f"meta jsonb, tile bytea, geom geometry(Point, 4326), emb vector(3), note text, tenant_id text NOT NULL, inserted_at timestamptz NOT NULL DEFAULT now(), "
-            f"updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)", quiet=True)
-    zb.psql(f"SELECT public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', writable => true, version_col => 'updated_at', "
-            f"tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => '{zb.publication()}', dry_run => false)", quiet=True)
-    zb.ok(f"{T} created and enabled on the master")
-    zb.psql(f"INSERT INTO {T} (n, price, ok, tags, matrix, meta, tile, geom, emb, note, tenant_id) VALUES "
-            f"(7, 12.5000, true, ARRAY['a', 'b c'], ARRAY[[1, 2], [3, 4]], '{{\"src\": \"seed\", \"k\": 1}}', decode('00ff10', 'hex'), ST_SetSRID(ST_MakePoint(2.3522, 48.8566), 4326), '[1,2,3]', 'seed', '{TENANT}')", quiet=True)
-    time.sleep(2)
-    for f in (DB, DB + ".wal"):
+    container, pg_port = postgres_with_extensions()
+    stack = rr.Stack(pathlib.Path(tempfile.mkdtemp(prefix="zb-dk-")), "dk", 5, {}, pg_port=pg_port)
+    try:
+        stack.start({"bob": TENANT})
+        stack.sql("CREATE EXTENSION postgis; CREATE EXTENSION vector;")
+        bridge = stack.bridge_up()
+        return await scenario(stack, bridge)
+    finally:
+        stack.stop()
+        subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+
+
+async def scenario(stack, bridge):
+    stack.sql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), n int, price numeric(12,4), ok boolean, tags text[], matrix int[][], "
+              f"meta jsonb, tile bytea, geom geometry(Point, 4326), emb vector(3), note text, tenant_id text NOT NULL, inserted_at timestamptz NOT NULL DEFAULT now(), "
+              f"updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)")
+    stack.sql(f"SELECT count(*) FROM public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', writable => true, version_col => 'updated_at', "
+              f"tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => 'rr_pub', dry_run => false)")
+    zb.ok(f"{T} created and enabled on the master (PostGIS and pgvector, private stack on port {stack.pg_port})")
+    stack.sql(f"INSERT INTO {T} (n, price, ok, tags, matrix, meta, tile, geom, emb, note, tenant_id) VALUES "
+              f"(7, 12.5000, true, ARRAY['a', 'b c'], ARRAY[[1, 2], [3, 4]], '{{\"src\": \"seed\", \"k\": 1}}', decode('00ff10', 'hex'), ST_SetSRID(ST_MakePoint(2.3522, 48.8566), 4326), '[1,2,3]', 'seed', '{TENANT}')")
+    # The descriptor before the client: a client that connects first finds no schema and no table.
+    stack.wait_log(bridge, f"schemas.{T}")
+    for f in (DB, DB + ".wal", DB + ".lock"):
         if os.path.exists(f): os.remove(f)
+    zb.NATS_URL = stack.url
 
     # ── the replica: libzb on DuckDB ────────────────────────────────────────────
-    em = Lib(DB, [T], "py-duckdb", principal="bob", engine="duckdb")
+    em = Lib(DB, [T], "py-duckdb", principal="bob", creds=stack.creds["bob"], engine="duckdb")
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline and not em.q(f"SELECT 1 FROM {T} WHERE note = 'seed'"): em.poll(300)
     types = {r[0]: r[1] for r in em.q(f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{T}'")}
@@ -69,8 +103,8 @@ async def main():
     check(f"the seed landed natively through the appender: {r}", r == [7, "12.5000", True, "b c", 3, "seed", 3, 25, 3.0])
 
     # ── CDC after the seed ──────────────────────────────────────────────────────
-    zb.psql(f"INSERT INTO {T} (n, price, ok, tags, matrix, meta, tile, geom, emb, note, tenant_id) VALUES "
-            f"(8, 0.2500, false, ARRAY['x'], ARRAY[[5, 6]], '{{\"src\": \"cdc\"}}', decode('deadbeef', 'hex'), ST_SetSRID(ST_MakePoint(13.405, 52.52), 4326), '[4,5,6]', 'cdc', '{TENANT}')", quiet=True)
+    stack.sql(f"INSERT INTO {T} (n, price, ok, tags, matrix, meta, tile, geom, emb, note, tenant_id) VALUES "
+            f"(8, 0.2500, false, ARRAY['x'], ARRAY[[5, 6]], '{{\"src\": \"cdc\"}}', decode('deadbeef', 'hex'), ST_SetSRID(ST_MakePoint(13.405, 52.52), 4326), '[4,5,6]', 'cdc', '{TENANT}')")
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline and not em.q(f"SELECT 1 FROM {T} WHERE note = 'cdc'"): em.poll(300)
     r = em.q(f"SELECT n, price, ok, tags[1], matrix[1][2], json_extract_string(meta, '$.src'), octet_length(tile), emb[1] FROM {T} WHERE note = 'cdc'")
@@ -84,8 +118,8 @@ async def main():
                                        "tile": b64(tile), "geom": b64(ewkb_point(4.9, 52.37)), "emb": b64(struct.pack("<3f", 7, 8, 9)), "note": "from libzb", "tenant_id": TENANT})
     fl = em.flush(3000)
     deadline = time.monotonic() + 30
-    while time.monotonic() < deadline and zb.psql(f"SELECT count(*) FROM {T} WHERE uid = '{u}'", quiet=True).strip() != "1": time.sleep(0.5)
-    m = zb.psql(f"SELECT n, price::text, ok, tags::text, matrix::text, meta->>'src', encode(tile, 'hex'), ST_AsText(geom), emb::text FROM {T} WHERE uid = '{u}'", quiet=True).strip()
+    while time.monotonic() < deadline and stack.sql(f"SELECT count(*) FROM {T} WHERE uid = '{u}'") != "1": time.sleep(0.5)
+    m = stack.sql(f"SELECT n, price::text, ok, tags::text, matrix::text, meta->>'src', encode(tile, 'hex'), ST_AsText(geom), emb::text FROM {T} WHERE uid = '{u}'")
     check(f"the client's write landed in the master: {m} (verdicts {fl.get('verdicts')})", m == '9|3.2500|t|{p,"q r"}|{{7,8}}|libzb|000102030405060708090a0b0c0d0e0f|POINT(4.9 52.37)|[7,8,9]')
     deadline = time.monotonic() + 30
     r = None
@@ -111,7 +145,6 @@ async def main():
     check(f"a Parquet export reads back whole: {back}", back == (3, 24))
     con.close()
 
-    zb.psql(f"DROP TABLE public.{T}", quiet=True)
     return 1 if FAILED else 0
 
 
