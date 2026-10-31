@@ -1,6 +1,6 @@
 .{
     .name = .bridge,
-    .version = "0.2.8",
+    .version = "0.2.9",
     .fingerprint = 0x69780f9fa376900c,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
