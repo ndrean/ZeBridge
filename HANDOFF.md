@@ -4,7 +4,9 @@ A snapshot for whoever (person or LLM session) picks the work up next. It is a l
 
 ## State of `main`
 
-`main` is at `2a8bd7c` (PR #41 merged: it carried #39 and #40, which had been merged into their stacked base branches, after #38). Everything in the table is on `main`. Open, not merged: #42 (the upgrade procedure in OPERATIONS and CLAUDE.md).
+`main` is at `bed95b7` (PR #43 merged, after #42 and #41; #41 carried #39 and #40, which had been merged into their stacked base branches, after #38). Everything in the table is on `main`.
+
+The production hub runs 0.2.8 since 2026-10-31 about 08:30: the init SQL applied first, every chain rebuilt at generation 1 (so clients re-seed), the doctor all clear, no table suspended. Its public NATS address is `tls://nats.zebridge.eu:4222` and its bridge credentials are `/etc/zebridge/creds/bridge.creds` on the hub; `/health` is not exposed through HAProxy, `/status` is. The lost `my_slot` and the dropped `storm_items` rules were removed from the London database by the owner. It runs 0.2.8, which predates #38 to #41: a 0.2.9 is the owner's call.
 
 | #   | Increment                                                                                                                      | PR  |
 | --- | ------------------------------------------------------------------------------------------------------------------------------ | --- |
