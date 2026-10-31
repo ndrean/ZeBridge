@@ -24,8 +24,14 @@ Needs a running bridge with generations, NATS_CREDS (bridge.creds), admin psql.
 """
 import json
 import os
+import pathlib
 import sys
+import tempfile
 import time
+import uuid
+
+import msgpack
+import zstandard
 
 import zb
 
@@ -37,6 +43,35 @@ def manifest(key):
     if r.returncode != 0 or not r.stdout.strip():
         return None
     return json.loads(r.stdout)
+
+
+def newest_object(m):
+    """The document of the manifest's newest generation (its full, or the delta of that generation), decoded,
+    or None: the object the cut published, read from the store the manifest names."""
+    name = m["full"]["object"] if m["full"]["gen"] == m["gen"] else next(
+        (d["object"] for d in m.get("deltas", []) if d.get("gen") == m["gen"]), None)
+    if name is None:
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "obj"
+        r = zb.nats_cli("object", "get", m["bucket"], name, "--output", str(path))
+        if r.returncode != 0 or not path.exists():
+            return None
+        blob = path.read_bytes()
+    if blob.startswith(b"\x28\xb5\x2f\xfd"):
+        blob = zstandard.ZstdDecompressor().decompress(blob, max_output_size=1 << 30)
+    return msgpack.unpackb(blob, raw=False, strict_map_key=False)
+
+
+def carries(doc, uid, value):
+    """Whether a chain document holds the row `uid` with some_text = `value`."""
+    if not doc:
+        return False
+    cols = doc["columns"]
+    if "uid" not in cols or "some_text" not in cols:
+        return False
+    iu, it = cols.index("uid"), cols.index("some_text")
+    return any(str(r[iu]) == uid and r[it] == value for r in doc["rows"])
 
 
 def main():
@@ -70,42 +105,58 @@ def main():
                f"{', '.join(missing[:6])}{' …' if len(missing) > 6 else ''}")
         failed += 1
 
-    # ── 2. an UPDATE in one tenant's rows cuts that pair's next generation ───────
-    tenant = next((t for t in tenants
-                   if zb.psql(f"SELECT count(*) FROM public.test_types WHERE tenant_id = '{t}' AND deleted_at IS NULL", quiet=True).strip() not in ("", "0")), None)
-    if tenant is None and tenants:
-        # No tenant holds a LIVE test_types row (a fresh stack, or only the tombstones other scenarios leave: the probe
-        # below updates a live row): write one, and let the cut it causes land before the baseline is taken.
-        tenant = tenants[0]
-        key = f"{tenant}.test_types"
-        gen_seen = (manifest(key) or {}).get("gen")
-        zb.psql(f"INSERT INTO public.test_types (uid, some_text, tenant_id, inserted_at, updated_at) "
-                f"VALUES (gen_random_uuid(), 'shared_cut seed', '{tenant}', now(), now())", quiet=True)
-        deadline = time.time() + CADENCE + 30
-        while time.time() < deadline and (manifest(key) or {}).get("gen") == gen_seen:
-            time.sleep(5)
-    if tenant is None:
+    # ── 2. an UPDATE in one tenant's rows cuts that pair's next generation, and that generation carries it ──
+    #
+    # The probe is a row this scenario owns, with a value no one else writes: a cut that merely happened (the
+    # cadence ticks anyway) does not pass, only a generation whose own object holds the changed row does. The
+    # UPDATE must say it changed exactly that row (RETURNING), or nothing was tested.
+    if not tenants:
         zb.bad("no tenant to update test_types for"); return 1
+    tenant = tenants[0]
     key = f"{tenant}.test_types"
-    before = manifest(key)
-    if before is None:
-        zb.bad(f"no manifest {key} to start from"); return 1
-    gen0 = before.get("gen")
-    zb.psql(f"UPDATE public.test_types SET some_text = 'shared_cut probe', updated_at = now() "
-            f"WHERE uid = (SELECT uid FROM public.test_types WHERE tenant_id = '{tenant}' "
-            f"AND deleted_at IS NULL ORDER BY uid LIMIT 1)", quiet=True)
-    deadline = time.time() + 2 * CADENCE + 30
-    gen = gen0
-    while time.time() < deadline:
-        gen = (manifest(key) or {}).get("gen", gen0)
-        if gen != gen0:
-            break
-        time.sleep(5)
-    if gen != gen0:
-        zb.ok(f"an UPDATE in '{tenant}' cut {key} g{gen0} → g{gen} (test_types keeps a tombstone)")
-    else:
-        zb.bad(f"an UPDATE in '{tenant}' cut nothing: {key} still g{gen0} after two cadences ({2 * CADENCE + 30} s)")
-        failed += 1
+    seeded = f"shared_cut seed {uuid.uuid4().hex[:12]}"
+    marker = f"shared_cut probe {uuid.uuid4().hex[:12]}"
+    gen_seen = (manifest(key) or {}).get("gen")
+    uid = zb.psql(f"INSERT INTO public.test_types (uid, some_text, tenant_id, inserted_at, updated_at) "
+                  f"VALUES (gen_random_uuid(), '{seeded}', '{tenant}', now(), now()) RETURNING uid", quiet=True).splitlines()
+    uid = uid[0].strip() if uid else ""
+    if len(uid) != 36:
+        zb.bad(f"the probe row was not inserted: {uid!r}"); return 1
+    try:
+        # its own insert's cut lands first, so the baseline is the generation after it
+        deadline = time.time() + 2 * CADENCE + 30
+        while time.time() < deadline:
+            m = manifest(key)
+            if m and m.get("gen") != gen_seen and carries(newest_object(m), uid, seeded):
+                break
+            time.sleep(5)
+        before = manifest(key)
+        if before is None:
+            zb.bad(f"no manifest {key} to start from"); return 1
+        gen0 = before.get("gen")
+        out = zb.psql(f"UPDATE public.test_types SET some_text = '{marker}', updated_at = now() "
+                      f"WHERE uid = '{uid}' AND tenant_id = '{tenant}' RETURNING uid", quiet=True).splitlines()
+        returned = [l.strip() for l in out if l.strip() and not l.startswith("UPDATE")]
+        if returned != [uid]:
+            zb.bad(f"the probe UPDATE did not change exactly the probe row: returned {returned}")
+            failed += 1
+        else:
+            deadline = time.time() + 2 * CADENCE + 30
+            gen, found = gen0, False
+            while time.time() < deadline:
+                m = manifest(key) or {}
+                gen = m.get("gen", gen0)
+                if gen != gen0 and carries(newest_object(m), uid, marker):
+                    found = True
+                    break
+                time.sleep(5)
+            if found:
+                zb.ok(f"an UPDATE of the probe row in '{tenant}' cut {key} g{gen0} → g{gen}, and that generation carries the new value")
+            else:
+                zb.bad(f"no generation of {key} after g{gen0} carries the probe's new value within two cadences ({2 * CADENCE + 30} s); newest g{gen}")
+                failed += 1
+    finally:
+        zb.psql(f"UPDATE public.test_types SET deleted_at = now(), updated_at = now() WHERE uid = '{uid}'", quiet=True)
     return 1 if failed else 0
 
 
