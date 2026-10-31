@@ -232,7 +232,10 @@ def main():
         check("TABLE DATA zebridge_private receipts_legacy" in listing and "FUNCTION zebridge_private lookup_receipts" in listing
               and "TABLE DATA zebridge_private receipt_policy" in listing, "a full pg_dump carries the private schema, its partitions and policy")
 
-        sql(f"UPDATE zebridge_private.receipt_policy SET min_accepted_ms = {ms(this_month)}")
+        # Raise the minimum to this month's start, never lower it: the shorter retention above already moved it to
+        # now - 30 days, which is past the 1st on the 31st of a 31-day month, and the policy refuses a lower minimum
+        # (the guard this scenario checks above). Either way the minimum now lies in this month.
+        sql(f"UPDATE zebridge_private.receipt_policy SET min_accepted_ms = greatest(min_accepted_ms, {ms(this_month)})")
         pruned = sql("SELECT * FROM zebridge_private.prune_receipts()").stdout.split()
         left = sql("SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid "
                    "WHERE i.inhparent = 'zebridge_private.receipts'::regclass ORDER BY 1").stdout.split()
