@@ -66,36 +66,7 @@ fn appendDefaultField(arena: std.mem.Allocator, out: *std.ArrayList(u8), col_val
     try out.append(arena, '"');
 }
 
-fn isInternalTable(name: []const u8) bool {
-    return std.mem.eql(u8, name, "zebridge_ddl_events") or
-        // The catalogue rides the publication so the bridge learns of an enable
-        // without a restart (§10bj); its rows are a control signal, never CDC, and
-        // it publishes no schema.
-        std.mem.eql(u8, name, "zebridge_catalogue") or
-        // Enrollment invites: pure bridge infrastructure, never published — but its
-        // CREATE fires the DDL trigger like any table, and without this line the DDL
-        // path refused it and left a suspended $KV.schemas key in every client.
-        std.mem.eql(u8, name, "zebridge_invites") or
-        // The refusal registry's psql mirror (§10cy): its own table so a refuse/lift
-        // is not a catalogue move; not published, but its CREATE fires the DDL
-        // trigger — same story as zebridge_invites.
-        std.mem.eql(u8, name, "zebridge_suspensions") or
-        // Table identities and seed-epoch floors: same story.
-        std.mem.eql(u8, name, "zebridge_incarnations") or
-        // Created by an upgrade after the DDL trigger exists, so the trigger published them
-        // (a fresh install creates them first and never did). Bridge-owned, never replicated.
-        std.mem.eql(u8, name, "zebridge_leaf_scopes") or
-        std.mem.eql(u8, name, "zebridge_principal_keys") or
-        std.mem.eql(u8, name, "zebridge_purges") or
-        std.mem.eql(u8, name, "schema_migrations");
-}
 
-test "isInternalTable: the tables an upgrade creates after the DDL trigger are internal; the public GC floor is not" {
-    for ([_][]const u8{ "zebridge_leaf_scopes", "zebridge_principal_keys", "zebridge_purges", "zebridge_invites", "schema_migrations" }) |t|
-        try std.testing.expect(isInternalTable(t));
-    try std.testing.expect(!isInternalTable("zebridge_gc_watermark"));
-    try std.testing.expect(!isInternalTable("users"));
-}
 
 /// Parse a PostgreSQL LSN in its text form ("1A/2B3C4D5E") into a u64, matching the
 /// integer LSN the WAL path reports. Returns 0 when unparseable — 0 reads as "valid
@@ -2503,7 +2474,7 @@ pub const EventProcessor = struct {
         var tombstoned: usize = 0;
         log.debug("🗑️ reconcile: {d} key(s) in $KV.{s}", .{ listed.value.len, self.topology.kv_schemas });
         for (listed.value) |key| {
-            if (isInternalTable(key)) continue;
+            if (Preflight.isInternalTable(key)) continue;
             // Already a tombstone: leave it. Re-publishing one every boot would hand
             // every client the same death notice for ever and churn the bucket.
             if (kv.get(key)) |entry_const| {
@@ -2600,7 +2571,7 @@ pub const EventProcessor = struct {
                 clean_table = clean_table[7..];
             }
 
-            if (isInternalTable(clean_table)) {
+            if (Preflight.isInternalTable(clean_table)) {
                 log.debug("Skipping boot schema for internal table '{s}'", .{clean_table});
                 continue;
             }
