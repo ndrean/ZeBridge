@@ -26,10 +26,12 @@ pub fn readResult(a: std.mem.Allocator, res: *dk.duckdb_result, want_names: bool
         nm.* = try a.dupe(u8, std.mem.span(D().duckdb_column_name(res, @intCast(i))));
     };
     var rows: std.ArrayList(Row) = .empty;
-    const nchunks: usize = @intCast(D().duckdb_result_chunk_count(res.*));
-    for (0..nchunks) |ci| {
-        var chunk = D().duckdb_result_get_chunk(res.*, @intCast(ci));
-        if (chunk == null) continue;
+    // `duckdb_fetch_chunk` until the result is exhausted: it consumes the result, so a result is
+    // read once (both callers do). The indexed `duckdb_result_get_chunk` and its count are
+    // deprecated since 1.0 and hidden by 2.0's header.
+    while (true) {
+        var chunk = D().duckdb_fetch_chunk(res.*);
+        if (chunk == null) break;
         defer D().duckdb_destroy_data_chunk(&chunk);
         const size: usize = @intCast(D().duckdb_data_chunk_get_size(chunk));
         const first = rows.items.len;

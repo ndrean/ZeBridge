@@ -150,10 +150,10 @@ def digest(rows):
 # ── the private stack ────────────────────────────────────────────────────────
 
 class Stack:
-    def __init__(self, tmp, tag, cadence, cdc_env):
-        self.tmp, self.tag, self.cadence, self.cdc_env = tmp, tag, cadence, cdc_env
+    def __init__(self, tmp, tag, cadence, cdc_env, pg_port=5432):
+        self.tmp, self.tag, self.cadence, self.cdc_env, self.pg_port = tmp, tag, cadence, cdc_env, pg_port
         self.name = "zb_rr_" + uuid.uuid4().hex[:8]
-        self.psql = [zb._psql_binary(), "-X", "-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-Atq"]
+        self.psql = [zb._psql_binary(), "-X", "-h", "127.0.0.1", "-p", str(pg_port), "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-Atq"]
         self.procs, self.bridges = {}, 0
         self.bridge_bin = BRIDGE
         self.owned = []   # loads and clients: stop() ends them, whatever interrupted the check
@@ -180,8 +180,8 @@ class Stack:
     def start(self, tenants):
         self.sql(f'CREATE DATABASE "{self.name}"', "postgres")
         r, w = self.name + "_r", self.name + "_w"
-        self.env = dict(os.environ, DATABASE_READER_URL=f"postgres://{r}:x@127.0.0.1:5432/{self.name}",
-                        DATABASE_WRITER_URL=f"postgres://{w}:x@127.0.0.1:5432/{self.name}", TARGET_DB=self.name,
+        self.env = dict(os.environ, DATABASE_READER_URL=f"postgres://{r}:x@127.0.0.1:{self.pg_port}/{self.name}",
+                        DATABASE_WRITER_URL=f"postgres://{w}:x@127.0.0.1:{self.pg_port}/{self.name}", TARGET_DB=self.name,
                         BRIDGE_CDC_PUBLICATION="rr_pub")
         self.sql(subprocess.run([str(BRIDGE), "--init-sql"], env=self.env, capture_output=True, text=True, check=True).stdout)
         self.sql("".join(f"INSERT INTO zebridge_user_tenants VALUES ('{p}', '{t}');" for p, t in tenants.items()))
@@ -225,7 +225,7 @@ class Stack:
         db = f"{self.name}_{label}"
         self.sql(f'CREATE DATABASE "{db}"', "postgres")
         self.replicas = getattr(self, "replicas", []) + [db]
-        return f"postgres://postgres@127.0.0.1:5432/{db}"
+        return f"postgres://postgres@127.0.0.1:{self.pg_port}/{db}"
 
     def stop(self):
         if getattr(self, "stopped", False): return
