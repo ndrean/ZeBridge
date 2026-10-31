@@ -11,5 +11,6 @@ zstandard>=0.22
 # examples/16-archive (archiver.py, responder.py) and the scenarios that run them (readings_fetch,
 # readings_roles, archive): Parquet through DuckDB, the S3 sink through boto3.
 # The same major as the host's libduckdb: duckdb_replica opens a file libzb wrote, and 1.x cannot read 2.0's storage.
-duckdb>=2.0
+# pip installs the newest (2.x); on a host whose libduckdb is 1.x, pin duckdb==1.5.*.
+duckdb>=1.5
 boto3>=1.34
