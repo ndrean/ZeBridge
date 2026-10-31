@@ -1659,3 +1659,50 @@ BEGIN
             regexp_replace(t.c, 'current_setting\(''([a-z_.]+)''::text, true\)', '(SELECT current_setting(''\1''::text, true))', 'g'));
     END LOOP;
 END $$;
+
+-- ── A client write cannot reach a bridge-owned table, whatever the bridge let through ────────────────
+--
+-- A client's write reaches PostgreSQL as this role with `zb.principal` set to the client
+-- (set_config(…, true): transaction-local, from the NATS subject). The sweeper sets it to `zb_sweeper`
+-- for its session. Nothing else the bridge does to its own tables sets it: enrollment, the producer,
+-- `--revoke`, the DDL trigger, a DBA's psql all write with it unset. So a write to a `zebridge_` table
+-- under any other principal is a client's, and this refuses it.
+--
+-- Until now the only guard in front of `zebridge_gc_watermark` and its neighbours was
+-- `mutation_listener.isForbiddenTable()`: with it disabled a client moved the GC floor (the writer holds
+-- UPDATE on the table for the sweeper, and the floor's own trigger only refuses a LOWER one). This is the
+-- layer behind it, in the database. It is not a defence against a compromised bridge, which can set
+-- `zb.principal` to anything.
+--
+-- Statement-level, so it fires once per statement whatever the row count (a bulk write to
+-- `zebridge_generations` pays one call) and also catches TRUNCATE. `zebridge_private` (the receipts) is
+-- left out on purpose: the receipts are written inside the client's own transaction, with the principal set.
+-- Attached by name prefix, like the revoke loop above, so a table a later release adds is covered; the
+-- prefix is reserved for the bridge (OPERATIONS "Reserved names"). `scripts/scenarios/bridge_table_guard.py`
+-- checks every `zebridge_` table has it.
+CREATE OR REPLACE FUNCTION public.zebridge_refuse_client_write()
+RETURNS trigger AS $$
+DECLARE
+    who text := coalesce(current_setting('zb.principal', true), '');
+BEGIN
+    IF who <> '' AND who <> 'zb_sweeper' THEN
+        RAISE EXCEPTION 'refusing a client write to %.%: it is a bridge-owned table', TG_TABLE_SCHEMA, TG_TABLE_NAME
+            USING ERRCODE = '42501',
+                  HINT = 'A write carrying a client principal (zb.principal) never reaches a zebridge_ table: only the bridge, the sweeper and a DBA write them.';
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+DECLARE
+    t text;
+BEGIN
+    FOR t IN SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname LIKE 'zebridge\_%'
+    LOOP
+        EXECUTE format('DROP TRIGGER IF EXISTS zebridge_refuse_client_write_t ON public.%I', t);
+        EXECUTE format('CREATE TRIGGER zebridge_refuse_client_write_t BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON public.%I '
+                       'FOR EACH STATEMENT EXECUTE FUNCTION public.zebridge_refuse_client_write()', t);
+    END LOOP;
+END $$;
