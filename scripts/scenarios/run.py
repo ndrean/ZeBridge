@@ -48,6 +48,7 @@ GROUPS = {
         "pubname":       ("none",   "the publication is named, never defaulted"),
         "abi":           ("none",   "libzb's exported functions and connect options against libzb/abi.json: a change must bump the version hosts check"),
         "enable_scoping": ("none",  "zebridge_enable's scoping choices: a read-only tenant table enables (§10fx), a dry run changes nothing, a nullable tenant column and an unscoped table are refused, writable and public still work"),
+        "bridge_table_guard": ("none", "the database refuses a client write to a bridge-owned table: every zebridge_* table refuses INSERT, UPDATE, DELETE and TRUNCATE under a client principal, passes with none and as zb_sweeper, and leaves user tables and zebridge_private alone (scratch database, no bridge)"),
     },
     "live": {
         "check":         ("bridge", "declared vs actual drift"),
