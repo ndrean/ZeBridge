@@ -10,5 +10,6 @@ paho-mqtt>=2.1
 zstandard>=0.22
 # examples/16-archive (archiver.py, responder.py) and the scenarios that run them (readings_fetch,
 # readings_roles, archive): Parquet through DuckDB, the S3 sink through boto3.
-duckdb>=1.0
+# The same major as the host's libduckdb: duckdb_replica opens a file libzb wrote, and 1.x cannot read 2.0's storage.
+duckdb>=2.0
 boto3>=1.34
