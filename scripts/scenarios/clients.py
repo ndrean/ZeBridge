@@ -19,6 +19,7 @@ def fresh_sqlite(path):
 class Lib:
     """The libzb client, host-driven: every observation is a poll."""
     def __init__(self, db, tables, client_id="py-scenario", principal="omar", creds=None, db_url=None, seed_streaming=False, seed_chunk_rows=None, seed_streaming_above=None, engine=None):
+        self.outcomes = {}
         if not LIBZB.exists():
             sys.exit(f"{LIBZB} missing — cd libzb && zig build -Doptimize=ReleaseFast")
         self.lib = lib = ctypes.CDLL(str(LIBZB))
@@ -61,13 +62,15 @@ class Lib:
     def poll(self, wait_ms=300):
         """One poll; the report dict, or {"error": name} once the connection is gone."""
         self.last_poll = self.take(self.lib.zb_client_poll(self.h, wait_ms))
-        # Each write's outcome arrives once, in one report: keep them all for the scenario.
+        # Each write's outcome arrives once, in one report: keep them for the scenario, by msg id.
+        # Updated in place: rebuilding a list per poll grew a long run's RSS (drip: 40 → 182 MB in 10 min).
         if isinstance(self.last_poll, dict):
-            self.outcomes = getattr(self, "outcomes", []) + self.last_poll.get("outcomes", [])
+            for o in self.last_poll.get("outcomes", []):
+                self.outcomes.setdefault(o.get("msgId"), o)
         return self.last_poll
     def outcome(self, msg_id):
         """The poll reports' outcome for the write `msg_id` (what mutate returned), or None."""
-        return next((o for o in getattr(self, "outcomes", []) if o.get("msgId") == msg_id), None)
+        return self.outcomes.get(msg_id)
     def q(self, sql, params=()):
         r = self.take(self.lib.zb_client_query(self.h, sql.encode(), json.dumps(list(params)).encode()))
         if "error" in r: raise RuntimeError(f"{r['error']}: {r['detail']}" if r.get("detail") else r["error"])
