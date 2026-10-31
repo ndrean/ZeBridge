@@ -175,6 +175,12 @@ What you may see on the first start after an upgrade: chains swept and rebuilt (
 3. **One process per replica.** The new client takes a lock on `<replica>.lock` and a second owner gets `ReplicaAlreadyInUse`: stop the old process before the new one starts, in tests as well.
 4. **Native hosts rebuild libzb for each target** and check the C ABI: `zb_abi_version()` against the version your host was written for; `scripts/scenarios/run.py offline -k abi` fails until `abi.json` and `capi.zig` agree.
 5. **Verify with the smoke client** of the release (`smoke/run.sh <V>` for the published packages; the phones by hand, [smoke/README.md](smoke/README.md)).
+6. **Refresh the Flutter example's lock** once `zebridge <V>` is on pub.dev: `version.py` moves `examples/10-airports/flutter/pubspec.yaml`, but the lock holds the hosted package's `sha256`, which exists only after the publish. Set the gitignored `pubspec_overrides.yaml` aside (it points the app at the local `zb-dart`, and `pub get` would write that path into the lock), run `flutter pub get`, put the overrides back, and commit `pubspec.lock` (`zebridge` hosted at `<V>`, no `path:`):
+
+   ```sh
+   cd examples/10-airports/flutter
+   mv pubspec_overrides.yaml /tmp/airports_overrides.yaml && flutter pub get && mv /tmp/airports_overrides.yaml pubspec_overrides.yaml
+   ```
 
 [⬆️](#table-of-contents)
 
