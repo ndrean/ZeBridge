@@ -5,4 +5,4 @@ publish_to: none
 environment:
   sdk: ^3.10.0
 dependencies:
-  zebridge: ^0.2.8
+  zebridge: ^0.2.9

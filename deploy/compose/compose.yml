@@ -16,7 +16,7 @@ x-logging: &logging
   driver: ${ZB_LOG_DRIVER:-journald}
 
 x-zebridge: &zebridge
-  image: ghcr.io/ndrean/zebridge:${ZB_VERSION:-0.2.8}
+  image: ghcr.io/ndrean/zebridge:${ZB_VERSION:-0.2.9}
   restart: unless-stopped
   init: true   # a small init as PID 1 passes SIGTERM on: a stop takes ms, not Docker's 10 s
   logging: *logging

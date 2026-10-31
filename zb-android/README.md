@@ -7,7 +7,7 @@ arm64-v8a, armeabi-v7a and x86_64 (the emulator), the JNI layer, and one class,
 
 ```kotlin
 dependencies {
-    implementation("eu.zebridge:zebridge-android:0.2.8")   // Maven Central
+    implementation("eu.zebridge:zebridge-android:0.2.9")   // Maven Central
 }
 ```
 
