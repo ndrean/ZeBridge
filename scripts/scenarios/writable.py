@@ -281,6 +281,7 @@ async def main():
     ahead = zb.psql("SELECT to_char(watermark + interval '1 minute', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') "
                     "FROM public.zebridge_gc_watermark").strip()
     print("\nsending an UPDATE that moves the GC floor one minute ahead (expected: refused)")
+    seen = len(verdicts)
     await send("zebridge_gc_watermark", {"id": 1}, {"watermark": ahead}, op="update")
     await asyncio.sleep(4)
     floor_after = zb.psql(floor_sql).strip()
@@ -289,6 +290,13 @@ async def main():
         failed += 1
     else:
         zb.ok("a client write to the GC floor is refused: the floor did not move")
+    # The refusal must reach the client: without a verdict the write stays in its outbox for ever.
+    floor_v = [v for v in verdicts[seen:] if v.get("reason") == "ForbiddenTable"]
+    if floor_v and floor_v[0].get("status") == "rejected" and not floor_v[0].get("sqlstate"):
+        zb.ok("and the client is told: rejected, ForbiddenTable")
+    else:
+        zb.bad(f"the client was not told its write to the GC floor was refused: verdicts {verdicts[seen:] or 'none'}")
+        failed += 1
 
     task.cancel()
     await nc.close()

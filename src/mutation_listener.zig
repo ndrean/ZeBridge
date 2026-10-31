@@ -1091,7 +1091,7 @@ pub const MutationListener = struct {
                 .{ mutation.principal, mutation.table },
             );
             self.deadLetter(conn_nats, msg, payload, error.ForbiddenTable);
-            msg.ack() catch {};
+            self.refuseForbidden(conn_nats, msg, mutation.principal);
             return;
         }
         if (!hasValidMessageId(msg)) {
@@ -1347,7 +1347,7 @@ pub const MutationListener = struct {
                     .{ mutation.principal, mutation.table },
                 );
                 self.deadLetter(conn_nats, msg, payload, error.ForbiddenTable);
-                msg.ack() catch {};
+                self.refuseForbidden(conn_nats, msg, mutation.principal);
                 continue;
             }
             if (!hasValidMessageId(msg)) {
@@ -2230,6 +2230,16 @@ pub const MutationListener = struct {
 
     /// No verdict can reach the client: verdicts are addressed by the very ID that is
     /// missing or unusable. The write is dead-lettered and the operator sees why.
+    /// The answer to a write on a bridge-owned table: `rejected`, final. Without it the client was
+    /// never told and kept the write in its outbox for ever, resending it on every reconnect.
+    /// The failure fields are cleared first: this runs before `clearFailure`, and the verdict
+    /// body would otherwise quote the previous write's SQLSTATE.
+    fn refuseForbidden(self: *MutationListener, conn_nats: *nats.Connection, msg: *nats.JetStreamMessage, principal: []const u8) void {
+        self.clearFailure();
+        self.publishVerdict(conn_nats, msg, principal, "rejected", "ForbiddenTable");
+        msg.ack() catch {};
+    }
+
     fn refuseUnidentified(self: *MutationListener, conn_nats: *nats.Connection, msg: *nats.JetStreamMessage, payload: []const u8, mutation: Mutation) void {
         log.warn("⚠️  '{s}' wrote to '{s}' without a valid message ID: not executed, dead-lettered, and no verdict is addressable", .{ mutation.principal, mutation.table });
         self.deadLetter(conn_nats, msg, payload, error.InvalidMessageId);
