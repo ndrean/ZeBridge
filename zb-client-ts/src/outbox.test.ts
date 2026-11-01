@@ -110,3 +110,30 @@ test('a reconnect retries the existing cohort without opening another window', a
     assert.equal(f.db.prepare('SELECT count(*) AS n FROM _zebridge_outbox WHERE retry_at>0').get()!.n,128);
   } finally {c.nc=null; await c.outboxWork; f.db.close();}
 });
+
+test('a CDC echo before its verdict does not swallow onVerdict: either order reports the write once', async () => {
+  // shared_record: alice's accepted doc write was CONFIRMED by its echo, which dropped the
+  // outbox row; the verdict then found nothing ("not from this session") and onVerdict never fired.
+  const version = '2026-11-01T00:00:00.000000Z';
+  const settle = () => new Promise((r) => setTimeout(r, 20));
+  for (const order of ['verdict, then echo', 'echo, then verdict']) {
+    const f = fixture(1), c = f.make();
+    const seen: any[] = [];
+    try {
+      c.verdictHandlers = new Set([(v: any) => seen.push(v)]);
+      f.db.prepare('UPDATE _zebridge_outbox SET payload = ?, row_id = ? WHERE msg_id = ?')
+        .run(JSON.stringify({ key: { id: '0' }, data: { id: '0', rating: 5, updated_at: version }, version }), '0', 'id0');
+      const state = { pkCols: ['id'], versionColumn: 'updated_at' };
+      c.syncedTables.set('item', state);
+      c.pendingWrites.set('id0', { table: 'item', id: '0', at: Date.now(), version });
+      const verdict = () => c.handleVerdict('mutation_ack.alice.id0', new TextEncoder().encode('{"status":"accepted"}'));
+      const echo = async () => { c.confirmEcho('item', state, { data: { id: '0', updated_at: version } }); await settle(); };
+      if (order.startsWith('verdict')) { await verdict(); await echo(); } else { await echo(); await verdict(); }
+      await settle();
+      assert.equal(seen.length, 1, `${order}: ${seen.length} onVerdict call(s)`);
+      assert.equal(seen[0].outcome, 'applied', order);
+      assert.deepEqual(seen[0].columns, ['id', 'rating'], order);
+      assert.equal(f.db.prepare('SELECT count(*) AS n FROM _zebridge_outbox').get()!.n, 0, `${order}: the outbox row is gone`);
+    } finally { c.nc = null; f.db.close(); }
+  }
+});
