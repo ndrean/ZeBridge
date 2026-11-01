@@ -690,11 +690,20 @@ export class ZeBridge {
   private outboxWake = false;
   private outboxReconnect = 0;
   private outboxRetryEpoch = 0;
+  /// Writes settled by their CDC echo whose verdict has not come yet (`settleByEcho`).
+  private echoedWrites?: Map<string, { version: string; table: string; key: any; columns: string[] }>;
+  /// IDs whose outcome was already reported in this session (`firstReport`).
+  private verdictReported?: Set<string>;
+  /// IDs whose verdict is being handled right now (`handleVerdict`).
+  private verdictInFlight?: Set<string>;
+  /// Per key: the confirmed row beneath my pending overlays, kept after a decision while other
+  /// edits on the key depend on it (`keepConfirmed`); forgotten when an authoritative row arrives.
+  private confirmedBase?: Map<string, { row: Record<string, unknown>; at: number }>;
   private readonly outboxWindow = 128;
   /// §10do: UPDATEs judged `stale` whose columns may still be rebased onto the
   /// winning row. Held until that row is here (it may already be), then either
   /// resubmitted with a fresh stamp or dropped and surfaced.
-  private rebase = new Map<string, { table: string; key: Record<string, unknown>; values: Record<string, unknown>; before: Record<string, unknown> | null; version: string; sentVersion: string; at: number }>();
+  private rebase = new Map<string, { table: string; key: Record<string, unknown>; values: Record<string, unknown>; before: Record<string, unknown> | null; basis?: Record<string, unknown> | null; rowId?: string; createdAt?: number; version: string; sentVersion: string; at: number }>();
   private rebaseTimer: ReturnType<typeof setTimeout> | null = null;
   /// Streams the gap rule found RESTARTED (position beyond last_seq, §10bm's third
   /// shape) and no manifest has re-anchored on since. A manifest whose cutoff_seq is
@@ -1186,6 +1195,11 @@ export class ZeBridge {
     await this.outboxInitPromise;
     let row: any;
     try { row = (await this.run(`SELECT tbl, payload FROM _zebridge_outbox WHERE msg_id = ?`, msgId))[0]; } catch { /* none */ }
+    if (!row) {
+      // Settled by its echo before its verdict: the description kept at the echo, read once.
+      const kept = this.echoedWrites?.get(msgId);
+      if (kept) { this.echoedWrites!.delete(msgId); return kept; }
+    }
     if (!row && !fallback) return null;
     let sent: any = {};
     try { sent = row ? JSON.parse(row.payload) : {}; } catch { /* unreadable */ }
@@ -1707,7 +1721,8 @@ export class ZeBridge {
         created_at ${this.dialect.int64} NOT NULL,
         attempts   INTEGER NOT NULL DEFAULT 0,
         published  INTEGER NOT NULL DEFAULT 1,
-        optimistic TEXT
+        optimistic TEXT,
+        basis      TEXT
       )
     `);
     // `published` is set before the first send: a write never published cannot have
@@ -1717,6 +1732,16 @@ export class ZeBridge {
     try { await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN published INTEGER NOT NULL DEFAULT 1`); } catch { /* present */ }
     try { await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN optimistic TEXT`); } catch { /* present */ }
     try { await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN retry_at INTEGER DEFAULT 0`); } catch { /* present */ }
+    // `basis`: the row as the user saw it when making the edit, written once and never
+    // rewritten. `before` is the rollback target, which a reseed refreshes; a rebase judges
+    // the winner against `basis` (an outbox from before the column falls back to `before`).
+    // Added: the existing entries' `before` is copied in at once, before any reseed of this
+    // session can rewrite it; an entry with no `before` keeps an unknown basis, which a rebase
+    // treats as a conflict (lost, never re-sent).
+    try {
+      await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN basis TEXT`);
+      await this.run(`UPDATE _zebridge_outbox SET basis = before WHERE basis IS NULL`);
+    } catch { /* present */ }
     await this.run(`CREATE INDEX IF NOT EXISTS _zbz_outbox_retry ON _zebridge_outbox (retry_at, attempts, created_at, msg_id)`);
     await this.run(`CREATE INDEX IF NOT EXISTS _zbz_outbox_recovery ON _zebridge_outbox (attempts, created_at, msg_id)`);
     await this.run(`
@@ -1740,11 +1765,11 @@ export class ZeBridge {
   ) {
     await this.outboxInitPromise;
     await exec(
-      `INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at, attempts, published, optimistic)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+      `INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, optimistic)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
        ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1`,
       r.msgId, r.subject, JSON.stringify(r.payload), r.table, String(r.id),
-      r.before == null ? null : JSON.stringify(r.before), Date.now(), JSON.stringify(r.optimistic),
+      r.before == null ? null : JSON.stringify(r.before), r.before == null ? null : JSON.stringify(r.before), Date.now(), JSON.stringify(r.optimistic),
     );
   }
 
@@ -1792,7 +1817,7 @@ export class ZeBridge {
   /// surfaced — LWW's word stands. Only an UPDATE qualifies.
   private async holdForRebase(msgId: string) {
     await this.outboxInitPromise;
-    const rows = await this.run(`SELECT tbl, subject, payload, before FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
+    const rows = await this.run(`SELECT tbl, subject, payload, before, basis, row_id, created_at FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
     const entry = rows[0];
     if (!entry || String(entry.subject).split('.').pop() !== 'update') return;
     const sent = JSON.parse(entry.payload);
@@ -1802,6 +1827,8 @@ export class ZeBridge {
     this.rebase.set(msgId, {
       table: entry.tbl, key, values,
       before: entry.before ? JSON.parse(entry.before) : null,
+      basis: entry.basis ? JSON.parse(entry.basis) : null,
+      rowId: String(entry.row_id ?? ''), createdAt: Number(entry.created_at ?? 0),
       version: normalizeVersion(String(sent.version ?? '')),
       sentVersion: String(sent.version ?? ''),
       at: Date.now(),
@@ -1852,17 +1879,43 @@ export class ZeBridge {
     // works because its winner arrives after the write).
     const verNow = normalizeVersion(String(cur[state.versionColumn] ?? ''));
     const verBefore = e.before ? normalizeVersion(String(e.before[state.versionColumn] ?? '')) : '';
-    if (!(verNow > e.version || verBefore > e.version)) return; // the winner is not here yet
+    // The row here may be ANY of my pending edits on this key, not only this one: after a
+    // reseed, each pending edit is laid over the one before it. The confirmed row is beneath
+    // all of them: the `before` of the oldest pending edit on the key.
+    const mineVersions = new Set([e.version]);
+    let base = e.before, baseAt = e.createdAt ?? Number.MAX_SAFE_INTEGER;
+    for (const o of await this.run(`SELECT payload, before, created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?`, e.table, e.rowId ?? '')) {
+      try { const v = normalizeVersion(String(JSON.parse(o.payload)?.version ?? '')); if (v) mineVersions.add(v); } catch { /* unreadable */ }
+      if (Number(o.created_at) < baseAt) { baseAt = Number(o.created_at); base = o.before ? JSON.parse(o.before) : null; }
+    }
+    // An earlier decision on this key may have kept the confirmed row: once the oldest pending
+    // edit settled and left the outbox, it is the only place the seeded winner still lives.
+    const ckey = `${e.table}\u0000${e.rowId ?? ''}`;
+    const kept = this.confirmedBase?.get(ckey);
+    if (kept && kept.at < baseAt) { baseAt = kept.at; base = kept.row; }
+    const overlaid = mineVersions.has(verNow) && base != null;
+    const winner = overlaid ? base! : cur;
+    const verWinner = normalizeVersion(String(winner[state.versionColumn] ?? ''));
+    if (!(verWinner > e.version || verBefore > e.version)) return; // the winner is not here yet
     const mine = Object.keys(e.values).filter((c) => c !== state.versionColumn);
-    const winnerChanged = Object.keys(cur).filter(
-      (c) => c !== state.versionColumn && JSON.stringify(cur[c] ?? null) !== JSON.stringify(e.before?.[c] ?? null),
+    // Judged against the AUTHORITATIVE winner, never against what is displayed: right after
+    // a reseed re-applied this pending edit, the row here is my own overlay (it carries my
+    // version) and the winner is the seeded row underneath it, which `before` holds. Read
+    // from the overlay, my own value looked like the winner's change, matched my edit, and
+    // a stale edit was re-sent as a fresh write (shared_record: carol's rating 2 overwrote
+    // alice's 5). And the winner is compared with the row as I saw it when I made the edit
+    // (`basis`), which a reseed does not rewrite.
+    const basis = e.basis ?? null; // unknown: every column of the edit counts as lost
+    const winnerChanged = Object.keys(winner).filter(
+      (c) => c !== state.versionColumn && JSON.stringify(winner[c] ?? null) !== JSON.stringify(basis?.[c] ?? null),
     );
-    // The winner changed one of MY columns when the row here holds neither the
-    // pre-write value nor mine: the CDC row overwrote my optimistic copy.
-    const overlap = e.before
-      ? mine.filter((c) => winnerChanged.includes(c) && JSON.stringify(cur[c] ?? null) !== JSON.stringify(e.values[c] ?? null))
+    // The winner changed one of MY columns, to something other than my value: a real loss.
+    // (The winner writing my very value is no loss, and a re-send of it changes nothing.)
+    const overlap = basis
+      ? mine.filter((c) => winnerChanged.includes(c) && JSON.stringify(winner[c] ?? null) !== JSON.stringify(e.values[c] ?? null))
       : mine;
     this.rebase.delete(msgId);
+    await this.keepConfirmed(e, ckey, base, baseAt);
     if (overlap.length) {
       this.appendLog(e.table, `edit LOST to a newer version on the same column(s) ${overlap.join(', ')} — the winning row stands; surface this to the user`, 'ERROR');
       reported('lost', { lostColumns: overlap });
@@ -1871,6 +1924,14 @@ export class ZeBridge {
     const r = await this.mutate(e.table, 'UPDATE', e.key, e.values);
     reported('rebased', { rebasedAs: r.version });
     this.appendLog(e.table, `rebased ${mine.join(', ')} onto the newer row (the winner changed ${winnerChanged.filter((c) => c !== 'last_writer').join(', ') || 'nothing else'}) as ${r.version}`, 'INFO');
+  }
+
+  /// Decided: the confirmed row stays for the other edits on the key, if any remain.
+  private async keepConfirmed(e: { table: string; rowId?: string }, ckey: string, base: Record<string, unknown> | null, at: number) {
+    const left = Number((await this.run(`SELECT count(*) AS n FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?`, e.table, e.rowId ?? ''))[0]?.n ?? 0) > 0
+      || [...this.rebase.values()].some((o) => o.table === e.table && o.rowId === e.rowId);
+    if (left && base) (this.confirmedBase ??= new Map()).set(ckey, { row: base, at });
+    else this.confirmedBase?.delete(ckey);
   }
 
   private async revertOptimisticWrite(msgId: string, mode: 'restore' | 'delete') {
@@ -2829,6 +2890,10 @@ export class ZeBridge {
   /// What follows a row's landing, whichever statement landed it: the echo pops the
   /// outbox entry, a held edit may have its winner, the global position advances.
   private async afterApplied(table: string, state: TableState, ev: any, exec: Exec) {
+    // An authoritative row for a key: my overlays on it are gone, and the confirmed row kept beneath them.
+    if (!ev.optimistic && this.confirmedBase?.size && state.pkCols.length) {
+      this.confirmedBase.delete(`${table}\u0000${state.pkCols.map((c) => String(ev.data?.[c])).join('|')}`);
+    }
     this.confirmEcho(table, state, ev);
     // §10do: a row arriving may be the winner a held edit waits for.
     if (!ev.optimistic && this.rebase.size) this.scheduleRebase();
@@ -2848,9 +2913,27 @@ export class ZeBridge {
       if (w.table !== table || String(w.id) !== echoedKey) continue;
       if (w.version && echoedVersion && normalizeVersion(w.version) !== echoedVersion) continue; // someone else's row on our key
       this.pendingWrites.delete(msgId);
-      void this.outboxDrop(msgId);
+      void this.settleByEcho(msgId, w);
       this.appendLog(table, `confirmed by CDC echo after ${Date.now() - w.at}ms`, 'CONFIRMED');
     }
+  }
+
+  /// The echo stops retransmission; it does not complete the write for the app. Its
+  /// verdict may still be on its way: the write's description is kept until that verdict
+  /// reads it, so onVerdict fires once whichever comes first. Dropping both here lost the
+  /// callback when the echo won (shared_record: alice's accepted doc write, then a
+  /// 60-second settle timeout).
+  private async settleByEcho(msgId: string, w: { table: string; version?: string | null }) {
+    const write = await this.outboxWrite(msgId, w);
+    if (write && !this.verdictReported?.has(msgId) && !this.verdictInFlight?.has(msgId)) (this.echoedWrites ??= new Map()).set(msgId, write);
+    await this.outboxDrop(msgId);
+  }
+
+  /// The ID's definitive outcome was handled to the end in this session; bounded.
+  private markReported(msgId: string) {
+    const done = (this.verdictReported ??= new Set());
+    done.add(msgId);
+    if (done.size > 10_000) done.delete(done.values().next().value!);
   }
 
   /// The global lsn and the stream's seq, persisted when either moves forward. Once
@@ -5358,7 +5441,27 @@ export class ZeBridge {
 
   /// One verdict, live or collected: true when it was definitive (the outbox entry is
   /// settled one way or another), false for `failed` or an unknown status (kept).
+  /// A write's outcome is reported once. A verdict for an ID being handled, or already
+  /// handled to the end, does nothing; the ID is marked done only when the handling returned,
+  /// so a failure on the way (an outbox delete, a revert) lets a later delivery retry it.
   private async handleVerdict(subject: string, data: Uint8Array): Promise<boolean> {
+    const prefix = `${this.ackPrefix()}.${this.config.principal}.`;
+    const msgId = subject.startsWith(prefix) ? subject.slice(prefix.length) : subject;
+    let status = '';
+    try { status = String(JSON.parse(new TextDecoder().decode(data))?.status ?? ''); } catch { /* the handler reports it */ }
+    const tracked = msgId !== 'revoked' && status !== 'failed';
+    if (tracked && (this.verdictReported?.has(msgId) || this.verdictInFlight?.has(msgId))) return true;
+    if (tracked) (this.verdictInFlight ??= new Set()).add(msgId);
+    try {
+      const ok = await this.handleVerdictOnce(subject, data);
+      if (tracked) this.markReported(msgId);
+      return ok;
+    } finally {
+      if (tracked) this.verdictInFlight!.delete(msgId);
+    }
+  }
+
+  private async handleVerdictOnce(subject: string, data: Uint8Array): Promise<boolean> {
     const m = { subject, data };
     let ok: boolean;
     {
