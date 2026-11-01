@@ -5891,7 +5891,8 @@ export class ZeBridge {
 
     // A fresh edit shares the durable window with recovery. It remains queued
     // when every slot is occupied; the next verdict advances it automatically.
-    await this.flushOutbox();
+    // Not awaiting the PubAcks: an app's loop of mutate() calls is not one round trip per write.
+    await this.flushOutboxPass(false);
   }
 
   /// Fill the in-flight window. Remaining entries advance automatically as verdicts
@@ -5912,10 +5913,10 @@ export class ZeBridge {
     return this.flushOutboxPass();
   }
 
-  private async flushOutboxPass() {
+  private async flushOutboxPass(awaitAcks = true) {
     if (this.outboxWork) { this.outboxWake = true; return this.outboxWork; }
     this.outboxWake = false;
-    const work = this.flushOutboxOnce();
+    const work = this.flushOutboxOnce(awaitAcks);
     this.outboxWork = work;
     try { await work; }
     finally {
@@ -5925,7 +5926,7 @@ export class ZeBridge {
     }
   }
 
-  private async flushOutboxOnce() {
+  private async flushOutboxOnce(awaitAcks = true) {
     const nc = this.nc;
     if (!nc || Date.now() < this.holdUntil) return;
     let rows: any[] = [];
@@ -5990,6 +5991,11 @@ export class ZeBridge {
     }
 
     let verdictManager: Promise<any> | undefined;
+    // The window goes out whole, then its PubAcks are collected: one round trip for the window
+    // instead of one per write. Every entry is reserved and marked published before its send,
+    // so one whose ack does not come stays queued for its retry, as before (the ack never
+    // changed the outbox). Sent in order on one connection, the stream stores them in order.
+    const acks: Promise<void>[] = [];
     for (const r of rows) {
       if (this.nc !== nc || Date.now() < this.holdUntil) return;
       try {
@@ -6010,13 +6016,25 @@ export class ZeBridge {
         this.pendingWrites.set(r.msg_id, { table: r.tbl, id: r.row_id, at: Date.now(), version: outboxVersionOf(r) });
         // Persist before publishing, independently of any CDC transaction.
         await this.transaction(async (exec) => { await exec(`UPDATE _zebridge_outbox SET published = 1 WHERE msg_id = ?`, r.msg_id); });
-        const ack = await this.transport.jetstream(nc, this.jsOpts()).publish(r.subject, encode(JSON.parse(r.payload)), { headers: h });
-        this.appendLog('OUTBOX', `replayed ${r.msg_id} (seq ${ack.seq}${ack.duplicate ? ', duplicate — already landed' : ''})`, 'INFO');
+        const sent = this.transport.jetstream(nc, this.jsOpts()).publish(r.subject, encode(JSON.parse(r.payload)), { headers: h });
+        // The pass's first write is a probe when it awaits acks: an ambiguous failure stops the
+        // pass with its peers still eligible, instead of spending every slot's backoff at once.
+        if (awaitAcks && !acks.length) {
+          const ack = await sent;
+          this.appendLog('OUTBOX', `replayed ${r.msg_id} (seq ${ack.seq}${ack.duplicate ? ', duplicate — already landed' : ''})`, 'INFO');
+          acks.push(Promise.resolve());
+          continue;
+        }
+        acks.push(sent.then(
+          (ack: any) => this.appendLog('OUTBOX', `replayed ${r.msg_id} (seq ${ack.seq}${ack.duplicate ? ', duplicate — already landed' : ''})`, 'INFO'),
+          (err: unknown) => this.appendLog('OUTBOX', `replay of ${r.msg_id} failed, kept with its retry deadline: ${err}`, 'ERROR'),
+        ));
       } catch (err) {
         this.appendLog('OUTBOX', `replay of ${r.msg_id} failed, kept with its retry deadline: ${err}`, 'ERROR');
         break;
       }
     }
+    if (awaitAcks) await Promise.all(acks);
   }
 
   /// A real PING against a possibly-lying transport: a frozen server can leave the
