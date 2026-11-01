@@ -110,3 +110,74 @@ test('a reconnect retries the existing cohort without opening another window', a
     assert.equal(f.db.prepare('SELECT count(*) AS n FROM _zebridge_outbox WHERE retry_at>0').get()!.n,128);
   } finally {c.nc=null; await c.outboxWork; f.db.close();}
 });
+
+test('a CDC echo before its verdict does not swallow onVerdict: either order reports the write once', async () => {
+  // shared_record: alice's accepted doc write was CONFIRMED by its echo, which dropped the
+  // outbox row; the verdict then found nothing ("not from this session") and onVerdict never fired.
+  const version = '2026-11-01T00:00:00.000000Z';
+  const settle = () => new Promise((r) => setTimeout(r, 20));
+  for (const order of ['verdict, then echo', 'echo, then verdict']) {
+    const f = fixture(1), c = f.make();
+    const seen: any[] = [];
+    try {
+      c.verdictHandlers = new Set([(v: any) => seen.push(v)]);
+      f.db.prepare('UPDATE _zebridge_outbox SET payload = ?, row_id = ? WHERE msg_id = ?')
+        .run(JSON.stringify({ key: { id: '0' }, data: { id: '0', rating: 5, updated_at: version }, version }), '0', 'id0');
+      const state = { pkCols: ['id'], versionColumn: 'updated_at' };
+      c.syncedTables.set('item', state);
+      c.pendingWrites.set('id0', { table: 'item', id: '0', at: Date.now(), version });
+      const verdict = () => c.handleVerdict('mutation_ack.alice.id0', new TextEncoder().encode('{"status":"accepted"}'));
+      const echo = async () => { c.confirmEcho('item', state, { data: { id: '0', updated_at: version } }); await settle(); };
+      if (order.startsWith('verdict')) { await verdict(); await echo(); } else { await echo(); await verdict(); }
+      await settle();
+      assert.equal(seen.length, 1, `${order}: ${seen.length} onVerdict call(s)`);
+      assert.equal(seen[0].outcome, 'applied', order);
+      assert.deepEqual(seen[0].columns, ['id', 'rating'], order);
+      assert.equal(f.db.prepare('SELECT count(*) AS n FROM _zebridge_outbox').get()!.n, 0, `${order}: the outbox row is gone`);
+    } finally { c.nc = null; f.db.close(); }
+  }
+});
+
+test('an echo racing its verdict, then a duplicate verdict: onVerdict fires once', async () => {
+  // Both paths read the outbox before either deleted it: the verdict reported the write, the
+  // echo kept a description, and a duplicate verdict consumed it and reported again.
+  const version = '2026-11-01T00:00:00.000000Z';
+  const f = fixture(1), c = f.make();
+  const seen: any[] = [];
+  try {
+    c.verdictHandlers = new Set([(v: any) => seen.push(v)]);
+    f.db.prepare('UPDATE _zebridge_outbox SET payload = ?, row_id = ? WHERE msg_id = ?')
+      .run(JSON.stringify({ key: { id: '0' }, data: { id: '0', rating: 5, updated_at: version }, version }), '0', 'id0');
+    const state = { pkCols: ['id'], versionColumn: 'updated_at' };
+    c.syncedTables.set('item', state);
+    c.pendingWrites.set('id0', { table: 'item', id: '0', at: Date.now(), version });
+    const accepted = () => c.handleVerdict('mutation_ack.alice.id0', new TextEncoder().encode('{"status":"accepted"}'));
+    c.confirmEcho('item', state, { data: { id: '0', updated_at: version } });
+    await accepted();
+    await new Promise((r) => setTimeout(r, 20));
+    await accepted();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(seen.length, 1, `${seen.length} onVerdict call(s) for one write`);
+  } finally { c.nc = null; f.db.close(); }
+});
+
+test('a verdict whose settlement fails is retried by its next delivery, and reported once', async () => {
+  const version = '2026-11-01T00:00:00.000000Z';
+  const f = fixture(1), c = f.make();
+  const seen: any[] = [];
+  try {
+    c.verdictHandlers = new Set([(v: any) => seen.push(v)]);
+    f.db.prepare('UPDATE _zebridge_outbox SET payload = ?, row_id = ? WHERE msg_id = ?')
+      .run(JSON.stringify({ key: { id: '0' }, data: { id: '0', rating: 5, updated_at: version }, version }), '0', 'id0');
+    c.syncedTables.set('item', { pkCols: ['id'], versionColumn: 'updated_at' });
+    c.pendingWrites.set('id0', { table: 'item', id: '0', at: Date.now(), version });
+    const real = c.outboxDrop.bind(c);
+    let failures = 1;
+    c.outboxDrop = async (id: string) => { if (failures-- > 0) throw new Error('database is locked'); return real(id); };
+    const accepted = () => c.handleVerdict('mutation_ack.alice.id0', new TextEncoder().encode('{"status":"accepted"}'));
+    await assert.rejects(accepted());
+    await accepted();
+    assert.equal(seen.length, 1, `${seen.length} onVerdict call(s)`);
+    assert.equal(f.db.prepare('SELECT count(*) AS n FROM _zebridge_outbox').get()!.n, 0, 'the retry removed the outbox row');
+  } finally { c.nc = null; f.db.close(); }
+});
