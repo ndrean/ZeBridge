@@ -45,7 +45,10 @@ pub const Nats = struct {
     /// batched apply (one explicit transaction, ONE WAL flush for the lot —
     /// §10cr measured the per-mutation ceiling at ~50/s); depth 1 takes the
     /// per-message path unchanged, so light load keeps today's exact semantics.
-    pub const mutation_pull_batch = 64;
+    /// 256, not 64: when the database is a round trip away (17 ms to Supabase from the hub),
+    /// a batch costs its round trips whatever its size, so the cap is the writes moved per
+    /// round trip. A fetch still returns what is there, so light traffic is not held back.
+    pub const mutation_pull_batch = 256;
 
     /// Derived, never written out again. Nothing in the live path builds a URL any more
     /// — `Endpoint` below is the address, and a URL is only ever an *input* — but the
