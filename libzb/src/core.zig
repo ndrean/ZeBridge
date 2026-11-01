@@ -118,7 +118,7 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 }
 
 /// JS `String(v)` for the scalar shapes fixtures carry (key ids).
-fn scalarToString(a: std.mem.Allocator, v: Value) ![]const u8 {
+pub fn scalarToString(a: std.mem.Allocator, v: Value) ![]const u8 {
     return switch (v) {
         .string => |s| s,
         .integer => |x| try std.fmt.allocPrint(a, "{d}", .{x}),

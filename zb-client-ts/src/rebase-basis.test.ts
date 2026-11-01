@@ -121,3 +121,25 @@ test('an outbox from before the basis column keeps the basis it had, whatever a 
   assert.equal(verdicts[0]?.outcome, 'lost');
   db.close();
 });
+
+test('two stale edits on one row both settle: the confirmed row outlives the first decision', async () => {
+  // edit 1 (rating 2) is lost to alice's seeded 5; edit 2 (notes) does not conflict. Once edit 1
+  // has left the outbox, the seeded winner must still be found for edit 2, or it waits for ever.
+  const { c, db, resent, verdicts } = world(
+    { id: '1', rating: 2, notes: 'x', updated_at: V(7) },
+    { id: '1', rating: 5, notes: 'n', updated_at: V(30) },
+    { id: '1', rating: null, notes: 'n', updated_at: V(1) },
+    { rating: 2, updated_at: V(5) },
+  );
+  db.prepare('INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1)')
+    .run('m2', 'mutation.carol.item.update', JSON.stringify({ key: { id: '1' }, data: { id: '1', notes: 'x', updated_at: V(7) }, version: V(7) }),
+      'item', '1', JSON.stringify({ id: '1', rating: 2, notes: 'n', updated_at: V(5) }), JSON.stringify({ id: '1', rating: null, notes: 'n', updated_at: V(1) }));
+  const drop = (id: string) => db.prepare('DELETE FROM _zebridge_outbox WHERE msg_id = ?').run(id);
+  await c.holdForRebase('m1'); drop('m1'); await c.tryRebase('m1');
+  assert.equal(verdicts[0]?.outcome, 'lost');
+  await c.holdForRebase('m2'); drop('m2'); await c.tryRebase('m2');
+  assert.equal(verdicts.length, 2, 'edit 2 is decided, not held for ever');
+  assert.equal(verdicts[1]?.outcome, 'rebased');
+  assert.deepEqual(resent.map((v) => v.notes), ['x']);
+  db.close();
+});

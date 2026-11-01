@@ -519,6 +519,10 @@ pub const SyncClient = struct {
     /// §10do: UPDATEs judged `stale` whose columns may still be rebased onto the
     /// winning row, keyed by msg_id; strings live in the client arena (rare, small).
     rebase: std.array_hash_map.String(Rebase) = .empty,
+    /// The confirmed row beneath my pending overlays on a key, kept after the edit that found it
+    /// settles while others on the key still depend on it; forgotten when the last one settles
+    /// or an authoritative row for the key arrives (`ConfirmedBases`).
+    confirmed: ConfirmedBases = .{},
     rebase_due: bool = false,
     /// Cumulative verdict counts by status, for the host (the flush report carries
     /// them): a single-writer run with anything but `accepted` here has a finding.
@@ -738,6 +742,7 @@ pub const SyncClient = struct {
         while (pit.next()) |e| self.a.free(e.key_ptr.*);
         self.last_pending.deinit(self.a);
         self.flows.deinit(self.a);
+        self.confirmed.deinit(self.a);
         for (self.outcomes.items) |o| self.a.free(o);
         self.outcomes.deinit(self.a);
         self.ro.close();
@@ -5389,6 +5394,19 @@ pub const SyncClient = struct {
         };
         // §10do: a row arriving may be the winner a held edit waits for.
         if (self.rebase.count() > 0) self.rebase_due = true;
+        self.forgetConfirmed(taa, table, st.pk, data);
+    }
+
+    /// An authoritative row for a key: my overlays on it are gone, and the confirmed row kept
+    /// beneath them with them.
+    fn forgetConfirmed(self: *SyncClient, a: std.mem.Allocator, table: []const u8, pk: []const []const u8, data: Value) void {
+        if (self.confirmed.map.count() == 0 or data != .object) return;
+        var id: std.ArrayList(u8) = .empty;
+        for (pk, 0..) |c, i| {
+            if (i > 0) id.append(a, '|') catch return;
+            id.appendSlice(a, core.scalarToString(a, data.object.get(c) orelse .null) catch return) catch return;
+        }
+        self.confirmed.remove(self.a, ConfirmedBases.key(a, table, id.items) catch return);
     }
 
     /// §10hh: did the last statement fail on a FOREIGN KEY? Each engine says it in its own
@@ -5656,7 +5674,10 @@ pub const SyncClient = struct {
                 if (cx.mt) |t| if (e.seq <= t.target) {
                     cx.mc.applied += 1;
                 };
-                if (e.ev.object.get("data")) |dv| try self.feedFloor(a, st, dv);
+                if (e.ev.object.get("data")) |dv| {
+                    try self.feedFloor(a, st, dv);
+                    self.forgetConfirmed(a, table, st.pk, dv);
+                }
             }
             if (cx.report_a) |ra_| if (cx.changed_map) |cm| {
                 if (!cm.contains(table)) cm.put(ra_, ra_.dupe(u8, table) catch table, {}) catch {};
@@ -6607,20 +6628,27 @@ pub const SyncClient = struct {
         // `before` of the oldest pending edit on the key.
         var mine_versions: std.ArrayList([]const u8) = .empty;
         try mine_versions.append(a, e.version);
-        var base = before;
-        var base_at: i64 = if (e.created_at > 0) e.created_at else std.math.maxInt(i64);
+        var pending: std.ArrayList(PendingBase) = .empty;
         for (try self.st.query(a, "SELECT payload, before, created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?", &.{ .{ .text = e.table }, .{ .text = e.row_id } })) |o| {
             if (o[0] == .text) if (parseStoredJson(a, o[0].text)) |env| {
                 if (env == .object) if (env.object.get("version")) |v| if (v == .string) try mine_versions.append(a, try core.normalizeVersion(a, v.string));
             } else |_| {};
-            const at: i64 = if (o[2] == .integer) o[2].integer else std.math.maxInt(i64);
-            if (at < base_at) {
-                base_at = at;
-                base = if (o[1] == .text) try parseStoredJson(a, o[1].text) else null;
-            }
+            try pending.append(a, .{ .before = if (o[1] == .text) try parseStoredJson(a, o[1].text) else null, .at = if (o[2] == .integer) o[2].integer else std.math.maxInt(i64) });
         }
+        const ckey = try ConfirmedBases.key(a, e.table, e.row_id);
+        const chosen = try oldestBase(a, before, if (e.created_at > 0) e.created_at else std.math.maxInt(i64), pending.items, self.confirmed.get(ckey));
+        const base = chosen.base;
+        const base_at = chosen.at;
         const decision = try rebaseDecision(a, cur, base, basis, values, vcol, e.version, mine_versions.items);
         if (decision == .wait) return false;
+        // Decided: the confirmed row stays for the other edits on this key, if any remain.
+        var dependents = (try self.st.query(a, "SELECT count(*) FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?", &.{ .{ .text = e.table }, .{ .text = e.row_id } }))[0][0].integer > 0;
+        for (self.rebase.keys(), self.rebase.values()) |k, other| {
+            if (!std.mem.eql(u8, k, mid) and std.mem.eql(u8, other.table, e.table) and std.mem.eql(u8, other.row_id, e.row_id)) dependents = true;
+        }
+        if (dependents and base != null) {
+            try self.confirmed.put(self.a, ckey, try core.valueToString(a, base.?), base_at);
+        } else self.confirmed.remove(self.a, ckey);
         var mine: std.ArrayList(u8) = .empty;
         for (values.object.keys()) |c| {
             if (std.mem.eql(u8, c, vcol)) continue;
@@ -7342,6 +7370,7 @@ test "measurement: isolated replay counts committed outcomes and excludes events
     const a = arena.allocator();
     // Only the storage/apply fields are used: no NATS connection or acknowledgments.
     var client: SyncClient = undefined;
+    client.confirmed = .{};
     client.a = a;
     client.st = try storage.Storage.open(":memory:");
     defer client.st.close();
@@ -7389,6 +7418,7 @@ test "measurement: isolated replay counts committed outcomes and excludes events
 /// A client with storage and routes only, for the frontier tests: no NATS, no tails.
 fn frontierClient(a: std.mem.Allocator) !SyncClient {
     var client: SyncClient = undefined;
+    client.confirmed = .{};
     client.a = a;
     client.arena = std.heap.ArenaAllocator.init(a);
     client.st = try storage.Storage.open(":memory:");
@@ -7824,6 +7854,64 @@ fn addOutboxBasis(st: *storage.Storage) !void {
     if (execDdl(st, "ALTER TABLE _zebridge_outbox ADD COLUMN basis TEXT")) |_| {
         try execDdl(st, "UPDATE _zebridge_outbox SET basis = before WHERE basis IS NULL");
     } else |_| {}
+}
+
+/// Per key (`table` NUL `row_id`): the confirmed row beneath my pending overlays and the
+/// `created_at` of the edit it came from. Owned by the client's allocator.
+const ConfirmedBases = struct {
+    const Entry = struct { row: []const u8, at: i64 };
+    map: std.StringHashMapUnmanaged(Entry) = .empty,
+
+    fn key(a: std.mem.Allocator, table: []const u8, row_id: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(a, "{s}\x00{s}", .{ table, row_id });
+    }
+    fn get(self: *const ConfirmedBases, k: []const u8) ?Entry {
+        return self.map.get(k);
+    }
+    fn put(self: *ConfirmedBases, gpa: std.mem.Allocator, k: []const u8, row: []const u8, at: i64) !void {
+        const owned_row = try gpa.dupe(u8, row);
+        errdefer gpa.free(owned_row);
+        if (self.map.getPtr(k)) |e| {
+            gpa.free(e.row);
+            e.* = .{ .row = owned_row, .at = at };
+            return;
+        }
+        const owned_key = try gpa.dupe(u8, k);
+        errdefer gpa.free(owned_key);
+        try self.map.put(gpa, owned_key, .{ .row = owned_row, .at = at });
+    }
+    fn remove(self: *ConfirmedBases, gpa: std.mem.Allocator, k: []const u8) void {
+        if (self.map.fetchRemove(k)) |kv| {
+            gpa.free(kv.key);
+            gpa.free(kv.value.row);
+        }
+    }
+    fn deinit(self: *ConfirmedBases, gpa: std.mem.Allocator) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            gpa.free(e.key_ptr.*);
+            gpa.free(e.value_ptr.row);
+        }
+        self.map.deinit(gpa);
+    }
+};
+
+const PendingBase = struct { before: ?Value, at: i64 };
+
+/// The confirmed row beneath my pending overlays on a key: the oldest of the edit's own
+/// `before`, the other pending edits' and the row kept after an earlier decision on the key.
+fn oldestBase(a: std.mem.Allocator, own: ?Value, own_at: i64, pending: []const PendingBase, kept: ?ConfirmedBases.Entry) !struct { base: ?Value, at: i64 } {
+    var base = own;
+    var at = own_at;
+    for (pending) |p| if (p.at < at) {
+        at = p.at;
+        base = p.before;
+    };
+    if (kept) |k| if (k.at < at) {
+        at = k.at;
+        base = try parseStoredJson(a, k.row);
+    };
+    return .{ .base = base, .at = at };
 }
 
 const RebaseDecision = union(enum) { wait, lost: []const []const u8, rebase };
@@ -8820,4 +8908,29 @@ test "addOutboxBasis: an outbox from before the column keeps the basis it had; a
     try std.testing.expect(r[0][0] == .text); // copied from `before` at the upgrade
     try std.testing.expectEqualStrings("{\"rating\":null}", r[0][0].text);
     try std.testing.expect(r[1][0] == .null); // unknown, judged as a conflict
+}
+
+test "two stale edits on one row both settle: the confirmed row outlives the first decision" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v1 = "2026-11-01T16:10:05.000000Z"; // edit 1: rating 2
+    const v2 = "2026-11-01T16:10:07.000000Z"; // edit 2: notes x, its overlay is what the row shows
+    const saw = try parseStoredJson(a, "{\"id\":\"1\",\"rating\":null,\"notes\":\"n\",\"updated_at\":\"2026-11-01T16:10:01.000000Z\"}");
+    const seed = try parseStoredJson(a, "{\"id\":\"1\",\"rating\":5,\"notes\":\"n\",\"updated_at\":\"2026-11-01T16:10:30.000000Z\"}");
+    const over1 = try parseStoredJson(a, "{\"id\":\"1\",\"rating\":2,\"notes\":\"n\",\"updated_at\":\"" ++ v1 ++ "\"}");
+    const shown = try parseStoredJson(a, "{\"id\":\"1\",\"rating\":2,\"notes\":\"x\",\"updated_at\":\"" ++ v2 ++ "\"}");
+    var kept: ConfirmedBases = .{};
+    defer kept.deinit(std.testing.allocator);
+    const k = try ConfirmedBases.key(a, "item", "1");
+    // edit 1, edit 2 still pending: decided against the seed beneath both, and the seed is kept.
+    const b1 = try oldestBase(a, seed, 0, &.{.{ .before = over1, .at = 1 }}, kept.get(k));
+    try std.testing.expect(try rebaseDecision(a, shown, b1.base, saw, try parseStoredJson(a, "{\"rating\":2}"), "updated_at", v1, &.{v2}) == .lost);
+    try kept.put(std.testing.allocator, k, try core.valueToString(a, b1.base.?), b1.at);
+    // edit 2, edit 1 gone from the outbox: its own `before` is edit 1's overlay; the kept seed decides.
+    const b2 = try oldestBase(a, over1, 1, &.{}, kept.get(k));
+    try std.testing.expect(try rebaseDecision(a, shown, b2.base, saw, try parseStoredJson(a, "{\"notes\":\"x\"}"), "updated_at", v2, &.{v2}) == .rebase);
+    // without the kept row, edit 2 would wait for a winner that never comes.
+    const lone = try oldestBase(a, over1, 1, &.{}, null);
+    try std.testing.expect(try rebaseDecision(a, shown, lone.base, saw, try parseStoredJson(a, "{\"notes\":\"x\"}"), "updated_at", v2, &.{v2}) == .wait);
 }

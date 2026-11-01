@@ -160,3 +160,24 @@ test('an echo racing its verdict, then a duplicate verdict: onVerdict fires once
     assert.equal(seen.length, 1, `${seen.length} onVerdict call(s) for one write`);
   } finally { c.nc = null; f.db.close(); }
 });
+
+test('a verdict whose settlement fails is retried by its next delivery, and reported once', async () => {
+  const version = '2026-11-01T00:00:00.000000Z';
+  const f = fixture(1), c = f.make();
+  const seen: any[] = [];
+  try {
+    c.verdictHandlers = new Set([(v: any) => seen.push(v)]);
+    f.db.prepare('UPDATE _zebridge_outbox SET payload = ?, row_id = ? WHERE msg_id = ?')
+      .run(JSON.stringify({ key: { id: '0' }, data: { id: '0', rating: 5, updated_at: version }, version }), '0', 'id0');
+    c.syncedTables.set('item', { pkCols: ['id'], versionColumn: 'updated_at' });
+    c.pendingWrites.set('id0', { table: 'item', id: '0', at: Date.now(), version });
+    const real = c.outboxDrop.bind(c);
+    let failures = 1;
+    c.outboxDrop = async (id: string) => { if (failures-- > 0) throw new Error('database is locked'); return real(id); };
+    const accepted = () => c.handleVerdict('mutation_ack.alice.id0', new TextEncoder().encode('{"status":"accepted"}'));
+    await assert.rejects(accepted());
+    await accepted();
+    assert.equal(seen.length, 1, `${seen.length} onVerdict call(s)`);
+    assert.equal(f.db.prepare('SELECT count(*) AS n FROM _zebridge_outbox').get()!.n, 0, 'the retry removed the outbox row');
+  } finally { c.nc = null; f.db.close(); }
+});
