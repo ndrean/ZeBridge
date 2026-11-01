@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { ZeBridge } from './libzb.ts';
+import { sqliteDialect } from './dialect.ts';
 
 const V = (s: number) => `2026-11-01T16:10:${String(s).padStart(2, '0')}.000000Z`;
 
@@ -72,6 +73,51 @@ test('without a reseed (the winner overwrote the overlay) the decision is unchan
   );
   await c.holdForRebase('m1'); await c.tryRebase('m1');
   assert.deepEqual(resent, []);
+  assert.equal(verdicts[0]?.outcome, 'lost');
+  db.close();
+});
+
+test('two pending edits on one row: the confirmed row under both overlays is the winner', async () => {
+  // carol's older edit (rating 2) is being rebased; her later edit (notes) is still queued and
+  // its overlay is what the row shows. The seeded winner (alice's rating 5) is under both.
+  const { c, db, resent, verdicts } = world(
+    { id: '1', rating: 2, notes: 'x', updated_at: V(7) },      // displayed: carol's SECOND overlay
+    { id: '1', rating: 5, notes: 'n', updated_at: V(30) },     // first edit's before: alice's seeded winner
+    { id: '1', rating: null, notes: 'n', updated_at: V(1) },   // basis: what carol saw
+    { rating: 2, updated_at: V(5) },
+  );
+  db.prepare('INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1)')
+    .run('m2', 'mutation.carol.item.update', JSON.stringify({ key: { id: '1' }, data: { id: '1', notes: 'x', updated_at: V(7) }, version: V(7) }),
+      'item', '1', JSON.stringify({ id: '1', rating: 2, notes: 'n', updated_at: V(5) }), JSON.stringify({ id: '1', rating: null, notes: 'n', updated_at: V(1) }));
+  await c.holdForRebase('m1'); await c.tryRebase('m1');
+  assert.deepEqual(resent, [], 'the later overlay is not the winner');
+  assert.equal(verdicts[0]?.outcome, 'lost');
+  db.close();
+});
+
+test('an outbox from before the basis column keeps the basis it had, whatever a later reseed does', async () => {
+  // The upgrade: `before` is what carol saw; the migration copies it into `basis` at once; a
+  // reseed then rewrites `before` to alice's seeded row and lays carol's edit over it.
+  const db = new DatabaseSync(':memory:');
+  db.exec(`CREATE TABLE item (id TEXT PRIMARY KEY, rating INTEGER, notes TEXT, updated_at TEXT)`);
+  db.exec(`CREATE TABLE _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT NOT NULL, payload TEXT NOT NULL, tbl TEXT NOT NULL,
+    row_id TEXT NOT NULL, before TEXT, created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)`);
+  db.prepare('INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at) VALUES (?, ?, ?, ?, ?, ?, 0)')
+    .run('m1', 'mutation.carol.item.update', JSON.stringify({ key: { id: '1' }, data: { id: '1', rating: 2, updated_at: V(5) }, version: V(5) }),
+      'item', '1', JSON.stringify({ id: '1', rating: null, notes: 'n', updated_at: V(1) }));
+  const resent: any[] = [], verdicts: any[] = [];
+  const c: any = Object.create(ZeBridge.prototype);
+  const run = async (sql: string, ...args: any[]) => { const st = db.prepare(sql); return st.columns().length ? st.all(...args) : (st.run(...args), []); };
+  Object.assign(c, {
+    outboxInitPromise: Promise.resolve(), rebase: new Map(), verdictHandlers: new Set([(v: any) => verdicts.push(v)]),
+    syncedTables: new Map([['item', { pkCols: ['id'], versionColumn: 'updated_at' }]]), dialect: sqliteDialect,
+    run, appendLog: () => {}, mutate: async (_t: string, _o: string, _k: any, v: any) => { resent.push(v); return { version: V(59) }; },
+  });
+  await c.createOutboxTable();
+  db.prepare('UPDATE _zebridge_outbox SET before = ? WHERE msg_id = ?').run(JSON.stringify({ id: '1', rating: 5, notes: 'n', updated_at: V(30) }), 'm1');
+  db.prepare('INSERT INTO item VALUES (?, ?, ?, ?)').run('1', 2, 'n', V(5));
+  await c.holdForRebase('m1'); await c.tryRebase('m1');
+  assert.deepEqual(resent, [], 'judged against the basis copied at the upgrade, not the refreshed before');
   assert.equal(verdicts[0]?.outcome, 'lost');
   db.close();
 });

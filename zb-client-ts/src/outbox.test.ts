@@ -137,3 +137,26 @@ test('a CDC echo before its verdict does not swallow onVerdict: either order rep
     } finally { c.nc = null; f.db.close(); }
   }
 });
+
+test('an echo racing its verdict, then a duplicate verdict: onVerdict fires once', async () => {
+  // Both paths read the outbox before either deleted it: the verdict reported the write, the
+  // echo kept a description, and a duplicate verdict consumed it and reported again.
+  const version = '2026-11-01T00:00:00.000000Z';
+  const f = fixture(1), c = f.make();
+  const seen: any[] = [];
+  try {
+    c.verdictHandlers = new Set([(v: any) => seen.push(v)]);
+    f.db.prepare('UPDATE _zebridge_outbox SET payload = ?, row_id = ? WHERE msg_id = ?')
+      .run(JSON.stringify({ key: { id: '0' }, data: { id: '0', rating: 5, updated_at: version }, version }), '0', 'id0');
+    const state = { pkCols: ['id'], versionColumn: 'updated_at' };
+    c.syncedTables.set('item', state);
+    c.pendingWrites.set('id0', { table: 'item', id: '0', at: Date.now(), version });
+    const accepted = () => c.handleVerdict('mutation_ack.alice.id0', new TextEncoder().encode('{"status":"accepted"}'));
+    c.confirmEcho('item', state, { data: { id: '0', updated_at: version } });
+    await accepted();
+    await new Promise((r) => setTimeout(r, 20));
+    await accepted();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(seen.length, 1, `${seen.length} onVerdict call(s) for one write`);
+  } finally { c.nc = null; f.db.close(); }
+});

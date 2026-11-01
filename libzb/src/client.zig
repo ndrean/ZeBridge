@@ -5858,7 +5858,10 @@ pub const SyncClient = struct {
         // `basis`: the row as the user saw it when making the edit, written once and never
         // rewritten. `before` is the rollback target, which a reseed refreshes; a rebase judges
         // the winner against `basis` (an outbox from before the column falls back to `before`).
-        execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN basis TEXT") catch {};
+        // Added: the existing entries' `before` is copied in at once, before any reseed of this
+        // session can rewrite it; an entry with no `before` keeps an unknown basis, which a
+        // rebase treats as a conflict (lost, never re-sent).
+        try addOutboxBasis(&self.st);
         try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_retry ON _zebridge_outbox (retry_at, attempts, created_at, msg_id)");
         try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_recovery ON _zebridge_outbox (attempts, created_at, msg_id)");
         // A write answered `indeterminate`: settled for retransmission, its outcome
@@ -6536,7 +6539,7 @@ pub const SyncClient = struct {
     /// surfaced — LWW's word stands. Only an UPDATE qualifies; read BEFORE the
     /// outbox row goes.
     fn holdForRebase(self: *SyncClient, a: std.mem.Allocator, mid: []const u8) !void {
-        const rows = try self.st.query(a, "SELECT subject, payload, tbl, before, basis FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
+        const rows = try self.st.query(a, "SELECT subject, payload, tbl, before, basis, row_id, created_at FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
         if (rows.len != 1) return;
         const r = rows[0];
         if (r[0] != .text or r[1] != .text or r[2] != .text) return;
@@ -6554,7 +6557,9 @@ pub const SyncClient = struct {
             .key = try la.dupe(u8, try core.valueToString(a, key)),
             .values = try la.dupe(u8, try core.valueToString(a, data)),
             .before = if (r[3] == .text) try la.dupe(u8, r[3].text) else null,
-            .basis = if (r[4] == .text) try la.dupe(u8, r[4].text) else if (r[3] == .text) try la.dupe(u8, r[3].text) else null,
+            .basis = if (r[4] == .text) try la.dupe(u8, r[4].text) else null,
+            .row_id = if (r[5] == .text) try la.dupe(u8, r[5].text) else "",
+            .created_at = if (r[6] == .integer) r[6].integer else 0,
             .version = try la.dupe(u8, try core.normalizeVersion(a, ver.string)),
             .sent_version = try la.dupe(u8, ver.string),
         });
@@ -6596,8 +6601,25 @@ pub const SyncClient = struct {
         if (cur != .object) return true;
         const values = try parseStoredJson(a, e.values);
         const before: ?Value = if (e.before) |b| try parseStoredJson(a, b) else null;
-        const basis: ?Value = if (e.basis) |b| try parseStoredJson(a, b) else before;
-        const decision = try rebaseDecision(a, cur, before, basis, values, vcol, e.version);
+        const basis: ?Value = if (e.basis) |b| try parseStoredJson(a, b) else null; // unknown: every column counts as lost
+        // The row here may be ANY of my pending edits on this key: after a reseed, each pending
+        // edit is laid over the one before it. The confirmed row is beneath all of them: the
+        // `before` of the oldest pending edit on the key.
+        var mine_versions: std.ArrayList([]const u8) = .empty;
+        try mine_versions.append(a, e.version);
+        var base = before;
+        var base_at: i64 = if (e.created_at > 0) e.created_at else std.math.maxInt(i64);
+        for (try self.st.query(a, "SELECT payload, before, created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?", &.{ .{ .text = e.table }, .{ .text = e.row_id } })) |o| {
+            if (o[0] == .text) if (parseStoredJson(a, o[0].text)) |env| {
+                if (env == .object) if (env.object.get("version")) |v| if (v == .string) try mine_versions.append(a, try core.normalizeVersion(a, v.string));
+            } else |_| {};
+            const at: i64 = if (o[2] == .integer) o[2].integer else std.math.maxInt(i64);
+            if (at < base_at) {
+                base_at = at;
+                base = if (o[1] == .text) try parseStoredJson(a, o[1].text) else null;
+            }
+        }
+        const decision = try rebaseDecision(a, cur, base, basis, values, vcol, e.version, mine_versions.items);
         if (decision == .wait) return false;
         var mine: std.ArrayList(u8) = .empty;
         for (values.object.keys()) |c| {
@@ -7793,7 +7815,16 @@ fn maybeZstd(a: std.mem.Allocator, b: []const u8) ![]const u8 {
 /// §10do: a stale UPDATE kept aside for a rebase. `before` is the pre-write image
 /// the outbox stored; null when the row was not here at write time (then every
 /// column counts as changed by the winner, and the edit is dropped).
-const Rebase = struct { table: []const u8, key: []const u8, values: []const u8, before: ?[]const u8, basis: ?[]const u8 = null, version: []const u8, sent_version: []const u8 };
+const Rebase = struct { table: []const u8, key: []const u8, values: []const u8, before: ?[]const u8, basis: ?[]const u8 = null, row_id: []const u8 = "", created_at: i64 = 0, version: []const u8, sent_version: []const u8 };
+
+/// The outbox's `basis` column, added to an outbox from before it. The existing entries'
+/// `before` is copied in at once, before any reseed of this session can rewrite it; an entry
+/// with no `before` keeps an unknown basis, which a rebase treats as a conflict.
+fn addOutboxBasis(st: *storage.Storage) !void {
+    if (execDdl(st, "ALTER TABLE _zebridge_outbox ADD COLUMN basis TEXT")) |_| {
+        try execDdl(st, "UPDATE _zebridge_outbox SET basis = before WHERE basis IS NULL");
+    } else |_| {}
+}
 
 const RebaseDecision = union(enum) { wait, lost: []const []const u8, rebase };
 
@@ -7805,14 +7836,17 @@ const RebaseDecision = union(enum) { wait, lost: []const []const u8, rebase };
 /// shared_record, carol's stale rating overwrote alice's newer one). The winner is compared
 /// with `basis`, the row as the user saw it when making the edit, which a reseed does not
 /// rewrite; a column is lost when the winner changed it to something other than my value.
-fn rebaseDecision(a: std.mem.Allocator, cur: Value, before: ?Value, basis: ?Value, values: Value, vcol: []const u8, version: []const u8) !RebaseDecision {
+fn rebaseDecision(a: std.mem.Allocator, cur: Value, before: ?Value, basis: ?Value, values: Value, vcol: []const u8, version: []const u8, mine_versions: []const []const u8) !RebaseDecision {
     const verOf = struct {
         fn f(al: std.mem.Allocator, row: Value, col: []const u8) ![]const u8 {
             const v = row.object.get(col) orelse return "";
             return if (v == .string) try core.normalizeVersion(al, v.string) else "";
         }
     }.f;
-    const overlaid = before != null and before.? == .object and std.mem.eql(u8, try verOf(a, cur, vcol), version);
+    const cur_ver = try verOf(a, cur, vcol);
+    var mine = std.mem.eql(u8, cur_ver, version);
+    for (mine_versions) |v| mine = mine or std.mem.eql(u8, cur_ver, v);
+    const overlaid = before != null and before.? == .object and mine;
     const winner: Value = if (overlaid) before.? else cur;
     if (std.mem.order(u8, try verOf(a, winner, vcol), version) != .gt) return .wait;
     var lost: std.ArrayList([]const u8) = .empty;
@@ -8743,16 +8777,47 @@ test "rebaseDecision: judged against the authoritative winner and the edit's bas
     // carol's pending edit re-applied over a reseed: the row shows her overlay, `before` alice's 5.
     const overlay = try j(a, "{\"id\":\"1\",\"rating\":2,\"notes\":\"n\",\"updated_at\":\"" ++ vc ++ "\"}");
     const alice = try j(a, "{\"id\":\"1\",\"rating\":5,\"notes\":\"n\",\"updated_at\":\"2026-11-01T16:10:30.000000Z\"}");
-    const d1 = try rebaseDecision(a, overlay, alice, saw, edit, "updated_at", vc);
+    const d1 = try rebaseDecision(a, overlay, alice, saw, edit, "updated_at", vc, &.{});
     try std.testing.expect(d1 == .lost);
     try std.testing.expectEqualStrings("rating", d1.lost[0]);
     // a disjoint winner (it changed notes only): still rebased.
     const overlay_w = try j(a, "{\"id\":\"1\",\"rating\":2,\"notes\":\"w\",\"updated_at\":\"" ++ vc ++ "\"}");
     const notes_winner = try j(a, "{\"id\":\"1\",\"rating\":null,\"notes\":\"w\",\"updated_at\":\"2026-11-01T16:10:30.000000Z\"}");
-    try std.testing.expect(try rebaseDecision(a, overlay_w, notes_winner, saw, edit, "updated_at", vc) == .rebase);
+    try std.testing.expect(try rebaseDecision(a, overlay_w, notes_winner, saw, edit, "updated_at", vc, &.{}) == .rebase);
     // no reseed: the winner overwrote the overlay; the same loss, decided as before.
-    try std.testing.expect(try rebaseDecision(a, alice, saw, saw, edit, "updated_at", vc) == .lost);
+    try std.testing.expect(try rebaseDecision(a, alice, saw, saw, edit, "updated_at", vc, &.{}) == .lost);
     // the winner is not here yet: the overlay is all there is, nothing newer under it.
     const old_under = try j(a, "{\"id\":\"1\",\"rating\":null,\"notes\":\"n\",\"updated_at\":\"2026-11-01T16:10:01.000000Z\"}");
-    try std.testing.expect(try rebaseDecision(a, overlay, old_under, saw, edit, "updated_at", vc) == .wait);
+    try std.testing.expect(try rebaseDecision(a, overlay, old_under, saw, edit, "updated_at", vc, &.{}) == .wait);
+}
+
+test "rebaseDecision: two pending edits on one row — the later overlay is not the winner" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const vc = "2026-11-01T16:10:05.000000Z"; // the edit being rebased (rating 2)
+    const v2 = "2026-11-01T16:10:07.000000Z"; // carol's later pending edit (notes), the overlay shown
+    const edit = try parseStoredJson(a, "{\"id\":\"1\",\"rating\":2}");
+    const saw = try parseStoredJson(a, "{\"id\":\"1\",\"rating\":null,\"notes\":\"n\",\"updated_at\":\"2026-11-01T16:10:01.000000Z\"}");
+    const shown = try parseStoredJson(a, "{\"id\":\"1\",\"rating\":2,\"notes\":\"x\",\"updated_at\":\"" ++ v2 ++ "\"}");
+    const alice = try parseStoredJson(a, "{\"id\":\"1\",\"rating\":5,\"notes\":\"n\",\"updated_at\":\"2026-11-01T16:10:30.000000Z\"}");
+    const d = try rebaseDecision(a, shown, alice, saw, edit, "updated_at", vc, &.{v2});
+    try std.testing.expect(d == .lost);
+}
+
+test "addOutboxBasis: an outbox from before the column keeps the basis it had; a later reseed cannot change it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var st = try storage.Storage.open(":memory:");
+    defer st.close();
+    try execDdl(&st, "CREATE TABLE _zebridge_outbox (msg_id TEXT PRIMARY KEY, before TEXT)");
+    _ = try st.query(a, "INSERT INTO _zebridge_outbox VALUES ('m1', '{\"rating\":null}'), ('m2', NULL)", &.{});
+    try addOutboxBasis(&st);
+    try addOutboxBasis(&st); // again, as at every open: nothing changes
+    _ = try st.query(a, "UPDATE _zebridge_outbox SET before = '{\"rating\":5}' WHERE msg_id = 'm1'", &.{}); // the reseed
+    const r = try st.query(a, "SELECT basis FROM _zebridge_outbox ORDER BY msg_id", &.{});
+    try std.testing.expect(r[0][0] == .text); // copied from `before` at the upgrade
+    try std.testing.expectEqualStrings("{\"rating\":null}", r[0][0].text);
+    try std.testing.expect(r[1][0] == .null); // unknown, judged as a conflict
 }
