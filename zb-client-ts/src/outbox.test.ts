@@ -10,7 +10,8 @@ function fixture(count = 300) {
   for (let i = 0; i < count; i++) db.prepare('INSERT INTO _zebridge_outbox(msg_id,subject,payload,tbl,row_id,created_at) VALUES (?,?,?,?,?,?)')
     .run(`id${i}`, 'mutation.alice.item.insert', '{}', 'item', String(i), i);
   const gets: string[] = [], sends: string[] = [];
-  let managers = 0, fail = false, stored = '';
+  let managers = 0, fail = false, stored = '', holding = false;
+  const held: Array<() => void> = [];
   const make = () => {
     const c: any = Object.create(ZeBridge.prototype);
     const exec = async (sql: string, ...args: any[]) => {
@@ -38,12 +39,15 @@ function fixture(count = 300) {
           } } };
         },
         jetstream: () => ({publish: async (_s: string, _b: Uint8Array, opts: any) => {
-          sends.push(opts.headers.get('Nats-Msg-Id')); if (fail) throw new Error('hub unavailable'); return {seq: sends.length};
+          sends.push(opts.headers.get('Nats-Msg-Id')); const seq = sends.length;
+          if (holding) await new Promise<void>((r) => held.push(r)); // the ack, released by the test
+          if (fail) throw new Error('hub unavailable'); return {seq};
         }}),
       },
     }); return c;
   };
-  return {db, gets, sends, make, managers: () => managers, fail: (v: boolean) => {fail=v;}, stored: (v: string) => {stored=v;}};
+  return {db, gets, sends, make, managers: () => managers, fail: (v: boolean) => {fail=v;}, stored: (v: string) => {stored=v;},
+    hold: (v: boolean) => {holding=v;}, held: () => held.length, release: () => {for (const r of held.splice(0)) r();}};
 }
 
 test('PubAcks do not free slots; a verdict immediately clocks the next send', async () => {
@@ -56,6 +60,26 @@ test('PubAcks do not free slots; a verdict immediately clocks the next send', as
     assert.equal(f.sends.length,129); assert.equal(f.sends.at(-1),'id128');
     assert.equal(f.db.prepare('SELECT count(*) AS n FROM _zebridge_outbox WHERE retry_at > 0').get()!.n,128);
   } finally {c.nc=null; await c.outboxWork; f.db.close();}
+});
+
+test('mutate does not wait for PubAcks; a recovery pass waits for its probe, then once for the window', async () => {
+  // One write per round trip capped a client at 26 writes/s 23 ms from its server. The acks
+  // here never resolve until the test releases them, so waiting and not waiting are told apart.
+  const f=fixture(128), c=f.make();
+  const tick = () => new Promise((r) => setTimeout(r, 10));
+  try {
+    f.hold(true);
+    await Promise.race([c.flushOutboxPass(false), new Promise((_, no) => setTimeout(() => no(new Error("mutate's pass waited for its PubAcks")), 500))]);
+    assert.equal(f.sends.length,128); assert.equal(f.held(),128); // returned with every ack unresolved
+    f.release();
+    const g=fixture(128), d=g.make(); g.hold(true);
+    let done=false; const p=d.recoverOutbox().then(() => {done=true;});
+    await tick(); assert.equal(g.sends.length,1); assert.equal(done,false); // the probe, waiting for its ack
+    g.release(); await tick();
+    assert.equal(g.sends.length,128); assert.equal(g.held(),127); assert.equal(done,false); // the burst, its acks pending
+    g.release(); await p; assert.equal(done,true);
+    g.db.close();
+  } finally {f.release(); c.nc=null; await c.outboxWork; f.db.close();}
 });
 
 test('restart preserves reservations; only due IDs retry, with exponential backoff', async () => {

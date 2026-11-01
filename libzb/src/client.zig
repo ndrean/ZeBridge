@@ -6017,7 +6017,8 @@ pub const SyncClient = struct {
         // Mutations share the same window as recovery; a full window leaves this
         // edit queued, and each subsequent verdict lets the poll refill it.
         if (self.t.conn.getStatus() == .connected) {
-            _ = self.flushOutbox() catch |err| log.info("mutate: {s} — queued as {s}", .{ @errorName(err), msg_id });
+            // Not waiting for the PubAck: an app's loop of mutate() calls is not one round trip per write.
+            _ = self.flushOutboxPass(false) catch |err| log.info("mutate: {s} — queued as {s}", .{ @errorName(err), msg_id });
         }
         return try result_a.dupe(u8, msg_id);
     }
@@ -6029,12 +6030,12 @@ pub const SyncClient = struct {
     /// remain eligible on the next pump. If NOTHING could be sent the last error
     /// is returned — "flushed: 0" next to a broker that is down should say why.
     pub fn flushOutbox(self: *SyncClient) !usize {
-        return self.flushOutboxPass();
+        return self.flushOutboxPass(true);
     }
 
     /// A self-clocking window, not a rate limit. New slots are filled on every
     /// pump; only already-reserved entries wait for their own retry deadline.
-    fn flushOutboxPass(self: *SyncClient) !usize {
+    fn flushOutboxPass(self: *SyncClient, await_acks: bool) !usize {
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const a = ca.allocator();
@@ -6079,6 +6080,8 @@ pub const SyncClient = struct {
         var failed: usize = 0;
         var last_err: ?anyerror = null;
         var collected: usize = 0;
+        var window: std.ArrayList(transport.Transport.WindowWrite) = .empty;
+        var probed = false;
         for (rows) |r| {
             const msg_id = if (r[0] == .text) r[0].text else continue;
             if (nowMillis() < self.hold_until_ms) break;
@@ -6131,13 +6134,41 @@ pub const SyncClient = struct {
                 _ = try self.st.query(a, "UPDATE _zebridge_outbox SET published = 1 WHERE msg_id = ?", &.{.{ .text = msg_id }});
             }
             const env = if (r[2] == .text) try parseStoredJson(a, r[2].text) else Value.null;
-            self.publishEnvelope(a, r[1].text, env, msg_id) catch |err| {
-                failed += 1;
-                last_err = err;
-                log.info("outbox: {s} not sent ({any}) — still queued", .{ msg_id, err });
-                break;
-            };
-            sent += 1;
+            const w: transport.Transport.WindowWrite = .{ .subject = r[1].text, .data = try encodeMsgpack(a, env), .msg_id = msg_id };
+            // The pass's first write is a probe when it awaits acks: an ambiguous failure stops the
+            // pass with its peers still eligible, instead of spending every slot's backoff at once.
+            if (await_acks and !probed) {
+                probed = true;
+                var one = [_]?anyerror{null};
+                self.t.publishWindow(a, self.opts.principal, &.{w}, &one, 5_000, true) catch |err| {
+                    one[0] = err;
+                };
+                if (one[0]) |err| {
+                    failed += 1;
+                    last_err = err;
+                    log.info("outbox: {s} not sent ({any}) — still queued", .{ msg_id, err });
+                    break;
+                }
+                sent += 1;
+                continue;
+            }
+            try window.append(a, w);
+        }
+        // The window goes out whole, then its PubAcks are collected: one round trip for the
+        // window instead of one per write. Every entry above is already reserved and marked
+        // published, so a write whose ack does not come stays queued for its retry, as before.
+        // Sent in order on one connection, the stream stores them in order; a write retried
+        // after a later one landed is judged by its version, like any late write.
+        if (window.items.len > 0) {
+            const results = try a.alloc(?anyerror, window.items.len);
+            self.t.publishWindow(a, self.opts.principal, window.items, results, 5_000, await_acks) catch |err| @memset(results, err);
+            for (window.items, results) |w, res| {
+                if (res) |err| {
+                    failed += 1;
+                    last_err = err;
+                    log.info("outbox: {s} not sent ({any}) — still queued", .{ w.msg_id, err });
+                } else sent += 1;
+            }
         }
         if (collected > 0) log.info("outbox: collected {d} verdict(s) published while this client was away — settled without replay", .{collected});
         if (sent == 0 and failed > 0) return last_err.?;
@@ -6882,11 +6913,6 @@ pub const SyncClient = struct {
             try self.t.publishCore(subject, payload);
         }
         self.last_heartbeat_ms = now;
-    }
-
-    fn publishEnvelope(self: *SyncClient, a: std.mem.Allocator, subject: []const u8, payload: Value, msg_id: []const u8) !void {
-        const bytes = try encodeMsgpack(a, payload);
-        try self.t.publish(subject, bytes, msg_id);
     }
 
     fn stepExec(self: *SyncClient, a: std.mem.Allocator, stp: Value) ![]storage.Row {

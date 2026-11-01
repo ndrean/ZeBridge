@@ -465,6 +465,115 @@ pub const Transport = struct {
         };
     }
 
+    pub const WindowWrite = struct { subject: []const u8, data: []const u8, msg_id: []const u8 };
+
+    /// A window of JetStream publishes, every write sent before any PubAck is awaited:
+    /// `publish` waited for each ack in turn, so one client wrote at most one write per
+    /// round trip to its server (26/s at 23 ms). Each write keeps its `Nats-Msg-Id` and has
+    /// its own reply subject under `_INBOX.<principal>.` (the only replies a client is
+    /// granted, §10hm); `results[i]` is null for a stored write (a duplicate included) and
+    /// an error otherwise — no responders, a JetStream refusal, or no ack before the
+    /// timeout. A write that fails stays in the outbox for its retry, as before.
+    ///
+    /// `await_acks == false` publishes with no reply subject and returns at once (`mutate`): the
+    /// outbox never depended on the ack (the retry deadline is set before the send, the verdict
+    /// settles the entry), and JetStream still deduplicates by the header. A write that was
+    /// not stored is sent again at its deadline, like a lost publish.
+    pub fn publishWindow(self: *Transport, a: std.mem.Allocator, principal: []const u8, writes: []const WindowWrite, results: []?anyerror, timeout_ms: i64, await_acks: bool) !void {
+        if (!await_acks) {
+            @memset(results, null);
+            for (writes, 0..) |w, i| {
+                const msg = try self.conn.newMsg();
+                defer msg.deinit();
+                try msg.setSubject(w.subject, false);
+                try msg.setPayload(w.data, false);
+                try msg.headerSet("Nats-Msg-Id", w.msg_id);
+                self.conn.publishMsg(msg) catch |err| {
+                    for (results[i..]) |*r| r.* = err;
+                    return;
+                };
+            }
+            return;
+        }
+        @memset(results, error.Timeout);
+        const fresh = try self.conn.newInbox(a);
+        defer a.free(fresh);
+        const nonce = fresh[(std.mem.findScalarLast(u8, fresh, '.') orelse return error.MalformedInbox) + 1 ..];
+        const base = try std.fmt.allocPrint(a, "_INBOX.{s}.pa.{s}", .{ principal, nonce });
+        defer a.free(base);
+        const filter = try std.fmt.allocPrint(a, "{s}.*", .{base});
+        defer a.free(filter);
+        const sub = try self.conn.subscribeSync(filter);
+        defer sub.deinit();
+        sub.setPendingLimits(@intCast(writes.len + 1), 8 << 20);
+        var sent: usize = 0;
+        for (writes, 0..) |w, i| {
+            const msg = try self.conn.newMsg();
+            defer msg.deinit();
+            try msg.setSubject(w.subject, false);
+            try msg.setPayload(w.data, false);
+            try msg.headerSet("Nats-Msg-Id", w.msg_id);
+            const reply = try std.fmt.allocPrint(a, "{s}.{d}", .{ base, i });
+            defer a.free(reply);
+            self.conn.publishRequestMsg(msg, reply) catch |err| {
+                for (results[i..]) |*r| r.* = err;
+                break;
+            };
+            sent += 1;
+        }
+        const received = try a.alloc(bool, sent);
+        var acks: WindowAcks = .{ .results = results[0..sent], .received = received, .deadline_us = monoUs() + timeout_ms * 1000 };
+        acks.reset();
+        while (!acks.done()) {
+            // One deadline for the whole window: each receive waits only for what is left of
+            // it, so a trickle of replies cannot hold the polling thread for minutes.
+            const left_ms = acks.leftMs(monoUs()) orelse break;
+            const m = sub.nextMsgTimeout(.{ .duration = .{ .raw = .fromMilliseconds(left_ms), .clock = .awake } }) catch break;
+            defer m.deinit();
+            const i = std.fmt.parseInt(usize, m.subject[(std.mem.findScalarLast(u8, m.subject, '.') orelse continue) + 1 ..], 10) catch continue;
+            _ = acks.take(i, ackOutcome(m.isNoResponders(), m.data));
+        }
+    }
+
+    /// What one PubAck says: stored (a duplicate included), no responders, or refused.
+    fn ackOutcome(no_responders: bool, data: []const u8) ?anyerror {
+        if (no_responders) return error.NoStreamResponse;
+        if (std.mem.find(u8, data, "\"error\"") != null or std.mem.find(u8, data, "\"seq\"") == null) return error.JetStreamRefused;
+        return null;
+    }
+
+    /// The window's replies: each index is received at most once, whatever its outcome, so a
+    /// repeated reply (an error included) cannot stand in for another write's missing one.
+    pub const WindowAcks = struct {
+        results: []?anyerror,
+        received: []bool,
+        deadline_us: i64,
+        count: usize = 0,
+
+        fn reset(self: *WindowAcks) void {
+            @memset(self.results, error.Timeout);
+            @memset(self.received, false);
+        }
+
+        /// True when this reply was the index's first.
+        fn take(self: *WindowAcks, i: usize, outcome: ?anyerror) bool {
+            if (i >= self.received.len or self.received[i]) return false;
+            self.received[i] = true;
+            self.count += 1;
+            self.results[i] = outcome;
+            return true;
+        }
+
+        fn done(self: *const WindowAcks) bool {
+            return self.count == self.received.len;
+        }
+
+        fn leftMs(self: *const WindowAcks, now_us: i64) ?i64 {
+            const left = self.deadline_us - now_us;
+            return if (left <= 0) null else @max(1, @divTrunc(left, 1000));
+        }
+    };
+
     /// Query replies name the tenant in the inbox, allowing a restricted leaf to
     /// answer that tenant's requests without permission to publish all inboxes.
     pub fn requestQuery(self: *Transport, a: std.mem.Allocator, principal: []const u8, prefix: []const u8, subject: []const u8, payload: []const u8, timeout: std.Io.Timeout) !*nats.Message {
@@ -508,6 +617,43 @@ pub const Transport = struct {
         return self.conn.subscribeSync(subject);
     }
 };
+
+fn monoUs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1_000_000 + @divTrunc(@as(i64, ts.nsec), 1000);
+}
+
+test "WindowAcks: each write counted once; a duplicate error cannot complete the window; missing replies stay Timeout" {
+    var results: [4]?anyerror = undefined;
+    var received: [4]bool = undefined;
+    var w: Transport.WindowAcks = .{ .results = &results, .received = &received, .deadline_us = 1_000_000 };
+    w.reset();
+    try std.testing.expect(w.take(0, error.JetStreamRefused));
+    try std.testing.expect(!w.take(0, error.JetStreamRefused)); // the same error again
+    try std.testing.expect(!w.take(0, null)); // and a late success for it: still the first reply's outcome
+    try std.testing.expect(w.take(1, null));
+    try std.testing.expect(!w.take(1, null));
+    try std.testing.expect(!w.take(9, null)); // an index outside the window
+    try std.testing.expect(!w.done()); // 2 and 3 never answered
+    try std.testing.expectEqual(@as(?anyerror, error.JetStreamRefused), results[0]);
+    try std.testing.expectEqual(@as(?anyerror, null), results[1]);
+    try std.testing.expectEqual(@as(?anyerror, error.Timeout), results[2]);
+    try std.testing.expectEqual(@as(?anyerror, error.Timeout), results[3]);
+    try std.testing.expect(w.take(3, error.NoStreamResponse));
+    try std.testing.expect(w.take(2, null));
+    try std.testing.expect(w.done());
+}
+
+test "WindowAcks: one deadline for the window, not one per reply" {
+    var results: [1]?anyerror = undefined;
+    var received: [1]bool = undefined;
+    const w: Transport.WindowAcks = .{ .results = &results, .received = &received, .deadline_us = 5_000_000 };
+    try std.testing.expectEqual(@as(?i64, 5_000), w.leftMs(0));
+    try std.testing.expectEqual(@as(?i64, 1_000), w.leftMs(4_000_000));
+    try std.testing.expectEqual(@as(?i64, 1), w.leftMs(4_999_999)); // under a millisecond left: wait 1 ms, not 0 (no wait)
+    try std.testing.expectEqual(@as(?i64, null), w.leftMs(5_000_000));
+}
 
 // ─── live test (gated: ZB_LIVE=1 with the native stack up) ──────────────────
 
