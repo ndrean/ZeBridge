@@ -227,6 +227,26 @@ See [SCOPE](SCOPE.md) for the boundaries and [SECURITY](SECURITY.md) for tenant 
 
 Measure CDC distribution, snapshot download/apply, mutation commits and outbox recovery separately. They have different bottlenecks. Results depend on the build, database latency, disk, lane count, principal count and recovery load; a historical peak is not a deployment capacity guarantee. The [event ramp](examples/09-event/README.md) and [storm harness](storm/README.md) provide starting points for evaluating your topology; [SPEED_TEST](SPEED_TEST.md) is one measured example, with its machine and load stated.
 
+### Measured
+
+Each figure is one run on the hardware named, not a capacity guarantee.
+
+| What | Figure | Conditions | Details |
+| --- | --- | --- | --- |
+| The bridge, PostgreSQL → NATS | ~100k events/s in Docker, 200k+ native | Apple M2 Pro, a 2,000,000-row burst, PostgreSQL and NATS on the same host | [SPEED_TEST](SPEED_TEST.md) |
+| A client applying a busy table live | libzb ~50k events/s, zb-client-ts ~33k | one Mac, a table under a steady write load | |
+| A change reaching a replica | median 12 ms | dev stack on one Mac, libzb on the DuckDB engine | |
+| Seeding a large table on a phone | libzb 35.0 s (React Native), 70.8 s (Flutter); JavaScript client 725 s | iPhone 12, the same table | [Large table](examples/06-large-table/README.md) |
+| Client writes into PostgreSQL | ~8,500 writes/s on one ingress lane, ~19,500 on four; median verdict 11 ms at 20,000/s | one Mac | [the ramp](examples/09-event/README.md#the-ramp-how-far-one-mac-goes) |
+| 500 clients starting at once, empty replicas | all synced, the slowest in 8.6 to 12 s; NATS at 140–165 % CPU, about 1 MB per client; PostgreSQL under 16 % CPU; the bridge near idle | 2-vCPU, 3.7 GB VPS, clients 100 ms away | [storm](storm/README.md) |
+| The same 500, replicas already seeded | all synced in 5.0 s | same | |
+| One write reaching all 500 | median 288 ms, p95 491 ms (100 ms of it network) | same | |
+| NATS restarted under the 500 | none lost; half back within 6 s, the last at 23 s | same | |
+| 100 clients through a leaf across the Atlantic | cold sync median 13.2 s, slowest 14.7 s; warm 1.7 s; after a NATS restart, longest gap 2.9 s, none lost | 0.2.8 test hub in Canada, clients on a Mac in Europe (~100 ms) | |
+| The bridge's memory under a steady stream | ~8 MB resident, allocation flat over 70 minutes | 20,246 ticks of insert, update, delete | `scripts/scenarios/drip.py` |
+
+**Not measured:** a comparison with another sync system on the same workload; how long each component may stay down before recovery needs a re-seed; NATS memory at a steady load (it follows recent load, not stored data); a long network partition under load.
+
 ## Documentation
 
 | Task | Reference |
