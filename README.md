@@ -55,6 +55,31 @@ To erase this evaluation stack and start again, run `docker compose -f docker-co
 
 ## Build an app
 
+Three parts: the hub, which you install; your backend, which signs users in and issues invites; and the app, which uses the client library.
+
+### Install the hub
+
+The hub is NATS, the bridge, mutation admission and the sweeper on one server. PostgreSQL can run on the same server or be managed elsewhere (it needs logical replication). Two routes are ready to use:
+
+- **Docker Compose:** two files on the server. HAProxy and Let's Encrypt are included, and PostgreSQL optionally:
+
+  ```sh
+  V=0.2.10
+  mkdir zebridge && cd zebridge
+  curl -fsSLO https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/compose.yml
+  curl -fsSL -o .env https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/.env.example
+  chmod 600 .env
+  # In .env: three domain names, the Let's Encrypt e-mail and the passwords (see the guide).
+  docker compose up -d
+  ```
+
+  The first start issues the certificates, generates the NATS identities and installs ZeBridge's SQL objects, including `zb_inviter`, the login your backend uses below. See [the Compose guide](deploy/compose/README.md).
+- **Ansible**, for a Debian VPS with systemd services: fill in the inventory and the vault, then `ansible-playbook site.yml --ask-vault-pass`. It can be run again at any time and changes only what differs. See [the Ansible guide](deploy/ansible/README.md).
+
+Then enable your tables ([Prepare your tables](#prepare-your-tables)) and check the hub with `bridge --diagnose`. Other routes, such as a manual install or Supabase, are listed in [Deploy](#deploy).
+
+### Your backend: sign in, then invite
+
 **Your backend has one job: sign users in, then issue invites.** ZeBridge does not authenticate users, and it does not care how you do it: OAuth, passwords, magic links, any language or framework. After your backend has signed a user in, it decides the user's principal and tenant and asks PostgreSQL for a one-time invite code, with a login that can create invites and nothing else. That is the only server code you write: there is no write API or sync endpoint to build, because writes go through the library and PostgreSQL's own rules judge them.
 
 ```ts
@@ -65,6 +90,8 @@ const { rows } = await db.query(
 );
 return { invite: rows[0].code };   // in the login response
 ```
+
+### The app
 
 The app passes the code to the library on its first start. The library enrolls the device, stores its identity, seeds its replica and follows changes; later starts need no code, and the library renews the device's credentials by itself. See [Users: invites](AUTHENTICATION.md#users-invites) for other ways to deliver the code (a link, an email) and the enrollment steps.
 
