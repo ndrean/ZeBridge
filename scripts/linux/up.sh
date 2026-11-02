@@ -50,7 +50,9 @@ fi
 # The init SQL reads pg_publication_rel.prqual (row filters), which PostgreSQL 15 added: an older server fails half way through
 # the SQL with "column pr.prqual does not exist". The first pg_ctl on PATH is not always the newest installed.
 PG_MAJOR="$(pg_major "$PGBIN")"
-[ "${PG_MAJOR:-0}" -ge 15 ] || die "PostgreSQL ${PG_MAJOR:-?} at $PGBIN is too old (15 or newer): set ZB_PGBIN to a newer one, e.g. ZB_PGBIN=/usr/lib/postgresql/16/bin, and run down.sh --clean"
+[ "${PG_MAJOR:-0}" -ge 15 ] || die "PostgreSQL ${PG_MAJOR:-?} at $PGBIN is too old (15 or newer): set ZB_PGBIN to a newer one, e.g. ZB_PGBIN=/usr/lib/postgresql/18/bin, and run down.sh --clean"
+# The other stacks run 18; an older server works, but a result on it may not be one the others reproduce.
+[ "$PG_MAJOR" = 18 ] || echo "[linux] PostgreSQL $PG_MAJOR at $PGBIN; the other stacks run 18 (README: the PostgreSQL apt repository)"
 # PostgreSQL refuses to run as root: its data directory then belongs to the `postgres` user, and (that user
 # cannot traverse most home directories) lives outside the repository.
 PG_OS_USER=""
