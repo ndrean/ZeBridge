@@ -55,7 +55,18 @@ To erase this evaluation stack and start again, run `docker compose -f docker-co
 
 ## Build an app
 
-The usual flow is: your backend authenticates a user and issues an invite; the library enrolls the device, stores its identity, seeds its replica, and follows changes. Later connections reuse that identity and renew its credentials.
+**Your backend has one job: sign users in, then issue invites.** ZeBridge does not authenticate users, and it does not care how you do it: OAuth, passwords, magic links, any language or framework. After your backend has signed a user in, it decides the user's principal and tenant and asks PostgreSQL for a one-time invite code, with a login that can create invites and nothing else. That is the only server code you write: there is no write API or sync endpoint to build, because writes go through the library and PostgreSQL's own rules judge them.
+
+```ts
+// Your backend, after it has signed the user in. Its database login holds only zebridge_inviter.
+const { rows } = await db.query(
+  "SELECT zebridge_invite($1, $2, interval '1 hour') AS code",
+  [user.id, user.tenant],
+);
+return { invite: rows[0].code };   // in the login response
+```
+
+The app passes the code to the library on its first start. The library enrolls the device, stores its identity, seeds its replica and follows changes; later starts need no code, and the library renews the device's credentials by itself. See [Users: invites](AUTHENTICATION.md#users-invites) for other ways to deliver the code (a link, an email) and the enrollment steps.
 
 For a browser app:
 
@@ -66,10 +77,12 @@ npm install @zebridge/client
 ```ts
 import { ZeBridge } from '@zebridge/client';
 
-// Your backend supplies the invite. The DBA has enabled the orders table.
+// From your own login flow; only the first start needs it. The DBA has enabled the orders table.
+const { invite } = await signIn(email, password);
+
 const zb = new ZeBridge({
   bridgeUrl: 'https://bridge.example.com',
-  invite: code,
+  invite,
   tables: ['orders'],
 });
 
@@ -139,6 +152,7 @@ flowchart LR
 | | ZeBridge | PowerSync |
 | --- | --- | --- |
 | What you run | NATS, the bridge, admission and the sweeper on one server | The PowerSync service and its bucket storage, or their hosted cloud |
+| Server code you write | Your sign-in, then one SQL call per invite | Your sign-in, a JWT signer the service trusts, and the write API that applies each upload |
 | Table schema on the client | Sent by the bridge | Declared again in the app |
 | Reads | SQL on the local replica | SQL on the local replica |
 | Writes | `mutate()`; the library sends them, PostgreSQL judges them and returns a verdict | Plain SQL on local tables; your `uploadData()` sends them to **your backend**, which applies its own rules |
