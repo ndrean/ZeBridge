@@ -20,7 +20,9 @@ import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { BSON } from 'bson';
 
-const SERVICE = 'http://127.0.0.1:18080', REST = 'http://127.0.0.1:13000';
+// The API processes (ps_service.py): reader i connects to the (i mod n)th, as a round-robin load balancer would.
+const API_PORTS = (process.env.API_PORTS ?? '18081,18082,18083,18084,18085').split(',');
+const SERVICE = (i) => `http://127.0.0.1:${API_PORTS[i % API_PORTS.length]}`, REST = 'http://127.0.0.1:13000';
 const KEY = readFileSync('./secrets/jwt.key', 'utf8').trim();
 const b64u = (b) => Buffer.from(b).toString('base64url');
 const principal = (i) => `p${String(i).padStart(3, '0')}`;
@@ -59,7 +61,7 @@ async function post(path, rows, who) {
 const PER = Number(process.env.PER_PROCESS ?? 25);
 
 async function reader(j, gi, startEpoch, st) {
-  const res = await fetch(`${SERVICE}/sync/stream`, {
+  const res = await fetch(`${SERVICE(gi)}/sync/stream`, {
     method: 'POST',
     // What the SDK asks for: BSON preferred, NDJSON otherwise; the service picks.
     headers: { 'content-type': 'application/json', authorization: `Token ${token(`crowd-${gi}`)}`, accept: 'application/vnd.powersync.bson-stream;q=0.9,application/x-ndjson;q=0.8' },
@@ -76,8 +78,20 @@ async function reader(j, gi, startEpoch, st) {
       // Concatenated BSON documents, each starting with its int32 length.
       bin = bin.length ? Buffer.concat([bin, chunk]) : Buffer.from(chunk);
       while (bin.length >= 4 && bin.length >= bin.readInt32LE(0)) {
-        const len = bin.readInt32LE(0);
-        msgs.push(BSON.deserialize(bin.subarray(0, len))); bin = bin.subarray(len);
+        const len = bin.readInt32LE(0), doc = bin.subarray(0, len);
+        bin = bin.subarray(len);
+        // Light (the crowd): the first field's name says what the document is (a type byte, then the name). A data
+        // document is counted and scanned for markers, as zb_crowd.py scans ZeBridge's, never decoded; only the
+        // small control documents (checkpoint, checkpoint_complete…) are.
+        if (st.light && doc.toString('latin1', 5, 9) === 'data' && doc[9] === 0) {
+          st.bytes[j] += len;
+          // A marker's id appears twice in its operation (object_id and the row's id): one arrival per document.
+          const ids = new Set();
+          for (let at = doc.indexOf(st.needle); at >= 0; at = doc.indexOf(st.needle, at + 1)) ids.add(doc.toString('latin1', at, at + st.needle.length + 4));
+          for (const id of ids) (st.arrivals[id] ??= []).push(Date.now());
+          continue;
+        }
+        msgs.push(BSON.deserialize(doc));
       }
     } else {
       buf += dec.decode(chunk, { stream: true });
@@ -100,8 +114,10 @@ async function reader(j, gi, startEpoch, st) {
 }
 
 // One process's readers, [offset, offset + count): reports when they are synced, then their markers when told to stop.
-async function syncWorker(offset, count, startEpoch) {
-  const st = { abort: new AbortController(), synced: Array(count).fill(null), ops: Array(count).fill(0), retries: 0, last: '', bson: false, arrivals: {} };
+async function syncWorker(offset, count, startEpoch, tag) {
+  (await import('node:events')).setMaxListeners(0);   // every reader's fetch listens on the one abort signal
+  const st = { abort: new AbortController(), synced: Array(count).fill(null), ops: Array(count).fill(0), bytes: Array(count).fill(0),
+    retries: 0, last: '', bson: false, arrivals: {}, light: true, needle: Buffer.from(tag, 'latin1') };
   process.on('message', async (m) => {
     if (m !== 'stop') return;
     process.send({ type: 'arrivals', arrivals: st.arrivals });
@@ -109,36 +125,37 @@ async function syncWorker(offset, count, startEpoch) {
   });
   await sleep(Math.max(0, startEpoch - Date.now()));
   for (let j = 0; j < count; j++) {
-    // A reader the service refuses (no checkpoint yet, overloaded) retries after a second, as the SDK does; its
+    // A reader the service refuses (no checkpoint yet, overloaded) retries after 5 s, as the SDK does; its
     // time to synced keeps counting from the shared start.
     void (async () => {
       while (!st.abort.signal.aborted && Date.now() - startEpoch < 900_000) {
         try { await reader(j, offset + j, startEpoch, st); return; } catch (e) {
           if (e.name === 'AbortError') return;
-          st.retries++; st.last = `reader ${offset + j}: ${e.message}`; await sleep(1000);
+          st.retries++; st.last = `reader ${offset + j}: ${e.message}`; await sleep(5000);   // the SDK's retryDelayMs
         }
       }
     })();
   }
   while (st.synced.some((s) => s === null) && Date.now() - startEpoch < 900_000) await sleep(200);
-  process.send({ type: 'synced', synced: st.synced, ops: st.ops, retries: st.retries, last: st.last, bson: st.bson, rss: rssMb() });
+  process.send({ type: 'synced', synced: st.synced, ops: st.ops, bytes: st.bytes, retries: st.retries, last: st.last, bson: st.bson, rss: rssMb() });
 }
 
 async function sync(n, markers) {
   const { fork } = await import('node:child_process');
   const startEpoch = Date.now() + 3000 + n * 4;   // time for the processes to load
+  const tag = `m-${randomUUID().slice(0, 6)}-`;
   const workers = [];
   for (let off = 0; off < n; off += PER) {
-    const w = fork(new URL(import.meta.url).pathname, ['sync-worker', String(off), String(Math.min(PER, n - off)), String(startEpoch)], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
+    const w = fork(new URL(import.meta.url).pathname, ['sync-worker', String(off), String(Math.min(PER, n - off)), String(startEpoch), tag], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
     workers.push({ w, synced: new Promise((r) => w.on('message', (m) => m.type === 'synced' && r(m))), arrivals: new Promise((r) => w.on('message', (m) => m.type === 'arrivals' && r(m.arrivals))) });
   }
   const parts = await Promise.all(workers.map((x) => x.synced));
   const synced = parts.flatMap((p) => p.synced), ops = parts.flatMap((p) => p.ops), ok = synced.filter((s) => s !== null);
   const retries = parts.reduce((a, p) => a + p.retries, 0), last = parts.map((p) => p.last).find(Boolean) ?? '';
-  console.log(`powersync crowd sync, ${n} readers in ${workers.length} process(es): synced ${ok.length}/${n}, median ${pct(ok, 0.5).toFixed(2)} s, p95 ${pct(ok, 0.95).toFixed(2)} s, slowest ${Math.max(...ok).toFixed(2)} s; ops per reader ${pct(ops, 0.5)} (${parts[0].bson ? 'BSON' : 'NDJSON'}); ${retries} retried connections${retries ? ` (last: ${last.slice(0, 120)})` : ''}; ${Math.round(parts.reduce((a, p) => a + p.rss, 0) / n)} MB per reader`);
-  const tag = randomUUID().slice(0, 6), sent = new Map(), errors = [];
+  console.log(`powersync crowd sync, ${n} readers in ${workers.length} process(es): synced ${ok.length}/${n}, median ${pct(ok, 0.5).toFixed(2)} s, p95 ${pct(ok, 0.95).toFixed(2)} s, slowest ${Math.max(...ok).toFixed(2)} s; ${(pct(parts.flatMap((p) => p.bytes), 0.5) / 1048576).toFixed(2)} MB of data documents per reader (${parts[0].bson ? 'BSON' : 'NDJSON'}, not decoded); ${retries} retried connections${retries ? ` (last: ${last.slice(0, 120)})` : ''}; ${Math.round(parts.reduce((a, p) => a + p.rss, 0) / n)} MB per reader`);
+  const sent = new Map(), errors = [];
   for (let k = 0; k < markers; k++) {
-    const id = `m-${tag}-${String(k).padStart(4, '0')}`, t = Date.now();
+    const id = `${tag}${String(k).padStart(4, '0')}`, t = Date.now();
     sent.set(id, t);
     try { await post('storm_items', [{ id, tenant_id: 'cmp', note: 'marker' }], principal(0)); } catch (e) { errors.push(`marker ${k}: ${e.message}`); }
     await sleep(Math.max(0, 1000 - (Date.now() - t)));
@@ -214,7 +231,7 @@ async function ready(rows) {
 
 const [mode, a1, a2, a3] = process.argv.slice(2);
 if (mode === 'ready') await ready(Number(a1));
-else if (mode === 'sync-worker') { await syncWorker(Number(a1), Number(a2), Number(a3)); await new Promise(() => {}); }
+else if (mode === 'sync-worker') { await syncWorker(Number(a1), Number(a2), Number(a3), process.argv[6]); await new Promise(() => {}); }
 else if (mode === 'sync') await sync(Number(a1), Number(a2 ?? 0));
 else if (mode === 'writes') await writes(Number(a1), Number(a2), Number(a3));
 else { console.error('usage: ps_crowd.mjs sync N MARKERS | writes N RATE SECONDS'); process.exit(2); }

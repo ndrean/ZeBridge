@@ -13,6 +13,9 @@
 #                              the write crowd: scripts/bench/ingress_load.py, N principals (one NATS connection
 #                              each, after `creds N`), RATE writes/s offered in all, into sensor_events; each
 #                              verdict timed, and the rows PostgreSQL committed counted before and after
+#   zebridge.sh crowd sync N MARKERS
+#                              the light sync crowd (zb_crowd.py): N readers that download the chain and follow
+#                              CDC without applying, PowerSync's readers' twin; after `creds N`
 #   zebridge.sh enroll N       N enrolled identities for storm.py, through the temporary bridge's /enroll
 #   zebridge.sh storm N [MARKERS]
 #                              the sync crowd: storm/storm.py, N libzb clients seeding storm_items at once, then
@@ -34,7 +37,8 @@ cd ~/zbcmp/zb && chmod 600 env.db
 /usr/bin/bridge --version | head -1
 /usr/bin/bridge --init-nats operator --dir ~/zbcmp/zb/id --js-domain cmp > init-nats.log 2>&1 || { tail -5 init-nats.log; exit 1; }
 conf=$(cat id/nats-server.conf)
-printf '%s\nhost: "127.0.0.1"\nport: 14222\njetstream { domain: cmp, store_dir: "%s/js" }\n' "${conf%%$'\n'port:*}" "$HOME/zbcmp/zb" > nats.conf
+# The hub's consumer cap kept (nats-server 2.15 defaults to 1000 a stream; 500 clients hold more than that).
+printf '%s\nhost: "127.0.0.1"\nport: 14222\njetstream { domain: cmp, store_dir: "%s/js", limits { default_max_consumers: 5000 } }\n' "${conf%%$'\n'port:*}" "$HOME/zbcmp/zb" > nats.conf
 nohup "$(command -v nats-server)" -c nats.conf > nats.log 2>&1 &
 echo $! > nats.pid
 for i in $(seq 30); do grep -q "Server is ready" nats.log && break; sleep 0.5; done
@@ -111,13 +115,17 @@ ingress)
   N="${2:?N}" RATE="${3:?RATE}" SECS="${4:?SECONDS}"
   db_env
   scp -q "$ROOT/scripts/bench/ingress_load.py" "$CMP_HOST:zbcmp/cl/"
-  before=$(psql "$ADMIN" -X -tA -c "SELECT count(*) FROM sensor_events" 2>&1 | redact)
-  t0=$(date +%s)
+  # Committed is PostgreSQL's own count, sampled every second (lib.sh count_rate), not the verdicts.
+  count_rate start
   ssh_h "cd ~/zbcmp/cl && ~/zbcmp/venv/bin/python ingress_load.py --url nats://127.0.0.1:14222 --creds \$HOME/zbcmp/cl/creds/p000.creds --creds-dir \$HOME/zbcmp/cl/creds \
     --principals \$(seq -f 'p%03g' 0 $((N - 1)) | paste -sd, -) --tenant cmp --variant zb1 --workers $N --rate $RATE --seconds $SECS 2>ingress.err | tail -1"
-  # Committed is PostgreSQL's own count, not the verdicts: wait until it stops rising.
-  last=-1; while :; do now=$(psql "$ADMIN" -X -tA -c "SELECT count(*) FROM sensor_events" 2>&1 | redact); [ "$now" = "$last" ] && break; last=$now; sleep 3; done
-  echo "committed: $((last - before)) rows, $(( (last - before) / ($(date +%s) - t0 - 3) )) rows/s over the whole run, offered $RATE/s for $SECS s"
+  count_rate stop
+  ;;
+crowd)
+  # The light sync crowd (zb_crowd.py): readers that download and follow, without applying; after `creds N`.
+  shift
+  scp -q "$HERE/zb_crowd.py" "$ROOT/scripts/bench/ingress_load.py" "$CMP_HOST:zbcmp/cl/"
+  ssh_h "cd ~/zbcmp/cl && ulimit -n 65536 && ~/zbcmp/venv/bin/python zb_crowd.py $* 2>crowd.err; tail -3 crowd.err | grep -iE 'error|Traceback' || true"
   ;;
 enroll)
   N="${2:?N}"
@@ -125,7 +133,8 @@ enroll)
   (umask 077; psql "$ADMIN" -X -tA -c "SELECT zebridge_invite('s' || lpad(i::text, 3, '0'), 'cmp', interval '1 day') FROM generate_series(0, $N - 1) i" 2>/dev/null > "$SEC/codes.txt")
   [ "$(wc -l < "$SEC/codes.txt" | tr -d ' ')" = "$N" ] || { echo "invites: expected $N, got $(wc -l < "$SEC/codes.txt")" >&2; rm -f "$SEC/codes.txt"; exit 1; }
   scp -q "$SEC/codes.txt" "$ROOT/storm/storm.py" "$CMP_HOST:zbcmp/cl/" && rm -f "$SEC/codes.txt"
-  ssh_h 'cd ~/zbcmp/cl && chmod 600 codes.txt && ~/zbcmp/venv/bin/python storm.py enroll codes.txt ids --bridge http://127.0.0.1:27534 2>enroll.err | tail -1; rm -f codes.txt; chmod 700 ids'
+  # Identities of an earlier stack's operator would be refused: start from none.
+  ssh_h 'cd ~/zbcmp/cl && rm -rf ids run && chmod 600 codes.txt && ~/zbcmp/venv/bin/python storm.py enroll codes.txt ids --bridge http://127.0.0.1:27534 2>enroll.err | tail -1; rm -f codes.txt; chmod 700 ids'
   ;;
 storm)
   N="${2:?N}" M="${3:-30}"
@@ -139,5 +148,5 @@ clean)
   ssh_h 'sudo rm -rf ~/zbcmp/zb ~/zbcmp/cl ~/zbcmp/venv /tmp/zbcmp-* /tmp/storm-*; rmdir ~/zbcmp 2>/dev/null; ls ~/zbcmp 2>/dev/null || true'
   rm -rf "$SEC/creds"
   ;;
-*) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+*) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

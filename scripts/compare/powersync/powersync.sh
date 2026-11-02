@@ -8,7 +8,7 @@
 #                                seed N | roundtrip S | burst N | writes P M
 #   powersync.sh crowd sync N MARKERS | crowd writes N RATE SECONDS
 #                                the crowd (client/ps_crowd.mjs), in the same container and watchdog: N stream
-#                                readers, or N apps uploading to PostgREST (rows committed counted before and after)
+#                                readers, or N apps uploading to PostgREST (PostgreSQL's row count sampled every second)
 #   powersync.sh down            remove the containers
 #   powersync.sh clean           down, remove ~/zbcmp/ps, ~/zbcmp/psc and the images
 # Each `run` starts with empty replicas: the container's /tmp goes with it.
@@ -36,7 +36,7 @@ up)
   # The service serves nothing until its first checkpoint, which needs the replication stream to move: the policy
   # check's accepted insert moves it. Then wait until one reader gets a stream, so no timed run includes the start.
   ssh_h 'for i in $(seq 120); do
-      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 -X POST http://127.0.0.1:18080/sync/stream \
+      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 -X POST http://127.0.0.1:18081/sync/stream \
         -H "content-type: application/json" -H "accept: application/x-ndjson" \
         -H "authorization: Token $(python3 -c "import base64,hashlib,hmac,json,time,sys; k=open(sys.argv[1]).read().strip(); b=lambda x: base64.urlsafe_b64encode(x).rstrip(b\"=\").decode(); n=int(time.time()); h=b(json.dumps({\"alg\":\"HS256\",\"kid\":\"cmp-key\",\"typ\":\"JWT\"}).encode())+\".\"+b(json.dumps({\"sub\":\"ready\",\"aud\":\"powersync-cmp\",\"iat\":n,\"exp\":n+600}).encode()); print(h+\".\"+b(hmac.new(base64.urlsafe_b64decode(k+\"=\"*(-len(k)%4)),h.encode(),hashlib.sha256).digest()))" ~/zbcmp/psc/secrets/jwt.key)" \
         -d "{\"buckets\":[],\"include_checksum\":true,\"raw_data\":true,\"client_id\":\"ready\"}" || true)
@@ -50,26 +50,24 @@ up)
 run|crowd)
   script=ps_cmp.mjs; [ "$1" = crowd ] && script=ps_crowd.mjs
   shift
-  if [ "$script" = ps_crowd.mjs ] && [ "${1:-}" = writes ]; then db_env; before=$(psql "$ADMIN" -X -tA -c "SELECT count(*) FROM sensor_events" 2>&1 | redact); fi
+  counting=; if [ "$script" = ps_crowd.mjs ] && [ "${1:-}" = writes ]; then db_env; counting=1; count_rate start; fi
   ssh_h "bash -s -- $script $*" <<'REMOTE'
 (while sleep 2; do a=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo); echo "$a" >> /tmp/zbcmp-mem.log
   [ "$a" -lt 1500 ] && { sudo docker kill zbcmp-psclient >/dev/null 2>&1; echo "WATCHDOG: killed the client at $a MB available"; }
-  sudo docker stats --no-stream --format '{{.Name}} {{.CPUPerc}}' zbcmp-powersync zbcmp-psclient 2>/dev/null | tr -d '%' >> /tmp/zbcmp-cpu.log; done) &
+  sudo docker stats --no-stream --format '{{.Name}} {{.CPUPerc}}' $(sudo docker ps --format '{{.Names}}' --filter name=zbcmp-powersync --filter name=zbcmp-psapi --filter name=zbcmp-psclient) 2>/dev/null \
+    | tr -d '%' | awk -v t=$(date +%s) '{print t, $0}' >> /tmp/zbcmp-cpu.log; done) &
 W=$!
 script=$1; shift
 sudo docker run --rm --name zbcmp-psclient --network host --memory 4g --ulimit nofile=65536 -v "$HOME/zbcmp/psc:/w" -w /w node:22 node "$script" "$@" 2>&1 \
   | grep -vE "Could not apply checkpoint|^ +at " | uniq -c | sed -E 's/^ +1 //'
 kill $W
-echo "(lowest available memory: $(sort -n /tmp/zbcmp-mem.log | head -1) MB; peak CPU in % of one core: the service $(awk '$1=="zbcmp-powersync"{print $2}' /tmp/zbcmp-cpu.log | sort -n | tail -1), the crowd process $(awk '$1=="zbcmp-psclient"{print $2}' /tmp/zbcmp-cpu.log | sort -n | tail -1))"; rm -f /tmp/zbcmp-mem.log /tmp/zbcmp-cpu.log
+echo "(lowest available memory: $(sort -n /tmp/zbcmp-mem.log | head -1) MB; peak CPU in % of one core: the service, all its processes $(awk '$2 != "zbcmp-psclient" {s[$1] += $3} END {for (t in s) print s[t]}' /tmp/zbcmp-cpu.log | sort -n | tail -1), the crowd $(awk '$2 == "zbcmp-psclient" {print $3}' /tmp/zbcmp-cpu.log | sort -n | tail -1))"; rm -f /tmp/zbcmp-mem.log /tmp/zbcmp-cpu.log
 for c in zbcmp-powersync zbcmp-psstore zbcmp-postgrest; do sudo docker inspect $c --format "$c restarts={{.RestartCount}} oom={{.State.OOMKilled}}" 2>/dev/null; done
 REMOTE
-  if [ -n "${before:-}" ]; then
-    last=-1; while :; do now=$(psql "$ADMIN" -X -tA -c "SELECT count(*) FROM sensor_events" 2>&1 | redact); [ "$now" = "$last" ] && break; last=$now; sleep 3; done
-    echo "committed: $((last - before)) rows in sensor_events"
-  fi
+  [ -z "$counting" ] || count_rate stop
   ;;
 down)
-  ssh_h 'sudo docker rm -f zbcmp-powersync zbcmp-postgrest zbcmp-psstore zbcmp-psclient >/dev/null 2>&1; sudo docker ps -a --filter name=zbcmp- --format "{{.Names}}" | grep . || echo "no comparison container left"'
+  ssh_h 'sudo docker ps -aq --filter name=zbcmp- | xargs -r sudo docker rm -f >/dev/null; sudo docker ps -a --filter name=zbcmp- --format "{{.Names}}" | grep . || echo "no comparison container left"'
   ;;
 clean)
   "$0" down

@@ -9,7 +9,7 @@ import { readFileSync, rmSync } from 'node:fs';
 import { fork } from 'node:child_process';
 import pg from 'pg';
 
-const SERVICE = 'http://127.0.0.1:18080', REST = 'http://127.0.0.1:13000';
+const SERVICE = 'http://127.0.0.1:18081', REST = 'http://127.0.0.1:13000';   // the first API process
 const KEY = readFileSync('./secrets/jwt.key', 'utf8').trim();
 const schema = new Schema({ storm_items: new Table({ tenant_id: column.text, note: column.text, updated_at: column.text }) });
 const b64u = (b) => Buffer.from(b).toString('base64url');

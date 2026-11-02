@@ -70,6 +70,34 @@ From this folder, in this order:
 
 `zebridge.sh up` starts from a new NATS operator each time, so run `zebridge.sh creds` after every `up`: the previous identities are refused. It also waits for the table's first snapshot, since a client connecting before it would time the wait. Repeat the write rows (`run writes …`) at least twice more for each system. `db.sh count` shows what reached the table. PowerSync's clients may log `Sync aborted Error: illegal end of stream in BSON object` and reconnect; `run` counts the lines, and in the measured runs no write was lost.
 
+## A crowd of 500
+
+The phases above use real clients, which do not fit 500 to a host. The crowd measures what each server delivers to many clients and takes from them, with light clients that do the wire work and nothing else:
+
+| Direction | ZeBridge | PowerSync |
+| --- | --- | --- |
+| Sync | `zebridge.sh crowd sync N MARKERS` (`zb_crowd.py`): each reader reads the chain's manifest, downloads its objects and follows CDC from the cut, as libzb does on the wire; it neither decompresses nor applies | `powersync.sh crowd sync N MARKERS` (`client/ps_crowd.mjs`): each reader opens `/sync/stream` as the SDK does (BSON preferred), decodes only the control documents and scans the data documents for markers |
+| Writes | `zebridge.sh ingress N RATE SECONDS`: `scripts/bench/ingress_load.py`, N principals, one NATS connection each | `powersync.sh crowd writes N RATE SECONDS`: N apps uploading as `uploadData` does, one request at a time, up to 200 rows, to PostgREST |
+
+Markers are written through each system's write path: a mutation from `p000` for ZeBridge, a PostgREST insert for PowerSync. The committed figure is PostgreSQL's row count, sampled every second (`count_rate.py`). Both write crowds use UUIDv7 keys.
+
+```sh
+./zebridge.sh up && ./zebridge.sh creds 500 && ./zebridge.sh tools
+./zebridge.sh crowd sync 500 30           # each run on a fresh `up`: see below
+./zebridge.sh ingress 500 1000 30
+./zebridge.sh down
+./db.sh table && ./powersync.sh roles && ./powersync.sh up
+./powersync.sh crowd sync 500 30          # each run after `db.sh table` and `up`
+./powersync.sh crowd writes 500 1000 30
+```
+
+What 500 clients taught, kept in the scripts:
+
+- **ZeBridge:** each object download holds a consumer for 5 minutes, and a client cannot delete it. So 500 cold readers on a chain of a full and 12 deltas need 6,500 consumers, past the hub's cap of 5,000 per stream. The temporary stack keeps the hub's `default_max_consumers: 5000` (nats-server 2.15 defaults to 1,000). Run each sync on a fresh `up`: a new NATS makes the bridge build a single full, and no consumers are left from the last run.
+- **PowerSync:** one API process serves 200 connections at most (`max_concurrent_connections`), and its documentation advises 100. `ps_service.py` runs PowerSync's production layout: one replication process (`start -r sync`) and one API process (`start -r api`) per 100 connections. `ps_crowd.mjs` spreads its readers over them, as a round-robin load balancer would.
+- **PostgREST's pool** is 10 connections by default. Under 500 apps it answers `504 Timed out acquiring connection` and the apps retry. That is the default a PowerSync backend would start from, but it is not tuned.
+- **One host for services and crowd:** the readers and the services share its cores, so the figures are what one host holds, not what a server alone would.
+
 ## Cleaning up
 
 ```sh

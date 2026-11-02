@@ -24,3 +24,19 @@ db_env() {
   [ "$got" = "$CMP_DB_SYSID" ] || { echo "WRONG DATABASE: $CMP_DB_ENV reaches '${got:-nothing}', settings say '$CMP_DB_SYSID'; refusing" >&2; exit 2; }
 }
 admin_sql() { psql "$ADMIN" -X -q -v ON_ERROR_STOP=1 "$@" 2>&1 | redact; }
+
+# sensor_events' row count, sampled every second while a write crowd runs: `count_rate start`, then `count_rate stop`
+# waits until the count stops rising (the drain) and prints what count_rate.py makes of the samples.
+count_rate() {
+  if [ "$1" = start ]; then
+    COUNT_LOG="$SEC/count.log"; : > "$COUNT_LOG"
+    ( while :; do echo "$(python3 -c 'import time; print(time.time())') $(psql "$ADMIN" -X -tA -c 'SELECT count(*) FROM sensor_events' 2>/dev/null)" >> "$COUNT_LOG"; sleep 1; done ) &
+    COUNT_PID=$!
+  else
+    local last=-1 now
+    while :; do now=$(tail -1 "$COUNT_LOG" | cut -d' ' -f2); [ "$now" = "$last" ] && break; last=$now; sleep 3; done
+    { kill "$COUNT_PID" && wait "$COUNT_PID"; } 2>/dev/null || true
+    python3 "$HERE/count_rate.py" "$COUNT_LOG"
+    rm -f "$COUNT_LOG"
+  fi
+}
