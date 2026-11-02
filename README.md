@@ -231,18 +231,20 @@ Measure CDC distribution, snapshot download/apply, mutation commits and outbox r
 
 Each figure is one run on the hardware named, not a capacity guarantee.
 
-**On a production hub.** The bridge, admission, the sweeper and NATS on one VPS (6 vCPU, 11.7 GB, 4 ingress lanes); PostgreSQL on Supabase in London, 17 ms per query from the hub; the clients on one Mac, 23 ms from the hub, with the published Python package; a table of 10,000 rows of about 200 bytes in one tenant.
+**On a production hub, 0.2.10.** The bridge, admission, the sweeper and NATS on one VPS (6 vCPU, 11.7 GB, 4 ingress lanes); PostgreSQL on Supabase in London, 17 ms per query from the hub; the clients on one Mac, 23 ms from the hub, with the published Python package; a table of 10,000 rows of about 200 bytes. Measured 2026-11-02.
 
 | Direction | What | Figure |
 | --- | --- | --- |
-| PostgreSQL → clients | 10 clients seeding the table | synced in 0.83 s (median), 0.33 s when their replicas were already seeded |
-| PostgreSQL → clients | 100,000 rows inserted in one statement | the bridge published them at about 41,000 events/s; one client held them all 3.2 s after the commit |
-| both | one client's write reaching all 10 clients through PostgreSQL | median 113 ms, p95 189 ms |
+| PostgreSQL → clients | 10 clients seeding the table | synced in 0.98 s (median), 0.35 s when their replicas were already seeded |
+| PostgreSQL → clients | 100,000 rows inserted in one statement | the bridge published them at about 46,700 events/s; one client held them all 2.95 s after the commit |
+| both | one client's write reaching all 10 clients through PostgreSQL | median 117–121 ms |
 | clients → PostgreSQL | writes judged and answered, one client | 263 writes/s |
 | clients → PostgreSQL | 10 clients | 1,414 writes/s |
-| clients → PostgreSQL | 50 clients | 1,447 writes/s, median verdict 3.2 s with every client sending 400 at once; with `MUTATION_RATE_PER_PRINCIPAL=2000` and `MUTATION_RATE_BURST=4000`, no write was delayed |
+| clients → PostgreSQL | 50 clients, each sending 400 at once | 1,447 writes/s, median verdict 3.2 s |
 
-The writes were measured with 0.2.10 (2026-11-02); with 0.2.9 the same runs gave 31, 303 and 1,090 writes/s. The PostgreSQL → clients rows were measured with 0.2.9 (2026-11-01): 0.2.10 changed the write path, not this one. During the write runs PostgreSQL and the bridge were nearly idle; a batch of writes costs its round trips to the database, so the distance between the bridge and PostgreSQL sets the ceiling. 1,450 writes/s is 14,500 devices each sending one write every 10 seconds.
+**What the write figures are.** They are the hub's total, shared by every tenant: all writes go through the same ingress lanes, each with one connection to PostgreSQL, so more tenants do not add capacity (more lanes or another bridge would; not measured). The runs used one tenant, which is not the designed topology but shows what one tenant can take when nothing else writes. During them PostgreSQL and the bridge were nearly idle: a batch of writes costs its round trips to the database, so the distance between the bridge and PostgreSQL sets the ceiling. 1,450 writes/s is 14,500 devices each sending one write every 10 seconds.
+
+**The rate limit sets what one tenant gets.** By default there is none (`MUTATION_RATE_PER_PRINCIPAL=0`), and a tenant can use the whole ceiling, as above. Set, it applies to each principal and to each tenant: at 100 per second (burst 200, this hub's setting) one tenant is held to about 100 writes/s, whatever the hub could take. These runs used 2,000 (burst 4,000) and no write was delayed. See [Write limits, as a client sees them](OPERATIONS.md#write-limits-as-a-client-sees-them).
 
 **On one machine, and earlier deployments.**
 
