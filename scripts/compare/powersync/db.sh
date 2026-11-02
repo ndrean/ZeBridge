@@ -1,8 +1,9 @@
 #!/bin/bash
 # The comparison's database steps, from your machine. Each checks the database's identity first (lib.sh).
 #   db.sh init        ZeBridge's init SQL, rendered by the host's installed bridge, applied as the administrator
-#   db.sh table       the comparison table: dropped and recreated with 10,000 rows in tenant `cmp`, enabled by
-#                     zebridge_enable (storm/setup.sql), so both systems write through the same triggers and policy
+#   db.sh table       the comparison tables, dropped and recreated, both enabled by zebridge_enable so both systems
+#                     write through the same triggers and tenant policy: storm_items, 10,000 rows in tenant `cmp`
+#                     (storm/setup.sql), and sensor_events, empty, for the write crowd (scripts/bench/ingress.py's)
 #   db.sh inventory   what is on the database: slots, publications, tables, ZeBridge's objects
 #   db.sh count       the table's rows by kind (seed, markers, burst, writes)
 #   db.sh rtt         the comparison host's distance to the database: 50 TCP connects, IPv6 and IPv4
@@ -28,7 +29,11 @@ init)
 table)
   admin_sql -c "DROP TABLE IF EXISTS public.storm_items" -c "DELETE FROM public.zebridge_catalogue WHERE tbl::text IN ('storm_items', 'public.storm_items')"
   sed "s/'storm'/'cmp'/" storm/setup.sql | admin_sql -v pub="$BRIDGE_CDC_PUBLICATION" > /dev/null
-  psql "$ADMIN" -X -tA -c "SELECT 'rows ' || count(*) || ' in tenant ' || string_agg(DISTINCT tenant_id, ',') FROM storm_items" 2>&1 | redact
+  admin_sql -c "DROP TABLE IF EXISTS public.sensor_events" -c "DELETE FROM public.zebridge_catalogue WHERE tbl::text IN ('sensor_events', 'public.sensor_events')" \
+    -c "CREATE TABLE public.sensor_events (event_id uuid PRIMARY KEY, tenant_id text NOT NULL, sensor_id integer NOT NULL, kind text NOT NULL, value double precision NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)"
+  refused=$(PGOPTIONS="-c client_min_messages=warning" psql "$ADMIN" -X -tA -v ON_ERROR_STOP=1 -c "SELECT step || ': ' || detail FROM zebridge_enable('public.sensor_events'::regclass, tenant_col => 'tenant_id', writable => true, version_col => 'updated_at', tombstone_col => 'deleted_at', publication => '$BRIDGE_CDC_PUBLICATION', dry_run => false) WHERE status = 'ERROR'" 2>&1 | redact)
+  [ -z "$refused" ] || { echo "zebridge_enable refused sensor_events: $refused" >&2; exit 1; }
+  psql "$ADMIN" -X -tA -c "SELECT 'storm_items: ' || count(*) || ' rows in tenant ' || string_agg(DISTINCT tenant_id, ',') FROM storm_items" -c "SELECT 'sensor_events: ' || count(*) || ' rows' FROM sensor_events" 2>&1 | redact
   ;;
 inventory)
   psql "$ADMIN" -X -tA -F ' | ' 2>&1 <<'SQL' | redact
@@ -77,7 +82,7 @@ DO \$\$ DECLARE r record; BEGIN
     EXECUTE format('DROP EVENT TRIGGER %I', r.evtname);
   END LOOP;
   FOR r IN SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-           WHERE n.nspname = 'public' AND c.relkind = 'r' AND (c.relname LIKE 'zebridge\_%' OR c.relname = 'storm_items') LOOP
+           WHERE n.nspname = 'public' AND c.relkind = 'r' AND (c.relname LIKE 'zebridge\_%' OR c.relname IN ('storm_items', 'sensor_events')) LOOP
     EXECUTE format('DROP TABLE public.%I CASCADE', r.relname);
   END LOOP;
 END \$\$;

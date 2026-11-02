@@ -26,7 +26,7 @@ class Client:
             f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
         lib.zb_client_close.argtypes = [ctypes.c_uint64]
         lib.zb_last_error.restype = ctypes.c_char_p
-        p = f"p{i:02d}"
+        p = f"p{i:03d}"
         self.h = lib.zb_client_connect(json.dumps({"natsUrl": NATS, "credsPath": str(pathlib.Path(os.environ.get("ZB_CMP_CREDS", str(HERE / "creds"))) / f"{p}.creds"), "dbPath": db,
                                                    "principal": p, "clientId": f"cmp-{i}", "tables": [T], "heartbeatMs": 0, "jsDomain": "cmp"}).encode())
         if not self.h: raise RuntimeError("connect failed: " + (lib.zb_last_error() or b"").decode())

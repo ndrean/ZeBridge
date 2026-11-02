@@ -4,7 +4,10 @@
 - `ps_api`, PostgREST's login: it switches to ZeBridge's write role `zb_writer`, so PowerSync's uploads meet the same
   tenant policy and triggers as ZeBridge's writes (no BYPASSRLS);
 - `ps_pre()`, PostgREST's pre-request function: it sets `zb.principal` from the request, as the bridge does in each
-  write's transaction (the policy checks it), and the principals p00..p09 mapped to tenant `cmp`.
+  write's transaction (the policy checks it), and the principals p000..p499 mapped to tenant `cmp`.
+
+`sensor_events`, the write crowd's table, is in the publication too: while ZeBridge's bridge replicates the
+crowd's rows, PowerSync's service replicates them into its storage (ps_service.py: a stream no client subscribes to).
 
 Passwords and the JWT signing key are generated here and kept, with the connection URIs, in 0600 files in
 ./secrets. The administrator URL comes from the environment (CMP_ADMIN_URL, set by powersync.sh after the database
@@ -32,14 +35,14 @@ steps = [
     "DROP PUBLICATION IF EXISTS powersync",
     "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'powersync_role') THEN CREATE ROLE powersync_role WITH REPLICATION BYPASSRLS LOGIN; END IF; END $$",
     f"ALTER ROLE powersync_role WITH PASSWORD '{rep_pw}'",
-    "GRANT SELECT ON public.storm_items TO powersync_role",
-    "CREATE PUBLICATION powersync FOR TABLE public.storm_items",
+    "GRANT SELECT ON public.storm_items, public.sensor_events TO powersync_role",
+    "CREATE PUBLICATION powersync FOR TABLE public.storm_items, public.sensor_events",
     "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ps_api') THEN CREATE ROLE ps_api WITH LOGIN NOINHERIT; END IF; END $$",
     f"ALTER ROLE ps_api WITH PASSWORD '{api_pw}'",
     "GRANT zb_writer TO ps_api",
     "CREATE OR REPLACE FUNCTION public.ps_pre() RETURNS void LANGUAGE sql AS $f$ SELECT set_config('zb.principal', current_setting('request.headers', true)::json->>'x-principal', true) $f$",
     "GRANT EXECUTE ON FUNCTION public.ps_pre() TO zb_writer",
-    "INSERT INTO zebridge_user_tenants (principal, tenant_id) SELECT 'p' || lpad(i::text, 2, '0'), 'cmp' FROM generate_series(0, 9) i ON CONFLICT DO NOTHING",
+    "INSERT INTO zebridge_user_tenants (principal, tenant_id) SELECT 'p' || lpad(i::text, 3, '0'), 'cmp' FROM generate_series(0, 499) i ON CONFLICT DO NOTHING",
 ]
 failed = 0
 for sql in steps:

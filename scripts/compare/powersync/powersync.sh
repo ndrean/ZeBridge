@@ -6,6 +6,9 @@
 #   powersync.sh run PHASE ...   one phase of client/ps_cmp.mjs in a fresh node:22 container (2 GB cap), with a
 #                                watchdog that kills it if the host's available memory falls under 1.5 GB:
 #                                seed N | roundtrip S | burst N | writes P M
+#   powersync.sh crowd sync N MARKERS | crowd writes N RATE SECONDS
+#                                the crowd (client/ps_crowd.mjs), in the same container and watchdog: N stream
+#                                readers, or N apps uploading to PostgREST (rows committed counted before and after)
 #   powersync.sh down            remove the containers
 #   powersync.sh clean           down, remove ~/zbcmp/ps, ~/zbcmp/psc and the images
 # Each `run` starts with empty replicas: the container's /tmp goes with it.
@@ -20,25 +23,32 @@ roles)
 up)
   for f in jwt.key admin.uri replication.uri api.uri store.pw; do [ -s "$SEC/$f" ] || { echo "no secrets/$f: run powersync.sh roles first" >&2; exit 2; }; done
   ssh_h 'mkdir -p -m 700 ~/zbcmp/psc/secrets'
-  scp -q "$HERE/client/ps_cmp.mjs" "$HERE/client/package.json" "$CMP_HOST:zbcmp/psc/"
+  scp -q "$HERE/client/ps_cmp.mjs" "$HERE/client/ps_crowd.mjs" "$HERE/client/package.json" "$CMP_HOST:zbcmp/psc/"
   scp -q "$SEC/jwt.key" "$SEC/admin.uri" "$CMP_HOST:zbcmp/psc/secrets/"
   ssh_h 'chmod 600 ~/zbcmp/psc/secrets/*; sudo docker run --rm --network host -v $HOME/zbcmp/psc:/w -w /w node:22 bash -c "npm install --no-audit --no-fund --loglevel=error >/dev/null 2>&1; echo npm install rc=\$?"' 2>&1 | grep "npm install"
   CMP_HOST="$CMP_HOST" python3 "$HERE/ps_service.py"
   # The tenant policy must apply: a mapped principal writes, an unmapped one is refused (42501).
   ssh_h 'for p in p00 nobody; do printf "policy check, x-principal %s: " $p; curl -s -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:13000/storm_items -H "content-type: application/json" -H "prefer: return=minimal" -H "x-principal: $p" -d "[{\"id\":\"policy-$p\",\"tenant_id\":\"cmp\",\"note\":\"check\"}]"; done; echo "(expected: 201, then 401)"'
   ;;
-run)
+run|crowd)
+  script=ps_cmp.mjs; [ "$1" = crowd ] && script=ps_crowd.mjs
   shift
-  ssh_h "bash -s -- $*" <<'REMOTE'
+  if [ "$script" = ps_crowd.mjs ] && [ "${1:-}" = writes ]; then db_env; before=$(psql "$ADMIN" -X -tA -c "SELECT count(*) FROM sensor_events" 2>&1 | redact); fi
+  ssh_h "bash -s -- $script $*" <<'REMOTE'
 (while sleep 2; do a=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo); echo "$a" >> /tmp/zbcmp-mem.log
   [ "$a" -lt 1500 ] && { sudo docker kill zbcmp-psclient >/dev/null 2>&1; echo "WATCHDOG: killed the client at $a MB available"; }; done) &
 W=$!
-sudo docker run --rm --name zbcmp-psclient --network host --memory 2g -v "$HOME/zbcmp/psc:/w" -w /w node:22 node ps_cmp.mjs "$@" 2>&1 \
+script=$1; shift
+sudo docker run --rm --name zbcmp-psclient --network host --memory 2g --ulimit nofile=65536 -v "$HOME/zbcmp/psc:/w" -w /w node:22 node "$script" "$@" 2>&1 \
   | grep -vE "Could not apply checkpoint|^ +at " | uniq -c | sed -E 's/^ +1 //'
 kill $W
 echo "(lowest available memory: $(sort -n /tmp/zbcmp-mem.log | head -1) MB)"; rm -f /tmp/zbcmp-mem.log
 for c in zbcmp-powersync zbcmp-psstore zbcmp-postgrest; do sudo docker inspect $c --format "$c restarts={{.RestartCount}} oom={{.State.OOMKilled}}" 2>/dev/null; done
 REMOTE
+  if [ -n "${before:-}" ]; then
+    last=-1; while :; do now=$(psql "$ADMIN" -X -tA -c "SELECT count(*) FROM sensor_events" 2>&1 | redact); [ "$now" = "$last" ] && break; last=$now; sleep 3; done
+    echo "committed: $((last - before)) rows in sensor_events"
+  fi
   ;;
 down)
   ssh_h 'sudo docker rm -f zbcmp-powersync zbcmp-postgrest zbcmp-psstore zbcmp-psclient >/dev/null 2>&1; sudo docker ps -a --filter name=zbcmp- --format "{{.Names}}" | grep . || echo "no comparison container left"'
@@ -47,5 +57,5 @@ clean)
   "$0" down
   ssh_h 'sudo docker rmi -f journeyapps/powersync-service:latest postgrest/postgrest:latest postgres:17 node:22 >/dev/null 2>&1; sudo rm -rf ~/zbcmp/ps ~/zbcmp/psc; rmdir ~/zbcmp 2>/dev/null; ls ~/zbcmp 2>/dev/null || true'
   ;;
-*) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+*) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

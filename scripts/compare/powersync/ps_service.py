@@ -4,7 +4,7 @@ Three containers, host network, local-only ports, each with a memory cap so a lo
 - `zbcmp-psstore`: PostgreSQL 17 on 127.0.0.1:15432, PowerSync's bucket storage, local to the service as
   PowerSync's own deployments place it (768 MB);
 - `zbcmp-powersync`: the PowerSync service on 127.0.0.1:18080, replicating from the comparison database, Sync
-  Streams with one auto-subscribed stream over the table (1 GB);
+  Streams: one auto-subscribed stream over storm_items, one nobody subscribes to over sensor_events (1 GB);
 - `zbcmp-postgrest`: PostgREST on 127.0.0.1:13000, the backend `uploadData` writes to, as `zb_writer` with
   `ps_pre()` (256 MB).
 
@@ -34,6 +34,9 @@ config = textwrap.dedent(f"""\
           items:
             auto_subscribe: true
             query: SELECT id, tenant_id, note, updated_at FROM storm_items
+          events:
+            auto_subscribe: false
+            query: SELECT event_id AS id, tenant_id, sensor_id, kind, value, updated_at FROM sensor_events
     client_auth:
       audience: ["powersync-cmp"]
       jwks:

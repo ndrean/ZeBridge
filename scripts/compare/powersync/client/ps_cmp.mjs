@@ -49,7 +49,7 @@ async function open(i, keep, onUploaded) {
   if (!keep) for (const s of ['', '-wal', '-shm']) rmSync(file + s, { force: true });
   const db = new PowerSyncDatabase({ schema, database: { dbFilename: `pscmp-${i}.db`, dbLocation: '/tmp' } });
   // No wait between upload rounds: ZeBridge's outbox sends at once, so the round trips compare the same thing.
-  await db.connect(new Connector(`user-${i}`, onUploaded, `p${String(i).padStart(2, '0')}`), { crudUploadThrottleMs: 0 });
+  await db.connect(new Connector(`user-${i}`, onUploaded, `p${String(i).padStart(3, '0')}`), { crudUploadThrottleMs: 0 });
   return db;
 }
 const count = async (db, where = 'TRUE') => (await db.get(`SELECT count(*) AS n FROM storm_items WHERE ${where}`)).n;
