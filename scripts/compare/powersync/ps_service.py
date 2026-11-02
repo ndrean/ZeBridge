@@ -52,11 +52,13 @@ config = textwrap.dedent(f"""\
 # API process (`start -r api`) per 100 connections, 1 GB each, the Node heap at 80% of it. APIS API processes on
 # 18081.., the replication one on 18080; ps_crowd.mjs spreads its readers over the API ports, as a load balancer would.
 APIS = int(os.environ.get("PS_API_PROCESSES", "5"))
+# PostgREST's connections to PostgreSQL: its default is 10; count them against the database's max_connections.
+POOL = int(os.environ.get("PS_REST_POOL", "10"))
 ps_env = lambda port: f"POWERSYNC_CONFIG_B64={base64.b64encode(config.replace('PORT_HERE', str(port)).encode()).decode()}\nNODE_OPTIONS=--max-old-space-size-percentage=80\n"
 files = {
     "ps.env": ps_env(18080),
     **{f"ps-api{k}.env": ps_env(18080 + k) for k in range(1, APIS + 1)},
-    "rest.env": f"PGRST_DB_URI={rd('api.uri')}\nPGRST_DB_ANON_ROLE=zb_writer\nPGRST_DB_PRE_REQUEST=public.ps_pre\nPGRST_DB_SCHEMAS=public\nPGRST_SERVER_HOST=127.0.0.1\nPGRST_SERVER_PORT=13000\n",
+    "rest.env": f"PGRST_DB_URI={rd('api.uri')}\nPGRST_DB_ANON_ROLE=zb_writer\nPGRST_DB_PRE_REQUEST=public.ps_pre\nPGRST_DB_SCHEMAS=public\nPGRST_SERVER_HOST=127.0.0.1\nPGRST_SERVER_PORT=13000\nPGRST_DB_POOL={POOL}\n",
     "store.env": f"POSTGRES_PASSWORD={rd('store.pw')}\nPGPORT=15432\n",
 }
 for name, body in files.items():

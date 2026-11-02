@@ -31,7 +31,8 @@ up)
   (umask 077; grep -E '^(DATABASE_READER_URL|DATABASE_WRITER_URL|BRIDGE_CDC_PUBLICATION|BRIDGE_CDC_SLOT|GENERATIONS_ENABLED|BASE_BUF)=' "$DB_ENV_FILE" > "$SEC/env.db")
   ssh_h 'for p in ~/zbcmp/zb/*.pid; do [ -f "$p" ] && kill "$(cat "$p")" 2>/dev/null; done; rm -rf ~/zbcmp/zb && mkdir -p -m 700 ~/zbcmp/zb'
   scp -q "$SEC/env.db" "$CMP_HOST:zbcmp/zb/env.db" && rm -f "$SEC/env.db"
-  ssh_h 'bash -s' <<'REMOTE'
+  # The ingress lanes, each one writer connection (1 to 8, default 4): count them against max_connections.
+  sed "s/LANES_HERE/${ZB_LANES:-4}/" <<'REMOTE' | ssh_h 'bash -s'
 set -e
 cd ~/zbcmp/zb && chmod 600 env.db
 /usr/bin/bridge --version | head -1
@@ -49,7 +50,7 @@ NATS_CREDS=$HOME/zbcmp/zb/id/creds/bridge.creds
 NATS_JS_DOMAIN=cmp
 NATS_TLS_CA=
 MUTATION_ADMISSION=1
-ZB_INGRESS_LANES=4
+ZB_INGRESS_LANES=LANES_HERE
 GENERATION_CADENCE_SECONDS=30
 LOG_LEVEL=info
 ENROLL_NATS_URL=nats://127.0.0.1:14222
