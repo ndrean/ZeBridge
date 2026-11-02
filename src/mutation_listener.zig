@@ -1405,12 +1405,22 @@ pub const MutationListener = struct {
             }
             sent_ok = sent_ok and try receipts.sendClaims(a, conn, principals, ids, routes, payloads);
         }
+        // The GC floor, in the same round: after BEGIN, inside the transaction that will hold
+        // the writes, under the shared floor lock until COMMIT (see `acquireGcFloor`). It was
+        // its own round trip, one of four per batch, 17 ms each to a database in another
+        // building; its result is read with the claims, before any write is built.
+        sent_ok = sent_ok and c.PQsendQueryParams(conn, gc_floor_sql, 0, null, null, null, null, 0) == 1;
         var failed_at: usize = 0;
         if (!sent_ok or c.PQpipelineSync(conn) != 1) return error.MutationFailed;
-        const r1 = try receipts.collect(a, conn, 3, &failed_at);
+        const r1 = try receipts.collect(a, conn, 4, &failed_at);
         defer receipts.clearAll(r1);
         try self.leavePipeline(conn);
+        if (failed_at == 3) {
+            log.err("🔴 the GC floor could not be read ({s}) — writes are retried, not let through unchecked (re-apply init.write.template.sql if zebridge_gc_floor_acquire is missing)", .{c.PQerrorMessage(conn)});
+            return error.MutationFailed;
+        }
         if (failed_at != r1.len) return error.ReceiptInfrastructure;
+        try self.readGcFloor(r1[3]);
         if (faultAt(.oom_in_claims)) return error.OutOfMemory;
         if (faultAt(.reset_after_claims)) c.PQreset(conn); // the transaction and its claims are gone
         try requireTransaction(conn);
@@ -1425,11 +1435,6 @@ pub const MutationListener = struct {
             const same = std.mem.eql(u8, f.route, it.route) and std.mem.eql(u8, f.msg.msg.data, it.msg.msg.data);
             it.claim = .{ .status = if (same) .repeat else .conflict };
         }
-
-        // The floor, once for the whole batch, in the batch's transaction and under the shared floor
-        // lock it holds until COMMIT (outside pipeline mode; see `acquireGcFloor`). Any failure
-        // abandons the transaction and the messages are replayed one by one.
-        try self.acquireGcFloor(conn);
 
         // Pre-warm the metas of the claimed writes only, outside pipeline mode. A table
         // that cannot take writes refuses its write here, deterministically, as long as
@@ -2346,14 +2351,22 @@ pub const MutationListener = struct {
     /// reaped); a read that fails — the function missing because init.write.template.sql was not
     /// re-applied, the connection gone — fails the attempt, which is retried. Must run outside
     /// pipeline mode, after the transaction has begun.
+    const gc_floor_sql = "SELECT public.zebridge_gc_floor_acquire()";
+
     fn acquireGcFloor(self: *MutationListener, conn: ?*c.PGconn) !void {
-        self.gc_watermark_us = null;
-        const res = c.PQexec(conn, "SELECT public.zebridge_gc_floor_acquire()") orelse return error.MutationFailed;
+        const res = c.PQexec(conn, gc_floor_sql) orelse return error.MutationFailed;
         defer c.PQclear(res);
-        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) {
+        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
             log.err("🔴 the GC floor could not be read ({s}) — writes are retried, not let through unchecked (re-apply init.write.template.sql if zebridge_gc_floor_acquire is missing)", .{c.PQerrorMessage(conn)});
             return error.MutationFailed;
         }
+        try self.readGcFloor(res);
+    }
+
+    /// The floor from `zebridge_gc_floor_acquire()`'s one row: null when nothing was ever reaped.
+    fn readGcFloor(self: *MutationListener, res: ?*c.PGresult) !void {
+        self.gc_watermark_us = null;
+        if (c.PQntuples(res) != 1) return error.MutationFailed;
         if (c.PQgetisnull(res, 0, 0) == 1) return;
         self.gc_watermark_us = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch return error.MutationFailed;
     }
