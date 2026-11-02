@@ -184,7 +184,7 @@ Start with [the first calls in each language](CLIENTS.md#the-first-ten-lines), t
 
 ## Compared with PowerSync
 
-[PowerSync](https://www.powersync.com) also keeps a local SQLite replica of PostgreSQL on each device. The two differ in where the write path lives and what you run.
+[PowerSync](https://www.powersync.com) also keeps a local SQLite replica of PostgreSQL on each device. The two differ in where the write path lives and what you run. This is a comparison, not a case against PowerSync: it shows that NATS is a serious base for offline-first apps, and that the same connection lets an app reach services, such as routing or analytics, which PowerSync does not offer.
 
 ```mermaid
 flowchart LR
@@ -219,6 +219,7 @@ flowchart LR
 | Reads | SQL on the local replica | SQL on the local replica |
 | Writes | `mutate()`; the library sends them, PostgreSQL judges them and returns a verdict | Plain SQL on local tables; your `uploadData()` sends them to **your backend**, which applies its own rules |
 | Exactly once, authorization, refusals | Built in: receipts, tenant credentials and row-level security, a verdict per write | Your backend's job; the SDK retries until `uploadData()` succeeds |
+| Services for the app | Responders on the same NATS connection and credentials, on the hub or a regional leaf ([Connect a service](#connect-a-service-if-you-need-one)) | None: a separate API you build and secure |
 | Client platforms | Browser, Node, Python, Dart/Flutter, React Native, Android, C ABI | Many mature SDKs, including web, React Native, Flutter, Kotlin, Swift and Node |
 
 **Measured, same workload.** Both against one Supabase database in Dublin, 10,000 rows of about 200 bytes, the same table setup for both (ZeBridge's triggers and tenant policy; PowerSync's writes went through PostgREST as ZeBridge's write role, so the policy applied). Clients on the server itself, one system running at a time. ZeBridge 0.2.10 (4 ingress lanes, rate limit off); PowerSync service 1.27.2 with its bucket storage in PostgreSQL on the same server, Sync Streams, the Node SDK 1.3.0 with no delay between uploads (`crudUploadThrottleMs: 0`; the default waits 1 s). Measured 2026-11-02: one run each, except the larger server's write rows, which give the median of three runs and their range.
@@ -235,7 +236,7 @@ flowchart LR
 
 A ZeBridge write counts when its verdict returns, after admission, the receipt and the commit; a PowerSync write counts when the backend has committed it and the SDK has completed the upload. Most of a write's cost is the table's own rules, for both systems: the same 100,000-row insert took 4.37 s on a plain table and 10.16 s with ZeBridge's triggers (smaller server), and an earlier PowerSync run whose backend role bypassed the tenant policy reached 2,495 writes/s with 10 clients on the larger server, despite settings that worked against it (a 1 s upload delay, its bucket storage in Dublin). During each 10-client PowerSync run, 7 to 9 client sync streams broke ("illegal end of stream in BSON object") and reconnected; no write was lost.
 
-**What it does not measure.** PowerSync was given a ready backend (PostgREST) with the same rules, so these figures compare database and transport cost. They do not measure the work of building and running that backend, which is the structural difference in the table above. PowerSync also has what ZeBridge does not yet: a company behind it, a longer production record and more SDKs. Its write model is the familiar one, too: the app writes local SQL and your existing API applies it. ZeBridge's outbox and verdicts mean less code, but a model to learn.
+**What it does not measure.** PowerSync was given a ready backend (PostgREST) with the same rules, so these figures compare database and transport cost. They do not measure the work of building and running that backend, which is the structural difference in the table above. PowerSync's write model is the familiar one: the app writes local SQL and your existing API applies it. ZeBridge's outbox and verdicts mean less code, but a model to learn.
 
 ## How it works
 
