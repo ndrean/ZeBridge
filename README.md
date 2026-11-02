@@ -8,6 +8,7 @@ The client library provides one interface to read the local replica, submit muta
 
 [Try it](#try-it-with-docker)
 [Build an app](#build-an-app)
+[Compared with PowerSync](#compared-with-powersync)
 [Deploy](#deploy)
 [Documentation](#documentation)
 
@@ -105,6 +106,56 @@ The TypeScript client drives its own synchronization loop. With native `libzb`, 
 The native core is written in Zig. The TypeScript client reuses shared core rules through WebAssembly; the platform bindings wrap libzb rather than implementing another synchronization engine.
 
 Start with [the first calls in each language](CLIENTS.md#the-first-ten-lines), then use [CLIENTS](CLIENTS.md) for options, lifecycle and differences between clients. Installation and platform artifacts are covered in [DISTRIBUTION](DISTRIBUTION.md).
+
+## Compared with PowerSync
+
+[PowerSync](https://www.powersync.com) also keeps a local SQLite replica of PostgreSQL on each device. The two differ in where the write path lives and what you run.
+
+```mermaid
+flowchart LR
+    subgraph ZB["ZeBridge: you run one hub"]
+        direction LR
+        PG[(PostgreSQL<br/>local or managed)] <--> B[Bridge]
+        S[Sweeper] --> PG
+        B <--> N[NATS JetStream]
+        A[Mutation admission] <--> N
+    end
+    N <--> C[libzb or zb-client-ts<br/>+ local replica]
+```
+
+```mermaid
+flowchart LR
+    subgraph PS["PowerSync: hosted or self-hosted service"]
+        direction LR
+        PG2[(PostgreSQL)] --> P[PowerSync service]
+        P <--> BS[(Bucket storage<br/>PostgreSQL or MongoDB)]
+    end
+    P --> C2[PowerSync SDK<br/>+ local SQLite]
+    C2 -->|"uploadData(): your code"| API[Your backend API]
+    API --> PG2
+    AUTH["Your auth: signs the JWT"] -.-> C2
+```
+
+| | ZeBridge | PowerSync |
+| --- | --- | --- |
+| What you run | NATS, the bridge, admission and the sweeper on one server | The PowerSync service and its bucket storage, or their hosted cloud |
+| Table schema on the client | Sent by the bridge | Declared again in the app |
+| Reads | SQL on the local replica | SQL on the local replica |
+| Writes | `mutate()`; the library sends them, PostgreSQL judges them and returns a verdict | Plain SQL on local tables; your `uploadData()` sends them to **your backend**, which applies its own rules |
+| Exactly once, authorization, refusals | Built in: receipts, tenant credentials and row-level security, a verdict per write | Your backend's job; the SDK retries until `uploadData()` succeeds |
+| Client platforms | Browser, Node, Python, Dart/Flutter, React Native, Android, C ABI | Many mature SDKs, including web, React Native, Flutter, Kotlin, Swift and Node |
+
+**Measured, same workload.** Both against one Supabase database in Dublin, 10,000 rows of about 200 bytes, the same table setup for both (ZeBridge's triggers and tenant policy; PowerSync's writes went through PostgREST as ZeBridge's write role, so the policy applied). Clients on the server itself, one system running at a time. ZeBridge 0.2.10 (4 ingress lanes, rate limit off); PowerSync service 1.27.2 with its bucket storage in PostgreSQL on the same server, Sync Streams, the Node SDK 1.3.0 with no delay between uploads (`crudUploadThrottleMs: 0`; the default waits 1 s). Measured 2026-11-02, one run each.
+
+| What | ZeBridge, 6 vCPU, 24.5 ms to the database | PowerSync, same | ZeBridge, 2 vCPU, 85 ms | PowerSync, same |
+| --- | --- | --- | --- | --- |
+| 10 clients seeding the table, empty / already seeded | **0.11 s / 0.03 s** | 5.93 s / 2.03 s | **0.35 s / 0.08 s** | 14.44 s / 6.82 s |
+| One client's write reaching another, median / p95 | **120 / 133 ms** | 167 / 181 ms | **367 / 634 ms** | 487 / 1,277 ms |
+| 100,000 rows inserted in one statement, until a client holds them all | **2.70 s** | 26.14 s | **3.74 s** | 33.40 s |
+| Writes, 1 client | **401/s** | 248/s | **178/s** | 155/s |
+| Writes, 10 clients | **1,680/s** | 1,550/s | **680/s** | 298/s |
+
+A ZeBridge write counts when its verdict returns, after admission, the receipt and the commit; a PowerSync write counts when the backend has committed it and the SDK has completed the upload. Without the tenant policy (the backend's role bypassing row-level security) PowerSync reached 2,495 writes/s with 10 clients on the larger server: the policy and triggers roughly double the database's cost per row, for both systems. During each 10-client PowerSync run, 7 to 9 client sync streams broke ("illegal end of stream in BSON object") and reconnected; no write was lost. Seeding differs most: a ZeBridge client loads a compressed snapshot, while a PowerSync client applies every operation in its bucket.
 
 ## How it works
 
@@ -261,7 +312,9 @@ Each figure is one run on the hardware named, not a capacity guarantee.
 | 100 clients through a leaf across the Atlantic | cold sync median 13.2 s, slowest 14.7 s; warm 1.7 s; after a NATS restart, longest gap 2.9 s, none lost | 0.2.8 test hub in Canada, clients on a Mac in Europe (~100 ms) | |
 | The bridge's memory under a steady stream | ~8 MB resident, allocation flat over 70 minutes | 20,246 ticks of insert, update, delete | `scripts/scenarios/drip.py` |
 
-**Not measured:** a comparison with another sync system on the same workload; the hub's write ceiling with more than 4 ingress lanes; how long each component may stay down before recovery needs a re-seed; NATS memory at a steady load (it follows recent load, not stored data); a long network partition under load.
+A comparison with PowerSync on the same workload is in [Compared with PowerSync](#compared-with-powersync).
+
+**Not measured:** the hub's write ceiling with more than 4 ingress lanes; how long each component may stay down before recovery needs a re-seed; NATS memory at a steady load (it follows recent load, not stored data); a long network partition under load.
 
 ## Documentation
 
