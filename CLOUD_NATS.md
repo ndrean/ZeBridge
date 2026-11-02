@@ -8,6 +8,18 @@ What ZeBridge asks of a NATS account it does not run itself, measured against Sy
 
 At `/enroll`, the bridge signs each device's JWT with an account signing key, and the JWT carries the device's tenant grants (see [Enrollment](AUTHENTICATION.md#users-invites)). On a self-run hub, ZeBridge holds the operator and that key (`bridge --init-nats operator`). On a hosted account the provider holds the operator. So the account must let the bridge hold a **scoped signing key** whose template carries ZeBridge's per-tenant grants, or enrollment needs another path. This is the first thing to check.
 
+**What Synadia Cloud offers** (its Control Plane documentation, 2026-11-02): signing keys come in **Signing Key Groups**, set per account, not on the account creation form. Every user belongs to a group; a **scoped** group carries permissions and limits that its users inherit, which is the model ZeBridge's client template uses (`{{tag(tenant)}}`, `{{name()}}`). A user created in the Control Plane can download its JWT and credentials. The documentation does not say whether a group's private seed can be exported, so that an application signs its own users.
+
+**Questions for Synadia:**
+
+1. Can a scoped signing key's seed be exported, or a key we generate be added to the account, so that our service signs user JWTs itself (one per device, at enrollment)?
+2. Do scoped templates accept the tag functions our grants use, `{{tag(tenant)}}` and `{{name()}}`?
+3. If not: can a service create users through the Control Plane's API at the rate devices enroll, and what does a user cost against the account's limits?
+4. Do the JetStream limits count a stream's `max_bytes` against the account's storage when the stream is created, or only the bytes stored?
+5. What do the paid tiers allow in streams, consumers per stream and connections per account?
+
+If the answer to 1 is no and to 3 is yes, enrollment would ask the Control Plane's API for each device's user instead of signing it in the bridge: a change in the code, not built.
+
 ## What ZeBridge uses on one account
 
 Everything runs in **one account**: devices, the bridge, admission and responders, kept apart by subjects and by the grants in each JWT. ZeBridge uses no imports and no exports.
