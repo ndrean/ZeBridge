@@ -47,24 +47,33 @@ That is **10 streams before the first tenant, and 2 more for each tenant.**
 
 ## Synadia Cloud's free tier, against those needs
 
-| Limit (free tier, 2026-11-02) | Value | What it means for ZeBridge |
-| --- | --- | --- |
-| Connections | 50 by default, 100 at most | about 95 devices online at once |
-| Imports, exports | 5 / 1 by default, 10 / 2 at most | not used |
-| Leaf node connections | 5 by default, 10 at most | one per regional leaf; a hub alone needs none |
-| JetStream storage | 2.5 GB at most | the base topology's byte limits take about 2.3 GB of it, if reserved as above |
-| Streams | 10 at most | the open tenant only: **no named tenant fits** |
-| Consumers per stream | 100 at most | well under 100 devices online, counting reconnects and cold starts |
-| Stream size | 5 GB at most | not a constraint |
+From a new account's JWT (2026-11-02), which is what NATS enforces, and the account form's maximums:
 
-So the free tier can answer the signing-key question and run a small demo whose tables have no tenant column. It cannot run a multi-tenant app such as the depot, nor a crowd of clients; those need a paid tier.
+| Claim | As created | At most | What it means for ZeBridge |
+| --- | --- | --- | --- |
+| `conn`, connections | 5 | 10 | a few devices online, beside the hub's own processes |
+| `subs`, subscriptions (account-wide) | 50 | 100 | each device holds several (its CDC tails, verdicts, its inbox) |
+| `payload`, message size | 512 KiB | | the bridge sizes its messages from the server's limit, not the account's: a larger event or object chunk would be refused |
+| `leaf`, leaf connections | 1 | | one per regional leaf; a hub alone needs none |
+| `imports` / `exports` | 7 / 1 | | two imports are Synadia's own (metrics); ZeBridge uses none |
+| JetStream `streams` | 5 | 10 | the open tenant only: **no named tenant fits** |
+| JetStream `consumer`, per stream | 50 | 100 | well under that many devices, counting reconnects and cold starts |
+| JetStream `disk_storage` | 2.5 GiB | | the base topology's byte limits take about 2.3 GiB of it |
+| JetStream `disk_max_stream_bytes` | 5 GiB | | not a constraint |
+| JetStream `max_bytes_required` | true | | **every stream must declare a byte limit when created**; the bridge creates its KV buckets and object stores without one, so the account would refuse them |
+
+The account's JWT lists two signing keys, both plain (unscoped) public keys: Synadia's, whose seeds it holds, used for the users you create in its interface. Neither can sign the bridge's device JWTs.
+
+So the free tier can answer the signing-key question, and with the changes below run a small demo whose tables have no tenant column. It cannot run a multi-tenant app such as the depot, nor a crowd of clients; those need a paid tier.
 
 ## What would make the fit easier
 
 - **A smaller base topology.** Some of the 10 fixed streams could merge, or be created only when used: `KV_time_manifests` only with the readings archive, `KV_live` only with the fleet monitor.
 - **Byte limits as settings,** so `MUTATIONS` and `VERDICTS` can be sized to a small account.
+- **A byte limit on every stream the bridge creates,** the KV buckets and object stores included: required by an account with `max_bytes_required`.
+- **The account's message size,** not only the server's, in the bridge's sizing.
 
-Neither is built.
+None is built.
 
 ## The trial
 
