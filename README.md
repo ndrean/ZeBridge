@@ -12,6 +12,8 @@ ZeBridge keeps a local database on each device, queues writes while it is offlin
 
 The client library provides one interface to read the local replica, submit mutations, and query remote responders such as routing or analytics services. Optional regional NATS leaves serve snapshot caches near devices and host those services.
 
+**See it running: <https://bridge.zebridge.eu/demo>.** Five trucks on a map of France's 16,173 charge points. Pick a truck and a destination, and it drives along the road on every open screen; change its destination from any screen and it turns from where it is. The chargers are a query on the browser's own replica, the route comes from a routing service over the same NATS connection, and PostgreSQL holds only the decisions. Open it in two tabs, or on a phone and a laptop: each visit gets its own one-hour identity in a shared demo tenant. How it is built: [the depot example](examples/14-depot/README.md).
+
 [Try it](#try-it-with-docker)
 [Build an app](#build-an-app)
 [Compared with PowerSync](#compared-with-powersync)
@@ -184,7 +186,7 @@ Start with [the first calls in each language](CLIENTS.md#the-first-ten-lines), t
 
 ## Compared with PowerSync
 
-[PowerSync](https://www.powersync.com) also keeps a local SQLite replica of PostgreSQL on each device. The two differ in where the write path lives and what you run.
+[PowerSync](https://www.powersync.com) also keeps a local SQLite replica of PostgreSQL on each device. The two differ in where the write path lives and what you run. This is a comparison, not a case against PowerSync: it shows that NATS is a serious base for offline-first apps, and that the same connection lets an app reach services, such as routing or analytics, which PowerSync does not offer.
 
 ```mermaid
 flowchart LR
@@ -219,19 +221,24 @@ flowchart LR
 | Reads | SQL on the local replica | SQL on the local replica |
 | Writes | `mutate()`; the library sends them, PostgreSQL judges them and returns a verdict | Plain SQL on local tables; your `uploadData()` sends them to **your backend**, which applies its own rules |
 | Exactly once, authorization, refusals | Built in: receipts, tenant credentials and row-level security, a verdict per write | Your backend's job; the SDK retries until `uploadData()` succeeds |
+| Services for the app | Responders on the same NATS connection and credentials, on the hub or a regional leaf ([Connect a service](#connect-a-service-if-you-need-one)) | None: a separate API you build and secure |
 | Client platforms | Browser, Node, Python, Dart/Flutter, React Native, Android, C ABI | Many mature SDKs, including web, React Native, Flutter, Kotlin, Swift and Node |
 
-**Measured, same workload.** Both against one Supabase database in Dublin, 10,000 rows of about 200 bytes, the same table setup for both (ZeBridge's triggers and tenant policy; PowerSync's writes went through PostgREST as ZeBridge's write role, so the policy applied). Clients on the server itself, one system running at a time. ZeBridge 0.2.10 (4 ingress lanes, rate limit off); PowerSync service 1.27.2 with its bucket storage in PostgreSQL on the same server, Sync Streams, the Node SDK 1.3.0 with no delay between uploads (`crudUploadThrottleMs: 0`; the default waits 1 s). Measured 2026-11-02, one run each.
+**Measured, same workload.** Both against one Supabase database in Dublin, 10,000 rows of about 200 bytes, the same table setup for both (ZeBridge's triggers and tenant policy; PowerSync's writes went through PostgREST as ZeBridge's write role, so the policy applied). Clients on the server itself, one system running at a time. ZeBridge 0.2.10 (4 ingress lanes, rate limit off); PowerSync service 1.27.2 with its bucket storage in PostgreSQL on the same server, Sync Streams, the Node SDK 1.3.0 with no delay between uploads (`crudUploadThrottleMs: 0`; the default waits 1 s). Measured 2026-11-02: one run each, except the larger server's write rows, which give the median of three runs and their range.
 
 | What | ZeBridge, 6 vCPU, 24.5 ms to the database | PowerSync, same | ZeBridge, 2 vCPU, 85 ms | PowerSync, same |
 | --- | --- | --- | --- | --- |
 | 10 clients seeding the table, empty / already seeded | **0.11 s / 0.03 s** | 5.93 s / 2.03 s | **0.35 s / 0.08 s** | 14.44 s / 6.82 s |
 | One client's write reaching another, median / p95 | **120 / 133 ms** | 167 / 181 ms | **367 / 634 ms** | 487 / 1,277 ms |
 | 100,000 rows inserted in one statement, until a client holds them all | **2.70 s** | 26.14 s | **3.74 s** | 33.40 s |
-| Writes, 1 client | **401/s** | 248/s | **178/s** | 155/s |
-| Writes, 10 clients | **1,680/s** | 1,550/s | **680/s** | 298/s |
+| Writes, 1 client | 395/s (380–401) | **708/s** (248–826) | **178/s** | 155/s |
+| Writes, 10 clients | **1,691/s** (1,680–1,863) | 879/s (689–1,550) | **680/s** | 298/s |
 
-A ZeBridge write counts when its verdict returns, after admission, the receipt and the commit; a PowerSync write counts when the backend has committed it and the SDK has completed the upload. Without the tenant policy (the backend's role bypassing row-level security) PowerSync reached 2,495 writes/s with 10 clients on the larger server: the policy and triggers roughly double the database's cost per row, for both systems. During each 10-client PowerSync run, 7 to 9 client sync streams broke ("illegal end of stream in BSON object") and reconnected; no write was lost. Seeding differs most: a ZeBridge client loads a compressed snapshot, while a PowerSync client applies every operation in its bucket.
+**How to read it.** The gaps that hold on both servers are delivery to clients. Seeding is 40 to 70 times faster, because a ZeBridge client loads a compressed snapshot while a PowerSync client applies every operation in its bucket; the already-seeded column is an app restarting with its replica, the common case. The 100,000-row burst reaches a client about 10 times sooner, and one write reaches another client sooner, with a shorter tail. Writes are about equal in performance: PowerSync is faster with one client, ZeBridge with ten. The difference is in what a write gets: ZeBridge judges each write separately and returns a verdict for each, with exactly-once receipts and the tenant's authorization, where PowerSync uploads batches of up to 200 rows and leaves those guarantees to your backend. ZeBridge's write figures also repeat within about 10% from run to run; PowerSync's varied by a factor of two to three.
+
+A ZeBridge write counts when its verdict returns, after admission, the receipt and the commit; a PowerSync write counts when the backend has committed it and the SDK has completed the upload. Most of a write's cost is the table's own rules, for both systems: the same 100,000-row insert took 4.37 s on a plain table and 10.16 s with ZeBridge's triggers (smaller server), and an earlier PowerSync run whose backend role bypassed the tenant policy reached 2,495 writes/s with 10 clients on the larger server, despite settings that worked against it (a 1 s upload delay, its bucket storage in Dublin). During each 10-client PowerSync run, 7 to 9 client sync streams broke ("illegal end of stream in BSON object") and reconnected; no write was lost.
+
+**What it does not measure.** PowerSync was given a ready backend (PostgREST) with the same rules, so these figures compare database and transport cost. They do not measure the work of building and running that backend, which is the structural difference in the table above. PowerSync's write model is the familiar one: the app writes local SQL and your existing API applies it. ZeBridge's outbox and verdicts mean less code, but a model to learn.
 
 ## How it works
 
@@ -344,7 +351,7 @@ See [SCOPE](SCOPE.md) for the boundaries and [SECURITY](SECURITY.md) for tenant 
 | A DuckDB replica | [DuckDB](examples/07-duckdb/README.md) |
 | Mutations and analytical queries under load | [Events](examples/09-event/README.md) |
 | Routing through a responder | [Valhalla routing](examples/13-routing/README.md) |
-| Shared plans, a map and routing | [Depot](examples/14-depot/README.md) |
+| Shared plans, a map and routing | [Depot](examples/14-depot/README.md), [running live](https://bridge.zebridge.eu/demo) |
 | Several editors on one record | [Shared record](examples/15-shared-record/README.md) |
 | Archiving readings to Parquet | [Archive](examples/16-archive/README.md) |
 
