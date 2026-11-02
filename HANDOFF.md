@@ -4,7 +4,7 @@ A snapshot for whoever (person or LLM session) picks the work up next. It is a l
 
 ## State of `main`
 
-`main` is at `826b3c4` (#67 merged). Everything in the table is on `main`. Open: #68 (`native/up.sh` safe to run twice; the README's outage table names the production layout). Every other branch was deleted on 2026-11-02, locally and on GitHub; tags `v0.2.x` are kept.
+`main` is at `826b3c4` (#67 merged). Everything in the table is on `main`. Merged since: #68 (`native/up.sh` safe to run twice). Open: #69 (the PowerSync harness and the 500-client figures), and the branches `client-outbox-metrics`, `cloud-nats` and this one. Every other branch was deleted on 2026-11-02, locally and on GitHub; tags `v0.2.x` are kept.
 
 **Deployed on the production hub** (`debian@141.95.95.12`, London Supabase database), recorded in two halves because a version number does not say both: **package** `zebridge 0.2.10` and `libzb 0.2.10`, from tag `v0.2.10` = `1216956`, installed 2026-11-02 10:28; **database** the init SQL of 0.2.9, rendered by the 0.2.9 package and applied 2026-11-01 before its packages (0.2.10 changed no init SQL and no C ABI, so it needed none). So everything merged up to #62 is deployed; #63 to #67 are docs, examples and scripts. Its public NATS address is `tls://nats.zebridge.eu:4222`, its bridge credentials `/etc/zebridge/creds/bridge.creds`; `/status` is exposed through HAProxy, `/health` is not. The hub's rate limit is `MUTATION_RATE_PER_PRINCIPAL=100` (burst 200); the README's write figures were measured with it raised for the runs.
 
@@ -67,13 +67,14 @@ Reported green on the Docker Compose stack on 2026-10-30, with every binary rebu
 ## Next (2026-11-02)
 
 1. **The Linux stack on PostgreSQL 18:** the owner runs `scripts/linux` on the Ubuntu machine (#66); its README's Status section says it has not run on 18 yet, and should say what passed once it has.
-2. **Three items from the README review**, product work, none started:
-   - a. a restore drill on a real backup destination: rebuild the hub elsewhere from a real backup, measure the recovery time, state what a restore can lose (also the priority in "Remaining work" below);
-   - b. client metrics for outbox depth and the distance to the GC floor (how close a pending write is to being refused), in both clients;
-   - c. a page for the policy boundary (what PostgreSQL's rules decide, what the client may assume), its cases pinned in `zb-client-ts/fixtures/core-fixtures.json` so both clients are checked against it.
+2. **Three items from the README review:**
+   - a. a restore drill on a real backup destination: set aside by the owner for now (also the priority in "Remaining work" below);
+   - b. **built**, on `client-outbox-metrics`: how long the oldest waiting write has before the GC floor refuses it, one rule in both cores (`outboxFloorMargin`, 14 fixtures), libzb's `poll` report `floor_margin_ms` (Dart maps it), zb-client-ts's `outboxStatus()`, one warning an hour under a day. Unit-tested and proved by mutation; not run in a live scenario;
+   - c. a page for the policy boundary (what PostgreSQL's rules decide, what the client may assume), its cases pinned in `zb-client-ts/fixtures/core-fixtures.json` so both clients are checked against it: not started.
 3. **The depot as the demonstration:** real sensors on trucks (`--mint-sensor`, `sensors.<tenant>.<name>.>`) and the 16-archive archiver writing them to Parquet, the readings responder serving them back; then one sentence in the README's demo paragraph.
+4. **ZeBridge on Synadia Cloud** (`CLOUD_NATS.md`, branch `cloud-nats`): the owner writes to Synadia about signing device JWTs on a hosted account (the deciding question), and its paid tiers. The free account's limits were probed with the bridge's user: `max_bytes_required` refuses a stream without a byte limit, no memory storage, 512 KiB messages against 8 MiB announced, 5 streams (10 at most) against the bridge's 10 before the first tenant. Making the bridge fit such an account (a byte limit on every stream, file storage, the account's message size) is not built.
 
-The PowerSync comparison is finished (README "Compared with PowerSync"; one run each, the larger server's write rows three). Its scratch setup is gone; the scripts that built it were in a session scratchpad, not in the tree.
+The PowerSync comparison is finished: README "Compared with PowerSync", with the 500-client crowd in both directions. Its harness is in the tree, `scripts/compare/powersync/` (branch `powersync-harness`, PR #69), with what 500 clients taught: the temporary NATS keeps the hub's consumer cap, each sync run on a fresh stack, PowerSync in its production layout (one replication process, one API process per 100 connections), PostgREST's pool and ZeBridge's lanes counted against the database's 60 connections. The scratch host for the crowd, `root@173.212.231.3` (6 vCPU, 12 GB, Debian 13, 23.6 ms from the Dublin database), keeps the 0.2.10 packages, nats-server 2.15.0, Docker and the images; `~/zbcmp` and the database are clean.
 
 ## Outstanding proof obligations
 
