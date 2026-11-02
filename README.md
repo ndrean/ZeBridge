@@ -55,7 +55,7 @@ To erase this evaluation stack and start again, run `docker compose -f docker-co
 
 ## Build an app
 
-Three parts: the hub, which you install; your backend, which signs users in and issues invites; and the app, which uses the client library.
+Three parts: the hub, which you install; your backend, which signs users in and issues invites; and the app, which uses the client library on the local database you choose. Services your apps can ask, such as routing or analytics, are optional and run as separate processes on the same library.
 
 ### Install the hub
 
