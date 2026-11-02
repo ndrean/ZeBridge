@@ -4273,6 +4273,92 @@
       "refuse": []
     }
   ],
+  "floorMargin": [
+    {
+      "name": "no floor received -> unknown (GC may simply be off)",
+      "versions": ["2026-08-01T00:00:00.000000Z"],
+      "watermark": null,
+      "margin": null
+    },
+    {
+      "name": "an empty floor is unknown, not the epoch",
+      "versions": ["2026-08-01T00:00:00.000000Z"],
+      "watermark": "",
+      "margin": null
+    },
+    {
+      "name": "a floor that is not a timestamp -> unknown",
+      "versions": ["2026-08-01T00:00:00.000000Z"],
+      "watermark": "not a version",
+      "margin": null
+    },
+    {
+      "name": "no waiting write -> unknown",
+      "versions": [],
+      "watermark": "2026-08-01T00:00:00.000000Z",
+      "margin": null
+    },
+    {
+      "name": "no waiting write with a version -> unknown",
+      "versions": [null, "not a version"],
+      "watermark": "2026-08-01T00:00:00.000000Z",
+      "margin": null
+    },
+    {
+      "name": "an hour ahead of the floor",
+      "versions": ["2026-08-01T01:00:00.000000Z"],
+      "watermark": "2026-08-01T00:00:00.000000Z",
+      "margin": 3600000
+    },
+    {
+      "name": "the oldest waiting write decides; writes with no version are skipped",
+      "versions": ["2026-08-03T00:00:00.000000Z", null, "2026-08-01T00:00:01.000000Z", "not a version"],
+      "watermark": "2026-08-01T00:00:00.000000Z",
+      "margin": 1000
+    },
+    {
+      "name": "exactly at the floor -> 0: already refused",
+      "versions": ["2026-08-01T00:00:00.000000Z"],
+      "watermark": "2026-08-01T00:00:00.000000Z",
+      "margin": 0
+    },
+    {
+      "name": "behind the floor -> negative",
+      "versions": ["2026-07-31T23:59:59.000000Z"],
+      "watermark": "2026-08-01T00:00:00.000000Z",
+      "margin": -1000
+    },
+    {
+      "name": "PG-trimmed micros are micros, and a floor without a fraction is .000000",
+      "versions": ["2026-08-01T00:00:00.5Z"],
+      "watermark": "2026-08-01T00:00:00Z",
+      "margin": 500
+    },
+    {
+      "name": "below a millisecond truncates toward zero, either way",
+      "versions": ["2026-08-01T00:00:00.000999Z", "2026-08-01T00:00:01.000000Z"],
+      "watermark": "2026-08-01T00:00:00.000000Z",
+      "margin": 0
+    },
+    {
+      "name": "behind by less than a millisecond is 0, not -0",
+      "versions": ["2026-07-31T23:59:59.999500Z"],
+      "watermark": "2026-08-01T00:00:00.000000Z",
+      "margin": 0
+    },
+    {
+      "name": "across a leap day and a year",
+      "versions": ["2029-03-01T00:00:00.000000Z"],
+      "watermark": "2028-02-28T00:00:00.000000Z",
+      "margin": 31708800000
+    },
+    {
+      "name": "a floor seven days back, the default retention",
+      "versions": ["2026-11-02T12:00:00.000000Z"],
+      "watermark": "2026-10-26T12:00:00.000000Z",
+      "margin": 604800000
+    }
+  ],
   "tombstoned": [
     {
       "name": "tombstone set drops the row (PROTOCOL §7.5: the soft delete IS the removal; the reap never arrives)",

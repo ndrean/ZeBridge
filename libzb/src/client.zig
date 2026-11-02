@@ -480,6 +480,11 @@ pub const SyncClient = struct {
     /// §10fk: a `rate_limited` verdict names `retry_after_ms`; the outbox is not
     /// flushed before then. The write stays queued, exactly as after `failed`.
     hold_until_ms: i64 = 0,
+    /// `floorMargin`'s last reading and when it was taken (it reads every waiting write), and
+    /// when its warning last went out.
+    floor_margin_ms: ?i64 = null,
+    floor_margin_at_ms: i64 = 0,
+    floor_warned_at_ms: i64 = 0,
     /// Reconnect jitter only. Steady-state refill is verdict-clocked; positive
     /// outbox retry_at reservations survive restart and back off per entry.
     next_outbox_retry_ms: i64 = 0,
@@ -5917,6 +5922,33 @@ pub const SyncClient = struct {
         return if (v == .text and v.text.len > 0) v.text else null;
     }
 
+    /// How far the oldest waiting write is ahead of the GC floor, in ms (`core.outboxFloorMargin`):
+    /// the time it has before it is refused (`PredatesGcWatermark`). null when unknown or nothing
+    /// waits. Read again at most every 10 s, as zb-client-ts's `outboxStatus()`, and a warning,
+    /// in the same words there, at most once an hour while it is under a day.
+    pub fn floorMargin(self: *SyncClient, a: std.mem.Allocator) ?i64 {
+        const now = nowMillis();
+        if (now - self.floor_margin_at_ms < 10_000) return self.floor_margin_ms;
+        self.floor_margin_at_ms = now;
+        self.floor_margin_ms = null;
+        const rows = self.st.query(a, "SELECT payload FROM _zebridge_outbox", &.{}) catch return null;
+        if (rows.len == 0) return null;
+        const versions = a.alloc(?[]const u8, rows.len) catch return null;
+        for (rows, 0..) |r, i| {
+            const env = if (r[0] == .text) parseStoredJson(a, r[0].text) catch Value.null else Value.null;
+            const ver = if (env == .object) env.object.get("version") else null;
+            versions[i] = if (ver) |v| (if (v == .string) v.string else null) else null;
+        }
+        const m = (core.outboxFloorMargin(a, versions, self.gcWatermark(a)) catch null) orelse return null;
+        self.floor_margin_ms = m;
+        // shortcut: a fixed day and hour, not the deployment's retention; make them options if asked.
+        if (m < 86_400_000 and now - self.floor_warned_at_ms >= 3_600_000) {
+            self.floor_warned_at_ms = now;
+            log.warn("libzb: outbox: the oldest waiting write is {d:.1} h from the GC floor — once the floor reaches it, it is refused (PredatesGcWatermark)", .{@as(f64, @floatFromInt(m)) / 3_600_000.0});
+        }
+        return m;
+    }
+
     /// One edit: stamp it, apply it locally, queue it, send it.
     ///
     /// The order is the contract. The optimistic apply and the outbox row are written
@@ -8825,6 +8857,35 @@ test "outbox window: reservations survive reopening and only definitive removal 
     const retry = try reserveOutbox(&st, a, 1003);
     try std.testing.expectEqual(@as(usize, 2), retry.len); // id<window> is still reserved, unsent
     try std.testing.expectEqualStrings("id7", retry[0][0].text);
+}
+
+test "floorMargin: the oldest waiting write against the GC floor, read again after 10 s, warned once an hour" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var client = try frontierClient(a);
+    defer client.st.close();
+    client.floor_margin_ms = null;
+    client.floor_margin_at_ms = 0;
+    client.floor_warned_at_ms = 0;
+    try client.st.execSimple("CREATE TABLE _zebridge_outbox (msg_id TEXT PRIMARY KEY, payload TEXT)");
+    try client.st.execSimple("CREATE TABLE zebridge_gc_watermark (watermark TEXT)");
+    try std.testing.expectEqual(@as(?i64, null), client.floorMargin(a)); // nothing waits
+    try client.st.execSimple(
+        \\INSERT INTO _zebridge_outbox VALUES ('a', '{"version":"2026-08-01T05:00:00.000000Z"}'),
+        \\  ('b', '{"version":"2026-08-01T02:00:00.000000Z"}'), ('c', '{}')
+    );
+    client.floor_margin_at_ms = 0;
+    try std.testing.expectEqual(@as(?i64, null), client.floorMargin(a)); // no floor received yet
+    try client.st.execSimple("INSERT INTO zebridge_gc_watermark VALUES ('2026-08-01T00:00:00Z')");
+    try std.testing.expectEqual(@as(?i64, null), client.floorMargin(a)); // within 10 s: the last reading
+    client.floor_margin_at_ms = 0;
+    try std.testing.expectEqual(@as(?i64, 7_200_000), client.floorMargin(a)); // b, two hours ahead
+    const warned = client.floor_warned_at_ms;
+    try std.testing.expect(warned > 0); // under a day: warned
+    client.floor_margin_at_ms = 0;
+    _ = client.floorMargin(a);
+    try std.testing.expectEqual(warned, client.floor_warned_at_ms); // not again within the hour
 }
 
 test "joint fence: the group is the owed records — a restart parks the routes of the flagged ones, before anything opens" {

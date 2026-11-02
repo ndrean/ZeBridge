@@ -121,7 +121,7 @@ import {
   planCdcBulk,
   seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica, tableSet,
   advancePosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
-  outboxWatermarkGate,
+  outboxWatermarkGate, outboxFloorMargin,
   heartbeatPayload,
   keyShape, typeShape, retypedColumns, isReadOnlySql,
 } from './core.ts';
@@ -164,6 +164,9 @@ for (const c of fx.chainPlan) {
 for (const c of fx.outboxWatermark) {
   test(`outboxWatermark: ${c.name}`, () =>
     assert.deepEqual(outboxWatermarkGate(c.entries, c.watermark), { send: c.send, refuse: c.refuse }));
+}
+for (const c of fx.floorMargin) {
+  test(`floorMargin: ${c.name}`, () => assert.strictEqual(outboxFloorMargin(c.versions, c.watermark), c.margin));
 }
 for (const c of fx.fullPredates) {
   test(`fullPredates: ${c.name}`, () =>

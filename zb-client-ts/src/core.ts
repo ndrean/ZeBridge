@@ -1279,6 +1279,30 @@ export function outboxWatermarkGate(
   return { send, refuse };
 }
 
+/// Microseconds since the epoch of a version (`YYYY-MM-DDTHH:MM:SS[.f]Z`), null for anything else.
+function versionMicros(v: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d{6})Z$/.exec(normalizeVersion(v));
+  if (!m) return null;
+  const [y, mo, d, h, mi, s, us] = m.slice(1).map(Number);
+  return Date.UTC(y, mo - 1, d, h, mi, s) * 1000 + us;
+}
+
+/// How far the oldest waiting write is ahead of the GC floor, in milliseconds: the time it
+/// has before the floor reaches it and it is refused (`PredatesGcWatermark`; at 0 or below it
+/// already is). Null when it cannot be known: no floor received, or no waiting write with a
+/// version. Measured against the floor this replica last received, which the sweeper moves
+/// once a pass, so it can overstate the margin by up to one pass. Truncated to the millisecond.
+export function outboxFloorMargin(versions: (string | null)[], watermark: string | null): number | null {
+  const mark = watermark ? versionMicros(watermark) : null;
+  if (mark === null) return null;
+  let oldest: number | null = null;
+  for (const v of versions) {
+    const us = v ? versionMicros(v) : null;
+    if (us !== null && (oldest === null || us < oldest)) oldest = us;
+  }
+  return oldest === null ? null : Math.trunc((oldest - mark) / 1000) + 0;   // + 0: never -0
+}
+
 
 /// The HLC stamp: strictly after BOTH this client\'s own last stamp and the
 /// newest version it has seen arrive. With an accurate clock this is exactly
