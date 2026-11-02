@@ -41,7 +41,7 @@ import { heartbeatPayload,
   fkClausesFor, createTableSteps, rebuildSteps, diffColumns, keyShape, typeShape, retypedColumns, isReadOnlySql,
   mutationSubject, mutationMsgId, idKeyPart, mutationKeyId, mutationPayload, optimisticEvent, normalizeOp,
   normalizeVersion, maxVersion, hlcVersion,
-  fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate,
+  fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate, outboxFloorMargin,
   isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, chainChunkJson, parseChainHead, msgpackScan, msgpackDecodeScanned, chainStageSql, vecColsOf, pgVectorValues, vecLiteral, strictMissing,
   planCdcBulk, type CdcBulkTable, cdcValue,
 } from './core.ts';
@@ -765,6 +765,8 @@ export class ZeBridge {
   public purged = false;
   private sweepId?: ReturnType<typeof setInterval>;
   private rttIntervalId?: ReturnType<typeof setInterval>;
+  /// When `outboxStatus()`'s GC-floor warning last went out.
+  private floorWarnedAt?: number;
   private hbIntervalId?: ReturnType<typeof setInterval>;
   private recountTimer?: ReturnType<typeof setTimeout>;
 
@@ -1183,6 +1185,24 @@ export class ZeBridge {
     try { return Number((await this.run(`SELECT count(*) AS n FROM _zebridge_outbox`))[0]?.n ?? 0); } catch { return 0; }
   }
 
+  /// The outbox at a glance: how many writes wait, and how long the oldest has before the GC
+  /// floor refuses it (`floorMarginMs`, ms; at 0 or below it is refused, `PredatesGcWatermark`;
+  /// null when the floor is unknown or nothing waits). libzb reports the same in `poll`
+  /// (`pending`, `floor_margin_ms`). Also run every 10 s while connected or not, for the warning,
+  /// in libzb's words, at most once an hour while the margin is under a day.
+  public async outboxStatus(): Promise<{ pending: number; floorMarginMs: number | null }> {
+    await this.outboxInitPromise;
+    let rows: any[] = [];
+    try { rows = await this.run(`SELECT payload FROM _zebridge_outbox`); } catch { /* no outbox yet */ }
+    const floorMarginMs = rows.length ? outboxFloorMargin(rows.map(outboxVersionOf), await this.gcWatermark()) : null;
+    // shortcut: a fixed day and hour, not the deployment's retention; make them options if asked.
+    if (floorMarginMs !== null && floorMarginMs < 86_400_000 && Date.now() - (this.floorWarnedAt ?? 0) >= 3_600_000) {
+      this.floorWarnedAt = Date.now();
+      this.appendLog('SYS', `outbox: the oldest waiting write is ${(floorMarginMs / 3_600_000).toFixed(1)} h from the GC floor — once the floor reaches it, it is refused (PredatesGcWatermark)`, 'WARNING');
+    }
+    return { pending: rows.length, floorMarginMs };
+  }
+
   private emitVerdict(v: Verdict) {
     for (const cb of this.verdictHandlers) { try { cb(v); } catch { /* a host's listener must not break the verdict path */ } }
   }
@@ -1456,7 +1476,7 @@ export class ZeBridge {
       });
 
       this.sweepId = setInterval(() => this.sweepPendingWrites(), 1000);
-      this.rttIntervalId = setInterval(() => void this.pollNatsRtt(), 10_000);
+      this.rttIntervalId = setInterval(() => { void this.pollNatsRtt(); void this.outboxStatus().catch(() => {}); }, 10_000);
     } catch (err) {
       this.emitStatus('disconnected');
       this.appendLog('SYS', `Connection failed: ${err}`, 'ERROR');

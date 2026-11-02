@@ -37,6 +37,7 @@ class PollReport {
     this.outcomes = const [],
     this.pending = 0,
     this.reconciling = 0,
+    this.floorMarginMs,
     this.error,
   });
 
@@ -65,6 +66,10 @@ class PollReport {
   /// Writes answered `indeterminate` whose reconciliation has not finished.
   final int reconciling;
 
+  /// How long the oldest pending write has before the GC floor refuses it, in ms (at 0 or
+  /// below it is refused, `PredatesGcWatermark`); null when nothing waits or the floor is unknown.
+  final int? floorMarginMs;
+
   /// Set by the worker when a poll itself failed (connection gone, principal revoked).
   final String? error;
 
@@ -78,6 +83,7 @@ class PollReport {
         outcomes: ((j['outcomes'] as List?) ?? const []).map((e) => Map<String, dynamic>.from(e as Map)).toList(),
         pending: (j['pending'] as num?)?.toInt() ?? 0,
         reconciling: (j['reconciling'] as num?)?.toInt() ?? 0,
+        floorMarginMs: (j['floor_margin_ms'] as num?)?.toInt(),
         error: j['error'] as String?,
       );
 
@@ -91,6 +97,7 @@ class PollReport {
         'outcomes': outcomes,
         'pending': pending,
         'reconciling': reconciling,
+        if (floorMarginMs != null) 'floor_margin_ms': floorMarginMs,
         if (error != null) 'error': error,
       };
 }

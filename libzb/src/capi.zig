@@ -303,6 +303,15 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
         const wm: ?[]const u8 = if (wm_v == .string) wm_v.string else null;
         return try core.valueToString(a, try core.outboxWatermarkGate(a, entries, wm));
     }
+    if (eq(u8, name, "floorMargin")) {
+        const items = args.object.get("versions").?.array.items;
+        const versions = try a.alloc(?[]const u8, items.len);
+        for (items, versions) |v, *slot| slot.* = if (v == .string) v.string else null;
+        const wm_v = args.object.get("watermark") orelse .null;
+        const wm: ?[]const u8 = if (wm_v == .string) wm_v.string else null;
+        const m = try core.outboxFloorMargin(a, versions, wm);
+        return try core.valueToString(a, if (m) |ms| .{ .integer = ms } else .null);
+    }
     if (eq(u8, name, "fullPredates")) {
         const man = args.object.get("manifest") orelse .null;
         const plan = args.object.get("plan").?.array;
@@ -1175,7 +1184,11 @@ fn pollJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
     defer b.c.freeOutcomes(taken);
     for (taken) |text| try outcomes.append(try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}));
     try out.put(a, "outcomes", .{ .array = outcomes });
-    try out.put(a, "pending", .{ .integer = @intCast(b.c.pendingCount(a)) });
+    const pending = b.c.pendingCount(a);
+    try out.put(a, "pending", .{ .integer = @intCast(pending) });
+    // How long the oldest of them has before the GC floor refuses it; only while writes wait
+    // and the floor is known.
+    if (pending > 0) if (b.c.floorMargin(a)) |m| try out.put(a, "floor_margin_ms", .{ .integer = m });
     // Writes answered `indeterminate` whose reconciliation has not finished (§7.4c).
     try out.put(a, "reconciling", .{ .integer = @intCast(b.c.reconcilingCount(a)) });
     try out.put(a, "settled", .{ .integer = @intCast(r.settled) });

@@ -205,3 +205,33 @@ test('a verdict whose settlement fails is retried by its next delivery, and repo
     assert.equal(f.db.prepare('SELECT count(*) AS n FROM _zebridge_outbox').get()!.n, 0, 'the retry removed the outbox row');
   } finally { c.nc = null; f.db.close(); }
 });
+
+test('outboxStatus: the oldest waiting write against the GC floor, warned once an hour under a day', async () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(`CREATE TABLE _zebridge_outbox (msg_id TEXT PRIMARY KEY, payload TEXT)`);
+  db.exec(`CREATE TABLE zebridge_gc_watermark (watermark TEXT)`);
+  const logs: string[] = [];
+  const c: any = Object.create(ZeBridge.prototype);
+  Object.assign(c, {
+    outboxInitPromise: Promise.resolve(),
+    run: async (sql: string, ...args: any[]) => { const st = db.prepare(sql); return st.columns().length ? st.all(...args) : (st.run(...args), []); },
+    appendLog: (_src: string, text: string, level: string) => logs.push(`${level} ${text}`),
+  });
+  try {
+    assert.deepEqual(await c.outboxStatus(), { pending: 0, floorMarginMs: null }, 'nothing waits');
+    const add = db.prepare('INSERT INTO _zebridge_outbox (msg_id, payload) VALUES (?, ?)');
+    add.run('a', JSON.stringify({ version: '2026-08-01T05:00:00.000000Z' }));
+    add.run('b', JSON.stringify({ version: '2026-08-01T02:00:00.000000Z' }));
+    add.run('c', '{}');
+    assert.deepEqual(await c.outboxStatus(), { pending: 3, floorMarginMs: null }, 'no floor received yet');
+    db.prepare('INSERT INTO zebridge_gc_watermark (watermark) VALUES (?)').run('2026-08-01T00:00:00Z');
+    assert.deepEqual(await c.outboxStatus(), { pending: 3, floorMarginMs: 7_200_000 }, 'the oldest, b, is two hours ahead');
+    assert.deepEqual(logs, ['WARNING outbox: the oldest waiting write is 2.0 h from the GC floor — once the floor reaches it, it is refused (PredatesGcWatermark)']);
+    await c.outboxStatus();
+    assert.equal(logs.length, 1, 'not again within the hour');
+    c.floorWarnedAt = Date.now() - 3_600_000;
+    db.exec(`UPDATE zebridge_gc_watermark SET watermark = '2026-07-01T00:00:00Z'`);
+    assert.equal((await c.outboxStatus()).floorMarginMs, 2_685_600_000, 'thirty-one days and two hours');
+    assert.equal(logs.length, 1, 'no warning while more than a day remains');
+  } finally { db.close(); }
+});

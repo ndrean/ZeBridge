@@ -1454,6 +1454,48 @@ pub fn outboxWatermarkGate(a: std.mem.Allocator, entries: std.json.Array, waterm
     return .{ .object = out };
 }
 
+/// Microseconds since the epoch of a version (`YYYY-MM-DDTHH:MM:SS[.f]Z`), null for anything else.
+fn versionMicros(a: std.mem.Allocator, v: []const u8) !?i64 {
+    const n = try normalizeVersion(a, v);
+    // normalizeVersion returns its input unchanged when it is not a version.
+    if (n.len != 27 or n[19] != '.') return null;
+    const num = struct {
+        fn of(s: []const u8) ?i64 {
+            return std.fmt.parseInt(i64, s, 10) catch null;
+        }
+    }.of;
+    const y = num(n[0..4]) orelse return null;
+    const mo = num(n[5..7]) orelse return null;
+    const d = num(n[8..10]) orelse return null;
+    const h = num(n[11..13]) orelse return null;
+    const mi = num(n[14..16]) orelse return null;
+    const s = num(n[17..19]) orelse return null;
+    const us = num(n[20..26]) orelse return null;
+    // Days from the civil date (H. Hinnant's algorithm), as Date.UTC counts them.
+    const yy = if (mo <= 2) y - 1 else y;
+    const era = @divFloor(yy, 400);
+    const yoe = yy - era * 400;
+    const mp = @mod(mo + 9, 12);
+    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    const days = era * 146097 + doe - 719468;
+    return ((days * 24 + h) * 60 + mi) * 60_000_000 + s * 1_000_000 + us;
+}
+
+/// core.ts outboxFloorMargin: how far the oldest waiting write is ahead of the GC floor, in
+/// milliseconds (at 0 or below it is already refused, `PredatesGcWatermark`); null when no
+/// floor was received or no waiting write has a version. Truncated toward zero.
+pub fn outboxFloorMargin(a: std.mem.Allocator, versions: []const ?[]const u8, watermark: ?[]const u8) !?i64 {
+    const mark = (if (watermark) |w| (if (w.len == 0) null else try versionMicros(a, w)) else null) orelse return null;
+    var oldest: ?i64 = null;
+    for (versions) |maybe| {
+        const v = maybe orelse continue;
+        const us = (try versionMicros(a, v)) orelse continue;
+        if (oldest == null or us < oldest.?) oldest = us;
+    }
+    return if (oldest) |o| @divTrunc(o - mark, 1000) else null;
+}
+
 // ─── the schema migration planner (§10s 2b) ─────────────────────────────────
 
 fn colName(c: Value) []const u8 {
