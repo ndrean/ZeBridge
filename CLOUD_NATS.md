@@ -62,6 +62,8 @@ From a new account's JWT (2026-11-02), which is what NATS enforces, and the acco
 | JetStream `disk_max_stream_bytes` | 5 GiB | | not a constraint |
 | JetStream `max_bytes_required` | true | | **every stream must declare a byte limit when created**; the bridge creates its KV buckets and object stores without one, so the account would refuse them |
 
+**Probed with the bridge's user** (2026-11-02, nats-server v2.15.2 at `tls://connect.ngs.global`): a KV bucket created without a byte limit is refused, `err_code=10113 'account requires a stream config to have max bytes set'`; the same bucket with a 1 MiB limit is created and written. The R1 tier allows no memory storage (`max_memory 0`), so a stream ZeBridge kept in memory would be refused too. The server announces an 8 MiB `max_payload`, while the account allows 512 KiB.
+
 The account's JWT lists two signing keys, both plain (unscoped) public keys: Synadia's, whose seeds it holds, used for the users you create in its interface. Neither can sign the bridge's device JWTs.
 
 So the free tier can answer the signing-key question, and with the changes below run a small demo whose tables have no tenant column. It cannot run a multi-tenant app such as the depot, nor a crowd of clients; those need a paid tier.
@@ -71,7 +73,8 @@ So the free tier can answer the signing-key question, and with the changes below
 - **A smaller base topology.** Some of the 10 fixed streams could merge, or be created only when used: `KV_time_manifests` only with the readings archive, `KV_live` only with the fleet monitor.
 - **Byte limits as settings,** so `MUTATIONS` and `VERDICTS` can be sized to a small account.
 - **A byte limit on every stream the bridge creates,** the KV buckets and object stores included: required by an account with `max_bytes_required`.
-- **The account's message size,** not only the server's, in the bridge's sizing.
+- **The account's message size,** not only the server's, in the bridge's sizing: the server announces 8 MiB, the account allows 512 KiB.
+- **File storage for every stream,** if any is kept in memory: the free tier allows none.
 
 None is built.
 
