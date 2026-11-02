@@ -12,6 +12,8 @@ ZeBridge keeps a local database on each device, queues writes while it is offlin
 
 The client library provides one interface to read the local replica, submit mutations, and query remote responders such as routing or analytics services. Optional regional NATS leaves serve snapshot caches near devices and host those services.
 
+**See it running: <https://bridge.zebridge.eu/demo>.** Five trucks on a map of France's 16,173 charge points. Pick a truck and a destination, and it drives along the road on every open screen; change its destination from any screen and it turns from where it is. The chargers are a query on the browser's own replica, the route comes from a routing service over the same NATS connection, and PostgreSQL holds only the decisions. Open it in two tabs, or on a phone and a laptop: each visit gets its own one-hour identity in a shared demo tenant. How it is built: [the depot example](examples/14-depot/README.md).
+
 [Try it](#try-it-with-docker)
 [Build an app](#build-an-app)
 [Compared with PowerSync](#compared-with-powersync)
@@ -349,7 +351,7 @@ See [SCOPE](SCOPE.md) for the boundaries and [SECURITY](SECURITY.md) for tenant 
 | A DuckDB replica | [DuckDB](examples/07-duckdb/README.md) |
 | Mutations and analytical queries under load | [Events](examples/09-event/README.md) |
 | Routing through a responder | [Valhalla routing](examples/13-routing/README.md) |
-| Shared plans, a map and routing | [Depot](examples/14-depot/README.md) |
+| Shared plans, a map and routing | [Depot](examples/14-depot/README.md), [running live](https://bridge.zebridge.eu/demo) |
 | Several editors on one record | [Shared record](examples/15-shared-record/README.md) |
 | Archiving readings to Parquet | [Archive](examples/16-archive/README.md) |
 
