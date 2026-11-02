@@ -38,6 +38,7 @@ PLACES = [
     # release, and the smoke client's editor view follows it.
     ("examples/10-airports/flutter/pubspec.yaml", rf"^(  zebridge: )({V})()(?=\s)", 1),
     ("smoke/clients/dart/pubspec.yaml", rf"^(  zebridge: \^)({V})()$", 1),
+    ("smoke/README.md", rf"(smoke/run\.sh |-f version=|--build-arg ZB_VERSION=)({V})()", 3),
 ]
 
 
