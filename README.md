@@ -2,12 +2,19 @@
 
 **Local PostgreSQL replicas for apps and services, over NATS.**
 
+<p align="center">
+<img width="400" height="400" alt="zebridge-logo" src="https://github.com/user-attachments/assets/3b0b7c42-a94b-45ff-a9d7-274fdf26132c" />
+</p>
+
+![Zig support](https://img.shields.io/badge/Zig-0.17.0-color?logo=zig&color=%23f3ab20)  [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![Tests](https://img.shields.io/badge/tested-scenarios-green)](https://github.com/ndrean/zebridge/blob/main/TEST_SCENARIOS.md)
+
 ZeBridge keeps a local database on each device, queues writes while it is offline, and synchronizes through NATS when it reconnects. PostgreSQL remains authoritative: it applies the rules, resolves conflicting writes, and returns a verdict to the app.
 
 The client library provides one interface to read the local replica, submit mutations, and query remote responders such as routing or analytics services. Optional regional NATS leaves serve snapshot caches near devices and host those services.
 
 [Try it](#try-it-with-docker)
 [Build an app](#build-an-app)
+[Compared with PowerSync](#compared-with-powersync)
 [Deploy](#deploy)
 [Documentation](#documentation)
 
@@ -54,7 +61,45 @@ To erase this evaluation stack and start again, run `docker compose -f docker-co
 
 ## Build an app
 
-The usual flow is: your backend authenticates a user and issues an invite; the library enrolls the device, stores its identity, seeds its replica, and follows changes. Later connections reuse that identity and renew its credentials.
+Three parts: the hub, which you install; your backend, which signs users in and issues invites; and the app, which uses the client library on the local database you choose. Services your apps can ask, such as routing or analytics, are optional and run as separate processes on the same library.
+
+### Install the hub
+
+The hub is NATS, the bridge, mutation admission and the sweeper on one server. PostgreSQL can run on the same server or be managed elsewhere (it needs logical replication). Two routes are ready to use:
+
+- **Docker Compose:** two files on the server. HAProxy and Let's Encrypt are included, and PostgreSQL optionally:
+
+  ```sh
+  V=0.2.10
+  mkdir zebridge && cd zebridge
+  curl -fsSLO https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/compose.yml
+  curl -fsSL -o .env https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/.env.example
+  chmod 600 .env
+  # In .env: three domain names, the Let's Encrypt e-mail and the passwords (see the guide).
+  docker compose up -d
+  ```
+
+  The first start issues the certificates, generates the NATS identities and installs ZeBridge's SQL objects, including `zb_inviter`, the login your backend uses below. See [the Compose guide](deploy/compose/README.md).
+- **Ansible**, for a Debian VPS with systemd services: fill in the inventory and the vault, then `ansible-playbook site.yml --ask-vault-pass`. It can be run again at any time and changes only what differs. See [the Ansible guide](deploy/ansible/README.md).
+
+Then enable your tables ([Prepare your tables](#prepare-your-tables)) and check the hub with `bridge --diagnose`. Other routes, such as a manual install or Supabase, are listed in [Deploy](#deploy).
+
+### Your backend: sign in, then invite
+
+**Your backend has one job: sign users in, then issue invites.** ZeBridge does not authenticate users, and it does not care how you do it: OAuth, passwords, magic links, any language or framework. After your backend has signed a user in, it decides the user's principal and tenant and asks PostgreSQL for a one-time invite code, with a login that can create invites and nothing else. That is the only server code you write: there is no write API or sync endpoint to build, because writes go through the library and PostgreSQL's own rules judge them.
+
+```ts
+// Your backend, after it has signed the user in. Its database login holds only zebridge_inviter.
+const { rows } = await db.query(
+  "SELECT zebridge_invite($1, $2, interval '1 hour') AS code",
+  [user.id, user.tenant],
+);
+return { invite: rows[0].code };   // in the login response
+```
+
+### The app
+
+The app passes the code to the library on its first start. The library enrolls the device, stores its identity, seeds its replica and follows changes; later starts need no code, and the library renews the device's credentials by itself. See [Users: invites](AUTHENTICATION.md#users-invites) for other ways to deliver the code (a link, an email) and the enrollment steps.
 
 For a browser app:
 
@@ -65,10 +110,12 @@ npm install @zebridge/client
 ```ts
 import { ZeBridge } from '@zebridge/client';
 
-// Your backend supplies the invite. The DBA has enabled the orders table.
+// From your own login flow; only the first start needs it. The DBA has enabled the orders table.
+const { invite } = await signIn(email, password);
+
 const zb = new ZeBridge({
   bridgeUrl: 'https://bridge.example.com',
-  invite: code,
+  invite,
   tables: ['orders'],
 });
 
@@ -92,6 +139,17 @@ if (orders.length > 0) {
 
 The TypeScript client drives its own synchronization loop. With native `libzb`, the host drives `sync()` and `poll()`; see the binding's example for its threading or worker model.
 
+### Choose the local database
+
+The replica is a real database on the device, and the app reads it with that database's SQL:
+
+- **SQLite**, the default everywhere: a file on phones, desktops and Node, OPFS in the browser.
+- **PGlite**, PostgreSQL compiled to WebAssembly, in the browser or Node (`engine: 'pglite'`): the same SQL dialect as the server.
+- **DuckDB**, through libzb (`engine: "duckdb"`): an analytical replica for dashboards and services, which DuckDB can open directly once libzb closes it.
+- **PostgreSQL**, through libzb (`dbUrl`): a server-side replica, for a service that wants the full PostgreSQL.
+
+The table below shows which host offers which; [CLIENTS](CLIENTS.md) has the options and the type mapping for each engine.
+
 | Host | Package | Local database |
 | --- | --- | --- |
 | Browser | `@zebridge/client` | SQLite in OPFS or PGlite |
@@ -104,7 +162,76 @@ The TypeScript client drives its own synchronization loop. With native `libzb`, 
 
 The native core is written in Zig. The TypeScript client reuses shared core rules through WebAssembly; the platform bindings wrap libzb rather than implementing another synchronization engine.
 
+### Connect a service, if you need one
+
+A **responder** is a service your apps can ask questions: routing, search, analytics, an external API. It is a separate process built on the same client library: it connects to NATS with its own identity, keeps its own replica if it needs data, and answers `query.<tenant>.<name>`. Any client of that tenant can call it, and none needs an HTTP endpoint, a URL or another credential:
+
+```ts
+// The service, in its own process: a client opened with credsPath: 'pois.creds'
+// (minted by `bridge --mint-responder --name pois --tenant acme`) instead of an invite.
+await service.serve({
+  tenants: ['acme'],
+  handlers: { nearby: ({ lat, lon }, tenant) => findNearby(lat, lon) },
+});
+
+// Any app of tenant acme.
+const pois = await zb.request('query.acme.nearby', { lat: 47.2, lon: -1.55 });
+```
+
+Several instances of a responder share the load (one NATS queue group), and a responder can run on a regional leaf, near its users. It can read but never write: NATS refuses a mutation from its identity. `ingest()` keeps an answer in the app's replica. See [Services and sensors](AUTHENTICATION.md#services-and-sensors) for the identities, and the [routing example](examples/13-routing/README.md) for Valhalla served this way.
+
 Start with [the first calls in each language](CLIENTS.md#the-first-ten-lines), then use [CLIENTS](CLIENTS.md) for options, lifecycle and differences between clients. Installation and platform artifacts are covered in [DISTRIBUTION](DISTRIBUTION.md).
+
+## Compared with PowerSync
+
+[PowerSync](https://www.powersync.com) also keeps a local SQLite replica of PostgreSQL on each device. The two differ in where the write path lives and what you run.
+
+```mermaid
+flowchart LR
+    subgraph ZB["ZeBridge: you run one hub"]
+        direction LR
+        PG[(PostgreSQL<br/>local or managed)] <--> B[Bridge]
+        S[Sweeper] --> PG
+        B <--> N[NATS JetStream]
+        A[Mutation admission] <--> N
+    end
+    N <--> C[libzb or zb-client-ts<br/>+ local replica]
+```
+
+```mermaid
+flowchart LR
+    subgraph PS["PowerSync: hosted or self-hosted service"]
+        direction LR
+        PG2[(PostgreSQL)] --> P[PowerSync service]
+        P <--> BS[(Bucket storage<br/>PostgreSQL or MongoDB)]
+    end
+    P --> C2[PowerSync SDK<br/>+ local SQLite]
+    C2 -->|"uploadData(): your code"| API[Your backend API]
+    API --> PG2
+    AUTH["Your auth: signs the JWT"] -.-> C2
+```
+
+| | ZeBridge | PowerSync |
+| --- | --- | --- |
+| What you run | NATS, the bridge, admission and the sweeper on one server | The PowerSync service and its bucket storage, or their hosted cloud |
+| Server code you write | Your sign-in, then one SQL call per invite | Your sign-in, a JWT signer the service trusts, and the write API that applies each upload |
+| Table schema on the client | Sent by the bridge | Declared again in the app |
+| Reads | SQL on the local replica | SQL on the local replica |
+| Writes | `mutate()`; the library sends them, PostgreSQL judges them and returns a verdict | Plain SQL on local tables; your `uploadData()` sends them to **your backend**, which applies its own rules |
+| Exactly once, authorization, refusals | Built in: receipts, tenant credentials and row-level security, a verdict per write | Your backend's job; the SDK retries until `uploadData()` succeeds |
+| Client platforms | Browser, Node, Python, Dart/Flutter, React Native, Android, C ABI | Many mature SDKs, including web, React Native, Flutter, Kotlin, Swift and Node |
+
+**Measured, same workload.** Both against one Supabase database in Dublin, 10,000 rows of about 200 bytes, the same table setup for both (ZeBridge's triggers and tenant policy; PowerSync's writes went through PostgREST as ZeBridge's write role, so the policy applied). Clients on the server itself, one system running at a time. ZeBridge 0.2.10 (4 ingress lanes, rate limit off); PowerSync service 1.27.2 with its bucket storage in PostgreSQL on the same server, Sync Streams, the Node SDK 1.3.0 with no delay between uploads (`crudUploadThrottleMs: 0`; the default waits 1 s). Measured 2026-11-02, one run each.
+
+| What | ZeBridge, 6 vCPU, 24.5 ms to the database | PowerSync, same | ZeBridge, 2 vCPU, 85 ms | PowerSync, same |
+| --- | --- | --- | --- | --- |
+| 10 clients seeding the table, empty / already seeded | **0.11 s / 0.03 s** | 5.93 s / 2.03 s | **0.35 s / 0.08 s** | 14.44 s / 6.82 s |
+| One client's write reaching another, median / p95 | **120 / 133 ms** | 167 / 181 ms | **367 / 634 ms** | 487 / 1,277 ms |
+| 100,000 rows inserted in one statement, until a client holds them all | **2.70 s** | 26.14 s | **3.74 s** | 33.40 s |
+| Writes, 1 client | **401/s** | 248/s | **178/s** | 155/s |
+| Writes, 10 clients | **1,680/s** | 1,550/s | **680/s** | 298/s |
+
+A ZeBridge write counts when its verdict returns, after admission, the receipt and the commit; a PowerSync write counts when the backend has committed it and the SDK has completed the upload. Without the tenant policy (the backend's role bypassing row-level security) PowerSync reached 2,495 writes/s with 10 clients on the larger server: the policy and triggers roughly double the database's cost per row, for both systems. During each 10-client PowerSync run, 7 to 9 client sync streams broke ("illegal end of stream in BSON object") and reconnected; no write was lost. Seeding differs most: a ZeBridge client loads a compressed snapshot, while a PowerSync client applies every operation in its bucket.
 
 ## How it works
 
@@ -231,18 +358,20 @@ Measure CDC distribution, snapshot download/apply, mutation commits and outbox r
 
 Each figure is one run on the hardware named, not a capacity guarantee.
 
-**On a production hub.** The bridge, admission, the sweeper and NATS on one VPS (6 vCPU, 11.7 GB, 4 ingress lanes); PostgreSQL on Supabase in London, 17 ms per query from the hub; the clients on one Mac, 23 ms from the hub, with the published Python package; a table of 10,000 rows of about 200 bytes in one tenant.
+**On a production hub, 0.2.10.** The bridge, admission, the sweeper and NATS on one VPS (6 vCPU, 11.7 GB, 4 ingress lanes); PostgreSQL on Supabase in London, 17 ms per query from the hub; the clients on one Mac, 23 ms from the hub, with the published Python package; a table of 10,000 rows of about 200 bytes. Measured 2026-11-02.
 
 | Direction | What | Figure |
 | --- | --- | --- |
-| PostgreSQL → clients | 10 clients seeding the table | synced in 0.83 s (median), 0.33 s when their replicas were already seeded |
-| PostgreSQL → clients | 100,000 rows inserted in one statement | the bridge published them at about 41,000 events/s; one client held them all 3.2 s after the commit |
-| both | one client's write reaching all 10 clients through PostgreSQL | median 113 ms, p95 189 ms |
+| PostgreSQL → clients | 10 clients seeding the table | synced in 0.98 s (median), 0.35 s when their replicas were already seeded |
+| PostgreSQL → clients | 100,000 rows inserted in one statement | the bridge published them at about 46,700 events/s; one client held them all 2.95 s after the commit |
+| both | one client's write reaching all 10 clients through PostgreSQL | median 117–121 ms |
 | clients → PostgreSQL | writes judged and answered, one client | 263 writes/s |
 | clients → PostgreSQL | 10 clients | 1,414 writes/s |
-| clients → PostgreSQL | 50 clients | 1,447 writes/s, median verdict 3.2 s with every client sending 400 at once; with `MUTATION_RATE_PER_PRINCIPAL=2000` and `MUTATION_RATE_BURST=4000`, no write was delayed |
+| clients → PostgreSQL | 50 clients, each sending 400 at once | 1,447 writes/s, median verdict 3.2 s |
 
-The writes were measured with 0.2.10 (2026-11-02); with 0.2.9 the same runs gave 31, 303 and 1,090 writes/s. The PostgreSQL → clients rows were measured with 0.2.9 (2026-11-01): 0.2.10 changed the write path, not this one. During the write runs PostgreSQL and the bridge were nearly idle; a batch of writes costs its round trips to the database, so the distance between the bridge and PostgreSQL sets the ceiling. 1,450 writes/s is 14,500 devices each sending one write every 10 seconds.
+**What the write figures are.** They are the hub's total, shared by every tenant: all writes go through the same ingress lanes, each with one connection to PostgreSQL, so more tenants do not add capacity (more lanes or another bridge would; not measured). The runs used one tenant, which is not the designed topology but shows what one tenant can take when nothing else writes. During them PostgreSQL and the bridge were nearly idle: a batch of writes costs its round trips to the database, so the distance between the bridge and PostgreSQL sets the ceiling. 1,450 writes/s is 14,500 devices each sending one write every 10 seconds.
+
+**The rate limit sets what one tenant gets.** By default there is none (`MUTATION_RATE_PER_PRINCIPAL=0`), and a tenant can use the whole ceiling, as above. Set, it applies to each principal and to each tenant: at 100 per second (burst 200, this hub's setting) one tenant is held to about 100 writes/s, whatever the hub could take. These runs used 2,000 (burst 4,000) and no write was delayed. See [Write limits, as a client sees them](OPERATIONS.md#write-limits-as-a-client-sees-them).
 
 **On one machine, and earlier deployments.**
 
@@ -259,7 +388,9 @@ The writes were measured with 0.2.10 (2026-11-02); with 0.2.9 the same runs gave
 | 100 clients through a leaf across the Atlantic | cold sync median 13.2 s, slowest 14.7 s; warm 1.7 s; after a NATS restart, longest gap 2.9 s, none lost | 0.2.8 test hub in Canada, clients on a Mac in Europe (~100 ms) | |
 | The bridge's memory under a steady stream | ~8 MB resident, allocation flat over 70 minutes | 20,246 ticks of insert, update, delete | `scripts/scenarios/drip.py` |
 
-**Not measured:** a comparison with another sync system on the same workload; the hub's write ceiling with more than 4 ingress lanes; how long each component may stay down before recovery needs a re-seed; NATS memory at a steady load (it follows recent load, not stored data); a long network partition under load.
+A comparison with PowerSync on the same workload is in [Compared with PowerSync](#compared-with-powersync).
+
+**Not measured:** the hub's write ceiling with more than 4 ingress lanes; how long each component may stay down before recovery needs a re-seed; NATS memory at a steady load (it follows recent load, not stored data); a long network partition under load.
 
 ## Documentation
 

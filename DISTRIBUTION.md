@@ -123,7 +123,7 @@ machine that runs the service.
 
 ## Building
 
-    # desktop, apps and services alike, in libzb/ with Zig 0.16.0: nothing needed on the machine to build or load
+    # desktop, apps and services alike, in libzb/ with Zig 0.17.0: nothing needed on the machine to build or load
     zig build lib -Doptimize=ReleaseFast -Dvendor=true
 
     # phones

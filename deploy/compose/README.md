@@ -31,7 +31,7 @@ Docker Engine, the standard (rootful) daemon, with the compose plugin. Rootless 
    ```txt
    # .env
    COMPOSE_PROFILES=postgres  # <-- local Postgres server on
-   ZB_VERSION=0.2.6
+   ZB_VERSION=0.2.10
    BRIDGE_HOST=               #<-- bridge.example.com
    WS_HOST=                   #<-- ws.example.com
    NATS_HOST=                 #<-- nats.example.com

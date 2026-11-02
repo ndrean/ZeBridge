@@ -1635,7 +1635,7 @@ ZeBridge does both directions: changes out, by logical replication and per tenan
 - `PostgreSQL` 14+/16+ (for standby read replica). Uses `pgoutput` v1 binary mode.
 - `Nats/JetStream` 2.10+
 - `SQLite` 3.41+ (for STRICT, `unhex`)
-- `Zig v0.16`
+- `Zig v0.17`
 - `Python3` (installed by default with Debian and OSX).
 
 **Sources**:

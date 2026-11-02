@@ -7,6 +7,8 @@ The reference for running ZeBridge: the CLI, the doctor (`--diagnose`), what nee
 - [The CLI](#the-cli)
 - [Diagnose](#diagnose)
 - [Upgrading a hub and a client library to a release](#upgrading-a-hub-and-a-client-library-to-a-release)
+  - [The bridge](#the-bridge)
+  - [A client library](#a-client-library)
 - [Upgrading mutation receipts](#upgrading-mutation-receipts)
   - [Client requirements for indeterminate recovery](#client-requirements-for-indeterminate-recovery)
 - [Restart rules](#restart-rules)
@@ -35,6 +37,8 @@ The reference for running ZeBridge: the CLI, the doctor (`--diagnose`), what nee
     - [What the producer builds](#what-the-producer-builds)
     - [The one rule](#the-one-rule)
     - [When the rule breaks](#when-the-rule-breaks)
+- [Mutation admission cutover](#mutation-admission-cutover)
+- [Hub checkpoints and recovery](#hub-checkpoints-and-recovery)
 
 ## The CLI
 
@@ -191,12 +195,12 @@ What you may see on the first start after an upgrade: chains swept and rebuilt (
 1. Stage the candidate binary or image separately from the running one and preserve a verified [hub checkpoint](#hub-checkpoints-and-recovery), including `zebridge_private` and its receipt policy. Pause mutation admission, drain accepted writes with the old workers, and stop the old bridge workers before changing their receipt functions. Clients retain unacknowledged writes in their outboxes.
 2. Render the init SQL with the candidate binary, using the target deployment's existing reader/writer URLs and publication. Review it and apply it as the database administrator, with errors stopping the migration. The rendered file contains role passwords; create it with restrictive permissions.
 
-```sh
-set -a; . ./.env.admin; . ./.env.bridge; set +a
-umask 077
-/path/to/new/bridge --init-sql > zebridge-upgrade.sql
-psql "$ADMIN_DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f zebridge-upgrade.sql
-```
+   ```sh
+   set -a; . ./.env.admin; . ./.env.bridge; set +a
+   umask 077
+   /path/to/new/bridge --init-sql > zebridge-upgrade.sql
+   psql "$ADMIN_DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction -f zebridge-upgrade.sql
+   ```
 
 3. Ensure the receipt completion guard is enabled. Normal builds and fresh SQL installs enable it by default. Reapplying init SQL preserves the existing guard setting, retention and minimum accepted timestamp. If the guard is disabled or the policy predates the guard column, enable it as administrator after the init SQL succeeds and the old workers have been drained and stopped: `UPDATE zebridge_private.receipt_policy SET completion_guard = true WHERE singleton;`. Enablement is one-way: the database refuses to turn the guard off, and a bridge whose build disagrees with the policy refuses to start.
 4. Upgrade and start the bridge workers, then resume mutation admission after startup succeeds. Startup maintenance creates the required monthly partitions and the legacy partition before the first receipt lookup; installation itself creates no partitions. Existing receipts and the monotonic minimum accepted timestamp must survive the upgrade. Do not clear them or recreate the policy to make a startup check pass.
@@ -864,10 +868,9 @@ The sweeper's clock is coupled to the same chain: what the chain promises must s
 
 ---
 
-
 ## Mutation admission cutover
 
-Build the bridge and client transports from this checkout using Zig 0.16; old packaged binaries/images do not contain the new commands. Admission is a separate NATS-only process, `bridge --mutation-ingress`. Set the worker's `MUTATION_ADMISSION=1` and the same limits on both. Deployment defaults use 64 MiB per principal, a 64 KiB message ceiling, 1 GiB total, and rate 100/burst 200. The effective default count is 1,016. Set `ZB_LEAF_NAMES` to the registered, space-separated leaf namespaces so their two-token principals are subscribed. Root principals continue to work without changing client mutation messages.
+Build the bridge and client transports from this checkout using Zig 0.17; old packaged binaries/images do not contain the new commands. Admission is a separate NATS-only process, `bridge --mutation-ingress`. Set the worker's `MUTATION_ADMISSION=1` and the same limits on both. Deployment defaults use 64 MiB per principal, a 64 KiB message ceiling, 1 GiB total, and rate 100/burst 200. The effective default count is 1,016. Set `ZB_LEAF_NAMES` to the registered, space-separated leaf namespaces so their two-token principals are subscribed. Root principals continue to work without changing client mutation messages.
 
 For an existing public `MUTATIONS` stream, keep its old worker running until all accepted writes are applied. Stop competing stream/configuration changes and admission during the cutover. Review/archive legacy dead letters; the migration refuses a nonempty stream. With current bridge binaries and the hub service credential in `NATS_URL`, `NATS_CREDS` and `NATS_JS_DOMAIN`:
 
