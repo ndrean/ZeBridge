@@ -33,7 +33,7 @@ Here, the client:
 
 ```sh
 docker build -q smoke/clients/python --build-arg ZB_VERSION=0.2.2 -t zb-smoke-python
-docker run --rm -e ZB_SMOKE_NAME=python-1 -e ZB_SMOKE_LIVE_WAIT=300 \
+docker run --rm -e ZB_SMOKE_NAME=python-1 -e ZB_SMOKE_LIVE_WAIT=300 --network host \
   -e ZB_BRIDGE_URL=https://bridge.example.com -e ZB_INVITE=<code> zb-smoke-python
 ```
 
