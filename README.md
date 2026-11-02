@@ -227,6 +227,40 @@ See [SCOPE](SCOPE.md) for the boundaries and [SECURITY](SECURITY.md) for tenant 
 
 Measure CDC distribution, snapshot download/apply, mutation commits and outbox recovery separately. They have different bottlenecks. Results depend on the build, database latency, disk, lane count, principal count and recovery load; a historical peak is not a deployment capacity guarantee. The [event ramp](examples/09-event/README.md) and [storm harness](storm/README.md) provide starting points for evaluating your topology; [SPEED_TEST](SPEED_TEST.md) is one measured example, with its machine and load stated.
 
+### Measured
+
+Each figure is one run on the hardware named, not a capacity guarantee.
+
+**On a production hub.** The bridge, admission, the sweeper and NATS on one VPS (6 vCPU, 11.7 GB, 4 ingress lanes); PostgreSQL on Supabase in London, 17 ms per query from the hub; the clients on one Mac, 23 ms from the hub, with the published Python package; a table of 10,000 rows of about 200 bytes in one tenant.
+
+| Direction | What | Figure |
+| --- | --- | --- |
+| PostgreSQL → clients | 10 clients seeding the table | synced in 0.83 s (median), 0.33 s when their replicas were already seeded |
+| PostgreSQL → clients | 100,000 rows inserted in one statement | the bridge published them at about 41,000 events/s; one client held them all 3.2 s after the commit |
+| both | one client's write reaching all 10 clients through PostgreSQL | median 113 ms, p95 189 ms |
+| clients → PostgreSQL | writes judged and answered, one client | 263 writes/s |
+| clients → PostgreSQL | 10 clients | 1,414 writes/s |
+| clients → PostgreSQL | 50 clients | 1,447 writes/s, median verdict 3.2 s with every client sending 400 at once; with `MUTATION_RATE_PER_PRINCIPAL=2000` and `MUTATION_RATE_BURST=4000`, no write was delayed |
+
+The writes were measured with 0.2.10 (2026-11-02); with 0.2.9 the same runs gave 31, 303 and 1,090 writes/s. The PostgreSQL → clients rows were measured with 0.2.9 (2026-11-01): 0.2.10 changed the write path, not this one. During the write runs PostgreSQL and the bridge were nearly idle; a batch of writes costs its round trips to the database, so the distance between the bridge and PostgreSQL sets the ceiling. 1,450 writes/s is 14,500 devices each sending one write every 10 seconds.
+
+**On one machine, and earlier deployments.**
+
+| What | Figure | Conditions | Details |
+| --- | --- | --- | --- |
+| The bridge, PostgreSQL → NATS | ~100k events/s in Docker, 200k+ native | Apple M2 Pro, a 2,000,000-row burst, PostgreSQL and NATS on the same host | [SPEED_TEST](SPEED_TEST.md) |
+| A client applying a busy table live | libzb ~50k events/s, zb-client-ts ~33k | one Mac, a table under a steady write load | |
+| A change reaching a replica | median 12 ms | dev stack on one Mac, libzb on the DuckDB engine | |
+| Seeding a large table on a phone | libzb 35.0 s (React Native), 70.8 s (Flutter); JavaScript client 725 s | iPhone 12, the same table | [Large table](examples/06-large-table/README.md) |
+| Client writes into PostgreSQL | ~8,500 writes/s on one ingress lane, ~19,500 on four | one Mac, PostgreSQL on the same machine | [the ramp](examples/09-event/README.md#the-ramp-how-far-one-mac-goes) |
+| 500 clients starting at once, empty replicas | all synced, the slowest in 8.6 to 12 s; NATS at 140–165 % CPU, about 1 MB per client; PostgreSQL under 16 % CPU; the bridge near idle | 2-vCPU, 3.7 GB VPS, clients 100 ms away | [storm](storm/README.md) |
+| One write reaching those 500 | median 288 ms, p95 491 ms (100 ms of it network) | same | |
+| NATS restarted under the 500 | none lost; half back within 6 s, the last at 23 s | same | |
+| 100 clients through a leaf across the Atlantic | cold sync median 13.2 s, slowest 14.7 s; warm 1.7 s; after a NATS restart, longest gap 2.9 s, none lost | 0.2.8 test hub in Canada, clients on a Mac in Europe (~100 ms) | |
+| The bridge's memory under a steady stream | ~8 MB resident, allocation flat over 70 minutes | 20,246 ticks of insert, update, delete | `scripts/scenarios/drip.py` |
+
+**Not measured:** a comparison with another sync system on the same workload; the hub's write ceiling with more than 4 ingress lanes; how long each component may stay down before recovery needs a re-seed; NATS memory at a steady load (it follows recent load, not stored data); a long network partition under load.
+
 ## Documentation
 
 | Task | Reference |
