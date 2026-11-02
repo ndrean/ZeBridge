@@ -60,12 +60,6 @@ grep -q "mutation admission ready" admission.log && echo "admission ready" || { 
 echo $! > bridge.pid
 for i in $(seq 90); do grep -q "Replication started successfully" bridge.log && break; sleep 1; done
 grep -q "Replication started successfully" bridge.log && echo "bridge replicating" || { grep -E "error" bridge.log | tail -5; exit 1; }
-# A client that connects before the table's first snapshot waits for it: a cold seed would time the wait.
-# Any generation that carries a full: g1 on a new database, a later one (`delta+full`) when this NATS is new but the
-# database already recorded a chain.
-snap="g[0-9]+ for 'cmp'/'storm_items': [a-z+]*full"
-for i in $(seq 300); do grep -qE "$snap" bridge.log && break; sleep 1; done
-grep -oE "$snap.*" bridge.log | head -1 | grep . || { echo "no snapshot of storm_items after 300 s"; exit 1; }
 echo "errors so far: $(grep -c 'error(' bridge.log admission.log | paste -sd' ' -)"
 REMOTE
   ;;
@@ -97,6 +91,12 @@ EOF
   scp -q "$HERE/zb_cmp.py" "$CMP_HOST:zbcmp/cl/"
   (cd "$SEC/creds" && COPYFILE_DISABLE=1 tar --no-xattrs -czf - p*.creds) | ssh_h 'tar -C ~/zbcmp/cl/creds -xzf -'
   ssh_h 'chmod 600 ~/zbcmp/cl/admin.env ~/zbcmp/cl/creds/*; echo "creds on the host: $(ls ~/zbcmp/cl/creds | wc -l)"'
+  # The tenant exists once a principal is mapped to it, and only then does the bridge build its snapshot. A client
+  # that connects before it waits for it, so a cold seed would time the wait: wait here instead. Any generation that
+  # carries a full: g1 on a new database, a later one (`delta+full`) when the NATS is new but the database recorded a chain.
+  ssh_h 'snap="g[0-9]+ for '"'"'cmp'"'"'/'"'"'storm_items'"'"': [a-z+]*full"
+    for i in $(seq 300); do grep -qE "$snap" ~/zbcmp/zb/bridge.log && break; sleep 1; done
+    grep -oE "$snap.*" ~/zbcmp/zb/bridge.log | tail -1 | grep . || { echo "no snapshot of storm_items after 300 s"; exit 1; }'
   ;;
 run)
   shift

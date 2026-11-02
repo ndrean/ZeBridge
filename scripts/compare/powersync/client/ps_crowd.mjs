@@ -6,6 +6,9 @@
 //                                        second (through PostgREST), each timed to every reader. A reader keeps
 //                                        no replica: it counts the operations it is sent, which is the service's
 //                                        share of a sync, not a client's apply.
+//   node ps_crowd.mjs ready ROWS         one reader, retried until a complete checkpoint carries ROWS operations:
+//                                        the service has the table in its storage (powersync.sh up runs it, so
+//                                        no timed run includes the service's own first copy)
 //   node ps_crowd.mjs writes N RATE SECONDS
 //                                        N simulated apps, RATE writes/s offered in all, into sensor_events. Each
 //                                        app uploads as uploadData does: one request at a time, up to 200 queued
@@ -15,6 +18,7 @@
 // Service 127.0.0.1:18080, PostgREST 127.0.0.1:13000; ./secrets/jwt.key signs the readers' tokens.
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { BSON } from 'bson';
 
 const SERVICE = 'http://127.0.0.1:18080', REST = 'http://127.0.0.1:13000';
 const KEY = readFileSync('./secrets/jwt.key', 'utf8').trim();
@@ -49,61 +53,108 @@ async function post(path, rows, who) {
 }
 
 // ── sync ──────────────────────────────────────────────────────────────────────
-async function reader(i, start, seen, state) {
+// Readers run PER_PROCESS to a process (default 25), all from one shared start, so that no single Node thread
+// decoding the streams becomes the limit (storm.py does the same with 60 libzb clients per process). Times are
+// wall-clock milliseconds, so the processes' numbers compare.
+const PER = Number(process.env.PER_PROCESS ?? 25);
+
+async function reader(j, gi, startEpoch, st) {
   const res = await fetch(`${SERVICE}/sync/stream`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Token ${token(`crowd-${i}`)}`, accept: 'application/x-ndjson' },
-    body: JSON.stringify({ buckets: [], include_checksum: true, raw_data: true, client_id: `crowd-${i}`, streams: { include_defaults: true, subscriptions: [] } }),
-    signal: state.abort.signal,
+    // What the SDK asks for: BSON preferred, NDJSON otherwise; the service picks.
+    headers: { 'content-type': 'application/json', authorization: `Token ${token(`crowd-${gi}`)}`, accept: 'application/vnd.powersync.bson-stream;q=0.9,application/x-ndjson;q=0.8' },
+    body: JSON.stringify({ buckets: [], include_checksum: true, raw_data: true, client_id: `crowd-${gi}`, streams: { include_defaults: true, subscriptions: [] } }),
+    signal: st.abort.signal,
   });
   if (!res.ok) throw new Error(`sync/stream ${res.status}: ${(await res.text()).slice(0, 160)}`);
+  st.bson = res.headers.get('content-type') === 'application/vnd.powersync.bson-stream';
   const dec = new TextDecoder();
-  let buf = '';
+  let buf = '', bin = Buffer.alloc(0);
   for await (const chunk of res.body) {
-    buf += dec.decode(chunk, { stream: true });
-    let nl;
-    while ((nl = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
-      if (!line) continue;
-      const m = JSON.parse(line);
+    const msgs = [];
+    if (st.bson) {
+      // Concatenated BSON documents, each starting with its int32 length.
+      bin = bin.length ? Buffer.concat([bin, chunk]) : Buffer.from(chunk);
+      while (bin.length >= 4 && bin.length >= bin.readInt32LE(0)) {
+        const len = bin.readInt32LE(0);
+        msgs.push(BSON.deserialize(bin.subarray(0, len))); bin = bin.subarray(len);
+      }
+    } else {
+      buf += dec.decode(chunk, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) { const line = buf.slice(0, nl); buf = buf.slice(nl + 1); if (line) msgs.push(JSON.parse(line)); }
+    }
+    for (const m of msgs) {
       if (m.data) {
-        state.ops[i] += m.data.data?.length ?? 0;
-        for (const op of m.data.data ?? []) if (op.object_id?.startsWith('m-')) seen.get(op.object_id)?.set(i, performance.now());
-      } else if (m.checkpoint_complete && state.synced[i] === null) {
-        state.synced[i] = (performance.now() - start) / 1000;
+        st.ops[j] += m.data.data?.length ?? 0;
+        for (const op of m.data.data ?? []) {
+          if (!op.object_id?.startsWith('m-')) continue;
+          if (!st.arrivals[op.object_id]) st.arrivals[op.object_id] = [];
+          st.arrivals[op.object_id].push(Date.now());
+        }
+      } else if (m.checkpoint_complete && st.synced[j] === null) {
+        st.synced[j] = (Date.now() - startEpoch) / 1000;
       }
     }
   }
 }
 
+// One process's readers, [offset, offset + count): reports when they are synced, then their markers when told to stop.
+async function syncWorker(offset, count, startEpoch) {
+  const st = { abort: new AbortController(), synced: Array(count).fill(null), ops: Array(count).fill(0), retries: 0, last: '', bson: false, arrivals: {} };
+  process.on('message', async (m) => {
+    if (m !== 'stop') return;
+    process.send({ type: 'arrivals', arrivals: st.arrivals });
+    st.abort.abort(); setTimeout(() => process.exit(0), 200);
+  });
+  await sleep(Math.max(0, startEpoch - Date.now()));
+  for (let j = 0; j < count; j++) {
+    // A reader the service refuses (no checkpoint yet, overloaded) retries after a second, as the SDK does; its
+    // time to synced keeps counting from the shared start.
+    void (async () => {
+      while (!st.abort.signal.aborted && Date.now() - startEpoch < 900_000) {
+        try { await reader(j, offset + j, startEpoch, st); return; } catch (e) {
+          if (e.name === 'AbortError') return;
+          st.retries++; st.last = `reader ${offset + j}: ${e.message}`; await sleep(1000);
+        }
+      }
+    })();
+  }
+  while (st.synced.some((s) => s === null) && Date.now() - startEpoch < 900_000) await sleep(200);
+  process.send({ type: 'synced', synced: st.synced, ops: st.ops, retries: st.retries, last: st.last, bson: st.bson, rss: rssMb() });
+}
+
 async function sync(n, markers) {
-  const state = { abort: new AbortController(), synced: Array(n).fill(null), ops: Array(n).fill(0), errors: [] };
-  const seen = new Map();   // marker id -> Map(reader -> arrival)
-  const start = performance.now();
-  const runs = Array.from({ length: n }, (_, i) => reader(i, start, seen, state).catch((e) => {
-    if (e.name !== 'AbortError') state.errors.push(`reader ${i}: ${e.message}`);
-  }));
-  while (state.synced.some((s) => s === null) && performance.now() - start < 300_000 && state.errors.length < n) await sleep(200);
-  const ok = state.synced.filter((s) => s !== null);
-  console.log(`powersync crowd sync, ${n} readers: synced ${ok.length}/${n}, median ${pct(ok, 0.5).toFixed(2)} s, p95 ${pct(ok, 0.95).toFixed(2)} s, slowest ${Math.max(...ok).toFixed(2)} s; ops per reader ${pct(state.ops, 0.5)}; process ${rssMb()} MB`);
-  const tag = randomUUID().slice(0, 6), sent = new Map();
+  const { fork } = await import('node:child_process');
+  const startEpoch = Date.now() + 3000 + n * 4;   // time for the processes to load
+  const workers = [];
+  for (let off = 0; off < n; off += PER) {
+    const w = fork(new URL(import.meta.url).pathname, ['sync-worker', String(off), String(Math.min(PER, n - off)), String(startEpoch)], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
+    workers.push({ w, synced: new Promise((r) => w.on('message', (m) => m.type === 'synced' && r(m))), arrivals: new Promise((r) => w.on('message', (m) => m.type === 'arrivals' && r(m.arrivals))) });
+  }
+  const parts = await Promise.all(workers.map((x) => x.synced));
+  const synced = parts.flatMap((p) => p.synced), ops = parts.flatMap((p) => p.ops), ok = synced.filter((s) => s !== null);
+  const retries = parts.reduce((a, p) => a + p.retries, 0), last = parts.map((p) => p.last).find(Boolean) ?? '';
+  console.log(`powersync crowd sync, ${n} readers in ${workers.length} process(es): synced ${ok.length}/${n}, median ${pct(ok, 0.5).toFixed(2)} s, p95 ${pct(ok, 0.95).toFixed(2)} s, slowest ${Math.max(...ok).toFixed(2)} s; ops per reader ${pct(ops, 0.5)} (${parts[0].bson ? 'BSON' : 'NDJSON'}); ${retries} retried connections${retries ? ` (last: ${last.slice(0, 120)})` : ''}; ${Math.round(parts.reduce((a, p) => a + p.rss, 0) / n)} MB per reader`);
+  const tag = randomUUID().slice(0, 6), sent = new Map(), errors = [];
   for (let k = 0; k < markers; k++) {
-    const id = `m-${tag}-${String(k).padStart(4, '0')}`, t = performance.now();
-    seen.set(id, new Map()); sent.set(id, t);
-    try { await post('storm_items', [{ id, tenant_id: 'cmp', note: 'marker' }], principal(0)); } catch (e) { state.errors.push(`marker ${k}: ${e.message}`); }
-    await sleep(Math.max(0, 1000 - (performance.now() - t)));
+    const id = `m-${tag}-${String(k).padStart(4, '0')}`, t = Date.now();
+    sent.set(id, t);
+    try { await post('storm_items', [{ id, tenant_id: 'cmp', note: 'marker' }], principal(0)); } catch (e) { errors.push(`marker ${k}: ${e.message}`); }
+    await sleep(Math.max(0, 1000 - (Date.now() - t)));
   }
   await sleep(5000);
+  for (const x of workers) x.w.send('stop');
+  const all = await Promise.all(workers.map((x) => x.arrivals));
   const lat = [];
   let complete = 0;
   for (const [id, t] of sent) {
-    const got = seen.get(id);
-    for (const at of got.values()) lat.push(at - t);
-    if (got.size === n) complete++;
+    const got = all.flatMap((a) => a[id] ?? []);
+    for (const at of got) lat.push(at - t);
+    if (got.length >= n) complete++;
   }
-  if (markers) console.log(`powersync crowd markers: ${markers} sent, ${complete} reached all ${n} readers; one write to a reader median ${ms(pct(lat, 0.5))} ms, p95 ${ms(pct(lat, 0.95))} ms, slowest ${ms(Math.max(...lat))} ms`);
-  if (state.errors.length) console.log(`errors: ${state.errors.length}, first: ${state.errors.slice(0, 3).join(' | ')}`);
-  state.abort.abort();
+  if (markers) console.log(`powersync crowd markers: ${markers} sent, ${complete} reached all ${n} readers; one write to a reader median ${ms(pct(lat, 0.5))} ms, p95 ${ms(pct(lat, 0.95))} ms, slowest ${ms(Math.max(...lat))} ms (n=${lat.length})`);
+  if (errors.length) console.log(`errors: ${errors.length}, first: ${errors.slice(0, 3).join(' | ')}`);
 }
 
 // ── writes ────────────────────────────────────────────────────────────────────
@@ -148,8 +199,23 @@ async function writes(n, rate, seconds) {
     first_error: errors[0] }));
 }
 
+async function ready(rows) {
+  const start = Date.now();
+  for (;;) {
+    const st = { abort: new AbortController(), synced: [null], ops: [0], arrivals: {} };
+    const done = reader(0, 0, start, st).catch(() => {});
+    while (st.synced[0] === null && Date.now() - start < 600_000) await sleep(200);
+    st.abort.abort(); await done;
+    if (st.ops[0] >= rows) { console.log(`service ready: ${st.ops[0]} operations in its first complete checkpoint, after ${((Date.now() - start) / 1000).toFixed(1)} s`); return; }
+    if (Date.now() - start > 600_000) { console.log(`service not ready after 600 s (${st.ops[0]} of ${rows} operations)`); process.exit(1); }
+    await sleep(2000);
+  }
+}
+
 const [mode, a1, a2, a3] = process.argv.slice(2);
-if (mode === 'sync') await sync(Number(a1), Number(a2 ?? 0));
+if (mode === 'ready') await ready(Number(a1));
+else if (mode === 'sync-worker') { await syncWorker(Number(a1), Number(a2), Number(a3)); await new Promise(() => {}); }
+else if (mode === 'sync') await sync(Number(a1), Number(a2 ?? 0));
 else if (mode === 'writes') await writes(Number(a1), Number(a2), Number(a3));
 else { console.error('usage: ps_crowd.mjs sync N MARKERS | writes N RATE SECONDS'); process.exit(2); }
 process.exit(0);
