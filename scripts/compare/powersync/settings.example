@@ -1,0 +1,12 @@
+# Copy to `settings` (git-ignored) and fill in. Read by every script here.
+
+# The comparison host, over SSH. A scratch machine, never a production hub (README: "Never on a production host").
+CMP_HOST=debian@203.0.113.10
+
+# The database's connection file, relative to the repository root or absolute. It must define SB_ADMIN_URL (or
+# ADMIN_DATABASE_URL), DATABASE_READER_URL, DATABASE_WRITER_URL, BRIDGE_CDC_PUBLICATION and BRIDGE_CDC_SLOT.
+CMP_DB_ENV=.env.supa.scratch
+
+# That database's `SELECT system_identifier FROM pg_control_system()`. Every database step checks it first and
+# refuses on any other value: these scripts drop tables, roles and slots.
+CMP_DB_SYSID=

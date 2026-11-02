@@ -23,6 +23,15 @@ import nats
 TABLE = "sensor_events"
 
 
+def _uuid7():
+    """RFC 9562 version 7 (48-bit milliseconds, then random), for Pythons before 3.14's uuid.uuid7."""
+    r = int.from_bytes(random.randbytes(10), "big")
+    return uuid.UUID(int=(time.time_ns() // 1_000_000) << 80 | 0x7 << 76 | (r >> 68 & 0xFFF) << 64 | 0b10 << 62 | (r & (1 << 62) - 1))
+
+
+uuid7 = getattr(uuid, "uuid7", _uuid7)
+
+
 def iso(ts):
     return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
@@ -116,7 +125,7 @@ async def main():
                 return
             await asyncio.sleep(max(0.0, due - time.monotonic()))
             k += 1
-            eid, now = uuid.uuid7(), time.time()
+            eid, now = uuid7(), time.time()
             row = {"event_id": str(eid), "tenant_id": a.tenant, "sensor_id": sid, "kind": "temperature",
                    "value": round(21 + 2 * math.cos(now), 3), "updated_at": iso(now)}
             if a.variant == "reject" and random.random() < a.reject_share:
@@ -135,7 +144,7 @@ async def main():
 
     async def single(until):
         while time.monotonic() < until:
-            eid, now = uuid.uuid7(), time.time()
+            eid, now = uuid7(), time.time()
             row = {"event_id": str(eid), "tenant_id": a.tenant, "sensor_id": a.first_id, "kind": "temperature",
                    "value": round(21 + 2 * math.cos(now), 3), "updated_at": iso(now)}
             client = f"sensor-{a.first_id}"

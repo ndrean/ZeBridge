@@ -15,7 +15,7 @@ package), started at once, timed.
       clients, and each client's longest gap (restart NATS during that time, and the gap is
       the time it took to come back).
 
-The table is storm_items (setup.sql), tenant `storm`.
+The table is storm_items (setup.sql), tenant `storm` (`--tenant` for another).
 """
 import argparse, json, os, pathlib, resource, statistics, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
@@ -122,7 +122,7 @@ def worker(args):
                 sent = time.time()   # before the call: a slow mutate() must not shorten the latency
                 try:
                     clients[0].mutate(TABLE, "INSERT", {"id": f"m-{tag}-{k:04d}"},
-                                      {"id": f"m-{tag}-{k:04d}", "tenant_id": "storm", "note": "marker",
+                                      {"id": f"m-{tag}-{k:04d}", "tenant_id": args.tenant, "note": "marker",
                                        "updated_at": datetime.now(timezone.utc).isoformat()})
                     writes.append(sent)
                 except Exception as e:
@@ -168,7 +168,7 @@ def run(args):
                "--count", str(min(PER_PROCESS, args.first + args.n - off)), "--bridge", args.bridge, "--nats", args.nats,
                "--seed-domain", args.seed_domain, "--dbs", str(dbs),
                "--start-at", str(start_at), "--markers", str(args.markers), "--markers-at", str(markers_at),
-               "--out", str(out)] + (["--writer"] if k == 0 and args.first == 0 else [])
+               "--out", str(out), "--tenant", args.tenant] + (["--writer"] if k == 0 and args.first == 0 else [])
         log = open(pathlib.Path(args.worker_logs) / f"w{off:04d}.log", "w") if args.worker_logs else subprocess.DEVNULL
         procs.append(subprocess.Popen(cmd, stderr=log))
     if args.markers:
@@ -226,6 +226,7 @@ def main():
     r.add_argument("--worker-logs", default="", help="keep each worker's library log in this directory")
     r.add_argument("--first", type=int, default=0, help="start at this identity (two halves side by side)")
     r.add_argument("--start-at", type=float, default=0, help="the shared start, epoch seconds (two halves side by side)")
+    r.add_argument("--tenant", default="storm", help="the tenant the marker rows are written in")
     r.add_argument("--warm", action="store_true")
     r.add_argument("--markers", type=int, default=0)
     r.add_argument("--settle", type=float, default=20, help="seconds from the start to the first marker")
@@ -236,7 +237,7 @@ def main():
     w.add_argument("--bridge", required=True); w.add_argument("--dbs", required=True); w.add_argument("--nats", default=""); w.add_argument("--seed-domain", default="")
     w.add_argument("--start-at", type=float, required=True); w.add_argument("--markers", type=int, default=0)
     w.add_argument("--markers-at", type=float, default=0); w.add_argument("--writer", action="store_true")
-    w.add_argument("--out", required=True)
+    w.add_argument("--out", required=True); w.add_argument("--tenant", default="storm")
     args = ap.parse_args()
     {"enroll": enroll, "run": run, "worker": worker}[args.cmd](args)
 

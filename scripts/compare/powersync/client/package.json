@@ -1,0 +1,11 @@
+{
+  "name": "ps-cmp",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@powersync/node": "1.3.0",
+    "better-sqlite3": "13.0.3",
+    "pg": "^8",
+    "bson": "^6"
+  }
+}
