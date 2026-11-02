@@ -8,7 +8,15 @@ On a Mac use `scripts/dev` (containers) or `scripts/native` (Homebrew, for speed
 
 Do these once per machine, in this order. Each line says what breaks when it is missing.
 
-- [ ] **PostgreSQL 15 or newer** with its server binaries: `sudo apt install postgresql postgresql-contrib` (16 on current Ubuntu). The init SQL reads `pg_publication_rel.prqual`, which 14 does not have: `up.sh` refuses an older server before it touches anything.
+- [ ] **PostgreSQL 18**, the version every other stack runs (`scripts/native`, `scripts/dev`, the Compose files), from PostgreSQL's own apt repository, since the distributions ship older ones (16 on Ubuntu 24.04, 17 on Debian 13):
+
+  ```sh
+  sudo apt install -y postgresql-common
+  sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+  sudo apt install -y postgresql-18
+  ```
+
+  An older server still works down to 15 (`up.sh` says which it uses); the init SQL reads `pg_publication_rel.prqual`, which 14 does not have, and `up.sh` refuses such a server before it touches anything.
 - [ ] **Stop the system cluster the package starts**: `sudo systemctl disable --now postgresql`. It listens on 5432, where `up.sh` wants to start its own cluster.
 - [ ] **Development headers for the build**: `sudo apt install libsqlite3-dev libzstd-dev libpq-dev build-essential curl openssl`. Without them the libzb build stops with "sqlite3.h not found" and the bridge build with "libpq-fe.h not found".
 - [ ] **`nats-server` 2.15 or newer** (2.11 lacks `default_max_consumers`), **`nats`** and **`nsc`**, from the releases of [nats-server](https://github.com/nats-io/nats-server/releases), [natscli](https://github.com/nats-io/natscli/releases) and [nsc](https://github.com/nats-io/nsc/releases), on `PATH`. Check with `nats-server --version`.
@@ -49,7 +57,7 @@ source scripts/scenarios/.venv/bin/activate
 set -a && . ./.env.bridge && set +a
 export BRIDGE_CDC_PUBLICATION=zb_pub
 export NATS_URL=nats://127.0.0.1:4222
-export ZB_PGBIN=/usr/lib/postgresql/16/bin ZB_PG_CTL=$PWD/scripts/linux/pg_ctl ZB_JWT_STATE=$PWD/scripts/linux/state
+export ZB_PGBIN=/usr/lib/postgresql/18/bin ZB_PG_CTL=$PWD/scripts/linux/pg_ctl ZB_JWT_STATE=$PWD/scripts/linux/state
 ```
 
 The last two lines are the ones `up.sh` prints with your values.
@@ -123,11 +131,11 @@ As any other user it lives in `scripts/linux/state/pgdata`. `ZB_PGDATA` moves it
 ## Differences from the container stack
 
 - `up.sh` runs the credential bootstrap every time, like `scripts/dev/up.sh`, and reloads a `nats-server` that is already up (`kill -HUP`), for the same reason: the account JWT it loaded does not know the newest signing key.
-- PostgreSQL 15 or newer. With several installed, `ZB_PGBIN` chooses; without it, a `pg_ctl` on `PATH` older than 15 gives way to the newest under `/usr/lib/postgresql/`.
+- PostgreSQL 18, as in the other stacks; 15 or newer is accepted. With several installed, `ZB_PGBIN` chooses; without it, a `pg_ctl` on `PATH` older than 15 gives way to the newest under `/usr/lib/postgresql/`.
 - `wal_compression=on` instead of `zstd` (a server built without zstd refuses the latter).
 - Not covered, as in `scripts/dev`: TLS and the leaf listener. Also not covered here: SeaweedFS.
 
 ## Status
 
 Run on Debian with PostgreSQL 16 as root: `up.sh` from nothing, `down.sh --clean`, `scripts/reprovision.py`, and the scenarios that restart or reload the servers (`pg_restart`, `nats_outage`, `jwt_expiry`, `revoke_midseed`).
-Run by the owner on Ubuntu with PostgreSQL 16 and Python 3.15: `offline` 9/9 and `live` 53/66 before the fault builds and the Node installs of the checklist were done. Re-run in the Debian sandbox on a fresh stack in admission mode: `reconcile` (fixed, a real regression), `outbox_recovery`, `outbox_backlog`, `jwt_renew`, `revoke_purge` and `shared_cut` (it needed a row of its own) pass. `standby` now finds its tools through `ZB_PGBIN` but cannot run as root, so it is not verified there. `serve` needs Python 3.14, which the sandbox lacks, so it is not verified either.
+Run by the owner on Ubuntu with PostgreSQL 16 and Python 3.15: `offline` 9/9 and `live` 53/66 before the fault builds and the Node installs of the checklist were done. Re-run in the Debian sandbox on a fresh stack in admission mode: `reconcile` (fixed, a real regression), `outbox_recovery`, `outbox_backlog`, `jwt_renew`, `revoke_purge` and `shared_cut` (it needed a row of its own) pass. `standby` now finds its tools through `ZB_PGBIN` but cannot run as root, so it is not verified there. `serve` needs Python 3.14, which the sandbox lacks, so it is not verified either. Not yet run with PostgreSQL 18.
