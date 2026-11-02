@@ -133,6 +133,17 @@ if (orders.length > 0) {
 
 The TypeScript client drives its own synchronization loop. With native `libzb`, the host drives `sync()` and `poll()`; see the binding's example for its threading or worker model.
 
+### Choose the local database
+
+The replica is a real database on the device, and the app reads it with that database's SQL:
+
+- **SQLite**, the default everywhere: a file on phones, desktops and Node, OPFS in the browser.
+- **PGlite**, PostgreSQL compiled to WebAssembly, in the browser or Node (`engine: 'pglite'`): the same SQL dialect as the server.
+- **DuckDB**, through libzb (`engine: "duckdb"`): an analytical replica for dashboards and services, which DuckDB can open directly once libzb closes it.
+- **PostgreSQL**, through libzb (`dbUrl`): a server-side replica, for a service that wants the full PostgreSQL.
+
+The table below shows which host offers which; [CLIENTS](CLIENTS.md) has the options and the type mapping for each engine.
+
 | Host | Package | Local database |
 | --- | --- | --- |
 | Browser | `@zebridge/client` | SQLite in OPFS or PGlite |
@@ -144,6 +155,24 @@ The TypeScript client drives its own synchronization loop. With native `libzb`, 
 | Other native hosts | libzb's C ABI | SQLite, PostgreSQL or DuckDB |
 
 The native core is written in Zig. The TypeScript client reuses shared core rules through WebAssembly; the platform bindings wrap libzb rather than implementing another synchronization engine.
+
+### Connect a service, if you need one
+
+A **responder** is a service your apps can ask questions: routing, search, analytics, an external API. It is a separate process built on the same client library: it connects to NATS with its own identity, keeps its own replica if it needs data, and answers `query.<tenant>.<name>`. Any client of that tenant can call it, and none needs an HTTP endpoint, a URL or another credential:
+
+```ts
+// The service, in its own process: a client opened with credsPath: 'pois.creds'
+// (minted by `bridge --mint-responder --name pois --tenant acme`) instead of an invite.
+await service.serve({
+  tenants: ['acme'],
+  handlers: { nearby: ({ lat, lon }, tenant) => findNearby(lat, lon) },
+});
+
+// Any app of tenant acme.
+const pois = await zb.request('query.acme.nearby', { lat: 47.2, lon: -1.55 });
+```
+
+Several instances of a responder share the load (one NATS queue group), and a responder can run on a regional leaf, near its users. It can read but never write: NATS refuses a mutation from its identity. `ingest()` keeps an answer in the app's replica. See [Services and sensors](AUTHENTICATION.md#services-and-sensors) for the identities, and the [routing example](examples/13-routing/README.md) for Valhalla served this way.
 
 Start with [the first calls in each language](CLIENTS.md#the-first-ten-lines), then use [CLIENTS](CLIENTS.md) for options, lifecycle and differences between clients. Installation and platform artifacts are covered in [DISTRIBUTION](DISTRIBUTION.md).
 
