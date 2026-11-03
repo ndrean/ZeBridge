@@ -221,7 +221,7 @@ flowchart LR
 | Reads | SQL on the local replica | SQL on the local replica |
 | Writes | `mutate()`; the library sends them, PostgreSQL judges them and returns a verdict | Plain SQL on local tables; your `uploadData()` sends them to **your backend**, which applies its own rules |
 | Exactly once, authorization, refusals | Built in: receipts, tenant credentials and row-level security, a verdict per write | Your backend's job; the SDK retries until `uploadData()` succeeds |
-| Services for the app | Responders on the same NATS connection and credentials, on the hub or a regional leaf ([Connect a service](#connect-a-service-if-you-need-one)) | None: a separate API you build and secure |
+| Services for the app | Responders on the same NATS connection and credentials, on the hub or a regional leaf ([Connect a service](#connect-a-service-if-you-need-one)) | No built-in equivalent: services are your own APIs, reached outside the sync connection and authenticated separately |
 | Client platforms | Browser, Node, Python, Dart/Flutter, React Native, Android, C ABI | Many mature SDKs, including web, React Native, Flutter, Kotlin, Swift and Node |
 
 **Measured, same workload.** Both against one Supabase database in Dublin, 10,000 rows of about 200 bytes, the same table setup for both (ZeBridge's triggers and tenant policy; PowerSync's writes went through PostgREST as ZeBridge's write role, so the policy applied). Clients on the server itself, one system running at a time. ZeBridge 0.2.10 (4 ingress lanes, rate limit off); PowerSync service 1.27.2 with its bucket storage in PostgreSQL on the same server, Sync Streams, the Node SDK 1.3.0 with no delay between uploads (`crudUploadThrottleMs: 0`; the default waits 1 s). Measured 2026-11-02: one run each, except the larger server's write rows, which give the median of three runs and their range. To run it again: [the harness](scripts/compare/powersync/README.md).
@@ -244,7 +244,7 @@ A ZeBridge write counts when its verdict returns, after admission, the receipt a
 
 | Sync, 500 clients starting cold | ZeBridge | PowerSync |
 | --- | --- | --- |
-| Time until each holds the 10,000 rows, median (three runs) | **5.3 / 5.7 / 5.3 s** | 61 / 76 / 65 s |
+| Time to receive the initial dataset, excluding local apply, median (three runs) | **5.3 / 5.7 / 5.3 s** | 61 / 76 / 65 s |
 | Slowest client | **6.7–8.2 s** | 68–82 s |
 | Sent to each client | **0.23 MB**, one compressed snapshot | 4.63 MB, 10,000 operations |
 | One write reaching each of the 500, median | 0.4–0.8 s | 0.7–1.6 s |
@@ -395,7 +395,7 @@ Each figure is one run on the hardware named, not a capacity guarantee.
 | clients → PostgreSQL | 10 clients | 1,414 writes/s |
 | clients → PostgreSQL | 50 clients, each sending 400 at once | 1,447 writes/s, median verdict 3.2 s |
 
-**What the write figures are.** They are the hub's total, shared by every tenant: all writes go through the same ingress lanes, each with one connection to PostgreSQL, so more tenants do not add capacity (more lanes or another bridge would; not measured). The runs used one tenant, which is not the designed topology but shows what one tenant can take when nothing else writes. During them PostgreSQL and the bridge were nearly idle: a batch of writes costs its round trips to the database, so the distance between the bridge and PostgreSQL sets the ceiling. 1,450 writes/s is 14,500 devices each sending one write every 10 seconds.
+**What the write figures are.** They are the hub's total, shared by every tenant: all writes go through the same ingress lanes, each with one connection to PostgreSQL, so more tenants do not add capacity. More ingress lanes can, until the database's round trips dominate: 8 lanes are measured in the comparison above. The runs used one tenant, which is not the designed topology but shows what one tenant can take when nothing else writes. During them PostgreSQL and the bridge were nearly idle: a batch of writes costs its round trips to the database, so the distance between the bridge and PostgreSQL sets the ceiling. 1,450 writes/s is 14,500 devices each sending one write every 10 seconds.
 
 **The rate limit sets what one tenant gets.** By default there is none (`MUTATION_RATE_PER_PRINCIPAL=0`), and a tenant can use the whole ceiling, as above. Set, it applies to each principal and to each tenant: at 100 per second (burst 200, this hub's setting) one tenant is held to about 100 writes/s, whatever the hub could take. These runs used 2,000 (burst 4,000) and no write was delayed. See [Write limits, as a client sees them](OPERATIONS.md#write-limits-as-a-client-sees-them).
 
@@ -407,7 +407,7 @@ Each figure is one run on the hardware named, not a capacity guarantee.
 | A client applying a busy table live | libzb ~50k events/s, zb-client-ts ~33k | one Mac, a table under a steady write load | |
 | A change reaching a replica | median 12 ms | dev stack on one Mac, libzb on the DuckDB engine | |
 | Seeding a large table on a phone | libzb 35.0 s (React Native), 70.8 s (Flutter); JavaScript client 725 s | iPhone 12, the same table | [Large table](examples/06-large-table/README.md) |
-| Client writes into PostgreSQL | ~8,500 writes/s on one ingress lane, ~19,500 on four | one Mac, PostgreSQL on the same machine | [the ramp](examples/09-event/README.md#the-ramp-how-far-one-mac-goes) |
+| Client writes into PostgreSQL | ~8,500 writes/s on one ingress lane, ~19,500 on four | one Mac, PostgreSQL on the same machine, before 0.2.7's durable mutation receipts | [the ramp](examples/09-event/README.md#the-ramp-how-far-one-mac-goes) |
 | 500 clients starting at once, empty replicas | all synced, the slowest in 8.6 to 12 s; NATS at 140–165 % CPU, about 1 MB per client; PostgreSQL under 16 % CPU; the bridge near idle | 2-vCPU, 3.7 GB VPS, clients 100 ms away | [storm](storm/README.md) |
 | One write reaching those 500 | median 288 ms, p95 491 ms (100 ms of it network) | same | |
 | NATS restarted under the 500 | none lost; half back within 6 s, the last at 23 s | same | |
@@ -416,7 +416,7 @@ Each figure is one run on the hardware named, not a capacity guarantee.
 
 A comparison with PowerSync on the same workload is in [Compared with PowerSync](#compared-with-powersync).
 
-**Not measured:** the hub's write ceiling with more than 4 ingress lanes; how long each component may stay down before recovery needs a re-seed; NATS memory at a steady load (it follows recent load, not stored data); a long network partition under load.
+**Not measured:** the production hub's write ceiling with more than 4 ingress lanes (8 were measured only on the comparison's server); how long each component may stay down before recovery needs a re-seed; NATS memory at a steady load (it follows recent load, not stored data); a long network partition under load.
 
 ## Documentation
 
