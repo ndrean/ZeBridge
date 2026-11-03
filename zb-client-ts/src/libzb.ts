@@ -430,17 +430,38 @@ export function offsetFrom(creds: string, local = localNow()): number {
   return t ? t.iat - local : 0;
 }
 
+/// Enrollment's retries: the attempts and waits of libzb's (`first_connect_attempts`, `Transport.backoff`).
+const ENROLL_ATTEMPTS = 5;
+const ENROLL_BUSY = new Set([429, 502, 503, 504]);
+const enrollBackoff = (attempt: number) => {
+  const base = 250 * 2 ** Math.min(attempt, 6);
+  return new Promise<void>((r) => setTimeout(r, base + Math.random() * (base / 2)));
+};
+
 /// Redeem an invite: this device's own key pair (the seed never leaves it), `GET
 /// <bridgeUrl>/enroll`, and the identity built from the answer. `connect()` calls it
 /// with an `invite`; an app that manages identities itself can call it directly.
 export async function enrollAt(bridgeUrl: string, code: string, transport: Transport = natsTransport): Promise<EnrolledIdentity> {
   const base = bridgeUrl.replace(/\/+$/, '');
   const kp = transport.createUser();
-  let res: Response;
-  try {
-    res = await fetch(`${base}/enroll?code=${encodeURIComponent(code.trim())}&user_pubkey=${kp.publicKey}`);
-  } catch (e) {
-    throw new Error(`enroll: ${base} unreachable (${(e as Error).message})`);
+  const url = `${base}/enroll?code=${encodeURIComponent(code.trim())}&user_pubkey=${kp.publicKey}`;
+  // Retried, briefly, while the bridge is busy or the network fails for a moment, as libzb's
+  // enroll: the bridge redeems a few invites at a time and answers 503 "retry shortly" to the
+  // rest, a proxy may answer 429 or 502/504 under a spike, and none of these spent the invite,
+  // so trying again is safe. libzb's waits (Transport.backoff, first_connect_attempts 5): 250 ms
+  // doubling, plus up to half again at random. A refusal (401, 403, 404) is final.
+  let res: Response | undefined;
+  for (let attempt = 0; ; attempt++) {
+    const last = attempt >= ENROLL_ATTEMPTS - 1;
+    try {
+      res = await fetch(url);
+    } catch (e) {
+      if (last) throw new Error(`enroll: ${base} unreachable (${(e as Error).message})`);
+      await enrollBackoff(attempt);
+      continue;
+    }
+    if (!ENROLL_BUSY.has(res.status) || last) break;
+    await enrollBackoff(attempt);
   }
   if (res.status === 404) throw new Error(`enroll: ${base} has enrollment off (404) — the bridge needs ZB_SIGNING_SEED and ZB_ACCOUNT_PUB`);
   if (res.status === 401 || res.status === 403) throw new Error(`enroll: refused (${res.status}): the code is invalid, used or expired, or the principal was revoked`);
