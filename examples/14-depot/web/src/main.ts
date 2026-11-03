@@ -938,9 +938,13 @@ try {
   status.textContent = 'connecting… (a first visit copies 16,000 chargers into this browser)';
   await zb.connect();
 } catch (e) {
+  const msg = (e as Error).message;
   status.textContent = e instanceof NotEnrolled
     ? 'This browser is not enrolled yet: open the invite link you were given (…/?invite=<code>).'
-    : `Could not connect: ${(e as Error).message}`;
+    // Busy after its retries, or unreachable: nothing spent the invite, so a reload works.
+    : /enroll: .*(answered (429|502|503|504)|unreachable)/.test(msg)
+      ? 'The demo is busy right now. Reload this page in a minute: your invite stays valid for an hour.'
+      : `Could not connect: ${msg}`;
   throw e;
 }
 const tConnected = performance.now();
