@@ -3,8 +3,8 @@
 Checks a published release as a user gets it, at one version, once every registry has it (after the npm approval):
 
 ```sh
-smoke/run.sh 0.2.10                              # here (OrbStack or Docker)
-gh workflow run smoke.yml -f version=0.2.10      # on GitHub, Linux x86_64
+smoke/run.sh 0.2.11                              # here (OrbStack or Docker)
+gh workflow run smoke.yml -f version=0.2.11      # on GitHub, Linux x86_64
 ```
 
 | what | how | checked |
@@ -32,7 +32,7 @@ psql … -tAc "INSERT INTO zebridge_invites (principal, tenant_id) VALUES ('t-py
 Here, the client:
 
 ```sh
-docker build -q smoke/clients/python --build-arg ZB_VERSION=0.2.10 -t zb-smoke-python
+docker build -q smoke/clients/python --build-arg ZB_VERSION=0.2.11 -t zb-smoke-python
 docker run --rm -e ZB_SMOKE_NAME=python-1 -e ZB_SMOKE_LIVE_WAIT=300 --network host \
   -e ZB_BRIDGE_URL=https://bridge.example.com -e ZB_INVITE=<code> zb-smoke-python
 ```
