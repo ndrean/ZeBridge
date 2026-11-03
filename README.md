@@ -224,11 +224,13 @@ flowchart LR
 | Services for the app | Responders on the same NATS connection and credentials, on the hub or a regional leaf ([Connect a service](#connect-a-service-if-you-need-one)) | No built-in equivalent: services are your own APIs, reached outside the sync connection and authenticated separately |
 | Client platforms | Browser, Node, Python, Dart/Flutter, React Native, Android, C ABI | Many mature SDKs, including web, React Native, Flutter, Kotlin, Swift and Node |
 
-**Measured, same workload** (one Supabase database, the same table rules for both, 2026-11-02):
+**Measured, same workload:** 500 clients, one Supabase database, the same table rules for both (2026-11-02).
 
-- **Delivery.** 500 clients starting cold received the 10,000-row table in a median 5.3–5.7 s with ZeBridge, 61–76 s with PowerSync: every ZeBridge client receives one shared compressed snapshot (0.23 MB), each PowerSync client every operation of its bucket (4.63 MB).
-- **Writes.** About equal at 500 clients: at 1,000 writes/s offered, ZeBridge committed 990/s with a median verdict of 0.69 s, PowerSync through PostgREST 879/s with a median acknowledgement of 4.8 s; at 2,000/s, 1,572/s against 1,702/s.
-- **A write reaching every client.** One write reached each of the 500 in a median 0.4–0.8 s with ZeBridge, 0.7–1.6 s with PowerSync.
+| | ZeBridge | PowerSync |
+| --- | --- | --- |
+| **Delivery:** 500 clients starting cold receive the 10,000-row table, median (excluding local apply) | **5.3–5.7 s**: one shared compressed snapshot, 0.23 MB a client | 61–76 s: every operation of the bucket, 4.63 MB a client |
+| **Writes,** offered at 1,000/s / 2,000/s | 990/s, verdict median 0.69 s / 1,572/s | 879/s through PostgREST, acknowledgement median 4.8 s / 1,702/s |
+| **A write reaching every client,** one write to each of the 500, median | **0.4–0.8 s** | 0.7–1.6 s |
 
 The configurations, both servers' figures, what the runs do not measure, and what a disconnect does to a write in each are in [COMPARISON](COMPARISON.md).
 
