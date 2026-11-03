@@ -1,6 +1,6 @@
 # The PowerSync comparison
 
-The harness behind the main README's [Compared with PowerSync](../../../README.md#compared-with-powersync): the same workload, run by ZeBridge and by PowerSync against one PostgreSQL database, from one host. The figures and how to read them are in that section; this page is how to run it again.
+The harness behind [the comparison with PowerSync](../../../COMPARISON.md): the same workload, run by ZeBridge and by PowerSync against one PostgreSQL database, from one host. The figures and how to read them are there; this page is how to run it again.
 
 ## What it measures
 

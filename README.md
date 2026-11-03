@@ -3,7 +3,7 @@
 **Local PostgreSQL replicas for apps and services, over NATS.**
 
 <p align="center">
-<img width="400" height="400" alt="zebridge-logo" src="https://github.com/user-attachments/assets/3b0b7c42-a94b-45ff-a9d7-274fdf26132c" />
+<img width="200" height="200" alt="zebridge-logo" src="https://github.com/user-attachments/assets/3b0b7c42-a94b-45ff-a9d7-274fdf26132c" />
 </p>
 
 ![Zig support](https://img.shields.io/badge/Zig-0.17.0-color?logo=zig&color=%23f3ab20)  [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![Tests](https://img.shields.io/badge/tested-scenarios-green)](https://github.com/ndrean/zebridge/blob/main/TEST_SCENARIOS.md)
@@ -186,7 +186,7 @@ Start with [the first calls in each language](CLIENTS.md#the-first-ten-lines), t
 
 ## Compared with PowerSync
 
-[PowerSync](https://www.powersync.com) also keeps a local SQLite replica of PostgreSQL on each device. The two differ in where the write path lives and what you run. This is a comparison, not a case against PowerSync: it shows that NATS is a serious base for offline-first apps, and that the same connection lets an app reach services, such as routing or analytics, which PowerSync does not offer.
+Both ZeBridge and [PowerSync](https://www.powersync.com) keep a local SQLite replica of PostgreSQL on each device. They differ in where the write path lives, what you run, and services, which ZeBridge carries on the same connection.
 
 ```mermaid
 flowchart LR
@@ -221,43 +221,18 @@ flowchart LR
 | Reads | SQL on the local replica | SQL on the local replica |
 | Writes | `mutate()`; the library sends them, PostgreSQL judges them and returns a verdict | Plain SQL on local tables; your `uploadData()` sends them to **your backend**, which applies its own rules |
 | Exactly once, authorization, refusals | Built in: receipts, tenant credentials and row-level security, a verdict per write | Your backend's job; the SDK retries until `uploadData()` succeeds |
-| Services for the app | Responders on the same NATS connection and credentials, on the hub or a regional leaf ([Connect a service](#connect-a-service-if-you-need-one)) | None: a separate API you build and secure |
+| Services for the app | Responders on the same NATS connection and credentials, on the hub or a regional leaf ([Connect a service](#connect-a-service-if-you-need-one)) | No built-in equivalent: services are your own APIs, reached outside the sync connection and authenticated separately |
 | Client platforms | Browser, Node, Python, Dart/Flutter, React Native, Android, C ABI | Many mature SDKs, including web, React Native, Flutter, Kotlin, Swift and Node |
 
-**Measured, same workload.** Both against one Supabase database in Dublin, 10,000 rows of about 200 bytes, the same table setup for both (ZeBridge's triggers and tenant policy; PowerSync's writes went through PostgREST as ZeBridge's write role, so the policy applied). Clients on the server itself, one system running at a time. ZeBridge 0.2.10 (4 ingress lanes, rate limit off); PowerSync service 1.27.2 with its bucket storage in PostgreSQL on the same server, Sync Streams, the Node SDK 1.3.0 with no delay between uploads (`crudUploadThrottleMs: 0`; the default waits 1 s). Measured 2026-11-02: one run each, except the larger server's write rows, which give the median of three runs and their range. To run it again: [the harness](scripts/compare/powersync/README.md).
+**Measured, same workload:** 500 clients, one Supabase database, the same table rules for both (2026-11-02).
 
-| What | ZeBridge, 6 vCPU, 24.5 ms to the database | PowerSync, same | ZeBridge, 2 vCPU, 85 ms | PowerSync, same |
-| --- | --- | --- | --- | --- |
-| 10 clients seeding the table, empty / already seeded | **0.11 s / 0.03 s** | 5.93 s / 2.03 s | **0.35 s / 0.08 s** | 14.44 s / 6.82 s |
-| One client's write reaching another, median / p95 | **120 / 133 ms** | 167 / 181 ms | **367 / 634 ms** | 487 / 1,277 ms |
-| 100,000 rows inserted in one statement, until a client holds them all | **2.70 s** | 26.14 s | **3.74 s** | 33.40 s |
-| Writes, 1 client | 395/s (380–401) | **708/s** (248–826) | **178/s** | 155/s |
-| Writes, 10 clients | **1,691/s** (1,680–1,863) | 879/s (689–1,550) | **680/s** | 298/s |
-
-**How to read it.** The gaps that hold on both servers are delivery to clients. Seeding is 40 to 70 times faster, because a ZeBridge client loads a compressed snapshot while a PowerSync client applies every operation in its bucket; the already-seeded column is an app restarting with its replica, the common case. The 100,000-row burst reaches a client about 10 times sooner, and one write reaches another client sooner, with a shorter tail. Writes are about equal in performance: PowerSync is faster with one client, ZeBridge with ten. The difference is in what a write gets: ZeBridge judges each write separately and returns a verdict for each, with exactly-once receipts and the tenant's authorization, where PowerSync uploads batches of up to 200 rows and leaves those guarantees to your backend. ZeBridge's write figures also repeat within about 10% from run to run; PowerSync's varied by a factor of two to three.
-
-A ZeBridge write counts when its verdict returns, after admission, the receipt and the commit; a PowerSync write counts when the backend has committed it and the SDK has completed the upload. Most of a write's cost is the table's own rules, for both systems: the same 100,000-row insert took 4.37 s on a plain table and 10.16 s with ZeBridge's triggers (smaller server), and an earlier PowerSync run whose backend role bypassed the tenant policy reached 2,495 writes/s with 10 clients on the larger server, despite settings that worked against it (a 1 s upload delay, its bucket storage in Dublin). During each 10-client PowerSync run, 7 to 9 client sync streams broke ("illegal end of stream in BSON object") and reconnected; no write was lost.
-
-**What it does not measure.** PowerSync was given a ready backend (PostgREST) with the same rules, so these figures compare database and transport cost. They do not measure the work of building and running that backend, which is the structural difference in the table above. PowerSync's write model is the familiar one: the app writes local SQL and your existing API applies it. ZeBridge's outbox and verdicts mean less code, but a model to learn.
-
-**A crowd of 500.** The same comparison with 500 clients at once: one server of 6 vCPU and 12 GB, 23.6 ms from the same Supabase database (60 connections), with the services and the crowd on it. The clients are light: they do each system's wire work and nothing else, since 500 real clients do not fit on one host. A ZeBridge reader fetches the chain from NATS and follows CDC without decompressing or applying; a PowerSync reader opens the sync stream as the SDK does and decodes only its control messages. PowerSync runs its production layout (one replication process, one API process per 100 connections); ZeBridge runs one bridge. Measured 2026-11-02; sync three runs each, writes one.
-
-| Sync, 500 clients starting cold | ZeBridge | PowerSync |
+| | ZeBridge | PowerSync |
 | --- | --- | --- |
-| Time until each holds the 10,000 rows, median (three runs) | **5.3 / 5.7 / 5.3 s** | 61 / 76 / 65 s |
-| Slowest client | **6.7–8.2 s** | 68–82 s |
-| Sent to each client | **0.23 MB**, one compressed snapshot | 4.63 MB, 10,000 operations |
-| One write reaching each of the 500, median | 0.4–0.8 s | 0.7–1.6 s |
+| **Delivery:** 500 clients starting cold receive the 10,000-row table, median (excluding local apply) | **5.3–5.7 s**: one shared compressed snapshot, 0.23 MB a client | 61–76 s: every operation of the bucket, 4.63 MB a client |
+| **Writes,** offered at 1,000/s / 2,000/s | 990/s, verdict median 0.69 s / 1,572/s | 879/s through PostgREST, acknowledgement median 4.8 s / 1,702/s |
+| **A write reaching every client,** one write to each of the 500, median | **0.4–0.8 s** | 0.7–1.6 s |
 
-| Writes, 500 clients, offered for 30 s | ZeBridge, 8 ingress lanes | PowerSync, PostgREST with 30 connections |
-| --- | --- | --- |
-| 500/s | 536/s committed, verdict median 0.34 s | 407/s, acknowledged median 7.4 s |
-| 1,000/s | 990/s, median 0.69 s | 879/s, median 4.8 s |
-| 2,000/s | 1,572/s, median 5.0 s | 1,702/s, median 6.4 s |
-
-Every write was committed on both sides. Connections set the write figures, within the database's 60: with ZeBridge's default 4 lanes and PostgREST's default pool of 10, the rates at 2,000/s were 983/s and 1,353/s. Under the crowd, PostgREST timed out acquiring a connection 150 to 1,000 times a run (`504`), and the apps retried until each write landed. **So writes are equivalent at 500 clients:** ZeBridge answers sooner below its ceiling, PowerSync's batches of up to 200 rows go further above it. **Delivery is where they differ:** a ZeBridge client receives one compressed snapshot that every client shares, while each PowerSync client is sent every operation of its bucket, so the server's work grows with clients times rows.
-
-**What a disconnect does to a write.** With ZeBridge, a write sent again after a lost connection meets its receipt in PostgreSQL: it is applied once, and the client receives the verdict of the first attempt. A refused write gets its own verdict. With PowerSync, the SDK keeps the write in its upload queue and calls `uploadData()` again after the reconnect; if the backend had committed it and only the reply was lost, the same operations arrive again, and PowerSync's documentation leaves it to the backend to detect them by the client's and the operation's IDs. A backend error makes the SDK retry the upload indefinitely, blocking the queue, so the documentation advises answering 2xx even for a refused write and reporting the refusal some other way, for example in a table synced back to the client. The scripts behind both tables are in [the harness](scripts/compare/powersync/README.md#a-crowd-of-500).
+The configurations, both servers' figures, what the runs do not measure, and what a disconnect does to a write in each are in [COMPARISON](COMPARISON.md).
 
 ## How it works
 
@@ -346,7 +321,7 @@ What an outage of one component does in the production layout (the [Compose](dep
 | Sweeper | Cleanup pauses; storage pressure grows with the length of the outage. |
 | Hub NATS | Hub CDC and mutation transport stop. Leaves can serve cached seeds and reachable regional responders, within the trust-staleness policy ([LEAF_NODES](LEAF_NODES.md)). |
 
-A supported deployment means restart policies and health monitoring (the Compose file sets `restart: unless-stopped`; the Ansible route runs under systemd), disk alerts, durable NATS volumes and preserved credentials, PostgreSQL backups with point-in-time recovery suited to the deployment, and a documented procedure to rebuild the hub on another machine with its recovery time measured and the data a restore can lose stated ([hub checkpoints and recovery](OPERATIONS.md#hub-checkpoints-and-recovery)). Restarting a process handles a crash; rebuilding elsewhere handles losing the server, and a drilled restore from a real backup is still open work. Automatic failover would need NATS clustering, PostgreSQL availability and explicit coordination of bridge ownership and background work; it can come if users need recovery in seconds rather than an operator-led restoration. Leaves add seeding capacity, not hub availability.
+Supervision, backups, rebuilding the hub on another machine, and what automatic failover would need: [A supported deployment](OPERATIONS.md#a-supported-deployment). Leaves add seeding capacity, not hub availability.
 
 ## Fit and boundaries
 
@@ -395,7 +370,7 @@ Each figure is one run on the hardware named, not a capacity guarantee.
 | clients → PostgreSQL | 10 clients | 1,414 writes/s |
 | clients → PostgreSQL | 50 clients, each sending 400 at once | 1,447 writes/s, median verdict 3.2 s |
 
-**What the write figures are.** They are the hub's total, shared by every tenant: all writes go through the same ingress lanes, each with one connection to PostgreSQL, so more tenants do not add capacity (more lanes or another bridge would; not measured). The runs used one tenant, which is not the designed topology but shows what one tenant can take when nothing else writes. During them PostgreSQL and the bridge were nearly idle: a batch of writes costs its round trips to the database, so the distance between the bridge and PostgreSQL sets the ceiling. 1,450 writes/s is 14,500 devices each sending one write every 10 seconds.
+**What the write figures are.** They are the hub's total, shared by every tenant: all writes go through the same ingress lanes, each with one connection to PostgreSQL, so more tenants do not add capacity. More ingress lanes can, until the database's round trips dominate: 8 lanes are measured in the comparison above. The runs used one tenant, which is not the designed topology but shows what one tenant can take when nothing else writes. During them PostgreSQL and the bridge were nearly idle: a batch of writes costs its round trips to the database, so the distance between the bridge and PostgreSQL sets the ceiling. 1,450 writes/s is 14,500 devices each sending one write every 10 seconds.
 
 **The rate limit sets what one tenant gets.** By default there is none (`MUTATION_RATE_PER_PRINCIPAL=0`), and a tenant can use the whole ceiling, as above. Set, it applies to each principal and to each tenant: at 100 per second (burst 200, this hub's setting) one tenant is held to about 100 writes/s, whatever the hub could take. These runs used 2,000 (burst 4,000) and no write was delayed. See [Write limits, as a client sees them](OPERATIONS.md#write-limits-as-a-client-sees-them).
 
@@ -407,7 +382,7 @@ Each figure is one run on the hardware named, not a capacity guarantee.
 | A client applying a busy table live | libzb ~50k events/s, zb-client-ts ~33k | one Mac, a table under a steady write load | |
 | A change reaching a replica | median 12 ms | dev stack on one Mac, libzb on the DuckDB engine | |
 | Seeding a large table on a phone | libzb 35.0 s (React Native), 70.8 s (Flutter); JavaScript client 725 s | iPhone 12, the same table | [Large table](examples/06-large-table/README.md) |
-| Client writes into PostgreSQL | ~8,500 writes/s on one ingress lane, ~19,500 on four | one Mac, PostgreSQL on the same machine | [the ramp](examples/09-event/README.md#the-ramp-how-far-one-mac-goes) |
+| Client writes into PostgreSQL | ~8,500 writes/s on one ingress lane, ~19,500 on four | one Mac, PostgreSQL on the same machine, before 0.2.7's durable mutation receipts | [the ramp](examples/09-event/README.md#the-ramp-how-far-one-mac-goes) |
 | 500 clients starting at once, empty replicas | all synced, the slowest in 8.6 to 12 s; NATS at 140–165 % CPU, about 1 MB per client; PostgreSQL under 16 % CPU; the bridge near idle | 2-vCPU, 3.7 GB VPS, clients 100 ms away | [storm](storm/README.md) |
 | One write reaching those 500 | median 288 ms, p95 491 ms (100 ms of it network) | same | |
 | NATS restarted under the 500 | none lost; half back within 6 s, the last at 23 s | same | |
@@ -416,7 +391,7 @@ Each figure is one run on the hardware named, not a capacity guarantee.
 
 A comparison with PowerSync on the same workload is in [Compared with PowerSync](#compared-with-powersync).
 
-**Not measured:** the hub's write ceiling with more than 4 ingress lanes; how long each component may stay down before recovery needs a re-seed; NATS memory at a steady load (it follows recent load, not stored data); a long network partition under load.
+**Not measured:** the production hub's write ceiling with more than 4 ingress lanes (8 were measured only on the comparison's server); how long each component may stay down before recovery needs a re-seed; NATS memory at a steady load (it follows recent load, not stored data); a long network partition under load.
 
 ## Documentation
 

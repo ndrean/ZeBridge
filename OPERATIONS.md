@@ -38,6 +38,7 @@ The reference for running ZeBridge: the CLI, the doctor (`--diagnose`), what nee
     - [The one rule](#the-one-rule)
     - [When the rule breaks](#when-the-rule-breaks)
 - [Mutation admission cutover](#mutation-admission-cutover)
+- [A supported deployment](#a-supported-deployment)
 - [Hub checkpoints and recovery](#hub-checkpoints-and-recovery)
 
 ## The CLI
@@ -883,6 +884,10 @@ bridge --mutation-ingress --check
 The script changes capture subjects only after observing an empty queue, rechecks in-flight writes before changing limits, and restores public capture if one arrived. It preserves stream identity and sequence history and removes only idle old-filter consumers. It never purges queued writes. During the brief capture gap clients receive no successful durable PubAck and retain their outbox for retry. Start admission, then restart workers with `MUTATION_ADMISSION=1`; verify an actual client write reaches PostgreSQL, echoes and clears its outbox. A published message's original PubAck comes from JetStream after private persistence. Refused-write diagnostics use a separate bounded stream; accepted writes do not expire by age.
 
 Apply the current init SQL and register `zebridge_leaf_scopes` before inviting scoped devices. Update libzb/TS query routing before tightening leaf grants. Before re-enrolling a device under a scoped identity, drain or explicitly preserve its pending local outbox; keep its old replica until that is verified. Use matching tenant lists in PostgreSQL, minted credentials and deployment settings. Prepare hub manifest projections with a running updated bridge, or `ZB_LEAF_TENANTS="demo storm" bridge --mutation-ingress --prepare-projections`. See [Leaf nodes](LEAF_NODES.md) for scoped identities, both credential replacements, legacy cache retirement and old-key revocation.
+
+## A supported deployment
+
+The supported shape is a single active hub under supervised restart ([README](README.md#scaling-and-availability)). A supported deployment means restart policies and health monitoring (the Compose file sets `restart: unless-stopped`; the Ansible route runs under systemd), disk alerts, durable NATS volumes and preserved credentials, PostgreSQL backups with point-in-time recovery suited to the deployment, and a documented procedure to rebuild the hub on another machine with its recovery time measured and the data a restore can lose stated ([Hub checkpoints and recovery](#hub-checkpoints-and-recovery)). Restarting a process handles a crash; rebuilding elsewhere handles losing the server, and a drilled restore from a real backup is still open work. Automatic failover would need NATS clustering, PostgreSQL availability and explicit coordination of bridge ownership and background work; it can come if users need recovery in seconds rather than an operator-led restoration.
 
 ## Hub checkpoints and recovery
 
