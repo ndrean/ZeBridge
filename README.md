@@ -14,7 +14,7 @@ The client library provides one interface to read the local replica, submit muta
 
 **Strongest use cases:** B2B operational apps, where each customer organisation is a tenant (a column in your schema) whose devices share a working dataset: field teams, fleets, depots, sites. They keep working on poor connections or while a team is cut off, and every write still ends with an authoritative decision from PostgreSQL. It is not built for consumer (B2C) apps with one tenant per user.
 
-**See it running: <https://bridge.zebridge.eu/demo>.** Five trucks on a map of France's 16,173 charge points. Pick a truck and a destination, and it drives along the road on every open screen; change its destination from any screen and it turns from where it is. The chargers are a query on the browser's own replica, the route comes from a routing service over the same NATS connection, and PostgreSQL holds only the decisions. Open it in two tabs, or on a phone and a laptop: each visit gets its own one-hour identity in a shared demo tenant. How it is built: [the depot example](examples/14-depot/README.md).
+**See it running: <https://bridge.zebridge.eu/demo>.** Five trucks on a map of France's 16,173 charge points. Pick a truck and a destination, and it drives along the road on every open screen; change its destination from any screen and it turns from where it is. The chargers are a query on the browser's own replica, the route comes from a routing service over the same NATS connection, and PostgreSQL holds only the decisions. Open it in two tabs, or on a phone and a laptop: each visit gets its own identity in a shared demo tenant, from a one-hour invite. How it is built: [the depot example](examples/14-depot/README.md).
 
 [Try it](#try-it-with-docker)
 [Build an app](#build-an-app)
@@ -74,7 +74,7 @@ The hub is NATS, the bridge, mutation admission and the sweeper on one server. P
 - **Docker Compose:** two files on the server. HAProxy and Let's Encrypt are included, and PostgreSQL optionally:
 
   ```sh
-  V=0.2.10
+  V=0.2.11
   mkdir zebridge && cd zebridge
   curl -fsSLO https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/compose.yml
   curl -fsSL -o .env https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/.env.example
