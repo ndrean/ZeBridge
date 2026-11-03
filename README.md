@@ -12,6 +12,8 @@ ZeBridge keeps a local database on each device, queues writes while it is offlin
 
 The client library provides one interface to read the local replica, submit mutations, and query remote responders such as routing or analytics services. Optional regional NATS leaves serve snapshot caches near devices and host those services.
 
+**Strongest use cases:** B2B operational apps, where each customer organisation is a tenant (a column in your schema) whose devices share a working dataset: field teams, fleets, depots, sites. They keep working on poor connections or while a team is cut off, and every write still ends with an authoritative decision from PostgreSQL. It is not built for consumer (B2C) apps with one tenant per user.
+
 **See it running: <https://bridge.zebridge.eu/demo>.** Five trucks on a map of France's 16,173 charge points. Pick a truck and a destination, and it drives along the road on every open screen; change its destination from any screen and it turns from where it is. The chargers are a query on the browser's own replica, the route comes from a routing service over the same NATS connection, and PostgreSQL holds only the decisions. Open it in two tabs, or on a phone and a laptop: each visit gets its own one-hour identity in a shared demo tenant. How it is built: [the depot example](examples/14-depot/README.md).
 
 [Try it](#try-it-with-docker)
