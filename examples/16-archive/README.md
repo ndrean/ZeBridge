@@ -4,7 +4,7 @@ Send sensor readings over MQTT or NATS. Query recent readings from DuckDB, and k
 
 Two processes run for each tenant:
 
-- **The archiver** reads the NATS stream with `bridge_readings_fetch`, converts each chunk to Parquet with DuckDB, and uploads it. A small Python process manages uploads and the archive manifest.
+- **The archiver** reads the NATS stream with `bridge_readings_fetch`, converts each chunk to Parquet with DuckDB, and uploads it. A small Python process manages uploads and the archive manifest. It is the standalone library [zb-archiver](../../zb-archiver/README.md); `archiver.py` here runs its command from the checkout.
 - **The responder** answers queries through libzb. Its DuckDB view combines archived files with recent readings from the stream.
 
 ## How it works
@@ -31,7 +31,7 @@ This example handles sensor messages. PostgreSQL CDC replication into DuckDB is 
 
 ## Run it
 
-You need NATS JetStream, an S3-compatible bucket, Python with `nats-py[nkeys]`, `boto3` and `duckdb`, and the native fetcher. The responder also needs [zb-python](../../zb-python) and libzb. The container images package these dependencies.
+You need NATS JetStream, an S3-compatible bucket, Python with `nats-py[nkeys]`, `boto3` and `duckdb` (or `pip install ./zb-archiver`, which brings them), and the native fetcher. The responder also needs [zb-python](../../zb-python) and libzb. The container images package these dependencies.
 
 Build the fetcher from the repository root:
 
@@ -51,7 +51,7 @@ export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 export PYTHONPATH=zb-python/src
 
-NATS_CREDS=archiver-acme.creds python3 examples/16-archive/archiver.py \
+NATS_CREDS=archiver-acme.creds zb-archiver \
   --tenant acme --fetch-bin zig-out/bin/bridge_readings_fetch --flush-s 60 &
 
 python3 examples/16-archive/responder.py \
@@ -62,13 +62,7 @@ Use a write-capable S3 key for the archiver and a read-only key for the responde
 
 The fetcher is required. Put `bridge_readings_fetch` on `PATH`, set `ZB_READINGS_FETCH`, or pass `--fetch-bin`. There is no Python reader mode.
 
-| Archiver option | Default | Purpose |
-| --- | --- | --- |
-| `--tenant` | Required | Tenant to archive |
-| `--flush-s` | 60 seconds | Start a flush after readings have waited this long |
-| `--batch` | 100,000 messages | Start earlier when a full batch is waiting; maximum messages per chunk |
-| `--outage-s` | 3,600 seconds | S3 outage allowance used in the stream-retention check |
-| `--fetch-bin` | `ZB_READINGS_FETCH` or `PATH` | Native fetcher executable |
+`python3 examples/16-archive/archiver.py` takes the same arguments without the package installed. The archiver's options, environment and exit codes are in [zb-archiver](../../zb-archiver/README.md#command).
 
 For containers, use [deploy/archiver.Dockerfile](../../deploy/archiver.Dockerfile) and [deploy/readings-responder.Dockerfile](../../deploy/readings-responder.Dockerfile). Build them with the matching release packages in `dist/<version>/`. Each Dockerfile includes its build and run commands.
 
@@ -124,7 +118,7 @@ The benchmark retains the former Python implementation as a baseline. The archiv
 - [archive.py](../../scripts/scenarios/archive.py): upload interruption, competing writers, retention loss, startup before provisioning, inaccessible files and queries during archive handover. Run with `--fetch-bin /path/to/bridge_readings_fetch`.
 - [readings_fetch.py](../../scripts/scenarios/readings_fetch.py): decoder parity with the responder, sequence gaps, skipped-only chunks, restart coverage and archived rows across chunk sizes.
 - [readings_roles.py](../../scripts/scenarios/readings_roles.py): archiver, responder and sensor permissions with real credentials.
-- `python -m unittest discover -s scripts/scenarios -p test_archive_readers.py`: coverage and manifest regressions without external services.
+- `cd zb-archiver && python -m unittest discover -s tests`: coverage, Parquet, start-up and manifest regressions without external services.
 
 ## Next steps
 

@@ -34,6 +34,8 @@ RUN apt-get update \
  && useradd --system --uid 10001 --no-create-home zbreadings \
  && mkdir -p /var/cache/zb-readings && chown 10001:10001 /var/cache/zb-readings
 COPY zb-python/src/zebridge/ /opt/zb-readings/zebridge/
+# The archive's contract and connections (common.py imports them): the zb-archiver library.
+COPY zb-archiver/src/zb_archiver/ /opt/zb-readings/zb_archiver/
 COPY examples/16-archive/responder.py examples/16-archive/common.py /opt/zb-readings/
 USER zbreadings
 WORKDIR /var/cache/zb-readings

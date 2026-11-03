@@ -1,4 +1,4 @@
-# The readings archiver of examples/16-archive as a container: one tenant's readings, from
+# The readings archiver (zb-archiver/, the example examples/16-archive) as a container: one tenant's readings, from
 # its stream READINGS_<tenant> to Parquet files in S3 (Cloudflare R2, or any S3). One
 # container per tenant, next to the NATS server that holds the stream (the hub).
 #
@@ -35,12 +35,15 @@ COPY --from=fetcher /extract/usr/bin/bridge_readings_fetch /usr/local/bin/bridge
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
- && pip install --no-cache-dir nats-py[nkeys]==2.15.0 nkeys==0.2.1 duckdb==1.5.5 boto3==1.43.112 \
  && useradd --system --uid 10001 --no-create-home zbarchiver
-COPY examples/16-archive/archiver.py examples/16-archive/common.py /opt/zb-archiver/
+# The pins first, then the package without resolving again: the image is the versions measured.
+COPY zb-archiver /tmp/zb-archiver
+RUN pip install --no-cache-dir nats-py[nkeys]==2.15.0 nkeys==0.2.1 duckdb==1.5.5 boto3==1.43.112 \
+ && pip install --no-cache-dir --no-deps /tmp/zb-archiver \
+ && rm -rf /tmp/zb-archiver
 USER zbarchiver
 WORKDIR /tmp
 # NATS_URL empty, not absent: the archiver then stops and asks for it, rather than dial
 # 127.0.0.1, which in a container is the container itself.
 ENV NATS_URL="" NATS_CREDS=/creds PYTHONUNBUFFERED=1
-ENTRYPOINT ["python", "/opt/zb-archiver/archiver.py"]
+ENTRYPOINT ["zb-archiver"]

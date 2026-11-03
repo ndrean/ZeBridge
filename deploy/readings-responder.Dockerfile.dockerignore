@@ -3,5 +3,6 @@
 *
 !dist/*/libzb_*.deb
 !zb-python/src/zebridge/*.py
+!zb-archiver/src/zb_archiver/*.py
 !examples/16-archive/responder.py
 !examples/16-archive/common.py

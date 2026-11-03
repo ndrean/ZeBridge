@@ -1,5 +1,5 @@
 //! Reads a range of one tenant's readings stream and writes it as CSV, for the archiver
-//! (examples/16-archive/archiver.py), which turns the file into Parquet with DuckDB.
+//! (zb-archiver, the `zb_archiver` Python package), which turns the file into Parquet with DuckDB.
 //!
 //!   bridge_readings_fetch --tenant acme --from 120001 --max 100000 --out /tmp/x.csv [--inbox-prefix _INBOX.archiver-acme]
 //!

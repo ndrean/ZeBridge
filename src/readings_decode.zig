@@ -10,7 +10,7 @@
 //! Anything else is not a reading: it is skipped (the stream position still moves past it), never
 //! a crash and never a guess. In particular a quoted number, a boolean, a non-finite number
 //! (`1e999`, `NaN`), an object without `ts_ms` or with a repeated key, a byte-order mark and
-//! UTF-16 are skipped. `examples/16-archive/common.py`
+//! UTF-16 are skipped. `zb-archiver/src/zb_archiver/layout.py`
 //! `reading()` applies the same rules, so the archive (this decoder, run by
 //! `bridge_readings_fetch`) and the responder's hot tail (Python) count the same readings; the
 //! scenario `readings_fetch.py` feeds both the same awkward payloads and compares.
