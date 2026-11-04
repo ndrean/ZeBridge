@@ -23,7 +23,7 @@ esac
 root=$(cd "$(dirname "$0")/.." && pwd)
 cache=${ZB_LINUX_CACHE:-$HOME/.cache/zebridge-linux-build}
 mkdir -p "$cache"
-zig=0.17.0   # the cache keeps its Zig across builds: a different version is replaced, not reused
+zig=0.17.1   # the cache keeps its Zig across builds: a different version is replaced, not reused
 
 docker run --rm --platform linux/arm64 -v "$root":/src -v "$cache":/cache debian:13-slim sh -eu -c "
 export DEBIAN_FRONTEND=noninteractive

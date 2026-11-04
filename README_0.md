@@ -5,7 +5,7 @@
 <img width="400" height="400" alt="zebridge-logo" src="https://github.com/user-attachments/assets/3b0b7c42-a94b-45ff-a9d7-274fdf26132c" />
 </p>
 
-![Zig support](https://img.shields.io/badge/Zig-0.17.0-color?logo=zig&color=%23f3ab20)  [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![Tests](https://img.shields.io/badge/tested-scenarios-green)](https://github.com/ndrean/zebridge/blob/main/TEST_SCENARIOS.md)
+![Zig support](https://img.shields.io/badge/Zig-0.17.1-color?logo=zig&color=%23f3ab20)  [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![Tests](https://img.shields.io/badge/tested-scenarios-green)](https://github.com/ndrean/zebridge/blob/main/TEST_SCENARIOS.md)
 
 **What is it?**: ZeBridge keeps many local replicas (SQLite, PGlite, PostgreSQL, DuckDB) in sync with one authoritative PostgreSQL database. It uses NATS JetStream to solve the distribution problem for offline-first applications. Clients read locally and optimistically mutate; every write is a request to PostgreSQL, which resolves it last-writer-wins and returns a verdict. Change distribution runs over NATS JetStream, so clients reconnect without a stampede on the database.
 

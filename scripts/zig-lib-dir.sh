@@ -4,10 +4,10 @@
 #
 #   zl=$(scripts/zig-lib-dir.sh); [ -z "$zl" ] || export ZIG_LIB_DIR="$zl"
 #
-# Zig 0.17.0 cannot build std.Io.Threaded for iOS (NullFile has no fd there); master's fix
-# is three lines (zig-std-patch/0.17.0-ios-threaded.patch). The copy is made once per Zig
-# version and patch set, in Zig's own cache. Delete zig-std-patch/<version>-*.patch when a
-# release carries the fix: this script then prints nothing and builds use Zig's own std.
+# Zig 0.17.1 includes the iOS Threaded fix, so it needs no patched copy. If a future
+# toolchain needs a patch, the copy is made once per Zig version and patch set, in Zig's
+# own cache. Delete zig-std-patch/<version>-*.patch when a release carries the fix: this
+# script then prints nothing and builds use Zig's own std.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 v=$(zig version)
