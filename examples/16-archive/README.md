@@ -105,10 +105,11 @@ Send requests through libzb to `query.<tenant>.<name>`:
 
 - **Upload first, publish second.** A file enters the manifest only after its upload and size check succeed. A crash before the manifest commit leaves an unused file; restart reads the same stream range again.
 - **Restart from the manifest.** `covers_up_to` records the last covered stream sequence, including skipped payloads. A skipped-only chunk advances this position without writing an empty file.
-- **Detect missing history.** A gap before or inside a chunk stops archiving. Missing messages are never marked as archived. Stream retention must cover at least two flush intervals plus `--outage-s`.
+- **Detect missing history.** A gap before or inside a chunk stops archiving, and so does a stream emptied past the archive: when purge or expiry removes every unarchived reading, the stream has no messages left but starts after `covers_up_to + 1`. Missing messages are never marked as archived. Stream retention must cover at least two flush intervals plus `--outage-s`.
 - **Reject competing writers.** Manifest updates check the revision read by the archiver. A second writer stops when its revision is stale.
 - **Count resent readings once.** The latest arrival wins for a given sensor, kind and sensor timestamp. The responder also deduplicates across files and its hot tail.
 - **Wait for provisioning.** If the tenant's stream does not exist yet, both processes wait for it.
+- **Times are instants.** `sensor_ts` and `received_at` are UTC `TIMESTAMPTZ` values, whatever the host's time zone. Before 2026-11-04, an archiver or responder on a host whose `TZ` was not UTC stored every time shifted by that zone's offset. The container images run in UTC. Files written on such a host keep the shift: rewrite them, or re-archive the stream range while it is still retained.
 
 ## Performance
 

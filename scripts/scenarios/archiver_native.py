@@ -11,6 +11,10 @@ nats-server and a local S3 (examples/16-archive, zb-archiver).
      unchanged and the next run covers the same readings again, once;
   D  two native archivers at once: one exits 0, the other 3 (the revision refused it);
   E  the stream pruned past the archive: exit 4, the manifest unchanged;
+  E2 every reading after the archive purged, the stream left EMPTY (first_seq = last_seq + 1, no
+     message): both archivers exit 4, rather than follow the stream from its next sequence and
+     certify the missing readings as covered;
+  E3 the same by expiry (max_age), the stream empty again: exit 4 from both;
   F  started before its stream exists: it says it waits, then archives;
   G  a stream that keeps readings less than 2 × flush + outage: exit 2;
   H  a wrong S3 secret: exit 1 on the upload (HTTP 403 from an S3 that checks signatures), the
@@ -21,6 +25,8 @@ nats-server and a local S3 (examples/16-archive, zb-archiver).
   L  the WebAssembly core (`zig build archive-core-wasm`, run by Node): its decoder and the
      Python one agree on readings_fetch.py's awkward and generated payloads, and its decisions
      are the native archiver's (skipped without node or the .wasm);
+  M  times are UTC on a host that is not: with TZ=Europe/Paris, both archivers store each
+     reading's sensor and stream time as the instant sent, and so does the responder's hot tail;
   K  the hosts of examples/16-archive/hosts — C, Go (cgo), Rust — each archive a tenant through
      libzbarchive (each is built here when its toolchain is on the PATH, skipped otherwise).
 
@@ -72,9 +78,57 @@ def env(**extra):
     return e
 
 
+def python_cmd(tenant, *extra):
+    return [sys.executable, str(EX / "archiver.py"), "--tenant", tenant, "--flush-s", "1", "--exit-when-idle", "3", "--outage-s", "60", *extra]
+
+
 def python_archiver(tenant, *extra, wait=True):
-    cmd = [sys.executable, str(EX / "archiver.py"), "--tenant", tenant, "--flush-s", "1", "--exit-when-idle", "3", "--outage-s", "60", *extra]
-    return run(cmd, env(), wait)
+    return run(python_cmd(tenant, *extra), env(), wait)
+
+
+async def parquet_times(nc, tenant):
+    """[[sensor ms, stream ms]] of every row of the archive, in stream order, read as instants."""
+    import duckdb
+    m, _ = await common.read_manifest(nc, tenant)
+    out = []
+    with tempfile.TemporaryDirectory() as d:
+        for f in (m or {}).get("files", []):
+            p = pathlib.Path(d) / "f.parquet"
+            common.s3().download_file(common.BUCKET, f["key"], str(p))
+            out += [list(r) for r in duckdb.sql(f"SELECT epoch_ms(sensor_ts), epoch_ms(received_at) FROM read_parquet('{p}') ORDER BY stream_seq").fetchall()]
+    return out
+
+
+async def stream_ms(js, tenant, seq):
+    """The stream's own time of one message in whole ms, truncated (what received_at must hold).
+    nats-py gives it as RFC 3339 with nanoseconds; read the digits, not a float."""
+    import calendar, datetime, re
+    t = (await js.get_msg(common.stream_for(tenant), seq)).time
+    if isinstance(t, datetime.datetime):
+        return calendar.timegm(t.utctimetuple()) * 1000 + t.microsecond // 1000
+    m = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z", t)
+    base = calendar.timegm(datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").timetuple())
+    return base * 1000 + int((m.group(2) or "0").ljust(3, "0")[:3])
+
+
+RESPONDER_PROBE = """
+import json, pathlib, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import responder
+r = responder.Readings(pathlib.Path(tempfile.mkdtemp()))
+r.add([{"tenant": "zone", "sensor_id": "s1", "kind": "temp", "value": 1.0, "sensor_ms": 1700000000000, "received_ms": 5, "stream_seq": 1},
+       {"tenant": "zone", "sensor_id": "s1", "kind": "temp", "value": 2.0, "sensor_ms": 253402300799999, "received_ms": 6, "stream_seq": 2}])
+print(json.dumps(r.query("SELECT epoch_ms(sensor_ts), stream_seq FROM readings ORDER BY stream_seq")["rows"]))
+"""
+
+
+def responder_hot_times(tenant):
+    """The responder's hot tail, filled in a child process with TZ=Europe/Paris (DuckDB takes TZ at connect)."""
+    e = env(TZ="Europe/Paris", PYTHONPATH=str(REPO / "zb-python" / "src"))
+    r = subprocess.run([sys.executable, "-c", RESPONDER_PROBE, str(EX)], env=e, capture_output=True, text=True, timeout=120)
+    if r.returncode:
+        return f"failed: {r.stderr.strip().splitlines()[-1] if r.stderr.strip() else r.returncode}"
+    return json.loads(r.stdout)
 
 
 def native_archiver(tenant, *extra, wait=True, **env_extra):
@@ -247,6 +301,39 @@ async def main(tmp):
         check(f"E the stream pruned past the archive: exit {code} — {(out + err).strip().splitlines()[-1][:110] if (out + err).strip() else ''}",
               code == 4 and rev_after == rev_before)
 
+        # E2 ── the whole unarchived suffix purged: an EMPTY stream past the archive
+        # E3 ── the same by expiry
+        for label, how in (("E2", "purge"), ("E3", "expiry")):
+            t = f"empty{how}"
+            try:
+                await js.delete_stream(common.stream_for(t))
+            except Exception:
+                pass
+            await js.add_stream(StreamConfig(name=common.stream_for(t), subjects=[common.subject_filter(t)],
+                                             max_age=(2 if how == "expiry" else 24 * 3600)))
+            await reset_archive(js, t)
+            await publish_mix(nc, t, 4, T0)                       # 1..7: four readings, a resend, two skipped
+            await settle(js, t, 7)
+            opts = ("--flush-s", "0", "--outage-s", "0.5") if how == "expiry" else ()
+            code, out, err = native_archiver(t, *opts)
+            covered, rev = await common.read_manifest(nc, t)
+            await publish_mix(nc, t, 6, T0 + 1000)                # 8..16, never archived
+            await settle(js, t, 16)
+            if how == "purge":
+                await js.purge_stream(common.stream_for(t))
+            else:
+                await asyncio.sleep(3)                            # max_age 2 s: every message expires
+            st = (await js.stream_info(common.stream_for(t))).state
+            results = {}
+            for name, run_one in (("native", native_archiver), ("python", python_archiver)):
+                code, out, err = run_one(t, *opts)
+                after, rev_after = await common.read_manifest(nc, t)
+                results[name] = (code, rev_after == rev, (out + err).strip().splitlines()[-1][:90] if (out + err).strip() else "")
+            check(f"{label} the stream {'purged' if how == 'purge' else 'expired'} past the archive ({covered and covered['covers_up_to']}), left empty (first {st.first_seq}, last {st.last_seq}, "
+                  f"{st.messages} messages): {results}",
+                  covered and covered["covers_up_to"] == 7 and st.messages == 0 and st.first_seq == 17
+                  and all(r[0] == 4 and r[1] for r in results.values()))
+
         # F ── started before its stream
         t = "early"
         try:
@@ -303,6 +390,29 @@ async def main(tmp):
         lib_debug = debug_build(LIB)
         check(f"I a Debug libzbarchive reports no leak (zba_leaks() = {leaks})" if lib_debug else "I leak check skipped: a release library checks nothing",
               leaks == 0)
+        # M ── UTC times on a host that is not UTC
+        t = "zone"
+        await common.ensure_for_tests(js, t)
+        await common.reset_tenant(js, t)
+        await nc.publish(f"sensors.{t}.s1.temp", json.dumps({"value": 1, "ts_ms": T0}).encode())
+        await nc.publish(f"sensors.{t}.s1.temp", json.dumps({"value": 2, "ts_ms": 253402300799999}).encode())
+        await nc.flush()
+        await settle(js, t, 2)
+        times = {}
+        for name, run_one in (("native", native_archiver), ("python", python_archiver)):
+            await reset_archive(js, t)
+            if name == "native":
+                code, out, err = native_archiver(t, TZ="Europe/Paris")
+            else:
+                code, out, err = run(python_cmd(t), env(TZ="Europe/Paris"), True)
+            times[name] = (code, await parquet_times(nc, t))
+        recv = [await stream_ms(js, t, seq) for seq in (1, 2)]
+        want = [[T0, recv[0]], [253402300799999, recv[1]]]
+        check(f"M with TZ=Europe/Paris both archivers store the instants sent: {times} (want {want})",
+              all(code == 0 and got == want for code, got in times.values()))
+        hot = await asyncio.to_thread(responder_hot_times, t)
+        check(f"M the responder's hot tail with TZ=Europe/Paris: {hot}", hot == [[T0, 1], [253402300799999, 2]])
+
         # L ── the WebAssembly core
         wasm_parity()
 
@@ -346,7 +456,7 @@ for (const line of fs.readFileSync(0, 'utf8').split('\n')) {
 }
 const d = {
   retention: [w.zba_retention_short(3719n * 1000000000n, 60, 3600), w.zba_retention_short(3720n * 1000000000n, 60, 3600), w.zba_retention_short(0n, 60, 3600)],
-  start: [w.zba_start_at(1, 4n, 6n, 10n, 0), w.zba_start_at(1, 4n, 6n, 10n, 1), w.zba_start_at(0, 0n, 6n, 10n, 0)].map(Number),
+  start: [w.zba_start_at(1, 4n, 6n, 0), w.zba_start_at(1, 4n, 6n, 1), w.zba_start_at(0, 0n, 6n, 0), w.zba_start_at(1, 4n, 11n, 0)].map(Number),
   chunk: [w.zba_check_chunk(0n, 0n, 0n, 0n, 0n, 0), w.zba_check_chunk(1n, 1n, 5n, 5n, 0n, 0), w.zba_check_chunk(2n, 2n, 1n, 3n, 0n, 1),
           w.zba_check_chunk(2n, 1n, 1n, 2n, 0n, 0), w.zba_check_chunk(1n, 0n, 1n, 1n, 0n, 0)],
 };
@@ -386,7 +496,7 @@ def wasm_parity():
     check(f"L the wasm decoder and the Python one: {len(payloads):,} payloads, {sum(e is not None for e in expected):,} readings, {len(diffs)} differ", not diffs)
     d = got["decisions"]
     check(f"L the wasm decisions are the native archiver's: {d}",
-          d["retention"] == [3720, 0, 0] and d["start"] == [0, 6, 6] and d["chunk"] == [0, 1, 2, 3, 4]
+          d["retention"] == [3720, 0, 0] and d["start"] == [0, 6, 6, 0] and d["chunk"] == [0, 1, 2, 3, 4]
           and d["key"] == "acme/readings/2023-11-14/000000000001-000000000003.parquet")
 
 

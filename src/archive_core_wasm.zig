@@ -32,9 +32,10 @@ export fn zba_retention_short(max_age_ns: u64, flush_s: f64, outage_s: f64) f64 
 }
 
 /// The first sequence to follow, or 0 when readings were lost (then `stream_first` names
-/// where the stream starts, and `covers + 1 .. stream_first - 1` are gone).
-export fn zba_start_at(archived: bool, covers: u64, stream_first: u64, stream_messages: u64, accept_loss: bool) u64 {
-    return switch (core.startAt(archived, covers, stream_first, stream_messages, accept_loss)) {
+/// where the stream starts, and `covers + 1 .. stream_first - 1` are gone). An empty stream
+/// whose first sequence is past `covers + 1` is a loss too (archive_core.startAt).
+export fn zba_start_at(archived: bool, covers: u64, stream_first: u64, accept_loss: bool) u64 {
+    return switch (core.startAt(archived, covers, stream_first, accept_loss)) {
         .from => |s| s,
         .lost => 0,
     };

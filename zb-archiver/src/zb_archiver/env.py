@@ -80,12 +80,14 @@ def s3(endpoint: str | None = None):
                         config=Config(s3={"addressing_style": "path"}), **kw)
 
 
-async def stream_when_there(js, tenant: str, every_s: float = 10, say=print):
+async def stream_when_there(js, tenant: str, every_s: float = 10, say=print, stop: asyncio.Event | None = None):
     """The tenant's stream, waited for: the bridge makes it when the tenant has its first row
-    in zebridge_user_tenants. Said once, then checked every `every_s` seconds."""
+    in zebridge_user_tenants. Said once, then checked every `every_s` seconds. None when
+    `stop` is set while it waits: a stopped archiver returns, it does not wait for a stream
+    that may never come."""
     from nats.js.errors import NotFoundError
     stream, said = stream_for(tenant), False
-    while True:
+    while not (stop and stop.is_set()):
         try:
             return await js.stream_info(stream)
         except NotFoundError:
@@ -94,7 +96,14 @@ async def stream_when_there(js, tenant: str, every_s: float = 10, say=print):
                     f"zebridge_user_tenants (INSERT INTO zebridge_user_tenants (principal, tenant_id) "
                     f"VALUES ('<principal>', '{tenant}')). Checking every {every_s:g} s.", flush=True)
                 said = True
-            await asyncio.sleep(every_s)
+            if stop is None:
+                await asyncio.sleep(every_s)
+            else:
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=every_s)
+                except asyncio.TimeoutError:
+                    pass
+    return None
 
 
 def fetch_files(files: list[dict], cache: pathlib.Path, bucket_name: str | None = None, client=None) -> list[pathlib.Path]:

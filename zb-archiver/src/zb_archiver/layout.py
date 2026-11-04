@@ -23,8 +23,20 @@ KV = "time_manifests"
 TABLE = "readings"
 SCHEMA = 1
 COLUMNS = "tenant VARCHAR, sensor_id VARCHAR, kind VARCHAR, value DOUBLE, sensor_ts TIMESTAMPTZ, received_at TIMESTAMPTZ, stream_seq BIGINT"
-SELECT_ROWS = ("SELECT tenant, sensor_id, kind, value, make_timestamp(sensor_ms * 1000)::TIMESTAMPTZ AS sensor_ts, "
-               "make_timestamp(received_ms * 1000)::TIMESTAMPTZ AS received_at, stream_seq")
+
+
+def utc_ts(ms_sql: str) -> str:
+    """The DuckDB expression for a TIMESTAMPTZ from milliseconds since 1970 in UTC.
+
+    `make_timestamptz(µs)` takes the instant as it is. The former
+    `make_timestamp(µs)::TIMESTAMPTZ` built a TIMESTAMP with no zone and cast it in the
+    session's TimeZone: with TZ=Europe/Paris, 1700000000000 was stored as 1699996400000. The
+    native archiver (src/archive_duckdb.zig) writes the same expression."""
+    return f"make_timestamptz(({ms_sql}) * 1000)"
+
+
+SELECT_ROWS = (f"SELECT tenant, sensor_id, kind, value, {utc_ts('sensor_ms')} AS sensor_ts, "
+               f"{utc_ts('received_ms')} AS received_at, stream_seq")
 
 # 9999-12-31T23:59:59.999Z, the last day datetime can name (readings_decode.zig, max_sensor_ms)
 MAX_SENSOR_MS = 253_402_300_799_999

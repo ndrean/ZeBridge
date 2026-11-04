@@ -17,7 +17,7 @@ except ImportError:
 from zb_archiver.env import connect, fetch_files, nats_url, principal_of, s3, stream_when_there, bucket
 from zb_archiver.layout import (COLUMNS, KV, MAX_SENSOR_MS, SCHEMA, SELECT_ROWS, STREAM_PREFIX, TABLE,
                                 manifest_key, read_manifest, reading, stream_for, stream_ms, subject_filter,
-                                write_manifest)
+                                utc_ts, write_manifest)
 
 BUCKET = bucket()
 

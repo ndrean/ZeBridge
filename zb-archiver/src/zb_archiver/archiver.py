@@ -83,7 +83,9 @@ async def run(cfg: ArchiverConfig, stop: asyncio.Event | None = None) -> ExitCod
         # The stream may not exist yet: the bridge makes it when the tenant has its first row in
         # zebridge_user_tenants. Waiting, rather than exiting, starts the archive the moment it
         # does, under Docker or systemd alike, with one line said instead of a restart loop.
-        info = await env.stream_when_there(js, cfg.tenant, say=say)
+        info = await env.stream_when_there(js, cfg.tenant, say=say, stop=stop)
+        if info is None:   # stopped while the stream did not exist yet
+            return ExitCode.STOPPED
 
         # The manifest AFTER the wait: its revision is what the first write must name, and a
         # revision read before a long wait may no longer be the latest.
@@ -100,9 +102,12 @@ async def run(cfg: ArchiverConfig, stop: asyncio.Event | None = None) -> ExitCod
                 f"(2 × flush {cfg.flush_s:.0f} s + outage {cfg.outage_s:.0f} s): raise the stream's max_age", flush=True)
             return ExitCode.RETENTION_SHORT
 
-        # Nothing may be missing between the archive and the stream.
+        # Nothing may be missing between the archive and the stream. An EMPTY stream can be the
+        # loss: purged or fully expired, it reports first_seq = last_seq + 1 with no message, and
+        # following it from there would certify the missing readings as covered. A stream that
+        # never held a message reports first_seq 0 (archive_core.startAt, the same rule).
         first = info.state.first_seq
-        if archived and info.state.messages > 0 and first > covers + 1 and not cfg.accept_loss:
+        if archived and first > covers + 1 and not cfg.accept_loss:
             say(f"🔴 the stream starts at {first}, the archive covers up to {covers}: readings "
                 f"{covers + 1}..{first - 1} are gone and no file holds them (--accept-loss to go on)", flush=True)
             return ExitCode.READINGS_LOST

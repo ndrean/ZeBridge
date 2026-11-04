@@ -112,8 +112,11 @@ pub const Db = struct {
     pub fn csvToParquet(d: *Db, gpa: std.mem.Allocator, csv_path: []const u8, parquet_path: []const u8) !u64 {
         var w: std.Io.Writer.Allocating = .init(gpa);
         defer w.deinit();
-        try w.writer.writeAll("COPY (SELECT tenant, sensor_id, kind, value, make_timestamp(sensor_ms * 1000)::TIMESTAMPTZ AS sensor_ts, " ++
-            "make_timestamp(received_ms * 1000)::TIMESTAMPTZ AS received_at, stream_seq FROM read_csv(");
+        // `make_timestamptz(µs)` is the instant itself. `make_timestamp(µs)::TIMESTAMPTZ` casts a
+        // zoneless TIMESTAMP in the session's TimeZone, so a host with TZ=Europe/Paris stored every
+        // reading an hour early. The Python writer's expression is the same (layout.utc_ts).
+        try w.writer.writeAll("COPY (SELECT tenant, sensor_id, kind, value, make_timestamptz(sensor_ms * 1000) AS sensor_ts, " ++
+            "make_timestamptz(received_ms * 1000) AS received_at, stream_seq FROM read_csv(");
         try quoted(&w.writer, csv_path);
         try w.writer.writeAll(", header=false, allow_quoted_nulls=false, columns={tenant:'VARCHAR', sensor_id:'VARCHAR', kind:'VARCHAR', " ++
             "value:'DOUBLE', sensor_ms:'BIGINT', received_ms:'BIGINT', stream_seq:'BIGINT'}) " ++

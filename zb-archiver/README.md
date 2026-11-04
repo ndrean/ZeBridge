@@ -61,7 +61,7 @@ A supervisor restarts on every exit code. Codes 2, 3 and 4 need a person to look
 import asyncio
 from zb_archiver import ArchiverConfig, ExitCode, run
 
-stop = asyncio.Event()                       # set it to stop after the current chunk
+stop = asyncio.Event()                       # set it to stop after the current chunk, or while waiting for the stream
 code = await run(ArchiverConfig(tenant="acme", flush_s=60, nats_url="tls://…",
                                 creds="archiver-acme.creds", bucket="zb-events"), stop)
 assert code in ExitCode

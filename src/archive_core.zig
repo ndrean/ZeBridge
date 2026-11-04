@@ -48,10 +48,15 @@ pub const Start = union(enum) {
     lost: struct { covers: u64, first: u64 },
 };
 
-/// `archived`: the manifest existed. A tenant with no archive yet has nothing to lose, and a
-/// stream with no message has pruned nothing the archive needs.
-pub fn startAt(archived: bool, covers: u64, stream_first: u64, stream_messages: u64, accept_loss: bool) Start {
-    if (archived and stream_messages > 0 and stream_first > covers + 1 and !accept_loss)
+/// `archived`: the manifest existed. A tenant with no archive yet has nothing to lose.
+///
+/// Readings are lost when the stream's first sequence is past `covers + 1`, whether or not
+/// the stream still holds a message: a purged or fully expired stream reports `first_seq =
+/// last_seq + 1` with no message, and following it from there would certify the missing
+/// readings as covered. A stream that never held a message reports `first_seq = 0`, which
+/// is never past `covers + 1` (the message count is not a test: an empty stream may be the loss).
+pub fn startAt(archived: bool, covers: u64, stream_first: u64, accept_loss: bool) Start {
+    if (archived and stream_first > covers + 1 and !accept_loss)
         return .{ .lost = .{ .covers = covers, .first = stream_first } };
     return .{ .from = @max(covers + 1, stream_first) };
 }
@@ -187,12 +192,22 @@ test "retention: two flushes and an outage, a stream with no age bound is enough
 }
 
 test "start: a pruned prefix is lost only for an archive that exists" {
-    try testing.expectEqual(Start{ .lost = .{ .covers = 4, .first = 6 } }, startAt(true, 4, 6, 10, false));
-    try testing.expectEqual(Start{ .from = 6 }, startAt(true, 4, 6, 10, true));
-    try testing.expectEqual(Start{ .from = 6 }, startAt(false, 0, 6, 10, false));
-    try testing.expectEqual(Start{ .from = 5 }, startAt(true, 4, 5, 10, false));
-    try testing.expectEqual(Start{ .from = 9 }, startAt(true, 4, 9, 0, false)); // an empty stream: nothing lost, follow from its next
-    try testing.expectEqual(Start{ .from = 5 }, startAt(true, 4, 2, 10, false)); // never re-read what is covered
+    try testing.expectEqual(Start{ .lost = .{ .covers = 4, .first = 6 } }, startAt(true, 4, 6, false));
+    try testing.expectEqual(Start{ .from = 6 }, startAt(true, 4, 6, true));
+    try testing.expectEqual(Start{ .from = 6 }, startAt(false, 0, 6, false));
+    try testing.expectEqual(Start{ .from = 5 }, startAt(true, 4, 5, false));
+    try testing.expectEqual(Start{ .from = 5 }, startAt(true, 4, 2, false)); // never re-read what is covered
+}
+
+test "start: a stream emptied past the archive is a loss, not a fresh start" {
+    // nats-server 2.15: 10 written then purged (or all expired) is first 11, last 10, 0 messages.
+    try testing.expectEqual(Start{ .lost = .{ .covers = 4, .first = 11 } }, startAt(true, 4, 11, false));
+    try testing.expectEqual(Start{ .from = 11 }, startAt(true, 4, 11, true));
+    // Emptied exactly at the archive's end: nothing lost.
+    try testing.expectEqual(Start{ .from = 11 }, startAt(true, 10, 11, false));
+    // Never written (first 0): nothing to lose, and the archive's next sequence is the start.
+    try testing.expectEqual(Start{ .from = 5 }, startAt(true, 4, 0, false));
+    try testing.expectEqual(Start{ .from = 1 }, startAt(false, 0, 0, false));
 }
 
 test "a chunk moves the manifest only when it is whole" {

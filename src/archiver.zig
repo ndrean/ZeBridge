@@ -275,7 +275,6 @@ pub const Archiver = struct {
 
         const max_age = info.value.config.max_age;
         const first = info.value.state.first_seq;
-        const messages = info.value.state.messages;
         info.deinit();
         if (core.retentionShort(max_age, cfg.flush_s, cfg.outage_s)) |need| {
             a.say(.err, "🔴 {s} keeps readings {d:.0} s; this archiver needs {d:.0} s (2 × flush {d:.0} s + outage {d:.0} s): raise the stream's max_age", .{
@@ -283,7 +282,7 @@ pub const Archiver = struct {
             });
             return .retention_short;
         }
-        const start = switch (core.startAt(archived, covers, first, messages, cfg.accept_loss)) {
+        const start = switch (core.startAt(archived, covers, first, cfg.accept_loss)) {
             .lost => |l| {
                 a.say(.err, "🔴 the stream starts at {d}, the archive covers up to {d}: readings {d}..{d} are gone and no file holds them (--accept-loss to go on)", .{ l.first, l.covers, l.covers + 1, l.first - 1 });
                 return .readings_lost;
