@@ -66,7 +66,9 @@ class Readings:
     def add(self, rows: list[dict]):
         with self.lock:
             self.db.executemany(
-                "INSERT INTO hot VALUES (?, ?, ?, ?, make_timestamp(? * 1000)::TIMESTAMPTZ, make_timestamp(? * 1000)::TIMESTAMPTZ, ?)",
+                # The archive's conversion (layout.utc_ts): a hot row and its Parquet copy must hold
+                # the same instant, or the view counts a reading twice across the boundary.
+                f"INSERT INTO hot VALUES (?, ?, ?, ?, {common.utc_ts('?')}, {common.utc_ts('?')}, ?)",
                 [(r["tenant"], r["sensor_id"], r["kind"], r["value"], r["sensor_ms"], r["received_ms"], r["stream_seq"]) for r in rows])
 
     def query(self, sql: str, params=()) -> dict:
@@ -87,7 +89,7 @@ async def follow(r: Readings, tenant: str, creds: str, ready: threading.Event):
     if m:
         await asyncio.to_thread(r.manifest, m)
     start = max(r.covers + 1, info.state.first_seq)
-    if info.state.messages and info.state.first_seq > r.covers + 1 and m:
+    if m and info.state.first_seq > r.covers + 1:   # an empty stream past the archive is a hole too
         print(f"⚠️ the stream starts at {info.state.first_seq}, the archive covers up to {r.covers}: a hole", flush=True)
     sub = await js.subscribe(common.subject_filter(tenant), stream=stream, ordered_consumer=True,
                              config=ConsumerConfig(deliver_policy=DeliverPolicy.BY_START_SEQUENCE, opt_start_seq=start))

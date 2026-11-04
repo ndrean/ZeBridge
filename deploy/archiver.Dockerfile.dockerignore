@@ -4,7 +4,11 @@
 !dist/
 !dist/*/
 !dist/*/zebridge_*.deb
-!examples/
-!examples/16-archive/
-!examples/16-archive/archiver.py
-!examples/16-archive/common.py
+!zb-archiver/
+!zb-archiver/pyproject.toml
+!zb-archiver/README.md
+!zb-archiver/LICENSE
+!zb-archiver/src/
+!zb-archiver/src/**
+**/__pycache__
+**/*.egg-info

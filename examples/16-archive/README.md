@@ -4,7 +4,7 @@ Send sensor readings over MQTT or NATS. Query recent readings from DuckDB, and k
 
 Two processes run for each tenant:
 
-- **The archiver** reads the NATS stream with `bridge_readings_fetch`, converts each chunk to Parquet with DuckDB, and uploads it. A small Python process manages uploads and the archive manifest.
+- **The archiver** reads the NATS stream with `bridge_readings_fetch`, converts each chunk to Parquet with DuckDB, and uploads it. A small Python process manages uploads and the archive manifest. It is the standalone library [zb-archiver](../../zb-archiver/README.md); `archiver.py` here runs its command from the checkout.
 - **The responder** answers queries through libzb. Its DuckDB view combines archived files with recent readings from the stream.
 
 ## How it works
@@ -31,7 +31,7 @@ This example handles sensor messages. PostgreSQL CDC replication into DuckDB is 
 
 ## Run it
 
-You need NATS JetStream, an S3-compatible bucket, Python with `nats-py[nkeys]`, `boto3` and `duckdb`, and the native fetcher. The responder also needs [zb-python](../../zb-python) and libzb. The container images package these dependencies.
+You need NATS JetStream, an S3-compatible bucket, Python with `nats-py[nkeys]`, `boto3` and `duckdb` (or `pip install ./zb-archiver`, which brings them), and the native fetcher. The responder also needs [zb-python](../../zb-python) and libzb. The container images package these dependencies.
 
 Build the fetcher from the repository root:
 
@@ -51,7 +51,7 @@ export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 export PYTHONPATH=zb-python/src
 
-NATS_CREDS=archiver-acme.creds python3 examples/16-archive/archiver.py \
+NATS_CREDS=archiver-acme.creds zb-archiver \
   --tenant acme --fetch-bin zig-out/bin/bridge_readings_fetch --flush-s 60 &
 
 python3 examples/16-archive/responder.py \
@@ -62,15 +62,27 @@ Use a write-capable S3 key for the archiver and a read-only key for the responde
 
 The fetcher is required. Put `bridge_readings_fetch` on `PATH`, set `ZB_READINGS_FETCH`, or pass `--fetch-bin`. There is no Python reader mode.
 
-| Archiver option | Default | Purpose |
-| --- | --- | --- |
-| `--tenant` | Required | Tenant to archive |
-| `--flush-s` | 60 seconds | Start a flush after readings have waited this long |
-| `--batch` | 100,000 messages | Start earlier when a full batch is waiting; maximum messages per chunk |
-| `--outage-s` | 3,600 seconds | S3 outage allowance used in the stream-retention check |
-| `--fetch-bin` | `ZB_READINGS_FETCH` or `PATH` | Native fetcher executable |
+`python3 examples/16-archive/archiver.py` takes the same arguments without the package installed. The archiver's options, environment and exit codes are in [zb-archiver](../../zb-archiver/README.md#command).
 
 For containers, use [deploy/archiver.Dockerfile](../../deploy/archiver.Dockerfile) and [deploy/readings-responder.Dockerfile](../../deploy/readings-responder.Dockerfile). Build them with the matching release packages in `dist/<version>/`. Each Dockerfile includes its build and run commands.
+
+## The native archiver
+
+`bridge_archiver` does the archiver's whole job in one native process, with no Python. It produces the same archive: the same files, manifest, options, exit codes and log lines as `zb-archiver`. Either can take over a tenant's archive from the other.
+
+```sh
+zig build archiver -Doptimize=ReleaseFast     # zig-out/bin/bridge_archiver, zig-out/lib/libzbarchive.so, zig-out/include/zbarchive.h
+
+NATS_CREDS=archiver-acme.creds zig-out/bin/bridge_archiver --tenant acme --flush-s 60
+```
+
+It takes the [zb-archiver options](../../zb-archiver/README.md#command), except `--fetch-bin`: it reads the stream itself. It reads the same environment variables, plus `ZB_DUCKDB_LIB`. It needs `libduckdb` at run time, from `ZB_DUCKDB_LIB`, then the loader's search, then `/usr/local/lib`. It uses no DuckDB extension and no AWS SDK: the upload is a SigV4-signed PUT, checked with a HEAD.
+
+- **From another language.** `libzbarchive` exposes the same archiver through a C ABI ([include/zbarchive.h](../../include/zbarchive.h)): `zba_open(config_json, log_callback, ctx)`, a blocking `zba_run`, `zba_stop` (safe from any thread or signal handler) and `zba_close`. [hosts/](hosts) has a host in C, one in Go (cgo) and one in Rust; each builds in one command, given at the top of its file.
+- **In WebAssembly.** `zig build archive-core-wasm` builds `zig-out/wasm/zb_archive_core.wasm`. It holds the archiver's decisions and the payload decoder, but no I/O, so a JavaScript archiver decodes and decides exactly like the native one. The functions are listed in [src/archive_core_wasm.zig](../../src/archive_core_wasm.zig).
+- **Leaks.** Debug and ReleaseSafe builds check every allocation. `bridge_archiver` reports a leak when it exits, and `zba_leaks()` counts the library handles that leaked.
+
+Measured on a 4-vCPU Linux VM: 500,000 readings took 2.33 s with the native archiver and 2.75 s with the Python one (ReleaseFast, local NATS and SeaweedFS, best of three). Both use the same reader and the same DuckDB SQL. The native archiver is about deployment more than speed: one binary to install, and a C library to call. The design is in [NOTES.md](../../NOTES.md) ("The native archiver").
 
 ## Publish and query
 
@@ -93,10 +105,11 @@ Send requests through libzb to `query.<tenant>.<name>`:
 
 - **Upload first, publish second.** A file enters the manifest only after its upload and size check succeed. A crash before the manifest commit leaves an unused file; restart reads the same stream range again.
 - **Restart from the manifest.** `covers_up_to` records the last covered stream sequence, including skipped payloads. A skipped-only chunk advances this position without writing an empty file.
-- **Detect missing history.** A gap before or inside a chunk stops archiving. Missing messages are never marked as archived. Stream retention must cover at least two flush intervals plus `--outage-s`.
+- **Detect missing history.** A gap before or inside a chunk stops archiving, and so does a stream emptied past the archive: when purge or expiry removes every unarchived reading, the stream has no messages left but starts after `covers_up_to + 1`. Missing messages are never marked as archived. Stream retention must cover at least two flush intervals plus `--outage-s`.
 - **Reject competing writers.** Manifest updates check the revision read by the archiver. A second writer stops when its revision is stale.
 - **Count resent readings once.** The latest arrival wins for a given sensor, kind and sensor timestamp. The responder also deduplicates across files and its hot tail.
 - **Wait for provisioning.** If the tenant's stream does not exist yet, both processes wait for it.
+- **Times are instants.** `sensor_ts` and `received_at` are UTC `TIMESTAMPTZ` values, whatever the host's time zone. Before 2026-11-04, an archiver or responder on a host whose `TZ` was not UTC stored every time shifted by that zone's offset. The container images run in UTC. Files written on such a host keep the shift: rewrite them, or re-archive the stream range while it is still retained.
 
 ## Performance
 
@@ -123,8 +136,9 @@ The benchmark retains the former Python implementation as a baseline. The archiv
 
 - [archive.py](../../scripts/scenarios/archive.py): upload interruption, competing writers, retention loss, startup before provisioning, inaccessible files and queries during archive handover. Run with `--fetch-bin /path/to/bridge_readings_fetch`.
 - [readings_fetch.py](../../scripts/scenarios/readings_fetch.py): decoder parity with the responder, sequence gaps, skipped-only chunks, restart coverage and archived rows across chunk sizes.
-- [readings_roles.py](../../scripts/scenarios/readings_roles.py): archiver, responder and sensor permissions with real credentials.
-- `python -m unittest discover -s scripts/scenarios -p test_archive_readers.py`: coverage and manifest regressions without external services.
+- [readings_roles.py](../../scripts/scenarios/readings_roles.py): archiver, responder and sensor permissions with real credentials, for both archivers.
+- [archiver_native.py](../../scripts/scenarios/archiver_native.py): the native archiver against the Python one: the same archive, the recovery cases, the C ABI from C, Go, Rust and ctypes, the wasm decoder, and leak checks.
+- `cd zb-archiver && python -m unittest discover -s tests`: coverage, Parquet, start-up and manifest regressions without external services.
 
 ## Next steps
 

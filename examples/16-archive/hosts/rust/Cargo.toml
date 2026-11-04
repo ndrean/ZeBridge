@@ -1,0 +1,9 @@
+[package]
+name = "zba-rust"
+version = "0.2.11"
+edition = "2021"
+publish = false
+
+# The native archiver from Rust: src/main.rs. No crates; libzbarchive is linked from
+# ZBARCHIVE_LIB_DIR (build.rs), zig-out/lib by default.
+[dependencies]

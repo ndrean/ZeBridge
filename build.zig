@@ -181,6 +181,90 @@ pub fn build(b: *std.Build) void {
     const fetch_step = b.step("readings-fetch", "Build only bridge_readings_fetch (the archiver's stream reader)");
     fetch_step.dependOn(&b.addInstallArtifact(fetch_exe, .{}).step);
 
+    // The native readings archiver (archiver.zig): the reader above in-process, DuckDB for
+    // the Parquet (opened at run time, from libzb's vendored header — no link, no extension),
+    // SigV4 S3 over std.http. Two artifacts over one module: the command `bridge_archiver`
+    // and the C ABI `libzbarchive` (include/zbarchive.h) for Go, Rust, Python, Swift hosts.
+    // Neither needs libpq or zstd; neither is part of libzbcore (a mobile client never carries it).
+    const duck_tc = b.addTranslateC(.{
+        .root_source_file = b.path("src/duckdb_includes.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    duck_tc.addIncludePath(b.path("libzb/include-engines"));
+    const duck_mod = duck_tc.createModule();
+    const archiver_imports: []const std.Build.Module.Import = &.{
+        .{ .name = "nats", .module = nats_mod },
+        .{ .name = "duckdb", .module = duck_mod },
+    };
+    const archiver_exe = b.addExecutable(.{
+        .name = "bridge_archiver",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bridge_archiver.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = archiver_imports,
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(archiver_exe);
+    const archiver_lib = b.addLibrary(.{
+        .name = "zbarchive",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/archiver_capi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = archiver_imports,
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(archiver_lib);
+    b.getInstallStep().dependOn(&b.addInstallFile(b.path("include/zbarchive.h"), "include/zbarchive.h").step);
+    const archiver_step = b.step("archiver", "Build only bridge_archiver and libzbarchive (the native readings archiver)");
+    archiver_step.dependOn(&b.addInstallArtifact(archiver_exe, .{}).step);
+    archiver_step.dependOn(&b.addInstallArtifact(archiver_lib, .{}).step);
+    archiver_step.dependOn(&b.addInstallFile(b.path("include/zbarchive.h"), "include/zbarchive.h").step);
+
+    // `zig build archive-core-wasm` — the archiver's decisions and the payload decoder for a
+    // WebAssembly host (src/archive_core_wasm.zig): wasm32, no I/O. Not part of the default build.
+    const archive_wasm = b.addExecutable(.{
+        .name = "zb_archive_core",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/archive_core_wasm.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    archive_wasm.entry = .disabled;
+    archive_wasm.rdynamic = true;
+    const archive_wasm_step = b.step("archive-core-wasm", "Build ONLY the archiver's core for WebAssembly (zig-out/wasm/zb_archive_core.wasm)");
+    archive_wasm_step.dependOn(&b.addInstallArtifact(archive_wasm, .{ .dest_dir = .{ .override = .{ .custom = "wasm" } } }).step);
+
+    // `zig build test-archiver` — the archiver's unit tests (no NATS, S3 or DuckDB needed).
+    const archiver_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/archiver_capi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = archiver_imports,
+            .link_libc = true,
+        }),
+    });
+    const archiver_core_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/archiver.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = archiver_imports,
+            .link_libc = true,
+        }),
+    });
+    const archiver_test_step = b.step("test-archiver", "Run the readings archiver's unit tests");
+    archiver_test_step.dependOn(&b.addRunArtifact(archiver_tests).step);
+    archiver_test_step.dependOn(&b.addRunArtifact(archiver_core_tests).step);
+
     // `zig build sweeper` — the sidecar alone. The default step installs both binaries
     // and `run-gc` depends on the whole install, so a loop that only touches
     // src/bridge_sweeper.zig was paying for the bridge's compile every time.
@@ -233,6 +317,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(archiver_test_step);
 
     // The vendored NATS test steps (`test-nats`, `test-nats-integration`) are gone with
     // src/nats_vendor/. The library is a dependency now and carries its own suite:

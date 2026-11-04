@@ -1,0 +1,31 @@
+[project]
+name = "zb-archiver"
+version = "0.2.11"
+description = "ZeBridge sensor readings, from a NATS JetStream stream into Parquet files in S3"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["nats-py[nkeys]>=2.15", "duckdb>=1.5", "boto3>=1.40"]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["nats", "jetstream", "parquet", "duckdb", "s3", "r2", "sensors", "archive"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Topic :: Database",
+]
+
+[project.scripts]
+zb-archiver = "zb_archiver.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ndrean/zebridge"
+Documentation = "https://github.com/ndrean/zebridge/blob/main/zb-archiver/README.md"
+Issues = "https://github.com/ndrean/zebridge/issues"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
