@@ -25,7 +25,7 @@ responder answers from the Parquet files the manifest names plus the stream afte
 Needs: the dev stack (NATS), local S3 (SeaweedFS on 127.0.0.1:8333, keys in
 ~/.config/zebridge/s3.json), boto3 and duckdb in the venv.
 
-Usage:  scripts/scenarios/.venv/bin/python scripts/scenarios/archive.py
+Usage:  scripts/scenarios/.venv/bin/python scripts/scenarios/archive.py [--fetch-bin PATH] [--archiver-bin zig-out/bin/bridge_archiver]
 """
 import argparse, asyncio, json, os, pathlib, subprocess, sys, time
 
@@ -45,8 +45,13 @@ ENV = dict(os.environ, NATS_URL=zb.nats_server(), NATS_CREDS=zb.creds_for("bridg
            PYTHONPATH=str(REPO / "zb-python" / "src"))
 
 
+ARCHIVER_BIN = None   # --archiver-bin: the native bridge_archiver in archiver.py's place (same options, codes, lines)
+
+
 def archiver(*extra, wait=True):
-    cmd = [PY, str(EX / "archiver.py"), "--tenant", TENANT, "--flush-s", "1", "--exit-when-idle", "3", *ARCHIVER_OPTIONS, *extra]
+    head = [ARCHIVER_BIN] if ARCHIVER_BIN else [PY, str(EX / "archiver.py")]
+    opts = [] if ARCHIVER_BIN else ARCHIVER_OPTIONS   # the native archiver reads in-process: no fetcher
+    cmd = [*head, "--tenant", TENANT, "--flush-s", "1", "--exit-when-idle", "3", *opts, *extra]
     if not wait:
         return subprocess.Popen(cmd, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     r = subprocess.run(cmd, env=ENV, capture_output=True, text=True, timeout=120)
@@ -240,11 +245,13 @@ async def main() -> int:
 
 def configure_archive(argv=None):
     """Pass the native fetcher to every subprocess, including the crash and competing writers."""
-    global ARCHIVER_OPTIONS
+    global ARCHIVER_OPTIONS, ARCHIVER_BIN
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fetch-bin", help="path to bridge_readings_fetch (or set ZB_READINGS_FETCH)")
+    parser.add_argument("--archiver-bin", help="run the native bridge_archiver (zig-out/bin/bridge_archiver) instead of archiver.py")
     args = parser.parse_args(argv)
     ARCHIVER_OPTIONS = []
+    ARCHIVER_BIN = args.archiver_bin
     if args.fetch_bin:
         ARCHIVER_OPTIONS += ["--fetch-bin", args.fetch_bin]
     return args

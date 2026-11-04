@@ -10,7 +10,7 @@ has a responder that does, and explains the whole pipeline.
 pip install ./zb-archiver        # from a checkout; Python 3.10 or later
 ```
 
-It depends on `nats-py[nkeys]`, `duckdb` and `boto3`. It also needs the native fetcher
+It depends on `nats-py[nkeys]`, `duckdb` and `boto3`. A native archiver with no Python (`bridge_archiver`, and `libzbarchive` for a C, Go, Rust or Swift host) writes the same archive and can replace this package: see [the example](https://github.com/ndrean/zebridge/blob/main/examples/16-archive/README.md#the-native-archiver). It also needs the native fetcher
 `bridge_readings_fetch`, which is built with the bridge (`zig build readings-fetch -Doptimize=ReleaseFast`)
 and ships in the `zebridge` package. It finds the fetcher through `--fetch-bin` / `fetch_bin`,
 then `ZB_READINGS_FETCH`, then `PATH`. The archiver has no Python reader.

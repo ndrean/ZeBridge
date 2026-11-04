@@ -66,6 +66,24 @@ The fetcher is required. Put `bridge_readings_fetch` on `PATH`, set `ZB_READINGS
 
 For containers, use [deploy/archiver.Dockerfile](../../deploy/archiver.Dockerfile) and [deploy/readings-responder.Dockerfile](../../deploy/readings-responder.Dockerfile). Build them with the matching release packages in `dist/<version>/`. Each Dockerfile includes its build and run commands.
 
+## The native archiver
+
+`bridge_archiver` does the archiver's whole job in one native process, with no Python. It produces the same archive: the same files, manifest, options, exit codes and log lines as `zb-archiver`. Either can take over a tenant's archive from the other.
+
+```sh
+zig build archiver -Doptimize=ReleaseFast     # zig-out/bin/bridge_archiver, zig-out/lib/libzbarchive.so, zig-out/include/zbarchive.h
+
+NATS_CREDS=archiver-acme.creds zig-out/bin/bridge_archiver --tenant acme --flush-s 60
+```
+
+It takes the [zb-archiver options](../../zb-archiver/README.md#command), except `--fetch-bin`: it reads the stream itself. It reads the same environment variables, plus `ZB_DUCKDB_LIB`. It needs `libduckdb` at run time, from `ZB_DUCKDB_LIB`, then the loader's search, then `/usr/local/lib`. It uses no DuckDB extension and no AWS SDK: the upload is a SigV4-signed PUT, checked with a HEAD.
+
+- **From another language.** `libzbarchive` exposes the same archiver through a C ABI ([include/zbarchive.h](../../include/zbarchive.h)): `zba_open(config_json, log_callback, ctx)`, a blocking `zba_run`, `zba_stop` (safe from any thread or signal handler) and `zba_close`. [hosts/](hosts) has a host in C, one in Go (cgo) and one in Rust; each builds in one command, given at the top of its file.
+- **In WebAssembly.** `zig build archive-core-wasm` builds `zig-out/wasm/zb_archive_core.wasm`. It holds the archiver's decisions and the payload decoder, but no I/O, so a JavaScript archiver decodes and decides exactly like the native one. The functions are listed in [src/archive_core_wasm.zig](../../src/archive_core_wasm.zig).
+- **Leaks.** Debug and ReleaseSafe builds check every allocation. `bridge_archiver` reports a leak when it exits, and `zba_leaks()` counts the library handles that leaked.
+
+Measured on a 4-vCPU Linux VM: 500,000 readings took 2.33 s with the native archiver and 2.75 s with the Python one (ReleaseFast, local NATS and SeaweedFS, best of three). Both use the same reader and the same DuckDB SQL. The native archiver is about deployment more than speed: one binary to install, and a C library to call. The design is in [NOTES.md](../../NOTES.md) ("The native archiver").
+
 ## Publish and query
 
 Publish on `sensors.<tenant>.<sensor>.<kind>`, for example `sensors.acme.truck42.temperature`. The payload is either:
@@ -117,7 +135,8 @@ The benchmark retains the former Python implementation as a baseline. The archiv
 
 - [archive.py](../../scripts/scenarios/archive.py): upload interruption, competing writers, retention loss, startup before provisioning, inaccessible files and queries during archive handover. Run with `--fetch-bin /path/to/bridge_readings_fetch`.
 - [readings_fetch.py](../../scripts/scenarios/readings_fetch.py): decoder parity with the responder, sequence gaps, skipped-only chunks, restart coverage and archived rows across chunk sizes.
-- [readings_roles.py](../../scripts/scenarios/readings_roles.py): archiver, responder and sensor permissions with real credentials.
+- [readings_roles.py](../../scripts/scenarios/readings_roles.py): archiver, responder and sensor permissions with real credentials, for both archivers.
+- [archiver_native.py](../../scripts/scenarios/archiver_native.py): the native archiver against the Python one: the same archive, the recovery cases, the C ABI from C, Go, Rust and ctypes, the wasm decoder, and leak checks.
 - `cd zb-archiver && python -m unittest discover -s tests`: coverage, Parquet, start-up and manifest regressions without external services.
 
 ## Next steps

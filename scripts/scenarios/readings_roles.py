@@ -12,7 +12,8 @@ and a responder, and tries what each may and may not do:
      tenant's stream and manifest, and any stream admin, are refused;
   R  a RESPONDER reads its tenant's stream and manifest, and cannot write the manifest;
   P  the real examples/16-archive programs inside those grants: archiver.py with an
-     archiver credential archives every reading to S3 using bridge_readings_fetch, and
+     archiver credential archives every reading to S3 using bridge_readings_fetch, the native
+     bridge_archiver continues that archive with the same credential (P1n), and
      responder.py with a responder credential answers the
      count from Parquet (needs local S3, boto3 and duckdb);
   U  an operator.store from before these roles: `--init-nats --update` adds the two keys,
@@ -239,6 +240,25 @@ async def programs(tmp, js, arch, resp):
           f"P1 archiver.py with the archiver credential: exit {r.returncode}, {sum(f['rows'] for f in m['files']) if m else 0} rows archived for 200")
     if r.returncode != 0:
         print(r.stdout[-800:], r.stderr[-800:])
+    # P1n: the native archiver (bridge_archiver, archiver.zig) inside the same grants: its own
+    # inbox from the creds, a direct get of the exact manifest key, the guarded publish. It
+    # continues the archive P1 wrote, so 50 more readings land in one more file.
+    native = zb.ROOT / "zig-out" / "bin" / "bridge_archiver"
+    archived = 200
+    if native.is_file():
+        for i in range(50):
+            await js.publish(f"sensors.acme.s{i % 4}.temperature", json.dumps({"value": i, "ts_ms": 1_700_000_100_000 + i}).encode())
+        r = subprocess.run([str(native), "--tenant", "acme", "--flush-s", "1", "--exit-when-idle", "3", "--outage-s", "60"],
+                           env=dict(env, NATS_CREDS=str(arch)), capture_output=True, text=True, timeout=120)
+        m = (await common.read_manifest(await common.connect(str(arch)), "acme"))[0]
+        check(r.returncode == 0 and m and sum(f["rows"] for f in m["files"]) == 250 and len(m["files"]) == 2,
+              f"P1n bridge_archiver with the archiver credential: exit {r.returncode}, {sum(f['rows'] for f in m['files']) if m else 0} rows archived for 250")
+        if r.returncode != 0:
+            print(r.stdout[-800:], r.stderr[-800:])
+        await js.purge_stream("READINGS_acme")   # P2 counts the archive alone
+        archived = 250
+    else:
+        print(f"  · P1n skipped: no {native} (zig build archiver)")
     cache = tmp / "resp-cache"
     p = subprocess.Popen([sys.executable, str(ex / "responder.py"), "--tenant", "acme", "--creds", str(resp), "--cache", str(cache),
                           "--queue", "probe"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -257,9 +277,9 @@ async def programs(tmp, js, arch, resp):
     finally:
         p.terminate()
         out = p.communicate(timeout=10)[0]
-    check(answer.get("rows") == 200 and answer.get("hot") == 0,
+    check(answer.get("rows") == archived and answer.get("hot") == 0,
           f"P2 responder.py with the responder credential answers from Parquet: {answer}")
-    if answer.get("rows") != 200:
+    if answer.get("rows") != archived:
         print(out[-1500:])
 
 

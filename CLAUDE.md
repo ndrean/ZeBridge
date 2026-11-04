@@ -12,7 +12,7 @@ fully current — **Zig is 0.17** everywhere, and any mention of 0.16 is stale.
 | `src/`               | The bridge (Zig): logical replication → CDC streams, generation producer (`generation_producer.zig`), RLS guard (`rls_guard.zig`), mutation admission, HTTP/metrics, `--init-sql`, `--init-nats`, `--diagnose`. `grammar.json` names buckets, streams, subjects.                              |
 | `libzb/`             | The native client (Zig, C ABI, shared library `libzbcore`): `client.zig` (sync, seed, tail, fence, frontiers), `core.zig` (pure decisions, shared with TypeScript), `transport.zig`, `capi.zig`. Wrappers: `zb-python/`, `zb-dart/`, `zb-android/`, `zb-react-native/`, Swift in `examples/`. |
 | `zb-client-ts/`      | The TypeScript client (`src/libzb.ts` is the whole shell; `src/fence.ts` the pure fence decision; `src/core.ts` wraps `wasm/zb_core.wasm`, built from libzb's `core.zig`).                                                                                                                    |
-| `zb-archiver/`       | The readings archiver as a Python package (`zb_archiver`, command `zb-archiver`): stream `READINGS_<tenant>` → `bridge_readings_fetch` → DuckDB Parquet → S3 → manifest (KV `time_manifests`). `layout.py` is the archive's contract, shared with readers (`examples/16-archive` re-exports it in `common.py`). |
+| `zb-archiver/`       | The readings archiver as a Python package (`zb_archiver`, command `zb-archiver`): stream `READINGS_<tenant>` → `bridge_readings_fetch` → DuckDB Parquet → S3 → manifest (KV `time_manifests`). `layout.py` is the archive's contract, shared with readers (`examples/16-archive` re-exports it in `common.py`). Its native twin is `src/archiver.zig` (`bridge_archiver`, C ABI `libzbarchive`, `include/zbarchive.h`; decisions in `archive_core.zig`, also built to wasm): same archive, same exit codes and log lines. |
 | `scripts/scenarios/` | The functional tests that matter. Python scenarios that start real Postgres databases, nats-servers and bridges. `README.md` there, `run.py` sequences groups.                                                                                                                                |
 | `nats.zig/`          | Git submodule: the fork `ndrean/nats.zig`, branch `zebridge` (upstream plus our patches, one commit each; ledger `NATS_ZIG_NOTES.md` in the fork). Nothing is applied at build time; `nats.zig-patch/` is a retired README.                                                                   |
 | `HANDOFF.md`         | A dated snapshot of open work and blockers; read it first if it exists, delete it when its items close.                                                                                                                                                                                       |
@@ -26,6 +26,7 @@ with the same words in the log lines, because the scenarios grep them.
 ```sh
 zig build                                   # the bridge (add -Doptimize=ReleaseFast for the scenarios)
 zig build test --summary all                # bridge unit tests (a few need a live PostgreSQL / are skipped)
+zig build archiver test-archiver -fincremental   # the native readings archiver (Debug: leaks are reported) and its unit tests
 cd libzb && zig build test --summary all    # libzb unit tests
 cd libzb && zig build -Doptimize=ReleaseFast                       # libzb/zig-out/lib/libzbcore.so
 cd libzb && zig build -Doptimize=ReleaseFast -Dtest-faults=true -p zig-out-faults   # fault-hook build (see below)
@@ -34,6 +35,8 @@ cd zb-client-ts && pnpm typecheck && pnpm test    # node:test with node:sqlite; 
 ```
 
 - The Zig test runner **fails a test that logs at `err`**: use `log.warn` for conditions a test provokes.
+- Zig **0.17.0**, not 0.17.1: 0.17.1 hashes a package with no `build.zig.zon` differently, so libzb's SQLite and zstd pins
+  fail with `hash mismatch` (NOTES "The native archiver").
 - A sandbox may block Zig's HTTP/archive fetch. Fetch dependencies with `git clone`, `git archive` to a tarball and
   `zig fetch ./x.tar.gz`; the hashes match. `libzb/build.zig.zon` may be locally trimmed in such a sandbox — check
   `git ls-files -v libzb/build.zig.zon` (an `S` means skip-worktree) before committing anything under `libzb/`.
@@ -63,6 +66,9 @@ lists only what differs.
 - `gc_isolation.py` — the GC floor: competing sweepers, lock-owner failure, rollback and retention increase, a delayed write racing with reaping (private stack).
 
 - `readings_fetch.py` — the archiver's native reader (`bridge_readings_fetch`) against `common.reading()`: same payload contract, chunks, empty/missing/pruned stream, and the native-only archiver across chunk sizes (bare nats-server; a local SeaweedFS for the last case). `readings_roles.py` P1 runs it inside the real archiver grants.
+
+- `archiver_native.py` — the native readings archiver against the Python one (same archive, recovery cases, C/Go/Rust/ctypes hosts,
+  the wasm decoder, no leak in a Debug build); a bare nats-server and a local S3 on :8333.
 
 - `walls.py` — the fixed limits at their edge, in bytes (the longest supported tenant and table, a tenant over the limit refused by the database / dropped and counted, `--diagnose` on stored values, an error escaping the loop ends the process, SIGTERM on an idle bridge); case E needs the bridge fault build (`-Dtest-faults=true -p zig-out-faults`, hook `ZB_TEST_LOOP_ERROR`).
 
