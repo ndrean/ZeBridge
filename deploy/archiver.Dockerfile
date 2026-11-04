@@ -1,10 +1,11 @@
-# The readings archiver (zb-archiver/, the example examples/16-archive) as a container: one tenant's readings, from
+# The native readings archiver (bridge_archiver, examples/16-archive): one tenant's readings, from
 # its stream READINGS_<tenant> to Parquet files in S3 (Cloudflare R2, or any S3). One
 # container per tenant, next to the NATS server that holds the stream (the hub).
 #
 # Build from the repository's root with the current release's .deb in dist/<version>/:
 #
 #   docker build -f deploy/archiver.Dockerfile --build-arg VERSION=<version> -t zb-archiver .
+#   scripts/scenarios/.venv/bin/python deploy/test-archiver-image.py zb-archiver
 #
 # Run it with an archiver's creds (bridge --mint-archiver --tenant acme) mounted, the NATS
 # server and the S3 settings. It holds no state: its position is the manifest in NATS KV, so
@@ -22,28 +23,36 @@
 # (the stream keeps readings too briefly, another archiver runs for this tenant, readings were
 # lost) — Docker restarts those too, so watch bridge_archive_lag_messages and the logs.
 
-# Extract only the fetcher; the archiver does not need PostgreSQL or the bridge service.
-FROM debian:13-slim AS fetcher
+# Extract only the native command; it needs neither PostgreSQL nor Python.
+FROM debian:13-slim AS archiver
 ARG VERSION
 ARG TARGETARCH
 COPY dist/${VERSION}/zebridge_${VERSION}_${TARGETARCH}.deb /tmp/zebridge.deb
 RUN dpkg-deb -x /tmp/zebridge.deb /extract \
- && test -x /extract/usr/bin/bridge_readings_fetch
+ && test -x /extract/usr/bin/bridge_archiver
 
-FROM python:3.13-slim
-COPY --from=fetcher /extract/usr/bin/bridge_readings_fetch /usr/local/bin/bridge_readings_fetch
+# DuckDB's official C library, pinned independently of the bridge release.
+FROM debian:13-slim AS duckdb
+ARG TARGETARCH
+ARG DUCKDB_VERSION=1.5.5
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates curl unzip \
+ && case "$TARGETARCH" in amd64|arm64) ;; *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; esac \
+ && curl -fsSL -o /tmp/duckdb.zip "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/libduckdb-linux-${TARGETARCH}.zip" \
+ && unzip -j /tmp/duckdb.zip libduckdb.so -d /out
+
+FROM debian:13-slim
+COPY --from=archiver /extract/usr/bin/bridge_archiver /usr/local/bin/bridge_archiver
+COPY --from=duckdb /out/libduckdb.so /usr/local/lib/libduckdb.so
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
+ && ldconfig \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --no-create-home zbarchiver
-# The pins first, then the package without resolving again: the image is the versions measured.
-COPY zb-archiver /tmp/zb-archiver
-RUN pip install --no-cache-dir nats-py[nkeys]==2.15.0 nkeys==0.2.1 duckdb==1.5.5 boto3==1.43.112 \
- && pip install --no-cache-dir --no-deps /tmp/zb-archiver \
- && rm -rf /tmp/zb-archiver
+COPY --chmod=755 deploy/archiver-entrypoint.sh /usr/local/bin/archiver-entrypoint
 USER zbarchiver
 WORKDIR /tmp
 # NATS_URL empty, not absent: the archiver then stops and asks for it, rather than dial
 # 127.0.0.1, which in a container is the container itself.
-ENV NATS_URL="" NATS_CREDS=/creds PYTHONUNBUFFERED=1
-ENTRYPOINT ["zb-archiver"]
+ENV NATS_URL="" NATS_CREDS=/creds ZB_DUCKDB_LIB=/usr/local/lib/libduckdb.so
+ENTRYPOINT ["/usr/local/bin/archiver-entrypoint"]

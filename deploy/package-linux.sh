@@ -59,17 +59,22 @@ EOF
 
 # ── zebridge: the bridge and the sweeper ──────────────────────────────────────────
 z="$stage/zebridge-$version-linux-$arch"
-mkdir -p "$z/bin" "$z/examples"
-cp "$bin/bridge" "$bin/bridge_sweeper" "$bin/bridge_readings_fetch" "$z/bin/"
+mkdir -p "$z/bin" "$z/lib" "$z/include" "$z/examples"
+cp "$bin/bridge" "$bin/bridge_sweeper" "$bin/bridge_readings_fetch" "$bin/bridge_archiver" "$z/bin/"
+cp "$root/zig-out/linux-$arch/lib/libzbarchive.so" "$z/lib/"
+cp "$root/zig-out/linux-$arch/include/zbarchive.h" "$z/include/"
 cp "$root/LICENSE" "$z/"
 unit "PostgreSQL to NATS" /usr/bin/bridge "network-online.target nats.service" 5 > "$z/examples/zebridge.service"
 unit "tombstone sweeper" /usr/bin/bridge_sweeper "zebridge.service" 30 > "$z/examples/zebridge-sweeper.service"
 cat > "$z/README.txt" <<EOF
-ZeBridge $version for Linux ($arch): the bridge and the sweeper.
+ZeBridge $version for Linux ($arch): the bridge, sweeper, readings fetcher and native archiver.
 
 Needs glibc 2.35 or later (Ubuntu 22.04+, Debian 12+), libpq 14 or later and libzstd:
     sudo apt install libpq5 libzstd1
 The .deb package installs these for you.
+bridge_archiver and lib/libzbarchive.so also need libduckdb at run time (install it,
+or set ZB_DUCKDB_LIB to its path). They need no PostgreSQL connection.
+include/zbarchive.h is the archiver's C ABI; link a host with -lzbarchive.
 
     bin/bridge --version
     bin/bridge --help
@@ -108,8 +113,10 @@ done
 # ── .deb, built with dpkg-deb in a Debian container ──────────────────────────────
 triplet="$arch-linux-gnu"
 zd="$stage/deb-zebridge"
-mkdir -p "$zd/DEBIAN" "$zd/usr/bin" "$zd/usr/share/doc/zebridge/examples"
-cp "$z/bin/bridge" "$z/bin/bridge_sweeper" "$z/bin/bridge_readings_fetch" "$zd/usr/bin/"
+mkdir -p "$zd/DEBIAN" "$zd/usr/bin" "$zd/usr/lib/$triplet" "$zd/usr/include" "$zd/usr/share/doc/zebridge/examples"
+cp "$z/bin/"* "$zd/usr/bin/"
+cp "$z/lib/libzbarchive.so" "$zd/usr/lib/$triplet/"
+cp "$z/include/zbarchive.h" "$zd/usr/include/"
 cp "$z/examples/"*.service "$zd/usr/share/doc/zebridge/examples/"
 cp "$root/LICENSE" "$zd/usr/share/doc/zebridge/copyright"
 cp "$z/README.txt" "$zd/usr/share/doc/zebridge/"
@@ -125,8 +132,12 @@ Homepage: https://github.com/ndrean/zebridge
 Description: PostgreSQL to NATS JetStream bridge, for offline-first replicas
  The bridge streams PostgreSQL logical replication to NATS JetStream and applies
  the clients' writes back to PostgreSQL. bridge_sweeper reaps old tombstones.
+ bridge_archiver archives sensor readings to Parquet in S3; it loads libduckdb
+ at run time. libzbarchive.so and zbarchive.h expose the same archiver to C hosts.
  Example systemd units are in /usr/share/doc/zebridge/examples.
 EOF
+
+printf 'activate-noawait ldconfig\n' > "$zd/DEBIAN/triggers"
 
 ld="$stage/deb-libzb"
 mkdir -p "$ld/DEBIAN" "$ld/usr/lib/$triplet" "$ld/usr/include" "$ld/usr/bin" "$ld/usr/share/doc/libzb"

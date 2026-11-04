@@ -1,8 +1,8 @@
 #!/bin/sh
 # Install the release on clean Debian and Ubuntu containers and check it runs:
-#   apt installs both .deb (and their dependencies), every binary prints its version,
-#   no library is missing, Python loads libzbcore.so, a C program builds against zb.h,
-#   and the tarball works on its own.
+#   apt installs both .deb (and their dependencies), bridge/sweeper/responder print their versions,
+#   no library is missing, Python loads libzbcore.so, C hosts build against zb.h and zbarchive.h,
+#   and both tarballs work on their own. The archiver's S3 path is test-archiver-image.py.
 #
 #   deploy/test-linux.sh                 # every image, both architectures
 #   deploy/test-linux.sh arm64           # one architecture
@@ -30,7 +30,9 @@ for a in $archs; do
       test \"\$(bridge --version)\" = 'bridge $version'
       test \"\$(bridge_sweeper --version)\" = 'bridge_sweeper $version'
       test \"\$(zb-respond --version)\" = 'zb-respond $version'
-      for f in /usr/bin/bridge /usr/bin/bridge_sweeper /usr/bin/zb-respond /usr/lib/$arch-linux-gnu/libzbcore.so; do
+      test -x /usr/bin/bridge_archiver
+      test -f /usr/include/zbarchive.h
+      for f in /usr/bin/bridge /usr/bin/bridge_sweeper /usr/bin/bridge_archiver /usr/bin/zb-respond /usr/lib/$arch-linux-gnu/libzbcore.so /usr/lib/$arch-linux-gnu/libzbarchive.so; do
         if ldd \$f | grep -q 'not found'; then echo \"missing library for \$f\"; ldd \$f; exit 1; fi
       done
       bridge --help | grep -q -- '--diagnose'
@@ -57,10 +59,25 @@ int main(void) {
 }
 EOF
       gcc -Wall -Wextra -o /tmp/smoke /tmp/smoke.c -lzbcore && /tmp/smoke
+      cat > /tmp/archive.c <<'EOF'
+#include <stddef.h>
+#include <zbarchive.h>
+int main(void) {
+    if (zba_abi_version() != 1) return 1;
+    zba_t *a = zba_open(\"{\\\"tenant\\\":\\\"smoke\\\"}\", NULL, NULL);
+    if (!a) return 2;
+    zba_close(a);
+    return zba_leaks() != 0;
+}
+EOF
+      gcc -Wall -Wextra -o /tmp/archive /tmp/archive.c -lzbarchive && /tmp/archive
       # the tarball, on its own
       mkdir /tmp/t && cd /tmp/t
       tar -xzf /dist/zebridge-$version-linux-$arch.tar.gz && tar -xzf /dist/libzb-$version-linux-$arch.tar.gz
       test \"\$(./zebridge-$version-linux-$arch/bin/bridge --version)\" = 'bridge $version'
+      test -x ./zebridge-$version-linux-$arch/bin/bridge_archiver
+      gcc -Wall -Wextra -o archive /tmp/archive.c -Izebridge-$version-linux-$arch/include -Lzebridge-$version-linux-$arch/lib -lzbarchive
+      LD_LIBRARY_PATH=\"\$PWD/zebridge-$version-linux-$arch/lib\" ./archive
       gcc -o smoke2 /tmp/smoke.c -Ilibzb-$version-linux-$arch/include -Llibzb-$version-linux-$arch/lib -lzbcore -Wl,-rpath,\"\\\$ORIGIN/libzb-$version-linux-$arch/lib\" && ./smoke2
       cat /etc/os-release | sed -n 's/^PRETTY_NAME=//p' | tr -d '\"'
     " 2>&1); then

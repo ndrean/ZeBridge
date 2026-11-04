@@ -64,7 +64,7 @@ The fetcher is required. Put `bridge_readings_fetch` on `PATH`, set `ZB_READINGS
 
 `python3 examples/16-archive/archiver.py` takes the same arguments without the package installed. The archiver's options, environment and exit codes are in [zb-archiver](../../zb-archiver/README.md#command).
 
-For containers, use [deploy/archiver.Dockerfile](../../deploy/archiver.Dockerfile) and [deploy/readings-responder.Dockerfile](../../deploy/readings-responder.Dockerfile). Build them with the matching release packages in `dist/<version>/`. Each Dockerfile includes its build and run commands.
+For containers, use [deploy/archiver.Dockerfile](../../deploy/archiver.Dockerfile) and [deploy/readings-responder.Dockerfile](../../deploy/readings-responder.Dockerfile). The archiver image runs `bridge_archiver` with DuckDB's shared library, without Python or a separate fetcher; the responder image still uses Python. Build them with the matching release packages in `dist/<version>/`. Each Dockerfile includes its build and run commands. Test the archiver image with `scripts/scenarios/.venv/bin/python deploy/test-archiver-image.py <image>`; it starts disposable NATS and SeaweedFS containers and checks the Parquet data, restart, lost-prefix refusal and shutdown.
 
 ## The native archiver
 
@@ -130,7 +130,7 @@ Reproduce with the listed Python dependencies:
 ZB_READINGS_FETCH=zig-out/bin/bridge_readings_fetch python3 examples/16-archive/bench.py 500000
 ```
 
-The benchmark retains the former Python implementation as a baseline. The archiver itself uses only the native fetcher. The Dockerfiles pin DuckDB's Python package to 1.5.5; the installed DuckDB CLI is separate, and these figures do not measure DuckDB 2.0.
+The benchmark retains the former Python implementation as a baseline. The Python archiver uses the native fetcher; `bridge_archiver` uses the same reader in-process. Both images pin DuckDB to 1.5.5 (the C library in the archiver, the Python package in the responder); the installed DuckDB CLI is separate, and these figures do not measure DuckDB 2.0.
 
 ## Tests
 
