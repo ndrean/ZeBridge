@@ -1,0 +1,2 @@
+# Cloudflare Pages: /demo on the depot goes to the hub's front door, which mints the invite.
+/demo  https://bridge.zebridge.eu/demo  302
