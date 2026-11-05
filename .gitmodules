@@ -8,5 +8,5 @@
 # rebase by themselves.
 [submodule "nats.zig"]
 	path = nats.zig
-	url = https://github.com/ndrean/nats.zig.git
+	url = https://github.com/ndrean/nats.zig
 	branch = zebridge
