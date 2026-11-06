@@ -8,7 +8,7 @@ zig-pkg/
 
 # Downloaded packages
 *.deb
-
+.mcp.json
 # NATS data
 nats-data/
 .claude/
@@ -53,6 +53,7 @@ skills-lock.json
 # Scenario harness venv
 scripts/scenarios/.venv/
 scripts/scenarios/__pycache__/
+scripts/compare/electric/client/node_modules/
 
 # Native (no-Docker) stack runtime artifacts — see scripts/native/
 # (postgres-data/ and nats-data/ are already covered above)

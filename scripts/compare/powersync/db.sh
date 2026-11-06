@@ -27,8 +27,10 @@ init)
   echo "init SQL applied"
   ;;
 table)
+  ROWS="${2:-10000}"
+  [[ "$ROWS" =~ ^[1-9][0-9]*$ ]] || { echo "row count must be a positive integer" >&2; exit 2; }
   admin_sql -c "DROP TABLE IF EXISTS public.storm_items" -c "DELETE FROM public.zebridge_catalogue WHERE tbl::text IN ('storm_items', 'public.storm_items')"
-  sed "s/'storm'/'cmp'/" storm/setup.sql | admin_sql -v pub="$BRIDGE_CDC_PUBLICATION" > /dev/null
+  sed -e "s/'storm'/'cmp'/" -e "s/generate_series(1, 10000)/generate_series(1, $ROWS)/" storm/setup.sql | admin_sql -v pub="$BRIDGE_CDC_PUBLICATION" > /dev/null
   admin_sql -c "DROP TABLE IF EXISTS public.sensor_events" -c "DELETE FROM public.zebridge_catalogue WHERE tbl::text IN ('sensor_events', 'public.sensor_events')" \
     -c "CREATE TABLE public.sensor_events (event_id uuid PRIMARY KEY, tenant_id text NOT NULL, sensor_id integer NOT NULL, kind text NOT NULL, value double precision NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)"
   refused=$(PGOPTIONS="-c client_min_messages=warning" psql "$ADMIN" -X -tA -v ON_ERROR_STOP=1 -c "SELECT step || ': ' || detail FROM zebridge_enable('public.sensor_events'::regclass, tenant_col => 'tenant_id', writable => true, version_col => 'updated_at', tombstone_col => 'deleted_at', publication => '$BRIDGE_CDC_PUBLICATION', dry_run => false) WHERE status = 'ERROR'" 2>&1 | redact)

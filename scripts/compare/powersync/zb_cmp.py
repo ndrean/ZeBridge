@@ -3,7 +3,7 @@ temporary stack's NATS (127.0.0.1:14222, JetStream domain `cmp`), with the insta
 clients' creds (`ZB_CMP_CREDS`) and a file holding the database's administrator URL (`ZB_CMP_ADMIN_ENV`, for the
 burst). `zebridge.sh` sets all three. Phases (each its own run):
 
-    zb_cmp.py seed N          N clients from empty replicas, then again warm: time to the table's 10,000 rows
+    zb_cmp.py seed N [ROWS]   N clients from empty replicas, then warm: time to the requested row count
     zb_cmp.py roundtrip S     one client writes a marker each second for S s; another reports when it has it
     zb_cmp.py burst N         the administrator inserts N rows in one statement; one client times when it holds all
     zb_cmp.py writes P M      P clients send M inserts each as fast as they can; time to every verdict
@@ -14,6 +14,7 @@ HERE = pathlib.Path(__file__).parent
 LIB = pathlib.Path(os.environ.get("ZB_CMP_LIB", "/usr/lib/x86_64-linux-gnu/libzbcore.so"))
 NATS = "nats://127.0.0.1:14222"
 T = "storm_items"
+SEED_ROWS = int(os.environ.get("ZB_CMP_SEED_ROWS", "10000"))
 
 
 class Client:
@@ -75,8 +76,8 @@ def seed_one(i, keep, q):
     t = time.monotonic()
     try:
         c = Client(i, db_path(i, keep))
-        while c.count() < 10000 and time.monotonic() - t < 120: c.poll(100)
-        q.put(time.monotonic() - t if c.count() >= 10000 else None)
+        while c.count() < SEED_ROWS and time.monotonic() - t < 300: c.poll(100)
+        q.put(time.monotonic() - t if c.count() >= SEED_ROWS else None)
         c.close()
     except Exception as e:
         q.put(f"client {i}: {e}")
@@ -118,9 +119,12 @@ def writes_one(i, m, q):
 
 
 def main():
+    global SEED_ROWS
     phase = sys.argv[1]
     if phase == "seed":
         n = int(sys.argv[2])
+        if len(sys.argv) > 3:
+            SEED_ROWS = int(sys.argv[3])
         for keep, label in ((False, "cold"), (True, "warm")):
             rs = run_parallel(n, seed_one, keep)
             ok = [r for r in rs if isinstance(r, float)]

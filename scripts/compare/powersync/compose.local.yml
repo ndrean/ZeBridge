@@ -1,0 +1,37 @@
+# Add PowerSync's read-side service and private bucket store to the isolated
+# ZeBridge/Electric Compose comparison project.
+services:
+  powersync-store:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: powersync
+      POSTGRES_USER: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d powersync"]
+      interval: 2s
+      retries: 30
+    volumes:
+      - powersync-data:/var/lib/postgresql/data
+
+  powersync-sync:
+    image: journeyapps/powersync-service:1.27.2
+    command: ["start", "-r", "sync"]
+    environment:
+      POWERSYNC_CONFIG_B64: ${POWERSYNC_CONFIG_B64:?generate the local PowerSync config first}
+    depends_on:
+      postgres: { condition: service_healthy }
+      powersync-store: { condition: service_healthy }
+
+  powersync-api:
+    image: journeyapps/powersync-service:1.27.2
+    command: ["start", "-r", "api"]
+    environment:
+      POWERSYNC_CONFIG_B64: ${POWERSYNC_CONFIG_B64:?generate the local PowerSync config first}
+    ports:
+      - "127.0.0.1:18081:8080"
+    depends_on:
+      powersync-sync: { condition: service_started }
+
+volumes:
+  powersync-data:

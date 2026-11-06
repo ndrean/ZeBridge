@@ -1,0 +1,63 @@
+# Add Electric to the ZeBridge quickstart's existing PostgreSQL service:
+#
+#   docker compose \
+#     -f docker-compose.quickstart.yml \
+#     -f scripts/compare/electric/compose.overlay.yml up
+#
+# This follows the Electric quickstart's self-hosted shape (Postgres + Electric,
+# ELECTRIC_INSECURE for local evaluation) and shares the same Postgres instance
+# with ZeBridge. Do not use ELECTRIC_INSECURE outside this isolated comparison.
+services:
+  # Match the PostgreSQL major used by Electric's official quickstart.
+  postgres:
+    image: postgres:17-alpine
+
+  electric:
+    image: electricsql/electric:latest
+    environment:
+      # Postgres uses trust auth in this isolated stack; Electric still expects the
+      # connection URI to contain a password field, so this placeholder is ignored.
+      DATABASE_URL: postgres://postgres:comparison@postgres:5432/app?sslmode=disable
+      ELECTRIC_INSECURE: "true"
+      ELECTRIC_STORAGE_DIR: /var/lib/electric
+    volumes:
+      - electric-data:/var/lib/electric
+    healthcheck:
+      test: ["CMD-SHELL", "test \"$$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/v1/health)\" = 200"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  electric-auth-proxy:
+    image: node:22-alpine
+    entrypoint: ["node", "/app/auth-proxy.mjs"]
+    environment:
+      ELECTRIC_URL: http://electric:3000/v1/shape
+      ELECTRIC_COMPARE_JWT_SECRET: ${ELECTRIC_COMPARE_JWT_SECRET:?set ELECTRIC_COMPARE_JWT_SECRET}
+      ELECTRIC_COMPARE_TENANT: cmp
+      ELECTRIC_COMPARE_SUBJECT: compare-reader
+      ELECTRIC_COMPARE_ISSUER: electric-read-compare
+    ports:
+      - "127.0.0.1:30001:3001"
+    volumes:
+      - ./scripts/compare/electric/auth-proxy.mjs:/app/auth-proxy.mjs:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    depends_on:
+      electric:
+        condition: service_healthy
+
+  # Native libzb clients in the host-side comparison runner use a local NATS
+  # connection. Keep it loopback-only; the broker is not exposed to the network.
+  nats:
+    ports:
+      - "127.0.0.1:14223:4222"
+
+volumes:
+  electric-data:

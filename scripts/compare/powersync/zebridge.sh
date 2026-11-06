@@ -105,7 +105,9 @@ EOF
   ;;
 run)
   shift
-  ssh_h "cd ~/zbcmp/cl && ZB_CMP_LIB=\$(ls /usr/lib/*/libzbcore.so | head -1) ZB_CMP_CREDS=\$HOME/zbcmp/cl/creds ZB_CMP_ADMIN_ENV=\$HOME/zbcmp/cl/admin.env python3 zb_cmp.py $* 2>run.err; echo \"(client log: ~/zbcmp/cl/run.err, \$(grep -ciE 'error\\(|refused|rejected' run.err) error lines)\""
+  seed_rows=10000
+  if [ "${1:-}" = seed ]; then seed_rows="${3:-10000}"; fi
+  ssh_h "cd ~/zbcmp/cl && ZB_CMP_SEED_ROWS=$seed_rows ZB_CMP_LIB=\$(ls /usr/lib/*/libzbcore.so | head -1) ZB_CMP_CREDS=\$HOME/zbcmp/cl/creds ZB_CMP_ADMIN_ENV=\$HOME/zbcmp/cl/admin.env python3 zb_cmp.py $* 2>run.err; echo \"(client log: ~/zbcmp/cl/run.err, \$(grep -ciE 'error\\(|refused|rejected' run.err) error lines)\""
   ;;
 tools)
   ssh_h 'set -e; v=$(dpkg-query -W -f "\${Version}" libzb); python3 -m venv ~/zbcmp/venv

@@ -58,12 +58,13 @@ const pct = (a, f) => { const s = [...a].sort((x, y) => x - y); return s[Math.mi
 
 // ── one child process per client for seed and writes, like zb_cmp.py's processes ──
 if (process.argv[2] === 'child') {
-  const [, , , role, i, arg] = process.argv;
+  const [, , , role, i, arg, argRows] = process.argv;
   if (role === 'seed') {
     const t = performance.now();
     const db = await open(Number(i), arg === 'warm');
     await db.waitForFirstSync();
-    while ((await count(db)) < 10000 && performance.now() - t < 120000) await new Promise((r) => setTimeout(r, 20));
+    const rows = Number(argRows);
+    while ((await count(db)) < rows && performance.now() - t < 300000) await new Promise((r) => setTimeout(r, 20));
     process.send({ s: (performance.now() - t) / 1000, n: await count(db) });
     await db.close();
   } else if (role === 'writes') {
@@ -85,18 +86,19 @@ if (process.argv[2] === 'child') {
   process.exit(0);
 }
 
-async function parallel(n, role, arg) {
+async function parallel(n, role, arg, argRows) {
   return Promise.all(Array.from({ length: n }, (_, i) => new Promise((resolve) => {
-    const c = fork(new URL(import.meta.url).pathname, ['child', role, String(i), String(arg)], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
+    const c = fork(new URL(import.meta.url).pathname, ['child', role, String(i), String(arg), String(argRows)], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
     c.on('message', resolve); c.on('exit', (code) => resolve({ error: `client ${i} exited ${code}` }));
   })));
 }
 
 const [phase, a1, a2] = process.argv.slice(2);
 if (phase === 'seed') {
+  const rows = Number(a2 ?? 10000);
   for (const keep of ['cold', 'warm']) {
-    const rs = await parallel(Number(a1), 'seed', keep);
-    const ok = rs.filter((r) => r.n >= 10000).map((r) => r.s);
+    const rs = await parallel(Number(a1), 'seed', keep, rows);
+    const ok = rs.filter((r) => r.n >= rows).map((r) => r.s);
     if (!ok.length) { console.log('seed results:', JSON.stringify(rs).slice(0, 400)); continue; }
     console.log(`powersync seed ${keep}, ${a1} clients: synced ${ok.length}/${a1}, median ${median(ok).toFixed(2)} s, slowest ${Math.max(...ok).toFixed(2)} s`);
   }

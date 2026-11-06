@@ -2,13 +2,30 @@
 
 The harness behind [the comparison with PowerSync](../../../COMPARISON.md): the same workload, run by ZeBridge and by PowerSync against one PostgreSQL database, from one host. The figures and how to read them are there; this page is how to run it again.
 
+## Isolated local Compose stack
+
+For the 50,000-row seed comparison, the local stack uses the same PostgreSQL 17 container and fixture as the Electric comparison. It is isolated under Compose project `zebridge-electric`; its database, NATS state, Electric cache, and PowerSync bucket store use project-specific volumes. The PostgreSQL fixture contains 50,000 rows, all in tenant `cmp`. PowerSync reads that same table through its own replication role and Sync Stream; its local API is published at `127.0.0.1:18081`.
+
+The stack currently running in the developer environment was started with a mode-0600 Compose environment file at `/private/tmp/zebridge-local-compose.env`. That file contains generated local JWT and PowerSync configuration values. To inspect or restart the stack, include all three Compose files and the same environment file:
+
+```sh
+docker compose --env-file /private/tmp/zebridge-local-compose.env \
+  -p zebridge-electric \
+  -f docker-compose.quickstart.yml \
+  -f scripts/compare/electric/compose.overlay.yml \
+  -f scripts/compare/powersync/compose.local.yml \
+  ps
+```
+
+The extra PowerSync services are defined in [`compose.local.yml`](compose.local.yml). The source fixture and replication role/publication are created in the isolated comparison database. PowerSync's stream uses the fixed test predicate `tenant_id = 'cmp'`; this performance fixture does not test per-user authorization. Keep this Compose project up while using its local database. Do not use `down -v` until the comparison is finished, because that deletes the isolated database and all service state.
+
 ## What it measures
 
-Four phases, the same for both systems, on a table of 10,000 rows of about 200 bytes (`storm_items`, tenant `cmp`):
+Four phases, the same for both systems, on a table of 10,000 rows of about 200 bytes by default (`storm_items`, tenant `cmp`). To compare at 50,000 rows, create that table with `db.sh table 50000`, then run `seed 10 50000` for each system:
 
 | Phase | What | ZeBridge | PowerSync |
 | --- | --- | --- | --- |
-| `seed N` | N clients from empty replicas, then again with their replicas kept: time until each holds the 10,000 rows | `zb_cmp.py` | `client/ps_cmp.mjs` |
+| `seed N [ROWS]` | N clients from empty replicas, then again with their replicas kept: time until each holds the requested rows (default 10,000) | `zb_cmp.py` | `client/ps_cmp.mjs` |
 | `roundtrip S` | one client writes a marker each second for S seconds; another reports when it has it | same | same |
 | `burst N` | the administrator inserts N rows in one statement; one client times when it holds them all | same | same |
 | `writes P M` | P clients send M inserts each as fast as they can: writes per second, and each write's latency | until its verdict returns | until the backend has committed it and the SDK has completed the upload |
@@ -46,21 +63,21 @@ From this folder, in this order:
 ```sh
 ./db.sh rtt                 # the host's distance to the database: it sets both systems' write figures
 ./db.sh init                # ZeBridge's init SQL
-./db.sh table               # the 10,000-row table
+./db.sh table 50000         # the 50,000-row table
 
 ./zebridge.sh up            # the temporary stack
 ./zebridge.sh creds         # 50 client identities, mapped to tenant cmp
-./zebridge.sh run seed 10
+./zebridge.sh run seed 10 50000
 ./zebridge.sh run roundtrip 30
 ./zebridge.sh run burst 100000
 ./zebridge.sh run writes 1 500
 ./zebridge.sh run writes 10 1000
 ./zebridge.sh down          # one system at a time
 
-./db.sh table               # a fresh table for PowerSync's seed
+./db.sh table 50000         # a fresh 50,000-row table for PowerSync's seed
 ./powersync.sh roles        # PowerSync's roles and publication
 ./powersync.sh up
-./powersync.sh run seed 10
+./powersync.sh run seed 10 50000
 ./powersync.sh run roundtrip 30
 ./powersync.sh run burst 100000
 ./powersync.sh run writes 1 500

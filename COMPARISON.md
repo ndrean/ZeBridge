@@ -2,7 +2,23 @@
 
 The measurements behind the README's [Compared with PowerSync](README.md#compared-with-powersync): the same workload, run by both systems against one PostgreSQL database. The architecture and what each asks you to run are in the README; how to run all of it again is in [the harness](scripts/compare/powersync/README.md).
 
+## Local cold seed: ZeBridge, PowerSync, and Electric
+
+To compare client seeding at the same scale without a cloud database path, I ran 10 clients per system against one local PostgreSQL 17 container in OrbStack. Each client started with an empty SQLite replica and the timer stopped after all 50,000 rows were present locally. The ZeBridge runner verified its replica; Electric checked both its TanStack collection and persisted SQLite rows; PowerSync's Node SDK waited for its first sync and reached 50,000 rows, then all ten SQLite files were independently checked. Every replica matched SHA-256 `f23eb95715da0c1c44811f949d27bb4bae36a8357b16244b67514f226ed574b7`.
+
+| System and client path | Cold local seed median, rounds | Slowest client, rounds |
+| --- | ---: | ---: |
+| ZeBridge 0.2.11 / libzb / SQLite | **3.076 s / 2.959 s** | 3.094 s / 2.963 s |
+| PowerSync Service 1.27.2 / Node SDK 1.3.0 / SQLite | 12.76 s / 12.99 s | 13.00 s / 13.14 s |
+| Electric / TanStack DB / Node SQLite | 12.052 s / **11.481 s** | 18.548 s / 17.636 s |
+
+Each system ran alone while Postgres and the fixture stayed up. PowerSync's two displayed rounds had a one-client readiness seed before timing the ten clients; a run immediately after restarting the service, without that stream warm-up, took 14.76 s median / 15.04 s slowest and logged initial connection retries. Electric's first round created its server-side shape; the second reused that shape. ZeBridge's generation chain was ready before timing. These are cold client stores with warmed server-side state, except Electric's first round. Across the readiness-warmed rounds, ZeBridge's median was about **4.2–4.4× lower than PowerSync** and **3.7–4.1× lower than Electric**.
+
+This measures each product's tested SQLite client path, including transfer and local materialization. It is a seed benchmark, not a general throughput result. The clients and services shared an 8-core Mac host; OrbStack exposed about 4 GB to Docker. Electric's image was `latest` at digest `sha256:efb6fa43859d67cb8c73439e0c8bc0f7a3daa467500fb06f2a924bcb2070c139`. The local PowerSync fixture used a fixed `tenant_id = 'cmp'` stream predicate; this run does not compare per-user authorization. Tenant authorization differs between the deployed paths and should be evaluated separately.
+
 ## Same workload, two servers
+
+These earlier measurements used Supabase in Dublin; they are retained as separate remote-database results and should not be compared directly with the local Compose measurement above.
 
 Both against one Supabase database in Dublin, 10,000 rows of about 200 bytes, the same table setup for both (ZeBridge's triggers and tenant policy; PowerSync's writes went through PostgREST as ZeBridge's write role, so the policy applied). Clients on the server itself, one system running at a time. ZeBridge 0.2.10 (4 ingress lanes, rate limit off); PowerSync service 1.27.2 with its bucket storage in PostgreSQL on the same server, Sync Streams, the Node SDK 1.3.0 with no delay between uploads (`crudUploadThrottleMs: 0`; the default waits 1 s). Measured 2026-11-02: one run each, except the larger server's write rows, which give the median of three runs and their range.
 
