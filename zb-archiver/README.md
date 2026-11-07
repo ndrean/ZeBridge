@@ -15,6 +15,52 @@ It depends on `nats-py[nkeys]`, `duckdb` and `boto3`. A native archiver with no 
 and ships in the `zebridge` package. It finds the fetcher through `--fetch-bin` / `fetch_bin`,
 then `ZB_READINGS_FETCH`, then `PATH`. The archiver has no Python reader.
 
+## Scope
+
+**What it is.** It archives sensor readings. Sensors publish to NATS (or MQTT) on
+`sensors.<tenant>.<sensor>.<kind>`, and their readings never pass through PostgreSQL. It is not the
+replication path: PostgreSQL tables reach SQLite or DuckDB replicas through CDC and libzb, and
+the archiver is not involved.
+
+```
+sensors ─▶ NATS / MQTT ─▶ READINGS_<tenant>  ─▶ archiver ─▶ Parquet in S3 ─▶ manifest (NATS KV)
+                                    │                                              │
+                                    └──── live tail ──▶ responder ◀── files ───────┘
+```
+
+**What it is like.** Two familiar designs, at the scale of one small process per tenant:
+
+| Part                   | Closest equivalent                                              | Difference                                                                                                                                    |
+| ---------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| The archiver           | A Kafka Connect S3 sink, a Kinesis Firehose delivery stream     | No Kafka or Connect cluster. The position (`covers_up_to`) and the file list commit together, in one write made only after the upload is verified |
+| Archiver and responder | Thanos (sidecar and querier), Druid (hand-off to deep storage)  | JetStream is the hot tier, Parquet in S3 the cold one, the NATS KV manifest records the hand-off, and the responder queries both              |
+| The manifest           | A table-format catalog (Iceberg, Delta Lake, DuckLake)          | A list of files and a position, nothing more: no snapshots, no schema evolution, no compaction                                               |
+
+It is not a stream processor (Flink, Spark): it transforms, joins and aggregates nothing.
+Aggregations happen when the data is read.
+
+**When it fits.** You already run ZeBridge, so the NATS server, the per-tenant streams and the
+credentials exist. Devices in the field push readings, tenants must stay isolated, and you want a
+durable archive in open Parquet that any tool reads (DuckDB, Polars, Spark, Athena, Trino). It
+stops rather than skip readings that left the stream before a file held them
+([what it guarantees](#what-it-guarantees)).
+
+**When it does not.**
+
+- **Monitoring metrics** (servers, services, alerting): use Prometheus with Thanos or Mimir.
+- **Interactive analytics over a long history** (many dimensions, months of data): use Druid,
+  Pinot or ClickHouse.
+
+**Limits today.**
+
+- One numeric value per reading, with fixed subjects and columns.
+- One writer per tenant, so throughput scales across tenants, not within one. Throughput is
+  [measured in the example](https://github.com/ndrean/zebridge/blob/main/examples/16-archive/README.md#performance).
+- One file per chunk and no compaction, so a slow tenant makes many small files.
+- No downsampling and no retention rules for the files.
+- The example's responder downloads every file the manifest names. Past a modest history, query
+  the Parquet with an engine that prunes files by time range.
+
 ## Command
 
 ```sh
