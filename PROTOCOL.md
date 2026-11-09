@@ -1474,6 +1474,8 @@ Two things follow, and they are the whole reason this section is long:
    — another client's CDC event, or a second write of your own — has touched it since,
    leave it alone rather than clobbering something more correct.
 
+   The verdict and the revert are separate steps. A local foreign key can refuse the revert: a rejected parent cannot be removed while its child, written after it and still waiting for its own verdict, references it. So both client libraries move the refused write from the outbox to an undo queue (`_zbz_undo` in libzb, `_zebridge_undo` in zb-client-ts) in one transaction, and report the verdict once. Each undo then runs in its own transaction; one the foreign key refuses rolls back, stays queued and is tried again after every later verdict and at each connect, so it survives a restart. The child's own `rejected` verdict removes the child, and the parent's undo succeeds on the next try. The poll report counts the queued undos as `undoing`: an empty outbox does not mean a settled replica until it is 0.
+
 5. **Treat the reply as a verdict, not as data.** State always arrives through CDC.
    Keeping one path for state and another for verdicts is what stops a client having two
    sources of truth.

@@ -2,6 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { ZeBridge } from './libzb.ts';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 function fixture(count = 300) {
   const db = new DatabaseSync(':memory:');
@@ -234,4 +237,87 @@ test('outboxStatus: the oldest waiting write against the GC floor, warned once a
     assert.equal((await c.outboxStatus()).floorMarginMs, 2_685_600_000, 'thirty-one days and two hours');
     assert.equal(logs.length, 1, 'no warning while more than a day remains');
   } finally { db.close(); }
+});
+
+// A refused write's local undo is owed durably (`_zebridge_undo`): a foreign key that refuses
+// it while a dependent row is still here keeps it owed, never throws (that ended Node), and
+// the dependent's own undo unblocks it. The twin of libzb's "undo: a refused parent's undo…".
+function undoFixture(path = ':memory:') {
+  const db = new DatabaseSync(path);
+  db.exec(`PRAGMA foreign_keys = ON;
+    CREATE TABLE IF NOT EXISTS _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT, payload TEXT, tbl TEXT, row_id TEXT, before TEXT, created_at INTEGER);
+    CREATE TABLE IF NOT EXISTS _zebridge_undo (msg_id TEXT PRIMARY KEY, tbl TEXT NOT NULL, payload TEXT NOT NULL, before TEXT, mode TEXT NOT NULL, since INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS p (id TEXT PRIMARY KEY, title TEXT);
+    CREATE TABLE IF NOT EXISTS c (id TEXT PRIMARY KEY, pid TEXT NOT NULL REFERENCES p(id));`);
+  const c: any = Object.create(ZeBridge.prototype);
+  const logs: string[] = [];
+  c.run = async (sql: string, ...args: any[]) => {
+    const stmt = db.prepare(sql);
+    return stmt.columns().length ? stmt.all(...args) : (stmt.run(...args), []);
+  };
+  c.transaction = async (fn: any) => {
+    db.exec('BEGIN');
+    try { await fn(c.run); db.exec('COMMIT'); } catch (e) { db.exec('ROLLBACK'); throw e; }
+  };
+  const table = (cols: string[]) => ({ pkCols: ['id'], columns: cols, tombstoneColumn: null });
+  Object.assign(c, {
+    outboxInitPromise: Promise.resolve(), appendLog: (_t: string, m: string) => logs.push(m), triggerChange: () => {},
+    syncedTables: new Map([['p', table(['id', 'title'])], ['c', table(['id', 'pid'])]]),
+  });
+  const insert = (t: 'p' | 'c', id: string, col: string, val: string) => {
+    db.prepare(`INSERT INTO ${t} (id, ${col}) VALUES (?, ?)`).run(id, val);
+    db.prepare('INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, created_at) VALUES (?, ?, ?, ?, ?, 1)')
+      .run(id, 's', JSON.stringify({ operation: 'INSERT', key: { id }, data: { id, [col]: val } }), t, id);
+  };
+  const has = (t: string, id: string) => db.prepare(`SELECT 1 FROM ${t} WHERE id = ?`).all(id).length === 1;
+  return { db, c, logs, insert, has };
+}
+
+test('undo: a refused parent\'s undo waits for its child\'s in either order, survives a restart, and spares a row that changed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zb-undo-'));
+  const path = `${dir}/r.sqlite3`;
+  const { db, c, logs, insert, has } = undoFixture(path);
+
+  // Parent first (dependent_writes.py): refused while the child is here, owed, unblocked by it.
+  insert('p', 'p1', 'title', 'refused');
+  insert('c', 'r1', 'pid', 'p1');
+  await c.revertOptimisticWrite('p1', 'restore');
+  assert.ok(has('p', 'p1'));
+  assert.equal(await c.undoing(), 1);
+  assert.ok(logs.some((m) => m.includes('local undo of p1 is blocked (FOREIGN KEY constraint failed)')));
+  await c.revertOptimisticWrite('r1', 'restore');
+  assert.ok(!has('p', 'p1') && !has('c', 'r1'));
+  assert.equal(await c.undoing(), 0);
+
+  // Child first, then a duplicate verdict: nothing blocks, nothing is owed twice.
+  insert('p', 'p2', 'title', 'refused');
+  insert('c', 'r2', 'pid', 'p2');
+  await c.revertOptimisticWrite('r2', 'restore');
+  await c.revertOptimisticWrite('p2', 'restore');
+  await c.revertOptimisticWrite('p2', 'restore');
+  assert.ok(!has('p', 'p2'));
+  assert.equal(await c.undoing(), 0);
+
+  // A newer value lands before the retry (CDC): the late undo leaves the row alone.
+  insert('p', 'p3', 'title', 'refused');
+  insert('c', 'r3', 'pid', 'p3');
+  await c.revertOptimisticWrite('p3', 'restore');
+  db.exec(`UPDATE p SET title = 'newer' WHERE id = 'p3'; DELETE FROM c WHERE id = 'r3'; DELETE FROM _zebridge_outbox WHERE msg_id = 'r3'`);
+  await c.runUndos();
+  assert.ok(has('p', 'p3'));
+  assert.equal(await c.undoing(), 0);
+
+  // A restart while the undo is owed: still owed after reopening, done once the child is gone.
+  insert('p', 'p4', 'title', 'refused');
+  insert('c', 'r4', 'pid', 'p4');
+  await c.revertOptimisticWrite('p4', 'restore');
+  db.close();
+  const again = undoFixture(path);
+  assert.equal(await again.c.undoing(), 1);
+  again.db.exec(`DELETE FROM c WHERE id = 'r4'`);
+  await again.c.runUndos();
+  assert.ok(!again.has('p', 'p4'));
+  assert.equal(await again.c.undoing(), 0);
+  again.db.close();
+  rmSync(dir, { recursive: true, force: true });
 });

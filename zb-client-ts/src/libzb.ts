@@ -1434,6 +1434,8 @@ export class ZeBridge {
         if (await this.reconcileClear()) setTimeout(() => void this.reconcile(), 2_000);
       } catch (e) { this.appendLog('SYS', `reconcile: ${e}`, 'WARNING'); }
       this.reach('cdc');
+      // Undos still owed from before a restart, now that the tables are registered.
+      void this.runUndos();
 
       // Start the durable write window, including entries from a previous page.
       // Verdicts clock subsequent windows; reconnect jitter only delays the start.
@@ -1798,6 +1800,19 @@ export class ZeBridge {
         state   TEXT NOT NULL DEFAULT 'pending'
       )
     `);
+    // A refused write's local undo, owed until it is done (`runUndos`). `mode`: `restore`
+    // (the before-image, or no row) for `rejected`, `delete` for `row_deleted`.
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS _zebridge_undo (
+        msg_id   TEXT PRIMARY KEY,
+        tbl      TEXT NOT NULL,
+        payload  TEXT NOT NULL,
+        before   TEXT,
+        mode     TEXT NOT NULL,
+        since    ${this.dialect.int64} NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0
+      )
+    `);
   }
 
   private async outboxPut(
@@ -1975,25 +1990,87 @@ export class ZeBridge {
     else this.confirmedBase?.delete(ckey);
   }
 
+  /// A definitive refusal settles the write; undoing its optimistic copy is a separate
+  /// obligation. In ONE transaction the outbox entry goes (never sent again) and the undo
+  /// is owed (`_zebridge_undo`), so a crash leaves one or the other, never neither.
   private async revertOptimisticWrite(msgId: string, mode: 'restore' | 'delete') {
     await this.outboxInitPromise;
-    const rows = await this.run(`SELECT tbl, payload, before FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
-    const entry = rows[0];
-    if (!entry) return;
+    await this.transaction(async (txExec) => {
+      await txExec(
+        `INSERT INTO _zebridge_undo (msg_id, tbl, payload, before, mode, since)
+         SELECT msg_id, tbl, payload, before, ?, ? FROM _zebridge_outbox WHERE msg_id = ? ON CONFLICT (msg_id) DO NOTHING`,
+        mode, Date.now(), msgId,
+      );
+      await txExec(`DELETE FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
+    });
+    await this.runUndos();
+  }
 
-    const table: string = entry.tbl;
-    const sent = JSON.parse(entry.payload);
-    const before = entry.before ? JSON.parse(entry.before) : null;
+  /// The undos still owed: a foreign key refused them while a dependent row was there.
+  public async undoing(): Promise<number> {
+    await this.outboxInitPromise;
+    try { return Number((await this.run(`SELECT count(*) AS n FROM _zebridge_undo`))[0]?.n ?? 0); } catch { return 0; }
+  }
+
+  private undoRunning = false;
+  private undoAgain = false;
+
+  /// Do the owed undos, each in its own transaction with the removal of its record. One a
+  /// foreign key refuses (a refused parent whose child is still here, dependent_writes.py)
+  /// rolls back and stays owed; passes repeat while one succeeds, so the child's own undo
+  /// unblocks the parent's whichever verdict came first. Run after every verdict and at
+  /// each connect (a restart included); never throws — an uncaught refusal here ended Node.
+  private async runUndos(): Promise<void> {
+    if (this.undoRunning) { this.undoAgain = true; return; }
+    this.undoRunning = true;
+    try {
+      let progress = true;
+      while (progress || this.undoAgain) {
+        progress = false;
+        this.undoAgain = false;
+        let rows: any[];
+        try { rows = await this.run(`SELECT msg_id, tbl, payload, before, mode, attempts FROM _zebridge_undo ORDER BY since, msg_id`); } catch { return; }
+        for (const u of rows) {
+          const attempts = Number(u.attempts ?? 0);
+          try {
+            const res = await this.undoOne(u);
+            if (res === 'waiting') continue;
+            progress = true;
+            if (res === 'skipped') this.appendLog(u.tbl, `local undo of ${u.msg_id} skipped — the row has changed since; left as it is`, 'INFO');
+            else if (attempts > 0) this.appendLog(u.tbl, `local undo of ${u.msg_id} done after ${attempts} blocked attempt(s)`, 'INFO');
+          } catch (e) {
+            try { await this.run(`UPDATE _zebridge_undo SET attempts = attempts + 1 WHERE msg_id = ?`, u.msg_id); } catch { /* retried anyway */ }
+            if (attempts === 0) this.appendLog(u.tbl, `local undo of ${u.msg_id} is blocked (${e instanceof Error ? e.message : e}) — kept, retried after the next verdict`, 'WARNING');
+          }
+        }
+      }
+    } finally {
+      this.undoRunning = false;
+    }
+  }
+
+  /// One owed undo (`runUndos`). It changes the row only while the row still holds what
+  /// the write put there (absent, for a DELETE or a tombstone): a late retry must not undo
+  /// a newer CDC value or another edit (libzb's `core.planOwned`).
+  private async undoOne(u: any): Promise<'done' | 'skipped' | 'waiting'> {
+    const msgId: string = u.msg_id;
+    const table: string = u.tbl;
+    const mode: 'restore' | 'delete' = u.mode === 'delete' ? 'delete' : 'restore';
+    const sent = JSON.parse(u.payload);
+    const before = u.before ? JSON.parse(u.before) : null;
     const state = this.syncedTables.get(table);
     const keyObj = sent.key as Record<string, unknown> | undefined;
 
-    if (!state?.pkCols.length || !keyObj) {
-      await this.run(`DELETE FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
-      return;
+    if (!state) return 'waiting'; // not registered yet: a later pass
+    if (!state.pkCols.length || !keyObj) {
+      await this.run(`DELETE FROM _zebridge_undo WHERE msg_id = ?`, msgId);
+      return 'skipped';
     }
 
     const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
     const pkVals = state.pkCols.map((c) => keyObj[c]);
+    const removed = sent.operation === 'DELETE' || tombstoned(state.tombstoneColumn, sent.data);
+    let stillOurs = false;
 
     await this.transaction(async (txExec) => {
       const current = await txExec(`SELECT * FROM ${table} WHERE ${where}`, ...pkVals);
@@ -2007,10 +2084,10 @@ export class ZeBridge {
         : isBytes(v) ? Array.from(v, (b) => b.toString(16).padStart(2, '0')).join('')
         : v !== null && typeof v === 'object' ? JSON.stringify(v)
         : String(v);
-      const stillOurs = sent.data
-        ? currentRow != null && Object.entries(sent.data as Record<string, unknown>)
-            .every(([k, v]) => asStored(currentRow[k]) === asStored(v))
-        : currentRow == null;
+      stillOurs = removed || !sent.data
+        ? currentRow == null
+        : currentRow != null && Object.entries(sent.data as Record<string, unknown>)
+            .every(([k, v]) => asStored(currentRow[k]) === asStored(v));
 
       if (stillOurs) {
         if (mode === 'delete') {
@@ -2033,9 +2110,10 @@ export class ZeBridge {
         }
       }
 
-      await txExec(`DELETE FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
+      await txExec(`DELETE FROM _zebridge_undo WHERE msg_id = ?`, msgId);
     });
     this.triggerChange(table);
+    return stillOurs ? 'done' : 'skipped';
   }
 
   // ── schemas ────────────────────────────────────────────────────────────────

@@ -1191,6 +1191,8 @@ fn pollJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
     if (pending > 0) if (b.c.floorMargin(a)) |m| try out.put(a, "floor_margin_ms", .{ .integer = m });
     // Writes answered `indeterminate` whose reconciliation has not finished (§7.4c).
     try out.put(a, "reconciling", .{ .integer = @intCast(b.c.reconcilingCount(a)) });
+    // Refused writes whose local undo is still owed: an empty outbox is not a settled replica.
+    try out.put(a, "undoing", .{ .integer = @intCast(b.c.undoingCount(a)) });
     try out.put(a, "settled", .{ .integer = @intCast(r.settled) });
 
     var changed = std.json.Array.init(a);

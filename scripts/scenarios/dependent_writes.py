@@ -147,8 +147,10 @@ END $$""")
                     if local == expect: break
                     time.sleep(0.3)
                 pending = cl.q("SELECT count(*) FROM _zebridge_outbox")[0][0]
-                check(f"§4 {name}: replica [refused parent, its child, fine parent, fine child] = {local} (want {expect}); outbox {pending}",
-                      local == expect and pending == 0)
+                # An empty outbox is not a settled replica: a refused write's undo may still be owed.
+                owed = cl.q(f"SELECT count(*) FROM {'_zbz_undo' if cl is py else '_zebridge_undo'}")[0][0]
+                check(f"§4 {name}: replica [refused parent, its child, fine parent, fine child] = {local} (want {expect}); outbox {pending}, undos owed {owed}",
+                      local == expect and pending == 0 and owed == 0)
 
             py.close(); nd.close(); py = nd = None
     finally:
