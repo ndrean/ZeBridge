@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { ZeBridge } from './libzb.ts';
+import { makePgliteStorage } from './pglite-storage.ts';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -246,9 +247,9 @@ test('outboxStatus: the oldest waiting write against the GC floor, warned once a
 function undoFixture(path = ':memory:') {
   const db = new DatabaseSync(path);
   db.exec(`PRAGMA foreign_keys = ON;
-    CREATE TABLE IF NOT EXISTS _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT, payload TEXT, tbl TEXT, row_id TEXT, before TEXT, created_at INTEGER, optimistic TEXT);
+    CREATE TABLE IF NOT EXISTS _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT, payload TEXT, tbl TEXT, row_id TEXT, before TEXT, created_at INTEGER, optimistic TEXT, authoritative INTEGER);
     CREATE TABLE IF NOT EXISTS _zebridge_undo (msg_id TEXT PRIMARY KEY, tbl TEXT NOT NULL, row_id TEXT NOT NULL, payload TEXT NOT NULL, before TEXT, optimistic TEXT,
-      created_at INTEGER NOT NULL, mode TEXT NOT NULL, since INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
+      created_at INTEGER NOT NULL, authoritative INTEGER, mode TEXT NOT NULL, since INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS p (id TEXT PRIMARY KEY, title TEXT);
     CREATE TABLE IF NOT EXISTS c (id TEXT PRIMARY KEY, pid TEXT NOT NULL REFERENCES p(id));`);
   const c: any = Object.create(ZeBridge.prototype);
@@ -277,10 +278,11 @@ function undoFixture(path = ':memory:') {
   // data) applied, outbox entry queued with the SPARSE wire data.
   const write = async (msg: string, t: 'p' | 'c', op: string, id: string, col: string, val: string) => {
     const before = db.prepare(`SELECT * FROM ${t} WHERE id = ?`).get(id) ?? null;
+    const authoritative = await c.beforeIsAuthoritative(t, c.syncedTables.get(t), id, c.run);
     const ev = { operation: op, data: { id, [col]: val } };
     await c.applyEvent(t, ev, c.run);
-    db.prepare('INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at, optimistic) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(msg, 's', JSON.stringify({ operation: op, key: { id }, data: { [col]: val } }), t, id, before == null ? null : JSON.stringify(before), await c.nextCreated(), JSON.stringify(ev));
+    db.prepare('INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at, optimistic, authoritative) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(msg, 's', JSON.stringify({ operation: op, key: { id }, data: { [col]: val } }), t, id, before == null ? null : JSON.stringify(before), c.nextCreated(), JSON.stringify(ev), authoritative ? 1 : 0);
   };
   const has = (t: string, id: string) => db.prepare(`SELECT 1 FROM ${t} WHERE id = ?`).all(id).length === 1;
   const title = (id: string) => (db.prepare('SELECT title FROM p WHERE id = ?').get(id) as any)?.title ?? null;
@@ -389,4 +391,35 @@ test('undo: a reseed settles the owed undos of the rows it replaced; a pending w
   assert.equal(await c.undoing(), 0);
   await c.revertOptimisticWrite('ub', 'restore');
   assert.equal(title('x'), 'srv');
+});
+
+test('undo: a server value that landed between two refused edits survives both, in either order', async () => {
+  const { db, c, write, title } = undoFixture();
+  for (const [x, first, second] of [['x1', 'x1a', 'x1b'], ['x2', 'x2b', 'x2a']]) {
+    db.prepare(`INSERT INTO p (id, title) VALUES (?, 'original')`).run(x);
+    await write(`${x}a`, 'p', 'UPDATE', x, 'title', 'A');
+    db.prepare(`UPDATE p SET title = 'server' WHERE id = ?`).run(x); // CDC
+    await write(`${x}b`, 'p', 'UPDATE', x, 'title', 'B');
+    await c.revertOptimisticWrite(first, 'restore');
+    await c.revertOptimisticWrite(second, 'restore');
+    assert.equal(title(x), 'server');
+    assert.equal(await c.undoing(), 0);
+  }
+});
+
+test('outbox: the first write queued on a fresh PGlite replica does not wait on itself', async () => {
+  const storage = makePgliteStorage()('zb-first-write');
+  const c: any = Object.create(ZeBridge.prototype);
+  Object.assign(c, { run: storage.exec, transaction: storage.transaction, dialect: storage.dialect, outboxInitPromise: Promise.resolve() });
+  try {
+    await c.createOutboxTable();
+    const put = storage.transaction(async (tx) => {
+      await c.outboxPut({ msgId: 'm1', subject: 's', payload: { key: { id: 1 } }, table: 'item', id: 1, before: null, optimistic: {}, authoritative: true }, tx);
+    });
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('the queued write waited on its own transaction')), 5_000));
+    await Promise.race([put, timeout]);
+    assert.equal(Number((await storage.exec(`SELECT count(*) AS n FROM _zebridge_outbox`))[0].n), 1);
+  } finally {
+    await storage.deleteDatabaseFile?.();
+  }
 });

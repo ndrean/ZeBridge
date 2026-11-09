@@ -5900,6 +5900,9 @@ pub const SyncClient = struct {
         // session can rewrite it; an entry with no `before` keeps an unknown basis, which a
         // rebase treats as a conflict (lost, never re-sent).
         try addOutboxBasis(&self.st);
+        // `authoritative`: whether `before` is the server's row, not an overlay of an earlier
+        // write (`beforeIsAuthoritative`). NULL: not known (an entry from before the column).
+        execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN authoritative INTEGER") catch {};
         try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_retry ON _zebridge_outbox (retry_at, attempts, created_at, msg_id)");
         try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_recovery ON _zebridge_outbox (attempts, created_at, msg_id)");
         // A write answered `indeterminate`: settled for retransmission, its outcome
@@ -5932,11 +5935,16 @@ pub const SyncClient = struct {
             \\  before     TEXT,
             \\  optimistic TEXT,
             \\  created_at INTEGER NOT NULL,
+            \\  authoritative INTEGER,
             \\  mode       TEXT NOT NULL,
             \\  since      INTEGER NOT NULL,
             \\  attempts   INTEGER NOT NULL DEFAULT 0
             \\)
         );
+        var fa = std.heap.ArenaAllocator.init(self.a);
+        defer fa.deinit();
+        const m = try self.st.query(fa.allocator(), "SELECT max(m) FROM (SELECT max(created_at) AS m FROM _zebridge_outbox UNION ALL SELECT max(created_at) FROM _zbz_undo)", &.{});
+        if (m.len > 0 and m[0][0] == .integer) self.last_created = @max(self.last_created, m[0][0].integer);
         self.outbox_ready = true;
     }
 
@@ -6047,6 +6055,7 @@ pub const SyncClient = struct {
         // The before-image, for the revert a refusal or a rejection needs. Captured
         // BEFORE the optimistic apply overwrites it, obviously.
         const before = try self.beforeImage(a, table, st, key);
+        const authoritative = try self.beforeIsAuthoritative(a, table, st, row_id);
 
         // NON-FATAL, matching the TS client (its failed optimistic upsert is a log
         // line and the write still queues): the payload is valid ON THE WIRE — the
@@ -6087,14 +6096,14 @@ pub const SyncClient = struct {
             break :blk .null;
         };
         _ = try self.st.query(a,
-            \\INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, tenant, optimistic)
-            \\VALUES (?,?,?,?,?,?,?,?,0,0,?,?)
+            \\INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, tenant, optimistic, authoritative)
+            \\VALUES (?,?,?,?,?,?,?,?,0,0,?,?,?)
             \\ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1
         , &.{
             .{ .text = msg_id },         .{ .text = subject }, .{ .text = payload_json },
             .{ .text = table },          .{ .text = row_id },  before_json,
-            before_json,                 .{ .integer = self.nextCreated(a) }, row_tenant,
-            .{ .text = try core.valueToString(a, opt) },
+            before_json,                 .{ .integer = self.nextCreated() }, row_tenant,
+            .{ .text = try core.valueToString(a, opt) }, .{ .integer = @intFromBool(authoritative) },
         });
 
         // ⚠️ Sent through flushOutbox, NOT published directly from here.
@@ -6617,9 +6626,11 @@ pub const SyncClient = struct {
     fn reapplyPending(self: *SyncClient, a: std.mem.Allocator, table: []const u8, tenant: []const u8, whole: bool) !void {
         const st = self.states.get(table) orelse return;
         const rows = if (whole)
-            try self.st.query(a, "SELECT msg_id, payload, optimistic FROM _zebridge_outbox WHERE tbl = ? ORDER BY created_at", &.{.{ .text = table }})
+            try self.st.query(a, "SELECT msg_id, payload, optimistic, row_id FROM _zebridge_outbox WHERE tbl = ? ORDER BY created_at", &.{.{ .text = table }})
         else
-            try self.st.query(a, "SELECT msg_id, payload, optimistic FROM _zebridge_outbox WHERE tbl = ? AND tenant = ? ORDER BY created_at", &.{ .{ .text = table }, .{ .text = tenant } });
+            try self.st.query(a, "SELECT msg_id, payload, optimistic, row_id FROM _zebridge_outbox WHERE tbl = ? AND tenant = ? ORDER BY created_at", &.{ .{ .text = table }, .{ .text = tenant } });
+        // The first write re-applied on a row covers the seeded row: the server's state.
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
         var applied: usize = 0;
         var skipped: usize = 0;
         for (rows) |r| {
@@ -6631,7 +6642,8 @@ pub const SyncClient = struct {
             const key = if (env == .object) env.object.get("key") orelse continue else continue;
             const before = try self.beforeImage(a, table, st, key);
             const before_v: storage.Value = if (before) |b| .{ .text = try core.valueToString(a, b) } else .null;
-            _ = try self.st.query(a, "UPDATE _zebridge_outbox SET before = ? WHERE msg_id = ?", &.{ before_v, r[0] });
+            const first = !(try seen.getOrPut(a, if (r[3] == .text) r[3].text else "")).found_existing;
+            _ = try self.st.query(a, "UPDATE _zebridge_outbox SET before = ?, authoritative = ? WHERE msg_id = ?", &.{ before_v, .{ .integer = @intFromBool(first) }, r[0] });
             const opt = parseStoredJson(a, r[2].text) catch continue;
             self.applyOptimistic(table, st, opt) catch {};
             applied += 1;
@@ -6968,7 +6980,7 @@ pub const SyncClient = struct {
             mid: []const u8,
             mode: []const u8,
             fn apply(cx: @This(), s: *storage.Storage) !void {
-                _ = try s.query(cx.a, "INSERT INTO _zbz_undo (msg_id, tbl, row_id, tenant, payload, before, optimistic, created_at, mode, since) SELECT msg_id, tbl, row_id, tenant, payload, before, optimistic, created_at, ?, ? FROM _zebridge_outbox WHERE msg_id = ? ON CONFLICT(msg_id) DO NOTHING", &.{
+                _ = try s.query(cx.a, "INSERT INTO _zbz_undo (msg_id, tbl, row_id, tenant, payload, before, optimistic, created_at, authoritative, mode, since) SELECT msg_id, tbl, row_id, tenant, payload, before, optimistic, created_at, authoritative, ?, ? FROM _zebridge_outbox WHERE msg_id = ? ON CONFLICT(msg_id) DO NOTHING", &.{
                     .{ .text = cx.mode }, .{ .integer = nowMillis() }, .{ .text = cx.mid },
                 });
                 _ = try s.query(cx.a, "DELETE FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = cx.mid }});
@@ -6981,11 +6993,8 @@ pub const SyncClient = struct {
     /// `created_at` orders this client's writes, on one row and in the outbox: strictly
     /// increasing, so two writes in one millisecond keep their order (`undoRow` rebuilds a
     /// row from the oldest before-image forward). Never read as a wall-clock age.
-    fn nextCreated(self: *SyncClient, a: std.mem.Allocator) i64 {
-        if (self.last_created == 0) {
-            const r = self.st.query(a, "SELECT max(m) FROM (SELECT max(created_at) AS m FROM _zebridge_outbox UNION ALL SELECT max(created_at) FROM _zbz_undo)", &.{}) catch &.{};
-            if (r.len > 0 and r[0][0] == .integer) self.last_created = r[0][0].integer;
-        }
+    /// The floor is read once, in `ensureOutbox`, never inside a write's transaction.
+    fn nextCreated(self: *SyncClient) i64 {
         self.last_created = @max(nowMillis(), self.last_created + 1);
         return self.last_created;
     }
@@ -7038,14 +7047,59 @@ pub const SyncClient = struct {
         self.undo_owed = self.undoingCount(a) > 0;
     }
 
+    /// What one of this client's writes put on its row: its key, the data the optimistic apply
+    /// used (the `optimistic` event: key, values and version stamp merged; the wire payload for
+    /// an entry from before that column), and whether it removed the row.
+    const OwnApplied = struct { key: Value, data: Value, removed: bool };
+    fn appliedOf(self: *SyncClient, a: std.mem.Allocator, st: TableState, payload: storage.Value, optimistic: storage.Value) !OwnApplied {
+        const env = if (payload == .text) parseStoredJson(a, payload.text) catch Value.null else Value.null;
+        const opt = if (optimistic == .text) parseStoredJson(a, optimistic.text) catch env else env;
+        const src = if (opt == .object) opt else env;
+        const op = if (src == .object) (if (src.object.get("operation")) |v| (if (v == .string) v.string else "") else "") else "";
+        var data = if (src == .object) src.object.get("data") orelse Value.null else Value.null;
+        if (data == .object) try self.pgArrayFixup(a, st, &data);
+        return .{
+            .key = if (env == .object) env.object.get("key") orelse Value.null else Value.null,
+            .data = data,
+            .removed = std.mem.eql(u8, op, "DELETE") or (data == .object and tombstoned(st, data)),
+        };
+    }
+
+    /// Whether the row still shows what `w` applied (absent, for a removal): nothing else has
+    /// landed on it since (`core.planOwned`; the TS client's `rowShows`).
+    fn rowShows(self: *SyncClient, a: std.mem.Allocator, table: []const u8, st: TableState, w: OwnApplied) !bool {
+        if (w.removed) {
+            const ex = (try core.planExists(a, table, st.pk, w.key)) orelse return false;
+            return (try self.stepExec(a, ex)).len == 0;
+        }
+        const own = (try core.planOwned(a, table, st.pk, w.key, w.data)) orelse return false;
+        return (try self.stepExec(a, own)).len > 0;
+    }
+
+    /// Whether the row a new write is about to cover is the SERVER's state, not one of this
+    /// client's overlays: no earlier write of it is on the row, or the row no longer shows the
+    /// latest one (CDC replaced it). Stored with the write (`authoritative`), it is where
+    /// `undoRow` rebuilds from: a server value between two refused edits must survive them.
+    fn beforeIsAuthoritative(self: *SyncClient, a: std.mem.Allocator, table: []const u8, st: TableState, row_id: []const u8) !bool {
+        const ws = try self.st.query(a,
+            \\SELECT payload, optimistic, created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?
+            \\UNION ALL SELECT payload, optimistic, created_at FROM _zbz_undo WHERE tbl = ? AND row_id = ?
+            \\ORDER BY 3 DESC LIMIT 1
+        , &.{ .{ .text = table }, .{ .text = row_id }, .{ .text = table }, .{ .text = row_id } });
+        if (ws.len == 0) return true;
+        return !(try self.rowShows(a, table, st, try self.appliedOf(a, st, ws[0][0], ws[0][1])));
+    }
+
     /// Settle every owed undo on one row. The row holds this client's writes on it in order:
     /// the pending ones (outbox) and the refused ones not yet undone (`_zbz_undo`). If it still
-    /// shows what the LATEST of them applied, nothing authoritative has landed since: it is
-    /// rebuilt from the OLDEST one's before-image, the pending writes are applied again in
-    /// order over fresh before-images (as `reapplyPending` does after a seed), and the owed
-    /// undos go. Otherwise a newer authoritative row stands, and they go without a change.
-    /// Undoing one write alone was wrong twice: an INSERT A then UPDATE B, both refused, left
-    /// A on the row (A's undo saw B and gave up, B's restored A).
+    /// shows what the LATEST of them applied, nothing has landed since: it is rebuilt from the
+    /// server's last known state — the before-image of the latest write that covered an
+    /// AUTHORITATIVE row (`beforeIsAuthoritative`; the oldest write's, for entries from before
+    /// that mark) —, the pending writes from there are applied again in order over fresh
+    /// before-images (as `reapplyPending` does after a seed), and the owed undos go. Otherwise a
+    /// newer authoritative row stands, and they go without a change. Undoing one write alone
+    /// was wrong (an INSERT A then UPDATE B, both refused, left A), and so was rebuilding from
+    /// the oldest before-image (A, a CDC value, B, both refused, lost the CDC value).
     fn undoRow(self: *SyncClient, a: std.mem.Allocator, table: []const u8, row_id: []const u8, why: *[]const u8) !enum { done, skipped, waiting } {
         const st = self.states.get(table) orelse return .waiting; // not registered yet: a later pass
         const Ctx = struct {
@@ -7056,61 +7110,46 @@ pub const SyncClient = struct {
             st: TableState,
             owned: *bool,
             why: *[]const u8,
-
-            /// What a write put on the row: its key, the data the optimistic apply used (the
-            /// `optimistic` event: key, values and version stamp merged), whether it removed it.
-            const Applied = struct { key: Value, data: Value, removed: bool };
-            fn applied(cx: @This(), payload: storage.Value, optimistic: storage.Value) !Applied {
-                const env = if (payload == .text) parseStoredJson(cx.a, payload.text) catch Value.null else Value.null;
-                const opt = if (optimistic == .text) parseStoredJson(cx.a, optimistic.text) catch env else env;
-                const src = if (opt == .object) opt else env;
-                const op = if (src == .object) (if (src.object.get("operation")) |v| (if (v == .string) v.string else "") else "") else "";
-                var data = if (src == .object) src.object.get("data") orelse Value.null else Value.null;
-                if (data == .object) try cx.c.pgArrayFixup(cx.a, cx.st, &data);
-                return .{
-                    .key = if (env == .object) env.object.get("key") orelse Value.null else Value.null,
-                    .data = data,
-                    .removed = std.mem.eql(u8, op, "DELETE") or (data == .object and tombstoned(cx.st, data)),
-                };
-            }
-            fn step(cx: @This(), s: *storage.Storage, stp: ?Value) !bool {
-                const plan = stp orelse return false;
-                const rows = cx.c.stepExec(cx.a, plan) catch |err| {
+            fn step(cx: @This(), s: *storage.Storage, stp: ?Value) !void {
+                const plan = stp orelse return;
+                _ = cx.c.stepExec(cx.a, plan) catch |err| {
                     cx.why.* = cx.a.dupe(u8, s.errMsg()) catch "";
                     return err;
                 };
-                return rows.len > 0;
             }
             fn apply(cx: @This(), s: *storage.Storage) !void {
                 const pk = cx.st.pk;
-                // msg_id, payload, before, optimistic, owed, mode — oldest first.
+                // msg_id, payload, before, optimistic, owed, mode, created_at, authoritative — oldest first.
                 const ws = try s.query(cx.a,
-                    \\SELECT msg_id, payload, before, optimistic, 0, '', created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?
-                    \\UNION ALL SELECT msg_id, payload, before, optimistic, 1, mode, created_at FROM _zbz_undo WHERE tbl = ? AND row_id = ?
+                    \\SELECT msg_id, payload, before, optimistic, 0, '', created_at, authoritative FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?
+                    \\UNION ALL SELECT msg_id, payload, before, optimistic, 1, mode, created_at, authoritative FROM _zbz_undo WHERE tbl = ? AND row_id = ?
                     \\ORDER BY 7, 1
                 , &.{ .{ .text = cx.table }, .{ .text = cx.row_id }, .{ .text = cx.table }, .{ .text = cx.row_id } });
                 if (ws.len == 0) return;
-                const last = try applied(cx, ws[ws.len - 1][1], ws[ws.len - 1][3]);
-                cx.owned.* = if (last.removed)
-                    !(try step(cx, s, try core.planExists(cx.a, cx.table, pk, last.key)))
-                else
-                    try step(cx, s, try core.planOwned(cx.a, cx.table, pk, last.key, last.data));
+                const last = try cx.c.appliedOf(cx.a, cx.st, ws[ws.len - 1][1], ws[ws.len - 1][3]);
+                cx.owned.* = try cx.c.rowShows(cx.a, cx.table, cx.st, last);
                 if (cx.owned.*) {
-                    // The base: the oldest write's before-image — or no row, when the server said
-                    // the row is gone (`row_deleted`).
+                    var from: usize = 0;
+                    for (ws, 0..) |w, i| if (w[7] == .integer and w[7].integer == 1) {
+                        from = i;
+                    };
+                    // The base: the server's state before `from` — or no row, when the server
+                    // said the row is gone (`row_deleted`).
                     var gone = false;
                     for (ws) |w| gone = gone or (w[4] == .integer and w[4].integer == 1 and w[5] == .text and std.mem.eql(u8, w[5].text, "delete"));
-                    const base: ?Value = if (gone or ws[0][2] != .text) null else try parseStoredJson(cx.a, ws[0][2].text);
+                    const base: ?Value = if (gone or ws[from][2] != .text) null else try parseStoredJson(cx.a, ws[from][2].text);
                     if (base) |b|
-                        _ = try step(cx, s, try core.planUpsert(cx.a, cx.table, pk, b))
+                        try step(cx, s, try core.planUpsert(cx.a, cx.table, pk, b))
                     else
-                        _ = try step(cx, s, try core.planDelete(cx.a, cx.table, pk, last.key));
-                    for (ws) |w| {
+                        try step(cx, s, try core.planDelete(cx.a, cx.table, pk, last.key));
+                    var first = true;
+                    for (ws[from..]) |w| {
                         if (w[4] != .integer or w[4].integer == 1 or w[3] != .text) continue;
-                        const pw = try applied(cx, w[1], .null);
+                        const pw = try cx.c.appliedOf(cx.a, cx.st, w[1], .null);
                         const before = try cx.c.beforeImage(cx.a, cx.table, cx.st, pw.key);
                         const before_v: storage.Value = if (before) |b| .{ .text = try core.valueToString(cx.a, b) } else .null;
-                        _ = try s.query(cx.a, "UPDATE _zebridge_outbox SET before = ? WHERE msg_id = ?", &.{ before_v, w[0] });
+                        _ = try s.query(cx.a, "UPDATE _zebridge_outbox SET before = ?, authoritative = ? WHERE msg_id = ?", &.{ before_v, .{ .integer = @intFromBool(first) }, w[0] });
+                        first = false;
                         try cx.c.applyOptimistic(cx.table, cx.st, try parseStoredJson(cx.a, w[3].text));
                     }
                 }
@@ -7982,12 +8021,14 @@ fn undoTestWrite(cl: *SyncClient, a: std.mem.Allocator, msg: []const u8, table: 
     const st = cl.states.get(table).?;
     const key = (try std.json.parseFromSlice(Value, a, try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{id}), .{})).value;
     const before = try cl.beforeImage(a, table, st, key);
+    const authoritative = try cl.beforeIsAuthoritative(a, table, st, id);
     const opt_text = try std.fmt.allocPrint(a, "{{\"operation\":\"{s}\",\"data\":{{\"id\":\"{s}\",\"{s}\":\"{s}\"}}}}", .{ op, id, col, val });
     try cl.applyOptimistic(table, st, (try std.json.parseFromSlice(Value, a, opt_text, .{})).value);
     const payload = try std.fmt.allocPrint(a, "{{\"operation\":\"{s}\",\"key\":{{\"id\":\"{s}\"}},\"data\":{{\"{s}\":\"{s}\"}}}}", .{ op, id, col, val });
     const before_v: storage.Value = if (before) |b| .{ .text = try core.valueToString(a, b) } else .null;
-    _ = try cl.st.query(a, "INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at, optimistic) VALUES (?, 's', ?, ?, ?, ?, ?, ?)", &.{
-        .{ .text = msg }, .{ .text = payload }, .{ .text = table }, .{ .text = id }, before_v, .{ .integer = cl.nextCreated(a) }, .{ .text = opt_text },
+    _ = try cl.st.query(a, "INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at, optimistic, authoritative) VALUES (?, 's', ?, ?, ?, ?, ?, ?, ?)", &.{
+        .{ .text = msg },                              .{ .text = payload },         .{ .text = table }, .{ .text = id }, before_v,
+        .{ .integer = cl.nextCreated() }, .{ .text = opt_text }, .{ .integer = @intFromBool(authoritative) },
     });
 }
 
@@ -8090,6 +8131,27 @@ test "undo: two refused writes on one row leave no trace in either order; a spar
     try undoTestWrite(&cl, a, "u3", "p", "UPDATE", "x3", "title", "new");
     try undoTestReject(&cl, a, "u3");
     try std.testing.expectEqualStrings("old", (try undoTestTitle(&cl, a, "x3")).?);
+}
+
+test "undo: a server value that landed between two refused edits survives both, in either order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cl = try undoTestClient(a, ":memory:");
+    defer cl.st.close();
+    for ([_][2][]const u8{ .{ "ea", "eb" }, .{ "fb", "fa" } }, [_][]const u8{ "x1", "x2" }) |order, x| {
+        _ = try cl.st.query(a, "INSERT INTO p (id, title) VALUES (?, 'original')", &.{.{ .text = x }});
+        const ma = try std.fmt.allocPrint(a, "{s}a", .{x});
+        const mb = try std.fmt.allocPrint(a, "{s}b", .{x});
+        try undoTestWrite(&cl, a, ma, "p", "UPDATE", x, "title", "A");
+        _ = try cl.st.query(a, "UPDATE p SET title = 'server' WHERE id = ?", &.{.{ .text = x }}); // CDC
+        try undoTestWrite(&cl, a, mb, "p", "UPDATE", x, "title", "B");
+        const first = if (order[0][1] == 'a') ma else mb;
+        try undoTestReject(&cl, a, first);
+        try undoTestReject(&cl, a, if (first.ptr == ma.ptr) mb else ma);
+        try std.testing.expectEqualStrings("server", (try undoTestTitle(&cl, a, x)).?);
+        try std.testing.expectEqual(@as(usize, 0), cl.undoingCount(a));
+    }
 }
 
 test "undo: a poll pass that applied CDC or seeded retries an owed undo; a quiet one does not" {

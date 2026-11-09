@@ -1812,24 +1812,32 @@ export class ZeBridge {
         before     TEXT,
         optimistic TEXT,
         created_at ${this.dialect.int64} NOT NULL,
+        authoritative INTEGER,
         mode       TEXT NOT NULL,
         since      ${this.dialect.int64} NOT NULL,
         attempts   INTEGER NOT NULL DEFAULT 0
       )
     `);
+    // `authoritative`: whether `before` is the server's row, not an overlay of an earlier write
+    // (`beforeIsAuthoritative`). NULL: not known (an entry from before the column).
+    try { await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN authoritative INTEGER`); } catch { /* present */ }
+    // The ordering floor, read here once: `nextCreated` runs inside the write's transaction, and
+    // a query outside it there waits behind that transaction (PGlite: forever).
+    const m = await this.run(`SELECT max(m) AS m FROM (SELECT max(created_at) AS m FROM _zebridge_outbox UNION ALL SELECT max(created_at) FROM _zebridge_undo) t`);
+    this.lastCreated = Math.max(this.lastCreated ?? 0, Number(m[0]?.m ?? 0));
   }
 
   private async outboxPut(
-    r: { msgId: string; subject: string; payload: unknown; table: string; id: string | number; before: unknown; optimistic: unknown },
+    r: { msgId: string; subject: string; payload: unknown; table: string; id: string | number; before: unknown; optimistic: unknown; authoritative?: boolean },
     exec: Exec = this.run,
   ) {
     await this.outboxInitPromise;
     await exec(
-      `INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, optimistic)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+      `INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, optimistic, authoritative)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
        ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1`,
       r.msgId, r.subject, JSON.stringify(r.payload), r.table, String(r.id),
-      r.before == null ? null : JSON.stringify(r.before), r.before == null ? null : JSON.stringify(r.before), await this.nextCreated(), JSON.stringify(r.optimistic),
+      r.before == null ? null : JSON.stringify(r.before), r.before == null ? null : JSON.stringify(r.before), this.nextCreated(), JSON.stringify(r.optimistic), r.authoritative == null ? null : r.authoritative ? 1 : 0,
     );
   }
 
@@ -2001,8 +2009,8 @@ export class ZeBridge {
     await this.outboxInitPromise;
     await this.transaction(async (txExec) => {
       await txExec(
-        `INSERT INTO _zebridge_undo (msg_id, tbl, row_id, payload, before, optimistic, created_at, mode, since)
-         SELECT msg_id, tbl, row_id, payload, before, optimistic, created_at, ?, ? FROM _zebridge_outbox WHERE msg_id = ? ON CONFLICT (msg_id) DO NOTHING`,
+        `INSERT INTO _zebridge_undo (msg_id, tbl, row_id, payload, before, optimistic, created_at, authoritative, mode, since)
+         SELECT msg_id, tbl, row_id, payload, before, optimistic, created_at, authoritative, ?, ? FROM _zebridge_outbox WHERE msg_id = ? ON CONFLICT (msg_id) DO NOTHING`,
         mode, Date.now(), msgId,
       );
       await txExec(`DELETE FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
@@ -2014,13 +2022,8 @@ export class ZeBridge {
   /// `created_at` orders this client's writes, on one row and in the outbox: strictly
   /// increasing, so two writes in one millisecond keep their order (`undoRow` rebuilds a
   /// row from the oldest before-image forward). Never read as a wall-clock age.
-  private async nextCreated(): Promise<number> {
-    if (!this.lastCreated) {
-      try {
-        const r = await this.run(`SELECT max(m) AS m FROM (SELECT max(created_at) AS m FROM _zebridge_outbox UNION ALL SELECT max(created_at) FROM _zebridge_undo) t`);
-        this.lastCreated = Number(r[0]?.m ?? 0);
-      } catch { this.lastCreated = 0; }
-    }
+  /// The floor is read once, in `createOutboxTable`, never inside a write's transaction.
+  private nextCreated(): number {
     this.lastCreated = Math.max(Date.now(), (this.lastCreated ?? 0) + 1);
     return this.lastCreated;
   }
@@ -2083,84 +2086,113 @@ export class ZeBridge {
     }
   }
 
-  /// Settle every owed undo on one row (libzb's `undoRow`). The row holds this client's writes
-  /// on it in order: the pending ones (outbox) and the refused ones not yet undone
-  /// (`_zebridge_undo`). If it still shows what the LATEST of them applied, nothing
-  /// authoritative has landed since: it is rebuilt from the OLDEST one's before-image, the
-  /// pending writes are applied again in order over fresh before-images (as `reapplyPending`
-  /// does after a seed), and the owed undos go. Otherwise a newer authoritative row stands,
-  /// and they go without a change. Undoing one write alone was wrong twice: an INSERT A then
-  /// UPDATE B, both refused, left A on the row (A's undo saw B and gave up, B's restored A).
-  private async undoRow(table: string, rowId: string): Promise<'done' | 'skipped' | 'waiting'> {
-    const state = this.syncedTables.get(table);
-    if (!state) return 'waiting'; // not registered yet: a later pass
-    // What a write put on the row: its key, the data the optimistic apply used (the
-    // `optimistic` event: key, values and version stamp merged), whether it removed it.
-    const applied = (w: any) => {
-      const sent = JSON.parse(w.payload);
-      let opt: any = null;
-      try { opt = w.optimistic ? JSON.parse(w.optimistic) : null; } catch { /* the wire payload */ }
-      const src = opt ?? sent;
-      const data = (src?.data ?? null) as Record<string, unknown> | null;
-      return {
-        key: sent?.key as Record<string, unknown> | undefined, data, ev: opt,
-        removed: src?.operation === 'DELETE' || tombstoned(state.tombstoneColumn, data),
-      };
+  /// What one of this client's writes put on its row: its key, the data the optimistic apply
+  /// used (the `optimistic` event: key, values and version stamp merged; the wire payload for
+  /// an entry from before that column), and whether it removed the row.
+  private appliedOf(state: { tombstoneColumn: string | null }, w: { payload: string; optimistic?: string | null }) {
+    const sent = JSON.parse(w.payload);
+    let opt: any = null;
+    try { opt = w.optimistic ? JSON.parse(w.optimistic) : null; } catch { /* the wire payload */ }
+    const src = opt ?? sent;
+    const data = (src?.data ?? null) as Record<string, unknown> | null;
+    return {
+      key: sent?.key as Record<string, unknown> | undefined, data, ev: opt,
+      removed: src?.operation === 'DELETE' || tombstoned(state.tombstoneColumn, data),
     };
-    // SQLite stores booleans as 0/1 and objects as JSON text — normalize the SENT side to
-    // storage shape before comparing, or a row with any boolean column never matches.
+  }
+
+  /// Whether the row still shows what `w` applied (absent, for a removal): nothing else has
+  /// landed on it since (libzb's `rowShows`). SQLite stores booleans as 0/1 and objects as
+  /// JSON text — the SENT side is normalized to storage shape before comparing, or a row with
+  /// any boolean column never matches.
+  private async rowShows(table: string, state: { pkCols: string[] }, w: ReturnType<ZeBridge['appliedOf']>, exec: Exec): Promise<boolean> {
+    const keyObj = w.key;
+    if (!state.pkCols.length || !keyObj) return false;
+    const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
+    const row = (await exec(`SELECT * FROM ${table} WHERE ${where}`, ...state.pkCols.map((c) => keyObj[c])))[0] ?? null;
     const asStored = (v: unknown): string =>
       typeof v === 'boolean' ? (v ? '1' : '0')
       : isBytes(v) ? Array.from(v, (b) => b.toString(16).padStart(2, '0')).join('')
       : v !== null && typeof v === 'object' ? JSON.stringify(v)
       : String(v);
+    if (w.removed || !w.data) return row == null;
+    return row != null && Object.entries(w.data).every(([k, v]) => asStored(row[k]) === asStored(v));
+  }
+
+  /// Whether the row a new write is about to cover is the SERVER's state, not one of this
+  /// client's overlays: no earlier write of it is on the row, or the row no longer shows the
+  /// latest one (CDC replaced it). Stored with the write (`authoritative`), it is where
+  /// `undoRow` rebuilds from: a server value between two refused edits must survive them.
+  private async beforeIsAuthoritative(table: string, state: any, rowId: string, exec: Exec): Promise<boolean> {
+    const ws: any[] = await exec(
+      `SELECT payload, optimistic, created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?
+       UNION ALL SELECT payload, optimistic, created_at FROM _zebridge_undo WHERE tbl = ? AND row_id = ?
+       ORDER BY 3 DESC LIMIT 1`,
+      table, rowId, table, rowId,
+    );
+    if (!ws.length) return true;
+    return !(await this.rowShows(table, state, this.appliedOf(state, ws[0]), exec));
+  }
+
+  /// Settle every owed undo on one row (libzb's `undoRow`). The row holds this client's writes
+  /// on it in order: the pending ones (outbox) and the refused ones not yet undone
+  /// (`_zebridge_undo`). If it still shows what the LATEST of them applied, nothing has landed
+  /// since: it is rebuilt from the server's last known state — the before-image of the latest
+  /// write that covered an AUTHORITATIVE row (`beforeIsAuthoritative`; the oldest write's, for
+  /// entries from before that mark) —, the pending writes from there are applied again in
+  /// order over fresh before-images (as `reapplyPending` does after a seed), and the owed undos
+  /// go. Otherwise a newer authoritative row stands, and they go without a change. Undoing one
+  /// write alone was wrong (an INSERT A then UPDATE B, both refused, left A), and so was
+  /// rebuilding from the oldest before-image (A, a CDC value, B, both refused, lost the CDC value).
+  private async undoRow(table: string, rowId: string): Promise<'done' | 'skipped' | 'waiting'> {
+    const state = this.syncedTables.get(table);
+    if (!state) return 'waiting'; // not registered yet: a later pass
     let owned = false;
 
     await this.transaction(async (txExec) => {
       const ws: any[] = await txExec(
-        `SELECT msg_id, payload, before, optimistic, 0 AS owed, '' AS mode, created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?
-         UNION ALL SELECT msg_id, payload, before, optimistic, 1 AS owed, mode, created_at FROM _zebridge_undo WHERE tbl = ? AND row_id = ?
+        `SELECT msg_id, payload, before, optimistic, 0 AS owed, '' AS mode, created_at, authoritative FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?
+         UNION ALL SELECT msg_id, payload, before, optimistic, 1 AS owed, mode, created_at, authoritative FROM _zebridge_undo WHERE tbl = ? AND row_id = ?
          ORDER BY 7, 1`,
         table, rowId, table, rowId,
       );
       if (!ws.length) return;
-      const last = applied(ws[ws.length - 1]);
-      if (state.pkCols.length && last.key) {
+      const last = this.appliedOf(state, ws[ws.length - 1]);
+      owned = await this.rowShows(table, state, last, txExec);
+      if (owned && last.key) {
         const keyObj = last.key;
         const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
         const pkVals = state.pkCols.map((c) => keyObj[c]);
-        const currentRow = (await txExec(`SELECT * FROM ${table} WHERE ${where}`, ...pkVals))[0] ?? null;
-        owned = last.removed || !last.data
-          ? currentRow == null
-          : currentRow != null && Object.entries(last.data)
-              .every(([k, v]) => asStored(currentRow[k]) === asStored(v));
-        if (owned) {
-          // The base: the oldest write's before-image — or no row, when the server said the
-          // row is gone (`row_deleted`).
-          const gone = ws.some((w) => Number(w.owed) === 1 && w.mode === 'delete');
-          const base = gone || !ws[0].before ? null : JSON.parse(ws[0].before);
-          if (base == null) {
-            await txExec(`DELETE FROM ${table} WHERE ${where}`, ...pkVals);
-          } else if (currentRow == null) {
-            const cols = Object.keys(base);
-            await txExec(
-              `INSERT INTO ${table} (${cols.map((c) => `"${c}"`).join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
-              ...cols.map((c) => base[c]),
-            );
-          } else {
-            const cols = Object.keys(base).filter((c) => !state.pkCols.includes(c));
-            if (cols.length) {
-              await txExec(`UPDATE ${table} SET ${cols.map((c) => `"${c}" = ?`).join(', ')} WHERE ${where}`, ...cols.map((c) => base[c]), ...pkVals);
-            }
+        let from = 0;
+        ws.forEach((w, i) => { if (Number(w.authoritative) === 1) from = i; });
+        // The base: the server's state before `from` — or no row, when the server said the
+        // row is gone (`row_deleted`).
+        const gone = ws.some((w) => Number(w.owed) === 1 && w.mode === 'delete');
+        const base = gone || !ws[from].before ? null : JSON.parse(ws[from].before);
+        const current = (await txExec(`SELECT * FROM ${table} WHERE ${where}`, ...pkVals))[0] ?? null;
+        if (base == null) {
+          await txExec(`DELETE FROM ${table} WHERE ${where}`, ...pkVals);
+        } else if (current == null) {
+          const cols = Object.keys(base);
+          await txExec(
+            `INSERT INTO ${table} (${cols.map((c) => `"${c}"`).join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
+            ...cols.map((c) => base[c]),
+          );
+        } else {
+          const cols = Object.keys(base).filter((c) => !state.pkCols.includes(c));
+          if (cols.length) {
+            await txExec(`UPDATE ${table} SET ${cols.map((c) => `"${c}" = ?`).join(', ')} WHERE ${where}`, ...cols.map((c) => base[c]), ...pkVals);
           }
-          for (const w of ws) {
-            if (Number(w.owed) === 1) continue;
-            const pw = applied(w);
-            if (!pw.ev) continue; // queued before the `optimistic` column: its echo restores it
-            const before = (await txExec(`SELECT * FROM ${table} WHERE ${where}`, ...pkVals))[0] ?? null;
-            await txExec(`UPDATE _zebridge_outbox SET before = ? WHERE msg_id = ?`, before == null ? null : JSON.stringify(before), w.msg_id);
-            await this.applyEvent(table, pw.ev, txExec);
-          }
+        }
+        let first = true;
+        for (const w of ws.slice(from)) {
+          if (Number(w.owed) === 1) continue;
+          const pw = this.appliedOf(state, w);
+          if (!pw.ev) continue; // queued before the `optimistic` column: its echo restores it
+          const before = (await txExec(`SELECT * FROM ${table} WHERE ${where}`, ...pkVals))[0] ?? null;
+          await txExec(`UPDATE _zebridge_outbox SET before = ?, authoritative = ? WHERE msg_id = ?`, before == null ? null : JSON.stringify(before), first ? 1 : 0, w.msg_id);
+          first = false;
+          await this.applyEvent(table, pw.ev, txExec);
         }
       }
       await txExec(`DELETE FROM _zebridge_undo WHERE tbl = ? AND row_id = ?`, table, rowId);
@@ -5924,8 +5956,9 @@ export class ZeBridge {
   private async reapplyPending(table: string) {
     await this.outboxInitPromise;
     const state = this.syncedTables.get(table);
-    const rows: any[] = await this.run(`SELECT msg_id, payload, optimistic FROM _zebridge_outbox WHERE tbl = ? ORDER BY created_at`, table);
+    const rows: any[] = await this.run(`SELECT msg_id, payload, optimistic, row_id FROM _zebridge_outbox WHERE tbl = ? ORDER BY created_at`, table);
     let applied = 0, skipped = 0;
+    const seen = new Set<string>(); // the first write re-applied on a row covers the seeded row: the server's state
     for (const r of rows) {
       if (!r.optimistic || !state?.pkCols.length) { skipped++; continue; }
       let sent: any, ev: any;
@@ -5935,7 +5968,9 @@ export class ZeBridge {
       await this.transaction(async (txExec) => {
         const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
         const before = (await txExec(`SELECT * FROM ${table} WHERE ${where}`, ...state.pkCols.map((c) => keyObj[c])))[0] ?? null;
-        await txExec(`UPDATE _zebridge_outbox SET before = ? WHERE msg_id = ?`, before == null ? null : JSON.stringify(before), r.msg_id);
+        const first = !seen.has(String(r.row_id));
+        seen.add(String(r.row_id));
+        await txExec(`UPDATE _zebridge_outbox SET before = ?, authoritative = ? WHERE msg_id = ?`, before == null ? null : JSON.stringify(before), first ? 1 : 0, r.msg_id);
         await this.applyEvent(table, ev, txExec);
       });
       applied++;
@@ -6003,6 +6038,7 @@ export class ZeBridge {
       await this.transaction(async (txExec) => {
         const state = this.syncedTables.get(table);
         let before: any = null;
+        let authoritative: boolean | undefined;
         if (state?.pkCols.length) {
           const keyObj = (payload as any).key as Record<string, unknown> | undefined;
           if (keyObj) {
@@ -6010,6 +6046,7 @@ export class ZeBridge {
             const pkVals = state.pkCols.map((c) => keyObj[c]);
             const existing = await txExec(`SELECT * FROM ${table} WHERE ${where}`, ...pkVals);
             before = existing[0] ?? null;
+            authoritative = await this.beforeIsAuthoritative(table, state, String(id), txExec);
           }
         }
         // §10dx: the optimistic row carries the write's own stamp in the version column
@@ -6019,7 +6056,7 @@ export class ZeBridge {
         if (op !== 'DELETE' && state?.versionColumn && applied.data && typeof applied.data === 'object' && !(state.versionColumn in (applied.data as any))) {
           (applied.data as any)[state.versionColumn] = version;
         }
-        await this.outboxPut({ msgId, subject, payload, table, id, before, optimistic: applied }, txExec);
+        await this.outboxPut({ msgId, subject, payload, table, id, before, optimistic: applied, authoritative }, txExec);
         await this.applyEvent(table, applied, txExec);
       });
       // Fire the change event AFTER the local replica is successfully updated — with
