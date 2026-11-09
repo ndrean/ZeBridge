@@ -15,7 +15,7 @@ Both clients (libzb, zb-client-ts in Node):
 """
 import json, re, sys, time, uuid
 import zb
-from clients import Lib, Node, fresh_sqlite
+from clients import Lib, Node, both, fresh_sqlite
 
 LOG = "/tmp/zb_dependent_writes_bridge.log"
 NODE_LOG = "/tmp/zb_dependent_writes_node.log"
@@ -83,15 +83,22 @@ END $$""")
             py = Lib("/tmp/zb-dw-py.sqlite3", [P, C], "py-dependent-writes")
             nd = Node("/tmp/zb-dw-node.sqlite3", NODE_LOG)
             pg_has = lambda t, u: zb.psql(f"SELECT count(*) FROM {t} WHERE uid = '{u}'").strip() == "1"
+            # Write only once both tables are seeded: a full that lands later would replace the rows under test.
+            anchors = lambda c: c.q(f"SELECT count(*) FROM {'_zbz_generations' if c is py else '_zebridge_generations'} "
+                                    f"WHERE tbl IN ('{P}', '{C}')")[0][0] == 2
+            dt = both(py, nd, anchors, 90)
+            check(f"both clients seeded {P} and {C} ({dt} s)", dt is not None)
+            if dt is None: return failed
 
             for name, cl in (("libzb", py), ("zb-client-ts", nd)):
                 bad_p, bad_c, ok_p, ok_c = (str(uuid.uuid4()) for _ in range(4))
+                tenant = py.tenant
                 # Four writes back to back, in this order, before any verdict.
                 writes = [
-                    (P, {"uid": bad_p}, {"title": REFUSED}),
-                    (C, {"uid": bad_c}, {"parent_id": bad_p, "note": "child of the refused parent"}),
-                    (P, {"uid": ok_p}, {"title": "fine"}),
-                    (C, {"uid": ok_c}, {"parent_id": ok_p, "note": "child of the fine parent"}),
+                    (P, {"uid": bad_p}, {"uid": bad_p, "title": REFUSED, "tenant_id": tenant}),
+                    (C, {"uid": bad_c}, {"uid": bad_c, "parent_id": bad_p, "note": "child of the refused parent", "tenant_id": tenant}),
+                    (P, {"uid": ok_p}, {"uid": ok_p, "title": "fine", "tenant_id": tenant}),
+                    (C, {"uid": ok_c}, {"uid": ok_c, "parent_id": ok_p, "note": "child of the fine parent", "tenant_id": tenant}),
                 ]
                 ids = []
                 for t, key, vals in writes:
