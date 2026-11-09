@@ -835,27 +835,30 @@ pub fn planExists(a: std.mem.Allocator, table: []const u8, pk: []const []const u
     return .{ .object = obj };
 }
 
-/// The undo of an own write may run late (a foreign key refuses it while a dependent row
-/// is still there), so it changes the row only while the row still holds what the write
-/// put there: `SELECT 1` by the key, each written column `IS NOT DISTINCT FROM` the value
-/// the optimistic apply stored (the same `cdcValue`). Null when the key is incomplete.
-pub fn planOwned(a: std.mem.Allocator, table: []const u8, pk: []const []const u8, data: Value) !?Value {
-    if (pk.len == 0 or data != .object) return null;
+/// An undo may run late (a foreign key refuses it while a dependent row is still there), so
+/// it changes the row only while the row still holds what this client's latest write on it
+/// applied: `SELECT 1` by the KEY (the wire `data` of an UPDATE is sparse and need not repeat
+/// it), each applied column `IS NOT DISTINCT FROM` the value the optimistic apply stored (the
+/// same `cdcValue`). Null when the key is incomplete.
+pub fn planOwned(a: std.mem.Allocator, table: []const u8, pk: []const []const u8, key: Value, data: Value) !?Value {
+    if (pk.len == 0 or key != .object) return null;
     var params = std.json.Array.init(a);
     var where: std.ArrayList(u8) = .empty;
     for (pk, 0..) |c, i| {
-        const v = data.object.get(c) orelse return null;
+        const v = key.object.get(c) orelse return null;
         if (v == .null) return null;
         try params.append(v);
         if (i > 0) try where.appendSlice(a, " AND ");
         try where.appendSlice(a, try std.fmt.allocPrint(a, "\"{s}\" = ?", .{c}));
     }
-    var it = data.object.iterator();
-    while (it.next()) |e| {
-        const k = e.key_ptr.*;
-        if (std.mem.startsWith(u8, k, "old.") or containsStr(pk, k)) continue;
-        try where.appendSlice(a, try std.fmt.allocPrint(a, " AND \"{s}\" IS NOT DISTINCT FROM ?", .{k}));
-        try params.append(try cdcValue(a, e.value_ptr.*));
+    if (data == .object) {
+        var it = data.object.iterator();
+        while (it.next()) |e| {
+            const k = e.key_ptr.*;
+            if (std.mem.startsWith(u8, k, "old.") or containsStr(pk, k)) continue;
+            try where.appendSlice(a, try std.fmt.allocPrint(a, " AND \"{s}\" IS NOT DISTINCT FROM ?", .{k}));
+            try params.append(try cdcValue(a, e.value_ptr.*));
+        }
     }
     var obj: std.json.ObjectMap = .empty;
     try obj.put(a, "sql", .{ .string = try std.fmt.allocPrint(a, "SELECT 1 FROM {s} WHERE {s} LIMIT 1", .{ table, where.items }) });

@@ -239,14 +239,16 @@ test('outboxStatus: the oldest waiting write against the GC floor, warned once a
   } finally { db.close(); }
 });
 
-// A refused write's local undo is owed durably (`_zebridge_undo`): a foreign key that refuses
-// it while a dependent row is still here keeps it owed, never throws (that ended Node), and
-// the dependent's own undo unblocks it. The twin of libzb's "undo: a refused parent's undo…".
+// A refused write's local undo is owed durably (`_zebridge_undo`) and settled per row: a
+// foreign key that refuses it while a dependent row is still here keeps it owed, never throws
+// (that ended Node), and is retried after a verdict, a change or a restart. The twin of
+// libzb's "undo: …" tests.
 function undoFixture(path = ':memory:') {
   const db = new DatabaseSync(path);
   db.exec(`PRAGMA foreign_keys = ON;
-    CREATE TABLE IF NOT EXISTS _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT, payload TEXT, tbl TEXT, row_id TEXT, before TEXT, created_at INTEGER);
-    CREATE TABLE IF NOT EXISTS _zebridge_undo (msg_id TEXT PRIMARY KEY, tbl TEXT NOT NULL, payload TEXT NOT NULL, before TEXT, mode TEXT NOT NULL, since INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT, payload TEXT, tbl TEXT, row_id TEXT, before TEXT, created_at INTEGER, optimistic TEXT);
+    CREATE TABLE IF NOT EXISTS _zebridge_undo (msg_id TEXT PRIMARY KEY, tbl TEXT NOT NULL, row_id TEXT NOT NULL, payload TEXT NOT NULL, before TEXT, optimistic TEXT,
+      created_at INTEGER NOT NULL, mode TEXT NOT NULL, since INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS p (id TEXT PRIMARY KEY, title TEXT);
     CREATE TABLE IF NOT EXISTS c (id TEXT PRIMARY KEY, pid TEXT NOT NULL REFERENCES p(id));`);
   const c: any = Object.create(ZeBridge.prototype);
@@ -261,26 +263,38 @@ function undoFixture(path = ':memory:') {
   };
   const table = (cols: string[]) => ({ pkCols: ['id'], columns: cols, tombstoneColumn: null });
   Object.assign(c, {
-    outboxInitPromise: Promise.resolve(), appendLog: (_t: string, m: string) => logs.push(m), triggerChange: () => {},
+    outboxInitPromise: Promise.resolve(), appendLog: (_t: string, m: string) => logs.push(m),
+    eventListeners: [], tableListeners: {}, scheduleRecount: () => {}, undoOwed: true,
     syncedTables: new Map([['p', table(['id', 'title'])], ['c', table(['id', 'pid'])]]),
+    // The optimistic apply, reduced to the upsert it is for these two tables.
+    applyEvent: async (t: string, ev: any, exec: any) => {
+      const cols = Object.keys(ev.data);
+      await exec(`INSERT INTO ${t} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})
+        ON CONFLICT (id) DO UPDATE SET ${cols.map((k) => `${k} = excluded.${k}`).join(', ')}`, ...cols.map((k) => ev.data[k]));
+    },
   });
-  const insert = (t: 'p' | 'c', id: string, col: string, val: string) => {
-    db.prepare(`INSERT INTO ${t} (id, ${col}) VALUES (?, ?)`).run(id, val);
-    db.prepare('INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, created_at) VALUES (?, ?, ?, ?, ?, 1)')
-      .run(id, 's', JSON.stringify({ operation: 'INSERT', key: { id }, data: { id, [col]: val } }), t, id);
+  // A write as `mutate` leaves it: before-image read, optimistic event (key merged into the
+  // data) applied, outbox entry queued with the SPARSE wire data.
+  const write = async (msg: string, t: 'p' | 'c', op: string, id: string, col: string, val: string) => {
+    const before = db.prepare(`SELECT * FROM ${t} WHERE id = ?`).get(id) ?? null;
+    const ev = { operation: op, data: { id, [col]: val } };
+    await c.applyEvent(t, ev, c.run);
+    db.prepare('INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at, optimistic) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(msg, 's', JSON.stringify({ operation: op, key: { id }, data: { [col]: val } }), t, id, before == null ? null : JSON.stringify(before), await c.nextCreated(), JSON.stringify(ev));
   };
   const has = (t: string, id: string) => db.prepare(`SELECT 1 FROM ${t} WHERE id = ?`).all(id).length === 1;
-  return { db, c, logs, insert, has };
+  const title = (id: string) => (db.prepare('SELECT title FROM p WHERE id = ?').get(id) as any)?.title ?? null;
+  return { db, c, logs, write, has, title };
 }
 
 test('undo: a refused parent\'s undo waits for its child\'s in either order, survives a restart, and spares a row that changed', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zb-undo-'));
   const path = `${dir}/r.sqlite3`;
-  const { db, c, logs, insert, has } = undoFixture(path);
+  const { db, c, logs, write, has, title } = undoFixture(path);
 
   // Parent first (dependent_writes.py): refused while the child is here, owed, unblocked by it.
-  insert('p', 'p1', 'title', 'refused');
-  insert('c', 'r1', 'pid', 'p1');
+  await write('p1', 'p', 'INSERT', 'p1', 'title', 'refused');
+  await write('r1', 'c', 'INSERT', 'r1', 'pid', 'p1');
   await c.revertOptimisticWrite('p1', 'restore');
   assert.ok(has('p', 'p1'));
   assert.equal(await c.undoing(), 1);
@@ -290,8 +304,8 @@ test('undo: a refused parent\'s undo waits for its child\'s in either order, sur
   assert.equal(await c.undoing(), 0);
 
   // Child first, then a duplicate verdict: nothing blocks, nothing is owed twice.
-  insert('p', 'p2', 'title', 'refused');
-  insert('c', 'r2', 'pid', 'p2');
+  await write('p2', 'p', 'INSERT', 'p2', 'title', 'refused');
+  await write('r2', 'c', 'INSERT', 'r2', 'pid', 'p2');
   await c.revertOptimisticWrite('r2', 'restore');
   await c.revertOptimisticWrite('p2', 'restore');
   await c.revertOptimisticWrite('p2', 'restore');
@@ -299,17 +313,17 @@ test('undo: a refused parent\'s undo waits for its child\'s in either order, sur
   assert.equal(await c.undoing(), 0);
 
   // A newer value lands before the retry (CDC): the late undo leaves the row alone.
-  insert('p', 'p3', 'title', 'refused');
-  insert('c', 'r3', 'pid', 'p3');
+  await write('p3', 'p', 'INSERT', 'p3', 'title', 'refused');
+  await write('r3', 'c', 'INSERT', 'r3', 'pid', 'p3');
   await c.revertOptimisticWrite('p3', 'restore');
   db.exec(`UPDATE p SET title = 'newer' WHERE id = 'p3'; DELETE FROM c WHERE id = 'r3'; DELETE FROM _zebridge_outbox WHERE msg_id = 'r3'`);
   await c.runUndos();
-  assert.ok(has('p', 'p3'));
+  assert.equal(title('p3'), 'newer');
   assert.equal(await c.undoing(), 0);
 
   // A restart while the undo is owed: still owed after reopening, done once the child is gone.
-  insert('p', 'p4', 'title', 'refused');
-  insert('c', 'r4', 'pid', 'p4');
+  await write('p4', 'p', 'INSERT', 'p4', 'title', 'refused');
+  await write('r4', 'c', 'INSERT', 'r4', 'pid', 'p4');
   await c.revertOptimisticWrite('p4', 'restore');
   db.close();
   const again = undoFixture(path);
@@ -320,4 +334,59 @@ test('undo: a refused parent\'s undo waits for its child\'s in either order, sur
   assert.equal(await again.c.undoing(), 0);
   again.db.close();
   rmSync(dir, { recursive: true, force: true });
+});
+
+test('undo: two refused writes on one row leave no trace in either order; a sparse UPDATE is restored', async () => {
+  const { c, write, has, title } = undoFixture();
+  await write('a1', 'p', 'INSERT', 'x1', 'title', 'A');
+  await write('b1', 'p', 'UPDATE', 'x1', 'title', 'B');
+  await c.revertOptimisticWrite('a1', 'restore');
+  assert.equal(title('x1'), 'B'); // B still pending, rebuilt over A's base (no row)
+  await c.revertOptimisticWrite('b1', 'restore');
+  assert.ok(!has('p', 'x1'));
+
+  await write('a2', 'p', 'INSERT', 'x2', 'title', 'A');
+  await write('b2', 'p', 'UPDATE', 'x2', 'title', 'B');
+  await c.revertOptimisticWrite('b2', 'restore');
+  assert.equal(title('x2'), 'A');
+  await c.revertOptimisticWrite('a2', 'restore');
+  assert.ok(!has('p', 'x2'));
+  assert.equal(await c.undoing(), 0);
+
+  const { db, c: c2, write: write2, title: title2 } = undoFixture();
+  db.exec(`INSERT INTO p (id, title) VALUES ('x3', 'old')`);
+  await write2('u3', 'p', 'UPDATE', 'x3', 'title', 'new');
+  await c2.revertOptimisticWrite('u3', 'restore');
+  assert.equal(title2('x3'), 'old');
+});
+
+test('undo: a change (CDC) retries an owed undo without another verdict', async () => {
+  const { db, c, write, has } = undoFixture();
+  await write('p1', 'p', 'INSERT', 'p1', 'title', 'refused');
+  await write('r1', 'c', 'INSERT', 'r1', 'pid', 'p1');
+  await c.revertOptimisticWrite('p1', 'restore');
+  assert.equal(await c.undoing(), 1);
+  // CDC removes the child (its write resolved without a refusal of its own).
+  db.exec(`DELETE FROM _zebridge_outbox WHERE msg_id = 'r1'; DELETE FROM c WHERE id = 'r1'`);
+  c.triggerChange('c');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(!has('p', 'p1'));
+  assert.equal(await c.undoing(), 0);
+});
+
+test('undo: a reseed settles the owed undos of the rows it replaced; a pending write then rolls back to the seeded row', async () => {
+  const { db, c, write, title } = undoFixture();
+  db.exec(`INSERT INTO p (id, title) VALUES ('x', 'old')`);
+  await write('ua', 'p', 'UPDATE', 'x', 'title', 'a');
+  await write('ub', 'p', 'UPDATE', 'x', 'title', 'b');
+  // Refused; its undo not run yet.
+  db.exec(`INSERT INTO _zebridge_undo (msg_id, tbl, row_id, payload, before, optimistic, created_at, mode, since)
+    SELECT msg_id, tbl, row_id, payload, before, optimistic, created_at, 'restore', 0 FROM _zebridge_outbox WHERE msg_id = 'ua';
+    DELETE FROM _zebridge_outbox WHERE msg_id = 'ua'`);
+  db.exec(`UPDATE p SET title = 'srv' WHERE id = 'x'`); // a full replaced the rows
+  await c.reapplyPending('p');
+  assert.equal(title('x'), 'b');
+  assert.equal(await c.undoing(), 0);
+  await c.revertOptimisticWrite('ub', 'restore');
+  assert.equal(title('x'), 'srv');
 });

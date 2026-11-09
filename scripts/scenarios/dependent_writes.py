@@ -152,6 +152,22 @@ END $$""")
                 check(f"§4 {name}: replica [refused parent, its child, fine parent, fine child] = {local} (want {expect}); outbox {pending}, undos owed {owed}",
                       local == expect and pending == 0 and owed == 0)
 
+                # §5 Two writes on ONE row, back to back: the refused INSERT, then a sparse UPDATE of
+                # it (which finds no row upstream). Undoing each write alone left the INSERT's row.
+                x = str(uuid.uuid4())
+                cl.mutate(P, "INSERT", {"uid": x}, {"uid": x, "title": REFUSED, "tenant_id": tenant})
+                cl.mutate(P, "UPDATE", {"uid": x}, {"title": "edited after"})
+                t0 = time.monotonic()
+                while time.monotonic() - t0 < 30:
+                    if cl is py: py.flush(500); py.poll()
+                    else: time.sleep(0.3)
+                    pending = cl.q("SELECT count(*) FROM _zebridge_outbox")[0][0]
+                    owed = cl.q(f"SELECT count(*) FROM {'_zbz_undo' if cl is py else '_zebridge_undo'}")[0][0]
+                    here = cl.q(f"SELECT count(*) FROM {P} WHERE uid = ?", [x])[0][0]
+                    if pending == 0 and owed == 0 and here == 0: break
+                check(f"§5 {name}: a refused INSERT and its UPDATE leave no row (replica {here}, PostgreSQL {int(pg_has(P, x))}); outbox {pending}, undos owed {owed}",
+                      here == 0 and not pg_has(P, x) and pending == 0 and owed == 0)
+
             py.close(); nd.close(); py = nd = None
     finally:
         if py: py.close()
