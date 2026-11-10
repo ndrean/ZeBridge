@@ -1,10 +1,14 @@
 """The comparison must reject matching counts with different data."""
 import datetime
+import asyncio
 import importlib.util
 from pathlib import Path
 import sqlite3
 import tempfile
+import sys
+import types
 import unittest
+from unittest.mock import AsyncMock, patch
 
 spec = importlib.util.spec_from_file_location("seed_compare", Path(__file__).with_name("seed.py"))
 seed = importlib.util.module_from_spec(spec)
@@ -12,6 +16,36 @@ spec.loader.exec_module(seed)
 
 
 class VerificationTests(unittest.TestCase):
+    def test_preparation_waits_for_readable_metadata_and_closes_connection(self):
+        missing = type("NotFoundError", (Exception,), {})
+        errors = types.ModuleType("nats.js.errors")
+        errors.NotFoundError = errors.KeyNotFoundError = missing
+        visited = []
+
+        async def get(key):
+            visited.append(key)
+            if len(visited) == 1:
+                raise missing()
+            return types.SimpleNamespace(value=b"ready")
+
+        js = types.SimpleNamespace(key_value=AsyncMock(return_value=types.SimpleNamespace(get=get)))
+        connection = types.SimpleNamespace(jetstream=lambda **kw: js, close=AsyncMock())
+        nats = types.ModuleType("nats")
+        nats.connect = AsyncMock(return_value=connection)
+        stack = types.SimpleNamespace(url="nats://test", bridge_creds="unused")
+        with patch.dict(sys.modules, {"nats": nats, "nats.js": types.ModuleType("nats.js"),
+                                      "nats.js.errors": errors}), patch.object(seed.asyncio, "sleep", new_callable=AsyncMock):
+            asyncio.run(seed.wait_seed_metadata(stack, 1))
+        self.assertEqual(visited, [seed.TABLE, seed.TABLE, seed.PRINCIPAL, f"{seed.TENANT}.{seed.TABLE}"])
+        connection.close.assert_awaited_once()
+
+    def test_enrollment_timing_requires_one_real_enrollment(self):
+        line = "info(libzb): zebridge: enrolled in 7 ms (the bridge's /enroll, the identity saved)\n"
+        self.assertEqual(seed.enrollment_duration(line), 0.007)
+        for invalid in ("", "JWT renewed in 7 ms", line + line):
+            with self.subTest(invalid=invalid), self.assertRaises(RuntimeError):
+                seed.enrollment_duration(invalid)
+
     def test_null_empty_and_typed_values_are_distinct(self):
         values = [None, "", "\n", 1, "1", "é\u0000x"]
         self.assertEqual(len(values), len({seed.fingerprint([(v,)])["sha256"] for v in values}))

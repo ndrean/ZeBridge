@@ -44,6 +44,7 @@ Options:
 | `--pg-port` | 5432 | Local Postgres administrator and source port |
 | `--timeout` | 180 | Hard wall-clock limit per child, including preparation/checksum |
 | `--output` | — | Save the JSON report, also printed to stdout |
+| `--enrollment` | off | Also measure fresh invitation enrollment plus seeding, before stopping the bridge |
 
 Progress goes to stderr. The JSON includes individual samples, direct-path phase
 times, median seconds and `libzb_over_direct`: below 1 means libzb was faster;
@@ -103,6 +104,62 @@ Postgres importer. `COPY` and a native direct importer are separate future basel
 
 Container/microVM launch time is excluded. Establish this initialization baseline
 first; measuring the same work inside constrained instances is a separate run.
+
+## Invitation enrollment
+
+Add `--enrollment` to exercise the first-run client path:
+
+```sh
+/tmp/zb-seed-venv/bin/python scripts/compare/postgres/seed.py \
+  --rows 50000 --rounds 5 --enrollment --output /tmp/enrollment-comparison.json
+```
+
+After validating the prepared generation, the harness keeps the bridge running
+and performs one enrollment/seed per round, sequentially. Each gets a new one-use
+invitation code, identity path, SQLite file and child process. The principal and
+tenant are the same, representing additional devices for the same user. Invitation
+creation is untimed. The client receives only the bridge URL, invite, identity/DB
+paths, table list and seed options: no pre-minted credentials, NATS URL override,
+principal override or domain override. The endpoint supplies those connection facts.
+
+The JSON `enrollment` object reports three boundaries and the combined duration:
+
+| Metric | Boundary |
+| --- | --- |
+| `enrollment` | libzb's existing internal timer: device key generation, HTTP invite redemption, response processing and identity persistence; reported at 1 ms resolution |
+| `connect_with_enrollment` | Immediately before `zb_client_connect` until it returns; includes enrollment, NATS authentication and local client initialization |
+| `sync_to_ready` | From successful connect until all expected rows and the generation watermark are present; some initial work can already occur inside connect |
+| `total` | Immediately before connect until the local database is ready; measured directly, not by adding medians |
+
+The `enrollment` phase is **inside** `connect_with_enrollment`, so these must not be
+added together. It is extracted from libzb's own `enrolled in … ms` log, not estimated
+by subtracting separate runs. A missing or ambiguous enrollment timing fails the
+run. After timing, each identity must contain credentials for the expected
+principal, its invitation must be marked used in Postgres, and its complete local
+database must pass the same checksum verification as the other paths.
+
+These measurements use HTTP and TCP over loopback with the bridge's real enrollment
+endpoint and NATS JWT authentication. They exclude user sign-in, code delivery,
+TLS, remote DNS/network latency and generation construction. The report records
+that the bridge is running during enrollment measurements. Afterwards the bridge
+is stopped and the original direct/pre-minted-credential comparison runs as before;
+its `enrollment_timed: false` describes those baseline samples only.
+
+Measured on 2026-11-10 with the same 50,000-row local fixture and runtime versions
+as below, five fresh devices produced these results ([raw report](results/local-enrollment-50000.json)):
+
+| Metric | Median | Minimum–maximum |
+| --- | ---: | ---: |
+| Enrollment: key generation, redemption and identity save | 9 ms | 8–10 ms |
+| Connect including enrollment | 12.0 ms | 11.3–12.2 ms |
+| Full first-run initialization, including enrollment and 50,000 rows | 167.4 ms | 153.8–169.3 ms |
+
+All five invitations were redeemed and all five new identities saved. All fifteen
+timed databases (five enrolled, five direct, five with pre-minted credentials)
+passed the complete contents check. The repeated baseline medians were 493.4 ms
+direct and 158.7 ms with pre-minted credentials. Enrollment runs keep the bridge
+active, whereas baseline runs stop it; treat them as separate operating conditions.
+No TLS or remote network was involved, so 9 ms is a local service measurement.
 
 ## First local result (2026-11-10)
 

@@ -7,18 +7,21 @@ and a new database. The private fixture is never written during measurements.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import sqlite3
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 ROOT = Path(__file__).resolve().parents[3]
 TABLE = "seed_items"
@@ -105,7 +108,7 @@ def direct(config, path):
         pg.close()
 
 
-def libzb(config, path):
+def libzb(config, path, *, enroll=False):
     # Use the C ABI directly so no Python background poll thread or sleep interval
     # becomes part of the result (zb-python's constructor also connects AND syncs).
     sys.path.insert(0, str(ROOT / "zb-python/src"))
@@ -121,6 +124,16 @@ def libzb(config, path):
                "principal": PRINCIPAL, "jsDomain": "hub", "dbPath": str(path),
                "clientId": path.stem, "tables": [TABLE], "heartbeatMs": 0,
                "seedChunkRows": config["batch_rows"]}
+    identity_path = Path(str(path) + ".identity")
+    if enroll:
+        if identity_path.exists():
+            raise RuntimeError("enrollment requires a new identity")
+        # The endpoint supplies NATS URLs, domain and principal. No pre-minted
+        # credentials or endpoint override may bypass the real invitation path.
+        options = {key: value for key, value in options.items()
+                   if key not in ("natsUrl", "credsPath", "principal", "jsDomain")}
+        options.update(bridgeUrl=config["bridge_url"], invite=config["invite"],
+                       identityPath=str(identity_path))
     encoded = json.dumps(options).encode()
     query = (f"SELECT count(*) FROM {TABLE} WHERE 1 = "
              f"(SELECT count(*) FROM _zbz_generations WHERE tbl = '{TABLE}' "
@@ -129,6 +142,7 @@ def libzb(config, path):
     handle = native.lib.zb_client_connect(encoded)
     if not handle:
         raise RuntimeError(native.last_error() or "libzb connect failed")
+    connected = time.perf_counter()
     try:
         take(native.lib.zb_client_sync(handle))
         while True:
@@ -138,7 +152,15 @@ def libzb(config, path):
             take(native.lib.zb_client_poll(handle, 10))
         elapsed = time.perf_counter() - started
         version = take(native.lib.zb_client_query(handle, b"SELECT sqlite_version()", b"[]"))["rows"][0][0]
-        return {"seconds": elapsed, "engine_sqlite_version": version}
+        result = {"seconds": elapsed, "engine_sqlite_version": version}
+        if enroll:
+            identity = json.loads(identity_path.read_text())
+            if identity.get("principal") != PRINCIPAL or not identity.get("creds"):
+                raise RuntimeError("enrollment did not persist the expected identity")
+            result.update(identity_saved=True, phases_seconds={
+                "connect_with_enrollment": connected - started,
+                "sync_to_ready": elapsed - (connected - started)})
+        return result
     finally:
         native.lib.zb_client_close(handle)
 
@@ -147,7 +169,7 @@ def worker(config_path, mode, path):
     config = json.loads(config_path.read_text())
     if path.exists():
         raise RuntimeError(f"refusing to reuse a replica: {path}")
-    result = (direct if mode == "direct" else libzb)(config, path)
+    result = direct(config, path) if mode == "direct" else libzb(config, path, enroll=mode == "enrolled")
     # Both timed handles have closed. A fresh SQLite reader proves that the rows
     # survived close; hashing and teardown are deliberately outside the timer.
     result.update(verify(path, config["expected"]))
@@ -155,14 +177,102 @@ def worker(config_path, mode, path):
     print(json.dumps(result))
 
 
+def enrollment_duration(stderr):
+    # capi.zig times the real enrollment/save path, inside zb_client_connect.
+    # Fail if an older build cannot report it; never invent a phase by subtraction.
+    matches = re.findall(r"zebridge: enrolled in (\d+) ms \(the bridge's /enroll, the identity saved\)", stderr)
+    if len(matches) != 1:
+        raise RuntimeError("expected exactly one libzb enrollment timing; use a current libzb build")
+    return int(matches[0]) / 1000
+
+
 def sample(config_path, mode, path, timeout):
     completed = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), "--worker", mode,
          "--config", str(config_path), "--db", str(path)],
-        capture_output=True, text=True, timeout=timeout)
+        capture_output=True, text=True, timeout=timeout,
+        env=dict(os.environ, ZB_LOG_LEVEL="info") if mode == "enrolled" else None)
     if completed.returncode:
         raise RuntimeError(f"{mode} worker failed:\n{completed.stderr[-3000:]}")
-    return json.loads(completed.stdout)
+    result = json.loads(completed.stdout)
+    if mode == "enrolled":
+        result["phases_seconds"]["enrollment"] = enrollment_duration(completed.stderr)
+    return result
+
+
+def start_bridge(stack, *, enrollment):
+    sys.path.insert(0, str(ROOT / "scripts/scenarios"))
+    from hub_fallback_stage2 import port
+
+    http_port = port()
+    env = dict(stack.env, ZB_FEED_RESTART="1")
+    if enrollment:
+        # Generated operator config, same signing key trusted by this private NATS.
+        identity_dir = stack.tmp / f"{stack.name}-id"
+        values = dict(line.split("=", 1) for line in (identity_dir / ".env.nats").read_text().splitlines()
+                      if "=" in line and not line.startswith("#"))
+        env.update(ZB_SIGNING_SEED=values["ZB_SIGNING_SEED"],
+                   ZB_ACCOUNT_PUB=values["ZB_ACCOUNT_PUB"], ENROLL_NATS_URL=stack.url)
+    stack.spawn("bridge1", [str(stack.bridge_bin), "--pub", "rr_pub", "--slot", stack.name + "_slot",
+                            "--port", str(http_port)], env)
+    stack.wait_log("bridge1", "Replication started successfully")
+    stack.wait_log("bridge1", f"g1 for '{TENANT}'/'{TABLE}': full")
+    if enrollment:
+        stack.wait_log("bridge1", "enrollment endpoint armed")
+    return f"http://127.0.0.1:{http_port}"
+
+
+async def wait_seed_metadata(stack, timeout):
+    import nats
+    from nats.js.errors import NotFoundError, KeyNotFoundError
+
+    nc = await nats.connect(stack.url, user_credentials=stack.bridge_creds)
+    try:
+        js = nc.jetstream(domain="hub")
+        deadline = time.monotonic() + timeout
+        # Boot log lines can precede visibility through the direct KV read API.
+        # Do not charge a fresh client for waiting on a partially prepared service.
+        while time.monotonic() < deadline:
+            try:
+                for bucket, key in (("schemas", TABLE), ("tenants", PRINCIPAL),
+                                    ("generations", f"{TENANT}.{TABLE}")):
+                    kv = await js.key_value(bucket)
+                    entry = await kv.get(key)
+                    if not entry.value:
+                        raise RuntimeError(f"empty seed metadata in {bucket}")
+                return
+            except (NotFoundError, KeyNotFoundError):
+                await asyncio.sleep(0.05)
+        raise TimeoutError("seed schema, tenant mapping and generation did not become readable")
+    finally:
+        await nc.close()
+
+
+def enrollment_samples(stack, tmp, config, args):
+    results = []
+    for round_no in range(1, args.rounds + 1):
+        # Invitation creation is backend setup, excluded from the device's timer.
+        code = "seed-" + uuid.uuid4().hex
+        stack.sql("INSERT INTO zebridge_invites (code, principal, tenant_id) "
+                  f"VALUES ('{code}', '{PRINCIPAL}', '{TENANT}')")
+        config_path = tmp / f"enroll-{round_no}.json"
+        config_path.write_text(json.dumps(dict(config, invite=code)))
+        config_path.chmod(0o600)
+        result = sample(config_path, "enrolled", tmp / f"enrolled-{round_no}.sqlite3", args.timeout)
+        if stack.sql(f"SELECT used_at IS NOT NULL FROM zebridge_invites WHERE code = '{code}'") != "t":
+            raise RuntimeError("enrollment did not redeem its fresh invitation")
+        result.update(round=round_no, invite_redeemed=True)
+        results.append(result)
+        phases = result["phases_seconds"]
+        print(f"Enrollment {round_no}: {phases['enrollment']:.3f} s; "
+              f"connect+seed {result['seconds']:.6f} s; verified", file=sys.stderr, flush=True)
+    return {"transport": "HTTP over loopback", "bridge_running_during_measurement": True,
+            "enrollment_resolution_seconds": 0.001, "invitation_creation_timed": False,
+            "fresh_identity_per_sample": True,
+            "median_seconds": {
+                **{phase: statistics.median(r["phases_seconds"][phase] for r in results)
+                   for phase in ("enrollment", "connect_with_enrollment", "sync_to_ready")},
+                "total": statistics.median(r["seconds"] for r in results)}, "samples": results}
 
 
 def run(args):
@@ -195,7 +305,8 @@ def run(args):
                   i FROM generate_series(1, {args.rows}) AS i;
                 ANALYZE public.{TABLE};
             """)
-            stack.bridge_up()
+            bridge_url = start_bridge(stack, enrollment=args.enrollment)
+            asyncio.run(wait_seed_metadata(stack, args.timeout))
             pg_url = stack.env["DATABASE_READER_URL"]
             with psycopg.connect(pg_url) as pg:
                 pg.execute("SELECT set_config('zb.tenant', %s, true)", (TENANT,))
@@ -205,7 +316,7 @@ def run(args):
             if expected["rows"] != args.rows:
                 raise RuntimeError("reader role cannot see the entire fixture")
             config = {"pg_url": pg_url, "nats_url": stack.url, "creds": stack.creds[PRINCIPAL],
-                      "batch_rows": args.batch_rows, "expected": expected}
+                      "batch_rows": args.batch_rows, "expected": expected, "bridge_url": bridge_url}
             config_path = tmp / "config.json"
             config_path.write_text(json.dumps(config))
             config_path.chmod(0o600)
@@ -222,6 +333,8 @@ def run(args):
             if local_columns != COLUMNS.split(", "):
                 raise RuntimeError(f"unexpected replica columns: {local_columns}")
             config_path.write_text(json.dumps(config))
+
+            enrollment = enrollment_samples(stack, tmp, config, args) if args.enrollment else None
 
             # With a static source, NATS can serve the prepared objects and retained
             # stream without a running bridge. Remove producer work from BOTH timers.
@@ -255,6 +368,7 @@ def run(args):
                     "nats_version": subprocess.check_output(["nats-server", "--version"], text=True).strip(),
                     "median_seconds": medians,
                     "libzb_over_direct": medians["libzb"] / medians["direct"],
+                    "enrollment": enrollment,
                     "samples": results}
         finally:
             stack.stop()
@@ -276,7 +390,8 @@ def main():
     parser.add_argument("--pg-port", type=positive, default=5432)
     parser.add_argument("--timeout", type=positive, default=180, help="hard timeout per worker, seconds")
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--worker", choices=("direct", "libzb"), help=argparse.SUPPRESS)
+    parser.add_argument("--enrollment", action="store_true", help="also measure fresh invitation enrollment and seeding")
+    parser.add_argument("--worker", choices=("direct", "libzb", "enrolled"), help=argparse.SUPPRESS)
     parser.add_argument("--config", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--db", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
