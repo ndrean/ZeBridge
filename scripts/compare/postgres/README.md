@@ -161,6 +161,40 @@ direct and 158.7 ms with pre-minted credentials. Enrollment runs keep the bridge
 active, whereas baseline runs stop it; treat them as separate operating conditions.
 No TLS or remote network was involved, so 9 ms is a local service measurement.
 
+## One million rows (2026-11-10)
+
+The same runner, local runtime versions and 192-byte non-null note fixture, scaled
+to 1,000,000 rows. Five sequential rounds used 50,000-row batches, new local files
+and alternating baseline order. All fifteen timed databases matched Postgres
+across all six columns, and all five enrollment invitations were redeemed with
+new identities saved. [Raw report](results/local-enrollment-1000000.json).
+
+```sh
+/tmp/zb-seed-venv/bin/python scripts/compare/postgres/seed.py \
+  --rows 1000000 --rounds 5 --batch-rows 50000 --enrollment --timeout 300 \
+  --output /tmp/enrollment-comparison-1000000.json
+```
+
+| Path | Median | Minimum–maximum |
+| --- | ---: | ---: |
+| Direct Postgres SELECT + Python/SQLite import | 14.467 s | 12.411–17.359 s |
+| Prepared NATS generation + libzb/SQLite | 3.197 s | 3.111–3.594 s |
+| Fresh enrollment + libzb connection and seed | 3.217 s | 3.081–3.379 s |
+
+The prepared-generation baseline was **4.52× faster** than this direct importer
+(about 22% of its time). Enrollment itself had a 9 ms median, ranging from 9 to
+23 ms. Its internal timer is included in the enrolled path above. The enrolled
+path runs with the bridge active; the two baselines run after the bridge stops.
+
+The producer log reported the initial full as 1,000,000 rows in a 29,333,907-byte
+object, built/uploaded in 1,589 ms. That preparation was untimed for client
+initialization. The fixture remains compressible, both paths run over local
+loopback, and Python conversion/insertion versus native import remains part of the
+comparison. It is not a measurement of transport overhead alone. Temporary
+replicas were retained until the end of the run; the host initially had about
+7.6 GiB free disk space. No attempt was made to flush OS/server caches between
+samples, and the observed ranges are reported rather than a single best time.
+
 ## First local result (2026-11-10)
 
 [Raw report](results/local-50000.json): 50,000 rows, 192-byte non-null notes,
