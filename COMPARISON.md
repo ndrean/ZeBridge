@@ -2,6 +2,10 @@
 
 The measurements behind the README's [Compared with PowerSync](README.md#compared-with-powersync): the same workload, run by both systems against one PostgreSQL database. The architecture and what each asks you to run are in the README; how to run all of it again is in [the harness](scripts/compare/powersync/README.md).
 
+A separate [direct Postgres versus libzb benchmark](scripts/compare/postgres/README.md)
+measures one fresh SQLite database at a time, including local schema creation and
+row loading, with a prepared NATS generation on the ZeBridge path.
+
 ## Local cold seed: ZeBridge, PowerSync, and Electric
 
 To compare client seeding at the same scale without a cloud database path, I ran 10 clients per system against one local PostgreSQL 17 container in OrbStack. Each client started with an empty SQLite replica and the timer stopped after all 50,000 rows were present locally. The ZeBridge runner verified its replica; Electric checked both its TanStack collection and persisted SQLite rows; PowerSync's Node SDK waited for its first sync and reached 50,000 rows, then all ten SQLite files were independently checked. Every replica matched SHA-256 `f23eb95715da0c1c44811f949d27bb4bae36a8357b16244b67514f226ed574b7`.

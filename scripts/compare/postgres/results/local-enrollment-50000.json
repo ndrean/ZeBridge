@@ -1,0 +1,247 @@
+{
+  "benchmark": "postgres-select-vs-libzb-seed",
+  "verified": true,
+  "rows": 50000,
+  "payload_bytes": 192,
+  "batch_rows": 50000,
+  "rounds": 5,
+  "concurrent_clients": 1,
+  "generation_prepared": true,
+  "bridge_running_during_measurement": false,
+  "enrollment_timed": false,
+  "schema": [
+    "CREATE TABLE seed_items (\"id\" TEXT NOT NULL PRIMARY KEY, \"tenant_id\" TEXT NOT NULL, \"note\" TEXT, \"quantity\" INTEGER NOT NULL, \"updated_at\" TEXT DEFAULT '2026-01-01 01:00:00.123456+01', \"deleted_at\" TEXT) STRICT"
+  ],
+  "sqlite_page_size": 16384,
+  "postgres_version": 180006,
+  "python_version": "3.13.18",
+  "psycopg_version": "3.3.8",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "git_commit": "0ca67a94645ed199d0a0df87ea906bfce75501cf",
+  "runner_sha256": "03ad32759f2067fde72a7bb2ce85d5b512cf2c675b3e5b608eb893105b599d0f",
+  "bridge_sha256": "d7ac80ab675d3a516134028aff1a01d3b02ad6191b0ab8e18a6db98e07033007",
+  "libzb_sha256": "85b8d572b293416831051a111e63c2359792a1eb380e26a5014d154d37013efd",
+  "nats_version": "nats-server: v2.15.2",
+  "median_seconds": {
+    "direct": 0.4933516669552773,
+    "libzb": 0.15868466696701944
+  },
+  "libzb_over_direct": 0.32164615546217323,
+  "enrollment": {
+    "transport": "HTTP over loopback",
+    "bridge_running_during_measurement": true,
+    "enrollment_resolution_seconds": 0.001,
+    "invitation_creation_timed": false,
+    "fresh_identity_per_sample": true,
+    "median_seconds": {
+      "enrollment": 0.009,
+      "connect_with_enrollment": 0.011971459025517106,
+      "sync_to_ready": 0.15539295808412135,
+      "total": 0.16736441710963845
+    },
+    "samples": [
+      {
+        "seconds": 0.15377004188485444,
+        "engine_sqlite_version": "3.54.1",
+        "identity_saved": true,
+        "phases_seconds": {
+          "connect_with_enrollment": 0.012081791879609227,
+          "sync_to_ready": 0.1416882500052452,
+          "enrollment": 0.009
+        },
+        "rows": 50000,
+        "sha256": "b799ec37e160b9b49c2a33fa84eb8e3744791cce1509296b4f568af7dd55ffbb",
+        "mode": "enrolled",
+        "verification_sqlite_version": "3.54.1",
+        "round": 1,
+        "invite_redeemed": true
+      },
+      {
+        "seconds": 0.1577403750270605,
+        "engine_sqlite_version": "3.54.1",
+        "identity_saved": true,
+        "phases_seconds": {
+          "connect_with_enrollment": 0.011844333028420806,
+          "sync_to_ready": 0.1458960419986397,
+          "enrollment": 0.008
+        },
+        "rows": 50000,
+        "sha256": "b799ec37e160b9b49c2a33fa84eb8e3744791cce1509296b4f568af7dd55ffbb",
+        "mode": "enrolled",
+        "verification_sqlite_version": "3.54.1",
+        "round": 2,
+        "invite_redeemed": true
+      },
+      {
+        "seconds": 0.16773620899766684,
+        "engine_sqlite_version": "3.54.1",
+        "identity_saved": true,
+        "phases_seconds": {
+          "connect_with_enrollment": 0.012153167044743896,
+          "sync_to_ready": 0.15558304195292294,
+          "enrollment": 0.009
+        },
+        "rows": 50000,
+        "sha256": "b799ec37e160b9b49c2a33fa84eb8e3744791cce1509296b4f568af7dd55ffbb",
+        "mode": "enrolled",
+        "verification_sqlite_version": "3.54.1",
+        "round": 3,
+        "invite_redeemed": true
+      },
+      {
+        "seconds": 0.16736441710963845,
+        "engine_sqlite_version": "3.54.1",
+        "identity_saved": true,
+        "phases_seconds": {
+          "connect_with_enrollment": 0.011971459025517106,
+          "sync_to_ready": 0.15539295808412135,
+          "enrollment": 0.01
+        },
+        "rows": 50000,
+        "sha256": "b799ec37e160b9b49c2a33fa84eb8e3744791cce1509296b4f568af7dd55ffbb",
+        "mode": "enrolled",
+        "verification_sqlite_version": "3.54.1",
+        "round": 4,
+        "invite_redeemed": true
+      },
+      {
+        "seconds": 0.1692812500987202,
+        "engine_sqlite_version": "3.54.1",
+        "identity_saved": true,
+        "phases_seconds": {
+          "connect_with_enrollment": 0.011288125067949295,
+          "sync_to_ready": 0.1579931250307709,
+          "enrollment": 0.008
+        },
+        "rows": 50000,
+        "sha256": "b799ec37e160b9b49c2a33fa84eb8e3744791cce1509296b4f568af7dd55ffbb",
+        "mode": "enrolled",
+        "verification_sqlite_version": "3.54.1",
+        "round": 5,
+        "invite_redeemed": true
+      }
+    ]
+  },
+  "samples": [
+    {
+      "seconds": 0.4933516669552773,
+      "engine_sqlite_version": "3.54.1",
+      "phases_seconds": {
+        "connect": 0.0048166250344365835,
+        "create": 0.0018344169948250055,
+        "select_and_insert": 0.48663366585969925,
+        "ready_query": 6.69590663164854e-05
+      },
+      "rows": 50000,
+      "sha256": "b799ec37e160b9b49c2a33fa84eb8e3744791cce1509296b4f568af7dd55ffbb",
+      "mode": "direct",
+      "verification_sqlite_version": "3.54.1",
+      "round": 1
+    },
+    {
+      "seconds": 0.15868466696701944,
+      "engine_sqlite_version": "3.54.1",
+      "rows": 50000,
+      "sha256": "b799ec37e160b9b49c2a33fa84eb8e3744791cce1509296b4f568af7dd55ffbb",
+      "mode": "libzb",
+      "verification_sqlite_version": "3.54.1",
+      "round": 1
+    },
+    {
+      "seconds": 0.15026791719719768,
+      "engine_sqlite_version": "3.54.1",
+      "rows": 50000,
+      "sha256": "b799ec37e160b9b49c2a33fa84eb8e3744791cce1509296b4f568af7dd55ffbb",
+      "mode": "libzb",
+      "verification_sqlite_version": "3.54.1",
+      "round": 2
+    },
+    {
+      "seconds": 0.47597629111260176,
+      "engine_sqlite_version": "3.54.1",
+      "phases_seconds": {
+        "connect": 0.005005875136703253,
+        "create": 0.0017153748776763678,
+        "select_and_insert": 0.4691265830770135,
+        "ready_query": 0.0001284580212086439
+      },
+      "rows": 50000,
+      "sha256": "b799ec37e160b9b49c2a33fa84eb8e3744791cce1509296b4f568af7dd55ffbb",
+      "mode": "direct",
+      "verification_sqlite_version": "3.54.1",
+      "round": 2
+    },
+    {
+      "seconds": 0.4865356660448015,
+      "engine_sqlite_version": "3.54.1",
+      "phases_seconds": {
+        "connect": 0.005107790930196643,
+        "create": 0.0016841250471770763,
+        "select_and_insert": 0.4796759590972215,
+        "ready_query": 6.779097020626068e-05
+      },
+      "rows": 50000,
+      "sha256": "b799ec37e160b9b49c2a33fa84eb8e3744791cce1509296b4f568af7dd55ffbb",
+      "mode": "direct",
+      "verification_sqlite_version": "3.54.1",
+      "round": 3
+    },
+    {
+      "seconds": 0.22488541691564023,
+      "engine_sqlite_version": "3.54.1",
+      "rows": 50000,
+      "sha256": "b799ec37e160b9b49c2a33fa84eb8e3744791cce1509296b4f568af7dd55ffbb",
+      "mode": "libzb",
+      "verification_sqlite_version": "3.54.1",
+      "round": 3
+    },
+    {
+      "seconds": 0.15881716599687934,
+      "engine_sqlite_version": "3.54.1",
+      "rows": 50000,
+      "sha256": "b799ec37e160b9b49c2a33fa84eb8e3744791cce1509296b4f568af7dd55ffbb",
+      "mode": "libzb",
+      "verification_sqlite_version": "3.54.1",
+      "round": 4
+    },
+    {
+      "seconds": 0.49546533287502825,
+      "engine_sqlite_version": "3.54.1",
+      "phases_seconds": {
+        "connect": 0.004825832787901163,
+        "create": 0.0016346671618521214,
+        "select_and_insert": 0.4889495000243187,
+        "ready_query": 5.533290095627308e-05
+      },
+      "rows": 50000,
+      "sha256": "b799ec37e160b9b49c2a33fa84eb8e3744791cce1509296b4f568af7dd55ffbb",
+      "mode": "direct",
+      "verification_sqlite_version": "3.54.1",
+      "round": 4
+    },
+    {
+      "seconds": 0.5116297081112862,
+      "engine_sqlite_version": "3.54.1",
+      "phases_seconds": {
+        "connect": 0.00485037500038743,
+        "create": 0.001697041094303131,
+        "select_and_insert": 0.5050140419043601,
+        "ready_query": 6.825011223554611e-05
+      },
+      "rows": 50000,
+      "sha256": "b799ec37e160b9b49c2a33fa84eb8e3744791cce1509296b4f568af7dd55ffbb",
+      "mode": "direct",
+      "verification_sqlite_version": "3.54.1",
+      "round": 5
+    },
+    {
+      "seconds": 0.15052354102954268,
+      "engine_sqlite_version": "3.54.1",
+      "rows": 50000,
+      "sha256": "b799ec37e160b9b49c2a33fa84eb8e3744791cce1509296b4f568af7dd55ffbb",
+      "mode": "libzb",
+      "verification_sqlite_version": "3.54.1",
+      "round": 5
+    }
+  ]
+}
