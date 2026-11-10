@@ -1,0 +1,11 @@
+{
+  "name": "zebridge-postgres-node-seed-compare",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test values.test.mjs" },
+  "dependencies": {
+    "better-sqlite3": "13.0.3",
+    "pg": "8.23.1",
+    "pg-cursor": "2.22.1"
+  }
+}

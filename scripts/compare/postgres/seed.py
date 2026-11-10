@@ -187,14 +187,21 @@ def enrollment_duration(stderr):
 
 
 def sample(config_path, mode, path, timeout):
+    command = (["node", str(Path(__file__).with_name("node") / "seed.mjs"), str(config_path), str(path)]
+               if mode == "node" else
+               [sys.executable, str(Path(__file__).resolve()), "--worker", mode,
+                "--config", str(config_path), "--db", str(path)])
     completed = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), "--worker", mode,
-         "--config", str(config_path), "--db", str(path)],
+        command,
         capture_output=True, text=True, timeout=timeout,
         env=dict(os.environ, ZB_LOG_LEVEL="info") if mode == "enrolled" else None)
     if completed.returncode:
         raise RuntimeError(f"{mode} worker failed:\n{completed.stderr[-3000:]}")
     result = json.loads(completed.stdout)
+    if mode == "node":
+        config = json.loads(config_path.read_text())
+        result.update(verify(path, config["expected"]), mode="node",
+                      verification_sqlite_version=sqlite3.sqlite_version)
     if mode == "enrolled":
         result["phases_seconds"]["enrollment"] = enrollment_duration(completed.stderr)
     return result
@@ -342,15 +349,17 @@ def run(args):
                 if label.startswith("bridge"):
                     stack.bridge_down(label)
             results = []
+            modes = ("direct", "node", "libzb") if args.node else ("direct", "libzb")
             for round_no in range(1, args.rounds + 1):
-                order = ("direct", "libzb") if round_no % 2 else ("libzb", "direct")
+                shift = (round_no - 1) % len(modes)
+                order = modes[shift:] + modes[:shift]
                 for mode in order:
                     result = sample(config_path, mode, tmp / f"{round_no}-{mode}.sqlite3", args.timeout)
                     result["round"] = round_no
                     results.append(result)
                     print(f"Round {round_no}: {mode} {result['seconds']:.6f} s; verified", file=sys.stderr, flush=True)
             medians = {mode: statistics.median(r["seconds"] for r in results if r["mode"] == mode)
-                       for mode in ("direct", "libzb")}
+                       for mode in modes}
             return {"benchmark": "postgres-select-vs-libzb-seed", "verified": True,
                     "rows": args.rows, "payload_bytes": args.payload_bytes,
                     "batch_rows": args.batch_rows, "rounds": args.rounds,
@@ -363,11 +372,14 @@ def run(args):
                     "platform": platform.platform(),
                     "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                     "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    "node_runner_sha256": ({name: hashlib.sha256((Path(__file__).with_name("node") / name).read_bytes()).hexdigest()
+                                            for name in ("seed.mjs", "values.mjs", "package-lock.json")} if args.node else None),
                     "bridge_sha256": hashlib.sha256(rr.BRIDGE.read_bytes()).hexdigest(),
                     "libzb_sha256": hashlib.sha256(Path(os.environ.get("ZB_LIB", rr.LIBRARY)).read_bytes()).hexdigest(),
                     "nats_version": subprocess.check_output(["nats-server", "--version"], text=True).strip(),
                     "median_seconds": medians,
                     "libzb_over_direct": medians["libzb"] / medians["direct"],
+                    "libzb_over_node": medians["libzb"] / medians["node"] if args.node else None,
                     "enrollment": enrollment,
                     "samples": results}
         finally:
@@ -391,6 +403,7 @@ def main():
     parser.add_argument("--timeout", type=positive, default=180, help="hard timeout per worker, seconds")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--enrollment", action="store_true", help="also measure fresh invitation enrollment and seeding")
+    parser.add_argument("--node", action="store_true", help="also compare Node pg-cursor and better-sqlite3")
     parser.add_argument("--worker", choices=("direct", "libzb", "enrolled"), help=argparse.SUPPRESS)
     parser.add_argument("--config", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--db", type=Path, help=argparse.SUPPRESS)

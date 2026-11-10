@@ -45,6 +45,7 @@ Options:
 | `--timeout` | 180 | Hard wall-clock limit per child, including preparation/checksum |
 | `--output` | — | Save the JSON report, also printed to stdout |
 | `--enrollment` | off | Also measure fresh invitation enrollment plus seeding, before stopping the bridge |
+| `--node` | off | Add a Node `pg-cursor` + `better-sqlite3` direct importer; rotate the three baseline paths each round |
 
 Progress goes to stderr. The JSON includes individual samples, direct-path phase
 times, median seconds and `libzb_over_direct`: below 1 means libzb was faster;
@@ -104,6 +105,80 @@ Postgres importer. `COPY` and a native direct importer are separate future basel
 
 Container/microVM launch time is excluded. Establish this initialization baseline
 first; measuring the same work inside constrained instances is a separate run.
+
+## Node direct importer
+
+The optional Node path uses pinned `pg`, `pg-cursor` and `better-sqlite3` packages.
+It is a Node server/worker baseline, not a browser/WASM or mobile database driver.
+It uses the ordinary SELECT -> INSERT model, without a custom Postgres binary
+COPY decoder. Install just this benchmark's packages and run:
+
+```sh
+npm ci --prefix scripts/compare/postgres/node
+/tmp/zb-seed-venv/bin/python scripts/compare/postgres/seed.py \
+  --rows 1000000 --rounds 5 --batch-rows 50000 --node --timeout 300 \
+  --output /tmp/node-comparison-1000000.json
+```
+
+`--node` rotates Python, Node and libzb order between rounds, with one fresh process
+and SQLite file at a time. All three use the same source, tenant/RLS, sorted rows,
+application schema, batch sizes and SQLite storage settings. It can also be
+combined with `--enrollment`, which remains a separately reported phase.
+
+The Node timer starts before opening a new `pg.Client` connection. It includes
+SQLite creation and schema setup, a server cursor returning array rows, one
+prepared INSERT reused inside a transaction per batch, and the final count query.
+No per-row promises are used. Package imports and version metadata collection,
+connection closing and the full checksum are outside the timer, like the other
+paths. Python verifies the closed Node-created SQLite file against the same source
+fingerprint, preserving identical verification semantics.
+
+Postgres timestamps are parsed directly into six-digit UTC text for SQLite;
+Node's default JavaScript Date conversion would truncate microseconds. This small
+type parser runs inside the timed fetch and does not change the SQL projection.
+The parser's tests run without the installed driver packages:
+
+```sh
+node --test scripts/compare/postgres/node/values.test.mjs
+```
+
+The report records actual Node/driver/SQLite versions and hashes of the Node
+worker, timestamp conversion and package lockfile. This comparison can distinguish
+the tested Python and Node application implementations; it still does not isolate
+NATS transport overhead from generation decoding and native libzb ingestion.
+
+### Million-row Node result (2026-11-10)
+
+[Raw report](results/local-node-1000000.json): five rotating-order rounds, one
+million rows, 192-byte non-null notes, 50,000-row batches. Python, Node and libzb
+ran sequentially against the same prepared source. All fifteen databases matched
+the same Postgres checksum across every column. This is a new contemporaneous
+comparison; use its Python baseline rather than mixing timings from earlier runs.
+
+| Path | Median | Minimum–maximum |
+| --- | ---: | ---: |
+| Python / psycopg SELECT + SQLite INSERT | 9.388 s | 9.165–10.099 s |
+| Node / pg-cursor SELECT + better-sqlite3 INSERT | 4.288 s | 4.037–4.387 s |
+| Prepared NATS generation / libzb / SQLite | 2.914 s | 2.768–3.236 s |
+
+Node was **2.19× faster than Python** in this run. libzb took about **32% less time
+than Node** (1.47× faster). All paths used the same SQLite pragmas, but their
+runtime versions differed: Node 26.13.0, pg 8.23.1, pg-cursor 2.22.1 and
+better-sqlite3 13.0.3 used SQLite 3.53.4; Python and libzb used SQLite 3.54.1.
+Postgres was 18.6 and NATS Server 2.15.2, on the same macOS ARM64 host over loopback.
+
+The initial generation log reported 29,333,906 compressed bytes built/uploaded in
+1,603 ms. Adding that separate preparation observation to the median libzb client
+time gives about **4.52 s**, compared with **4.29 s** for direct Node initialization.
+Those are separately observed stages, not a timed combined pipeline. The result
+supports faster client initialization from an existing generation; it does **not**
+support claiming that generation construction plus one seed beats the tested Node
+importer. Preparation can be shared across subsequent clients.
+
+The fixture is compressible and the bridge is stopped during all three baseline
+measurements. No enrollment, browser/mobile runtime, microVM launch or remote
+network is included. A small 1,000-row run with 333-row batches first verified the
+Node path's partial final batch and timestamp preservation.
 
 ## Invitation enrollment
 

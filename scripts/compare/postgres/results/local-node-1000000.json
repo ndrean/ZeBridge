@@ -1,0 +1,265 @@
+{
+  "benchmark": "postgres-select-vs-libzb-seed",
+  "verified": true,
+  "rows": 1000000,
+  "payload_bytes": 192,
+  "batch_rows": 50000,
+  "rounds": 5,
+  "concurrent_clients": 1,
+  "generation_prepared": true,
+  "bridge_running_during_measurement": false,
+  "enrollment_timed": false,
+  "schema": [
+    "CREATE TABLE seed_items (\"id\" TEXT NOT NULL PRIMARY KEY, \"tenant_id\" TEXT NOT NULL, \"note\" TEXT, \"quantity\" INTEGER NOT NULL, \"updated_at\" TEXT DEFAULT '2026-01-01 01:00:00.123456+01', \"deleted_at\" TEXT) STRICT"
+  ],
+  "sqlite_page_size": 16384,
+  "postgres_version": 180006,
+  "python_version": "3.13.18",
+  "psycopg_version": "3.3.8",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "git_commit": "1c47f982e66763ea825e4ef51f5b7da2d40aa36c",
+  "runner_sha256": "3c07c235a44b03c64136c46e30c66b60d30887364e86069165839e5dce781525",
+  "node_runner_sha256": {
+    "seed.mjs": "61b793815c78e73caa6c5f89f3a3f1a31f440a3202002ba3b6edfe8de378dbf9",
+    "values.mjs": "176ac784caec44783390b02b9876bfc38120b9df8055cd6d9bc630bd776ebc17",
+    "package-lock.json": "a9a02a7421d331b37ee9bba4a3c8aef2174163e73587d7896986f9939e15e0eb"
+  },
+  "bridge_sha256": "d7ac80ab675d3a516134028aff1a01d3b02ad6191b0ab8e18a6db98e07033007",
+  "libzb_sha256": "85b8d572b293416831051a111e63c2359792a1eb380e26a5014d154d37013efd",
+  "nats_version": "nats-server: v2.15.2",
+  "median_seconds": {
+    "direct": 9.38849245919846,
+    "node": 4.287682124999999,
+    "libzb": 2.913586375070736
+  },
+  "libzb_over_direct": 0.3103359125794603,
+  "libzb_over_node": 0.6795248085399372,
+  "enrollment": null,
+  "samples": [
+    {
+      "seconds": 9.165383249986917,
+      "engine_sqlite_version": "3.54.1",
+      "phases_seconds": {
+        "connect": 0.008271625032648444,
+        "create": 0.0014919170644134283,
+        "select_and_insert": 9.151820749975741,
+        "ready_query": 0.0037989579141139984
+      },
+      "rows": 1000000,
+      "sha256": "e49e332474d7dc28e517549058b382120af2b15e2d5753db83aeab6ba7861187",
+      "mode": "direct",
+      "verification_sqlite_version": "3.54.1",
+      "round": 1
+    },
+    {
+      "seconds": 4.287682124999999,
+      "phases_seconds": {
+        "connect": 0.012079333999999988,
+        "create": 0.011405166000000008,
+        "select_and_insert": 4.26008275,
+        "ready_query": 0.004114875000000211
+      },
+      "engine_sqlite_version": "3.53.4",
+      "node_version": "v26.13.0",
+      "packages": {
+        "pg": "8.23.1",
+        "pg-cursor": "2.22.1",
+        "better-sqlite3": "13.0.3"
+      },
+      "rows": 1000000,
+      "sha256": "e49e332474d7dc28e517549058b382120af2b15e2d5753db83aeab6ba7861187",
+      "mode": "node",
+      "verification_sqlite_version": "3.54.1",
+      "round": 1
+    },
+    {
+      "seconds": 2.996104500023648,
+      "engine_sqlite_version": "3.54.1",
+      "rows": 1000000,
+      "sha256": "e49e332474d7dc28e517549058b382120af2b15e2d5753db83aeab6ba7861187",
+      "mode": "libzb",
+      "verification_sqlite_version": "3.54.1",
+      "round": 1
+    },
+    {
+      "seconds": 4.036892125,
+      "phases_seconds": {
+        "connect": 0.011069000000000002,
+        "create": 0.006068916999999999,
+        "select_and_insert": 4.015822916,
+        "ready_query": 0.003931291999999757
+      },
+      "engine_sqlite_version": "3.53.4",
+      "node_version": "v26.13.0",
+      "packages": {
+        "pg": "8.23.1",
+        "pg-cursor": "2.22.1",
+        "better-sqlite3": "13.0.3"
+      },
+      "rows": 1000000,
+      "sha256": "e49e332474d7dc28e517549058b382120af2b15e2d5753db83aeab6ba7861187",
+      "mode": "node",
+      "verification_sqlite_version": "3.54.1",
+      "round": 2
+    },
+    {
+      "seconds": 2.7758813749533147,
+      "engine_sqlite_version": "3.54.1",
+      "rows": 1000000,
+      "sha256": "e49e332474d7dc28e517549058b382120af2b15e2d5753db83aeab6ba7861187",
+      "mode": "libzb",
+      "verification_sqlite_version": "3.54.1",
+      "round": 2
+    },
+    {
+      "seconds": 9.38849245919846,
+      "engine_sqlite_version": "3.54.1",
+      "phases_seconds": {
+        "connect": 0.007129459176212549,
+        "create": 0.0015687078703194857,
+        "select_and_insert": 9.37482695817016,
+        "ready_query": 0.004967333981767297
+      },
+      "rows": 1000000,
+      "sha256": "e49e332474d7dc28e517549058b382120af2b15e2d5753db83aeab6ba7861187",
+      "mode": "direct",
+      "verification_sqlite_version": "3.54.1",
+      "round": 2
+    },
+    {
+      "seconds": 3.2360397919546813,
+      "engine_sqlite_version": "3.54.1",
+      "rows": 1000000,
+      "sha256": "e49e332474d7dc28e517549058b382120af2b15e2d5753db83aeab6ba7861187",
+      "mode": "libzb",
+      "verification_sqlite_version": "3.54.1",
+      "round": 3
+    },
+    {
+      "seconds": 10.099382000043988,
+      "engine_sqlite_version": "3.54.1",
+      "phases_seconds": {
+        "connect": 0.02958295796997845,
+        "create": 0.0017241248860955238,
+        "select_and_insert": 9.978791959118098,
+        "ready_query": 0.08928295806981623
+      },
+      "rows": 1000000,
+      "sha256": "e49e332474d7dc28e517549058b382120af2b15e2d5753db83aeab6ba7861187",
+      "mode": "direct",
+      "verification_sqlite_version": "3.54.1",
+      "round": 3
+    },
+    {
+      "seconds": 4.386772167,
+      "phases_seconds": {
+        "connect": 0.018102375000000025,
+        "create": 0.014278749999999974,
+        "select_and_insert": 4.350110584,
+        "ready_query": 0.00428045800000018
+      },
+      "engine_sqlite_version": "3.53.4",
+      "node_version": "v26.13.0",
+      "packages": {
+        "pg": "8.23.1",
+        "pg-cursor": "2.22.1",
+        "better-sqlite3": "13.0.3"
+      },
+      "rows": 1000000,
+      "sha256": "e49e332474d7dc28e517549058b382120af2b15e2d5753db83aeab6ba7861187",
+      "mode": "node",
+      "verification_sqlite_version": "3.54.1",
+      "round": 3
+    },
+    {
+      "seconds": 9.35922791599296,
+      "engine_sqlite_version": "3.54.1",
+      "phases_seconds": {
+        "connect": 0.02182754105888307,
+        "create": 0.0017602499574422836,
+        "select_and_insert": 9.331876167096198,
+        "ready_query": 0.003763957880437374
+      },
+      "rows": 1000000,
+      "sha256": "e49e332474d7dc28e517549058b382120af2b15e2d5753db83aeab6ba7861187",
+      "mode": "direct",
+      "verification_sqlite_version": "3.54.1",
+      "round": 4
+    },
+    {
+      "seconds": 4.067191708999999,
+      "phases_seconds": {
+        "connect": 0.012463542000000018,
+        "create": 0.011359749999999991,
+        "select_and_insert": 4.0392355,
+        "ready_query": 0.004132916999999907
+      },
+      "engine_sqlite_version": "3.53.4",
+      "node_version": "v26.13.0",
+      "packages": {
+        "pg": "8.23.1",
+        "pg-cursor": "2.22.1",
+        "better-sqlite3": "13.0.3"
+      },
+      "rows": 1000000,
+      "sha256": "e49e332474d7dc28e517549058b382120af2b15e2d5753db83aeab6ba7861187",
+      "mode": "node",
+      "verification_sqlite_version": "3.54.1",
+      "round": 4
+    },
+    {
+      "seconds": 2.913586375070736,
+      "engine_sqlite_version": "3.54.1",
+      "rows": 1000000,
+      "sha256": "e49e332474d7dc28e517549058b382120af2b15e2d5753db83aeab6ba7861187",
+      "mode": "libzb",
+      "verification_sqlite_version": "3.54.1",
+      "round": 4
+    },
+    {
+      "seconds": 4.316229167,
+      "phases_seconds": {
+        "connect": 0.012532125,
+        "create": 0.0059602919999999955,
+        "select_and_insert": 4.293708,
+        "ready_query": 0.0040287500000004
+      },
+      "engine_sqlite_version": "3.53.4",
+      "node_version": "v26.13.0",
+      "packages": {
+        "pg": "8.23.1",
+        "pg-cursor": "2.22.1",
+        "better-sqlite3": "13.0.3"
+      },
+      "rows": 1000000,
+      "sha256": "e49e332474d7dc28e517549058b382120af2b15e2d5753db83aeab6ba7861187",
+      "mode": "node",
+      "verification_sqlite_version": "3.54.1",
+      "round": 5
+    },
+    {
+      "seconds": 2.7679002080112696,
+      "engine_sqlite_version": "3.54.1",
+      "rows": 1000000,
+      "sha256": "e49e332474d7dc28e517549058b382120af2b15e2d5753db83aeab6ba7861187",
+      "mode": "libzb",
+      "verification_sqlite_version": "3.54.1",
+      "round": 5
+    },
+    {
+      "seconds": 9.834991208044812,
+      "engine_sqlite_version": "3.54.1",
+      "phases_seconds": {
+        "connect": 0.011206875089555979,
+        "create": 0.0015119579620659351,
+        "select_and_insert": 9.818373500136659,
+        "ready_query": 0.00389887485653162
+      },
+      "rows": 1000000,
+      "sha256": "e49e332474d7dc28e517549058b382120af2b15e2d5753db83aeab6ba7861187",
+      "mode": "direct",
+      "verification_sqlite_version": "3.54.1",
+      "round": 5
+    }
+  ]
+}
