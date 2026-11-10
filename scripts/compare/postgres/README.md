@@ -175,6 +175,12 @@ supports faster client initialization from an existing generation; it does **not
 support claiming that generation construction plus one seed beats the tested Node
 importer. Preparation can be shared across subsequent clients.
 
+For this static million-row dataset, **ZeBridge takes approximately 4.5 s to build
+the generation and seed the first SQLite database, then 2.9 s for each subsequent
+fresh SQLite database reusing that generation, versus 4.3 s per database with
+direct Node seeding and 9.4 s with direct Python seeding**. Each subsequent seed
+starts from an empty local database; it is not a warm restart of an existing replica.
+
 The fixture is compressible and the bridge is stopped during all three baseline
 measurements. No enrollment, browser/mobile runtime, microVM launch or remote
 network is included. A small 1,000-row run with 333-row batches first verified the
