@@ -1,0 +1,4 @@
+nats-py>=2.15
+nkeys>=0.2
+msgpack>=1.0
+psycopg[binary]>=3.2,<4
