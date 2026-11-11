@@ -264,11 +264,15 @@ pub fn messageIdCreatedMs(id: []const u8) ?i64 {
 /// principal; the bridge resolves it under the authenticated one. A write that has left the
 /// outbox still passes: only its shape counts.
 pub fn messageIdOfClient(a: std.mem.Allocator, id: []const u8, client_id: []const u8) !bool {
-    if (client_id.len == 0 or id.len > 512 or messageIdCreatedMs(id) == null) return false;
+    const ms = messageIdCreatedMs(id) orelse return false;
+    if (client_id.len == 0 or id.len > 512) return false;
     var t: [8][]const u8 = undefined;
     var tokens = std.mem.splitScalar(u8, id, '-');
     for (&t) |*slot| slot.* = tokens.next() orelse return false;
     if (tokens.next() != null) return false;
+    // The time as the generator writes it: `t` and the value's own digits, never zero-padded.
+    var time_buf: [20]u8 = undefined;
+    if (!std.mem.eql(u8, t[1], std.fmt.bufPrint(&time_buf, "t{d}", .{ms}) catch return false)) return false;
     if (!std.mem.eql(u8, t[0], "zb1") or normalizeOp(t[2]) == null or !std.mem.eql(u8, normalizeOp(t[2]).?, t[2])) return false;
     var encoded: std.ArrayList(u8) = .empty;
     defer encoded.deinit(a);
@@ -341,6 +345,12 @@ test "messageIdOfClient: the ID's client token, escaped, against this client" {
     try std.testing.expect(try messageIdOfClient(a, genuine, "phone-1.a"));
     const respelled = try std.mem.replaceOwned(u8, arena.allocator(), genuine, "-rows-", "-~72ows-");
     try std.testing.expect(!try messageIdOfClient(a, respelled, "phone-1.a"));
+    // The time spelled canonically: t0 is a time, t00 and a zero-padded t0123 are not.
+    try std.testing.expect(try messageIdOfClient(a, try messageId(arena.allocator(), 0, "phone-1.a", "rows", "UPDATE", &.{"7"}, "v"), "phone-1.a"));
+    try std.testing.expect(!try messageIdOfClient(a, "zb1-t00-UPDATE-phone~2D1~2Ea-rows-k1-7-v", "phone-1.a"));
+    const t123 = try messageId(arena.allocator(), 123, "phone-1.a", "rows", "UPDATE", &.{"7"}, "v");
+    try std.testing.expect(try messageIdOfClient(a, t123, "phone-1.a"));
+    try std.testing.expect(!try messageIdOfClient(a, try std.mem.replaceOwned(u8, arena.allocator(), t123, "-t123-", "-t0123-"), "phone-1.a"));
     // Every ID the generator makes from awkward inputs validates.
     for ([_][3][]const u8{
         .{ "phone 1~x", "my-table.v2", "2026-11-11T10:00:00.123456Z" },

@@ -1128,8 +1128,11 @@ const isIdComponent = (s: string): boolean =>
   /^(?:[A-Za-z0-9_:]|~[0-9A-F]{2})*$/.test(s) &&
   [...s.matchAll(/~([0-9A-F]{2})/g)].every((m) => !ID_SAFE.test(String.fromCharCode(parseInt(m[1], 16))));
 export function messageIdOfClient(id: string, clientId: string): boolean {
-  if (!clientId || id.length > 512 || messageIdCreatedMs(id) === null) return false;
+  const ms = messageIdCreatedMs(id);
+  if (!clientId || id.length > 512 || ms === null) return false;
   const t = id.split('-');
+  // The time as the generator writes it: `t` and the value's own digits, never zero-padded.
+  if (t[1] !== `t${ms}`) return false;
   if (t.length !== 8 || t[0] !== 'zb1' || !['INSERT', 'UPDATE', 'DELETE'].includes(t[2])) return false;
   if (t[3] !== idComponent(clientId) || !t[4] || !isIdComponent(t[4]) || !t[7] || !isIdComponent(t[7])) return false;
   const k = /^k([1-9]\d{0,3})$/.exec(t[5]);

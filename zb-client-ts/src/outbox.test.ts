@@ -1261,6 +1261,12 @@ test('ordering modes: every misuse refuses before anything is written, and names
   const genuine = mutationMsgId(1787824800123, 'phone-1.a', 'rows', 'UPDATE', ['7'], 'v');
   assert.equal(messageIdOfClient(genuine, 'phone-1.a'), true);
   assert.equal(messageIdOfClient(genuine.replace('-rows-', '-~72ows-'), 'phone-1.a'), false, 'a non-canonical spelling of the same table');
+  // The time spelled canonically: t0 is a time, t00 and a zero-padded t0123 are not (libzb's same cases).
+  assert.equal(messageIdOfClient(mutationMsgId(0, 'phone-1.a', 'rows', 'UPDATE', ['7'], 'v'), 'phone-1.a'), true, 't0');
+  assert.equal(messageIdOfClient('zb1-t00-UPDATE-phone~2D1~2Ea-rows-k1-7-v', 'phone-1.a'), false, 't00');
+  const t123 = mutationMsgId(123, 'phone-1.a', 'rows', 'UPDATE', ['7'], 'v');
+  assert.equal(messageIdOfClient(t123, 'phone-1.a'), true);
+  assert.equal(messageIdOfClient(t123.replace('-t123-', '-t0123-'), 'phone-1.a'), false, 'zero-padded');
   // Every ID the generator makes from awkward inputs validates (libzb's same cases).
   for (const [client, table, v] of [['phone 1~x', 'my-table.v2', '2026-11-11T10:00:00.123456Z'], ['é+ü', 't', 'a~b'], ['c:1_2', 'rows', '-']])
     assert.equal(messageIdOfClient(mutationMsgId(1787824800123, client, table, 'INSERT', [v, '', '+'], v), client), true, `${client} ${table} ${v}`);

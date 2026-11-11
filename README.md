@@ -148,7 +148,7 @@ The TypeScript client drives its own synchronization loop. With native `libzb`, 
 
 ⚠️ On tables that support ordering, a write waits by default for this client's most recent unsettled ordered write. That lets you queue an order and then its lines without a line overtaking the order. Use `after` to name a specific earlier write from the same client. Use `independent` for a write such as a page view that can be judged in any order. It can still wait for a free lane or a database lock.
 
-The default is also a constraint: a slow write (a long trigger, a lock) delays this client's ordered writes made after it. Ordering never spans clients: a line written on a phone cannot wait for an order written on a laptop.
+The default is also a constraint: a slow write (a long trigger, a lock) delays later writes that depend on it, directly or through the tail. Ordering never spans clients: a line written on a phone cannot wait for an order written on a laptop.
 
 **The default needs nothing.** Write in the order your data depends on:
 
