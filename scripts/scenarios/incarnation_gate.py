@@ -40,6 +40,9 @@ window can be held open (`ZB_TEST_FAULT=incarnation_pause` while a file exists):
      triggered by reseeding ig_t only, observed on ig_u. A publication that fails (fault
      hook) is retried by the next reload through ig_t: ig_u recovers with no restart and no
      reseed of its own.
+  P  a partial publication: stamping turned on while ig_u's column query fails (fault
+     hook): ig_t gets its stamp, ig_u keeps its legacy descriptor; once the query works, a
+     reload through ig_t alone gives ig_u its stamp (the pass reports the unread table).
   N  a cold start whose catalogue read fails (the reader may not read zebridge_catalogue)
      with the switch on: every table is refused (no rules, so no CDC subject) and published
      as a suspension (suspended, reason no_cdc_subject, writable false), which carries no
@@ -161,7 +164,9 @@ async def run(tmp):
     try:
         stack.start({PRINCIPAL: TENANT})
         publish_fail = tmp / "publish.fail"
-        stack.env.update(MUTATION_ADMISSION="1", ZB_TEST_PAUSE_FILE=str(g.pause), ZB_TEST_PUBLISH_FAIL_FILE=str(publish_fail))
+        schema_fail = tmp / "schema.fail"
+        stack.env.update(MUTATION_ADMISSION="1", ZB_TEST_PAUSE_FILE=str(g.pause), ZB_TEST_PUBLISH_FAIL_FILE=str(publish_fail),
+                         ZB_TEST_SCHEMA_FAIL_FILE=str(schema_fail))
         writer = stack.name + "_w"
         r_a, r_hold, r_w = (str(uuid.uuid4()) for _ in range(3))
         g.create(T, [(r_a, "original", "now()"), (r_hold, "original", "now()"), (r_w, "original", "now()")])
@@ -454,6 +459,29 @@ async def run(tmp):
         republish()
         ok, d = await u_where(lambda d: d.get("incarnation") == inc_u)
         check(f"M: the switch back on: {U} advertises again", ok, str(summary(d)))
+
+        # ── P: one table's descriptor cannot be read while the others publish ──
+        g.s.sql("UPDATE zebridge_private.write_policy SET incarnation_stamps = false WHERE singleton")
+        republish()
+        ok, d = await u_where(lambda d: "incarnation" not in d)
+        check(f"P: before: {U} advertises legacy writes (no incarnation)", ok, str(summary(d)))
+        schema_fail.write_text(U)
+        g.s.sql("UPDATE zebridge_private.write_policy SET incarnation_stamps = true WHERE singleton")
+        republish()  # through ig_t only
+        end, dt = time.monotonic() + 30, None
+        while time.monotonic() < end:
+            dt = await g.descriptor(T)
+            if isinstance(dt, dict) and dt.get("incarnation") == g.inc(T): break
+            await asyncio.sleep(0.5)
+        fired = f"ZB_TEST_SCHEMA_FAIL_FILE fired for '{U}'" in bridge_log(stack, bridge)
+        du = await g.descriptor(U)
+        check(f"P: stamping on, {U}'s column query failing: {T} gets its stamp, {U} keeps its old descriptor",
+              fired and isinstance(dt, dict) and dt.get("incarnation") == g.inc(T) and isinstance(du, dict) and "incarnation" not in du,
+              f"{T} {summary(dt)}, {U} {summary(du)}, hook fired {fired}")
+        schema_fail.unlink()
+        republish()  # again through ig_t alone
+        ok, d = await u_where(lambda d: d.get("incarnation") == inc_u)
+        check(f"P: the query restored, a reload through {T} alone: {U} acquires its stamp", ok, str(summary(d)))
 
         # ── N: a cold start whose catalogue read fails, the switch on ──
         stack.bridge_down(bridge)

@@ -1595,8 +1595,16 @@ pub fn main(init: std.process.Init) !void {
     // processor's ctor predates it in the file's dependency order).
     event_proc.publisher = &publisher;
 
-    // Publish boot schemas to NATS KV for all monitored tables
-    try event_proc.publishBootSchemas(allocator, monitored_tables);
+    // Publish boot schemas to NATS KV for all monitored tables. A table whose shape could
+    // not be read is not a reason to stop: the others are published, and the whole list
+    // rides the catalogue's retry list to the next reload (`LiveCatalogue.unpublished`).
+    event_proc.publishBootSchemas(allocator, monitored_tables) catch |err| switch (err) {
+        error.SchemaUnread => for (monitored_tables) |t| {
+            const copy = allocator.dupe(u8, t) catch continue;
+            live_catalogue.unpublished.append(allocator, copy) catch allocator.free(copy);
+        },
+        else => return err,
+    };
 
     // Backfill $KV.tenants.* from zebridge_user_tenants — replication only carries
     // changes from here on; this catches mappings that existed before this boot.

@@ -2555,6 +2555,21 @@ pub const EventProcessor = struct {
     }
 
     /// Publish schemas for all monitored tables on boot.
+    /// Fault build: the column query of the table named in the file `ZB_TEST_SCHEMA_FAIL_FILE`
+    /// fails while the file exists (incarnation_gate.py, a partial publication).
+    fn schemaReadFailInjected(table: []const u8) bool {
+        if (comptime !@import("build_options").test_faults) return false;
+        const path = std.c.getenv("ZB_TEST_SCHEMA_FAIL_FILE") orelse return false;
+        var buf: [256]u8 = undefined;
+        const f = std.c.fopen(path, "r") orelse return false;
+        defer _ = std.c.fclose(f);
+        const n = std.c.fread(&buf, 1, buf.len, f);
+        const want = std.mem.trim(u8, buf[0..n], " \n\r\t");
+        if (!std.mem.eql(u8, want, table)) return false;
+        log.warn("ZB_TEST_SCHEMA_FAIL_FILE fired for '{s}'", .{table});
+        return true;
+    }
+
     pub fn publishBootSchemas(
         self: *EventProcessor,
         allocator: std.mem.Allocator,
@@ -2591,6 +2606,11 @@ pub const EventProcessor = struct {
             break :blk parsePgLsnText(std.mem.span(c.PQgetvalue(lsn_res, 0, 0)));
         };
 
+        // Tables whose shape could not be read: the pass goes on with the others, then says
+        // so (`SchemaUnread`), so a caller that keeps a retry list does not drop them — a
+        // stored descriptor left as it was may still invite unstamped writes. A table
+        // PostgreSQL confirms is gone is not one of them: its tombstone stands.
+        var unread: usize = 0;
         // Descriptors too wide for one event: refused one by one below, summed up once.
         const TooWide = struct { table: []const u8, len: usize };
         var too_wide: std.ArrayList(TooWide) = .empty;
@@ -2698,14 +2718,16 @@ pub const EventProcessor = struct {
             const result = c.PQexec(conn, query.ptr);
             defer c.PQclear(result);
 
-            if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
+            if (schemaReadFailInjected(clean_table) or c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
                 log.warn("⚠️ Failed to query schema for {s}: {s}", .{ clean_table, c.PQerrorMessage(conn) });
+                unread += 1;
                 continue;
             }
 
             const num_rows: i32 = c.PQntuples(result);
             if (num_rows == 0) {
                 log.warn("⚠️ No schema found for table {s}", .{clean_table});
+                unread += 1;
                 continue;
             }
             // §10dk: wider than one event can carry — the same verdict the DDL path
@@ -3104,6 +3126,10 @@ pub const EventProcessor = struct {
             log.err("🔴 {d} table(s) refused at boot (schema_too_large): their descriptors are wider than the {d}-byte event buffer — {s}. BASE_BUF={d} fits them all; every other table replicates.", .{
                 too_wide.items.len, self.batch_publisher.events[0].data_buffer.len, list.items, baseBufFor(widest),
             });
+        }
+        if (unread > 0) {
+            log.warn("📋 {d} table(s) could not be read for their descriptors — reported, so the caller retries them", .{unread});
+            return error.SchemaUnread;
         }
     }
 };
