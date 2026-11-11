@@ -13,6 +13,7 @@ const utils = @import("utils.zig");
 const rate_limit = @import("rate_limit.zig");
 const receipts = @import("receipts.zig");
 const ingress_stats = @import("ingress_stats.zig");
+const ack_limit = @import("ack_limit.zig");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 
@@ -698,6 +699,8 @@ pub const Dispatcher = struct {
     /// Spill + every lane's pending.
     pending_total: usize = 0,
     last_renew_ms: i64 = 0,
+    /// The bridge's startup-fault flag (its exit code), raised by `fail`.
+    boot_fatal: ?*std.atomic.Value(bool) = null,
     thread: ?std.Thread = null,
 
     pub fn init(allocator: std.mem.Allocator, endpoint: config.Nats.Endpoint, topology: *const Topology.Topology, io: std.Io, should_stop: *std.atomic.Value(bool), lanes: []const *MutationListener) !*Dispatcher {
@@ -966,6 +969,9 @@ pub const Dispatcher = struct {
         conn_nats.connect(url) catch |err| return self.fail(err);
         var js = nats.JetStream.init(&conn_nats, .{ .domain = self.endpoint.js_domain });
 
+        // An existing durable at the old default is raised in place first, or the subscribe
+        // below would find a mismatch (it checks every field it asks for).
+        ack_limit.ensure(js, self.allocator, self.endpoint_topology.stream_mutations, "bridge_mutations_worker") catch |err| return self.fail(err);
         // `.stream` given explicitly rather than derived from the subject: grammar.json
         // names it, and the lookup path allocates a name the subscription then owns (see
         // nats.zig/NOTES.md #1).
@@ -982,6 +988,7 @@ pub const Dispatcher = struct {
                     // attempts.
                     .max_deliver = config.Nats.mutation_max_deliver,
                     .ack_wait = config.Nats.mutation_ack_wait_ns,
+                    .max_ack_pending = config.Nats.mutation_max_ack_pending,
                     .filter_subject = self.endpoint_topology.mutations_subject_wildcard,
                 },
             },
@@ -1052,9 +1059,11 @@ pub const Dispatcher = struct {
         }
     }
 
-    /// Only startup paths fail (connect, subscribe).
+    /// Only startup paths fail (connect, subscribe, the ack limit): a fault of configuration,
+    /// which must not exit 0 like a requested stop.
     fn fail(self: *Dispatcher, err: anyerror) void {
         log.err("🔴 Mutation dispatcher: cannot pull mutations ({s}) — stopping the bridge", .{@errorName(err)});
+        if (self.boot_fatal) |f| f.store(true, .release);
         self.should_stop.store(true, .seq_cst);
     }
 };

@@ -51,6 +51,7 @@ const diagnose_live = @import("diagnose_live.zig");
 // Zig only collects tests from files the root actually references, so every module
 // carrying `test` blocks must be listed here or its tests silently never run.
 comptime {
+    _ = @import("ack_limit.zig");
     _ = @import("admin_invite.zig");
     _ = @import("demo_invites.zig");
     _ = @import("http_respond.zig");
@@ -1711,6 +1712,7 @@ pub fn main(init: std.process.Init) !void {
     if (mut_listeners.items.len > 0) {
         const d = try mutation_listener.Dispatcher.init(allocator, nats_endpoint, &runtime_config.topology, io, &should_stop, mut_listeners.items);
         errdefer d.deinit(); // start closes the lanes itself when its thread cannot be spawned
+        d.boot_fatal = &boot_fatal;
         try d.start();
         dispatcher = d;
     }

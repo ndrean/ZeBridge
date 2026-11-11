@@ -213,11 +213,12 @@ async def main(args):
                     else: return
                     e_ids.append(mid); e_rows.append(rid); preds[c] = mid
                 await asyncio.sleep(.003)  # more than twice what the four slowed lanes apply
-        # The durable's max_ack_pending (the server default, 1,000) is below four lanes' queues
-        # (4 × 512): the server would never deliver enough to fill them and the dispatcher's
-        # buffer too, and the spill could not starve. Raised here, so the condition the rule
-        # guards exists.
+        # The bridge's own max_ack_pending (2048, config.Nats.mutation_max_ack_pending) is no
+        # more than four lanes' queues (4 × 512): the server would never deliver enough to fill
+        # them and the dispatcher's buffer too, and the spill could not starve. Raised here,
+        # after checking the value the bridge chose, so the condition the rule guards exists.
         ci = await consumer()
+        check('the bridge created its durable with max_ack_pending 2048', ci.config.max_ack_pending == 2048, max_ack_pending=ci.config.max_ack_pending)
         cfg = ci.config; cfg.max_ack_pending = 20000
         await admin.jetstream(domain='hub').add_consumer('MUTATIONS', cfg)
         pubs = [asyncio.create_task(publisher(clients[i::8])) for i in range(8)]
