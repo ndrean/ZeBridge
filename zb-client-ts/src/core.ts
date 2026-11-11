@@ -1116,6 +1116,14 @@ export function messageIdCreatedMs(id: string): number | null {
   return m ? Number(m[1]) : null;
 }
 
+/// Whether `id` is a structured ID made by `clientId`: its fourth `-` token is the client,
+/// escaped as every ID component is (libzb core.messageIdOfClient; the bridge's rule). An ID
+/// does not name the principal; the bridge resolves it under the authenticated one.
+export function messageIdOfClient(id: string, clientId: string): boolean {
+  if (messageIdCreatedMs(id) === null || !clientId) return false;
+  return id.split('-')[3] === idComponent(clientId);
+}
+
 export function mutationMsgId(createdMs: number, clientId: string, table: string, op: string, keyParts: string[], version: string): string {
   if (typeof createdMs !== 'number') throw new Error('MissingCreatedMs');
   if (!Number.isInteger(createdMs) || createdMs < 0 || createdMs > 999_999_999_999_999) throw new Error(`InvalidCreatedMs: ${createdMs}`);

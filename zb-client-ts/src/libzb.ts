@@ -39,7 +39,7 @@ import { heartbeatPayload,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgEngineValues, chainUpsertSql, chainRowParams,
   type SqlStep,
   fkClausesFor, createTableSteps, rebuildSteps, diffColumns, keyShape, typeShape, retypedColumns, isReadOnlySql,
-  mutationSubject, mutationMsgId, messageIdCreatedMs, idKeyPart, mutationKeyId, mutationPayload, optimisticEvent, normalizeOp,
+  mutationSubject, mutationMsgId, messageIdCreatedMs, messageIdOfClient, idKeyPart, mutationKeyId, mutationPayload, optimisticEvent, normalizeOp,
   normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate, outboxFloorMargin,
   isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, chainChunkJson, parseChainHead, msgpackScan, msgpackDecodeScanned, chainStageSql, vecColsOf, pgVectorValues, vecLiteral, strictMissing,
@@ -277,6 +277,26 @@ export type Phase = 'connected' | 'migrated' | 'snapshot' | 'cdc';
 ///             MessageIdExpired, ReceiptUnreadable). Never re-sent under a new ID: its table
 ///             reseeds from the hub (`reconciling()` counts it until then), then
 ///   reconciled  the local copy is the authoritative state, whichever way it went.
+/// How one write is ordered on a table whose bridge offers ordering (`mutate`, `mutateWithId`).
+export type MutateOptions = {
+  /// The caller's own version stamp.
+  version?: string;
+  /// Wait for this earlier write of this client (a `writeId`) instead of the newest
+  /// unsettled one; the write then becomes the tail.
+  after?: string;
+  /// No predecessor and no ordered envelope; the tail is left as it was.
+  independent?: boolean;
+};
+
+/// A misuse of `after` / `independent` (libzb: `AfterNeedsOrdering`, `AfterNotThisClient`,
+/// `AfterSelf`, `AfterWithIndependent`): nothing was written.
+export class OrderingRefusal extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OrderingRefusal';
+  }
+}
+
 export type Verdict = {
   version: string;
   table: string;
@@ -969,13 +989,42 @@ export class ZeBridge {
   /// The blessed write path: a 1:1 constructor for the wire message
   /// `mutation.<principal>.<table>.<verb>` — no SQL is ever parsed. Returns the
   /// version stamped on the write so callers can mirror it into value columns.
+  ///
+  /// On a table whose bridge offers ordering, a write waits for this client's newest unsettled
+  /// ordered write (the tail) and becomes the tail. `opts.after` waits for that earlier write
+  /// of this client instead (it may have left the outbox: the bridge has its receipt);
+  /// `opts.independent` has no predecessor and leaves the tail as it was. A misuse of these
+  /// (`after` with no ordering offered, another client's ID, a write naming itself, both at
+  /// once) throws; a write refused at run time (suspended table, the GC floor, a failed local
+  /// transaction) is logged and reported, as it always was.
   public async mutate(
     table: string,
     opIn: string,
     key: Record<string, unknown>,
     values?: Record<string, unknown>,
-    opts?: { version?: string },
+    opts?: MutateOptions,
   ): Promise<{ version: string }> {
+    const { version } = await this.mutation(table, opIn, key, values, opts);
+    return { version };
+  }
+
+  /// `mutate`, returning the write's ID too: the outbox row's `msg_id`, which a later
+  /// `after` can name. Only a write durably queued has one: when nothing was queued (the
+  /// refusals `mutate` only logs) this rejects, so no successor can wait on a write the
+  /// bridge will never receive.
+  public async mutateWithId(
+    table: string,
+    opIn: string,
+    key: Record<string, unknown>,
+    values?: Record<string, unknown>,
+    opts?: MutateOptions,
+  ): Promise<{ version: string; writeId: string }> {
+    const { version, queued } = await this.mutation(table, opIn, key, values, opts);
+    if ('refused' in queued) throw new Error(`write not queued: ${queued.refused}`);
+    return { version, writeId: queued.writeId };
+  }
+
+  private async mutation(table: string, opIn: string, key: Record<string, unknown>, values: Record<string, unknown> | undefined, opts: MutateOptions | undefined) {
     const op = normalizeOp(opIn); // §10jm: any case in, capitals from here on
     await this.initializeStorage();
     const state = this.syncedTables.get(table);
@@ -983,8 +1032,8 @@ export class ZeBridge {
     const version = opts?.version ?? this.newVersion();
     const id = mutationKeyId(state.pkCols, key);
     const payload = mutationPayload(op, key, values, version, this.clientIdValue);
-    await this.rawMutation(table, op, id, version, payload);
-    return { version };
+    const queued = await this.enqueueMutation(table, op, id, version, payload, opts);
+    return { version, queued };
   }
 
   /// §10hp: BE a service. Answer `query.<tenant>.<name>` for these tenants, in one
@@ -6272,16 +6321,46 @@ export class ZeBridge {
   /// escape hatch for demos that deliberately send broken payloads (no key, wrong
   /// grants) — mutate() is the blessed path and builds the payload correctly.
   public async rawMutation(table: string, op: string, id: string | number, version: string, payload: Record<string, unknown>) {
+    await this.enqueueMutation(table, op, id, version, payload, undefined);
+  }
+
+  /// One write queued (and sent when connected): its outbox `msg_id`, or why nothing was
+  /// queued. Ordering misuse throws (`OrderingRefusal`); every other refusal is logged here.
+  private async enqueueMutation(table: string, op: string, id: string | number, version: string, payload: Record<string, unknown>, opts: MutateOptions | undefined): Promise<{ writeId: string } | { refused: string }> {
     // No socket is not a refusal: the write applies locally and waits in the outbox,
     // and connect() flushes it (§10dp). Only a table without a shape cannot be written.
-    if (!this.syncedTables.has(table)) return;
+    if (!this.syncedTables.has(table)) return { refused: 'UnknownTable' };
 
     // A suspended table has no CDC path: an optimistic write here would never get a
     // confirming or correcting echo — permanently. Refused client-side.
     const suspendReason = this.suspendedMap.get(table);
     if (suspendReason) {
       this.appendLog(table, `write refused: table is suspended upstream (${suspendReason}) — no CDC echo would ever confirm it`, 'ERROR');
-      return;
+      return { refused: 'TableSuspended' };
+    }
+
+    // The ordering mode, checked before anything is written (libzb `mutateWith`, same words).
+    const after = opts?.after;
+    const offered = this.syncedTables.get(table)?.ordering ?? 0;
+    if (after !== undefined) {
+      if (opts?.independent) throw new OrderingRefusal('after and independent cannot be combined');
+      if (!offered) throw new OrderingRefusal(`after needs ordering: the bridge does not offer it for '${table}'`);
+      if (!messageIdOfClient(after, this.clientIdValue)) throw new OrderingRefusal(`after: '${after}' is not a write of this client`);
+    }
+
+    // The GC floor before the write is applied or queued: a refused write never yields an ID
+    // a successor could wait on (libzb `mutateWith`). The first send below checks again, and
+    // the flush on every replay, for a floor that moved on while the write waited offline.
+    {
+      const wm = await this.gcWatermark();
+      if (outboxWatermarkGate([{ msgId: 'new', version }], wm).refuse.length) {
+        const vcol = this.syncedTables.get(table)?.versionColumn;
+        const data = (payload as any)?.data && typeof (payload as any).data === 'object' ? (payload as any).data : {};
+        const key = (payload as any)?.key && typeof (payload as any).key === 'object' ? (payload as any).key : {};
+        this.emitVerdict({ version, table, key, columns: Object.keys(data).filter((c) => c !== vcol), outcome: 'rejected', reason: 'PredatesGcWatermark' });
+        this.appendLog(table, `${table}[${id}] predates the GC watermark (${wm}) and CANNOT be sent: its tombstone has been reaped, so sending it would resurrect a deleted row (PROTOCOL §MUST 6). Not applied, not queued — this edit is lost.`, 'ERROR');
+        return { refused: 'PredatesGcWatermark' };
+      }
     }
 
     // Subject and idempotency id come from core (§10s 2c): the version stays
@@ -6326,10 +6405,11 @@ export class ZeBridge {
         // The ordering tail is the outbox itself (libzb `mutateAt`): its newest ordered entry,
         // read in this transaction, so the link is fixed when the write is made. An entry
         // leaves only on a terminal verdict or its echo, or as `indeterminate`.
+        // `after` names the predecessor itself; `independent` has none and no envelope.
         let predecessor: string | null = null;
-        const ordered = (state?.ordering ?? 0) > 0;
+        const ordered = (state?.ordering ?? 0) > 0 && !opts?.independent;
         if (ordered) {
-          predecessor = (await txExec(`SELECT msg_id FROM _zebridge_outbox WHERE ordered = 1 ORDER BY created_at DESC LIMIT 1`))[0]?.msg_id ?? null;
+          predecessor = after ?? (await txExec(`SELECT msg_id FROM _zebridge_outbox WHERE ordered = 1 ORDER BY created_at DESC LIMIT 1`))[0]?.msg_id ?? null;
           payload.ordering = state!.ordering;
           payload.predecessor = predecessor;
         }
@@ -6339,6 +6419,9 @@ export class ZeBridge {
         // gives an equal time, not an earlier one, and equal is allowed.
         const createdMs = Math.max(Math.floor(Date.now() + this.clockOffsetMs()), predecessor ? messageIdCreatedMs(predecessor) ?? 0 : 0);
         msgId = mutationMsgId(createdMs, this.clientIdValue, table, op, keyParts, version);
+        // A caller's stamp, the same operation and key, and a clock at or behind the named
+        // write's time give back that write's own ID: refused before anything is written.
+        if (after !== undefined && msgId === after) throw new OrderingRefusal(`after: a write cannot depend on itself (${after})`);
         await this.outboxPut({ msgId, subject, payload, table, id, before, optimistic: applied, authoritative, ordered, predecessor }, txExec);
         await this.applyEvent(table, applied, txExec);
       });
@@ -6348,8 +6431,9 @@ export class ZeBridge {
       if (applied) this.triggerChange(table, applied);
     } catch (err) {
       this.pendingWrites.delete(msgId);
+      if (err instanceof OrderingRefusal) throw err;
       this.appendLog(subject, `optimistic apply failed, write not sent: ${err}`, 'ERROR');
-      return;
+      return { refused: `NotQueued: ${err}` };
     }
 
     // ⚠️ The GC watermark gates the FIRST send too, not only replays.
@@ -6377,20 +6461,21 @@ export class ZeBridge {
           `The local copy has been reverted — this edit is lost.`,
         'ERROR',
       );
-      return;
+      return { refused: 'PredatesGcWatermark' };
     }
 
     // Closed on purpose (close(), a battery saver, an offline toggle): the row is
     // queued and optimistic, and goes out with the outbox flush on the next connect().
     if (!this.nc) {
       this.appendLog(subject, `${table}[${id}] queued — no connection; sent on the next connect()`, 'OUTBOX');
-      return;
+      return { writeId: msgId };
     }
 
     // A fresh edit shares the durable window with recovery. It remains queued
     // when every slot is occupied; the next verdict advances it automatically.
     // Not awaiting the PubAcks: an app's loop of mutate() calls is not one round trip per write.
     await this.flushOutboxPass(false);
+    return { writeId: msgId };
   }
 
   /// Fill the in-flight window. Remaining entries advance automatically as verdicts

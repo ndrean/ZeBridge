@@ -67,8 +67,10 @@ for await (const line of rl) {
     if (req.mutate) {
       // {"mutate": {"table", "op", "key", "values"}} → the blessed write path
       const m = req.mutate;
-      // an explicit version models a slow clock (§10do): the stamp is the caller's
-      const r = await zb.mutate(m.table, m.op, m.key, m.values, m.version ? { version: m.version } : undefined);
+      // an explicit version models a slow clock (§10do): the stamp is the caller's;
+      // `after` / `independent` choose the ordering, `withId` returns the write's ID too
+      const opts = { ...(m.version ? { version: m.version } : {}), ...(m.after ? { after: m.after } : {}), ...(m.independent ? { independent: true } : {}) };
+      const r = m.withId ? await zb.mutateWithId(m.table, m.op, m.key, m.values, opts) : await zb.mutate(m.table, m.op, m.key, m.values, opts);
       console.log(JSON.stringify({ rows: [r] }));
       continue;
     }

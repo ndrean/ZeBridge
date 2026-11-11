@@ -6044,8 +6044,20 @@ pub const SyncClient = struct {
     /// `result_a` owns the returned msg_id and nothing else: everything this call
     /// builds — envelope, before-image, JSON, msgpack — is per-call and freed on return.
     pub fn mutate(self: *SyncClient, result_a: std.mem.Allocator, table: []const u8, op: []const u8, key: Value, values: ?Value) ![]const u8 {
-        return self.mutateAt(result_a, table, op, key, values, null);
+        return self.mutateWith(result_a, table, op, key, values, .{});
     }
+
+    /// How one write is ordered on a table whose bridge offers ordering (`ordering` in the
+    /// write contract). The default follows the tail: the newest unsettled ordered write.
+    pub const MutateOptions = struct {
+        /// The caller's own version stamp (`mutateAt`).
+        stamp: ?[]const u8 = null,
+        /// Wait for this earlier write of the same client instead of the tail; the write then
+        /// becomes the tail. It may have left the outbox already: the bridge has its receipt.
+        after: ?[]const u8 = null,
+        /// No predecessor and no ordered envelope; the tail is left as it was.
+        independent: bool = false,
+    };
 
     /// `mutate` with the caller's own stamp (the TypeScript client's `opts.version`):
     /// a host that keeps its own clock, or a test modelling a slow one. The HLC only
@@ -6061,7 +6073,15 @@ pub const SyncClient = struct {
         return version;
     }
 
-    pub fn mutateAt(self: *SyncClient, result_a: std.mem.Allocator, table: []const u8, op_in: []const u8, key: Value, values: ?Value, stamp: ?[]const u8) ![]const u8 {
+    pub fn mutateAt(self: *SyncClient, result_a: std.mem.Allocator, table: []const u8, op: []const u8, key: Value, values: ?Value, stamp: ?[]const u8) ![]const u8 {
+        return self.mutateWith(result_a, table, op, key, values, .{ .stamp = stamp });
+    }
+
+    /// `mutate` with its options. Returns the ID of a write durably queued in the outbox, and
+    /// nothing else: a write refused before queueing (the GC floor, an `after` that cannot
+    /// hold) is an error, so no caller can name a write that will never have a receipt.
+    pub fn mutateWith(self: *SyncClient, result_a: std.mem.Allocator, table: []const u8, op_in: []const u8, key: Value, values: ?Value, opts: MutateOptions) ![]const u8 {
+        const stamp = opts.stamp;
         // §10jm: any case in, capitals from here on — the `"DELETE"` checks below read this.
         const op = core.normalizeOp(op_in) orelse return error.UnknownOperation;
         var ca = std.heap.ArenaAllocator.init(self.a);
@@ -6069,6 +6089,21 @@ pub const SyncClient = struct {
         const a = ca.allocator();
         const st = self.states.get(table) orelse return error.UnknownTable;
         try self.ensureOutbox();
+        if (opts.after) |x| {
+            if (opts.independent) {
+                log.warn("libzb: after and independent cannot be combined", .{});
+                return error.AfterWithIndependent;
+            }
+            if (st.ordering == 0) {
+                log.warn("libzb: after needs ordering: the bridge does not offer it for '{s}'", .{table});
+                return error.AfterNeedsOrdering;
+            }
+            if (!try core.messageIdOfClient(a, x, self.opts.client_id)) {
+                log.warn("libzb: after: '{s}' is not a write of this client", .{x});
+                return error.AfterNotThisClient;
+            }
+        }
+        const ordered = st.ordering > 0 and !opts.independent;
 
         const version = stamp orelse try core.hlcVersion(a, try nowWireIsoAt(a, self.clock_offset_ms), self.last_version, self.seen_floor);
         if (version.len > self.last_version_buf.len) return error.VersionTooLong;
@@ -6090,7 +6125,8 @@ pub const SyncClient = struct {
         // every write that entry named) or as `indeterminate` (reconciled, so a new write must
         // not depend on it). Read and inserted in this one call, single-threaded, so the link
         // is fixed when the write is made and survives restart with the entry.
-        const predecessor: ?[]const u8 = if (st.ordering > 0) blk: {
+        // `after` names the predecessor itself; `independent` has none.
+        const predecessor: ?[]const u8 = if (opts.after) |x| x else if (ordered) blk: {
             const tail = try self.st.query(a, "SELECT msg_id FROM _zebridge_outbox WHERE ordered = 1 ORDER BY created_at DESC LIMIT 1", &.{});
             break :blk if (tail.len == 1 and tail[0][0] == .text) tail[0][0].text else null;
         } else null;
@@ -6107,7 +6143,7 @@ pub const SyncClient = struct {
         for (st.pk) |c| try pk_arr.append(.{ .string = c });
         try args.put(a, "pkCols", .{ .array = pk_arr });
         try args.put(a, "mutationsPrefix", .{ .string = self.subject_mutations_prefix });
-        if (st.ordering > 0) {
+        if (ordered) {
             try args.put(a, "ordering", .{ .integer = st.ordering });
             if (predecessor) |p| try args.put(a, "predecessor", .{ .string = p });
         }
@@ -6117,6 +6153,35 @@ pub const SyncClient = struct {
         const msg_id = env.object.get("msgId").?.string;
         const row_id = env.object.get("id").?.string;
         const payload = env.object.get("payload").?;
+
+        // A caller's stamp, the same operation and key, and a clock at or behind the named
+        // write's time give back that write's own ID: refused before anything is touched.
+        if (opts.after) |x| if (std.mem.eql(u8, msg_id, x)) {
+            log.warn("libzb: after: a write cannot depend on itself ({s})", .{x});
+            return error.AfterSelf;
+        };
+        // The GC floor, before the write is applied or queued: a refused write must never yield
+        // an ID a successor could wait on. The flush checks again, for a floor that moved on
+        // while this write waited offline.
+        {
+            const watermark = self.gcWatermark(a);
+            var one = std.json.Array.init(a);
+            var e: std.json.ObjectMap = .empty;
+            try e.put(a, "msgId", .{ .string = msg_id });
+            try e.put(a, "version", .{ .string = version });
+            try one.append(.{ .object = e });
+            const gate = try core.outboxWatermarkGate(a, one, watermark);
+            if (gate.object.get("refuse").?.array.items.len > 0) {
+                log.warn(
+                    "outbox: {s}[{s}] {s} predates the GC watermark ({s}) and CANNOT be sent — " ++
+                        "its tombstone was reaped, so sending it would resurrect a deleted row " ++
+                        "(PROTOCOL MUST 6). Not applied, not queued; this edit is lost.",
+                    .{ table, row_id, msg_id, watermark orelse "?" },
+                );
+                self.noteOutcome(a, msg_id, version, table, if (payload == .object) payload.object.get("data") else null, "rejected", &.{.{ "reason", .{ .string = "PredatesGcWatermark" } }});
+                return error.PredatesGcWatermark;
+            }
+        }
 
         // The before-image, for the revert a refusal or a rejection needs. Captured
         // BEFORE the optimistic apply overwrites it, obviously.
@@ -6173,7 +6238,7 @@ pub const SyncClient = struct {
             .{ .text = msg_id },                              .{ .text = subject },                        .{ .text = payload_json },
             .{ .text = table },                               .{ .text = row_id },                         before_json,
             before_json,                                      .{ .integer = created },                     row_tenant,
-            .{ .text = try core.valueToString(a, opt) },      .{ .integer = @intFromBool(authoritative) }, .{ .integer = @intFromBool(st.ordering > 0) },
+            .{ .text = try core.valueToString(a, opt) },      .{ .integer = @intFromBool(authoritative) }, .{ .integer = @intFromBool(ordered) },
             if (predecessor) |pr| .{ .text = pr } else .null,
         });
 
@@ -10440,4 +10505,135 @@ test "ordering: a successor's ID is never dated before its predecessor's, after 
     try std.testing.expectEqualStrings(m2, rows[1][0].text);
     try std.testing.expect((try orderTestLink(&again, a, m1)).payload.? == .null);
     try std.testing.expectEqualStrings(m1, (try orderTestLink(&again, a, m2)).payload.?.string);
+}
+
+/// One write through `mutateWith`, with its own stamp, as the ordering-mode tests make them.
+fn modesWrite(cl: *SyncClient, a: std.mem.Allocator, table: []const u8, op: []const u8, id: []const u8, version: []const u8, after: ?[]const u8, independent: bool) ![]const u8 {
+    const key = try parseStoredJson(a, try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{id}));
+    const values: ?Value = if (std.mem.eql(u8, op, "DELETE")) null else if (std.mem.eql(u8, table, "p")) try parseStoredJson(a, try std.fmt.allocPrint(a, "{{\"title\":\"{s}\"}}", .{version})) else try parseStoredJson(a, "{\"pid\":\"x\"}");
+    return cl.mutateWith(a, table, op, key, values, .{ .stamp = version, .after = after, .independent = independent });
+}
+
+fn modesOutbox(cl: *SyncClient, a: std.mem.Allocator) !i64 {
+    return (try cl.st.query(a, "SELECT count(*) FROM _zebridge_outbox", &.{}))[0][0].integer;
+}
+
+fn modesFloorRefusals(cl: *SyncClient) usize {
+    var n: usize = 0;
+    for (cl.outcomes.items) |o| {
+        if (std.mem.indexOf(u8, o, "PredatesGcWatermark") != null) n += 1;
+    }
+    return n;
+}
+
+test "ordering modes: after names its predecessor, independent leaves the tail, across reopen (escaped client)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/tmp/zb-order-modes.sqlite3";
+    for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    var cl = try orderTestClient(a, path, &conn, &t);
+    cl.opts.client_id = "phone-1.a";
+
+    const wp = try modesWrite(&cl, a, "p", "INSERT", "x", "2026-11-09T10:00:00.000001Z", null, false);
+    try std.testing.expect(std.mem.indexOf(u8, wp, "-phone~2D1~2Ea-") != null);
+    const wb = try modesWrite(&cl, a, "p", "UPDATE", "x", "2026-11-09T10:00:00.000002Z", wp, false);
+    const wc = try modesWrite(&cl, a, "p", "UPDATE", "x", "2026-11-09T10:00:00.000003Z", wp, false);
+    try std.testing.expectEqualStrings(wp, (try orderTestLink(&cl, a, wb)).column.?);
+    // wc names wp although wb was the tail when wc was made.
+    const lc = try orderTestLink(&cl, a, wc);
+    try std.testing.expectEqualStrings(wp, lc.column.?);
+    try std.testing.expectEqualStrings(wp, lc.payload.?.string);
+    try std.testing.expect(core.messageIdCreatedMs(wc).? >= core.messageIdCreatedMs(wp).?);
+    const wi = try modesWrite(&cl, a, "p", "UPDATE", "x", "2026-11-09T10:00:00.000004Z", null, true);
+    const li = try orderTestLink(&cl, a, wi);
+    try std.testing.expect(!li.ordered and li.column == null and li.payload == null);
+
+    // Reopen with all four still queued: the links hold, and a default write follows wc, not wi.
+    cl.st.close();
+    var conn2 = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn2.deinit();
+    var t2: transport.Transport = undefined;
+    var again = try orderTestClient(a, path, &conn2, &t2);
+    defer again.st.close();
+    again.opts.client_id = "phone-1.a";
+    try std.testing.expectEqualStrings(wp, (try orderTestLink(&again, a, wc)).column.?);
+    const wd = try modesWrite(&again, a, "p", "UPDATE", "x", "2026-11-09T10:00:00.000005Z", null, false);
+    try std.testing.expectEqualStrings(wc, (try orderTestLink(&again, a, wd)).column.?);
+}
+
+test "ordering modes: after a write already gone from the outbox is accepted and dated no earlier than it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    var cl = try orderTestClient(a, ":memory:", &conn, &t);
+    defer cl.st.close();
+    cl.opts.client_id = "phone-1.a";
+    const wp = try modesWrite(&cl, a, "p", "INSERT", "x", "2026-11-09T10:00:00.000001Z", null, false);
+    _ = try cl.settleVerdict(a, wp, "{\"status\":\"accepted\"}");
+    cl.clock_offset_ms = -3_600_000; // the clock an hour behind P's time
+    const wc = try modesWrite(&cl, a, "p", "UPDATE", "x", "2026-11-09T10:00:00.000002Z", wp, false);
+    try std.testing.expectEqualStrings(wp, (try orderTestLink(&cl, a, wc)).column.?);
+    try std.testing.expectEqual(core.messageIdCreatedMs(wp), core.messageIdCreatedMs(wc)); // equal, not earlier
+}
+
+test "ordering modes: every misuse refuses before anything is written" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    var cl = try orderTestClient(a, ":memory:", &conn, &t);
+    defer cl.st.close();
+    cl.opts.client_id = "phone-1.a";
+    const wp = try modesWrite(&cl, a, "p", "INSERT", "x", "2026-11-09T10:00:00.000001Z", null, false);
+    const queued = try modesOutbox(&cl, a);
+    const shown = (try cl.st.query(a, "SELECT title FROM p WHERE id = 'x'", &.{}))[0][0].text;
+    try std.testing.expectError(error.AfterNeedsOrdering, modesWrite(&cl, a, "c", "INSERT", "k", "2026-11-09T10:00:00.000002Z", wp, false));
+    try std.testing.expectError(error.AfterNotThisClient, modesWrite(&cl, a, "p", "UPDATE", "x", "2026-11-09T10:00:00.000003Z", "legacy-id", false));
+    const foreign = try core.messageId(a, nowMillis(), "phone-2", "p", "UPDATE", &.{"x"}, "v");
+    try std.testing.expectError(error.AfterNotThisClient, modesWrite(&cl, a, "p", "UPDATE", "x", "2026-11-09T10:00:00.000004Z", foreign, false));
+    try std.testing.expectError(error.AfterWithIndependent, modesWrite(&cl, a, "p", "UPDATE", "x", "2026-11-09T10:00:00.000005Z", wp, true));
+    // Self: wp's own version, operation and key, the clock behind wp: the built ID is wp's.
+    cl.clock_offset_ms = -3_600_000;
+    try std.testing.expectError(error.AfterSelf, modesWrite(&cl, a, "p", "INSERT", "x", "2026-11-09T10:00:00.000001Z", wp, false));
+    try std.testing.expectEqual(queued, try modesOutbox(&cl, a));
+    try std.testing.expectEqualStrings(shown, (try cl.st.query(a, "SELECT title FROM p WHERE id = 'x'", &.{}))[0][0].text);
+    try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT attempts FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = wp }}))[0][0].integer);
+}
+
+test "ordering modes: the GC floor refuses at enqueue (no ID, one outcome) and still at send time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    var cl = try orderTestClient(a, ":memory:", &conn, &t);
+    defer cl.st.close();
+    cl.opts.client_id = "phone-1.a";
+    try cl.st.execSimple("CREATE TABLE zebridge_gc_watermark (watermark TEXT)");
+    // Offline: a parent and its child queued; then the floor passes the parent's version only.
+    const wp = try modesWrite(&cl, a, "p", "INSERT", "x", "2026-11-09T10:00:00.000001Z", null, false);
+    const wc = try modesWrite(&cl, a, "p", "UPDATE", "x", "2026-11-09T10:00:05.000000Z", wp, false);
+    try cl.st.execSimple("INSERT INTO zebridge_gc_watermark VALUES ('2026-11-09T10:00:02.000000Z')");
+    // At enqueue: a write older than the floor yields no ID, is not applied, and is reported once.
+    const queued = try modesOutbox(&cl, a);
+    try std.testing.expectError(error.PredatesGcWatermark, modesWrite(&cl, a, "p", "UPDATE", "y", "2026-11-09T10:00:01.000000Z", null, false));
+    try std.testing.expectEqual(queued, try modesOutbox(&cl, a));
+    try std.testing.expectEqual(@as(usize, 0), (try cl.st.query(a, "SELECT 1 FROM p WHERE id = 'y'", &.{})).len);
+    try std.testing.expectEqual(@as(usize, 1), modesFloorRefusals(&cl));
+    // At send time (the flush on reconnect): wp, overtaken while offline, is refused once and
+    // dropped; wc stays queued naming wp, the documented limit the bridge resolves.
+    _ = cl.flushOutboxPass(false) catch {};
+    try std.testing.expectEqual(@as(usize, 2), modesFloorRefusals(&cl));
+    try std.testing.expectEqual(@as(usize, 0), (try cl.st.query(a, "SELECT 1 FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = wp }})).len);
+    try std.testing.expectEqualStrings(wp, (try orderTestLink(&cl, a, wc)).column.?);
 }

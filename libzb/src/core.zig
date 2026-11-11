@@ -257,6 +257,32 @@ pub fn messageIdCreatedMs(id: []const u8) ?i64 {
     return std.fmt.parseInt(i64, rest[0..end], 10) catch null;
 }
 
+/// Whether `id` is a structured ID made by `client_id`: its fourth `-` token is the client,
+/// escaped as every ID component is (the bridge's own rule, `ordered_ingress.parse`). An ID
+/// does not name the principal; the bridge resolves it under the authenticated one.
+pub fn messageIdOfClient(a: std.mem.Allocator, id: []const u8, client_id: []const u8) !bool {
+    if (messageIdCreatedMs(id) == null or client_id.len == 0) return false;
+    var tokens = std.mem.splitScalar(u8, id, '-');
+    for (0..3) |_| _ = tokens.next();
+    const token = tokens.next() orelse return false;
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(a);
+    try appendIdComponent(a, &encoded, client_id);
+    return std.mem.eql(u8, token, encoded.items);
+}
+
+test "messageIdOfClient: the ID's client token, escaped, against this client" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const id = try messageId(arena.allocator(), 1787824800123, "phone-1.a", "rows", "UPDATE", &.{"7"}, "v");
+    try std.testing.expect(try messageIdOfClient(a, id, "phone-1.a"));
+    try std.testing.expect(!try messageIdOfClient(a, id, "phone-1"));
+    try std.testing.expect(!try messageIdOfClient(a, id, "phone~2D1~2Ea")); // the escaped form is not the client
+    for ([_][]const u8{ "legacy-id", "zb1-t1787824800123", "zb1-tx-UPDATE-phone~2D1~2Ea-rows" }) |bad|
+        try std.testing.expect(!try messageIdOfClient(a, bad, "phone-1.a"));
+}
+
 test "messageIdCreatedMs reads only a structured ID's time" {
     try std.testing.expectEqual(@as(?i64, 1787824800123), messageIdCreatedMs("zb1-t1787824800123-UPDATE-c-t-k1-u-v"));
     for ([_][]const u8{ "legacy-id", "zb1-t-UPDATE", "zb1-tabc-UPDATE", "zb1-t1787824800123", "zb1-t9999999999999999-X" }) |bad|
