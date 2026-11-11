@@ -268,7 +268,7 @@ writes a bucket by publishing there. Clients should use their NATS client's KV A
 }
 ```
 
-Root keys are `table`, `pg`, `sqlite`, `lsn`, `pk`, `pk_columns`, `indexes`, `foreign_keys`, `max_row_bytes`, plus the **write contract**: `version_column`, `tombstone_column`, `tiebreak_column`, `tenant_column`, `writable`, `mutation_timeout_ms` and `replica_identity`. `indexes` and `foreign_keys` are dialect-neutral (a `CREATE INDEX` and a `FOREIGN KEY` clause read the same on every engine), so they sit at the root; `pg` and `sqlite` carry only column types, and a client reads the block its engine speaks — SQLite replicas the `sqlite` block, PostgreSQL replicas (PGlite, a local server) the `pg` block (§10).
+Root keys are `table`, `pg`, `sqlite`, `lsn`, `pk`, `pk_columns`, `indexes`, `foreign_keys`, `max_row_bytes`, plus the **write contract**: `version_column`, `tombstone_column`, `tiebreak_column`, `tenant_column`, `writable`, `ordering`, `mutation_timeout_ms` and `replica_identity`. `indexes` and `foreign_keys` are dialect-neutral (a `CREATE INDEX` and a `FOREIGN KEY` clause read the same on every engine), so they sit at the root; `pg` and `sqlite` carry only column types, and a client reads the block its engine speaks — SQLite replicas the `sqlite` block, PostgreSQL replicas (PGlite, a local server) the `pg` block (§10).
 
 `pk_columns` is the whole primary key in key order; `pk` is the legacy single-column
 form and is `null` for a composite key. Both live at the root and only there: the key
@@ -292,6 +292,8 @@ whose catalogue row is public (`tenant_col IS NULL`, the reason recorded in
 KV key or object-store name for that specific table: its own resolved tenant when `tenant_column` is set, the
 shared open-tenant token when it is `null`, so every principal converges on the one shared
 entry of a tenant-agnostic table (§6, "Connection Flow").
+
+`ordering: 1` advertises support for [ordered ingress (version 1)](#ordered-ingress-version-1). A client refuses an explicit `after(writeId)` dependency when the descriptor omits this capability.
 
 `tiebreak_column` is the configured server-stamped writer column when it exists, otherwise `null`. Clients may omit an own-echo baseline copy only for a single pending outbox write whose normalized version and `client_id` both match the CDC row through this column. Equal timestamps alone do not prove an echo. An absent field, missing identity, peer identity, or owed undo retains conservative capture.
 
