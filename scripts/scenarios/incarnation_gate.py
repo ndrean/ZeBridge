@@ -37,13 +37,15 @@ window can be held open (`ZB_TEST_FAULT=incarnation_pause` while a file exists):
      recover once it can be read.
   M  a reload through one table republishes the other's descriptor when its advert
      changed: the switch off, then on, then the policy unreadable and readable again, each
-     triggered by reseeding ig_t only, observed on ig_u.
+     triggered by reseeding ig_t only, observed on ig_u. A publication that fails (fault
+     hook) is retried by the next reload through ig_t: ig_u recovers with no restart and no
+     reseed of its own.
   N  a cold start whose catalogue read fails (the reader may not read zebridge_catalogue)
-     with the switch on: no writable descriptor goes out without `incarnation`. Observed:
-     every table is refused (no rules, so no CDC subject) and published as a suspension,
-     which carries no write contract; so this pins the outcome but does not exercise the
-     load's default (`unknown`), which the catalogue unit test pins. Once the catalogue
-     reads again, advertising recovers.
+     with the switch on: every table is refused (no rules, so no CDC subject) and published
+     as a suspension (suspended, reason no_cdc_subject, writable false), which carries no
+     write contract. This pins the observed outcome; the load's default (`unknown`) is
+     pinned by the catalogue unit test. Once the catalogue reads again, advertising
+     recovers.
 
 Needs a PostgreSQL superuser on 127.0.0.1:5432, nats-server and the fault build of the
 bridge (`zig build -Doptimize=ReleaseFast -Dtest-faults=true -p zig-out-faults`).
@@ -158,7 +160,8 @@ async def run(tmp):
     g = Gate(stack, tmp)
     try:
         stack.start({PRINCIPAL: TENANT})
-        stack.env.update(MUTATION_ADMISSION="1", ZB_TEST_PAUSE_FILE=str(g.pause))
+        publish_fail = tmp / "publish.fail"
+        stack.env.update(MUTATION_ADMISSION="1", ZB_TEST_PAUSE_FILE=str(g.pause), ZB_TEST_PUBLISH_FAIL_FILE=str(publish_fail))
         writer = stack.name + "_w"
         r_a, r_hold, r_w = (str(uuid.uuid4()) for _ in range(3))
         g.create(T, [(r_a, "original", "now()"), (r_hold, "original", "now()"), (r_w, "original", "now()")])
@@ -431,6 +434,27 @@ async def run(tmp):
             ok, d = await u_where(want)
             check(f"M: {label}, reload through {T}: {U}'s descriptor follows", ok, str(summary(d)))
 
+        # A publication that fails is retried by the next reload, through ig_t only.
+        publish_fail.touch()
+        g.s.sql("UPDATE zebridge_private.write_policy SET incarnation_stamps = false WHERE singleton")
+        republish()
+        end = time.monotonic() + 30
+        while time.monotonic() < end and "ZB_TEST_PUBLISH_FAIL_FILE fired" not in bridge_log(stack, bridge):
+            await asyncio.sleep(0.2)
+        fired = "ZB_TEST_PUBLISH_FAIL_FILE fired" in bridge_log(stack, bridge)
+        await asyncio.sleep(2)
+        d = await g.descriptor(U)
+        check(f"M: a reload's publication fails: {U} keeps its stale descriptor (precondition)",
+              fired and isinstance(d, dict) and d.get("incarnation") == inc_u, str(summary(d)))
+        publish_fail.unlink()
+        republish()
+        ok, d = await u_where(lambda d: "incarnation" not in d and d.get("writable") is not False)
+        check(f"M: the next reload through {T} republishes {U}, whose publication had failed", ok, str(summary(d)))
+        g.s.sql("UPDATE zebridge_private.write_policy SET incarnation_stamps = true WHERE singleton")
+        republish()
+        ok, d = await u_where(lambda d: d.get("incarnation") == inc_u)
+        check(f"M: the switch back on: {U} advertises again", ok, str(summary(d)))
+
         # ── N: a cold start whose catalogue read fails, the switch on ──
         stack.bridge_down(bridge)
         g.s.sql(f"REVOKE SELECT ON public.zebridge_catalogue FROM {reader}")
@@ -448,9 +472,11 @@ async def run(tmp):
                 await asyncio.sleep(0.5)
         except RuntimeError as e:
             cold = str(e)[-300:]
-        invites = isinstance(cold, dict) and any(isinstance(v, dict) and "incarnation" not in v and v.get("writable") is True for v in cold.values())
-        check("N: catalogue unreadable at boot, switch on: no writable descriptor without `incarnation` (tables suspended)",
-              isinstance(cold, dict) and all(isinstance(v, dict) for v in cold.values()) and not invites,
+        suspended = isinstance(cold, dict) and all(
+            isinstance(v, dict) and v.get("suspended") is True and v.get("reason") == "no_cdc_subject" and v.get("writable") is False
+            for v in cold.values())
+        check("N: catalogue unreadable at boot, switch on: each table suspended (no_cdc_subject, writable false)",
+              suspended,
               str({t: summary(v) for t, v in cold.items()} if isinstance(cold, dict) else cold))
         if label_n and label_n in stack.procs: stack.bridge_down(label_n)
         g.s.sql(f"GRANT SELECT ON public.zebridge_catalogue TO {reader}")

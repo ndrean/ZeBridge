@@ -2625,6 +2625,11 @@ const LiveCatalogue = struct {
     publication_name: []const u8,
     stream_limits: Config.StreamLimits,
     readings_limits: Config.StreamLimits,
+    /// Tables whose descriptors a reload decided to publish and could not (owned names).
+    /// The swap to the fresh catalogue happens before the publication, so after a failure
+    /// the in-memory adverts already agree and the next reload would see nothing to do:
+    /// these ride every reload until one publishes them.
+    unpublished: std.ArrayList([]u8) = .empty,
 
     fn reload(self: *LiveCatalogue, publisher: anytype, event_proc: anytype) void {
         var fresh = catalogue.loadRules(self.allocator, self.pg_config, self.tenant_rules, self.sync_rules);
@@ -2751,19 +2756,49 @@ const LiveCatalogue = struct {
         var it = self.tenant_rules.keyIterator();
         while (it.next()) |k| self.liftIfUnrouted(k.*, &republish);
         for (self.topo.public_tables) |t| self.liftIfUnrouted(t, &republish);
+        for (self.unpublished.items) |tbl| {
+            for (republish.items) |r| {
+                if (std.mem.eql(u8, r, tbl)) break;
+            } else republish.append(self.allocator, tbl) catch {};
+        }
         if (republish.items.len > 0) {
             // The writability verdict was computed at each table's DDL event — for a
             // pre-existing table, BEFORE zebridge_enable granted the writer role — so
             // the descriptor would carry `writable: false`. Re-run the report against
             // the grants as they are now, then publish.
             for (republish.items) |tbl| event_proc.reportEdgeWritability(tbl);
-            event_proc.publishBootSchemas(self.allocator, republish.items) catch |err| {
-                log.err("🗂️ catalogue reloaded but {d} schema(s) could not be published ({s})", .{ republish.items.len, @errorName(err) });
-            };
+            const published = if (publishFailInjected())
+                error.TestFault
+            else
+                event_proc.publishBootSchemas(self.allocator, republish.items);
+            if (published) |_| {
+                for (self.unpublished.items) |t| self.allocator.free(t);
+                self.unpublished.clearRetainingCapacity();
+            } else |err| {
+                log.err("🗂️ catalogue reloaded but {d} schema(s) could not be published ({s}) — retried with the next reload", .{ republish.items.len, @errorName(err) });
+                // Owned copies first: `republish` may point into `unpublished` itself.
+                var keep: std.ArrayList([]u8) = .empty;
+                for (republish.items) |t| {
+                    const copy = self.allocator.dupe(u8, t) catch continue;
+                    keep.append(self.allocator, copy) catch self.allocator.free(copy);
+                }
+                for (self.unpublished.items) |t| self.allocator.free(t);
+                self.unpublished.deinit(self.allocator);
+                self.unpublished = keep;
+            }
         }
         log.info("🗂️ catalogue reloaded live: {d} public, {d} tenant-scoped rule(s), {d} table(s) changed, {d} schema(s) published", .{
             self.topo.public_tables.len, self.tenant_rules.count(), self.cat.changed.len, republish.items.len,
         });
+    }
+
+    /// Fault build: a reload's publication fails while the file `ZB_TEST_PUBLISH_FAIL_FILE` exists.
+    fn publishFailInjected() bool {
+        if (comptime !@import("build_options").test_faults) return false;
+        const path = std.c.getenv("ZB_TEST_PUBLISH_FAIL_FILE") orelse return false;
+        if (std.c.access(path, 0) != 0) return false;
+        log.warn("ZB_TEST_PUBLISH_FAIL_FILE fired: the reload's publication fails", .{});
+        return true;
     }
 
     fn liftIfUnrouted(self: *LiveCatalogue, table: []const u8, republish: *std.ArrayList([]const u8)) void {
