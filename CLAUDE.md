@@ -26,7 +26,7 @@ with the same words in the log lines, because the scenarios grep them.
 ```sh
 zig build                                   # the bridge (add -Doptimize=ReleaseFast for the scenarios)
 zig build test --summary all                # bridge unit tests (a few need a live PostgreSQL / are skipped)
-zig build archiver test-archiver -fincremental   # the native readings archiver (Debug: leaks are reported) and its unit tests
+zig build archiver test-archiver                # the native readings archiver (Debug: leaks are reported) and its unit tests
 cd libzb && zig build test --summary all    # libzb unit tests
 cd libzb && zig build -Doptimize=ReleaseFast                       # libzb/zig-out/lib/libzbcore.so
 cd libzb && zig build -Doptimize=ReleaseFast -Dtest-faults=true -p zig-out-faults   # fault-hook build (see below)
@@ -34,6 +34,8 @@ cd libzb && zig build wasm-core             # core.zig → zig-out/wasm (pnpm wa
 cd zb-client-ts && pnpm typecheck && pnpm test    # node:test with node:sqlite; one test skips without a libzb wasm build
 ```
 
+- No `-fincremental`: on macOS Zig 0.17 panics linking any of these binaries (`TODO(MachO2): load archive`, they all link C
+  libraries); on Linux arm64 it works but rebuilt the bridge no faster (14.4 s against 13.9 s).
 - The Zig test runner **fails a test that logs at `err`**: use `log.warn` for conditions a test provokes.
 - Zig **0.17.1** is the minimum (`minimum_zig_version`): its std builds `std.Io.Threaded` for iOS, so no patched copy is
   needed (`scripts/zig-lib-dir.sh` prints nothing). A `hash mismatch` on libzb's SQLite and zstd pins is a stale archive
