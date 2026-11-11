@@ -273,5 +273,5 @@ open(sys.argv[2], 'w').write(conf)
 print('nats-server-jwt.conf: account JWTs refreshed — reload the server (nats-server --signal reload)')
 PY
 fi
-echo; echo "── store ──"; nsc describe account ZEBRIDGE | head -30
+echo; echo "── store ──"; nsc describe account ZEBRIDGE | head -30 || true   # head closes the pipe early: pipefail would end the script on SIGPIPE (exit 141)
 echo "── creds ──"; ls -la "$CREDS"

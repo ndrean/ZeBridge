@@ -160,6 +160,7 @@ GROUPS = {
         "rekey_offline": ("bridge", "both clients OFFLINE across a re-key and the writes after it: reopen on the same files, meet the new key and epoch at once, converge"),
         "cascade_held":  ("bridge", "a two-level cascade delete while the middle rows are HELD in the inbox: no ghost, no orphan, both replicas equal PostgreSQL"),
         "tombstone_children": ("bridge", "a parent's tombstone is refused while a live child references it; children first, then the parent; a cascade into a tombstone table refused at enable and at DDL (the reap of a family is gc_isolation §7)"),
+        "dependent_writes": ("bridge", "a rejected write costs that write only: a parent refused by the server (23514), its child then refused by the foreign key (23503), an unrelated parent and child written after both applied; the replica reverts the two refused rows, both clients"),
         "revoke_midseed": ("bridge", "a principal revoked while its re-seed is in flight: the mapping rung (seed completes, writes die) and the full hammer (session kicked mid-download, no partial table, cause named); a witness untouched"),
         "suspension_reasons": ("bridge", "every refusal reason: the registry's row and the published descriptor say the same thing, live and at boot; each lifts when fixed"),
         "rebuild_kill":  ("bridge", "a client killed at every point of a local rebuild and of a re-key: each leftover state converges on reopen, both clients"),

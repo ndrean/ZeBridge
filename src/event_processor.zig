@@ -1452,9 +1452,11 @@ pub const EventProcessor = struct {
 
         var version_name: []const u8 = Config.Sync.default_version_column;
         var tombstone_name: ?[]const u8 = null;
+        var tiebreak_name: ?[]const u8 = null;
         if (self.sync_rules.get(table)) |cols| {
             if (cols.len > 0 and cols[0].len > 0) version_name = cols[0];
             if (cols.len > 1 and cols[1].len > 0) tombstone_name = cols[1];
+            if (cols.len > 2 and cols[2].len > 0) tiebreak_name = cols[2];
         }
 
         const has = struct {
@@ -1525,6 +1527,14 @@ pub const EventProcessor = struct {
         } else {
             try json_str.appendSlice(arena, ",\"tombstone_column\":null");
         }
+
+        // Clients may skip an own CDC copy only with the server-stamped writer identity.
+        // Never guess a conventional name, and never advertise a missing column.
+        if (tiebreak_name) |name| {
+            if (has(column_names, name)) {
+                try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"tiebreak_column\":\"{s}\"", .{name}));
+            } else try json_str.appendSlice(arena, ",\"tiebreak_column\":null");
+        } else try json_str.appendSlice(arena, ",\"tiebreak_column\":null");
 
         // The catalogue's `tenant_col`: which column scopes this table's rows by tenant, or `null` for
         // a table every principal reads and writes the same content of (system tables,
@@ -3135,4 +3145,30 @@ test "baseBufFor: the smallest buffer that holds the descriptor behind its colum
     try std.testing.expectEqual(@as(u6, 12), EventProcessor.baseBufFor(2048 - "schema".len + 1));
     // charge_points' 4,221-byte DDL descriptor on Supabase: 8 KB.
     try std.testing.expectEqual(@as(u6, 13), EventProcessor.baseBufFor(4221));
+}
+
+test "write contract publishes only the configured, present tiebreak column" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var sync = Config.EventClassification.TransitionRules.init(a);
+    var tenants = Config.EventClassification.TransitionRules.init(a);
+    var writable = WritableTables.Registry.init(a);
+    var ep: EventProcessor = undefined;
+    ep.cat = null;
+    ep.sync_rules = &sync;
+    ep.tenant_rules = &tenants;
+    ep.writable = &writable;
+    ep.event_buf_bytes = 4096;
+    try sync.put("configured", &.{ "v", "", "custom_writer" });
+    for ([_][]const u8{ "configured", "missing", "unconfigured" }) |table| {
+        if (std.mem.eql(u8, table, "missing")) try sync.put(table, &.{ "v", "", "not_here" });
+        var buf: std.ArrayList(u8) = .empty;
+        try buf.appendSlice(a, "{\"table\":\"test\"");
+        try ep.appendWriteContract(a, &buf, table, &.{ "id", "v", "custom_writer" });
+        try buf.append(a, '}');
+        const doc = (try std.json.parseFromSlice(std.json.Value, a, buf.items, .{})).value;
+        const col = doc.object.get("tiebreak_column") orelse return error.MissingWriterContract;
+        if (std.mem.eql(u8, table, "configured")) try std.testing.expectEqualStrings("custom_writer", col.string) else try std.testing.expect(col == .null);
+    }
 }

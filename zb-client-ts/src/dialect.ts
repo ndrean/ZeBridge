@@ -47,6 +47,9 @@ export interface Dialect {
   deferForeignKeys(tx: Exec): Promise<void>;
   /// Violations after a bulk load; -1 when the engine cannot answer.
   foreignKeyViolations(exec: Exec): Promise<number>;
+  /// Incoming FK actions that could change OTHER rows when an undo deletes this row.
+  /// Relation/column identifiers are quoted by the engine, not inferred from descriptors.
+  undoDeleteReferences?(exec: Exec, table: string): Promise<{child: string; joins: string; parent: string; unsafe_scope: number; self_ref: number}[]>;
   /// `INSERT … ` that ignores a conflicting row / replaces it. `?` placeholders.
   insertIgnore(table: string, cols: string[], conflictCols: string[]): string;
   insertReplace(table: string, cols: string[], conflictCols: string[]): string;
@@ -83,6 +86,19 @@ export const sqliteDialect: Dialect = {
     const rows = await exec(
       `SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=? AND name NOT LIKE 'sqlite_%'`, table);
     return (rows ?? []).map((r: any) => r.name);
+  },
+  async undoDeleteReferences(exec, table) {
+    return exec(`WITH target(name) AS (VALUES (?))
+      SELECT '"' || replace(m.name, '"', '""') || '"' AS child,
+        group_concat('c."' || replace(f."from", '"', '""') || '" = p."' ||
+          replace(coalesce(nullif(f."to", ''), pk.name), '"', '""') || '"', ' AND ') AS joins,
+        '"' || replace(target.name, '"', '""') || '"' AS parent,
+        0 AS unsafe_scope, CASE WHEN m.name = target.name COLLATE NOCASE THEN 1 ELSE 0 END AS self_ref
+      FROM sqlite_schema m JOIN pragma_foreign_key_list(m.name) f JOIN target
+      LEFT JOIN pragma_table_info((SELECT name FROM target)) pk ON pk.pk = f.seq + 1
+      WHERE m.type = 'table' AND f."table" = target.name COLLATE NOCASE
+        AND f.on_delete IN ('CASCADE', 'SET NULL', 'SET DEFAULT')
+      GROUP BY m.name, f.id, target.name`, table);
   },
   async setForeignKeys(exec, on) { await exec(`PRAGMA foreign_keys = ${on ? 'ON' : 'OFF'};`); },
   async deferForeignKeys(tx) { await tx(`PRAGMA defer_foreign_keys = ON;`); },
@@ -135,6 +151,22 @@ export const postgresDialect: Dialect = {
   // when it goes back to `origin`. Same contract as SQLite's PRAGMA — the bulk load is
   // of an already-consistent snapshot — and `foreignKeyViolations` below is the
   // post-load check that PostgreSQL does not offer as a pragma.
+  async undoDeleteReferences(exec, table) {
+    return exec(`SELECT format('%I.%I', ns.nspname, child.relname) AS child,
+        string_agg(format('c.%I = p.%I', ca.attname, pa.attname), ' AND ') AS joins,
+        format('%I.%I', pns.nspname, parent.relname) AS parent,
+        CASE WHEN row_security_active(child.oid) THEN 1 ELSE 0 END AS unsafe_scope,
+        CASE WHEN child.oid = parent.oid THEN 1 ELSE 0 END AS self_ref
+      FROM pg_constraint fk JOIN pg_class child ON child.oid = fk.conrelid
+      JOIN pg_namespace ns ON ns.oid = child.relnamespace
+      JOIN pg_class parent ON parent.oid = fk.confrelid
+      JOIN pg_namespace pns ON pns.oid = parent.relnamespace
+      CROSS JOIN LATERAL unnest(fk.conkey, fk.confkey) AS k(child_att, parent_att)
+      JOIN pg_attribute ca ON ca.attrelid = child.oid AND ca.attnum = k.child_att
+      JOIN pg_attribute pa ON pa.attrelid = parent.oid AND pa.attnum = k.parent_att
+      WHERE fk.contype = 'f' AND fk.confrelid = to_regclass(?) AND fk.confdeltype IN ('c','n','d')
+      GROUP BY fk.oid, child.oid, child.relname, ns.nspname, parent.oid, parent.relname, pns.nspname`, table);
+  },
   async setForeignKeys(exec, on) { await exec(`SET session_replication_role = ${on ? 'origin' : 'replica'}`); },
   async deferForeignKeys(tx) { await tx(`SET CONSTRAINTS ALL DEFERRED`); },
   /// PostgreSQL has no `foreign_key_check`, and `session_replication_role = replica`

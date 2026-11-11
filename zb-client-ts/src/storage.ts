@@ -23,6 +23,8 @@ export interface Storage {
   /// node.ts).
   transaction(fn: (tx: Exec) => Promise<void>): Promise<void>;
   deleteDatabaseFile(): Promise<void>;
+  /// Close a persistent engine without deleting its replica (for reopening in another host).
+  close?(): Promise<void>;
   /// One synchronization owner per file-backed replica (libzb's `ReplicaLock`, the same SQLite lock on
   /// `<replica>.lock`). The adapter takes it when it is built and throws `ReplicaAlreadyInUse` when
   /// another owner holds it; `close()` gives it up, and a later `connect()` takes it again. Absent on

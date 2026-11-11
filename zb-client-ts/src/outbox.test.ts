@@ -1,12 +1,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
+import { sqliteDialect } from './dialect.ts';
 import { ZeBridge } from './libzb.ts';
+import { makePgliteStorage } from './pglite-storage.ts';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 function fixture(count = 300) {
   const db = new DatabaseSync(':memory:');
   db.exec(`CREATE TABLE _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT, payload TEXT, tbl TEXT, row_id TEXT,
-    attempts INTEGER DEFAULT 0, created_at INTEGER, published INTEGER DEFAULT 1, retry_at INTEGER DEFAULT 0)`);
+    attempts INTEGER DEFAULT 0, created_at INTEGER, published INTEGER DEFAULT 1, retry_at INTEGER DEFAULT 0, before TEXT, optimistic TEXT, authoritative INTEGER)`);
+  db.exec(`CREATE TABLE _zebridge_undo (msg_id TEXT PRIMARY KEY,tbl TEXT,row_id TEXT,payload TEXT,before TEXT,optimistic TEXT,created_at INTEGER,authoritative INTEGER,mode TEXT,since INTEGER,attempts INTEGER DEFAULT 0)`);
+  db.exec(`CREATE TABLE _zebridge_base(tbl TEXT NOT NULL,row_id TEXT NOT NULL,at INTEGER NOT NULL,data TEXT,PRIMARY KEY(tbl,row_id))`);
   for (let i = 0; i < count; i++) db.prepare('INSERT INTO _zebridge_outbox(msg_id,subject,payload,tbl,row_id,created_at) VALUES (?,?,?,?,?,?)')
     .run(`id${i}`, 'mutation.alice.item.insert', '{}', 'item', String(i), i);
   const gets: string[] = [], sends: string[] = [];
@@ -234,4 +241,825 @@ test('outboxStatus: the oldest waiting write against the GC floor, warned once a
     assert.equal((await c.outboxStatus()).floorMarginMs, 2_685_600_000, 'thirty-one days and two hours');
     assert.equal(logs.length, 1, 'no warning while more than a day remains');
   } finally { db.close(); }
+});
+
+// A refused write's local undo is owed durably (`_zebridge_undo`) and settled per row: a
+// foreign key that refuses it while a dependent row is still here keeps it owed, never throws
+// (that ended Node), and is retried after a verdict, a change or a restart. The twin of
+// libzb's "undo: …" tests.
+function undoFixture(path = ':memory:') {
+  const db = new DatabaseSync(path);
+  db.exec(`PRAGMA foreign_keys = ON;
+    CREATE TABLE IF NOT EXISTS _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT, payload TEXT, tbl TEXT, row_id TEXT, before TEXT, created_at INTEGER, optimistic TEXT, authoritative INTEGER, attempts INTEGER DEFAULT 0, published INTEGER DEFAULT 0, retry_at INTEGER DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS _zebridge_undo (msg_id TEXT PRIMARY KEY, tbl TEXT NOT NULL, row_id TEXT NOT NULL, payload TEXT NOT NULL, before TEXT, optimistic TEXT,
+      created_at INTEGER NOT NULL, authoritative INTEGER, mode TEXT NOT NULL, since INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS _zebridge_base(tbl TEXT NOT NULL,row_id TEXT NOT NULL,at INTEGER NOT NULL,data TEXT,PRIMARY KEY(tbl,row_id));
+    CREATE TABLE IF NOT EXISTS _zebridge_reconcile(msg_id TEXT PRIMARY KEY,tbl TEXT NOT NULL,reason TEXT,version TEXT DEFAULT '',data TEXT,routes TEXT DEFAULT '',targets TEXT DEFAULT '',since INTEGER,state TEXT DEFAULT 'pending');
+    CREATE TABLE IF NOT EXISTS p (id TEXT PRIMARY KEY, title TEXT);
+    CREATE TABLE IF NOT EXISTS c (id TEXT PRIMARY KEY, pid TEXT NOT NULL REFERENCES p(id));`);
+  const c: any = Object.create(ZeBridge.prototype);
+  const logs: string[] = [];
+  c.run = async (sql: string, ...args: any[]) => {
+    const stmt = db.prepare(sql);
+    return stmt.columns().length ? stmt.all(...args) : (stmt.run(...args), []);
+  };
+  c.transaction = async (fn: any) => {
+    db.exec('BEGIN');
+    try { await fn(c.run); db.exec('COMMIT'); } catch (e) { db.exec('ROLLBACK'); throw e; }
+  };
+  const table = (cols: string[]) => ({ pkCols: ['id'], columns: cols, tombstoneColumn: null });
+  Object.assign(c, {
+    dialect: sqliteDialect, baselineActive: !!db.prepare('SELECT 1 FROM _zebridge_base LIMIT 1').get(), ledgerActive: true,
+    outboxInitPromise: Promise.resolve(), appendLog: (_t: string, m: string) => logs.push(m),
+    eventListeners: [], tableListeners: {}, scheduleRecount: () => {}, undoOwed: true,
+    syncedTables: new Map([['p', table(['id', 'title'])], ['c', table(['id', 'pid'])]]),
+    // The optimistic apply, reduced for these tables: an UPDATE of a present row updates it
+    // (an upsert's INSERT would trip a NOT NULL column it does not carry), otherwise an upsert.
+    applyEvent: async (t: string, ev: any, exec: any) => {
+      if (ev.operation === 'DELETE') { await exec(`DELETE FROM ${t} WHERE id = ?`, ev.data.id); return; }
+      const cols = Object.keys(ev.data);
+      if (ev.operation === 'UPDATE' && (await exec(`SELECT 1 FROM ${t} WHERE id = ?`, ev.data.id)).length) {
+        await exec(`UPDATE ${t} SET ${cols.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`, ...cols.map((k) => ev.data[k]), ev.data.id);
+        return;
+      }
+      await exec(`INSERT INTO ${t} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})
+        ON CONFLICT (id) DO UPDATE SET ${cols.map((k) => `${k} = excluded.${k}`).join(', ')}`, ...cols.map((k) => ev.data[k]));
+    },
+  });
+  // A write as `mutate` leaves it: before-image read, optimistic event (key merged into the
+  // data) applied, outbox entry queued with the SPARSE wire data.
+  const write = async (msg: string, t: 'p' | 'c', op: string, id: string, col: string, val: string) => {
+    const before = db.prepare(`SELECT * FROM ${t} WHERE id = ?`).get(id) ?? null;
+    const authoritative = await c.beforeIsAuthoritative(t, c.syncedTables.get(t), id, c.run);
+    const ev = { operation: op, data: { id, [col]: val } };
+    await c.applyEvent(t, ev, c.run);
+    const at = c.nextCreated();
+    c.ledgerChanged(); // as `outboxPut`: no base copy until CDC brings one
+    db.prepare('INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at, optimistic, authoritative) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(msg, 's', JSON.stringify({ operation: op, key: { id }, data: { [col]: val } }), t, id, before == null ? null : JSON.stringify(before), at, JSON.stringify(ev), authoritative ? 1 : 0);
+  };
+  const has = (t: string, id: string) => db.prepare(`SELECT 1 FROM ${t} WHERE id = ?`).all(id).length === 1;
+  const title = (id: string) => (db.prepare('SELECT title FROM p WHERE id = ?').get(id) as any)?.title ?? null;
+  return { db, c, logs, write, has, title };
+}
+
+test('undo: a refused parent\'s undo waits for its child\'s in either order, survives a restart, and spares a row that changed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zb-undo-'));
+  const path = `${dir}/r.sqlite3`;
+  const { db, c, logs, write, has, title } = undoFixture(path);
+
+  // Parent first (dependent_writes.py): refused while the child is here, owed, unblocked by it.
+  await write('p1', 'p', 'INSERT', 'p1', 'title', 'refused');
+  await write('r1', 'c', 'INSERT', 'r1', 'pid', 'p1');
+  await c.revertOptimisticWrite('p1', 'restore');
+  assert.ok(has('p', 'p1'));
+  assert.equal(await c.undoing(), 1);
+  assert.ok(logs.some((m) => m.includes('local undo of p1 is blocked (FOREIGN KEY constraint failed)')));
+  await c.revertOptimisticWrite('r1', 'restore');
+  assert.ok(!has('p', 'p1') && !has('c', 'r1'));
+  assert.equal(await c.undoing(), 0);
+
+  // Child first, then a duplicate verdict: nothing blocks, nothing is owed twice.
+  await write('p2', 'p', 'INSERT', 'p2', 'title', 'refused');
+  await write('r2', 'c', 'INSERT', 'r2', 'pid', 'p2');
+  await c.revertOptimisticWrite('r2', 'restore');
+  await c.revertOptimisticWrite('p2', 'restore');
+  await c.revertOptimisticWrite('p2', 'restore');
+  assert.ok(!has('p', 'p2'));
+  assert.equal(await c.undoing(), 0);
+
+  // A newer value lands before the retry (CDC): the late undo leaves the row alone.
+  await write('p3', 'p', 'INSERT', 'p3', 'title', 'refused');
+  await write('r3', 'c', 'INSERT', 'r3', 'pid', 'p3');
+  await c.revertOptimisticWrite('p3', 'restore');
+  db.exec(`UPDATE p SET title = 'newer' WHERE id = 'p3'; DELETE FROM c WHERE id = 'r3'; DELETE FROM _zebridge_outbox WHERE msg_id = 'r3'`);
+  await c.runUndos();
+  assert.equal(title('p3'), 'newer');
+  assert.equal(await c.undoing(), 0);
+
+  // A restart while the undo is owed: still owed after reopening, done once the child is gone.
+  await write('p4', 'p', 'INSERT', 'p4', 'title', 'refused');
+  await write('r4', 'c', 'INSERT', 'r4', 'pid', 'p4');
+  await c.revertOptimisticWrite('p4', 'restore');
+  db.close();
+  const again = undoFixture(path);
+  assert.equal(await again.c.undoing(), 1);
+  again.db.exec(`DELETE FROM c WHERE id = 'r4'`);
+  await again.c.runUndos();
+  assert.ok(!again.has('p', 'p4'));
+  assert.equal(await again.c.undoing(), 0);
+  again.db.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('undo: two refused writes on one row leave no trace in either order; a sparse UPDATE is restored', async () => {
+  const { c, write, has, title } = undoFixture();
+  await write('a1', 'p', 'INSERT', 'x1', 'title', 'A');
+  await write('b1', 'p', 'UPDATE', 'x1', 'title', 'B');
+  await c.revertOptimisticWrite('a1', 'restore');
+  // The base is no row, and B (still pending) has nothing to update, upstream either: no
+  // partial row is made from its sparse data.
+  assert.ok(!has('p', 'x1'));
+  assert.equal((await c.run(`SELECT 1 FROM _zebridge_outbox WHERE msg_id = 'b1'`)).length, 1);
+  await c.revertOptimisticWrite('b1', 'restore');
+  assert.ok(!has('p', 'x1'));
+
+  await write('a2', 'p', 'INSERT', 'x2', 'title', 'A');
+  await write('b2', 'p', 'UPDATE', 'x2', 'title', 'B');
+  await c.revertOptimisticWrite('b2', 'restore');
+  assert.equal(title('x2'), 'A');
+  await c.revertOptimisticWrite('a2', 'restore');
+  assert.ok(!has('p', 'x2'));
+  assert.equal(await c.undoing(), 0);
+
+  const { db, c: c2, write: write2, title: title2 } = undoFixture();
+  db.exec(`INSERT INTO p (id, title) VALUES ('x3', 'old')`);
+  await write2('u3', 'p', 'UPDATE', 'x3', 'title', 'new');
+  await c2.revertOptimisticWrite('u3', 'restore');
+  assert.equal(title2('x3'), 'old');
+});
+
+test('undo: a change (CDC) retries an owed undo without another verdict', async () => {
+  const { db, c, write, has } = undoFixture();
+  await write('p1', 'p', 'INSERT', 'p1', 'title', 'refused');
+  await write('r1', 'c', 'INSERT', 'r1', 'pid', 'p1');
+  await c.revertOptimisticWrite('p1', 'restore');
+  assert.equal(await c.undoing(), 1);
+  // CDC removes the child (its write resolved without a refusal of its own).
+  db.exec(`DELETE FROM _zebridge_outbox WHERE msg_id = 'r1'; DELETE FROM c WHERE id = 'r1'`);
+  c.triggerChange('c');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(!has('p', 'p1'));
+  assert.equal(await c.undoing(), 0);
+});
+
+test('undo: a reseed settles the owed undos of the rows it replaced; a pending write then rolls back to the seeded row', async () => {
+  const { db, c, write, title } = undoFixture();
+  db.exec(`INSERT INTO p (id, title) VALUES ('x', 'old')`);
+  await write('ua', 'p', 'UPDATE', 'x', 'title', 'a');
+  await write('ub', 'p', 'UPDATE', 'x', 'title', 'b');
+  // Refused; its undo not run yet.
+  db.exec(`INSERT INTO _zebridge_undo (msg_id, tbl, row_id, payload, before, optimistic, created_at, mode, since)
+    SELECT msg_id, tbl, row_id, payload, before, optimistic, created_at, 'restore', 0 FROM _zebridge_outbox WHERE msg_id = 'ua';
+    DELETE FROM _zebridge_outbox WHERE msg_id = 'ua'`);
+  db.exec(`UPDATE p SET title = 'srv' WHERE id = 'x'`); // a full replaced the rows
+  await c.reapplyPending('p');
+  assert.equal(title('x'), 'b');
+  assert.equal(await c.undoing(), 0);
+  await c.revertOptimisticWrite('ub', 'restore');
+  assert.equal(title('x'), 'srv');
+});
+
+test('undo: a server value that landed between two refused edits survives both, in either order', async () => {
+  const { db, c, write, title } = undoFixture();
+  for (const [x, first, second] of [['x1', 'x1a', 'x1b'], ['x2', 'x2b', 'x2a']]) {
+    db.prepare(`INSERT INTO p (id, title) VALUES (?, 'original')`).run(x);
+    await write(`${x}a`, 'p', 'UPDATE', x, 'title', 'A');
+    db.prepare(`UPDATE p SET title = 'server' WHERE id = ?`).run(x); // CDC
+    await write(`${x}b`, 'p', 'UPDATE', x, 'title', 'B');
+    await c.revertOptimisticWrite(first, 'restore');
+    await c.revertOptimisticWrite(second, 'restore');
+    assert.equal(title(x), 'server');
+    assert.equal(await c.undoing(), 0);
+  }
+});
+
+test('outbox: the first write queued on a fresh PGlite replica does not wait on itself', async () => {
+  const storage = makePgliteStorage()('zb-first-write');
+  const c: any = Object.create(ZeBridge.prototype);
+  Object.assign(c, { run: storage.exec, transaction: storage.transaction, dialect: storage.dialect, outboxInitPromise: Promise.resolve() });
+  try {
+    await c.createOutboxTable();
+    const put = storage.transaction(async (tx) => {
+      await c.outboxPut({ msgId: 'm1', subject: 's', payload: { key: { id: 1 } }, table: 'item', id: 1, before: null, optimistic: {}, authoritative: true }, tx);
+    });
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('the queued write waited on its own transaction')), 5_000));
+    await Promise.race([put, timeout]);
+    assert.equal(Number((await storage.exec(`SELECT count(*) AS n FROM _zebridge_outbox`))[0].n), 1);
+  } finally {
+    await storage.deleteDatabaseFile?.();
+  }
+});
+
+
+test('undo: an accepted middle write survives surrounding refusals and restart (verdict or echo)', async () => {
+  for (const restart of [false, true]) for (const reverse of [false, true]) for (const echo of [false, true]) {
+    const dir = mkdtempSync(join(tmpdir(), 'zb-middle-'));
+    const path = join(dir, 'r.sqlite3');
+    let f = undoFixture(path);
+    f.db.exec("INSERT INTO p VALUES ('x', 'original')");
+    await f.write('a', 'p', 'UPDATE', 'x', 'title', 'A');
+    f.db.exec("UPDATE p SET title = 'server' WHERE id = 'x'");
+    await f.write('b', 'p', 'UPDATE', 'x', 'title', 'B');
+    await f.write('c', 'p', 'UPDATE', 'x', 'title', 'C');
+    f.c.wakeOutbox = () => {};
+    if (echo) {
+      f.c.outboxWrite = async () => ({table: 'p', version: 'v', key: {id: 'x'}, columns: ['title']});
+      await f.c.settleByEcho('b', {table: 'p', version: 'v'});
+    } else {
+      // Through the verdict dispatch, as an `accepted` verdict arrives.
+      Object.assign(f.c, {config: {principal: 'alice'}, ackPrefix: () => 'mutation_ack', pendingWrites: new Map(), emitVerdict: () => {}});
+      await f.c.handleVerdict('mutation_ack.alice.b', new TextEncoder().encode('{"status":"accepted"}'));
+    }
+    if (restart) { f.db.close(); f = undoFixture(path); }
+    for (const mid of reverse ? ['c', 'a'] : ['a', 'c']) await f.c.revertOptimisticWrite(mid, 'restore');
+    assert.equal(f.title('x'), 'B', `restart=${restart}, reverse=${reverse}, echo=${echo}`);
+    assert.equal(await f.c.undoing(), 0);
+    assert.equal(f.db.prepare('SELECT count(*) AS n FROM _zebridge_undo').get()!.n, 0, 'settled history is reclaimed');
+    await new Promise((r) => setTimeout(r, 10)); f.db.close(); rmSync(dir, {recursive: true, force: true});
+  }
+});
+
+test('undo: PGlite compares typed values and reopens with a blocked undo', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zb-pg-undo-'));
+  const open = async () => {
+    const storage = makePgliteStorage({persist: true, dataDir: dir})('replica');
+    const c: any = Object.create(ZeBridge.prototype);
+    Object.assign(c, {run: storage.exec, transaction: storage.transaction, dialect: storage.dialect,
+      outboxInitPromise: Promise.resolve(), undoOwed: true, appendLog: () => {}, triggerChange: () => {},
+      syncedTables: new Map([['p', {pkCols: ['id'], columns: ['id','title','updated_at','flag','amount','doc'],
+        versionColumn: 'updated_at', tombstoneColumn: null}]])});
+    await c.createOutboxTable();
+    return {storage, c};
+  };
+  let f = await open();
+  try {
+    await f.storage.exec('CREATE TABLE p(id TEXT PRIMARY KEY,title TEXT,updated_at TIMESTAMPTZ,flag BOOLEAN,amount NUMERIC,doc JSONB)');
+    await f.storage.exec('CREATE TABLE child(id TEXT PRIMARY KEY,pid TEXT REFERENCES p(id))');
+    const before = {id:'x', title:'original', updated_at:'2026-11-09T00:00:00.000000Z', flag:false, amount:'1.00', doc:'{"a":1}'};
+    const data = {id:'x', title:'refused', updated_at:'2026-11-09T00:00:01.000000Z', flag:true, amount:'2.00', doc:'{"a":2}'};
+    await f.storage.exec('INSERT INTO p VALUES(?,?,?,?,?,?)', ...Object.values(data));
+    await f.storage.exec("INSERT INTO child VALUES('child','x')");
+    // A refused INSERT requires a DELETE, blocked by the child until after reopening.
+    await f.storage.transaction(async tx => await f.c.outboxPut({msgId:'a', subject:'s', payload:{operation:'INSERT',key:{id:'x'},data},
+      table:'p', id:'x', before:null, optimistic:{operation:'INSERT',data}, authoritative:true},tx));
+    await f.c.revertOptimisticWrite('a','restore');
+    assert.equal(await f.c.undoing(), 1);
+    await f.storage.close!();
+    f = await open();
+    await f.storage.exec('DELETE FROM child');
+    await f.c.runUndos();
+    assert.equal((await f.storage.exec('SELECT * FROM p')).length, 0);
+    assert.equal(await f.c.undoing(), 0);
+    // A refused UPDATE restores its typed before-image rather than skipping it.
+    await f.storage.exec('INSERT INTO p VALUES(?,?,?,?,?,?)', ...Object.values(data));
+    await f.storage.transaction(async tx => await f.c.outboxPut({msgId:'u', subject:'s', payload:{operation:'UPDATE',key:{id:'x'},data},
+      table:'p', id:'x', before, optimistic:{operation:'UPDATE',data}, authoritative:true},tx));
+    await f.c.revertOptimisticWrite('u','restore');
+    assert.equal((await f.storage.exec('SELECT title FROM p'))[0].title,'original');
+  } finally {
+    await f.storage.close?.().catch(() => {});
+    rmSync(dir, {recursive: true, force: true});
+  }
+});
+
+
+test('undo: CASCADE waits for independent children, including grandchildren and reopen', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zb-cascade-'));
+  const path = join(dir, 'r.sqlite3');
+  let f = undoFixture(path);
+  f.db.exec(`DROP TABLE c; CREATE TABLE c(id TEXT PRIMARY KEY,pid TEXT NOT NULL REFERENCES p(id) ON DELETE CASCADE);
+    CREATE TABLE g(id TEXT PRIMARY KEY,pid TEXT NOT NULL REFERENCES c(id) ON DELETE CASCADE)`);
+  const followGrandchild = () => f.c.syncedTables.set('g', {pkCols:['id'], columns:['id','pid'], tombstoneColumn:null});
+  followGrandchild();
+  try {
+    await f.write('p', 'p', 'INSERT', 'p', 'title', 'refused');
+    await f.write('c', 'c', 'INSERT', 'c', 'pid', 'p');
+    await f.write('g', 'g' as any, 'INSERT', 'g', 'pid', 'c');
+    await f.c.revertOptimisticWrite('p', 'restore');
+    assert.ok(f.has('p','p') && f.has('c','c') && f.has('g','g'), 'parent refusal must not cancel or cascade-delete independent descendants');
+    assert.equal(await f.c.undoing(), 1);
+    assert.equal(f.db.prepare('SELECT count(*) AS n FROM _zebridge_outbox').get()!.n, 2);
+    await new Promise(r=>setTimeout(r,10)); f.db.close();
+    f=undoFixture(path); followGrandchild();
+    await f.c.runUndos();
+    assert.ok(f.has('c','c') && f.has('g','g'));
+    await f.c.revertOptimisticWrite('c','restore');
+    assert.ok(f.has('p','p') && f.has('c','c') && f.has('g','g'));
+    assert.equal(await f.c.undoing(),2);
+    await f.c.revertOptimisticWrite('g','restore');
+    assert.ok(!f.has('p','p') && !f.has('c','c') && !f.has('g','g'));
+    assert.equal(await f.c.undoing(),0);
+    assert.equal(f.db.prepare('SELECT count(*) AS n FROM _zebridge_outbox').get()!.n,0);
+    assert.equal(f.db.prepare('PRAGMA foreign_key_check').all().length,0);
+  } finally { await new Promise(r=>setTimeout(r,10)); f.db.close(); rmSync(dir,{recursive:true,force:true}); }
+});
+
+test('undo: a temporary parent rebuild must not cascade; an unfollowed child is protected too', async () => {
+  const f=undoFixture();
+  f.db.exec('DROP TABLE c; CREATE TABLE c(id TEXT PRIMARY KEY,pid TEXT REFERENCES p(id) ON DELETE CASCADE)');
+  try {
+    await f.write('a','p','INSERT','p','title','A');
+    await f.write('b','p','UPDATE','p','title','B');
+    await f.write('c','c','INSERT','c','pid','p');
+    // A's rebuild deletes and re-inserts p, which used to lose c even though p survived.
+    await f.c.revertOptimisticWrite('a','restore');
+    assert.equal(f.title('p'),'B'); assert.ok(f.has('c','c')); assert.equal(await f.c.undoing(),1);
+    // This child is not followed: safety must use the physical schema, not syncedTables.
+    f.c.syncedTables.delete('c');
+    await f.c.revertOptimisticWrite('b','restore');
+    assert.ok(f.has('p','p') && f.has('c','c')); assert.equal(await f.c.undoing(),2);
+    f.db.exec('DELETE FROM c'); // authoritative removal, no dependent verdict
+    f.c.triggerChange('c'); await new Promise(r=>setTimeout(r,20));
+    assert.ok(!f.has('p','p')); assert.equal(await f.c.undoing(),0);
+  } finally { await new Promise(r=>setTimeout(r,10)); f.db.close(); }
+});
+
+test('undo: CASCADE composite implicit keys, PGlite and self references', async () => {
+  for (const postgres of [false,true]) {
+    const sqlite=postgres?null:new DatabaseSync(':memory:');
+    const storage=postgres?makePgliteStorage()('zb-cascade-pg'):null;
+    const exec=storage?.exec ?? (async(q:string,...p:any[])=>{const st=sqlite!.prepare(q);return st.columns().length?st.all(...p):(st.run(...p),[])});
+    const transaction=storage?.transaction ?? (async(fn:any)=>{sqlite!.exec('BEGIN');try{await fn(exec);sqlite!.exec('COMMIT')}catch(e){sqlite!.exec('ROLLBACK');throw e}});
+    const c:any=Object.create(ZeBridge.prototype);
+    Object.assign(c,{run:exec,transaction,dialect:storage?.dialect??sqliteDialect,outboxInitPromise:Promise.resolve(),undoOwed:true,appendLog:()=>{},triggerChange:()=>{},
+      syncedTables:new Map([['p',{pkCols:['region','id'],columns:['region','id','title'],tombstoneColumn:null}]])});
+    try {
+      if(sqlite) sqlite.exec('PRAGMA foreign_keys=ON');
+      await c.createOutboxTable();
+      await exec('CREATE TABLE p(region TEXT,id TEXT,title TEXT,PRIMARY KEY(region,id))');
+      // Omitting parent columns tests primary-key resolution; the child is deliberately unfollowed.
+      await exec('CREATE TABLE child(id TEXT PRIMARY KEY,region TEXT,pid TEXT,FOREIGN KEY(region,pid) REFERENCES p ON DELETE CASCADE)');
+      await exec("INSERT INTO p VALUES('other','p','other'),('own','p','refused')");
+      await exec("INSERT INTO child VALUES('other','other','p'),('own','own','p')");
+      const key={region:'own',id:'p'},data={...key,title:'refused'};
+      await transaction(async(tx:any)=>await c.outboxPut({msgId:'p',subject:'s',payload:{operation:'INSERT',key,data},table:'p',id:'own|p',before:null,optimistic:{operation:'INSERT',data},authoritative:true},tx));
+      await c.revertOptimisticWrite('p','restore');
+      assert.equal(await c.undoing(),1,`composite blocker postgres=${postgres}`);
+      assert.equal((await exec('SELECT * FROM child')).length,2);
+      if (postgres) {
+        // A cascade runs with RI privileges: a filtered SELECT must not prove the child absent.
+        await exec('CREATE ROLE undo_cascade_hidden NOSUPERUSER');
+        await exec('GRANT USAGE ON SCHEMA public TO undo_cascade_hidden');
+        await exec('GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO undo_cascade_hidden');
+        await exec('ALTER TABLE child ENABLE ROW LEVEL SECURITY');
+        await exec('CREATE POLICY hidden ON child USING (false)');
+        await exec('SET ROLE undo_cascade_hidden');
+        assert.equal((await exec('SELECT * FROM child')).length,0);
+        await c.runUndos();
+        assert.equal((await exec("SELECT * FROM p WHERE region='own'")).length,1,'hidden children are unknown, not absent');
+        assert.equal(await c.undoing(),1);
+        await exec('RESET ROLE');
+        assert.equal((await exec('SELECT * FROM child')).length,2);
+      }
+      await exec("DELETE FROM child WHERE id='own'"); await c.runUndos();
+      assert.equal((await exec("SELECT * FROM p WHERE region='own'")).length,0);
+      assert.equal((await exec('SELECT * FROM child')).length,1,'an unrelated same-id parent must not block or be removed');
+      assert.equal(await c.undoing(),0);
+      await exec('DROP TABLE child'); await exec('DROP TABLE p');
+      await exec('CREATE TABLE p(id TEXT PRIMARY KEY,title TEXT,pid TEXT REFERENCES p(id) ON DELETE CASCADE)');
+      c.syncedTables.set('p',{pkCols:['id'],columns:['id','title','pid'],tombstoneColumn:null});
+      await exec("INSERT INTO p VALUES('self','refused','self')");
+      const self={id:'self',title:'refused',pid:'self'};
+      await transaction(async(tx:any)=>await c.outboxPut({msgId:'self',subject:'s',payload:{operation:'INSERT',key:{id:'self'},data:self},table:'p',id:'self',before:null,optimistic:{operation:'INSERT',data:self},authoritative:true},tx));
+      await c.revertOptimisticWrite('self','restore');
+      assert.equal((await exec('SELECT * FROM p')).length,0,'self reference is the same row, not collateral damage');
+      assert.equal(await c.undoing(),0);
+    } finally { if(storage) await storage.close?.(); else sqlite!.close(); }
+  }
+});
+
+test('undo: accepted history goes when the row\'s last write settles otherwise', async () => {
+  const f = undoFixture();
+  f.c.wakeOutbox = () => {};
+  try {
+    f.db.exec("INSERT INTO p VALUES ('x', 'original')");
+    await f.write('a', 'p', 'UPDATE', 'x', 'title', 'A');
+    await f.write('b', 'p', 'UPDATE', 'x', 'title', 'B');
+    await f.write('c', 'p', 'UPDATE', 'x', 'title', 'C');
+    await f.c.outboxDrop('b', true);
+    const kept = () => f.db.prepare('SELECT count(*) AS n FROM _zebridge_undo').get()!.n;
+    assert.equal(kept(), 1);
+    await f.c.outboxDrop('a'); // stale, indeterminate…: settled without history of its own
+    assert.equal(kept(), 1, 'c is still pending on the row');
+    await f.c.outboxDrop('c');
+    assert.equal(kept(), 0, 'nothing left on the row: its history goes');
+    assert.equal(f.title('x'), 'C');
+  } finally { f.db.close(); }
+});
+
+test('undo: a refused INSERT\'s rebuild does not replay a pending sparse UPDATE onto the absent row (NOT NULL column)', async () => {
+  // dependent_writes.py §5: the replay's upsert of {id, title} failed NOT NULL.
+  const f = undoFixture();
+  f.db.exec('DROP TABLE c; DROP TABLE p; CREATE TABLE p (id TEXT PRIMARY KEY, title TEXT, tenant TEXT NOT NULL)');
+  await f.write('i', 'p', 'INSERT', 'x', 'tenant', 't1');
+  await f.write('u', 'p', 'UPDATE', 'x', 'title', 'edited');
+  await f.c.revertOptimisticWrite('i', 'restore');
+  assert.equal(await f.c.undoing(), 0);
+  assert.ok(!f.has('p', 'x'));
+  const pend: any[] = await f.c.run(`SELECT before, authoritative FROM _zebridge_outbox WHERE msg_id = 'u'`);
+  assert.deepEqual(pend.map((r) => [r.before, Number(r.authoritative)]), [[null, 1]]); // left for its own verdict
+});
+
+test('undo: a rebuild that replays a pending DELETE waits for a CASCADE child, then settles', async () => {
+  const f = undoFixture();
+  f.db.exec('DROP TABLE c; CREATE TABLE c(id TEXT PRIMARY KEY,pid TEXT REFERENCES p(id) ON DELETE CASCADE)');
+  try {
+    f.db.exec("INSERT INTO p VALUES ('x', 'original')");
+    await f.write('a', 'p', 'UPDATE', 'x', 'title', 'A');
+    await f.write('d', 'p', 'DELETE', 'x', 'title', 'A');
+    // A child received with the keys off (a seed's bulk load): the parent is absent locally
+    // (the pending DELETE), and the rebuild brings it back before replaying that DELETE.
+    f.db.exec("PRAGMA foreign_keys = OFF; INSERT INTO c VALUES ('kid', 'x'); PRAGMA foreign_keys = ON;");
+    await f.c.revertOptimisticWrite('a', 'restore');
+    assert.ok(f.has('c', 'kid'), 'the replayed DELETE must not cascade into the child');
+    assert.equal(await f.c.undoing(), 1);
+    f.db.exec("DELETE FROM c WHERE id = 'kid'"); // CDC
+    await f.c.runUndos();
+    assert.equal(await f.c.undoing(), 0);
+    assert.ok(!f.has('p', 'x'), 'the pending DELETE still shows');
+  } finally { await new Promise((r) => setTimeout(r, 10)); f.db.close(); }
+});
+
+test('undo: history left by an indeterminate write goes at the next undo pass', async () => {
+  const f = undoFixture();
+  f.c.wakeOutbox = () => {};
+  try {
+    f.db.exec("INSERT INTO p VALUES ('x', 'original')");
+    await f.write('a', 'p', 'UPDATE', 'x', 'title', 'A');
+    await f.write('b', 'p', 'UPDATE', 'x', 'title', 'B');
+    await f.c.outboxDrop('b', true);
+    f.db.exec(`CREATE TABLE IF NOT EXISTS _zebridge_reconcile (msg_id TEXT PRIMARY KEY, tbl TEXT, reason TEXT, version TEXT, data TEXT, since INTEGER, state TEXT)`);
+    assert.equal(await f.c.settleIndeterminate('a', 'x', null), true);
+    await f.c.runUndos();
+    assert.equal(f.db.prepare('SELECT count(*) AS n FROM _zebridge_undo').get()!.n, 0);
+  } finally { f.db.close(); }
+});
+
+test('undo: PGlite compares an array column in the engine\'s form', async () => {
+  const storage = makePgliteStorage()('zb-undo-array');
+  const c: any = Object.create(ZeBridge.prototype);
+  Object.assign(c, {run: storage.exec, transaction: storage.transaction, dialect: storage.dialect, outboxInitPromise: Promise.resolve(),
+    undoOwed: true, appendLog: () => {}, triggerChange: () => {},
+    applyEvent: async (_t: string, ev: any, exec: any) => { await exec('UPDATE p SET tags = ? WHERE id = ?', `{${ev.data.tags.join(',')}}`, ev.data.id); },
+    syncedTables: new Map([['p', {pkCols: ['id'], columns: ['id', 'tags'], tombstoneColumn: null}]])});
+  try {
+    await c.createOutboxTable();
+    await storage.exec('CREATE TABLE p(id TEXT PRIMARY KEY, tags TEXT[])');
+    await storage.exec("INSERT INTO p VALUES ('x', '{refused,edit}')");
+    const data = {id: 'x', tags: ['refused', 'edit']};
+    await storage.transaction(async (tx) => await c.outboxPut({msgId: 'u', subject: 's', payload: {operation: 'UPDATE', key: {id: 'x'}, data},
+      table: 'p', id: 'x', before: {id: 'x', tags: '{original}'}, optimistic: {operation: 'UPDATE', data}, authoritative: true}, tx));
+    await c.revertOptimisticWrite('u', 'restore');
+    assert.deepEqual((await storage.exec('SELECT tags FROM p'))[0].tags, ['original'], 'an own row with an array column is still recognised as own');
+    assert.equal(await c.undoing(), 0);
+  } finally { await storage.close?.(); }
+});
+
+
+test('undo: accepted middle UPDATE survives an absent baseline and restart in both refusal orders', async () => {
+  for (const restart of [false,true]) for (const reverse of [false,true]) for (const echo of [false,true]) {
+    const dir=mkdtempSync(join(tmpdir(),'zb-absent-middle-')), path=join(dir,'r.sqlite3');
+    let f=undoFixture(path); f.c.wakeOutbox=()=>{};
+    try {
+      await f.write('a','p','INSERT','x','title','A');
+      await f.write('b','p','UPDATE','x','title','B');
+      await f.write('c','p','UPDATE','x','title','C');
+      if (echo) {
+        f.c.outboxWrite=async()=>({table:'p',version:'v',key:{id:'x'},columns:['title']});
+        await f.c.settleByEcho('b',{table:'p',version:'v'});
+      } else await f.c.outboxDrop('b',true);
+      if(restart) { await new Promise(r=>setTimeout(r,10)); f.db.close(); f=undoFixture(path); }
+      for(const mid of reverse?['c','a']:['a','c']) await f.c.revertOptimisticWrite(mid,'restore');
+      assert.equal(f.title('x'),'B',`absent base restart=${restart}, reverse=${reverse}, echo=${echo}`);
+      assert.equal(await f.c.undoing(),0);
+      assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_outbox').get()!.n,0);
+      assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_undo').get()!.n,0);
+    } finally { await new Promise(r=>setTimeout(r,10)); f.db.close(); rmSync(dir,{recursive:true,force:true}); }
+  }
+});
+
+test('undo: sparse accepted history keeps an obligation across restart until an authoritative seed', async () => {
+  for(const required of [false,true]) {
+    const dir=mkdtempSync(join(tmpdir(),'zb-absent-sparse-')), path=join(dir,'r.sqlite3');
+    let f=undoFixture(path); f.c.wakeOutbox=()=>{};
+    try {
+      f.db.exec(`DROP TABLE c; DROP TABLE p; CREATE TABLE p(id TEXT PRIMARY KEY,title TEXT,tenant TEXT ${required?'NOT NULL':''})`);
+      await f.write('a','p','INSERT','x','tenant','local');
+      await f.write('b','p','UPDATE','x','title','B');
+      await f.write('c','p','UPDATE','x','title','C');
+      await f.c.outboxDrop('b',true);
+      await f.c.revertOptimisticWrite('a','restore');
+      assert.equal(await f.c.undoing(),1,`missing column required=${required}: do not discard accepted history`);
+      assert.equal(f.title('x'),'C','an unsuccessful rebuild is rolled back');
+      assert.equal(f.db.prepare("SELECT count(*) n FROM _zebridge_undo WHERE mode='accepted'").get()!.n,1);
+      await new Promise(r=>setTimeout(r,10)); f.db.close(); f=undoFixture(path);
+      await f.c.runUndos();
+      assert.equal(await f.c.undoing(),1);
+      // A full now supplies B's actual row, including the column the sparse UPDATE never carried.
+      f.db.prepare("UPDATE p SET title='server B',tenant='server' WHERE id='x'").run();
+      await f.c.reapplyPending('p');
+      assert.equal(f.title('x'),'C');
+      await f.c.revertOptimisticWrite('c','restore');
+      assert.deepEqual({...f.db.prepare("SELECT * FROM p WHERE id='x'").get()}, {id:'x',title:'server B',tenant:'server'});
+      assert.equal(await f.c.undoing(),0);
+      assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_outbox').get()!.n,0);
+      assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_undo').get()!.n,0);
+    } finally { await new Promise(r=>setTimeout(r,10)); f.db.close(); rmSync(dir,{recursive:true,force:true}); }
+  }
+});
+
+test('undo: PGlite accepted UPDATE from an absent base preserves a complete row or keeps recovery owed', async () => {
+  for(const partial of [false,true]) {
+    const storage=makePgliteStorage()('zb-absent-accepted-pg');
+    const c:any=Object.create(ZeBridge.prototype);
+    Object.assign(c,{run:storage.exec,transaction:storage.transaction,dialect:storage.dialect,outboxInitPromise:Promise.resolve(),
+      undoOwed:true,wakeOutbox:()=>{},triggerChange:()=>{},appendLog:()=>{},
+      syncedTables:new Map([['p',{pkCols:['id'],columns:partial?['id','title','tenant']:['id','title'],tombstoneColumn:null}]]),
+      applyEvent:async(_t:string,ev:any,exec:any)=>{
+        const cols=Object.keys(ev.data);
+        if(ev.operation==='UPDATE'&&(await exec('SELECT 1 FROM p WHERE id=?',ev.data.id)).length) {
+          await exec(`UPDATE p SET ${cols.map(k=>`"${k}"=?`).join(',')} WHERE id=?`,...cols.map(k=>ev.data[k]),ev.data.id);
+        } else await exec(`INSERT INTO p(${cols.join(',')}) VALUES(${cols.map(()=>'?').join(',')}) ON CONFLICT(id) DO UPDATE SET ${cols.map(k=>`"${k}"=excluded."${k}"`).join(',')}`,...cols.map(k=>ev.data[k]));
+      }});
+    try {
+      await c.createOutboxTable();
+      await storage.exec(`CREATE TABLE p(id TEXT PRIMARY KEY,title TEXT${partial?',tenant TEXT':''})`);
+      for(const [id,op,title] of [['a','INSERT','A'],['b','UPDATE','B'],['c','UPDATE','C']]) {
+        await storage.transaction(async tx=>{
+          const before=(await tx("SELECT * FROM p WHERE id='x'"))[0]??null;
+          const authoritative=await c.beforeIsAuthoritative('p',c.syncedTables.get('p'),'x',tx);
+          const data=partial&&op==='INSERT'?{id:'x',title,tenant:'local'}:{id:'x',title};
+          const ev={operation:op,data};
+          await c.outboxPut({msgId:id,subject:'s',payload:{operation:op,key:{id:'x'},data:{title}},table:'p',id:'x',before,optimistic:ev,authoritative},tx);
+          await c.applyEvent('p',ev,tx);
+        });
+      }
+      await c.outboxDrop('b',true); await c.revertOptimisticWrite('a','restore');
+      if(partial) {
+        assert.equal(await c.undoing(),1,'missing nullable data is not supplied by a default');
+        assert.equal((await storage.exec('SELECT title FROM p'))[0].title,'C');
+        await storage.exec("UPDATE p SET title='server B',tenant='server'");
+        await c.reapplyPending('p');
+      }
+      await c.revertOptimisticWrite('c','restore');
+      assert.equal((await storage.exec('SELECT title FROM p'))[0].title,partial?'server B':'B');
+      assert.equal(await c.undoing(),0);
+      assert.equal(Number((await storage.exec('SELECT count(*) n FROM _zebridge_outbox'))[0].n),0);
+    } finally { await storage.close?.(); }
+  }
+});
+
+test('undo: the confirmed baseline is the ledger\'s authoritative before-image, across overlays and reopen', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zb-confirmed-base-'));
+  const path = join(dir, 'replica.sqlite3');
+  let f = undoFixture(path); f.c.wakeOutbox = () => {};
+  try {
+    f.db.exec("INSERT INTO p VALUES('x','server')");
+    await f.write('a', 'p', 'UPDATE', 'x', 'title', 'A');
+    await f.write('b', 'p', 'UPDATE', 'x', 'title', 'B');
+    f.db.exec("UPDATE p SET title='new server' WHERE id='x'");
+    await f.write('c', 'p', 'UPDATE', 'x', 'title', 'C');
+    // Lazy: no copy is written for a write; c's authoritative before-image holds "new server".
+    assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_base').get()!.n, 0);
+    await new Promise(r => setTimeout(r, 10)); f.db.close(); f = undoFixture(path);
+    for (const id of ['a', 'b', 'c']) await f.c.revertOptimisticWrite(id, 'restore');
+    assert.equal(f.title('x'), 'new server');
+    await f.c.runUndos();
+    assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_base').get()!.n, 0);
+  } finally { await new Promise(r => setTimeout(r, 10)); f.db.close(); rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('undo: an UPDATE omitting a column merges the trusted server copy; explicit NULL overwrites; no trusted copy recovers', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zb-toast-merge-'));
+  const path = join(dir, 'replica.sqlite3');
+  let f = undoFixture(path); f.c.wakeOutbox = () => {};
+  const spec = { pkCols: ['id'], columns: ['id', 'title', 'body'], tombstoneColumn: null };
+  const base = (id: string) => { const r: any = f.db.prepare('SELECT data FROM _zebridge_base WHERE row_id=?').get(id); return r ? JSON.parse(r.data) : null; };
+  try {
+    f.db.exec("DROP TABLE c; DROP TABLE p; CREATE TABLE p(id TEXT PRIMARY KEY,title TEXT,body TEXT); INSERT INTO p VALUES('x','server','big')");
+    f.c.syncedTables.set('p', spec);
+    await f.write('a', 'p', 'UPDATE', 'x', 'title', 'mine');
+    assert.equal(base('x'), null, 'lazy: no copy for a write');
+    // Another writer's UPDATE of the title, `body` unchanged (omitted by pgoutput), across a restart.
+    await new Promise(r => setTimeout(r, 10)); f.db.close(); f = undoFixture(path); f.c.wakeOutbox = () => {};
+    f.c.syncedTables.set('p', spec);
+    await f.c.recordAuthoritative(f.c.run, 'p', spec, { operation: 'UPDATE', data: { id: 'x', title: 'theirs' } });
+    f.db.exec("UPDATE p SET title='theirs' WHERE id='x'"); // what the CDC apply itself writes
+    assert.deepEqual(base('x'), { id: 'x', title: 'theirs', body: 'big' });
+    await f.c.recordAuthoritative(f.c.run, 'p', spec, { operation: 'UPDATE', data: { id: 'x', title: null } });
+    f.db.exec("UPDATE p SET title=NULL WHERE id='x'");
+    assert.deepEqual(base('x'), { id: 'x', title: null, body: 'big' }, 'explicit NULL overwrites, omission preserves');
+    assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_reconcile').get()!.n, 0);
+    await f.c.revertOptimisticWrite('a', 'restore');
+    assert.deepEqual({ ...f.db.prepare("SELECT * FROM p WHERE id='x'").get() }, { id: 'x', title: null, body: 'big' });
+    // No trusted copy: a key whose only write is not authoritative (its before is an overlay).
+    await f.write('y1', 'p', 'INSERT', 'y', 'title', 'one');
+    await f.write('y2', 'p', 'UPDATE', 'y', 'title', 'two');
+    f.db.exec("DELETE FROM _zebridge_outbox WHERE msg_id='y1'");
+    await f.c.recordAuthoritative(f.c.run, 'p', spec, { operation: 'UPDATE', data: { id: 'y', title: 's' } });
+    assert.equal(f.db.prepare("SELECT reason FROM _zebridge_reconcile").get()!.reason, 'UndoNeedsBaseline');
+  } finally { await new Promise(r => setTimeout(r, 10)); f.db.close(); rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('undo: no base copy for a write\'s own echo or for a key with no writes', async () => {
+  const f = undoFixture();
+  const spec = { pkCols: ['id'], columns: ['id', 'title', 'v', 'origin'], tombstoneColumn: null, versionColumn: 'v', tiebreakColumn: 'origin' };
+  f.db.prepare("INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, created_at, authoritative) VALUES ('m','s',?,'p','x',1,1)")
+    .run(JSON.stringify({ operation: 'INSERT', key: { id: 'x' }, data: { title: 't' }, version: '2026-11-09T10:00:00.000000Z', client_id: 'deviceA' }));
+  await f.c.recordAuthoritative(f.c.run, 'p', spec, { operation: 'INSERT', data: { id: 'x', title: 't', v: '2026-11-09T10:00:00.000000Z', origin: 'deviceA' } });
+  await f.c.recordAuthoritative(f.c.run, 'p', spec, { operation: 'INSERT', data: { id: 'z', title: 't', v: '2026-11-09T10:00:00.000000Z', origin: 'deviceA' } });
+  assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_base').get()!.n, 0);
+  // Someone else's row on the same key (another stamp) is kept.
+  await f.c.recordAuthoritative(f.c.run, 'p', spec, { operation: 'UPDATE', data: { id: 'x', title: 'o', v: '2026-11-09T11:00:00.000000Z', origin: 'deviceB' } });
+  assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_base').get()!.n, 1);
+  f.db.close();
+});
+
+test('undo: missing accepted baseline requests durable recovery after restart without another write', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zb-baseline-recovery-'));
+  const path = join(dir, 'replica.sqlite3');
+  let f = undoFixture(path); f.c.wakeOutbox = () => {};
+  try {
+    f.db.exec('DROP TABLE c; DROP TABLE p; CREATE TABLE p(id TEXT PRIMARY KEY,title TEXT,tenant TEXT NOT NULL)');
+    await f.write('a','p','INSERT','x','tenant','local');
+    await f.write('b','p','UPDATE','x','title','B');
+    await f.write('c','p','UPDATE','x','title','C');
+    await f.c.outboxDrop('b', true);
+    await f.c.revertOptimisticWrite('a','restore');
+    await f.c.revertOptimisticWrite('c','restore');
+    assert.equal(await f.c.pending(), 0);
+    const marker = f.db.prepare('SELECT msg_id,reason,state FROM _zebridge_reconcile').get()!;
+    assert.equal(marker.reason, 'UndoNeedsBaseline');
+    assert.equal(marker.state, 'pending');
+    assert.equal(await f.c.undoing(), 2);
+    await new Promise(r => setTimeout(r,10)); f.db.close(); f = undoFixture(path);
+    assert.deepEqual(f.db.prepare('SELECT msg_id,reason,state FROM _zebridge_reconcile').get(), marker);
+    // Connected recovery is scheduled by the owed undo itself, with no new CDC or
+    // verdict. The actual fenced orchestration and network are covered live in §7.
+    let requested = 0;
+    f.c.nc = {};
+    f.c.reconcile = async () => { requested++; };
+    await f.c.runUndos();
+    assert.equal(requested, 1);
+    assert.equal(await f.c.pending(), 0);
+    assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_reconcile').get()!.n, 1);
+    f.c.nc = null;
+  } finally { await new Promise(r => setTimeout(r,10)); f.db.close(); rmSync(dir, {recursive:true,force:true}); }
+});
+
+test('undo: authoritative CDC matching an overlay survives refusals and restart on single and bulk paths', async () => {
+  for (const bulk of [false, true]) {
+    const dir = mkdtempSync(join(tmpdir(), 'zb-cdc-baseline-'));
+    const path = join(dir,'replica.sqlite3');
+    let f = undoFixture(path); f.c.wakeOutbox = () => {};
+    try {
+      f.db.exec("INSERT INTO p VALUES('x','server')");
+      await f.write('a','p','UPDATE','x','title','A');
+      await f.write('b','p','UPDATE','x','title','B');
+      await f.write('c','p','UPDATE','x','title','C');
+      await f.c.outboxDrop('b',true);
+      Object.assign(f.c,{ dialect:sqliteDialect, frontiers:new Map(), rebase:new Map(), config:{bulkStatement:'json_each'},
+        bulkStats:{single:0,bulked:0,statements:0,fallbacks:0}, advanceGlobal:async()=>{}, confirmEcho:()=>{} });
+      const ev = {operation:'UPDATE', data:{id:'x',title:'C'}};
+      if (bulk) {
+        await f.c.applyBatchPlanned([{table:'p',ev}, {table:'p',ev:{operation:'INSERT',data:{id:'y',title:'other'}}}],f.c.run);
+        assert.ok(f.c.bulkStats.bulked > 0, 'exercise the actual bulk path');
+      } else await (ZeBridge.prototype as any).applyEvent.call(f.c,'p',ev,f.c.run);
+      assert.equal(JSON.parse(f.db.prepare('SELECT data FROM _zebridge_base WHERE row_id=?').get('x')!.data as string).title,'C');
+      const savedAt = Number(f.db.prepare('SELECT at FROM _zebridge_base WHERE row_id=?').get('x')!.at);
+      await new Promise(r=>setTimeout(r,10)); f.db.close(); f=undoFixture(path);
+      await f.c.createOutboxTable();
+      assert.ok(f.c.lastCreated >= savedAt, 'a restart retains the ordering floor of confirmed CDC');
+      await f.c.revertOptimisticWrite('a','restore');
+      await f.c.revertOptimisticWrite('c','restore');
+      assert.equal(f.title('x'),'C',`confirmed CDC survives the identical overlay: bulk=${bulk}`);
+      assert.equal(await f.c.undoing(),0);
+      assert.equal(await f.c.pending(),0);
+      await f.write('d','p','UPDATE','x','title','D');
+      // A row omitting a column (an unchanged TOAST value) takes it from the trusted server
+      // copy (d's authoritative before-image), never from the displayed overlay "D".
+      await f.c.recordAuthoritative(f.c.run,'p',f.c.syncedTables.get('p'),{operation:'UPDATE',data:{id:'x'}});
+      assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_reconcile').get()!.n,0);
+      assert.equal(JSON.parse(f.db.prepare('SELECT data FROM _zebridge_base WHERE row_id=?').get('x')!.data as string).title,'C','merged from the trusted copy, not the overlay');
+    } finally { await new Promise(r=>setTimeout(r,10)); f.db.close(); rmSync(dir,{recursive:true,force:true}); }
+  }
+});
+
+test('undo: stale empty-ledger refresh cannot disable tracking for a newly committed write', async () => {
+ const f=undoFixture(); f.c.wakeOutbox=()=>{}; f.c.pendingWrites=new Map();
+ await f.c.createOutboxTable();
+ let release!:()=>void, entered!:()=>void;
+ const gate=new Promise<void>(r=>release=r), arrived=new Promise<void>(r=>entered=r);
+ const run=f.c.run;
+ f.c.run=async(sql:string,...args:any[])=>{
+   const rows=await run(sql,...args);
+   if(sql.startsWith('SELECT 1 AS x WHERE EXISTS')) {entered();await gate;}
+   return rows;
+ };
+ try {
+   await f.write('old','p','INSERT','old','title','old');
+   const dropping=f.c.outboxDrop('old',true);
+   await arrived;
+   await f.c.transaction(async (tx:any)=> {
+     await f.c.outboxPut({msgId:'new',subject:'s',payload:{key:{id:'new'},data:{title:'new'}},table:'p',id:'new',before:null,optimistic:{operation:'INSERT',data:{id:'new',title:'new'}},authoritative:true},tx);
+     await f.c.applyEvent('p',{operation:'INSERT',data:{id:'new',title:'new'}},tx);
+   });
+   assert.equal(f.c.ledgerActive,true);
+   release(); await dropping;
+   assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_outbox').get()!.n,1);
+   const tracking=f.c.ledgerActive;
+   const event={operation:'INSERT',data:{id:'new',title:'new'}};
+   await f.c.recordAuthoritative(f.c.run,'p',f.c.syncedTables.get('p'),event);
+   await f.c.applyEvent('p',event,f.c.run);
+   await f.c.revertOptimisticWrite('new','restore');
+   assert.equal(f.has('p','new'),true,`new authoritative row must survive rejection; ledgerActive was ${tracking}`);
+ } finally {release();f.db.close();}
+});
+
+
+test('undo: equal-stamp peer CDC survives a rejection and restart; owed entries never count as pending echoes', async () => {
+  for (const restart of [false,true]) for (const mode of ['pending','owed','unknown-writer']) {
+    const dir=mkdtempSync(join(tmpdir(),'zb-writer-proof-')), path=join(dir,'r.sqlite3');
+    let f=undoFixture(path); f.c.wakeOutbox=()=>{};
+    const version='2026-11-09T10:00:00.000000Z';
+    const spec={pkCols:['id'],columns:['id','title','v','origin','body'],tombstoneColumn:null,versionColumn:'v',tiebreakColumn:mode==='unknown-writer'?null:'origin'};
+    try {
+      f.db.exec("DROP TABLE c; DROP TABLE p; CREATE TABLE p(id TEXT PRIMARY KEY,title TEXT,v TEXT,origin TEXT,body TEXT); INSERT INTO p VALUES('x','original','older','old writer','old body')");
+      f.c.syncedTables.set('p',spec);
+      await f.write('a','p','UPDATE','x','title','mine');
+      f.db.prepare('UPDATE _zebridge_outbox SET payload=?,optimistic=? WHERE msg_id=?').run(
+        JSON.stringify({operation:'UPDATE',key:{id:'x'},data:{title:'mine'},version,client_id:'deviceA'}),
+        JSON.stringify({operation:'UPDATE',data:{id:'x',title:'mine',v:version},optimistic:true}), 'a');
+      f.db.prepare("UPDATE p SET v=? WHERE id='x'").run(version);
+      if(mode==='owed') f.db.exec("INSERT INTO _zebridge_undo(msg_id,tbl,row_id,payload,before,optimistic,created_at,authoritative,mode,since) SELECT msg_id,tbl,row_id,payload,before,optimistic,created_at,authoritative,'restore',0 FROM _zebridge_outbox; DELETE FROM _zebridge_outbox");
+      const origin=mode==='owed'?'deviceA':'deviceB';
+      await f.c.recordAuthoritative(f.c.run,'p',spec,{operation:'UPDATE',data:{id:'x',title:'mine',v:version,origin,body:'peer body'}});
+      f.db.prepare("UPDATE p SET body='peer body',origin=? WHERE id='x'").run(origin);
+      assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_base').get()!.n,1,mode);
+      if(restart) {await new Promise(r=>setTimeout(r,10));f.db.close();f=undoFixture(path);f.c.syncedTables.set('p',spec);}
+      if(mode==='owed') await f.c.runUndos(); else await f.c.revertOptimisticWrite('a','restore');
+      assert.equal(f.db.prepare("SELECT body FROM p WHERE id='x'").get()!.body,'peer body',`${mode}, restart=${restart}`);
+      assert.equal(await f.c.undoing(),0);
+    } finally {await new Promise(r=>setTimeout(r,10));f.db.close();rmSync(dir,{recursive:true,force:true});}
+  }
+});
+
+test('undo: verified pending echoes skip copies with either PostgreSQL or wire timestamp spelling', async () => {
+  for(const stamp of ['2026-11-09T10:00:00.000000Z','2026-11-09 10:00:00+00']) {
+    const f=undoFixture();
+    try {
+      const spec={pkCols:['id'],columns:['id','title','v','origin'],tombstoneColumn:null,versionColumn:'v',tiebreakColumn:'origin'};
+      f.c.ledgerActive=true;
+      f.db.prepare("INSERT INTO _zebridge_outbox(msg_id,subject,payload,tbl,row_id,created_at,authoritative) VALUES('m','s',?,'p','x',1,1)")
+        .run(JSON.stringify({key:{id:'x'},data:{title:'mine'},version:'2026-11-09T10:00:00.000000Z',client_id:'deviceA'}));
+      await f.c.recordAuthoritative(f.c.run,'p',spec,{operation:'UPDATE',data:{id:'x',title:'mine',v:stamp,origin:'deviceA'}});
+      assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_base').get()!.n,0,stamp);
+    } finally {f.db.close();}
+  }
+});
+
+test('undo: an insert completing after an empty refresh re-enables tracking', async () => {
+  const f=undoFixture(); f.c.wakeOutbox=()=>{};
+  let release!:()=>void, arrived!:()=>void;
+  const gate=new Promise<void>(r=>release=r), waiting=new Promise<void>(r=>arrived=r);
+  try {
+    await f.c.createOutboxTable();
+    const run=f.c.run;
+    f.c.run=async(sql:string,...args:any[])=>{
+      if(sql.startsWith('INSERT INTO _zebridge_outbox')) {arrived();await gate;}
+      return run(sql,...args);
+    };
+    const putting=f.c.transaction((tx:any)=>f.c.outboxPut({msgId:'new',subject:'s',payload:{key:{id:'x'}},table:'p',id:'x',before:null,optimistic:{operation:'INSERT',data:{id:'x',title:'new'}},authoritative:true},tx));
+    await waiting;
+    await f.c.refreshLedgerActive();
+    release(); await putting;
+    assert.equal(f.c.ledgerActive,true);
+    assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_outbox').get()!.n,1);
+  } finally {release();f.db.close();}
+});
+
+test('undo: independent empty reads during and across commit cannot switch tracking off', async () => {
+  for(const delayedRead of [false,true]) {
+    const dir=mkdtempSync(join(tmpdir(),'zb-ledger-commit-')), path=join(dir,'r.sqlite3');
+    const f=undoFixture(path); f.c.wakeOutbox=()=>{};
+    f.db.exec('PRAGMA journal_mode=WAL');
+    const reader=new DatabaseSync(path,{readOnly:true});
+    let commit!:()=>void, inserted!:()=>void, readDone!:()=>void, deliver!:()=>void;
+    const gate=new Promise<void>(r=>commit=r), waiting=new Promise<void>(r=>inserted=r);
+    const readStarted=new Promise<void>(r=>readDone=r), readGate=new Promise<void>(r=>deliver=r);
+    try {
+      await f.c.createOutboxTable();
+      const run=f.c.run;
+      f.c.run=async(sql:string,...args:any[])=>{
+        if(!sql.startsWith('SELECT 1 AS x WHERE EXISTS'))return run(sql,...args);
+        const rows=reader.prepare(sql).all(...args);readDone();
+        if(delayedRead)await readGate;
+        return rows;
+      };
+      f.c.transaction=async(fn:any)=>{
+        f.db.exec('BEGIN');
+        try {await fn(run);inserted();await gate;f.db.exec('COMMIT');}
+        catch(e){f.db.exec('ROLLBACK');throw e;}
+      };
+      const putting=f.c.ledgerTransaction((tx:any)=>f.c.outboxPut({msgId:'new',subject:'s',payload:{key:{id:'x'}},table:'p',id:'x',before:null,optimistic:{operation:'INSERT',data:{id:'x',title:'new'}},authoritative:true},tx));
+      await waiting;
+      assert.equal(reader.prepare('SELECT count(*) n FROM _zebridge_outbox').get()!.n,0,'the separate reader cannot see an uncommitted insert');
+      const refreshing=f.c.refreshLedgerActive();await readStarted;
+      if(delayedRead) {commit();await putting;deliver();await refreshing;}
+      else {await refreshing;assert.equal(f.c.ledgerActive,true,'tracking remains conservative until commit');commit();await putting;}
+      assert.equal(f.c.ledgerActive,true,`delayed read=${delayedRead}`);
+      assert.equal(reader.prepare('SELECT count(*) n FROM _zebridge_outbox').get()!.n,1);
+    } finally {commit();deliver();reader.close();f.db.close();rmSync(dir,{recursive:true,force:true});}
+  }
 });

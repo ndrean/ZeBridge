@@ -268,14 +268,7 @@ writes a bucket by publishing there. Clients should use their NATS client's KV A
 }
 ```
 
-Root keys are `table`, `pg`, `sqlite`, `lsn`, `pk`, `pk_columns`, `indexes`,
-`foreign_keys`, `max_row_bytes`, plus the **write contract**: `version_column`,
-`tombstone_column`, `tenant_column`, `writable`, `mutation_timeout_ms` and
-`replica_identity`. `indexes` and `foreign_keys` are dialect-neutral (a `CREATE INDEX`
-and a `FOREIGN KEY` clause read the same on every engine), so they sit at the root;
-`pg` and `sqlite` carry only column types, and a client reads the block its engine
-speaks — SQLite replicas the `sqlite` block, PostgreSQL replicas (PGlite, a local
-server) the `pg` block (§10).
+Root keys are `table`, `pg`, `sqlite`, `lsn`, `pk`, `pk_columns`, `indexes`, `foreign_keys`, `max_row_bytes`, plus the **write contract**: `version_column`, `tombstone_column`, `tiebreak_column`, `tenant_column`, `writable`, `mutation_timeout_ms` and `replica_identity`. `indexes` and `foreign_keys` are dialect-neutral (a `CREATE INDEX` and a `FOREIGN KEY` clause read the same on every engine), so they sit at the root; `pg` and `sqlite` carry only column types, and a client reads the block its engine speaks — SQLite replicas the `sqlite` block, PostgreSQL replicas (PGlite, a local server) the `pg` block (§10).
 
 `pk_columns` is the whole primary key in key order; `pk` is the legacy single-column
 form and is `null` for a composite key. Both live at the root and only there: the key
@@ -299,6 +292,8 @@ whose catalogue row is public (`tenant_col IS NULL`, the reason recorded in
 KV key or object-store name for that specific table: its own resolved tenant when `tenant_column` is set, the
 shared open-tenant token when it is `null`, so every principal converges on the one shared
 entry of a tenant-agnostic table (§6, "Connection Flow").
+
+`tiebreak_column` is the configured server-stamped writer column when it exists, otherwise `null`. Clients may omit an own-echo baseline copy only for a single pending outbox write whose normalized version and `client_id` both match the CDC row through this column. Equal timestamps alone do not prove an echo. An absent field, missing identity, peer identity, or owed undo retains conservative capture.
 
 ⚠️ **This payload is always JSON, unconditionally — never MessagePack.** Unlike the CDC and
 chain payloads (§4, §6), there is no `--json` flag or runtime choice for schema:
@@ -1473,6 +1468,16 @@ Two things follow, and they are the whole reason this section is long:
    Revert only if the row still shows exactly what this write applied; if something else
    — another client's CDC event, or a second write of your own — has touched it since,
    leave it alone rather than clobbering something more correct.
+
+   The verdict and the revert are separate steps. A local foreign key can refuse the revert: a rejected parent cannot be removed while its child, written after it and still waiting for its own verdict, references it. So both client libraries move the refused write from the outbox to an undo queue (`_zbz_undo` in libzb, `_zebridge_undo` in zb-client-ts) in one transaction, and report the verdict once.
+
+   An undo settles a whole row, not one write, because several writes of one client can be stacked on the same row (an INSERT and an UPDATE of it, both refused, must leave no row in either order). The row holds the client's pending writes on it (outbox) and its refused ones not yet undone (queue), in the order they were made (`created_at`, strictly increasing per client). Each write records, when it is made, whether the row it covers is the server's state rather than an overlay of the client's own earlier write: it is when no earlier write is on the row, or when the row no longer shows the latest one because CDC replaced it (`authoritative`). If the row still shows what the latest write applied, it is rebuilt from the before-image of the latest write that covered the server's state (no row after a `row_deleted`), the pending writes from there are applied again in order over fresh before-images, and the queued undos for the row go. A server value that landed between two refused edits therefore survives both. If it shows something else, a newer authoritative row has landed, and they go without a change. A full seed settles the queued undos of the rows it replaced: the seeded rows plus the pending writes are already the settled state.
+
+   Accepted writes and CDC echoes stop retransmission, but their rollback history is retained durably while another write on the same row is pending or owed. These records use mode `accepted` in the undo table; they do not count in `undoing` and are reclaimed when the row settles or a full replaces it. A rebuild replays them as confirmed writes, so rejecting surrounding edits cannot erase an accepted middle write, even after a restart. Ownership comparisons use the replica engine's column types. Pending UPDATEs are not replayed onto an absent reconstructed row. Accepted UPDATEs are not skipped: without enough known row data, the rebuild remains durably owed and requests authoritative recovery. The ledger's authoritative before-image is the baseline until CDC supplies newer information; separate baseline copies are materialized lazily for keys with outstanding history. Omitted UPDATE columns are merged from the newest trusted baseline or authoritative before-image, never from the displayed optimistic row; explicit NULL overwrites, and unknown omitted values request recovery. Whole CDC rows and deletes refresh that baseline even when they match an optimistic overlay, except for an own echo proven by both normalized version and configured writer identity on a single pending outbox entry. Baseline ordering survives reopening. A full refreshes the before-images before pending overlays are reapplied. A durable `UndoNeedsBaseline` reconciliation request uses the hub reseed and retained CDC suffix catch-up, including after reopening with an empty outbox; no additional mutation is required to start recovery, and the original verdict is not changed or repeated.
+
+   An undo that would delete a row first checks the replica's physical incoming foreign keys. If `ON DELETE CASCADE`, `SET NULL` or `SET DEFAULT` would change another row, it rolls back and stays owed until those references disappear through their own verdicts or CDC. The check includes unfollowed child tables and composite or implicit primary-key references; a row referring only to itself is not collateral damage. The same rule applies to a temporary delete-and-reinsert during a row rebuild and to deletes replayed by that rebuild. Foreign-key enforcement and schema definitions stay intact. SQLite performs the check inside its writer transaction; PostgreSQL also locks the parent row before the check so a new reference cannot commit between the probe and delete. An unreadable or RLS-hidden dependency is not treated as absent.
+
+   Each row's undo runs in its own transaction; one the foreign key refuses rolls back, stays queued, and is tried again after every later refusal, after any change CDC or a seed applies, and at each connect, so it survives a restart. The child's own `rejected` verdict, or its removal by CDC or a reseed, unblocks the parent's. The poll report counts the queued undos as `undoing`: an empty outbox does not mean a settled replica until it is 0.
 
 5. **Treat the reply as a verdict, not as data.** State always arrives through CDC.
    Keeping one path for state and another for verdicts is what stops a client having two
