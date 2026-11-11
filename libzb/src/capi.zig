@@ -305,6 +305,36 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
         const wm: ?[]const u8 = if (wm_v == .string) wm_v.string else null;
         return try core.valueToString(a, try core.outboxWatermarkGate(a, entries, wm));
     }
+    if (eq(u8, name, "decideStamp")) {
+        const o = args.object;
+        const opt = struct {
+            fn int(v: ?std.json.Value) ?i64 {
+                const x = v orelse return null;
+                return if (x == .integer) x.integer else null;
+            }
+            fn boolean(v: ?std.json.Value) ?bool {
+                const x = v orelse return null;
+                return if (x == .bool) x.bool else null;
+            }
+        };
+        const d = core.decideStamp(.{
+            .writable = opt.boolean(o.get("writable")),
+            .advertised = opt.boolean(o.get("advertised")) orelse false,
+            .incarnation = opt.int(o.get("incarnation")),
+            .replacing = opt.boolean(o.get("replacing")) orelse false,
+            .scope_stamp = opt.int(o.get("scopeStamp")),
+            .anchor_epoch = opt.int(o.get("anchorEpoch")),
+            .seed_epoch = opt.int(o.get("seedEpoch")) orelse 0,
+            .on_demand = opt.boolean(o.get("onDemand")) orelse false,
+        });
+        var decided: std.json.ObjectMap = .empty;
+        switch (d) {
+            .stamp => |n| try decided.put(a, "stamp", .{ .integer = n }),
+            .unstamped => try decided.put(a, "stamp", .null),
+            .refuse => |why| try decided.put(a, "refuse", .{ .string = why }),
+        }
+        return try core.valueToString(a, .{ .object = decided });
+    }
     if (eq(u8, name, "floorMargin")) {
         const items = args.object.get("versions").?.array.items;
         const versions = try a.alloc(?[]const u8, items.len);
