@@ -183,7 +183,9 @@ GROUPS = {
     # Regressions for a known, unfixed bug: each asserts the desired outcome, so it exits 1 today.
     # Kept out of `owns` (and `all`) so that group stays a signal; here exit 1 counts as expected,
     # and an unexpected pass fails the group: the fix landed, move the scenario to `owns`.
-    "known_red": {},
+    "known_red": {
+        "recreate_incarnation": ("bridge", "a queued write belongs to its table incarnation: an offline UPDATE of row K across a DROP + CREATE with a new K must be refused (TableIncarnationChanged), not applied to the replacement row; the zebridge_reseed control (same incarnation) stays eligible; both clients"),
+    },
     "manual": {
         "ingress_baseline": ("none", "paused-consumer backlog baseline, 1/10/100/500 connected publishers and 1/8 ingress lanes; three rounds, optional diagnostic binary and mixed traffic; requires --log-dir, see --help"),
         "firehose_topology": ("none", "the firehose with N TLS consumers attached, topology 2 (TLS on nats-server, bridge tls://) vs topology 1 (plain nats-server, HAProxy terminates the clients' TLS): chain margin, cuts, CPU per process (§10gb); ~10 min"),
