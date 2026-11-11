@@ -13,6 +13,8 @@ exit codes remain 0 for success, 1 for the original exact `23503` defect, 2 for 
 failure and 3 for another failure. `ZB_ORDERING_BRIDGE_BIN` selects an older bridge
 as a negative control; provisioning and admission still use the current build.
 
+Run `python3 scripts/scenarios/run.py owns -k ordering_modes` to exercise the per-write API in libzb and zb-client-ts. [ordering_modes.py](ordering_modes.py) holds a parent on one ingress lane and queues two children that each name it with `after`. An independent write from the same client commits on the free lane while the parent is held. After release, the scenario checks for one accepted receipt per parent and child and an empty outbox.
+
 `ingress_release.py` tests durable parking across restart, immutable resends, batch
 rollback, a rejected predecessor and `PredecessorUnknown` propagation. To include a
 crash after a parked write commits but before its verdict, build with
