@@ -1,12 +1,12 @@
-# nats.zig is a FORK: github.com/ndrean/nats.zig, branch `zebridge` = lalinsky's upstream
-# (b8ffdd9) + the local series, one commit per patch, tagged `zebridge/<upstream>-<n>`. The
-# gitlink pins a commit on that branch, so a fresh clone gets the patched library with
-# `git submodule update --init` and nothing to apply. The ledger of the changes is
-# NATS_ZIG_NOTES.md in the fork. To follow upstream: `git remote add upstream
-# https://github.com/lalinsky/nats.zig` in the fork, rebase `zebridge` onto upstream/main,
-# tag the result, and bump the gitlink here. Changes accepted upstream drop out of the
-# rebase by themselves.
+# nats.zig is a FORK: github.com/ndrean/nats.zig, branch `main` = lalinsky's upstream
+# (b8ffdd9) + the local series, one commit per patch (the `zebridge` branch, merged into the
+# fork's main as its PR #1), tagged `zebridge/<upstream>-<n>`. The gitlink pins a commit on
+# that branch, so a fresh clone gets the patched library with `git submodule update --init`
+# and nothing to apply. The ledger of the changes is NATS_ZIG_NOTES.md in the fork. To follow
+# upstream: `git remote add upstream https://github.com/lalinsky/nats.zig` in the fork,
+# rebase the series onto upstream/main, tag the result, and bump the gitlink here. Changes
+# accepted upstream drop out of the rebase by themselves.
 [submodule "nats.zig"]
 	path = nats.zig
 	url = https://github.com/ndrean/nats.zig
-	branch = zebridge
+	branch = main
