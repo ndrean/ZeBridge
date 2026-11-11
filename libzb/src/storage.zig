@@ -98,7 +98,7 @@ pub const ReplicaLock = struct {
         const n = if (std.c.realpath(try zTerminated(&in, path), &real)) |r| blk: {
             break :blk (std.fmt.bufPrint(out[0 .. out.len - 1], "{s}.lock", .{std.mem.span(r)}) catch return Error.OpenFailed).len;
         } else blk: {
-            if (std.c._errno().* != @as(c_int, @intFromEnum(std.c.E.NOENT))) return Error.OpenFailed;
+            if (std.c._errno().* != @as(c_int, @backingInt(std.c.E.NOENT))) return Error.OpenFailed;
             const slash = std.mem.findScalarLast(u8, path, '/');
             const dir: []const u8 = if (slash) |i| (if (i == 0) "/" else path[0..i]) else ".";
             const base = if (slash) |i| path[i + 1 ..] else path;
@@ -122,7 +122,6 @@ pub const ReplicaLock = struct {
         _ = c.sqlite3_close(self.db);
     }
 };
-
 
 test "ReplicaLock: one owner per FILE, whatever the path to it: a symlink, or a symlinked directory" {
     const real = "zbz-lock-real.sqlite3";
@@ -799,6 +798,45 @@ pub const Storage = struct {
     // ── the catalogue questions, answered per engine ──────────────────────────
 
     /// The table's columns in order, or empty when it does not exist.
+    /// Physical incoming referential actions, not descriptor FKs (which deliberately use
+    /// NO ACTION). Columns: quoted child relation, join, quoted parent, unsafe RLS, self-FK.
+    pub fn undoDeleteReferences(self: *Storage, a: std.mem.Allocator, table: []const u8) Error![]Row {
+        return switch (self.engine) {
+            .sqlite => try self.query(a,
+                \\WITH target(name) AS (VALUES (?))
+                \\SELECT '"' || replace(m.name, '"', '""') || '"',
+                \\group_concat('c."' || replace(f."from", '"', '""') || '" = p."' ||
+                \\replace(coalesce(nullif(f."to", ''), pk.name), '"', '""') || '"', ' AND '),
+                \\'"' || replace(target.name, '"', '""') || '"',
+                \\0, CASE WHEN m.name = target.name COLLATE NOCASE THEN 1 ELSE 0 END
+                \\FROM sqlite_schema m JOIN pragma_foreign_key_list(m.name) f JOIN target
+                \\LEFT JOIN pragma_table_info((SELECT name FROM target)) pk ON pk.pk = f.seq + 1
+                \\WHERE m.type = 'table' AND f."table" = target.name COLLATE NOCASE
+                \\AND f.on_delete IN ('CASCADE', 'SET NULL', 'SET DEFAULT')
+                \\GROUP BY m.name, f.id, target.name
+            , &.{.{ .text = table }}),
+            .postgres => try self.query(a,
+                \\SELECT format('%I.%I', ns.nspname, child.relname),
+                \\string_agg(format('c.%I = p.%I', ca.attname, pa.attname), ' AND '),
+                \\format('%I.%I', pns.nspname, parent.relname),
+                \\CASE WHEN row_security_active(child.oid) THEN 1 ELSE 0 END,
+                \\CASE WHEN child.oid = parent.oid THEN 1 ELSE 0 END
+                \\FROM pg_constraint fk JOIN pg_class child ON child.oid = fk.conrelid
+                \\JOIN pg_namespace ns ON ns.oid = child.relnamespace
+                \\JOIN pg_class parent ON parent.oid = fk.confrelid
+                \\JOIN pg_namespace pns ON pns.oid = parent.relnamespace
+                \\CROSS JOIN LATERAL unnest(fk.conkey, fk.confkey) AS k(child_att, parent_att)
+                \\JOIN pg_attribute ca ON ca.attrelid = child.oid AND ca.attnum = k.child_att
+                \\JOIN pg_attribute pa ON pa.attrelid = parent.oid AND pa.attnum = k.parent_att
+                \\WHERE fk.contype = 'f' AND fk.confrelid = to_regclass(?) AND fk.confdeltype IN ('c','n','d')
+                \\GROUP BY fk.oid, child.oid, child.relname, ns.nspname, parent.oid, parent.relname, pns.nspname
+            , &.{.{ .text = table }}),
+            // Current DuckDB rejects cascading FK actions. Fail closed if a future engine
+            // supports them rather than silently treating them as safe.
+            .duckdb => try self.query(a, "SELECT '', '', '', 1, 0 FROM information_schema.referential_constraints WHERE delete_rule IN ('CASCADE','SET NULL','SET DEFAULT') LIMIT 1", &.{}),
+        };
+    }
+
     pub fn tableColumns(self: *Storage, a: std.mem.Allocator, table: []const u8) Error![]const []const u8 {
         const rows = switch (self.engine) {
             .sqlite => try self.query(a, "SELECT name FROM pragma_table_info(?)", &.{.{ .text = table }}),

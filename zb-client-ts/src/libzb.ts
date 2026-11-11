@@ -29,7 +29,7 @@ import type { Transport, TransportConnection, JetStreamOpts, UserKeyPair } from 
 import { decode, encode, decodeMulti } from '@msgpack/msgpack';
 import type { Storage, StorageFactory, Exec as StorageExec } from './storage.ts';
 
-import { sqliteDialect, type Dialect } from './dialect.ts';
+import { sqliteDialect, postgresDialect, type Dialect } from './dialect.ts';
 import { decideFence, fenceScope as fenceScopeOf, frontierDrops, verifyRoutes, type FenceRoute, type Frontier, type Untouched } from './fence.ts';
 import { loadCore, scopeSeeding, caughtUpPosition, streamResume, deltaEligible, cdcBacklogBytes, streamDeltaChoice, streamForward } from './wasm-core.ts';
 import { v7 as uuidv7 } from 'uuid';
@@ -224,6 +224,8 @@ export type TableState = {
   /// The table's LWW version column (from the schema payload) — read to feed
   /// the HLC floor; the guard itself runs in SQL and in PG.
   versionColumn?: string | null;
+  /// The configured server-stamped writer identity, needed to prove an own echo.
+  tiebreakColumn?: string | null;
   /// The catalogue's seed_epoch the descriptor carried (§10df).
   seedEpoch?: number;
   lsn: number;
@@ -1801,6 +1803,12 @@ export class ZeBridge {
         state   TEXT NOT NULL DEFAULT 'pending'
       )
     `);
+    // Kept independently of optimistic history. SQL NULL is a known absent baseline;
+    // no row in this table means no certificate. `at` bounds later overlays.
+    await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_base (
+      tbl TEXT NOT NULL, row_id TEXT NOT NULL, at ${this.dialect.int64} NOT NULL, data TEXT,
+      PRIMARY KEY (tbl, row_id))`);
+    this.baselineActive = (await this.run(`SELECT 1 FROM _zebridge_base LIMIT 1`)).length > 0;
     // A refused write's local undo, owed until it is done (`runUndos`). `mode`: `restore`
     // (the before-image, or no row) for `rejected`, `delete` for `row_deleted`.
     await this.run(`
@@ -1818,12 +1826,17 @@ export class ZeBridge {
         attempts   INTEGER NOT NULL DEFAULT 0
       )
     `);
+    await this.run(`CREATE INDEX IF NOT EXISTS _zbz_outbox_row ON _zebridge_outbox (tbl, row_id, created_at)`);
+    await this.run(`CREATE INDEX IF NOT EXISTS _zbz_undo_row ON _zebridge_undo (tbl, row_id, created_at)`);
+    // Owed undos only: `mode <> 'accepted'` on the row index read a row's whole accepted history.
+    await this.run(`CREATE INDEX IF NOT EXISTS _zbz_undo_owed ON _zebridge_undo (tbl, row_id) WHERE mode <> 'accepted'`);
     // `authoritative`: whether `before` is the server's row, not an overlay of an earlier write
     // (`beforeIsAuthoritative`). NULL: not known (an entry from before the column).
     try { await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN authoritative INTEGER`); } catch { /* present */ }
     // The ordering floor, read here once: `nextCreated` runs inside the write's transaction, and
     // a query outside it there waits behind that transaction (PGlite: forever).
-    const m = await this.run(`SELECT max(m) AS m FROM (SELECT max(created_at) AS m FROM _zebridge_outbox UNION ALL SELECT max(created_at) FROM _zebridge_undo) t`);
+    const m = await this.run(`SELECT max(m) AS m FROM (SELECT max(created_at) AS m FROM _zebridge_outbox UNION ALL SELECT max(created_at) FROM _zebridge_undo UNION ALL SELECT max(at) FROM _zebridge_base) t`);
+    this.ledgerActive = await this.ledgerHasRows();
     this.lastCreated = Math.max(this.lastCreated ?? 0, Number(m[0]?.m ?? 0));
   }
 
@@ -1832,19 +1845,159 @@ export class ZeBridge {
     exec: Exec = this.run,
   ) {
     await this.outboxInitPromise;
+    const created = this.nextCreated();
+    // No base copy here: until CDC says more, the authoritative before-image in the ledger
+    // IS the server's state (`recordAuthoritative` materializes one lazily).
+    this.ledgerChanged();
     await exec(
       `INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, optimistic, authoritative)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
        ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1`,
       r.msgId, r.subject, JSON.stringify(r.payload), r.table, String(r.id),
-      r.before == null ? null : JSON.stringify(r.before), r.before == null ? null : JSON.stringify(r.before), this.nextCreated(), JSON.stringify(r.optimistic), r.authoritative == null ? null : r.authoritative ? 1 : 0,
+      r.before == null ? null : JSON.stringify(r.before), r.before == null ? null : JSON.stringify(r.before), created, JSON.stringify(r.optimistic), r.authoritative == null ? null : r.authoritative ? 1 : 0,
     );
+    // A refresh may have run while the insert awaited storage. Mark completion too.
+    this.ledgerChanged();
   }
 
-  private async outboxDrop(msgId: string) {
+  private async outboxDrop(msgId: string, accepted = false) {
     await this.outboxInitPromise;
-    await this.run(`DELETE FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
+    // Another device's verdict (same principal): no write transaction for nothing.
+    if (!(await this.run(`SELECT 1 FROM _zebridge_outbox WHERE msg_id = ?`, msgId)).length) { this.wakeOutbox(); return; }
+    // Keep an accepted write as rollback history while another write on its row is pending
+    // or owed (the receipt/echo settles retransmission, not the other edits' baseline); the
+    // row's history goes once nothing else is left on it (libzb's `settleAccepted`). Every
+    // check is bound to the row's key: a form correlated per history row cost O(depth) per
+    // verdict (1 ms at 5,000 stacked).
+    const bases = this.baselineActive !== false;
+    await this.transaction(async (tx) => {
+      const row = (await tx(`SELECT tbl, row_id FROM _zebridge_outbox WHERE msg_id = ?`, msgId))[0];
+      if (!row) return; // another device's write: nothing of it is here
+      const others = (await tx(`SELECT 1 FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND msg_id <> ? LIMIT 1`, row.tbl, row.row_id, msgId)).length > 0;
+      const owed = (await tx(`SELECT 1 FROM _zebridge_undo WHERE tbl = ? AND row_id = ? AND mode <> 'accepted' LIMIT 1`, row.tbl, row.row_id)).length > 0;
+      if (accepted && (others || owed)) {
+        await tx(`INSERT INTO _zebridge_undo (msg_id,tbl,row_id,payload,before,optimistic,created_at,authoritative,mode,since)
+          SELECT msg_id,tbl,row_id,payload,before,optimistic,created_at,authoritative,'accepted',?
+          FROM _zebridge_outbox WHERE msg_id = ? ON CONFLICT(msg_id) DO NOTHING`, Date.now(), msgId);
+      }
+      await tx(`DELETE FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
+      if (!others && !owed) {
+        await tx(`DELETE FROM _zebridge_undo WHERE tbl = ? AND row_id = ? AND mode = 'accepted'`, row.tbl, row.row_id);
+        if (bases) await tx(`DELETE FROM _zebridge_base WHERE tbl = ? AND row_id = ?`, row.tbl, row.row_id);
+      }
+    });
+    // `baselineActive` is recomputed once per undo pass, not per verdict; the ledger flag
+    // only once nothing is pending, so a burst pays no global query per verdict.
+    if (this.ledgerActive && !this.pendingWrites?.size) { try { await this.refreshLedgerActive(); } catch { /* stays set */ } }
     this.wakeOutbox();
+  }
+
+  private async saveBaseline(exec: Exec, table: string, rowId: string, at: number, row: unknown) {
+    await exec(`INSERT INTO _zebridge_base (tbl,row_id,at,data) VALUES (?,?,?,?)
+      ON CONFLICT(tbl,row_id) DO UPDATE SET at=excluded.at,data=excluded.data`,
+      table, rowId, at, row == null ? null : JSON.stringify(row));
+    this.baselineActive = true;
+  }
+
+  /// A CDC row for a key with writes in the ledger is the server's newest state: kept as the
+  /// base a rebuild starts from (libzb's `recordAuthoritative`). Nothing is kept for the echo
+  /// of a row's only write (its verdict settles it), nor for a key with no writes. An UPDATE
+  /// omits a column it did not change (an unchanged TOAST value): taken from the newest trusted
+  /// server copy (the base, or the ledger's authoritative before-image), never from the
+  /// displayed row; with none, the row is recovered from the hub instead.
+  private async recordAuthoritative(exec: Exec, table: string, state: TableState, ev: any) {
+    if (!this.ledgerActive || ev.optimistic || !state.pkCols.length || !ev.data) return;
+    const rowId = state.pkCols.map(c => String(ev.data?.[c])).join('|');
+    const ledger: any[] = await exec(`SELECT payload,1 AS pending FROM _zebridge_outbox WHERE tbl=? AND row_id=?
+      UNION ALL SELECT payload,0 AS pending FROM _zebridge_undo WHERE tbl=? AND row_id=? LIMIT 2`, table, rowId, table, rowId);
+    if (!ledger.length) return;
+    const removed = ev.operation === 'DELETE' || tombstoned(state.tombstoneColumn, ev.data);
+    if (ledger.length === 1 && Number(ledger[0].pending) === 1 && !removed && this.isEchoOf(state, ev.data, ledger[0].payload)) return;
+    if (removed) { await this.saveBaseline(exec, table, rowId, this.nextCreated(), null); return; }
+    let data = ev.data;
+    if (this.dialect?.name === 'postgres') {
+      if (state.arrayCols?.length) data = pgArrayValues(data, state.arrayCols);
+      if (state.vecCols?.length) data = pgVectorValues(data, state.vecCols);
+    }
+    const row: Record<string, unknown> = {};
+    let prior: Record<string, unknown> | null | undefined;
+    for (const c of state.columns) {
+      if (Object.prototype.hasOwnProperty.call(data, c)) { row[c] = data[c]; continue; } // an explicit NULL overwrites
+      if (prior === undefined) prior = await this.trustedPrior(exec, table, rowId);
+      if (!prior || !Object.prototype.hasOwnProperty.call(prior, c)) { await this.requestUndoRecovery(table, rowId, exec); return; }
+      row[c] = prior[c];
+    }
+    await this.saveBaseline(exec, table, rowId, this.nextCreated(), row);
+  }
+
+  private isEchoOf(state: TableState, data: any, payload: string): boolean {
+    if (!state.versionColumn || !state.tiebreakColumn) return false;
+    let sent: any;
+    try { sent = JSON.parse(payload); } catch { return false; }
+    const writer = data?.[state.tiebreakColumn];
+    if (typeof sent.client_id !== 'string' || !sent.client_id || typeof writer !== 'string' || writer !== sent.client_id) return false;
+    const version = data?.[state.versionColumn];
+    return typeof sent.version === 'string' && typeof version === 'string'
+      && normalizeVersion(pgTsToWire(version)) === normalizeVersion(pgTsToWire(sent.version));
+  }
+
+  private ledgerChanged() {
+    this.ledgerRevision = (this.ledgerRevision ?? 0) + 1;
+    this.ledgerActive = true;
+  }
+
+  private async ledgerTransaction(fn: (exec: Exec) => Promise<void>) {
+    this.ledgerWriters = (this.ledgerWriters ?? 0) + 1;
+    this.ledgerChanged();
+    try { await this.transaction(fn); }
+    finally {
+      this.ledgerWriters--;
+      // Only transaction completion closes the interval in which another connection
+      // could have observed an empty committed ledger.
+      this.ledgerChanged();
+    }
+  }
+
+  private async refreshLedgerActive() {
+    const revision = this.ledgerRevision ?? 0;
+    const active = await this.ledgerHasRows();
+    if (active) this.ledgerActive = true;
+    else if (!(this.ledgerWriters ?? 0) && revision === (this.ledgerRevision ?? 0)) this.ledgerActive = false;
+  }
+
+  /// The newest server state known for a key: the base copy, or the before-image of its newest
+  /// authoritative write, whichever is later. Null when neither holds a row.
+  private async trustedPrior(exec: Exec, table: string, rowId: string): Promise<Record<string, unknown> | null> {
+    const r = (await exec(`SELECT data FROM (SELECT data, at AS t FROM _zebridge_base WHERE tbl=? AND row_id=?
+      UNION ALL SELECT before, created_at FROM _zebridge_outbox WHERE tbl=? AND row_id=? AND authoritative=1
+      UNION ALL SELECT before, created_at FROM _zebridge_undo WHERE tbl=? AND row_id=? AND authoritative=1) p ORDER BY t DESC LIMIT 1`,
+      table, rowId, table, rowId, table, rowId))[0];
+    if (!r || r.data == null) return null;
+    try { return typeof r.data === 'string' ? JSON.parse(r.data) : r.data; } catch { return null; }
+  }
+
+  private async ledgerHasRows(): Promise<boolean> {
+    return (await this.run(`SELECT 1 AS x WHERE EXISTS (SELECT 1 FROM _zebridge_outbox) OR EXISTS (SELECT 1 FROM _zebridge_undo)`)).length > 0;
+  }
+
+  /// Recovery is durable, and uses the existing hub reseed + retained-suffix catch-up.
+  /// No outcome is emitted: the accepted/rejected verdicts were already delivered.
+  private async requestUndoRecovery(table: string, rowId: string, exec: Exec = this.run) {
+    await exec(`INSERT INTO _zebridge_reconcile (msg_id,tbl,reason,since,state)
+      VALUES (?,?,'UndoNeedsBaseline',?,'pending') ON CONFLICT(msg_id) DO NOTHING`,
+      `undo:${JSON.stringify([table,rowId])}`, table, Date.now());
+    if (this.nc && !this.undoRecoveryScheduled) {
+      this.undoRecoveryScheduled = true;
+      setTimeout(() => { this.undoRecoveryScheduled = false; if (this.nc) void this.reconcile(); }, 0);
+    }
+  }
+
+  /// History left by a write settled elsewhere (an indeterminate one, a seed): once per undo pass.
+  private async pruneAccepted(exec: Exec) {
+    await exec(`DELETE FROM _zebridge_undo WHERE mode = 'accepted'
+      AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox o WHERE o.tbl = _zebridge_undo.tbl AND o.row_id = _zebridge_undo.row_id)
+      AND NOT EXISTS (SELECT 1 FROM _zebridge_undo u WHERE u.tbl = _zebridge_undo.tbl AND u.row_id = _zebridge_undo.row_id AND u.mode <> 'accepted')`);
+    if (this.baselineActive !== false) await exec(`DELETE FROM _zebridge_base WHERE NOT EXISTS (SELECT 1 FROM _zebridge_outbox o WHERE o.tbl=_zebridge_base.tbl AND o.row_id=_zebridge_base.row_id) AND NOT EXISTS (SELECT 1 FROM _zebridge_undo u WHERE u.tbl=_zebridge_base.tbl AND u.row_id=_zebridge_base.row_id)`);
   }
 
   /// The one row of `zebridge_gc_watermark`, read from THIS client's own replica.
@@ -2031,9 +2184,16 @@ export class ZeBridge {
   /// The undos still owed: a foreign key refused them while a dependent row was there.
   public async undoing(): Promise<number> {
     await this.outboxInitPromise;
-    try { return Number((await this.run(`SELECT count(*) AS n FROM _zebridge_undo`))[0]?.n ?? 0); } catch { return 0; }
+    try { return Number((await this.run(`SELECT count(*) AS n FROM _zebridge_undo WHERE mode <> 'accepted'`))[0]?.n ?? 0); } catch { return 0; }
   }
 
+  private undoRecoveryScheduled = false;
+  private baselineActive = false;
+  /// This client may have writes in its ledger (outbox or undo): only then can an arriving row
+  /// be a base a rebuild needs. Set by `outboxPut` and at boot.
+  private ledgerActive = true;
+  private ledgerRevision = 0;
+  private ledgerWriters = 0;
   private lastCreated = 0;
   private undoOwed = true;
   private undoRunning = false;
@@ -2055,16 +2215,18 @@ export class ZeBridge {
   /// change (CDC, a seed) and at each connect (a restart included); never throws — an
   /// uncaught refusal here ended Node.
   private async runUndos(): Promise<void> {
+    let recover = false;
     if (this.undoRunning) { this.undoAgain = true; return; }
     this.undoRunning = true;
     try {
+      try { await this.transaction(async (tx) => { await this.pruneAccepted(tx); }); } catch { return; }
       let progress = true;
       while (progress || this.undoAgain) {
         progress = false;
         this.undoAgain = false;
         let rows: any[];
         try {
-          rows = await this.run(`SELECT tbl, row_id, min(msg_id) AS msg_id, max(attempts) AS attempts FROM _zebridge_undo GROUP BY tbl, row_id ORDER BY min(since)`);
+          rows = await this.run(`SELECT tbl, row_id, min(msg_id) AS msg_id, max(attempts) AS attempts FROM _zebridge_undo WHERE mode <> 'accepted' GROUP BY tbl, row_id ORDER BY min(since)`);
         } catch { return; }
         for (const u of rows) {
           const attempts = Number(u.attempts ?? 0);
@@ -2075,14 +2237,24 @@ export class ZeBridge {
             if (res === 'skipped') this.appendLog(u.tbl, `local undo of ${u.msg_id} skipped — the row has changed since; left as it is`, 'INFO');
             else if (attempts > 0) this.appendLog(u.tbl, `local undo of ${u.msg_id} done after ${attempts} blocked attempt(s)`, 'INFO');
           } catch (e) {
+            if (e instanceof Error && e.message === 'accepted write needs an authoritative baseline — undo remains owed') {
+              try {
+                await this.requestUndoRecovery(String(u.tbl), String(u.row_id));
+                recover = true;
+              } catch (error) {
+                this.appendLog(u.tbl, `could not persist undo recovery: ${error} — undo remains owed`, 'WARNING');
+              }
+            }
             try { await this.run(`UPDATE _zebridge_undo SET attempts = attempts + 1 WHERE tbl = ? AND row_id = ?`, u.tbl, u.row_id); } catch { /* retried anyway */ }
             if (attempts === 0) this.appendLog(u.tbl, `local undo of ${u.msg_id} is blocked (${e instanceof Error ? e.message : e}) — kept, retried after the next verdict`, 'WARNING');
           }
         }
       }
       this.undoOwed = (await this.undoing()) > 0;
+      try { this.baselineActive = (await this.run(`SELECT 1 FROM _zebridge_base LIMIT 1`)).length > 0; } catch { this.baselineActive = true; }
     } finally {
       this.undoRunning = false;
+      if (recover && this.nc) void this.reconcile();
     }
   }
 
@@ -2109,14 +2281,16 @@ export class ZeBridge {
     const keyObj = w.key;
     if (!state.pkCols.length || !keyObj) return false;
     const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
-    const row = (await exec(`SELECT * FROM ${table} WHERE ${where}`, ...state.pkCols.map((c) => keyObj[c])))[0] ?? null;
-    const asStored = (v: unknown): string =>
-      typeof v === 'boolean' ? (v ? '1' : '0')
-      : isBytes(v) ? Array.from(v, (b) => b.toString(16).padStart(2, '0')).join('')
-      : v !== null && typeof v === 'object' ? JSON.stringify(v)
-      : String(v);
-    if (w.removed || !w.data) return row == null;
-    return row != null && Object.entries(w.data).every(([k, v]) => asStored(row[k]) === asStored(v));
+    if (w.removed || !w.data) return (await exec(`SELECT 1 FROM ${table} WHERE ${where}`, ...state.pkCols.map((c) => keyObj[c]))).length === 0;
+    const data = this.dialect?.name === 'postgres' ? pgEngineValues(w.data) : w.data;
+    const cols = Object.keys(data).filter((k) => !k.startsWith('old.'));
+    const params = cols.map((k) => {
+      const v = cdcValue(data[k]);
+      return this.dialect?.name !== 'postgres' && typeof v === 'boolean' ? (v ? 1 : 0) : v;
+    });
+    const checks = cols.map((k) => `"${k}" IS NOT DISTINCT FROM ?`);
+    return (await exec(`SELECT 1 FROM ${table} WHERE ${where}${checks.length ? ' AND ' + checks.join(' AND ') : ''} LIMIT 1`,
+      ...state.pkCols.map((c) => keyObj[c]), ...params)).length > 0;
   }
 
   /// Whether the row a new write is about to cover is the SERVER's state, not one of this
@@ -2132,6 +2306,28 @@ export class ZeBridge {
     );
     if (!ws.length) return true;
     return !(await this.rowShows(table, state, this.appliedOf(state, ws[0]), exec));
+  }
+
+  /// Undo is not a new DELETE request: it may not cancel another row's independent write.
+  /// Turn referential actions into a wait, inside the undo transaction, without changing DDL
+  /// or disabling FK enforcement. Query the physical schema, including unfollowed children.
+  private async assertUndoDeleteSafe(table: string, state: {pkCols: string[]}, key: Record<string, unknown>, exec: Exec) {
+    const quote = (s: string) => `"${s.replaceAll('"', '""')}"`;
+    const where = state.pkCols.map((c) => `p.${quote(c)} = ?`).join(' AND ');
+    if (!where || state.pkCols.some((c) => key[c] == null)) throw new Error('local undo cannot verify its delete key');
+    const params = state.pkCols.map((c) => key[c]);
+    const dialect = this.dialect ?? sqliteDialect;
+    // A new referencing INSERT must not commit between the probe and DELETE (SQLite's
+    // BEGIN IMMEDIATE already excludes other writers; PostgreSQL needs a key-conflicting lock).
+    if (dialect.name === 'postgres') await exec(`SELECT 1 FROM ${table} p WHERE ${where} FOR UPDATE`, ...params);
+    const inspect = dialect.undoDeleteReferences ?? (dialect.name === 'postgres' ? postgresDialect : sqliteDialect).undoDeleteReferences!;
+    for (const fk of await inspect.call(dialect, exec, table)) {
+      if (!fk.child || !fk.parent || !fk.joins || Number(fk.unsafe_scope)) throw new Error('local undo cannot verify referencing rows');
+      const self = Number(fk.self_ref) ? ` AND NOT (${state.pkCols.map((c) => `c.${quote(c)} IS NOT DISTINCT FROM p.${quote(c)}`).join(' AND ')})` : '';
+      if ((await exec(`SELECT 1 FROM ${fk.child} c JOIN ${fk.parent} p ON ${fk.joins} WHERE ${where}${self} LIMIT 1`, ...params)).length) {
+        throw new Error(`local undo would change dependent rows in ${fk.child} — waiting for their own verdicts or CDC`);
+      }
+    }
   }
 
   /// Settle every owed undo on one row (libzb's `undoRow`). The row holds this client's writes
@@ -2152,7 +2348,7 @@ export class ZeBridge {
     await this.transaction(async (txExec) => {
       const ws: any[] = await txExec(
         `SELECT msg_id, payload, before, optimistic, 0 AS owed, '' AS mode, created_at, authoritative FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?
-         UNION ALL SELECT msg_id, payload, before, optimistic, 1 AS owed, mode, created_at, authoritative FROM _zebridge_undo WHERE tbl = ? AND row_id = ?
+         UNION ALL SELECT msg_id, payload, before, optimistic, CASE WHEN mode = 'accepted' THEN 2 ELSE 1 END AS owed, mode, created_at, authoritative FROM _zebridge_undo WHERE tbl = ? AND row_id = ?
          ORDER BY 7, 1`,
         table, rowId, table, rowId,
       );
@@ -2168,9 +2364,17 @@ export class ZeBridge {
         // The base: the server's state before `from` — or no row, when the server said the
         // row is gone (`row_deleted`).
         const gone = ws.some((w) => Number(w.owed) === 1 && w.mode === 'delete');
-        const base = gone || !ws[from].before ? null : JSON.parse(ws[from].before);
+        const certified = (await txExec(`SELECT at,data FROM _zebridge_base WHERE tbl = ? AND row_id = ?`, table, rowId))[0];
+        let before = ws[from].before;
+        if (certified && Number(certified.at) >= Number(ws[from].created_at)) {
+          before = certified.data;
+          const i = ws.findIndex((w) => Number(w.created_at) >= Number(certified.at));
+          from = i < 0 ? ws.length : i;
+        }
+        const base = gone || before == null ? null : JSON.parse(before);
         const current = (await txExec(`SELECT * FROM ${table} WHERE ${where}`, ...pkVals))[0] ?? null;
         if (base == null) {
+          await this.assertUndoDeleteSafe(table, state, keyObj, txExec);
           await txExec(`DELETE FROM ${table} WHERE ${where}`, ...pkVals);
         } else if (current == null) {
           const cols = Object.keys(base);
@@ -2188,14 +2392,33 @@ export class ZeBridge {
         for (const w of ws.slice(from)) {
           if (Number(w.owed) === 1) continue;
           const pw = this.appliedOf(state, w);
-          if (!pw.ev) continue; // queued before the `optimistic` column: its echo restores it
+          if (!pw.ev) {
+            if (Number(w.owed) === 2) throw new Error('accepted write needs an authoritative baseline — undo remains owed');
+            continue; // a legacy pending write still waits for its verdict or echo
+          }
           const before = (await txExec(`SELECT * FROM ${table} WHERE ${where}`, ...pkVals))[0] ?? null;
-          await txExec(`UPDATE _zebridge_outbox SET before = ?, authoritative = ? WHERE msg_id = ?`, before == null ? null : JSON.stringify(before), first ? 1 : 0, w.msg_id);
-          first = false;
+          if (Number(w.owed) === 0) {
+            await txExec(`UPDATE _zebridge_outbox SET before = ?, authoritative = ? WHERE msg_id = ?`, before == null ? null : JSON.stringify(before), first ? 1 : 0, w.msg_id);
+            first = false;
+          }
+          // A pending UPDATE cannot create a row during rollback; its verdict is still
+          // independent. Accepted history is different: local absence says nothing about
+          // the server. Reconstruct it only from a complete row, otherwise keep the undo.
+          if (before == null && !pw.removed && pw.ev.operation === 'UPDATE') {
+            if (Number(w.owed) === 0) continue;
+            const columns = await (this.dialect ?? sqliteDialect).tableInfo(txExec, table);
+            if (!columns.length || !pw.data || columns.some((c) => !Object.prototype.hasOwnProperty.call(pw.data, c.name))) {
+              throw new Error('accepted write needs an authoritative baseline — undo remains owed');
+            }
+          }
+          if (pw.removed) await this.assertUndoDeleteSafe(table, state, pw.key!, txExec);
           await this.applyEvent(table, pw.ev, txExec);
         }
       }
-      await txExec(`DELETE FROM _zebridge_undo WHERE tbl = ? AND row_id = ?`, table, rowId);
+      await txExec(`DELETE FROM _zebridge_undo WHERE tbl = ? AND row_id = ? AND mode <> 'accepted'`, table, rowId);
+      await txExec(`DELETE FROM _zebridge_undo WHERE tbl = ? AND row_id = ? AND mode = 'accepted'
+        AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?)`, table, rowId, table, rowId);
+      await txExec(`DELETE FROM _zebridge_base WHERE tbl=? AND row_id=? AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox WHERE tbl=? AND row_id=?)`, table,rowId,table,rowId);
     });
     this.triggerChange(table);
     return owned ? 'done' : 'skipped';
@@ -2351,6 +2574,7 @@ export class ZeBridge {
     const tenantColumn: string | null = typeof val.tenant_column === 'string' ? val.tenant_column : null;
     const seedEpoch: number = typeof val.seed_epoch === 'number' ? val.seed_epoch : 0;
     const versionColumn: string | null = typeof val.version_column === 'string' ? val.version_column : null;
+    const tiebreakColumn: string | null = typeof val.tiebreak_column === 'string' ? val.tiebreak_column : null;
     const names = cols.map((c) => c.name);
 
     // ── FINDING 9 (the destroyer behind §10j): "first sight" must be decided by
@@ -2482,7 +2706,7 @@ export class ZeBridge {
       } else if (added.length === 0 && removed.length === 0 && renames.length === 0 && retyped.length === 0 &&
                  !(await this.foreignKeysDiffer(table, fkClauses)) && !(await this.strictMissing(table))) {
         await recordShape();
-        this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
+        this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, tiebreakColumn, seedEpoch });
         await this.restoreSeedGate(table);
         this.reach('migrated');
         this.scheduleRecount();
@@ -2545,7 +2769,7 @@ export class ZeBridge {
       await this.syncIndexes(table, indexes);
       await recordShape();
 
-      this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
+      this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, tiebreakColumn, seedEpoch });
       await this.restoreSeedGate(table);
       // Both registration paths mark the phase — a strip that lies is worse than none.
       this.reach('migrated');
@@ -3094,6 +3318,7 @@ export class ZeBridge {
   /// What follows a row's landing, whichever statement landed it: the echo pops the
   /// outbox entry, a held edit may have its winner, the global position advances.
   private async afterApplied(table: string, state: TableState, ev: any, exec: Exec) {
+    await this.recordAuthoritative(exec, table, state, ev);
     // An authoritative row for a key: my overlays on it are gone, and the confirmed row kept beneath them.
     if (!ev.optimistic && this.confirmedBase?.size && state.pkCols.length) {
       this.confirmedBase.delete(`${table}\u0000${state.pkCols.map((c) => String(ev.data?.[c])).join('|')}`);
@@ -3130,7 +3355,7 @@ export class ZeBridge {
   private async settleByEcho(msgId: string, w: { table: string; version?: string | null }) {
     const write = await this.outboxWrite(msgId, w);
     if (write && !this.verdictReported?.has(msgId) && !this.verdictInFlight?.has(msgId)) (this.echoedWrites ??= new Map()).set(msgId, write);
-    await this.outboxDrop(msgId);
+    await this.outboxDrop(msgId, true);
   }
 
   /// The ID's definitive outcome was handled to the end in this session; bounded.
@@ -3211,6 +3436,7 @@ export class ZeBridge {
         for (const i of seg.events) {
           const ev = toApply[i].ev;
           this.feedFloor(state, ev);
+          await this.recordAuthoritative(exec, seg.table, state, ev);
           this.confirmEcho(seg.table, state, ev);
           lsn = Math.max(lsn, ev.lsn ?? 0); seq = Math.max(seq, ev.seq ?? 0); stream = ev.stream ?? stream;
         }
@@ -5719,7 +5945,7 @@ export class ZeBridge {
           await this.holdForRebase(msgId);
         }
         if (definitive && verdict.status !== 'rejected' && verdict.status !== 'row_deleted') {
-          await this.outboxDrop(msgId);
+          await this.outboxDrop(msgId, verdict.status === 'accepted');
         }
 
         switch (verdict.status) {
@@ -5803,7 +6029,7 @@ export class ZeBridge {
     return true;
   }
 
-  /// Writes answered `indeterminate` whose reconciliation has not finished.
+  /// Durable authoritative recovery still pending (indeterminate writes or missing undo baselines).
   public async reconciling(): Promise<number> {
     await this.outboxInitPromise;
     try { return Number((await this.run(`SELECT count(*) AS n FROM _zebridge_reconcile`))[0]?.n ?? 0); } catch { return 0; }
@@ -5956,7 +6182,7 @@ export class ZeBridge {
   private async reapplyPending(table: string) {
     await this.outboxInitPromise;
     const state = this.syncedTables.get(table);
-    const rows: any[] = await this.run(`SELECT msg_id, payload, optimistic, row_id FROM _zebridge_outbox WHERE tbl = ? ORDER BY created_at`, table);
+    const rows: any[] = await this.run(`SELECT msg_id, payload, optimistic, row_id, created_at FROM _zebridge_outbox WHERE tbl = ? ORDER BY created_at`, table);
     let applied = 0, skipped = 0;
     const seen = new Set<string>(); // the first write re-applied on a row covers the seeded row: the server's state
     for (const r of rows) {
@@ -5970,6 +6196,7 @@ export class ZeBridge {
         const before = (await txExec(`SELECT * FROM ${table} WHERE ${where}`, ...state.pkCols.map((c) => keyObj[c])))[0] ?? null;
         const first = !seen.has(String(r.row_id));
         seen.add(String(r.row_id));
+        if (first) await this.saveBaseline(txExec, table, String(r.row_id), Number(r.created_at), before);
         await txExec(`UPDATE _zebridge_outbox SET before = ?, authoritative = ? WHERE msg_id = ?`, before == null ? null : JSON.stringify(before), first ? 1 : 0, r.msg_id);
         await this.applyEvent(table, ev, txExec);
       });
@@ -6035,7 +6262,7 @@ export class ZeBridge {
     // the publish: a duplicate is collapsed by dedup, a loss is unrecoverable.
     let applied: Record<string, unknown> | null = null;
     try {
-      await this.transaction(async (txExec) => {
+      await this.ledgerTransaction(async (txExec) => {
         const state = this.syncedTables.get(table);
         let before: any = null;
         let authoritative: boolean | undefined;

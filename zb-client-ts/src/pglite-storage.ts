@@ -81,6 +81,7 @@ export function makePgliteStorage(opts: PgliteStorageOptions = {}): StorageFacto
     return {
       dialect: postgresDialect,
       exec,
+      close: () => pg.close(),
       transaction: (fn) =>
         pg.transaction(async (tx) => {
           const txExec: Exec = async (q, ...p) => (await tx.query(numberPlaceholders(q), bind(p))).rows as any[];

@@ -168,6 +168,8 @@ const TableState = struct {
     cols: []const []const u8,
     version_col: ?[]const u8,
     tenant_col: ?[]const u8,
+    /// Configured server-stamped writer identity; absent means no echo shortcut.
+    tiebreak_col: ?[]const u8 = null,
     /// PROTOCOL §7.5: a soft delete arrives as an update setting this column, and the
     /// physical reap is never forwarded — so a row with it set is REMOVED here, on
     /// seed, on CDC and on the local optimistic apply alike. See `tombstoned`.
@@ -528,6 +530,10 @@ pub const SyncClient = struct {
     /// settles while others on the key still depend on it; forgotten when the last one settles
     /// or an authoritative row for the key arrives (`ConfirmedBases`).
     confirmed: ConfirmedBases = .{},
+    baseline_active: bool = false,
+    /// This client may have writes in its ledger (outbox or undo): only then can an arriving
+    /// row be a base a rebuild needs. Set by `mutate` and at boot; recomputed once per poll.
+    ledger_active: bool = true,
     rebase_due: bool = false,
     /// Cumulative verdict counts by status, for the host (the flush report carries
     /// them): a single-writer run with anything but `accepted` here has a finding.
@@ -1149,7 +1155,8 @@ pub const SyncClient = struct {
             _ = self.pass_streams.remove(r[2].text);
             const ok_route = if (self.streamFacts(r[2].text)) |f|
                 std.mem.eql(u8, f.created, r[4].text) and @as(i64, @intCast(f.first_seq)) <= r[3].integer + 1
-            else |_| false;
+            else |_|
+                false;
             if (!ok_route) try out.append(a, .{ .table = r[0].text, .tenant = r[1].text, .stream = r[2].text, .cut = r[3].integer });
         }
         return out.items;
@@ -1694,12 +1701,17 @@ pub const SyncClient = struct {
         const tenant_col: ?[]const u8 = if (val.object.get("tenant_column")) |v| (if (v == .string) v.string else null) else null;
         const version_col: ?[]const u8 = if (val.object.get("version_column")) |v| (if (v == .string) v.string else null) else null;
         const tombstone_col: ?[]const u8 = if (val.object.get("tombstone_column")) |v| (if (v == .string) v.string else null) else null;
+        const tiebreak_col: ?[]const u8 = if (val.object.get("tiebreak_column")) |v| (if (v == .string) v.string else null) else null;
         const seed_epoch: i64 = if (val.object.get("seed_epoch")) |v| (if (v == .integer) v.integer else 0) else 0;
 
         if (self.states.getPtr(table)) |st| {
             // §10df first: a republished descriptor is usually UNCHANGED in shape — the
             // epoch is the whole message, and it must not be lost to the shortcut below.
             st.seed_epoch = seed_epoch;
+            // Contract-only changes also land when the physical shape is unchanged.
+            if (tiebreak_col) |col| {
+                if (st.tiebreak_col == null or !std.mem.eql(u8, st.tiebreak_col.?, col)) st.tiebreak_col = try self.aa().dupe(u8, col);
+            } else st.tiebreak_col = null;
             try self.reseedIfEpochMoved(a, table, seed_epoch);
             if (outcome == .unchanged and sameStrings(st.cols, names.items) and sameStrings(st.pk, pk)) return;
         }
@@ -1719,6 +1731,7 @@ pub const SyncClient = struct {
             .version_col = if (version_col) |v| try ca.dupe(u8, v) else null,
             .tenant_col = if (tenant_col) |v| try ca.dupe(u8, v) else null,
             .tombstone_col = if (tombstone_col) |v| try ca.dupe(u8, v) else null,
+            .tiebreak_col = if (tiebreak_col) |v| try ca.dupe(u8, v) else null,
             .array_cols = try dupeStrings(ca, try arrayColsOf(a, val)),
             .geom_cols = try dupeStrings(ca, try geomColsOf(a, val)),
             .vec_cols = try dupeVecCols(ca, try vecColsOf(a, val)),
@@ -3440,7 +3453,8 @@ pub const SyncClient = struct {
                 _ = self.pass_streams.remove(r.stream);
                 const ok_route = if (self.streamFacts(r.stream)) |f|
                     std.mem.eql(u8, f.created, r.created) and @as(i64, @intCast(f.first_seq)) <= r.cut + 1
-                else |_| false;
+                else |_|
+                    false;
                 if (!ok_route) {
                     log.warn("{s}: fence not committed — {s} no longer holds the events after the cut {d} on the incarnation the chain was cut on; the pair stays unseeded with its cursor at the cut (recovery incomplete)", .{ table, r.stream, r.cut });
                     self.reseed_pending = true;
@@ -3563,7 +3577,7 @@ pub const SyncClient = struct {
             }
             const full_gen: i64 = if (man.object.get("full")) |f| (if (f == .object) (if (f.object.get("gen")) |g| (if (g == .integer) g.integer else 0) else 0) else 0) else 0;
             log.info("measure {{\"m\":\"chain\",\"table\":\"{s}\",\"tenant\":\"{s}\",\"source\":\"{s}\",\"gen\":{d},\"full_gen\":{d},\"fulls\":{d},\"deltas\":{d},\"rows\":{d},\"bytes\":{d},\"t0_ms\":{d},\"t1_ms\":{d},\"fetch_ms\":{d},\"inflate_ms\":{d},\"decode_ms\":{d},\"apply_ms\":{d},\"streamed\":{d},\"cutoff_version\":\"{s}\",\"cdc_stream\":\"{s}\",\"cutoff_seq\":{d},\"shared_cutoff_seq\":{d},\"cut_age_ms\":{d},\"cdc_behind\":{d}}}", .{
-                table, tenant, if (from_seed) "seed" else "hub", if (man.object.get("gen")) |v| v.integer else 0, full_gen, fulls, plan.array.items.len - fulls, applied, bytes_total, chain_t0, nowMillis(), ph[0], ph[1], ph[2], ph[3], streamed, cv, cdc_stream, cutoff_seq, shared_seq orelse -1,
+                table,                                      tenant,                                           if (from_seed) "seed" else "hub", if (man.object.get("gen")) |v| v.integer else 0, full_gen, fulls, plan.array.items.len - fulls, applied, bytes_total, chain_t0, nowMillis(), ph[0], ph[1], ph[2], ph[3], streamed, cv, cdc_stream, cutoff_seq, shared_seq orelse -1,
                 if (isoMs(cv)) |t| nowMillis() - t else -1, if (own_last >= 0) own_last - cutoff_seq else -1,
             });
         }
@@ -5021,6 +5035,15 @@ pub const SyncClient = struct {
     /// applied or seeded anything tries again, outside their transactions.
     fn undoAfterPass(self: *SyncClient, r: PollReport) void {
         if (self.undo_owed and (r.applied > 0 or r.seeded.len > 0)) self.runUndos();
+        if (self.ledger_active) {
+            var arena = std.heap.ArenaAllocator.init(self.a);
+            defer arena.deinit();
+            self.ledger_active = self.ledgerHasRows(arena.allocator()) catch true;
+        }
+    }
+
+    fn ledgerHasRows(self: *SyncClient, a: std.mem.Allocator) !bool {
+        return (try self.st.query(a, "SELECT 1 WHERE EXISTS (SELECT 1 FROM _zebridge_outbox) OR EXISTS (SELECT 1 FROM _zbz_undo)", &.{})).len > 0;
     }
 
     fn pumpOutbox(self: *SyncClient) void {
@@ -5401,6 +5424,7 @@ pub const SyncClient = struct {
             // §10dg: whatever was held for this key (an INSERT waiting for its parent)
             // must not replay after the row's DELETE went by — it would resurrect it.
             pruneInboxKey(&self.st, taa, table, st.pk, data) catch {};
+            try self.recordAuthoritative(taa, table, st, data, true);
             return;
         }
         if (try core.planKeyChange(taa, table, st.pk, data)) |kc| _ = try self.stepExec(taa, kc);
@@ -5411,6 +5435,7 @@ pub const SyncClient = struct {
         };
         // §10do: a row arriving may be the winner a held edit waits for.
         if (self.rebase.count() > 0) self.rebase_due = true;
+        try self.recordAuthoritative(taa, table, st, data, false);
         self.forgetConfirmed(taa, table, st.pk, data);
     }
 
@@ -5693,6 +5718,7 @@ pub const SyncClient = struct {
                 };
                 if (e.ev.object.get("data")) |dv| {
                     try self.feedFloor(a, st, dv);
+                    try self.recordAuthoritative(a, table, st, dv, false);
                     self.forgetConfirmed(a, table, st.pk, dv);
                 }
             }
@@ -5923,6 +5949,9 @@ pub const SyncClient = struct {
             \\  state   TEXT NOT NULL DEFAULT 'pending'
             \\)
         );
+        // Independent confirmed state under a row's optimistic history. NULL data is
+        // certified absence; no record is unknown. `at` bounds later overlays.
+        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_base (tbl TEXT NOT NULL, row_id TEXT NOT NULL, at BIGINT NOT NULL, data TEXT, PRIMARY KEY(tbl,row_id))");
         // A refused write's local undo, owed until it is done (`runUndos`). `mode`: `restore`
         // (the before-image, or no row) for `rejected`, `delete` for `row_deleted`.
         try execDdl(&self.st,
@@ -5943,8 +5972,15 @@ pub const SyncClient = struct {
         );
         var fa = std.heap.ArenaAllocator.init(self.a);
         defer fa.deinit();
-        const m = try self.st.query(fa.allocator(), "SELECT max(m) FROM (SELECT max(created_at) AS m FROM _zebridge_outbox UNION ALL SELECT max(created_at) FROM _zbz_undo)", &.{});
+        const m = try self.st.query(fa.allocator(), "SELECT max(m) FROM (SELECT max(created_at) AS m FROM _zebridge_outbox UNION ALL SELECT max(created_at) FROM _zbz_undo UNION ALL SELECT max(at) FROM _zbz_base)", &.{});
         if (m.len > 0 and m[0][0] == .integer) self.last_created = @max(self.last_created, m[0][0].integer);
+        try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_row ON _zebridge_outbox (tbl, row_id, created_at)");
+        try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_undo_row ON _zbz_undo (tbl, row_id, created_at)");
+        // Owed undos only: `mode <> 'accepted'` on the row index read a row's whole accepted history.
+        // A speed-up, not a rule: an engine without partial indexes (DuckDB) goes without it.
+        execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_undo_owed ON _zbz_undo (tbl, row_id) WHERE mode <> 'accepted'") catch {};
+        self.baseline_active = (try self.st.query(fa.allocator(), "SELECT 1 FROM _zbz_base LIMIT 1", &.{})).len > 0;
+        self.ledger_active = try self.ledgerHasRows(fa.allocator());
         self.outbox_ready = true;
     }
 
@@ -6056,6 +6092,11 @@ pub const SyncClient = struct {
         // BEFORE the optimistic apply overwrites it, obviously.
         const before = try self.beforeImage(a, table, st, key);
         const authoritative = try self.beforeIsAuthoritative(a, table, st, row_id);
+        const before_json: storage.Value = if (before) |b| .{ .text = try core.valueToString(a, b) } else .null;
+        const created = self.nextCreated();
+        // No base copy here: until CDC says more, the authoritative before-image in the
+        // ledger IS the server's state (`recordAuthoritative` materializes one lazily).
+        self.ledger_active = true;
 
         // NON-FATAL, matching the TS client (its failed optimistic upsert is a log
         // line and the write still queues): the payload is valid ON THE WIRE — the
@@ -6082,7 +6123,6 @@ pub const SyncClient = struct {
         self.applyOptimistic(table, st, opt) catch {};
 
         const payload_json = try core.valueToString(a, payload);
-        const before_json: storage.Value = if (before) |b| .{ .text = try core.valueToString(a, b) } else .null;
         // The row's tenant: a public table's is the open tenant; a tenant-scoped one's is
         // its tenant column, from the write or the row it replaces.
         const row_tenant: storage.Value = blk: {
@@ -6100,9 +6140,9 @@ pub const SyncClient = struct {
             \\VALUES (?,?,?,?,?,?,?,?,0,0,?,?,?)
             \\ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1
         , &.{
-            .{ .text = msg_id },         .{ .text = subject }, .{ .text = payload_json },
-            .{ .text = table },          .{ .text = row_id },  before_json,
-            before_json,                 .{ .integer = self.nextCreated() }, row_tenant,
+            .{ .text = msg_id },                         .{ .text = subject },                        .{ .text = payload_json },
+            .{ .text = table },                          .{ .text = row_id },                         before_json,
+            before_json,                                 .{ .integer = created },                     row_tenant,
             .{ .text = try core.valueToString(a, opt) }, .{ .integer = @intFromBool(authoritative) },
         });
 
@@ -6400,7 +6440,9 @@ pub const SyncClient = struct {
         if (std.mem.eql(u8, status, "rejected") or std.mem.eql(u8, status, "row_deleted")) {
             try self.oweUndo(a, mid, if (std.mem.eql(u8, status, "row_deleted")) "delete" else "restore");
             self.runUndos();
-        } else _ = try self.st.query(a, "DELETE FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
+        } else if (ob.len > 0) { // another device's verdict (same principal): nothing here to settle
+            try self.settleAccepted(a, mid, std.mem.eql(u8, status, "accepted"));
+        }
         if (ob.len > 0) self.outbox_next_check_ms = 0;
         return true;
     }
@@ -6438,7 +6480,7 @@ pub const SyncClient = struct {
         if (own) |w| self.noteOutcome(a, mid, w.version, w.table, w.data, "indeterminate", &.{.{ "reason", .{ .string = reason } }});
     }
 
-    /// The writes still waiting for reconciliation.
+    /// Durable authoritative recovery still pending (indeterminate writes or missing undo baselines).
     pub fn reconcilingCount(self: *SyncClient, a: std.mem.Allocator) usize {
         const r = self.st.query(a, "SELECT count(*) FROM _zbz_reconcile", &.{}) catch return 0;
         if (r.len == 0 or r[0][0] != .integer) return 0;
@@ -6602,7 +6644,7 @@ pub const SyncClient = struct {
             const mid = if (r[0] == .text) r[0].text else "";
             const data: ?Value = if (r[6] == .text) parseStoredJson(a, r[6].text) catch null else null;
             log.info("libzb: {s} reconciled — the local copy is the authoritative state", .{mid});
-            self.noteOutcome(a, mid, if (r[5] == .text) r[5].text else "", if (r[1] == .text) r[1].text else "", data, "reconciled", &.{});
+            if (!std.mem.startsWith(u8, mid, "undo:")) self.noteOutcome(a, mid, if (r[5] == .text) r[5].text else "", if (r[1] == .text) r[1].text else "", data, "reconciled", &.{});
         }
     }
 
@@ -6626,9 +6668,9 @@ pub const SyncClient = struct {
     fn reapplyPending(self: *SyncClient, a: std.mem.Allocator, table: []const u8, tenant: []const u8, whole: bool) !void {
         const st = self.states.get(table) orelse return;
         const rows = if (whole)
-            try self.st.query(a, "SELECT msg_id, payload, optimistic, row_id FROM _zebridge_outbox WHERE tbl = ? ORDER BY created_at", &.{.{ .text = table }})
+            try self.st.query(a, "SELECT msg_id, payload, optimistic, row_id, created_at FROM _zebridge_outbox WHERE tbl = ? ORDER BY created_at", &.{.{ .text = table }})
         else
-            try self.st.query(a, "SELECT msg_id, payload, optimistic, row_id FROM _zebridge_outbox WHERE tbl = ? AND tenant = ? ORDER BY created_at", &.{ .{ .text = table }, .{ .text = tenant } });
+            try self.st.query(a, "SELECT msg_id, payload, optimistic, row_id, created_at FROM _zebridge_outbox WHERE tbl = ? AND tenant = ? ORDER BY created_at", &.{ .{ .text = table }, .{ .text = tenant } });
         // The first write re-applied on a row covers the seeded row: the server's state.
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         var applied: usize = 0;
@@ -6643,6 +6685,7 @@ pub const SyncClient = struct {
             const before = try self.beforeImage(a, table, st, key);
             const before_v: storage.Value = if (before) |b| .{ .text = try core.valueToString(a, b) } else .null;
             const first = !(try seen.getOrPut(a, if (r[3] == .text) r[3].text else "")).found_existing;
+            if (first and r[3] == .text and r[4] == .integer) try self.saveBaseline(a, table, r[3].text, r[4].integer, before_v);
             _ = try self.st.query(a, "UPDATE _zebridge_outbox SET before = ?, authoritative = ? WHERE msg_id = ?", &.{ before_v, .{ .integer = @intFromBool(first) }, r[0] });
             const opt = parseStoredJson(a, r[2].text) catch continue;
             self.applyOptimistic(table, st, opt) catch {};
@@ -6990,6 +7033,124 @@ pub const SyncClient = struct {
         self.undo_owed = true;
     }
 
+    fn saveBaseline(self: *SyncClient, a: std.mem.Allocator, table: []const u8, row_id: []const u8, at: i64, data: storage.Value) !void {
+        _ = try self.st.query(a, "INSERT INTO _zbz_base (tbl,row_id,at,data) VALUES (?,?,?,?) ON CONFLICT(tbl,row_id) DO UPDATE SET at=excluded.at,data=excluded.data", &.{ .{ .text = table }, .{ .text = row_id }, .{ .integer = at }, data });
+        self.baseline_active = true;
+    }
+
+    /// A CDC row for a key with writes in the ledger is the server's newest state: kept as
+    /// the base a rebuild starts from. Nothing is kept for the echo of a row's only write
+    /// (its verdict settles it), nor for a key with no writes. An UPDATE omits a column it
+    /// did not change (an unchanged TOAST value): taken from the newest trusted server copy
+    /// (the base, or the ledger's authoritative before-image), never from the displayed
+    /// row; with none, the row is recovered from the hub instead.
+    fn recordAuthoritative(self: *SyncClient, a: std.mem.Allocator, table: []const u8, st: TableState, data: Value, removed: bool) !void {
+        if (!self.ledger_active or data != .object or st.pk.len == 0) return;
+        var id: std.ArrayList(u8) = .empty;
+        for (st.pk, 0..) |col, i| {
+            if (i > 0) try id.append(a, '|');
+            try id.appendSlice(a, try core.scalarToString(a, data.object.get(col) orelse return));
+        }
+        const key: []const storage.Value = &.{ .{ .text = table }, .{ .text = id.items }, .{ .text = table }, .{ .text = id.items } };
+        const ledger = try self.st.query(a, "SELECT payload,1 FROM _zebridge_outbox WHERE tbl=? AND row_id=? UNION ALL SELECT payload,0 FROM _zbz_undo WHERE tbl=? AND row_id=? LIMIT 2", key);
+        if (ledger.len == 0) return;
+        if (ledger.len == 1 and ledger[0][1] == .integer and ledger[0][1].integer == 1 and !removed and try self.isEchoOf(a, st, data, ledger[0][0])) return;
+        var normalized = data;
+        try self.pgArrayFixup(a, st, &normalized);
+        if (removed) return self.saveBaseline(a, table, id.items, self.nextCreated(), .null);
+        var row: std.json.ObjectMap = .empty;
+        var prior: ?Value = null;
+        for (st.cols) |col| {
+            if (normalized.object.get(col)) |v| { // an explicit NULL overwrites; only omission is filled
+                try row.put(a, col, v);
+                continue;
+            }
+            if (prior == null) prior = try self.trustedPrior(a, table, id.items);
+            const v = if (prior) |p| (if (p == .object) p.object.get(col) else null) else null;
+            try row.put(a, col, v orelse return self.requestUndoRecovery(a, table, id.items));
+        }
+        try self.saveBaseline(a, table, id.items, self.nextCreated(), .{ .text = try core.valueToString(a, .{ .object = row }) });
+    }
+
+    /// Whether `data` carries the version stamp of the stored write `payload`: its own echo.
+    fn isEchoOf(self: *SyncClient, a: std.mem.Allocator, st: TableState, data: Value, payload: storage.Value) !bool {
+        _ = self;
+        const vc = st.version_col orelse return false;
+        const tc = st.tiebreak_col orelse return false;
+        const writer = data.object.get(tc) orelse return false;
+        if (writer != .string) return false;
+        const sv = data.object.get(vc) orelse return false;
+        if (sv != .string or payload != .text) return false;
+        const env = parseStoredJson(a, payload.text) catch return false;
+        const mine = if (env == .object) env.object.get("version") orelse return false else return false;
+        const client = if (env == .object) env.object.get("client_id") orelse return false else return false;
+        if (client != .string or client.string.len == 0 or !std.mem.eql(u8, client.string, writer.string)) return false;
+        if (mine != .string) return false;
+        return std.mem.eql(u8, try core.normalizeVersion(a, try core.pgTsToWire(a, sv.string)), try core.normalizeVersion(a, try core.pgTsToWire(a, mine.string)));
+    }
+
+    /// The newest server state known for a key: the base copy, or the before-image of its
+    /// newest authoritative write, whichever is later. Null when neither holds a row.
+    fn trustedPrior(self: *SyncClient, a: std.mem.Allocator, table: []const u8, row_id: []const u8) !?Value {
+        const r = try self.st.query(a,
+            \\SELECT data FROM (SELECT data, at AS t FROM _zbz_base WHERE tbl=? AND row_id=?
+            \\UNION ALL SELECT before, created_at FROM _zebridge_outbox WHERE tbl=? AND row_id=? AND authoritative=1
+            \\UNION ALL SELECT before, created_at FROM _zbz_undo WHERE tbl=? AND row_id=? AND authoritative=1) p ORDER BY t DESC LIMIT 1
+        , &.{ .{ .text = table }, .{ .text = row_id }, .{ .text = table }, .{ .text = row_id }, .{ .text = table }, .{ .text = row_id } });
+        if (r.len == 0 or r[0][0] != .text) return null;
+        return try parseStoredJson(a, r[0][0].text);
+    }
+
+    fn requestUndoRecovery(self: *SyncClient, a: std.mem.Allocator, table: []const u8, row_id: []const u8) !void {
+        // The original verdict remains final: this marker asks for state, not another write.
+        // Its tenant comes from the owed row, so multi-tenant handles recover that pair.
+        const mid = try std.fmt.allocPrint(a, "undo:{d}:{s}{s}", .{ table.len, table, row_id });
+        _ = try self.st.query(a, "INSERT INTO _zbz_reconcile (msg_id,tbl,tenant,reason,since,state) SELECT ?,tbl,tenant,'UndoNeedsBaseline',?,'pending' FROM (SELECT tbl,row_id,tenant FROM _zbz_undo UNION ALL SELECT tbl,row_id,tenant FROM _zebridge_outbox) u WHERE tbl=? AND row_id=? LIMIT 1 ON CONFLICT(msg_id) DO NOTHING", &.{ .{ .text = mid }, .{ .integer = nowMillis() }, .{ .text = table }, .{ .text = row_id } });
+    }
+
+    /// History left by a write settled elsewhere (an indeterminate one, a seed): once per undo pass.
+    fn pruneAccepted(self: *SyncClient, a: std.mem.Allocator) !void {
+        _ = try self.st.query(a,
+            \\DELETE FROM _zbz_undo WHERE mode = 'accepted'
+            \\AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox o WHERE o.tbl = _zbz_undo.tbl AND o.row_id = _zbz_undo.row_id)
+            \\AND NOT EXISTS (SELECT 1 FROM _zbz_undo u WHERE u.tbl = _zbz_undo.tbl AND u.row_id = _zbz_undo.row_id AND u.mode <> 'accepted')
+        , &.{});
+        if (self.baseline_active) _ = try self.st.query(a, "DELETE FROM _zbz_base WHERE NOT EXISTS (SELECT 1 FROM _zebridge_outbox o WHERE o.tbl=_zbz_base.tbl AND o.row_id=_zbz_base.row_id) AND NOT EXISTS (SELECT 1 FROM _zbz_undo u WHERE u.tbl=_zbz_base.tbl AND u.row_id=_zbz_base.row_id)", &.{});
+    }
+
+    /// Settle a write for retransmission (`accepted`, `stale`). An accepted one stays as
+    /// rollback history while another write on its row is pending or owed; either way the
+    /// row's history goes once nothing else is left on it. `accepted` records are not owed
+    /// undos and never count as work left to do. Every check is bound to the row's key: a
+    /// form correlated per history row cost O(depth) per verdict (1 ms at 5,000 stacked).
+    fn settleAccepted(self: *SyncClient, a: std.mem.Allocator, mid: []const u8, keep: bool) !void {
+        const Ctx = struct {
+            a: std.mem.Allocator,
+            mid: []const u8,
+            keep: bool,
+            bases: bool,
+            fn apply(cx: @This(), s: *storage.Storage) !void {
+                const ob = try s.query(cx.a, "SELECT tbl, row_id FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = cx.mid }});
+                if (ob.len == 0) return; // another device's write: nothing of it is here
+                const row: []const storage.Value = &.{ ob[0][0], ob[0][1] };
+                const others = (try s.query(cx.a, "SELECT 1 FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND msg_id <> ? LIMIT 1", &.{ row[0], row[1], .{ .text = cx.mid } })).len > 0;
+                const owed = (try s.query(cx.a, "SELECT 1 FROM _zbz_undo WHERE tbl = ? AND row_id = ? AND mode <> 'accepted' LIMIT 1", row)).len > 0;
+                if (cx.keep and (others or owed)) _ = try s.query(cx.a,
+                    \\INSERT INTO _zbz_undo (msg_id,tbl,row_id,tenant,payload,before,optimistic,created_at,authoritative,mode,since)
+                    \\SELECT msg_id,tbl,row_id,tenant,payload,before,optimistic,created_at,authoritative,'accepted',?
+                    \\FROM _zebridge_outbox WHERE msg_id = ? ON CONFLICT(msg_id) DO NOTHING
+                , &.{ .{ .integer = nowMillis() }, .{ .text = cx.mid } });
+                _ = try s.query(cx.a, "DELETE FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = cx.mid }});
+                if (!others and !owed) {
+                    _ = try s.query(cx.a, "DELETE FROM _zbz_undo WHERE tbl = ? AND row_id = ? AND mode = 'accepted'", row);
+                    if (cx.bases) _ = try s.query(cx.a, "DELETE FROM _zbz_base WHERE tbl = ? AND row_id = ?", row);
+                }
+            }
+        };
+        // `baseline_active` is recomputed once per undo pass, not per verdict.
+        try self.st.transaction(Ctx{ .a = a, .mid = mid, .keep = keep, .bases = self.baseline_active }, Ctx.apply);
+    }
+
     /// `created_at` orders this client's writes, on one row and in the outbox: strictly
     /// increasing, so two writes in one millisecond keep their order (`undoRow` rebuilds a
     /// row from the oldest before-image forward). Never read as a wall-clock age.
@@ -7001,7 +7162,7 @@ pub const SyncClient = struct {
 
     /// The undos still owed: a foreign key refused them while a dependent row was there.
     pub fn undoingCount(self: *SyncClient, a: std.mem.Allocator) usize {
-        const r = self.st.query(a, "SELECT count(*) FROM _zbz_undo", &.{}) catch return 0;
+        const r = self.st.query(a, "SELECT count(*) FROM _zbz_undo WHERE mode <> 'accepted'", &.{}) catch return 0;
         if (r.len == 0 or r[0][0] != .integer) return 0;
         return @intCast(r[0][0].integer);
     }
@@ -7016,10 +7177,11 @@ pub const SyncClient = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
+        self.pruneAccepted(a) catch return;
         var progress = true;
         while (progress) {
             progress = false;
-            const rows = self.st.query(a, "SELECT tbl, row_id, min(msg_id), max(attempts) FROM _zbz_undo GROUP BY tbl, row_id ORDER BY min(since)", &.{}) catch return;
+            const rows = self.st.query(a, "SELECT tbl, row_id, min(msg_id), max(attempts) FROM _zbz_undo WHERE mode <> 'accepted' GROUP BY tbl, row_id ORDER BY min(since)", &.{}) catch return;
             for (rows) |r| {
                 const table = if (r[0] == .text) r[0].text else continue;
                 const row_id = if (r[1] == .text) r[1].text else continue;
@@ -7027,6 +7189,9 @@ pub const SyncClient = struct {
                 const attempts: i64 = if (r[3] == .integer) r[3].integer else 0;
                 var why: []const u8 = "";
                 const res = self.undoRow(a, table, row_id, &why) catch |err| {
+                    if (err == error.AcceptedReplayNeedsBaseline) self.requestUndoRecovery(a, table, row_id) catch |e| {
+                        log.warn("{s}: could not persist undo recovery ({s}) — retried on the next pass", .{ table, @errorName(e) });
+                    };
                     _ = self.st.query(a, "UPDATE _zbz_undo SET attempts = attempts + 1 WHERE tbl = ? AND row_id = ?", &.{ .{ .text = table }, .{ .text = row_id } }) catch {};
                     if (attempts == 0) log.warn("libzb: local undo of {s} on '{s}' is blocked ({s}: {s}) — kept, retried after the next verdict", .{ mid, table, @errorName(err), why });
                     continue;
@@ -7045,6 +7210,10 @@ pub const SyncClient = struct {
             }
         }
         self.undo_owed = self.undoingCount(a) > 0;
+        self.baseline_active = (self.st.query(a, "SELECT 1 FROM _zbz_base LIMIT 1", &.{}) catch {
+            self.baseline_active = true;
+            return;
+        }).len > 0;
     }
 
     /// What one of this client's writes put on its row: its key, the data the optimistic apply
@@ -7090,6 +7259,44 @@ pub const SyncClient = struct {
         return !(try self.rowShows(a, table, st, try self.appliedOf(a, st, ws[0][0], ws[0][1])));
     }
 
+    /// An undo may delete its own row, never another row whose write is independently
+    /// judged. Make referential actions wait as NO ACTION would, without changing DDL.
+    /// The physical schema includes unfollowed children and compound/implicit FK keys.
+    fn assertUndoDeleteSafe(self: *SyncClient, a: std.mem.Allocator, table: []const u8, st: TableState, key: Value, why: *[]const u8) !void {
+        if (st.pk.len == 0 or key != .object) return error.IncompleteUndoKey;
+        var where: std.ArrayList(u8) = .empty;
+        var same: std.ArrayList(u8) = .empty;
+        const params = try a.alloc(storage.Value, st.pk.len);
+        for (st.pk, 0..) |col, i| {
+            const value = key.object.get(col) orelse return error.IncompleteUndoKey;
+            if (value == .null) return error.IncompleteUndoKey;
+            params[i] = try jsonToStorage(a, value);
+            const quoted = try std.mem.replaceOwned(u8, a, col, "\"", "\"\"");
+            if (i > 0) {
+                try where.appendSlice(a, " AND ");
+                try same.appendSlice(a, " AND ");
+            }
+            try where.appendSlice(a, try std.fmt.allocPrint(a, "p.\"{s}\" = ?", .{quoted}));
+            try same.appendSlice(a, try std.fmt.allocPrint(a, "c.\"{s}\" IS NOT DISTINCT FROM p.\"{s}\"", .{ quoted, quoted }));
+        }
+        // Prevent a new referencing INSERT between the probe and DELETE. SQLite's
+        // BEGIN IMMEDIATE already excludes other writers; PostgreSQL needs this row lock.
+        if (self.st.engine == .postgres) _ = try self.st.query(a, try std.fmt.allocPrint(a, "SELECT 1 FROM {s} p WHERE {s} FOR UPDATE", .{ table, where.items }), params);
+        const refs = try self.st.undoDeleteReferences(a, table);
+        for (refs) |r| {
+            if (r.len != 5 or r[0] != .text or r[1] != .text or r[2] != .text or r[3] != .integer or r[3].integer != 0 or r[4] != .integer) {
+                why.* = "local undo cannot verify referencing rows";
+                return error.UndoWouldCascade;
+            }
+            const self_filter = if (r[4].integer == 1) try std.fmt.allocPrint(a, " AND NOT ({s})", .{same.items}) else "";
+            const sql = try std.fmt.allocPrint(a, "SELECT 1 FROM {s} c JOIN {s} p ON {s} WHERE {s}{s} LIMIT 1", .{ r[0].text, r[2].text, r[1].text, where.items, self_filter });
+            if ((try self.st.query(a, sql, params)).len > 0) {
+                why.* = try std.fmt.allocPrint(a, "local undo would change dependent rows in {s} — waiting for their own verdicts or CDC", .{r[0].text});
+                return error.UndoWouldCascade;
+            }
+        }
+    }
+
     /// Settle every owed undo on one row. The row holds this client's writes on it in order:
     /// the pending ones (outbox) and the refused ones not yet undone (`_zbz_undo`). If it still
     /// shows what the LATEST of them applied, nothing has landed since: it is rebuilt from the
@@ -7122,7 +7329,7 @@ pub const SyncClient = struct {
                 // msg_id, payload, before, optimistic, owed, mode, created_at, authoritative — oldest first.
                 const ws = try s.query(cx.a,
                     \\SELECT msg_id, payload, before, optimistic, 0, '', created_at, authoritative FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?
-                    \\UNION ALL SELECT msg_id, payload, before, optimistic, 1, mode, created_at, authoritative FROM _zbz_undo WHERE tbl = ? AND row_id = ?
+                    \\UNION ALL SELECT msg_id, payload, before, optimistic, CASE WHEN mode = 'accepted' THEN 2 ELSE 1 END, mode, created_at, authoritative FROM _zbz_undo WHERE tbl = ? AND row_id = ?
                     \\ORDER BY 7, 1
                 , &.{ .{ .text = cx.table }, .{ .text = cx.row_id }, .{ .text = cx.table }, .{ .text = cx.row_id } });
                 if (ws.len == 0) return;
@@ -7137,23 +7344,70 @@ pub const SyncClient = struct {
                     // said the row is gone (`row_deleted`).
                     var gone = false;
                     for (ws) |w| gone = gone or (w[4] == .integer and w[4].integer == 1 and w[5] == .text and std.mem.eql(u8, w[5].text, "delete"));
-                    const base: ?Value = if (gone or ws[from][2] != .text) null else try parseStoredJson(cx.a, ws[from][2].text);
-                    if (base) |b|
-                        try step(cx, s, try core.planUpsert(cx.a, cx.table, pk, b))
-                    else
+                    const bases = try s.query(cx.a, "SELECT at,data FROM _zbz_base WHERE tbl=? AND row_id=?", &.{ .{ .text = cx.table }, .{ .text = cx.row_id } });
+                    var stored_base = ws[from][2];
+                    if (bases.len > 0 and bases[0][0] == .integer and ws[from][6] == .integer and bases[0][0].integer >= ws[from][6].integer) {
+                        stored_base = bases[0][1];
+                        from = ws.len;
+                        for (ws, 0..) |w, i| {
+                            if (w[6] == .integer and w[6].integer >= bases[0][0].integer) {
+                                from = i;
+                                break;
+                            }
+                        }
+                    }
+                    const base: ?Value = if (gone or stored_base != .text) null else try parseStoredJson(cx.a, stored_base.text);
+                    if (base) |b| {
+                        try step(cx, s, try core.planUpsert(cx.a, cx.table, pk, b));
+                    } else {
+                        try cx.c.assertUndoDeleteSafe(cx.a, cx.table, cx.st, last.key, cx.why);
                         try step(cx, s, try core.planDelete(cx.a, cx.table, pk, last.key));
+                    }
                     var first = true;
                     for (ws[from..]) |w| {
-                        if (w[4] != .integer or w[4].integer == 1 or w[3] != .text) continue;
+                        if (w[4] != .integer or w[4].integer == 1) continue;
+                        if (w[3] != .text) {
+                            if (w[4].integer == 2) {
+                                cx.why.* = "accepted write needs an authoritative baseline — undo remains owed";
+                                return error.AcceptedReplayNeedsBaseline;
+                            }
+                            continue; // a legacy pending write still waits for its verdict or echo
+                        }
                         const pw = try cx.c.appliedOf(cx.a, cx.st, w[1], .null);
                         const before = try cx.c.beforeImage(cx.a, cx.table, cx.st, pw.key);
                         const before_v: storage.Value = if (before) |b| .{ .text = try core.valueToString(cx.a, b) } else .null;
-                        _ = try s.query(cx.a, "UPDATE _zebridge_outbox SET before = ?, authoritative = ? WHERE msg_id = ?", &.{ before_v, .{ .integer = @intFromBool(first) }, w[0] });
-                        first = false;
-                        try cx.c.applyOptimistic(cx.table, cx.st, try parseStoredJson(cx.a, w[3].text));
+                        if (w[4].integer == 0) {
+                            _ = try s.query(cx.a, "UPDATE _zebridge_outbox SET before = ?, authoritative = ? WHERE msg_id = ?", &.{ before_v, .{ .integer = @intFromBool(first) }, w[0] });
+                            first = false;
+                        }
+                        const replay = try cx.c.appliedOf(cx.a, cx.st, w[1], w[3]);
+                        const ev = try parseStoredJson(cx.a, w[3].text);
+                        // A pending UPDATE cannot create a row during rollback. Accepted
+                        // history is different: local absence says nothing about the server.
+                        // Reconstruct a complete row or leave a durable undo obligation.
+                        const op = if (ev.object.get("operation")) |o| (if (o == .string) o.string else "") else "";
+                        if (before == null and !replay.removed and std.mem.eql(u8, op, "UPDATE")) {
+                            if (w[4].integer == 0) continue;
+                            const columns = try s.tableColumns(cx.a, cx.table);
+                            var complete = columns.len > 0 and replay.data == .object;
+                            for (columns) |col| {
+                                if (replay.data != .object or replay.data.object.get(col) == null) complete = false;
+                            }
+                            if (!complete) {
+                                cx.why.* = "accepted write needs an authoritative baseline — undo remains owed";
+                                return error.AcceptedReplayNeedsBaseline;
+                            }
+                        }
+                        if (replay.removed) try cx.c.assertUndoDeleteSafe(cx.a, cx.table, cx.st, replay.key, cx.why);
+                        cx.c.applyOptimistic(cx.table, cx.st, ev) catch |err| {
+                            cx.why.* = cx.a.dupe(u8, s.errMsg()) catch "";
+                            return err;
+                        };
                     }
                 }
-                _ = try s.query(cx.a, "DELETE FROM _zbz_undo WHERE tbl = ? AND row_id = ?", &.{ .{ .text = cx.table }, .{ .text = cx.row_id } });
+                _ = try s.query(cx.a, "DELETE FROM _zbz_undo WHERE tbl = ? AND row_id = ? AND mode <> 'accepted'", &.{ .{ .text = cx.table }, .{ .text = cx.row_id } });
+                _ = try s.query(cx.a, "DELETE FROM _zbz_undo WHERE tbl = ? AND row_id = ? AND mode = 'accepted' AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?)", &.{ .{ .text = cx.table }, .{ .text = cx.row_id }, .{ .text = cx.table }, .{ .text = cx.row_id } });
+                _ = try s.query(cx.a, "DELETE FROM _zbz_base WHERE tbl=? AND row_id=? AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox WHERE tbl=? AND row_id=?)", &.{ .{ .text = cx.table }, .{ .text = cx.row_id }, .{ .text = cx.table }, .{ .text = cx.row_id } });
             }
         };
         var owned = false;
@@ -7639,6 +7893,7 @@ test "measurement: isolated replay counts committed outcomes and excludes events
     const a = arena.allocator();
     // Only the storage/apply fields are used: no NATS connection or acknowledgments.
     var client: SyncClient = undefined;
+    client.baseline_active = false;
     client.confirmed = .{};
     client.a = a;
     client.st = try storage.Storage.open(":memory:");
@@ -7687,6 +7942,7 @@ test "measurement: isolated replay counts committed outcomes and excludes events
 /// A client with storage and routes only, for the frontier tests: no NATS, no tails.
 fn frontierClient(a: std.mem.Allocator) !SyncClient {
     var client: SyncClient = undefined;
+    client.baseline_active = false;
     client.confirmed = .{};
     client.a = a;
     client.arena = std.heap.ArenaAllocator.init(a);
@@ -7996,12 +8252,18 @@ test "outbox: a dropped or re-keyed table takes its queued writes with it" {
 
 fn undoTestClient(a: std.mem.Allocator, path: [:0]const u8) !SyncClient {
     var client: SyncClient = undefined;
+    client.baseline_active = false;
     client.a = a;
     client.st = try storage.Storage.open(path);
     client.states = .empty;
     client.outbox_ready = false;
+    client.confirmed = .{};
     client.undo_owed = true;
     client.last_created = 0;
+    client.outcomes = .empty; // settleVerdict reports into it
+    client.verdict_counts = .{};
+    client.rebase = .empty;
+    client.seen_floor = ""; // feedFloor reads it once a table has a version column
     try client.ensureOutbox();
     try client.st.execSimple("CREATE TABLE IF NOT EXISTS p (id TEXT PRIMARY KEY, title TEXT)");
     try client.st.execSimple("CREATE TABLE IF NOT EXISTS c (id TEXT PRIMARY KEY, pid TEXT NOT NULL REFERENCES p(id))");
@@ -8026,9 +8288,11 @@ fn undoTestWrite(cl: *SyncClient, a: std.mem.Allocator, msg: []const u8, table: 
     try cl.applyOptimistic(table, st, (try std.json.parseFromSlice(Value, a, opt_text, .{})).value);
     const payload = try std.fmt.allocPrint(a, "{{\"operation\":\"{s}\",\"key\":{{\"id\":\"{s}\"}},\"data\":{{\"{s}\":\"{s}\"}}}}", .{ op, id, col, val });
     const before_v: storage.Value = if (before) |b| .{ .text = try core.valueToString(a, b) } else .null;
+    const created = cl.nextCreated();
+    cl.ledger_active = true; // as `mutate`: no base copy until CDC brings one
     _ = try cl.st.query(a, "INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at, optimistic, authoritative) VALUES (?, 's', ?, ?, ?, ?, ?, ?, ?)", &.{
-        .{ .text = msg },                              .{ .text = payload },         .{ .text = table }, .{ .text = id }, before_v,
-        .{ .integer = cl.nextCreated() }, .{ .text = opt_text }, .{ .integer = @intFromBool(authoritative) },
+        .{ .text = msg },        .{ .text = payload },  .{ .text = table },                          .{ .text = id }, before_v,
+        .{ .integer = created }, .{ .text = opt_text }, .{ .integer = @intFromBool(authoritative) },
     });
 }
 
@@ -8109,11 +8373,13 @@ test "undo: two refused writes on one row leave no trace in either order; a spar
     var cl = try undoTestClient(a, ":memory:");
     defer cl.st.close();
 
-    // INSERT A then UPDATE B, A refused first: B still pending, rebuilt over A's base (no row)…
+    // INSERT A then UPDATE B, A refused first: the base is no row, and B (still pending) has
+    // nothing to update — upstream either — so no partial row is made from its sparse data…
     try undoTestWrite(&cl, a, "a1", "p", "INSERT", "x1", "title", "A");
     try undoTestWrite(&cl, a, "b1", "p", "UPDATE", "x1", "title", "B");
     try undoTestReject(&cl, a, "a1");
-    try std.testing.expectEqualStrings("B", (try undoTestTitle(&cl, a, "x1")).?);
+    try std.testing.expect(!try undoTestHas(&cl, a, "p", "x1"));
+    try std.testing.expectEqual(@as(usize, 1), (try cl.st.query(a, "SELECT 1 FROM _zebridge_outbox WHERE msg_id = 'b1'", &.{})).len);
     try undoTestReject(&cl, a, "b1"); // …then B refused: nothing of either stays.
     try std.testing.expect(!try undoTestHas(&cl, a, "p", "x1"));
 
@@ -9430,4 +9696,503 @@ test "two stale edits on one row both settle: the confirmed row outlives the fir
     // without the kept row, edit 2 would wait for a winner that never comes.
     const lone = try oldestBase(a, over1, 1, &.{}, null);
     try std.testing.expect(try rebaseDecision(a, shown, lone.base, saw, try parseStoredJson(a, "{\"notes\":\"x\"}"), "updated_at", v2, &.{v2}) == .wait);
+}
+
+test "undo: accepted middle writes survive surrounding refusals across restart" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/tmp/zb-accepted-middle-test.sqlite3";
+    for ([_]bool{ false, true }) |restart| {
+        for ([_]bool{ false, true }) |reverse| {
+            for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+            var cl = try undoTestClient(a, path);
+            _ = try cl.st.query(a, "INSERT INTO p VALUES ('x','original')", &.{});
+            try undoTestWrite(&cl, a, "a", "p", "UPDATE", "x", "title", "A");
+            _ = try cl.st.query(a, "UPDATE p SET title = 'server' WHERE id = 'x'", &.{});
+            try undoTestWrite(&cl, a, "b", "p", "UPDATE", "x", "title", "B");
+            try undoTestWrite(&cl, a, "c", "p", "UPDATE", "x", "title", "C");
+            _ = try cl.settleVerdict(a, "b", "{\"status\":\"accepted\"}"); // through the dispatch, as a verdict arrives
+            try std.testing.expectEqual(@as(usize, 0), cl.undoingCount(a));
+            if (restart) {
+                cl.st.close();
+                cl = try undoTestClient(a, path);
+            }
+            try undoTestReject(&cl, a, if (reverse) "c" else "a");
+            try undoTestReject(&cl, a, if (reverse) "a" else "c");
+            try std.testing.expectEqualStrings("B", (try undoTestTitle(&cl, a, "x")).?);
+            try std.testing.expectEqual(@as(usize, 0), cl.undoingCount(a));
+            const history = try cl.st.query(a, "SELECT count(*) FROM _zbz_undo", &.{});
+            try std.testing.expectEqual(@as(i64, 0), history[0][0].integer);
+            cl.st.close();
+        }
+    }
+}
+
+test "undo: CASCADE preserves independent descendants across restart and temporary rebuilds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/tmp/zb-undo-cascade.sqlite3";
+    for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+    var cl = try undoTestClient(a, path);
+    try cl.st.execSimple("DROP TABLE c");
+    try cl.st.execSimple("CREATE TABLE c(id TEXT PRIMARY KEY,pid TEXT REFERENCES p(id) ON DELETE CASCADE)");
+    try cl.st.execSimple("CREATE TABLE g(id TEXT PRIMARY KEY,pid TEXT REFERENCES c(id) ON DELETE CASCADE)");
+    try cl.states.put(a, "g", cl.states.get("c").?);
+    try undoTestWrite(&cl, a, "p", "p", "INSERT", "p", "title", "refused");
+    try undoTestWrite(&cl, a, "c", "c", "INSERT", "c", "pid", "p");
+    try undoTestWrite(&cl, a, "g", "g", "INSERT", "g", "pid", "c");
+    try undoTestReject(&cl, a, "p");
+    try std.testing.expect(try undoTestHas(&cl, a, "p", "p"));
+    try std.testing.expect(try undoTestHas(&cl, a, "c", "c"));
+    try std.testing.expect(try undoTestHas(&cl, a, "g", "g"));
+    try std.testing.expectEqual(@as(usize, 1), cl.undoingCount(a));
+    cl.st.close();
+    cl = try undoTestClient(a, path);
+    defer cl.st.close();
+    try cl.states.put(a, "g", cl.states.get("c").?);
+    cl.runUndos();
+    try undoTestReject(&cl, a, "c");
+    try std.testing.expect(try undoTestHas(&cl, a, "g", "g"));
+    try std.testing.expectEqual(@as(usize, 2), cl.undoingCount(a));
+    try undoTestReject(&cl, a, "g");
+    try std.testing.expect(!try undoTestHas(&cl, a, "p", "p"));
+    try std.testing.expect(!try undoTestHas(&cl, a, "c", "c"));
+    try std.testing.expect(!try undoTestHas(&cl, a, "g", "g"));
+    try std.testing.expectEqual(@as(usize, 0), cl.undoingCount(a));
+
+    // A row rebuild deletes then re-inserts the parent; the child must survive that too.
+    try undoTestWrite(&cl, a, "a", "p", "INSERT", "p", "title", "A");
+    try undoTestWrite(&cl, a, "b", "p", "UPDATE", "p", "title", "B");
+    try undoTestWrite(&cl, a, "child", "c", "INSERT", "child", "pid", "p");
+    try undoTestReject(&cl, a, "a");
+    try std.testing.expectEqualStrings("B", (try undoTestTitle(&cl, a, "p")).?);
+    try std.testing.expect(try undoTestHas(&cl, a, "c", "child"));
+    _ = cl.states.swapRemove("c"); // physical, unfollowed children still count
+    try undoTestReject(&cl, a, "b");
+    try std.testing.expect(try undoTestHas(&cl, a, "c", "child"));
+    _ = try cl.st.query(a, "DELETE FROM c WHERE id = 'child'", &.{}); // CDC
+    cl.runUndos();
+    try std.testing.expect(!try undoTestHas(&cl, a, "p", "p"));
+    try std.testing.expectEqual(@as(usize, 0), cl.undoingCount(a));
+}
+
+fn undoCascadePhysicalKeys(a: std.mem.Allocator, pg_url: ?[*:0]const u8) !void {
+    var cl = try undoTestClient(a, ":memory:");
+    if (pg_url) |url| {
+        cl.st.close();
+        cl.st = try storage.Storage.openPostgres(url, false);
+        cl.outbox_ready = false;
+        try cl.ensureOutbox();
+    }
+    defer cl.st.close();
+    try cl.st.execSimple("DROP TABLE IF EXISTS c");
+    try cl.st.execSimple("DROP TABLE IF EXISTS p");
+    try cl.st.execSimple("CREATE TABLE p(region TEXT,id TEXT,title TEXT,PRIMARY KEY(region,id))");
+    try cl.st.execSimple("CREATE TABLE c(id TEXT PRIMARY KEY,region TEXT,pid TEXT,FOREIGN KEY(region,pid) REFERENCES p ON DELETE CASCADE)");
+    var spec = cl.states.get("p").?;
+    spec.pk = &.{ "region", "id" };
+    spec.cols = &.{ "region", "id", "title" };
+    try cl.states.put(a, "p", spec);
+    _ = cl.states.swapRemove("c"); // the physical child is deliberately unfollowed
+    try cl.st.execSimple("INSERT INTO p VALUES('other','p','other'),('own','p','refused')");
+    try cl.st.execSimple("INSERT INTO c VALUES('other','other','p'),('own','own','p')");
+    const payload = "{\"operation\":\"INSERT\",\"key\":{\"region\":\"own\",\"id\":\"p\"},\"data\":{\"region\":\"own\",\"id\":\"p\",\"title\":\"refused\"}}";
+    _ = try cl.st.query(a, "INSERT INTO _zebridge_outbox(msg_id,subject,payload,tbl,row_id,created_at,optimistic,authoritative) VALUES('p','s',?,'p','own|p',?,?,1)", &.{ .{ .text = payload }, .{ .integer = cl.nextCreated() }, .{ .text = payload } });
+    try undoTestReject(&cl, a, "p");
+    try std.testing.expectEqual(@as(usize, 1), cl.undoingCount(a));
+    const children = try cl.st.query(a, "SELECT count(*) FROM c", &.{});
+    try std.testing.expectEqual(@as(i64, 2), children[0][0].integer);
+    try cl.st.execSimple("DELETE FROM c WHERE id = 'own'");
+    cl.runUndos();
+    try std.testing.expectEqual(@as(usize, 0), (try cl.st.query(a, "SELECT 1 FROM p WHERE region = 'own'", &.{})).len);
+    try std.testing.expectEqual(@as(usize, 1), (try cl.st.query(a, "SELECT 1 FROM c WHERE id = 'other'", &.{})).len);
+    try std.testing.expectEqual(@as(usize, 0), cl.undoingCount(a));
+
+    try cl.st.execSimple("DROP TABLE c");
+    try cl.st.execSimple("DROP TABLE p");
+    try cl.st.execSimple("CREATE TABLE p(id TEXT PRIMARY KEY,title TEXT,pid TEXT REFERENCES p(id) ON DELETE CASCADE)");
+    spec.pk = &.{"id"};
+    spec.cols = &.{ "id", "title", "pid" };
+    try cl.states.put(a, "p", spec);
+    try cl.st.execSimple("INSERT INTO p VALUES('self','refused','self')");
+    const self_payload = "{\"operation\":\"INSERT\",\"key\":{\"id\":\"self\"},\"data\":{\"id\":\"self\",\"title\":\"refused\",\"pid\":\"self\"}}";
+    _ = try cl.st.query(a, "INSERT INTO _zebridge_outbox(msg_id,subject,payload,tbl,row_id,created_at,optimistic,authoritative) VALUES('self','s',?,'p','self',?,?,1)", &.{ .{ .text = self_payload }, .{ .integer = cl.nextCreated() }, .{ .text = self_payload } });
+    try undoTestReject(&cl, a, "self");
+    try std.testing.expectEqual(@as(usize, 0), (try cl.st.query(a, "SELECT 1 FROM p", &.{})).len);
+    try std.testing.expectEqual(@as(usize, 0), cl.undoingCount(a));
+}
+
+test "undo: physical CASCADE compound implicit keys and self references (optional PostgreSQL replica)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try undoCascadePhysicalKeys(arena.allocator(), null);
+    if (std.c.getenv("ZB_UNDO_CASCADE_PG_URL")) |url| try undoCascadePhysicalKeys(arena.allocator(), url);
+}
+
+test "undo: accepted history goes when the row's last write settles otherwise, and a deep stack stays cheap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cl = try undoTestClient(a, ":memory:");
+    defer cl.st.close();
+    _ = try cl.st.query(a, "INSERT INTO p VALUES ('x','original')", &.{});
+    try undoTestWrite(&cl, a, "a", "p", "UPDATE", "x", "title", "A");
+    try undoTestWrite(&cl, a, "b", "p", "UPDATE", "x", "title", "B");
+    try undoTestWrite(&cl, a, "c", "p", "UPDATE", "x", "title", "C");
+    _ = try cl.settleVerdict(a, "b", "{\"status\":\"accepted\"}");
+    try std.testing.expectEqual(@as(i64, 1), (try cl.st.query(a, "SELECT count(*) FROM _zbz_undo WHERE mode = 'accepted'", &.{}))[0][0].integer);
+    // `a` and `c` settle without a verdict that keeps history (stale, indeterminate…): the row is done.
+    try cl.settleAccepted(a, "a", false);
+    try std.testing.expectEqual(@as(i64, 1), (try cl.st.query(a, "SELECT count(*) FROM _zbz_undo", &.{}))[0][0].integer);
+    try cl.settleAccepted(a, "c", false);
+    try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT count(*) FROM _zbz_undo", &.{}))[0][0].integer);
+    try std.testing.expectEqualStrings("C", (try undoTestTitle(&cl, a, "x")).?);
+}
+
+test "undo: a rebuild that replays a pending DELETE waits for a CASCADE child, then settles" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cl = try undoTestClient(a, ":memory:");
+    defer cl.st.close();
+    try cl.st.execSimple("DROP TABLE c");
+    try cl.st.execSimple("CREATE TABLE c(id TEXT PRIMARY KEY,pid TEXT REFERENCES p(id) ON DELETE CASCADE)");
+    _ = try cl.st.query(a, "INSERT INTO p VALUES ('x','original')", &.{});
+    try undoTestWrite(&cl, a, "a", "p", "UPDATE", "x", "title", "A");
+    try undoTestWrite(&cl, a, "d", "p", "DELETE", "x", "title", "A");
+    // A child the replica received with its keys off (a seed's bulk load): the parent is
+    // absent locally (the pending DELETE), and the rebuild brings it back before replaying.
+    try cl.st.execSimple("PRAGMA foreign_keys = OFF");
+    try cl.st.execSimple("INSERT INTO c VALUES ('kid','x')");
+    try cl.st.execSimple("PRAGMA foreign_keys = ON");
+    try undoTestReject(&cl, a, "a");
+    try std.testing.expect(try undoTestHas(&cl, a, "c", "kid")); // the replayed DELETE did not cascade
+    try std.testing.expectEqual(@as(usize, 1), cl.undoingCount(a));
+    _ = try cl.st.query(a, "DELETE FROM c WHERE id = 'kid'", &.{}); // CDC
+    cl.runUndos();
+    try std.testing.expectEqual(@as(usize, 0), cl.undoingCount(a));
+    try std.testing.expect(!try undoTestHas(&cl, a, "p", "x")); // the pending DELETE still shows
+}
+
+test "undo: a refused INSERT's rebuild does not replay a pending sparse UPDATE onto the absent row (NOT NULL column)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cl = try undoTestClient(a, ":memory:");
+    defer cl.st.close();
+    // dependent_writes.py §5: the replay's upsert of {id, title} failed NOT NULL and blocked the undo.
+    try cl.st.execSimple("DROP TABLE c");
+    try cl.st.execSimple("DROP TABLE p");
+    try cl.st.execSimple("CREATE TABLE p (id TEXT PRIMARY KEY, title TEXT, tenant TEXT NOT NULL)");
+    try undoTestWrite(&cl, a, "i", "p", "INSERT", "x", "tenant", "t1");
+    try undoTestWrite(&cl, a, "u", "p", "UPDATE", "x", "title", "edited");
+    try undoTestReject(&cl, a, "i");
+    try std.testing.expectEqual(@as(usize, 0), cl.undoingCount(a));
+    try std.testing.expect(!try undoTestHas(&cl, a, "p", "x"));
+    const pend = try cl.st.query(a, "SELECT before, authoritative FROM _zebridge_outbox WHERE msg_id = 'u'", &.{});
+    try std.testing.expect(pend.len == 1 and pend[0][0] == .null and pend[0][1].integer == 1); // left for its own verdict
+}
+
+test "undo: history left by an indeterminate write goes at the next undo pass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cl = try undoTestClient(a, ":memory:");
+    defer cl.st.close();
+    _ = try cl.st.query(a, "INSERT INTO p VALUES ('x','original')", &.{});
+    try undoTestWrite(&cl, a, "a", "p", "UPDATE", "x", "title", "A");
+    try undoTestWrite(&cl, a, "b", "p", "UPDATE", "x", "title", "B");
+    _ = try cl.settleVerdict(a, "b", "{\"status\":\"accepted\"}");
+    try cl.settleIndeterminate(a, "a", "x", null);
+    cl.runUndos();
+    try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT count(*) FROM _zbz_undo", &.{}))[0][0].integer);
+}
+
+test "undo: accepted middle UPDATE survives an absent baseline across restart and refusal orders" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/tmp/zb-absent-middle.sqlite3";
+    for ([_]bool{ false, true }) |restart| {
+        for ([_]bool{ false, true }) |reverse| {
+            for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+            var cl = try undoTestClient(a, path);
+            defer cl.st.close();
+            try undoTestWrite(&cl, a, "a", "p", "INSERT", "x", "title", "A");
+            try undoTestWrite(&cl, a, "b", "p", "UPDATE", "x", "title", "B");
+            try undoTestWrite(&cl, a, "c", "p", "UPDATE", "x", "title", "C");
+            _ = try cl.settleVerdict(a, "b", "{\"status\":\"accepted\"}");
+            if (restart) {
+                cl.st.close();
+                cl = try undoTestClient(a, path);
+            }
+            try undoTestReject(&cl, a, if (reverse) "c" else "a");
+            try undoTestReject(&cl, a, if (reverse) "a" else "c");
+            try std.testing.expect(try undoTestHas(&cl, a, "p", "x"));
+            try std.testing.expectEqualStrings("B", (try undoTestTitle(&cl, a, "x")).?);
+            try std.testing.expectEqual(@as(usize, 0), cl.undoingCount(a));
+            try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT count(*) FROM _zebridge_outbox", &.{}))[0][0].integer);
+            try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT count(*) FROM _zbz_undo", &.{}))[0][0].integer);
+        }
+    }
+}
+
+test "undo: sparse accepted history remains owed through restart until a seed provides the missing column" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/tmp/zb-absent-sparse.sqlite3";
+    for ([_]bool{ false, true }) |required| {
+        for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+        var cl = try undoTestClient(a, path);
+        defer cl.st.close();
+        try cl.st.execSimple("DROP TABLE c");
+        try cl.st.execSimple("DROP TABLE p");
+        try cl.st.execSimple(if (required) "CREATE TABLE p(id TEXT PRIMARY KEY,title TEXT,tenant TEXT NOT NULL)" else "CREATE TABLE p(id TEXT PRIMARY KEY,title TEXT,tenant TEXT)");
+        var spec = cl.states.get("p").?;
+        spec.cols = &.{ "id", "title", "tenant" };
+        try cl.states.put(a, "p", spec);
+        try undoTestWrite(&cl, a, "a", "p", "INSERT", "x", "tenant", "local");
+        try undoTestWrite(&cl, a, "b", "p", "UPDATE", "x", "title", "B");
+        try undoTestWrite(&cl, a, "c", "p", "UPDATE", "x", "title", "C");
+        _ = try cl.settleVerdict(a, "b", "{\"status\":\"accepted\"}");
+        try undoTestReject(&cl, a, "a");
+        try std.testing.expectEqual(@as(usize, 1), cl.undoingCount(a));
+        try std.testing.expectEqualStrings("C", (try undoTestTitle(&cl, a, "x")).?);
+        try std.testing.expectEqual(@as(i64, 1), (try cl.st.query(a, "SELECT count(*) FROM _zbz_undo WHERE mode='accepted'", &.{}))[0][0].integer);
+        cl.st.close();
+        cl = try undoTestClient(a, path);
+        try cl.states.put(a, "p", spec);
+        cl.runUndos();
+        try std.testing.expectEqual(@as(usize, 1), cl.undoingCount(a));
+        _ = try cl.st.query(a, "UPDATE p SET title='server B',tenant='server' WHERE id='x'", &.{});
+        try cl.reapplyPending(a, "p", "", true);
+        try std.testing.expectEqualStrings("C", (try undoTestTitle(&cl, a, "x")).?);
+        try undoTestReject(&cl, a, "c");
+        try std.testing.expectEqualStrings("server B", (try undoTestTitle(&cl, a, "x")).?);
+        try std.testing.expectEqualStrings("server", (try cl.st.query(a, "SELECT tenant FROM p WHERE id='x'", &.{}))[0][0].text);
+        try std.testing.expectEqual(@as(usize, 0), cl.undoingCount(a));
+        try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT count(*) FROM _zbz_undo", &.{}))[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT count(*) FROM _zebridge_outbox", &.{}))[0][0].integer);
+    }
+}
+
+test "undo: the confirmed baseline is the ledger's authoritative before-image, across overlays and reopen" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/tmp/zb-confirmed-base.sqlite3";
+    for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+    var cl = try undoTestClient(a, path);
+    defer cl.st.close();
+    try cl.st.execSimple("INSERT INTO p VALUES('x','server')");
+    try undoTestWrite(&cl, a, "a", "p", "UPDATE", "x", "title", "A");
+    try undoTestWrite(&cl, a, "b", "p", "UPDATE", "x", "title", "B");
+    try cl.st.execSimple("UPDATE p SET title='new server' WHERE id='x'");
+    try undoTestWrite(&cl, a, "c", "p", "UPDATE", "x", "title", "C");
+    // Lazy: no copy is written for a write; c's authoritative before-image holds "new server".
+    try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT count(*) FROM _zbz_base", &.{}))[0][0].integer);
+    cl.st.close();
+    cl = try undoTestClient(a, path);
+    for ([_][]const u8{ "a", "b", "c" }) |mid| try undoTestReject(&cl, a, mid);
+    try std.testing.expect(try undoTestHas(&cl, a, "p", "x"));
+    try std.testing.expectEqualStrings("new server", (try undoTestTitle(&cl, a, "x")).?);
+    cl.runUndos();
+    try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT count(*) FROM _zbz_base", &.{}))[0][0].integer);
+}
+
+test "undo: missing accepted baseline requests durable recovery with no pending writes after restart" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/tmp/zb-missing-base.sqlite3";
+    for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+    var cl = try undoTestClient(a, path);
+    defer cl.st.close();
+    try cl.st.execSimple("DROP TABLE c");
+    try cl.st.execSimple("DROP TABLE p");
+    try cl.st.execSimple("CREATE TABLE p(id TEXT PRIMARY KEY,title TEXT,tenant TEXT NOT NULL)");
+    var spec = cl.states.get("p").?;
+    spec.cols = &.{ "id", "title", "tenant" };
+    try cl.states.put(a, "p", spec);
+    try undoTestWrite(&cl, a, "a", "p", "INSERT", "x", "tenant", "local");
+    try undoTestWrite(&cl, a, "b", "p", "UPDATE", "x", "title", "B");
+    try undoTestWrite(&cl, a, "c", "p", "UPDATE", "x", "title", "C");
+    _ = try cl.settleVerdict(a, "b", "{\"status\":\"accepted\"}");
+    try undoTestReject(&cl, a, "a");
+    try undoTestReject(&cl, a, "c");
+    try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT count(*) FROM _zebridge_outbox", &.{}))[0][0].integer);
+    try std.testing.expectEqual(@as(i64, 1), (try cl.st.query(a, "SELECT count(*) FROM _zbz_reconcile WHERE reason='UndoNeedsBaseline' AND state='pending'", &.{}))[0][0].integer);
+    cl.st.close();
+    cl = try undoTestClient(a, path);
+    try cl.states.put(a, "p", spec);
+    cl.runUndos();
+    try std.testing.expectEqual(@as(usize, 2), cl.undoingCount(a));
+    try std.testing.expectEqual(@as(i64, 1), (try cl.st.query(a, "SELECT count(*) FROM _zbz_reconcile", &.{}))[0][0].integer);
+}
+
+test "undo: authoritative CDC identical to an overlay survives refusals and restart" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/tmp/zb-cdc-base.sqlite3";
+    for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+    var cl = try undoTestClient(a, path);
+    defer cl.st.close();
+    try cl.st.execSimple("INSERT INTO p VALUES('x','server')");
+    try undoTestWrite(&cl, a, "a", "p", "UPDATE", "x", "title", "A");
+    try undoTestWrite(&cl, a, "b", "p", "UPDATE", "x", "title", "B");
+    try undoTestWrite(&cl, a, "c", "p", "UPDATE", "x", "title", "C");
+    _ = try cl.settleVerdict(a, "b", "{\"status\":\"accepted\"}");
+    const ev = try parseStoredJson(a, "{\"operation\":\"UPDATE\",\"data\":{\"id\":\"x\",\"title\":\"C\"}}");
+    try cl.applyEvent("p", ev, "", 0);
+    const saved = (try cl.st.query(a, "SELECT data FROM _zbz_base WHERE row_id='x'", &.{}))[0][0].text;
+    try std.testing.expectEqualStrings("C", (try parseStoredJson(a, saved)).object.get("title").?.string);
+    const saved_at = (try cl.st.query(a, "SELECT at FROM _zbz_base WHERE row_id='x'", &.{}))[0][0].integer;
+    cl.st.close();
+    cl = try undoTestClient(a, path);
+    try std.testing.expect(cl.last_created >= saved_at);
+    try undoTestReject(&cl, a, "a");
+    try undoTestReject(&cl, a, "c");
+    try std.testing.expect(try undoTestHas(&cl, a, "p", "x"));
+    try std.testing.expectEqualStrings("C", (try undoTestTitle(&cl, a, "x")).?);
+    try std.testing.expectEqual(@as(usize, 0), cl.undoingCount(a));
+    try undoTestWrite(&cl, a, "d", "p", "UPDATE", "x", "title", "D");
+    // A row omitting a column (an unchanged TOAST value) takes it from the trusted server
+    // copy (d's authoritative before-image), never from the displayed overlay "D".
+    const partial = try parseStoredJson(a, "{\"operation\":\"UPDATE\",\"data\":{\"id\":\"x\"}}");
+    try cl.applyEvent("p", partial, "", 0);
+    try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT count(*) FROM _zbz_reconcile", &.{}))[0][0].integer);
+    const merged = (try cl.st.query(a, "SELECT data FROM _zbz_base WHERE row_id='x'", &.{}))[0][0].text;
+    try std.testing.expectEqualStrings("C", (try parseStoredJson(a, merged)).object.get("title").?.string);
+}
+
+test "undo: an UPDATE omitting a column merges the trusted server copy; explicit NULL overwrites; no trusted copy recovers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/tmp/zb-toast-merge.sqlite3";
+    for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+    var cl = try undoTestClient(a, path);
+    defer cl.st.close();
+    try cl.st.execSimple("DROP TABLE c");
+    try cl.st.execSimple("DROP TABLE p");
+    try cl.st.execSimple("CREATE TABLE p(id TEXT PRIMARY KEY,title TEXT,body TEXT)");
+    var spec = cl.states.get("p").?;
+    spec.cols = &.{ "id", "title", "body" };
+    try cl.states.put(a, "p", spec);
+    const base = struct {
+        fn of(c: *SyncClient, al: std.mem.Allocator, id: []const u8) !?Value {
+            const r = try c.st.query(al, "SELECT data FROM _zbz_base WHERE row_id=?", &.{.{ .text = id }});
+            return if (r.len == 1 and r[0][0] == .text) try parseStoredJson(al, r[0][0].text) else null;
+        }
+    };
+    // The server's row, then my pending edit of the title: no base copy yet (lazy).
+    try cl.st.execSimple("INSERT INTO p VALUES('x','server','big')");
+    try undoTestWrite(&cl, a, "a", "p", "UPDATE", "x", "title", "mine");
+    try std.testing.expect((try base.of(&cl, a, "x")) == null);
+    // Another writer's UPDATE of the title, `body` unchanged (omitted by pgoutput), across a restart.
+    cl.st.close();
+    cl = try undoTestClient(a, path);
+    try cl.states.put(a, "p", spec);
+    try cl.applyEvent("p", try parseStoredJson(a, "{\"operation\":\"UPDATE\",\"data\":{\"id\":\"x\",\"title\":\"theirs\"}}"), "", 0);
+    const b1 = (try base.of(&cl, a, "x")).?;
+    try std.testing.expectEqualStrings("theirs", b1.object.get("title").?.string);
+    try std.testing.expectEqualStrings("big", b1.object.get("body").?.string);
+    // A second omission merges over that newer copy; an explicit NULL overwrites.
+    try cl.applyEvent("p", try parseStoredJson(a, "{\"operation\":\"UPDATE\",\"data\":{\"id\":\"x\",\"title\":null}}"), "", 0);
+    const b2 = (try base.of(&cl, a, "x")).?;
+    try std.testing.expect(b2.object.get("title").? == .null);
+    try std.testing.expectEqualStrings("big", b2.object.get("body").?.string);
+    try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT count(*) FROM _zbz_reconcile", &.{}))[0][0].integer);
+    // My edit refused: the row rebuilds from the merged server copy.
+    try undoTestReject(&cl, a, "a");
+    try std.testing.expect((try undoTestTitle(&cl, a, "x")) == null);
+    try std.testing.expectEqualStrings("big", (try cl.st.query(a, "SELECT body FROM p WHERE id='x'", &.{}))[0][0].text);
+
+    // No trusted copy: a key with only a non-authoritative write (its before is an overlay).
+    try undoTestWrite(&cl, a, "y1", "p", "INSERT", "y", "title", "one");
+    try undoTestWrite(&cl, a, "y2", "p", "UPDATE", "y", "title", "two");
+    _ = try cl.st.query(a, "DELETE FROM _zebridge_outbox WHERE msg_id='y1'", &.{});
+    try cl.applyEvent("p", try parseStoredJson(a, "{\"operation\":\"UPDATE\",\"data\":{\"id\":\"y\",\"title\":\"s\"}}"), "", 0);
+    try std.testing.expectEqual(@as(i64, 1), (try cl.st.query(a, "SELECT count(*) FROM _zbz_reconcile WHERE reason='UndoNeedsBaseline'", &.{}))[0][0].integer);
+}
+
+test "undo: no base copy for a write's own echo or for a key with no writes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cl = try undoTestClient(a, ":memory:");
+    defer cl.st.close();
+    var spec = cl.states.get("p").?;
+    spec.version_col = "v";
+    spec.tiebreak_col = "origin";
+    try cl.st.execSimple("ALTER TABLE p ADD COLUMN v TEXT");
+    try cl.st.execSimple("ALTER TABLE p ADD COLUMN origin TEXT");
+    spec.cols = &.{ "id", "title", "v", "origin" };
+    try cl.states.put(a, "p", spec);
+    _ = try cl.st.query(a, "INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, created_at, authoritative) VALUES ('m','s','{\"operation\":\"INSERT\",\"key\":{\"id\":\"x\"},\"data\":{\"title\":\"t\"},\"version\":\"2026-11-09T10:00:00.000000Z\",\"client_id\":\"deviceA\"}','p','x',1,1)", &.{});
+    cl.ledger_active = true; // as `mutate` sets it
+    try cl.applyEvent("p", try parseStoredJson(a, "{\"operation\":\"INSERT\",\"data\":{\"id\":\"x\",\"title\":\"t\",\"v\":\"2026-11-09 10:00:00+00\",\"origin\":\"deviceA\"}}"), "", 0);
+    try cl.applyEvent("p", try parseStoredJson(a, "{\"operation\":\"INSERT\",\"data\":{\"id\":\"z\",\"title\":\"t\",\"v\":\"2026-11-09 10:00:00+00\",\"origin\":\"deviceA\"}}"), "", 0);
+    try cl.applyEvent("p", try parseStoredJson(a, "{\"operation\":\"INSERT\",\"data\":{\"id\":\"x\",\"title\":\"t\",\"v\":\"2026-11-09T10:00:00.000000Z\",\"origin\":\"deviceA\"}}"), "", 0);
+    try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT count(*) FROM _zbz_base", &.{}))[0][0].integer);
+    // Someone else's row on the same key (another stamp) is kept.
+    try cl.applyEvent("p", try parseStoredJson(a, "{\"operation\":\"UPDATE\",\"data\":{\"id\":\"x\",\"title\":\"o\",\"v\":\"2026-11-09 11:00:00+00\",\"origin\":\"deviceB\"}}"), "", 0);
+    try std.testing.expectEqual(@as(i64, 1), (try cl.st.query(a, "SELECT count(*) FROM _zbz_base", &.{}))[0][0].integer);
+}
+
+test "undo: equal-stamp peer CDC survives a rejection and restart; only pending entries may be echoes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/tmp/zb-writer-proof.sqlite3";
+    for ([_]bool{ false, true }) |restart| for (0..3) |mode| {
+        for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+        var cl = try undoTestClient(a, path);
+        defer cl.st.close();
+        try cl.st.execSimple("DROP TABLE c");
+        try cl.st.execSimple("DROP TABLE p");
+        try cl.st.execSimple("CREATE TABLE p(id TEXT PRIMARY KEY,title TEXT,v TEXT,origin TEXT,body TEXT)");
+        try cl.st.execSimple("INSERT INTO p VALUES('x','original','older','old writer','old body')");
+        var spec = cl.states.get("p").?;
+        spec.cols = &.{ "id", "title", "v", "origin", "body" };
+        spec.version_col = "v";
+        spec.tiebreak_col = if (mode == 2) null else "origin";
+        try cl.states.put(a, "p", spec);
+        try undoTestWrite(&cl, a, "a", "p", "UPDATE", "x", "title", "mine");
+        _ = try cl.st.query(a, "UPDATE _zebridge_outbox SET payload=?,optimistic=? WHERE msg_id='a'", &.{ .{ .text = "{\"key\":{\"id\":\"x\"},\"data\":{\"title\":\"mine\"},\"version\":\"2026-11-09T10:00:00.000000Z\",\"client_id\":\"deviceA\"}" }, .{ .text = "{\"operation\":\"UPDATE\",\"data\":{\"id\":\"x\",\"title\":\"mine\",\"v\":\"2026-11-09T10:00:00.000000Z\"},\"optimistic\":true}" } });
+        try cl.st.execSimple("UPDATE p SET v='2026-11-09T10:00:00.000000Z' WHERE id='x'");
+        if (mode == 1) try cl.oweUndo(a, "a", "restore");
+        const origin = if (mode == 1) "deviceA" else "deviceB";
+        const ev = try parseStoredJson(a, try std.fmt.allocPrint(a, "{{\"operation\":\"UPDATE\",\"data\":{{\"id\":\"x\",\"title\":\"mine\",\"v\":\"2026-11-09T10:00:00.000000Z\",\"origin\":\"{s}\",\"body\":\"peer body\"}}}}", .{origin}));
+        try cl.applyEvent("p", ev, "", 0);
+        try std.testing.expectEqual(@as(i64, 1), (try cl.st.query(a, "SELECT count(*) FROM _zbz_base", &.{}))[0][0].integer);
+        if (restart) {
+            cl.st.close();
+            cl = try undoTestClient(a, path);
+            try cl.states.put(a, "p", spec);
+        }
+        if (mode == 1) cl.runUndos() else try undoTestReject(&cl, a, "a");
+        const rows = try cl.st.query(a, "SELECT body FROM p WHERE id='x'", &.{});
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqualStrings("peer body", rows[0][0].text);
+    };
+}
+
+test "undo: a new write re-enables tracking after an empty poll; authoritative CDC is kept" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cl = try undoTestClient(a, ":memory:");
+    defer cl.st.close();
+    cl.ledger_active = try cl.ledgerHasRows(a);
+    try std.testing.expect(!cl.ledger_active);
+    try undoTestWrite(&cl, a, "a", "p", "INSERT", "x", "title", "new");
+    try std.testing.expect(cl.ledger_active);
+    try cl.applyEvent("p", try parseStoredJson(a, "{\"operation\":\"INSERT\",\"data\":{\"id\":\"x\",\"title\":\"new\"}}"), "", 0);
+    try undoTestReject(&cl, a, "a");
+    try std.testing.expect(try undoTestHas(&cl, a, "p", "x"));
 }
