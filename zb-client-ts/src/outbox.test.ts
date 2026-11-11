@@ -295,7 +295,7 @@ function undoFixture(path = ':memory:') {
     const ev = { operation: op, data: { id, [col]: val } };
     await c.applyEvent(t, ev, c.run);
     const at = c.nextCreated();
-    c.ledgerChanged(); // as `outboxPut`: no base copy until CDC brings one
+    c.ledgerKeys?.include(t, id); c.ledgerChanged(); // as `outboxPut`: no base copy until CDC brings one
     db.prepare('INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at, optimistic, authoritative) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(msg, 's', JSON.stringify({ operation: op, key: { id }, data: { [col]: val } }), t, id, before == null ? null : JSON.stringify(before), at, JSON.stringify(ev), authoritative ? 1 : 0);
   };
@@ -1063,6 +1063,68 @@ test('undo: independent empty reads during and across commit cannot switch track
       assert.equal(reader.prepare('SELECT count(*) n FROM _zebridge_outbox').get()!.n,1);
     } finally {commit();deliver();reader.close();f.db.close();rmSync(dir,{recursive:true,force:true});}
   }
+});
+
+// The CDC ledger filter (libzb's "CDC ledger filter …" tests). A probe is the ledger lookup in
+// `recordAuthoritative`; a key the filter rules out must not reach SQL.
+function probing(f: ReturnType<typeof undoFixture>) {
+  const probes: string[] = [];
+  const exec = async (sql: string, ...a: any[]) => {
+    if (sql.includes('0 AS pending FROM _zebridge_undo')) probes.push(`${a[0]}/${a[1]}`);
+    return f.c.run(sql, ...a);
+  };
+  const cdc = (t: string, id: string) => f.c.recordAuthoritative(exec, t, f.c.syncedTables.get(t), { operation: 'UPDATE', data: { id, title: 'peer' } });
+  return { probes, cdc };
+}
+
+test('undo: the CDC ledger filter skips unrelated keys and captures outbox and undo overlaps across reopen', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zb-ledger-keys-')), path = join(dir, 'r.sqlite3');
+  let f = undoFixture(path); f.c.wakeOutbox = () => {};
+  try {
+    await f.c.createOutboxTable();
+    for (const id of ['pending', 'owed'])
+      await f.c.outboxPut({ msgId: id, subject: 's', payload: { key: { id } }, table: 'p', id, before: null, optimistic: { operation: 'INSERT', data: { id, title: id } }, authoritative: true });
+    // As `revertOptimisticWrite` moves it: the key goes with the row.
+    f.db.exec("INSERT INTO _zebridge_undo (msg_id,tbl,row_id,payload,before,optimistic,created_at,authoritative,mode,since) SELECT msg_id,tbl,row_id,payload,before,optimistic,created_at,authoritative,'restore',1 FROM _zebridge_outbox WHERE msg_id='owed'; DELETE FROM _zebridge_outbox WHERE msg_id='owed'");
+    assert.equal(f.c.ledgerKeys.mayContain('p', 'pending'), true);
+    assert.equal(f.c.ledgerKeys.mayContain('p', 'owed'), true);
+    f.db.close(); f = undoFixture(path); f.c.wakeOutbox = () => {};
+    await f.c.createOutboxTable();
+    const { probes, cdc } = probing(f);
+    // The same row ID on another table is a miss too.
+    for (const [t, id] of [['p', 'other'], ['c', 'owed'], ['p', 'owed'], ['p', 'pending']]) await cdc(t, id);
+    assert.deepEqual(probes, ['p/owed', 'p/pending']);
+    assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_base').get()!.n, 2);
+  } finally { f.db.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('undo: the CDC ledger filter never trusts a truncated startup scan', async () => {
+  const f = undoFixture();
+  try {
+    await f.c.createOutboxTable();
+    // Repeated writes to one key fill the startup scan before it reaches undo: the few
+    // distinct keys of that prefix cannot certify a miss.
+    f.db.prepare("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < ?) INSERT INTO _zebridge_outbox (msg_id,subject,payload,tbl,row_id,created_at) SELECT 'm'||i,'s','{}','p','repeat',i FROM n").run(1024);
+    f.db.exec("INSERT INTO _zebridge_undo (msg_id,tbl,row_id,payload,created_at,mode,since) VALUES ('z','p','owed','{}',1,'restore',1)");
+    await f.c.createOutboxTable();
+    const { probes, cdc } = probing(f);
+    await cdc('p', 'owed');
+    assert.deepEqual(probes, ['p/owed']);
+  } finally { f.db.close(); }
+});
+
+test('undo: the CDC ledger filter falls back to SQL at capacity and is trusted again once the ledger empties', async () => {
+  const f = undoFixture();
+  try {
+    await f.c.createOutboxTable();
+    const keys = f.c.ledgerKeys;
+    assert.equal(keys.mayContain('p', 'unseen'), false);
+    for (let i = 0; i <= 1024; i++) keys.include('p', String(i));
+    assert.equal(keys.mayContain('p', 'unseen'), true);
+    await f.c.refreshLedgerActive(); // the ledger is empty: tracking off, the set starts over
+    assert.equal(f.c.ledgerActive, false);
+    assert.equal(keys.mayContain('p', 'unseen'), false);
+  } finally { f.db.close(); }
 });
 
 // The ordered envelope (libzb's "ordering: …" tests): a write names the newest unsettled ordered

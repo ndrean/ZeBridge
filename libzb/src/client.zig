@@ -537,6 +537,7 @@ pub const SyncClient = struct {
     /// This client may have writes in its ledger (outbox or undo): only then can an arriving
     /// row be a base a rebuild needs. Set by `mutate` and at boot; recomputed once per poll.
     ledger_active: bool = true,
+    ledger_keys: LedgerKeys = .{},
     rebase_due: bool = false,
     /// Cumulative verdict counts by status, for the host (the flush report carries
     /// them): a single-writer run with anything but `accepted` here has a finding.
@@ -762,6 +763,7 @@ pub const SyncClient = struct {
         self.last_pending.deinit(self.a);
         self.flows.deinit(self.a);
         self.confirmed.deinit(self.a);
+        self.ledger_keys.keys.deinit(self.a);
         for (self.outcomes.items) |o| self.a.free(o);
         self.outcomes.deinit(self.a);
         self.ro.close();
@@ -5046,6 +5048,7 @@ pub const SyncClient = struct {
             var arena = std.heap.ArenaAllocator.init(self.a);
             defer arena.deinit();
             self.ledger_active = self.ledgerHasRows(arena.allocator()) catch true;
+            if (!self.ledger_active) self.ledger_keys.reset();
         }
     }
 
@@ -5994,6 +5997,10 @@ pub const SyncClient = struct {
         execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_undo_owed ON _zbz_undo (tbl, row_id) WHERE mode <> 'accepted'") catch {};
         self.baseline_active = (try self.st.query(fa.allocator(), "SELECT 1 FROM _zbz_base LIMIT 1", &.{})).len > 0;
         self.ledger_active = try self.ledgerHasRows(fa.allocator());
+        self.ledger_keys.reset();
+        if (self.ledger_active) self.ledger_keys.load(self.a, fa.allocator(), &self.st) catch {
+            self.ledger_keys.complete = false;
+        };
         self.outbox_ready = true;
     }
 
@@ -6197,6 +6204,7 @@ pub const SyncClient = struct {
         // No base copy here: until CDC says more, the authoritative before-image in the
         // ledger IS the server's state (`recordAuthoritative` materializes one lazily).
         self.ledger_active = true;
+        self.ledger_keys.include(self.a, table, row_id);
 
         // NON-FATAL, matching the TS client (its failed optimistic upsert is a log
         // line and the write still queues): the payload is valid ON THE WIRE — the
@@ -7184,6 +7192,7 @@ pub const SyncClient = struct {
             if (i > 0) try id.append(a, '|');
             try id.appendSlice(a, try core.scalarToString(a, data.object.get(col) orelse return));
         }
+        if (!self.ledger_keys.mayContain(table, id.items)) return;
         const key: []const storage.Value = &.{ .{ .text = table }, .{ .text = id.items }, .{ .text = table }, .{ .text = id.items } };
         const ledger = try self.st.query(a, "SELECT payload,1 FROM _zebridge_outbox WHERE tbl=? AND row_id=? UNION ALL SELECT payload,0 FROM _zbz_undo WHERE tbl=? AND row_id=? LIMIT 2", key);
         if (ledger.len == 0) return;
@@ -8026,6 +8035,8 @@ test "measurement: isolated replay counts committed outcomes and excludes events
     const a = arena.allocator();
     // Only the storage/apply fields are used: no NATS connection or acknowledgments.
     var client: SyncClient = undefined;
+    client.ledger_keys = .{};
+    client.ledger_active = false;
     client.baseline_active = false;
     client.confirmed = .{};
     client.a = a;
@@ -8075,6 +8086,8 @@ test "measurement: isolated replay counts committed outcomes and excludes events
 /// A client with storage and routes only, for the frontier tests: no NATS, no tails.
 fn frontierClient(a: std.mem.Allocator) !SyncClient {
     var client: SyncClient = undefined;
+    client.ledger_keys = .{};
+    client.ledger_active = false;
     client.baseline_active = false;
     client.confirmed = .{};
     client.a = a;
@@ -8385,6 +8398,8 @@ test "outbox: a dropped or re-keyed table takes its queued writes with it" {
 
 fn undoTestClient(a: std.mem.Allocator, path: [:0]const u8) !SyncClient {
     var client: SyncClient = undefined;
+    client.ledger_keys = .{};
+    client.ledger_active = false;
     client.baseline_active = false;
     client.a = a;
     client.st = try storage.Storage.open(path);
@@ -8422,6 +8437,7 @@ fn undoTestWrite(cl: *SyncClient, a: std.mem.Allocator, msg: []const u8, table: 
     const payload = try std.fmt.allocPrint(a, "{{\"operation\":\"{s}\",\"key\":{{\"id\":\"{s}\"}},\"data\":{{\"{s}\":\"{s}\"}}}}", .{ op, id, col, val });
     const before_v: storage.Value = if (before) |b| .{ .text = try core.valueToString(a, b) } else .null;
     const created = cl.nextCreated();
+    cl.ledger_keys.include(a, table, id);
     cl.ledger_active = true; // as `mutate`: no base copy until CDC brings one
     _ = try cl.st.query(a, "INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at, optimistic, authoritative) VALUES (?, 's', ?, ?, ?, ?, ?, ?, ?)", &.{
         .{ .text = msg },        .{ .text = payload },  .{ .text = table },                          .{ .text = id }, before_v,
@@ -8722,6 +8738,55 @@ fn addOutboxBasis(st: *storage.Storage) !void {
         try execDdl(st, "UPDATE _zebridge_outbox SET basis = before WHERE basis IS NULL");
     } else |_| {}
 }
+
+/// A bounded superset of (table, row_id) in the outbox and undo ledger. Moving a
+/// write to undo preserves its key. Settled and rolled-back writes may leave extra
+/// keys until the ledger empties. A hash collision only causes an extra SQL probe.
+const LedgerKeys = struct {
+    const limit = 1024;
+    keys: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    complete: bool = false,
+
+    fn reset(self: *LedgerKeys) void {
+        self.keys.clearRetainingCapacity();
+        self.complete = true;
+    }
+
+    fn fingerprint(table: []const u8, id: []const u8) u64 {
+        return std.hash.Wyhash.hash(std.hash.Wyhash.hash(0, table), id);
+    }
+
+    fn include(self: *LedgerKeys, a: std.mem.Allocator, table: []const u8, id: []const u8) void {
+        if (!self.complete) return;
+        const hash = fingerprint(table, id);
+        if (self.keys.count() >= limit) {
+            if (!self.keys.contains(hash)) self.complete = false;
+            return;
+        }
+        self.keys.put(a, hash, {}) catch {
+            self.complete = false;
+        };
+    }
+
+    fn mayContain(self: *const LedgerKeys, table: []const u8, id: []const u8) bool {
+        return !self.complete or self.keys.contains(fingerprint(table, id));
+    }
+
+    fn load(self: *LedgerKeys, a: std.mem.Allocator, scratch: std.mem.Allocator, st: *storage.Storage) !void {
+        const rows = try st.query(scratch, "SELECT tbl,row_id FROM _zebridge_outbox UNION ALL SELECT tbl,row_id FROM _zbz_undo LIMIT " ++ std.fmt.comptimePrint("{d}", .{limit + 1}), &.{});
+        if (rows.len > limit) {
+            self.complete = false;
+            return;
+        }
+        for (rows) |row| {
+            if (row[0] != .text or row[1] != .text) {
+                self.complete = false;
+                return;
+            }
+            self.include(a, row[0].text, row[1].text);
+        }
+    }
+};
 
 /// Per key (`table` NUL `row_id`): the confirmed row beneath my pending overlays and the
 /// `created_at` of the edit it came from. Owned by the client's allocator.
@@ -10267,6 +10332,7 @@ test "undo: no base copy for a write's own echo or for a key with no writes" {
     spec.cols = &.{ "id", "title", "v", "origin" };
     try cl.states.put(a, "p", spec);
     _ = try cl.st.query(a, "INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, created_at, authoritative) VALUES ('m','s','{\"operation\":\"INSERT\",\"key\":{\"id\":\"x\"},\"data\":{\"title\":\"t\"},\"version\":\"2026-11-09T10:00:00.000000Z\",\"client_id\":\"deviceA\"}','p','x',1,1)", &.{});
+    cl.ledger_keys.include(a, "p", "x");
     cl.ledger_active = true; // as `mutate` sets it
     try cl.applyEvent("p", try parseStoredJson(a, "{\"operation\":\"INSERT\",\"data\":{\"id\":\"x\",\"title\":\"t\",\"v\":\"2026-11-09 10:00:00+00\",\"origin\":\"deviceA\"}}"), "", 0);
     try cl.applyEvent("p", try parseStoredJson(a, "{\"operation\":\"INSERT\",\"data\":{\"id\":\"z\",\"title\":\"t\",\"v\":\"2026-11-09 10:00:00+00\",\"origin\":\"deviceA\"}}"), "", 0);
@@ -10360,6 +10426,78 @@ fn orderTestLink(cl: *SyncClient, a: std.mem.Allocator, mid: []const u8) !struct
     if (r.len != 1) return error.NoOutboxRow;
     const env = try parseStoredJson(a, r[0][2].text);
     return .{ .ordered = r[0][0] == .integer and r[0][0].integer == 1, .column = if (r[0][1] == .text) r[0][1].text else null, .payload = env.object.get("predecessor") };
+}
+
+test "CDC ledger filter skips unrelated keys and captures outbox and undo overlaps across reopen" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/r7.sqlite3", .{dir}, 0);
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    {
+        var cl = try orderTestClient(a, path, &conn, &t);
+        defer cl.st.close();
+        _ = try orderTestMutate(&cl, a, "p", "INSERT", "pending");
+        const owed = try orderTestMutate(&cl, a, "p", "INSERT", "owed");
+        try cl.oweUndo(a, owed, "restore");
+        try std.testing.expect(cl.ledger_keys.mayContain("p", "pending"));
+        try std.testing.expect(cl.ledger_keys.mayContain("p", "owed"));
+    }
+    var cl = try orderTestClient(a, path, &conn, &t);
+    defer cl.st.close();
+    // Make an accidental SQL probe observable even though a successful miss would
+    // also leave no baseline. The same row ID on another table is a miss too.
+    try cl.st.execSimple("ALTER TABLE _zbz_undo RENAME TO hidden_undo");
+    const other = try parseStoredJson(a, "{\"id\":\"other\"}");
+    const owed = try parseStoredJson(a, "{\"id\":\"owed\",\"title\":\"peer\"}");
+    try cl.recordAuthoritative(a, "p", cl.states.get("p").?, other, true);
+    try cl.recordAuthoritative(a, "c", cl.states.get("c").?, owed, true);
+    try cl.st.execSimple("ALTER TABLE hidden_undo RENAME TO _zbz_undo");
+    try cl.recordAuthoritative(a, "p", cl.states.get("p").?, owed, false);
+    const pending = try parseStoredJson(a, "{\"id\":\"pending\"}");
+    try cl.recordAuthoritative(a, "p", cl.states.get("p").?, pending, true);
+    const rows = try cl.st.query(a, "SELECT row_id,data FROM _zbz_base ORDER BY row_id", &.{});
+    try std.testing.expectEqual(2, rows.len);
+    try std.testing.expectEqualStrings("peer", (try parseStoredJson(a, rows[0][1].text)).object.get("title").?.string);
+    try std.testing.expect(rows[1][1] == .null);
+}
+
+test "CDC ledger filter never trusts a truncated startup scan" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cl = try undoTestClient(a, ":memory:");
+    defer cl.st.close();
+    // Repeated writes to one key fill the startup scan before it reaches undo.
+    // The small number of distinct keys in the prefix cannot certify its misses.
+    _ = try cl.st.query(a, "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < ?) INSERT INTO _zebridge_outbox(msg_id, subject, payload, tbl, row_id, created_at) SELECT 'm'||i,'s','{}','p','repeat',i FROM n", &.{.{ .integer = LedgerKeys.limit }});
+    try cl.st.execSimple("INSERT INTO _zbz_undo(msg_id,tbl,row_id,payload,created_at,mode,since) VALUES ('z','p','owed','{}',1,'restore',1)");
+    cl.outbox_ready = false;
+    try cl.ensureOutbox();
+    try cl.recordAuthoritative(a, "p", cl.states.get("p").?, try parseStoredJson(a, "{\"id\":\"owed\"}"), true);
+    try std.testing.expectEqual(1, (try cl.st.query(a, "SELECT 1 FROM _zbz_base WHERE row_id='owed' AND data IS NULL", &.{})).len);
+}
+
+test "CDC ledger filter falls back to SQL at capacity and on allocation failure" {
+    var keys: LedgerKeys = .{};
+    defer keys.keys.deinit(std.testing.allocator);
+    keys.reset();
+    for (0..LedgerKeys.limit + 1) |i| {
+        var buf: [24]u8 = undefined;
+        keys.include(std.testing.allocator, "p", try std.fmt.bufPrint(&buf, "{d}", .{i}));
+    }
+    try std.testing.expect(keys.mayContain("p", "unseen"));
+    keys.reset();
+    try std.testing.expect(!keys.mayContain("p", "unseen"));
+    var oom: LedgerKeys = .{};
+    oom.reset();
+    oom.include(std.testing.failing_allocator, "p", "new");
+    try std.testing.expect(oom.mayContain("p", "new"));
 }
 
 test "ordering: each ordered write names the newest unsettled one, fixed at creation, across settlement and reopen" {

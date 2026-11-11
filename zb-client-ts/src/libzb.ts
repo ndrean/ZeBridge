@@ -362,6 +362,25 @@ const GENERATION_SLOW_POLL_MS = 15_000; // after the first window: the producer'
 const GENERATION_POLL_MS = 10_000;
 /// §10et: events held for a table waiting for its chain, at most, per table.
 const UNSEEDED_HOLD_MAX = 50_000;
+
+/// A bounded superset of (table, row_id) in the outbox and undo ledger (libzb `LedgerKeys`):
+/// a CDC row whose key is not here has no write to rebuild, so `recordAuthoritative` skips its
+/// SQL probe. Moving a write to undo keeps its key; settled and rolled-back writes may leave
+/// extra keys until the ledger empties. Not `complete` (over the limit, a truncated scan, a
+/// client built without one): every key may be present, and the probe runs.
+class LedgerKeys {
+  static readonly limit = 1024;
+  private keys = new Set<string>();
+  complete = false;
+  reset() { this.keys.clear(); this.complete = true; }
+  include(table: string, id: string) {
+    if (!this.complete) return;
+    const k = `${table}\0${id}`;
+    if (this.keys.size >= LedgerKeys.limit) { if (!this.keys.has(k)) this.complete = false; return; }
+    this.keys.add(k);
+  }
+  mayContain(table: string, id: string) { return !this.complete || this.keys.has(`${table}\0${id}`); }
+}
 /// Derived from bridge-side max_deliver × retry sleep + batch window + slack; see the
 /// verdict-timeout discussion in PROTOCOL §7 — a guess kept in step by hand until it
 /// rides in the schema descriptor.
@@ -1892,6 +1911,14 @@ export class ZeBridge {
     // a query outside it there waits behind that transaction (PGlite: forever).
     const m = await this.run(`SELECT max(m) AS m FROM (SELECT max(created_at) AS m FROM _zebridge_outbox UNION ALL SELECT max(created_at) FROM _zebridge_undo UNION ALL SELECT max(at) FROM _zebridge_base) t`);
     this.ledgerActive = await this.ledgerHasRows();
+    const keys = new LedgerKeys();
+    keys.reset();
+    if (this.ledgerActive) {
+      const rows: any[] = await this.run(`SELECT tbl,row_id FROM _zebridge_outbox UNION ALL SELECT tbl,row_id FROM _zebridge_undo LIMIT ${LedgerKeys.limit + 1}`);
+      if (rows.length > LedgerKeys.limit) keys.complete = false;
+      else for (const r of rows) keys.include(String(r.tbl), String(r.row_id));
+    }
+    this.ledgerKeys = keys;
     this.lastCreated = Math.max(this.lastCreated ?? 0, Number(m[0]?.m ?? 0));
   }
 
@@ -1912,6 +1939,7 @@ export class ZeBridge {
     const created = this.nextCreated();
     // No base copy here: until CDC says more, the authoritative before-image in the ledger
     // IS the server's state (`recordAuthoritative` materializes one lazily).
+    this.ledgerKeys?.include(r.table, String(r.id));
     this.ledgerChanged();
     await exec(
       `INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, optimistic, authoritative, ordered, predecessor)
@@ -1973,6 +2001,7 @@ export class ZeBridge {
   private async recordAuthoritative(exec: Exec, table: string, state: TableState, ev: any) {
     if (!this.ledgerActive || ev.optimistic || !state.pkCols.length || !ev.data) return;
     const rowId = state.pkCols.map(c => String(ev.data?.[c])).join('|');
+    if (this.ledgerKeys && !this.ledgerKeys.mayContain(table, rowId)) return;
     const ledger: any[] = await exec(`SELECT payload,1 AS pending FROM _zebridge_outbox WHERE tbl=? AND row_id=?
       UNION ALL SELECT payload,0 AS pending FROM _zebridge_undo WHERE tbl=? AND row_id=? LIMIT 2`, table, rowId, table, rowId);
     if (!ledger.length) return;
@@ -2027,7 +2056,7 @@ export class ZeBridge {
     const revision = this.ledgerRevision ?? 0;
     const active = await this.ledgerHasRows();
     if (active) this.ledgerActive = true;
-    else if (!(this.ledgerWriters ?? 0) && revision === (this.ledgerRevision ?? 0)) this.ledgerActive = false;
+    else if (!(this.ledgerWriters ?? 0) && revision === (this.ledgerRevision ?? 0)) { this.ledgerActive = false; this.ledgerKeys?.reset(); }
   }
 
   /// The newest server state known for a key: the base copy, or the before-image of its newest
@@ -2257,6 +2286,8 @@ export class ZeBridge {
   /// This client may have writes in its ledger (outbox or undo): only then can an arriving row
   /// be a base a rebuild needs. Set by `outboxPut` and at boot.
   private ledgerActive = true;
+  /// Fixtures built with `Object.create` have none: optional, and then every probe runs.
+  private ledgerKeys = new LedgerKeys();
   private ledgerRevision = 0;
   private ledgerWriters = 0;
   private lastCreated = 0;
