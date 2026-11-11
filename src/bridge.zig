@@ -2769,6 +2769,27 @@ const LiveCatalogue = struct {
                 if (std.mem.eql(u8, r, tbl)) break;
             } else republish.append(self.allocator, tbl) catch {};
         }
+        // A catalogued table whose descriptor says it cannot be written may hold a verdict
+        // taken before its grant: a re-created table's CREATE event and its epoch move both
+        // publish before `zebridge_enable` grants the writer, and the enable then rewrites the
+        // catalogue row unchanged, so nothing above lists it. Clients refuse new edits on
+        // `writable: false`, so it is asked again here (only the tables not reported
+        // writable, one query each) and republished when the answer changed.
+        {
+            var it_w = self.cat.epochs.keyIterator();
+            while (it_w.next()) |k| {
+                const was = event_proc.writable.get(k.*);
+                if (was == true) continue;
+                event_proc.reportEdgeWritability(k.*);
+                if (event_proc.writable.get(k.*) == was) continue;
+                for (republish.items) |r| {
+                    if (std.mem.eql(u8, r, k.*)) break;
+                } else {
+                    log.info("🗂️ '{s}': its writability is now known ({?}) — descriptor republished", .{ k.*, event_proc.writable.get(k.*) });
+                    republish.append(self.allocator, k.*) catch {};
+                }
+            }
+        }
         if (republish.items.len > 0) {
             // The writability verdict was computed at each table's DDL event — for a
             // pre-existing table, BEFORE zebridge_enable granted the writer role — so

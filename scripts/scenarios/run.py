@@ -125,6 +125,8 @@ GROUPS = {
         "collist":       ("bridge", "publication column lists (§10ff): a STORED tsvector and a column the DBA leaves out never travel — publication, descriptor, a libzb replica, CDC, a client write and the audit agree; a stray second publication with a narrower list cannot shrink the descriptor; zebridge_enable refreshes the list after ADD COLUMN. SECURITY.md's column-list claim is proven HERE — it asserts, so it belongs in the battery, not in manual"),
     },
     "owns": {
+        "incarnation_clients": ("bridge", "both client decisions: a stamped edit queued offline, a withheld descriptor (identity unknown) refuses a second edit with the row and outbox untouched, the first keeps its ID and stamp across a restart and gets one TableIncarnationChanged verdict, the replacement row intact; both clients"),
+        "recreate_incarnation": ("bridge", "a queued write belongs to its table incarnation: an offline UPDATE of row K across a DROP + CREATE with a new K must be refused (TableIncarnationChanged), not applied to the replacement row; the zebridge_reseed control (same incarnation) stays eligible; both clients"),
         "incarnation_gate": ("none", "the bridge's incarnation gate with stamped payloads, private stack with admission and the fault build: legacy and malformed stamps, a DROP waiting on the gate's lock, receipts winning over a recreate (and a fingerprint conflict), old stamps and dropped tables rejected TableIncarnationChanged, a mixed batch, a parked release, retryable permission and catalogue failures, preflight, the descriptor switch"),
         "ingress_ordering": ("none", "ordered parent/child: held parent with one/four lanes; successor durably parked while another client commits; disposable PostgreSQL/NATS"),
         "ingress_arrival": ("none", "ordered successor arrives before admission-refused parent; immutable resend releases it; single-lane rate-limit control; disposable stack"),
@@ -184,10 +186,7 @@ GROUPS = {
     # Regressions for a known, unfixed bug: each asserts the desired outcome, so it exits 1 today.
     # Kept out of `owns` (and `all`) so that group stays a signal; here exit 1 counts as expected,
     # and an unexpected pass fails the group: the fix landed, move the scenario to `owns`.
-    "known_red": {
-        "incarnation_clients": ("bridge", "both client decisions: a stamped edit queued offline, a withheld descriptor (identity unknown) refuses a second edit with the row and outbox untouched, the first keeps its ID and stamp across a restart and gets one TableIncarnationChanged verdict, the replacement row intact; both clients"),
-        "recreate_incarnation": ("bridge", "a queued write belongs to its table incarnation: an offline UPDATE of row K across a DROP + CREATE with a new K must be refused (TableIncarnationChanged), not applied to the replacement row; the zebridge_reseed control (same incarnation) stays eligible; both clients"),
-    },
+    "known_red": {},
     "manual": {
         "ingress_baseline": ("none", "paused-consumer backlog baseline, 1/10/100/500 connected publishers and 1/8 ingress lanes; three rounds, optional diagnostic binary and mixed traffic; requires --log-dir, see --help"),
         "firehose_topology": ("none", "the firehose with N TLS consumers attached, topology 2 (TLS on nats-server, bridge tls://) vs topology 1 (plain nats-server, HAProxy terminates the clients' TLS): chain margin, cuts, CPU per process (§10gb); ~10 min"),

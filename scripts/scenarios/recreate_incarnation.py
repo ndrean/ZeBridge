@@ -297,6 +297,8 @@ def main():
     results = {}
     try:
         create()
+        # The contract holds where the bridge asks for stamps: the switch on for this run.
+        zb.psql("UPDATE zebridge_private.write_policy SET incarnation_stamps = true WHERE singleton")
         relay = Relay()
         with zb.Bridge(LOG, GENERATIONS_ENABLED="1", GENERATION_CADENCE_SECONDS="5") as bridge:
             if not bridge.wait_for_log("Generation producer started", timeout=30):
@@ -312,9 +314,15 @@ def main():
                     side.close()
     finally:
         if relay: relay.close()
+        zb.psql("UPDATE zebridge_private.write_policy SET incarnation_stamps = false WHERE singleton", quiet=True)
         teardown()
     return classify(results)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # An exception is not a verdict: Python's own exit 1 would read as "known defect
+    # reproduced" in known_red. It is an unexpected result (3), with its traceback.
+    try:
+        sys.exit(main())
+    except Exception:
+        import traceback; traceback.print_exc(); sys.exit(3)

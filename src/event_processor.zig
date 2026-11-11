@@ -2063,6 +2063,14 @@ pub const EventProcessor = struct {
                 try json_str.appendSlice(arena, "]");
             }
         }
+        // The edge-writability verdict, asked BEFORE this descriptor is written: it carries
+        // `writable`, and clients refuse new edits on `false`. Asked after, it described the
+        // previous event — a re-created table's ALTER from `zebridge_enable` (whose grants
+        // are committed by the time its event is decoded) still published the CREATE's
+        // `false`, and nothing republished it. Preflight runs once and only sees what the
+        // publication held then, so this is also where the ✍️/⚠️ lines appear for a table
+        // that appeared after boot. Best-effort: a failed report must never cost the event.
+        self.reportEdgeWritability(clean_table);
         try self.appendWriteContract(arena, &json_str, clean_table, column_names.items);
         try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"lsn\":{d}}}", .{wal_end}));
 
@@ -2090,13 +2098,6 @@ pub const EventProcessor = struct {
         );
 
         log.info("✅ DDL schema mapped and published to KV for '{s}'", .{clean_table});
-
-        // The edge-writability report, for a table that appeared after boot. Preflight
-        // runs once and only sees what the publication held then, so without this the
-        // ✍️/⚠️ lines — the sole warning that the version column is naive, coarse or
-        // nullable — were shown only to whoever restarted the bridge afterwards.
-        // Best-effort: a failed report must never cost the DDL event.
-        self.reportEdgeWritability(clean_table);
         return slot_idx;
     }
 

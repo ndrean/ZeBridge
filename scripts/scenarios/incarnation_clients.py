@@ -40,12 +40,22 @@ def policy(on):
     zb.psql(f"UPDATE zebridge_private.write_policy SET incarnation_stamps = {'true' if on else 'false'} WHERE singleton")
 
 
+REVOKED = []  # roles whose EXECUTE was taken: given back in main's finally, whatever failed
+
+
 def make_policy_unreadable():
     """Revoke EXECUTE on the switch's reader from every non-superuser that has it; returns them."""
     roles = zb.psql(f"SELECT string_agg(quote_ident(rolname), ',') FROM pg_roles WHERE NOT rolsuper "
                     f"AND has_function_privilege(oid, '{STAMPS}', 'EXECUTE')") or ""
-    if roles: zb.psql(f"REVOKE EXECUTE ON FUNCTION {STAMPS} FROM {roles}")
+    if roles:
+        REVOKED.append(roles)
+        zb.psql(f"REVOKE EXECUTE ON FUNCTION {STAMPS} FROM {roles}")
     return roles
+
+
+def restore_policy_grants():
+    while REVOKED:
+        zb.psql(f"GRANT EXECUTE ON FUNCTION {STAMPS} TO {REVOKED.pop()}", quiet=True)
 
 
 def descriptor():
@@ -87,6 +97,14 @@ def run_client(kind, relay, bridge_env):
         create()
         zb.psql(f"INSERT INTO public.{T} (uid, title, tenant_id, updated_at) VALUES ('{uid}', '{REPLACEMENT}', '{side.tenant}', '{RESTORED_AT}')")
         if not until(lambda: withheld(descriptor()), 60, 0.5): return {"setup": f"the descriptor never turned withheld: {descriptor()}"}
+        # The new incarnation's chain first: a client that comes back seeds from it, and with
+        # the bridge stopped no producer would build it (zb-client-ts's connect waits for one).
+        new_inc = incarnation()[0]
+        def chain_ready():
+            raw = zb.kv_get("generations", f"{side.tenant}.{T}")
+            try: return json.loads(raw).get("incarnation") == new_inc
+            except (ValueError, AttributeError): return False
+        if not until(chain_ready, 90, 0.5): return {"setup": f"no chain of incarnation {new_inc} for {side.tenant}"}
         bridge_env["stop"]()                     # nothing settles until step 7
         side.online()
         # The client has the withheld descriptor once its replica says the table moved on, or
@@ -109,7 +127,7 @@ def run_client(kind, relay, bridge_env):
         present, stamp_after = stored(side, mid)
         f.update(kept_after_restart=present, stamp_after_restart=stamp_after)
         # Step 7: the policy readable, the bridge back.
-        if roles: zb.psql(f"GRANT EXECUTE ON FUNCTION {STAMPS} TO {roles}")
+        restore_policy_grants()
         bridge_env["start"]()
         until(lambda: (side.poll(), side.queued(mid) == 0)[1], 90, 0.3)
         end = time.monotonic() + OBSERVE_S
@@ -172,10 +190,16 @@ def main():
     finally:
         stop()
         if relay: relay.close()
+        restore_policy_grants()
         policy(False)
         teardown()
     return classify(results)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # An exception is not a verdict: Python's own exit 1 would read as "known defect
+    # reproduced" in known_red. It is an unexpected result (3), with its traceback.
+    try:
+        sys.exit(main())
+    except Exception:
+        import traceback; traceback.print_exc(); sys.exit(3)
