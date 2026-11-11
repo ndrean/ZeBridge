@@ -22,7 +22,7 @@ jobs:
           submodules: true
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
       # build.zig looks for libpq and zstd under /usr/lib; Ubuntu keeps them in the arch folder.
       - name: Install libpq and zstd
         run: |
@@ -41,7 +41,7 @@ jobs:
           submodules: true
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
       - name: ABI and zb.h match the code
         run: python3 libzb/python/abi_check.py
       # Zig 0.16 downloads zip sources into <cache>/tmp without creating it first.

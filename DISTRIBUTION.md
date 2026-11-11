@@ -123,7 +123,7 @@ machine that runs the service.
 
 ## Building
 
-    # desktop, apps and services alike, in libzb/ with Zig 0.17.0: nothing needed on the machine to build or load
+    # desktop, apps and services alike, in libzb/ with Zig 0.17.1: nothing needed on the machine to build or load
     zig build lib -Doptimize=ReleaseFast -Dvendor=true
 
     # phones
@@ -208,14 +208,14 @@ In `dist/<version>/`:
 
 | file | holds | needs |
 | --- | --- | --- |
-| `zebridge_<version>_<arch>.deb` | `bridge` and `bridge_sweeper` in `/usr/bin`; example systemd units in `/usr/share/doc/zebridge/examples` | `libpq5` (14 or later), `libzstd1`: apt installs them |
+| `zebridge_<version>_<arch>.deb` | `bridge`, `bridge_sweeper`, `bridge_readings_fetch`, `bridge_archiver` in `/usr/bin`; `libzbarchive.so` and `/usr/include/zbarchive.h`; example systemd units in `/usr/share/doc/zebridge/examples` | `libpq5` (14 or later), `libzstd1`: apt installs them. The native archiver loads a separately installed `libduckdb` at run time (`ZB_DUCKDB_LIB` can name it). |
 | `libzb_<version>_<arch>.deb` | `libzbcore.so`, `/usr/include/zb.h`, `zb-respond` | glibc only; `libpq5` is suggested, for the PostgreSQL engine |
 | `zebridge-<version>-linux-<arch>.tar.gz`, `libzb-<version>-linux-<arch>.tar.gz` | the same files, to unpack anywhere | the same, installed by hand |
 | `SHA256SUMS` | the checksum of every file | |
 
 A downloaded package installs the same way: `sudo apt install ./zebridge_0.1.0_amd64.deb`.
 
-Every binary prints its version with `--version`. The binaries keep their debug
+The bridge, sweeper and native responder print their version with `--version`. The binaries keep their debug
 information, so a crash prints the file and line it happened at.
 
 `libzb/include/zb.h` declares the C ABI. `libzb/scripts/gen-header.py` writes it from
