@@ -1,3 +1,4 @@
+const ordered_ingress = @import("ordered_ingress.zig");
 const std = @import("std");
 const admission = @import("mutation_admission.zig");
 const nats = @import("nats");
@@ -11,6 +12,8 @@ const pg_conn = @import("pg_conn.zig");
 const utils = @import("utils.zig");
 const rate_limit = @import("rate_limit.zig");
 const receipts = @import("receipts.zig");
+const ingress_stats = @import("ingress_stats.zig");
+const ack_limit = @import("ack_limit.zig");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 
@@ -439,7 +442,632 @@ fn appendIdent(out: *std.ArrayList(u8), alloc: std.mem.Allocator, ident: []const
     try out.append(alloc, '"');
 }
 
+/// The clock of ack renewals and of the lanes' wait and busy times: monotonic, so a wall
+/// clock set back does not stop renewals (a step over ack wait − a third of it would
+/// redeliver every held write), and counting suspended time, as the server's ack deadline does.
+const ingress_clock: std.Io.Clock = .boot;
+
 /// One mutation, as parsed from its subject and payload.
+/// A lane's inbox: the messages the `Dispatcher` routed to it, in stream order. Bounded in
+/// COUNT only — a queue's depth says nothing about time: one message behind a held
+/// application transaction waits as long as that transaction does. What keeps a waiting
+/// message from being redelivered is `renew` (an in-progress ack every third of the ack
+/// wait), which covers what is queued here and the batch the lane is executing; the
+/// Dispatcher calls it, so a lane blocked in PostgreSQL still has its deadlines extended.
+///
+/// Ownership: a message is the Dispatcher's until `tryPush` took it, the lane's once
+/// `popBatch` returned it (the lane frees it after `endBatch`); in between it belongs to
+/// the queue, and `leave` releases it unacked when the lane leaves early.
+pub const LaneQueue = struct {
+    pub const capacity = 2 * config.Nats.mutation_pull_batch;
+    /// `since_ms` moves at each renewal; `at_ms` is when the message was queued.
+    const Entry = struct { msg: *nats.JetStreamMessage, since_ms: i64, at_ms: i64 };
+
+    io: std.Io,
+    /// This lane's number in `ingress_stats` (set before the lane starts).
+    index: usize = 0,
+    mutex: std.Io.Mutex = .init,
+    not_empty: std.Io.Condition = .init,
+    not_full: std.Io.Condition = .init,
+    ring: [capacity]Entry = undefined,
+    head: usize = 0,
+    len: usize = 0,
+    /// Set by the Dispatcher at a stop, or by the lane when it leaves: no more pushes.
+    closed: bool = false,
+    /// Set by the lane as it leaves: nothing will be acked through this lane any more.
+    finished: bool = false,
+    /// The batch the lane is applying right now (its own buffer; cleared by `endBatch`
+    /// BEFORE the messages are freed, so a renewal never touches a freed message).
+    executing: []const *nats.JetStreamMessage = &.{},
+    executing_since_ms: i64 = 0,
+    batch_start_ms: i64 = 0,
+
+    fn nowMs(self: *LaneQueue) i64 {
+        return ingress_clock.now(self.io).toMilliseconds();
+    }
+
+    /// Queues as many of `msgs` as fit, in order, without waiting: the count taken.
+    /// `Closed` when the lane is gone (nothing was taken).
+    pub fn tryPush(self: *LaneQueue, msgs: []const *nats.JetStreamMessage) error{Closed}!usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.closed) return error.Closed;
+        const now = self.nowMs();
+        const n = @min(msgs.len, capacity - self.len);
+        for (msgs[0..n]) |m| {
+            self.ring[(self.head + self.len) % capacity] = .{ .msg = m, .since_ms = now, .at_ms = now };
+            self.len += 1;
+        }
+        if (n > 0) self.not_empty.broadcast(self.io);
+        return n;
+    }
+
+    /// Up to `out.len` messages, waiting at most `timeout` for the first; 0 on a timeout
+    /// or when the queue is closed and empty. What is returned is `executing` until
+    /// `endBatch`.
+    pub fn popBatch(self: *LaneQueue, out: []*nats.JetStreamMessage, timeout: std.Io.Timeout) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.len == 0 and !self.closed) self.not_empty.waitTimeout(self.io, &self.mutex, timeout) catch {};
+        const n = @min(self.len, out.len);
+        const now = self.nowMs();
+        var waited_ms: i64 = 0;
+        for (out[0..n]) |*slot| {
+            slot.* = self.ring[self.head].msg;
+            waited_ms += now - self.ring[self.head].at_ms;
+            self.head = (self.head + 1) % capacity;
+        }
+        self.len -= n;
+        if (n > 0) {
+            self.executing = out[0..n];
+            self.executing_since_ms = now;
+            self.batch_start_ms = now;
+            self.not_full.broadcast(self.io);
+            ingress_stats.noteBatch(self.index, n, @intCast(@max(0, waited_ms)));
+        }
+        return n;
+    }
+
+    /// The lane is done with the batch `popBatch` returned; call before freeing it.
+    pub fn endBatch(self: *LaneQueue) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.executing.len > 0) ingress_stats.noteBusy(self.index, @intCast(@max(0, self.nowMs() - self.batch_start_ms)));
+        self.executing = &.{};
+    }
+
+    /// Extends the ack deadline of every queued message that has waited `after_ms` or
+    /// longer since its last extension, and of the executing batch likewise: the count.
+    pub fn renew(self: *LaneQueue, after_ms: i64) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const now = self.nowMs();
+        var n: usize = 0;
+        for (0..self.len) |i| {
+            const e = &self.ring[(self.head + i) % capacity];
+            if (now - e.since_ms < after_ms) continue;
+            e.msg.inProgress() catch {};
+            e.since_ms = now;
+            n += 1;
+        }
+        if (self.executing.len > 0 and now - self.executing_since_ms >= after_ms) {
+            for (self.executing) |m| if (!m.acked.load(.acquire)) {
+                m.inProgress() catch {};
+                n += 1;
+            };
+            self.executing_since_ms = now;
+        }
+        return n;
+    }
+
+    /// The Dispatcher, with nowhere to put a message for this lane: waits for a pop.
+    pub fn waitSpace(self: *LaneQueue, timeout: std.Io.Timeout) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.len == capacity and !self.closed) self.not_full.waitTimeout(self.io, &self.mutex, timeout) catch {};
+    }
+
+    /// No more pushes; a waiting pop returns what is left, then 0.
+    pub fn close(self: *LaneQueue) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.closed = true;
+        self.not_empty.broadcast(self.io);
+        self.not_full.broadcast(self.io);
+    }
+
+    /// The lane's last word: closed, and nothing more will be acked through it.
+    pub fn finish(self: *LaneQueue) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.closed = true;
+        self.finished = true;
+        self.not_empty.broadcast(self.io);
+        self.not_full.broadcast(self.io);
+    }
+
+    /// The lane's exit: closed, what is queued freed without an ack (redelivered after its ack
+    /// wait, at the head of the next boot's pull, §10eb), finished — under one lock: a queue
+    /// closed only after the drain took a push in between that was neither freed nor acked. The count.
+    pub fn leave(self: *LaneQueue) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.closed = true;
+        self.finished = true;
+        const n = self.freeQueued();
+        self.not_empty.broadcast(self.io);
+        self.not_full.broadcast(self.io);
+        return n;
+    }
+
+    fn freeQueued(self: *LaneQueue) usize {
+        const n = self.len;
+        for (0..self.len) |i| self.ring[(self.head + i) % capacity].msg.deinit();
+        self.len = 0;
+        return n;
+    }
+
+    pub fn isClosed(self: *LaneQueue) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.closed;
+    }
+
+    pub fn isFinished(self: *LaneQueue) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.finished;
+    }
+
+    pub fn depth(self: *LaneQueue) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.len;
+    }
+};
+
+/// The lane for a message: one lane per (principal, client), so a client's writes are
+/// applied in stream order by one PostgreSQL session and an ordered write finds its
+/// predecessor in its own batch or already committed — parking is for the exceptions
+/// (a refused or rate-limited predecessor), not the rule. The client is the fourth
+/// token of a `zb1-` message ID, already escaped (no literal `-`); a legacy ID hashes
+/// by principal alone. What cannot be routed goes to lane 0, which refuses it as before.
+pub fn routeLane(subject: []const u8, id: ?[]const u8, prefix: []const u8, leaf_prefix: []const u8, lanes: usize) usize {
+    if (lanes <= 1) return 0;
+    const parsed = admission.route(subject, prefix, leaf_prefix) catch return 0;
+    var h = std.hash.Wyhash.init(0);
+    h.update(parsed.principal);
+    h.update(&.{0});
+    if (id) |i| if (std.mem.startsWith(u8, i, "zb1-")) {
+        var tokens = std.mem.splitScalar(u8, i, '-');
+        _ = tokens.next(); // zb1
+        _ = tokens.next(); // t<ms>
+        _ = tokens.next(); // operation
+        if (tokens.next()) |client| h.update(client);
+    };
+    return @intCast(h.final() % lanes);
+}
+
+/// The one puller (§10cs, revised): fetches the durable `bridge_mutations_worker` and
+/// routes every fresh ORDERED delivery to its client's lane (`routeLane`); unordered ones
+/// go in whole chunks to the lane with the most room (`spread`). Lanes used to pull the durable
+/// themselves and JetStream spread one client's writes over all of them, so with the
+/// ordered envelope 97–99% of a backlog's writes found their predecessor in flight in
+/// another lane and parked; ingress then ran at the park sweep's rate (measured: 100
+/// clients, 8 lanes, 14.2k → 108 writes/s). Owns the NATS connection the messages are
+/// acked through, the §10eb boot wait, the §10ec stop drain and the ack renewals.
+///
+/// Distribution never blocks on one lane: what a full lane cannot take waits in that lane's
+/// pending buffer here, in order, while every other lane is served. The one limit is the
+/// Dispatcher's own memory: with `budget` writes pending in all (a stream dominated by one
+/// held client), it stops pulling until a lane takes something, and then no client gets
+/// anything new. Unrelated clients that share the held client's lane wait with it (fixed
+/// hashing); per-client scheduling can follow if that collision proves costly.
+///
+/// Affinity covers FRESH deliveries only. A parked write is released by whichever lane the
+/// sweep elects (`sweepParked`): that path is protected by the receipts and the durable
+/// predecessor check, not by routing, and so are reordered arrivals, retries, crashes and
+/// a second bridge on the same database. Routing makes parking rare; it does not replace
+/// the checks.
+pub const Dispatcher = struct {
+    const Pending = struct { msg: *nats.JetStreamMessage, since_ms: i64 };
+    /// Pending writes in all, over every lane, before the puller pauses.
+    pub fn budget(lanes: usize) usize {
+        return lanes * LaneQueue.capacity;
+    }
+    /// An ack deadline is extended once it has waited this long: a third of the ack wait,
+    /// so two renewals can be lost before a message is redelivered.
+    const renew_after_ms: i64 = @intCast(config.Nats.mutation_ack_wait_ns / std.time.ns_per_ms / 3);
+
+    allocator: std.mem.Allocator,
+    endpoint: config.Nats.Endpoint,
+    endpoint_topology: *const Topology.Topology,
+    io: std.Io,
+    should_stop: *std.atomic.Value(bool),
+    lanes: []const *MutationListener,
+    /// Ordered writes, per lane by routing key.
+    pending: []std.ArrayList(Pending),
+    /// Unordered writes: no lane of their own, handed out in chunks to whichever lane
+    /// has the most room (`spread`).
+    spill: std.ArrayList(Pending) = .empty,
+    /// Where `spread`'s tie-break starts: lanes of equal depth take chunks in turn.
+    cursor: usize = 0,
+    /// The spill is served before the ordered writes at the next flush (`flush`).
+    spill_turn: bool = false,
+    /// Scratch for `ordered_ingress.wantsAffinity`, reset per message.
+    scratch: std.heap.ArenaAllocator,
+    /// Spill + every lane's pending.
+    pending_total: usize = 0,
+    last_renew_ms: i64 = 0,
+    /// The bridge's startup-fault flag (its exit code), raised by `fail`.
+    boot_fatal: ?*std.atomic.Value(bool) = null,
+    thread: ?std.Thread = null,
+
+    pub fn init(allocator: std.mem.Allocator, endpoint: config.Nats.Endpoint, topology: *const Topology.Topology, io: std.Io, should_stop: *std.atomic.Value(bool), lanes: []const *MutationListener) !*Dispatcher {
+        // A lane waits on its queue until it is closed: a Dispatcher that never comes up must
+        // close them, or the lanes' join never returns (as in `start`).
+        errdefer for (lanes) |lane| lane.queue.close();
+        const self = try allocator.create(Dispatcher);
+        errdefer allocator.destroy(self);
+        const pending = try allocator.alloc(std.ArrayList(Pending), lanes.len);
+        for (pending) |*p| p.* = .empty;
+        self.* = .{ .allocator = allocator, .endpoint = endpoint, .endpoint_topology = topology, .io = io, .should_stop = should_stop, .lanes = lanes, .pending = pending, .scratch = .init(allocator) };
+        return self;
+    }
+
+    pub fn deinit(self: *Dispatcher) void {
+        self.scratch.deinit();
+        self.spill.deinit(self.allocator);
+        for (self.pending) |*p| p.deinit(self.allocator);
+        self.allocator.free(self.pending);
+        self.allocator.destroy(self);
+    }
+
+    pub fn start(self: *Dispatcher) !void {
+        self.thread = std.Thread.spawn(.{}, run, .{self}) catch |err| {
+            self.closeLanes(); // a lane waits on its queue until it is closed
+            return err;
+        };
+    }
+
+    pub fn join(self: *Dispatcher) void {
+        if (self.thread) |th| th.join();
+    }
+
+    fn closeLanes(self: *Dispatcher) void {
+        for (self.lanes) |lane| lane.queue.close();
+    }
+
+    fn nowMs(self: *Dispatcher) i64 {
+        return ingress_clock.now(self.io).toMilliseconds();
+    }
+
+    /// Fresh deliveries: an ordered write (or a malformed one, which its lane refuses) into
+    /// its lane's pending buffer by routing key; an unordered write into the spill. Affinity
+    /// is the price of the ordering promise — one client's writes in one session — and an
+    /// unordered write never asked for it (measured: one client over 8 lanes, 11.4k →
+    /// 3.0k writes/s when every write had it). Its row conflicts are settled by version,
+    /// as they were before ordering existed.
+    fn absorb(self: *Dispatcher, messages: []const *nats.JetStreamMessage) void {
+        const prefix = self.endpoint_topology.subject_mutations_prefix;
+        const leaf = self.endpoint_topology.leaf_prefix;
+        const now = self.nowMs();
+        const t0 = std.Io.Clock.awake.now(self.io);
+        var ordered: usize = 0;
+        for (messages) |m| {
+            const id = MutationListener.msgIdOf(m);
+            const list = if (self.lanes.len <= 1) &self.pending[0] else blk: {
+                defer _ = self.scratch.reset(.retain_capacity);
+                if (!ordered_ingress.wantsAffinity(self.scratch.allocator(), m.msg.data, id orelse "")) break :blk &self.spill;
+                ordered += 1;
+                const subject = admission.originalSubject(m.msg, prefix, leaf) catch "";
+                break :blk &self.pending[routeLane(subject, id, prefix, leaf, self.lanes.len)];
+            };
+            list.append(self.allocator, .{ .msg = m, .since_ms = now }) catch {
+                m.deinit(); // unacked: redelivered after its ack wait
+                continue;
+            };
+            self.pending_total += 1;
+        }
+        const elapsed = t0.durationTo(std.Io.Clock.awake.now(self.io));
+        ingress_stats.noteRouted(ordered, if (self.lanes.len <= 1) 0 else messages.len - ordered, @intCast(@max(0, elapsed.toNanoseconds())));
+        _ = ingress_stats.fetched.fetchAdd(messages.len, .monotonic);
+    }
+
+    /// The spill, in chunks of up to one pull batch, each to the lane with the shallowest
+    /// queue (ties in turn from `cursor`), so a lane is handed a batch it can apply in one
+    /// transaction rather than a trickle. Depth is the one signal: a lane held in a long
+    /// transaction with an empty queue still looks free, and takes a chunk that then waits
+    /// behind it (renewed, not redelivered).
+    /// shortcut: depth ignores the executing batch, upgrade to "depth + executing" if a
+    /// held lane proves to swallow unordered chunks in the benchmarks.
+    fn spread(self: *Dispatcher) usize {
+        var total: usize = 0;
+        while (self.spill.items.len > 0) {
+            var best: ?usize = null;
+            var best_depth: usize = LaneQueue.capacity;
+            for (0..self.lanes.len) |i| {
+                const k = (self.cursor + i) % self.lanes.len;
+                const d = self.lanes[k].queue.depth();
+                if (d < best_depth) {
+                    best = k;
+                    best_depth = d;
+                }
+            }
+            const k = best orelse return total; // every lane is full
+            var group: [config.Nats.mutation_pull_batch]*nats.JetStreamMessage = undefined;
+            const want = @min(self.spill.items.len, group.len);
+            for (self.spill.items[0..want], 0..) |e, i| group[i] = e.msg;
+            const taken = self.lanes[k].queue.tryPush(group[0..want]) catch {
+                self.laneLost(k);
+                return total; // what is left is freed at the stop
+            };
+            self.spill.replaceRangeAssumeCapacity(0, taken, &.{});
+            self.pending_total -= taken;
+            total += taken;
+            self.cursor = (k + 1) % self.lanes.len;
+            if (taken == 0) return total;
+        }
+        return total;
+    }
+
+    fn laneLost(self: *Dispatcher, k: usize) void {
+        if (self.should_stop.load(.seq_cst)) return;
+        log.err("🔴 ingress lane {d} stopped while writes were routed to it: stopping the bridge (they are redelivered at the next boot)", .{k});
+        self.should_stop.store(true, .seq_cst);
+    }
+
+    /// Every lane gets what it has room for, in order; a lane that left takes the bridge
+    /// down with it (its principals would otherwise never be served again).
+    fn flush(self: *Dispatcher) void {
+        // Bounded service: ordered writes first, except that once they have taken room
+        // while unordered writes waited, the next room any lane frees goes to the spill.
+        // Ordered-first alone starves the spill under sustained ordered load on every lane
+        // (each slot a pop frees is refilled from that lane's pending before `spread` runs).
+        if (self.spill_turn) {
+            if (self.spread() > 0) self.spill_turn = false;
+            _ = self.pushOrdered();
+        } else if (self.pushOrdered() > 0 and self.spill.items.len > 0) {
+            self.spill_turn = true;
+        } else _ = self.spread();
+        for (self.lanes, 0..) |lane, k| ingress_stats.noteQueued(k, lane.queue.depth());
+        ingress_stats.notePending(self.pending_total);
+    }
+
+    /// Each lane's pending ordered writes, as far as its queue has room: the count taken.
+    fn pushOrdered(self: *Dispatcher) usize {
+        var total: usize = 0;
+        for (self.lanes, self.pending, 0..) |lane, *p, k| {
+            if (p.items.len > 0) {
+                var group: [LaneQueue.capacity]*nats.JetStreamMessage = undefined;
+                const want = @min(p.items.len, group.len);
+                for (p.items[0..want], 0..) |e, i| group[i] = e.msg;
+                const taken = lane.queue.tryPush(group[0..want]) catch {
+                    self.laneLost(k);
+                    for (p.items) |e| e.msg.deinit();
+                    self.pending_total -= p.items.len;
+                    p.clearRetainingCapacity();
+                    continue;
+                };
+                p.replaceRangeAssumeCapacity(0, taken, &.{});
+                self.pending_total -= taken;
+                total += taken;
+            }
+        }
+        return total;
+    }
+
+    /// Once a second: the ack deadlines of what has waited a third of the ack wait,
+    /// pending here, queued in a lane or executing in one.
+    fn renewIfDue(self: *Dispatcher) void {
+        const now = self.nowMs();
+        if (now - self.last_renew_ms < 1000) return;
+        self.last_renew_ms = now;
+        var n: usize = 0;
+        for (self.pending) |*p| n += renewList(p, now);
+        n += renewList(&self.spill, now);
+        for (self.lanes) |lane| n += lane.queue.renew(renew_after_ms);
+        if (n > 0) _ = ingress_stats.renewals.fetchAdd(n, .monotonic);
+    }
+
+    fn renewList(list: *std.ArrayList(Pending), now: i64) usize {
+        var n: usize = 0;
+        for (list.items) |*e| if (now - e.since_ms >= renew_after_ms) {
+            e.msg.inProgress() catch {};
+            e.since_ms = now;
+            n += 1;
+        };
+        return n;
+    }
+
+    fn lanesFinished(self: *Dispatcher) bool {
+        for (self.lanes) |lane| if (!lane.queue.isFinished()) return false;
+        return true;
+    }
+
+    /// How long a fetch may wait: the normal pull when nothing is held, and a short one
+    /// while fetched writes wait for a lane. A fetch the server cannot answer (the consumer
+    /// at its max_ack_pending) blocks for its whole timeout, and a dispatcher blocked
+    /// there refills no queue: measured, one ordered client on 8 lanes left its lane
+    /// idle ~1.2 s of 3.1 s, against ~0.6 s of 2.4 s on 1 lane. Never `.none`: nats.zig
+    /// sends no `expires` then, and the fetch waits forever.
+    const fetch_ms = 500;
+    const held_fetch_ms = 10;
+
+    /// One turn of the pull loop: hand out what is held, then at most one bounded wait
+    /// (for room, or a fetch). `consumer` is the pull subscription (a fake in tests).
+    fn step(self: *Dispatcher, consumer: anytype) void {
+        self.flush();
+        self.renewIfDue();
+        if (self.pending_total >= budget(self.lanes.len)) {
+            _ = ingress_stats.budget_waits.fetchAdd(1, .monotonic);
+            self.waitRoom(100);
+            return;
+        }
+        const held = self.pending_total > 0;
+        if (held and !self.hasRoom()) {
+            // Every queue a held write may go to is full: wait for a pop, not in a loop.
+            self.waitRoom(held_fetch_ms);
+            if (self.hasRoom()) return; // the next turn's flush takes it
+        }
+        _ = ingress_stats.fetches.fetchAdd(1, .monotonic);
+        if (held) _ = ingress_stats.fetches_held.fetchAdd(1, .monotonic);
+        const ms: i64 = if (held) held_fetch_ms else fetch_ms;
+        // ⚠️ Status frames (408, 409, idle heartbeats) are handled by the library now
+        // — it recognises them and does not surface them as messages.
+        var batch = consumer.fetch(config.Nats.mutation_pull_batch, .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } }) catch return;
+        // The messages are the lanes' to free; only the array is ours.
+        defer batch.allocator.free(batch.messages);
+        if (batch.messages.len == 0) {
+            // Idle: the fetch waited out its expiry; a pause before the next, as the
+            // lanes used to (a pull loop with no pause capped ingress at ~10 writes/s).
+            // Not while writes are held: their lane may have room by now.
+            if (!held) utils.sleep(config.Nats.mutation_pull_idle_ms * std.time.ns_per_ms);
+            return;
+        }
+        self.absorb(batch.messages);
+    }
+
+    /// A held write could be pushed now: its lane (ordered) or any lane (the spill) has room.
+    fn hasRoom(self: *Dispatcher) bool {
+        for (self.lanes, self.pending) |lane, p| if (p.items.len > 0 and lane.queue.depth() < LaneQueue.capacity) return true;
+        if (self.spill.items.len > 0) for (self.lanes) |lane| if (lane.queue.depth() < LaneQueue.capacity) return true;
+        return false;
+    }
+
+    /// Waits up to `ms` for a pop in the first lane holding work (the spill: the cursor's).
+    fn waitRoom(self: *Dispatcher, ms: i64) void {
+        const t = std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
+        for (self.lanes, self.pending) |lane, p| {
+            if (p.items.len > 0) return lane.queue.waitSpace(t);
+        }
+        self.lanes[self.cursor].queue.waitSpace(t);
+    }
+
+    fn run(self: *Dispatcher) void {
+        defer log.info("🛑 Mutation dispatcher stopped", .{});
+        // Whatever ends this thread, the lanes must not wait for a push that never comes —
+        // and a bridge whose ingress is gone must not look alive to its supervisor.
+        defer self.closeLanes();
+        errdefer self.should_stop.store(true, .seq_cst);
+
+        // Pull, not push: the bridge fetches when it is ready, so a burst cannot outrun
+        // the PostgreSQL apply loop, and the position lives in the durable so a restart
+        // resumes where it stopped.
+        var conn_nats = nats.Connection.init(self.allocator, self.io, .{
+            .user = self.endpoint.user,
+            .password = self.endpoint.pass,
+            .nkey_seed = self.endpoint.seed,
+            .user_creds = self.endpoint.creds,
+            .tls = nats_endpoint.tlsOptions(self.endpoint),
+        });
+        // The lanes ack through this connection: it closes only after the last lane has
+        // finished (the wait at the end of this function), never on an early return.
+        defer conn_nats.deinit();
+        const url = self.endpoint.dialUrl(self.allocator) catch |err| return self.fail(err);
+        defer self.allocator.free(url);
+        conn_nats.connect(url) catch |err| return self.fail(err);
+        var js = nats.JetStream.init(&conn_nats, .{ .domain = self.endpoint.js_domain });
+
+        // An existing durable at the old default is raised in place first, or the subscribe
+        // below would find a mismatch (it checks every field it asks for).
+        ack_limit.ensure(js, self.allocator, self.endpoint_topology.stream_mutations, "bridge_mutations_worker") catch |err| return self.fail(err);
+        // `.stream` given explicitly rather than derived from the subject: grammar.json
+        // names it, and the lookup path allocates a name the subscription then owns (see
+        // nats.zig/NOTES.md #1).
+        const consumer = js.pullSubscribe(
+            self.endpoint_topology.mutations_subject_wildcard,
+            "bridge_mutations_worker",
+            .{
+                .stream = self.endpoint_topology.stream_mutations,
+                .config = .{
+                    .ack_policy = .explicit,
+                    .deliver_policy = .all,
+                    // The server-side half of the poison-pill guard: even a failure the
+                    // bridge wrongly classifies as retryable stops after this many
+                    // attempts.
+                    .max_deliver = config.Nats.mutation_max_deliver,
+                    .ack_wait = config.Nats.mutation_ack_wait_ns,
+                    .max_ack_pending = config.Nats.mutation_max_ack_pending,
+                    .filter_subject = self.endpoint_topology.mutations_subject_wildcard,
+                },
+            },
+        ) catch |err| return self.fail(err);
+        defer consumer.deinit();
+
+        // §10eb: the previous instance may have died with writes in flight — fetched,
+        // applied or not, never acked. JetStream redelivers those only when their ack
+        // wait expires, while NEWER messages flow to this instance at once: a DELETE
+        // landed before the UPDATE of the same row that preceded it on the stream
+        // (measured under the wasp: row_deleted for a write published 260 ms before
+        // the delete). Per-row order across a crash holds only if the in-flight ones
+        // are redelivered FIRST — so, if any are pending, wait one ack wait before the
+        // first pull; they then come at the head of it, in stream order.
+        {
+            var ci = js.getConsumerInfo(self.endpoint_topology.stream_mutations, "bridge_mutations_worker") catch null;
+            if (ci) |*info| {
+                defer info.deinit();
+                if (info.value.num_ack_pending > 0) {
+                    const wait_ms = config.Nats.mutation_ack_wait_ns / std.time.ns_per_ms + 500;
+                    log.info("Mutation dispatcher: {d} write(s) were in flight when the previous instance stopped — waiting {d} ms for their redelivery, so they are judged before anything newer (§10eb)", .{ info.value.num_ack_pending, wait_ms });
+                    var slept: u64 = 0;
+                    while (slept < wait_ms and !self.should_stop.load(.seq_cst)) : (slept += 100) utils.sleep(100 * std.time.ns_per_ms);
+                }
+            }
+        }
+
+        log.info("Mutation dispatcher: pulling for {d} lane(s), routed by principal and client; up to {d} write(s) pending", .{ self.lanes.len, budget(self.lanes.len) });
+        while (!self.should_stop.load(.seq_cst)) self.step(consumer);
+
+        // §10ec: a clean stop leaves nothing in flight. The batch in hand is queued
+        // and judged by its lane; what can remain is the last PULL REQUEST, still parked
+        // at the server for up to its expiry after a fetch returned early — writes
+        // published into that window are delivered to a subscription nobody reads,
+        // and count as in flight until their ack wait runs out (two of them, measured
+        // under the wasp at 15 writes/s). So: NO new pull (a new one would park in
+        // turn — "until a pull comes back empty" never ends under a steady writer),
+        // and read the inbox for what the parked request still delivers, until it
+        // has been silent for longer than that request can live. A crash (kill -9)
+        // still leaves in-flight writes; the boot drain (§10eb) covers that.
+        var judged: usize = 0;
+        const quiet = std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(600), .clock = .awake } };
+        while (consumer.nextDelivered(quiet) catch null) |jm| {
+            self.absorb(&.{jm});
+            judged += 1;
+        }
+        if (judged > 0) log.info("Mutation listener: stopping — {d} write(s) the parked pull still delivered, judged before exit (§10ec)", .{judged});
+        // What fits in the lanes' queues is judged before they stop; what does not is left
+        // unacked for the next boot (§10eb) rather than waited for behind a held transaction.
+        self.flush();
+        if (self.pending_total > 0) {
+            log.info("Mutation dispatcher: stopping — {d} fetched write(s) left for the next boot (§10eb)", .{self.pending_total});
+            _ = ingress_stats.dropped_at_stop.fetchAdd(self.pending_total, .monotonic);
+            for (self.pending) |*p| {
+                for (p.items) |e| e.msg.deinit();
+                p.clearRetainingCapacity();
+            }
+            for (self.spill.items) |e| e.msg.deinit();
+            self.spill.clearRetainingCapacity();
+            self.pending_total = 0;
+        }
+        self.closeLanes();
+        // The lanes drain their queues and ack through this connection: stay, renewing
+        // their deadlines, until the last has finished.
+        while (!self.lanesFinished()) {
+            self.renewIfDue();
+            utils.sleep(200 * std.time.ns_per_ms);
+        }
+    }
+
+    /// Only startup paths fail (connect, subscribe, the ack limit): a fault of configuration,
+    /// which must not exit 0 like a requested stop.
+    fn fail(self: *Dispatcher, err: anyerror) void {
+        log.err("🔴 Mutation dispatcher: cannot pull mutations ({s}) — stopping the bridge", .{@errorName(err)});
+        if (self.boot_fatal) |f| f.store(true, .release);
+        self.should_stop.store(true, .seq_cst);
+    }
+};
+
 const Mutation = struct {
     principal: []const u8,
     table: []const u8,
@@ -513,12 +1141,21 @@ pub const MutationListener = struct {
     last_outcome: WriteOutcome = .applied,
     /// When the receipt partitions are next maintained (epoch seconds; 0: at once).
     receipts_due_at: i64 = 0,
+    park_sweep_at: i64 = 0,
+    ordered_work_claimed: bool = false,
+    /// IDs whose claim released a parked row into a credit that owes the verdict (see
+    /// `creditOwnsVerdict`), for the current batch and its sweep; cleared after them.
+    credit_verdicts: std.StringHashMapUnmanaged(void) = .empty,
+    parked_replay: bool = false,
+    parked_attempt: bool = false,
     /// Batches replayed message by message since the last warning, and when it was.
     replayed_batches: u64 = 0,
     replay_logged_at: i64 = 0,
     /// Non-null while `applyBatched` has a pipeline open: routes `exec()` into
     /// send-only mode. Always null on the per-message path.
     batch_ctx: ?*BatchCtx = null,
+    /// What the Dispatcher routed to this lane, in stream order (see `Dispatcher`).
+    queue: LaneQueue,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -547,12 +1184,15 @@ pub const MutationListener = struct {
             .limiter = limiter,
             .publication = publication,
             .tenant_cache = std.StringHashMap([]const u8).init(allocator),
+            .queue = .{ .io = io },
         };
 
         return self;
     }
 
     pub fn deinit(self: *MutationListener) void {
+        self.clearCreditVerdicts();
+        self.credit_verdicts.deinit(self.allocator);
         var it = self.meta_cache.iterator();
         while (it.next()) |e| {
             self.allocator.free(e.key_ptr.*);
@@ -580,6 +1220,12 @@ pub const MutationListener = struct {
 
     fn listenLoop(self: *MutationListener) void {
         log.info("Mutation listener thread started. Connecting to NATS and PostgreSQL...", .{});
+        // Leaving, for whatever reason: what is still queued goes back unacked, and the
+        // Dispatcher learns that nothing more will be acked through this lane.
+        defer {
+            const left = self.queue.leave();
+            if (left > 0) log.info("Mutation listener: stopping — {d} queued write(s) left for the next boot (§10eb)", .{left});
+        }
 
         // 1. Connect to PostgreSQL (dedicated connection for mutations — the WAL
         //    stream's connection is in replication mode and cannot run ordinary SQL).
@@ -608,11 +1254,10 @@ pub const MutationListener = struct {
             c.PQhost(conn), c.PQport(conn), c.PQuser(conn),
         });
 
-        // 2. Connect to NATS, and bind a durable pull consumer.
-        //
-        // Pull, not push: the bridge fetches when it is ready, so a burst cannot outrun
-        // the PostgreSQL apply loop, and the position lives in the durable so a restart
-        // resumes where it stopped.
+        // 2. Connect to NATS: this lane's connection carries its verdicts, dead letters
+        //    and park notices. The pull itself is the Dispatcher's (one puller, lanes
+        //    keyed by principal and client); what it hands over is acked through the
+        //    message's own connection.
         const conn_nats = self.allocator.create(nats.Connection) catch |err| {
             log.err("Mutation listener: out of memory: {}", .{err});
             return;
@@ -635,60 +1280,16 @@ pub const MutationListener = struct {
             return;
         };
 
-        var js = nats.JetStream.init(conn_nats, .{ .domain = self.endpoint.js_domain });
-
-        // `.stream` given explicitly rather than derived from the subject: grammar.json
-        // names it, and the lookup path allocates a name the subscription then owns (see
-        // nats.zig/NOTES.md #1).
-        const consumer = js.pullSubscribe(
-            self.endpoint_topology.mutations_subject_wildcard,
-            "bridge_mutations_worker",
-            .{
-                .stream = self.endpoint_topology.stream_mutations,
-                .config = .{
-                    .ack_policy = .explicit,
-                    .deliver_policy = .all,
-                    // The server-side half of the poison-pill guard: even a failure the
-                    // bridge wrongly classifies as retryable stops after this many
-                    // attempts.
-                    .max_deliver = config.Nats.mutation_max_deliver,
-                    .ack_wait = config.Nats.mutation_ack_wait_ns,
-                    .filter_subject = self.endpoint_topology.mutations_subject_wildcard,
-                },
-            },
-        ) catch |err| {
-            log.err("Mutation listener: Failed to start NATS consumer: {}", .{err});
-            return;
-        };
-        defer consumer.deinit();
-
-        // §10eb: the previous instance may have died with writes in flight — fetched,
-        // applied or not, never acked. JetStream redelivers those only when their ack
-        // wait expires, while NEWER messages flow to this instance at once: a DELETE
-        // landed before the UPDATE of the same row that preceded it on the stream
-        // (measured under the wasp: row_deleted for a write published 260 ms before
-        // the delete). Per-row order across a crash holds only if the in-flight ones
-        // are redelivered FIRST — so, if any are pending, wait one ack wait before the
-        // first pull; they then come at the head of it, in stream order.
-        {
-            var ci = js.getConsumerInfo(self.endpoint_topology.stream_mutations, "bridge_mutations_worker") catch null;
-            if (ci) |*info| {
-                defer info.deinit();
-                if (info.value.num_ack_pending > 0) {
-                    const wait_ms = config.Nats.mutation_ack_wait_ns / std.time.ns_per_ms + 500;
-                    log.info("Mutation listener: {d} write(s) were in flight when the previous instance stopped — waiting {d} ms for their redelivery, so they are judged before anything newer (§10eb)", .{ info.value.num_ack_pending, wait_ms });
-                    var slept: u64 = 0;
-                    while (slept < wait_ms and !self.should_stop.load(.seq_cst)) : (slept += 100) utils.sleep(100 * std.time.ns_per_ms);
-                }
-            }
-        }
-
         log.info("Mutation listener: ✅ Ready! Pulling mutations from JetStream...", .{});
 
-        // 3. Pull Loop
-        while (!self.should_stop.load(.seq_cst)) {
+        // 3. The lane's loop: what the Dispatcher queued for this lane, a batch at a time,
+        //    until the queue is closed and empty (the Dispatcher closes it after its §10ec
+        //    drain, so a clean stop judges everything that was delivered).
+        var queued: [config.Nats.mutation_pull_batch]*nats.JetStreamMessage = undefined;
+        while (true) {
             // Ensure PostgreSQL connection is alive
             if (c.PQstatus(conn) == c.CONNECTION_BAD) {
+                if (self.queue.isClosed()) break; // what is still queued is redelivered at the next boot (§10eb)
                 log.warn("Mutation listener: PostgreSQL connection lost. Attempting to reconnect...", .{});
                 c.PQreset(conn);
                 if (c.PQstatus(conn) != c.CONNECTION_OK) {
@@ -700,22 +1301,27 @@ pub const MutationListener = struct {
             }
             // Before the first write and daily after: every claim needs its month's partition.
             self.maintainReceiptsIfDue(conn);
+            self.sweepParked(conn, conn_nats);
 
-            // One pull for a whole batch: at depth >= 2 the batched apply amortizes
+            // A whole batch at a time: at depth >= 2 the batched apply amortizes
             // the WAL flush and the round trips (§10cr measured the one-at-a-time
             // ceiling at ~50 mutations/s while PostgreSQL coasted); a single
             // message takes the per-message path, so light load keeps today's
             // exact semantics — and so does every failure, via the replay below.
-            //
-            // ⚠️ Status frames (408, 409, idle heartbeats) are handled by the library now
-            // — it recognises them and does not surface them as messages.
-            var batch = consumer.fetch(config.Nats.mutation_pull_batch, .{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .awake } }) catch {
+            const n = self.queue.popBatch(&queued, .{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .awake } });
+            if (n == 0) {
+                if (self.queue.isClosed()) break;
                 continue;
-            };
-            defer batch.deinit();
+            }
+            const messages = queued[0..n];
+            defer {
+                self.queue.endBatch(); // before the free: a renewal must never see a freed message
+                for (messages) |m| m.deinit();
+            }
 
-            if (batch.messages.len > 1) {
-                self.applyBatched(conn, conn_nats, batch.messages) catch |err| {
+            self.ordered_work_claimed = false;
+            if (messages.len > 1) {
+                self.applyBatched(conn, conn_nats, messages) catch |err| {
                     // The transaction rolled back whole; every message replays
                     // through the per-message path — the full retry, dead-letter
                     // and verdict machinery decides there. No delivery budget was
@@ -731,39 +1337,13 @@ pub const MutationListener = struct {
                         self.replay_logged_at = now;
                         self.replayed_batches = 0;
                     }
-                    for (batch.messages) |msg| self.processOne(conn, conn_nats, msg);
+                    for (messages) |msg| self.processOne(conn, conn_nats, msg);
                 };
-            } else for (batch.messages) |msg| self.processOne(conn, conn_nats, msg);
+            } else for (messages) |msg| self.processOne(conn, conn_nats, msg);
 
-            // Sleep ONLY when the fetch came back empty. This was a `for … else`,
-            // meant as "sleep on timeout" — but Zig runs the else on every normal
-            // completion, so the listener slept 100 ms after EVERY message and the
-            // whole ingress lane was capped at ~10 writes/s regardless of backlog
-            // (found by race.py: 24 writers × 5 writes outlived a 6 s window).
-            if (batch.messages.len == 0) {
-                utils.sleep(config.Nats.mutation_pull_idle_ms * std.time.ns_per_ms);
-            }
-        }
-
-        // §10ec: a clean stop leaves nothing in flight. The batch in hand is committed
-        // and acked above; what can remain is the last PULL REQUEST, still parked at
-        // the server for up to its expiry after a fetch returned early — writes
-        // published into that window are delivered to a subscription nobody reads,
-        // and count as in flight until their ack wait runs out (two of them, measured
-        // under the wasp at 15 writes/s). So: NO new pull (a new one would park in
-        // turn — "until a pull comes back empty" never ends under a steady writer),
-        // and read the inbox for what the parked request still delivers, until it
-        // has been silent for longer than that request can live. A crash (kill -9)
-        // still leaves in-flight writes; the boot drain (§10eb) covers that.
-        if (c.PQstatus(conn) == c.CONNECTION_OK) {
-            var judged: usize = 0;
-            const quiet = std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(600), .clock = .awake } };
-            while (consumer.nextDelivered(quiet) catch null) |jm| {
-                self.processOne(conn, conn_nats, jm);
-                jm.deinit();
-                judged += 1;
-            }
-            if (judged > 0) log.info("Mutation listener: stopping — {d} write(s) the parked pull still delivered, judged before exit (§10ec)", .{judged});
+            if (self.ordered_work_claimed) self.park_sweep_at = 0;
+            self.sweepParked(conn, conn_nats);
+            self.clearCreditVerdicts();
         }
 
         // Every other thread announces its exit — a shutdown where one thread goes
@@ -930,6 +1510,12 @@ pub const MutationListener = struct {
             log.debug("no Nats-Msg-Id on this mutation; no verdict addressable", .{});
             return;
         };
+        if (self.creditOwnsVerdict(msg_id, status)) {
+            _ = (if (self.parked_replay) &ingress_stats.credit_verdicts_sweep else &ingress_stats.credit_verdicts_lane).fetchAdd(1, .monotonic);
+            self.park_sweep_at = 0; // the next sweep delivers it, after its PubAck
+            log.debug("📮 verdict for {s} left to its park credit", .{msg_id});
+            return;
+        }
 
         // ⚠️ Client-supplied, and it becomes the last token of a subject. A value carrying
         // a dot silently adds tokens; `*` and `>` publish as literals but match broadly
@@ -995,6 +1581,7 @@ pub const MutationListener = struct {
     /// phone cannot spend a whole tenant's budget alone and a tenant cannot crowd
     /// out the others. True when the message was handled here.
     fn rateLimited(self: *MutationListener, conn: ?*c.PGconn, conn_nats: *nats.Connection, msg: *nats.JetStreamMessage, mutation: Mutation) bool {
+        if (self.parked_replay) return false;
         if (!self.limiter.enabled()) return false;
         // A redelivery was charged when it was refused (the bucket's debt), and a
         // redelivery for any other reason was admitted once already: no second toll.
@@ -1007,6 +1594,7 @@ pub const MutationListener = struct {
         else
             mutation.principal;
         const wait = self.limiter.takeTwo(mutation.principal, tenant_key, now_ms) orelse return false;
+        log.debug("🚦 refused [{s}] {s} (delivery {d}, stream seq {d}): retry after {d} ms", .{ mutation.principal, msgIdOf(msg) orelse "-", msg.metadata.num_delivered, msg.metadata.sequence.stream, wait });
         if (msg.metadata.num_delivered >= config.Nats.mutation_max_deliver) {
             var extra_buf: [48]u8 = undefined;
             const extra = std.fmt.bufPrint(&extra_buf, ",\"retry_after_ms\":{d}", .{wait}) catch "";
@@ -1060,6 +1648,170 @@ pub const MutationListener = struct {
     /// apply in its own implicit transaction, verdict, ack/NAK — extracted
     /// verbatim from the pull loop when the batched path arrived (§10cr), and
     /// still the path every message takes at queue depth 1 and on batch replay.
+    /// Called only with an idle writer connection: park's counters cannot leak into
+    /// application SQL. Its autocommit completes before JetStream is acknowledged.
+    fn parkWaiting(self: *MutationListener, a: std.mem.Allocator, conn: ?*c.PGconn, nc: *nats.Connection, msg: *nats.JetStreamMessage, mutation: Mutation, route: []const u8, predecessor: ?[:0]const u8) void {
+        if (c.PQtransactionStatus(conn) != c.PQTRANS_IDLE) return self.receiptTrouble(conn, nc, msg, mutation.principal);
+        const principal = a.dupeSentinel(u8, mutation.principal, 0) catch return;
+        const id = a.dupeSentinel(u8, msgIdOf(msg).?, 0) catch return;
+        const state = ordered_ingress.park(a, conn, principal, id, route, msg.msg.data, predecessor, msg.metadata.sequence.stream) catch return self.receiptTrouble(conn, nc, msg, mutation.principal);
+        if (std.mem.eql(u8, state, "parked")) {
+            _ = ingress_stats.parked.fetchAdd(1, .monotonic);
+            // A lost ack: JetStream redelivers the parked write into an ordinary lane batch.
+            if (faultAt(.park_before_ack)) std.process.exit(70);
+            msg.ack() catch {};
+            const target = Topology.render(a, self.endpoint_topology.mutation_ack_pattern, &.{ .{ .name = "principal", .value = principal }, .{ .name = "msg_id", .value = id } }, null) catch return;
+            const subject = std.fmt.allocPrint(a, "{s}.held", .{target}) catch return;
+            const lease_ms: u64 = @as(u64, @intCast(config.Nats.mutation_max_deliver)) * 1000 + @as(u64, @intCast(config.Batch.max_age_ms)) + 2000;
+            const notice = std.fmt.allocPrint(a, "{{\"status\":\"held\",\"lease_ms\":{d}}}", .{lease_ms}) catch return;
+            nc.publish(subject, notice) catch {};
+            return;
+        }
+        if (std.mem.eql(u8, state, "backlog_full")) {
+            self.clearFailure();
+            self.publishVerdict(nc, msg, principal, "failed", "DependencyBacklogFull");
+            msg.ack() catch {};
+            return;
+        }
+        // State changed while waiting for quota, or a conflicting resend won.
+        // Re-enter the locked gate; never run based solely on park's observation.
+        self.processOne(conn, nc, msg);
+    }
+
+    fn deliverParkVerdicts(self: *MutationListener, conn: ?*c.PGconn, nc: *nats.Connection) void {
+        if (c.PQtransactionStatus(conn) != c.PQTRANS_IDLE) return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const publication = a.dupeSentinel(u8, self.publication, 0) catch return;
+        const args = [_]?[*:0]const u8{publication.ptr};
+        const r = c.PQexecParams(conn, "SELECT credit_id,principal,message_id,outcome::text FROM zebridge_private.pending_park_verdicts($1)", 1, null, &args, null, null, 0);
+        defer c.PQclear(r);
+        if (c.PQresultStatus(r) != c.PGRES_TUPLES_OK) {
+            log.warn("park verdict scan failed: {s}", .{c.PQerrorMessage(conn)});
+            return;
+        }
+        const js = nats.JetStream.init(nc, .{ .domain = self.endpoint.js_domain });
+        var i: c_int = 0;
+        while (i < c.PQntuples(r)) : (i += 1) {
+            const principal = std.mem.span(c.PQgetvalue(r, i, 1));
+            const id = std.mem.span(c.PQgetvalue(r, i, 2));
+            const subject = Topology.render(a, self.endpoint_topology.mutation_ack_pattern, &.{ .{ .name = "principal", .value = principal }, .{ .name = "msg_id", .value = id } }, null) catch return;
+            const published = js.publish(subject, std.mem.span(c.PQgetvalue(r, i, 3)), .{}) catch |err| {
+                log.warn("park verdict delivery deferred: {s}", .{@errorName(err)});
+                return;
+            };
+            defer published.deinit();
+            const delivered = [_]?[*:0]const u8{c.PQgetvalue(r, i, 0)};
+            const done = c.PQexecParams(conn, "SELECT zebridge_private.park_verdict_delivered($1)", 1, null, &delivered, null, null, 0);
+            defer c.PQclear(done);
+            if (c.PQresultStatus(done) != c.PGRES_TUPLES_OK) return;
+        }
+    }
+
+    fn sweepParked(self: *MutationListener, conn: ?*c.PGconn, nc: *nats.Connection) void {
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
+        if (self.parked_replay or now < self.park_sweep_at) return;
+        self.park_sweep_at = now + 1;
+        if (c.PQtransactionStatus(conn) != c.PQTRANS_IDLE) return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const publication = a.dupeSentinel(u8, self.publication, 0) catch return;
+        const vals = [_]?[*:0]const u8{publication.ptr};
+        const elected = c.PQexecParams(conn, "SELECT zebridge_private.try_park_sweeper($1)", 1, null, &vals, null, null, 0);
+        defer c.PQclear(elected);
+        if (c.PQresultStatus(elected) != c.PGRES_TUPLES_OK or c.PQntuples(elected) != 1) {
+            log.warn("park sweeper election failed: {s}", .{c.PQerrorMessage(conn)});
+            return;
+        }
+        if (!std.mem.eql(u8, std.mem.span(c.PQgetvalue(elected, 0, 0)), "t")) return;
+        defer {
+            const released = c.PQexecParams(conn, "SELECT zebridge_private.leave_park_sweeper($1)", 1, null, &vals, null, null, 0);
+            if (c.PQresultStatus(released) != c.PGRES_TUPLES_OK) c.PQreset(conn); // never strand a session lock
+            c.PQclear(released);
+        }
+        self.deliverParkVerdicts(conn, nc);
+        ordered_ingress.settle(conn) catch |err| {
+            log.warn("park credit settlement deferred: {s}", .{@errorName(err)});
+            return;
+        };
+        // Binary result retains bytea exactly; all other columns are UTF-8 strings.
+        const r = c.PQexecParams(conn, "SELECT principal,message_id,route,payload,headers::text FROM zebridge_private.parked_mutations_ready($1,256)", 1, null, &vals, null, null, 1);
+        defer c.PQclear(r);
+        if (c.PQresultStatus(r) != c.PGRES_TUPLES_OK) {
+            log.warn("park release scan failed: {s}", .{c.PQerrorMessage(conn)});
+            return;
+        }
+        const n: usize = @intCast(c.PQntuples(r));
+        const messages = a.alloc(nats.Message, n) catch return;
+        const js_messages = a.alloc(nats.JetStreamMessage, n) catch return;
+        const pointers = a.alloc(*nats.JetStreamMessage, n) catch return;
+        var initialized: usize = 0;
+        defer for (messages[0..initialized]) |*m| m.deinit();
+        for (0..n) |i| {
+            const row: c_int = @intCast(i);
+            messages[i] = nats.Message.init(a);
+            initialized += 1;
+            messages[i].subject = std.mem.span(c.PQgetvalue(r, row, 2));
+            messages[i].data = c.PQgetvalue(r, row, 3)[0..@intCast(c.PQgetlength(r, row, 3))];
+            messages[i].headerSet("Nats-Msg-Id", std.mem.span(c.PQgetvalue(r, row, 1))) catch return;
+            const h = std.json.parseFromSliceLeaky(struct { seq: u64 = 0 }, a, std.mem.span(c.PQgetvalue(r, row, 4)), .{ .ignore_unknown_fields = true }) catch return;
+            js_messages[i] = .{ .msg = &messages[i], .nc = nc, .metadata = .{ .sequence = .{ .stream = h.seq }, .num_delivered = 2 } };
+            pointers[i] = &js_messages[i];
+        }
+        self.parked_replay = true;
+        defer self.parked_replay = false;
+        if (n > 0) self.applyBatched(conn, nc, pointers) catch {
+            for (pointers) |msg| {
+                self.parked_attempt = false;
+                self.processOne(conn, nc, msg);
+                if (!self.parked_attempt) continue;
+                // Only a real application attempt may spend this budget. If it
+                // committed, there is no parked row and this is an idempotent no-op.
+                const route = parseSubject(msg.msg.subject, self.endpoint_topology.subject_mutations_prefix, self.endpoint_topology.leaf_prefix) catch continue;
+                const principal = a.dupeSentinel(u8, route.principal, 0) catch continue;
+                const id = a.dupeSentinel(u8, msgIdOf(msg).?, 0) catch continue;
+                const args = [_]?[*:0]const u8{ principal.ptr, id.ptr };
+                const f = c.PQexecParams(conn, "SELECT zebridge_private.fail_parked_mutation($1,$2)", 2, null, &args, null, null, 0);
+                if (c.PQresultStatus(f) != c.PGRES_TUPLES_OK) log.warn("park execution-attempt accounting deferred", .{});
+                c.PQclear(f);
+            }
+        };
+        ordered_ingress.settle(conn) catch |err| log.warn("park credit settlement deferred: {s}", .{@errorName(err)});
+        // Still elected: the verdicts of what the replay just released (left to their credits).
+        self.deliverParkVerdicts(conn, nc);
+    }
+
+    /// A claim's credit, remembered by ID. Only the statuses whose transaction the bridge then
+    /// commits: any other rolls back, and the credit with it.
+    fn noteClaim(self: *MutationListener, id: []const u8, claim: receipts.Claim) void {
+        const committed = switch (claim.status) {
+            .claimed, .duplicate, .predecessor_unknown, .invalid_predecessor => true,
+            else => false,
+        };
+        if (claim.released and committed) {
+            if (self.credit_verdicts.contains(id)) return;
+            const key = self.allocator.dupe(u8, id) catch return; // shortcut: on OOM the verdict is sent twice, as before
+            self.credit_verdicts.put(self.allocator, key, {}) catch self.allocator.free(key);
+        } else if (self.credit_verdicts.fetchRemove(id)) |kv| self.allocator.free(kv.key);
+    }
+
+    /// For a released write, the park credit publishes the terminal verdict
+    /// (`deliverParkVerdicts`, settled after its PubAck). If the bridge stops after JetStream
+    /// stores the verdict but before PostgreSQL records delivery, recovery may publish it
+    /// again. Sending it here as well gave every released write two (ingress_release.py).
+    /// `failed` follows a full rollback, which took the credit with it: that one is still ours.
+    fn creditOwnsVerdict(self: *MutationListener, msg_id: []const u8, status: []const u8) bool {
+        return !std.mem.eql(u8, status, "failed") and self.credit_verdicts.contains(msg_id);
+    }
+
+    fn clearCreditVerdicts(self: *MutationListener) void {
+        var it = self.credit_verdicts.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
+        self.credit_verdicts.clearRetainingCapacity();
+    }
+
     fn processOne(self: *MutationListener, conn: ?*c.PGconn, conn_nats: *nats.Connection, msg: *nats.JetStreamMessage) void {
         const payload = msg.msg.data;
 
@@ -1115,7 +1867,37 @@ pub const MutationListener = struct {
         const id_z = a.dupeSentinel(u8, msgIdOf(msg).?, 0) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
         // Three exchanges when it succeeds: (1) BEGIN, the claim, SAVEPOINT; (2) the write
         // and its classify; (3) the outcome, the deferred constraints, COMMIT.
-        const claim = receipts.beginClaim(a, conn, principal_z, id_z, subject, payload) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        const envelope = ordered_ingress.parse(a, payload, id_z) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        var claim = (if (envelope.ordered)
+            receipts.beginOrderedClaim(a, conn, principal_z, id_z, subject, payload, envelope.predecessor, a.dupeSentinel(u8, self.publication, 0) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal))
+        else
+            receipts.beginClaim(a, conn, principal_z, id_z, subject, payload)) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        self.noteClaim(id_z, claim);
+        if (claim.status == .waiting) {
+            receipts.rollback(conn);
+            self.parkWaiting(a, conn, conn_nats, msg, mutation, subject, envelope.predecessor);
+            return;
+        }
+        if (envelope.ordered and claim.park_work and claim.status == .claimed) self.ordered_work_claimed = true;
+        const dependency_unknown = claim.status == .predecessor_unknown;
+        const bad_predecessor = claim.status == .invalid_predecessor;
+        if (dependency_unknown or bad_predecessor) claim.status = .claimed;
+        if (claim.status == .claimed and (dependency_unknown or bad_predecessor or envelope.refusal != null)) {
+            self.clearFailure();
+            const status: []const u8 = if (dependency_unknown) "indeterminate" else "rejected";
+            const reason: []const u8 = if (dependency_unknown) "PredecessorUnknown" else if (bad_predecessor) "InvalidPredecessor" else @errorName(envelope.refusal.?);
+            const result = receipts.outcomeJson(a, .{ .status = status, .reason = reason }) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+            receipts.finishOne(conn, principal_z, id_z, claim.fingerprint.?, result) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+            receipts.commit(conn, null) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+            self.publishVerdict(conn_nats, msg, mutation.principal, status, reason);
+            msg.ack() catch {};
+            return;
+        }
+        if (claim.status == .expired or claim.status == .exhausted or claim.status == .duplicate) {
+            // An ordered lookup may have released a park into a credit, even without
+            // claiming an application write. Keep that deletion on terminal exits.
+            if (envelope.ordered) receipts.commit(conn, null) catch return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+        }
         if (claim.status != .claimed) {
             receipts.rollback(conn); // the claim inserted nothing
             self.answerUnclaimed(a, conn_nats, msg, mutation, claim);
@@ -1131,6 +1913,7 @@ pub const MutationListener = struct {
             return;
         };
 
+        self.parked_attempt = self.parked_replay;
         self.handleMutation(mutation, payload, conn) catch |err| {
             // A SQLSTATE the server returned and we recognise as permanent ends the
             // retries now: waiting cannot change a privilege or a constraint.
@@ -1184,6 +1967,7 @@ pub const MutationListener = struct {
                 msg.ack() catch {};
                 return;
             }
+            if (self.parked_replay) return;
             log.err("Failed to handle mutation, will retry: {}", .{err});
             msg.nak() catch {};
             utils.sleep(1 * std.time.ns_per_s);
@@ -1227,6 +2011,8 @@ pub const MutationListener = struct {
                 return self.retryOrFail(conn_nats, msg, mutation.principal, "CommitFailed");
             },
         };
+
+        if (self.parked_replay and faultAt(.ordered_after_commit)) std.process.exit(70);
 
         // ⚠️ A verdict on **every** write that PostgreSQL accepted, not only the
         // ones that changed something. PROTOCOL.md §7.1 makes a client's outbox
@@ -1290,20 +2076,14 @@ pub const MutationListener = struct {
         refused: ?anyerror = null,
         /// Its table's layout was re-read once for it already (a stale-cache candidate).
         rechecked: bool = false,
-
-        fn keyLess(items: []const BatchItem, x: usize, y: usize) bool {
-            return switch (std.mem.order(u8, items[x].principal_z, items[y].principal_z)) {
-                .lt => true,
-                .gt => false,
-                .eq => std.mem.order(u8, items[x].id_z, items[y].id_z) == .lt,
-            };
-        }
+        envelope: ordered_ingress.Envelope = .{},
     };
 
     /// A fetched batch, in ONE explicit transaction across four pipeline rounds:
     ///
-    ///   R1  BEGIN and the receipt claims, one per distinct (principal, ID), sent sorted so
-    ///       concurrent batches take index locks in one order
+    ///   R1  BEGIN, every receipt key locked (`lock_receipts` takes them in hash order, so
+    ///       concurrent batches never deadlock), then the claims, one per distinct
+    ///       (principal, ID), predecessors before their successors
     ///   R2  the claimed writes, in fetch order, each after its own set_config
     ///   R3  only when a write touched zero rows: the classify probes (stale or deleted)
     ///   R4  every finish_receipts, then COMMIT, whose tag must say COMMIT
@@ -1364,20 +2144,45 @@ pub const MutationListener = struct {
                     break;
                 }
             }
-            try items.append(self.allocator, .{ .msg = msg, .mutation = mutation, .route = subject, .principal_z = principal_z, .id_z = id_z, .first = first });
+            const envelope = try ordered_ingress.parse(a, payload, id_z);
+            try items.append(self.allocator, .{ .msg = msg, .mutation = mutation, .route = subject, .principal_z = principal_z, .id_z = id_z, .first = first, .envelope = envelope });
         }
         if (items.items.len == 0) return;
 
         // ── R1: BEGIN and the claims ──
         var order: std.ArrayList(usize) = .empty;
         for (items.items, 0..) |it, k| if (it.first == k) try order.append(a, k);
-        std.mem.sort(usize, order.items, @as([]const BatchItem, items.items), BatchItem.keyLess);
+        // Stable topological order. Cycles remain at the end and the SQL gate parks
+        // them; presence in this array alone never certifies predecessor completion.
+        var sorted: std.ArrayList(usize) = .empty;
+        while (sorted.items.len < order.items.len) {
+            const before = sorted.items.len;
+            for (order.items) |k| {
+                if (std.mem.findScalar(usize, sorted.items, k) != null) continue;
+                var blocked = false;
+                if (items.items[k].envelope.predecessor) |pred| for (order.items) |j| {
+                    if (std.mem.eql(u8, items.items[k].principal_z, items.items[j].principal_z) and std.mem.eql(u8, pred, items.items[j].id_z) and std.mem.findScalar(usize, sorted.items, j) == null) {
+                        blocked = true;
+                        break;
+                    }
+                };
+                if (!blocked) try sorted.append(a, k);
+            }
+            if (sorted.items.len == before) {
+                for (order.items) |k| if (std.mem.findScalar(usize, sorted.items, k) == null) {
+                    try sorted.append(a, k);
+                };
+                break;
+            }
+        }
+        order = sorted;
         // From here on, ANY error return (allocation failures included) leaves the
         // connection idle and outside any transaction, ready for the per-message replay.
         errdefer self.abandonTransaction(conn);
         // One lookup call for the whole batch, a principal per row: a function call costs
         // about 60 µs beyond its rows, and one call per principal made a batch from many
-        // devices pay it per device. `order` is sorted by (principal, ID).
+        // devices pay it per device. `order` is fetch order with each predecessor
+        // moved before its successors; the lock order is `lock_receipts`' own, not this one.
         if (c.PQenterPipelineMode(conn) != 1) return error.MutationFailed;
         var sent_ok = c.PQsendQueryParams(conn, "BEGIN", 0, null, null, null, null, 0) == 1;
         // Every receipt key locked first, in one call, before any receipt is read: a
@@ -1403,7 +2208,15 @@ pub const MutationListener = struct {
                 routes[n] = items.items[k].route;
                 payloads[n] = items.items[k].msg.msg.data;
             }
-            sent_ok = sent_ok and try receipts.sendClaims(a, conn, principals, ids, routes, payloads);
+            const flags = try a.alloc(bool, span.len);
+            const preds = try a.alloc(?[:0]const u8, span.len);
+            var any_ordered = false;
+            for (span, 0..) |k, n| {
+                flags[n] = items.items[k].envelope.ordered;
+                preds[n] = items.items[k].envelope.predecessor;
+                any_ordered = any_ordered or flags[n];
+            }
+            sent_ok = sent_ok and (if (any_ordered) try receipts.sendOrderedClaims(a, conn, principals, ids, routes, payloads, flags, preds, try a.dupeSentinel(u8, self.publication, 0)) else try receipts.sendClaims(a, conn, principals, ids, routes, payloads));
         }
         // The GC floor, in the same round: after BEGIN, inside the transaction that will hold
         // the writes, under the shared floor lock until COMMIT (see `acquireGcFloor`). It was
@@ -1427,7 +2240,10 @@ pub const MutationListener = struct {
         {
             const claims = try a.alloc(receipts.Claim, order.items.len);
             try receipts.readClaims(a, r1[2], claims);
-            for (order.items, claims) |k, claim| items.items[k].claim = claim;
+            for (order.items, claims) |k, claim| {
+                items.items[k].claim = claim;
+                self.noteClaim(items.items[k].id_z, claim);
+            }
         }
         for (items.items, 0..) |*it, k| {
             if (it.first == k) continue;
@@ -1436,11 +2252,24 @@ pub const MutationListener = struct {
             it.claim = .{ .status = if (same) .repeat else .conflict };
         }
 
+        for (items.items) |*it| {
+            if (it.envelope.ordered and it.claim.park_work and it.claim.status == .claimed) self.ordered_work_claimed = true;
+            if (it.claim.status == .predecessor_unknown) {
+                it.claim.status = .claimed;
+                it.refused = error.PredecessorUnknown;
+            }
+            if (it.claim.status == .invalid_predecessor) {
+                it.claim.status = .claimed;
+                it.refused = error.InvalidPredecessor;
+            }
+            if (it.claim.status == .claimed and it.envelope.refusal != null) it.refused = it.envelope.refusal;
+        }
+
         // Pre-warm the metas of the claimed writes only, outside pipeline mode. A table
         // that cannot take writes refuses its write here, deterministically, as long as
         // the transaction is intact; any other failure fails the batch.
         for (items.items) |*it| {
-            if (it.claim.status != .claimed) continue;
+            if (it.claim.status != .claimed or it.refused != null) continue;
             _ = self.tableMeta(conn, it.mutation.table) catch |err| {
                 if ((isPermanent(err) or isOperatorFault(err)) and c.PQtransactionStatus(conn) == c.PQTRANS_INTRANS) {
                     it.refused = err;
@@ -1458,8 +2287,8 @@ pub const MutationListener = struct {
         {
             defer self.batch_ctx = null;
             var n: usize = 0;
-            while (n < items.items.len) : (n +%= 1) {
-                const it = &items.items[n];
+            while (n < order.items.len) : (n +%= 1) {
+                const it = &items.items[order.items[n]];
                 if (it.claim.status != .claimed or it.refused != null) continue;
                 self.clearFailure();
                 const sent_before = bc.pending.items.len;
@@ -1518,7 +2347,7 @@ pub const MutationListener = struct {
         var done: std.ArrayList(usize) = .empty;
         for (order.items) |k| if (items.items[k].pending != null or items.items[k].refused != null) try done.append(a, k);
         if (done.items.len == 0) {
-            receipts.rollback(conn); // nothing was claimed: nothing to keep
+            try receipts.commit(conn, null); // ordered expiry may have produced release credits
         } else {
             // The transaction must still hold the claims and the writes: a COMMIT sent
             // outside one answers only a warning, with the very tag COMMIT.
@@ -1539,7 +2368,7 @@ pub const MutationListener = struct {
                     ids[n] = items.items[k].id_z;
                     fps[n] = items.items[k].claim.fingerprint orelse return error.ReceiptInfrastructure;
                     if (items.items[k].refused) |err| {
-                        outcomes[n] = try receipts.outcomeJson(a, .{ .status = "rejected", .reason = @errorName(err) });
+                        outcomes[n] = try receipts.outcomeJson(a, .{ .status = if (err == error.PredecessorUnknown) "indeterminate" else "rejected", .reason = @errorName(err) });
                         continue;
                     }
                     const pnd = bc.pending.items[items.items[k].pending.?];
@@ -1570,6 +2399,8 @@ pub const MutationListener = struct {
             if (failed_at != r4.len or !receipts.committed(r4[finishes])) return error.MutationFailed;
         }
 
+        if (self.parked_replay and faultAt(.ordered_after_commit)) std.process.exit(70);
+
         // ── Verdicts and acks, now that the outcomes are durable ──
         for (items.items) |it| {
             const src = if (it.claim.status == .repeat) items.items[it.first] else it;
@@ -1583,8 +2414,8 @@ pub const MutationListener = struct {
                         log.info("⛔ Mutation refused [{s}] on '{s}': {} (not retrying)", .{ it.mutation.principal, it.mutation.table, err });
                     }
                 }
-                self.deadLetter(conn_nats, it.msg, it.msg.msg.data, err);
-                self.publishVerdict(conn_nats, it.msg, it.mutation.principal, "rejected", @errorName(err));
+                if (err != error.PredecessorUnknown) self.deadLetter(conn_nats, it.msg, it.msg.msg.data, err);
+                self.publishVerdict(conn_nats, it.msg, it.mutation.principal, if (err == error.PredecessorUnknown) "indeterminate" else "rejected", @errorName(err));
             } else if (src.claim.status == .claimed) {
                 const pnd = bc.pending.items[src.pending.?];
                 self.last_sqlstate_len = 0;
@@ -1596,6 +2427,9 @@ pub const MutationListener = struct {
                     log.info("🕒 clamped a future version [{s}] → {s}", .{ pnd.principal, self.lastVersion() });
                 }
                 self.publishVerdict(conn_nats, it.msg, it.mutation.principal, pnd.outcome.wireName(), if (pnd.clamped) "version_clamped" else "");
+            } else if (src.claim.status == .waiting) {
+                self.parkWaiting(a, conn, conn_nats, it.msg, it.mutation, it.route, it.envelope.predecessor);
+                continue;
             } else {
                 self.answerUnclaimed(a, conn_nats, it.msg, it.mutation, src.claim);
             }
@@ -1646,7 +2480,7 @@ pub const MutationListener = struct {
     /// actually fires logs `ZB_TEST_FAULT <point> fired`, which the scenario asserts.
     /// commit_before_receipts fires once per process: the replay then runs normally, so
     /// the scenario sees what that one COMMIT left behind.
-    const TestFault = enum { none, reset_after_claims, oom_in_claims, oom_in_finishes, commit_before_receipts };
+    const TestFault = enum { none, reset_after_claims, oom_in_claims, oom_in_finishes, commit_before_receipts, ordered_after_commit, park_before_ack };
     var test_fault: ?TestFault = null;
     var fired_once = false;
     fn faultAt(point: TestFault) bool {
@@ -2145,6 +2979,7 @@ pub const MutationListener = struct {
     /// the last one JetStream stops redelivering, so the client is told: `failed` (never a
     /// receipt, so the write stays in its outbox and is sent again) and an ACK.
     fn retryOrFail(self: *MutationListener, conn_nats: *nats.Connection, msg: *nats.JetStreamMessage, principal: []const u8, reason: []const u8) void {
+        if (self.parked_replay) return;
         if (msg.metadata.num_delivered >= config.Nats.mutation_max_deliver) {
             log.err("🔴 a write from '{s}' failed on its last delivery ({s}): answered `failed`, the client retries it", .{ principal, reason });
             self.publishVerdict(conn_nats, msg, principal, "failed", reason);
@@ -2217,7 +3052,8 @@ pub const MutationListener = struct {
                 self.publishVerdict(conn_nats, msg, mutation.principal, "failed", "MessageIdFromFuture");
             },
             .invalid => self.publishVerdict(conn_nats, msg, mutation.principal, "rejected", "InvalidMessageId"),
-            .claimed, .repeat => unreachable,
+            .exhausted => self.publishVerdict(conn_nats, msg, mutation.principal, "failed", "MutationAttemptsExhausted"),
+            .claimed, .repeat, .waiting, .predecessor_unknown, .invalid_predecessor => unreachable,
         }
     }
 
@@ -4138,4 +4974,311 @@ test "json: an array is a JSON array, NOT a PG array literal" {
     const as_array = try arrLit(a, arr);
     defer a.free(as_array);
     try std.testing.expectEqualStrings("{\"a\",\"2\"}", as_array);
+}
+
+test "routeLane: one lane per (principal, client); legacy IDs by principal; the unroutable to lane 0" {
+    const p = "mutation";
+    const a = routeLane("mutation.alice.rows.insert", "zb1-t1-INSERT-phone~2D1-rows-k1-x-v", p, "lf", 8);
+    const b = routeLane("mutation.alice.other.update", "zb1-t2-UPDATE-phone~2D1-other-k1-y-v", p, "lf", 8);
+    try testing.expectEqual(a, b); // the same client, whatever the table, ID or operation
+    var apart = false;
+    for (0..32) |i| {
+        var id_buf: [64]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "zb1-t1-INSERT-c{d}-rows-k1-x-v", .{i});
+        if (routeLane("mutation.alice.rows.insert", id, p, "lf", 8) != a) apart = true;
+    }
+    try testing.expect(apart); // another client of the same principal can land elsewhere
+    try testing.expectEqual(routeLane("mutation.alice.rows.insert", "7f3a-legacy", p, "lf", 8), routeLane("mutation.alice.rows.delete", "other-legacy", p, "lf", 8));
+    try testing.expectEqual(@as(usize, 0), routeLane("garbage", "zb1-t1-INSERT-c-rows-k1-x-v", p, "lf", 8));
+    try testing.expectEqual(@as(usize, 0), routeLane("mutation.alice.rows.insert", null, p, "lf", 1));
+    for (2..9) |lanes| try testing.expect(routeLane("mutation.alice.rows.insert", "zb1-t1-INSERT-phone~2D1-rows-k1-x-v", p, "lf", lanes) < lanes);
+}
+
+test "LaneQueue: FIFO, non-blocking push takes what fits, close wakes a waiting pop" {
+    var q = LaneQueue{ .io = testing.io };
+    var backing: [LaneQueue.capacity + 3]nats.Message = undefined;
+    var msgs: [LaneQueue.capacity + 3]nats.JetStreamMessage = undefined;
+    var ptrs: [LaneQueue.capacity + 3]*nats.JetStreamMessage = undefined;
+    for (&msgs, &backing, 0..) |*m, *b, i| {
+        b.* = nats.Message.init(testing.allocator);
+        m.* = .{ .msg = b, .nc = undefined, .metadata = .{ .sequence = .{ .stream = i } } };
+        ptrs[i] = m;
+    }
+    defer for (&backing) |*b| b.deinit();
+    try testing.expectEqual(LaneQueue.capacity, try q.tryPush(&ptrs)); // three did not fit
+    try testing.expectEqual(@as(usize, 0), try q.tryPush(ptrs[LaneQueue.capacity..]));
+    var out: [5]*nats.JetStreamMessage = undefined;
+    const quick = std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } };
+    try testing.expectEqual(@as(usize, 5), q.popBatch(&out, quick));
+    for (out, 0..) |m, i| try testing.expectEqual(i, m.metadata.sequence.stream);
+    try testing.expectEqual(@as(usize, 5), q.executing.len);
+    q.endBatch();
+    try testing.expectEqual(@as(usize, 3), try q.tryPush(ptrs[LaneQueue.capacity..])); // room again, order kept
+    var rest: [LaneQueue.capacity]*nats.JetStreamMessage = undefined;
+    try testing.expectEqual(LaneQueue.capacity - 2, q.popBatch(&rest, quick));
+    try testing.expectEqual(@as(usize, 5), rest[0].metadata.sequence.stream);
+    try testing.expectEqual(LaneQueue.capacity + 2, rest[LaneQueue.capacity - 3].metadata.sequence.stream);
+    try testing.expectEqual(@as(usize, 0), q.popBatch(&rest, quick)); // empty: a timeout
+    const Waiter = struct {
+        fn go(queue: *LaneQueue, got: *usize) void {
+            var buf: [1]*nats.JetStreamMessage = undefined;
+            got.* = queue.popBatch(&buf, .none);
+        }
+    };
+    var got: usize = 99;
+    const t = try std.Thread.spawn(.{}, Waiter.go, .{ &q, &got });
+    utils.sleep(20 * std.time.ns_per_ms);
+    q.close();
+    t.join();
+    try testing.expectEqual(@as(usize, 0), got); // woken by close, nothing to take
+    try testing.expectError(error.Closed, q.tryPush(ptrs[0..1]));
+    try testing.expect(q.isClosed() and !q.isFinished());
+    q.finish();
+    try testing.expect(q.isFinished());
+}
+
+test "wantsAffinity: every ordered envelope (the first included) and every malformed one keep their lane" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const id = "zb1-t1-INSERT-c-rows-k1-x-v";
+    // {"ordering":1,"client_id":"c","predecessor":nil}: a sequence's first write.
+    const first = "\x83\xa8ordering\x01\xa9client_id\xa1c\xabpredecessor\xc0";
+    try testing.expect(ordered_ingress.wantsAffinity(a, first, id));
+    // The same with a predecessor.
+    try testing.expect(ordered_ingress.wantsAffinity(a, "\x83\xa8ordering\x01\xa9client_id\xa1c\xabpredecessor\xa2p1", id));
+    // Malformed: an unknown version, a predecessor without "ordering", a client the ID does not name.
+    try testing.expect(ordered_ingress.wantsAffinity(a, "\x81\xa8ordering\x02", id));
+    try testing.expect(ordered_ingress.wantsAffinity(a, "\x81\xabpredecessor\xc0", id));
+    try testing.expect(ordered_ingress.wantsAffinity(a, first, "zb1-t1-INSERT-other-rows-k1-x-v"));
+    // Unordered: no ordering fields, or not msgpack at all (its lane's validator rejects it).
+    try testing.expect(!ordered_ingress.wantsAffinity(a, "\x81\xa1a\x01", id));
+    try testing.expect(!ordered_ingress.wantsAffinity(a, "\xc1", id));
+}
+
+test "Dispatcher.spread: unordered writes go in whole batches to the shallowest lanes, in turn" {
+    const n_spill = 600;
+    const pre = 500;
+    var backing: [n_spill + pre]nats.Message = undefined;
+    var msgs: [n_spill + pre]nats.JetStreamMessage = undefined;
+    for (&msgs, &backing, 0..) |*m, *b, i| {
+        b.* = nats.Message.init(testing.allocator);
+        m.* = .{ .msg = b, .nc = undefined, .metadata = .{ .sequence = .{ .stream = i } } };
+    }
+    defer for (&backing) |*b| b.deinit();
+    var ls: [3]MutationListener = undefined;
+    var lanes: [3]*MutationListener = undefined;
+    for (&ls, 0..) |*l, i| {
+        l.queue = .{ .io = testing.io, .index = i };
+        lanes[i] = l;
+    }
+    var held: [pre]*nats.JetStreamMessage = undefined;
+    for (&held, msgs[n_spill..]) |*p, *m| p.* = m;
+    try testing.expectEqual(@as(usize, pre), try ls[1].queue.tryPush(&held)); // lane 1 is busy
+    var stop = std.atomic.Value(bool).init(false);
+    const d = try Dispatcher.init(testing.allocator, undefined, undefined, testing.io, &stop, &lanes);
+    defer d.deinit();
+    for (msgs[0..n_spill]) |*m| try d.spill.append(testing.allocator, .{ .msg = m, .since_ms = 0 });
+    d.pending_total = n_spill;
+    try testing.expectEqual(@as(usize, n_spill), d.spread());
+    try testing.expectEqual(@as(usize, 0), d.spill.items.len);
+    try testing.expectEqual(@as(usize, 0), d.pending_total);
+    // A whole pull batch to lane 0, then one to lane 2 (lane 1 is deeper), then the 88
+    // left to lane 0 again; the busy lane took none.
+    const b = config.Nats.mutation_pull_batch;
+    try testing.expectEqual(@as(usize, n_spill - b), ls[0].queue.depth());
+    try testing.expectEqual(@as(usize, pre), ls[1].queue.depth());
+    try testing.expectEqual(b, ls[2].queue.depth());
+    var out: [LaneQueue.capacity]*nats.JetStreamMessage = undefined;
+    const quick = std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } };
+    try testing.expectEqual(b, ls[0].queue.popBatch(out[0..b], quick)); // a full batch, in order
+    for (out[0..b], 0..) |m, i| try testing.expectEqual(i, m.metadata.sequence.stream);
+    ls[0].queue.endBatch();
+}
+
+test "Dispatcher.flush: under sustained ordered load on every lane an unordered write is still served" {
+    const pool_n = 4096;
+    const backing = try testing.allocator.alloc(nats.Message, pool_n);
+    defer testing.allocator.free(backing);
+    const msgs = try testing.allocator.alloc(nats.JetStreamMessage, pool_n);
+    defer testing.allocator.free(msgs);
+    for (msgs, backing, 0..) |*m, *b, i| {
+        b.* = nats.Message.init(testing.allocator);
+        m.* = .{ .msg = b, .nc = undefined, .metadata = .{ .sequence = .{ .stream = i } } };
+    }
+    defer for (backing) |*b| b.deinit();
+    var next: usize = 0;
+    var ls: [2]MutationListener = undefined;
+    var lanes: [2]*MutationListener = undefined;
+    for (&ls, 0..) |*l, i| {
+        l.queue = .{ .io = testing.io, .index = i };
+        lanes[i] = l;
+    }
+    var stop = std.atomic.Value(bool).init(false);
+    const d = try Dispatcher.init(testing.allocator, undefined, undefined, testing.io, &stop, &lanes);
+    defer d.deinit();
+    const unordered = &msgs[pool_n - 1];
+    try d.spill.append(testing.allocator, .{ .msg = unordered, .since_ms = 0 });
+    d.pending_total = 1;
+    var out: [config.Nats.mutation_pull_batch]*nats.JetStreamMessage = undefined;
+    const quick = std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } };
+    var served_at: ?usize = null;
+    for (0..6) |round| {
+        // Every lane keeps a backlog of ordered writes larger than what a pop frees.
+        for (d.pending) |*p| while (p.items.len < LaneQueue.capacity) {
+            try p.append(testing.allocator, .{ .msg = &msgs[next], .since_ms = 0 });
+            next += 1;
+            d.pending_total += 1;
+        };
+        d.flush();
+        if (d.spill.items.len == 0 and served_at == null) served_at = round;
+        // One lane finishes a batch; the next flush sees the room it freed.
+        const lane = &ls[round % 2].queue;
+        _ = lane.popBatch(&out, quick);
+        lane.endBatch();
+    }
+    // Round 0 fills both lanes from their pending while the spill waits, so the turn
+    // passes; in round 1 the room lane 0 freed goes to the spill first. Ordered-first
+    // alone never serves it here (every freed slot is refilled from pending).
+    try testing.expectEqual(@as(?usize, 1), served_at);
+}
+
+test "credit verdicts: a released write's definitive verdict is left to its credit, only when its claim commits" {
+    var l: MutationListener = undefined;
+    l.allocator = testing.allocator;
+    l.credit_verdicts = .empty;
+    defer l.credit_verdicts.deinit(testing.allocator);
+    defer l.clearCreditVerdicts();
+    l.noteClaim("w1", .{ .status = .claimed, .released = true });
+    try testing.expect(l.creditOwnsVerdict("w1", "accepted"));
+    try testing.expect(l.creditOwnsVerdict("w1", "rejected"));
+    try testing.expect(!l.creditOwnsVerdict("w1", "failed")); // after a full rollback: the credit went with it
+    l.noteClaim("w2", .{ .status = .duplicate, .released = true });
+    l.noteClaim("w3", .{ .status = .predecessor_unknown, .released = true });
+    try testing.expect(l.creditOwnsVerdict("w2", "accepted") and l.creditOwnsVerdict("w3", "indeterminate"));
+    l.noteClaim("w4", .{ .status = .conflict, .released = true }); // rolled back by the bridge
+    try testing.expect(!l.creditOwnsVerdict("w4", "rejected"));
+    l.noteClaim("w5", .{ .status = .claimed }); // never parked
+    try testing.expect(!l.creditOwnsVerdict("w5", "accepted"));
+    // The same write claimed again (a batch replayed one by one) without a release: ours again.
+    l.noteClaim("w1", .{ .status = .claimed });
+    try testing.expect(!l.creditOwnsVerdict("w1", "accepted"));
+    l.noteClaim("w2", .{ .status = .duplicate, .released = true }); // idempotent
+    l.clearCreditVerdicts();
+    try testing.expect(!l.creditOwnsVerdict("w2", "accepted"));
+}
+
+test "LaneQueue.leave: what was queued is freed and no push can land after it" {
+    var q = LaneQueue{ .io = testing.io };
+    var b: [2]nats.Message = .{ nats.Message.init(testing.allocator), nats.Message.init(testing.allocator) };
+    var m: [2]nats.JetStreamMessage = .{ .{ .msg = &b[0], .nc = undefined, .metadata = .{} }, .{ .msg = &b[1], .nc = undefined, .metadata = .{} } };
+    const ptrs: [2]*nats.JetStreamMessage = .{ &m[0], &m[1] };
+    try testing.expectEqual(@as(usize, 1), try q.tryPush(ptrs[0..1]));
+    try testing.expectEqual(@as(usize, 1), q.leave());
+    // The Dispatcher's next flush, racing the lane's exit: refused, not stranded in the ring.
+    try testing.expectError(error.Closed, q.tryPush(ptrs[1..2]));
+    try testing.expectEqual(@as(usize, 0), q.len);
+    try testing.expect(q.isFinished());
+    b[1].deinit();
+}
+
+test "Dispatcher.init: a failed init closes the lanes, which would otherwise wait for ever" {
+    var lanes: [2]MutationListener = undefined;
+    var ptrs: [2]*MutationListener = undefined;
+    var stop = std.atomic.Value(bool).init(false);
+    for (0..2) |fail_at| {
+        for (&lanes, &ptrs) |*l, *p| {
+            l.queue = .{ .io = testing.io };
+            p.* = l;
+        }
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_at });
+        try testing.expectError(error.OutOfMemory, Dispatcher.init(failing.allocator(), undefined, undefined, testing.io, &stop, &ptrs));
+        for (&lanes) |*l| try testing.expect(l.queue.isClosed());
+    }
+    for (&lanes) |*l| l.queue = .{ .io = testing.io };
+    const d = try Dispatcher.init(testing.allocator, undefined, undefined, testing.io, &stop, &ptrs);
+    defer d.deinit();
+    for (&lanes) |*l| try testing.expect(!l.queue.isClosed()); // a good init leaves them open
+}
+
+test "LaneQueue: renewal times are on the monotonic clock, not the wall clock a step can move back" {
+    var q = LaneQueue{ .io = testing.io };
+    var b = nats.Message.init(testing.allocator);
+    defer b.deinit();
+    var m: nats.JetStreamMessage = .{ .msg = &b, .nc = undefined, .metadata = .{} };
+    const ptr: [1]*nats.JetStreamMessage = .{&m};
+    const before = std.Io.Clock.boot.now(testing.io).toMilliseconds();
+    try testing.expectEqual(@as(usize, 1), try q.tryPush(&ptr));
+    const after = std.Io.Clock.boot.now(testing.io).toMilliseconds();
+    // On the wall clock the stamps would be Unix milliseconds (~1.7e12), far outside this window.
+    try testing.expect(q.ring[0].since_ms >= before and q.ring[0].since_ms <= after);
+    try testing.expect(q.ring[0].at_ms >= before and q.ring[0].at_ms <= after);
+    var d: Dispatcher = undefined;
+    d.io = testing.io;
+    const now = d.nowMs();
+    try testing.expect(now >= before and now <= std.Io.Clock.boot.now(testing.io).toMilliseconds());
+}
+
+test "Dispatcher.step: writes held for a full lane reach it when it frees room, not after a blocked fetch" {
+    // A pull the server cannot answer (the consumer at its max_ack_pending) blocks for its
+    // whole timeout and brings nothing back.
+    const Stalled = struct {
+        d: *Dispatcher,
+        last_ms: i64 = 0,
+        /// When a fetch first began with nothing held: the held writes were all pushed.
+        emptied_at: ?i64 = null,
+        pub fn fetch(self: *@This(), n: usize, t: std.Io.Timeout) !nats.MessageBatch {
+            _ = n;
+            if (self.d.pending_total == 0 and self.emptied_at == null) self.emptied_at = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+            self.last_ms = t.duration.raw.toMilliseconds();
+            utils.sleep(@as(u64, @intCast(self.last_ms)) * std.time.ns_per_ms);
+            return error.Timeout;
+        }
+    };
+    const held_n = 10;
+    const total = LaneQueue.capacity + held_n;
+    var backing: [total]nats.Message = undefined;
+    var msgs: [total]nats.JetStreamMessage = undefined;
+    var ptrs: [total]*nats.JetStreamMessage = undefined;
+    for (&msgs, &backing, &ptrs, 0..) |*m, *b, *p, i| {
+        b.* = nats.Message.init(testing.allocator);
+        m.* = .{ .msg = b, .nc = undefined, .metadata = .{ .sequence = .{ .stream = i } } };
+        p.* = m;
+    }
+    defer for (&backing) |*b| b.deinit();
+    var ls: [2]MutationListener = undefined;
+    var lanes: [2]*MutationListener = undefined;
+    for (&ls, 0..) |*l, i| {
+        l.queue = .{ .io = testing.io, .index = i };
+        lanes[i] = l;
+    }
+    try testing.expectEqual(LaneQueue.capacity, try ls[0].queue.tryPush(ptrs[0..LaneQueue.capacity])); // lane 0 is full
+    var stop = std.atomic.Value(bool).init(false);
+    const d = try Dispatcher.init(testing.allocator, undefined, undefined, testing.io, &stop, &lanes);
+    defer d.deinit();
+    for (ptrs[LaneQueue.capacity..]) |m| try d.pending[0].append(testing.allocator, .{ .msg = m, .since_ms = 0 });
+    d.pending_total = held_n;
+
+    // Lane 0 finishes a batch 30 ms in.
+    const Pop = struct {
+        fn run(q: *LaneQueue) void {
+            utils.sleep(30 * std.time.ns_per_ms);
+            var out: [config.Nats.mutation_pull_batch]*nats.JetStreamMessage = undefined;
+            _ = q.popBatch(&out, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } });
+            q.endBatch();
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Pop.run, .{&ls[0].queue});
+    var pull: Stalled = .{ .d = d };
+    const t0 = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    while (d.pending_total > 0 and std.Io.Clock.awake.now(testing.io).toMilliseconds() - t0 < 3000) {
+        d.step(&pull);
+        if (d.pending_total > 0) try testing.expect(pull.last_ms <= Dispatcher.held_fetch_ms); // short while held
+    }
+    th.join();
+    try testing.expectEqual(@as(usize, 0), d.pending_total);
+    // Pushed well before one normal fetch could have returned (the pop is at 30 ms).
+    try testing.expect(pull.emptied_at.? - t0 < Dispatcher.fetch_ms / 2);
+    // Nothing held: the turn that pushed them went on to the normal, long pull.
+    try testing.expectEqual(@as(i64, Dispatcher.fetch_ms), pull.last_ms);
 }

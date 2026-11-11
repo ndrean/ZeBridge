@@ -22,6 +22,7 @@ as libpq requires — this parser splits on the last `@` and the first `:`, whic
 is the same rule the database itself applies.
 """
 import json
+import re
 import os
 import pathlib
 import shlex
@@ -93,6 +94,11 @@ def derive_into(env) -> dict:
     # renders `octet_length(x) <= ` — init.write.template.sql does not apply.
     if not env.get("MAX_TENANT_BYTES"):
         env["MAX_TENANT_BYTES"] = out["MAX_TENANT_BYTES"] = _tenant_limit(env)
+    # Match the source checkout used by envsubst; the binary renders its own constant.
+    retry_limit = re.search(r"pub const mutation_max_deliver: i32 = ([0-9]+);", (ROOT / "src/config.zig").read_text()).group(1)
+    if env.get("MUTATION_MAX_DELIVER", retry_limit) != retry_limit:
+        raise ValueError("MUTATION_MAX_DELIVER must match src/config.zig; use bridge --init-sql for an installed binary")
+    env["MUTATION_MAX_DELIVER"] = out["MUTATION_MAX_DELIVER"] = retry_limit
     # Legacy envsubst installs enable the guard by default. An explicit override
     # can set false; bridge --init-sql uses its own build option instead.
     if not env.get("RECEIPT_COMPLETION_GUARD"):

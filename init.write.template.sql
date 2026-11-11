@@ -1456,7 +1456,7 @@ DROP FUNCTION IF EXISTS zebridge_private.lookup_receipts(text, text[], bytea[], 
 DROP FUNCTION IF EXISTS zebridge_private.record_receipts(text, text[], bytea[], jsonb[]);
 CREATE OR REPLACE FUNCTION zebridge_private.lookup_receipts(p_principals text[], p_ids text[], p_routes bytea[], p_payloads bytea[])
 RETURNS TABLE(ord integer, status text, outcome jsonb, fingerprint bytea)
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog
+LANGUAGE plpgsql SECURITY DEFINER SET jit = off SET search_path = pg_catalog
 SET enable_hashjoin = off SET enable_mergejoin = off SET enable_seqscan = off AS $$
 DECLARE
     now_ms   bigint := (extract(epoch FROM clock_timestamp()) * 1000)::bigint;
@@ -1466,8 +1466,9 @@ DECLARE
     verdicts text[];
     timing   text[];
     firsts   integer[];
-    rec_fp   bytea;
-    rec_outcome jsonb;
+    rec_fps bytea[];
+    rec_outcomes jsonb[];
+    park_conflicts boolean[];
     g_keys   text[] := '{}';
     g_fps    bytea[] := '{}';
     p_guard  boolean;
@@ -1482,8 +1483,9 @@ BEGIN
     END IF;
     SELECT min_accepted_ms, completion_guard INTO floor_ms, p_guard FROM zebridge_private.receipt_policy;
     SELECT array_agg(i.fp ORDER BY i.n), array_agg(i.m ORDER BY i.n), array_agg(i.v ORDER BY i.n), array_agg(i.t ORDER BY i.n),
-           array_agg(i.f ORDER BY i.n)
-      INTO fps, months, verdicts, timing, firsts
+           array_agg(i.f ORDER BY i.n), array_agg(r.fingerprint ORDER BY i.n),
+           array_agg(r.outcome ORDER BY i.n), array_agg(coalesce(p.fingerprint<>i.fp,false) ORDER BY i.n)
+      INTO fps, months, verdicts, timing, firsts, rec_fps, rec_outcomes, park_conflicts
       FROM (SELECT c.*,
                    -- The first position of this (principal, ID) among the valid candidates.
                    CASE WHEN c.v = 'candidate' THEN min(c.n) FILTER (WHERE c.v = 'candidate') OVER (PARTITION BY c.pr, c.id) END AS f
@@ -1497,7 +1499,15 @@ BEGIN
                            CASE WHEN zebridge_private.receipt_created_ms(x.id) < floor_ms THEN 'expired'
                                 WHEN zebridge_private.receipt_created_ms(x.id) > now_ms + 60000 THEN 'future'
                                 ELSE 'ok' END AS t
-                      FROM unnest(p_principals, p_ids, p_routes, p_payloads) WITH ORDINALITY AS x(pr, id, r, p, n)) c) i;
+                      FROM unnest(p_principals, p_ids, p_routes, p_payloads) WITH ORDINALITY AS x(pr, id, r, p, n)) c) i
+      -- Only the first valid occurrence needs a durable lookup. Later occurrences
+      -- are compared with its input fingerprint, BEFORE receipt/expiry decisions.
+      -- Keep indexed partition probes even with cached generic plans; JIT is off
+      -- because disabled seqscans can give tiny policy scans very high costs.
+      LEFT JOIN zebridge_private.receipts r ON i.v='candidate' AND i.f=i.n
+           AND r.principal=i.pr AND r.message_id=i.id AND r.id_month=i.m
+      LEFT JOIN zebridge_private.mutation_parked p ON i.v='candidate' AND i.f=i.n
+           AND p.principal=i.pr AND p.message_id=i.id AND p.id_month=i.m;
 
     FOR n IN 1 .. coalesce(cardinality(p_ids), 0) LOOP
         ord := n;
@@ -1508,13 +1518,12 @@ BEGIN
         ELSIF firsts[n] < n THEN
             status := CASE WHEN fps[n] = fps[firsts[n]] THEN 'repeat' ELSE 'conflict' END;
         ELSE
-            SELECT r.fingerprint, r.outcome INTO rec_fp, rec_outcome
-              FROM zebridge_private.receipts r
-             WHERE r.principal = p_principals[n] AND r.message_id = p_ids[n] AND r.id_month = months[n];
-            IF FOUND AND rec_fp = fps[n] THEN
+            IF rec_fps[n] IS NOT NULL AND rec_fps[n] = fps[n] THEN
                 status := 'duplicate';
-                outcome := rec_outcome;
-            ELSIF FOUND THEN
+                outcome := rec_outcomes[n];
+            ELSIF rec_fps[n] IS NOT NULL THEN
+                status := 'conflict';
+            ELSIF park_conflicts[n] THEN
                 status := 'conflict';
             ELSIF timing[n] <> 'ok' THEN
                 status := timing[n];
@@ -1598,6 +1607,497 @@ BEGIN
 END;
 $$;
 
+-- ─── Ordered ingress, stage 1: durable parking and transaction boundaries ──────────
+-- Not advertised by the bridge yet. The listener must validate the ordered envelope
+-- (including that p_predecessor is the field in the fingerprinted payload) before
+-- calling these primitives. All arguments are the original bytes, never re-encoded.
+-- Park only in a separate SHORT transaction, never mixed with application SQL.
+-- Park: sorted own receipt locks -> global counter -> sorted principal counters ->
+-- parked rows. Release: sorted own receipt locks -> parked rows/credits -> receipts
+-- and application rows; it never locks counters. Settle: global -> sorted principal
+-- counters -> credits, with NO receipt or application locks. Settle after COMMIT or
+-- from the sweep, not inside the application transaction. A failure to settle leaves
+-- conservative charges; it must never change an already committed verdict.
+CREATE TABLE IF NOT EXISTS zebridge_private.mutation_park_total (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    rows bigint NOT NULL DEFAULT 0 CHECK (rows >= 0),
+    bytes bigint NOT NULL DEFAULT 0 CHECK (bytes >= 0)
+);
+INSERT INTO zebridge_private.mutation_park_total DEFAULT VALUES ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS zebridge_private.mutation_park_policy (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    max_rows bigint NOT NULL DEFAULT 1000000 CHECK (max_rows > 0),
+    max_bytes bigint NOT NULL DEFAULT 1073741824 CHECK (max_bytes > 0),
+    principal_rows bigint NOT NULL DEFAULT 1000 CHECK (principal_rows > 0),
+    principal_bytes bigint NOT NULL DEFAULT 67108864 CHECK (principal_bytes > 0),
+    max_attempts integer NOT NULL DEFAULT ${MUTATION_MAX_DELIVER} CHECK (max_attempts > 0)
+);
+ALTER TABLE zebridge_private.mutation_park_policy ADD COLUMN IF NOT EXISTS max_attempts integer NOT NULL DEFAULT ${MUTATION_MAX_DELIVER} CHECK (max_attempts > 0);
+ALTER TABLE zebridge_private.mutation_park_policy ALTER COLUMN max_attempts SET DEFAULT ${MUTATION_MAX_DELIVER};
+INSERT INTO zebridge_private.mutation_park_policy DEFAULT VALUES ON CONFLICT DO NOTHING;
+-- Generated from config.Nats.mutation_max_deliver, the JetStream retry budget too.
+UPDATE zebridge_private.mutation_park_policy SET max_attempts = ${MUTATION_MAX_DELIVER};
+CREATE TABLE IF NOT EXISTS zebridge_private.mutation_park_quota (
+    principal text PRIMARY KEY,
+    rows bigint NOT NULL DEFAULT 0 CHECK (rows >= 0),
+    bytes bigint NOT NULL DEFAULT 0 CHECK (bytes >= 0)
+);
+CREATE TABLE IF NOT EXISTS zebridge_private.mutation_parked (
+    principal text NOT NULL,
+    message_id text NOT NULL,
+    id_month date NOT NULL,
+    predecessor text NOT NULL,
+    route bytea NOT NULL,
+    payload bytea NOT NULL,
+    headers jsonb NOT NULL,
+    fingerprint bytea NOT NULL CHECK (octet_length(fingerprint) = 32),
+    charged_bytes bigint NOT NULL CHECK (charged_bytes > 0),
+    parked_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    attempts integer NOT NULL DEFAULT 0 CONSTRAINT mutation_parked_attempts_check CHECK (attempts >= 0),
+    PRIMARY KEY (principal, message_id, id_month),
+    CHECK (id_month IS NOT DISTINCT FROM zebridge_private.receipt_month(message_id)),
+    CHECK (zebridge_private.receipt_created_ms(message_id) IS NOT NULL),
+    CHECK (zebridge_private.receipt_created_ms(predecessor) IS NOT NULL)
+);
+-- Upgrade the stage-1 prototype's fixed upper bound, preserving queued attempts.
+ALTER TABLE zebridge_private.mutation_parked DROP CONSTRAINT IF EXISTS mutation_parked_attempts_check;
+ALTER TABLE zebridge_private.mutation_parked ADD CONSTRAINT mutation_parked_attempts_check CHECK (attempts >= 0);
+
+-- A credit belongs to a RELEASE, not to a message ID: an exhausted write can be
+-- parked and released again before the previous credit settles. Identity gaps on
+-- rollback are harmless. Counters charge parked rows PLUS unsettled credits.
+CREATE TABLE IF NOT EXISTS zebridge_private.mutation_park_credit (
+    credit_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    principal text NOT NULL,
+    message_id text NOT NULL,
+    charged_bytes bigint NOT NULL CHECK (charged_bytes > 0)
+);
+
+-- A released ordered write also owes durable verdict delivery. This survives a
+-- crash between application COMMIT and JetStream publication (resends may still
+-- be suppressed by JetStream's duplicate window). Never settle it before PubAck.
+ALTER TABLE zebridge_private.mutation_park_credit ADD COLUMN IF NOT EXISTS verdict_pending boolean NOT NULL DEFAULT false;
+ALTER TABLE zebridge_private.mutation_park_credit ADD COLUMN IF NOT EXISTS publication text NOT NULL DEFAULT '';
+
+CREATE INDEX IF NOT EXISTS mutation_parked_predecessor ON zebridge_private.mutation_parked (principal, predecessor);
+CREATE INDEX IF NOT EXISTS mutation_parked_expiry ON zebridge_private.mutation_parked (id_month, message_id);
+
+-- Bytes are an exact logical charge (original data plus identity, JSON headers and
+-- a fixed metadata allowance), not PostgreSQL relation/WAL/index physical size.
+CREATE OR REPLACE FUNCTION zebridge_private.lock_mutation_parks(p_principals text[])
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE pr text;
+BEGIN
+    IF p_principals IS NULL OR EXISTS (SELECT 1 FROM unnest(p_principals) x WHERE x IS NULL OR x = '') THEN
+        RAISE EXCEPTION 'invalid park principals' USING ERRCODE = '22023';
+    END IF;
+    PERFORM 1 FROM zebridge_private.mutation_park_total WHERE singleton FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'missing global park counter' USING ERRCODE = 'ZBG01'; END IF;
+    FOR pr IN SELECT DISTINCT x FROM unnest(p_principals) x ORDER BY x LOOP
+        INSERT INTO zebridge_private.mutation_park_quota(principal) VALUES (pr) ON CONFLICT DO NOTHING;
+        PERFORM 1 FROM zebridge_private.mutation_park_quota WHERE principal = pr FOR UPDATE;
+    END LOOP;
+END;
+$$;
+
+-- No receipt claim/guard is created for waiting writes. Call under S's receipt lock;
+-- P is ONLY read, never locked. A caller must re-check after every rollback/retry.
+CREATE OR REPLACE FUNCTION zebridge_private.ordered_mutation_state(
+    p_principal text, p_id text, p_route bytea, p_payload bytea, p_predecessor text)
+RETURNS TABLE(status text, fingerprint bytea, outcome jsonb)
+LANGUAGE plpgsql SECURITY DEFINER SET jit = off ROWS 1 SET search_path = pg_catalog AS $$
+DECLARE r record; s_ms bigint; p_ms bigint; floor_ms bigint;
+BEGIN
+    IF p_principal IS NULL OR p_principal = '' OR p_route IS NULL OR p_payload IS NULL THEN
+        RAISE EXCEPTION 'invalid ordered mutation arguments' USING ERRCODE = '22023';
+    END IF;
+    fingerprint := sha256(int4send(octet_length(p_route)) || p_route || p_payload);
+    s_ms := zebridge_private.receipt_created_ms(p_id);
+    IF s_ms IS NULL OR octet_length(p_id) NOT BETWEEN 1 AND 512 OR p_id ~ '[.*>\x01-\x20\x7f]' THEN
+        status := 'invalid'; RETURN NEXT; RETURN;
+    END IF;
+    SELECT x.fingerprint, x.outcome INTO r FROM zebridge_private.receipts x
+     WHERE x.principal = p_principal AND x.message_id = p_id AND x.id_month = zebridge_private.receipt_month(p_id);
+    IF FOUND THEN
+        status := CASE WHEN r.fingerprint = fingerprint THEN 'duplicate' ELSE 'conflict' END;
+        outcome := r.outcome; RETURN NEXT; RETURN;
+    END IF;
+    SELECT x.fingerprint, x.predecessor INTO r FROM zebridge_private.mutation_parked x
+     WHERE x.principal = p_principal AND x.message_id = p_id AND x.id_month = zebridge_private.receipt_month(p_id);
+    IF FOUND AND (r.fingerprint <> fingerprint OR r.predecessor IS DISTINCT FROM p_predecessor) THEN
+        status := 'conflict'; RETURN NEXT; RETURN;
+    END IF;
+    SELECT min_accepted_ms INTO STRICT floor_ms FROM zebridge_private.receipt_policy;
+    IF s_ms < floor_ms THEN status := 'expired'; RETURN NEXT; RETURN; END IF;
+    IF s_ms > (extract(epoch FROM clock_timestamp()) * 1000)::bigint + 60000 THEN
+        status := 'future'; RETURN NEXT; RETURN;
+    END IF;
+    IF p_predecessor IS NULL THEN status := 'ready'; RETURN NEXT; RETURN; END IF;
+    p_ms := zebridge_private.receipt_created_ms(p_predecessor);
+    -- Client IDs are escaped components (no literal '-'), in token four of zb1 IDs.
+    IF p_ms IS NULL OR p_ms > s_ms OR p_id = p_predecessor
+       OR octet_length(p_predecessor) NOT BETWEEN 1 AND 512 OR p_predecessor ~ '[.*>\x01-\x20\x7f]'
+       OR split_part(p_id, '-', 4) = '' OR split_part(p_id, '-', 4) <> split_part(p_predecessor, '-', 4) THEN
+        status := 'invalid_predecessor'; RETURN NEXT; RETURN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM zebridge_private.mutation_parked p WHERE p.principal=p_principal
+       AND p.message_id=p_predecessor AND p.predecessor=p_id AND p.id_month=zebridge_private.receipt_month(p_predecessor)) THEN
+        status := 'invalid_predecessor'; RETURN NEXT; RETURN;
+    END IF;
+    SELECT x.outcome INTO r FROM zebridge_private.receipts x
+     WHERE x.principal = p_principal AND x.message_id = p_predecessor
+       AND x.id_month = zebridge_private.receipt_month(p_predecessor);
+    IF FOUND THEN
+        IF jsonb_typeof(r.outcome) = 'object' AND r.outcome->>'status' IN ('accepted', 'stale', 'row_deleted', 'rejected') THEN
+            status := 'ready';
+        ELSIF r.outcome->>'status' = 'indeterminate' AND r.outcome->>'reason' = 'PredecessorUnknown' THEN
+            status := 'predecessor_unknown';
+        ELSE status := 'unreadable_predecessor'; END IF;
+    ELSIF p_ms < floor_ms THEN status := 'predecessor_unknown';
+    ELSE status := 'waiting'; END IF;
+    RETURN NEXT;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION zebridge_private.park_mutation(
+    p_principal text, p_id text, p_route bytea, p_payload bytea, p_predecessor text, p_headers jsonb)
+RETURNS text LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE d record; n bigint; pol record; total record; quota record;
+BEGIN
+    PERFORM zebridge_private.lock_receipts(ARRAY[p_principal], ARRAY[p_id]);
+    SELECT * INTO d FROM zebridge_private.ordered_mutation_state(p_principal, p_id, p_route, p_payload, p_predecessor);
+    IF d.status NOT IN ('waiting', 'unreadable_predecessor') THEN RETURN d.status; END IF;
+    PERFORM zebridge_private.lock_mutation_parks(ARRAY[p_principal]);
+    -- Same-ID park/release cannot race: both own S's receipt lock. Re-read P after
+    -- the quota wait so an already committed predecessor does not need another sweep.
+    SELECT * INTO d FROM zebridge_private.ordered_mutation_state(p_principal, p_id, p_route, p_payload, p_predecessor);
+    IF d.status NOT IN ('waiting', 'unreadable_predecessor') THEN
+        DELETE FROM zebridge_private.mutation_park_quota WHERE principal = p_principal AND rows = 0;
+        RETURN d.status;
+    END IF;
+    IF EXISTS (SELECT 1 FROM zebridge_private.mutation_parked WHERE principal = p_principal AND message_id = p_id
+               AND id_month = zebridge_private.receipt_month(p_id)) THEN RETURN 'parked'; END IF;
+    IF EXISTS (SELECT 1 FROM zebridge_private.mutation_parked WHERE principal = p_principal AND message_id = p_predecessor
+               AND predecessor = p_id AND id_month = zebridge_private.receipt_month(p_predecessor)) THEN
+        DELETE FROM zebridge_private.mutation_park_quota WHERE principal = p_principal AND rows = 0;
+        RETURN 'invalid_predecessor';
+    END IF;
+    IF p_headers IS NULL OR jsonb_typeof(p_headers) <> 'object' THEN
+        RAISE EXCEPTION 'park headers must be an object' USING ERRCODE = '22023';
+    END IF;
+    n := 256::bigint + octet_length(p_principal) + octet_length(p_id) + octet_length(p_predecessor)
+         + octet_length(p_route) + octet_length(p_payload) + octet_length(p_headers::text);
+    SELECT * INTO STRICT pol FROM zebridge_private.mutation_park_policy;
+    SELECT * INTO STRICT total FROM zebridge_private.mutation_park_total;
+    SELECT * INTO STRICT quota FROM zebridge_private.mutation_park_quota WHERE principal = p_principal;
+    IF total.rows >= pol.max_rows OR n > pol.max_bytes - total.bytes
+       OR quota.rows >= pol.principal_rows OR n > pol.principal_bytes - quota.bytes THEN
+        DELETE FROM zebridge_private.mutation_park_quota WHERE principal = p_principal AND rows = 0;
+        RETURN 'backlog_full';
+    END IF;
+    INSERT INTO zebridge_private.mutation_parked(principal, message_id, id_month, predecessor, route, payload, headers, fingerprint, charged_bytes)
+      VALUES (p_principal, p_id, zebridge_private.receipt_month(p_id), p_predecessor, p_route, p_payload, p_headers, d.fingerprint, n);
+    UPDATE zebridge_private.mutation_park_total SET rows = rows + 1, bytes = bytes + n;
+    UPDATE zebridge_private.mutation_park_quota SET rows = rows + 1, bytes = bytes + n WHERE principal = p_principal;
+    RETURN 'parked';
+END;
+$$;
+
+-- One parked write's release, on its own: the primitive scripts/scenarios/ingress_park_sql.py
+-- exercises. The bridge never calls it; it releases through lookup_ordered_receipts, whose
+-- copy of this logic also releases 'invalid_predecessor' and marks the credit's verdict
+-- (verdict_pending, publication). Called BEFORE application SQL. Normal release requires a
+-- matching receipt by COMMIT, even when the optional legacy receipt completion guard is
+-- disabled. An expired row and an exhausted retry budget are explicit non-execution exits.
+CREATE OR REPLACE FUNCTION zebridge_private.take_parked_mutation(p_principal text, p_id text)
+RETURNS TABLE(status text, fingerprint bytea, outcome jsonb, route bytea, payload bytea, headers jsonb)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE p zebridge_private.mutation_parked%ROWTYPE; d record; budget integer;
+BEGIN
+    PERFORM zebridge_private.lock_receipts(ARRAY[p_principal], ARRAY[p_id]);
+    SELECT * INTO p FROM zebridge_private.mutation_parked x WHERE x.principal = p_principal AND x.message_id = p_id
+      AND x.id_month = zebridge_private.receipt_month(p_id);
+    IF NOT FOUND THEN status := 'absent'; RETURN NEXT; RETURN; END IF;
+    SELECT max_attempts INTO STRICT budget FROM zebridge_private.mutation_park_policy;
+    SELECT * INTO d FROM zebridge_private.ordered_mutation_state(p.principal, p.message_id, p.route, p.payload, p.predecessor);
+    status := d.status; fingerprint := d.fingerprint; outcome := d.outcome;
+    route := p.route; payload := p.payload; headers := p.headers;
+    IF status IN ('ready', 'predecessor_unknown', 'expired', 'duplicate') OR p.attempts >= budget THEN
+        IF p.attempts >= budget AND status NOT IN ('duplicate', 'expired') THEN status := 'exhausted'; END IF;
+        DELETE FROM zebridge_private.mutation_parked x WHERE x.principal = p_principal AND x.message_id = p_id AND x.id_month = p.id_month;
+        INSERT INTO zebridge_private.mutation_park_credit(principal, message_id, charged_bytes)
+          VALUES (p_principal, p_id, p.charged_bytes);
+    END IF;
+    RETURN NEXT;
+END;
+$$;
+
+-- Only call after rolling back a REAL execution failure, never a dependency wait.
+-- At the shared budget, the next release (lookup_ordered_receipts) removes it as exhausted and the listener sends failed (MutationAttemptsExhausted).
+CREATE OR REPLACE FUNCTION zebridge_private.fail_parked_mutation(p_principal text, p_id text)
+RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE n integer; budget integer;
+BEGIN
+    PERFORM zebridge_private.lock_receipts(ARRAY[p_principal], ARRAY[p_id]);
+    SELECT max_attempts INTO STRICT budget FROM zebridge_private.mutation_park_policy;
+    UPDATE zebridge_private.mutation_parked SET attempts = CASE WHEN attempts >= budget THEN attempts ELSE attempts + 1 END
+      WHERE principal = p_principal AND message_id = p_id AND id_month = zebridge_private.receipt_month(p_id)
+      RETURNING attempts INTO n;
+    RETURN n;
+END;
+$$;
+
+-- Bounded, short accounting transaction. The global lock serializes settlers;
+-- release transactions only INSERT credits and never need a counter lock. SELECT
+-- sees committed credits only, so an application transaction held open cannot
+-- block this sweep. Never acquire receipt locks here (including on retry).
+CREATE OR REPLACE FUNCTION zebridge_private.settle_park_credits(p_limit integer DEFAULT 256)
+RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE ids bigint[]; principals text[]; n bigint; size bigint; q record;
+BEGIN
+    IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 4096 THEN
+        RAISE EXCEPTION 'credit settle limit must be between 1 and 4096' USING ERRCODE = '22023';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM zebridge_private.mutation_park_credit WHERE NOT verdict_pending) THEN RETURN 0; END IF;
+    PERFORM 1 FROM zebridge_private.mutation_park_total WHERE singleton FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'missing global park counter' USING ERRCODE = 'ZBG01'; END IF;
+    SELECT array_agg(c.credit_id), array_agg(DISTINCT c.principal) INTO ids, principals
+      FROM (SELECT credit_id, principal FROM zebridge_private.mutation_park_credit WHERE NOT verdict_pending ORDER BY credit_id LIMIT p_limit) c;
+    IF ids IS NULL THEN RETURN 0; END IF;
+    PERFORM zebridge_private.lock_mutation_parks(principals);
+    -- No other settler can delete these IDs while we own the global lock.
+    FOR q IN SELECT principal, count(*) AS rows, sum(charged_bytes) AS bytes
+               FROM zebridge_private.mutation_park_credit WHERE credit_id = ANY(ids) GROUP BY principal ORDER BY principal LOOP
+        UPDATE zebridge_private.mutation_park_quota SET rows = rows - q.rows, bytes = bytes - q.bytes WHERE principal = q.principal;
+    END LOOP;
+    SELECT count(*), sum(charged_bytes) INTO n, size FROM zebridge_private.mutation_park_credit WHERE credit_id = ANY(ids);
+    UPDATE zebridge_private.mutation_park_total SET rows = rows - n, bytes = bytes - size;
+    DELETE FROM zebridge_private.mutation_park_credit WHERE credit_id = ANY(ids);
+    DELETE FROM zebridge_private.mutation_park_quota WHERE principal = ANY(principals) AND rows = 0;
+    RETURN n::integer;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION zebridge_private.park_release_finished()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+BEGIN
+    IF OLD.attempts >= (SELECT max_attempts FROM zebridge_private.mutation_park_policy) OR zebridge_private.receipt_created_ms(OLD.message_id)
+       < (SELECT min_accepted_ms FROM zebridge_private.receipt_policy) THEN RETURN NULL; END IF;
+    IF NOT EXISTS (SELECT 1 FROM zebridge_private.receipts r WHERE r.principal = OLD.principal
+       AND r.message_id = OLD.message_id AND r.id_month = OLD.id_month AND r.fingerprint = OLD.fingerprint) THEN
+        RAISE EXCEPTION 'park release committed without its receipt' USING ERRCODE = 'ZBG01';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+DROP TRIGGER IF EXISTS park_release_finished ON zebridge_private.mutation_parked;
+CREATE CONSTRAINT TRIGGER park_release_finished AFTER DELETE ON zebridge_private.mutation_parked
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION zebridge_private.park_release_finished();
+
+-- Ordered batch gate. The caller locks the complete union of OWN receipt keys first
+-- and supplies a topological order. A predecessor tentatively claimed in this SAME
+-- transaction may release its suffix; the receipt completion guard and whole-batch
+-- rollback make that satisfaction durable together or discard it together.
+DROP FUNCTION IF EXISTS zebridge_private.lookup_ordered_receipts(text[],text[],bytea[],bytea[],boolean[],text[]);
+-- `released` was added to the result: a return type cannot be replaced, so the older
+-- function is dropped once (only when it lacks the column, never on a plain re-apply).
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_proc WHERE oid = to_regprocedure('zebridge_private.lookup_ordered_receipts(text[],text[],bytea[],bytea[],boolean[],text[],text)')
+               AND NOT ('released' = ANY(coalesce(proargnames, '{}')))) THEN
+        DROP FUNCTION zebridge_private.lookup_ordered_receipts(text[],text[],bytea[],bytea[],boolean[],text[],text);
+    END IF;
+END $$;
+-- `released`: this call released the write's parked row into a credit that owes its verdict;
+-- the bridge then sends none of its own once the transaction commits. For a released write,
+-- the park credit publishes the terminal verdict. If the bridge stops after JetStream stores
+-- the verdict but before PostgreSQL records delivery, recovery may publish it again.
+CREATE OR REPLACE FUNCTION zebridge_private.lookup_ordered_receipts(
+    p_principals text[], p_ids text[], p_routes bytea[], p_payloads bytea[], p_ordered boolean[], p_predecessors text[], p_publication text DEFAULT '')
+RETURNS TABLE(ord integer, status text, outcome jsonb, fingerprint bytea, released boolean)
+LANGUAGE plpgsql SECURITY DEFINER SET jit = off SET search_path = pg_catalog AS $$
+DECLARE i integer; j integer; d record; claim record; prior text[] := '{}'; saved zebridge_private.mutation_parked%ROWTYPE;
+    fast boolean;
+    fast_fps bytea[];
+    guard_keys text[];
+    guard_on boolean;
+    floor_ms bigint;
+    now_ms bigint := (extract(epoch FROM clock_timestamp()) * 1000)::bigint;
+BEGIN
+    IF cardinality(p_ids) IS DISTINCT FROM cardinality(p_principals) OR cardinality(p_ids) IS DISTINCT FROM cardinality(p_routes)
+       OR cardinality(p_ids) IS DISTINCT FROM cardinality(p_payloads) OR cardinality(p_ids) IS DISTINCT FROM cardinality(p_ordered)
+       OR cardinality(p_ids) IS DISTINCT FROM cardinality(p_predecessors) THEN
+        RAISE EXCEPTION 'ordered batch array lengths differ' USING ERRCODE = '22023';
+    END IF;
+    -- Common ordered batch: read both generations of receipts and parked state in
+    -- sets, once. No scalar security-definer call, policy read or guard UPDATE per
+    -- write. The caller already holds all OWN receipt locks; predecessors are only
+    -- read. A committed predecessor is immutable, and an in-batch predecessor is
+    -- safe only when every candidate below can be claimed in this transaction.
+    -- Any exception falls through WITHOUT changing guards, parks or counters to
+    -- the full decision table below. In particular duplicates/conflicts/expiry,
+    -- unknown outcomes, parked releases and mixed legacy batches keep their paths.
+    IF cardinality(p_ids) > 0 AND NOT EXISTS (
+        SELECT 1 FROM unnest(p_ordered) x WHERE x IS DISTINCT FROM true
+    ) THEN
+        SELECT min_accepted_ms, completion_guard INTO STRICT floor_ms, guard_on
+          FROM zebridge_private.receipt_policy;
+        WITH inputs AS MATERIALIZED (
+            SELECT x.*, zebridge_private.receipt_created_ms(x.id) AS ms,
+                   zebridge_private.receipt_created_ms(x.pred) AS pred_ms,
+                   zebridge_private.receipt_month(x.id) AS month,
+                   zebridge_private.receipt_month(x.pred) AS pred_month,
+                   sha256(int4send(octet_length(x.route)) || x.route || x.payload) AS fp
+              FROM unnest(p_principals,p_ids,p_routes,p_payloads,p_predecessors)
+                   WITH ORDINALITY x(pr,id,route,payload,pred,n)
+        ), positions AS MATERIALIZED (
+            SELECT pr,id,min(n) AS first_n,count(*) AS copies FROM inputs GROUP BY pr,id
+        )
+        SELECT coalesce(bool_and(coalesce(
+                   x.pr IS NOT NULL AND x.pr <> '' AND x.route IS NOT NULL AND x.payload IS NOT NULL
+                   AND x.ms IS NOT NULL AND x.ms >= floor_ms AND x.ms <= now_ms + 60000
+                   AND octet_length(x.id) BETWEEN 1 AND 512 AND x.id !~ '[.*>\x01-\x20\x7f]'
+                   AND own_pos.copies = 1
+                   AND own_receipt.message_id IS NULL AND own_park.message_id IS NULL
+                   AND (x.pred IS NULL OR (
+                       x.pred_ms IS NOT NULL AND x.pred_ms <= x.ms AND x.pred <> x.id
+                       AND octet_length(x.pred) BETWEEN 1 AND 512 AND x.pred !~ '[.*>\x01-\x20\x7f]'
+                       AND split_part(x.id,'-',4) <> '' AND split_part(x.id,'-',4)=split_part(x.pred,'-',4)
+                       AND pred_park.predecessor IS DISTINCT FROM x.id
+                       AND (CASE WHEN pred_receipt.message_id IS NOT NULL THEN
+                           jsonb_typeof(pred_receipt.outcome)='object'
+                           AND pred_receipt.outcome->>'status' IN ('accepted','stale','row_deleted','rejected')
+                         ELSE pred_pos.first_n < x.n END)
+                   )),false)),false),
+               array_agg(x.fp ORDER BY x.n), array_agg(x.pr || chr(31) || x.id ORDER BY x.n)
+          INTO fast, fast_fps, guard_keys
+          FROM inputs x
+          JOIN positions own_pos ON own_pos.pr=x.pr AND own_pos.id=x.id
+          LEFT JOIN positions pred_pos ON pred_pos.pr=x.pr AND pred_pos.id=x.pred
+          LEFT JOIN zebridge_private.receipts own_receipt ON own_receipt.principal=x.pr
+               AND own_receipt.message_id=x.id AND own_receipt.id_month=x.month
+          LEFT JOIN zebridge_private.mutation_parked own_park ON own_park.principal=x.pr
+               AND own_park.message_id=x.id AND own_park.id_month=x.month
+          LEFT JOIN zebridge_private.receipts pred_receipt ON pred_receipt.principal=x.pr
+               AND pred_receipt.message_id=x.pred AND pred_receipt.id_month=x.pred_month
+          LEFT JOIN zebridge_private.mutation_parked pred_park ON pred_park.principal=x.pr
+               AND pred_park.message_id=x.pred AND pred_park.id_month=x.pred_month;
+        -- The joins must not accidentally discard an invalid/null identity.
+        IF fast AND cardinality(fast_fps)=cardinality(p_ids) THEN
+            IF guard_on THEN
+                INSERT INTO zebridge_private.receipt_guards AS g(txid,expected_keys,expected_fps)
+                VALUES(pg_current_xact_id(),guard_keys,fast_fps)
+                ON CONFLICT(txid) DO UPDATE SET expected_keys=g.expected_keys || EXCLUDED.expected_keys,
+                                                expected_fps=g.expected_fps || EXCLUDED.expected_fps;
+            END IF;
+            RETURN QUERY SELECT n::integer,'claimed'::text,NULL::jsonb,fp,false
+                FROM unnest(fast_fps) WITH ORDINALITY x(fp,n) ORDER BY n;
+            RETURN;
+        END IF;
+    END IF;
+    FOR i IN 1..coalesce(cardinality(p_ids),0) LOOP
+        ord := i; outcome := NULL; fingerprint := NULL; released := false;
+        IF NOT p_ordered[i] THEN
+            SELECT * INTO claim FROM zebridge_private.lookup_receipts(ARRAY[p_principals[i]],ARRAY[p_ids[i]],ARRAY[p_routes[i]],ARRAY[p_payloads[i]]);
+            status := claim.status; outcome := claim.outcome; fingerprint := claim.fingerprint;
+        ELSE
+            SELECT * INTO d FROM zebridge_private.ordered_mutation_state(p_principals[i],p_ids[i],p_routes[i],p_payloads[i],p_predecessors[i]);
+            IF d.status = 'waiting' THEN
+                FOR j IN 1..i-1 LOOP
+                    IF p_principals[j] = p_principals[i] AND p_ids[j] = p_predecessors[i] THEN
+                        IF prior[j] = 'claimed' THEN d.status := 'ready';
+                        ELSIF prior[j] = 'predecessor_unknown' THEN d.status := 'predecessor_unknown'; END IF;
+                        EXIT;
+                    END IF;
+                END LOOP;
+            END IF;
+            SELECT * INTO saved FROM zebridge_private.mutation_parked p WHERE p.principal=p_principals[i]
+              AND p.message_id=p_ids[i] AND p.id_month=zebridge_private.receipt_month(p_ids[i]);
+            IF FOUND AND d.status <> 'conflict' THEN
+                IF saved.attempts >= (SELECT max_attempts FROM zebridge_private.mutation_park_policy) AND d.status NOT IN ('duplicate','expired') THEN
+                    d.status := 'exhausted';
+                END IF;
+                IF d.status IN ('ready','predecessor_unknown','invalid_predecessor','expired','duplicate','exhausted') THEN
+                    DELETE FROM zebridge_private.mutation_parked p WHERE p.principal=saved.principal AND p.message_id=saved.message_id AND p.id_month=saved.id_month;
+                    INSERT INTO zebridge_private.mutation_park_credit(principal,message_id,charged_bytes,verdict_pending,publication) VALUES(saved.principal,saved.message_id,saved.charged_bytes,d.status NOT IN ('expired','exhausted'),p_publication);
+                    released := d.status NOT IN ('expired','exhausted');
+                END IF;
+            END IF;
+            status := d.status; outcome := d.outcome; fingerprint := d.fingerprint;
+            IF status IN ('ready','predecessor_unknown','invalid_predecessor') THEN
+                SELECT * INTO claim FROM zebridge_private.lookup_receipts(ARRAY[p_principals[i]],ARRAY[p_ids[i]],ARRAY[p_routes[i]],ARRAY[p_payloads[i]]);
+                IF claim.status <> 'claimed' OR status = 'ready' THEN status := claim.status; END IF;
+                outcome := claim.outcome; fingerprint := claim.fingerprint;
+            ELSIF status = 'unreadable_predecessor' THEN status := 'waiting'; END IF;
+        END IF;
+        prior := array_append(prior,status);
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+
+-- Candidates are hints only; every replay uses the same locked batch gate above.
+-- Scope to this bridge's publication, and don't let permanently absent predecessors
+-- occupy the bounded candidate window ahead of ready work. The sweep also handles
+-- own expiry and exhausted execution budgets without waiting for the predecessor.
+CREATE OR REPLACE FUNCTION zebridge_private.parked_mutations_ready(p_publication text, p_limit integer DEFAULT 256)
+RETURNS TABLE(principal text, message_id text, route bytea, payload bytea, headers jsonb)
+LANGUAGE sql SECURITY DEFINER SET jit = off SET search_path = pg_catalog AS $$
+    WITH RECURSIVE candidates AS (
+        SELECT p.principal,p.message_id,p.id_month,1 AS depth FROM zebridge_private.mutation_parked p
+        CROSS JOIN zebridge_private.receipt_policy pol CROSS JOIN zebridge_private.mutation_park_policy budget
+        WHERE zebridge_private.receipt_created_ms(p.message_id)<pol.min_accepted_ms OR p.attempts>=budget.max_attempts
+          OR (EXISTS (SELECT 1 FROM pg_publication_tables t WHERE t.pubname=p_publication AND t.schemaname='public'
+                      AND t.tablename=split_part(convert_from(p.route,'UTF8'),'.',-2))
+              AND (SELECT status FROM zebridge_private.ordered_mutation_state(p.principal,p.message_id,p.route,p.payload,p.predecessor))
+                  IN ('ready','predecessor_unknown','invalid_predecessor','duplicate','expired'))
+        UNION ALL
+        SELECT p.principal,p.message_id,p.id_month,c.depth+1 FROM zebridge_private.mutation_parked p JOIN candidates c
+          ON p.principal=c.principal AND p.predecessor=c.message_id
+        WHERE c.depth<256 AND EXISTS (SELECT 1 FROM pg_publication_tables t WHERE t.pubname=p_publication AND t.schemaname='public'
+                      AND t.tablename=split_part(convert_from(p.route,'UTF8'),'.',-2))
+    ), ranked AS (SELECT principal,message_id,id_month,min(depth) AS depth FROM candidates GROUP BY principal,message_id,id_month)
+    SELECT p.principal,p.message_id,p.route,p.payload,p.headers FROM ranked c
+      JOIN zebridge_private.mutation_parked p USING(principal,message_id,id_month)
+    ORDER BY c.depth,p.parked_at,p.principal,p.message_id LIMIT greatest(0,least(p_limit,256))
+$$;
+
+CREATE OR REPLACE FUNCTION zebridge_private.pending_park_verdicts(p_publication text)
+RETURNS TABLE(credit_id bigint, principal text, message_id text, outcome jsonb)
+LANGUAGE sql SECURITY DEFINER SET jit = off SET search_path=pg_catalog AS $$
+    SELECT c.credit_id,c.principal,c.message_id,
+           coalesce(r.outcome,jsonb_build_object('status','indeterminate','reason','MessageIdExpired'))
+      FROM zebridge_private.mutation_park_credit c
+      LEFT JOIN zebridge_private.receipts r ON r.principal=c.principal AND r.message_id=c.message_id
+        AND r.id_month=zebridge_private.receipt_month(c.message_id)
+      WHERE c.verdict_pending AND c.publication=p_publication
+        AND (r.message_id IS NOT NULL OR zebridge_private.receipt_created_ms(c.message_id)<(SELECT min_accepted_ms FROM zebridge_private.receipt_policy))
+      ORDER BY c.credit_id LIMIT 256
+$$;
+CREATE OR REPLACE FUNCTION zebridge_private.park_verdict_delivered(p_credit bigint)
+RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog AS $$
+    UPDATE zebridge_private.mutation_park_credit SET verdict_pending=false WHERE credit_id=p_credit
+$$;
+
+-- A cheap R1 hint: no extra client/database round trip on the ordered fast path.
+CREATE OR REPLACE FUNCTION zebridge_private.park_work()
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET jit=off SET search_path=pg_catalog AS $$
+    SELECT EXISTS(SELECT 1 FROM zebridge_private.mutation_parked)
+        OR EXISTS(SELECT 1 FROM zebridge_private.mutation_park_credit)
+$$;
+-- A session lock is necessary: release commits several short transactions.
+-- An xact lock would expire at candidate selection and elect every lane again.
+-- The listener releases this in a defer; disconnect/crash releases it automatically.
+CREATE OR REPLACE FUNCTION zebridge_private.try_park_sweeper(p_publication text)
+RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET jit=off SET search_path=pg_catalog AS $$
+BEGIN
+    IF NOT zebridge_private.park_work() THEN RETURN false; END IF;
+    RETURN pg_try_advisory_lock(hashtextextended('zebridge.park.sweep:'||p_publication,0));
+END $$;
+CREATE OR REPLACE FUNCTION zebridge_private.leave_park_sweeper(p_publication text)
+RETURNS boolean LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog AS $$
+    SELECT pg_advisory_unlock(hashtextextended('zebridge.park.sweep:'||p_publication,0))
+$$;
+
 DO $$
 DECLARE
     f regprocedure;
@@ -1614,6 +2114,14 @@ GRANT EXECUTE ON FUNCTION zebridge_private.lookup_receipts(text[], text[], bytea
 GRANT EXECUTE ON FUNCTION zebridge_private.record_receipts(text[], text[], bytea[], jsonb[]) TO ${POSTGRES_WRITER_USER};
 GRANT EXECUTE ON FUNCTION zebridge_private.close_guard() TO ${POSTGRES_WRITER_USER};
 GRANT EXECUTE ON FUNCTION zebridge_private.completion_guard_on() TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.lock_mutation_parks(text[]) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.ordered_mutation_state(text, text, bytea, bytea, text) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.park_mutation(text, text, bytea, bytea, text, jsonb) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.take_parked_mutation(text, text) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.fail_parked_mutation(text, text) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.settle_park_credits(integer) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.lookup_ordered_receipts(text[],text[],bytea[],bytea[],boolean[],text[],text) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.parked_mutations_ready(text,integer) TO ${POSTGRES_WRITER_USER};
 -- No partition is created here: the bridge runs maintain_receipts at startup. A recovery
 -- applies this file before `pg_restore --clean`, which cannot drop a partition's
 -- inherited primary key; with no partitions present it restores the dumped ones intact.
@@ -1706,3 +2214,10 @@ BEGIN
                        'FOR EACH STATEMENT EXECUTE FUNCTION public.zebridge_refuse_client_write()', t);
     END LOOP;
 END $$;
+
+GRANT EXECUTE ON FUNCTION zebridge_private.pending_park_verdicts(text) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.park_verdict_delivered(bigint) TO ${POSTGRES_WRITER_USER};
+
+GRANT EXECUTE ON FUNCTION zebridge_private.park_work() TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.try_park_sweeper(text) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.leave_park_sweeper(text) TO ${POSTGRES_WRITER_USER};

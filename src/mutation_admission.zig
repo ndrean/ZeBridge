@@ -205,6 +205,8 @@ fn relay(conn: *nats.Connection, incoming: *nats.Message, prefix: []const u8, le
     if (!validMessageId(id)) return error.InvalidMessageId;
     const outgoing = try conn.newMsg();
     defer outgoing.deinit();
+    const envelope = try @import("ordered_ingress.zig").parse(outgoing.arena.allocator(), incoming.data, id);
+    if (envelope.refusal) |err| return err;
     const subject = try std.fmt.allocPrint(outgoing.arena.allocator(), "$ZB.{s}.{s}", .{ prefix, parsed.principal });
     try outgoing.setSubject(subject, false);
     try outgoing.setPayload(incoming.data, false);

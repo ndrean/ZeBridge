@@ -263,6 +263,15 @@ pub const Nats = struct {
     /// raising this further.
     pub const mutation_max_deliver: i32 = 15;
 
+    /// Unacknowledged mutations the durable may hold at once, set explicitly: the server default
+    /// (1,000) capped ingress below the lanes' queues, and 2,048 is the value the dispatcher and the
+    /// receipt gates were validated at. Not a claim that it is optimal everywhere. It bounds
+    /// everything delivered and unacked (pending in the dispatcher, queued, executing); the
+    /// dispatcher's own budget only bounds its pending buffer. A durable still at the old default
+    /// is raised in place at boot (`ack_limit.zig`).
+    pub const mutation_max_ack_pending: i64 = 2048;
+    pub const mutation_max_ack_pending_old_default: i64 = 1000;
+
     /// How long JetStream waits for an ack before it redelivers a mutation. 10 s, not
     /// the library's 30 s default: the listener applies a message in milliseconds and
     /// naks what it cannot, so a longer wait only lengthens the window after a crash

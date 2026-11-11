@@ -39,7 +39,7 @@ import { heartbeatPayload,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgEngineValues, chainUpsertSql, chainRowParams,
   type SqlStep,
   fkClausesFor, createTableSteps, rebuildSteps, diffColumns, keyShape, typeShape, retypedColumns, isReadOnlySql,
-  mutationSubject, mutationMsgId, idKeyPart, mutationKeyId, mutationPayload, optimisticEvent, normalizeOp,
+  mutationSubject, mutationMsgId, messageIdCreatedMs, idKeyPart, mutationKeyId, mutationPayload, optimisticEvent, normalizeOp,
   normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate, outboxFloorMargin,
   isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, chainChunkJson, parseChainHead, msgpackScan, msgpackDecodeScanned, chainStageSql, vecColsOf, pgVectorValues, vecLiteral, strictMissing,
@@ -226,6 +226,9 @@ export type TableState = {
   versionColumn?: string | null;
   /// The configured server-stamped writer identity, needed to prove an own echo.
   tiebreakColumn?: string | null;
+  /// The ordered-envelope version the bridge advertises (`ordering` in the write contract);
+  /// 0 or absent: unordered. A client never sends an envelope the bridge did not offer.
+  ordering?: number;
   /// The catalogue's seed_epoch the descriptor carried (§10df).
   seedEpoch?: number;
   lsn: number;
@@ -1833,6 +1836,7 @@ export class ZeBridge {
     // `authoritative`: whether `before` is the server's row, not an overlay of an earlier write
     // (`beforeIsAuthoritative`). NULL: not known (an entry from before the column).
     try { await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN authoritative INTEGER`); } catch { /* present */ }
+    await this.addOutboxOrdering();
     // The ordering floor, read here once: `nextCreated` runs inside the write's transaction, and
     // a query outside it there waits behind that transaction (PGlite: forever).
     const m = await this.run(`SELECT max(m) AS m FROM (SELECT max(created_at) AS m FROM _zebridge_outbox UNION ALL SELECT max(created_at) FROM _zebridge_undo UNION ALL SELECT max(at) FROM _zebridge_base) t`);
@@ -1840,8 +1844,17 @@ export class ZeBridge {
     this.lastCreated = Math.max(this.lastCreated ?? 0, Number(m[0]?.m ?? 0));
   }
 
+  /// The ordered envelope (libzb `ensureOutbox`): `ordered` marks an entry sent with it,
+  /// `predecessor` the ID it names. An entry from before these columns is unordered (0): no
+  /// history is invented for it.
+  private async addOutboxOrdering() {
+    try { await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN ordered INTEGER DEFAULT 0`); } catch { /* present */ }
+    try { await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN predecessor TEXT`); } catch { /* present */ }
+    await this.run(`CREATE INDEX IF NOT EXISTS _zbz_outbox_tail ON _zebridge_outbox (ordered, created_at)`);
+  }
+
   private async outboxPut(
-    r: { msgId: string; subject: string; payload: unknown; table: string; id: string | number; before: unknown; optimistic: unknown; authoritative?: boolean },
+    r: { msgId: string; subject: string; payload: unknown; table: string; id: string | number; before: unknown; optimistic: unknown; authoritative?: boolean; predecessor?: string | null; ordered?: boolean },
     exec: Exec = this.run,
   ) {
     await this.outboxInitPromise;
@@ -1850,11 +1863,12 @@ export class ZeBridge {
     // IS the server's state (`recordAuthoritative` materializes one lazily).
     this.ledgerChanged();
     await exec(
-      `INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, optimistic, authoritative)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+      `INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, optimistic, authoritative, ordered, predecessor)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
        ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1`,
       r.msgId, r.subject, JSON.stringify(r.payload), r.table, String(r.id),
       r.before == null ? null : JSON.stringify(r.before), r.before == null ? null : JSON.stringify(r.before), created, JSON.stringify(r.optimistic), r.authoritative == null ? null : r.authoritative ? 1 : 0,
+      r.ordered ? 1 : 0, r.predecessor ?? null,
     );
     // A refresh may have run while the insert awaited storage. Mark completion too.
     this.ledgerChanged();
@@ -2575,6 +2589,8 @@ export class ZeBridge {
     const seedEpoch: number = typeof val.seed_epoch === 'number' ? val.seed_epoch : 0;
     const versionColumn: string | null = typeof val.version_column === 'string' ? val.version_column : null;
     const tiebreakColumn: string | null = typeof val.tiebreak_column === 'string' ? val.tiebreak_column : null;
+    // Version 1 is the only one this client speaks: any advertised version >= 1 includes it.
+    const ordering = Number.isInteger(val.ordering) && val.ordering >= 1 ? 1 : 0;
     const names = cols.map((c) => c.name);
 
     // ── FINDING 9 (the destroyer behind §10j): "first sight" must be decided by
@@ -2706,7 +2722,7 @@ export class ZeBridge {
       } else if (added.length === 0 && removed.length === 0 && renames.length === 0 && retyped.length === 0 &&
                  !(await this.foreignKeysDiffer(table, fkClauses)) && !(await this.strictMissing(table))) {
         await recordShape();
-        this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, tiebreakColumn, seedEpoch });
+        this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, tiebreakColumn, ordering, seedEpoch });
         await this.restoreSeedGate(table);
         this.reach('migrated');
         this.scheduleRecount();
@@ -2769,7 +2785,7 @@ export class ZeBridge {
       await this.syncIndexes(table, indexes);
       await recordShape();
 
-      this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, tiebreakColumn, seedEpoch });
+      this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, tiebreakColumn, ordering, seedEpoch });
       await this.restoreSeedGate(table);
       // Both registration paths mark the phase — a strip that lies is worse than none.
       this.reach('migrated');
@@ -5877,6 +5893,14 @@ export class ZeBridge {
   private async handleVerdict(subject: string, data: Uint8Array): Promise<boolean> {
     const prefix = `${this.ackPrefix()}.${this.config.principal}.`;
     const msgId = subject.startsWith(prefix) ? subject.slice(prefix.length) : subject;
+    // `<id>.held`: the write waits for its predecessor. Not a verdict (it never touches the
+    // verdict subject, so it cannot replace one): it only moves the replay deadline out.
+    // A notice that cannot be applied changes nothing that matters: the replay comes earlier, and is answered by the same verdict.
+    if (msgId.endsWith('.held')) {
+      try { await this.noteHeld(msgId.slice(0, -'.held'.length), data); }
+      catch (e) { this.appendLog('SYS', `a held notice was not applied (${e instanceof Error ? e.message : e})`, 'WARNING'); }
+      return false;
+    }
     let status = '';
     try { status = String(JSON.parse(new TextDecoder().decode(data))?.status ?? ''); } catch { /* the handler reports it */ }
     const tracked = msgId !== 'revoked' && status !== 'failed';
@@ -5889,6 +5913,20 @@ export class ZeBridge {
     } finally {
       if (tracked) this.verdictInFlight!.delete(msgId);
     }
+  }
+
+  /// A `held` notice (libzb `noteHeld`): the bridge parked the write behind its predecessor.
+  /// It stays pending; its replay (a direct get of its verdict, then the same message again)
+  /// is due when the lease ends. A settled write has no row and is untouched; a shorter lease
+  /// never brings the replay forward.
+  private async noteHeld(msgId: string, data: Uint8Array) {
+    let lease = 0;
+    try { const v = JSON.parse(new TextDecoder().decode(data)); if (Number.isInteger(v?.lease_ms) && v.lease_ms > 0) lease = v.lease_ms; } catch { return; }
+    if (!lease) return;
+    await this.outboxInitPromise;
+    const due = Date.now() + lease;
+    await this.run(`UPDATE _zebridge_outbox SET retry_at = CASE WHEN retry_at < ? THEN ? ELSE retry_at END WHERE msg_id = ? AND retry_at > 0`, due, due, msgId);
+    this.appendLog('SYS', `${msgId} held behind its predecessor, replay due in ${lease} ms`, 'DEBUG');
   }
 
   private async handleVerdictOnce(subject: string, data: Uint8Array): Promise<boolean> {
@@ -6256,7 +6294,9 @@ export class ZeBridge {
     const pkCols = this.syncedTables.get(table)?.pkCols ?? [];
     const keyObj = (payload as { key?: Record<string, unknown> }).key;
     const keyParts = pkCols.length && keyObj ? pkCols.map((c) => idKeyPart(keyObj[c])) : [String(id)];
-    const msgId = mutationMsgId(Math.floor(Date.now() + this.clockOffsetMs()), this.clientIdValue, table, op, keyParts, version);
+    // The ID is made inside the transaction, once its predecessor is known: never dated
+    // before it (libzb `mutateAt`).
+    let msgId = '';
 
     // Outbox insert and optimistic apply in ONE transaction (§7.1), persisted BEFORE
     // the publish: a duplicate is collapsed by dedup, a loss is unrecoverable.
@@ -6283,7 +6323,23 @@ export class ZeBridge {
         if (op !== 'DELETE' && state?.versionColumn && applied.data && typeof applied.data === 'object' && !(state.versionColumn in (applied.data as any))) {
           (applied.data as any)[state.versionColumn] = version;
         }
-        await this.outboxPut({ msgId, subject, payload, table, id, before, optimistic: applied, authoritative }, txExec);
+        // The ordering tail is the outbox itself (libzb `mutateAt`): its newest ordered entry,
+        // read in this transaction, so the link is fixed when the write is made. An entry
+        // leaves only on a terminal verdict or its echo, or as `indeterminate`.
+        let predecessor: string | null = null;
+        const ordered = (state?.ordering ?? 0) > 0;
+        if (ordered) {
+          predecessor = (await txExec(`SELECT msg_id FROM _zebridge_outbox WHERE ordered = 1 ORDER BY created_at DESC LIMIT 1`))[0]?.msg_id ?? null;
+          payload.ordering = state!.ordering;
+          payload.predecessor = predecessor;
+        }
+        // createdMs: the bridge's clock as this device estimates it, taken once here; the
+        // outbox keeps the resulting ID, so a retry never regenerates it. Never before the
+        // predecessor's (the bridge refuses a successor dated earlier): a clock stepped back
+        // gives an equal time, not an earlier one, and equal is allowed.
+        const createdMs = Math.max(Math.floor(Date.now() + this.clockOffsetMs()), predecessor ? messageIdCreatedMs(predecessor) ?? 0 : 0);
+        msgId = mutationMsgId(createdMs, this.clientIdValue, table, op, keyParts, version);
+        await this.outboxPut({ msgId, subject, payload, table, id, before, optimistic: applied, authoritative, ordered, predecessor }, txExec);
         await this.applyEvent(table, applied, txExec);
       });
       // Fire the change event AFTER the local replica is successfully updated — with

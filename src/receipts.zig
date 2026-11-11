@@ -19,10 +19,14 @@ const c = @import("c_imports.zig").c;
 
 const log = std.log.scoped(.receipts);
 
-pub const Status = enum { claimed, duplicate, repeat, conflict, expired, future, invalid };
+pub const Status = enum { claimed, duplicate, repeat, conflict, expired, future, invalid, waiting, predecessor_unknown, invalid_predecessor, exhausted };
 
 pub const Claim = struct {
     status: Status,
+    park_work: bool = false,
+    /// This claim released the write's parked row into a credit that delivers its verdict
+    /// (`deliverParkVerdicts`): once the transaction commits, the bridge sends none itself.
+    released: bool = false,
     /// A duplicate's recorded outcome, as stored (JSON).
     outcome: ?[]const u8 = null,
     /// The write's fingerprint as PostgreSQL's bytea text (`\x…`), for its receipt.
@@ -124,6 +128,38 @@ pub fn sendClaims(a: std.mem.Allocator, conn: ?*c.PGconn, principals: []const [:
     return c.PQsendQueryParams(conn, sql_z.ptr, @intCast(4 * n), null, values.ptr, lengths.ptr, formats.ptr, 0) == 1;
 }
 
+pub fn sendOrderedClaims(a: std.mem.Allocator, conn: ?*c.PGconn, principals: []const [:0]const u8, ids: []const [:0]const u8, routes: []const []const u8, payloads: []const []const u8, ordered: []const bool, predecessors: []const ?[:0]const u8, publication: [:0]const u8) !bool {
+    const n = ids.len;
+    var sql: std.ArrayList(u8) = .empty;
+    try sql.appendSlice(a, "SELECT status, outcome::text, fingerprint, (SELECT zebridge_private.park_work()), released FROM zebridge_private.lookup_ordered_receipts(");
+    try placeholders(a, &sql, 1, n, "text");
+    try sql.appendSlice(a, ", ");
+    try placeholders(a, &sql, 1 + n, n, "text");
+    try sql.appendSlice(a, ", ");
+    try placeholders(a, &sql, 1 + 2 * n, n, "bytea");
+    try sql.appendSlice(a, ", ");
+    try placeholders(a, &sql, 1 + 3 * n, n, "bytea");
+    try sql.appendSlice(a, ", ");
+    try placeholders(a, &sql, 1 + 4 * n, n, "boolean");
+    try sql.appendSlice(a, ", ");
+    try placeholders(a, &sql, 1 + 5 * n, n, "text");
+    try sql.print(a, ", ${d}::text) ORDER BY ord", .{6 * n + 1});
+    const sql_z = try a.dupeSentinel(u8, sql.items, 0);
+    const values = try a.alloc(?[*]const u8, 6 * n + 1);
+    const lengths = try a.alloc(c_int, 6 * n + 1);
+    const formats = try a.alloc(c_int, 6 * n + 1);
+    values[6 * n], lengths[6 * n], formats[6 * n] = .{ publication.ptr, 0, 0 };
+    for (0..n) |i| {
+        values[i], lengths[i], formats[i] = .{ principals[i].ptr, 0, 0 };
+        values[n + i], lengths[n + i], formats[n + i] = .{ ids[i].ptr, 0, 0 };
+        values[2 * n + i], lengths[2 * n + i], formats[2 * n + i] = .{ routes[i].ptr, @intCast(routes[i].len), 1 };
+        values[3 * n + i], lengths[3 * n + i], formats[3 * n + i] = .{ payloads[i].ptr, @intCast(payloads[i].len), 1 };
+        values[4 * n + i], lengths[4 * n + i], formats[4 * n + i] = .{ if (ordered[i]) "true" else "false", 0, 0 };
+        values[5 * n + i], lengths[5 * n + i], formats[5 * n + i] = .{ if (predecessors[i]) |p| p.ptr else null, 0, 0 };
+    }
+    return c.PQsendQueryParams(conn, sql_z.ptr, @intCast(6 * n + 1), null, values.ptr, lengths.ptr, formats.ptr, 0) == 1;
+}
+
 /// A batch's complete receipts in one call, pipelined (one INSERT), a principal per row.
 pub fn sendFinishes(a: std.mem.Allocator, conn: ?*c.PGconn, principals: []const [:0]const u8, ids: []const [:0]const u8, fps: []const [:0]const u8, outcomes: []const [:0]const u8) !bool {
     const n = ids.len;
@@ -156,7 +192,13 @@ pub fn readClaims(a: std.mem.Allocator, r: ?*c.PGresult, out: []Claim) !void {
         const status = std.meta.stringToEnum(Status, std.mem.span(c.PQgetvalue(r, row, 0))) orelse return error.ReceiptInfrastructure;
         const outcome: ?[]const u8 = if (c.PQgetisnull(r, row, 1) == 0) try a.dupe(u8, std.mem.span(c.PQgetvalue(r, row, 1))) else null;
         const fp: ?[:0]const u8 = if (c.PQgetisnull(r, row, 2) == 0) try a.dupeSentinel(u8, std.mem.span(c.PQgetvalue(r, row, 2)), 0) else null;
-        claim.* = .{ .status = status, .outcome = outcome, .fingerprint = fp };
+        claim.* = .{
+            .status = status,
+            .outcome = outcome,
+            .fingerprint = fp,
+            .park_work = c.PQnfields(r) > 3 and std.mem.eql(u8, std.mem.span(c.PQgetvalue(r, row, 3)), "t"),
+            .released = c.PQnfields(r) > 4 and std.mem.eql(u8, std.mem.span(c.PQgetvalue(r, row, 4)), "t"),
+        };
     }
 }
 
@@ -282,6 +324,24 @@ pub fn beginClaim(a: std.mem.Allocator, conn: ?*c.PGconn, principal: [:0]const u
     return readClaim(a, rs[2]);
 }
 
+pub fn beginOrderedClaim(a: std.mem.Allocator, conn: ?*c.PGconn, principal: [:0]const u8, id: [:0]const u8, route: []const u8, payload: []const u8, predecessor: ?[:0]const u8, publication: [:0]const u8) !Claim {
+    if (c.PQenterPipelineMode(conn) != 1) return error.ReceiptInfrastructure;
+    errdefer resetIfPipelined(conn);
+    const lock_values = [_]?[*:0]const u8{ principal.ptr, id.ptr };
+    const sent = c.PQsendQueryParams(conn, "BEGIN", 0, null, null, null, null, 0) == 1 and
+        c.PQsendQueryParams(conn, lock_sql, 2, null, &lock_values, null, null, 0) == 1 and
+        try sendOrderedClaims(a, conn, &.{principal}, &.{id}, &.{route}, &.{payload}, &.{true}, &.{predecessor}, publication) and
+        c.PQsendQueryParams(conn, "SAVEPOINT zb_write", 0, null, null, null, null, 0) == 1 and
+        c.PQpipelineSync(conn) == 1;
+    if (!sent) return error.ReceiptInfrastructure;
+    var failed_at: usize = 0;
+    const rs = try collect(a, conn, 4, &failed_at);
+    defer clearAll(rs);
+    try leave(conn);
+    if (failed_at != 4) return error.ReceiptInfrastructure;
+    return readClaim(a, rs[2]);
+}
+
 /// The single path's last exchange: the receipt (and close_guard when enabled), the
 /// application's deferred constraints checked now (SET CONSTRAINTS ALL IMMEDIATE) and
 /// COMMIT, in one pipeline round. `skip_receipt` is the commit_before_receipts test fault:
@@ -384,6 +444,16 @@ pub fn bootCheck(conn: ?*c.PGconn) !void {
         \\   AND has_function_privilege(current_user, 'zebridge_private.record_receipts(text[], text[], bytea[], jsonb[])', 'EXECUTE')
         \\   AND has_function_privilege(current_user, 'zebridge_private.close_guard()', 'EXECUTE')
         \\   AND has_function_privilege(current_user, 'zebridge_private.maintain_receipts()', 'EXECUTE')
+        \\   AND has_function_privilege(current_user, 'zebridge_private.lookup_ordered_receipts(text[],text[],bytea[],bytea[],boolean[],text[],text)', 'EXECUTE')
+        \\   AND has_function_privilege(current_user, 'zebridge_private.park_mutation(text,text,bytea,bytea,text,jsonb)', 'EXECUTE')
+        \\   AND has_function_privilege(current_user, 'zebridge_private.settle_park_credits(integer)', 'EXECUTE')
+        \\   AND has_function_privilege(current_user, 'zebridge_private.parked_mutations_ready(text,integer)', 'EXECUTE')
+        \\   AND has_function_privilege(current_user, 'zebridge_private.pending_park_verdicts(text)', 'EXECUTE')
+        \\   AND has_function_privilege(current_user, 'zebridge_private.park_verdict_delivered(bigint)', 'EXECUTE')
+        \\   AND has_function_privilege(current_user, 'zebridge_private.fail_parked_mutation(text,text)', 'EXECUTE')
+        \\   AND has_function_privilege(current_user, 'zebridge_private.park_work()', 'EXECUTE')
+        \\   AND has_function_privilege(current_user, 'zebridge_private.try_park_sweeper(text)', 'EXECUTE')
+        \\   AND has_function_privilege(current_user, 'zebridge_private.leave_park_sweeper(text)', 'EXECUTE')
     ;
     const r = c.PQexec(conn, sql);
     defer c.PQclear(r);

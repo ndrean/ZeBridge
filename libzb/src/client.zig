@@ -170,6 +170,9 @@ const TableState = struct {
     tenant_col: ?[]const u8,
     /// Configured server-stamped writer identity; absent means no echo shortcut.
     tiebreak_col: ?[]const u8 = null,
+    /// The ordered-envelope version the bridge advertises for this table (`ordering` in the
+    /// write contract); 0: unordered. A client never sends an envelope the bridge did not offer.
+    ordering: u32 = 0,
     /// PROTOCOL §7.5: a soft delete arrives as an update setting this column, and the
     /// physical reap is never forwarded — so a row with it set is REMOVED here, on
     /// seed, on CDC and on the local optimistic apply alike. See `tombstoned`.
@@ -1703,6 +1706,8 @@ pub const SyncClient = struct {
         const tombstone_col: ?[]const u8 = if (val.object.get("tombstone_column")) |v| (if (v == .string) v.string else null) else null;
         const tiebreak_col: ?[]const u8 = if (val.object.get("tiebreak_column")) |v| (if (v == .string) v.string else null) else null;
         const seed_epoch: i64 = if (val.object.get("seed_epoch")) |v| (if (v == .integer) v.integer else 0) else 0;
+        // Version 1 is the only one this client speaks: any advertised version >= 1 includes it.
+        const ordering: u32 = if (val.object.get("ordering")) |v| @intFromBool(v == .integer and v.integer >= 1) else 0;
 
         if (self.states.getPtr(table)) |st| {
             // §10df first: a republished descriptor is usually UNCHANGED in shape — the
@@ -1712,6 +1717,7 @@ pub const SyncClient = struct {
             if (tiebreak_col) |col| {
                 if (st.tiebreak_col == null or !std.mem.eql(u8, st.tiebreak_col.?, col)) st.tiebreak_col = try self.aa().dupe(u8, col);
             } else st.tiebreak_col = null;
+            st.ordering = ordering;
             try self.reseedIfEpochMoved(a, table, seed_epoch);
             if (outcome == .unchanged and sameStrings(st.cols, names.items) and sameStrings(st.pk, pk)) return;
         }
@@ -1732,6 +1738,7 @@ pub const SyncClient = struct {
             .tenant_col = if (tenant_col) |v| try ca.dupe(u8, v) else null,
             .tombstone_col = if (tombstone_col) |v| try ca.dupe(u8, v) else null,
             .tiebreak_col = if (tiebreak_col) |v| try ca.dupe(u8, v) else null,
+            .ordering = ordering,
             .array_cols = try dupeStrings(ca, try arrayColsOf(a, val)),
             .geom_cols = try dupeStrings(ca, try geomColsOf(a, val)),
             .vec_cols = try dupeVecCols(ca, try vecColsOf(a, val)),
@@ -5929,6 +5936,12 @@ pub const SyncClient = struct {
         // `authoritative`: whether `before` is the server's row, not an overlay of an earlier
         // write (`beforeIsAuthoritative`). NULL: not known (an entry from before the column).
         execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN authoritative INTEGER") catch {};
+        // The ordered envelope: `ordered` marks an entry sent with it, `predecessor` the ID it
+        // names (both also in `payload`, which is what is sent). An entry from before these
+        // columns is unordered (0): no history is invented for it.
+        execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN ordered INTEGER DEFAULT 0") catch {}; // no constraint: DuckDB refuses one in ADD COLUMN
+        execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN predecessor TEXT") catch {};
+        try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_tail ON _zebridge_outbox (ordered, created_at)");
         try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_retry ON _zebridge_outbox (retry_at, attempts, created_at, msg_id)");
         try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_recovery ON _zebridge_outbox (attempts, created_at, msg_id)");
         // A write answered `indeterminate`: settled for retransmission, its outcome
@@ -6072,15 +6085,32 @@ pub const SyncClient = struct {
         try args.put(a, "table", .{ .string = table });
         try args.put(a, "op", .{ .string = op });
         try args.put(a, "version", .{ .string = version });
+        // The ordering tail is the outbox itself: its newest ordered entry. An entry leaves
+        // only on a terminal verdict or its echo (the bridge evaluated it, and it evaluated
+        // every write that entry named) or as `indeterminate` (reconciled, so a new write must
+        // not depend on it). Read and inserted in this one call, single-threaded, so the link
+        // is fixed when the write is made and survives restart with the entry.
+        const predecessor: ?[]const u8 = if (st.ordering > 0) blk: {
+            const tail = try self.st.query(a, "SELECT msg_id FROM _zebridge_outbox WHERE ordered = 1 ORDER BY created_at DESC LIMIT 1", &.{});
+            break :blk if (tail.len == 1 and tail[0][0] == .text) tail[0][0].text else null;
+        } else null;
         // The ID's creation time: the bridge's clock as this device estimates it, taken
         // once here; the outbox keeps the resulting ID, so a retry never regenerates it.
-        try args.put(a, "createdMs", .{ .integer = nowMillis() + self.clock_offset_ms });
+        // Never before the predecessor's (the bridge refuses a successor dated earlier): a
+        // clock stepped back, or a new offset after reopening, gives an equal time, not an
+        // earlier one. Equal is allowed, so no millisecond is invented.
+        const created_ms = @max(nowMillis() + self.clock_offset_ms, if (predecessor) |p| core.messageIdCreatedMs(p) orelse 0 else 0);
+        try args.put(a, "createdMs", .{ .integer = created_ms });
         try args.put(a, "key", key);
         if (values) |v| try args.put(a, "values", v);
         var pk_arr = std.json.Array.init(a);
         for (st.pk) |c| try pk_arr.append(.{ .string = c });
         try args.put(a, "pkCols", .{ .array = pk_arr });
         try args.put(a, "mutationsPrefix", .{ .string = self.subject_mutations_prefix });
+        if (st.ordering > 0) {
+            try args.put(a, "ordering", .{ .integer = st.ordering });
+            if (predecessor) |p| try args.put(a, "predecessor", .{ .string = p });
+        }
 
         const env = try core.buildMutation(a, .{ .object = args });
         const subject = env.object.get("subject").?.string;
@@ -6136,14 +6166,15 @@ pub const SyncClient = struct {
             break :blk .null;
         };
         _ = try self.st.query(a,
-            \\INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, tenant, optimistic, authoritative)
-            \\VALUES (?,?,?,?,?,?,?,?,0,0,?,?,?)
+            \\INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, tenant, optimistic, authoritative, ordered, predecessor)
+            \\VALUES (?,?,?,?,?,?,?,?,0,0,?,?,?,?,?)
             \\ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1
         , &.{
-            .{ .text = msg_id },                         .{ .text = subject },                        .{ .text = payload_json },
-            .{ .text = table },                          .{ .text = row_id },                         before_json,
-            before_json,                                 .{ .integer = created },                     row_tenant,
-            .{ .text = try core.valueToString(a, opt) }, .{ .integer = @intFromBool(authoritative) },
+            .{ .text = msg_id },                              .{ .text = subject },                        .{ .text = payload_json },
+            .{ .text = table },                               .{ .text = row_id },                         before_json,
+            before_json,                                      .{ .integer = created },                     row_tenant,
+            .{ .text = try core.valueToString(a, opt) },      .{ .integer = @intFromBool(authoritative) }, .{ .integer = @intFromBool(st.ordering > 0) },
+            if (predecessor) |pr| .{ .text = pr } else .null,
         });
 
         // ⚠️ Sent through flushOutbox, NOT published directly from here.
@@ -6353,6 +6384,21 @@ pub const SyncClient = struct {
         const r = self.st.query(a, "SELECT count(*) FROM _zebridge_outbox", &.{}) catch return 0;
         if (r.len == 0 or r[0][0] != .integer) return 0;
         return @intCast(r[0][0].integer);
+    }
+
+    /// A `held` notice: the write's predecessor is unresolved and the bridge parked it. The
+    /// write stays pending; its replay (a direct get of its verdict, then the same message
+    /// again) is due when the lease ends. A write already settled has no row and is untouched.
+    fn noteHeld(self: *SyncClient, a: std.mem.Allocator, subject: []const u8, data: []const u8) !void {
+        const end = std.mem.lastIndexOfScalar(u8, subject, '.') orelse return;
+        const start = (std.mem.lastIndexOfScalar(u8, subject[0..end], '.') orelse return) + 1;
+        const mid = subject[start..end];
+        const v = parseStoredJson(a, data) catch return;
+        const lease: i64 = if (v == .object) (if (v.object.get("lease_ms")) |x| (if (x == .integer and x.integer > 0) x.integer else 0) else 0) else 0;
+        if (lease == 0) return;
+        _ = try self.st.query(a, "UPDATE _zebridge_outbox SET retry_at = CASE WHEN retry_at < ? THEN ? ELSE retry_at END WHERE msg_id = ? AND retry_at > 0", &.{ .{ .integer = nowMillis() + lease }, .{ .integer = nowMillis() + lease }, .{ .text = mid } });
+        self.outbox_next_check_ms = 0;
+        log.debug("libzb: {s} held behind its predecessor, replay due in {d} ms", .{ mid, lease });
     }
 
     fn settleVerdict(self: *SyncClient, a: std.mem.Allocator, mid: []const u8, data: []const u8) !bool {
@@ -6895,25 +6941,42 @@ pub const SyncClient = struct {
             // subjects and not payloads, so identity belongs where the broker can see it.
             // Reading it from the body found nothing and silently settled zero verdicts
             // while the row was already in PostgreSQL (measured).
-            const mid = blk: {
-                var last: []const u8 = "";
-                var it = std.mem.splitScalar(u8, msg.subject, '.');
-                while (it.next()) |part| last = part;
-                break :blk last;
-            };
-            if (mid.len == 0) continue;
-            if (std.mem.eql(u8, mid, "revoked")) {
-                self.notePurge(msg.data);
-                return self.hangUpRevoked();
+            switch (try self.routeVerdict(a, msg.subject, msg.data)) {
+                .settled => settled += 1,
+                .kept, .held => {},
+                .revoked => {
+                    self.notePurge(msg.data);
+                    return self.hangUpRevoked();
+                },
             }
-
-            // ⚠️ JSON, not msgpack. CDC and mutations are msgpack; a verdict is JSON —
-            // it is read by humans and by `nats sub` as often as by a client. The wire
-            // names are the bridge's: accepted / stale / row_deleted / rejected settle
-            // the entry (the last two revert the optimistic copy); `failed` stays queued.
-            if (try self.settleVerdict(a, mid, msg.data)) settled += 1;
         }
         return settled;
+    }
+
+    /// One message on `mutation_ack.<principal>.>`, by its subject's last token: the write's
+    /// ID (a verdict), `held` (`<id>.held`: a notice, never a verdict), or `revoked` (the ban,
+    /// acted on by the caller).
+    fn routeVerdict(self: *SyncClient, a: std.mem.Allocator, subject: []const u8, data: []const u8) !enum { settled, kept, held, revoked } {
+        const mid = blk: {
+            var last: []const u8 = "";
+            var it = std.mem.splitScalar(u8, subject, '.');
+            while (it.next()) |part| last = part;
+            break :blk last;
+        };
+        if (mid.len == 0) return .kept;
+        // `mutation_ack.<principal>.<id>.held`: the write waits for its predecessor. Not a
+        // verdict (it never touches the verdict subject, so it cannot replace one): it only
+        // moves the write's replay deadline out by its lease.
+        if (std.mem.eql(u8, mid, "held")) {
+            self.noteHeld(a, subject, data) catch |err| log.warn("libzb: a held notice was not applied ({s})", .{@errorName(err)});
+            return .held;
+        }
+        if (std.mem.eql(u8, mid, "revoked")) return .revoked;
+        // ⚠️ JSON, not msgpack. CDC and mutations are msgpack; a verdict is JSON —
+        // it is read by humans and by `nats sub` as often as by a client. The wire
+        // names are the bridge's: accepted / stale / row_deleted / rejected settle
+        // the entry (the last two revert the optimistic copy); `failed` stays queued.
+        return if (try self.settleVerdict(a, mid, data)) .settled else .kept;
     }
 
     /// §10dm: the ban, acted on — the socket dropped now, the flag set for every later
@@ -10195,4 +10258,186 @@ test "undo: a new write re-enables tracking after an empty poll; authoritative C
     try cl.applyEvent("p", try parseStoredJson(a, "{\"operation\":\"INSERT\",\"data\":{\"id\":\"x\",\"title\":\"new\"}}"), "", 0);
     try undoTestReject(&cl, a, "a");
     try std.testing.expect(try undoTestHas(&cl, a, "p", "x"));
+}
+
+/// `undoTestClient` able to `mutate`: an unconnected NATS connection, so a write is queued in the
+/// outbox and nothing is published. `p` speaks the ordered envelope, `c` does not.
+fn orderTestClient(a: std.mem.Allocator, path: [:0]const u8, conn: *@import("nats").Connection, t: *transport.Transport) !SyncClient {
+    var cl = try undoTestClient(a, path);
+    t.* = .{ .allocator = a, .threaded = undefined, .conn = conn, .js = undefined };
+    cl.t = t;
+    cl.opts = .{ .url = "", .creds_path = "", .db_path = path, .principal = "omar", .tables = &.{}, .client_id = "c-1" };
+    cl.subject_mutations_prefix = "mutation";
+    cl.open_tenants = &.{"_open"};
+    cl.last_version = "";
+    cl.clock_offset_ms = 0;
+    cl.hold_until_ms = 0;
+    cl.outbox_next_check_ms = 0;
+    cl.outbox_retry_on_reconnect = false;
+    cl.states.getPtr("p").?.ordering = 1;
+    return cl;
+}
+
+fn orderTestMutate(cl: *SyncClient, a: std.mem.Allocator, table: []const u8, op: []const u8, id: []const u8) ![]const u8 {
+    const key = try parseStoredJson(a, try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{id}));
+    const values: ?Value = if (std.mem.eql(u8, table, "p")) try parseStoredJson(a, "{\"title\":\"t\"}") else try parseStoredJson(a, "{\"pid\":\"x\"}");
+    return cl.mutate(a, table, op, key, values);
+}
+
+/// (ordered, predecessor) of an outbox entry, and the predecessor its sent payload carries.
+fn orderTestLink(cl: *SyncClient, a: std.mem.Allocator, mid: []const u8) !struct { ordered: bool, column: ?[]const u8, payload: ?Value } {
+    const r = try cl.st.query(a, "SELECT ordered, predecessor, payload FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
+    if (r.len != 1) return error.NoOutboxRow;
+    const env = try parseStoredJson(a, r[0][2].text);
+    return .{ .ordered = r[0][0] == .integer and r[0][0].integer == 1, .column = if (r[0][1] == .text) r[0][1].text else null, .payload = env.object.get("predecessor") };
+}
+
+test "ordering: each ordered write names the newest unsettled one, fixed at creation, across settlement and reopen" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/tmp/zb-order-tail.sqlite3";
+    for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    var cl = try orderTestClient(a, path, &conn, &t);
+
+    // The first ordered write has nothing before it: an explicit null, in the column and on the wire.
+    const m1 = try orderTestMutate(&cl, a, "p", "INSERT", "x");
+    var l = try orderTestLink(&cl, a, m1);
+    try std.testing.expect(l.ordered and l.column == null and l.payload.? == .null);
+    const m2 = try orderTestMutate(&cl, a, "p", "UPDATE", "x");
+    l = try orderTestLink(&cl, a, m2);
+    try std.testing.expectEqualStrings(m1, l.column.?);
+    try std.testing.expectEqualStrings(m1, l.payload.?.string);
+    // A table the bridge offers no ordering for: no field, and never a predecessor.
+    const m3 = try orderTestMutate(&cl, a, "c", "INSERT", "k");
+    l = try orderTestLink(&cl, a, m3);
+    try std.testing.expect(!l.ordered and l.column == null and l.payload == null);
+    const m4 = try orderTestMutate(&cl, a, "p", "UPDATE", "x");
+    try std.testing.expectEqualStrings(m2, (try orderTestLink(&cl, a, m4)).column.?);
+
+    // m4 settles (evaluated, so everything it named was too): the next write names m2, the
+    // newest still unsettled, and m4's own link never changes.
+    _ = try cl.settleVerdict(a, m4, "{\"status\":\"accepted\"}");
+    const m5 = try orderTestMutate(&cl, a, "p", "UPDATE", "x");
+    try std.testing.expectEqualStrings(m2, (try orderTestLink(&cl, a, m5)).column.?);
+    try std.testing.expectEqualStrings(m1, (try orderTestLink(&cl, a, m2)).payload.?.string);
+
+    // Reopen: the tail is the outbox itself, so the chain continues where it was.
+    cl.st.close();
+    var conn2 = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn2.deinit();
+    var t2: transport.Transport = undefined;
+    var again = try orderTestClient(a, path, &conn2, &t2);
+    defer again.st.close();
+    const m6 = try orderTestMutate(&again, a, "p", "UPDATE", "x");
+    try std.testing.expectEqualStrings(m5, (try orderTestLink(&again, a, m6)).column.?);
+    try std.testing.expectEqualStrings(m2, (try orderTestLink(&again, a, m5)).payload.?.string);
+}
+
+test "ordering: an outbox from before the ordered envelope stays unordered; the first ordered write names none" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/tmp/zb-order-migrate.sqlite3";
+    for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+    {
+        var old = try storage.Storage.open(path);
+        defer old.close();
+        try execDdl(&old,
+            \\CREATE TABLE _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT NOT NULL, payload TEXT NOT NULL,
+            \\  tbl TEXT NOT NULL, row_id TEXT NOT NULL, before TEXT, created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+            \\  published INTEGER NOT NULL DEFAULT 1, retry_at INTEGER NOT NULL DEFAULT 0, tenant TEXT, optimistic TEXT)
+        );
+        try old.execSimple("INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, created_at) VALUES ('old-1', 's', '{}', 'p', 'y', 1)");
+    }
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    var cl = try orderTestClient(a, path, &conn, &t);
+    defer cl.st.close();
+    const old_row = try cl.st.query(a, "SELECT ordered, predecessor FROM _zebridge_outbox WHERE msg_id = 'old-1'", &.{});
+    try std.testing.expect(old_row[0][0] == .integer and old_row[0][0].integer == 0 and old_row[0][1] == .null);
+    const m1 = try orderTestMutate(&cl, a, "p", "INSERT", "x");
+    const l = try orderTestLink(&cl, a, m1);
+    try std.testing.expect(l.ordered and l.column == null and l.payload.? == .null);
+}
+
+test "ordering: held, as the poll loop routes it, moves only the replay deadline; at lease end the same message is replayed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/tmp/zb-order-held.sqlite3";
+    for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    var cl = try orderTestClient(a, path, &conn, &t);
+    defer cl.st.close();
+    const m1 = try orderTestMutate(&cl, a, "p", "INSERT", "x");
+    const sent = nowMillis() + 1000; // published: a replay deadline is set
+    _ = try cl.st.query(a, "UPDATE _zebridge_outbox SET retry_at = ? WHERE msg_id = ?", &.{ .{ .integer = sent }, .{ .text = m1 } });
+    const subject = try std.fmt.allocPrint(a, "mutation_ack.omar.{s}.held", .{m1});
+    try std.testing.expectEqual(.held, try cl.routeVerdict(a, subject, "{\"status\":\"held\",\"lease_ms\":30000}"));
+    const due = (try cl.st.query(a, "SELECT retry_at FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = m1 }}))[0][0].integer;
+    try std.testing.expect(due >= sent + 28_000);
+    try std.testing.expectEqual(@as(usize, 0), cl.outcomes.items.len);
+    // A shorter lease never brings the replay forward; no lease is no change.
+    _ = try cl.routeVerdict(a, subject, "{\"status\":\"held\",\"lease_ms\":10}");
+    _ = try cl.routeVerdict(a, subject, "{\"status\":\"held\"}");
+    try std.testing.expectEqual(due, (try cl.st.query(a, "SELECT retry_at FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = m1 }}))[0][0].integer);
+    // The lease is the replay timer: not due before it ends; at its end the replay selects the
+    // same entry, its stored ID and payload (predecessor included) unchanged, for the direct
+    // get of its verdict and then the same message again.
+    const stored = (try cl.st.query(a, "SELECT payload FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = m1 }}))[0][0].text;
+    try std.testing.expectEqual(@as(usize, 0), (try reserveOutbox(&cl.st, a, due - 1)).len);
+    const replay = try reserveOutbox(&cl.st, a, due);
+    try std.testing.expectEqual(@as(usize, 1), replay.len);
+    try std.testing.expectEqualStrings(m1, replay[0][0].text);
+    try std.testing.expectEqualStrings(stored, replay[0][2].text);
+    // Terminal first, then a delayed held: the outcome stands and nothing comes back.
+    try std.testing.expectEqual(.settled, try cl.routeVerdict(a, try std.fmt.allocPrint(a, "mutation_ack.omar.{s}", .{m1}), "{\"status\":\"accepted\"}"));
+    try std.testing.expectEqual(.held, try cl.routeVerdict(a, subject, "{\"status\":\"held\",\"lease_ms\":30000}"));
+    try std.testing.expectEqual(@as(usize, 0), (try cl.st.query(a, "SELECT msg_id FROM _zebridge_outbox", &.{})).len);
+}
+
+test "ordering: a successor's ID is never dated before its predecessor's, after a clock step back and across reopen" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = "/tmp/zb-order-clock.sqlite3";
+    for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    var cl = try orderTestClient(a, path, &conn, &t);
+    const m1 = try orderTestMutate(&cl, a, "p", "INSERT", "x");
+    const t1 = core.messageIdCreatedMs(m1).?;
+    cl.clock_offset_ms = -3_600_000; // the bridge's clock re-estimated an hour back
+    const m2 = try orderTestMutate(&cl, a, "p", "UPDATE", "x");
+    try std.testing.expectEqual(t1, core.messageIdCreatedMs(m2).?); // equal, not earlier, not invented
+    try std.testing.expectEqualStrings(m1, (try orderTestLink(&cl, a, m2)).payload.?.string);
+    // An unordered write keeps its own clock: nothing to stay after.
+    const u = try orderTestMutate(&cl, a, "c", "INSERT", "k");
+    try std.testing.expect(core.messageIdCreatedMs(u).? < t1 - 3_000_000);
+    cl.st.close();
+
+    var conn2 = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn2.deinit();
+    var t2: transport.Transport = undefined;
+    var again = try orderTestClient(a, path, &conn2, &t2);
+    defer again.st.close();
+    again.clock_offset_ms = -7_200_000; // reopened with an offset two hours back
+    const m3 = try orderTestMutate(&again, a, "p", "UPDATE", "x");
+    try std.testing.expectEqual(t1, core.messageIdCreatedMs(m3).?);
+    try std.testing.expectEqualStrings(m2, (try orderTestLink(&again, a, m3)).column.?);
+    // What was queued is unchanged: the IDs (the outbox key) and the payloads' links.
+    const rows = try again.st.query(a, "SELECT msg_id FROM _zebridge_outbox WHERE ordered = 1 ORDER BY created_at", &.{});
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    try std.testing.expectEqualStrings(m1, rows[0][0].text);
+    try std.testing.expectEqualStrings(m2, rows[1][0].text);
+    try std.testing.expect((try orderTestLink(&again, a, m1)).payload.? == .null);
+    try std.testing.expectEqualStrings(m1, (try orderTestLink(&again, a, m2)).payload.?.string);
 }

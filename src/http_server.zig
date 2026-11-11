@@ -1092,6 +1092,7 @@ pub const Server = struct {
             if (self.limiter) |l| try writeIngressPrometheus(&w, l);
             if (self.health) |h| try h.writePrometheus(&w);
             try verdict_stats.writePrometheus(&w);
+            try @import("ingress_stats.zig").writePrometheus(&w);
 
             try respond(req, .ok, "text/plain", buf[0 .. body.len + w.buffered().len]);
         } else {

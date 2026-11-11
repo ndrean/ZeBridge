@@ -15,6 +15,9 @@ Groups, because the scenarios differ in what they need and what they break:
             (`NATS_CREDS`, default omar) or as the bridge (`bridge.creds`).
   owns      start a probe bridge (`--slot zb_probe --port 9096`) and refuse to run
             beside another — serialized here, never in a parallel lane.
+  known_red regressions for a known, unfixed bug. Exit 1 means exactly that defect
+            reproduced (expected); 0 the fix landed (move it to owns); 2 the harness
+            could not set up; 3 another failure. Not part of `all`.
   manual    benchmarks and soaks that report rather than assert (speed, burst,
             leaksoak, objstore_race, bench_poll): listed, never run by the battery.
 
@@ -39,6 +42,7 @@ CREDS = ROOT / "scripts" / "native" / "creds"
 # set); "bridge" connects with bridge.creds; "none" needs no NATS at all.
 GROUPS = {
     "offline": {
+        "ingress_park_sql": ("none", "ordered-ingress SQL: durable parking, quota races, receipt/release atomicity and held-transaction contention (disposable PostgreSQL, no NATS)"),
         "render":        ("none",   "envsubst on both templates, applied to a scratch DB"),
         "tzguard":       ("none",   "naive timestamp columns refused at DDL time"),
         "tenant_writes": ("none",   "RLS + tenant stamping on the write path"),
@@ -121,6 +125,11 @@ GROUPS = {
         "collist":       ("bridge", "publication column lists (§10ff): a STORED tsvector and a column the DBA leaves out never travel — publication, descriptor, a libzb replica, CDC, a client write and the audit agree; a stray second publication with a narrower list cannot shrink the descriptor; zebridge_enable refreshes the list after ADD COLUMN. SECURITY.md's column-list claim is proven HERE — it asserts, so it belongs in the battery, not in manual"),
     },
     "owns": {
+        "ingress_ordering": ("none", "ordered parent/child: held parent with one/four lanes; successor durably parked while another client commits; disposable PostgreSQL/NATS"),
+        "ingress_arrival": ("none", "ordered successor arrives before admission-refused parent; immutable resend releases it; single-lane rate-limit control; disposable stack"),
+        "ingress_release": ("none", "ordered park/release across restart, duplicate window, batch rollback, rejected parent and unknown predecessor; --fault-bridge additionally tests commit-before-verdict crash"),
+        "ingress_affinity": ("none", "the ingress dispatcher under a held lane: one client's chain fills its lane past the queue while an unrelated client commits elsewhere; a hold longer than the ack wait redelivers nothing; a clean stop with full queues and a kill -9 with queued writes both apply everything exactly once; disposable stack, 4 lanes"),
+        "ingress_ack_limit": ("none", "the mutation durable's explicit max_ack_pending 2048: created with it; an existing durable at the old default 1000, with unacked and undelivered writes, raised in place (same durable, other settings unchanged, every write settled once); a restart changes nothing; another value or a refused update stops the boot (exit 1) and leaves the durable as it was; disposable stack, 2 lanes"),
         "ratelimit":     ("bridge", "the ingress rate limit: bob floods 200 writes, the excess is served at the rate (NAK'd and redelivered, one verdict each), alice in another tenant is answered within 2 s during the flood, libzb holds its outbox and loses nothing; starts its own probe with the limit set, so it OWNS the only bridge (§10fk)"),
         "sizing":        ("bridge", "BASE_BUF / ring sizing refusals"),
         "endpoint":      ("bridge", "one NATS address"),
@@ -170,7 +179,12 @@ GROUPS = {
         "registers":     ("bridge", "a jsonb register column merged by PostgreSQL: a late offline write built on an old doc keeps the other editor's newer register (control: without the merge it rolls it back)"),
         "shared_record": ("bridge", "example 15 played mechanically: three editors (two offline) and an outsider, the README's timeline on five columns and on five registers of doc; PostgreSQL and every replica end at the expected values, carol told she lost rating"),
     },
+    # Regressions for a known, unfixed bug: each asserts the desired outcome, so it exits 1 today.
+    # Kept out of `owns` (and `all`) so that group stays a signal; here exit 1 counts as expected,
+    # and an unexpected pass fails the group: the fix landed, move the scenario to `owns`.
+    "known_red": {},
     "manual": {
+        "ingress_baseline": ("none", "paused-consumer backlog baseline, 1/10/100/500 connected publishers and 1/8 ingress lanes; three rounds, optional diagnostic binary and mixed traffic; requires --log-dir, see --help"),
         "firehose_topology": ("none", "the firehose with N TLS consumers attached, topology 2 (TLS on nats-server, bridge tls://) vs topology 1 (plain nats-server, HAProxy terminates the clients' TLS): chain margin, cuts, CPU per process (§10gb); ~10 min"),
         "firehose_tls":  ("none",   "the §10eu firehose isolated, plain vs TLS: does the producer keep its chain on a pruning CDC stream (margin sampled every second, early cuts, fallen cuts, build and upload times)? §10ga; ~10 min, stop other bridges first; --runs transport:index:defer:async picks each run (§10gd–§10gf), --preload static rows, --verify seeds the final chain in Python and compares with PostgreSQL; reports RSS, slot lag, WAL written (§10gg)"),
         "burst_tls":     ("none",   "the 2M-row burst, plain vs TLS between the bridge and NATS, isolated (scratch DB, scratch nats-servers, own slot): events/s, CPU, and the full chain's upload (§10fz); minutes, stop other bridges first; --runs=tls:on,tls:off compares the version index, with the WAL written (§10ge)"),
@@ -378,8 +392,11 @@ def main() -> int:
             with open(log, "w") as f:
                 rc = subprocess.run([PY, str(HERE / f"{name}.py")], env=env_for(role), stdout=f, stderr=subprocess.STDOUT, cwd=ROOT).returncode
             dt = time.monotonic() - t0
-            results.append((g, name, rc, dt, log))
-            print(f"  {'✓' if rc == 0 else '✗'} {g}/{name:18s} rc={rc:<3d} {dt:6.1f}s  {log}", flush=True)
+            expected = (rc == 1) if g == "known_red" else (rc == 0)
+            results.append((g, name, 0 if expected else (rc or 1), dt, log))
+            note = {1: "known defect reproduced", 0: "now passes: the fix landed, move it to owns", 2: "harness could not set up",
+                    3: "UNEXPECTED failure, not the known defect"}.get(rc, "unexpected exit") if g == "known_red" else ""
+            print(f"  {'✓' if expected else '✗'} {g}/{name:18s} rc={rc:<3d} {dt:6.1f}s  {log}" + (f"  ({note})" if note else ""), flush=True)
             if floor and g != "offline":
                 after = gc_floor()
                 if after and after[0] != floor[0]:
@@ -403,7 +420,11 @@ def main() -> int:
     if any(g != "offline" for g in groups):
         drop_probe_slot()
     failed = [r for r in results if r[2] != 0]
-    print(f"\n{len(results) - len(failed)}/{len(results)} passed" + (f"; failed: {', '.join(r[1] for r in failed)}" if failed else ""))
+    if groups == ["known_red"]:
+        # Worded so a green run cannot read as "ordering fixed": it means the defects are still there.
+        print(f"\n{len(results) - len(failed)}/{len(results)} known defect(s) reproduced" + (f"; not as expected: {', '.join(r[1] for r in failed)}" if failed else ""))
+    else:
+        print(f"\n{len(results) - len(failed)}/{len(results)} passed" + (f"; failed: {', '.join(r[1] for r in failed)}" if failed else ""))
     return 1 if failed else 0
 
 

@@ -179,6 +179,8 @@ its `defer join`, never before.
 
 ### Walls
 
+- Ordered ingress requires the matching init SQL: missing park, receipt, delivery or election functions fail startup as `ReceiptsNotInstalled`. Re-apply `bridge --init-sql` before starting the new workers; never work around it by disabling guards.
+
 Every limit below is in **bytes** (`octet_length`, not `length`: a tenant of 47 two-byte characters is 94 bytes).
 `bridge --limits` prints this build's identifier limits as JSON; a running bridge shows them in `/status` (`limits`) and `/dropped`.
 Each row reads _symptom → exact limit → how to inspect → remedy → what recovery it needs_. **Correcting a value or raising a
