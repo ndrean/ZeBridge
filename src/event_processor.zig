@@ -1545,11 +1545,10 @@ pub const EventProcessor = struct {
         // writes withheld below. Omitting the key would read as "no enforcement", and a
         // client would queue an unstamped write the gate cannot judge.
         var withhold_writes = false;
-        if (self.cat) |cat| switch (cat.incarnation_stamps) {
-            .off => {},
-            .on, .unknown => if (cat.incarnation_stamps == .on and cat.incarnations.get(table) != null) {
-                try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"incarnation\":{d}", .{cat.incarnations.get(table).?}));
-            } else {
+        if (self.cat) |cat| switch (cat.advert(table)) {
+            .none => {},
+            .stamp => |n| try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"incarnation\":{d}", .{n})),
+            .withheld => {
                 try json_str.appendSlice(arena, ",\"incarnation\":null");
                 withhold_writes = true;
             },

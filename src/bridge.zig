@@ -2649,6 +2649,18 @@ const LiveCatalogue = struct {
                 if (was != e.value_ptr.*) epoch_moved.append(self.allocator, e.key_ptr.*) catch {};
             }
         }
+        // What each descriptor advertises about incarnations, before and after: the switch
+        // and the identities are read on every reload, and a table whose advert changed must
+        // be republished even if nothing else about it did — a stored descriptor that still
+        // omits `incarnation` invites unstamped writes the gate cannot judge.
+        var advert_moved: std.ArrayList([]const u8) = .empty;
+        defer advert_moved.deinit(self.allocator);
+        {
+            var it = fresh.epochs.keyIterator();
+            while (it.next()) |k| {
+                if (!std.meta.eql(old.advert(k.*), fresh.advert(k.*))) advert_moved.append(self.allocator, k.*) catch {};
+            }
+        }
         self.topo.public_tables = fresh.publics;
         if (fresh.tenants.len > 0) {
             self.topo.tenants = fresh.tenants;
@@ -2686,6 +2698,14 @@ const LiveCatalogue = struct {
         for (epoch_moved.items) |tbl| {
             log.info("🗂️ '{s}': seed epoch moved to {d} — descriptor republished, clients re-seed", .{ tbl, self.cat.epochs.get(tbl) orelse 0 });
             republish.append(self.allocator, tbl) catch {};
+        }
+        for (advert_moved.items) |tbl| {
+            for (republish.items) |r| {
+                if (std.mem.eql(u8, r, tbl)) break;
+            } else {
+                log.info("🗂️ '{s}': its incarnation advert is now {s} — descriptor republished", .{ tbl, @tagName(self.cat.advert(tbl)) });
+                republish.append(self.allocator, tbl) catch {};
+            }
         }
         for (self.cat.changed) |tbl| {
             if (self.topo.isCdcRoutable(tbl, self.tenant_rules.contains(tbl))) {

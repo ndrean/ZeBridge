@@ -58,9 +58,25 @@ pub const Load = struct {
     /// `zebridge_incarnation_stamps()`: whether descriptors advertise `incarnation`, so that
     /// clients stamp their writes. `unknown`: the policy could not be read, which is not
     /// the same as off — a descriptor then withholds writes rather than invite unstamped ones.
-    incarnation_stamps: Stamps = .off,
+    /// The default: a load that never reached the policy (the catalogue itself unreadable)
+    /// must not read as off. Only a successful read of `false` is `.off`.
+    incarnation_stamps: Stamps = .unknown,
 
     pub const Stamps = enum { off, on, unknown };
+
+    /// What a table's descriptor advertises about incarnations: nothing (the switch off:
+    /// clients send unstamped writes), the incarnation to stamp, or writes withheld (the
+    /// switch on or unreadable, with no identity to state). One rule for the descriptor
+    /// builder and for the reload, which republishes every table whose advert changed.
+    pub const Advert = union(enum) { none, withheld, stamp: i64 };
+
+    pub fn advert(self: *const Load, table: []const u8) Advert {
+        return switch (self.incarnation_stamps) {
+            .off => .none,
+            .unknown => .withheld,
+            .on => if (self.incarnations.get(table)) |n| .{ .stamp = n } else .withheld,
+        };
+    }
 
     pub fn deinit(self: *Load, allocator: std.mem.Allocator) void {
         var it = self.epochs.keyIterator();
@@ -295,4 +311,19 @@ pub fn loadRules(
         out.rows, out.merged, out.publics.len, out.tenants.len, out.changed.len,
     });
     return out;
+}
+
+test "advert: unknown by default, none only when read off, withheld without an identity" {
+    const a = std.testing.allocator;
+    var load: Load = .{};
+    defer load.deinit(a);
+    // A load that never read the policy (the catalogue unreadable at boot) withholds.
+    try std.testing.expect(load.advert("t") == .withheld);
+    load.incarnation_stamps = .off;
+    try std.testing.expect(load.advert("t") == .none);
+    load.incarnation_stamps = .on;
+    try std.testing.expect(load.advert("t") == .withheld);
+    try load.incarnations.put(a, try a.dupe(u8, "t"), 4);
+    try std.testing.expectEqual(Load.Advert{ .stamp = 4 }, load.advert("t"));
+    try std.testing.expect(load.advert("other") == .withheld);
 }
