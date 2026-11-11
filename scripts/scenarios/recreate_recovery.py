@@ -210,9 +210,22 @@ class Stack:
         self.bridges += 1
         env = dict(self.env, **({"ZB_FEED_RESTART": "1"} if self.bridges == 1 else {}))
         label = f"bridge{self.bridges}"
-        self.spawn(label, [str(self.bridge_bin), "--pub", "rr_pub", "--slot", self.name + "_slot", "--port", str(port())], env)
+        self.http_port = port()
+        self.spawn(label, [str(self.bridge_bin), "--pub", "rr_pub", "--slot", self.name + "_slot", "--port", str(self.http_port)], env)
         self.wait_log(label, ready)
         return label
+
+    def metrics(self):
+        """The running bridge's /metrics as {name_with_labels: value}."""
+        import urllib.request
+        text = urllib.request.urlopen(f"http://127.0.0.1:{self.http_port}/metrics", timeout=5).read().decode()
+        out = {}
+        for line in text.splitlines():
+            if not line or line.startswith("#"): continue
+            k, _, v = line.rpartition(" ")
+            try: out[k] = float(v)
+            except ValueError: pass
+        return out
 
     def bridge_down(self, label):
         p = self.procs.pop(label)

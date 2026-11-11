@@ -1536,6 +1536,8 @@ pub const EventProcessor = struct {
             } else try json_str.appendSlice(arena, ",\"tiebreak_column\":null");
         } else try json_str.appendSlice(arena, ",\"tiebreak_column\":null");
 
+        try json_str.appendSlice(arena, ",\"ordering\":1");
+
         // The catalogue's `tenant_col`: which column scopes this table's rows by tenant, or `null` for
         // a table every principal reads and writes the same content of (system tables,
         // genuinely public business tables alike). Published so a client can tell the two

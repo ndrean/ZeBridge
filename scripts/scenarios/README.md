@@ -5,6 +5,28 @@ claims, so a group in that document is a command rather than a paragraph someone
 re-derive at 1am. Every script's exit code is its verdict (0 = pass); `run.py` sequences
 them.
 
+`ingress_ordering.py` holds a parent before commit while its child arrives. With several lanes the child must either stay durably parked or, since the dispatcher routes a client's writes to one lane, wait queued behind its parent (`child_queued_behind_parent`, with the lane's queue depth from `/metrics` as evidence); an unrelated client must still commit. `ingress_affinity.py` is the dispatcher's own test: a held client's chain fills its lane past the queue while an unrelated client commits on another lane; a hold longer than the ack wait redelivers nothing; a clean stop with full queues and a kill -9 with queued writes both end with every write applied exactly once.
+`ingress_arrival.py` tests a parent refused by admission then resent under its original ID,
+plus a single-lane rate-limit case. Both now belong to `owns`; `known_red` is empty.
+Run either with `--repeat 3 --log-dir /tmp/zb-ordering` to keep the evidence. Their
+exit codes remain 0 for success, 1 for the original exact `23503` defect, 2 for setup
+failure and 3 for another failure. `ZB_ORDERING_BRIDGE_BIN` selects an older bridge
+as a negative control; provisioning and admission still use the current build.
+
+`ingress_release.py` tests durable parking across restart, immutable resends, batch
+rollback, a rejected predecessor and `PredecessorUnknown` propagation. To include a
+crash after a parked write commits but before its verdict, build with
+`-Dtest-faults=true -p zig-out-faults`, then pass
+`--fault-bridge "$PWD/zig-out-faults/bin/bridge"`. The publisher stays connected and
+recovers through a direct verdict read without another application write. These are
+raw protocol tests, not the client libraries' timer loops.
+All three use disposable stacks; `ZB_TEST_PG_PORT` selects the local PostgreSQL port
+(default 5432). They do not require the shared dev stack.
+
+`ingress_baseline.py --log-dir /tmp/zb-ingress-baseline` measures current ingress with connected raw NATS publishers through admission. It preloads a paused consumer and measures drain after resuming it, using 1/10/100/500 clients and 1/8 lanes. `--mixed --clients 101` measures one large backlog beside 100 occasional publishers. `--trace-bin PATH` alternates the ordinary bridge with a separately built diagnostic binary; the diagnostic source patch and measured logging overhead belong with the run report. This measures ingress, not client-library or CDC-tail throughput. Every run uses a disposable database and NATS server, and validates accepted verdicts and PostgreSQL row counts.
+
+The baseline's default IDs are short legacy fixtures. Use `--structured-ids` to emit the current timestamped client ID format; record the selected format when comparing runs. `--resume` skips completed cases and retains failed setup directories separately. The harness waits for every lane to bind before pausing and refuses to time a backlog that has already started draining.
+
 Deliberately **not** in `python-consumer/`: that is a reference _client_, meant to show
 an SDK author what a correct consumer looks like. These are a test harness. They rot for
 different reasons and should read as different things.
@@ -192,3 +214,27 @@ SELECT * FROM zebridge_enable('public.test_types',
 
 Without writer credentials (`DATABASE_WRITER_URL`) the mutation listener does not start at
 all — deliberately, rather than falling back to the read role, which has REPLICATION.
+
+### Ordered ingress SQL (stage 1)
+
+`python scripts/scenarios/ingress_park_sql.py` renders the current init templates into a disposable database and tests parking/release with independent PostgreSQL writer sessions. It needs `psql` and a PostgreSQL administrator (`--admin-url`, or `ADMIN_DATABASE_URL`; default local port 5432), but no NATS or bridge. It belongs to `offline`; the end-to-end ordering regressions now run in `owns`.
+
+`--log-dir` retains SQL transcripts, PostgreSQL errors and `results.json`. `--hold-seconds` controls the measured hold after the test proves the application trigger and competing sessions are blocked. Ordinary eligible writes must still commit during that hold. Park releases create durable credits without taking counter locks. Unrelated parks, including another device of the same principal, must commit while the application gate is still held. A separate short `settle_park_credits()` transaction accounts for committed credits; counters equal parked mutations plus unsettled credits. The test also covers settlement crashes, competing settlers, bounded settlement and repeat releases of one exhausted ID.
+
+The park quota charges original payload/route bytes, identity strings, serialized headers and a fixed metadata allowance. It is an exact logical budget; PostgreSQL indexes, WAL, dead tuples and disk allocation are not covered by that number. Policy limits live in `zebridge_private.mutation_park_policy`; its retry budget is rendered from `config.Nats.mutation_max_deliver`, shared with JetStream. Other listener configuration wiring is a later increment. Parking and settlement must each use a short transaction separate from application execution. Add `--upgrade-write-sql PATH` to test migration of parked data from an earlier write-template snapshot. Stage 1 does not advertise ordering support or change live mutation dispatch.
+
+
+For ingress comparisons, `ZB_BENCH_BRIDGE_BIN` and `ZB_BENCH_ADMISSION_BIN`
+select the two executables independently. `ZB_BENCH_ORDERED=1` with
+`--structured-ids` adds immutable predecessor links to the same workload (`mix`: even-numbered clients ordered, odd unordered, a mixed backlog drained together; `ordered_writes_s` and `unordered_writes_s` share the run's window and add up to `writes_s`, and `*_finish_seconds` say when each class's last verdict came). `ZB_BENCH_PER_CLIENT` overrides the writes queued per client (default `max(256, 8192 / clients)`); held
+notices are excluded from terminal-verdict counts. `ZB_TEST_PG_PORT` selects the
+scratch PostgreSQL host port. The benchmark raises the disposable database's park
+row cap to 20,000 per principal, matching its queue-budget experiment, so quota
+rejection is not mistaken for throughput. It records admission preload time/CPU
+separately from the paused-queue drain rate; admission does not run during most of
+that drain. Do not describe the drain rate as end-to-end publication throughput.
+
+`ingress_park_sql` also checks empty-sweep execution below 50 ms, the local JIT
+settings, the one-row estimate, and election across commits, disconnect and separate
+publications. Run it against a PostgreSQL build where `pg_jit_available()` is true
+to exercise LLVM compilation; `jit=on` alone does not establish that.

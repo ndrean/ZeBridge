@@ -2085,8 +2085,7 @@ reply published under it would be read back by the bridge as if it were a write.
   "sqlstate": "",
   "detail":   "",
   "seq":      186,
-  "version":  "2026-08-19T05:55:40.495972Z",
-  "write":    "users#42"
+  "version":  "2026-08-19T05:55:40.495972Z"
 }
 ```
 
@@ -2098,9 +2097,8 @@ reply published under it would be read back by the bridge as if it were a write.
 | `retry_after_ms` | only with `rate_limited`: how long to hold the outbox before sending again. Both clients honour it. Rare: a write refused by the rate limit is normally NAK'd with a delay and redelivered by JetStream when its turn comes, so the client sees a slower `accepted` and nothing else; this verdict comes only after the delivery limit (fifteen refusals) |
 | `sqlstate` | PostgreSQL's code when it refused; empty on success |
 | `detail` | **first line only** of the server's message. Its `DETAIL` can quote rows written by other tenants, so the rest is kept to the operator's log |
-| `seq` | the `MUTATIONS` stream sequence — the number the client already got in its `PubAck`, so it can correlate without having stored its own `msg_id` |
+| `seq` | the `MUTATIONS` stream sequence — the number the client already got in its `PubAck`, so it can correlate without having stored its own `msg_id`. **Absent** when the verdict is delivered from its receipt by a park credit: an ordered write that waited for its predecessor and was released, or one whose verdict was lost to a crash after its commit. Key on the subject's `msg_id`, which every verdict has |
 | `version` | the version **actually stored**, in the wire format of §7.3. Authoritative: after a clamp it is not what you sent |
-| `write` | `<table>#<key>` — the row the verdict is about, for a log line that has nothing else to name it by |
 
 **The six statuses**:
 
@@ -2576,3 +2574,21 @@ Under `MUTATION_ADMISSION=1`, a separate service validates routes, rebuilds head
 Query transport replies use `_INBOX.<principal>.query.<tenant>.<nonce>`; libzb and TS construct it internally. Leaf response publishing is restricted by that tenant token, and reply subscriptions by principal namespace. This is a client transport update without a public C ABI or request API change. Deploy it before restricted leaf keys. Other API replies keep the principal inbox prefix.
 
 A seeding leaf combines `KV_generations_leaf_<tenant>` hub source projections, including `_default`, instead of consuming shared manifests. Object snapshots retain their normal names; mirror delivery uses `$ZB.MIRROR.<leaf>.>`, while the local keeper uses `$ZB.KEEPER.<leaf>.>` replies. `/nats-account` exposes only the public account JWT; pinned-operator trust refresh and the five-minute stale limit are described in [Leaf nodes](LEAF_NODES.md).
+
+### Ordered ingress (version 1)
+
+A descriptor with `ordering: 1` permits an envelope with `ordering: 1` and an immutable `predecessor` (message ID or null). It orders a client's writes across lanes; it does not make them an application transaction. Unversioned writes retain the legacy behavior. Upgrade init SQL and every queue reader before advertising or sending the ordered envelope; mixed old/new readers are not safe for this contract.
+
+The bridge checks the successor's own receipt and fingerprint first, then expiry, then its predecessor. Accepted, stale, rejected and row_deleted receipts release the successor for normal PostgreSQL judgment. `23503` remains a terminal rejection. An expired, unknown predecessor yields a durable `indeterminate/PredecessorUnknown` receipt without executing the successor; this propagates through its suffix.
+
+An unresolved successor is committed to `zebridge_private.mutation_parked` in a short, separate transaction before its JetStream message is acknowledged. A notice on `<verdict-subject>.held` extends the client's retry timer; it never replaces the terminal verdict subject. The notice uses the advertised mutation timeout as its lease. Neither a dependency wait nor a release holds quota locks during application SQL. A batch checks and executes an eligible dependency prefix in predecessor order.
+
+Release deletes the parked row and creates a credit in the application/receipt transaction. Counters charge parks plus unsettled credits. A released write's credit also retains pending terminal-verdict delivery, scoped to the releasing publication. The bridge obtains a JetStream PubAck for that verdict before clearing its delivery flag; only then can short credit settlement debit its quota. After a crash, the sweep resumes delivery. For a released write, the park credit publishes the terminal verdict; the lane that applied the write sends none of its own. If the bridge stops after JetStream stores the verdict but before PostgreSQL records delivery, recovery may publish it again. This matters because NATS can suppress an immutable resend inside its duplicate window even when the earlier execution's verdict was lost. A duplicate terminal publication is safe; dropping a pending delivery is not.
+
+Parking quotas are database policy (`mutation_park_policy`), independent of queue storage: 1,000 rows / 64 MiB per principal and 1,000,000 rows / 1 GiB globally by default. Capacity refusal is retryable `failed/DependencyBacklogFull`. Execution failure attempts use the shared `mutation_max_deliver` value rendered by init SQL; dependency waits do not spend it. A bounded sweep also handles expiry and release when no new application writes arrive. Affinity scheduling and its performance measurements are separate from this correctness mechanism.
+
+The release sweep is elected per database/publication with a session advisory lock. Its scope is one bounded sweep, not the bridge lifetime; it is released on return, error or connection loss. Transaction-scoped election cannot span the separate application and credit-settlement commits. The election holds no open transaction or quota locks. Other lanes continue pulling ordinary work. Periodic election is at most once per second per lane; a post-batch attempt is forced only after an ordered claim whose R1 snapshot saw park/credit work. The hint rides the receipt query, so empty ordered batches add no separate existence-check round trip.
+
+The hot SQL functions disable JIT locally and `ordered_mutation_state` declares `ROWS 1`. This avoids spending hundreds of milliseconds compiling an empty recursive sweep when a deployment's PostgreSQL supports LLVM. It does not require a global `jit=off` setting. The SQL regression checks cold and warm empty sweeps below 50 ms with the caller's JIT enabled at PostgreSQL's default thresholds.
+
+Sweep election requires the direct PostgreSQL connection already specified in DEPLOYMENT.md. A transaction-pooling proxy cannot preserve its session lock across the short release transactions.

@@ -64,6 +64,8 @@ pub fn run(io: std.Io, init: *const std.process.Init) u8 {
     // The one source of the tenant limit is limits.zig; the SQL guards quote it.
     const max_tenant_bytes_text = std.fmt.allocPrint(a, "{d}", .{limits.max_tenant_bytes}) catch return 1;
 
+    const mutation_max_deliver_text = std.fmt.allocPrint(a, "{d}", .{@import("config.zig").Nats.mutation_max_deliver}) catch return 1;
+
     var vars = [_]Var{
         .{ .name = "POSTGRES_READER_USER", .value = reader.user },
         .{ .name = "POSTGRES_READER_PASSWORD", .value = quoteDoubled(a, reader.password) catch return 1 },
@@ -73,6 +75,7 @@ pub fn run(io: std.Io, init: *const std.process.Init) u8 {
         .{ .name = "OPEN_TENANT", .value = open_tenant },
         .{ .name = "MAX_TENANT_BYTES", .value = max_tenant_bytes_text },
         .{ .name = "LEAF_PREFIX", .value = owned.topology.leaf_prefix },
+        .{ .name = "MUTATION_MAX_DELIVER", .value = mutation_max_deliver_text },
         .{ .name = "RECEIPT_COMPLETION_GUARD", .value = if (@import("build_options").receipt_guard) "true" else "false" },
     };
 
@@ -236,7 +239,7 @@ test "render substitutes, quotes passwords, and refuses a leftover" {
 }
 
 test "both embedded templates name only known variables" {
-    const known = [_][]const u8{ "POSTGRES_READER_USER", "POSTGRES_READER_PASSWORD", "POSTGRES_WRITER_USER", "POSTGRES_WRITER_PASSWORD", "TARGET_DB", "OPEN_TENANT", "MAX_TENANT_BYTES", "LEAF_PREFIX", "RECEIPT_COMPLETION_GUARD" };
+    const known = [_][]const u8{ "POSTGRES_READER_USER", "POSTGRES_READER_PASSWORD", "POSTGRES_WRITER_USER", "POSTGRES_WRITER_PASSWORD", "TARGET_DB", "OPEN_TENANT", "MAX_TENANT_BYTES", "LEAF_PREFIX", "RECEIPT_COMPLETION_GUARD", "MUTATION_MAX_DELIVER" };
     for ([_][]const u8{ core_template, write_template }) |t| {
         var i: usize = 0;
         while (std.mem.findPos(u8, t, i, "${")) |start| {
@@ -279,4 +282,3 @@ test "every zebridge_ table the init SQL creates is internal to the bridge, exce
     try std.testing.expect(count >= 10);
     for (seen) |s| try std.testing.expect(s);
 }
-

@@ -191,7 +191,7 @@ What you may see on the first start after an upgrade: chains swept and rebuilt (
 
 ## Upgrading mutation receipts
 
-**Apply the new bridge's init SQL before replacing or starting the running bridge.** Receipt storage and its writer functions are part of the database contract; deploying only a new binary or container image is not a complete upgrade. The bridge checks the receipt schema, writer privileges and completion-guard setting before starting any mutation lane. This applies to Ansible and Docker deployments alike.
+**Apply the new bridge's init SQL before replacing or starting the running bridge.** This includes the ordered-receipt, park/release, credit-delivery and sweep-election functions and their writer grants. An older init SQL makes the new binary fail startup with `ReceiptsNotInstalled`; render and apply init SQL from that exact binary before restarting workers. Receipt storage and its writer functions are part of the database contract; deploying only a new binary or container image is not a complete upgrade. The bridge checks the receipt schema, writer privileges and completion-guard setting before starting any mutation lane. This applies to Ansible and Docker deployments alike.
 
 1. Stage the candidate binary or image separately from the running one and preserve a verified [hub checkpoint](#hub-checkpoints-and-recovery), including `zebridge_private` and its receipt policy. Pause mutation admission, drain accepted writes with the old workers, and stop the old bridge workers before changing their receipt functions. Clients retain unacknowledged writes in their outboxes.
 2. Render the init SQL with the candidate binary, using the target deployment's existing reader/writer URLs and publication. Review it and apply it as the database administrator, with errors stopping the migration. The rendered file contains role passwords; create it with restrictive permissions.
@@ -329,6 +329,7 @@ Start from what you see. Each row names the check and the rule behind it.
 
 | you see | check | usually |
 | --- | --- | --- |
+| bridge refuses startup with `ReceiptsNotInstalled` after a binary upgrade | apply that binary's `--init-sql`, including private ordered/park functions and writer grants | a binary-only upgrade is incomplete; do not disable the receipt guard |
 | a table's clients stop receiving new generations, or hold fewer rows than PostgreSQL | `bridge_snapshot_rls_blocked_pairs`; the log line `publication BLOCKED`; `bridge --diagnose` | the reader's row-level-security policies may hide rows: see [Snapshots blocked by row-level security](#snapshots-blocked-by-row-level-security) |
 | a table is missing on every client | `SELECT * FROM zebridge_suspensions`; the log line naming the table | suspended: see [Suspended tables](#suspended-tables). Or never enabled: `zebridge_enable` |
 | rows are missing on every client | `bridge_refused_events_dropped_total` on `/metrics`; the table's `seed_epoch` in `zebridge_catalogue` | the table was suspended for a while; the lift re-seeds. If the epoch did not move, `zebridge_reseed('t')` |
@@ -376,6 +377,8 @@ At boot the bridge checks the writer role's connection limit, and PostgreSQL's `
 ### Write limits, as a client sees them
 
  writes per client are limited in backlog, on by default (`MUTATION_BACKLOG_PER_PRINCIPAL`, 5,000 queued writes: past it, that client's new writes are refused, and nothing already queued is evicted), and optionally in rate (`MUTATION_RATE_PER_PRINCIPAL`, off by default: over the rate, writes are delayed, not dropped). A delayed write changes nothing for `mutate()`, which returns at once: the client has already sent it, it waits in JetStream, and `pending()` counts it until its verdict comes back. The backlog limit refuses at the NATS publish, before the bridge: there is no verdict, the write stays in the device's outbox, and the library sends it again until the backlog has room. The backlog limit is set when the bridge first creates the MUTATIONS stream: change it on a fresh deployment, or edit the stream with `nats stream edit`.
+
+An ordered write whose predecessor has not been applied yet is parked in PostgreSQL (`bridge_ingress_parked_total` on `/metrics`) and released once the predecessor is settled. Its verdict is then published by the elected sweeper from the write's receipt, after the PubAck, never by the lane that applied it: `bridge_ingress_credit_verdicts_total{path}` counts these verdicts. `path` says where the write was released, not who published: `sweep` is the sweeper's replay of parked writes, `lane` an ordinary batch (a parked write redelivered after its acknowledgement was lost, meeting its committed predecessor). The sweeper publishes the verdict in both cases. A bridge that stops after JetStream stored such a verdict but before PostgreSQL recorded its delivery may publish it again after the restart.
 
 **3. Chain, sweeper and stream retention**:
 

@@ -1638,19 +1638,22 @@ pub fn main(init: std.process.Init) !void {
     // the defers run in reverse: the lanes stop taking writes first, the stream drains.
     // ── Rung 4 (§10cs): parallel ingress lanes ──────────────────────────────
     // N independent listeners, each with its OWN PostgreSQL connection, NATS
-    // connection, table-meta cache and verdict state, all pulling from the ONE
-    // durable — JetStream load-balances the pullers, so lanes receive disjoint
-    // batches for free. LWW is the ordering license: two lanes applying the same
-    // row's writes out of order converge to the same winner (the older version
-    // is refused, which is the fate it had anyway). Two lanes' BATCHES can
-    // deadlock on crossed row locks — PostgreSQL kills one (40P01), the batch
-    // rolls back whole and replays per-message, where single-row transactions
-    // cannot deadlock. Self-healing, rare, and the price of the parallelism.
+    // connection, table-meta cache and verdict state. ONE puller (the Dispatcher)
+    // pulls the durable and routes each fresh write to the lane of its (principal,
+    // client), so a client's writes are applied in stream order by one session and an
+    // ordered write finds its predecessor in its own batch or committed (lanes used to
+    // pull the durable themselves, and the ordered envelope then parked nearly every
+    // backlog write — see `Dispatcher`). LWW is the ordering license across clients:
+    // two lanes applying the same row's writes out of order converge to the same
+    // winner (the older version is refused, which is the fate it had anyway). Two
+    // lanes' BATCHES can deadlock on crossed row locks — PostgreSQL kills one (40P01),
+    // the batch rolls back whole and replays per-message, where single-row
+    // transactions cannot deadlock. Self-healing, rare, and the price of the parallelism.
     //
     // Default 1: identical behavior to the single-listener bridge, and the
-    // connection-budget arithmetic the scenarios pin stays untouched. Raise it
-    // only where ingress throughput is the constraint (the serial lane measures
-    // ~4.6k mutations/s colocated).
+    // connection-budget arithmetic the scenarios pin stays untouched (the Dispatcher
+    // holds a NATS connection, not a PostgreSQL one). Raise it only where ingress
+    // throughput is the constraint (the serial lane measures ~4.6k mutations/s colocated).
     // §10fk: one token bucket table for every lane, so the limit is per principal
     // across the bridge, not per lane.
     var rate_limiter = rate_limit.Limiter.init(allocator, runtime_config.mutation_rate_per_principal, runtime_config.mutation_rate_burst);
@@ -1691,6 +1694,7 @@ pub fn main(init: std.process.Init) !void {
                 &rate_limiter,
                 parsed_args.publication_name,
             );
+            lane_ptr.queue.index = mut_listeners.items.len;
             try mut_listeners.append(allocator, lane_ptr);
             try lane_ptr.start();
         }
@@ -1700,6 +1704,18 @@ pub fn main(init: std.process.Init) !void {
     }
     defer for (mut_listeners.items) |m| m.deinit();
     defer for (mut_listeners.items) |m| m.join();
+    // The puller, over the lanes just started. Its thread outlives the lanes (it waits
+    // for them, so their acks have a connection), so it is joined before them here:
+    // these defers run before the two above.
+    var dispatcher: ?*mutation_listener.Dispatcher = null;
+    if (mut_listeners.items.len > 0) {
+        const d = try mutation_listener.Dispatcher.init(allocator, nats_endpoint, &runtime_config.topology, io, &should_stop, mut_listeners.items);
+        errdefer d.deinit(); // start closes the lanes itself when its thread cannot be spawned
+        try d.start();
+        dispatcher = d;
+    }
+    defer if (dispatcher) |d| d.deinit();
+    defer if (dispatcher) |d| d.join();
     // ⚠️ Registered AFTER the joins above, so on an error it runs BEFORE them: errdefers and
     // defers unwind in reverse order. The `errdefer should_stop.store(true)` further up ran
     // after `m.join()` had begun, and a listener only leaves its loop when `should_stop` is
@@ -3120,6 +3136,8 @@ test {
     _ = @import("leaf_scope.zig");
     _ = @import("mutation_admission.zig");
     _ = @import("receipts.zig");
+    _ = @import("ordered_ingress.zig");
+    _ = @import("ingress_stats.zig");
     _ = @import("mutation_listener.zig");
     _ = @import("nats_init.zig");
     _ = @import("numeric.zig");
