@@ -1252,13 +1252,41 @@ test('ordering modes: every misuse refuses before anything is written, and names
   };
   await refuses('no ordering offered', () => f.write('c', 'INSERT', 'k', '2026-11-09T10:00:00.000002Z', { after: P }), /^after needs ordering: the bridge does not offer it for 'c'$/);
   await refuses('malformed ID', () => f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000003Z', { after: 'legacy-id' }), /^after: 'legacy-id' is not a write of this client$/);
+  // Truncated: the client token is right, but no table, key or version: no client made it.
+  await refuses('truncated ID', () => f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000003Z', { after: `zb1-t${Date.now()}-INSERT-phone~2D1~2Ea` }), /is not a write of this client/);
+  for (const bad of [`zb1-t1-UPDATE-phone~2D1~2Ea-p-k2-x-v`, `zb1-t1-UPDATE-phone~2D1~2Ea-p-k1-x~2-v`, `zb1-t1-MERGE-phone~2D1~2Ea-p-k1-x-v`, `zb1-t1-UPDATE-phone~2D1~2Ea-p-k1-x-v-extra`, `zb1-t1-UPDATE-phone~2D1~2Ea--k1-x-v`])
+    assert.equal(messageIdOfClient(bad, 'phone-1.a'), false, bad);
+  assert.equal(messageIdOfClient(mutationMsgId(1, 'phone-1.a', 'p', 'DELETE', ['a+b', 'null'], 'v'), 'phone-1.a'), true, 'a composite key');
   const foreign = mutationMsgId(Date.now(), 'phone-2', 'p', 'UPDATE', ['x'], 'v');
   await refuses('another client', () => f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000004Z', { after: foreign }), /is not a write of this client/);
   await refuses('both options', () => f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000005Z', { after: P, independent: true }), /^after and independent cannot be combined$/);
-  // Self: P's own version, operation and key, the clock behind P: the built ID is P's.
+  // Self: P's own version, operation and key, the clock behind P: the built ID is P's. P is
+  // in flight (sent, tracked for its echo): the refusal must leave that tracking alone.
+  f.c.pendingWrites.set(P, { table: 'p', id: 'x', at: Date.now(), version: '2026-11-09T10:00:00.000001Z' });
   f.c.clockOffsetMs = () => -3_600_000;
   await refuses('self-dependency', () => f.write('p', 'INSERT', 'x', '2026-11-09T10:00:00.000001Z', { after: P }), /^after: a write cannot depend on itself/);
   assert.equal((f.db.prepare('SELECT attempts FROM _zebridge_outbox WHERE msg_id = ?').get(P) as any).attempts, 0, "P's own entry is untouched");
+  assert.ok(f.c.pendingWrites.has(P), "P's session tracking survives the refusal");
+  // P's echo still settles it, as for any write in flight.
+  f.c.confirmEcho('p', f.c.syncedTables.get('p'), { operation: 'INSERT', data: { id: 'x', title: '2026-11-09T10:00:00.000001Z' } });
+  assert.ok(!f.c.pendingWrites.has(P), 'its echo found it');
+  const gone = () => !f.db.prepare('SELECT 1 FROM _zebridge_outbox WHERE msg_id = ?').get(P);
+  for (let i = 0; i < 100 && !gone(); i++) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(gone(), 'and settled it: the outbox entry is gone');
+  f.db.close();
+});
+
+test('ordering modes: ordering withdrawn while the call waits refuses after, with nothing written', async () => {
+  const f = modesFixture(':memory:');
+  await f.c.addOutboxOrdering();
+  const P = (await f.write('p', 'INSERT', 'x', '2026-11-09T10:00:00.000001Z')).writeId;
+  const queued = f.count();
+  const shown = { ...(f.db.prepare(`SELECT title FROM p WHERE id = 'x'`).get() as any) };
+  // A descriptor update lands during the floor read: the table no longer offers ordering.
+  f.c.gcWatermark = async () => { f.c.syncedTables.get('p').ordering = 0; return null; };
+  await assert.rejects(f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000002Z', { after: P }), (e: any) => e instanceof OrderingRefusal && /^after needs ordering: the bridge does not offer it for 'p'$/.test(e.message));
+  assert.equal(f.count(), queued, 'no outbox entry');
+  assert.deepEqual({ ...(f.db.prepare(`SELECT title FROM p WHERE id = 'x'`).get() as any) }, shown, 'no optimistic change');
   f.db.close();
 });
 

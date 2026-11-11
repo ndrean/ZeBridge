@@ -6405,6 +6405,10 @@ export class ZeBridge {
         // The ordering tail is the outbox itself (libzb `mutateAt`): its newest ordered entry,
         // read in this transaction, so the link is fixed when the write is made. An entry
         // leaves only on a terminal verdict or its echo, or as `indeterminate`.
+        // The capability, decided from the state that builds the envelope: a descriptor update
+        // during the awaits above may have withdrawn ordering, and `after` must not then be
+        // queued without its predecessor.
+        if (after !== undefined && !((state?.ordering ?? 0) > 0)) throw new OrderingRefusal(`after needs ordering: the bridge does not offer it for '${table}'`);
         // `after` names the predecessor itself; `independent` has none and no envelope.
         let predecessor: string | null = null;
         const ordered = (state?.ordering ?? 0) > 0 && !opts?.independent;
@@ -6430,8 +6434,9 @@ export class ZeBridge {
       // `ev.data.<version column>` sees the write's own version, not undefined.
       if (applied) this.triggerChange(table, applied);
     } catch (err) {
-      this.pendingWrites.delete(msgId);
+      // First: a self-dependency's msgId IS the earlier write's, whose tracking must stay.
       if (err instanceof OrderingRefusal) throw err;
+      this.pendingWrites.delete(msgId);
       this.appendLog(subject, `optimistic apply failed, write not sent: ${err}`, 'ERROR');
       return { refused: `NotQueued: ${err}` };
     }

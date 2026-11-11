@@ -257,18 +257,45 @@ pub fn messageIdCreatedMs(id: []const u8) ?i64 {
     return std.fmt.parseInt(i64, rest[0..end], 10) catch null;
 }
 
-/// Whether `id` is a structured ID made by `client_id`: its fourth `-` token is the client,
-/// escaped as every ID component is (the bridge's own rule, `ordered_ingress.parse`). An ID
-/// does not name the principal; the bridge resolves it under the authenticated one.
+/// Whether `id` is a complete ID `client_id` could have made (`messageId`): all eight tokens,
+/// `zb1-t<ms>-<OP>-<client>-<table>-k<n>-<n parts joined by +>-<version>`, every component
+/// encoded, at most 512 bytes, and the client token this client's (core.ts messageIdOfClient;
+/// the bridge reads the same token, `ordered_ingress.parse`). An ID does not name the
+/// principal; the bridge resolves it under the authenticated one. A write that has left the
+/// outbox still passes: only its shape counts.
 pub fn messageIdOfClient(a: std.mem.Allocator, id: []const u8, client_id: []const u8) !bool {
-    if (messageIdCreatedMs(id) == null or client_id.len == 0) return false;
+    if (client_id.len == 0 or id.len > 512 or messageIdCreatedMs(id) == null) return false;
+    var t: [8][]const u8 = undefined;
     var tokens = std.mem.splitScalar(u8, id, '-');
-    for (0..3) |_| _ = tokens.next();
-    const token = tokens.next() orelse return false;
+    for (&t) |*slot| slot.* = tokens.next() orelse return false;
+    if (tokens.next() != null) return false;
+    if (!std.mem.eql(u8, t[0], "zb1") or normalizeOp(t[2]) == null or !std.mem.eql(u8, normalizeOp(t[2]).?, t[2])) return false;
     var encoded: std.ArrayList(u8) = .empty;
     defer encoded.deinit(a);
     try appendIdComponent(a, &encoded, client_id);
-    return std.mem.eql(u8, token, encoded.items);
+    if (!std.mem.eql(u8, t[3], encoded.items)) return false;
+    if (t[4].len == 0 or !isIdComponent(t[4]) or t[7].len == 0 or !isIdComponent(t[7])) return false;
+    if (t[5].len < 2 or t[5].len > 5 or t[5][0] != 'k' or t[5][1] == '0') return false;
+    const n = std.fmt.parseInt(usize, t[5][1..], 10) catch return false;
+    var parts = std.mem.splitScalar(u8, t[6], '+');
+    var count: usize = 0;
+    while (parts.next()) |p| : (count += 1) if (!isIdComponent(p)) return false;
+    return count == n;
+}
+
+/// An encoded ID component (`appendIdComponent`): safe bytes, or `~` and two uppercase hex digits.
+fn isIdComponent(s: []const u8) bool {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) switch (s[i]) {
+        'A'...'Z', 'a'...'z', '0'...'9', '_', ':' => {},
+        '~' => {
+            if (i + 2 >= s.len) return false;
+            for (s[i + 1 .. i + 3]) |h| if (!((h >= '0' and h <= '9') or (h >= 'A' and h <= 'F'))) return false;
+            i += 2;
+        },
+        else => return false,
+    };
+    return true;
 }
 
 test "messageIdOfClient: the ID's client token, escaped, against this client" {
@@ -281,6 +308,23 @@ test "messageIdOfClient: the ID's client token, escaped, against this client" {
     try std.testing.expect(!try messageIdOfClient(a, id, "phone~2D1~2Ea")); // the escaped form is not the client
     for ([_][]const u8{ "legacy-id", "zb1-t1787824800123", "zb1-tx-UPDATE-phone~2D1~2Ea-rows" }) |bad|
         try std.testing.expect(!try messageIdOfClient(a, bad, "phone-1.a"));
+    // Shapes no client generates, though the client token is right: truncated (no table, key,
+    // version), the key count wrong, a broken escape, an unknown or lower-case operation, a token
+    // too many, an empty table.
+    try std.testing.expect(!try messageIdOfClient(a, "zb1-t1787824800123-INSERT-phone", "phone"));
+    for ([_][]const u8{
+        "zb1-t1787824800123-UPDATE-phone~2D1~2Ea-rows-k2-7-v",
+        "zb1-t1787824800123-UPDATE-phone~2D1~2Ea-rows-k1-7~2-v",
+        "zb1-t1787824800123-UPDATE-phone~2D1~2Ea-rows-k1-7-v~2x",
+        "zb1-t1787824800123-MERGE-phone~2D1~2Ea-rows-k1-7-v",
+        "zb1-t1787824800123-update-phone~2D1~2Ea-rows-k1-7-v",
+        "zb1-t1787824800123-UPDATE-phone~2D1~2Ea-rows-k1-7-v-extra",
+        "zb1-t1787824800123-UPDATE-phone~2D1~2Ea--k1-7-v",
+        "zb1-t1787824800123-UPDATE-phone~2D1~2Ea-rows-k0--v",
+    }) |bad| try std.testing.expect(!try messageIdOfClient(a, bad, "phone-1.a"));
+    // A composite key: parts joined by `+`, counted.
+    const two = try messageId(arena.allocator(), 1787824800123, "phone-1.a", "rows", "DELETE", &.{ "a+b", "null" }, "v");
+    try std.testing.expect(try messageIdOfClient(a, two, "phone-1.a"));
 }
 
 test "messageIdCreatedMs reads only a structured ID's time" {
