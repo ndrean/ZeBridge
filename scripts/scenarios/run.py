@@ -185,6 +185,7 @@ GROUPS = {
     # Kept out of `owns` (and `all`) so that group stays a signal; here exit 1 counts as expected,
     # and an unexpected pass fails the group: the fix landed, move the scenario to `owns`.
     "known_red": {
+        "incarnation_clients": ("bridge", "both client decisions: a stamped edit queued offline, a withheld descriptor (identity unknown) refuses a second edit with the row and outbox untouched, the first keeps its ID and stamp across a restart and gets one TableIncarnationChanged verdict, the replacement row intact; both clients"),
         "recreate_incarnation": ("bridge", "a queued write belongs to its table incarnation: an offline UPDATE of row K across a DROP + CREATE with a new K must be refused (TableIncarnationChanged), not applied to the replacement row; the zebridge_reseed control (same incarnation) stays eligible; both clients"),
     },
     "manual": {

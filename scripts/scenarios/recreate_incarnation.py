@@ -183,6 +183,14 @@ class Side:
         try: rows = self.c.q(f"SELECT uid, title FROM {T} ORDER BY uid")
         except RuntimeError: return False
         return ",".join(f"{u}={t or ''}" for u, t in rows) == want
+    def restart(self):
+        """Close and reopen on the same replica file (the outbox survives on disk)."""
+        try: self.c.close()
+        except Exception: pass
+        if self.kind == "libzb":
+            self.c = Lib(self.db, [T], "py-recreate-incarnation", nats_url=self.relay.url)
+        else:
+            self.c = Node(self.db, NODE_LOG)
     def close(self):
         try: self.c.close()
         except Exception: pass
