@@ -6107,6 +6107,11 @@ pub const SyncClient = struct {
 
         const version = stamp orelse try core.hlcVersion(a, try nowWireIsoAt(a, self.clock_offset_ms), self.last_version, self.seen_floor);
         if (version.len > self.last_version_buf.len) return error.VersionTooLong;
+        // An empty stamp makes an ID that ends in `-`, which no `after` can name.
+        if (version.len == 0) {
+            log.warn("libzb: a write's version cannot be empty", .{});
+            return error.EmptyVersion;
+        }
         // The clock only moves forward: a caller's stamp from the past is sent as
         // given but never becomes what the next unstamped write follows.
         if (stamp == null or std.mem.order(u8, version, self.last_version) == .gt) {
@@ -10636,4 +10641,17 @@ test "ordering modes: the GC floor refuses at enqueue (no ID, one outcome) and s
     try std.testing.expectEqual(@as(usize, 2), modesFloorRefusals(&cl));
     try std.testing.expectEqual(@as(usize, 0), (try cl.st.query(a, "SELECT 1 FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = wp }})).len);
     try std.testing.expectEqualStrings(wp, (try orderTestLink(&cl, a, wc)).column.?);
+}
+
+test "ordering modes: an empty version is refused before anything is queued" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    var cl = try orderTestClient(a, ":memory:", &conn, &t);
+    defer cl.st.close();
+    try std.testing.expectError(error.EmptyVersion, modesWrite(&cl, a, "p", "INSERT", "x", "", null, false));
+    try std.testing.expectEqual(@as(i64, 0), try modesOutbox(&cl, a));
 }

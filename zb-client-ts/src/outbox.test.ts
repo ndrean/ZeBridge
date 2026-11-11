@@ -1257,6 +1257,13 @@ test('ordering modes: every misuse refuses before anything is written, and names
   for (const bad of [`zb1-t1-UPDATE-phone~2D1~2Ea-p-k2-x-v`, `zb1-t1-UPDATE-phone~2D1~2Ea-p-k1-x~2-v`, `zb1-t1-MERGE-phone~2D1~2Ea-p-k1-x-v`, `zb1-t1-UPDATE-phone~2D1~2Ea-p-k1-x-v-extra`, `zb1-t1-UPDATE-phone~2D1~2Ea--k1-x-v`])
     assert.equal(messageIdOfClient(bad, 'phone-1.a'), false, bad);
   assert.equal(messageIdOfClient(mutationMsgId(1, 'phone-1.a', 'p', 'DELETE', ['a+b', 'null'], 'v'), 'phone-1.a'), true, 'a composite key');
+  // Canonical only: `~72` decodes to `r`, which the generator writes literally.
+  const genuine = mutationMsgId(1787824800123, 'phone-1.a', 'rows', 'UPDATE', ['7'], 'v');
+  assert.equal(messageIdOfClient(genuine, 'phone-1.a'), true);
+  assert.equal(messageIdOfClient(genuine.replace('-rows-', '-~72ows-'), 'phone-1.a'), false, 'a non-canonical spelling of the same table');
+  // Every ID the generator makes from awkward inputs validates (libzb's same cases).
+  for (const [client, table, v] of [['phone 1~x', 'my-table.v2', '2026-11-11T10:00:00.123456Z'], ['é+ü', 't', 'a~b'], ['c:1_2', 'rows', '-']])
+    assert.equal(messageIdOfClient(mutationMsgId(1787824800123, client, table, 'INSERT', [v, '', '+'], v), client), true, `${client} ${table} ${v}`);
   const foreign = mutationMsgId(Date.now(), 'phone-2', 'p', 'UPDATE', ['x'], 'v');
   await refuses('another client', () => f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000004Z', { after: foreign }), /is not a write of this client/);
   await refuses('both options', () => f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000005Z', { after: P, independent: true }), /^after and independent cannot be combined$/);
@@ -1299,6 +1306,10 @@ test('ordering modes: an ID only for a write durably queued; mutate() keeps its 
   assert.deepEqual(Object.keys(r).sort(), ['version', 'writeId']);
   assert.ok((f.db.prepare('SELECT 1 FROM _zebridge_outbox WHERE msg_id = ?').get(r.writeId)));
   assert.deepEqual(await f.c.mutate('p', 'update', { id: 'y' }, { title: 'z' }, { version: '2026-11-09T10:00:00.000010Z' }), { version: '2026-11-09T10:00:00.000010Z' });
+  // An empty stamp would make an ID no `after` can name: refused before anything is queued.
+  const queuedBefore = f.count();
+  await assert.rejects(f.c.mutateWithId('p', 'update', { id: 'y' }, { title: 'e' }, { version: '' }), /^Error: a write's version cannot be empty$/);
+  assert.equal(f.count(), queuedBefore);
   // A local transaction that rolls back queues nothing: mutateWithId rejects.
   const apply = f.c.applyEvent;
   f.c.applyEvent = async () => { throw new Error('disk full'); };

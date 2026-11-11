@@ -1030,6 +1030,8 @@ export class ZeBridge {
     const state = this.syncedTables.get(table);
     if (!state || !state.pkCols.length) throw new Error(`table ${table} is not synced or has no primary key`);
     const version = opts?.version ?? this.newVersion();
+    // An empty stamp makes an ID that ends in `-`, which no `after` can name (libzb: EmptyVersion).
+    if (version === '') throw new Error("a write's version cannot be empty");
     const id = mutationKeyId(state.pkCols, key);
     const payload = mutationPayload(op, key, values, version, this.clientIdValue);
     const queued = await this.enqueueMutation(table, op, id, version, payload, opts);

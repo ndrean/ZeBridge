@@ -1121,16 +1121,21 @@ export function messageIdCreatedMs(id: string): number | null {
 /// component encoded, at most 512 bytes, and the client token this client's (libzb
 /// core.messageIdOfClient). An ID does not name the principal; the bridge resolves it under
 /// the authenticated one. A write that has left the outbox still passes: only its shape counts.
-const ID_COMPONENT = /^(?:[A-Za-z0-9_:]|~[0-9A-F]{2})*$/;
+// An ID component exactly as `idComponent` writes it: safe bytes literally, every other byte as
+// `~` and two uppercase hex digits. Canonical only: receipts are keyed by the exact ID, so `~72`
+// for an `r` the generator writes literally names a write that never existed.
+const isIdComponent = (s: string): boolean =>
+  /^(?:[A-Za-z0-9_:]|~[0-9A-F]{2})*$/.test(s) &&
+  [...s.matchAll(/~([0-9A-F]{2})/g)].every((m) => !ID_SAFE.test(String.fromCharCode(parseInt(m[1], 16))));
 export function messageIdOfClient(id: string, clientId: string): boolean {
   if (!clientId || id.length > 512 || messageIdCreatedMs(id) === null) return false;
   const t = id.split('-');
   if (t.length !== 8 || t[0] !== 'zb1' || !['INSERT', 'UPDATE', 'DELETE'].includes(t[2])) return false;
-  if (t[3] !== idComponent(clientId) || !t[4] || !ID_COMPONENT.test(t[4]) || !t[7] || !ID_COMPONENT.test(t[7])) return false;
+  if (t[3] !== idComponent(clientId) || !t[4] || !isIdComponent(t[4]) || !t[7] || !isIdComponent(t[7])) return false;
   const k = /^k([1-9]\d{0,3})$/.exec(t[5]);
   if (!k) return false;
   const parts = t[6].split('+');
-  return parts.length === Number(k[1]) && parts.every((p) => ID_COMPONENT.test(p));
+  return parts.length === Number(k[1]) && parts.every(isIdComponent);
 }
 
 export function mutationMsgId(createdMs: number, clientId: string, table: string, op: string, keyParts: string[], version: string): string {

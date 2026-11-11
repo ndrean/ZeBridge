@@ -146,7 +146,9 @@ The TypeScript client drives its own synchronization loop. With native `libzb`, 
 
 ### Write order: what waits for what
 
-⚠️ **Every write from a device waits for that device's previous write.** PostgreSQL judges a write only after it has judged the write before it, from the same device. This is what lets you insert an order and then its lines without the lines arriving first and failing their foreign key. It is also a constraint: if one write is slow (a long trigger, a lock), every later write from that device waits behind it. Writes from other devices are not affected, and ordering never spans devices: a line written on a phone cannot wait for an order written on a laptop.
+⚠️ On tables that support ordering, a write waits by default for this client's most recent unsettled ordered write. That lets you queue an order and then its lines without a line overtaking the order. Use `after` to name a specific earlier write from the same client. Use `independent` for a write such as a page view that can be judged in any order. It can still wait for a free lane or a database lock.
+
+The default is also a constraint: a slow write (a long trigger, a lock) delays this client's ordered writes made after it. Ordering never spans clients: a line written on a phone cannot wait for an order written on a laptop.
 
 **The default needs nothing.** Write in the order your data depends on:
 
@@ -166,7 +168,7 @@ await zb.mutate("customers", "UPDATE", { id: 7 }, { last_seen: now });  // unrel
 await zb.mutate("order_lines", "INSERT", { id: 20 }, { id: 20, order_id: 2, qty: 1 }, { after: order.writeId });
 ```
 
-**`independent`: wait for nothing.** Use it for a write that depends on no earlier write and must not be stuck behind a slow one:
+**`independent`: no predecessor.** Use it for a write that depends on no earlier write and can be judged in any order:
 
 ```ts
 await zb.mutate("page_views", "INSERT", { id: viewId }, { id: viewId, page: "/orders" }, { independent: true });
