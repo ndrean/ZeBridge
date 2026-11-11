@@ -1109,6 +1109,13 @@ export function mutationSubject(principal: string, table: string, op: string, pr
 /// write, a retry of the same edit is not. `createdMs` is the shell's estimate of the
 /// bridge's clock when the write is made, taken once and never the version; the bridge
 /// reads only that prefix. At most 512 bytes, counted after escaping.
+/// The creation time a structured ID encodes (`zb1-t<ms>-…`); null for any other ID
+/// (libzb core.messageIdCreatedMs).
+export function messageIdCreatedMs(id: string): number | null {
+  const m = /^zb1-t(\d{1,15})-/.exec(id);
+  return m ? Number(m[1]) : null;
+}
+
 export function mutationMsgId(createdMs: number, clientId: string, table: string, op: string, keyParts: string[], version: string): string {
   if (typeof createdMs !== 'number') throw new Error('MissingCreatedMs');
   if (!Number.isInteger(createdMs) || createdMs < 0 || createdMs > 999_999_999_999_999) throw new Error(`InvalidCreatedMs: ${createdMs}`);
@@ -1146,8 +1153,12 @@ export function mutationPayload(
   values: Record<string, unknown> | undefined,
   version: string,
   clientId: string,
+  ordering?: { version: number; predecessor: string | null },
 ): Record<string, unknown> {
   const payload: Record<string, unknown> = { key, version, client_id: clientId };
+  // The ordered envelope (libzb core.buildMutation): sent only when the bridge advertises it,
+  // inside the payload so the receipt fingerprint covers it and a resend cannot change it.
+  if (ordering && ordering.version > 0) { payload.ordering = ordering.version; payload.predecessor = ordering.predecessor; }
   if (op !== 'DELETE') {
     // §10dv: a key column in `values` must equal the key. An UPDATE cannot move a row —
     // the ingress refuses it (`KeyChange`) — and the optimistic apply must not pretend
@@ -1202,10 +1213,12 @@ export function buildMutation(args: {
   key: Record<string, unknown>; values?: Record<string, unknown>;
   pkCols: string[]; version: string; createdMs: number;
   mutationsPrefix?: string;
+  ordering?: number; predecessor?: string | null;
 }): { subject: string; msgId: string; id: string; payload: Record<string, unknown>; optimistic: Record<string, unknown> } {
   const op = normalizeOp(args.op);
   const id = mutationKeyId(args.pkCols, args.key);
-  const payload = mutationPayload(op, args.key, args.values, args.version, args.clientId);
+  const payload = mutationPayload(op, args.key, args.values, args.version, args.clientId,
+    args.ordering ? { version: args.ordering, predecessor: args.predecessor ?? null } : undefined);
   return {
     subject: mutationSubject(args.principal, args.table, op, args.mutationsPrefix),
     msgId: mutationMsgId(args.createdMs, args.clientId, args.table, op, args.pkCols.map((c) => idKeyPart(args.key[c])), args.version),

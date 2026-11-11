@@ -248,6 +248,21 @@ pub fn lsnToNumber(lsn: []const u8) i64 {
 /// share an ID: not `a.b` and `a-b`, not `["a|b","c"]` and `["a","b|c"]`, not an INSERT
 /// and a DELETE of one key. The bridge reads only the `zb1-t<ms>-` prefix; the rest is
 /// opaque to it. At most 512 bytes, counted after escaping.
+/// The creation time a structured ID encodes (`zb1-t<ms>-…`); null for any other ID.
+pub fn messageIdCreatedMs(id: []const u8) ?i64 {
+    if (!std.mem.startsWith(u8, id, "zb1-t")) return null;
+    const rest = id["zb1-t".len..];
+    const end = std.mem.indexOfScalar(u8, rest, '-') orelse return null;
+    if (end == 0 or end > 15) return null;
+    return std.fmt.parseInt(i64, rest[0..end], 10) catch null;
+}
+
+test "messageIdCreatedMs reads only a structured ID's time" {
+    try std.testing.expectEqual(@as(?i64, 1787824800123), messageIdCreatedMs("zb1-t1787824800123-UPDATE-c-t-k1-u-v"));
+    for ([_][]const u8{ "legacy-id", "zb1-t-UPDATE", "zb1-tabc-UPDATE", "zb1-t1787824800123", "zb1-t9999999999999999-X" }) |bad|
+        try std.testing.expectEqual(@as(?i64, null), messageIdCreatedMs(bad));
+}
+
 pub fn messageId(a: std.mem.Allocator, created_ms: i64, client_id: []const u8, table: []const u8, op_in: []const u8, key_parts: []const []const u8, version: []const u8) ![]const u8 {
     if (created_ms < 0 or created_ms > 999_999_999_999_999) return error.InvalidCreatedMs;
     const op = normalizeOp(op_in) orelse return error.UnknownOperation;
@@ -1178,6 +1193,14 @@ pub fn buildMutation(a: std.mem.Allocator, args: Value) !Value {
     try payload.put(a, "key", key);
     try payload.put(a, "version", .{ .string = version });
     try payload.put(a, "client_id", .{ .string = client_id });
+    // The ordered envelope (NOTES "Ordered execution per client"), sent only when the bridge
+    // advertises it: `ordering` is the contract's version, `predecessor` this client's
+    // previous unsettled ordered write (null: none). Both are part of the payload, so the
+    // bridge's receipt fingerprint covers them and a resend can never change them.
+    if (getInt(args, "ordering")) |ordering| if (ordering > 0) {
+        try payload.put(a, "ordering", .{ .integer = ordering });
+        try payload.put(a, "predecessor", if (getStr(args, "predecessor")) |p| Value{ .string = p } else .null);
+    };
     if (!is_delete) {
         const data: Value = if (values) |v| (if (v == .null) Value{ .object = .empty } else v) else .{ .object = .empty };
         // §10dv: a key column in the values must equal the key — an UPDATE cannot move

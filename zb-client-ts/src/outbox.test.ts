@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { sqliteDialect } from './dialect.ts';
 import { ZeBridge } from './libzb.ts';
+import { messageIdCreatedMs } from './core.ts';
 import { makePgliteStorage } from './pglite-storage.ts';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -1062,4 +1063,126 @@ test('undo: independent empty reads during and across commit cannot switch track
       assert.equal(reader.prepare('SELECT count(*) n FROM _zebridge_outbox').get()!.n,1);
     } finally {commit();deliver();reader.close();f.db.close();rmSync(dir,{recursive:true,force:true});}
   }
+});
+
+// The ordered envelope (libzb's "ordering: …" tests): a write names the newest unsettled ordered
+// write, fixed when made and sent inside the payload; a `held` notice only delays the replay.
+function orderFixture(path: string) {
+  const f = undoFixture(path);
+  try { f.db.exec('ALTER TABLE _zebridge_outbox ADD COLUMN basis TEXT'); } catch { /* reopened */ }
+  Object.assign(f.c, {
+    suspendedMap: new Map(), config: { principal: 'omar', grammar: { subjects: {} } }, clientIdValue: 'c-1',
+    clockOffsetMs: () => 0, triggerChange: () => {}, pendingWrites: new Map(), nc: null,
+  });
+  f.c.syncedTables.get('p').ordering = 1;
+  const mutate = async (t: 'p' | 'c', op: string, id: string, version: string) => {
+    const values = t === 'p' ? { title: 't' } : { pid: 'x' };
+    const before = new Set((f.db.prepare('SELECT msg_id FROM _zebridge_outbox').all() as any[]).map((r) => r.msg_id));
+    await f.c.rawMutation(t, op, id, version, { key: { id }, version, client_id: 'c-1', ...(op === 'DELETE' ? {} : { data: values }) });
+    const added = (f.db.prepare('SELECT msg_id FROM _zebridge_outbox').all() as any[]).map((r) => r.msg_id).filter((m) => !before.has(m));
+    assert.equal(added.length, 1, `one outbox entry per write: ${f.logs.join(' | ')}`);
+    return added[0] as string;
+  };
+  const link = (mid: string) => {
+    const r = f.db.prepare('SELECT ordered, predecessor, payload FROM _zebridge_outbox WHERE msg_id = ?').get(mid) as any;
+    return { ordered: r.ordered === 1, column: r.predecessor ?? null, payload: JSON.parse(r.payload) };
+  };
+  return { ...f, mutate, link };
+}
+
+test('ordering: each ordered write names the newest unsettled one, fixed at creation, across settlement and reopen; an old outbox stays unordered', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zb-order-'));
+  const path = `${dir}/r.sqlite3`;
+  const f = orderFixture(path);
+  // An outbox from before the ordered envelope: its entry stays unordered once migrated.
+  f.db.prepare(`INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, created_at) VALUES ('old-1', 's', '{}', 'p', 'y', 0)`).run();
+  await f.c.addOutboxOrdering();
+  assert.deepEqual({ ...(f.db.prepare(`SELECT ordered, predecessor FROM _zebridge_outbox WHERE msg_id = 'old-1'`).get() as any) }, { ordered: 0, predecessor: null });
+
+  const m1 = await f.mutate('p', 'INSERT', 'x', '2026-11-09T10:00:00.000001Z');
+  assert.deepEqual([f.link(m1).ordered, f.link(m1).column, f.link(m1).payload.predecessor, f.link(m1).payload.ordering], [true, null, null, 1]);
+  const m2 = await f.mutate('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000002Z');
+  assert.equal(f.link(m2).column, m1);
+  assert.equal(f.link(m2).payload.predecessor, m1);
+  // A table the bridge offers no ordering for: no field, and never a predecessor.
+  const m3 = await f.mutate('c', 'INSERT', 'k', '2026-11-09T10:00:00.000003Z');
+  assert.deepEqual([f.link(m3).ordered, f.link(m3).column, 'ordering' in f.link(m3).payload, 'predecessor' in f.link(m3).payload], [false, null, false, false]);
+  const m4 = await f.mutate('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000004Z');
+  assert.equal(f.link(m4).column, m2);
+
+  // m4 settles: the next write names m2, the newest still unsettled; links never change.
+  await f.c.outboxDrop(m4, true);
+  const m5 = await f.mutate('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000005Z');
+  assert.equal(f.link(m5).column, m2);
+  assert.equal(f.link(m2).payload.predecessor, m1);
+  f.db.close();
+
+  // Reopen: the tail is the outbox itself, so the chain continues where it was.
+  const g = orderFixture(path);
+  g.c.lastCreated = Number((g.db.prepare('SELECT max(created_at) AS m FROM _zebridge_outbox').get() as any).m);
+  const m6 = await g.mutate('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000006Z');
+  assert.equal(g.link(m6).column, m5);
+  g.db.close();
+});
+
+test('ordering: held moves only the replay deadline; never settles, never shortens, ignored once settled', async () => {
+  const f = orderFixture(':memory:');
+  await f.c.addOutboxOrdering();
+  const m1 = await f.mutate('p', 'INSERT', 'x', '2026-11-09T10:00:00.000001Z');
+  const sent = Date.now() + 1000; // published: a replay deadline is set
+  f.db.prepare('UPDATE _zebridge_outbox SET retry_at = ? WHERE msg_id = ?').run(sent, m1);
+  const seen: any[] = [];
+  f.c.verdictHandlers = new Set([(v: any) => seen.push(v)]);
+  const logs: [string, string][] = [];
+  f.c.appendLog = (_t: string, d: any, level: string) => logs.push([level, String(d)]);
+  const held = (body: string) => f.c.handleVerdict(`mutation_ack.omar.${m1}.held`, new TextEncoder().encode(body));
+  const due = () => Number((f.db.prepare('SELECT retry_at FROM _zebridge_outbox WHERE msg_id = ?').get(m1) as any)?.retry_at);
+  assert.equal(await held('{"status":"held","lease_ms":30000}'), false, 'not definitive');
+  const first = due();
+  assert.ok(first >= sent + 28_000, `replay moved out (${first - sent} ms)`);
+  assert.deepEqual(logs, [['DEBUG', `${m1} held behind its predecessor, replay due in 30000 ms`]], 'the words of libzb\'s debug line');
+  // An outbox that cannot be updated: said, and the notice is dropped (libzb's warn line), not thrown at the verdict loop.
+  const run = f.c.run;
+  f.c.run = async () => { throw new Error('disk I/O error'); };
+  assert.equal(await held('{"status":"held","lease_ms":60000}'), false);
+  f.c.run = run;
+  assert.deepEqual(logs[1], ['WARNING', 'a held notice was not applied (disk I/O error)']);
+  assert.equal(due(), first, 'nothing changed');
+  await held('{"status":"held","lease_ms":10}');
+  await held('{"status":"held"}');
+  assert.equal(due(), first, 'a shorter lease or none changes nothing');
+  assert.equal(seen.length, 0, 'held reports no outcome');
+  // Terminal first, then a delayed held: the outcome stands and nothing comes back.
+  await f.c.outboxDrop(m1, true);
+  await held('{"status":"held","lease_ms":30000}');
+  assert.equal((f.db.prepare('SELECT count(*) AS n FROM _zebridge_outbox').get() as any).n, 0);
+  f.db.close();
+});
+
+test('ordering: a successor\'s ID is never dated before its predecessor\'s, after a clock step back and across reopen', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zb-order-clock-'));
+  const path = `${dir}/r.sqlite3`;
+  const f = orderFixture(path);
+  await f.c.addOutboxOrdering();
+  const t = (id: string) => messageIdCreatedMs(id)!;
+  const m1 = await f.mutate('p', 'INSERT', 'x', '2026-11-09T10:00:00.000001Z');
+  f.c.clockOffsetMs = () => -3_600_000; // the bridge's clock re-estimated an hour back
+  const m2 = await f.mutate('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000002Z');
+  assert.equal(t(m2), t(m1), 'equal, not earlier, not invented');
+  assert.equal(f.link(m2).payload.predecessor, m1);
+  const u = await f.mutate('c', 'INSERT', 'k', '2026-11-09T10:00:00.000003Z');
+  assert.ok(t(u) < t(m1) - 3_000_000, 'an unordered write keeps its own clock');
+  f.db.close();
+
+  const g = orderFixture(path);
+  g.c.lastCreated = Number((g.db.prepare('SELECT max(created_at) AS m FROM _zebridge_outbox').get() as any).m);
+  g.c.clockOffsetMs = () => -7_200_000; // reopened with an offset two hours back
+  const m3 = await g.mutate('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000004Z');
+  assert.equal(t(m3), t(m1));
+  assert.equal(g.link(m3).column, m2);
+  const ids = (g.db.prepare('SELECT msg_id FROM _zebridge_outbox WHERE ordered = 1 ORDER BY created_at').all() as any[]).map((r) => r.msg_id);
+  assert.deepEqual(ids, [m1, m2, m3], 'what was queued is unchanged');
+  assert.equal(g.link(m1).payload.predecessor, null);
+  assert.equal(g.link(m2).payload.predecessor, m1);
+  g.db.close();
 });
