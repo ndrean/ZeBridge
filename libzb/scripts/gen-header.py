@@ -50,6 +50,7 @@ DOCS = {
     "zb_client_query": "Reads the local replica. `params_json` is a JSON array of the `?` parameters. Returns {\"columns\", \"rows\"}.",
     "zb_client_mutate": "One write: applied locally at once, then sent. `op` is INSERT, UPDATE or DELETE; `key_json` and `values_json` are JSON objects. Returns {\"msgId\"}: the poll report's outcomes name it.",
     "zb_client_mutate_at": "zb_client_mutate with the caller's own version stamp (RFC 3339, UTC).",
+    "zb_client_mutate_opts": "zb_client_mutate with options. `opts_json` (or NULL): {\"version\", \"after\", \"independent\"}. `after` waits for that earlier write of this client instead of the newest unsettled one; `independent` has no predecessor and leaves the ordering tail as it was. Returns {\"msgId\"} only for a write durably queued; a refusal is an error.",
     "zb_client_serve": "Answers questions on this client's connection. `opts_json`: {\"tenants\", \"queries\"}. The questions arrive in the poll report's `requests`.",
     "zb_client_reply": "Answers one question from the poll report's `requests`. Returns {\"replied\"}.",
     "zb_client_poll": "Waits up to `wait_ms` for changes, applies them and collects verdicts. Blocks the calling thread. Returns {\"applied\", \"settled\", \"changed_tables\", \"seeded\", \"outcomes\", \"pending\"}.",

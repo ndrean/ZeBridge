@@ -14,7 +14,7 @@
 
 #include <stdint.h>
 
-#define ZB_ABI_VERSION 7
+#define ZB_ABI_VERSION 8
 
 #ifdef __cplusplus
 extern "C" {
@@ -79,6 +79,9 @@ char *zb_client_query(uint64_t handle, const char *sql, const char *params_json)
 
 /* One write: applied locally at once, then sent. `op` is INSERT, UPDATE or DELETE; `key_json` and `values_json` are JSON objects. Returns {"msgId"}: the poll report's outcomes name it. Free the result with zb_free(). */
 char *zb_client_mutate(uint64_t handle, const char *table, const char *op, const char *key_json, const char *values_json);
+
+/* zb_client_mutate with options. `opts_json` (or NULL): {"version", "after", "independent"}. `after` waits for that earlier write of this client instead of the newest unsettled one; `independent` has no predecessor and leaves the ordering tail as it was. Returns {"msgId"} only for a write durably queued; a refusal is an error. Free the result with zb_free(). */
+char *zb_client_mutate_opts(uint64_t handle, const char *table, const char *op, const char *key_json, const char *values_json, const char *opts_json);
 
 /* zb_client_mutate with the caller's own version stamp (RFC 3339, UTC). Free the result with zb_free(). */
 char *zb_client_mutate_at(uint64_t handle, const char *table, const char *op, const char *key_json, const char *values_json, const char *version);

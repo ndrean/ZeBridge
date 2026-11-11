@@ -144,6 +144,53 @@ if (orders.length > 0) {
 
 The TypeScript client drives its own synchronization loop. With native `libzb`, the host drives `sync()` and `poll()`; see the binding's example for its threading or worker model.
 
+### Write order: what waits for what
+
+⚠️ On tables that support ordering, a write waits by default for this client's most recent unsettled ordered write. That lets you queue an order and then its lines without a line overtaking the order. Use `after` to name a specific earlier write from the same client. Use `independent` for a write such as a page view that can be judged in any order. It can still wait for a free lane or a database lock.
+
+The default is also a constraint: a slow write (a long trigger, a lock) delays later writes that depend on it, directly or through the tail. Ordering never spans clients: a line written on a phone cannot wait for an order written on a laptop.
+
+**The default needs nothing.** Write in the order your data depends on:
+
+```ts
+await zb.mutate("orders", "INSERT", { id: 1 }, { id: 1, customer: "acme" });
+await zb.mutate("order_lines", "INSERT", { id: 10 }, { id: 10, order_id: 1, qty: 3 });
+// order_lines #10 is judged after orders #1. If orders #1 is refused, #10 is still judged,
+// and PostgreSQL refuses it in turn on its foreign key: nothing runs out of order.
+```
+
+**`after`: wait for a specific earlier write.** Use it when the parent is not the write you made just before. Get the parent's ID with `mutateWithId()`:
+
+```ts
+const order = await zb.mutateWithId("orders", "INSERT", { id: 2 }, { id: 2, customer: "globex" });
+await zb.mutate("customers", "UPDATE", { id: 7 }, { last_seen: now });  // unrelated
+// Without `after`, this line would wait for the customer update above. With it, it waits for the order.
+await zb.mutate("order_lines", "INSERT", { id: 20 }, { id: 20, order_id: 2, qty: 1 }, { after: order.writeId });
+```
+
+**`independent`: no predecessor.** Use it for a write that depends on no earlier write and can be judged in any order:
+
+```ts
+await zb.mutate("page_views", "INSERT", { id: viewId }, { id: viewId, page: "/orders" }, { independent: true });
+```
+
+The same in Python, where `mutate` returns the write's ID as `msgId`:
+
+```python
+order = zb.mutate("orders", "INSERT", {"id": 2}, {"id": 2, "customer": "globex"})
+zb.mutate("order_lines", "INSERT", {"id": 20}, {"id": 20, "order_id": 2, "qty": 1}, after=order["msgId"])
+zb.mutate("page_views", "INSERT", {"id": view_id}, {"id": view_id, "page": "/orders"}, independent=True)
+```
+
+What to know:
+
+- `after` means "wait for that write's verdict", not "only if it succeeded". A refused parent still lets its child be judged; your foreign keys decide what happens to the child.
+- Two writes can name the same parent, for example two lines of one order. Either may be judged first. A later write without options follows whichever of them was made last, not both.
+- An ID is returned only for a write that was queued. A write refused on the device before it was queued (for example, one older than what the server still keeps) has no ID: `mutateWithId()` rejects, so nothing can be made to wait for it.
+- `after` and `independent` work on tables whose bridge offers ordering, which a current bridge does for every writable table. `after` is refused on a table that does not offer it, and so is an ID that is not one of this device's writes.
+
+The details are in [Clients: ordering a write](CLIENTS.md#ordering-a-write) and the protocol in [PROTOCOL, Ordered ingress](PROTOCOL.md#ordered-ingress-version-1).
+
 ### Choose the local database
 
 The replica is a real database on the device, and the app reads it with that database's SQL:

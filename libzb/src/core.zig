@@ -257,6 +257,111 @@ pub fn messageIdCreatedMs(id: []const u8) ?i64 {
     return std.fmt.parseInt(i64, rest[0..end], 10) catch null;
 }
 
+/// Whether `id` is a complete ID `client_id` could have made (`messageId`): all eight tokens,
+/// `zb1-t<ms>-<OP>-<client>-<table>-k<n>-<n parts joined by +>-<version>`, every component
+/// encoded, at most 512 bytes, and the client token this client's (core.ts messageIdOfClient;
+/// the bridge reads the same token, `ordered_ingress.parse`). An ID does not name the
+/// principal; the bridge resolves it under the authenticated one. A write that has left the
+/// outbox still passes: only its shape counts.
+pub fn messageIdOfClient(a: std.mem.Allocator, id: []const u8, client_id: []const u8) !bool {
+    const ms = messageIdCreatedMs(id) orelse return false;
+    if (client_id.len == 0 or id.len > 512) return false;
+    var t: [8][]const u8 = undefined;
+    var tokens = std.mem.splitScalar(u8, id, '-');
+    for (&t) |*slot| slot.* = tokens.next() orelse return false;
+    if (tokens.next() != null) return false;
+    // The time as the generator writes it: `t` and the value's own digits, never zero-padded.
+    var time_buf: [20]u8 = undefined;
+    if (!std.mem.eql(u8, t[1], std.fmt.bufPrint(&time_buf, "t{d}", .{ms}) catch return false)) return false;
+    if (!std.mem.eql(u8, t[0], "zb1") or normalizeOp(t[2]) == null or !std.mem.eql(u8, normalizeOp(t[2]).?, t[2])) return false;
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(a);
+    try appendIdComponent(a, &encoded, client_id);
+    if (!std.mem.eql(u8, t[3], encoded.items)) return false;
+    if (t[4].len == 0 or !isIdComponent(t[4]) or t[7].len == 0 or !isIdComponent(t[7])) return false;
+    if (t[5].len < 2 or t[5].len > 5 or t[5][0] != 'k' or t[5][1] == '0') return false;
+    const n = std.fmt.parseInt(usize, t[5][1..], 10) catch return false;
+    var parts = std.mem.splitScalar(u8, t[6], '+');
+    var count: usize = 0;
+    while (parts.next()) |p| : (count += 1) if (!isIdComponent(p)) return false;
+    return count == n;
+}
+
+/// An ID component exactly as `appendIdComponent` writes it: safe bytes literally, every other
+/// byte as `~` and two uppercase hex digits. Canonical only: receipts are keyed by the exact ID,
+/// so `~72` for an `r` the generator writes literally names a write that never existed.
+fn isIdComponent(s: []const u8) bool {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) switch (s[i]) {
+        'A'...'Z', 'a'...'z', '0'...'9', '_', ':' => {},
+        '~' => {
+            if (i + 2 >= s.len) return false;
+            var b: u8 = 0;
+            for (s[i + 1 .. i + 3]) |h| b = b * 16 + switch (h) {
+                '0'...'9' => h - '0',
+                'A'...'F' => h - 'A' + 10,
+                else => return false,
+            };
+            switch (b) {
+                'A'...'Z', 'a'...'z', '0'...'9', '_', ':' => return false, // written literally, never escaped
+                else => {},
+            }
+            i += 2;
+        },
+        else => return false,
+    };
+    return true;
+}
+
+test "messageIdOfClient: the ID's client token, escaped, against this client" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const id = try messageId(arena.allocator(), 1787824800123, "phone-1.a", "rows", "UPDATE", &.{"7"}, "v");
+    try std.testing.expect(try messageIdOfClient(a, id, "phone-1.a"));
+    try std.testing.expect(!try messageIdOfClient(a, id, "phone-1"));
+    try std.testing.expect(!try messageIdOfClient(a, id, "phone~2D1~2Ea")); // the escaped form is not the client
+    for ([_][]const u8{ "legacy-id", "zb1-t1787824800123", "zb1-tx-UPDATE-phone~2D1~2Ea-rows" }) |bad|
+        try std.testing.expect(!try messageIdOfClient(a, bad, "phone-1.a"));
+    // Shapes no client generates, though the client token is right: truncated (no table, key,
+    // version), the key count wrong, a broken escape, an unknown or lower-case operation, a token
+    // too many, an empty table.
+    try std.testing.expect(!try messageIdOfClient(a, "zb1-t1787824800123-INSERT-phone", "phone"));
+    for ([_][]const u8{
+        "zb1-t1787824800123-UPDATE-phone~2D1~2Ea-rows-k2-7-v",
+        "zb1-t1787824800123-UPDATE-phone~2D1~2Ea-rows-k1-7~2-v",
+        "zb1-t1787824800123-UPDATE-phone~2D1~2Ea-rows-k1-7-v~2x",
+        "zb1-t1787824800123-MERGE-phone~2D1~2Ea-rows-k1-7-v",
+        "zb1-t1787824800123-update-phone~2D1~2Ea-rows-k1-7-v",
+        "zb1-t1787824800123-UPDATE-phone~2D1~2Ea-rows-k1-7-v-extra",
+        "zb1-t1787824800123-UPDATE-phone~2D1~2Ea--k1-7-v",
+        "zb1-t1787824800123-UPDATE-phone~2D1~2Ea-rows-k0--v",
+    }) |bad| try std.testing.expect(!try messageIdOfClient(a, bad, "phone-1.a"));
+    // A composite key: parts joined by `+`, counted.
+    const two = try messageId(arena.allocator(), 1787824800123, "phone-1.a", "rows", "DELETE", &.{ "a+b", "null" }, "v");
+    try std.testing.expect(try messageIdOfClient(a, two, "phone-1.a"));
+    // Canonical only: `~72` decodes to `r`, which the generator writes literally.
+    const genuine = try messageId(arena.allocator(), 1787824800123, "phone-1.a", "rows", "UPDATE", &.{"7"}, "v");
+    try std.testing.expect(try messageIdOfClient(a, genuine, "phone-1.a"));
+    const respelled = try std.mem.replaceOwned(u8, arena.allocator(), genuine, "-rows-", "-~72ows-");
+    try std.testing.expect(!try messageIdOfClient(a, respelled, "phone-1.a"));
+    // The time spelled canonically: t0 is a time, t00 and a zero-padded t0123 are not.
+    try std.testing.expect(try messageIdOfClient(a, try messageId(arena.allocator(), 0, "phone-1.a", "rows", "UPDATE", &.{"7"}, "v"), "phone-1.a"));
+    try std.testing.expect(!try messageIdOfClient(a, "zb1-t00-UPDATE-phone~2D1~2Ea-rows-k1-7-v", "phone-1.a"));
+    const t123 = try messageId(arena.allocator(), 123, "phone-1.a", "rows", "UPDATE", &.{"7"}, "v");
+    try std.testing.expect(try messageIdOfClient(a, t123, "phone-1.a"));
+    try std.testing.expect(!try messageIdOfClient(a, try std.mem.replaceOwned(u8, arena.allocator(), t123, "-t123-", "-t0123-"), "phone-1.a"));
+    // Every ID the generator makes from awkward inputs validates.
+    for ([_][3][]const u8{
+        .{ "phone 1~x", "my-table.v2", "2026-11-11T10:00:00.123456Z" },
+        .{ "é+ü", "t", "a~b" },
+        .{ "c:1_2", "rows", "-" },
+    }) |case| {
+        const made = try messageId(arena.allocator(), 1787824800123, case[0], case[1], "INSERT", &.{ case[2], "", "+" }, case[2]);
+        try std.testing.expect(try messageIdOfClient(a, made, case[0]));
+    }
+}
+
 test "messageIdCreatedMs reads only a structured ID's time" {
     try std.testing.expectEqual(@as(?i64, 1787824800123), messageIdCreatedMs("zb1-t1787824800123-UPDATE-c-t-k1-u-v"));
     for ([_][]const u8{ "legacy-id", "zb1-t-UPDATE", "zb1-tabc-UPDATE", "zb1-t1787824800123", "zb1-t9999999999999999-X" }) |bad|

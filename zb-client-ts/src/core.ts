@@ -1116,6 +1116,31 @@ export function messageIdCreatedMs(id: string): number | null {
   return m ? Number(m[1]) : null;
 }
 
+/// Whether `id` is a complete ID `clientId` could have made (`mutationMsgId`): all eight
+/// tokens, `zb1-t<ms>-<OP>-<client>-<table>-k<n>-<n parts joined by +>-<version>`, every
+/// component encoded, at most 512 bytes, and the client token this client's (libzb
+/// core.messageIdOfClient). An ID does not name the principal; the bridge resolves it under
+/// the authenticated one. A write that has left the outbox still passes: only its shape counts.
+// An ID component exactly as `idComponent` writes it: safe bytes literally, every other byte as
+// `~` and two uppercase hex digits. Canonical only: receipts are keyed by the exact ID, so `~72`
+// for an `r` the generator writes literally names a write that never existed.
+const isIdComponent = (s: string): boolean =>
+  /^(?:[A-Za-z0-9_:]|~[0-9A-F]{2})*$/.test(s) &&
+  [...s.matchAll(/~([0-9A-F]{2})/g)].every((m) => !ID_SAFE.test(String.fromCharCode(parseInt(m[1], 16))));
+export function messageIdOfClient(id: string, clientId: string): boolean {
+  const ms = messageIdCreatedMs(id);
+  if (!clientId || id.length > 512 || ms === null) return false;
+  const t = id.split('-');
+  // The time as the generator writes it: `t` and the value's own digits, never zero-padded.
+  if (t[1] !== `t${ms}`) return false;
+  if (t.length !== 8 || t[0] !== 'zb1' || !['INSERT', 'UPDATE', 'DELETE'].includes(t[2])) return false;
+  if (t[3] !== idComponent(clientId) || !t[4] || !isIdComponent(t[4]) || !t[7] || !isIdComponent(t[7])) return false;
+  const k = /^k([1-9]\d{0,3})$/.exec(t[5]);
+  if (!k) return false;
+  const parts = t[6].split('+');
+  return parts.length === Number(k[1]) && parts.every(isIdComponent);
+}
+
 export function mutationMsgId(createdMs: number, clientId: string, table: string, op: string, keyParts: string[], version: string): string {
   if (typeof createdMs !== 'number') throw new Error('MissingCreatedMs');
   if (!Number.isInteger(createdMs) || createdMs < 0 || createdMs > 999_999_999_999_999) throw new Error(`InvalidCreatedMs: ${createdMs}`);

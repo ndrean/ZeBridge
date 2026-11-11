@@ -2,8 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { sqliteDialect } from './dialect.ts';
-import { ZeBridge } from './libzb.ts';
-import { messageIdCreatedMs } from './core.ts';
+import { ZeBridge, OrderingRefusal } from './libzb.ts';
+import { messageIdCreatedMs, messageIdOfClient, mutationMsgId } from './core.ts';
 import { makePgliteStorage } from './pglite-storage.ts';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -1185,4 +1185,172 @@ test('ordering: a successor\'s ID is never dated before its predecessor\'s, afte
   assert.equal(g.link(m1).payload.predecessor, null);
   assert.equal(g.link(m2).payload.predecessor, m1);
   g.db.close();
+});
+
+// Ordering modes (libzb's "ordering modes: …" tests): `after` names one earlier write of this
+// client, `independent` has none and leaves the tail. A client ID that needs escaping.
+function modesFixture(path: string) {
+  const f = orderFixture(path);
+  f.c.clientIdValue = 'phone-1.a';
+  const verdicts: any[] = [];
+  f.c.verdictHandlers = new Set([(v: any) => verdicts.push(v)]);
+  const write = (t: 'p' | 'c', op: string, id: string, version: string, opts?: any) =>
+    f.c.enqueueMutation(t, op, id, version, { key: { id }, version, client_id: 'phone-1.a', ...(op === 'DELETE' ? {} : { data: t === 'p' ? { title: version } : { pid: 'x' } }) }, opts);
+  const count = () => (f.db.prepare('SELECT count(*) AS n FROM _zebridge_outbox').get() as any).n as number;
+  return { ...f, write, count, verdicts };
+}
+
+test('ordering modes: after names its predecessor, independent leaves the tail, across reopen (escaped client)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zb-modes-'));
+  const path = `${dir}/r.sqlite3`;
+  const f = modesFixture(path);
+  await f.c.addOutboxOrdering();
+  const P = (await f.write('p', 'INSERT', 'x', '2026-11-09T10:00:00.000001Z')).writeId;
+  assert.ok(messageIdOfClient(P, 'phone-1.a') && P.includes('-phone~2D1~2Ea-'), P);
+  const B = (await f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000002Z', { after: P })).writeId;
+  const C = (await f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000003Z', { after: P })).writeId;
+  assert.equal(f.link(B).column, P);
+  assert.equal(f.link(C).column, P, 'C names P although B was the tail when C was made');
+  assert.equal(f.link(C).payload.predecessor, P);
+  assert.ok(messageIdCreatedMs(C)! >= messageIdCreatedMs(P)!);
+  const I = (await f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000004Z', { independent: true })).writeId;
+  assert.deepEqual([f.link(I).ordered, f.link(I).column, 'ordering' in f.link(I).payload, 'predecessor' in f.link(I).payload], [false, null, false, false]);
+  f.db.close();
+
+  // Reopen with all four still queued: the links hold, and a default write follows C, not I.
+  const g = modesFixture(path);
+  g.c.lastCreated = Number((g.db.prepare('SELECT max(created_at) AS m FROM _zebridge_outbox').get() as any).m);
+  assert.deepEqual([g.link(B).column, g.link(C).column, g.link(I).column], [P, P, null]);
+  const D = (await g.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000005Z')).writeId;
+  assert.equal(g.link(D).column, C, 'the tail after the independent write is still C');
+  g.db.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('ordering modes: after a write already gone from the outbox is accepted and dated no earlier than it', async () => {
+  const f = modesFixture(':memory:');
+  await f.c.addOutboxOrdering();
+  const P = (await f.write('p', 'INSERT', 'x', '2026-11-09T10:00:00.000001Z')).writeId;
+  await f.c.outboxDrop(P, true);
+  f.c.clockOffsetMs = () => -3_600_000; // the clock an hour behind P's time
+  const C = (await f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000002Z', { after: P })).writeId;
+  assert.equal(f.link(C).column, P);
+  assert.equal(messageIdCreatedMs(C), messageIdCreatedMs(P), 'equal, not earlier');
+  f.db.close();
+});
+
+test('ordering modes: every misuse refuses before anything is written, and names what is wrong', async () => {
+  const f = modesFixture(':memory:');
+  await f.c.addOutboxOrdering();
+  const P = (await f.write('p', 'INSERT', 'x', '2026-11-09T10:00:00.000001Z')).writeId;
+  const row = () => ({ ...(f.db.prepare(`SELECT title FROM p WHERE id = 'x'`).get() as any) });
+  const shown = row(), queued = f.count();
+  const refuses = async (label: string, run: () => Promise<unknown>, words: RegExp) => {
+    await assert.rejects(run, (e: any) => e instanceof OrderingRefusal && words.test(e.message), label);
+    assert.equal(f.count(), queued, `${label}: nothing queued`);
+    assert.deepEqual(row(), shown, `${label}: the displayed row is intact`);
+  };
+  await refuses('no ordering offered', () => f.write('c', 'INSERT', 'k', '2026-11-09T10:00:00.000002Z', { after: P }), /^after needs ordering: the bridge does not offer it for 'c'$/);
+  await refuses('malformed ID', () => f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000003Z', { after: 'legacy-id' }), /^after: 'legacy-id' is not a write of this client$/);
+  // Truncated: the client token is right, but no table, key or version: no client made it.
+  await refuses('truncated ID', () => f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000003Z', { after: `zb1-t${Date.now()}-INSERT-phone~2D1~2Ea` }), /is not a write of this client/);
+  for (const bad of [`zb1-t1-UPDATE-phone~2D1~2Ea-p-k2-x-v`, `zb1-t1-UPDATE-phone~2D1~2Ea-p-k1-x~2-v`, `zb1-t1-MERGE-phone~2D1~2Ea-p-k1-x-v`, `zb1-t1-UPDATE-phone~2D1~2Ea-p-k1-x-v-extra`, `zb1-t1-UPDATE-phone~2D1~2Ea--k1-x-v`])
+    assert.equal(messageIdOfClient(bad, 'phone-1.a'), false, bad);
+  assert.equal(messageIdOfClient(mutationMsgId(1, 'phone-1.a', 'p', 'DELETE', ['a+b', 'null'], 'v'), 'phone-1.a'), true, 'a composite key');
+  // Canonical only: `~72` decodes to `r`, which the generator writes literally.
+  const genuine = mutationMsgId(1787824800123, 'phone-1.a', 'rows', 'UPDATE', ['7'], 'v');
+  assert.equal(messageIdOfClient(genuine, 'phone-1.a'), true);
+  assert.equal(messageIdOfClient(genuine.replace('-rows-', '-~72ows-'), 'phone-1.a'), false, 'a non-canonical spelling of the same table');
+  // The time spelled canonically: t0 is a time, t00 and a zero-padded t0123 are not (libzb's same cases).
+  assert.equal(messageIdOfClient(mutationMsgId(0, 'phone-1.a', 'rows', 'UPDATE', ['7'], 'v'), 'phone-1.a'), true, 't0');
+  assert.equal(messageIdOfClient('zb1-t00-UPDATE-phone~2D1~2Ea-rows-k1-7-v', 'phone-1.a'), false, 't00');
+  const t123 = mutationMsgId(123, 'phone-1.a', 'rows', 'UPDATE', ['7'], 'v');
+  assert.equal(messageIdOfClient(t123, 'phone-1.a'), true);
+  assert.equal(messageIdOfClient(t123.replace('-t123-', '-t0123-'), 'phone-1.a'), false, 'zero-padded');
+  // Every ID the generator makes from awkward inputs validates (libzb's same cases).
+  for (const [client, table, v] of [['phone 1~x', 'my-table.v2', '2026-11-11T10:00:00.123456Z'], ['é+ü', 't', 'a~b'], ['c:1_2', 'rows', '-']])
+    assert.equal(messageIdOfClient(mutationMsgId(1787824800123, client, table, 'INSERT', [v, '', '+'], v), client), true, `${client} ${table} ${v}`);
+  const foreign = mutationMsgId(Date.now(), 'phone-2', 'p', 'UPDATE', ['x'], 'v');
+  await refuses('another client', () => f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000004Z', { after: foreign }), /is not a write of this client/);
+  await refuses('both options', () => f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000005Z', { after: P, independent: true }), /^after and independent cannot be combined$/);
+  // Self: P's own version, operation and key, the clock behind P: the built ID is P's. P is
+  // in flight (sent, tracked for its echo): the refusal must leave that tracking alone.
+  f.c.pendingWrites.set(P, { table: 'p', id: 'x', at: Date.now(), version: '2026-11-09T10:00:00.000001Z' });
+  f.c.clockOffsetMs = () => -3_600_000;
+  await refuses('self-dependency', () => f.write('p', 'INSERT', 'x', '2026-11-09T10:00:00.000001Z', { after: P }), /^after: a write cannot depend on itself/);
+  assert.equal((f.db.prepare('SELECT attempts FROM _zebridge_outbox WHERE msg_id = ?').get(P) as any).attempts, 0, "P's own entry is untouched");
+  assert.ok(f.c.pendingWrites.has(P), "P's session tracking survives the refusal");
+  // P's echo still settles it, as for any write in flight.
+  f.c.confirmEcho('p', f.c.syncedTables.get('p'), { operation: 'INSERT', data: { id: 'x', title: '2026-11-09T10:00:00.000001Z' } });
+  assert.ok(!f.c.pendingWrites.has(P), 'its echo found it');
+  const gone = () => !f.db.prepare('SELECT 1 FROM _zebridge_outbox WHERE msg_id = ?').get(P);
+  for (let i = 0; i < 100 && !gone(); i++) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(gone(), 'and settled it: the outbox entry is gone');
+  f.db.close();
+});
+
+test('ordering modes: ordering withdrawn while the call waits refuses after, with nothing written', async () => {
+  const f = modesFixture(':memory:');
+  await f.c.addOutboxOrdering();
+  const P = (await f.write('p', 'INSERT', 'x', '2026-11-09T10:00:00.000001Z')).writeId;
+  const queued = f.count();
+  const shown = { ...(f.db.prepare(`SELECT title FROM p WHERE id = 'x'`).get() as any) };
+  // A descriptor update lands during the floor read: the table no longer offers ordering.
+  f.c.gcWatermark = async () => { f.c.syncedTables.get('p').ordering = 0; return null; };
+  await assert.rejects(f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:00.000002Z', { after: P }), (e: any) => e instanceof OrderingRefusal && /^after needs ordering: the bridge does not offer it for 'p'$/.test(e.message));
+  assert.equal(f.count(), queued, 'no outbox entry');
+  assert.deepEqual({ ...(f.db.prepare(`SELECT title FROM p WHERE id = 'x'`).get() as any) }, shown, 'no optimistic change');
+  f.db.close();
+});
+
+test('ordering modes: an ID only for a write durably queued; mutate() keeps its shape and its single verdict', async () => {
+  const f = modesFixture(':memory:');
+  await f.c.addOutboxOrdering();
+  Object.assign(f.c, { initializeStorage: async () => {}, newVersion: () => '2026-11-09T10:00:00.000009Z' });
+  // Offline: queued, and the returned ID is the stored one.
+  const r = await f.c.mutateWithId('p', 'insert', { id: 'y' }, { title: 'y' });
+  assert.deepEqual(Object.keys(r).sort(), ['version', 'writeId']);
+  assert.ok((f.db.prepare('SELECT 1 FROM _zebridge_outbox WHERE msg_id = ?').get(r.writeId)));
+  assert.deepEqual(await f.c.mutate('p', 'update', { id: 'y' }, { title: 'z' }, { version: '2026-11-09T10:00:00.000010Z' }), { version: '2026-11-09T10:00:00.000010Z' });
+  // An empty stamp would make an ID no `after` can name: refused before anything is queued.
+  const queuedBefore = f.count();
+  await assert.rejects(f.c.mutateWithId('p', 'update', { id: 'y' }, { title: 'e' }, { version: '' }), /^Error: a write's version cannot be empty$/);
+  assert.equal(f.count(), queuedBefore);
+  // A local transaction that rolls back queues nothing: mutateWithId rejects.
+  const apply = f.c.applyEvent;
+  f.c.applyEvent = async () => { throw new Error('disk full'); };
+  const before = f.count();
+  await assert.rejects(f.c.mutateWithId('p', 'update', { id: 'y' }, { title: 'w' }, { version: '2026-11-09T10:00:00.000011Z' }), /^Error: write not queued: NotQueued/);
+  assert.equal(f.count(), before);
+  f.c.applyEvent = apply;
+  // The GC floor at enqueue: mutate() reports rejected / PredatesGcWatermark once; mutateWithId rejects; nothing applied or queued.
+  f.c.gcWatermark = async () => '2099-01-01T00:00:00.000000Z';
+  assert.deepEqual(await f.c.mutate('p', 'update', { id: 'y' }, { title: 'v' }, { version: '2026-11-09T10:00:00.000012Z' }), { version: '2026-11-09T10:00:00.000012Z' });
+  assert.deepEqual(f.verdicts.map((v) => [v.outcome, v.reason]), [['rejected', 'PredatesGcWatermark']], 'one notification');
+  await assert.rejects(f.c.mutateWithId('p', 'update', { id: 'y' }, { title: 'u' }, { version: '2026-11-09T10:00:00.000013Z' }), /write not queued: PredatesGcWatermark/);
+  assert.equal(f.verdicts.length, 2);
+  assert.equal(f.count(), before);
+  assert.equal((f.db.prepare(`SELECT title FROM p WHERE id = 'y'`).get() as any).title, 'z', 'the displayed row is the last queued write');
+  f.db.close();
+});
+
+test('ordering modes: the GC floor is still checked at send time, for a floor that moved while offline', async () => {
+  const f = modesFixture(':memory:');
+  await f.c.addOutboxOrdering();
+  const P = (await f.write('p', 'INSERT', 'x', '2026-11-09T10:00:00.000001Z')).writeId;
+  const C = (await f.write('p', 'UPDATE', 'x', '2026-11-09T10:00:05.000000Z', { after: P })).writeId;
+  // Offline the floor passes P's version, not C's; then the client reconnects and flushes.
+  f.c.gcWatermark = async () => '2026-11-09T10:00:02.000000Z';
+  const sends: string[] = [];
+  Object.assign(f.c, {
+    nc: {}, outboxWork: null, outboxWake: false, outboxWindow: 128, nextOutboxRetry: 0, outboxReconnect: 0, outboxRetryEpoch: 0, holdUntil: 0,
+    ackPrefix: () => 'mutation_ack', revertOptimisticWrite: async () => {},
+    transport: { headers: () => new Map(), jetstream: () => ({ publish: async (_s: string, _b: Uint8Array, o: any) => { sends.push(o.headers.get('Nats-Msg-Id')); return { seq: sends.length }; } }) },
+  });
+  await f.c.flushOutboxPass();
+  assert.deepEqual(f.verdicts.filter((v) => v.reason === 'PredatesGcWatermark').length, 1, 'P refused once');
+  assert.ok(!f.db.prepare('SELECT 1 FROM _zebridge_outbox WHERE msg_id = ?').get(P), 'P never sent, dropped');
+  assert.deepEqual(sends, [C], 'C is sent, still naming P: the documented limit, resolved by the bridge');
+  assert.equal(f.link(C).payload.predecessor, P);
+  f.db.close();
 });

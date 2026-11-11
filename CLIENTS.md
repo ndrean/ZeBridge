@@ -115,6 +115,22 @@ library's, in both clients, and it is what PROTOCOL §7 requires of any client:
 4. **State only arrives through CDC.** A verdict is never data: the row the app sees is
    what PostgreSQL emitted, apart from the optimistic row still waiting for its echo.
 
+### Ordering a write
+
+On a table whose bridge offers ordering (`ordering: 1` in its write contract), each write chooses what it waits for. The contract is [PROTOCOL, Ordered ingress](PROTOCOL.md#ordered-ingress-version-1).
+
+| mode | the write waits for | later writes |
+| --- | --- | --- |
+| default (the tail) | this client's newest unsettled ordered write, if any | it becomes the new tail |
+| `after: <writeId>` | that earlier write of this client | it becomes the new tail |
+| `independent` | nothing: it has no predecessor | the tail is left as it was |
+
+- **libzb:** `zb_client_mutate_opts(…, opts_json)` with `{"after"}` or `{"independent": true}` (and `"version"`), returning `{"msgId"}`; zb-python `mutate(…, after=…, independent=True)`. **zb-client-ts:** `mutate(…, { after })` or `{ independent: true }`, returning `{ version }` as before, and `mutateWithId(…)` returning `{ version, writeId }`.
+- **An ID only for a write durably queued.** `msgId` / `writeId` is the outbox row's. A write refused before it was queued (the GC floor, a suspended table, a local transaction that failed) gives no ID: libzb returns an error, `mutateWithId` rejects, and `mutate` behaves as it always did (a refusal by the GC floor still reports `rejected` / `PredatesGcWatermark` once).
+- **Refused before anything is written**, in both clients with the same words: `after` on a table whose bridge offers no ordering, an ID that is not a complete one of this client (the whole generated shape, canonically encoded, with this client's token; the principal is the bridge's to resolve), `after` with `independent`, a write whose own ID would equal the one it names (the same operation, key and version, on a clock at or behind it), and an empty caller-supplied version (its ID could not be named).
+- **`after` names a write, not a row.** The named write may already have left the outbox: the bridge answers from its receipt. A rejected predecessor still releases the write, which PostgreSQL then judges on its own.
+- **Branching.** Two writes may each name the same earlier write; either may run first, and a later default write follows whichever was queued last. Waiting for several writes at once is not offered.
+
 Last-write-wins is decided by PostgreSQL on the table's version column (and its tiebreak
 column, on equal versions). The version, tombstone and tiebreak columns are the table's
 `zebridge_catalogue` row, and every client learns them from the schema it receives.
@@ -244,6 +260,7 @@ Everything below the core — the shells — is where parity is by hand, and whe
 | outbox durable, optimistic apply + queue in one transaction | ✓ | ✓ |
 | version stamped by the client (HLC) | ✓ | ✓ |
 | verdicts: accepted / stale / rejected / row_deleted, two revert targets | ✓ | ✓ |
+| a write's ordering: the tail by default, `after` one earlier write, `independent`; an ID only for a write durably queued | ✓ `zb_client_mutate_opts` | ✓ `mutate(…, { after \| independent })`, `mutateWithId` |
 | a stale UPDATE rebased onto the winning row when the columns are disjoint, dropped and surfaced when they overlap; the winner before or after the verdict, a slow clock | ✓ `mutate_at` stamps a write explicitly | ✓ `mutate(…, { version })` |
 | each write's final outcome, once — applied, rebased, lost, deleted, rejected — and only for this client's own writes (another device of the same principal hears the verdict too) | ✓ poll report `outcomes` | ✓ `onVerdict` |
 | a write with no socket queues in the outbox and goes out on the next connect | ✓ (the host's flush) | ✓ |

@@ -23,6 +23,8 @@
 //!   char* zb_client_mutate(uint64_t h, const char* table, const char* op,
 //!       // key_json addresses the row; an INSERT's values_json carries the WHOLE row, key included (the bridge builds it from data)
 //!                          const char* key_json, const char* values_json);   // {"msgId":…}
+//!   char* zb_client_mutate_opts(uint64_t h, const char* table, const char* op, const char* key_json,
+//!                          const char* values_json, const char* opts_json);   // {"version"?,"after"?,"independent"?} → {"msgId":…}
 //!   char* zb_client_flush_outbox(uint64_t h, uint64_t wait_ms);    // {"sent":n,"settled":n}
 //!   char* zb_client_request(uint64_t h, const char* subject, const char* payload_json, uint64_t timeout_ms);
 //!                                                                    // §10hj: ask a service on `query.<tenant>.<name>`; its reply verbatim
@@ -96,7 +98,7 @@ var clients: handles.Table(ClientBox, 64) = .{};
 
 /// The ABI version — libzb/abi.json's `version`, which python/abi_check.py keeps in
 /// step with what this file exports and what `openBox` reads.
-pub const abi_version: c_int = 7;
+pub const abi_version: c_int = 8;
 
 export fn zb_abi_version() c_int {
     return abi_version;
@@ -1122,10 +1124,10 @@ export fn zb_client_query(handle: u64, sql: ?[*:0]const u8, params_json: ?[*:0]c
     return dupeZ(out);
 }
 
-fn mutateJson(a: std.mem.Allocator, b: *ClientBox, table: []const u8, op: []const u8, key_text: []const u8, values_text: []const u8, stamp: ?[]const u8) ![]const u8 {
+fn mutateJson(a: std.mem.Allocator, b: *ClientBox, table: []const u8, op: []const u8, key_text: []const u8, values_text: []const u8, opts: client.SyncClient.MutateOptions) ![]const u8 {
     const key = (try std.json.parseFromSlice(Value, a, key_text, .{})).value;
     const values: ?Value = if (values_text.len == 0) null else (try std.json.parseFromSlice(Value, a, values_text, .{})).value;
-    const msg_id = try b.c.mutateAt(a, table, op, key, values, stamp);
+    const msg_id = try b.c.mutateWith(a, table, op, key, values, opts);
     var out: std.json.ObjectMap = .empty;
     try out.put(a, "msgId", .{ .string = msg_id });
     return try core.valueToString(a, .{ .object = out });
@@ -1139,7 +1141,28 @@ export fn zb_client_mutate(handle: u64, table: ?[*:0]const u8, op: ?[*:0]const u
     const v = if (values_json) |vj| std.mem.span(vj) else "";
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
-    const out = mutateJson(arena.allocator(), b, t, o, k, v, null) catch |err| return errJson(@errorName(err));
+    const out = mutateJson(arena.allocator(), b, t, o, k, v, .{}) catch |err| return errJson(@errorName(err));
+    return dupeZ(out);
+}
+
+/// `zb_client_mutate` with options, `opts_json` an object (or NULL) of `version` (the
+/// caller's stamp, as `zb_client_mutate_at`), `after` (wait for this earlier write of the
+/// same client instead of the newest unsettled one) and `independent` (no predecessor;
+/// the ordering tail is left as it was). `msgId` is returned only for a write durably
+/// queued: a refusal (`AfterNeedsOrdering`, `AfterNotThisClient`, `AfterSelf`,
+/// `AfterWithIndependent`, `PredatesGcWatermark`) is an `error`.
+export fn zb_client_mutate_opts(handle: u64, table: ?[*:0]const u8, op: ?[*:0]const u8, key_json: ?[*:0]const u8, values_json: ?[*:0]const u8, opts_json: ?[*:0]const u8) ?[*:0]u8 {
+    const b = lookup(handle) orelse return goneJson(handle);
+    const t = std.mem.span(table orelse return null);
+    const o = std.mem.span(op orelse return null);
+    const k = std.mem.span(key_json orelse return null);
+    const v = if (values_json) |vj| std.mem.span(vj) else "";
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Opts = struct { version: ?[]const u8 = null, after: ?[]const u8 = null, independent: bool = false };
+    const parsed: Opts = if (opts_json) |oj| (std.json.parseFromSliceLeaky(Opts, a, std.mem.span(oj), .{}) catch return errJson("InvalidOptions")) else .{};
+    const out = mutateJson(a, b, t, o, k, v, .{ .stamp = parsed.version, .after = parsed.after, .independent = parsed.independent }) catch |err| return errJson(@errorName(err));
     return dupeZ(out);
 }
 
@@ -1154,7 +1177,7 @@ export fn zb_client_mutate_at(handle: u64, table: ?[*:0]const u8, op: ?[*:0]cons
     const stamp: ?[]const u8 = if (version) |vz| std.mem.span(vz) else null;
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
-    const out = mutateJson(arena.allocator(), b, t, o, k, v, stamp) catch |err| return errJson(@errorName(err));
+    const out = mutateJson(arena.allocator(), b, t, o, k, v, .{ .stamp = stamp }) catch |err| return errJson(@errorName(err));
     return dupeZ(out);
 }
 

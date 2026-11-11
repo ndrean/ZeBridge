@@ -38,7 +38,7 @@ from . import _native as n
 __all__ = ["ZeBridge", "ZeBridgeError", "ZB_ABI", "create_user", "creds_file_text", "grammar_hash", "merge_registers"]
 
 #: libzb's C ABI version this package was written for; libzb/python/abi_check.py checks it.
-ZB_ABI = 7
+ZB_ABI = 8
 
 
 class ZeBridgeError(RuntimeError):
@@ -215,10 +215,19 @@ class ZeBridge:
             return [dict(zip(cols, row)) for row in r["rows"]]
         return self._call(go)
 
-    def mutate(self, table: str, op: str, key: dict, values: dict | None = None, version: str | None = None) -> dict:
+    def mutate(self, table: str, op: str, key: dict, values: dict | None = None, version: str | None = None,
+               after: str | None = None, independent: bool = False) -> dict:
         """Write a row (op: INSERT, UPDATE or DELETE, any case): applied locally at once,
-        sent to PostgreSQL, settled by its verdict (`on_change` sees `settled`)."""
+        sent to PostgreSQL, settled by its verdict (`on_change` sees `settled`). Returns
+        {"msgId"} for a write durably queued.
+
+        On a table whose bridge offers ordering, a write waits for this client's newest
+        unsettled ordered write. `after=<msgId>` waits for that earlier write instead;
+        `independent=True` has no predecessor and leaves the ordering tail as it was."""
         def go():
+            if after is not None or independent:
+                opts = {k: v for k, v in (("version", version), ("after", after), ("independent", independent or None)) if v is not None}
+                return _check(n.take(n.lib.zb_client_mutate_opts(self._handle, table.encode(), op.encode(), n.enc(key), n.enc(values), n.enc(opts))))
             if version is None:
                 return _check(n.take(n.lib.zb_client_mutate(self._handle, table.encode(), op.encode(), n.enc(key), n.enc(values))))
             return _check(n.take(n.lib.zb_client_mutate_at(self._handle, table.encode(), op.encode(), n.enc(key), n.enc(values), version.encode())))
