@@ -35,8 +35,9 @@ cd zb-client-ts && pnpm typecheck && pnpm test    # node:test with node:sqlite; 
 ```
 
 - The Zig test runner **fails a test that logs at `err`**: use `log.warn` for conditions a test provokes.
-- Zig 0.17.0 and 0.17.1 both build the tree and give libzb's SQLite and zstd pins the same hashes. A `hash mismatch` on them
-  is a stale archive in `~/.cache/zig/p/`: delete the archive named in the error and fetch again (NOTES "The native archiver").
+- Zig **0.17.1** is the minimum (`minimum_zig_version`): its std builds `std.Io.Threaded` for iOS, so no patched copy is
+  needed (`scripts/zig-lib-dir.sh` prints nothing). A `hash mismatch` on libzb's SQLite and zstd pins is a stale archive
+  in `~/.cache/zig/p/`: delete the archive named in the error and fetch again (NOTES "The native archiver").
 - A sandbox may block Zig's HTTP/archive fetch. Fetch dependencies with `git clone`, `git archive` to a tarball and
   `zig fetch ./x.tar.gz`; the hashes match. `libzb/build.zig.zon` may be locally trimmed in such a sandbox — check
   `git ls-files -v libzb/build.zig.zon` (an `S` means skip-worktree) before committing anything under `libzb/`.
