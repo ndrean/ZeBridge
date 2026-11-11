@@ -2147,7 +2147,9 @@ BEGIN
         SELECT i.incarnation, (rel IS NOT NULL AND COALESCE(i.incarnation_relid = rel, false))
           INTO incarnation, live
           FROM public.zebridge_incarnations i WHERE i.tbl = t;
-        IF NOT FOUND THEN incarnation := NULL; live := NULL; END IF;
+        -- Nothing recorded, or a row the epoch floor created with no incarnation yet (0):
+        -- the write's table cannot be identified, so it is retried, never judged.
+        IF NOT FOUND OR incarnation IS NULL OR incarnation < 1 THEN incarnation := NULL; live := NULL; END IF;
         RETURN NEXT;
     END LOOP;
 END $$;

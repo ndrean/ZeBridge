@@ -28,6 +28,13 @@ window can be held open (`ZB_TEST_FAULT=incarnation_pause` while a file exists):
   H  preflight: a bridge whose writer may not run the gate does not start.
   I  advertising: with the switch on and the bridge restarted, the descriptor carries the
      table's current incarnation.
+  J  an all-unstamped batch (switch off) commits as one batch, with no per-write replay.
+  K  identity unknown while advertised: the incarnation row gone and the descriptor
+     republished, it says `incarnation: null` and `writable: false`, and a stamped write is
+     retried, not judged; the row restored and republished, advertising recovers and the
+     write is applied.
+  L  the policy unreadable (not "off"): descriptors withhold writes the same way, and
+     recover once it can be read.
 
 Needs a PostgreSQL superuser on 127.0.0.1:5432, nats-server and the fault build of the
 bridge (`zig build -Doptimize=ReleaseFast -Dtest-faults=true -p zig-out-faults`).
@@ -181,6 +188,17 @@ async def run(tmp):
             got = await g.verdict(sub)
             check(f"A: stamp {label}: {want[0]} {want[1]}".rstrip(), got == want and g.receipt(mid) == want, f"verdict {got}, receipt {g.receipt(mid)}")
 
+        # ── J: an all-unstamped batch, the switch off ──
+        stack.bridge_down(bridge)
+        unstamped = [(T, g.mid("UPDATE", T), g.payload(r_a, "J unstamped a")),
+                     (T, g.mid("UPDATE", T), g.payload(r_w, "J unstamped w")),
+                     (U, g.mid("UPDATE", U), g.payload(r_u, "J unstamped u"))]
+        subs = [(await g.send(t, m, b))[0] for t, m, b in unstamped]
+        bridge = stack.bridge_up()
+        results = [await g.verdict(x) for x in subs]
+        check("J: three unstamped writes, all accepted", results == [("accepted", "")] * 3, str(results))
+        check("J: they committed as one batch (no per-write replay)", "replayed one write at a time" not in bridge_log(stack, bridge))
+
         # ── B: the write holds the gate's lock, a DROP waits for it ──
         g.pause.touch()
         mid_hold = g.mid("UPDATE", T)
@@ -321,6 +339,59 @@ async def run(tmp):
             if isinstance(d, dict) and "incarnation" in d: break
             await asyncio.sleep(0.5)
         check(f"I: switch on: the descriptor carries {T}'s current incarnation ({g.inc(T)})", isinstance(d, dict) and d.get("incarnation") == g.inc(T), str(d.get("incarnation") if isinstance(d, dict) else d))
+
+        async def descriptor_where(pred, label):
+            end, d = time.monotonic() + 30, None
+            while time.monotonic() < end:
+                d = await g.descriptor(T)
+                if isinstance(d, dict) and pred(d): return d
+                await asyncio.sleep(0.5)
+            return d
+
+        def republish():
+            g.s.sql(f"SELECT zebridge_reseed('{T}')")
+
+        # ── K: identity unknown while advertised ──
+        saved = g.s.sql(f"SELECT incarnation || ',' || incarnation_relid::text FROM public.zebridge_incarnations WHERE tbl = '{T}'")
+        inc_s, relid_s = saved.split(",")
+        epoch0 = (await g.descriptor(T) or {}).get("seed_epoch", 0)
+        g.s.sql(f"DELETE FROM public.zebridge_incarnations WHERE tbl = '{T}'")
+        republish()
+        d = await descriptor_where(lambda d: d.get("seed_epoch", 0) > epoch0, "republished")
+        check("K: identity unknown, advertised: the descriptor says incarnation null and writes withheld",
+              isinstance(d, dict) and "incarnation" in d and d["incarnation"] is None and d.get("writable") is False,
+              str({k: d.get(k) for k in ("seed_epoch", "incarnation", "writable")} if isinstance(d, dict) else d))
+        r_k = str(uuid.uuid4())
+        g.s.sql(f"INSERT INTO public.{T} (uid, title, tenant_id) VALUES ('{r_k}', 'original', '{TENANT}')")
+        mid_k2 = g.mid("UPDATE", T)
+        sub_k2, _, _ = await g.send(T, mid_k2, g.payload(r_k, "K stamped while unknown", int(inc_s)))
+        early = await g.verdict(sub_k2, timeout=4)
+        check("K: a stamped write meanwhile is retried, not judged (no receipt)", early in (None, ("failed", "IncarnationUnavailable")) and g.receipt(mid_k2) is None, f"verdict {early}")
+        g.s.sql(f"UPDATE public.zebridge_incarnations SET incarnation = {inc_s}, incarnation_relid = {relid_s} WHERE tbl = '{T}'")
+        epoch1 = d.get("seed_epoch", 0) if isinstance(d, dict) else 0
+        republish()
+        d = await descriptor_where(lambda d: d.get("seed_epoch", 0) > epoch1, "recovered")
+        check(f"K: restored and republished: advertising recovers (incarnation {inc_s}, writes not withheld)",
+              isinstance(d, dict) and d.get("incarnation") == int(inc_s) and d.get("writable") is not False,
+              str({k: d.get(k) for k in ("seed_epoch", "incarnation", "writable")} if isinstance(d, dict) else d))
+        got = await g.verdict(sub_k2, timeout=30)
+        check("K: the stamped write is applied once the identity is known", got == ("accepted", "") and g.row(T, r_k) == "K stamped while unknown", f"verdict {got}")
+
+        # ── L: the policy unreadable is not "off" ──
+        reader = stack.name + "_r"
+        g.s.sql(f"REVOKE EXECUTE ON FUNCTION public.zebridge_incarnation_stamps() FROM {reader}, {writer}")
+        epoch2 = d.get("seed_epoch", 0) if isinstance(d, dict) else 0
+        republish()
+        d = await descriptor_where(lambda d: d.get("seed_epoch", 0) > epoch2, "unreadable")
+        check("L: the policy unreadable: writes withheld (incarnation null, writable false), not advertised as off",
+              isinstance(d, dict) and "incarnation" in d and d["incarnation"] is None and d.get("writable") is False,
+              str({k: d.get(k) for k in ("seed_epoch", "incarnation", "writable")} if isinstance(d, dict) else d))
+        g.s.sql(f"GRANT EXECUTE ON FUNCTION public.zebridge_incarnation_stamps() TO {reader}, {writer}")
+        epoch3 = d.get("seed_epoch", 0) if isinstance(d, dict) else 0
+        republish()
+        d = await descriptor_where(lambda d: d.get("seed_epoch", 0) > epoch3, "readable")
+        check("L: readable again: advertising recovers", isinstance(d, dict) and d.get("incarnation") == g.inc(T) and d.get("writable") is not False,
+              str({k: d.get(k) for k in ("seed_epoch", "incarnation", "writable")} if isinstance(d, dict) else d))
         await g.nc.close(); await g.look.nc.close()
     finally:
         stack.stop()

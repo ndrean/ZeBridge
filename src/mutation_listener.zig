@@ -2264,7 +2264,9 @@ pub const MutationListener = struct {
             log.err("🔴 the GC floor could not be read ({s}) — writes are retried, not let through unchecked (re-apply init.write.template.sql if zebridge_gc_floor_acquire is missing)", .{c.PQerrorMessage(conn)});
             return error.MutationFailed;
         }
-        if (failed_at == 4) {
+        // `collect` sets failed_at to the result count on success: an index only when a
+        // result failed. An unstamped batch expects four, so 4 is its success, not the gate.
+        if (failed_at != r1.len and failed_at == 4) {
             log.err("🔴 the table incarnations could not be read or locked ({s}) — stamped writes are retried, not let through unchecked (re-apply init.write.template.sql if zebridge_private.lock_incarnations is missing)", .{c.PQerrorMessage(conn)});
             return error.MutationFailed;
         }

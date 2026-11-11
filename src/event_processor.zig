@@ -1539,10 +1539,20 @@ pub const EventProcessor = struct {
         try json_str.appendSlice(arena, ",\"ordering\":1");
 
         // The incarnation a client stamps its writes with, and the bridge checks them
-        // against: advertised only once the administrator turned the switch on (every
-        // worker that consumes writes enforces it by then; see `lock_incarnations`).
-        if (self.cat) |cat| if (cat.incarnation_stamps) if (cat.incarnations.get(table)) |inc| if (inc > 0) {
-            try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"incarnation\":{d}", .{inc}));
+        // against: advertised once the administrator turned the switch on (every worker
+        // that consumes writes enforces it by then; see `lock_incarnations`). Advertised
+        // (or the policy unreadable) with no identity to state: `"incarnation": null` and
+        // writes withheld below. Omitting the key would read as "no enforcement", and a
+        // client would queue an unstamped write the gate cannot judge.
+        var withhold_writes = false;
+        if (self.cat) |cat| switch (cat.incarnation_stamps) {
+            .off => {},
+            .on, .unknown => if (cat.incarnation_stamps == .on and cat.incarnations.get(table) != null) {
+                try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"incarnation\":{d}", .{cat.incarnations.get(table).?}));
+            } else {
+                try json_str.appendSlice(arena, ",\"incarnation\":null");
+                withhold_writes = true;
+            },
         };
 
         // The catalogue's `tenant_col`: which column scopes this table's rows by tenant, or `null` for
@@ -1572,7 +1582,9 @@ pub const EventProcessor = struct {
         // `null` means "not yet reported" (a table that raced this publish before its
         // own DDL event landed), not "not writable" — a client should not treat the two
         // the same, so the field is omitted rather than defaulted to `false`.
-        if (self.writable.get(table)) |w| {
+        if (withhold_writes) {
+            try json_str.appendSlice(arena, ",\"writable\":false");
+        } else if (self.writable.get(table)) |w| {
             try json_str.appendSlice(arena, try std.fmt.allocPrint(
                 arena,
                 ",\"writable\":{s}",

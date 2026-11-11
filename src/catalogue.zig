@@ -52,11 +52,15 @@ pub const Load = struct {
     /// tbl → seed_epoch (§10df): a bump republishes the table's descriptor and tells
     /// clients to forget their watermark.
     epochs: std.StringHashMapUnmanaged(i64) = .empty,
-    /// tbl → its current incarnation (`zebridge_incarnations`; 0 when none is recorded).
+    /// tbl → its current incarnation (`zebridge_incarnations`), only when one is recorded
+    /// (≥ 1). A table absent here has an identity the bridge cannot state.
     incarnations: std.StringHashMapUnmanaged(i64) = .empty,
-    /// `zebridge_incarnation_stamps()`: whether descriptors advertise `incarnation`, so
-    /// that clients stamp their writes with it. Off when the function is missing.
-    incarnation_stamps: bool = false,
+    /// `zebridge_incarnation_stamps()`: whether descriptors advertise `incarnation`, so that
+    /// clients stamp their writes. `unknown`: the policy could not be read, which is not
+    /// the same as off — a descriptor then withholds writes rather than invite unstamped ones.
+    incarnation_stamps: Stamps = .off,
+
+    pub const Stamps = enum { off, on, unknown };
 
     pub fn deinit(self: *Load, allocator: std.mem.Allocator) void {
         var it = self.epochs.keyIterator();
@@ -177,7 +181,7 @@ pub fn loadRules(
     const res = c.PQexec(conn,
         "SELECT c.tbl, COALESCE(c.tenant_col::text, ''), c.version_col::text, " ++
             "COALESCE(c.tombstone_col::text, ''), COALESCE(c.tiebreak_col::text, ''), c.seed_epoch, " ++
-            "COALESCE((SELECT i.incarnation FROM public.zebridge_incarnations i WHERE i.tbl = c.tbl), 0) " ++
+            "(SELECT i.incarnation FROM public.zebridge_incarnations i WHERE i.tbl = c.tbl) " ++
             "FROM public.zebridge_catalogue c ORDER BY c.tbl");
     defer c.PQclear(res);
     if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
@@ -187,12 +191,15 @@ pub fn loadRules(
         return out;
     }
     out.available = true;
-    // The switch, apart: a database without the function (an older write SQL) reads as off,
-    // never as a catalogue that could not be read.
+    // The switch, apart, so it cannot fail the catalogue: read on or off, or `unknown`
+    // when the call fails (the descriptors then withhold writes; see `appendWriteContract`).
     {
         const sw = c.PQexec(conn, "SELECT public.zebridge_incarnation_stamps()");
         defer c.PQclear(sw);
-        out.incarnation_stamps = c.PQresultStatus(sw) == c.PGRES_TUPLES_OK and c.PQntuples(sw) == 1 and c.PQgetvalue(sw, 0, 0)[0] == 't';
+        out.incarnation_stamps = if (c.PQresultStatus(sw) != c.PGRES_TUPLES_OK or c.PQntuples(sw) != 1 or c.PQgetisnull(sw, 0, 0) == 1)
+            .unknown
+        else if (c.PQgetvalue(sw, 0, 0)[0] == 't') .on else .off;
+        if (out.incarnation_stamps == .unknown) log.warn("🗂️ the incarnation policy could not be read ({s}) — writable tables are published with writes withheld until it can", .{c.PQerrorMessage(conn)});
     }
 
     var publics: std.ArrayList([]const u8) = .empty;
@@ -209,10 +216,10 @@ pub fn loadRules(
         if (allocator.dupe(u8, tbl)) |k| {
             out.epochs.put(allocator, k, epoch) catch allocator.free(k);
         } else |_| {}
-        const incarnation = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, @intCast(i), 6)), 10) catch 0;
-        if (allocator.dupe(u8, tbl)) |k| {
+        const incarnation: i64 = if (c.PQgetisnull(res, @intCast(i), 6) == 1) 0 else std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, @intCast(i), 6)), 10) catch 0;
+        if (incarnation >= 1) if (allocator.dupe(u8, tbl)) |k| {
             out.incarnations.put(allocator, k, incarnation) catch allocator.free(k);
-        } else |_| {}
+        } else |_| {};
         var grew = false;
 
         if (tenant_col.len == 0) {
