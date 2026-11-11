@@ -8,7 +8,7 @@ uint64_t zb_client_connect(const char* opts_json);
 int      zb_client_close(uint64_t handle);
 char*    zb_client_sync(uint64_t h);
 char*    zb_client_query(uint64_t h, const char* sql, const char* params_json);
-char*    zb_client_mutate(uint64_t h, const char* table, const char* op, const char* key_json, const char* values_json);
+char*    zb_client_mutate_opts(uint64_t h, const char* table, const char* op, const char* key_json, const char* values_json, const char* opts_json);
 char*    zb_client_poll(uint64_t h, uint64_t wait_ms);
 char*    zb_client_flush_outbox(uint64_t h, uint64_t wait_ms);
 void     zb_free(char* p);

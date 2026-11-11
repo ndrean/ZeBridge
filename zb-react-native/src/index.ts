@@ -23,6 +23,7 @@ type Native = {
   query(handle: string, sql: string, paramsJson: string): Promise<string>;
   close(handle: string): Promise<number>;
   mutate(handle: string, table: string, op: string, keyJson: string, valuesJson: string): Promise<string>;
+  mutateOpts(handle: string, table: string, op: string, keyJson: string, valuesJson: string, optsJson: string): Promise<string>;
   request(handle: string, subject: string, payloadJson: string, timeoutMs: number): Promise<string>;
   flushOutbox(handle: string, waitMs: number): Promise<string>;
   stamp(handle: string): Promise<string>;
@@ -95,6 +96,10 @@ export type LibzbOptions = {
   seedStreamingAboveBytes?: number;
 };
 
+export type MutationResult =
+  | { msgId: string; error?: undefined; detail?: undefined }
+  | { error: string; detail?: string; msgId?: undefined };
+
 export type QueryResult = { columns: string[]; rows: any[][] };
 
 export class Libzb {
@@ -127,8 +132,12 @@ export class Libzb {
   }
 
   /// One write: applied locally at once, sent to the bridge, judged by PostgreSQL.
-  async mutate(table: string, op: 'INSERT' | 'UPDATE' | 'DELETE', key: Record<string, unknown>, values: Record<string, unknown> = {}): Promise<any> {
-    return JSON.parse(await native().mutate(this.woken(), table, op, JSON.stringify(key), JSON.stringify(values)));
+  async mutate(table: string, op: 'INSERT' | 'UPDATE' | 'DELETE', key: Record<string, unknown>, values: Record<string, unknown> = {}, options?: { after?: string; independent?: boolean }): Promise<MutationResult> {
+    const args = [this.woken(), table, op, JSON.stringify(key), JSON.stringify(values)] as const;
+    const reply = options === undefined
+      ? await native().mutate(...args)
+      : await native().mutateOpts(...args, JSON.stringify(options));
+    return JSON.parse(reply);
   }
 
   /// A question to a service (`query.<tenant>.<name>`): its answer, parsed.

@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 struct PollReport: Codable {
@@ -83,40 +84,27 @@ class ZeBridge: ObservableObject {
         }
     }
     
-    func mutate(table: String, op: String, key: [String: Any], values: [String: Any]?) throws {
-        guard handle != 0 else { return }
-        
-        let keyData = try JSONSerialization.data(withJSONObject: key)
-        let keyStr = String(data: keyData, encoding: .utf8) ?? "{}"
-        
-        var valStr = ""
-        if let values = values {
-            let valData = try JSONSerialization.data(withJSONObject: values)
-            valStr = String(data: valData, encoding: .utf8) ?? ""
+    @discardableResult
+    func mutate(table: String, op: String, key: [String: Any], values: [String: Any]? = nil,
+                after: String? = nil, independent: Bool = false) throws -> String {
+        func json(_ object: [String: Any]) throws -> String {
+            String(decoding: try JSONSerialization.data(withJSONObject: object), as: UTF8.self)
         }
-        
-        var resultStr: String?
-        
-        table.withCString { tableC in
-            op.withCString { opC in
-                keyStr.withCString { keyC in
-                    valStr.withCString { valC in
-                        if let resPtr = zb_client_mutate(handle, tableC, opC, keyC, valC) {
-                            resultStr = String(cString: resPtr)
-                            zb_free(resPtr)
-                        }
-                    }
-                }
-            }
+        var options: [String: Any] = ["independent": independent]
+        options["after"] = after
+        guard let ptr = zb_client_mutate_opts(handle, table, op, try json(key),
+                                              try values.map(json), try json(options)) else {
+            throw NSError(domain: "ZeBridge", code: 1, userInfo: [NSLocalizedDescriptionKey: "No mutation reply"])
         }
-        
-        if let resStr = resultStr, let data = resStr.data(using: .utf8),
-           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let err = dict["error"] as? String {
-            throw NSError(domain: "ZeBridge", code: 1, userInfo: [NSLocalizedDescriptionKey: err])
+        defer { zb_free(ptr) }
+        let reply = try JSONSerialization.jsonObject(with: Data(String(cString: ptr).utf8)) as? [String: Any]
+        guard let id = reply?["msgId"] as? String else {
+            throw NSError(domain: "ZeBridge", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                reply?["error"] as? String ?? "Missing msgId in mutation reply"])
         }
+        return id
     }
-    
+
     func poll(waitMs: UInt64) -> PollReport? {
         guard handle != 0 else { return nil }
         

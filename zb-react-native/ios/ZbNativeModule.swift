@@ -55,6 +55,10 @@ public class ZbNativeModule: Module {
       try Self.take(zb_client_mutate(try Self.handle(h), table, op, key, values), "zb_client_mutate")
     }.runOnQueue(queue)
 
+    AsyncFunction("mutateOpts") { (h: String, table: String, op: String, key: String, values: String, options: String) throws -> String in
+      try Self.take(zb_client_mutate_opts(try Self.handle(h), table, op, key, values, options), "zb_client_mutate_opts")
+    }.runOnQueue(queue)
+
     AsyncFunction("request") { (h: String, subject: String, payload: String, timeoutMs: Double) throws -> String in
       try Self.take(zb_client_request(try Self.handle(h), subject, payload, UInt64(max(0, timeoutMs))), "zb_client_request")
     }.runOnQueue(queue)

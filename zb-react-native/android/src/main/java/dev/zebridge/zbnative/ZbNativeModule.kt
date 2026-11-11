@@ -43,6 +43,9 @@ class ZbNativeModule : Module() {
     AsyncFunction("mutate") { h: String, table: String, op: String, key: String, values: String, promise: Promise ->
       run(promise) { take(Native.mutate(handle(h), table.toByteArray(), op.toByteArray(), key.toByteArray(), values.toByteArray(), null), "zb_client_mutate") }
     }
+    AsyncFunction("mutateOpts") { h: String, table: String, op: String, key: String, values: String, options: String, promise: Promise ->
+      run(promise) { take(Native.mutateOpts(handle(h), table.toByteArray(), op.toByteArray(), key.toByteArray(), values.toByteArray(), options.toByteArray()), "zb_client_mutate_opts") }
+    }
     AsyncFunction("request") { h: String, subject: String, payload: String, timeoutMs: Double, promise: Promise ->
       run(promise) { take(Native.request(handle(h), subject.toByteArray(), payload.toByteArray(), maxOf(0.0, timeoutMs).toLong()), "zb_client_request") }
     }
