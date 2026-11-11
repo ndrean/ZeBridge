@@ -32,6 +32,7 @@ extern char *zb_client_poll(uint64_t h, uint64_t wait_ms);
 extern char *zb_client_query(uint64_t h, const char *sql, const char *params_json);
 extern char *zb_client_mutate(uint64_t h, const char *table, const char *op, const char *key_json, const char *values_json);
 extern char *zb_client_mutate_at(uint64_t h, const char *table, const char *op, const char *key_json, const char *values_json, const char *version);
+extern char *zb_client_mutate_opts(uint64_t h, const char *table, const char *op, const char *key_json, const char *values_json, const char *options);
 extern char *zb_client_flush_outbox(uint64_t h, uint64_t wait_ms);
 extern char *zb_client_join(uint64_t h, const char *tenant);
 extern char *zb_client_leave(uint64_t h, const char *tenant);
@@ -117,6 +118,17 @@ FN(jbyteArray, mutate)(JNIEnv *env, jclass cls, jlong h, jbyteArray table, jbyte
     char *res = ver != NULL ? zb_client_mutate_at(U64(h), t, o, k, v, ver) : zb_client_mutate(U64(h), t, o, k, v);
     jbyteArray r = owned(env, res);
     free(t); free(o); free(k); free(v); free(ver);
+    return r;
+}
+
+FN(jbyteArray, mutateOpts)(JNIEnv *env, jclass cls, jlong h, jbyteArray table, jbyteArray op, jbyteArray key, jbyteArray values, jbyteArray options) {
+    char *t = in(env, table), *o = in(env, op), *k = in(env, key), *v = in(env, values), *opts = in(env, options);
+    /* A failed copy must never turn an explicit dependency into the default mode. */
+    jbyteArray r = NULL;
+    if (t && o && k && opts && (!values || v) && !(*env)->ExceptionCheck(env)) {
+        r = owned(env, zb_client_mutate_opts(U64(h), t, o, k, v, opts));
+    }
+    free(t); free(o); free(k); free(v); free(opts);
     return r;
 }
 

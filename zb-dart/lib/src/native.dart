@@ -120,8 +120,8 @@ typedef _PtrOfHSSC = ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Pointer<Utf8>, f
 typedef _PtrOfHSS = ffi.Pointer<Utf8> Function(int, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
 typedef _PtrOfHSSSC = ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
 typedef _PtrOfHSSS = ffi.Pointer<Utf8> Function(int, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
-typedef _PtrOfHSSSSC = ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
-typedef _PtrOfHSSSS = ffi.Pointer<Utf8> Function(int, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
+typedef _PtrOfHSSSSSC = ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
+typedef _PtrOfHSSSSS = ffi.Pointer<Utf8> Function(int, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
 typedef _PtrOfHSSNC = ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Uint64);
 typedef _PtrOfHSSN = ffi.Pointer<Utf8> Function(int, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int);
 typedef _PtrOfHNSC = ffi.Pointer<Utf8> Function(ffi.Uint64, ffi.Uint64, ffi.Pointer<Utf8>);
@@ -158,8 +158,8 @@ external ffi.Pointer<Utf8> _zbPoll(int h, int ms);
 external ffi.Pointer<Utf8> _zbFlush(int h, int ms);
 @ffi.Native<_PtrOfHSSC>(symbol: 'zb_client_query')
 external ffi.Pointer<Utf8> _zbQuery(int h, ffi.Pointer<Utf8> sql, ffi.Pointer<Utf8> params);
-@ffi.Native<_PtrOfHSSSSC>(symbol: 'zb_client_mutate')
-external ffi.Pointer<Utf8> _zbMutate(int h, ffi.Pointer<Utf8> table, ffi.Pointer<Utf8> op, ffi.Pointer<Utf8> key, ffi.Pointer<Utf8> values);
+@ffi.Native<_PtrOfHSSSSSC>(symbol: 'zb_client_mutate_opts')
+external ffi.Pointer<Utf8> _zbMutate(int h, ffi.Pointer<Utf8> table, ffi.Pointer<Utf8> op, ffi.Pointer<Utf8> key, ffi.Pointer<Utf8> values, ffi.Pointer<Utf8> options);
 @ffi.Native<_PtrOfHSC>(symbol: 'zb_client_join')
 external ffi.Pointer<Utf8> _zbJoin(int h, ffi.Pointer<Utf8> tenant);
 @ffi.Native<_PtrOfHSC>(symbol: 'zb_client_leave')
@@ -185,7 +185,7 @@ class ZeBridge {
   static late _PtrOfH _stamp;
   static late _PtrOfHN _poll, _flush;
   static late _PtrOfHSS _query;
-  static late _PtrOfHSSSS _mutate;
+  static late _PtrOfHSSSSS _mutate;
   static late _PtrOfHS _join, _leave, _serve;
   static late _PtrOfHSSN _request;
   static late _PtrOfHSSS _ingest;
@@ -209,7 +209,7 @@ class ZeBridge {
     _poll = (h, ms) => _zbPoll(h, ms);
     _flush = (h, ms) => _zbFlush(h, ms);
     _query = (h, a, b) => _zbQuery(h, a, b);
-    _mutate = (h, a, b, c, d) => _zbMutate(h, a, b, c, d);
+    _mutate = (h, a, b, c, d, e) => _zbMutate(h, a, b, c, d, e);
     _join = (h, t) => _zbJoin(h, t);
     _leave = (h, t) => _zbLeave(h, t);
     _serve = (h, o) => _zbServe(h, o);
@@ -277,7 +277,14 @@ class ZeBridge {
 
   /// Write a row (INSERT, UPDATE or DELETE, any case): local at once, settled by its verdict.
   Map<String, dynamic> mutate(String table, String op, Map<String, dynamic> key, [Map<String, dynamic>? values]) =>
-      Map<String, dynamic>.from(_with([table, op, key, values], (p) => _take(_mutate(_handle, p[0], p[1], p[2], p[3]))) as Map);
+      mutateWith(table, op, key, values: values);
+
+  Map<String, dynamic> mutateWith(String table, String op, Map<String, dynamic> key,
+      {Map<String, dynamic>? values, String? after, bool independent = false}) {
+    final options = {if (after != null) 'after': after, if (independent) 'independent': true};
+    return Map<String, dynamic>.from(_with([table, op, key, values, options],
+        (p) => _take(_mutate(_handle, p[0], p[1], p[2], p[3], p[4]))) as Map);
+  }
 
   /// A register stamp (the `t` of {v, t, w}, COOPERATIVE_EDITING.md): the bridge's time as
   /// this client estimates it, never behind what it has seen or stamped.

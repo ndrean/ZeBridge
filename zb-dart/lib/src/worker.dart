@@ -140,10 +140,16 @@ class ZeBridgeWorker {
   }
 
   /// The blessed write path: optimistic locally, sent at once, judged upstream.
-  Future<void> mutate(String table, String op, Map<String, dynamic> key,
+  Future<Map<String, dynamic>> mutate(String table, String op, Map<String, dynamic> key,
           [Map<String, dynamic>? values]) =>
-      _call<dynamic>(
-          'mutate', {'table': table, 'mop': op, 'key': key, 'values': values});
+      mutateWith(table, op, key, values: values);
+
+  Future<Map<String, dynamic>> mutateWith(String table, String op, Map<String, dynamic> key,
+      {Map<String, dynamic>? values, String? after, bool independent = false}) async =>
+      Map<String, dynamic>.from(await _call<dynamic>('mutate', {
+        'table': table, 'mop': op, 'key': key, 'values': values,
+        'after': after, 'independent': independent,
+      }) as Map);
 
   /// Send the outbox and collect verdicts (the loop does this after every poll; call
   /// it yourself to wait for a verdict).
@@ -262,15 +268,14 @@ Future<void> _workerMain(_Boot boot) async {
               List<dynamic>.from(m['params'] as List? ?? const [])));
           break;
         case 'mutate':
-          zb.mutate(
+          reply(zb.mutateWith(
               m['table'] as String,
               m['mop'] as String,
               Map<String, dynamic>.from(m['key'] as Map),
-              m['values'] == null
+              values: m['values'] == null
                   ? null
-                  : Map<String, dynamic>.from(m['values'] as Map));
-          // sent at once: the report of the echo follows on a later poll
-          reply(null);
+                  : Map<String, dynamic>.from(m['values'] as Map),
+              after: m['after'] as String?, independent: m['independent'] as bool));
           break;
         case 'flush':
           reply(zb.flush(m['waitMs'] as int));

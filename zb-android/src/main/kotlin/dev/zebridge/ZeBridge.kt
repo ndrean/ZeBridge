@@ -204,12 +204,18 @@ class ZeBridge @JvmOverloads constructor(
      * [version] pins the write's version instead of the library's clock.
      */
     @JvmOverloads
-    fun mutate(table: String, op: String, key: Map<String, Any?>, values: Map<String, Any?>? = null, version: String? = null): JSONObject = onWorker {
-        result(Native.mutate(
+    fun mutate(table: String, op: String, key: Map<String, Any?>, values: Map<String, Any?>? = null, version: String? = null): JSONObject =
+        mutate(table, op, key, values, version, after = null, independent = false)
+
+    /** [after] names the msgId returned for a previous write. [independent] leaves the ordering tail unchanged. */
+    fun mutate(table: String, op: String, key: Map<String, Any?>, values: Map<String, Any?>? = null,
+               version: String? = null, after: String? = null, independent: Boolean = false): JSONObject = onWorker {
+        val options = JSONObject().put("version", version).put("after", after).put("independent", independent)
+        result(Native.mutateOpts(
             handle, table.toByteArray(Charsets.UTF_8), op.toByteArray(Charsets.UTF_8),
             JSONObject(key).toString().toByteArray(Charsets.UTF_8),
             values?.let { JSONObject(it).toString().toByteArray(Charsets.UTF_8) },
-            version?.toByteArray(Charsets.UTF_8),
+            options.toString().toByteArray(Charsets.UTF_8),
         ))
     }
 

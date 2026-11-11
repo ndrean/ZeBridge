@@ -15,6 +15,13 @@ as a negative control; provisioning and admission still use the current build.
 
 Run `python3 scripts/scenarios/run.py owns -k ordering_modes` to exercise the per-write API in libzb and zb-client-ts. [ordering_modes.py](ordering_modes.py) holds a parent on one ingress lane and queues two children that each name it with `after`. An independent write from the same client commits on the free lane while the parent is held. After release, the scenario checks for one accepted receipt per parent and child and an empty outbox.
 
+For wrapper tests, [wrapper_ordering_fixture.py](wrapper_ordering_fixture.py) starts a private NATS server, publishes an ordered table descriptor, and runs a command with `ZB_ORDERING_URL` set. It leaves mutations unsettled so the wrapper can inspect the predecessor stored in SQLite. Each probe queues a parent, an unrelated write, an explicit child, an independent write and a default write.
+
+- **Dart:** with the host ABI 8 library built in `zb-dart/prebuilt`, run `scripts/scenarios/.venv/bin/python scripts/scenarios/wrapper_ordering_fixture.py sh -c 'cd zb-dart && dart run test/ordering_modes.dart "$ZB_ORDERING_URL"'`.
+- **Swift:** compile [the probe](../../examples/05-tables/ios/tests/main.swift) together with the example's `ZeBridge.swift`, importing `ZeBridge-Bridging-Header.h` and linking the host `libzbcore`. Run the resulting executable with `"$ZB_ORDERING_URL"`.
+- **Android:** use `--port 24297` on the fixture, run `adb reverse tcp:24297 tcp:24297`, then run `gradle connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.zebridge.OrderingModesTest -Pandroid.testInstrumentationRunnerArguments.orderingUrl="$ZB_ORDERING_URL"` from `zb-android` with the rebuilt JNI library.
+- **React Native:** use [the ordering probe](../../zb-react-native/test/entry.js) as the Expo app entry and set `EXPO_PUBLIC_ORDERING_URL` to the fixture URL when bundling. Build with the updated native module on iOS or Android. The probe displays `ordering PASS` and writes the result to `ordering-result.txt` in the app cache. Android uses the same port forwarding as the Kotlin probe.
+
 `ingress_release.py` tests durable parking across restart, immutable resends, batch
 rollback, a rejected predecessor and `PredecessorUnknown` propagation. To include a
 crash after a parked write commits but before its verdict, build with

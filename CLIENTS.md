@@ -126,6 +126,9 @@ On a table whose bridge offers ordering (`ordering: 1` in its write contract), e
 | `independent` | nothing: it has no predecessor | the tail is left as it was |
 
 - **libzb:** `zb_client_mutate_opts(…, opts_json)` with `{"after"}` or `{"independent": true}` (and `"version"`), returning `{"msgId"}`; zb-python `mutate(…, after=…, independent=True)`. **zb-client-ts:** `mutate(…, { after })` or `{ independent: true }`, returning `{ version }` as before, and `mutateWithId(…)` returning `{ version, writeId }`.
+- **Dart/Flutter:** both `ZeBridge` and `ZeBridgeWorker` return a map from `mutate`. Pass its `msgId` to `mutateWith(table, op, key, values: values, after: parentId)`, or set `independent: true`.
+- **Android:** `mutate(table, op, key, values, after = parent.getString("msgId"))` or `independent = true`. **React Native:** pass `{ after: parent.msgId }` or `{ independent: true }` as the fifth argument to `mutate`. Rebuild the native app when adding these options to an existing Expo build.
+- **Swift (05-tables):** `try zb.mutate(table: ..., op: ..., key: ..., values: ...)` returns the ID as a string. Pass it as `after: parentId` or use `independent: true`.
 - **An ID only for a write durably queued.** `msgId` / `writeId` is the outbox row's. A write refused before it was queued (the GC floor, a suspended table, a local transaction that failed) gives no ID: libzb returns an error, `mutateWithId` rejects, and `mutate` behaves as it always did (a refusal by the GC floor still reports `rejected` / `PredatesGcWatermark` once).
 - **Refused before anything is written**, in both clients with the same words: `after` on a table whose bridge offers no ordering, an ID that is not a complete one of this client (the whole generated shape, canonically encoded, with this client's token; the principal is the bridge's to resolve), `after` with `independent`, a write whose own ID would equal the one it names (the same operation, key and version, on a clock at or behind it), and an empty caller-supplied version (its ID could not be named).
 - **`after` names a write, not a row.** The named write may already have left the outbox: the bridge answers from its receipt. A rejected predecessor still releases the write, which PostgreSQL then judges on its own.
@@ -260,7 +263,7 @@ Everything below the core — the shells — is where parity is by hand, and whe
 | outbox durable, optimistic apply + queue in one transaction | ✓ | ✓ |
 | version stamped by the client (HLC) | ✓ | ✓ |
 | verdicts: accepted / stale / rejected / row_deleted, two revert targets | ✓ | ✓ |
-| a write's ordering: the tail by default, `after` one earlier write, `independent`; an ID only for a write durably queued | ✓ `zb_client_mutate_opts` | ✓ `mutate(…, { after \| independent })`, `mutateWithId` |
+| a write's ordering: the tail by default, `after` one earlier write, `independent`; an ID only for a write durably queued | ✓ C `zb_client_mutate_opts`, Dart `mutateWith`, Python/Android/React Native/Swift example `mutate` ([signatures](#ordering-a-write)) | ✓ `mutate(…, { after \| independent })`, `mutateWithId` |
 | a stale UPDATE rebased onto the winning row when the columns are disjoint, dropped and surfaced when they overlap; the winner before or after the verdict, a slow clock | ✓ `mutate_at` stamps a write explicitly | ✓ `mutate(…, { version })` |
 | each write's final outcome, once — applied, rebased, lost, deleted, rejected — and only for this client's own writes (another device of the same principal hears the verdict too) | ✓ poll report `outcomes` | ✓ `onVerdict` |
 | a write with no socket queues in the outbox and goes out on the next connect | ✓ (the host's flush) | ✓ |
