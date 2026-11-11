@@ -125,6 +125,7 @@ GROUPS = {
         "collist":       ("bridge", "publication column lists (§10ff): a STORED tsvector and a column the DBA leaves out never travel — publication, descriptor, a libzb replica, CDC, a client write and the audit agree; a stray second publication with a narrower list cannot shrink the descriptor; zebridge_enable refreshes the list after ADD COLUMN. SECURITY.md's column-list claim is proven HERE — it asserts, so it belongs in the battery, not in manual"),
     },
     "owns": {
+        "incarnation_gate": ("none", "the bridge's incarnation gate with stamped payloads, private stack with admission and the fault build: legacy and malformed stamps, a DROP waiting on the gate's lock, receipts winning over a recreate (and a fingerprint conflict), old stamps and dropped tables rejected TableIncarnationChanged, a mixed batch, a parked release, retryable permission and catalogue failures, preflight, the descriptor switch"),
         "ingress_ordering": ("none", "ordered parent/child: held parent with one/four lanes; successor durably parked while another client commits; disposable PostgreSQL/NATS"),
         "ingress_arrival": ("none", "ordered successor arrives before admission-refused parent; immutable resend releases it; single-lane rate-limit control; disposable stack"),
         "ingress_release": ("none", "ordered park/release across restart, duplicate window, batch rollback, rejected parent and unknown predecessor; --fault-bridge additionally tests commit-before-verdict crash"),

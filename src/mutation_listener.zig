@@ -1385,6 +1385,8 @@ pub const MutationListener = struct {
             error.KeyChange,
             error.RowTooLargeToReplicate,
             error.PredatesGcWatermark,
+            error.TableIncarnationChanged,
+            error.InvalidIncarnation,
             error.MissingVersion,
             error.NoVersionColumn,
             error.NoTombstoneColumn,
@@ -1912,6 +1914,25 @@ pub const MutationListener = struct {
             self.retryOrFail(conn_nats, msg, mutation.principal, "GcFloorUnavailable");
             return;
         };
+        // The incarnation gate (see `applyBatched`), in THIS transaction: the lock it takes
+        // holds until COMMIT. A confirmed change is this write's durable outcome.
+        if (envelope.incarnation) |stamp| switch (self.checkIncarnation(a, conn, mutation.table, stamp)) {
+            .current => pauseAt(.incarnation_pause),
+            .changed => {
+                log.info("⛔ Mutation refused [{s}] on '{s}': made against incarnation {d}, the table is another one now (not retrying)", .{ mutation.principal, mutation.table, stamp });
+                if (!self.recordRejection(a, conn, principal_z, id_z, claim.fingerprint, "TableIncarnationChanged")) return self.receiptTrouble(conn, conn_nats, msg, mutation.principal);
+                self.deadLetter(conn_nats, msg, payload, error.TableIncarnationChanged);
+                self.publishVerdict(conn_nats, msg, mutation.principal, "rejected", "TableIncarnationChanged");
+                msg.ack() catch {};
+                return;
+            },
+            .unknown => {
+                receipts.rollback(conn);
+                self.clearFailure();
+                self.retryOrFail(conn_nats, msg, mutation.principal, "IncarnationUnavailable");
+                return;
+            },
+        };
 
         self.parked_attempt = self.parked_replay;
         self.handleMutation(mutation, payload, conn) catch |err| {
@@ -2223,13 +2244,28 @@ pub const MutationListener = struct {
         // its own round trip, one of four per batch, 17 ms each to a database in another
         // building; its result is read with the claims, before any write is built.
         sent_ok = sent_ok and c.PQsendQueryParams(conn, gc_floor_sql, 0, null, null, null, null, 0) == 1;
+        // The incarnation gate, in the same round: every table a stamped write names, locked
+        // until COMMIT (see `lock_incarnations`). Taken for repeats too, whose receipts win
+        // over it below: a lock costs nothing they would notice.
+        var stamped_tables: std.ArrayList([:0]const u8) = .empty;
+        for (items.items) |it| if (it.envelope.incarnation != null) {
+            for (stamped_tables.items) |t| {
+                if (std.mem.eql(u8, t, it.mutation.table)) break;
+            } else try stamped_tables.append(a, try a.dupeSentinel(u8, it.mutation.table, 0));
+        };
+        if (stamped_tables.items.len > 0) sent_ok = sent_ok and try sendIncarnationLocks(a, conn, stamped_tables.items);
+        const rounds: usize = if (stamped_tables.items.len > 0) 5 else 4;
         var failed_at: usize = 0;
         if (!sent_ok or c.PQpipelineSync(conn) != 1) return error.MutationFailed;
-        const r1 = try receipts.collect(a, conn, 4, &failed_at);
+        const r1 = try receipts.collect(a, conn, rounds, &failed_at);
         defer receipts.clearAll(r1);
         try self.leavePipeline(conn);
         if (failed_at == 3) {
             log.err("🔴 the GC floor could not be read ({s}) — writes are retried, not let through unchecked (re-apply init.write.template.sql if zebridge_gc_floor_acquire is missing)", .{c.PQerrorMessage(conn)});
+            return error.MutationFailed;
+        }
+        if (failed_at == 4) {
+            log.err("🔴 the table incarnations could not be read or locked ({s}) — stamped writes are retried, not let through unchecked (re-apply init.write.template.sql if zebridge_private.lock_incarnations is missing)", .{c.PQerrorMessage(conn)});
             return error.MutationFailed;
         }
         if (failed_at != r1.len) return error.ReceiptInfrastructure;
@@ -2264,6 +2300,22 @@ pub const MutationListener = struct {
             }
             if (it.claim.status == .claimed and it.envelope.refusal != null) it.refused = it.envelope.refusal;
         }
+        // A claimed write's stamp against its table's incarnation. Each write gets its own
+        // outcome: a stale one is refused, the others of the batch go on. An undecidable read
+        // (no incarnation recorded) fails the batch: the replay retries each write alone.
+        if (stamped_tables.items.len > 0) for (items.items) |*it| {
+            if (it.claim.status != .claimed or it.refused != null) continue;
+            const stamp = it.envelope.incarnation orelse continue;
+            switch (incarnationRow(r1[4], it.mutation.table, stamp)) {
+                .current => {},
+                .changed => it.refused = error.TableIncarnationChanged,
+                .unknown => {
+                    log.warn("⚠️  no incarnation recorded for '{s}': its stamped writes are retried", .{it.mutation.table});
+                    return error.MutationFailed;
+                },
+            }
+        };
+        if (stamped_tables.items.len > 0) pauseAt(.incarnation_pause);
 
         // Pre-warm the metas of the claimed writes only, outside pipeline mode. A table
         // that cannot take writes refuses its write here, deterministically, as long as
@@ -2480,7 +2532,7 @@ pub const MutationListener = struct {
     /// actually fires logs `ZB_TEST_FAULT <point> fired`, which the scenario asserts.
     /// commit_before_receipts fires once per process: the replay then runs normally, so
     /// the scenario sees what that one COMMIT left behind.
-    const TestFault = enum { none, reset_after_claims, oom_in_claims, oom_in_finishes, commit_before_receipts, ordered_after_commit, park_before_ack };
+    const TestFault = enum { none, reset_after_claims, oom_in_claims, oom_in_finishes, commit_before_receipts, ordered_after_commit, park_before_ack, incarnation_pause };
     var test_fault: ?TestFault = null;
     var fired_once = false;
     fn faultAt(point: TestFault) bool {
@@ -2492,6 +2544,14 @@ pub const MutationListener = struct {
         }
         log.warn("ZB_TEST_FAULT {s} fired", .{@tagName(point)});
         return true;
+    }
+    /// Fault build: hold at `point` while the file `ZB_TEST_PAUSE_FILE` exists. The
+    /// incarnation gate's window, between its check and the write, is held open this way so
+    /// a test can run a DROP inside it and see it wait for the gate's lock.
+    fn pauseAt(point: TestFault) void {
+        if (!faultAt(point)) return;
+        const path = std.c.getenv("ZB_TEST_PAUSE_FILE") orelse return;
+        while (std.c.access(path, 0) == 0) utils.sleep(50 * std.time.ns_per_ms);
     }
     fn testFault() TestFault {
         if (test_fault) |f| return f;
@@ -3200,6 +3260,22 @@ pub const MutationListener = struct {
     }
 
     /// The floor from `zebridge_gc_floor_acquire()`'s one row: null when nothing was ever reaped.
+    /// One call of `lock_incarnations` for a single write, outside pipeline mode. A failed
+    /// call (the function missing, a permission, a table replaced while locked) is
+    /// `.unknown`: retried, never let through.
+    fn checkIncarnation(self: *MutationListener, a: std.mem.Allocator, conn: ?*c.PGconn, table: []const u8, stamp: i64) IncarnationCheck {
+        _ = self;
+        const t = a.dupeSentinel(u8, table, 0) catch return .unknown;
+        const values = [_]?[*:0]const u8{t.ptr};
+        const res = c.PQexecParams(conn, "SELECT tbl, incarnation, live FROM zebridge_private.lock_incarnations(ARRAY[$1::text])", 1, null, &values, null, null, 0);
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+            log.err("🔴 the incarnation of '{s}' could not be read or locked ({s}) — the write is retried", .{ table, c.PQerrorMessage(conn) });
+            return .unknown;
+        }
+        return incarnationRow(res, table, stamp);
+    }
+
     fn readGcFloor(self: *MutationListener, res: ?*c.PGresult) !void {
         self.gc_watermark_us = null;
         if (c.PQntuples(res) != 1) return error.MutationFailed;
@@ -5281,4 +5357,56 @@ test "Dispatcher.step: writes held for a full lane reach it when it frees room, 
     try testing.expect(pull.emptied_at.? - t0 < Dispatcher.fetch_ms / 2);
     // Nothing held: the turn that pushed them went on to the normal, long pull.
     try testing.expectEqual(@as(i64, Dispatcher.fetch_ms), pull.last_ms);
+}
+
+/// What a table's recorded incarnation says of a write stamped `stamp`.
+const IncarnationCheck = enum { current, changed, unknown };
+
+/// The decision, on one row of `lock_incarnations`: `live` false (the table is gone, or the
+/// live relation is not the one recorded) or another number is a confirmed change; no row,
+/// or no incarnation recorded, cannot be decided.
+fn incarnationDecision(incarnation: ?i64, live: ?bool, stamp: i64) IncarnationCheck {
+    const l = live orelse return .unknown;
+    const n = incarnation orelse return .unknown;
+    if (!l) return .changed;
+    return if (n == stamp) .current else .changed;
+}
+
+fn incarnationRow(res: ?*c.PGresult, table: []const u8, stamp: i64) IncarnationCheck {
+    const rows = c.PQntuples(res);
+    var i: c_int = 0;
+    while (i < rows) : (i += 1) {
+        if (!std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, i, 0)), table)) continue;
+        const inc: ?i64 = if (c.PQgetisnull(res, i, 1) == 1) null else std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, i, 1)), 10) catch return .unknown;
+        const live: ?bool = if (c.PQgetisnull(res, i, 2) == 1) null else c.PQgetvalue(res, i, 2)[0] == 't';
+        return incarnationDecision(inc, live, stamp);
+    }
+    return .unknown;
+}
+
+/// The batch's gate, pipelined: one call naming every stamped table (the function sorts
+/// them, so concurrent batches lock in one order).
+fn sendIncarnationLocks(a: std.mem.Allocator, conn: ?*c.PGconn, tables: []const [:0]const u8) !bool {
+    var sql: std.ArrayList(u8) = .empty;
+    try sql.appendSlice(a, "SELECT tbl, incarnation, live FROM zebridge_private.lock_incarnations(ARRAY[");
+    for (tables, 0..) |_, i| {
+        if (i > 0) try sql.append(a, ',');
+        try sql.print(a, "${d}::text", .{i + 1});
+    }
+    try sql.appendSlice(a, "])");
+    const sql_z = try a.dupeSentinel(u8, sql.items, 0);
+    const values = try a.alloc(?[*:0]const u8, tables.len);
+    for (tables, 0..) |t, i| values[i] = t.ptr;
+    return c.PQsendQueryParams(conn, sql_z.ptr, @intCast(tables.len), null, values.ptr, null, null, 0) == 1;
+}
+
+test "incarnation gate: the decision on one recorded row" {
+    try std.testing.expectEqual(IncarnationCheck.current, incarnationDecision(3, true, 3));
+    // Replaced and observed: another number.
+    try std.testing.expectEqual(IncarnationCheck.changed, incarnationDecision(4, true, 3));
+    // Dropped (no live relation), or replaced unobserved (a restore): not live.
+    try std.testing.expectEqual(IncarnationCheck.changed, incarnationDecision(3, false, 3));
+    // Nothing recorded: undecidable, retried.
+    try std.testing.expectEqual(IncarnationCheck.unknown, incarnationDecision(null, null, 3));
+    try std.testing.expectEqual(IncarnationCheck.unknown, incarnationDecision(3, null, 3));
 }

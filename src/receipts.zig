@@ -454,6 +454,7 @@ pub fn bootCheck(conn: ?*c.PGconn) !void {
         \\   AND has_function_privilege(current_user, 'zebridge_private.park_work()', 'EXECUTE')
         \\   AND has_function_privilege(current_user, 'zebridge_private.try_park_sweeper(text)', 'EXECUTE')
         \\   AND has_function_privilege(current_user, 'zebridge_private.leave_park_sweeper(text)', 'EXECUTE')
+        \\   AND has_function_privilege(current_user, 'zebridge_private.lock_incarnations(text[])', 'EXECUTE')
     ;
     const r = c.PQexec(conn, sql);
     defer c.PQclear(r);
@@ -480,6 +481,12 @@ pub fn bootCheck(conn: ?*c.PGconn) !void {
     }
     if (!guard) log.warn("Receipt completion guard disabled: a premature COMMIT can persist writes without receipts", .{});
     log.info("🧾 receipts: advisory locks, completion guard {s}", .{if (guard) "enabled" else "disabled"});
+    // The incarnation gate is always on (a stamped write is checked); the switch only says
+    // whether descriptors ask clients to stamp. Turned on after every worker runs the gate.
+    const sw = c.PQexec(conn, "SELECT public.zebridge_incarnation_stamps()");
+    defer c.PQclear(sw);
+    const stamps = c.PQresultStatus(sw) == c.PGRES_TUPLES_OK and c.PQntuples(sw) == 1 and c.PQgetvalue(sw, 0, 0)[0] == 't';
+    log.info("🧾 incarnation stamps: {s}", .{if (stamps) "advertised (clients stamp their writes; this bridge checks them)" else "not advertised (stamped writes are still checked; enable with UPDATE zebridge_private.write_policy SET incarnation_stamps = true WHERE singleton, once every worker runs this build, then restart the bridges)"});
     try maintain(conn);
 }
 

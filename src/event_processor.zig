@@ -1538,6 +1538,13 @@ pub const EventProcessor = struct {
 
         try json_str.appendSlice(arena, ",\"ordering\":1");
 
+        // The incarnation a client stamps its writes with, and the bridge checks them
+        // against: advertised only once the administrator turned the switch on (every
+        // worker that consumes writes enforces it by then; see `lock_incarnations`).
+        if (self.cat) |cat| if (cat.incarnation_stamps) if (cat.incarnations.get(table)) |inc| if (inc > 0) {
+            try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"incarnation\":{d}", .{inc}));
+        };
+
         // The catalogue's `tenant_col`: which column scopes this table's rows by tenant, or `null` for
         // a table every principal reads and writes the same content of (system tables,
         // genuinely public business tables alike). Published so a client can tell the two

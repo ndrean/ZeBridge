@@ -52,11 +52,19 @@ pub const Load = struct {
     /// tbl → seed_epoch (§10df): a bump republishes the table's descriptor and tells
     /// clients to forget their watermark.
     epochs: std.StringHashMapUnmanaged(i64) = .empty,
+    /// tbl → its current incarnation (`zebridge_incarnations`; 0 when none is recorded).
+    incarnations: std.StringHashMapUnmanaged(i64) = .empty,
+    /// `zebridge_incarnation_stamps()`: whether descriptors advertise `incarnation`, so
+    /// that clients stamp their writes with it. Off when the function is missing.
+    incarnation_stamps: bool = false,
 
     pub fn deinit(self: *Load, allocator: std.mem.Allocator) void {
         var it = self.epochs.keyIterator();
         while (it.next()) |k| allocator.free(k.*);
         self.epochs.deinit(allocator);
+        var inc = self.incarnations.keyIterator();
+        while (inc.next()) |k| allocator.free(k.*);
+        self.incarnations.deinit(allocator);
         for (self.publics) |name| allocator.free(name);
         if (self.publics.len > 0) allocator.free(self.publics);
         for (self.tenants) |name| allocator.free(name);
@@ -167,9 +175,10 @@ pub fn loadRules(
     }
 
     const res = c.PQexec(conn,
-        "SELECT tbl, COALESCE(tenant_col::text, ''), version_col::text, " ++
-            "COALESCE(tombstone_col::text, ''), COALESCE(tiebreak_col::text, ''), seed_epoch " ++
-            "FROM public.zebridge_catalogue ORDER BY tbl");
+        "SELECT c.tbl, COALESCE(c.tenant_col::text, ''), c.version_col::text, " ++
+            "COALESCE(c.tombstone_col::text, ''), COALESCE(c.tiebreak_col::text, ''), c.seed_epoch, " ++
+            "COALESCE((SELECT i.incarnation FROM public.zebridge_incarnations i WHERE i.tbl = c.tbl), 0) " ++
+            "FROM public.zebridge_catalogue c ORDER BY c.tbl");
     defer c.PQclear(res);
     if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
         // Missing table = init.core.template.sql was never applied. Preflight then
@@ -178,6 +187,13 @@ pub fn loadRules(
         return out;
     }
     out.available = true;
+    // The switch, apart: a database without the function (an older write SQL) reads as off,
+    // never as a catalogue that could not be read.
+    {
+        const sw = c.PQexec(conn, "SELECT public.zebridge_incarnation_stamps()");
+        defer c.PQclear(sw);
+        out.incarnation_stamps = c.PQresultStatus(sw) == c.PGRES_TUPLES_OK and c.PQntuples(sw) == 1 and c.PQgetvalue(sw, 0, 0)[0] == 't';
+    }
 
     var publics: std.ArrayList([]const u8) = .empty;
 
@@ -192,6 +208,10 @@ pub fn loadRules(
         const epoch = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, @intCast(i), 5)), 10) catch 0;
         if (allocator.dupe(u8, tbl)) |k| {
             out.epochs.put(allocator, k, epoch) catch allocator.free(k);
+        } else |_| {}
+        const incarnation = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, @intCast(i), 6)), 10) catch 0;
+        if (allocator.dupe(u8, tbl)) |k| {
+            out.incarnations.put(allocator, k, incarnation) catch allocator.free(k);
         } else |_| {}
         var grew = false;
 
