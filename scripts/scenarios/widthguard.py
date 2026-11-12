@@ -161,6 +161,7 @@ async def main():
             js = client.jetstream()
             verdicts: list = []
             async def on_ack(m):
+                if m.subject.endswith(".tenants"): return  # the membership notice, not a verdict
                 verdicts.append(json.loads(m.data.decode()))
             sub = await zb.subscribe(client, f"{zb.TOPOLOGY['subjects']['mutation_ack_prefix']}.{who}.>", cb=on_ack)
 

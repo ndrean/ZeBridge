@@ -180,6 +180,7 @@ def teardown():
         zb.psql(f"DELETE FROM public.zebridge_generations WHERE tbl = '{t}'", quiet=True)
     for principal in PRINCIPALS:
         zb.psql(f"DELETE FROM public.zebridge_user_tenants WHERE principal = '{principal}'", quiet=True)
+    zb.drop_tenant_streams(TA, TB)
 
 
 class Hold:

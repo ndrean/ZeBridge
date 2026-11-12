@@ -74,7 +74,7 @@ async def main(args):
         async def collect(ids, timeout, what):
             end = time.monotonic() + timeout
             while any(i not in seen for i in ids) and time.monotonic() < end:
-                try: m = await verdicts.next_msg(timeout=.5)
+                try: m = await zb.next_verdict(verdicts, .5)
                 except asyncio.TimeoutError: continue
                 tail = m.subject[len(f'{ack}.{PRINCIPAL}.'):]
                 if tail.endswith('.held'): held.add(tail[:-5]); continue
@@ -84,7 +84,7 @@ async def main(args):
         async def drain(quiet=1.0):
             """Reads the verdicts already delivered, until the subscription has been quiet."""
             while True:
-                try: m = await verdicts.next_msg(timeout=quiet)
+                try: m = await zb.next_verdict(verdicts, quiet)
                 except asyncio.TimeoutError: return
                 tail = m.subject[len(f'{ack}.{PRINCIPAL}.'):]
                 if tail.endswith('.held'): held.add(tail[:-5]); continue
@@ -122,7 +122,7 @@ async def main(args):
         check('the held client fills one lane and the dispatcher keeps the rest pending', max(q.values()) >= QUEUE_CAPACITY and m['bridge_ingress_pending'] > 0 and sum(1 for v in q.values() if v > 0) == 1, queued=q, pending=m['bridge_ingress_pending'])
         oid, orow = str(uuid.uuid7()), str(uuid.uuid4())
         await other.jetstream(domain='hub').publish(zb.subject(zb.TOPOLOGY['subjects']['mutations_prefix'], 'iop2', IND) + '.insert', msgpack.packb(dict(key={'id': orow}, data=dict(id=orow, tenant_id='iot2', updated_at=version), version=version, client_id='other-client')), headers={'Nats-Msg-Id': oid}, timeout=10)
-        ov = zb.decode((await other_verdicts.next_msg(timeout=5)).data)
+        ov = zb.decode((await zb.next_verdict(other_verdicts, 5)).data)
         check('an unrelated client commits on another lane while the held lane is full', ov['status'] == 'accepted' and gates.pids(1) and s.sql(f"SELECT count(*) FROM {IND} WHERE id='{orow}'") == '1', unrelated=ov['status'])
         await asyncio.sleep(max(0, ACK_WAIT_S + 2.5 - (time.monotonic() - t0)))
         ci = await consumer(); m = s.metrics()
@@ -248,7 +248,7 @@ async def main(args):
         # per-principal fairness), and this case is about the dispatcher.
         other_seen = {}
         async def other_wait():
-            m = await other_verdicts.next_msg(timeout=60)
+            m = await zb.next_verdict(other_verdicts, 60)
             other_seen[m.subject[len(f'{ack}.iop2.'):]] = zb.decode(m.data)
         ow = asyncio.create_task(other_wait())
         await other.jetstream(domain='hub').publish(zb.subject(zb.TOPOLOGY['subjects']['mutations_prefix'], 'iop2', IND) + '.insert', msgpack.packb(dict(key={'id': urow}, data=dict(id=urow, tenant_id='iot2', updated_at=version), version=version, client_id='other-client')), headers={'Nats-Msg-Id': uid}, timeout=10)

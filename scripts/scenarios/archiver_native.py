@@ -53,7 +53,7 @@ os.environ.setdefault("S3_ENDPOINT", "http://127.0.0.1:8333")
 import common  # noqa: E402
 
 NATIVE = pathlib.Path(os.environ.get("ZB_ARCHIVER", REPO / "zig-out" / "bin" / "bridge_archiver"))
-LIB = pathlib.Path(os.environ.get("ZB_ARCHIVE_LIB", REPO / "zig-out" / "lib" / "libzbarchive.so"))
+LIB = pathlib.Path(os.environ.get("ZB_ARCHIVE_LIB", REPO / "zig-out" / "lib" / ("libzbarchive.dylib" if sys.platform == "darwin" else "libzbarchive.so")))
 FETCH = pathlib.Path(os.environ.get("ZB_READINGS_FETCH", REPO / "zig-out" / "bin" / "bridge_readings_fetch"))
 WASM = pathlib.Path(os.environ.get("ZB_ARCHIVE_WASM", REPO / "zig-out" / "wasm" / "zb_archive_core.wasm"))
 PORT = 14337
