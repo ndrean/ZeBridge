@@ -6327,6 +6327,7 @@
   "decideStamp": [
     {"name": "writable false refuses, whatever the advert", "in": {"writable": false, "advertised": true, "incarnation": 4, "replacing": false, "scopeStamp": 4, "anchorEpoch": null, "seedEpoch": 7, "onDemand": false}, "out": {"refuse": "TableNotWritable"}},
     {"name": "writable false refuses a legacy table too", "in": {"writable": false, "advertised": false, "incarnation": null, "replacing": false, "scopeStamp": null, "anchorEpoch": null, "seedEpoch": 7, "onDemand": false}, "out": {"refuse": "TableNotWritable"}},
+    {"name": "legacy scope being replaced", "in": {"writable": true, "advertised": false, "incarnation": null, "replacing": true, "scopeStamp": 3, "anchorEpoch": null, "seedEpoch": 7, "onDemand": false}, "out": {"refuse": "ReplacementIncomplete"}},
     {"name": "not advertised: unstamped (legacy)", "in": {"writable": true, "advertised": false, "incarnation": null, "replacing": false, "scopeStamp": 3, "anchorEpoch": null, "seedEpoch": 7, "onDemand": false}, "out": {"stamp": null}},
     {"name": "writable null is not a refusal", "in": {"writable": null, "advertised": false, "incarnation": null, "replacing": false, "scopeStamp": null, "anchorEpoch": null, "seedEpoch": 7, "onDemand": false}, "out": {"stamp": null}},
     {"name": "advertised null: the identity unknown, writes withheld", "in": {"writable": true, "advertised": true, "incarnation": null, "replacing": false, "scopeStamp": 4, "anchorEpoch": null, "seedEpoch": 7, "onDemand": false}, "out": {"refuse": "IncarnationUnknown"}},

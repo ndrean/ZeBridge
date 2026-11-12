@@ -1669,9 +1669,9 @@ pub const Stamp = union(enum) { stamp: i64, unstamped, refuse: []const u8 };
 
 pub fn decideStamp(i: StampInput) Stamp {
     if (i.writable == false) return .{ .refuse = "TableNotWritable" };
+    if (i.replacing) return .{ .refuse = "ReplacementIncomplete" };
     if (!i.advertised) return .unstamped;
     const current = i.incarnation orelse return .{ .refuse = "IncarnationUnknown" };
-    if (i.replacing) return .{ .refuse = "ReplacementIncomplete" };
     // Rows that arrive as query answers are the table as it is now.
     if (i.on_demand) return .{ .stamp = current };
     // The rows the user sees: the scope's stamp, even when the descriptor has moved on (the

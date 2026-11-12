@@ -1248,9 +1248,9 @@ export type StampInput = {
 };
 export function decideStamp(i: StampInput): { stamp: number | null } | { refuse: string } {
   if (i.writable === false) return { refuse: 'TableNotWritable' };
+  if (i.replacing) return { refuse: 'ReplacementIncomplete' };
   if (!i.advertised) return { stamp: null };
   if (i.incarnation == null) return { refuse: 'IncarnationUnknown' };
-  if (i.replacing) return { refuse: 'ReplacementIncomplete' };
   if (i.onDemand) return { stamp: i.incarnation };
   if (i.scopeStamp != null) return { stamp: i.scopeStamp };
   if (i.anchorEpoch != null && i.anchorEpoch === i.seedEpoch) return { stamp: i.incarnation };

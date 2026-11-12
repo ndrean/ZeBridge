@@ -6189,10 +6189,9 @@ pub const SyncClient = struct {
         }
 
         const env = try core.buildMutation(a, .{ .object = args });
-        const subject = env.object.get("subject").?.string;
         const msg_id = env.object.get("msgId").?.string;
         const row_id = env.object.get("id").?.string;
-        var payload = env.object.get("payload").?;
+        const payload = env.object.get("payload").?;
 
         // A caller's stamp, the same operation and key, and a clock at or behind the named
         // write's time give back that write's own ID: refused before anything is touched.
@@ -6223,100 +6222,18 @@ pub const SyncClient = struct {
             }
         }
 
-        // The before-image, for the revert a refusal or a rejection needs. Captured
-        // BEFORE the optimistic apply overwrites it, obviously.
-        const before = try self.beforeImage(a, table, st, key);
-        // The row's tenant: a public table's is the open tenant; a tenant-scoped one's is
-        // its tenant column, from the write or the row it replaces.
-        const row_tenant: storage.Value = blk: {
-            const tc = st.tenant_col orelse break :blk .{ .text = self.open_tenants[0] };
-            for ([_]?Value{ values, key, before }) |src| {
-                const o = src orelse continue;
-                if (o != .object) continue;
-                const tv = o.object.get(tc) orelse continue;
-                if (tv == .string) break :blk .{ .text = tv.string };
-            }
-            break :blk .null;
+        const returned_id = try result_a.dupe(u8, msg_id);
+        errdefer result_a.free(returned_id);
+        var edit = LocalMutation{ .client = self, .arena = a, .table = table, .op = op, .key = key, .values = values, .version = version, .env = env, .state = st, .ordered = ordered, .predecessor = predecessor };
+        self.st.transaction(&edit, LocalMutation.store) catch |err| {
+            if (err != error.OptimisticApplyFailed) return err;
+            // Some backends abort a transaction on a local constraint failure. Preserve
+            // the existing wire-only submission, with a fresh transaction and stamp check.
+            edit.optimistic = false;
+            try self.st.transaction(&edit, LocalMutation.store);
         };
-        // Permission to queue a NEW edit, and its stamp (core.decideStamp; twin: zb-client-ts
-        // `enqueueMutation`), per the anchor's scope (table, tenant): decided before anything
-        // is applied or queued.
-        {
-            const scope: []const storage.Value = &.{ .{ .text = table }, if (row_tenant == .text) row_tenant else .{ .text = self.tenant } };
-            const stamp_rows: []const []storage.Value = self.st.query(a, "SELECT incarnation FROM _zbz_stamp WHERE tbl = ? AND tenant = ?", scope) catch &.{};
-            const anchor_rows: []const []storage.Value = self.st.query(a, "SELECT seed_epoch FROM _zbz_generations WHERE tbl = ? AND tenant = ?", scope) catch &.{};
-            const fence_rows: []const []storage.Value = self.st.query(a, "SELECT 1 FROM _zbz_fence WHERE tbl = ? AND tenant = ?", scope) catch &.{};
-            const replacing = fence_rows.len > 0;
-            const decided = core.decideStamp(.{
-                .writable = st.writable,
-                .advertised = st.advertised,
-                .incarnation = st.incarnation,
-                .replacing = replacing,
-                .scope_stamp = if (stamp_rows.len == 1 and stamp_rows[0][0] == .integer) stamp_rows[0][0].integer else null,
-                .anchor_epoch = if (anchor_rows.len == 1 and anchor_rows[0][0] == .integer) anchor_rows[0][0].integer else null,
-                .seed_epoch = st.seed_epoch,
-                .on_demand = self.isOnDemand(table),
-            });
-            switch (decided) {
-                .refuse => |why| {
-                    log.warn("libzb: write refused: {s} — nothing applied, nothing queued", .{try refusalWords(a, table, why)});
-                    return refusalError(why);
-                },
-                .unstamped => {},
-                .stamp => |n| {
-                    try payload.object.put(a, "incarnation", .{ .integer = n });
-                    // A replica seeded before stamps adopts the descriptor's: recorded, as an anchor would.
-                    if (stamp_rows.len == 0) _ = try self.st.query(a, "INSERT INTO _zbz_stamp (tbl, tenant, incarnation) VALUES (?, ?, ?)", &.{ scope[0], scope[1], .{ .integer = n } });
-                },
-            }
-        }
-        const authoritative = try self.beforeIsAuthoritative(a, table, st, row_id);
-        const before_json: storage.Value = if (before) |b| .{ .text = try core.valueToString(a, b) } else .null;
-        const created = self.nextCreated();
-        // No base copy here: until CDC says more, the authoritative before-image in the
-        // ledger IS the server's state (`recordAuthoritative` materializes one lazily).
         self.ledger_active = true;
         self.ledger_keys.include(self.a, table, row_id);
-
-        // NON-FATAL, matching the TS client (its failed optimistic upsert is a log
-        // line and the write still queues): the payload is valid ON THE WIRE — the
-        // bridge builds the UPDATE from key + data — so a local echo that cannot
-        // apply (an UPDATE whose values do not repeat the pk fails the upsert arm's
-        // NOT NULL) must not abort the queueing. Aborting here LOST every such
-        // update: 24 per client per swarm smoke, audible but wrong (§10cp). The
-        // CDC echo applies the row properly moments later.
-        // §10dx: the optimistic row carries the write's own stamp in the version column
-        // (the ingress sets it from `version`); without it a NOT NULL version column
-        // refused every optimistic INSERT locally.
-        var opt = env.object.get("optimistic").?;
-        if (st.version_col) |vc| {
-            if (opt == .object and !std.mem.eql(u8, op, "DELETE")) {
-                if (opt.object.get("data")) |d| {
-                    if (d == .object and d.object.get(vc) == null) {
-                        var stamped = d;
-                        try stamped.object.put(a, vc, .{ .string = version });
-                        try opt.object.put(a, "data", stamped);
-                    }
-                }
-            }
-        }
-        self.applyOptimistic(table, st, opt) catch {};
-
-        const payload_json = try core.valueToString(a, payload);
-        _ = try self.st.query(a,
-            \\INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, tenant, optimistic, authoritative, ordered, predecessor, incarnation)
-            \\VALUES (?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?)
-            \\ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1
-        , &.{
-            .{ .text = msg_id },                              .{ .text = subject },                        .{ .text = payload_json },
-            .{ .text = table },                               .{ .text = row_id },                         before_json,
-            before_json,                                      .{ .integer = created },                     row_tenant,
-            .{ .text = try core.valueToString(a, opt) },      .{ .integer = @intFromBool(authoritative) }, .{ .integer = @intFromBool(ordered) },
-            if (predecessor) |pr| .{ .text = pr } else .null,
-            if (payload.object.get("incarnation")) |inc| inc_blk: {
-                break :inc_blk if (inc == .integer) storage.Value{ .integer = inc.integer } else storage.Value.null;
-            } else .null,
-        });
 
         // ⚠️ Sent through flushOutbox, NOT published directly from here.
         //
@@ -6332,8 +6249,125 @@ pub const SyncClient = struct {
             // Not waiting for the PubAck: an app's loop of mutate() calls is not one round trip per write.
             _ = self.flushOutboxPass(false) catch |err| log.info("mutate: {s} — queued as {s}", .{ @errorName(err), msg_id });
         }
-        return try result_a.dupe(u8, msg_id);
+        return returned_id;
     }
+
+    const LocalMutation = struct {
+        client: *SyncClient,
+        arena: std.mem.Allocator,
+        table: []const u8,
+        op: []const u8,
+        key: Value,
+        values: ?Value,
+        version: []const u8,
+        env: Value,
+        state: TableState,
+        ordered: bool,
+        predecessor: ?[]const u8,
+        optimistic: bool = true,
+
+        fn store(edit: *const LocalMutation, _: *storage.Storage) !void {
+            const self = edit.client;
+            const a = edit.arena;
+            const table = edit.table;
+            const st = edit.state;
+            const env = edit.env;
+            const row_id = env.object.get("id").?.string;
+            var payload = env.object.get("payload").?;
+            // The before-image, for the revert a refusal or a rejection needs. Captured
+            // BEFORE the optimistic apply overwrites it, obviously.
+            const before = try self.beforeImage(a, table, st, edit.key);
+            // The row's tenant: a public table's is the open tenant; a tenant-scoped one's is
+            // its tenant column, from the write or the row it replaces.
+            const row_tenant: storage.Value = blk: {
+                const tc = st.tenant_col orelse break :blk .{ .text = self.open_tenants[0] };
+                for ([_]?Value{ edit.values, edit.key, before }) |src| {
+                    const o = src orelse continue;
+                    if (o != .object) continue;
+                    const tv = o.object.get(tc) orelse continue;
+                    if (tv == .string) break :blk .{ .text = tv.string };
+                }
+                break :blk .null;
+            };
+            // Permission to queue a NEW edit, and its stamp (core.decideStamp; twin: zb-client-ts
+            // `enqueueMutation`), per the anchor's scope (table, tenant): decided before anything
+            // is applied or queued.
+            {
+                const scope: []const storage.Value = &.{ .{ .text = table }, if (row_tenant == .text) row_tenant else .{ .text = self.tenant } };
+                const stamp_rows: []const []storage.Value = try self.st.query(a, "SELECT incarnation FROM _zbz_stamp WHERE tbl = ? AND tenant = ?", scope);
+                const anchor_rows: []const []storage.Value = try self.st.query(a, "SELECT seed_epoch FROM _zbz_generations WHERE tbl = ? AND tenant = ?", scope);
+                const fence_rows: []const []storage.Value = try self.st.query(a, "SELECT 1 FROM _zbz_fence WHERE tbl = ? AND tenant = ?", scope);
+                const replacing = fence_rows.len > 0;
+                const decided = core.decideStamp(.{
+                    .writable = st.writable,
+                    .advertised = st.advertised,
+                    .incarnation = st.incarnation,
+                    .replacing = replacing,
+                    .scope_stamp = if (stamp_rows.len == 1 and stamp_rows[0][0] == .integer) stamp_rows[0][0].integer else null,
+                    .anchor_epoch = if (anchor_rows.len == 1 and anchor_rows[0][0] == .integer) anchor_rows[0][0].integer else null,
+                    .seed_epoch = st.seed_epoch,
+                    .on_demand = self.isOnDemand(table),
+                });
+                switch (decided) {
+                    .refuse => |why| {
+                        log.warn("libzb: write refused: {s} — nothing applied, nothing queued", .{try refusalWords(a, table, why)});
+                        return refusalError(why);
+                    },
+                    .unstamped => {},
+                    .stamp => |n| {
+                        try payload.object.put(a, "incarnation", .{ .integer = n });
+                        // A replica seeded before stamps adopts the descriptor's: recorded, as an anchor would.
+                        if (stamp_rows.len == 0) _ = try self.st.query(a, "INSERT INTO _zbz_stamp (tbl, tenant, incarnation) VALUES (?, ?, ?)", &.{ scope[0], scope[1], .{ .integer = n } });
+                    },
+                }
+            }
+            const authoritative = try self.beforeIsAuthoritative(a, table, st, row_id);
+            const before_json: storage.Value = if (before) |b| .{ .text = try core.valueToString(a, b) } else .null;
+            const created = self.nextCreated();
+            // No base copy here: until CDC says more, the authoritative before-image in the
+            // ledger IS the server's state (`recordAuthoritative` materializes one lazily).
+
+            // NON-FATAL, matching the TS client (its failed optimistic upsert is a log
+            // line and the write still queues): the payload is valid ON THE WIRE — the
+            // bridge builds the UPDATE from key + data — so a local echo that cannot
+            // apply (an UPDATE whose values do not repeat the pk fails the upsert arm's
+            // NOT NULL) must not abort the queueing. Aborting here LOST every such
+            // update: 24 per client per swarm smoke, audible but wrong (§10cp). The
+            // CDC echo applies the row properly moments later.
+            // §10dx: the optimistic row carries the write's own stamp in the version column
+            // (the ingress sets it from `version`); without it a NOT NULL version column
+            // refused every optimistic INSERT locally.
+            var opt = env.object.get("optimistic").?;
+            if (st.version_col) |vc| {
+                if (opt == .object and !std.mem.eql(u8, edit.op, "DELETE")) {
+                    if (opt.object.get("data")) |d| {
+                        if (d == .object and d.object.get(vc) == null) {
+                            var stamped = d;
+                            try stamped.object.put(a, vc, .{ .string = edit.version });
+                            try opt.object.put(a, "data", stamped);
+                        }
+                    }
+                }
+            }
+            if (edit.optimistic) self.applyOptimistic(table, st, opt) catch return error.OptimisticApplyFailed;
+
+            const payload_json = try core.valueToString(a, payload);
+            _ = try self.st.query(a,
+                \\INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, tenant, optimistic, authoritative, ordered, predecessor, incarnation)
+                \\VALUES (?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?)
+                \\ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1
+            , &.{
+                .{ .text = env.object.get("msgId").?.string },         .{ .text = env.object.get("subject").?.string }, .{ .text = payload_json },
+                .{ .text = table },                                    .{ .text = row_id },                             before_json,
+                before_json,                                           .{ .integer = created },                         row_tenant,
+                .{ .text = try core.valueToString(a, opt) },           .{ .integer = @intFromBool(authoritative) },     .{ .integer = @intFromBool(edit.ordered) },
+                if (edit.predecessor) |pr| .{ .text = pr } else .null,
+                if (payload.object.get("incarnation")) |inc| inc_blk: {
+                    break :inc_blk if (inc == .integer) storage.Value{ .integer = inc.integer } else storage.Value.null;
+                } else .null,
+            });
+        }
+    };
 
     /// Fill free window slots and retry due reservations; refuse writes the GC
     /// watermark outlived (§10at). Returns the number actually sent.
@@ -10505,6 +10539,7 @@ test "undo: a new write re-enables tracking after an empty poll; authoritative C
 /// outbox and nothing is published. `p` speaks the ordered envelope, `c` does not.
 fn orderTestClient(a: std.mem.Allocator, path: [:0]const u8, conn: *@import("nats").Connection, t: *transport.Transport) !SyncClient {
     var cl = try undoTestClient(a, path);
+    try cl.ensureGenerations();
     t.* = .{ .allocator = a, .threaded = undefined, .conn = conn, .js = undefined };
     cl.t = t;
     cl.opts = .{ .url = "", .creds_path = "", .db_path = path, .principal = "omar", .tables = &.{}, .client_id = "c-1" };
@@ -10983,6 +11018,8 @@ test "incarnation: a stamped write carries the scope stamp; seeded before stamps
     try std.testing.expectEqual(@as(i64, 4), ob[1][1].integer);
     try cl.st.execSimple("INSERT INTO _zbz_fence (tbl, tenant) VALUES ('p', '_open')");
     try std.testing.expectError(error.ReplacementIncomplete, incTestWrite(&cl, a, "mid-replacement"));
+    st.advertised = false;
+    try std.testing.expectError(error.ReplacementIncomplete, incTestWrite(&cl, a, "legacy during replacement"));
     try std.testing.expectEqual(@as(usize, 2), (try incTestOutbox(&cl, a)).len);
     try std.testing.expectEqualStrings("still the old rows", try incTestTitle(&cl, a));
 }
@@ -11043,4 +11080,62 @@ test "incarnation: a dropped table keeps its stamped writes for the bridge to se
     try discardOutbox(&cl.st, a, "p", "dropped");
     const ob = try incTestOutbox(&cl, a);
     try std.testing.expect(ob.len == 1 and ob[0][1].integer == 4 and ob[0][2].integer == 1);
+}
+
+test "enqueue fails closed when scope metadata cannot be read" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    var cl = try incTestClient(a, &conn, &t);
+    defer cl.st.close();
+    const state = cl.states.getPtr("p").?;
+    state.advertised = true;
+    state.incarnation = 5;
+    try cl.st.execSimple("INSERT INTO _zbz_stamp VALUES ('p', '_open', 5)");
+    for ([_][]const u8{ "_zbz_fence", "_zbz_generations", "_zbz_stamp" }) |table| {
+        try cl.st.execSimple(try std.fmt.allocPrintSentinel(a, "ALTER TABLE {s} RENAME TO unavailable", .{table}, 0));
+        if (incTestWrite(&cl, a, "blocked")) |_| {
+            return error.TestExpectedError;
+        } else |err| switch (err) {
+            // SQLite may recompile a cached statement at step time after the rename.
+            error.PrepareFailed, error.StepFailed => {},
+            else => return err,
+        }
+        try std.testing.expectEqualStrings("orig", try incTestTitle(&cl, a));
+        try std.testing.expectEqual(@as(usize, 0), (try incTestOutbox(&cl, a)).len);
+        try cl.st.execSimple(try std.fmt.allocPrintSentinel(a, "ALTER TABLE unavailable RENAME TO {s}", .{table}, 0));
+    }
+}
+
+test "failed outbox insert rolls back stamp adoption and optimistic UPDATE across reopen" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/atomic.sqlite3", .{dir}, 0);
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    {
+        var cl = try orderTestClient(a, path, &conn, &t);
+        defer cl.st.close();
+        const state = cl.states.getPtr("p").?;
+        state.advertised = true;
+        state.incarnation = 5;
+        state.seed_epoch = 3;
+        try cl.st.execSimple("INSERT INTO p VALUES ('x','orig')");
+        try cl.st.execSimple("INSERT INTO _zbz_generations (tbl,tenant,watermark,seed_epoch) VALUES ('p','_open','w',3)");
+        try cl.st.execSimple("CREATE TRIGGER refuse_insert BEFORE INSERT ON _zebridge_outbox BEGIN SELECT RAISE(ABORT,'injected refusal'); END");
+        try std.testing.expectError(error.StepFailed, incTestWrite(&cl, a, "must roll back"));
+    }
+    var reopened = try orderTestClient(a, path, &conn, &t);
+    defer reopened.st.close();
+    try std.testing.expectEqualStrings("orig", try incTestTitle(&reopened, a));
+    try std.testing.expectEqual(@as(usize, 0), (try incTestOutbox(&reopened, a)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try reopened.st.query(a, "SELECT * FROM _zbz_stamp", &.{})).len);
 }

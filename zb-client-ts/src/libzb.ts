@@ -6482,6 +6482,8 @@ export class ZeBridge {
     try {
       await this.ledgerTransaction(async (txExec) => {
         const state = this.syncedTables.get(table);
+        if (!state) throw new WriteRefusal('UnknownTable');
+        if (this.suspendedMap.has(table)) throw new WriteRefusal('TableSuspended');
         let before: any = null;
         let authoritative: boolean | undefined;
         if (state?.pkCols.length) {
@@ -6505,7 +6507,7 @@ export class ZeBridge {
           writable: state?.writable ?? null, advertised: state?.advertised ?? false, incarnation: state?.incarnation ?? null,
           replacing: (await txExec(`SELECT 1 AS x FROM _zebridge_fence WHERE tbl = ?`, table)).length > 0,
           scopeStamp: stampRow ? Number(stampRow.incarnation) : null,
-          anchorEpoch: anchorRow ? Number(anchorRow.seed_epoch) : null, seedEpoch: state?.seedEpoch ?? 0, onDemand: false,
+          anchorEpoch: anchorRow ? Number(anchorRow.seed_epoch) : null, seedEpoch: state?.seedEpoch ?? 0, onDemand: this.ondemandSet.has(table),
         });
         if ('refuse' in decided) throw new WriteRefusal(decided.refuse);
         if (decided.stamp != null) {

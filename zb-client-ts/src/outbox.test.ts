@@ -1136,7 +1136,7 @@ function orderFixture(path: string) {
   const f = undoFixture(path);
   try { f.db.exec('ALTER TABLE _zebridge_outbox ADD COLUMN basis TEXT'); } catch { /* reopened */ }
   Object.assign(f.c, {
-    suspendedMap: new Map(), config: { principal: 'omar', grammar: { subjects: {} } }, clientIdValue: 'c-1',
+    ondemandSet: new Set(), suspendedMap: new Map(), config: { principal: 'omar', grammar: { subjects: {} } }, clientIdValue: 'c-1',
     clockOffsetMs: () => 0, triggerChange: () => {}, pendingWrites: new Map(), nc: null,
   });
   f.c.syncedTables.get('p').ordering = 1;
@@ -1478,6 +1478,8 @@ test('incarnation: a stamped write carries the scope stamp; seeded before stamps
     // A replacement in progress (an owed record): refused, nothing written.
     f.db.exec("INSERT INTO _zebridge_fence (tbl) VALUES ('p')");
     assert.deepEqual(await f.write('mid-replacement'), { refused: 'ReplacementIncomplete' });
+    f.st.advertised = false;
+    assert.deepEqual(await f.write('legacy during replacement'), { refused: 'ReplacementIncomplete' });
     assert.equal(f.outbox().length, 2);
     assert.equal(f.title('x'), 'still the old rows');
   } finally { f.db.close(); }
@@ -1518,5 +1520,41 @@ test('incarnation: a dropped table keeps its stamped writes for the bridge to se
     await f.write('stamped');
     await f.c.discardOutbox('p', 'dropped');
     assert.deepEqual(f.outbox().map((r) => [r.incarnation, r.other_incarnation]), [[4, 1]]);
+  } finally { f.db.close(); }
+});
+
+test('mutateWithId refuses a DROP or suspension observed during the floor read', async () => {
+  for (const reason of ['UnknownTable', 'TableSuspended']) {
+    const f = await incarnationFixture();
+    try {
+      Object.assign(f.st, { advertised: true, incarnation: 5, writable: true });
+      f.c.initializeStorage = async () => {};
+      f.c.gcWatermark = async () => {
+        if (reason === 'UnknownTable') await f.c.dropLocalTable('p', 'dropped');
+        else f.c.suspendedMap.set('p', 'no_cdc_subject');
+        return null;
+      };
+      await assert.rejects(f.c.mutateWithId('p', 'UPDATE', { id: 'x' }, { title: 'blocked' },
+        { version: '2026-11-12T10:00:00.000001Z' }), new RegExp(reason));
+      assert.equal(f.outbox().length, 0);
+      if (reason === 'UnknownTable') assert.equal(f.db.prepare("SELECT 1 FROM sqlite_master WHERE name='p'").get(), undefined);
+      else assert.equal(f.title('x'), 'orig');
+    } finally { f.db.close(); }
+  }
+});
+
+test('mutateWithId stamps an on-demand row from the descriptor without a seed anchor', async () => {
+  const f = await incarnationFixture();
+  try {
+    f.c.initializeStorage = async () => {};
+    f.c.ondemandSet.add('p');
+    Object.assign(f.st, { advertised: true, incarnation: 5, writable: true });
+    assert.equal(f.db.prepare('SELECT 1 FROM _zebridge_generations').get(), undefined);
+    assert.equal(await f.c.ingest('p', { columns: ['id', 'title'], rows: [['answer', 'from service']] }), 1);
+    const { writeId } = await f.c.mutateWithId('p', 'UPDATE', { id: 'answer' }, { title: 'edited' },
+      { version: '2026-11-12T10:00:00.000001Z' });
+    assert.equal(f.title('answer'), 'edited');
+    assert.equal(f.outbox()[0].msg_id, writeId);
+    assert.equal(JSON.parse(f.outbox()[0].payload).incarnation, 5);
   } finally { f.db.close(); }
 });
