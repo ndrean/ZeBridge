@@ -423,6 +423,10 @@ pub const TenantRouting = struct {
     /// "$KV.tenants.": a principal's tenant set, published by this publisher in WAL order
     /// (`members`). Empty: membership unknown, every missing stream is skipped as before.
     tenants_kv_prefix: []const u8 = "",
+    /// "mutation_ack": a principal whose tenant set was published is told so on
+    /// `<prefix>.<principal>.tenants`, the subject family its clients already receive
+    /// verdicts and the ban on. Empty: no notice.
+    notice_prefix: []const u8 = "",
 
     /// The tenant of `<cdc_prefix>.<tenant>.<table>.<op>`, or of its batch form
     /// `….<op>.batch` (several rows in one message, encodeGroup). Null for an untenanted
@@ -1096,6 +1100,7 @@ pub const BatchPublisher = struct {
 
                     try self.timedPublish(event.getSubject(), msg_id, raw_json);
                     self.noteMembers(event.getSubject(), raw_json);
+                    try self.noticeMembership(event.getSubject(), msg_id);
                     // §1.7's undercount, resolved sideways: SCHEMA events get their own
                     // counter rather than joining `cdc_events_published`, whose value is
                     // trusted to equal row events (README burst method, speed.py).
@@ -1323,6 +1328,33 @@ pub const BatchPublisher = struct {
         }
         log.debug("⏭️ skipped {d} event(s) on '{s}': {s} does not exist", .{ count, subject, stream });
         return true;
+    }
+
+    /// A principal's tenant set was published (`$KV.tenants.<principal>`): tell its clients,
+    /// on `<notice_prefix>.<principal>.tenants`, that their membership changed. The notice
+    /// carries nothing: a client reads its own key for the list and renews its credentials
+    /// for the grants. Published after the KV value's PubAck, in the same flush: the flush
+    /// confirms its LSN only once everything in it is published, so a bridge stopped
+    /// between the two replays the roster row at its next start and publishes both again.
+    /// A JetStream publish (the VERDICTS stream keeps it, as it keeps the ban), deduplicated
+    /// on the KV event's own ID.
+    fn noticeMembership(self: *BatchPublisher, subject: []const u8, kv_msg_id: ?[]const u8) !void {
+        const routing = self.tenant_routing orelse return;
+        if (routing.notice_prefix.len == 0 or routing.tenants_kv_prefix.len == 0) return;
+        if (!std.mem.startsWith(u8, subject, routing.tenants_kv_prefix)) return;
+        const principal = subject[routing.tenants_kv_prefix.len..];
+        if (principal.len == 0) return;
+        // The stop is armed for one principal: a slot replaying other roster rows passes them.
+        if (comptime @import("build_options").test_faults) if (std.c.getenv("ZB_TEST_TENANT_NOTICE_EXIT")) |who| if (std.mem.eql(u8, std.mem.span(who), principal)) {
+            log.warn("ZB_TEST_TENANT_NOTICE_EXIT: stopping after '{s}' was published, before its notice", .{subject});
+            std.process.exit(70);
+        };
+        var subject_buf: [320]u8 = undefined;
+        const notice = std.fmt.bufPrint(&subject_buf, "{s}.{s}.tenants", .{ routing.notice_prefix, principal }) catch return;
+        var id_buf: [320]u8 = undefined;
+        const id: ?[]const u8 = if (kv_msg_id) |k| (std.fmt.bufPrint(&id_buf, "tenants-{s}", .{k}) catch null) else null;
+        try self.timedPublish(notice, id, "{\"status\":\"tenants\"}");
+        log.info("📣 '{s}': membership changed — notice on {s}", .{ principal, notice });
     }
 
     /// A principal's tenant set was published (`$KV.tenants.<principal>`, a JSON array):

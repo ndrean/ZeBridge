@@ -1563,6 +1563,7 @@ pub fn main(init: std.process.Init) !void {
         .open_tenant = runtime_config.topology.open_tenant,
         // A missing stream of a tenant someone is mapped to is a fault (see `members`).
         .tenants_kv_prefix = tenants_kv_prefix,
+        .notice_prefix = runtime_config.topology.mutation_ack_prefix,
     };
     // Start flush thread - batch_pub is now at stable heap address
     try batch_pub.start();

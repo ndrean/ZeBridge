@@ -2415,10 +2415,26 @@ pub const EventProcessor = struct {
         while (r < num_rows) : (r += 1) {
             try self.rosterAdd(std.mem.span(c.PQgetvalue(result, r, 0)), std.mem.span(c.PQgetvalue(result, r, 1)));
         }
+        // A key that already holds the principal's set is left alone: every put tells its
+        // principal the membership changed (`BatchPublisher.noticeMembership`), and a boot
+        // that changed nothing must not tell every principal so. A key that cannot be read
+        // is put. A notice lost with a stopped bridge is not this pass's to reissue: the
+        // roster row it belonged to was never confirmed, and the slot replays it.
+        var tenants_kv = if (self.publisher) |publ| (if (publ.js) |*js| (js.kvBucket(self.topology.kv_tenants) catch null) else null) else null;
+        defer if (tenants_kv) |*kv| kv.deinit();
         var published: usize = 0;
+        var unchanged: usize = 0;
         var pit = self.roster.iterator();
         while (pit.next()) |e| {
             if (e.value_ptr.items.len == 0) continue;
+            if (tenants_kv) |*kv| if (kv.get(e.key_ptr.*)) |entry_const| {
+                var entry = entry_const;
+                defer entry.deinit();
+                if (std.mem.eql(u8, entry.value, try Topology.tenantsValue(arena, e.value_ptr.items))) {
+                    unchanged += 1;
+                    continue;
+                }
+            } else |_| {};
             const slot_idx = try self.packRosterSet(arena, e.key_ptr.*, 0, boot_lsn);
             try self.releaseSlotToQueue(slot_idx);
             published += 1;
@@ -2450,7 +2466,7 @@ pub const EventProcessor = struct {
         };
 
         const lifted = self.liftStaleBans(arena);
-        log.info("✅ Boot tenant backfill published to KV for {d} principal(s) ({d} membership row(s)), {d} stale key(s) purged, {d} ban(s) lifted", .{ published, num_rows, stale, lifted });
+        log.info("✅ Boot tenant backfill published to KV for {d} principal(s) ({d} unchanged, {d} membership row(s)), {d} stale key(s) purged, {d} ban(s) lifted", .{ published, unchanged, num_rows, stale, lifted });
     }
 
     /// §10gz: the DELETING direction of the `$KV.schemas` mirror, which boot never had.
