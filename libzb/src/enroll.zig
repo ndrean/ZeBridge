@@ -487,22 +487,24 @@ pub fn androidNoBackupPath(a: std.mem.Allocator, db_path: []const u8) !?[]u8 {
 }
 
 /// The identity used to sit beside the replica, where Android backs it up: moved into
-/// `no_backup/` once (the folder made if needed). When `new` already exists it wins, and the
+/// `no_backup/` once. The folder is made on every call, even with nothing to move. When `new` already exists it wins, and the
 /// old copy is removed so no later backup carries it.
 pub fn moveIdentity(old: [:0]const u8, new: [:0]const u8) void {
     const log = std.log.scoped(.libzb);
-    if (std.c.access(old, 0) != 0) return;
-    if (std.c.access(new, 0) == 0) {
-        _ = std.c.unlink(old);
-        log.info("identity: {s} is kept, the old copy beside the replica is removed", .{new});
-        return;
-    }
+    // The folder first, move or not: a fresh install (or `pm clear`) has no old identity
+    // and no no_backup/, and the first save into it would fail with FileNotFound.
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = std.fs.path.dirname(new) orelse ".";
     if (dir.len < buf.len) {
         @memcpy(buf[0..dir.len], dir);
         buf[dir.len] = 0;
         _ = std.c.mkdir(@ptrCast(&buf), 0o700); // EEXIST is fine
+    }
+    if (std.c.access(old, 0) != 0) return;
+    if (std.c.access(new, 0) == 0) {
+        _ = std.c.unlink(old);
+        log.info("identity: {s} is kept, the old copy beside the replica is removed", .{new});
+        return;
     }
     if (std.c.rename(old, new) == 0) {
         log.info("identity: moved to {s}, out of Android's backup", .{new});
@@ -735,6 +737,25 @@ test "androidNoBackupPath: a replica in an app's private folder keeps its identi
         defer a.free(got);
         try std.testing.expectEqualStrings(c[1], got);
     }
+}
+
+test "moveIdentity: a fresh install with no identity to move still gets its no_backup/ folder" {
+    // `pm clear` (or a first install) leaves no no_backup/ and no old identity: the first
+    // save then failed with FileNotFound (moto e20, 0.3.1) because only a move made the folder.
+    const a = std.testing.allocator;
+    var app_buf: [96]u8 = undefined;
+    const app = try std.fmt.bufPrintSentinel(&app_buf, "/tmp/zbz-nobackup-{d}", .{std.c.getpid()}, 0);
+    _ = std.c.mkdir(app, 0o700);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, app) catch {};
+    var old_buf: [128]u8 = undefined;
+    var new_buf: [128]u8 = undefined;
+    const old = try std.fmt.bufPrintSentinel(&old_buf, "{s}/files/a.sqlite3.identity", .{app}, 0);
+    const new = try std.fmt.bufPrintSentinel(&new_buf, "{s}/no_backup/a.sqlite3.identity", .{app}, 0);
+    moveIdentity(old, new);
+    var id: Identity = .{ .bridge_url = @constCast("https://b"), .principal = @constCast("p"), .creds = @constCast("c") };
+    _ = &id;
+    try save(a, new, id);
+    try std.testing.expect(std.c.access(new, 0) == 0);
 }
 
 test "androidNoBackupPath: any other path keeps the default beside the replica" {
