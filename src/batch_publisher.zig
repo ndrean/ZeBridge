@@ -476,6 +476,10 @@ pub const BatchPublisher = struct {
     /// keeping every row. Touched by the flush thread alone.
     members: std.StringHashMapUnmanaged([]const []const u8) = .empty,
     members_arena: ?std.heap.ArenaAllocator = null,
+    /// A tenant set could not be recorded (unparsable value, no memory): `members` may
+    /// miss a member, so every tenant counts as held until a restart rebuilds the map —
+    /// a missing stream then stops the bridge instead of confirming rows nobody keeps.
+    members_lost: bool = false,
 
     // Pre-allocated ring buffer of CDCEvent structs (zero malloc/free!)
     // Allocated once at startup, reused for entire lifetime
@@ -1372,17 +1376,25 @@ pub const BatchPublisher = struct {
 
     fn setMembers(self: *BatchPublisher, principal: []const u8, value: []const u8) void {
         if (principal.len == 0) return;
+        self.putMembers(principal, value) catch |err| {
+            if (!self.members_lost) log.warn("⚠️ the tenant set of '{s}' could not be recorded ({s}): every tenant now counts as mapped until a restart — a missing tenant stream stops the bridge rather than skip its rows", .{ principal, @errorName(err) });
+            self.members_lost = true;
+        };
+    }
+
+    fn putMembers(self: *BatchPublisher, principal: []const u8, value: []const u8) !void {
         if (self.members_arena == null) self.members_arena = std.heap.ArenaAllocator.init(self.allocator);
         const ma = self.members_arena.?.allocator();
-        const parsed = std.json.parseFromSliceLeaky([]const []const u8, ma, value, .{ .allocate = .alloc_always }) catch return;
+        const parsed = try std.json.parseFromSliceLeaky([]const []const u8, ma, value, .{ .allocate = .alloc_always });
         // The arena grows with every change; the roster is small and changes are rare.
-        const gop = self.members.getOrPut(self.allocator, principal) catch return;
-        if (!gop.found_existing) gop.key_ptr.* = ma.dupe(u8, principal) catch return;
+        const key = try ma.dupe(u8, principal);
+        const gop = try self.members.getOrPut(self.allocator, key);
         gop.value_ptr.* = parsed;
     }
 
     /// Whether some principal is mapped to `tenant`, as of the rows published so far.
     fn tenantHasMembers(self: *BatchPublisher, tenant: []const u8) bool {
+        if (self.members_lost) return true;
         var it = self.members.valueIterator();
         while (it.next()) |ts| for (ts.*) |t| if (std.mem.eql(u8, t, tenant)) return true;
         return false;
@@ -1687,4 +1699,22 @@ test "the slot's message id holds the longest id a 63-character table can produc
     try std.testing.expectEqualStrings(id, ev.getMsgId());
     const suspend_id = try std.fmt.bufPrint(&buf, "schema-suspend-boot-cols-{s}-{d}", .{ table, std.math.maxInt(u64) });
     try ev.setMsgId(suspend_id);
+}
+
+test "members: a tenant set that cannot be recorded makes every tenant count as mapped" {
+    var bp: BatchPublisher = undefined;
+    bp.allocator = std.testing.allocator;
+    bp.members = .empty;
+    bp.members_arena = null;
+    bp.members_lost = false;
+    defer {
+        bp.members.deinit(bp.allocator);
+        if (bp.members_arena) |*ar| ar.deinit();
+    }
+    bp.setMembers("p1", "[\"acme\"]");
+    try std.testing.expect(bp.tenantHasMembers("acme"));
+    try std.testing.expect(!bp.tenantHasMembers("kilo"));
+    // p2 just joined kilo, but its value is unreadable: kilo's missing stream is a fault.
+    bp.setMembers("p2", "[\"kilo\"");
+    try std.testing.expect(bp.tenantHasMembers("kilo"));
 }
