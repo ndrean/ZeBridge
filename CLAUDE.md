@@ -79,8 +79,10 @@ lists only what differs.
 
 **Fault-hook builds.** Crash and timing points are compiled in only with `-Dtest-faults=true` (libzb) and exist as env
 variables there (`ZB_TEST_FENCE_ABORT`, `ZB_TEST_FENCE_SLEEP_MS`, `ZB_TEST_SHARED_UNREADABLE`,
-`ZB_TEST_SCHEMA_PAUSE_FILE`). zb-client-ts reads **no** environment for them: they are the `faultHook` config option, mapped
-from the same variables by `scripts/scenarios/fence_client.mts`. A scenario fails if an ordinary build carries a hook.
+`ZB_TEST_SCHEMA_PAUSE_FILE`, `ZB_TEST_SEED_COMMIT_PAUSE_FILE`, `ZB_TEST_TENANT_RENEW_PAUSE_FILE`,
+`ZB_TEST_TENANT_RECONNECT_FAIL_ONCE`). zb-client-ts reads **no** environment for them: they are the `faultHook` config option, mapped
+from the same variables by `scripts/scenarios/fence_client.mts` (the tenant hooks by `tenant_faults.mts`). A scenario fails if an
+ordinary build carries a hook.
 
 ## How recovery works (the part most changes touch)
 

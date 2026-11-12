@@ -14,7 +14,7 @@
 
 #include <stdint.h>
 
-#define ZB_ABI_VERSION 8
+#define ZB_ABI_VERSION 9
 
 #ifdef __cplusplus
 extern "C" {

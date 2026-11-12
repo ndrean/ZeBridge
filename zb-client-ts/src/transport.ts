@@ -26,6 +26,8 @@ export interface JetStreamOpts {
 
 export interface TransportConnection {
   close(): Promise<void>;
+  reconnect(): Promise<void>;
+  flush(): Promise<void>;
   status(): AsyncIterable<unknown>;
   /// `opts.queue` puts this subscription in a QUEUE GROUP: one member of the group
   /// gets each message, which is how a responder scales and fails over (§10hp).

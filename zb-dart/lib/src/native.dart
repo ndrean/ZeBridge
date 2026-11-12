@@ -16,7 +16,7 @@ import 'dart:ffi' as ffi;
 import 'package:ffi/ffi.dart';
 
 /// libzb's C ABI version this package was written for; libzb/python/abi_check.py checks it.
-const zbAbi = 8;
+const zbAbi = 9;
 
 /// A call libzb refused, with libzb's own words.
 class ZeBridgeException implements Exception {
@@ -38,6 +38,7 @@ class PollReport {
     this.pending = 0,
     this.reconciling = 0,
     this.floorMarginMs,
+    this.membership,
     this.error,
   });
 
@@ -69,6 +70,7 @@ class PollReport {
   /// How long the oldest pending write has before the GC floor refuses it, in ms (at 0 or
   /// below it is refused, `PredatesGcWatermark`); null when nothing waits or the floor is unknown.
   final int? floorMarginMs;
+  final String? membership;
 
   /// Set by the worker when a poll itself failed (connection gone, principal revoked).
   final String? error;
@@ -84,6 +86,7 @@ class PollReport {
         pending: (j['pending'] as num?)?.toInt() ?? 0,
         reconciling: (j['reconciling'] as num?)?.toInt() ?? 0,
         floorMarginMs: (j['floor_margin_ms'] as num?)?.toInt(),
+        membership: j['membership'] as String?,
         error: j['error'] as String?,
       );
 
@@ -98,6 +101,7 @@ class PollReport {
         'pending': pending,
         'reconciling': reconciling,
         if (floorMarginMs != null) 'floor_margin_ms': floorMarginMs,
+        if (membership != null) 'membership': membership,
         if (error != null) 'error': error,
       };
 }

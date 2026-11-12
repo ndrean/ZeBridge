@@ -127,6 +127,9 @@ GROUPS = {
     "owns": {
         "incarnation_clients": ("bridge", "both client decisions: a stamped edit queued offline, a withheld descriptor (identity unknown) refuses a second edit with the row and outbox untouched, the first keeps its ID and stamp across a restart and gets one TableIncarnationChanged verdict, the replacement row intact; both clients"),
         "recreate_incarnation": ("bridge", "a queued write belongs to its table incarnation: an offline UPDATE of row K across a DROP + CREATE with a new K must be refused (TableIncarnationChanged), not applied to the replacement row; the zebridge_reseed control (same incarnation) stays eligible; both clients"),
+        "late_tenant": ("bridge", "a running client gets its first private assignment through its original handle (no private assignment -> tenant A added beside the open one): a public CDC change before; after, A's seed and a later private change, B's probe never; a /renew control proves the grants; both clients; compose dev stack (ZB_NATS_CONTAINER)"),
+        "seed_boundaries": ("none", "an open transaction crosses a snapshot cut; after a plain full commits, both clients replay the next update and delete and match PostgreSQL on the original anchor; private stack and fault libzb"),
+        "tenant_notice": ("bridge", "the membership notice: a tenant added in PostgreSQL reaches the principal on mutation_ack.<principal>.tenants once its key holds it; a bridge stopped between the key and the notice (fault build, ZB_TEST_TENANT_NOTICE_EXIT) replays the roster row at its restart and the notice reaches the same, never-dropped connection; compose dev stack (ZB_NATS_CONTAINER)"),
         "incarnation_gate": ("none", "the bridge's incarnation gate with stamped payloads, private stack with admission and the fault build: legacy and malformed stamps, a DROP waiting on the gate's lock, receipts winning over a recreate (and a fingerprint conflict), old stamps and dropped tables rejected TableIncarnationChanged, a mixed batch, a parked release, retryable permission and catalogue failures, preflight, the descriptor switch"),
         "ingress_ordering": ("none", "ordered parent/child: held parent with one/four lanes; successor durably parked while another client commits; disposable PostgreSQL/NATS"),
         "ingress_arrival": ("none", "ordered successor arrives before admission-refused parent; immutable resend releases it; single-lane rate-limit control; disposable stack"),
@@ -186,7 +189,8 @@ GROUPS = {
     # Regressions for a known, unfixed bug: each asserts the desired outcome, so it exits 1 today.
     # Kept out of `owns` (and `all`) so that group stays a signal; here exit 1 counts as expected,
     # and an unexpected pass fails the group: the fix landed, move the scenario to `owns`.
-    "known_red": {},
+    "known_red": {
+    },
     "manual": {
         "ingress_baseline": ("none", "paused-consumer backlog baseline, 1/10/100/500 connected publishers and 1/8 ingress lanes; three rounds, optional diagnostic binary and mixed traffic; requires --log-dir, see --help"),
         "firehose_topology": ("none", "the firehose with N TLS consumers attached, topology 2 (TLS on nats-server, bridge tls://) vs topology 1 (plain nats-server, HAProxy terminates the clients' TLS): chain margin, cuts, CPU per process (§10gb); ~10 min"),

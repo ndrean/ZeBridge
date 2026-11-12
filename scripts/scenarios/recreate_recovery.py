@@ -803,7 +803,8 @@ async def check4(a, tmp, ts=False):
     """The fence's crash and retention boundaries, one client per case, the load running.
     A seed-epoch move (zebridge_reseed) gives a prompt chain cut behind a live follower.
     ts: the same cases with a zb-client-ts client (check 12)."""
-    hooks = (b"ZB_TEST_FENCE_ABORT", b"ZB_TEST_FENCE_SLEEP_MS", b"ZB_TEST_SHARED_UNREADABLE", b"ZB_TEST_SCHEMA_PAUSE_FILE")
+    hooks = (b"ZB_TEST_FENCE_ABORT", b"ZB_TEST_FENCE_SLEEP_MS", b"ZB_TEST_SHARED_UNREADABLE", b"ZB_TEST_SCHEMA_PAUSE_FILE",
+             b"ZB_TEST_TENANT_RENEW_PAUSE_FILE", b"ZB_TEST_TENANT_RECONNECT_FAIL_ONCE", b"ZB_TEST_SEED_COMMIT_PAUSE_FILE")
     if ts:
         # The fault points belong to the harness: the library reads no environment for them.
         lib_src = (zb.ROOT / "zb-client-ts/src/libzb.ts").read_bytes()

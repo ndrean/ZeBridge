@@ -137,6 +137,8 @@ export interface ZeBridgeConfig {
   /// (`/renew`), kept in the identity; and where the grammar hash is fetched when
   /// `grammarHash` is unset. libzb: same name.
   bridgeUrl?: string;
+  /** Trusted bridge base URL for renewing explicitly supplied credentials. */
+  renewalUrl?: string;
   /** @internal The compiled-in grammar (§10dq). Not a consumer input: any value passed here is replaced. */
   grammar?: any;
   /// PROTOCOL §11: the fleet heartbeat cadence in ms (default 30 000; 0 disables).
@@ -162,7 +164,7 @@ export interface ZeBridgeConfig {
   /// replacement committed), `before_verify`, `before_commit`, and `shared_lookup` (the
   /// shared route's stream lookup; a throw there makes the route unreadable). A harness
   /// crashes the process, sleeps while it prunes the stream, or throws. Never set in an app.
-  faultHook?: (point: 'before_decision' | 'after_chunk' | 'before_verify' | 'before_commit' | 'after_commit' | 'shared_lookup') => void | Promise<void>;
+  faultHook?: (point: 'before_decision' | 'after_chunk' | 'before_verify' | 'before_commit' | 'after_commit' | 'shared_lookup' | 'tenant_renew_pause' | 'tenant_reconnect_fail_once') => void | Promise<void>;
   /// §10ix (libzb: same name): apply a chain step AS IT ARRIVES — chunks inflated and
   /// decoded into windows of `seedChunkRows`, never the whole document. Measured on a
   /// 3M-row base: 2.5 GB peak when the document was materialised whole (§10iw).
@@ -914,7 +916,11 @@ export class ZeBridge {
 
   /// Renew when due in the bridge's time, or now (`force`): NATS refused the JWT, so the
   /// device's estimate of the bridge's time may be wrong, and a renewal corrects it.
-  private async renewNow(force: boolean): Promise<'renewed' | 'skipped' | 'failed' | 'purged'> {
+  private renewing?: Promise<'renewed' | 'skipped' | 'failed' | 'purged'>;
+  private renewNow(force: boolean) {
+    return this.renewing ??= this.renewIdentity(force).finally(() => { this.renewing = undefined; });
+  }
+  private async renewIdentity(force: boolean): Promise<'renewed' | 'skipped' | 'failed' | 'purged'> {
     const id = this.identityNow;
     if (!id || (!force && !renewDue(id.creds, serverNow(id)))) return 'skipped';
     try {
@@ -987,6 +993,10 @@ export class ZeBridge {
         c.jsDomain ??= id.js_domain ?? undefined;
         c.bridgeUrl ??= id.bridge_url;
       }
+    }
+    if (c.creds && !this.identityNow && (c.renewalUrl || c.bridgeUrl)) {
+      c.principal ??= principalFromCreds(c.creds) ?? undefined;
+      if (c.principal) this.identityNow = { version: 1, bridge_url: (c.renewalUrl || c.bridgeUrl)!, creds: c.creds, principal: c.principal };
     }
     if (!c.natsUrl && !c.creds && !this.identityNow) throw new NotEnrolled();
     if (!c.natsUrl) throw new Error('zb-client-ts: no `natsUrl`, and no identity that names one (the bridge sets ENROLL_NATS_URL / ENROLL_NATS_WS_URL)');
@@ -1505,9 +1515,11 @@ export class ZeBridge {
       // and a tenant-scoped table that arrives before the tenant is known is skipped
       // as "no tenant" — and never created. Measured: counter_tenant missing for
       // alice on the web page, note_t for the same creds in Node, by arrival order.
+      await this.watchVerdicts();
+      if (!nc || this.nc !== nc) return;
+      await nc.flush();
       await this.resolveTenant();
       await this.watchSchemas();
-      await this.watchVerdicts();
       // §10dm: a ban published while this client was away is retained — one direct get.
       await this.collectMissedVerdicts([{ msg_id: 'revoked' }]);
       if (this.revoked) throw new Error(`'${this.config.principal}' is revoked`);
@@ -1554,6 +1566,8 @@ export class ZeBridge {
             for await (const st of this.nc.status()) {
               const t = String((st as any).type);
               if (t === 'reconnect') {
+                this.membershipEpoch++;
+                this.scheduleMembership();
                 this.naturallyConnected = true;
                 this.outboxReconnect++;
                 this.emitStatus('connected');
@@ -1588,6 +1602,8 @@ export class ZeBridge {
         }
       })();
 
+      this.membershipReady = true;
+      if (this.membershipDirty) this.scheduleMembership();
       // The terminal reason, named (§10dl): closed() resolves with the error that
       // ended the connection — an auth verdict reads as such, not as a bare close.
       const closedP: Promise<unknown> | undefined = (nc as any).closed?.();
@@ -1652,6 +1668,11 @@ export class ZeBridge {
   }
 
   public async close(): Promise<void> {
+    this.membershipReady = false;
+    this.membershipNeedsCredentials = false;
+    clearTimeout(this.membershipTimer);
+    this.membershipTimer = undefined;
+    this.renewedAtEpoch = undefined;
     if (this.renewTimer) { clearTimeout(this.renewTimer); this.renewTimer = null; }
     clearInterval(this.sweepId);
     clearInterval(this.rttIntervalId);
@@ -3875,36 +3896,133 @@ export class ZeBridge {
     return this.config.grammar.subjects?.mutation_ack_prefix ?? 'mutation_ack';
   }
 
+  private membershipReady = false;
+  private membershipNeedsCredentials = false;
+  public get credentialsRequired(): boolean { return this.membershipNeedsCredentials; }
+  private membershipEpoch = 0;
+  private renewedAtEpoch: number | undefined;
+  private membershipDirty = false;
+  private membershipRunning = false;
+  private membershipTimer?: ReturnType<typeof setTimeout>;
+  private membershipDelay = 250;
+
+  private async readMembership(nc: TransportConnection): Promise<string[]> {
+    const kv = await this.transport.kv(nc, this.config.grammar.kv.tenants, { allow_direct: true }, this.jsOpts());
+    const entry = await kv.get(this.config.principal);
+    if (!entry || entry.operation !== 'PUT' || !entry.value?.length) return [];
+    let val: unknown;
+    try { val = decode(entry.value); } catch { /* JSON */ }
+    return parseTenantList(typeof val === 'string' ? val : td.decode(entry.value));
+  }
+
   private async resolveTenant() {
-    if (!this.nc) return;
+    const nc = this.nc;
+    if (!nc) return;
+    const open = this.config.grammar.open_tenant || '_default';
     try {
-      // allow_direct must be explicit: the KV open never asks the server, and the
-      // grant covers ONLY the per-key Direct Get path (measured — App.tsx history).
-      const kv = await this.transport.kv(this.nc, this.config.grammar.kv.tenants, { allow_direct: true }, this.jsOpts());
-      const entry = await kv.get(this.config.principal);
-      // A purged mapping (§10ce: `bridge --revoke`) leaves a DEL marker with an empty
-      // value — that is "no mapping", not a tenant named "".
-      if (entry && entry.operation === 'PUT' && entry.value?.length) {
-        let val: string;
-        try { val = decode(entry.value) as string; } catch { val = td.decode(entry.value); }
-        if (typeof val !== 'string') val = td.decode(entry.value);
-        // §10fn: the value is the roster's SET, a JSON array (`["acme","globex"]`). This
-        // client follows ONE tenant — the first — and
-        // says so when there are more (membership across several is libzb's, parity
-        // queued).
-        const list = parseTenantList(val);
-        this.tenantValue = list[0] ?? '';
-        if (list.length > 1) {
-          this.appendLog('SYS', `'${this.config.principal}' belongs to ${list.length} tenants (${list.join(', ')}) — this client follows '${list[0]}' only`, 'WARN');
-        } else {
-          this.appendLog('SYS', `Resolved tenant for '${this.config.principal}': ${this.tenantValue}`, 'INFO');
-        }
-      } else {
-        this.tenantValue = '';
+      const list = await this.readMembership(nc);
+      const tenant = selectTenant(list, open);
+      if (!list.length) {
         this.appendLog('SYS', `No tenant mapping for '${this.config.principal}' — revoked, or never enrolled: tenant-scoped tables are not followed, public tables are`, 'WARN');
+      } else if (list.filter(t => t !== open).length > 1) {
+        this.appendLog('SYS', `Following the first private membership: ${tenant}`, 'WARN');
       }
+      if (tenant && tenant !== open && list.includes(open)) {
+        this.tenantValue = open;
+        await this.verifyTenantRoute(nc, tenant);
+      }
+      this.tenantValue = tenant;
     } catch (err) {
-      this.appendLog('SYS', `Tenant resolution failed: ${err}`, 'ERROR');
+      this.appendLog('SYS', `Tenant resolution deferred: ${err}`, 'WARN');
+      this.scheduleMembership();
+    }
+  }
+
+  private async verifyTenantRoute(nc: TransportConnection, tenant: string) {
+    const jsm = await this.transport.jetstreamManager(nc, this.jsOpts());
+    await jsm.streams.info(this.cdcStreamForTenant(tenant));
+  }
+
+  private scheduleMembership(delay = 0) {
+    this.membershipDirty = true;
+    if (!this.nc || !this.membershipReady || this.membershipRunning || this.membershipTimer) return;
+    this.membershipTimer = setTimeout(() => {
+      this.membershipTimer = undefined;
+      void this.refreshMembership();
+    }, delay);
+  }
+
+  private async refreshMembership() {
+    const nc = this.nc;
+    if (!nc || this.membershipRunning) return;
+    this.membershipRunning = true;
+    this.membershipDirty = false;
+    let delay = 0;
+    try {
+      await nc.flush();
+      const open = this.config.grammar.open_tenant || '_default';
+      const tenant = selectTenant(await this.readMembership(nc), open);
+      if (this.nc !== nc || (this.tenantValue && this.tenantValue !== open)) return;
+      if (!tenant || tenant === open) {
+        this.membershipNeedsCredentials = false;
+        if (tenant === open && !this.tenantValue) {
+          // The initial direct get failed. Public CDC kept running while we
+          // retried; now the open membership can seed tenant-scoped tables.
+          this.tenantValue = open;
+          await this.subscribeStreams();
+        }
+        return;
+      }
+      if (this.renewedAtEpoch === undefined) {
+        if (!this.identityNow) {
+          this.membershipNeedsCredentials = true;
+          this.appendLog('SYS', 'tenant: credentials required for first private assignment', 'WARN');
+          return;
+        }
+        await this.fault('tenant_renew_pause');
+        if (this.nc !== nc) return;
+        if (await this.renewNow(true) !== 'renewed') throw new Error('tenant renewal incomplete');
+        if (this.nc !== nc) return;
+        this.renewedAtEpoch = this.membershipEpoch;
+      }
+      if (this.nc !== nc) return;
+      if (this.renewedAtEpoch === this.membershipEpoch) {
+        await this.fault('tenant_reconnect_fail_once');
+        await nc.reconnect();
+        return;
+      }
+      await this.verifyTenantRoute(nc, tenant);
+      if (this.nc !== nc) return;
+      await this.changeStreams(async () => {
+        if (this.nc !== nc) return;
+        // Finish any seed already applying the open tenant's chain. As in a
+        // normal stream pass, lend it our queue turn while waiting for it.
+        for (const table of this.seedInFlight.keys()) await this.applyGenerations(table, true);
+        // An open-only chain cannot establish coverage for a new private route.
+        for (const [table, state] of this.syncedTables) {
+          if (!state.tenantColumn || this.ondemandSet.has(table)) continue;
+          await this.run('DELETE FROM _zebridge_generations WHERE tbl = ?', table);
+          state.seedSeq = undefined;
+          state.seedStream = undefined;
+          state.sharedSeedSeq = undefined;
+          state.seedLsn = undefined;
+          state.unseeded = true;
+        }
+        this.tenantValue = tenant;
+        await this.subscribeStreamsOnce();
+      });
+      this.membershipNeedsCredentials = false;
+      this.renewedAtEpoch = undefined;
+      this.membershipDelay = 250;
+      this.appendLog('SYS', `tenant: activated ${tenant} after credential refresh`, 'INFO');
+    } catch (err) {
+      this.appendLog('SYS', `tenant: refresh deferred (${err})`, 'WARN');
+      this.membershipDirty = true;
+      delay = this.membershipDelay;
+      this.membershipDelay = Math.min(60_000, 2 * delay);
+    } finally {
+      this.membershipRunning = false;
+      if (this.nc === nc && this.membershipDirty) this.scheduleMembership(delay);
     }
   }
 
@@ -5119,7 +5237,7 @@ export class ZeBridge {
   }
 
   /// The test harness's fault point (config.faultHook); nothing in an app.
-  private async fault(point: 'before_decision' | 'after_chunk' | 'before_verify' | 'before_commit' | 'after_commit' | 'shared_lookup'): Promise<void> {
+  private async fault(point: 'before_decision' | 'after_chunk' | 'before_verify' | 'before_commit' | 'after_commit' | 'shared_lookup' | 'tenant_renew_pause' | 'tenant_reconnect_fail_once'): Promise<void> {
     await this.config.faultHook?.(point);
   }
 
@@ -6029,6 +6147,10 @@ export class ZeBridge {
   private async handleVerdict(subject: string, data: Uint8Array): Promise<boolean> {
     const prefix = `${this.ackPrefix()}.${this.config.principal}.`;
     const msgId = subject.startsWith(prefix) ? subject.slice(prefix.length) : subject;
+    if (msgId === 'tenants') {
+      this.scheduleMembership();
+      return false;
+    }
     // `<id>.held`: the write waits for its predecessor. Not a verdict (it never touches the
     // verdict subject, so it cannot replace one): it only moves the replay deadline out.
     // A notice that cannot be applied changes nothing that matters: the replay comes earlier, and is answered by the same verdict.
@@ -6799,6 +6921,10 @@ export class ZeBridge {
   }
 }
 
+
+export function selectTenant(list: string[], open: string): string {
+  return list.find((tenant) => tenant !== open) ?? list[0] ?? '';
+}
 
 /** §10fn: `$KV.tenants.<principal>` — a JSON array of tenants. Anything else is malformed. */
 export function parseTenantList(value: string): string[] {

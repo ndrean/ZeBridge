@@ -17,7 +17,7 @@ Two client libraries speak the protocol.
 | reply inbox | `_INBOX.<principal>`, from the `inbox_prefix` connection option — replies, KV watchers, object reads and pull consumers all land there, inside the principal's `_INBOX.<principal>.>` grant | the same, through nats.js's `inboxPrefix` |
 | loop | host-driven: `sync`, `poll`, `flush` | self-driven: `connect()` runs it |
 | tables followed | **one rule, both clients (`core.tableSet`, fixtures `tableSet`)**: `tables` is a list, or `"*"` for every published table; `ondemandTables` are held for their schema only, never seeded or tailed, rows through `ingest`; a name in both is on-demand; absent both, nothing is followed — and the TS client says so in its log | the same |
-| tenants followed | every membership in `$KV.tenants.<principal>` (a set): one chain per tenant into one table, one CDC stream per tenant, watermarks per (table, tenant); `zb_client_join`/`zb_client_leave` at runtime; a join the credentials cannot read is refused, and a stream that becomes unreadable is set aside alone and named in the poll report (`unreadable`) | the FIRST membership only, with a warning when there are more |
+| tenants followed | every membership in `$KV.tenants.<principal>` (a set): one chain per tenant into one table, one CDC stream per tenant, watermarks per (table, tenant); `zb_client_join`/`zb_client_leave` at runtime; a join the credentials cannot read is refused, and a stream that becomes unreadable is set aside alone and named in the poll report (`unreadable`) | the first private membership, or the open tenant while it is the only membership |
 
 ## The first ten lines
 
@@ -183,6 +183,7 @@ One vocabulary: the same key means the same thing in libzb's `opts_json` and in 
 | `identityPath` | ✅ where the identity is kept (JSON, mode 0600); default `<dbPath>.identity`, else `zebridge.identity`. On Android, a replica in the app's private folder keeps it in the app's `no_backup/` (Android backs up everything else, the device's key with it); an identity found beside the replica moves there once. On iOS it is flagged out of iCloud and computer backups (`kCFURLIsExcludedFromBackupKey`). Apps read who they are from the client (`principal`), never from this file | ✅ the same file on Node; a localStorage key in the browser |
 | `natsUrl` | ✅ optional once enrolled; a comma-separated ordered endpoint list, replacing the whole enrolled list when supplied | ✅ the same; defaults to the identity's native list on Node and WebSocket list in the browser |
 | `creds` | ✅ the .creds TEXT; wins over the identity | ✅ |
+| `renewalUrl` | With static credentials, the bridge base URL for `/renew`. The client signs with its existing NKey. Renewed credentials stay in memory. | Same. Without a renewal endpoint the client exposes `credentialsRequired` (libzb poll reports `membership: "credentials_required"`). |
 | `credsPath` | ✅ a .creds file | ✅ where there is a filesystem (Node) |
 | `principal` | ✅ optional: the creds or the identity name it | ✅ the same (also the inbox prefix on both) |
 | `password` | — (creds only) | ✅ dev shape, user/password |
@@ -321,7 +322,7 @@ Everything below the core — the shells — is where parity is by hand, and whe
 1. **Chain-orphan check** is built in neither. Retention ≥ cadence keeps it rare, not
    impossible.
 2. **The TypeScript client follows one tenant.** A principal in several tenants gets the
-   first one only, with a warning in the log; libzb follows every membership and can
+   first private one, or the open tenant while it is the only membership. libzb follows every membership and can
    join or leave at runtime.
 
 ## What is tested, per client

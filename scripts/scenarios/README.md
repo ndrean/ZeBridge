@@ -15,6 +15,10 @@ as a negative control; provisioning and admission still use the current build.
 
 Run `python3 scripts/scenarios/run.py owns -k ordering_modes` to exercise the per-write API in libzb and zb-client-ts. [ordering_modes.py](ordering_modes.py) holds a parent on one ingress lane and queues two children that each name it with `after`. An independent write from the same client commits on the free lane while the parent is held. After release, the scenario checks for one accepted receipt per parent and child and an empty outbox.
 
+`late_tenant.py` (owns) enrolls two clients in the open tenant, adds a private membership and checks the private anchor and subsequent public and private changes on the original handles. Run it with `--faults` to hold renewal across a duplicate notice and fail the first internal reconnect.
+
+Run `python3 scripts/scenarios/run.py owns -k seed_boundaries` for the snapshot-cut and replay checks. It uses a disposable PostgreSQL database, a private NATS server, and the fault build of libzb (`cd libzb && zig build lib -Doptimize=ReleaseFast -Dtest-faults=true -p zig-out-faults`). Both clients pause after their full commits so the scenario can inspect the anchor and the two subsequent CDC messages.
+
 For wrapper tests, [wrapper_ordering_fixture.py](wrapper_ordering_fixture.py) starts a private NATS server, publishes an ordered table descriptor, and runs a command with `ZB_ORDERING_URL` set. It leaves mutations unsettled so the wrapper can inspect the predecessor stored in SQLite. Each probe queues a parent, an unrelated write, an explicit child, an independent write and a default write.
 
 - **Dart:** with the host ABI 8 library built in `zb-dart/prebuilt`, run `scripts/scenarios/.venv/bin/python scripts/scenarios/wrapper_ordering_fixture.py sh -c 'cd zb-dart && dart run test/ordering_modes.dart "$ZB_ORDERING_URL"'`.

@@ -11,6 +11,7 @@ the bridge, and writes back through it.
 The options are the ones every ZeBridge client reads (CLIENTS.md), camelCase or snake_case
 alike. The first run enrolls with `invite` and keeps the identity next to the replica;
 later runs need only `bridge_url` (or nothing but `identity_path`); the JWT renews itself.
+With static credentials, pass renewal_url to refresh the JWT on first private assignment.
 
 libzb drives a client from ONE thread; this class owns that thread. Every method may be
 called from any thread and blocks until the worker has run it (at most one poll, 250 ms
@@ -38,7 +39,7 @@ from . import _native as n
 __all__ = ["ZeBridge", "ZeBridgeError", "ZB_ABI", "create_user", "creds_file_text", "grammar_hash", "merge_registers"]
 
 #: libzb's C ABI version this package was written for; libzb/python/abi_check.py checks it.
-ZB_ABI = 8
+ZB_ABI = 9
 
 
 class ZeBridgeError(RuntimeError):
@@ -132,6 +133,7 @@ class ZeBridge:
         import time
         busy_s, busy_poll_ms = 0.05, 5
         last_call = last_poll = 0.0
+        membership = "observe"
         pending: list = []
         while self._running:
             while True:
@@ -163,7 +165,8 @@ class ZeBridge:
                 r = _check(n.take(n.lib.zb_client_poll(h, busy_poll_ms if busy else self._poll_ms)))
                 if r.get("requests"):
                     r["requests"] = self._answer(r["requests"])
-                if (r.get("applied") or r.get("settled") or r.get("requests") or r.get("outcomes")) and self._on_change:
+                previous, membership = membership, r.get("membership", "observe")
+                if (membership != previous or r.get("applied") or r.get("settled") or r.get("requests") or r.get("outcomes")) and self._on_change:
                     self._on_change(r)
             except ZeBridgeError as e:
                 if self._on_error:

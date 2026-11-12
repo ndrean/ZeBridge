@@ -298,21 +298,28 @@ pub fn principalFromCreds(a: std.mem.Allocator, creds: []const u8) ?[]u8 {
     return a.dupe(u8, name.string) catch null;
 }
 
-/// The same, from a creds file.
+/// Load a static NATS identity, including its signing key, for in-memory renewal.
+pub fn readCredsFile(a: std.mem.Allocator, path: [:0]const u8) ![]u8 {
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0);
+    defer _ = std.posix.system.close(fd);
+    var buf: [65536]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
+    var n: usize = 0;
+    while (n < buf.len) {
+        const got = try std.posix.read(fd, buf[n..]);
+        if (got == 0) return a.dupe(u8, buf[0..n]);
+        n += got;
+    }
+    return error.CredentialsTooLarge;
+}
+
 pub fn principalFromCredsFile(a: std.mem.Allocator, path: []const u8) ?[]u8 {
     const pz = a.dupeSentinel(u8, path, 0) catch return null;
     defer a.free(pz);
-    const fd = std.posix.openat(std.posix.AT.FDCWD, pz, .{ .ACCMODE = .RDONLY }, 0) catch return null;
-    defer _ = std.posix.system.close(fd);
-    var text: [16384]u8 = undefined;
-    var len: usize = 0;
-    while (len < text.len) {
-        const got = std.posix.read(fd, text[len..]) catch return null;
-        if (got == 0) break;
-        len += got;
-    }
-    defer std.crypto.secureZero(u8, text[0..len]); // the seed is in there
-    return principalFromCreds(a, text[0..len]);
+    const text = readCredsFile(a, pz) catch return null;
+    defer a.free(text);
+    defer std.crypto.secureZero(u8, text);
+    return principalFromCreds(a, text);
 }
 
 /// Renew when less than a quarter of the JWT's life is left (or it is gone). `now` is

@@ -325,6 +325,7 @@ Future<void> _workerMain(_Boot boot) async {
     }
   });
 
+  String? membership = 'observe';
   while (!closing) {
     if (paused) {
       await Future.delayed(const Duration(milliseconds: 200));
@@ -332,7 +333,9 @@ Future<void> _workerMain(_Boot boot) async {
     }
     try {
       final report = zb.poll(boot.pollWaitMs);
-      if (report.changedTables.isNotEmpty ||
+      final previous = membership;
+      membership = report.membership;
+      if (membership != previous || report.changedTables.isNotEmpty ||
           report.seeded.isNotEmpty ||
           report.unreadable.isNotEmpty ||
           report.outcomes.isNotEmpty) {
