@@ -114,7 +114,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
   normalizeVersion, hlcVersion,
-  nextVersion, mutationMsgId, buildMutation,
+  nextVersion, mutationMsgId, buildMutation, decideStamp,
   columnDdl, fkClausesFor, createTableSteps, rebuildSteps, diffColumns,
   fkTextDiffers, viewSteps, indexSyncPlan,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgArrayLiteral, chainUpsertSql, chainRowParams,
@@ -164,6 +164,9 @@ for (const c of fx.chainPlan) {
 for (const c of fx.outboxWatermark) {
   test(`outboxWatermark: ${c.name}`, () =>
     assert.deepEqual(outboxWatermarkGate(c.entries, c.watermark), { send: c.send, refuse: c.refuse }));
+}
+for (const c of fx.decideStamp) {
+  test(`decideStamp: ${c.name}`, () => assert.deepEqual(decideStamp(c.in), c.out));
 }
 for (const c of fx.floorMargin) {
   test(`floorMargin: ${c.name}`, () => assert.strictEqual(outboxFloorMargin(c.versions, c.watermark), c.margin));

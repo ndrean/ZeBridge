@@ -173,6 +173,12 @@ const TableState = struct {
     /// The ordered-envelope version the bridge advertises for this table (`ordering` in the
     /// write contract); 0: unordered. A client never sends an envelope the bridge did not offer.
     ordering: u32 = 0,
+    /// The descriptor's `writable` (null: not reported yet, which refuses nothing) and its
+    /// `incarnation`: `advertised` when the key is present, `incarnation` null when the bridge
+    /// withholds writes. Read by `core.decideStamp` at each new edit (twin: zb-client-ts).
+    writable: ?bool = null,
+    advertised: bool = false,
+    incarnation: ?i64 = null,
     /// PROTOCOL §7.5: a soft delete arrives as an update setting this column, and the
     /// physical reap is never forwarded — so a row with it set is REMOVED here, on
     /// seed, on CDC and on the local optimistic apply alike. See `tombstoned`.
@@ -1710,6 +1716,9 @@ pub const SyncClient = struct {
         const seed_epoch: i64 = if (val.object.get("seed_epoch")) |v| (if (v == .integer) v.integer else 0) else 0;
         // Version 1 is the only one this client speaks: any advertised version >= 1 includes it.
         const ordering: u32 = if (val.object.get("ordering")) |v| @intFromBool(v == .integer and v.integer >= 1) else 0;
+        const writable: ?bool = if (val.object.get("writable")) |v| (if (v == .bool) v.bool else null) else null;
+        const advertised = val.object.get("incarnation") != null;
+        const incarnation: ?i64 = if (val.object.get("incarnation")) |v| (if (v == .integer and v.integer >= 1) v.integer else null) else null;
 
         if (self.states.getPtr(table)) |st| {
             // §10df first: a republished descriptor is usually UNCHANGED in shape — the
@@ -1720,6 +1729,9 @@ pub const SyncClient = struct {
                 if (st.tiebreak_col == null or !std.mem.eql(u8, st.tiebreak_col.?, col)) st.tiebreak_col = try self.aa().dupe(u8, col);
             } else st.tiebreak_col = null;
             st.ordering = ordering;
+            st.writable = writable;
+            st.advertised = advertised;
+            st.incarnation = incarnation;
             try self.reseedIfEpochMoved(a, table, seed_epoch);
             if (outcome == .unchanged and sameStrings(st.cols, names.items) and sameStrings(st.pk, pk)) return;
         }
@@ -1741,6 +1753,9 @@ pub const SyncClient = struct {
             .tombstone_col = if (tombstone_col) |v| try ca.dupe(u8, v) else null,
             .tiebreak_col = if (tiebreak_col) |v| try ca.dupe(u8, v) else null,
             .ordering = ordering,
+            .writable = writable,
+            .advertised = advertised,
+            .incarnation = incarnation,
             .array_cols = try dupeStrings(ca, try arrayColsOf(a, val)),
             .geom_cols = try dupeStrings(ca, try geomColsOf(a, val)),
             .vec_cols = try dupeVecCols(ca, try vecColsOf(a, val)),
@@ -3510,7 +3525,11 @@ pub const SyncClient = struct {
             mode: JointMode,
             routes: []const FenceRoute,
             lapsed: []const Lapsed,
+            /// The manifest's incarnation: the rows just seeded. Installed as the scope's stamp
+            /// with the anchor; writes queued against another incarnation are marked so.
+            stamp: ?i64,
             fn apply(cx: @This(), s: *storage.Storage) !void {
+                if (cx.stamp) |n| try installStamp(s, cx.a, cx.key[0], cx.key[1], n);
                 _ = try s.query(cx.a, "INSERT INTO _zbz_generations (tbl, tenant, watermark, cutoff_lsn, seed_epoch, anchor_stream, anchor_seq, shared_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tbl, tenant) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch, anchor_stream = excluded.anchor_stream, anchor_seq = excluded.anchor_seq, shared_seq = excluded.shared_seq", cx.args);
                 _ = try s.query(cx.a, "DELETE FROM _zbz_fence WHERE tbl = ? AND tenant = ?", cx.key);
                 _ = try s.query(cx.a, "DELETE FROM _zbz_joint_done WHERE tbl = ? AND tenant = ?", cx.key);
@@ -3538,6 +3557,7 @@ pub const SyncClient = struct {
             .a = a,
             .args = &.{ .{ .text = table }, .{ .text = tenant }, .{ .text = cv }, .{ .integer = seed_lsn }, .{ .integer = st.seed_epoch }, .{ .text = cdc_stream }, .{ .integer = anchor_seq }, if (shared_seq) |q| .{ .integer = q } else .null },
             .key = &.{ .{ .text = table }, .{ .text = tenant } },
+            .stamp = if (man.object.get("incarnation")) |v| (if (v == .integer and v.integer >= 1) v.integer else null) else null,
         }, Commit.apply);
         if (replaced_by_full) st.frontiers.clearRetainingCapacity();
         self.jointAfterCommit(joint_mode, lapsed);
@@ -5944,6 +5964,14 @@ pub const SyncClient = struct {
         // columns is unordered (0): no history is invented for it.
         execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN ordered INTEGER DEFAULT 0") catch {}; // no constraint: DuckDB refuses one in ADD COLUMN
         execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN predecessor TEXT") catch {};
+        // The table incarnation a write was made against (`incarnation`; NULL: an unstamped,
+        // legacy write) and whether its scope moved to another one since (`other_incarnation`):
+        // such a write is settled by the bridge alone and never touches the local rows.
+        // `_zbz_stamp`: the incarnation of the rows the user can edit, per anchor scope,
+        // installed with the anchor (twin: zb-client-ts `_zebridge_stamp`).
+        execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN incarnation INTEGER") catch {};
+        execDdl(&self.st, "ALTER TABLE _zebridge_outbox ADD COLUMN other_incarnation INTEGER DEFAULT 0") catch {}; // no constraint: DuckDB
+        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_stamp (tbl TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT '', incarnation INTEGER NOT NULL, PRIMARY KEY (tbl, tenant))");
         try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_tail ON _zebridge_outbox (ordered, created_at)");
         try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_retry ON _zebridge_outbox (retry_at, attempts, created_at, msg_id)");
         try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_recovery ON _zebridge_outbox (attempts, created_at, msg_id)");
@@ -6161,7 +6189,6 @@ pub const SyncClient = struct {
         }
 
         const env = try core.buildMutation(a, .{ .object = args });
-        const subject = env.object.get("subject").?.string;
         const msg_id = env.object.get("msgId").?.string;
         const row_id = env.object.get("id").?.string;
         const payload = env.object.get("payload").?;
@@ -6195,65 +6222,18 @@ pub const SyncClient = struct {
             }
         }
 
-        // The before-image, for the revert a refusal or a rejection needs. Captured
-        // BEFORE the optimistic apply overwrites it, obviously.
-        const before = try self.beforeImage(a, table, st, key);
-        const authoritative = try self.beforeIsAuthoritative(a, table, st, row_id);
-        const before_json: storage.Value = if (before) |b| .{ .text = try core.valueToString(a, b) } else .null;
-        const created = self.nextCreated();
-        // No base copy here: until CDC says more, the authoritative before-image in the
-        // ledger IS the server's state (`recordAuthoritative` materializes one lazily).
+        const returned_id = try result_a.dupe(u8, msg_id);
+        errdefer result_a.free(returned_id);
+        var edit = LocalMutation{ .client = self, .arena = a, .table = table, .op = op, .key = key, .values = values, .version = version, .env = env, .state = st, .ordered = ordered, .predecessor = predecessor };
+        self.st.transaction(&edit, LocalMutation.store) catch |err| {
+            if (err != error.OptimisticApplyFailed) return err;
+            // Some backends abort a transaction on a local constraint failure. Preserve
+            // the existing wire-only submission, with a fresh transaction and stamp check.
+            edit.optimistic = false;
+            try self.st.transaction(&edit, LocalMutation.store);
+        };
         self.ledger_active = true;
         self.ledger_keys.include(self.a, table, row_id);
-
-        // NON-FATAL, matching the TS client (its failed optimistic upsert is a log
-        // line and the write still queues): the payload is valid ON THE WIRE — the
-        // bridge builds the UPDATE from key + data — so a local echo that cannot
-        // apply (an UPDATE whose values do not repeat the pk fails the upsert arm's
-        // NOT NULL) must not abort the queueing. Aborting here LOST every such
-        // update: 24 per client per swarm smoke, audible but wrong (§10cp). The
-        // CDC echo applies the row properly moments later.
-        // §10dx: the optimistic row carries the write's own stamp in the version column
-        // (the ingress sets it from `version`); without it a NOT NULL version column
-        // refused every optimistic INSERT locally.
-        var opt = env.object.get("optimistic").?;
-        if (st.version_col) |vc| {
-            if (opt == .object and !std.mem.eql(u8, op, "DELETE")) {
-                if (opt.object.get("data")) |d| {
-                    if (d == .object and d.object.get(vc) == null) {
-                        var stamped = d;
-                        try stamped.object.put(a, vc, .{ .string = version });
-                        try opt.object.put(a, "data", stamped);
-                    }
-                }
-            }
-        }
-        self.applyOptimistic(table, st, opt) catch {};
-
-        const payload_json = try core.valueToString(a, payload);
-        // The row's tenant: a public table's is the open tenant; a tenant-scoped one's is
-        // its tenant column, from the write or the row it replaces.
-        const row_tenant: storage.Value = blk: {
-            const tc = st.tenant_col orelse break :blk .{ .text = self.open_tenants[0] };
-            for ([_]?Value{ values, key, before }) |src| {
-                const o = src orelse continue;
-                if (o != .object) continue;
-                const tv = o.object.get(tc) orelse continue;
-                if (tv == .string) break :blk .{ .text = tv.string };
-            }
-            break :blk .null;
-        };
-        _ = try self.st.query(a,
-            \\INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, tenant, optimistic, authoritative, ordered, predecessor)
-            \\VALUES (?,?,?,?,?,?,?,?,0,0,?,?,?,?,?)
-            \\ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1
-        , &.{
-            .{ .text = msg_id },                              .{ .text = subject },                        .{ .text = payload_json },
-            .{ .text = table },                               .{ .text = row_id },                         before_json,
-            before_json,                                      .{ .integer = created },                     row_tenant,
-            .{ .text = try core.valueToString(a, opt) },      .{ .integer = @intFromBool(authoritative) }, .{ .integer = @intFromBool(ordered) },
-            if (predecessor) |pr| .{ .text = pr } else .null,
-        });
 
         // ⚠️ Sent through flushOutbox, NOT published directly from here.
         //
@@ -6269,8 +6249,125 @@ pub const SyncClient = struct {
             // Not waiting for the PubAck: an app's loop of mutate() calls is not one round trip per write.
             _ = self.flushOutboxPass(false) catch |err| log.info("mutate: {s} — queued as {s}", .{ @errorName(err), msg_id });
         }
-        return try result_a.dupe(u8, msg_id);
+        return returned_id;
     }
+
+    const LocalMutation = struct {
+        client: *SyncClient,
+        arena: std.mem.Allocator,
+        table: []const u8,
+        op: []const u8,
+        key: Value,
+        values: ?Value,
+        version: []const u8,
+        env: Value,
+        state: TableState,
+        ordered: bool,
+        predecessor: ?[]const u8,
+        optimistic: bool = true,
+
+        fn store(edit: *const LocalMutation, _: *storage.Storage) !void {
+            const self = edit.client;
+            const a = edit.arena;
+            const table = edit.table;
+            const st = edit.state;
+            const env = edit.env;
+            const row_id = env.object.get("id").?.string;
+            var payload = env.object.get("payload").?;
+            // The before-image, for the revert a refusal or a rejection needs. Captured
+            // BEFORE the optimistic apply overwrites it, obviously.
+            const before = try self.beforeImage(a, table, st, edit.key);
+            // The row's tenant: a public table's is the open tenant; a tenant-scoped one's is
+            // its tenant column, from the write or the row it replaces.
+            const row_tenant: storage.Value = blk: {
+                const tc = st.tenant_col orelse break :blk .{ .text = self.open_tenants[0] };
+                for ([_]?Value{ edit.values, edit.key, before }) |src| {
+                    const o = src orelse continue;
+                    if (o != .object) continue;
+                    const tv = o.object.get(tc) orelse continue;
+                    if (tv == .string) break :blk .{ .text = tv.string };
+                }
+                break :blk .null;
+            };
+            // Permission to queue a NEW edit, and its stamp (core.decideStamp; twin: zb-client-ts
+            // `enqueueMutation`), per the anchor's scope (table, tenant): decided before anything
+            // is applied or queued.
+            {
+                const scope: []const storage.Value = &.{ .{ .text = table }, if (row_tenant == .text) row_tenant else .{ .text = self.tenant } };
+                const stamp_rows: []const []storage.Value = try self.st.query(a, "SELECT incarnation FROM _zbz_stamp WHERE tbl = ? AND tenant = ?", scope);
+                const anchor_rows: []const []storage.Value = try self.st.query(a, "SELECT seed_epoch FROM _zbz_generations WHERE tbl = ? AND tenant = ?", scope);
+                const fence_rows: []const []storage.Value = try self.st.query(a, "SELECT 1 FROM _zbz_fence WHERE tbl = ? AND tenant = ?", scope);
+                const replacing = fence_rows.len > 0;
+                const decided = core.decideStamp(.{
+                    .writable = st.writable,
+                    .advertised = st.advertised,
+                    .incarnation = st.incarnation,
+                    .replacing = replacing,
+                    .scope_stamp = if (stamp_rows.len == 1 and stamp_rows[0][0] == .integer) stamp_rows[0][0].integer else null,
+                    .anchor_epoch = if (anchor_rows.len == 1 and anchor_rows[0][0] == .integer) anchor_rows[0][0].integer else null,
+                    .seed_epoch = st.seed_epoch,
+                    .on_demand = self.isOnDemand(table),
+                });
+                switch (decided) {
+                    .refuse => |why| {
+                        log.warn("libzb: write refused: {s} — nothing applied, nothing queued", .{try refusalWords(a, table, why)});
+                        return refusalError(why);
+                    },
+                    .unstamped => {},
+                    .stamp => |n| {
+                        try payload.object.put(a, "incarnation", .{ .integer = n });
+                        // A replica seeded before stamps adopts the descriptor's: recorded, as an anchor would.
+                        if (stamp_rows.len == 0) _ = try self.st.query(a, "INSERT INTO _zbz_stamp (tbl, tenant, incarnation) VALUES (?, ?, ?)", &.{ scope[0], scope[1], .{ .integer = n } });
+                    },
+                }
+            }
+            const authoritative = try self.beforeIsAuthoritative(a, table, st, row_id);
+            const before_json: storage.Value = if (before) |b| .{ .text = try core.valueToString(a, b) } else .null;
+            const created = self.nextCreated();
+            // No base copy here: until CDC says more, the authoritative before-image in the
+            // ledger IS the server's state (`recordAuthoritative` materializes one lazily).
+
+            // NON-FATAL, matching the TS client (its failed optimistic upsert is a log
+            // line and the write still queues): the payload is valid ON THE WIRE — the
+            // bridge builds the UPDATE from key + data — so a local echo that cannot
+            // apply (an UPDATE whose values do not repeat the pk fails the upsert arm's
+            // NOT NULL) must not abort the queueing. Aborting here LOST every such
+            // update: 24 per client per swarm smoke, audible but wrong (§10cp). The
+            // CDC echo applies the row properly moments later.
+            // §10dx: the optimistic row carries the write's own stamp in the version column
+            // (the ingress sets it from `version`); without it a NOT NULL version column
+            // refused every optimistic INSERT locally.
+            var opt = env.object.get("optimistic").?;
+            if (st.version_col) |vc| {
+                if (opt == .object and !std.mem.eql(u8, edit.op, "DELETE")) {
+                    if (opt.object.get("data")) |d| {
+                        if (d == .object and d.object.get(vc) == null) {
+                            var stamped = d;
+                            try stamped.object.put(a, vc, .{ .string = edit.version });
+                            try opt.object.put(a, "data", stamped);
+                        }
+                    }
+                }
+            }
+            if (edit.optimistic) self.applyOptimistic(table, st, opt) catch return error.OptimisticApplyFailed;
+
+            const payload_json = try core.valueToString(a, payload);
+            _ = try self.st.query(a,
+                \\INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, tenant, optimistic, authoritative, ordered, predecessor, incarnation)
+                \\VALUES (?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?)
+                \\ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1
+            , &.{
+                .{ .text = env.object.get("msgId").?.string },         .{ .text = env.object.get("subject").?.string }, .{ .text = payload_json },
+                .{ .text = table },                                    .{ .text = row_id },                             before_json,
+                before_json,                                           .{ .integer = created },                         row_tenant,
+                .{ .text = try core.valueToString(a, opt) },           .{ .integer = @intFromBool(authoritative) },     .{ .integer = @intFromBool(edit.ordered) },
+                if (edit.predecessor) |pr| .{ .text = pr } else .null,
+                if (payload.object.get("incarnation")) |inc| inc_blk: {
+                    break :inc_blk if (inc == .integer) storage.Value{ .integer = inc.integer } else storage.Value.null;
+                } else .null,
+            });
+        }
+    };
 
     /// Fill free window slots and retry due reservations; refuse writes the GC
     /// watermark outlived (§10at). Returns the number actually sent.
@@ -6509,6 +6606,18 @@ pub const SyncClient = struct {
             log.info("libzb: verdict {s} for {s}{s}{s}{s}{s}", .{ status, mid, if (reason.len > 0) " — " else "", reason, if (detail.len > 0) ": " else "", detail });
         }
         if (std.mem.eql(u8, status, "failed")) return false;
+        // A write of another incarnation of its table: its verdict settles it and is reported
+        // once; nothing local is reverted, rebased or reconciled (its rows are not these).
+        if ((try self.st.query(a, "SELECT 1 FROM _zebridge_outbox WHERE msg_id = ? AND other_incarnation = 1", &.{.{ .text = mid }})).len > 0) {
+            if (own) |w| {
+                const outcome: []const u8 = if (std.mem.eql(u8, status, "accepted")) "applied" else if (std.mem.eql(u8, status, "stale")) "lost" else if (std.mem.eql(u8, status, "rejected")) "rejected" else if (std.mem.eql(u8, status, "row_deleted")) "deleted" else "indeterminate";
+                const reason: []const struct { []const u8, Value } = if (reason0.len > 0) &.{.{ "reason", .{ .string = reason0 } }} else &.{};
+                self.noteOutcome(a, mid, w.version, w.table, w.data, outcome, reason);
+            }
+            _ = try self.st.query(a, "DELETE FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
+            log.warn("libzb: {s} settled ({s}{s}{s}) — made against another incarnation of its table, so nothing local changes", .{ mid, status, if (reason0.len > 0) " " else "", reason0 });
+            return true;
+        }
         // `indeterminate`, or a status this client does not know: settled for
         // retransmission, outcome unknown. Never reverted, never re-sent under a new ID.
         const known = for ([_][]const u8{ "accepted", "stale", "rejected", "row_deleted" }) |k| {
@@ -6792,9 +6901,9 @@ pub const SyncClient = struct {
     fn reapplyPending(self: *SyncClient, a: std.mem.Allocator, table: []const u8, tenant: []const u8, whole: bool) !void {
         const st = self.states.get(table) orelse return;
         const rows = if (whole)
-            try self.st.query(a, "SELECT msg_id, payload, optimistic, row_id, created_at FROM _zebridge_outbox WHERE tbl = ? ORDER BY created_at", &.{.{ .text = table }})
+            try self.st.query(a, "SELECT msg_id, payload, optimistic, row_id, created_at FROM _zebridge_outbox WHERE tbl = ? AND other_incarnation = 0 ORDER BY created_at", &.{.{ .text = table }})
         else
-            try self.st.query(a, "SELECT msg_id, payload, optimistic, row_id, created_at FROM _zebridge_outbox WHERE tbl = ? AND tenant = ? ORDER BY created_at", &.{ .{ .text = table }, .{ .text = tenant } });
+            try self.st.query(a, "SELECT msg_id, payload, optimistic, row_id, created_at FROM _zebridge_outbox WHERE tbl = ? AND tenant = ? AND other_incarnation = 0 ORDER BY created_at", &.{ .{ .text = table }, .{ .text = tenant } });
         // The first write re-applied on a row covers the seeded row: the server's state.
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         var applied: usize = 0;
@@ -6904,7 +7013,7 @@ pub const SyncClient = struct {
         var mine_versions: std.ArrayList([]const u8) = .empty;
         try mine_versions.append(a, e.version);
         var pending: std.ArrayList(PendingBase) = .empty;
-        for (try self.st.query(a, "SELECT payload, before, created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?", &.{ .{ .text = e.table }, .{ .text = e.row_id } })) |o| {
+        for (try self.st.query(a, "SELECT payload, before, created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND other_incarnation = 0", &.{ .{ .text = e.table }, .{ .text = e.row_id } })) |o| {
             if (o[0] == .text) if (parseStoredJson(a, o[0].text)) |env| {
                 if (env == .object) if (env.object.get("version")) |v| if (v == .string) try mine_versions.append(a, try core.normalizeVersion(a, v.string));
             } else |_| {};
@@ -6917,7 +7026,7 @@ pub const SyncClient = struct {
         const decision = try rebaseDecision(a, cur, base, basis, values, vcol, e.version, mine_versions.items);
         if (decision == .wait) return false;
         // Decided: the confirmed row stays for the other edits on this key, if any remain.
-        var dependents = (try self.st.query(a, "SELECT count(*) FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?", &.{ .{ .text = e.table }, .{ .text = e.row_id } }))[0][0].integer > 0;
+        var dependents = (try self.st.query(a, "SELECT count(*) FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND other_incarnation = 0", &.{ .{ .text = e.table }, .{ .text = e.row_id } }))[0][0].integer > 0;
         for (self.rebase.keys(), self.rebase.values()) |k, other| {
             if (!std.mem.eql(u8, k, mid) and std.mem.eql(u8, other.table, e.table) and std.mem.eql(u8, other.row_id, e.row_id)) dependents = true;
         }
@@ -7194,7 +7303,7 @@ pub const SyncClient = struct {
         }
         if (!self.ledger_keys.mayContain(table, id.items)) return;
         const key: []const storage.Value = &.{ .{ .text = table }, .{ .text = id.items }, .{ .text = table }, .{ .text = id.items } };
-        const ledger = try self.st.query(a, "SELECT payload,1 FROM _zebridge_outbox WHERE tbl=? AND row_id=? UNION ALL SELECT payload,0 FROM _zbz_undo WHERE tbl=? AND row_id=? LIMIT 2", key);
+        const ledger = try self.st.query(a, "SELECT payload,1 FROM _zebridge_outbox WHERE tbl=? AND row_id=? AND other_incarnation = 0 UNION ALL SELECT payload,0 FROM _zbz_undo WHERE tbl=? AND row_id=? LIMIT 2", key);
         if (ledger.len == 0) return;
         if (ledger.len == 1 and ledger[0][1] == .integer and ledger[0][1].integer == 1 and !removed and try self.isEchoOf(a, st, data, ledger[0][0])) return;
         var normalized = data;
@@ -7236,7 +7345,7 @@ pub const SyncClient = struct {
     fn trustedPrior(self: *SyncClient, a: std.mem.Allocator, table: []const u8, row_id: []const u8) !?Value {
         const r = try self.st.query(a,
             \\SELECT data FROM (SELECT data, at AS t FROM _zbz_base WHERE tbl=? AND row_id=?
-            \\UNION ALL SELECT before, created_at FROM _zebridge_outbox WHERE tbl=? AND row_id=? AND authoritative=1
+            \\UNION ALL SELECT before, created_at FROM _zebridge_outbox WHERE tbl=? AND row_id=? AND other_incarnation = 0 AND authoritative=1
             \\UNION ALL SELECT before, created_at FROM _zbz_undo WHERE tbl=? AND row_id=? AND authoritative=1) p ORDER BY t DESC LIMIT 1
         , &.{ .{ .text = table }, .{ .text = row_id }, .{ .text = table }, .{ .text = row_id }, .{ .text = table }, .{ .text = row_id } });
         if (r.len == 0 or r[0][0] != .text) return null;
@@ -7254,10 +7363,10 @@ pub const SyncClient = struct {
     fn pruneAccepted(self: *SyncClient, a: std.mem.Allocator) !void {
         _ = try self.st.query(a,
             \\DELETE FROM _zbz_undo WHERE mode = 'accepted'
-            \\AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox o WHERE o.tbl = _zbz_undo.tbl AND o.row_id = _zbz_undo.row_id)
+            \\AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox o WHERE o.tbl = _zbz_undo.tbl AND o.row_id = _zbz_undo.row_id AND o.other_incarnation = 0)
             \\AND NOT EXISTS (SELECT 1 FROM _zbz_undo u WHERE u.tbl = _zbz_undo.tbl AND u.row_id = _zbz_undo.row_id AND u.mode <> 'accepted')
         , &.{});
-        if (self.baseline_active) _ = try self.st.query(a, "DELETE FROM _zbz_base WHERE NOT EXISTS (SELECT 1 FROM _zebridge_outbox o WHERE o.tbl=_zbz_base.tbl AND o.row_id=_zbz_base.row_id) AND NOT EXISTS (SELECT 1 FROM _zbz_undo u WHERE u.tbl=_zbz_base.tbl AND u.row_id=_zbz_base.row_id)", &.{});
+        if (self.baseline_active) _ = try self.st.query(a, "DELETE FROM _zbz_base WHERE NOT EXISTS (SELECT 1 FROM _zebridge_outbox o WHERE o.tbl=_zbz_base.tbl AND o.row_id=_zbz_base.row_id AND o.other_incarnation = 0) AND NOT EXISTS (SELECT 1 FROM _zbz_undo u WHERE u.tbl=_zbz_base.tbl AND u.row_id=_zbz_base.row_id)", &.{});
     }
 
     /// Settle a write for retransmission (`accepted`, `stale`). An accepted one stays as
@@ -7275,7 +7384,7 @@ pub const SyncClient = struct {
                 const ob = try s.query(cx.a, "SELECT tbl, row_id FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = cx.mid }});
                 if (ob.len == 0) return; // another device's write: nothing of it is here
                 const row: []const storage.Value = &.{ ob[0][0], ob[0][1] };
-                const others = (try s.query(cx.a, "SELECT 1 FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND msg_id <> ? LIMIT 1", &.{ row[0], row[1], .{ .text = cx.mid } })).len > 0;
+                const others = (try s.query(cx.a, "SELECT 1 FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND other_incarnation = 0 AND msg_id <> ? LIMIT 1", &.{ row[0], row[1], .{ .text = cx.mid } })).len > 0;
                 const owed = (try s.query(cx.a, "SELECT 1 FROM _zbz_undo WHERE tbl = ? AND row_id = ? AND mode <> 'accepted' LIMIT 1", row)).len > 0;
                 if (cx.keep and (others or owed)) _ = try s.query(cx.a,
                     \\INSERT INTO _zbz_undo (msg_id,tbl,row_id,tenant,payload,before,optimistic,created_at,authoritative,mode,since)
@@ -7393,7 +7502,7 @@ pub const SyncClient = struct {
     /// `undoRow` rebuilds from: a server value between two refused edits must survive them.
     fn beforeIsAuthoritative(self: *SyncClient, a: std.mem.Allocator, table: []const u8, st: TableState, row_id: []const u8) !bool {
         const ws = try self.st.query(a,
-            \\SELECT payload, optimistic, created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?
+            \\SELECT payload, optimistic, created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND other_incarnation = 0
             \\UNION ALL SELECT payload, optimistic, created_at FROM _zbz_undo WHERE tbl = ? AND row_id = ?
             \\ORDER BY 3 DESC LIMIT 1
         , &.{ .{ .text = table }, .{ .text = row_id }, .{ .text = table }, .{ .text = row_id } });
@@ -7470,7 +7579,7 @@ pub const SyncClient = struct {
                 const pk = cx.st.pk;
                 // msg_id, payload, before, optimistic, owed, mode, created_at, authoritative — oldest first.
                 const ws = try s.query(cx.a,
-                    \\SELECT msg_id, payload, before, optimistic, 0, '', created_at, authoritative FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?
+                    \\SELECT msg_id, payload, before, optimistic, 0, '', created_at, authoritative FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND other_incarnation = 0
                     \\UNION ALL SELECT msg_id, payload, before, optimistic, CASE WHEN mode = 'accepted' THEN 2 ELSE 1 END, mode, created_at, authoritative FROM _zbz_undo WHERE tbl = ? AND row_id = ?
                     \\ORDER BY 7, 1
                 , &.{ .{ .text = cx.table }, .{ .text = cx.row_id }, .{ .text = cx.table }, .{ .text = cx.row_id } });
@@ -7548,8 +7657,8 @@ pub const SyncClient = struct {
                     }
                 }
                 _ = try s.query(cx.a, "DELETE FROM _zbz_undo WHERE tbl = ? AND row_id = ? AND mode <> 'accepted'", &.{ .{ .text = cx.table }, .{ .text = cx.row_id } });
-                _ = try s.query(cx.a, "DELETE FROM _zbz_undo WHERE tbl = ? AND row_id = ? AND mode = 'accepted' AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?)", &.{ .{ .text = cx.table }, .{ .text = cx.row_id }, .{ .text = cx.table }, .{ .text = cx.row_id } });
-                _ = try s.query(cx.a, "DELETE FROM _zbz_base WHERE tbl=? AND row_id=? AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox WHERE tbl=? AND row_id=?)", &.{ .{ .text = cx.table }, .{ .text = cx.row_id }, .{ .text = cx.table }, .{ .text = cx.row_id } });
+                _ = try s.query(cx.a, "DELETE FROM _zbz_undo WHERE tbl = ? AND row_id = ? AND mode = 'accepted' AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND other_incarnation = 0)", &.{ .{ .text = cx.table }, .{ .text = cx.row_id }, .{ .text = cx.table }, .{ .text = cx.row_id } });
+                _ = try s.query(cx.a, "DELETE FROM _zbz_base WHERE tbl=? AND row_id=? AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox WHERE tbl=? AND row_id=? AND other_incarnation = 0)", &.{ .{ .text = cx.table }, .{ .text = cx.row_id }, .{ .text = cx.table }, .{ .text = cx.row_id } });
             }
         };
         var owned = false;
@@ -8021,12 +8130,41 @@ pub fn pruneInboxDropped(st: *storage.Storage, a: std.mem.Allocator, table: []co
 /// reuses the name. Discard them LOUDLY — a silent queue draining into a void is
 /// exactly what an outbox exists to prevent. The TS client's `discardOutbox`; this
 /// is the libzb half, which was missing (§10hs).
+/// A table dropped, emptied or re-keyed: its unstamped (legacy) queued writes are discarded as
+/// before; its stamped ones stay for the bridge to settle (a predecessor named by another
+/// table's `after` must get a durable verdict), marked as another incarnation's so they never
+/// touch the local rows (twin: zb-client-ts `discardOutbox`).
 pub fn discardOutbox(st: *storage.Storage, a: std.mem.Allocator, table: []const u8, why: []const u8) !void {
-    const q = try st.query(a, "SELECT count(*) FROM _zebridge_outbox WHERE tbl = ?", &.{.{ .text = table }});
+    const q = try st.query(a, "SELECT count(*), sum(CASE WHEN incarnation IS NULL THEN 1 ELSE 0 END) FROM _zebridge_outbox WHERE tbl = ?", &.{.{ .text = table }});
     const k: i64 = if (q.len > 0 and q[0][0] == .integer) q[0][0].integer else 0;
     if (k == 0) return;
-    _ = try st.query(a, "DELETE FROM _zebridge_outbox WHERE tbl = ?", &.{.{ .text = table }});
-    log.info("{s}: {d} queued write(s) discarded — the table was {s} — surface this to the user", .{ table, k, why });
+    const legacy: i64 = if (q[0][1] == .integer) q[0][1].integer else 0;
+    _ = try st.query(a, "DELETE FROM _zebridge_outbox WHERE tbl = ? AND incarnation IS NULL", &.{.{ .text = table }});
+    _ = try st.query(a, "UPDATE _zebridge_outbox SET other_incarnation = 1 WHERE tbl = ? AND incarnation IS NOT NULL", &.{.{ .text = table }});
+    if (legacy > 0) log.info("{s}: {d} queued write(s) discarded — the table was {s} — surface this to the user", .{ table, legacy, why });
+    if (k - legacy > 0) log.info("{s}: {d} stamped write(s) kept for the bridge to settle — the table was {s}", .{ table, k - legacy, why });
+}
+
+/// The scope's stamp, in the anchor's own transaction: the incarnation of the rows just seeded.
+/// Writes queued against another incarnation are marked so: settled by the bridge, never
+/// replayed or undone over these rows (twin: zb-client-ts `installStamp`).
+fn installStamp(s: *storage.Storage, a: std.mem.Allocator, table: storage.Value, tenant: storage.Value, n: i64) !void {
+    _ = try s.query(a, "INSERT INTO _zbz_stamp (tbl, tenant, incarnation) VALUES (?, ?, ?) ON CONFLICT(tbl, tenant) DO UPDATE SET incarnation = excluded.incarnation", &.{ table, tenant, .{ .integer = n } });
+    _ = try s.query(a, "UPDATE _zebridge_outbox SET other_incarnation = 1 WHERE tbl = ? AND tenant = ? AND incarnation IS NOT NULL AND incarnation <> ?", &.{ table, tenant, .{ .integer = n } });
+}
+
+/// The words of a refused edit, the same as zb-client-ts's `refusalWords`.
+fn refusalWords(a: std.mem.Allocator, table: []const u8, why: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, why, "TableNotWritable")) return std.fmt.allocPrint(a, "'{s}' does not accept writes (TableNotWritable)", .{table});
+    if (std.mem.eql(u8, why, "IncarnationUnknown")) return std.fmt.allocPrint(a, "the bridge withholds writes on '{s}': its incarnation is unknown (IncarnationUnknown)", .{table});
+    if (std.mem.eql(u8, why, "ReplacementIncomplete")) return std.fmt.allocPrint(a, "'{s}' is being replaced; edit it once its new rows are in (ReplacementIncomplete)", .{table});
+    return why;
+}
+
+fn refusalError(why: []const u8) error{ TableNotWritable, IncarnationUnknown, ReplacementIncomplete } {
+    if (std.mem.eql(u8, why, "TableNotWritable")) return error.TableNotWritable;
+    if (std.mem.eql(u8, why, "ReplacementIncomplete")) return error.ReplacementIncomplete;
+    return error.IncarnationUnknown;
 }
 
 test "measurement: isolated replay counts committed outcomes and excludes events past the target" {
@@ -8375,7 +8513,8 @@ test "outbox: a dropped or re-keyed table takes its queued writes with it" {
         \\CREATE TABLE IF NOT EXISTS _zebridge_outbox (
         \\  msg_id TEXT PRIMARY KEY, subject TEXT NOT NULL, payload TEXT NOT NULL,
         \\  tbl TEXT NOT NULL, row_id TEXT NOT NULL, before TEXT,
-        \\  created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0
+        \\  created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+        \\  incarnation INTEGER, other_incarnation INTEGER DEFAULT 0
         \\)
     );
     const ins = "INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, created_at) VALUES (?, 'sub', '{}', ?, 'r1', 1)";
@@ -10400,6 +10539,7 @@ test "undo: a new write re-enables tracking after an empty poll; authoritative C
 /// outbox and nothing is published. `p` speaks the ordered envelope, `c` does not.
 fn orderTestClient(a: std.mem.Allocator, path: [:0]const u8, conn: *@import("nats").Connection, t: *transport.Transport) !SyncClient {
     var cl = try undoTestClient(a, path);
+    try cl.ensureGenerations();
     t.* = .{ .allocator = a, .threaded = undefined, .conn = conn, .js = undefined };
     cl.t = t;
     cl.opts = .{ .url = "", .creds_path = "", .db_path = path, .principal = "omar", .tables = &.{}, .client_id = "c-1" };
@@ -10792,4 +10932,210 @@ test "ordering modes: an empty version is refused before anything is queued" {
     defer cl.st.close();
     try std.testing.expectError(error.EmptyVersion, modesWrite(&cl, a, "p", "INSERT", "x", "", null, false));
     try std.testing.expectEqual(@as(i64, 0), try modesOutbox(&cl, a));
+}
+
+// ── A queued write belongs to its table incarnation (zb-client-ts's "incarnation: …" tests) ──
+
+fn incTestClient(a: std.mem.Allocator, conn: *@import("nats").Connection, t: *transport.Transport) !SyncClient {
+    var cl = try orderTestClient(a, ":memory:", conn, t);
+    try cl.st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_generations (tbl TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT '', watermark TEXT, seed_epoch INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tbl, tenant))");
+    try cl.st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_fence (tbl TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT '', joint INTEGER DEFAULT 0, PRIMARY KEY (tbl, tenant))");
+    try cl.st.execSimple("INSERT INTO p (id, title) VALUES ('x', 'orig')");
+    cl.states.getPtr("p").?.ordering = 0;
+    return cl;
+}
+
+fn incTestWrite(cl: *SyncClient, a: std.mem.Allocator, title: []const u8) ![]const u8 {
+    const key = try parseStoredJson(a, "{\"id\":\"x\"}");
+    const values = try parseStoredJson(a, try std.fmt.allocPrint(a, "{{\"title\":\"{s}\"}}", .{title}));
+    return cl.mutate(a, "p", "UPDATE", key, values);
+}
+
+fn incTestTitle(cl: *SyncClient, a: std.mem.Allocator) ![]const u8 {
+    const r = try cl.st.query(a, "SELECT title FROM p WHERE id = 'x'", &.{});
+    return if (r.len == 1 and r[0][0] == .text) r[0][0].text else "";
+}
+
+fn incTestOutbox(cl: *SyncClient, a: std.mem.Allocator) ![]const []storage.Value {
+    return cl.st.query(a, "SELECT msg_id, incarnation, other_incarnation, payload FROM _zebridge_outbox ORDER BY created_at", &.{});
+}
+
+test "incarnation: a withheld or unwritable descriptor refuses a new edit before anything is applied or queued; writable null refuses nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    var cl = try incTestClient(a, &conn, &t);
+    defer cl.st.close();
+    const st = cl.states.getPtr("p").?;
+    st.advertised = true;
+    st.incarnation = null;
+    st.writable = true;
+    try std.testing.expectError(error.IncarnationUnknown, incTestWrite(&cl, a, "withheld"));
+    st.advertised = false;
+    st.writable = false;
+    try std.testing.expectError(error.TableNotWritable, incTestWrite(&cl, a, "unwritable"));
+    st.advertised = true;
+    st.writable = null;
+    try std.testing.expectError(error.IncarnationUnknown, incTestWrite(&cl, a, "withheld, writable null"));
+    try std.testing.expectEqualStrings("orig", try incTestTitle(&cl, a));
+    try std.testing.expectEqual(@as(usize, 0), (try incTestOutbox(&cl, a)).len);
+    st.advertised = false;
+    st.writable = null;
+    _ = try incTestWrite(&cl, a, "legacy");
+    try std.testing.expectEqualStrings("legacy", try incTestTitle(&cl, a));
+    const ob = try incTestOutbox(&cl, a);
+    try std.testing.expect(ob.len == 1 and ob[0][1] == .null);
+    try std.testing.expect((try parseStoredJson(a, ob[0][3].text)).object.get("incarnation") == null);
+}
+
+test "incarnation: a stamped write carries the scope stamp; seeded before stamps adopts at the same epoch; a replacement in progress refuses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    var cl = try incTestClient(a, &conn, &t);
+    defer cl.st.close();
+    const st = cl.states.getPtr("p").?;
+    st.advertised = true;
+    st.incarnation = 5;
+    st.writable = true;
+    st.seed_epoch = 3;
+    try std.testing.expectError(error.IncarnationUnknown, incTestWrite(&cl, a, "unknown"));
+    try cl.st.execSimple("INSERT INTO _zbz_generations (tbl, tenant, watermark, seed_epoch) VALUES ('p', '_open', 'w', 3)");
+    _ = try incTestWrite(&cl, a, "adopted");
+    var ob = try incTestOutbox(&cl, a);
+    try std.testing.expectEqual(@as(i64, 5), ob[0][1].integer);
+    try std.testing.expectEqual(@as(i64, 5), (try parseStoredJson(a, ob[0][3].text)).object.get("incarnation").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), (try cl.st.query(a, "SELECT incarnation FROM _zbz_stamp WHERE tbl = 'p' AND tenant = '_open'", &.{}))[0][0].integer);
+    try cl.st.execSimple("UPDATE _zbz_stamp SET incarnation = 4 WHERE tbl = 'p'");
+    _ = try incTestWrite(&cl, a, "still the old rows");
+    ob = try incTestOutbox(&cl, a);
+    try std.testing.expectEqual(@as(i64, 4), ob[1][1].integer);
+    try cl.st.execSimple("INSERT INTO _zbz_fence (tbl, tenant) VALUES ('p', '_open')");
+    try std.testing.expectError(error.ReplacementIncomplete, incTestWrite(&cl, a, "mid-replacement"));
+    st.advertised = false;
+    try std.testing.expectError(error.ReplacementIncomplete, incTestWrite(&cl, a, "legacy during replacement"));
+    try std.testing.expectEqual(@as(usize, 2), (try incTestOutbox(&cl, a)).len);
+    try std.testing.expectEqualStrings("still the old rows", try incTestTitle(&cl, a));
+}
+
+test "incarnation: a new stamp marks older writes; they are never replayed, and their verdict settles them once without touching the new row" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    var cl = try incTestClient(a, &conn, &t);
+    defer cl.st.close();
+    const st = cl.states.getPtr("p").?;
+    st.advertised = true;
+    st.incarnation = 4;
+    st.writable = true;
+    try cl.st.execSimple("INSERT INTO _zbz_stamp (tbl, tenant, incarnation) VALUES ('p', '_open', 4)");
+    const old = try incTestWrite(&cl, a, "old edit");
+    // The table was re-created; its seed installs incarnation 5 over a row of the same key.
+    try installStamp(&cl.st, a, .{ .text = "p" }, .{ .text = "_open" }, 5);
+    try std.testing.expectEqual(@as(i64, 1), (try incTestOutbox(&cl, a))[0][2].integer);
+    try cl.st.execSimple("UPDATE p SET title = 'replacement' WHERE id = 'x'");
+    try cl.reapplyPending(a, "p", "_open", true);
+    try std.testing.expectEqualStrings("replacement", try incTestTitle(&cl, a));
+    // The new row equal in key AND value to the old edit: a check of values alone would take
+    // it for the old write's copy and revert it.
+    try cl.st.execSimple("UPDATE p SET title = 'old edit' WHERE id = 'x'");
+    try std.testing.expect(try cl.settleVerdict(a, old, "{\"status\":\"rejected\",\"reason\":\"TableIncarnationChanged\"}"));
+    cl.runUndos();
+    try std.testing.expectEqual(@as(usize, 0), (try incTestOutbox(&cl, a)).len);
+    try std.testing.expectEqualStrings("old edit", try incTestTitle(&cl, a));
+    try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT count(*) FROM _zbz_undo", &.{}))[0][0].integer);
+    var reported: usize = 0;
+    for (cl.outcomes.items) |o| if (std.mem.indexOf(u8, o, old) != null) {
+        reported += 1;
+        try std.testing.expect(std.mem.indexOf(u8, o, "TableIncarnationChanged") != null);
+    };
+    try std.testing.expectEqual(@as(usize, 1), reported);
+}
+
+test "incarnation: a dropped table keeps its stamped writes for the bridge to settle and discards unstamped ones" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    var cl = try incTestClient(a, &conn, &t);
+    defer cl.st.close();
+    _ = try incTestWrite(&cl, a, "legacy");
+    const st = cl.states.getPtr("p").?;
+    st.advertised = true;
+    st.incarnation = 4;
+    st.writable = true;
+    try cl.st.execSimple("INSERT INTO _zbz_stamp (tbl, tenant, incarnation) VALUES ('p', '_open', 4)");
+    _ = try incTestWrite(&cl, a, "stamped");
+    try discardOutbox(&cl.st, a, "p", "dropped");
+    const ob = try incTestOutbox(&cl, a);
+    try std.testing.expect(ob.len == 1 and ob[0][1].integer == 4 and ob[0][2].integer == 1);
+}
+
+test "enqueue fails closed when scope metadata cannot be read" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    var cl = try incTestClient(a, &conn, &t);
+    defer cl.st.close();
+    const state = cl.states.getPtr("p").?;
+    state.advertised = true;
+    state.incarnation = 5;
+    try cl.st.execSimple("INSERT INTO _zbz_stamp VALUES ('p', '_open', 5)");
+    for ([_][]const u8{ "_zbz_fence", "_zbz_generations", "_zbz_stamp" }) |table| {
+        try cl.st.execSimple(try std.fmt.allocPrintSentinel(a, "ALTER TABLE {s} RENAME TO unavailable", .{table}, 0));
+        if (incTestWrite(&cl, a, "blocked")) |_| {
+            return error.TestExpectedError;
+        } else |err| switch (err) {
+            // SQLite may recompile a cached statement at step time after the rename.
+            error.PrepareFailed, error.StepFailed => {},
+            else => return err,
+        }
+        try std.testing.expectEqualStrings("orig", try incTestTitle(&cl, a));
+        try std.testing.expectEqual(@as(usize, 0), (try incTestOutbox(&cl, a)).len);
+        try cl.st.execSimple(try std.fmt.allocPrintSentinel(a, "ALTER TABLE unavailable RENAME TO {s}", .{table}, 0));
+    }
+}
+
+test "failed outbox insert rolls back stamp adoption and optimistic UPDATE across reopen" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/atomic.sqlite3", .{dir}, 0);
+    var conn = @import("nats").Connection.init(a, std.testing.io, .{});
+    defer conn.deinit();
+    var t: transport.Transport = undefined;
+    {
+        var cl = try orderTestClient(a, path, &conn, &t);
+        defer cl.st.close();
+        const state = cl.states.getPtr("p").?;
+        state.advertised = true;
+        state.incarnation = 5;
+        state.seed_epoch = 3;
+        try cl.st.execSimple("INSERT INTO p VALUES ('x','orig')");
+        try cl.st.execSimple("INSERT INTO _zbz_generations (tbl,tenant,watermark,seed_epoch) VALUES ('p','_open','w',3)");
+        try cl.st.execSimple("CREATE TRIGGER refuse_insert BEFORE INSERT ON _zebridge_outbox BEGIN SELECT RAISE(ABORT,'injected refusal'); END");
+        try std.testing.expectError(error.StepFailed, incTestWrite(&cl, a, "must roll back"));
+    }
+    var reopened = try orderTestClient(a, path, &conn, &t);
+    defer reopened.st.close();
+    try std.testing.expectEqualStrings("orig", try incTestTitle(&reopened, a));
+    try std.testing.expectEqual(@as(usize, 0), (try incTestOutbox(&reopened, a)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try reopened.st.query(a, "SELECT * FROM _zbz_stamp", &.{})).len);
 }

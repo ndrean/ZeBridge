@@ -39,7 +39,7 @@ import { heartbeatPayload,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgEngineValues, chainUpsertSql, chainRowParams,
   type SqlStep,
   fkClausesFor, createTableSteps, rebuildSteps, diffColumns, keyShape, typeShape, retypedColumns, isReadOnlySql,
-  mutationSubject, mutationMsgId, messageIdCreatedMs, messageIdOfClient, idKeyPart, mutationKeyId, mutationPayload, optimisticEvent, normalizeOp,
+  mutationSubject, mutationMsgId, messageIdCreatedMs, messageIdOfClient, idKeyPart, mutationKeyId, mutationPayload, optimisticEvent, normalizeOp, decideStamp,
   normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate, outboxFloorMargin,
   isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, chainChunkJson, parseChainHead, msgpackScan, msgpackDecodeScanned, chainStageSql, vecColsOf, pgVectorValues, vecLiteral, strictMissing,
@@ -229,6 +229,12 @@ export type TableState = {
   /// The ordered-envelope version the bridge advertises (`ordering` in the write contract);
   /// 0 or absent: unordered. A client never sends an envelope the bridge did not offer.
   ordering?: number;
+  /// The descriptor's `writable` (null: not reported yet, which refuses nothing), and its
+  /// `incarnation`: `advertised` when the key is present, `incarnation` null when the bridge
+  /// withholds writes (the identity unknown). Read by `decideStamp` at each new edit.
+  writable?: boolean | null;
+  advertised?: boolean;
+  incarnation?: number | null;
   /// The catalogue's seed_epoch the descriptor carried (§10df).
   seedEpoch?: number;
   lsn: number;
@@ -290,6 +296,22 @@ export type MutateOptions = {
 
 /// A misuse of `after` / `independent` (libzb: `AfterNeedsOrdering`, `AfterNotThisClient`,
 /// `AfterSelf`, `AfterWithIndependent`): nothing was written.
+/// A new edit refused before anything was applied or queued (core `decideStamp`).
+class WriteRefusal extends Error {
+  readonly reason: string;
+  constructor(reason: string) { super(reason); this.reason = reason; this.name = 'WriteRefusal'; }
+}
+
+/// The refusal's words, the same as libzb's log line.
+function refusalWords(table: string, reason: string): string {
+  switch (reason) {
+    case 'TableNotWritable': return `'${table}' does not accept writes (TableNotWritable)`;
+    case 'IncarnationUnknown': return `the bridge withholds writes on '${table}': its incarnation is unknown (IncarnationUnknown)`;
+    case 'ReplacementIncomplete': return `'${table}' is being replaced; edit it once its new rows are in (ReplacementIncomplete)`;
+    default: return reason;
+  }
+}
+
 export class OrderingRefusal extends Error {
   constructor(message: string) {
     super(message);
@@ -1861,6 +1883,14 @@ export class ZeBridge {
       await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN basis TEXT`);
       await this.run(`UPDATE _zebridge_outbox SET basis = before WHERE basis IS NULL`);
     } catch { /* present */ }
+    // The table incarnation a write was made against (`incarnation`; null: an unstamped,
+    // legacy write) and whether its scope has moved to another one since (`other_incarnation`):
+    // such a write is settled by the bridge alone and never touches the local rows (its row
+    // here is another table's). `_zebridge_stamp`: the incarnation of the rows the user can
+    // edit, installed with the anchor (libzb `_zbz_stamp`, per scope).
+    try { await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN incarnation ${this.dialect.int64}`); } catch { /* present */ }
+    try { await this.run(`ALTER TABLE _zebridge_outbox ADD COLUMN other_incarnation INTEGER NOT NULL DEFAULT 0`); } catch { /* present */ }
+    await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_stamp (tbl TEXT PRIMARY KEY, incarnation ${this.dialect.int64} NOT NULL)`);
     await this.run(`CREATE INDEX IF NOT EXISTS _zbz_outbox_retry ON _zebridge_outbox (retry_at, attempts, created_at, msg_id)`);
     await this.run(`CREATE INDEX IF NOT EXISTS _zbz_outbox_recovery ON _zebridge_outbox (attempts, created_at, msg_id)`);
     await this.run(`
@@ -1932,7 +1962,7 @@ export class ZeBridge {
   }
 
   private async outboxPut(
-    r: { msgId: string; subject: string; payload: unknown; table: string; id: string | number; before: unknown; optimistic: unknown; authoritative?: boolean; predecessor?: string | null; ordered?: boolean },
+    r: { msgId: string; subject: string; payload: unknown; table: string; id: string | number; before: unknown; optimistic: unknown; authoritative?: boolean; predecessor?: string | null; ordered?: boolean; incarnation?: number | null },
     exec: Exec = this.run,
   ) {
     await this.outboxInitPromise;
@@ -1942,12 +1972,12 @@ export class ZeBridge {
     this.ledgerKeys?.include(r.table, String(r.id));
     this.ledgerChanged();
     await exec(
-      `INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, optimistic, authoritative, ordered, predecessor)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
+      `INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, optimistic, authoritative, ordered, predecessor, incarnation)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)
        ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1`,
       r.msgId, r.subject, JSON.stringify(r.payload), r.table, String(r.id),
       r.before == null ? null : JSON.stringify(r.before), r.before == null ? null : JSON.stringify(r.before), created, JSON.stringify(r.optimistic), r.authoritative == null ? null : r.authoritative ? 1 : 0,
-      r.ordered ? 1 : 0, r.predecessor ?? null,
+      r.ordered ? 1 : 0, r.predecessor ?? null, r.incarnation ?? null,
     );
     // A refresh may have run while the insert awaited storage. Mark completion too.
     this.ledgerChanged();
@@ -1966,7 +1996,7 @@ export class ZeBridge {
     await this.transaction(async (tx) => {
       const row = (await tx(`SELECT tbl, row_id FROM _zebridge_outbox WHERE msg_id = ?`, msgId))[0];
       if (!row) return; // another device's write: nothing of it is here
-      const others = (await tx(`SELECT 1 FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND msg_id <> ? LIMIT 1`, row.tbl, row.row_id, msgId)).length > 0;
+      const others = (await tx(`SELECT 1 FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND other_incarnation = 0 AND msg_id <> ? LIMIT 1`, row.tbl, row.row_id, msgId)).length > 0;
       const owed = (await tx(`SELECT 1 FROM _zebridge_undo WHERE tbl = ? AND row_id = ? AND mode <> 'accepted' LIMIT 1`, row.tbl, row.row_id)).length > 0;
       if (accepted && (others || owed)) {
         await tx(`INSERT INTO _zebridge_undo (msg_id,tbl,row_id,payload,before,optimistic,created_at,authoritative,mode,since)
@@ -2002,7 +2032,7 @@ export class ZeBridge {
     if (!this.ledgerActive || ev.optimistic || !state.pkCols.length || !ev.data) return;
     const rowId = state.pkCols.map(c => String(ev.data?.[c])).join('|');
     if (this.ledgerKeys && !this.ledgerKeys.mayContain(table, rowId)) return;
-    const ledger: any[] = await exec(`SELECT payload,1 AS pending FROM _zebridge_outbox WHERE tbl=? AND row_id=?
+    const ledger: any[] = await exec(`SELECT payload,1 AS pending FROM _zebridge_outbox WHERE tbl=? AND row_id=? AND other_incarnation = 0
       UNION ALL SELECT payload,0 AS pending FROM _zebridge_undo WHERE tbl=? AND row_id=? LIMIT 2`, table, rowId, table, rowId);
     if (!ledger.length) return;
     const removed = ev.operation === 'DELETE' || tombstoned(state.tombstoneColumn, ev.data);
@@ -2063,7 +2093,7 @@ export class ZeBridge {
   /// authoritative write, whichever is later. Null when neither holds a row.
   private async trustedPrior(exec: Exec, table: string, rowId: string): Promise<Record<string, unknown> | null> {
     const r = (await exec(`SELECT data FROM (SELECT data, at AS t FROM _zebridge_base WHERE tbl=? AND row_id=?
-      UNION ALL SELECT before, created_at FROM _zebridge_outbox WHERE tbl=? AND row_id=? AND authoritative=1
+      UNION ALL SELECT before, created_at FROM _zebridge_outbox WHERE tbl=? AND row_id=? AND other_incarnation = 0 AND authoritative=1
       UNION ALL SELECT before, created_at FROM _zebridge_undo WHERE tbl=? AND row_id=? AND authoritative=1) p ORDER BY t DESC LIMIT 1`,
       table, rowId, table, rowId, table, rowId))[0];
     if (!r || r.data == null) return null;
@@ -2199,7 +2229,7 @@ export class ZeBridge {
     // all of them: the `before` of the oldest pending edit on the key.
     const mineVersions = new Set([e.version]);
     let base = e.before, baseAt = e.createdAt ?? Number.MAX_SAFE_INTEGER;
-    for (const o of await this.run(`SELECT payload, before, created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?`, e.table, e.rowId ?? '')) {
+    for (const o of await this.run(`SELECT payload, before, created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND other_incarnation = 0`, e.table, e.rowId ?? '')) {
       try { const v = normalizeVersion(String(JSON.parse(o.payload)?.version ?? '')); if (v) mineVersions.add(v); } catch { /* unreadable */ }
       if (Number(o.created_at) < baseAt) { baseAt = Number(o.created_at); base = o.before ? JSON.parse(o.before) : null; }
     }
@@ -2243,7 +2273,7 @@ export class ZeBridge {
 
   /// Decided: the confirmed row stays for the other edits on the key, if any remain.
   private async keepConfirmed(e: { table: string; rowId?: string }, ckey: string, base: Record<string, unknown> | null, at: number) {
-    const left = Number((await this.run(`SELECT count(*) AS n FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?`, e.table, e.rowId ?? ''))[0]?.n ?? 0) > 0
+    const left = Number((await this.run(`SELECT count(*) AS n FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND other_incarnation = 0`, e.table, e.rowId ?? ''))[0]?.n ?? 0) > 0
       || [...this.rebase.values()].some((o) => o.table === e.table && o.rowId === e.rowId);
     if (left && base) (this.confirmedBase ??= new Map()).set(ckey, { row: base, at });
     else this.confirmedBase?.delete(ckey);
@@ -2395,7 +2425,7 @@ export class ZeBridge {
   /// `undoRow` rebuilds from: a server value between two refused edits must survive them.
   private async beforeIsAuthoritative(table: string, state: any, rowId: string, exec: Exec): Promise<boolean> {
     const ws: any[] = await exec(
-      `SELECT payload, optimistic, created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?
+      `SELECT payload, optimistic, created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND other_incarnation = 0
        UNION ALL SELECT payload, optimistic, created_at FROM _zebridge_undo WHERE tbl = ? AND row_id = ?
        ORDER BY 3 DESC LIMIT 1`,
       table, rowId, table, rowId,
@@ -2443,7 +2473,7 @@ export class ZeBridge {
 
     await this.transaction(async (txExec) => {
       const ws: any[] = await txExec(
-        `SELECT msg_id, payload, before, optimistic, 0 AS owed, '' AS mode, created_at, authoritative FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?
+        `SELECT msg_id, payload, before, optimistic, 0 AS owed, '' AS mode, created_at, authoritative FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND other_incarnation = 0
          UNION ALL SELECT msg_id, payload, before, optimistic, CASE WHEN mode = 'accepted' THEN 2 ELSE 1 END AS owed, mode, created_at, authoritative FROM _zebridge_undo WHERE tbl = ? AND row_id = ?
          ORDER BY 7, 1`,
         table, rowId, table, rowId,
@@ -2513,8 +2543,8 @@ export class ZeBridge {
       }
       await txExec(`DELETE FROM _zebridge_undo WHERE tbl = ? AND row_id = ? AND mode <> 'accepted'`, table, rowId);
       await txExec(`DELETE FROM _zebridge_undo WHERE tbl = ? AND row_id = ? AND mode = 'accepted'
-        AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox WHERE tbl = ? AND row_id = ?)`, table, rowId, table, rowId);
-      await txExec(`DELETE FROM _zebridge_base WHERE tbl=? AND row_id=? AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox WHERE tbl=? AND row_id=?)`, table,rowId,table,rowId);
+        AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND other_incarnation = 0)`, table, rowId, table, rowId);
+      await txExec(`DELETE FROM _zebridge_base WHERE tbl=? AND row_id=? AND NOT EXISTS (SELECT 1 FROM _zebridge_outbox WHERE tbl=? AND row_id=? AND other_incarnation = 0)`, table,rowId,table,rowId);
     });
     this.triggerChange(table);
     return owned ? 'done' : 'skipped';
@@ -2631,16 +2661,33 @@ export class ZeBridge {
       : 'watermark dropped, re-seeding from a fresh full';
   }
 
+  /// A table dropped, emptied or re-keyed: its unstamped (legacy) queued writes are discarded
+  /// as before; its stamped ones stay for the bridge to settle (a predecessor named by
+  /// another table's `after` must get a durable verdict), marked as another incarnation's so
+  /// they never touch the local rows (libzb `discardOutbox`).
   private async discardOutbox(table: string, why: string) {
     try {
-      const q = await this.run(`SELECT count(*) AS k FROM _zebridge_outbox WHERE tbl = ?`, table);
-      const k = q?.[0]?.k ?? 0;
+      const q = (await this.run(`SELECT count(*) AS k, sum(CASE WHEN incarnation IS NULL THEN 1 ELSE 0 END) AS legacy FROM _zebridge_outbox WHERE tbl = ?`, table))[0];
+      const k = Number(q?.k ?? 0), legacy = Number(q?.legacy ?? 0);
       if (k > 0) {
-        await this.run(`DELETE FROM _zebridge_outbox WHERE tbl = ?`, table);
-        this.appendLog('SCHEMA', `${k} queued write(s) for ${why} table "${table}" discarded — surface this to the user`, 'WARNING');
+        await this.run(`DELETE FROM _zebridge_outbox WHERE tbl = ? AND incarnation IS NULL`, table);
+        await this.run(`UPDATE _zebridge_outbox SET other_incarnation = 1 WHERE tbl = ? AND incarnation IS NOT NULL`, table);
+        if (legacy > 0) this.appendLog('SCHEMA', `${legacy} queued write(s) for ${why} table "${table}" discarded — surface this to the user`, 'WARNING');
+        if (k - legacy > 0) this.appendLog('SCHEMA', `${k - legacy} stamped write(s) for ${why} table "${table}" kept for the bridge to settle`, 'WARNING');
       }
     } catch { /* outbox not initialized yet — nothing queued */ }
   }
+
+  /// The anchor's stamp: the incarnation of the rows just seeded (the manifest's), in the
+  /// anchor's own transaction. Writes queued against another incarnation of the table are
+  /// marked so: settled by the bridge, never replayed or undone over these rows.
+  private async installStamp(exec: Exec, table: string, manifest: any) {
+    const n = manifest?.incarnation;
+    if (!Number.isInteger(n) || n < 1) return;
+    await exec(`INSERT INTO _zebridge_stamp (tbl, incarnation) VALUES (?, ?) ON CONFLICT(tbl) DO UPDATE SET incarnation = excluded.incarnation`, table, n);
+    await exec(`UPDATE _zebridge_outbox SET other_incarnation = 1 WHERE tbl = ? AND incarnation IS NOT NULL AND incarnation <> ?`, table, n);
+  }
+
 
   private async applySchema(table: string, val: any) {
     // `pk_columns` is authoritative; `pk` is the legacy single-column form.
@@ -2673,6 +2720,9 @@ export class ZeBridge {
     const tiebreakColumn: string | null = typeof val.tiebreak_column === 'string' ? val.tiebreak_column : null;
     // Version 1 is the only one this client speaks: any advertised version >= 1 includes it.
     const ordering = Number.isInteger(val.ordering) && val.ordering >= 1 ? 1 : 0;
+    const writable: boolean | null = val.writable === true ? true : val.writable === false ? false : null;
+    const advertised = Object.prototype.hasOwnProperty.call(val, 'incarnation');
+    const incarnation: number | null = Number.isInteger(val.incarnation) && val.incarnation >= 1 ? val.incarnation : null;
     const names = cols.map((c) => c.name);
 
     // ── FINDING 9 (the destroyer behind §10j): "first sight" must be decided by
@@ -2804,7 +2854,7 @@ export class ZeBridge {
       } else if (added.length === 0 && removed.length === 0 && renames.length === 0 && retyped.length === 0 &&
                  !(await this.foreignKeysDiffer(table, fkClauses)) && !(await this.strictMissing(table))) {
         await recordShape();
-        this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, tiebreakColumn, ordering, seedEpoch });
+        this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, tiebreakColumn, ordering, seedEpoch, writable, advertised, incarnation });
         await this.restoreSeedGate(table);
         this.reach('migrated');
         this.scheduleRecount();
@@ -2867,7 +2917,7 @@ export class ZeBridge {
       await this.syncIndexes(table, indexes);
       await recordShape();
 
-      this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, tiebreakColumn, ordering, seedEpoch });
+      this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, tiebreakColumn, ordering, seedEpoch, writable, advertised, incarnation });
       await this.restoreSeedGate(table);
       // Both registration paths mark the phase — a strip that lies is worse than none.
       this.reach('migrated');
@@ -4736,6 +4786,7 @@ export class ZeBridge {
         await this.transaction(async (txExec) => {
           await txExec(upsert, table, manifest.cutoff_version, seedLsn, state.seedEpoch ?? 0,
             gated ? proof.gateSeq : null, gated ? manifest.cdc_stream : null, proof.sharedSeq);
+          await this.installStamp(txExec, table, manifest);
           await txExec(`DELETE FROM _zebridge_fence WHERE tbl = ?`, table);
           await txExec(`DELETE FROM _zebridge_joint_done WHERE tbl = ?`, table);
           if (joint && othersOwed > 0) {
@@ -4770,7 +4821,10 @@ export class ZeBridge {
     } else {
       setAnchor();
       await this.pruneInboxSeeded(table, state.lsn);
-      await this.run(upsert, table, manifest.cutoff_version, state.lsn, state.seedEpoch ?? 0, state.seedSeq ?? null, state.seedStream ?? null, proof.sharedSeq);
+      await this.transaction(async (txExec) => {
+        await txExec(upsert, table, manifest.cutoff_version, state.lsn, state.seedEpoch ?? 0, state.seedSeq ?? null, state.seedStream ?? null, proof.sharedSeq);
+        await this.installStamp(txExec, table, manifest);
+      });
     }
     // A full replaced the rows: this client's writes still queued lost their optimistic
     // copies with them, so they go back on top (PROTOCOL §7.4c).
@@ -6036,6 +6090,18 @@ export class ZeBridge {
         const pending = this.pendingWrites.get(msgId);
         const where = pending ? `${pending.table}#${pending.id}` : '(not from this session)';
 
+        // A write of another incarnation of its table: its verdict settles it and is reported
+        // once; nothing local is reverted, rebased or reconciled (its rows are not these).
+        if (verdict.status !== 'failed' && (await this.run(`SELECT 1 AS x FROM _zebridge_outbox WHERE msg_id = ? AND other_incarnation = 1`, msgId)).length) {
+          const write = await this.outboxWrite(msgId, pending);
+          this.pendingWrites.delete(msgId);
+          await this.run(`DELETE FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
+          const outcome = ({ accepted: 'applied', stale: 'lost', rejected: 'rejected', row_deleted: 'deleted' } as Record<string, string>)[verdict.status] ?? 'indeterminate';
+          this.appendLog(m.subject, `${where}: settled (${verdict.status}${verdict.reason ? ` ${verdict.reason}` : ''}) — made against another incarnation of its table, so nothing local changes`, 'WARNING');
+          if (write) this.emitVerdict({ ...write, outcome, ...(verdict.reason ? { reason: String(verdict.reason) } : {}) } as Verdict);
+          return true;
+        }
+
         // `indeterminate`, or a status this client does not know: settled for
         // retransmission, outcome unknown (PROTOCOL §7.4c). Never reverted, never
         // re-sent under a new ID: the table reseeds from the hub, then `reconciled`.
@@ -6302,7 +6368,7 @@ export class ZeBridge {
   private async reapplyPending(table: string) {
     await this.outboxInitPromise;
     const state = this.syncedTables.get(table);
-    const rows: any[] = await this.run(`SELECT msg_id, payload, optimistic, row_id, created_at FROM _zebridge_outbox WHERE tbl = ? ORDER BY created_at`, table);
+    const rows: any[] = await this.run(`SELECT msg_id, payload, optimistic, row_id, created_at FROM _zebridge_outbox WHERE tbl = ? AND other_incarnation = 0 ORDER BY created_at`, table);
     let applied = 0, skipped = 0;
     const seen = new Set<string>(); // the first write re-applied on a row covers the seeded row: the server's state
     for (const r of rows) {
@@ -6416,6 +6482,8 @@ export class ZeBridge {
     try {
       await this.ledgerTransaction(async (txExec) => {
         const state = this.syncedTables.get(table);
+        if (!state) throw new WriteRefusal('UnknownTable');
+        if (this.suspendedMap.has(table)) throw new WriteRefusal('TableSuspended');
         let before: any = null;
         let authoritative: boolean | undefined;
         if (state?.pkCols.length) {
@@ -6431,6 +6499,22 @@ export class ZeBridge {
         // §10dx: the optimistic row carries the write's own stamp in the version column
         // — the ingress sets it from `version` server-side, and locally a NOT NULL
         // version column without it refused every optimistic INSERT.
+        // Permission to queue a NEW edit, and its stamp (core `decideStamp`, libzb's twin):
+        // decided here, in the transaction that would write it, before the optimistic change.
+        const stampRow = (await txExec(`SELECT incarnation FROM _zebridge_stamp WHERE tbl = ?`, table))[0];
+        const anchorRow = (await txExec(`SELECT seed_epoch FROM _zebridge_generations WHERE tbl = ?`, table))[0];
+        const decided = decideStamp({
+          writable: state?.writable ?? null, advertised: state?.advertised ?? false, incarnation: state?.incarnation ?? null,
+          replacing: (await txExec(`SELECT 1 AS x FROM _zebridge_fence WHERE tbl = ?`, table)).length > 0,
+          scopeStamp: stampRow ? Number(stampRow.incarnation) : null,
+          anchorEpoch: anchorRow ? Number(anchorRow.seed_epoch) : null, seedEpoch: state?.seedEpoch ?? 0, onDemand: this.ondemandSet.has(table),
+        });
+        if ('refuse' in decided) throw new WriteRefusal(decided.refuse);
+        if (decided.stamp != null) {
+          payload.incarnation = decided.stamp;
+          // A replica seeded before stamps adopts the descriptor's: recorded, as an anchor would.
+          if (!stampRow) await txExec(`INSERT INTO _zebridge_stamp (tbl, incarnation) VALUES (?, ?)`, table, decided.stamp);
+        }
         applied = optimisticEvent(table, op, payload);
         if (op !== 'DELETE' && state?.versionColumn && applied.data && typeof applied.data === 'object' && !(state.versionColumn in (applied.data as any))) {
           (applied.data as any)[state.versionColumn] = version;
@@ -6459,7 +6543,7 @@ export class ZeBridge {
         // A caller's stamp, the same operation and key, and a clock at or behind the named
         // write's time give back that write's own ID: refused before anything is written.
         if (after !== undefined && msgId === after) throw new OrderingRefusal(`after: a write cannot depend on itself (${after})`);
-        await this.outboxPut({ msgId, subject, payload, table, id, before, optimistic: applied, authoritative, ordered, predecessor }, txExec);
+        await this.outboxPut({ msgId, subject, payload, table, id, before, optimistic: applied, authoritative, ordered, predecessor, incarnation: (payload.incarnation as number | undefined) ?? null }, txExec);
         await this.applyEvent(table, applied, txExec);
       });
       // Fire the change event AFTER the local replica is successfully updated — with
@@ -6469,6 +6553,10 @@ export class ZeBridge {
     } catch (err) {
       // First: a self-dependency's msgId IS the earlier write's, whose tracking must stay.
       if (err instanceof OrderingRefusal) throw err;
+      if (err instanceof WriteRefusal) {
+        this.appendLog(table, `write refused: ${refusalWords(table, err.reason)} — nothing applied, nothing queued`, 'ERROR');
+        return { refused: err.reason };
+      }
       this.pendingWrites.delete(msgId);
       this.appendLog(subject, `optimistic apply failed, write not sent: ${err}`, 'ERROR');
       return { refused: `NotQueued: ${err}` };

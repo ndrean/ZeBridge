@@ -77,6 +77,7 @@ SECTIONS = {
     "chainPlan":       (lambda c: {"manifest": c["manifest"], "watermark": c["watermark"]}, lambda c: c["plan"]),
     "fullPredates":    (lambda c: {"manifest": c["manifest"], "plan": c["plan"], "storedSeq": c["storedSeq"]}, lambda c: c["predates"]),
     "outboxWatermark": (lambda c: {"entries": c["entries"], "watermark": c["watermark"]}, lambda c: {"send": c["send"], "refuse": c["refuse"]}),
+    "decideStamp":     (lambda c: c["in"],                                         lambda c: c["out"]),
     "floorMargin":     (lambda c: {"versions": c["versions"], "watermark": c["watermark"]}, lambda c: c["margin"]),
     "scope":           (lambda c: {"streams": c["streams"], "tables": c["tables"]}, lambda c: {"gapped": sorted(c["gapped"]), "tablesToSeed": sorted(c["tablesToSeed"])}),
     "columnDdl":       (lambda c: {"col": c["col"], "pkCols": c["pkCols"]},          lambda c: c["ddl"]),

@@ -11,6 +11,7 @@ The reference for running ZeBridge: the CLI, the doctor (`--diagnose`), what nee
   - [A client library](#a-client-library)
 - [Upgrading mutation receipts](#upgrading-mutation-receipts)
   - [Client requirements for indeterminate recovery](#client-requirements-for-indeterminate-recovery)
+- [Turning on incarnation stamps](#turning-on-incarnation-stamps)
 - [Restart rules](#restart-rules)
   - [Checking a table / database against the bridge's rules](#checking-a-table--database-against-the-bridges-rules)
 - [Suspended tables](#suspended-tables)
@@ -212,6 +213,30 @@ What you may see on the first start after an upgrade: chains swept and rebuilt (
 **Minimum compatible client release: not yet assigned.** Clients from the `v0.2.6` tag do not provide durable `indeterminate` recovery. Until a compatible release is numbered, use a validated candidate build of libzb or zb-client-ts implementing [PROTOCOL §7.4c](PROTOCOL.md#74c-reconciling-an-indeterminate-write) before relying on automatic recovery from expired or reused message IDs. The package version and C ABI alone do not certify this capability.
 
 If a replica settled an uncertain write without a durable reconciliation marker, perform an authoritative full resync; upgrading the client cannot reconstruct that marker. On-demand and unfollowed tables remain unresolved until configured with an authoritative recovery path.
+
+[⬆️](#table-of-contents)
+
+---
+
+## Turning on incarnation stamps
+
+A table dropped and re-created under its name is another table, and a write queued against the old one must not land on the new one ([PROTOCOL §7.8](PROTOCOL.md#78-a-write-belongs-to-its-table-incarnation)). Every bridge with this release checks a write that carries an `incarnation` stamp. Clients stamp only when a table's descriptor carries `incarnation`, and descriptors carry it only when the database switch is on. It is off by default.
+
+**A bridge older than the check would apply a stamped write unchecked.** So the order is:
+
+1. Apply this release's init SQL (it creates the switch, `zebridge_private.write_policy`, and the check's function, `zebridge_private.lock_incarnations`), as in [Upgrading mutation receipts](#upgrading-mutation-receipts).
+2. Upgrade every bridge that consumes writes on the database, every lane and every instance. A bridge whose writer may not run the check refuses to start (`ReceiptsNotInstalled`).
+3. Only then turn the switch on, as the administrator:
+
+   ```sql
+   UPDATE zebridge_private.write_policy SET incarnation_stamps = true WHERE singleton;
+   ```
+
+A running bridge reads the switch at boot and again at every catalogue reload, so do not change it before step 2 is complete, even with the bridges still running. Each bridge logs its value at boot: `incarnation stamps: advertised` or `not advertised`. A table's descriptor then carries its incarnation (`nats kv get schemas <table>`), and clients stamp their next edits; writes already queued without a stamp are checked as before.
+
+**Turning it off** (`incarnation_stamps = false`) makes descriptors drop the key at the next catalogue reload or restart. Clients then send unstamped writes; stamped writes already queued are still checked.
+
+**When writes are refused `IncarnationUnknown`.** With the switch on, a descriptor says `"incarnation": null` and `"writable": false` when the bridge cannot state a table's identity, and clients refuse new edits on it. Check `SELECT * FROM zebridge_incarnations WHERE tbl = '<table>'` (a row with an incarnation of 1 or more), and that the reader and writer roles may run `public.zebridge_incarnation_stamps()`. Once fixed, the next catalogue reload republishes the descriptor.
 
 [⬆️](#table-of-contents)
 

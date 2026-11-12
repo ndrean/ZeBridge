@@ -268,7 +268,7 @@ writes a bucket by publishing there. Clients should use their NATS client's KV A
 }
 ```
 
-Root keys are `table`, `pg`, `sqlite`, `lsn`, `pk`, `pk_columns`, `indexes`, `foreign_keys`, `max_row_bytes`, plus the **write contract**: `version_column`, `tombstone_column`, `tiebreak_column`, `tenant_column`, `writable`, `ordering`, `mutation_timeout_ms` and `replica_identity`. `indexes` and `foreign_keys` are dialect-neutral (a `CREATE INDEX` and a `FOREIGN KEY` clause read the same on every engine), so they sit at the root; `pg` and `sqlite` carry only column types, and a client reads the block its engine speaks — SQLite replicas the `sqlite` block, PostgreSQL replicas (PGlite, a local server) the `pg` block (§10).
+Root keys are `table`, `pg`, `sqlite`, `lsn`, `pk`, `pk_columns`, `indexes`, `foreign_keys`, `max_row_bytes`, plus the **write contract**: `version_column`, `tombstone_column`, `tiebreak_column`, `tenant_column`, `writable`, `ordering`, `incarnation`, `mutation_timeout_ms` and `replica_identity`. `indexes` and `foreign_keys` are dialect-neutral (a `CREATE INDEX` and a `FOREIGN KEY` clause read the same on every engine), so they sit at the root; `pg` and `sqlite` carry only column types, and a client reads the block its engine speaks — SQLite replicas the `sqlite` block, PostgreSQL replicas (PGlite, a local server) the `pg` block (§10).
 
 `pk_columns` is the whole primary key in key order; `pk` is the legacy single-column
 form and is `null` for a composite key. Both live at the root and only there: the key
@@ -294,6 +294,8 @@ shared open-tenant token when it is `null`, so every principal converges on the 
 entry of a tenant-agnostic table (§6, "Connection Flow").
 
 `ordering: 1` advertises support for [ordered ingress (version 1)](#ordered-ingress-version-1). A client refuses an explicit `after(writeId)` dependency when the descriptor omits this capability.
+
+`incarnation` is the table's current incarnation, a positive integer: a table dropped and re-created under its name, or restored from a backup, is a new incarnation. When the key is present, the bridge checks every stamped write against it and a client stamps every new edit (§7.8). `"incarnation": null` means the bridge asks for stamps but cannot state this table's identity, or cannot read its own stamping policy: it withholds writes, and the same descriptor says `"writable": false`. When the key is absent, the bridge does not ask for stamps and a client sends its writes unstamped.
 
 `tiebreak_column` is the configured server-stamped writer column when it exists, otherwise `null`. Clients may omit an own-echo baseline copy only for a single pending outbox write whose normalized version and `client_id` both match the CDC row through this column. Equal timestamps alone do not prove an echo. An absent field, missing identity, peer identity, or owed undo retains conservative capture.
 
@@ -335,8 +337,10 @@ offering to edit a table.
 edge writes outright, `DbAllocatedKey`, independent of the grant) — the same combined
 verdict preflight computes and logs at boot. `false` means at least one of those fails,
 permanently until the DBA changes it. `null` means "not yet checked" — a table that
-raced this publish before its own edge-writability report landed; treat it the same as
-`false` for now and expect a follow-up publish shortly after.
+raced this publish before its own edge-writability report landed; a follow-up publish
+usually comes shortly after.
+
+**A client refuses a new edit when `writable` is `false`**, before it changes the local row or queues anything. `null` refuses nothing: the bridge still judges the write. A later `false` does not affect a write already queued: it is still sent, and the bridge settles it (§7.8).
 
 This is a **whole-bridge** fact today, not a per-principal one: there is one
 `bridge_writer` role, so `writable` is the same answer for every client. If per-principal
@@ -1600,6 +1604,7 @@ MessagePack, as everywhere else on the wire (§4).
 | `key` | always | Every primary key column, by name. It is the only source of the row's key: an INSERT stores the row under it, an UPDATE and a DELETE address the row by it. A **partial** key is refused rather than guessed: `ON CONFLICT` would otherwise match a different row than the client meant, and a DELETE would remove more rows than it asked for |
 | `data` | insert, update | The row's other columns: all of them for an insert, the changed ones for an update. The key columns may be left out; a key column that is present must equal `key`, or the write is refused (`KeyChange`). Column names are checked against the catalog, which is the allowlist — an unknown name is refused and never reaches SQL. Ignored for `delete` |
 | `version` | always | The value of *this table's* version column, as text, rendered exactly as CDC renders it (§7.3). Not a timestamp of your choosing, and not a field name you pick |
+| `incarnation` | when the descriptor carries `incarnation` | The table incarnation the edited rows belong to (§7.8). The bridge checks it in the write's own transaction; a write of another incarnation is refused `TableIncarnationChanged`. Part of the payload, so a retry must send it unchanged: the same message ID with another value is a different write (`MessageIdReused`). Absent: not checked, as before stamps existed |
 | `client_id` | should | Tiebreaker for equal versions (§7.3): on a table with a `tiebreak_col` the higher `client_id` wins and is stored in that column (§7.4, 2b). Must be **stable across restarts** — a value regenerated per page load also changes `Nats-Msg-Id`, so a mutation retried after a crash is deduplicated against nothing and applies twice |
 
 **`msg_id` is a header, not a field.** Set `Nats-Msg-Id` on the message and JetStream deduplicates retries for you; a payload field named `msg_id` is ignored. The header is **required**. Under admission (`MUTATION_ADMISSION=1`), a write without one, or with an invalid one, is refused before it is queued: the error PubAck names the reason, `MissingMessageId` or `InvalidMessageId`. In direct mode, JetStream may already have acknowledged storing such a write; the bridge then refuses to execute it, dead-letters it, and sends no verdict, since a verdict is addressed by that very ID. A valid ID is 1 to 512 bytes with no `.`, `*`, `>` and no ASCII control or space byte (0x00–0x20, 0x7F); other bytes, UTF-8 included, are allowed. It ends the verdict subject `mutation_ack.<principal>.<msg_id>`. libzb and zb-client-ts send `zb1-t<created-ms>-<OPERATION>-<client_id>-<table>-k<n>-<key part>+…-<version>`, where `created-ms` is the bridge's clock in epoch milliseconds as the device estimates it, taken once when the write is made, and the `n` key parts follow the table's primary-key order. Each component is escaped separately: `A–Z a–z 0–9 _ :` pass, every other byte becomes `~` and two uppercase hex digits, so two different writes never share an ID. The bridge reads only the `zb1-t<created-ms>-` prefix. An ID starting with `zb1-` must have exactly that shape; any other valid ID is accepted as an older client's. Never regenerate an ID when retrying a write.
@@ -1720,6 +1725,8 @@ with no SQLSTATE at all — are retried up to `max_deliver` and then reported as
 | `RowTooLargeToReplicate` | the payload is wider than `max_row_bytes` (§3) — storing it would suspend the table for every client |
 | `PredatesGcWatermark` | the write's version is at or before the GC watermark (§7.5): its row's tombstone may have been reaped, and applying it could bring a deleted row back. The bridge compares against the current watermark, so this holds even for a client whose own copy of the watermark is old |
 | `UnsupportedPayloadType` | a value's MessagePack type cannot be rendered for its column — an array or a map sent to a scalar column |
+| `TableIncarnationChanged` | the write's `incarnation` is not the table's: it was dropped and re-created (or restored) since the client made the edit, or dropped with no replacement yet (§7.8). The row of the same key in the new table is not touched |
+| `InvalidIncarnation` | `incarnation` is present but not a positive integer. Under admission it is refused at the door: the publish fails with `mutation admission refused: InvalidIncarnation`, and nothing is stored |
 
 ⚠️ **A verdict can only have come from the bridge.** A client may publish under its own
 `mutation.<principal>.>` and nowhere else — it cannot publish a verdict, to itself or to
@@ -2283,6 +2290,32 @@ present in `data` must carry the key's own value, for an INSERT as for an UPDATE
 different value is refused by the ingress as `rejected` / `KeyChange`, and both client
 libraries refuse it before an outbox row exists. A rename is a DELETE of the old key and an INSERT under the new one, and the
 old key's tombstone keeps it occupied until the sweeper reaps it (§7.5).
+
+### 7.8 A write belongs to its table incarnation
+
+A table dropped and re-created under its name is another table, even with the same shape and the same keys. An edit of row 42 made against the old table must not change row 42 of the new one, whose version may be older than the edit (a restore), so last-write-wins cannot be relied on to stop it. When the descriptor carries `incarnation` (§3), every write says which incarnation it was made against, and the bridge enforces it.
+
+**What the bridge does.**
+
+- **Receipts first.** A write with an existing receipt is answered from it, whatever happened to the table since; it is never judged again.
+- **The check.** Otherwise it checks the write's `incarnation` in the write's own transaction, under a lock a `DROP TABLE` must wait for, so the table cannot be replaced between the check and the commit.
+- **Outcomes.** Another number, a table dropped with no replacement, or a table replaced without the change being recorded (a restore with the event triggers off) is `rejected` / `TableIncarnationChanged`, durably. A failure to read or lock the incarnation is retried, never a rejection.
+- **Batches.** In a batch each write gets its own outcome.
+
+**What a client does.**
+
+- **The stamp.** It is the incarnation of the rows the user can edit: recorded when a seed or fence commits the table's anchor, from the chain's manifest, per anchor scope. A table that was re-created keeps its old stamp until its rows are replaced, because until then the visible rows are the old incarnation's. A table whose rows arrive as query answers takes the descriptor's `incarnation`. A replica seeded before stamps existed takes the descriptor's when its anchor's seed epoch is the descriptor's.
+- **New edits are refused** before the local row changes and before anything is queued:
+  - `TableNotWritable`: the descriptor says `writable: false`;
+  - `IncarnationUnknown`: the descriptor says `incarnation: null`, or the client cannot state the stamp of the rows it shows;
+  - `ReplacementIncomplete`: the table's rows are being replaced (a seed or fence is owed).
+- **Queued stamped writes are never refused.** A write already queued keeps its message ID and its stamp across restarts and is sent and settled whatever the descriptor says later.
+- **Drops.** When a table is dropped, emptied or re-keyed, its stamped writes stay for the bridge to settle (a write another table's `after` names must get a durable verdict). Unstamped ones are discarded, as before stamps.
+- **Other incarnations.** Once the client's stamp for the table moves on, its older stamped writes belong to another table. They are never replayed over the new rows, never reverted or rebased locally, and their verdict is reported once with nothing changed locally.
+
+**Writes without a stamp.** A write with no `incarnation`, from a client older than stamps or from a table the bridge does not ask stamps for, is checked as before: by its version against the row. Its original target cannot be reconstructed from the current manifest, so it cannot be held to an incarnation.
+
+The switch that makes descriptors carry `incarnation`, and the order of a rollout, are in OPERATIONS ([Turning on incarnation stamps](OPERATIONS.md#turning-on-incarnation-stamps)).
 
 ## 8. Ordering guarantees
 

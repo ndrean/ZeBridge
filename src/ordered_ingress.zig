@@ -4,7 +4,10 @@ const std = @import("std");
 const c = @import("c_imports.zig").c;
 const receipts = @import("receipts.zig");
 const mp = @import("msgpack");
-pub const Envelope = struct { ordered: bool = false, predecessor: ?[:0]const u8 = null, refusal: ?anyerror = null };
+/// `incarnation`: the table incarnation the write was made against, when the client stamped
+/// it (null: an unstamped write, checked as before). A stamp that is not a positive integer
+/// is the write's refusal, `InvalidIncarnation`, unless its ordering fields were refused first.
+pub const Envelope = struct { ordered: bool = false, predecessor: ?[:0]const u8 = null, refusal: ?anyerror = null, incarnation: ?i64 = null };
 
 pub fn parse(a: std.mem.Allocator, bytes: []const u8, id: []const u8) !Envelope {
     var r = std.Io.Reader.fixed(bytes);
@@ -16,6 +19,19 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, id: []const u8) !Envelope 
         return .{}; // the existing payload validator records its permanent rejection
     };
     if (value != .map) return .{};
+    var env = try parseOrdering(a, value, id);
+    if (value.map.getByString("incarnation")) |stamp| {
+        const n: i64 = switch (stamp) {
+            .int => |x| x,
+            .uint => |x| if (x <= std.math.maxInt(i64)) @intCast(x) else -1,
+            else => -1,
+        };
+        if (n > 0) env.incarnation = n else if (env.refusal == null) env.refusal = error.InvalidIncarnation;
+    }
+    return env;
+}
+
+fn parseOrdering(a: std.mem.Allocator, value: mp.Payload, id: []const u8) !Envelope {
     const version = value.map.getByString("ordering") orelse {
         if (value.map.getByString("predecessor") != null) return .{ .refusal = error.InvalidOrderedEnvelope };
         return .{};
@@ -99,6 +115,37 @@ test "ordered envelope legacy" {
     defer arena.deinit();
     const got = try parse(arena.allocator(), "\x81\xa9\x63\x6c\x69\x65\x6e\x74\x5f\x69\x64\xaa\x6f\x6e\x65\x2d\x63\x6c\x69\x65\x6e\x74", "zb1-t1-INSERT-one~2Dclient-tab-k1-s-v");
     try std.testing.expect(!got.ordered and got.refusal == null);
+}
+
+fn packed_(a: std.mem.Allocator, entries: []const struct { []const u8, mp.Payload }) ![]u8 {
+    var m = mp.Payload.mapPayload(a);
+    for (entries) |e| try m.mapPut(e[0], e[1]);
+    var out: std.Io.Writer.Allocating = .init(a);
+    var empty: [0]u8 = .{};
+    var r = std.Io.Reader.fixed(&empty);
+    var packer = mp.PackerIO.init(&r, &out.writer);
+    try packer.write(m);
+    return out.written();
+}
+
+test "incarnation stamp: absent, valid, malformed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const id = "zb1-t1-UPDATE-c-tab-k1-x-v";
+    // Absent: a legacy write, unchecked and not refused.
+    const legacy = try parse(a, try packed_(a, &.{.{ "version", try mp.Payload.strToPayload("v", a) }}), id);
+    try std.testing.expect(legacy.incarnation == null and legacy.refusal == null);
+    // Valid: carried.
+    const stamped = try parse(a, try packed_(a, &.{.{ "incarnation", .{ .uint = 7 } }}), id);
+    try std.testing.expectEqual(@as(?i64, 7), stamped.incarnation);
+    try std.testing.expect(stamped.refusal == null);
+    // Malformed: zero, negative, a string, nil. Each is the write's refusal.
+    for ([_]mp.Payload{ .{ .uint = 0 }, .{ .int = -3 }, try mp.Payload.strToPayload("7", a), .{ .nil = {} } }) |bad| {
+        const got = try parse(a, try packed_(a, &.{.{ "incarnation", bad }}), id);
+        try std.testing.expect(got.incarnation == null);
+        try std.testing.expectEqual(error.InvalidIncarnation, got.refusal.?);
+    }
 }
 
 /// Whether the dispatcher must keep a write on its client's lane: any ordered envelope,

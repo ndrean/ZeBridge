@@ -52,11 +52,39 @@ pub const Load = struct {
     /// tbl → seed_epoch (§10df): a bump republishes the table's descriptor and tells
     /// clients to forget their watermark.
     epochs: std.StringHashMapUnmanaged(i64) = .empty,
+    /// tbl → its current incarnation (`zebridge_incarnations`), only when one is recorded
+    /// (≥ 1). A table absent here has an identity the bridge cannot state.
+    incarnations: std.StringHashMapUnmanaged(i64) = .empty,
+    /// `zebridge_incarnation_stamps()`: whether descriptors advertise `incarnation`, so that
+    /// clients stamp their writes. `unknown`: the policy could not be read, which is not
+    /// the same as off — a descriptor then withholds writes rather than invite unstamped ones.
+    /// The default: a load that never reached the policy (the catalogue itself unreadable)
+    /// must not read as off. Only a successful read of `false` is `.off`.
+    incarnation_stamps: Stamps = .unknown,
+
+    pub const Stamps = enum { off, on, unknown };
+
+    /// What a table's descriptor advertises about incarnations: nothing (the switch off:
+    /// clients send unstamped writes), the incarnation to stamp, or writes withheld (the
+    /// switch on or unreadable, with no identity to state). One rule for the descriptor
+    /// builder and for the reload, which republishes every table whose advert changed.
+    pub const Advert = union(enum) { none, withheld, stamp: i64 };
+
+    pub fn advert(self: *const Load, table: []const u8) Advert {
+        return switch (self.incarnation_stamps) {
+            .off => .none,
+            .unknown => .withheld,
+            .on => if (self.incarnations.get(table)) |n| .{ .stamp = n } else .withheld,
+        };
+    }
 
     pub fn deinit(self: *Load, allocator: std.mem.Allocator) void {
         var it = self.epochs.keyIterator();
         while (it.next()) |k| allocator.free(k.*);
         self.epochs.deinit(allocator);
+        var inc = self.incarnations.keyIterator();
+        while (inc.next()) |k| allocator.free(k.*);
+        self.incarnations.deinit(allocator);
         for (self.publics) |name| allocator.free(name);
         if (self.publics.len > 0) allocator.free(self.publics);
         for (self.tenants) |name| allocator.free(name);
@@ -167,9 +195,10 @@ pub fn loadRules(
     }
 
     const res = c.PQexec(conn,
-        "SELECT tbl, COALESCE(tenant_col::text, ''), version_col::text, " ++
-            "COALESCE(tombstone_col::text, ''), COALESCE(tiebreak_col::text, ''), seed_epoch " ++
-            "FROM public.zebridge_catalogue ORDER BY tbl");
+        "SELECT c.tbl, COALESCE(c.tenant_col::text, ''), c.version_col::text, " ++
+            "COALESCE(c.tombstone_col::text, ''), COALESCE(c.tiebreak_col::text, ''), c.seed_epoch, " ++
+            "(SELECT i.incarnation FROM public.zebridge_incarnations i WHERE i.tbl = c.tbl) " ++
+            "FROM public.zebridge_catalogue c ORDER BY c.tbl");
     defer c.PQclear(res);
     if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
         // Missing table = init.core.template.sql was never applied. Preflight then
@@ -178,6 +207,16 @@ pub fn loadRules(
         return out;
     }
     out.available = true;
+    // The switch, apart, so it cannot fail the catalogue: read on or off, or `unknown`
+    // when the call fails (the descriptors then withhold writes; see `appendWriteContract`).
+    {
+        const sw = c.PQexec(conn, "SELECT public.zebridge_incarnation_stamps()");
+        defer c.PQclear(sw);
+        out.incarnation_stamps = if (c.PQresultStatus(sw) != c.PGRES_TUPLES_OK or c.PQntuples(sw) != 1 or c.PQgetisnull(sw, 0, 0) == 1)
+            .unknown
+        else if (c.PQgetvalue(sw, 0, 0)[0] == 't') .on else .off;
+        if (out.incarnation_stamps == .unknown) log.warn("🗂️ the incarnation policy could not be read ({s}) — writable tables are published with writes withheld until it can", .{c.PQerrorMessage(conn)});
+    }
 
     var publics: std.ArrayList([]const u8) = .empty;
 
@@ -193,6 +232,10 @@ pub fn loadRules(
         if (allocator.dupe(u8, tbl)) |k| {
             out.epochs.put(allocator, k, epoch) catch allocator.free(k);
         } else |_| {}
+        const incarnation: i64 = if (c.PQgetisnull(res, @intCast(i), 6) == 1) 0 else std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, @intCast(i), 6)), 10) catch 0;
+        if (incarnation >= 1) if (allocator.dupe(u8, tbl)) |k| {
+            out.incarnations.put(allocator, k, incarnation) catch allocator.free(k);
+        } else |_| {};
         var grew = false;
 
         if (tenant_col.len == 0) {
@@ -268,4 +311,19 @@ pub fn loadRules(
         out.rows, out.merged, out.publics.len, out.tenants.len, out.changed.len,
     });
     return out;
+}
+
+test "advert: unknown by default, none only when read off, withheld without an identity" {
+    const a = std.testing.allocator;
+    var load: Load = .{};
+    defer load.deinit(a);
+    // A load that never read the policy (the catalogue unreadable at boot) withholds.
+    try std.testing.expect(load.advert("t") == .withheld);
+    load.incarnation_stamps = .off;
+    try std.testing.expect(load.advert("t") == .none);
+    load.incarnation_stamps = .on;
+    try std.testing.expect(load.advert("t") == .withheld);
+    try load.incarnations.put(a, try a.dupe(u8, "t"), 4);
+    try std.testing.expectEqual(Load.Advert{ .stamp = 4 }, load.advert("t"));
+    try std.testing.expect(load.advert("other") == .withheld);
 }

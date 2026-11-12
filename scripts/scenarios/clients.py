@@ -18,7 +18,8 @@ def fresh_sqlite(path):
 
 class Lib:
     """The libzb client, host-driven: every observation is a poll."""
-    def __init__(self, db, tables, client_id="py-scenario", principal="omar", creds=None, db_url=None, seed_streaming=False, seed_chunk_rows=None, seed_streaming_above=None, engine=None):
+    def __init__(self, db, tables, client_id="py-scenario", principal="omar", creds=None, db_url=None, seed_streaming=False, seed_chunk_rows=None, seed_streaming_above=None, engine=None, nats_url=None):
+        """`nats_url`: dial this instead of the stack's NATS (a relay that can cut the link)."""
         self.outcomes = {}
         if not LIBZB.exists():
             sys.exit(f"{LIBZB} missing — cd libzb && zig build -Doptimize=ReleaseFast")
@@ -37,7 +38,7 @@ class Lib:
             f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
         lib.zb_client_wipe.restype, lib.zb_client_wipe.argtypes = ctypes.c_int, [ctypes.c_uint64]
         self.h = lib.zb_client_connect(json.dumps({
-            "natsUrl": zb.nats_server(), **zb.tls_opts(), "credsPath": str(creds) if creds else zb.creds_for(principal), "dbPath": db,
+            "natsUrl": nats_url or zb.nats_server(), **zb.tls_opts(), "credsPath": str(creds) if creds else zb.creds_for(principal), "dbPath": db,
             "principal": principal, "clientId": client_id, "tables": list(tables), "heartbeatMs": 0,
             **({"dbUrl": db_url} if db_url else {}), **({"seedStreaming": True} if seed_streaming else {}),
             **({"seedChunkRows": seed_chunk_rows} if seed_chunk_rows is not None else {}),

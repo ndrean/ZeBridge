@@ -1302,6 +1302,9 @@ pub fn buildMutation(a: std.mem.Allocator, args: Value) !Value {
     // advertises it: `ordering` is the contract's version, `predecessor` this client's
     // previous unsettled ordered write (null: none). Both are part of the payload, so the
     // bridge's receipt fingerprint covers them and a resend can never change them.
+    // The table incarnation the edited rows belong to, when the bridge asks for it: part of
+    // the payload, so the receipt fingerprint covers it and a resend cannot change it.
+    if (getInt(args, "incarnation")) |inc| if (inc > 0) try payload.put(a, "incarnation", .{ .integer = inc });
     if (getInt(args, "ordering")) |ordering| if (ordering > 0) {
         try payload.put(a, "ordering", .{ .integer = ordering });
         try payload.put(a, "predecessor", if (getStr(args, "predecessor")) |p| Value{ .string = p } else .null);
@@ -1644,6 +1647,42 @@ fn versionMicros(a: std.mem.Allocator, v: []const u8) !?i64 {
 /// core.ts outboxFloorMargin: how far the oldest waiting write is ahead of the GC floor, in
 /// milliseconds (at 0 or below it is already refused, `PredatesGcWatermark`); null when no
 /// floor was received or no waiting write has a version. Truncated toward zero.
+/// A new edit's permission and stamp (NOTES "A queued write belongs to its table
+/// incarnation"). `advertised`: the descriptor carries an `incarnation` key; `incarnation`
+/// its value (null: the bridge withholds writes, the identity unknown); `writable` the
+/// descriptor's (null: not reported yet, which refuses nothing); `replacing`: the scope's
+/// rows are being replaced (an owed record); `scope_stamp`: the incarnation of the rows the
+/// user can edit, installed with the scope's anchor; `anchor_epoch` the anchor's seed epoch
+/// (null: unseeded), `seed_epoch` the descriptor's. Twin: core.ts `decideStamp`.
+pub const StampInput = struct {
+    writable: ?bool = null,
+    advertised: bool = false,
+    incarnation: ?i64 = null,
+    replacing: bool = false,
+    scope_stamp: ?i64 = null,
+    anchor_epoch: ?i64 = null,
+    seed_epoch: i64 = 0,
+    on_demand: bool = false,
+};
+/// `unstamped`: the bridge does not ask for stamps (a legacy write); `refuse`: queue nothing.
+pub const Stamp = union(enum) { stamp: i64, unstamped, refuse: []const u8 };
+
+pub fn decideStamp(i: StampInput) Stamp {
+    if (i.writable == false) return .{ .refuse = "TableNotWritable" };
+    if (i.replacing) return .{ .refuse = "ReplacementIncomplete" };
+    if (!i.advertised) return .unstamped;
+    const current = i.incarnation orelse return .{ .refuse = "IncarnationUnknown" };
+    // Rows that arrive as query answers are the table as it is now.
+    if (i.on_demand) return .{ .stamp = current };
+    // The rows the user sees: the scope's stamp, even when the descriptor has moved on (the
+    // replacement has not begun, so the visible rows are still the old incarnation's).
+    if (i.scope_stamp) |s| return .{ .stamp = s };
+    // A replica seeded before stamps existed: the same seed epoch means no new incarnation
+    // since its seed, so the rows are the current incarnation's.
+    if (i.anchor_epoch) |e| if (e == i.seed_epoch) return .{ .stamp = current };
+    return .{ .refuse = "IncarnationUnknown" };
+}
+
 pub fn outboxFloorMargin(a: std.mem.Allocator, versions: []const ?[]const u8, watermark: ?[]const u8) !?i64 {
     const mark = (if (watermark) |w| (if (w.len == 0) null else try versionMicros(a, w)) else null) orelse return null;
     var oldest: ?i64 = null;

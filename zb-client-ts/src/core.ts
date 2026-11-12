@@ -1179,8 +1179,12 @@ export function mutationPayload(
   version: string,
   clientId: string,
   ordering?: { version: number; predecessor: string | null },
+  incarnation?: number,
 ): Record<string, unknown> {
   const payload: Record<string, unknown> = { key, version, client_id: clientId };
+  // The table incarnation the edited rows belong to, when the bridge asks for it (libzb
+  // core.buildMutation): in the payload, so the receipt fingerprint covers it.
+  if (Number.isInteger(incarnation) && (incarnation as number) > 0) payload.incarnation = incarnation;
   // The ordered envelope (libzb core.buildMutation): sent only when the bridge advertises it,
   // inside the payload so the receipt fingerprint covers it and a resend cannot change it.
   if (ordering && ordering.version > 0) { payload.ordering = ordering.version; payload.predecessor = ordering.predecessor; }
@@ -1232,6 +1236,27 @@ export function normalizeOp(op: string): MutationOp {
 }
 
 /// The whole envelope in one call — what a port implements first.
+/// A new edit's permission and stamp (libzb core.decideStamp, same fixtures). `advertised`:
+/// the descriptor carries an `incarnation` key; `incarnation` its value (null: writes withheld,
+/// the identity unknown); `writable` the descriptor's (null: not reported, refuses nothing);
+/// `replacing`: the scope's rows are being replaced; `scopeStamp`: the incarnation of the rows
+/// the user can edit; `anchorEpoch`/`seedEpoch`: the anchor's and the descriptor's.
+/// `{ stamp: null }`: an unstamped (legacy) write; `{ refuse }`: queue nothing.
+export type StampInput = {
+  writable: boolean | null; advertised: boolean; incarnation: number | null; replacing: boolean;
+  scopeStamp: number | null; anchorEpoch: number | null; seedEpoch: number; onDemand: boolean;
+};
+export function decideStamp(i: StampInput): { stamp: number | null } | { refuse: string } {
+  if (i.writable === false) return { refuse: 'TableNotWritable' };
+  if (i.replacing) return { refuse: 'ReplacementIncomplete' };
+  if (!i.advertised) return { stamp: null };
+  if (i.incarnation == null) return { refuse: 'IncarnationUnknown' };
+  if (i.onDemand) return { stamp: i.incarnation };
+  if (i.scopeStamp != null) return { stamp: i.scopeStamp };
+  if (i.anchorEpoch != null && i.anchorEpoch === i.seedEpoch) return { stamp: i.incarnation };
+  return { refuse: 'IncarnationUnknown' };
+}
+
 export function buildMutation(args: {
   principal: string; clientId: string; table: string;
   op: string;
@@ -1239,11 +1264,12 @@ export function buildMutation(args: {
   pkCols: string[]; version: string; createdMs: number;
   mutationsPrefix?: string;
   ordering?: number; predecessor?: string | null;
+  incarnation?: number;
 }): { subject: string; msgId: string; id: string; payload: Record<string, unknown>; optimistic: Record<string, unknown> } {
   const op = normalizeOp(args.op);
   const id = mutationKeyId(args.pkCols, args.key);
   const payload = mutationPayload(op, args.key, args.values, args.version, args.clientId,
-    args.ordering ? { version: args.ordering, predecessor: args.predecessor ?? null } : undefined);
+    args.ordering ? { version: args.ordering, predecessor: args.predecessor ?? null } : undefined, args.incarnation);
   return {
     subject: mutationSubject(args.principal, args.table, op, args.mutationsPrefix),
     msgId: mutationMsgId(args.createdMs, args.clientId, args.table, op, args.pkCols.map((c) => idKeyPart(args.key[c])), args.version),

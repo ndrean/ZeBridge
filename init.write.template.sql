@@ -2098,6 +2098,63 @@ RETURNS boolean LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog AS $$
     SELECT pg_advisory_unlock(hashtextextended('zebridge.park.sweep:'||p_publication,0))
 $$;
 
+-- ─── A queued write belongs to the table incarnation it was made against ─────────────
+-- A client stamps a write with the incarnation of the rows it edited (`incarnation` in the
+-- payload). A table dropped and re-created under its name is another table: an edit of the
+-- old row 42 must not land on the new row 42, whose version may well be older (a restore).
+-- The bridge checks the stamp in the write's own transaction, under a lock DROP must wait
+-- for, so the relation cannot be replaced between the check and the commit.
+--
+-- The switch: clients stamp only when a table's descriptor advertises `incarnation`, and the
+-- bridge advertises it only when this is on. A worker that predates the gate would apply a
+-- stamped write unchecked, so the administrator turns it on only after every worker that
+-- consumes writes runs a build with the gate. A running bridge reads it at boot and again at
+-- every catalogue reload, so turning it on early reaches bridges that are already running.
+CREATE TABLE IF NOT EXISTS zebridge_private.write_policy (
+    singleton          boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    incarnation_stamps boolean NOT NULL DEFAULT false
+);
+INSERT INTO zebridge_private.write_policy DEFAULT VALUES ON CONFLICT DO NOTHING;
+CREATE OR REPLACE FUNCTION public.zebridge_incarnation_stamps() RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
+    SELECT COALESCE((SELECT incarnation_stamps FROM zebridge_private.write_policy), false)
+$$;
+
+-- The gate, one call per batch: every table named, in one stable order (sorted, so two
+-- batches never wait on each other's table locks in a cycle), resolved and locked
+-- ROW EXCLUSIVE, the mode a write takes anyway and the one DROP's ACCESS EXCLUSIVE waits
+-- for, until COMMIT. Per table: its recorded incarnation, and whether the live relation is
+-- the one recorded (`live`: false for a table gone, or replaced unobserved by a restore
+-- with the event triggers off). A table dropped between its resolution and its lock fails
+-- the call: the batch is retried, never answered from a half-read catalogue.
+CREATE OR REPLACE FUNCTION zebridge_private.lock_incarnations(p_tables text[])
+RETURNS TABLE (tbl text, incarnation bigint, live boolean)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+    t text;
+    rel oid;
+BEGIN
+    FOR t IN SELECT DISTINCT x FROM unnest(p_tables) AS x ORDER BY x LOOP
+        rel := to_regclass(format('public.%I', t));
+        IF rel IS NOT NULL THEN
+            EXECUTE format('LOCK TABLE public.%I IN ROW EXCLUSIVE MODE', t);
+            IF to_regclass(format('public.%I', t)) IS DISTINCT FROM rel THEN
+                RAISE EXCEPTION 'table % was replaced while its lock was taken', t USING ERRCODE = '40001';
+            END IF;
+        END IF;
+        tbl := t;
+        -- An ended incarnation (incarnation_relid NULL: its DROP was recorded) is not live,
+        -- whether or not a table of that name exists again unobserved.
+        SELECT i.incarnation, (rel IS NOT NULL AND COALESCE(i.incarnation_relid = rel, false))
+          INTO incarnation, live
+          FROM public.zebridge_incarnations i WHERE i.tbl = t;
+        -- Nothing recorded, or a row the epoch floor created with no incarnation yet (0):
+        -- the write's table cannot be identified, so it is retried, never judged.
+        IF NOT FOUND OR incarnation IS NULL OR incarnation < 1 THEN incarnation := NULL; live := NULL; END IF;
+        RETURN NEXT;
+    END LOOP;
+END $$;
+
 DO $$
 DECLARE
     f regprocedure;
@@ -2122,6 +2179,7 @@ GRANT EXECUTE ON FUNCTION zebridge_private.fail_parked_mutation(text, text) TO $
 GRANT EXECUTE ON FUNCTION zebridge_private.settle_park_credits(integer) TO ${POSTGRES_WRITER_USER};
 GRANT EXECUTE ON FUNCTION zebridge_private.lookup_ordered_receipts(text[],text[],bytea[],bytea[],boolean[],text[],text) TO ${POSTGRES_WRITER_USER};
 GRANT EXECUTE ON FUNCTION zebridge_private.parked_mutations_ready(text,integer) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION zebridge_private.lock_incarnations(text[]) TO ${POSTGRES_WRITER_USER};
 -- No partition is created here: the bridge runs maintain_receipts at startup. A recovery
 -- applies this file before `pg_restore --clean`, which cannot drop a partition's
 -- inherited primary key; with no partitions present it restores the dumped ones intact.

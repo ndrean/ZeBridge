@@ -12,7 +12,7 @@ import { join } from 'node:path';
 function fixture(count = 300) {
   const db = new DatabaseSync(':memory:');
   db.exec(`CREATE TABLE _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT, payload TEXT, tbl TEXT, row_id TEXT,
-    attempts INTEGER DEFAULT 0, created_at INTEGER, published INTEGER DEFAULT 1, retry_at INTEGER DEFAULT 0, before TEXT, optimistic TEXT, authoritative INTEGER)`);
+    attempts INTEGER DEFAULT 0, created_at INTEGER, published INTEGER DEFAULT 1, retry_at INTEGER DEFAULT 0, before TEXT, optimistic TEXT, authoritative INTEGER, incarnation INTEGER, other_incarnation INTEGER NOT NULL DEFAULT 0)`);
   db.exec(`CREATE TABLE _zebridge_undo (msg_id TEXT PRIMARY KEY,tbl TEXT,row_id TEXT,payload TEXT,before TEXT,optimistic TEXT,created_at INTEGER,authoritative INTEGER,mode TEXT,since INTEGER,attempts INTEGER DEFAULT 0)`);
   db.exec(`CREATE TABLE _zebridge_base(tbl TEXT NOT NULL,row_id TEXT NOT NULL,at INTEGER NOT NULL,data TEXT,PRIMARY KEY(tbl,row_id))`);
   for (let i = 0; i < count; i++) db.prepare('INSERT INTO _zebridge_outbox(msg_id,subject,payload,tbl,row_id,created_at) VALUES (?,?,?,?,?,?)')
@@ -251,10 +251,13 @@ test('outboxStatus: the oldest waiting write against the GC floor, warned once a
 function undoFixture(path = ':memory:') {
   const db = new DatabaseSync(path);
   db.exec(`PRAGMA foreign_keys = ON;
-    CREATE TABLE IF NOT EXISTS _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT, payload TEXT, tbl TEXT, row_id TEXT, before TEXT, created_at INTEGER, optimistic TEXT, authoritative INTEGER, attempts INTEGER DEFAULT 0, published INTEGER DEFAULT 0, retry_at INTEGER DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT, payload TEXT, tbl TEXT, row_id TEXT, before TEXT, created_at INTEGER, optimistic TEXT, authoritative INTEGER, attempts INTEGER DEFAULT 0, published INTEGER DEFAULT 0, retry_at INTEGER DEFAULT 0, incarnation INTEGER, other_incarnation INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS _zebridge_undo (msg_id TEXT PRIMARY KEY, tbl TEXT NOT NULL, row_id TEXT NOT NULL, payload TEXT NOT NULL, before TEXT, optimistic TEXT,
       created_at INTEGER NOT NULL, authoritative INTEGER, mode TEXT NOT NULL, since INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS _zebridge_base(tbl TEXT NOT NULL,row_id TEXT NOT NULL,at INTEGER NOT NULL,data TEXT,PRIMARY KEY(tbl,row_id));
+    CREATE TABLE IF NOT EXISTS _zebridge_stamp (tbl TEXT PRIMARY KEY, incarnation INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS _zebridge_fence (tbl TEXT PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS _zebridge_generations (tbl TEXT PRIMARY KEY, watermark TEXT, cutoff_lsn INTEGER, seed_epoch INTEGER NOT NULL DEFAULT 0, seed_seq INTEGER, seed_stream TEXT, shared_seed_seq INTEGER);
     CREATE TABLE IF NOT EXISTS _zebridge_reconcile(msg_id TEXT PRIMARY KEY,tbl TEXT NOT NULL,reason TEXT,version TEXT DEFAULT '',data TEXT,routes TEXT DEFAULT '',targets TEXT DEFAULT '',since INTEGER,state TEXT DEFAULT 'pending');
     CREATE TABLE IF NOT EXISTS p (id TEXT PRIMARY KEY, title TEXT);
     CREATE TABLE IF NOT EXISTS c (id TEXT PRIMARY KEY, pid TEXT NOT NULL REFERENCES p(id));`);
@@ -1133,7 +1136,7 @@ function orderFixture(path: string) {
   const f = undoFixture(path);
   try { f.db.exec('ALTER TABLE _zebridge_outbox ADD COLUMN basis TEXT'); } catch { /* reopened */ }
   Object.assign(f.c, {
-    suspendedMap: new Map(), config: { principal: 'omar', grammar: { subjects: {} } }, clientIdValue: 'c-1',
+    ondemandSet: new Set(), suspendedMap: new Map(), config: { principal: 'omar', grammar: { subjects: {} } }, clientIdValue: 'c-1',
     clockOffsetMs: () => 0, triggerChange: () => {}, pendingWrites: new Map(), nc: null,
   });
   f.c.syncedTables.get('p').ordering = 1;
@@ -1415,4 +1418,143 @@ test('ordering modes: the GC floor is still checked at send time, for a floor th
   assert.deepEqual(sends, [C], 'C is sent, still naming P: the documented limit, resolved by the bridge');
   assert.equal(f.link(C).payload.predecessor, P);
   f.db.close();
+});
+
+// ── A queued write belongs to its table incarnation (libzb's "incarnation: …" tests) ──
+async function incarnationFixture() {
+  const f = orderFixture(':memory:');
+  await f.c.addOutboxOrdering();
+  f.db.exec("INSERT INTO p (id, title) VALUES ('x', 'orig')");
+  const st = f.c.syncedTables.get('p');
+  const verdicts: any[] = [];
+  Object.assign(f.c, { emitVerdict: (v: any) => verdicts.push(v), ackPrefix: () => 'mutation_ack', reconcile: async () => {} });
+  let n = 0;
+  const write = (title: string, id = 'x') => {
+    const version = `2026-11-12T10:00:00.00000${++n}Z`;
+    return f.c.enqueueMutation('p', 'UPDATE', id, version, { key: { id }, version, client_id: 'c-1', data: { title } }, undefined);
+  };
+  const outbox = () => (f.db.prepare('SELECT msg_id, incarnation, other_incarnation, payload FROM _zebridge_outbox ORDER BY created_at').all() as any[]);
+  return { ...f, st, write, outbox, verdicts };
+}
+
+test('incarnation: a withheld or unwritable descriptor refuses a new edit before anything is applied or queued; writable null refuses nothing', async () => {
+  const f = await incarnationFixture();
+  try {
+    for (const [label, patch, reason] of [
+      ['writes withheld', { advertised: true, incarnation: null, writable: true }, 'IncarnationUnknown'],
+      ['writable false', { advertised: false, incarnation: null, writable: false }, 'TableNotWritable'],
+      ['writes withheld, writable null', { advertised: true, incarnation: null, writable: null }, 'IncarnationUnknown'],
+    ] as const) {
+      Object.assign(f.st, patch);
+      assert.deepEqual(await f.write(`refused: ${label}`), { refused: reason }, label);
+      assert.equal(f.title('x'), 'orig', `${label}: the row is untouched`);
+      assert.equal(f.outbox().length, 0, `${label}: nothing queued`);
+    }
+    Object.assign(f.st, { advertised: false, incarnation: null, writable: null });
+    const r = await f.write('legacy');
+    assert.ok('writeId' in r, `writable null and no advert: an ordinary, unstamped write — got ${JSON.stringify(r)}; ${f.logs.slice(-3).join(' | ')}`);
+    assert.equal(f.title('x'), 'legacy');
+    assert.equal(f.outbox()[0].incarnation, null);
+    assert.equal('incarnation' in JSON.parse(f.outbox()[0].payload), false);
+  } finally { f.db.close(); }
+});
+
+test('incarnation: a stamped write carries the scope stamp; seeded before stamps adopts at the same epoch; a replacement in progress refuses', async () => {
+  const f = await incarnationFixture();
+  try {
+    Object.assign(f.st, { advertised: true, incarnation: 5, writable: true, seedEpoch: 3 });
+    // No stamp, no anchor: the identity of the rows cannot be stated.
+    assert.deepEqual(await f.write('unknown'), { refused: 'IncarnationUnknown' });
+    // An anchor at the descriptor's epoch: seeded before stamps, adopted and recorded.
+    f.db.exec("INSERT INTO _zebridge_generations (tbl, watermark, seed_epoch) VALUES ('p', 'w', 3)");
+    await f.write('adopted');
+    assert.equal(f.outbox()[0].incarnation, 5);
+    assert.equal(JSON.parse(f.outbox()[0].payload).incarnation, 5);
+    assert.equal((f.db.prepare("SELECT incarnation FROM _zebridge_stamp WHERE tbl = 'p'").get() as any).incarnation, 5);
+    // The scope's stamp wins over a descriptor that moved on: the rows are not replaced yet.
+    f.db.exec("UPDATE _zebridge_stamp SET incarnation = 4 WHERE tbl = 'p'");
+    await f.write('still the old rows');
+    assert.equal(f.outbox()[1].incarnation, 4);
+    // A replacement in progress (an owed record): refused, nothing written.
+    f.db.exec("INSERT INTO _zebridge_fence (tbl) VALUES ('p')");
+    assert.deepEqual(await f.write('mid-replacement'), { refused: 'ReplacementIncomplete' });
+    f.st.advertised = false;
+    assert.deepEqual(await f.write('legacy during replacement'), { refused: 'ReplacementIncomplete' });
+    assert.equal(f.outbox().length, 2);
+    assert.equal(f.title('x'), 'still the old rows');
+  } finally { f.db.close(); }
+});
+
+test('incarnation: a new stamp marks older writes; they are never replayed, and their verdict settles them once without touching the new row', async () => {
+  const f = await incarnationFixture();
+  try {
+    Object.assign(f.st, { advertised: true, incarnation: 4, writable: true });
+    f.db.exec("INSERT INTO _zebridge_stamp (tbl, incarnation) VALUES ('p', 4)");
+    await f.write('old edit');
+    const [old] = f.outbox();
+    // The table was re-created; its seed installs incarnation 5 over a row of the same key.
+    await f.c.transaction((tx: any) => f.c.installStamp(tx, 'p', { incarnation: 5 }));
+    assert.equal(f.outbox()[0].other_incarnation, 1, 'the old write is marked as another incarnation\'s');
+    // The new row has the same key AND the same value the old edit wrote: a check of values
+    // alone would take it for the old write's own copy and revert it.
+    f.db.exec("UPDATE p SET title = 'old edit' WHERE id = 'x'");
+    f.db.exec("UPDATE p SET title = 'replacement' WHERE id = 'x'");
+    await f.c.reapplyPending('p');
+    assert.equal(f.title('x'), 'replacement', 'not replayed over the new rows');
+    f.db.exec("UPDATE p SET title = 'old edit' WHERE id = 'x'");
+    // Its verdict: settled and reported once; nothing local reverted.
+    await f.c.handleVerdictOnce(`mutation_ack.omar.${old.msg_id}`, new TextEncoder().encode(JSON.stringify({ status: 'rejected', reason: 'TableIncarnationChanged' })));
+    assert.equal(f.outbox().length, 0);
+    assert.equal(f.title('x'), 'old edit', 'the new row, equal in key and value to the old edit, is untouched');
+    assert.equal(f.db.prepare('SELECT count(*) n FROM _zebridge_undo').get()!.n, 0, 'no undo owed against the new row');
+    assert.deepEqual(f.verdicts.map((v) => [v.outcome, v.reason]), [['rejected', 'TableIncarnationChanged']]);
+  } finally { f.db.close(); }
+});
+
+test('incarnation: a dropped table keeps its stamped writes for the bridge to settle and discards unstamped ones', async () => {
+  const f = await incarnationFixture();
+  try {
+    await f.write('legacy');                                   // no advert: unstamped
+    Object.assign(f.st, { advertised: true, incarnation: 4, writable: true });
+    f.db.exec("INSERT INTO _zebridge_stamp (tbl, incarnation) VALUES ('p', 4)");
+    await f.write('stamped');
+    await f.c.discardOutbox('p', 'dropped');
+    assert.deepEqual(f.outbox().map((r) => [r.incarnation, r.other_incarnation]), [[4, 1]]);
+  } finally { f.db.close(); }
+});
+
+test('mutateWithId refuses a DROP or suspension observed during the floor read', async () => {
+  for (const reason of ['UnknownTable', 'TableSuspended']) {
+    const f = await incarnationFixture();
+    try {
+      Object.assign(f.st, { advertised: true, incarnation: 5, writable: true });
+      f.c.initializeStorage = async () => {};
+      f.c.gcWatermark = async () => {
+        if (reason === 'UnknownTable') await f.c.dropLocalTable('p', 'dropped');
+        else f.c.suspendedMap.set('p', 'no_cdc_subject');
+        return null;
+      };
+      await assert.rejects(f.c.mutateWithId('p', 'UPDATE', { id: 'x' }, { title: 'blocked' },
+        { version: '2026-11-12T10:00:00.000001Z' }), new RegExp(reason));
+      assert.equal(f.outbox().length, 0);
+      if (reason === 'UnknownTable') assert.equal(f.db.prepare("SELECT 1 FROM sqlite_master WHERE name='p'").get(), undefined);
+      else assert.equal(f.title('x'), 'orig');
+    } finally { f.db.close(); }
+  }
+});
+
+test('mutateWithId stamps an on-demand row from the descriptor without a seed anchor', async () => {
+  const f = await incarnationFixture();
+  try {
+    f.c.initializeStorage = async () => {};
+    f.c.ondemandSet.add('p');
+    Object.assign(f.st, { advertised: true, incarnation: 5, writable: true });
+    assert.equal(f.db.prepare('SELECT 1 FROM _zebridge_generations').get(), undefined);
+    assert.equal(await f.c.ingest('p', { columns: ['id', 'title'], rows: [['answer', 'from service']] }), 1);
+    const { writeId } = await f.c.mutateWithId('p', 'UPDATE', { id: 'answer' }, { title: 'edited' },
+      { version: '2026-11-12T10:00:00.000001Z' });
+    assert.equal(f.title('answer'), 'edited');
+    assert.equal(f.outbox()[0].msg_id, writeId);
+    assert.equal(JSON.parse(f.outbox()[0].payload).incarnation, 5);
+  } finally { f.db.close(); }
 });

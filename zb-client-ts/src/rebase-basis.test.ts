@@ -17,7 +17,7 @@ function world(visible: Record<string, unknown>, before: Record<string, unknown>
   const db = new DatabaseSync(':memory:');
   db.exec(`CREATE TABLE item (id TEXT PRIMARY KEY, rating INTEGER, notes TEXT, updated_at TEXT)`);
   db.exec(`CREATE TABLE _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT, payload TEXT, tbl TEXT, row_id TEXT,
-    before TEXT, basis TEXT, created_at INTEGER, attempts INTEGER DEFAULT 0, published INTEGER DEFAULT 1, optimistic TEXT, retry_at INTEGER DEFAULT 0)`);
+    before TEXT, basis TEXT, created_at INTEGER, attempts INTEGER DEFAULT 0, published INTEGER DEFAULT 1, optimistic TEXT, retry_at INTEGER DEFAULT 0, incarnation INTEGER, other_incarnation INTEGER NOT NULL DEFAULT 0)`);
   db.prepare('INSERT INTO item VALUES (?, ?, ?, ?)').run(visible.id as string, visible.rating as any, visible.notes as any, visible.updated_at as string);
   db.prepare('INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0)')
     .run('m1', 'mutation.carol.item.update', JSON.stringify({ key: { id: '1' }, data: { id: '1', ...edit }, version: edit.updated_at }),
@@ -101,7 +101,7 @@ test('an outbox from before the basis column keeps the basis it had, whatever a 
   const db = new DatabaseSync(':memory:');
   db.exec(`CREATE TABLE item (id TEXT PRIMARY KEY, rating INTEGER, notes TEXT, updated_at TEXT)`);
   db.exec(`CREATE TABLE _zebridge_outbox (msg_id TEXT PRIMARY KEY, subject TEXT NOT NULL, payload TEXT NOT NULL, tbl TEXT NOT NULL,
-    row_id TEXT NOT NULL, before TEXT, created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)`);
+    row_id TEXT NOT NULL, before TEXT, created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, incarnation INTEGER, other_incarnation INTEGER NOT NULL DEFAULT 0)`);
   db.prepare('INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at) VALUES (?, ?, ?, ?, ?, ?, 0)')
     .run('m1', 'mutation.carol.item.update', JSON.stringify({ key: { id: '1' }, data: { id: '1', rating: 2, updated_at: V(5) }, version: V(5) }),
       'item', '1', JSON.stringify({ id: '1', rating: null, notes: 'n', updated_at: V(1) }));
