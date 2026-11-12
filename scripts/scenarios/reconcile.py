@@ -55,8 +55,9 @@ class Libzb:
             self.lib.zb_client_close(self.h)
             self.h = 0
 
-    async def mutate(self, key, v):
-        r = await asyncio.to_thread(lambda: self.take(self.lib.zb_client_mutate(self.h, b"s2_row", b"INSERT", json.dumps({"id": key}).encode(), json.dumps({"v": v}).encode())))
+    async def mutate(self, key, v, independent=False):
+        opts = json.dumps({"independent": independent}).encode()
+        r = await asyncio.to_thread(lambda: self.take(self.lib.zb_client_mutate_opts(self.h, b"s2_row", b"INSERT", json.dumps({"id": key}).encode(), json.dumps({"v": v}).encode(), opts)))
         assert "error" not in r, r
 
     async def step(self):
@@ -100,8 +101,8 @@ class Ts:
         if self.proc:
             await self.call(cmd="close")
 
-    async def mutate(self, key, v):
-        await self.call(cmd="mutate", table="s2_row", op="INSERT", key={"id": key}, values={"v": v})
+    async def mutate(self, key, v, independent=False):
+        await self.call(cmd="mutate", table="s2_row", op="INSERT", key={"id": key}, values={"v": v}, independent=independent)
 
     async def step(self):
         await self.call(cmd="flush")
@@ -137,7 +138,7 @@ async def main():
     lib.zb_client_close.argtypes = [ctypes.c_uint64]
     lib.zb_free.argtypes = [ctypes.c_void_p]
     for fn, extra in (("sync", []), ("poll", [ctypes.c_uint64]), ("flush_outbox", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p]),
-                      ("mutate", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p])):
+                      ("mutate_opts", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p])):
         f = getattr(lib, "zb_client_" + fn)
         f.argtypes, f.restype = [ctypes.c_uint64] + extra, ctypes.c_void_p
 
@@ -201,7 +202,10 @@ async def main():
                 await c.mutate(kb, 10)
                 await expire_until_now()
                 await admission_stop()
-                await c.mutate(kp, 30)
+                # Independent: queued behind kb (the default tail), it would inherit kb's
+                # fate — an expired, unknown predecessor answers its successor
+                # indeterminate/PredecessorUnknown (PROTOCOL "ordered ingress").
+                await c.mutate(kp, 30, independent=True)
                 await bridge_start()
                 ok = await until(c, lambda n: _done(c, kb, n))
                 got = outcomes_for(c, kb)

@@ -18,7 +18,7 @@ const answer = async (cmd: any): Promise<unknown> => {
   switch (cmd.cmd) {
     case 'open': await open(cmd.ondemand); return { ok: true };
     case 'close': await client?.close(); client = null; return { ok: true };
-    case 'mutate': return await client!.mutate(cmd.table, cmd.op, cmd.key, cmd.values);
+    case 'mutate': return await client!.mutate(cmd.table, cmd.op, cmd.key, cmd.values, cmd.independent ? { independent: true } : undefined);
     case 'flush': await client!.flushOutbox(); return { ok: true };
     case 'state': return {
       verdicts: verdicts.splice(0),
