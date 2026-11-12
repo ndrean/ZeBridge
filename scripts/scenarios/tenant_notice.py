@@ -13,6 +13,10 @@ notice subject with its own credentials, on ONE connection kept open for the who
      must not have dropped: a reconnect-time read of the key would otherwise hide a missing
      notice.
 
+  C  enroll after the boot roster snapshot, and enroll over a stale key after the
+     purge decision. Each enrollment's acknowledged revision must still be directly
+     readable with its own credentials before WAL replay can repair a missing key.
+
 Exit 0 when every check passes, 1 when one fails, 2 when the setup is incomplete.
 Needs the compose dev stack (ZB_NATS_CONTAINER: the probe bridge signs with the stack's
 client key) and the fault build (zig build -Doptimize=ReleaseFast -Dtest-faults=true -p zig-out-faults).
@@ -26,6 +30,7 @@ FAULT_BRIDGE = ROOT / "zig-out-faults" / "bin" / "bridge"
 TMP = pathlib.Path(tempfile.mkdtemp(prefix="zb_tenant_notice_"))
 TAG = os.urandom(3).hex()
 P = f"tn_{TAG}"
+FRESH, REPLACED, ORPHAN = (f"{P}_{suffix}" for suffix in ("fresh", "replaced", "orphan"))
 A1, A2 = f"tna{TAG}", f"tnb{TAG}"
 OPEN = zb.TOPOLOGY.get("open_tenant", "_default")
 ACK = zb.TOPOLOGY["subjects"]["mutation_ack_prefix"]
@@ -54,11 +59,12 @@ def enrol(principal, tenant):
     return str(path)
 
 
-def start_bridge(fault):
+def start_bridge(fault, **gates):
     """A probe bridge; the fault one is the fault build with its stop armed."""
     jwt = zb.jwt_stack()
     env = dict(ZB_SIGNING_SEED=jwt["client_sk_file"].read_text().strip(), ZB_ACCOUNT_PUB=jwt["account_pub"])
-    if fault: env["ZB_TEST_TENANT_NOTICE_EXIT"] = P
+    if gates: env.update(gates)
+    elif fault: env["ZB_TEST_TENANT_NOTICE_EXIT"] = P
     STARTS.append(fault)
     b = zb.Bridge(f"/tmp/zb_tenant_notice_bridge_{len(STARTS)}{'_fault' if fault else ''}.log", **env)
     normal, zb.BRIDGE = zb.BRIDGE, (FAULT_BRIDGE if fault else zb.BRIDGE)
@@ -68,12 +74,18 @@ def start_bridge(fault):
 
 
 def teardown():
-    for sql in (f"DELETE FROM public.zebridge_user_tenants WHERE principal = '{P}'",
-                f"DELETE FROM public.zebridge_principal_keys WHERE principal = '{P}'",
-                f"DELETE FROM public.zebridge_invites WHERE principal = '{P}'"):
-        zb.psql(sql, quiet=True)
-    zb.nats_cli("kv", "purge", BUCKET, P, "-f")
+    for principal in (P, FRESH, REPLACED):
+        clean_principal(principal)
+    zb.nats_cli("kv", "purge", BUCKET, ORPHAN, "-f")
     zb.drop_tenant_streams(A1, A2)
+
+
+def clean_principal(principal):
+    for sql in (f"DELETE FROM public.zebridge_user_tenants WHERE principal = '{principal}'",
+                f"DELETE FROM public.zebridge_principal_keys WHERE principal = '{principal}'",
+                f"DELETE FROM public.zebridge_invites WHERE principal = '{principal}'"):
+        zb.psql(sql, quiet=True)
+    zb.nats_cli("kv", "purge", BUCKET, principal, "-f")
 
 
 async def until(pred, budget):
@@ -84,10 +96,70 @@ async def until(pred, budget):
     return pred()
 
 
+async def startup_enrollment():
+    after_snapshot, before_purge, before_replay = (TMP / name for name in ("snapshot", REPLACED, "replay"))
+    gates = dict(ZB_TEST_TENANT_AFTER_SNAPSHOT=str(after_snapshot),
+                 ZB_TEST_TENANT_BEFORE_PURGE=str(before_purge),
+                 ZB_TEST_TENANT_BEFORE_REPLAY=str(before_replay))
+    for path in (after_snapshot, before_purge, before_replay):
+        path.touch()
+    for principal in (REPLACED, ORPHAN):
+        zb.nats_cli("kv", "put", BUCKET, principal, json.dumps([OPEN])).check_returncode()
+    clients = []
+    b = start_bridge(True, **gates)
+
+    async def revision(nc, principal):
+        msg = await nc.jetstream(domain="hub").get_msg(
+            f"KV_{BUCKET}", subject=f"$KV.{BUCKET}.{principal}", direct=True)
+        if not msg.seq or json.loads(msg.data) != [OPEN]:
+            raise ValueError(f"unexpected membership for {principal}")
+        return msg.seq
+
+    async def enroll_at(gate, principal):
+        if not b.wait_for_log(gate + ": holding", timeout=60):
+            raise RuntimeError(f"bridge never reached {gate}")
+        creds = enrol(principal, OPEN)
+        nc = await nats.connect(zb.nats_server(), user_credentials=creds,
+                                inbox_prefix=f"_INBOX.{principal}".encode())
+        clients.append(nc)
+        return nc, principal, await revision(nc, principal)
+
+    try:
+        fresh = await enroll_at("ZB_TEST_TENANT_AFTER_SNAPSHOT", FRESH)
+        after_snapshot.unlink()
+        replaced = await enroll_at("ZB_TEST_TENANT_BEFORE_PURGE", REPLACED)
+        before_purge.unlink()
+        if not b.wait_for_log("ZB_TEST_TENANT_BEFORE_REPLAY: holding", timeout=60):
+            raise RuntimeError("boot did not finish tenant reconciliation")
+        for nc, principal, first in (fresh, replaced):
+            try:
+                last = await revision(nc, principal)
+            except Exception as err:
+                last = str(err)
+            check(f"C: {principal} still reads its enrollment revision before WAL replay",
+                  last == first, f"{first} → {last}")
+        # The same pass must still remove a genuinely stale mapping.
+        admin = await zb.connect()
+        clients.append(admin)
+        kv = await admin.jetstream(domain="hub").key_value(BUCKET)
+        try:
+            await kv.get(ORPHAN)
+        except nats.js.errors.KeyNotFoundError:
+            check("C: the unclaimed stale key was purged", True)
+        else:
+            check("C: the unclaimed stale key was purged", False)
+    finally:
+        for path in (after_snapshot, before_purge, before_replay):
+            path.unlink(missing_ok=True)
+        for nc in clients:
+            await nc.close()
+        b.__exit__(None, None, None)
+
+
 async def run():
     b = start_bridge(fault=False)
     try:
-        # /enroll is armed before the boot backfill, which can purge a key it did not read.
+        # A and B exercise the WAL path; C holds the startup path open separately.
         if not b.wait_for_log("WAL replication resumed", timeout=60): print("bridge did not start"); return 2
         creds = enrol(P, OPEN)
         drops = []
@@ -138,6 +210,7 @@ async def run():
     finally:
         try: b.__exit__(None, None, None)
         except Exception: pass
+    await startup_enrollment()
     return 0
 
 
