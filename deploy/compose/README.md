@@ -19,7 +19,7 @@ Docker Engine, the standard (rootful) daemon, with the compose plugin. Rootless 
 2. The two files, on the server:
 
    ```sh
-   V=0.3.1
+   V=0.3.2
    mkdir zebridge && cd zebridge
    curl -fsSLO https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/compose.yml
    curl -fsSL -o .env https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/.env.example
@@ -31,7 +31,7 @@ Docker Engine, the standard (rootful) daemon, with the compose plugin. Rootless 
    ```txt
    # .env
    COMPOSE_PROFILES=postgres  # <-- local Postgres server on
-   ZB_VERSION=0.3.1
+   ZB_VERSION=0.3.2
    BRIDGE_HOST=               #<-- bridge.example.com
    WS_HOST=                   #<-- ws.example.com
    NATS_HOST=                 #<-- nats.example.com
