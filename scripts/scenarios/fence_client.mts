@@ -39,6 +39,10 @@ const client = new ZeBridge({
     }
     if (point === 'after_chunk' && abortAt === 'after_chunk') process.exit(70);
     if (point === 'before_commit' && abortAt === 'before_commit') process.exit(70);
+    if (point === 'after_commit' && process.env.ZB_TEST_SEED_COMMIT_PAUSE_FILE) {
+      say(`test: seed anchor committed for ${table}`);
+      while (existsSync(process.env.ZB_TEST_SEED_COMMIT_PAUSE_FILE)) await sleep(25);
+    }
     if (point === 'after_commit' && abortAt === 'after_commit') process.exit(70);
     if (point === 'before_verify' && holdMs > 0) {
       say(`test: fence holding ${holdMs} ms before its verify`);

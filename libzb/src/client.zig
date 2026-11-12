@@ -3617,6 +3617,10 @@ pub const SyncClient = struct {
         }, Commit.apply);
         if (replaced_by_full) st.frontiers.clearRetainingCapacity();
         self.jointAfterCommit(joint_mode, lapsed);
+        if (comptime test_faults) if (std.c.getenv("ZB_TEST_SEED_COMMIT_PAUSE_FILE")) |path| {
+            log.info("test: seed anchor committed for {s}", .{table});
+            while (std.c.access(path, 0) == 0) std.Io.sleep(self.t.conn.io, .fromMilliseconds(25), .awake) catch {};
+        };
         // ZB_TEST_FENCE_ABORT=after_commit: a crash with this participant committed, the others of a joint fence not.
         if (testFenceAbort("after_commit")) std.process.exit(70);
         if (fence) log.warn("{s}: fenced — chain g{d} cut at {d} on {s} replaced the rows; the position moved back from {d}, the events after the cut replay{s}", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, cdc_stream, pos, if (shared_rewind != null) " (the shared route too)" else "" });
