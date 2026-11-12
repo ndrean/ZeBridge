@@ -7,6 +7,7 @@
 /// would; the scenario drives PostgreSQL and asks this replica what it holds.
 ///
 /// Env: NATS_URL ZB_PRINCIPAL ZB_DB ZB_ENGINE (sqlite|pglite) ZB_TABLES (comma list; default every table)
+import { tenantFaultHook } from '../../scripts/scenarios/tenant_faults.mts';
 import { createInterface } from 'node:readline';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { ZeBridge, mergeRegisters } from '@zebridge/client';
@@ -26,6 +27,8 @@ const zb = new ZeBridge({
   natsUrl: process.env.NATS_URL ?? 'nats://127.0.0.1:4222',
   principal: PRINCIPAL,
   creds: readFileSync(process.env.ZB_CREDS ?? `${REPO}scripts/native/creds/${PRINCIPAL}.creds`, 'utf8'),
+  faultHook: tenantFaultHook(),
+  renewalUrl: process.env.ZB_RENEWAL_URL,
   heartbeatMs: 0,
   tables: process.env.ZB_TABLES ? process.env.ZB_TABLES.split(',').map((t) => t.trim()).filter(Boolean) : '*', // §10hn
   dbPath: DB,

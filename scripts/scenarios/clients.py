@@ -18,12 +18,12 @@ def fresh_sqlite(path):
 
 class Lib:
     """The libzb client, host-driven: every observation is a poll."""
-    def __init__(self, db, tables, client_id="py-scenario", principal="omar", creds=None, db_url=None, seed_streaming=False, seed_chunk_rows=None, seed_streaming_above=None, engine=None, nats_url=None):
+    def __init__(self, db, tables, client_id="py-scenario", principal="omar", creds=None, db_url=None, seed_streaming=False, seed_chunk_rows=None, seed_streaming_above=None, engine=None, nats_url=None, renewal_url=None, library=None):
         """`nats_url`: dial this instead of the stack's NATS (a relay that can cut the link)."""
         self.outcomes = {}
         if not LIBZB.exists():
             sys.exit(f"{LIBZB} missing — cd libzb && zig build -Doptimize=ReleaseFast")
-        self.lib = lib = ctypes.CDLL(str(LIBZB))
+        self.lib = lib = ctypes.CDLL(str(library or LIBZB))
         lib.zb_free.argtypes = [ctypes.c_void_p]
         lib.zb_client_connect.restype, lib.zb_client_connect.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
         lib.zb_client_close.argtypes = [ctypes.c_uint64]
@@ -40,7 +40,7 @@ class Lib:
         self.h = lib.zb_client_connect(json.dumps({
             "natsUrl": nats_url or zb.nats_server(), **zb.tls_opts(), "credsPath": str(creds) if creds else zb.creds_for(principal), "dbPath": db,
             "principal": principal, "clientId": client_id, "tables": list(tables), "heartbeatMs": 0,
-            **({"dbUrl": db_url} if db_url else {}), **({"seedStreaming": True} if seed_streaming else {}),
+            **({"renewalUrl": renewal_url} if renewal_url else {}), **({"dbUrl": db_url} if db_url else {}), **({"seedStreaming": True} if seed_streaming else {}),
             **({"seedChunkRows": seed_chunk_rows} if seed_chunk_rows is not None else {}),
             **({"seedStreamingAboveBytes": seed_streaming_above} if seed_streaming_above is not None else {}),
             **({"engine": engine} if engine else {})}).encode())
@@ -99,8 +99,9 @@ class Lib:
 
 class Node:
     """The zb-client-ts client, event-driven, behind query-worker.ts."""
-    def __init__(self, db, log="/tmp/zb_node_worker.log", principal="omar", creds=None):
+    def __init__(self, db, log="/tmp/zb_node_worker.log", principal="omar", creds=None, renewal_url=None):
         env = dict(os.environ, ZB_DB=db, ZB_PRINCIPAL=principal, NATS_URL=zb.nats_server(), **zb.node_tls_env())
+        if renewal_url: env["ZB_RENEWAL_URL"] = renewal_url
         if creds: env["ZB_CREDS"] = str(creds)
         self.log = open(log, "w")
         self.p = subprocess.Popen(["node", "--experimental-strip-types", "query-worker.ts"], cwd=NODE_DIR, env=env,

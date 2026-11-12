@@ -1163,7 +1163,9 @@ it was down); a revoked KEY stays revoked in the account JWT.
 **Resolved fresh on every connect, never cached client-side across sessions**: the
 bucket is what lets a membership change take effect without restarting anything.
 
-libzb follows EVERY tenant listed (zb-client-ts follows the first only, and logs a warning): for each tenant-scoped table, one chain per
+A running client subscribes to its verdict subjects, flushes the subscription, then reads its membership key. A notice on `mutation_ack.<principal>.tenants` asks it to read the key again. On the first private assignment it renews its credentials, reconnects on the existing handle and checks access to the private stream before seeding. The open tenant’s rows are included in the private seed.
+
+libzb follows every tenant listed (zb-client-ts selects the first private membership, or the open tenant while it is the only membership): for each tenant-scoped table, one chain per
 tenant (`$KV.generations.<tenant>.<table>`, bucket `gen-<tenant>`) seeded into the
 same local table — every row carries its tenant column — and one `CDC_<tenant>`
 stream per tenant on the tail. Watermarks are kept per (table, tenant), the seed gate

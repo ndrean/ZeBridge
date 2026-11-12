@@ -71,6 +71,8 @@ export type LibzbOptions = {
   /// With `bridgeUrl` and `invite`, the first run enrolls and later runs read the identity
   /// kept beside the replica; `natsUrl` then only overrides the address it names (a leaf).
   bridgeUrl?: string;
+  /** Bridge base URL for renewing static creds or credsPath on first private assignment. */
+  renewalUrl?: string;
   invite?: string;
   identityPath?: string;
   natsUrl?: string;

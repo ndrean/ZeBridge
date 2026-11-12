@@ -16,7 +16,7 @@ assigned) and B (never P's). The first private membership is added beside the op
   4. Through the original handles: A's probe, then a later private change, never B's probe;
      and the handles stay healthy (a later public change still arrives).
 
-Exit status (it starts in `known_red`):
+Exit status:
   1  the known defect: the control passes, nothing leaked, the original handles are healthy,
      and they never receive A's seed by the deadline;
   0  both original handles receive A's seed and the later private change, nothing leaks;
@@ -28,7 +28,7 @@ stack's client key.
 """
 import json, os, pathlib, re, subprocess, sys, tempfile, time, urllib.request, uuid
 import zb
-from clients import Lib, Node, fresh_sqlite
+from clients import LIBZB, Lib, Node, fresh_sqlite
 
 LOG = "/tmp/zb_late_tenant_bridge.log"
 TMP = pathlib.Path(tempfile.mkdtemp(prefix="zb_late_tenant_"))
@@ -116,6 +116,14 @@ def public_seen(c):
 def main():
     if not os.environ.get("ZB_NATS_CONTAINER"):
         print("ZB_NATS_CONTAINER unset: this scenario needs the compose dev stack (its client signing key)"); return 2
+    faults = "--faults" in sys.argv
+    hold = TMP / "renew.pause"
+    fault_lib = LIBZB.parents[2] / "zig-out-faults" / "lib" / LIBZB.name
+    if faults:
+        if not fault_lib.is_file():
+            print(f"build the fault library first: {fault_lib}"); return 2
+        hold.touch()
+        os.environ.update(ZB_TEST_TENANT_RENEW_PAUSE_FILE=str(hold), ZB_TEST_TENANT_RECONNECT_FAIL_ONCE="1")
     jwt = zb.jwt_stack()
     teardown()
     clients = {}
@@ -136,12 +144,19 @@ def main():
             original, pub, seed = enrol(P, OPEN)
             for kind in ("libzb", "ts"):
                 db = str(TMP / f"original-{kind}.sqlite3")
-                clients[kind] = Lib(db, [TEN, PUBT], f"py-lt-{kind}", principal=P, creds=original) if kind == "libzb" \
-                    else Node(db, str(TMP / "node.log"), principal=P, creds=original)
+                clients[kind] = Lib(db, [TEN, PUBT], f"py-lt-{kind}", principal=P, creds=original, renewal_url=zb.http_base(probe=True),
+                                    library=fault_lib if faults else LIBZB) if kind == "libzb" \
+                    else Node(db, str(TMP / "node.log"), principal=P, creds=original, renewal_url=zb.http_base(probe=True))
 
+            reconnect_retry_seen = False
             def poll():
+                nonlocal reconnect_retry_seen
                 c = clients.get("libzb")
-                if c: c.poll(200)
+                if c:
+                    report = c.poll(200)
+                    # After successful renewal, poll normally returns reconnecting.
+                    # A refused reconnect leaves the installed credential ready to retry.
+                    if report.get('membership') == 'renewed': reconnect_retry_seen = True
             def watch_leak():
                 for kind, c in clients.items():
                     if "probe of B" in titles(c) and kind not in results["leak"]: results["leak"].append(kind)
@@ -157,6 +172,8 @@ def main():
                 results["setup"] = "the original clients never received a public change while unmapped"; return classify(results)
             before = {k: titles(c) for k, c in clients.items()}
             print(f"  · before the assignment, tenant rows seen: {json.dumps({k: sorted(v) for k, v in before.items()})}", flush=True)
+            if any(before.values()):
+                print("unexpected private rows before assignment"); return 3
             # 2. The assignment, with the original handles running.
             zb.psql(f"INSERT INTO public.zebridge_user_tenants (principal, tenant_id) VALUES ('{P}', '{A}')")
             # 3. The control: credentials from /renew for the same principal and key read A,
@@ -166,6 +183,36 @@ def main():
             control = Lib(str(TMP / "control.sqlite3"), [TEN], "py-lt-control", principal=P, creds=control_creds)
             try:
                 seeded = until(lambda: (control.poll(200), "probe of A" in titles(control))[1], 90)
+                if faults:
+                    def held():
+                        poll()
+                        return (clients['libzb'].last_poll.get('membership') == 'renewing'
+                                and 'test: tenant renewal held' in (TMP / 'node.log').read_text())
+                    if not until(held, 30):
+                        print("both originals did not reach the renewal barrier"); return 2
+                    zb.nats_cli("pub", f"{zb.TOPOLOGY['subjects']['mutation_ack_prefix']}.{P}.tenants",
+                                '').check_returncode()
+                    poll()
+                    hold.unlink()
+                def originals_seeded():
+                    poll(); watch_leak()
+                    for kind, c in clients.items():
+                        if 'probe of A' not in titles(c): return False
+                        if kind == 'libzb':
+                            anchor = c.q("SELECT tenant FROM _zbz_generations WHERE tbl=? AND tenant=?", (TEN, A))
+                        else:
+                            # A cut at sequence zero has no TS sequence gate. Compare
+                            # its durable snapshot identity with the private control.
+                            expected = control.q("SELECT watermark, cutoff_lsn FROM _zbz_generations WHERE tbl=? AND tenant=?", (TEN, A))
+                            anchor = c.q("SELECT watermark, cutoff_lsn FROM _zebridge_generations WHERE tbl=?", (TEN,))
+                            if anchor != expected: return False
+                        if not anchor: return False
+                    return True
+                results["seeded_before_change"] = until(originals_seeded, DEADLINE_S)
+                print(f"  · both original handles have A's snapshot anchor before later CDC: {results['seeded_before_change']}", flush=True)
+                if faults and (not reconnect_retry_seen or 'test: first tenant reconnect failed' not in (TMP / 'node.log').read_text()
+                               or bridge.text().count(f"renewed '{P}'") != 3):
+                    print("expected one renewal per original plus the control, and the injected reconnect failure"); return 3
                 zb.psql(f"INSERT INTO public.{TEN} (uid, title, tenant_id) VALUES ('{uuid.uuid4()}', 'after the assignment', '{A}')")
                 later = until(lambda: (control.poll(200), "after the assignment" in titles(control))[1], 60)
                 results["control"] = {"seeded A": seeded, "later change": later, "B leaked": "probe of B" in titles(control)}
@@ -188,6 +235,7 @@ def main():
             results["healthy"] = {k: until(lambda c=c: (poll(), healthy(c))[1], 60) for k, c in clients.items()}
             print(f"  · original handles after {DEADLINE_S} s: {json.dumps(results['original'])}", flush=True)
     finally:
+        hold.unlink(missing_ok=True)
         for c in clients.values():
             try: c.close()
             except Exception: pass
@@ -206,7 +254,7 @@ def classify(r):
         print(f"  an original handle is not healthy (no public change at the deadline): {r.get('healthy')}"); return 3
     got = {k: {"probe of A", "after the assignment"} <= set(v) for k, v in r["original"].items()}
     print(f"  original handles: {got}", flush=True)
-    if all(got.values()): return 0
+    if all(got.values()) and r.get("seeded_before_change"): return 0
     if not any("probe of A" in v for v in r["original"].values()):
         print("  known defect reproduced: the running clients never pick up their first private tenant")
         return 1

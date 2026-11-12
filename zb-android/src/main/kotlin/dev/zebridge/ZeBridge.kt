@@ -9,7 +9,7 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
 /** libzb's C ABI version this binding was written for; libzb/python/abi_check.py checks it. */
-const val ZB_ABI = 8
+const val ZB_ABI = 9
 
 /** A call libzb refused, with libzb's own words (`{"error": …}` or `zb_last_error`). */
 class ZeBridgeException(message: String) : RuntimeException(message)
@@ -32,7 +32,7 @@ class ZeBridgeException(message: String) : RuntimeException(message)
  * The same names and options as zb-client-ts, libzb and the Python package (CLIENTS.md).
  * Constructing connects: the first run enrolls with `invite` and keeps the identity
  * next to the replica, later runs need only `bridgeUrl` (or nothing), and the JWT renews
- * itself. With a [context] and neither `dbPath` nor `dbUrl`, the replica is
+ * itself. With static credentials, pass renewalUrl alongside creds or credsPath. With a [context] and neither `dbPath` nor `dbUrl`, the replica is
  * `zebridge.sqlite3` in the app's private database directory, and the identity beside it.
  * Throws [ZeBridgeException] with libzb's reason when it cannot connect.
  *
@@ -139,6 +139,8 @@ class ZeBridge @JvmOverloads constructor(
 
     // ─── the loop ───────────────────────────────────────────────────────────────
 
+    private var membership = "observe"
+
     private fun startLoop() {
         worker.execute { workerThread = Thread.currentThread() }
         worker.execute(::loopOnce)
@@ -152,7 +154,9 @@ class ZeBridge @JvmOverloads constructor(
         if (!running) return
         try {
             val r = result(Native.poll(handle, pollMs))
-            if (r.optInt("applied") > 0 || r.optInt("settled") > 0 || (r.optJSONArray("requests")?.length() ?: 0) > 0 ||
+            val previous = membership
+            membership = r.optString("membership", "observe")
+            if (membership != previous || r.optInt("applied") > 0 || r.optInt("settled") > 0 || (r.optJSONArray("requests")?.length() ?: 0) > 0 ||
                 (r.optJSONArray("outcomes")?.length() ?: 0) > 0) {
                 listener?.onPoll(r)
             }

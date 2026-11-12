@@ -10,6 +10,7 @@
 //   ZB_TEST_FENCE_HOLD_FILE=<path>                  while the file exists, hold before the fence reads the position (the tails keep applying)
 //
 //   node --experimental-strip-types fence_client.mts <natsUrl> <creds> <db> <principal> <table[,table...]> [seedChunkRows]
+import { tenantFaultHook } from './tenant_faults.mts';
 import { existsSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { ZeBridge } from '../../zb-client-ts/src/entry-node.ts';
@@ -24,11 +25,14 @@ const seedDomain = process.env.ZB_SEED_DOMAIN;
 
 const say = (line: string) => console.error(line);
 
+const tenantFault = tenantFaultHook();
 const client = new ZeBridge({
   natsUrl: url, ...(creds === '-' ? {} : { credsPath: creds }), dbPath: db, principal, jsDomain: 'hub', tables: table.split(','), heartbeatMs: 0,
   ...(seedDomain ? { seedDomain } : {}),
   ...(Number(chunk) > 0 ? { seedChunkRows: Number(chunk) } : {}),
+  renewalUrl: process.env.ZB_RENEWAL_URL,
   faultHook: async (point) => {
+    await tenantFault(point);
     if (point === 'before_decision' && holdFile && existsSync(holdFile)) {
       say('test: fence holding before reading the position');
       while (existsSync(holdFile)) await sleep(100);

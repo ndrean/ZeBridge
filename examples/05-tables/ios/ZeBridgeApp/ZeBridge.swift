@@ -6,12 +6,14 @@ struct PollReport: Codable {
     var settled: Int
     var changed_tables: [String]?
     var seeded: [String]?
+    var membership: String?
 }
 
 class ZeBridge: ObservableObject {
     private var handle: UInt64 = 0
     @Published var tenant: String = "—"
     
+    // Static creds or credsPath can be paired with renewalUrl for private assignment.
     init(options: [String: Any]) {
         guard let jsonData = try? JSONSerialization.data(withJSONObject: options),
               let jsonStr = String(data: jsonData, encoding: .utf8) else {

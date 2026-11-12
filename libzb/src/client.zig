@@ -465,6 +465,7 @@ pub const SyncClient = struct {
     /// §10dl: no `$KV.tenants.<principal>` key — the principal was never mapped, or was
     /// revoked. Tenant-scoped tables are then unreadable (no stream to grant) and are
     /// SKIPPED, audibly, the TS client's rule; public tables still follow.
+    membership_dirty: bool = false,
     tenant_missing: bool = false,
     /// `open_tenant` as a one-element list (what `tenantsFor` hands out for a public table).
     open_tenants: []const []const u8 = &.{},
@@ -878,22 +879,36 @@ pub const SyncClient = struct {
 
     // ─── step 0: tenant (PROTOCOL §6 Step 0 — resolved, never guessed) ──────
 
+    pub fn readMembership(self: *SyncClient, a: std.mem.Allocator) ![]const []const u8 {
+        const bytes = (try self.t.kvGet(a, self.kv_tenants, self.opts.principal)) orelse return &.{};
+        return try parseTenantList(a, decodeMaybeMsgpackString(a, bytes) catch bytes);
+    }
+
     pub fn resolveTenant(self: *SyncClient) !void {
-        const bytes = (try self.t.kvGet(self.aa(), self.kv_tenants, self.opts.principal)) orelse {
-            self.tenants = &.{};
-            self.tenant = self.open_tenant;
-            self.tenant_missing = true;
-            // A responder follows no table: no mapping is its normal state, not a warning.
-            if (self.opts.tables.len == 0)
+        self.tenants = try self.readMembership(self.aa());
+        // The mapping can change between enrollment and the first connection.
+        // Keep open access until the current session can read its private stream.
+        if (self.tenants.len == 2 and (std.mem.eql(u8, self.tenants[0], self.open_tenant) or std.mem.eql(u8, self.tenants[1], self.open_tenant))) {
+            for (self.tenants) |tenant| {
+                if (std.mem.eql(u8, tenant, self.open_tenant)) continue;
+                const route = try self.routeFor(self.aa(), tenant);
+                var info = self.t.js.getStreamInfo(route) catch |err| {
+                    log.warn("Tenant resolution deferred: {s}", .{@errorName(err)});
+                    self.tenants = self.open_tenants;
+                    self.membership_dirty = true;
+                    break;
+                };
+                info.deinit();
+            }
+        }
+        self.tenant_missing = self.tenants.len == 0;
+        self.tenant = if (self.tenants.len > 0) self.tenants[0] else self.open_tenant;
+        if (self.tenant_missing) {
+            if (self.opts.tables.len == 0 and !self.opts.follow_all)
                 log.info("tenant: {s} has no mapping ($KV.tenants.{s}) — it follows no table, so none is needed", .{ self.opts.principal, self.opts.principal })
             else
                 log.warn("tenant: {s} has no mapping ($KV.tenants.{s}) — revoked, or never enrolled: tenant-scoped tables are skipped, public tables follow", .{ self.opts.principal, self.opts.principal });
-            return;
-        };
-        self.tenants = try parseTenantList(self.aa(), decodeMaybeMsgpackString(self.aa(), bytes) catch bytes);
-        self.tenant_missing = self.tenants.len == 0;
-        self.tenant = if (self.tenants.len > 0) self.tenants[0] else self.open_tenant;
-        if (self.tenants.len == 1) {
+        } else if (self.tenants.len == 1) {
             log.info("tenant: {s} -> {s}", .{ self.opts.principal, self.tenant });
         } else {
             var buf: [512]u8 = undefined;
@@ -931,7 +946,17 @@ pub const SyncClient = struct {
     /// The tenants a table's chains are keyed on: every membership for a
     /// tenant-scoped table, the open tenant alone for a public one.
     fn tenantsFor(self: *SyncClient, st: TableState) []const []const u8 {
-        return if (st.tenant_col != null) self.tenants else self.open_tenants[0..1];
+        if (st.tenant_col == null) return self.open_tenants[0..1];
+        // A private full already includes the open rows. During first assignment
+        // the two memberships therefore require only the private chain.
+        return self.firstPrivateScope() orelse self.tenants;
+    }
+
+    fn firstPrivateScope(self: *SyncClient) ?[]const []const u8 {
+        if (self.tenants.len != 2) return null;
+        if (std.mem.eql(u8, self.tenants[0], self.open_tenant)) return self.tenants[1..];
+        if (std.mem.eql(u8, self.tenants[1], self.open_tenant)) return self.tenants[0..1];
+        return null;
     }
 
     /// The stream a tenant's rows of a table ride: `CDC_<tenant>`, or CDC_PUBLIC for
@@ -1193,6 +1218,36 @@ pub const SyncClient = struct {
         }
     }
 
+    /// A private full also replaces the open rows. If the old open-only scope
+    /// owes a replacement, carry that obligation into the scope that can now
+    /// discharge it. An earlier joint completion must be proven on the new chain.
+    fn moveOpenFence(self: *SyncClient, a: std.mem.Allocator, tenant: []const u8) !void {
+        const rows = try self.st.query(a,
+            "SELECT tbl, MAX(joint) FROM (SELECT tbl, joint FROM _zbz_fence WHERE tenant = ? UNION ALL SELECT tbl, 1 FROM _zbz_joint_done WHERE tenant = ?) AS debts GROUP BY tbl",
+            &.{ .{ .text = self.open_tenant }, .{ .text = self.open_tenant } });
+        const Move = struct {
+            a: std.mem.Allocator,
+            tbl: storage.Value,
+            old: storage.Value,
+            new: storage.Value,
+            joint: storage.Value,
+            fn apply(cx: @This(), st: *storage.Storage) !void {
+                _ = try st.query(cx.a, "INSERT INTO _zbz_fence (tbl, tenant, joint) VALUES (?, ?, ?) ON CONFLICT (tbl, tenant) DO UPDATE SET joint = CASE WHEN excluded.joint = 1 THEN 1 ELSE _zbz_fence.joint END", &.{ cx.tbl, cx.new, cx.joint });
+                _ = try st.query(cx.a, "DELETE FROM _zbz_generations WHERE tbl = ? AND tenant IN (?, ?)", &.{ cx.tbl, cx.old, cx.new });
+                _ = try st.query(cx.a, "DELETE FROM _zbz_frontier WHERE tbl = ?", &.{cx.tbl});
+                _ = try st.query(cx.a, "DELETE FROM _zbz_joint_done WHERE tbl = ? AND tenant = ?", &.{ cx.tbl, cx.old });
+                _ = try st.query(cx.a, "DELETE FROM _zbz_fence WHERE tbl = ? AND tenant = ?", &.{ cx.tbl, cx.old });
+            }
+        };
+        for (rows) |row| {
+            const st = self.states.getPtr(row[0].text) orelse continue;
+            if (st.tenant_col == null) continue;
+            try self.st.transaction(Move{ .a = a, .tbl = row[0], .joint = row[1], .old = .{ .text = self.open_tenant }, .new = .{ .text = tenant } }, Move.apply);
+            st.frontiers.clearRetainingCapacity();
+            st.anchors.clearRetainingCapacity();
+        }
+    }
+
     /// Once per process, before any consumer opens or any chain is applied: the joint fences a previous run left unfinished
     /// park their routes again, from the durable owed records (`joint`). Without this a restart would open the tails under
     /// participants still to be replaced. A read that fails is an error (nothing opens), never "no group".
@@ -1201,6 +1256,7 @@ pub const SyncClient = struct {
         var qa = std.heap.ArenaAllocator.init(self.a);
         defer qa.deinit();
         const a = qa.allocator();
+        if (self.firstPrivateScope()) |scope| try self.moveOpenFence(a, scope[0]);
         const rows = try self.st.query(a, "SELECT tbl, tenant FROM _zbz_fence WHERE joint = 1", &.{});
         var n: usize = 0;
         for (rows) |r| {
@@ -1234,7 +1290,7 @@ pub const SyncClient = struct {
     /// chain of one tenant may only clear THAT tenant's rows, and its rows go in as
     /// upserts (the open rows it carries are already there from a sibling's chain).
     fn multiTenant(self: *SyncClient, st: TableState) bool {
-        return st.tenant_col != null and self.tenants.len > 1;
+        return st.tenant_col != null and self.tenantsFor(st).len > 1;
     }
 
     // ─── step 1: schemas → local DDL, existence from the DATABASE (finding 9) ─
@@ -7150,6 +7206,10 @@ pub const SyncClient = struct {
             while (it.next()) |part| last = part;
             break :blk last;
         };
+        if (std.mem.eql(u8, mid, "tenants")) {
+            self.membership_dirty = true;
+            return .kept;
+        }
         if (mid.len == 0) return .kept;
         // `mutation_ack.<principal>.<id>.held`: the write waits for its predecessor. Not a
         // verdict (it never touches the verdict subject, so it cannot replace one): it only
@@ -7756,13 +7816,19 @@ pub const SyncClient = struct {
         try self.refuseIfRevoked();
         const first = !self.schemas_synced;
         if (first) {
-            try self.resolveTenant();
+            try self.subscribeVerdicts();
+            try self.t.conn.flush();
+            self.resolveTenant() catch |err| {
+                log.warn("Tenant resolution deferred: {s}", .{@errorName(err)});
+                self.tenant = self.open_tenant;
+                self.tenant_missing = true;
+                self.membership_dirty = true;
+            };
             self.startup.mark("tenant");
             try self.probeRevoked();
             self.startup.mark("revoked?");
             try self.ensureOutbox();
             self.startup.mark("outbox");
-            try self.subscribeVerdicts();
             self.startup.mark("verdicts");
             self.schemas_synced = true;
         }
@@ -7820,8 +7886,13 @@ pub const SyncClient = struct {
         self.tenants = list.items;
         self.tenant_missing = false;
         self.tenant = self.tenants[0];
-        try self.refreshRoutes();
+        try self.syncJoinedTenant();
         log.info("tenant: joined {s} ({d} membership(s))", .{ tenant, self.tenants.len });
+    }
+
+    pub fn syncJoinedTenant(self: *SyncClient) !void {
+        self.joint_restored = false;
+        try self.refreshRoutes();
         // Tables skipped for want of a tenant get their descriptor applied now; then
         // the unseeded (table, tenant) pairs seed. The tail opens at the next poll.
         try self.syncSchemas();
@@ -9930,6 +10001,22 @@ test "joint fence: the group is the owed records — a restart parks the routes 
     try std.testing.expectEqual(@as(usize, 0), try client.jointOwedOthers(a, "orders", "acme"));
     // A tail may not open on a parked route.
     try std.testing.expectError(error.FrontiersParked, client.tailFor("CDC_acme"));
+}
+
+test "first private assignment carries an unfinished open fence onto the private chain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var client = try frontierClient(a);
+    defer client.st.close();
+    client.tenants = &.{ "_default", "acme" };
+    try client.states.put(a, "orders", tenantState(&.{"CDC_acme"}, "CDC_PUBLIC"));
+    try client.st.execSimple("INSERT INTO _zbz_fence (tbl,tenant,joint) VALUES ('orders','_default',1)");
+    try client.ensureJointRestored();
+    try std.testing.expect(try client.jointFlag(a, "orders", "acme"));
+    try std.testing.expectEqual(@as(usize, 0), try client.jointOwedOthers(a, "orders", "acme"));
+    try std.testing.expect(client.joint_parked.contains("CDC_acme"));
+    try std.testing.expect(client.joint_parked.contains("CDC_PUBLIC"));
 }
 
 test "joint fence: a clean end opens the routes and a lapsed participant keeps them parked" {

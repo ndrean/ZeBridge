@@ -98,7 +98,7 @@ var clients: handles.Table(ClientBox, 64) = .{};
 
 /// The ABI version — libzb/abi.json's `version`, which python/abi_check.py keeps in
 /// step with what this file exports and what `openBox` reads.
-pub const abi_version: c_int = 8;
+pub const abi_version: c_int = 9;
 
 export fn zb_abi_version() c_int {
     return abi_version;
@@ -474,6 +474,13 @@ const ClientBox = struct {
     /// §10jt: the identity file this client came from (null: explicit creds), and when
     /// `poll` last asked whether its JWT is due for renewal.
     id_path: ?[]u8 = null,
+    renewal_url: ?[]u8 = null,
+    membership_phase: enum { observe, renewing, renewed, reconnecting, credentials_required } = .observe,
+    request_epoch: u64 = 0,
+    membership_epoch: u64 = 0,
+    membership_retry: i64 = 0,
+    membership_delay: i64 = 1,
+    reconnect_fault_used: bool = false,
     next_renew_check: i64 = 0,
     /// The bridge's time at `anchor_steady` (§10ks). Renewal is timed and stamped with
     /// `serverNow`, which counts on the steady clock from there, so a user who moves the
@@ -492,6 +499,7 @@ const ClientBox = struct {
 
     fn destroy(self: *ClientBox, a: std.mem.Allocator) void {
         self.c.deinit();
+        if (self.renewal_url) |u| a.free(u);
         if (self.id_path) |p| a.free(p);
         a.free(self.url);
         a.free(self.creds);
@@ -731,8 +739,15 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     errdefer a.free(creds);
     // "creds": the credentials as text (what /enroll hands an app) — the same option as
     // zb-client-ts's. Kept for the connection's life: every reconnect reads it.
-    const creds_text = try a.dupe(u8, idv.or_(str.get(o, "creds", ""), if (ident) |i| i.creds else null));
-    errdefer a.free(creds_text);
+    const renewal_opt = str.get(o, "renewalUrl", str.get(o, "bridgeUrl", ""));
+    const renewal_url = if (renewal_opt.len > 0 and (creds.len > 0 or str.get(o, "creds", "").len > 0)) try a.dupe(u8, renewal_opt) else null;
+    errdefer if (renewal_url) |u| a.free(u);
+    const file_identity = renewal_url != null and creds.len > 0;
+    var creds_text = if (file_identity) try enroll.readCredsFile(a, creds) else try a.dupe(u8, idv.or_(str.get(o, "creds", ""), if (ident) |i| i.creds else null));
+    errdefer {
+        std.crypto.secureZero(u8, creds_text);
+        a.free(creds_text);
+    }
     // "grammarHash": what the host received beside its creds (§10dq). Empty = unchecked.
     const gh_raw = idv.or_(str.get(o, "grammarHash", ""), if (ident) |i| i.grammar_hash else null);
     const grammar_hash: ?[]u8 = if (gh_raw.len > 0) try a.dupe(u8, gh_raw) else null;
@@ -767,6 +782,19 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     defer if (from_jwt) |p| a.free(p);
     const principal = try a.dupeSentinel(u8, if (principal_opt.len > 0) principal_opt else from_jwt orelse "", 0);
     errdefer a.free(principal);
+    // Static files keep their original JWT. A later open after expiry can still
+    // sign /renew with the file's key when the first handshake is refused.
+    var renewed_offset: i64 = 0;
+    if (force_renew) if (renewal_url) |base| {
+        const id: enroll.Identity = .{ .principal = principal, .creds = creds_text, .bridge_url = base };
+        var fresh = try enroll.renew(a, id, id.serverNow(), ca_file);
+        defer fresh.deinit(a);
+        const replacement = try a.dupe(u8, fresh.creds);
+        std.crypto.secureZero(u8, creds_text);
+        a.free(creds_text);
+        creds_text = replacement;
+        renewed_offset = fresh.clock_offset;
+    };
     // The same defaults as zb-client-ts: one replica per principal, kept across runs;
     // a random client id per instance (it prefixes every mutation's msg_id — a fixed
     // default would give every client that omits it the same prefix).
@@ -846,7 +874,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     box.* = .{
         .c = try client.SyncClient.init(a, .{
             .url = url,
-            .creds_path = creds,
+            .creds_path = if (file_identity) "" else creds,
             .creds = creds_text,
             .grammar_hash = grammar_hash,
             .js_domain = js_domain,
@@ -879,7 +907,8 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         .ondemand = ondemand,
         .all_tables = all_tables,
         .id_path = kept_id_path,
-        .anchor_server_ms = enroll.localNowMillis() + (if (ident) |i| i.clock_offset * 1000 else 0),
+        .renewal_url = renewal_url,
+        .anchor_server_ms = enroll.localNowMillis() + (if (ident) |i| i.clock_offset else renewed_offset) * 1000,
         .anchor_steady_ms = enroll.steadyMillis(),
     };
     return box;
@@ -1231,6 +1260,7 @@ fn pollJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
     const r = try b.c.poll(a, wait_ms);
     var out: std.json.ObjectMap = .empty;
     try out.put(a, "applied", .{ .integer = @intCast(r.applied) });
+    try out.put(a, "membership", .{ .string = @tagName(b.membership_phase) });
     // What became of this client's writes since the last report, and what still waits.
     var outcomes: std.json.Array = .init(a);
     const taken = b.c.takeOutcomes();
@@ -1332,21 +1362,22 @@ export fn zb_client_reply(handle: u64, id: u64, answer_json: ?[*:0]const u8) ?[*
 /// rewritten, and the new creds go to the connection for its NEXT handshake (nats.zig
 /// patch 29, under the connection's mutex). The current socket is left alone: the
 /// server ends it at the old JWT's expiry and the reconnect presents the new one.
-fn maybeRenew(b: *ClientBox, force: bool) void {
-    const path = b.id_path orelse return;
+fn maybeRenew(b: *ClientBox, force: bool) bool {
+    if (b.id_path == null and b.renewal_url == null) return false;
     // The spacing runs on the steady clock: a user who sets the wall clock back by a
     // day must not stop the checks for a day.
     const tick = enroll.steadySeconds();
-    if (!force and tick < b.next_renew_check) return;
+    if (!force and tick < b.next_renew_check) return false;
     // An eighth of the JWT's life between checks, at most a minute: several chances
     // inside the last quarter, whatever the lifetime (24 h in production, seconds in
     // a test).
     const life: i64 = if (enroll.jwtTimes(b.creds_text)) |t| t.exp - t.iat else 480;
     b.next_renew_check = tick + std.math.clamp(@divTrunc(life, 8), 1, 60);
-    if (!force and !enroll.renewDue(b.creds_text, b.serverNow())) return;
+    if (!force and !enroll.renewDue(b.creds_text, b.serverNow())) return false;
     const a = std.heap.c_allocator;
-    var id = (enroll.load(a, path) catch null) orelse return;
-    defer id.deinit(a);
+    var loaded = if (b.id_path) |path| (enroll.load(a, path) catch null) orelse return false else null;
+    defer if (loaded) |*i| i.deinit(a);
+    const id = loaded orelse enroll.Identity{ .bridge_url = b.renewal_url.?, .principal = b.principal, .creds = b.creds_text };
     // Another process sharing the identity may have renewed it already.
     const ours = force or enroll.renewDue(id.creds, b.serverNow());
     var fresh = if (ours) (enroll.renew(a, id, b.serverNow(), b.ca_file) catch {
@@ -1354,18 +1385,18 @@ fn maybeRenew(b: *ClientBox, force: bool) void {
             // §10kn: the next entry point (`zb_client_poll`, right after this) purges.
             b.c.revoked = true;
             b.c.purge_requested = true;
-            return;
+            return false;
         }
         log.warn("zebridge: {s} — retried in a minute", .{enroll.last_failure orelse "renew failed"});
-        return;
-    }) else (enroll.load(a, path) catch null) orelse return;
+        return false;
+    }) else (enroll.load(a, b.id_path orelse return false) catch null) orelse return false;
     defer fresh.deinit(a);
-    enroll.save(a, path, fresh) catch return;
-    const text = a.dupe(u8, fresh.creds) catch return;
+    if (b.id_path) |path| enroll.save(a, path, fresh) catch return false;
+    const text = a.dupe(u8, fresh.creds) catch return false;
     b.c.t.js.nc.setCredsContent(text) catch {
         std.crypto.secureZero(u8, text);
         a.free(text);
-        return;
+        return false;
     };
     const old = b.creds_text;
     b.creds_text = text;
@@ -1379,19 +1410,91 @@ fn maybeRenew(b: *ClientBox, force: bool) void {
     std.crypto.secureZero(u8, old);
     a.free(old);
     log.info("zebridge: renewed '{s}' — the next reconnect presents the new JWT", .{fresh.principal});
+    return true;
+}
+
+// Driven by poll, on the same thread and handle as the outbox and CDC consumers.
+fn refreshMembership(b: *ClientBox, a: std.mem.Allocator) !void {
+    const c = b.c;
+    const epoch = c.t.conn.reconnect_epoch.load(.acquire);
+    if (enroll.steadySeconds() < b.membership_retry or c.t.conn.getStatus() != .connected) return;
+    if (epoch != b.membership_epoch) {
+        try c.t.conn.flush();
+        if (b.membership_phase == .reconnecting) b.membership_phase = .renewed;
+        b.membership_epoch = epoch;
+        c.membership_dirty = true;
+    }
+    if (!c.membership_dirty) return;
+    if (b.membership_phase == .reconnecting) return;
+    const members = try c.readMembership(a);
+    for (c.tenants) |active| if (!std.mem.eql(u8, active, c.open_tenant)) {
+        if (b.membership_phase == .renewed) try c.syncJoinedTenant();
+        b.membership_phase = .observe;
+        b.membership_delay = 1;
+        c.membership_dirty = false;
+        return;
+    };
+    if (c.tenant_missing) {
+        for (members) |t| if (std.mem.eql(u8, t, c.open_tenant)) {
+            try c.join(t);
+            break;
+        };
+    }
+    for (members) |tenant| {
+        if (std.mem.eql(u8, tenant, c.open_tenant)) continue;
+        if (b.membership_phase == .renewed and epoch != b.request_epoch) {
+            try c.join(tenant);
+            log.info("tenant: activated {s} after credential refresh", .{tenant});
+            break;
+        }
+        if (b.id_path == null and b.renewal_url == null) {
+            b.membership_phase = .credentials_required;
+            c.membership_dirty = false;
+            log.warn("tenant: credentials required for first private assignment", .{});
+            return;
+        }
+        if (b.membership_phase != .renewed) {
+            b.membership_phase = .renewing;
+            if (comptime @import("libzb_options").test_faults) if (std.c.getenv("ZB_TEST_TENANT_RENEW_PAUSE_FILE")) |path| {
+                if (std.c.access(path, 0) == 0) return;
+            };
+            if (!maybeRenew(b, true)) return error.TenantRenewFailed;
+            b.membership_phase = .renewed;
+            b.request_epoch = epoch;
+        }
+        if (comptime @import("libzb_options").test_faults) if (!b.reconnect_fault_used and std.c.getenv("ZB_TEST_TENANT_RECONNECT_FAIL_ONCE") != null) {
+            b.reconnect_fault_used = true;
+            return error.TestReconnectFailed;
+        };
+        try c.t.conn.reconnect();
+        b.membership_phase = .reconnecting;
+        return;
+    }
+    c.membership_dirty = false;
+    b.membership_phase = .observe;
+    b.membership_delay = 1;
 }
 
 export fn zb_client_poll(handle: u64, wait_ms: u64) ?[*:0]u8 {
     const b = lookup(handle) orelse return goneJson(handle);
     syncClockOffset(b);
-    maybeRenew(b, false);
+    if (!b.c.membership_dirty and b.membership_phase == .observe) _ = maybeRenew(b, false);
     if (purgeIfAsked(handle, b)) return errJson("Revoked");
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
+    refreshMembership(b, arena.allocator()) catch |err| {
+        b.membership_retry = enroll.steadySeconds() + b.membership_delay;
+        b.membership_delay = @min(60, b.membership_delay * 2);
+        log.warn("tenant: refresh deferred ({s})", .{@errorName(err)});
+    };
     const out = pollJson(arena.allocator(), b, wait_ms) catch |err| {
         // The server ended the session on the JWT, or refused it on a reconnect: renew
         // now, whatever the clock says, so the host's reopen presents a fresh one (§10kr).
-        if (b.c.authError()) |auth_err| if (auth_err == error.AuthExpired or auth_err == error.AuthorizationViolation) maybeRenew(b, true);
+        if (b.membership_phase == .observe) {
+            if (b.c.authError()) |err_auth| {
+                if (err_auth == error.AuthExpired or err_auth == error.AuthorizationViolation) _ = maybeRenew(b, true);
+            }
+        }
         if (purgeIfAsked(handle, b)) return errJson("Revoked");
         // The single door every poll error passes — so the auth verdict is named
         // HERE, once, whichever `try` inside poll surfaced the dead socket (§10cj:
