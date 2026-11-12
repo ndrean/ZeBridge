@@ -318,11 +318,6 @@ fn initHttpServer(
     );
 }
 
-/// Hand a transaction's buffered slots to the background publisher.
-///
-/// Called at `.commit` for the whole transaction, and mid-transaction whenever the
-/// scratchpad fills (NOTES.md finding 5) — which is what lets a transaction of any
-/// size stream through at ring-buffer pace instead of killing the process.
 /// Fault build: a WAL message whose payload holds the bytes of `ZB_TEST_DECODE_FAIL` fails to
 /// decode, as a parser defect would (scripts/scenarios/decode_fatal.py).
 fn decodeFailInjected(payload: []const u8) bool {
@@ -333,6 +328,11 @@ fn decodeFailInjected(payload: []const u8) bool {
     return true;
 }
 
+/// Hand a transaction's buffered slots to the background publisher.
+///
+/// Called at `.commit` for the whole transaction, and mid-transaction whenever the
+/// scratchpad fills (NOTES.md finding 5) — which is what lets a transaction of any
+/// size stream through at ring-buffer pace instead of killing the process.
 fn releaseTxSlots(
     event_proc: anytype,
     tx_slots_buf: []u32,
@@ -2082,7 +2082,7 @@ pub fn main(init: std.process.Init) !void {
                 }
 
                 // Parse and publish pgoutput messages
-                if (wal_msg.type == .xlogdata and wal_msg.payload.len > 0) {
+                if (wal_msg.type == .xlogdata) {
                     // Reset arena for this message (retains capacity for efficiency)
                     // reset allocations from previous message while keeping the memory buffer
                     _ = arena.reset(.retain_capacity);
@@ -2090,9 +2090,10 @@ pub fn main(init: std.process.Init) !void {
 
                     // Parse messages with arena allocator
                     // Relations use main allocator since they persist in the map
-                    var parser = pgoutput.Parser.init(arena_allocator, wal_msg.payload);
-                    const decoded = if (decodeFailInjected(wal_msg.payload)) error.TestDecodeFailure else parser.parse();
-                    if (decoded) |pg_msg| {
+                    // In the fault build, preserve the tag but truncate its body so the real decoder fails.
+                    const payload = if (decodeFailInjected(wal_msg.payload)) wal_msg.payload[0..1] else wal_msg.payload;
+                    var parser = pgoutput.Parser.init(arena_allocator, payload);
+                    if (parser.parse()) |pg_msg| {
                         // arena.deinit() handles everything
 
                         switch (pg_msg) {
@@ -2416,9 +2417,9 @@ pub fn main(init: std.process.Init) !void {
                         // here, the slot keeps it and a fixed bridge replays it. No row content logged.
                         const tag: u8 = if (wal_msg.payload.len > 0) wal_msg.payload[0] else '?';
                         log.err("🔴 pgoutput decode failed ({s}) on a '{c}' message of {d} bytes at WAL {X}/{X}; slot '{s}', last acknowledged LSN {X}/{X} — stopping without confirming it: the slot keeps the change, and a start that fails here again needs a fixed bridge", .{
-                            @errorName(err),             tag,                        wal_msg.payload.len,
-                            wal_msg.wal_start >> 32,     wal_msg.wal_start & 0xffffffff, parsed_args.slot_name,
-                            last_ack_lsn >> 32,          last_ack_lsn & 0xffffffff,
+                            @errorName(err),         tag,                            wal_msg.payload.len,
+                            wal_msg.wal_start >> 32, wal_msg.wal_start & 0xffffffff, parsed_args.slot_name,
+                            last_ack_lsn >> 32,      last_ack_lsn & 0xffffffff,
                         });
                         return error.PgoutputDecodeFailed;
                     }
