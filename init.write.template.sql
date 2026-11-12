@@ -2107,8 +2107,9 @@ $$;
 --
 -- The switch: clients stamp only when a table's descriptor advertises `incarnation`, and the
 -- bridge advertises it only when this is on. A worker that predates the gate would apply a
--- stamped write unchecked, so the administrator turns it on after every worker that consumes
--- writes runs a build with the gate, then restarts the bridges (they read it at boot).
+-- stamped write unchecked, so the administrator turns it on only after every worker that
+-- consumes writes runs a build with the gate. A running bridge reads it at boot and again at
+-- every catalogue reload, so turning it on early reaches bridges that are already running.
 CREATE TABLE IF NOT EXISTS zebridge_private.write_policy (
     singleton          boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     incarnation_stamps boolean NOT NULL DEFAULT false

@@ -134,6 +134,21 @@ On a table whose bridge offers ordering (`ordering: 1` in its write contract), e
 - **`after` names a write, not a row.** The named write may already have left the outbox: the bridge answers from its receipt. A rejected predecessor still releases the write, which PostgreSQL then judges on its own.
 - **Branching.** Two writes may each name the same earlier write; either may run first, and a later default write follows whichever was queued last. Waiting for several writes at once is not offered.
 
+### A write and its table incarnation
+
+When the bridge asks for stamps (`incarnation` in a table's descriptor), each write carries the incarnation of the rows the user edited, and a write made against a table that has since been dropped and re-created is refused rather than applied to the new rows. The contract is [PROTOCOL §7.8](PROTOCOL.md#78-a-write-belongs-to-its-table-incarnation). Both clients behave the same way, with the same log lines.
+
+- **A new edit can be refused before anything happens.** The local row is not changed and nothing is queued. The reasons:
+  - `TableNotWritable`: the table does not accept writes;
+  - `IncarnationUnknown`: the bridge cannot state the table's identity right now;
+  - `ReplacementIncomplete`: the table's rows are being replaced; edit once the new rows are in.
+- **How a refusal reaches the application.**
+  - **libzb:** `zb_client_mutate` and `zb_client_mutate_opts` answer `{"error": "<reason>"}`, and zb-python, Dart, Android, React Native and Swift raise it.
+  - **zb-client-ts:** `mutateWithId` rejects with `write not queued: <reason>`; `mutate` logs it and returns, as for the other refusals made before queueing.
+- **A write already queued is never refused** by a later descriptor. It keeps its ID across restarts and gets its verdict.
+- **A write that the re-creation made obsolete** is answered `rejected` with reason `TableIncarnationChanged`, through `onVerdict` (zb-client-ts) or the poll report's outcomes (libzb), once. The local rows of the new table are not touched, and nothing is reverted.
+- **A dropped table keeps its stamped writes** in the outbox until the bridge answers them; unstamped writes of a dropped table are discarded, as before.
+
 Last-write-wins is decided by PostgreSQL on the table's version column (and its tiebreak
 column, on equal versions). The version, tombstone and tiebreak columns are the table's
 `zebridge_catalogue` row, and every client learns them from the schema it receives.

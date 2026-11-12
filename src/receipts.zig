@@ -486,7 +486,7 @@ pub fn bootCheck(conn: ?*c.PGconn) !void {
     const sw = c.PQexec(conn, "SELECT public.zebridge_incarnation_stamps()");
     defer c.PQclear(sw);
     const stamps = c.PQresultStatus(sw) == c.PGRES_TUPLES_OK and c.PQntuples(sw) == 1 and c.PQgetvalue(sw, 0, 0)[0] == 't';
-    log.info("🧾 incarnation stamps: {s}", .{if (stamps) "advertised (clients stamp their writes; this bridge checks them)" else "not advertised (stamped writes are still checked; enable with UPDATE zebridge_private.write_policy SET incarnation_stamps = true WHERE singleton, once every worker runs this build, then restart the bridges)"});
+    log.info("🧾 incarnation stamps: {s}", .{if (stamps) "advertised (clients stamp their writes; this bridge checks them)" else "not advertised (stamped writes are still checked; enable with UPDATE zebridge_private.write_policy SET incarnation_stamps = true WHERE singleton, only once every bridge consuming writes runs this build: running bridges pick it up at their next catalogue reload)"});
     try maintain(conn);
 }
 
