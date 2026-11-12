@@ -2268,15 +2268,16 @@ pub const EventProcessor = struct {
         // The key is purged directly, not through the ring: tell the publisher, in WAL
         // order, that this principal holds no tenant any more (`BatchPublisher.members`
         // decides whether a missing stream is a fault). Never published.
-        return try self.packRosterNote(arena, row.principal, rel.relation_id, wal_end);
+        return try self.packRosterNote(arena, row.principal, "[]", rel.relation_id, wal_end);
     }
 
-    /// The publisher's own roster note: `<roster_note_prefix><principal>`, no tenants.
-    fn packRosterNote(self: *EventProcessor, arena: std.mem.Allocator, principal: []const u8, relation_id: u32, wal_end: u64) !u32 {
+    /// The publisher's own roster note: `<roster_note_prefix><principal>` with the principal's set
+    /// (`[]`: no tenants). Never published: it tells the publisher who is mapped (`BatchPublisher.members`).
+    fn packRosterNote(self: *EventProcessor, arena: std.mem.Allocator, principal: []const u8, tenants: []const u8, relation_id: u32, wal_end: u64) !u32 {
         const subject = try std.fmt.allocPrint(arena, "{s}{s}", .{ @import("batch_publisher.zig").roster_note_prefix, principal });
         const msg_id = try std.fmt.allocPrint(arena, "roster-{s}-{d}", .{ principal, wal_end });
         var cols: std.ArrayList(pgoutput.Column) = .empty;
-        try cols.append(arena, .{ .name = "tenants", .value = .{ .text = "[]" } });
+        try cols.append(arena, .{ .name = "tenants", .value = .{ .text = tenants } });
         return try self.acquireAndFillSlot(subject, principal, "TENANT", msg_id, relation_id, cols, wal_end);
     }
 
@@ -2421,11 +2422,14 @@ pub const EventProcessor = struct {
         while (r < num_rows) : (r += 1) {
             try self.rosterAdd(std.mem.span(c.PQgetvalue(result, r, 0)), std.mem.span(c.PQgetvalue(result, r, 1)));
         }
-        // A key that already holds the principal's set is left alone: every put tells its
+        // A key that already holds the principal's set is not put again: every put tells its
         // principal the membership changed (`BatchPublisher.noticeMembership`), and a boot
-        // that changed nothing must not tell every principal so. A key that cannot be read
-        // is put. A notice lost with a stopped bridge is not this pass's to reissue: the
-        // roster row it belonged to was never confirmed, and the slot replays it.
+        // that changed nothing must not tell every principal so. The publisher still gets the
+        // set as a roster note: it learns who is mapped from these events only, and without
+        // them a deleted tenant stream would read as "nobody mapped" and its rows be skipped.
+        // A key that cannot be read is put. A notice lost with a stopped bridge is not this
+        // pass's to reissue: the roster row it belonged to was never confirmed, and the slot
+        // replays it.
         var tenants_kv = if (self.publisher) |publ| (if (publ.js) |*js| (js.kvBucket(self.topology.kv_tenants) catch null) else null) else null;
         defer if (tenants_kv) |*kv| kv.deinit();
         var published: usize = 0;
@@ -2436,7 +2440,9 @@ pub const EventProcessor = struct {
             if (tenants_kv) |*kv| if (kv.get(e.key_ptr.*)) |entry_const| {
                 var entry = entry_const;
                 defer entry.deinit();
-                if (std.mem.eql(u8, entry.value, try Topology.tenantsValue(arena, e.value_ptr.items))) {
+                const value = try Topology.tenantsValue(arena, e.value_ptr.items);
+                if (std.mem.eql(u8, entry.value, value)) {
+                    try self.releaseSlotToQueue(try self.packRosterNote(arena, e.key_ptr.*, value, 0, boot_lsn));
                     unchanged += 1;
                     continue;
                 }

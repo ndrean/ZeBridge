@@ -60,7 +60,12 @@ class Editor:
         return json.loads(d) if isinstance(d, str) else d
 
     def row(self, uid):
-        r = self.node.q(f"SELECT {', '.join(COLS)}, doc FROM {T} WHERE uid = ?", [uid])
+        try:
+            r = self.node.q(f"SELECT {', '.join(COLS)}, doc FROM {T} WHERE uid = ?", [uid])
+        except RuntimeError as e:
+            # A client just started has not created the table yet: no row so far.
+            if "no such table" in str(e): return None
+            raise
         if not r: return None
         vals = dict(zip(COLS, r[0][:5]))
         d = r[0][5]

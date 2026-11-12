@@ -119,9 +119,15 @@ def main():
             while time.monotonic() - t0 < 20 and suspended_reason() is not None:
                 py.poll(); time.sleep(0.2)
             check(f"§3 the descriptor is unsuspended after the restart ({round(time.monotonic() - t0, 1)} s)", suspended_reason() is None)
-            # The epoch the clients are told: this is what makes them re-seed (§10df).
-            raw = zb.kv_get("schemas", T)
-            kv_epoch = raw.split('"seed_epoch":')[1].split(',')[0].strip() if '"seed_epoch":' in raw else "absent"
+            # The epoch the clients are told: this is what makes them re-seed (§10df). The boot
+            # lifts the suspension first; the bumped epoch follows with the catalogue reload the
+            # bump's WAL row brings, a moment later in the same boot.
+            t1 = time.monotonic()
+            while True:
+                raw = zb.kv_get("schemas", T)
+                kv_epoch = raw.split('"seed_epoch":')[1].split(',')[0].strip() if '"seed_epoch":' in raw else "absent"
+                if kv_epoch == str(e1) or time.monotonic() - t1 > 15: break
+                time.sleep(0.2)
             check(f"§3 the republished descriptor carries the bumped seed_epoch ({kv_epoch}, catalogue {e1})", kv_epoch == str(e1))
             # LIVE rows only: a replica reaps tombstoned rows on seed (PROTOCOL §7.5), so
             # the soft-deleted r2 is absent there and NULL-stamped in PostgreSQL.

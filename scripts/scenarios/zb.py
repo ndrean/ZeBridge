@@ -613,13 +613,31 @@ def kv_get(bucket_key: str, key: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+async def next_verdict(sub, timeout: float):
+    """The next message on a `mutation_ack.<principal>.>` subscription that is not the
+    bridge's membership notice (`.tenants`, sent when the principal's roster changes, so a
+    scenario that maps its principals at setup receives one before its first verdict)."""
+    import time
+    end = time.monotonic() + timeout
+    while True:
+        m = await sub.next_msg(timeout=max(0.001, end - time.monotonic()))
+        if not m.subject.endswith(".tenants"):
+            return m
+
+
 def drop_tenant_streams(*tenants: str) -> None:
     """The streams a throwaway tenant made the bridge create, removed once the scenario has
     unregistered the tenant: CDC_<t>, READINGS_<t> and the generation object store gen-<t>.
     The bridge never deletes a departed tenant's streams (that is an operator's call), and
     CDC_ and READINGS_ each reserve their max_bytes (1 GiB and 256 MiB by default): left
     behind, a few runs fill the dev server's JetStream reservation and every later stream
-    creation fails with StorageResourcesExceeded. A stream that is not there is fine."""
+    creation fails with StorageResourcesExceeded. A stream that is not there is fine.
+
+    The sweeper's membership goes first: a trigger maps `zb_sweeper` to every new tenant,
+    and left behind it keeps the tenant live (every boot recreates its streams, every
+    producer pass cuts its chains, and `--diagnose` reports it). Pass throwaway tenants only."""
+    for t in tenants:
+        psql(f"DELETE FROM public.zebridge_user_tenants WHERE principal = 'zb_sweeper' AND tenant_id = '{t}'", quiet=True)
     for t in tenants:
         # READINGS_ is topology.zig's readings_stream_prefix (not in grammar.json).
         for name in (TOPOLOGY["cdc_streams"]["tenant_prefix"] + t, "READINGS_" + t):

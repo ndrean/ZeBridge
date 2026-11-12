@@ -104,6 +104,7 @@ async def main():
 
     async def collect():
         async for msg in sub.messages:
+            if msg.subject.endswith(".tenants"): continue  # the membership notice, not a verdict
             try:
                 verdicts.append(json.loads(msg.data.decode()))
             except Exception:

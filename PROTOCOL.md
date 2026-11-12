@@ -190,7 +190,7 @@ flowchart TD
 | `MUTATIONS` | **stream** | admission → bridge | Private `$ZB.mutation.<principal>` capture in production, aggregate principal count/byte limits, discard new, no age expiry. Legacy mode captures public routes and only caps each route. |
 | `MUTATIONS_ERRORS` | **stream** | bridge → operator | Admission mode dead letters on `mutation_error.<table>`, separate 64 MiB/2 h discard-old diagnostics. |
 | `live` | **KV bucket** | client → bridge | Each client's heartbeat, `$KV.live.<tenant>.<principal>`, expiring after `FLEET_TTL_SECONDS`; the bridge reads it for the fleet metrics (§11). |
-| `VERDICTS` | **stream** | bridge → client | The verdicts answering writes (`mutation_ack.<principal>.<msg_id>`) and the ban (`mutation_ack.<principal>.revoked`), kept 2 h for a client that was offline. One message per subject, discard old: verdicts never take the space writes need, and a verdict pushed out early costs one idempotent replay. |
+| `VERDICTS` | **stream** | bridge → client | The verdicts answering writes (`mutation_ack.<principal>.<msg_id>`) the ban (`mutation_ack.<principal>.revoked`) and the membership notice (`mutation_ack.<principal>.tenants`), kept 2 h for a client that was offline. One message per subject, discard old: verdicts never take the space writes need, and a verdict pushed out early costs one idempotent replay. |
 
 ### `query.<tenant>.<name>` is request/reply, not a stream
 
@@ -1464,6 +1464,7 @@ Two things follow, and they are the whole reason this section is long:
    | `stale` | pop — do **not** hand-revert; the winning row arrives via CDC. An UPDATE is kept aside until that row is here (its version is above the refused stamp): resubmitted with a fresh stamp when the winner changed none of its columns, dropped and surfaced when they overlap (§7.6) |
    | `row_deleted` | pop, revert the local row to "deleted," and surface it to the user |
    | `revoked` | not a reply to a write: the ban. Published as `mutation_ack.<principal>.revoked` when the principal's last mapping is deleted, retained by `VERDICTS` until a mapping is given back or 2 h pass. Close the connection now, stay closed on reconnect (probe it by direct get before reading anything), answer `Revoked` to every call; leave the rows — the wipe is the application's explicit act. **Unless** the body carries `"purge": true` (`bridge --revoke --purge`): then close, delete the replica (and its `-wal`/`-shm`), and forget the stored identity. The same purge applies when `/renew` answers 403 with `"purge": true`, the channel that still reaches a device whose token NATS already refuses |
+   | `tenants` | not a reply to a write: the principal's membership changed. Published as `mutation_ack.<principal>.tenants` after its `$KV.tenants.<principal>` value, with an empty body (`{"status":"tenants"}`). Read the key again; never settle a write with it. A reader of `mutation_ack.<principal>.>` that takes every message as a verdict must skip this subject |
    | `rejected` | pop, revert the local row to its pre-write state |
    | timeout / error | keep, retry (idempotent via `msg_id` for 2 minutes — §2) |
 
