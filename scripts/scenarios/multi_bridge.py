@@ -115,11 +115,37 @@ def start_stack(tmp: str) -> tuple[subprocess.Popen, dict]:
     return ns, genv
 
 
+def stack_env(genv: dict, **extra) -> dict:
+    """The private stack's environment. Admission is set here, never inherited: the dev
+    stack's shell exports MUTATION_ADMISSION=1, and a bridge that consumes the admission
+    queue with no ingress in front of it leaves every client write unanswered."""
+    return dict(os.environ, NATS_URL=NATS_URL, NATS_CREDS=genv["NATS_CREDS"], NATS_TLS_CA="", NATS_JS_DOMAIN="",
+                ZB_SIGNING_SEED=genv["ZB_SIGNING_SEED"], ZB_ACCOUNT_PUB=genv["ZB_ACCOUNT_PUB"], MUTATION_ADMISSION="1",
+                GENERATIONS_ENABLED="1", GENERATION_CADENCE_SECONDS="10", LOG_LEVEL="info", **extra)
+
+
+def start_admission(tmp: str, env: dict) -> subprocess.Popen:
+    """The production write path in front of the bridges: `bridge --mutation-ingress`."""
+    log = os.path.join(tmp, "admission.log")
+    p = subprocess.Popen([str(BRIDGE), "--mutation-ingress"], env=env, stdout=subprocess.DEVNULL, stderr=open(log, "w"))
+    if not wait_log(log, "mutation admission ready", 30):
+        raise RuntimeError("mutation admission never became ready:\n" + open(log, errors="replace").read()[-1500:])
+    return p
+
+
+def stop(p: subprocess.Popen | None) -> None:
+    if p is None:
+        return
+    p.terminate()
+    try:
+        p.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        p.kill()
+
+
 def start_bridge(tmp: str, side: str, genv: dict) -> tuple[subprocess.Popen, str]:
     log = os.path.join(tmp, f"bridge_{side}.log")
-    env = dict(os.environ, NATS_URL=NATS_URL, NATS_CREDS=genv["NATS_CREDS"], NATS_TLS_CA="", NATS_JS_DOMAIN="",
-               ZB_SIGNING_SEED=genv["ZB_SIGNING_SEED"], ZB_ACCOUNT_PUB=genv["ZB_ACCOUNT_PUB"],
-               GENERATIONS_ENABLED="1", GENERATION_CADENCE_SECONDS="10", LOG_LEVEL="info")
+    env = stack_env(genv)
     p = subprocess.Popen([str(BRIDGE), "--pub", f"zb_mb_{side}", "--slot", f"zb_mb_{side}", "--port", str(SIDES[side])],
                          env=env, stdout=subprocess.DEVNULL, stderr=open(log, "w"))
     return p, log
@@ -179,12 +205,14 @@ def main() -> int:
     tmp = tempfile.mkdtemp(prefix="zb-multi-")
     ns = None
     bridges: dict[str, tuple[subprocess.Popen, str]] = {}
+    admission = None
     h = 0
     try:
         teardown_db(principal)
         setup_db()
         ns, genv = start_stack(tmp)
         creds = genv["NATS_CREDS"]
+        admission = start_admission(tmp, stack_env(genv))
         for s in SIDES:
             bridges[s] = start_bridge(tmp, s, genv)
 
@@ -275,11 +303,8 @@ def main() -> int:
         if h:
             lib.zb_client_close(h)
         for p, _ in bridges.values():
-            p.terminate()
-            try:
-                p.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                p.kill()
+            stop(p)
+        stop(admission)
         if ns:
             ns.terminate()
             ns.wait(timeout=10)

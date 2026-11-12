@@ -30,7 +30,7 @@ import urllib.parse
 import uuid
 
 import zb
-from multi_bridge import BRIDGE, NATS_URL, lib, start_stack, take, wait_log
+from multi_bridge import BRIDGE, NATS_URL, lib, stack_env, start_admission, start_stack, stop, take, wait_log
 
 
 def pgtool(name):
@@ -138,7 +138,7 @@ def main() -> int:
     tmp = tempfile.mkdtemp(prefix="zb-standby-")
     datadir = os.path.join(tmp, "pg")
     blog = os.path.join(tmp, "bridge.log")
-    ns = bridge = None
+    ns = bridge = admission = None
     h = 0
     standby_up = False
     try:
@@ -153,10 +153,8 @@ def main() -> int:
         if not standby_up:
             return 1
         ns, genv = start_stack(tmp)
-        env = dict(os.environ, NATS_URL=NATS_URL, NATS_CREDS=genv["NATS_CREDS"], NATS_TLS_CA="", NATS_JS_DOMAIN="",
-                   ZB_SIGNING_SEED=genv["ZB_SIGNING_SEED"], ZB_ACCOUNT_PUB=genv["ZB_ACCOUNT_PUB"],
-                   DATABASE_READER_URL=with_port(os.environ["DATABASE_READER_URL"], SB_PORT),
-                   GENERATIONS_ENABLED="1", GENERATION_CADENCE_SECONDS="10", LOG_LEVEL="info")
+        env = stack_env(genv, DATABASE_READER_URL=with_port(os.environ["DATABASE_READER_URL"], SB_PORT))
+        admission = start_admission(tmp, env)
         bridge = subprocess.Popen([str(BRIDGE), "--pub", PUB, "--slot", SLOT, "--port", str(PORT)],
                                   env=env, stdout=subprocess.DEVNULL, stderr=open(blog, "w"))
 
@@ -213,12 +211,8 @@ def main() -> int:
     finally:
         if h:
             lib.zb_client_close(h)
-        if bridge:
-            bridge.terminate()
-            try:
-                bridge.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                bridge.kill()
+        stop(bridge)
+        stop(admission)
         if ns:
             ns.terminate()
             ns.wait(timeout=10)
