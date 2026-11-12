@@ -186,7 +186,9 @@ GROUPS = {
     # Regressions for a known, unfixed bug: each asserts the desired outcome, so it exits 1 today.
     # Kept out of `owns` (and `all`) so that group stays a signal; here exit 1 counts as expected,
     # and an unexpected pass fails the group: the fix landed, move the scenario to `owns`.
-    "known_red": {},
+    "known_red": {
+        "late_tenant": ("bridge", "a running client gets its first private assignment through its original handle (no private assignment -> tenant A added beside the open one): a public CDC change before; after, A's seed and a later private change, B's probe never; a /renew control proves the grants; both clients; compose dev stack (ZB_NATS_CONTAINER)"),
+    },
     "manual": {
         "ingress_baseline": ("none", "paused-consumer backlog baseline, 1/10/100/500 connected publishers and 1/8 ingress lanes; three rounds, optional diagnostic binary and mixed traffic; requires --log-dir, see --help"),
         "firehose_topology": ("none", "the firehose with N TLS consumers attached, topology 2 (TLS on nats-server, bridge tls://) vs topology 1 (plain nats-server, HAProxy terminates the clients' TLS): chain margin, cuts, CPU per process (§10gb); ~10 min"),
