@@ -74,7 +74,7 @@ The hub is NATS, the bridge, mutation admission and the sweeper on one server. P
 - **Docker Compose:** two files on the server. HAProxy and Let's Encrypt are included, and PostgreSQL optionally:
 
   ```sh
-  V=0.3.0
+  V=0.3.1
   mkdir zebridge && cd zebridge
   curl -fsSLO https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/compose.yml
   curl -fsSL -o .env https://raw.githubusercontent.com/ndrean/ZeBridge/v$V/deploy/compose/.env.example
