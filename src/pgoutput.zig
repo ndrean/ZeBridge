@@ -1059,8 +1059,10 @@ pub const Parser = struct {
 
     // https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-TRUNCATE
     fn parseTruncate(self: *Parser) !TruncateMessage {
-        const options = try self.readU8();
+        // The count comes BEFORE the options byte (read the other way round, one relation
+        // became 256 and every TRUNCATE failed as UnexpectedEndOfData).
         const num_relations = try self.readU32();
+        const options = try self.readU8();
 
         var relation_ids = try self.allocator.alloc(u32, num_relations);
         errdefer self.allocator.free(relation_ids);
@@ -1681,4 +1683,14 @@ test "empty array renders as [] instead of crashing" {
     const txt = try arrayToText(alloc, arr);
     defer alloc.free(txt);
     try std.testing.expectEqualStrings("[]", txt);
+}
+
+test "parse: a TRUNCATE as PostgreSQL sends it (count, options, OIDs)" {
+    // Captured from pg_logical_slot_peek_binary_changes, proto_version 1, one table.
+    const bytes = [_]u8{ 'T', 0, 0, 0, 1, 0, 0x00, 0x10, 0x3d, 0x3c };
+    var parser = Parser.init(std.testing.allocator, &bytes);
+    const msg = try parser.parse();
+    defer std.testing.allocator.free(msg.truncate.relation_ids);
+    try std.testing.expectEqual(@as(u8, 0), msg.truncate.options);
+    try std.testing.expectEqualSlices(u32, &.{1064252}, msg.truncate.relation_ids);
 }
