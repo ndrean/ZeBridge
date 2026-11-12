@@ -75,6 +75,8 @@ lists only what differs.
 
 - `walls.py` — the fixed limits at their edge, in bytes (the longest supported tenant and table, a tenant over the limit refused by the database / dropped and counted, `--diagnose` on stored values, an error escaping the loop ends the process, SIGTERM on an idle bridge); case E needs the bridge fault build (`-Dtest-faults=true -p zig-out-faults`, hook `ZB_TEST_LOOP_ERROR`).
 
+- `decode_fatal.py` — a pgoutput message the bridge cannot decode stops it and the slot keeps the change; the same slot without the fault replays it (bridge fault build, hook `ZB_TEST_DECODE_FAIL`).
+
 - `scripts/scenarios/run.py {offline|live|owns|all}` sequences the groups; `--list` shows them.
 
 **Fault-hook builds.** Crash and timing points are compiled in only with `-Dtest-faults=true` (libzb) and exist as env

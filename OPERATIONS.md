@@ -354,6 +354,7 @@ Start from what you see. Each row names the check and the rule behind it.
 
 | you see | check | usually |
 | --- | --- | --- |
+| the bridge exits with `pgoutput decode failed` and stops at the same WAL position on every start | the log line: message tag, size, WAL position, slot, last acknowledged LSN; `pg_replication_slots` for the slot's retained WAL | a change this bridge cannot decode. It stops rather than confirm the slot past the change, so nothing is lost while it is down, but the slot retains WAL until a fixed bridge replays it: upgrade the bridge, do not advance or drop the slot |
 | bridge refuses startup with `ReceiptsNotInstalled` after a binary upgrade | apply that binary's `--init-sql`, including private ordered/park functions and writer grants | a binary-only upgrade is incomplete; do not disable the receipt guard |
 | a table's clients stop receiving new generations, or hold fewer rows than PostgreSQL | `bridge_snapshot_rls_blocked_pairs`; the log line `publication BLOCKED`; `bridge --diagnose` | the reader's row-level-security policies may hide rows: see [Snapshots blocked by row-level security](#snapshots-blocked-by-row-level-security) |
 | a table is missing on every client | `SELECT * FROM zebridge_suspensions`; the log line naming the table | suspended: see [Suspended tables](#suspended-tables). Or never enabled: `zebridge_enable` |

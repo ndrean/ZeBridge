@@ -323,6 +323,16 @@ fn initHttpServer(
 /// Called at `.commit` for the whole transaction, and mid-transaction whenever the
 /// scratchpad fills (NOTES.md finding 5) — which is what lets a transaction of any
 /// size stream through at ring-buffer pace instead of killing the process.
+/// Fault build: a WAL message whose payload holds the bytes of `ZB_TEST_DECODE_FAIL` fails to
+/// decode, as a parser defect would (scripts/scenarios/decode_fatal.py).
+fn decodeFailInjected(payload: []const u8) bool {
+    if (comptime !@import("build_options").test_faults) return false;
+    const marker = std.mem.span(std.c.getenv("ZB_TEST_DECODE_FAIL") orelse return false);
+    if (marker.len == 0 or std.mem.indexOf(u8, payload, marker) == null) return false;
+    log.warn("ZB_TEST_DECODE_FAIL fired", .{});
+    return true;
+}
+
 fn releaseTxSlots(
     event_proc: anytype,
     tx_slots_buf: []u32,
@@ -2081,7 +2091,8 @@ pub fn main(init: std.process.Init) !void {
                     // Parse messages with arena allocator
                     // Relations use main allocator since they persist in the map
                     var parser = pgoutput.Parser.init(arena_allocator, wal_msg.payload);
-                    if (parser.parse()) |pg_msg| {
+                    const decoded = if (decodeFailInjected(wal_msg.payload)) error.TestDecodeFailure else parser.parse();
+                    if (decoded) |pg_msg| {
                         // arena.deinit() handles everything
 
                         switch (pg_msg) {
@@ -2399,7 +2410,17 @@ pub fn main(init: std.process.Init) !void {
                             else => {},
                         }
                     } else |err| {
-                        log.warn("Failed to parse pgoutput message: {}", .{err});
+                        // Fatal, whatever the message: a skipped row is confirmed past by the next
+                        // commit or a drained keepalive, a skipped RELATION leaves later rows read
+                        // with stale columns, a skipped BEGIN/COMMIT blurs the transaction. Stopped
+                        // here, the slot keeps it and a fixed bridge replays it. No row content logged.
+                        const tag: u8 = if (wal_msg.payload.len > 0) wal_msg.payload[0] else '?';
+                        log.err("🔴 pgoutput decode failed ({s}) on a '{c}' message of {d} bytes at WAL {X}/{X}; slot '{s}', last acknowledged LSN {X}/{X} — stopping without confirming it: the slot keeps the change, and a start that fails here again needs a fixed bridge", .{
+                            @errorName(err),             tag,                        wal_msg.payload.len,
+                            wal_msg.wal_start >> 32,     wal_msg.wal_start & 0xffffffff, parsed_args.slot_name,
+                            last_ack_lsn >> 32,          last_ack_lsn & 0xffffffff,
+                        });
+                        return error.PgoutputDecodeFailed;
                     }
                 }
 
