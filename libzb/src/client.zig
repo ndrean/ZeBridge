@@ -6055,7 +6055,7 @@ pub const SyncClient = struct {
         );
         // Independent confirmed state under a row's optimistic history. NULL data is
         // certified absence; no record is unknown. `at` bounds later overlays.
-        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_base (tbl TEXT NOT NULL, row_id TEXT NOT NULL, at BIGINT NOT NULL, data TEXT, PRIMARY KEY(tbl,row_id))");
+        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_base (tbl TEXT NOT NULL, row_id TEXT NOT NULL, \"at\" BIGINT NOT NULL, data TEXT, PRIMARY KEY(tbl,row_id))");
         // A refused write's local undo, owed until it is done (`runUndos`). `mode`: `restore`
         // (the before-image, or no row) for `rejected`, `delete` for `row_deleted`.
         try execDdl(&self.st,
@@ -6076,7 +6076,7 @@ pub const SyncClient = struct {
         );
         var fa = std.heap.ArenaAllocator.init(self.a);
         defer fa.deinit();
-        const m = try self.st.query(fa.allocator(), "SELECT max(m) FROM (SELECT max(created_at) AS m FROM _zebridge_outbox UNION ALL SELECT max(created_at) FROM _zbz_undo UNION ALL SELECT max(at) FROM _zbz_base)", &.{});
+        const m = try self.st.query(fa.allocator(), "SELECT max(m) FROM (SELECT max(created_at) AS m FROM _zebridge_outbox UNION ALL SELECT max(created_at) FROM _zbz_undo UNION ALL SELECT max(\"at\") FROM _zbz_base)", &.{});
         if (m.len > 0 and m[0][0] == .integer) self.last_created = @max(self.last_created, m[0][0].integer);
         try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_outbox_row ON _zebridge_outbox (tbl, row_id, created_at)");
         try execDdl(&self.st, "CREATE INDEX IF NOT EXISTS _zbz_undo_row ON _zbz_undo (tbl, row_id, created_at)");
@@ -7348,7 +7348,7 @@ pub const SyncClient = struct {
     }
 
     fn saveBaseline(self: *SyncClient, a: std.mem.Allocator, table: []const u8, row_id: []const u8, at: i64, data: storage.Value) !void {
-        _ = try self.st.query(a, "INSERT INTO _zbz_base (tbl,row_id,at,data) VALUES (?,?,?,?) ON CONFLICT(tbl,row_id) DO UPDATE SET at=excluded.at,data=excluded.data", &.{ .{ .text = table }, .{ .text = row_id }, .{ .integer = at }, data });
+        _ = try self.st.query(a, "INSERT INTO _zbz_base (tbl,row_id,\"at\",data) VALUES (?,?,?,?) ON CONFLICT(tbl,row_id) DO UPDATE SET \"at\"=excluded.\"at\",data=excluded.data", &.{ .{ .text = table }, .{ .text = row_id }, .{ .integer = at }, data });
         self.baseline_active = true;
     }
 
@@ -7408,7 +7408,7 @@ pub const SyncClient = struct {
     /// newest authoritative write, whichever is later. Null when neither holds a row.
     fn trustedPrior(self: *SyncClient, a: std.mem.Allocator, table: []const u8, row_id: []const u8) !?Value {
         const r = try self.st.query(a,
-            \\SELECT data FROM (SELECT data, at AS t FROM _zbz_base WHERE tbl=? AND row_id=?
+            \\SELECT data FROM (SELECT data, "at" AS t FROM _zbz_base WHERE tbl=? AND row_id=?
             \\UNION ALL SELECT before, created_at FROM _zebridge_outbox WHERE tbl=? AND row_id=? AND other_incarnation = 0 AND authoritative=1
             \\UNION ALL SELECT before, created_at FROM _zbz_undo WHERE tbl=? AND row_id=? AND authoritative=1) p ORDER BY t DESC LIMIT 1
         , &.{ .{ .text = table }, .{ .text = row_id }, .{ .text = table }, .{ .text = row_id }, .{ .text = table }, .{ .text = row_id } });
@@ -7659,7 +7659,7 @@ pub const SyncClient = struct {
                     // said the row is gone (`row_deleted`).
                     var gone = false;
                     for (ws) |w| gone = gone or (w[4] == .integer and w[4].integer == 1 and w[5] == .text and std.mem.eql(u8, w[5].text, "delete"));
-                    const bases = try s.query(cx.a, "SELECT at,data FROM _zbz_base WHERE tbl=? AND row_id=?", &.{ .{ .text = cx.table }, .{ .text = cx.row_id } });
+                    const bases = try s.query(cx.a, "SELECT \"at\",data FROM _zbz_base WHERE tbl=? AND row_id=?", &.{ .{ .text = cx.table }, .{ .text = cx.row_id } });
                     var stored_base = ws[from][2];
                     if (bases.len > 0 and bases[0][0] == .integer and ws[from][6] == .integer and bases[0][0].integer >= ws[from][6].integer) {
                         stored_base = bases[0][1];
@@ -8611,12 +8611,16 @@ test "outbox: a dropped or re-keyed table takes its queued writes with it" {
 }
 
 fn undoTestClient(a: std.mem.Allocator, path: [:0]const u8) !SyncClient {
+    return undoTestClientOn(a, try storage.Storage.open(path));
+}
+
+fn undoTestClientOn(a: std.mem.Allocator, st: storage.Storage) !SyncClient {
     var client: SyncClient = undefined;
     client.ledger_keys = .{};
     client.ledger_active = false;
     client.baseline_active = false;
     client.a = a;
-    client.st = try storage.Storage.open(path);
+    client.st = st;
     client.states = .empty;
     client.outbox_ready = false;
     client.confirmed = .{};
@@ -10405,6 +10409,22 @@ test "undo: sparse accepted history remains owed through restart until a seed pr
         try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT count(*) FROM _zbz_undo", &.{}))[0][0].integer);
         try std.testing.expectEqual(@as(i64, 0), (try cl.st.query(a, "SELECT count(*) FROM _zebridge_outbox", &.{}))[0][0].integer);
     }
+}
+
+test "the bookkeeping tables and the baseline's statements are valid DuckDB (a reserved word broke the 0.3.0 airports responder)" {
+    if (!@import("engines.zig").duckdb.load()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cl = try undoTestClientOn(a, try storage.Storage.openDuckdb(":memory:"));
+    defer cl.st.close();
+    // The baseline's statements as the client issues them (saveBase, its overlay read, ensureOutbox's max).
+    try cl.st.execSimple("INSERT INTO p VALUES('x','server')");
+    try undoTestWrite(&cl, a, "a", "p", "UPDATE", "x", "title", "A");
+    try cl.st.execSimple("UPDATE p SET title='new server' WHERE id='x'");
+    try undoTestWrite(&cl, a, "b", "p", "UPDATE", "x", "title", "B");
+    try undoTestReject(&cl, a, "b");
+    try std.testing.expectEqualStrings("new server", (try undoTestTitle(&cl, a, "x")).?);
 }
 
 test "undo: the confirmed baseline is the ledger's authoritative before-image, across overlays and reopen" {
