@@ -1081,7 +1081,12 @@ pub const BatchPublisher = struct {
                     try self.publishCDCSubBatch(cdc_indices.items);
                     cdc_indices.clearRetainingCapacity();
                 }
-                _ = self.members.remove(event.getSubject()[roster_note_prefix.len..]);
+                const principal = event.getSubject()[roster_note_prefix.len..];
+                const set = if (event.column_count > 0) blk: {
+                    const col = event.columns[0];
+                    break :blk event.data_buffer[col.valueOffset()..][0..col.value_len];
+                } else "[]";
+                if (std.mem.eql(u8, set, "[]")) _ = self.members.remove(principal) else self.setMembers(principal, set);
                 continue;
             }
             if (std.mem.startsWith(u8, event.getSubject(), Config.Nats.kv_subject_prefix)) {
@@ -1362,7 +1367,10 @@ pub const BatchPublisher = struct {
     fn noteMembers(self: *BatchPublisher, subject: []const u8, value: []const u8) void {
         const routing = self.tenant_routing orelse return;
         if (routing.tenants_kv_prefix.len == 0 or !std.mem.startsWith(u8, subject, routing.tenants_kv_prefix)) return;
-        const principal = subject[routing.tenants_kv_prefix.len..];
+        self.setMembers(subject[routing.tenants_kv_prefix.len..], value);
+    }
+
+    fn setMembers(self: *BatchPublisher, principal: []const u8, value: []const u8) void {
         if (principal.len == 0) return;
         if (self.members_arena == null) self.members_arena = std.heap.ArenaAllocator.init(self.allocator);
         const ma = self.members_arena.?.allocator();
