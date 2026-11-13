@@ -32,22 +32,23 @@ A ZeBridge write counts when its verdict returns, after admission, the receipt a
 | 10 clients × 1,000 writes | **6,971–8,578/s**, 0.18–0.30 s | 6,094–6,494/s, **30–36 ms** | 2,054–2,210/s, 2.2 s | **5,568–6,911/s, 0.35–0.71 s** |
 | A write reaching another client, median | **53–54 ms** | 73–74 ms | **143–156 ms** | 212 ms |
 
-The crowd: 500 light writers (ZeBridge: one NATS connection each, publishing writes; PowerSync: apps uploading to PostgREST as `uploadData` does, up to 200 rows a request) offered a fixed rate for 30 s; committed is PostgreSQL's own row count, sampled every second. ZeBridge 8 lanes, PostgREST 30 connections:
+The crowd: 500 light writers sending unordered inserts (ZeBridge: one NATS connection each, publishing writes with a `client_id` and no ordering envelope, so no write waits for another; PowerSync: apps uploading to PostgREST as `uploadData` does, up to 200 rows a request) offered a fixed rate for 30 s; committed is PostgreSQL's own row count, sampled every second. ZeBridge 8 lanes, PostgREST 30 connections:
 
 | Offered | ZeBridge, same machine | PowerSync, same machine | ZeBridge, 29 ms | PowerSync, 29 ms |
 | --- | --- | --- | --- | --- |
 | 500/s | 498/s, median 9 ms | 503/s, 8 ms | **511/s, 184 ms** | 418–441/s, 3.5–4.5 s |
 | 1,000/s | 1,009/s, 8 ms | 1,005/s, 8 ms | **1,021/s, 0.20–0.21 s** | 878–895/s, 3.8 s |
 | 2,000/s | 2,012/s, 8 ms | 2,040/s, 8 ms | **1,932–2,001/s, 0.31–0.46 s** | 1,714–1,718/s, 4.0 s |
-| 5,000/s | **5,000/s, 10 ms** | 4,942/s, 485 ms | 1,547–2,179/s, 17 s (queued) | **4,325/s, 4.2 s** |
+| 5,000/s | **5,000/s, 10 ms** | 4,942/s, 485 ms | 1,547–2,179/s; median 17 s of the verdicts seen before collection stopped | **4,325/s, 4.2 s** |
 | 10,000/s | **9,900/s, 16 ms** | 9,792/s, 415 ms | not run | not run |
 
-Every write was committed on both sides. At 29 ms, PostgREST answered `504` (pool timeout) 60 to 121 times a run, and the apps retried until each write landed; ZeBridge's writes past its ceiling waited in its queue and were all committed after the run.
+Every write was committed on both sides, with one exception at 29 ms and 5,000/s offered. ZeBridge's first run ended with 84,654 writes without a verdict, still in its queue, and the run's teardown removed that queue. A rerun with a 90-second drain verified the exact final PostgreSQL count: every write sent (209,985 rows, the 2,000/s and 5,000/s runs together) was committed. That count establishes completeness for the rerun, but gives no latency for the verdicts that came after collection stopped. At 29 ms, PostgREST answered `504` (pool timeout) 60 to 121 times a run, and the apps retried until each write landed.
 
 **How to read it.**
 
-- **On the same machine the two are level:** both commit what is offered up to 10,000 writes/s. From 5,000/s ZeBridge confirms in 10–16 ms where PowerSync's acknowledgements take 415–485 ms.
-- **At 29 ms, ZeBridge's ceiling is about 2,000 writes/s with 8 lanes**, and below it ZeBridge confirms 10 to 20 times sooner (0.2–0.5 s against about 4 s). The ceiling is round trips, not the database: each lane's batch makes about 18 round trips (receipts looked up, locked and recorded; the GC floor; one statement a row), so at 29 ms a lane spends about 4 ms a write; PostgreSQL meanwhile waits on the bridge, with no lock contention. **Put the bridge as close to PostgreSQL as you can.**
+- **The workload decides which comes out ahead.** At 29 ms, with 500 light writers offering 1,000 writes/s, ZeBridge's median verdict was 0.20–0.21 s against 3.8 s for PostgREST's acknowledgement; on the same setup, ten real clients draining bursts got 2,054–2,210 writes/s through ZeBridge and 5,568–6,911/s through PowerSync.
+- **On the same machine the aggregate throughput is level:** both commit what is offered up to 10,000 writes/s (9,900 and 9,792/s at 10,000/s offered). The confirmations are not: from 5,000/s ZeBridge's median is 10–16 ms, PowerSync's acknowledgements 415–485 ms.
+- **At 29 ms, for unordered inserts, ZeBridge's ceiling was about 2,000 writes/s with 8 lanes**, and below it ZeBridge confirmed 10 to 20 times sooner (0.2–0.5 s against about 4 s). All eight lanes were busy, each averaging about 4 ms a write, which gives roughly 2,000 writes/s across the bridge; database round-trip time was the main constraint in this run (SQL execution took about 85 ms of a lane's ~540 ms per batch; PostgreSQL waited on the bridge, with no lock contention). Ordered writes, the SDKs' default, also park and release and were not measured here. **Put the bridge as close to PostgreSQL as you can.**
 - **PowerSync wins bursts from few clients at a distance**, 2 to 3 times: its SDK uploads up to 200 rows per request, one multi-row `INSERT`, where each ZeBridge write is judged on its own, with its receipt, its tenant's authorization and its verdict.
 - **A write reaches other clients sooner with ZeBridge**, at either distance.
 
