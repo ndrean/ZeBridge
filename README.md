@@ -104,7 +104,7 @@ return { invite: rows[0].code }; // in the login response
 
 ### The app
 
-The app passes the code to the library on its first start. The library enrolls the device, stores its identity, seeds its replica and follows changes; later starts need no code, and the library renews the device's credentials by itself. See [Users: invites](AUTHENTICATION.md#users-invites) for other ways to deliver the code (a link, an email) and the enrollment steps.
+The app passes the code to the library on its first start. The library enrolls the device, stores its identity, seeds its replica and follows changes; later starts need no code, and the library renews the device's credentials by itself. See [How a device gets access](AUTHENTICATION.md#how-a-device-gets-access) for the role of the NATS operator, the bridge and the device key. [Users: invites](AUTHENTICATION.md#users-invites) shows how to deliver the code.
 
 For a browser app:
 
