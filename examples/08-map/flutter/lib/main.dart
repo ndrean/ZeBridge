@@ -27,7 +27,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 // import 'package:flutter/foundation.dart' show debugPrint;
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:pmtiles/pmtiles.dart';
@@ -97,6 +97,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   bool asking = false;
   Timer? askDebounce;
   Timer? refreshDebounce;
+
   /// §10ic: the LAST ANSWER, unfiltered — not a local table. Persisting the markers
   /// made the map draw the union of everywhere the phone had been rather than what was
   /// in view, so a zoom-out showed clusters from earlier pans. The stations never had
@@ -125,6 +126,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   final routeMine = <String,
       dynamic>{}; // this phone's own registers, shipped whole on every write
   int routeRounds = 0;
+
   /// §10if: which end a tap moves. Null means the old behaviour — alternate start, end,
   /// start — which is the only thing either client had and which cannot move ONE end
   /// twice in a row. Tap a pin to take hold of it; tap it again to let go.
@@ -392,7 +394,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       if (mounted) {
         setState(() => status =
             '${ans['count']} charger(s) within ${(radius / 1000).toStringAsFixed(0)} km · '
-            '${_transport(ans)} · $ms ms total');
+                '${_transport(ans)} · $ms ms total');
       }
       await _refresh();
     } catch (e) {
@@ -476,13 +478,12 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
                 : 'tap near an end to take hold of it · $writers';
       });
     }
-      // §10ie: the line between the two pins, straight. Valhalla drew it by road
-      // until it was dropped; it cost a 4 GB extract and a container per region and
-      // said nothing about replication, tenancy or a phone that can write. The browser
-      // always drew this line, and the two clients now agree.
-      setState(() => routeLine = pins.length == 2
-          ? [pins[0].value, pins[1].value]
-          : const []);
+    // §10ie: the line between the two pins, straight. Valhalla drew it by road
+    // until it was dropped; it cost a 4 GB extract and a container per region and
+    // said nothing about replication, tenancy or a phone that can write. The browser
+    // always drew this line, and the two clients now agree.
+    setState(() => routeLine =
+        pins.length == 2 ? [pins[0].value, pins[1].value] : const []);
   }
 
   /// This phone's registers merged into the document it last saw — the union, whole.

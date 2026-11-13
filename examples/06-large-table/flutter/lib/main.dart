@@ -13,7 +13,7 @@ library;
 import 'dart:async';
 import 'dart:io';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
 
@@ -21,16 +21,18 @@ import 'package:zebridge/zebridge.dart';
 
 /// The simulator shares the Mac's network; a real phone needs the Mac's LAN address:
 ///   flutter run -d `<device>` --dart-define=ZB_NATS_URL=nats://192.168.1.11:4222
-const natsUrl = String.fromEnvironment('ZB_NATS_URL', defaultValue: 'nats://127.0.0.1:4222');
+const natsUrl = String.fromEnvironment(
+  'ZB_NATS_URL',
+  defaultValue: 'nats://127.0.0.1:4222',
+);
 const principal = 'bob'; // on globex, the tenant that holds the fixture
 /// The table to follow: `--dart-define=ZB_TABLE=fire_types` for the capacity scenarios
 /// (NOTES §10jc), `test_types` — the 3M-row fixture — by default.
 const table = String.fromEnvironment('ZB_TABLE', defaultValue: 'test_types');
 
-void main() => runApp(const MaterialApp(
-      debugShowCheckedModeBanner: false,
-      home: SeedScreen(),
-    ));
+void main() => runApp(
+  const MaterialApp(debugShowCheckedModeBanner: false, home: SeedScreen()),
+);
 
 class SeedScreen extends StatefulWidget {
   const SeedScreen({super.key});
@@ -69,19 +71,35 @@ class _SeedScreenState extends State<SeedScreen> {
   void _say(String line) => setState(() => _log.add(line));
 
   Future<void> _start() async {
-    setState(() { _phase = 'starting'; _error = null; _facts = null; _log.clear(); });
+    setState(() {
+      _phase = 'starting';
+      _error = null;
+      _facts = null;
+      _log.clear();
+    });
     try {
       // The creds travel as a bundled asset (dev only) and libzb wants a file path;
       // the replica lives in the app's own support directory, kept across launches.
       final dir = await getApplicationSupportDirectory();
       final creds = File('${dir.path}/$principal.creds');
-      await creds.writeAsString(await rootBundle.loadString('assets/creds/$principal.creds'));
+      await creds.writeAsString(
+        await rootBundle.loadString('assets/creds/$principal.creds'),
+      );
       _dbPath = '${dir.path}/zebridge_$principal.sqlite3';
       final fresh = !File(_dbPath).existsSync();
-      _say(fresh ? 'fresh replica — the seed is the whole table' : 'replica present — no seed unless the chain moved');
+      _say(
+        fresh
+            ? 'fresh replica — the seed is the whole table'
+            : 'replica present — no seed unless the chain moved',
+      );
 
-      _clock..reset()..start();
-      _tick = Timer.periodic(const Duration(milliseconds: 100), (_) => setState(() {}));
+      _clock
+        ..reset()
+        ..start();
+      _tick = Timer.periodic(
+        const Duration(milliseconds: 100),
+        (_) => setState(() {}),
+      );
       setState(() => _phase = 'connect + seed');
       _say('connecting to $natsUrl as $principal, following [$table]');
 
@@ -103,12 +121,20 @@ class _SeedScreenState extends State<SeedScreen> {
       // §10iz: "usable" is a claim about the table, not about the call returning.
       final failed = w.unseeded.where((u) => u['table'] == table).toList();
       if (failed.isNotEmpty) {
-        setState(() { _phase = 'failed'; _error = '$table: seeding failed: ${failed.first['reason']} — libzb retries at each poll'; });
-        _say('not seeded after ${_secs(_clock.elapsedMilliseconds)}: ${failed.first['reason']}');
+        setState(() {
+          _phase = 'failed';
+          _error =
+              '$table: seeding failed: ${failed.first['reason']} — libzb retries at each poll';
+        });
+        _say(
+          'not seeded after ${_secs(_clock.elapsedMilliseconds)}: ${failed.first['reason']}',
+        );
         return;
       }
       setState(() => _phase = 'usable');
-      _say('usable after ${_secs(_clock.elapsedMilliseconds)} (tenant ${w.tenant})');
+      _say(
+        'usable after ${_secs(_clock.elapsedMilliseconds)} (tenant ${w.tenant})',
+      );
 
       await _check();
       _reportsSub = w.reports.listen((r) {
@@ -124,7 +150,10 @@ class _SeedScreenState extends State<SeedScreen> {
     } catch (e) {
       _clock.stop();
       _tick?.cancel();
-      setState(() { _phase = 'failed'; _error = '$e'; });
+      setState(() {
+        _phase = 'failed';
+        _error = '$e';
+      });
     }
   }
 
@@ -132,9 +161,11 @@ class _SeedScreenState extends State<SeedScreen> {
   Future<void> _check() async {
     final w = _worker;
     if (w == null) return;
-    final rows = await w.query(table == 'test_types'
-        ? 'SELECT count(*) AS count, count(DISTINCT uid) AS "distinct", sum(age) AS sum FROM $table'
-        : 'SELECT count(*) AS count, NULL AS "distinct", sum(age) AS sum FROM $table');
+    final rows = await w.query(
+      table == 'test_types'
+          ? 'SELECT count(*) AS count, count(DISTINCT uid) AS "distinct", sum(age) AS sum FROM $table'
+          : 'SELECT count(*) AS count, NULL AS "distinct", sum(age) AS sum FROM $table',
+    );
     final size = File(_dbPath).existsSync() ? File(_dbPath).lengthSync() : 0;
     setState(() => _facts = {...rows.first, 'bytes': size});
   }
@@ -159,89 +190,150 @@ class _SeedScreenState extends State<SeedScreen> {
   static String _n(Object? v) {
     if (v == null) return '—'; // an empty table's sum is NULL
     final n = int.tryParse('$v') ?? 0;
-    return n.toString().replaceAllMapped(RegExp(r'(\d)(?=(\d{3})+$)'), (m) => '${m[1]},');
+    return n.toString().replaceAllMapped(
+      RegExp(r'(\d)(?=(\d{3})+$)'),
+      (m) => '${m[1]},',
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    const mono = TextStyle(fontFamily: 'Menlo', fontSize: 13, color: Color(0xFFCCCCCC));
+    const mono = TextStyle(
+      fontFamily: 'Menlo',
+      fontSize: 13,
+      color: Color(0xFFCCCCCC),
+    );
     final dim = mono.copyWith(color: const Color(0xFF888888));
     return Scaffold(
       backgroundColor: const Color(0xFF121212),
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(14),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('ZeBridge — one large table, libzb',
-                style: TextStyle(color: Color(0xFFE0E0E0), fontSize: 18, fontWeight: FontWeight.w700)),
-            const SizedBox(height: 4),
-            const Text('$table as bob, seeded from the generation chain by the C client: streamed, '
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'ZeBridge — one large table, libzb',
+                style: TextStyle(
+                  color: Color(0xFFE0E0E0),
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                '$table as bob, seeded from the generation chain by the C client: streamed, '
                 'sorted per window, applied in Zig. One database, kept across launches.',
-                style: TextStyle(color: Color(0xFF999999), fontSize: 12)),
-            const SizedBox(height: 14),
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
+                style: TextStyle(color: Color(0xFF999999), fontSize: 12),
+              ),
+              const SizedBox(height: 14),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
                   color: const Color(0xFF1C1C1C),
                   border: Border.all(color: const Color(0xFF333333)),
-                  borderRadius: BorderRadius.circular(6)),
-              child: Row(children: [
-                Expanded(
-                    child: Text(
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
                         _phase == 'connect + seed'
                             ? 'connecting + seeding…  (libzb reports nothing until it is done)'
                             : _phase,
-                        style: dim)),
-                Text(_secs(_clock.elapsedMilliseconds),
-                    style: const TextStyle(fontFamily: 'Menlo', fontSize: 24, color: Color(0xFFE0E0E0))),
-              ]),
-            ),
-            const SizedBox(height: 12),
-            if (_facts != null) ...[
-              _fact('rows', _n(_facts!['count']), mono, dim),
-              if (_facts!['distinct'] != null) _fact('distinct uid', _n(_facts!['distinct']), mono, dim),
-              _fact('sum(age)', _n(_facts!['sum']), mono, dim),
-              _fact('connect → usable', _secs(_clock.elapsedMilliseconds), mono, dim),
-              _fact('replica', '${((_facts!['bytes'] as int) / 1e9).toStringAsFixed(2)} GB', mono, dim),
-              const SizedBox(height: 10),
-            ],
-            if (_error != null)
-              Text(_error!, style: mono.copyWith(color: const Color(0xFFEF9A9A))),
-            const SizedBox(height: 6),
-            if (_polls > 0)
-              Text('following: ${_n(_applied)} event(s) applied in ${_n(_polls)} report(s)${_pollErrors > 0 ? ', $_pollErrors error(s)' : ''}',
-                  style: dim),
-            const SizedBox(height: 6),
-            Row(children: [
-              OutlinedButton(
-                onPressed: _phase == 'connect + seed' ? null : _wipe,
-                child: const Text('wipe & seed again'),
-              ),
-              const SizedBox(width: 10),
-              OutlinedButton(
-                onPressed: _facts == null ? null : _check,
-                child: const Text('check (count, sum)'),
-              ),
-            ]),
-            const SizedBox(height: 10),
-            Expanded(
-              child: Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(color: const Color(0xFF0D0D0D), border: Border.all(color: const Color(0xFF2A2A2A))),
-                child: SingleChildScrollView(
-                  child: Text(_log.join('\n'), style: mono.copyWith(fontSize: 11, color: const Color(0xFF9E9E9E))),
+                        style: dim,
+                      ),
+                    ),
+                    Text(
+                      _secs(_clock.elapsedMilliseconds),
+                      style: const TextStyle(
+                        fontFamily: 'Menlo',
+                        fontSize: 24,
+                        color: Color(0xFFE0E0E0),
+                      ),
+                    ),
+                  ],
                 ),
               ),
-            ),
-          ]),
+              const SizedBox(height: 12),
+              if (_facts != null) ...[
+                _fact('rows', _n(_facts!['count']), mono, dim),
+                if (_facts!['distinct'] != null)
+                  _fact('distinct uid', _n(_facts!['distinct']), mono, dim),
+                _fact('sum(age)', _n(_facts!['sum']), mono, dim),
+                _fact(
+                  'connect → usable',
+                  _secs(_clock.elapsedMilliseconds),
+                  mono,
+                  dim,
+                ),
+                _fact(
+                  'replica',
+                  '${((_facts!['bytes'] as int) / 1e9).toStringAsFixed(2)} GB',
+                  mono,
+                  dim,
+                ),
+                const SizedBox(height: 10),
+              ],
+              if (_error != null)
+                Text(
+                  _error!,
+                  style: mono.copyWith(color: const Color(0xFFEF9A9A)),
+                ),
+              const SizedBox(height: 6),
+              if (_polls > 0)
+                Text(
+                  'following: ${_n(_applied)} event(s) applied in ${_n(_polls)} report(s)${_pollErrors > 0 ? ', $_pollErrors error(s)' : ''}',
+                  style: dim,
+                ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  OutlinedButton(
+                    onPressed: _phase == 'connect + seed' ? null : _wipe,
+                    child: const Text('wipe & seed again'),
+                  ),
+                  const SizedBox(width: 10),
+                  OutlinedButton(
+                    onPressed: _facts == null ? null : _check,
+                    child: const Text('check (count, sum)'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Expanded(
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0D0D0D),
+                    border: Border.all(color: const Color(0xFF2A2A2A)),
+                  ),
+                  child: SingleChildScrollView(
+                    child: Text(
+                      _log.join('\n'),
+                      style: mono.copyWith(
+                        fontSize: 11,
+                        color: const Color(0xFF9E9E9E),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
   }
 
   Widget _fact(String k, String v, TextStyle mono, TextStyle dim) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 2),
-        child: Row(children: [SizedBox(width: 150, child: Text(k, style: dim)), Text(v, style: mono)]),
-      );
+    padding: const EdgeInsets.symmetric(vertical: 2),
+    child: Row(
+      children: [
+        SizedBox(width: 150, child: Text(k, style: dim)),
+        Text(v, style: mono),
+      ],
+    ),
+  );
 }
