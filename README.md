@@ -146,7 +146,18 @@ The TypeScript client drives its own synchronization loop. With native `libzb`, 
 
 ### Write order: what waits for what
 
-⚠️ On tables that support ordering, a write waits by default for this client's most recent unsettled ordered write. That lets you queue an order and then its lines without a line overtaking the order. Use `after` to name a specific earlier write from the same client. Use `independent` for a write such as a page view that can be judged in any order. It can still wait for a free lane or a database lock.
+**Why.** The bridge applies writes in parallel, on up to 8 lanes, each with its own connection to PostgreSQL. Two writes made one after the other on a device could therefore reach PostgreSQL in either order. A user creates an order, then a line of that order: if the line arrives first, its foreign key refuses it, although the app did everything right.
+
+```
+device:            INSERT orders #1   then   INSERT order_lines #10 (order_id 1)
+bridge:            lane 3 takes #1           lane 5 takes #10
+without ordering:  #10 can reach PostgreSQL first → refused by its foreign key
+with ordering:     #10 waits for the verdict of #1 → applied after it
+```
+
+**What.** Ordering makes a write wait for the verdict of an earlier write from the same device, so a write is never judged before the one it depends on. It does not turn them into one transaction: each write still gets its own verdict.
+
+**What a table needs: nothing of its own.** Every writable table (`zebridge_enable(…, writable => true)`) supports ordering with a bridge and client libraries from 0.3.0 on, once that version's init SQL is applied. The clients order writes by default: each waits for this device's most recent unsettled write. Use `after` to name a specific earlier write instead, and `independent` for a write that depends on nothing, such as a page view; it can still wait for a free lane or a database lock.
 
 The default is also a constraint: a slow write (a long trigger, a lock) delays later writes that depend on it, directly or through the tail. Ordering never spans clients: a line written on a phone cannot wait for an order written on a laptop.
 
@@ -187,7 +198,7 @@ What to know:
 - `after` means "wait for that write's verdict", not "only if it succeeded". A refused parent still lets its child be judged; your foreign keys decide what happens to the child.
 - Two writes can name the same parent, for example two lines of one order. Either may be judged first. A later write without options follows whichever of them was made last, not both.
 - An ID is returned only for a write that was queued. A write refused on the device before it was queued (for example, one older than what the server still keeps) has no ID: `mutateWithId()` rejects, so nothing can be made to wait for it.
-- `after` and `independent` work on tables whose bridge offers ordering, which a current bridge does for every writable table. `after` is refused on a table that does not offer it, and so is an ID that is not one of this device's writes.
+- `after` is refused before anything is queued on a table whose bridge does not offer ordering (a bridge before 0.3.0), and so is an ID that is not one of this device's writes.
 
 The details are in [Clients: ordering a write](CLIENTS.md#ordering-a-write) and the protocol in [PROTOCOL, Ordered ingress](PROTOCOL.md#ordered-ingress-version-1).
 
