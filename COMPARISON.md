@@ -39,10 +39,10 @@ The crowd: 500 light writers sending unordered inserts (ZeBridge: one NATS conne
 | 500/s | 498/s, median 9 ms | 503/s, 8 ms | **511/s, 184 ms** | 418–441/s, 3.5–4.5 s |
 | 1,000/s | 1,009/s, 8 ms | 1,005/s, 8 ms | **1,021/s, 0.20–0.21 s** | 878–895/s, 3.8 s |
 | 2,000/s | 2,012/s, 8 ms | 2,040/s, 8 ms | **1,932–2,001/s, 0.31–0.46 s** | 1,714–1,718/s, 4.0 s |
-| 5,000/s | **5,000/s, 10 ms** | 4,942/s, 485 ms | 1,547–2,179/s; median 17 s of the verdicts seen before collection stopped | **4,325/s, 4.2 s** |
+| 5,000/s | **5,000/s, 10 ms** | 4,942/s, 485 ms | 2,179/s, 17.5 s | **4,325/s, 4.2 s** |
 | 10,000/s | **9,900/s, 16 ms** | 9,792/s, 415 ms | not run | not run |
 
-Every write was committed on both sides, with one exception at 29 ms and 5,000/s offered. ZeBridge's first run ended with 84,654 writes without a verdict, still in its queue, and the run's teardown removed that queue. A rerun with a 90-second drain verified the exact final PostgreSQL count: every write sent (209,985 rows, the 2,000/s and 5,000/s runs together) was committed. That count establishes completeness for the rerun, but gives no latency for the verdicts that came after collection stopped. At 29 ms, PostgREST answered `504` (pool timeout) 60 to 121 times a run, and the apps retried until each write landed.
+Every write was committed on both sides. At 29 ms and 5,000/s offered, ZeBridge queued what it could not take: the run was given a 90-second drain, and the final PostgreSQL count was exact (209,985 rows, the 2,000/s and 5,000/s runs together). Its median covers the 120,477 verdicts received within the measurement; the other 29,512 writes were committed during the drain. At 29 ms, PostgREST answered `504` (pool timeout) 60 to 121 times a run, and the apps retried until each write landed.
 
 **How to read it.**
 
@@ -82,8 +82,18 @@ PowerSync's documented production layout, as the crowd ran it:
 
 PowerSync Cloud runs the service, its storage and the balancer for you. ZeBridge's hub, against the same clients, is four processes: NATS, the bridge, admission and the sweeper.
 
-## What a disconnect does to a write
+## Tenant access and write outcomes
 
-With ZeBridge, a write sent again after a lost connection meets its receipt in PostgreSQL: it is applied once, and the client receives the verdict of the first attempt. A refused write gets its own verdict.
+Both systems can isolate tenants. In ZeBridge you designate the tenant column and map principals to tenants. NATS credentials restrict which private snapshots and change streams a device can read. On a write, the bridge sets the authenticated principal in the PostgreSQL transaction and row-level security checks the row. In PowerSync you express download access in Sync Streams using authenticated identity or membership data. Uploads go through your API, where you enforce write access, for example with Supabase RLS. [PowerSync: RLS and Sync Streams](https://docs.powersync.com/integrations/supabase/rls-and-sync-streams.md)
 
-With PowerSync, the SDK keeps the write in its upload queue and calls `uploadData()` again after the reconnect; if the backend had committed it and only the reply was lost, the same operations arrive again, and PowerSync's documentation leaves it to the backend to detect them by the client's and the operation's IDs. A backend error makes the SDK retry the upload indefinitely, blocking the queue, so the documentation advises answering 2xx even for a refused write and reporting the refusal some other way, for example in a table synced back to the client.
+### What a disconnect does to a write
+
+Suppose a phone submits an order, PostgreSQL commits it, and the reply is lost. ZeBridge commits the order and its receipt in the same transaction. The outbox resends the original write ID and payload. A matching retained receipt returns the original outcome without applying the order again. If the ID has expired and its receipt is gone, the bridge returns `indeterminate`. The client reconciles from the hub and never reissues the order under a fresh ID. [ZeBridge protocol](PROTOCOL.md#74c-reconciling-an-indeterminate-write)
+
+PowerSync keeps an incomplete upload in its local queue and retries through the app's `uploadData()` connector. The backend can make that retry idempotent, for example by recording an operation ID with the order. The SDK leaves the endpoint and its response format to the application. [PowerSync: Writing Client Changes](https://docs.powersync.com/handling-writes/writing-client-changes.md)
+
+### What the app learns when PostgreSQL refuses a write
+
+If an order line violates a foreign key, ZeBridge reports `rejected` for that write ID with PostgreSQL's SQLSTATE. The client removes the entry from its send queue and reconciles the optimistic edit. Other writes receive their own verdicts. PowerSync also brings the replica back to server state once uploads complete and sync catches up. Its recommended pattern for a permanent rejection is to complete the upload and communicate the reason in the successful response or through a synced error table. The app chooses how to associate that reason with the edit. [ZeBridge protocol](PROTOCOL.md) · [PowerSync: Handling Write / Validation Errors](https://docs.powersync.com/handling-writes/handling-write-validation-errors.md)
+
+In the write benchmark, PostgREST used the same writer role and tenant policy as ZeBridge. A ZeBridge confirmation included a durable per-write receipt. A PowerSync confirmation meant the connector completed its PostgREST upload. The throughput runs timed these two paths. They did not test a lost reply or audit isolation between tenants.
