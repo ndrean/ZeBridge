@@ -410,6 +410,7 @@ See [SCOPE](SCOPE.md) for the boundaries and [SECURITY](SECURITY.md) for tenant 
 | Shared plans, a map and routing                      | [Depot](examples/14-depot/README.md), [running live](https://bridge.zebridge.eu/demo) |
 | Several editors on one record                        | [Shared record](examples/15-shared-record/README.md)                                  |
 | Archiving readings to Parquet                        | [Archive](examples/16-archive/README.md)                                              |
+| Collaborative text, including offline edits          | [Yjs](examples/17-yjs/README.md)                                                      |
 
 ## Testing and performance
 

@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.sqlite3*
+*.identity
+.env.local

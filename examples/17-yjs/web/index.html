@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ZeBridge · Yjs collaborative text</title>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">ZeBridge example 17 · Yjs</p>
+      <h1>One document, concurrent edits.</h1>
+      <p>Open the same document as two editors. Take both offline, type in each, then reconnect.
+        Yjs merges the edits; ZeBridge stores and synchronizes the binary updates.</p>
+      <div class="toolbar">
+        <button id="network" disabled>Go offline</button>
+        <button id="download">Download text</button>
+        <a id="new-document">New document</a>
+        <span id="status" role="status">Starting…</span>
+      </div>
+      <p id="who" class="meta"></p>
+      <div id="editor"></div>
+      <p id="error" role="alert"></p>
+      <p id="stats" class="meta"></p>
+      <p class="meta">Document <code id="document"></code></p>
+      <details>
+        <summary>Try it with another editor</summary>
+        <p>Use <code>?as=alice</code> and <code>?as=bob</code> in the local dev stack,
+          with both principals mapped to the same tenant. Keep the same <code>doc</code> parameter.
+          With enrollment, give each editor its own invite.</p>
+        <p>Each editor name has a separate local replica. Use one tab per editor name.
+          Reload after reconnecting to verify that the text reconstructs from stored updates.</p>
+      </details>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

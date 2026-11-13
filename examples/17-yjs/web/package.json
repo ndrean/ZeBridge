@@ -1,0 +1,30 @@
+{
+  "name": "zb-yjs-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test:live": "node --experimental-strip-types test/live.ts",
+    "compact": "node --experimental-strip-types scripts/compact.ts",
+    "test:compaction": "node --experimental-strip-types --test test/compaction.live.ts",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@zebridge/client": "link:../../../zb-client-ts",
+    "@codemirror/commands": "^6.8.0",
+    "@codemirror/state": "^6.5.0",
+    "@codemirror/view": "^6.36.0",
+    "y-codemirror.next": "^0.3.5",
+    "yjs": "^13.6.27"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.15.0",
+    "@types/node": "^24.3.0",
+    "pg": "^8.16.0",
+    "typescript": "^5.7.2",
+    "vite": "^8.2.0"
+  }
+}
