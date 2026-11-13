@@ -68,6 +68,10 @@ CREATE OR REPLACE FUNCTION public.yjs_updates_replace_take() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog AS $$
 BEGIN
     IF NEW.replaces IS NOT NULL THEN
+        -- An empty value would be set aside as '' and read back as "no list": refuse it here.
+        IF btrim(NEW.replaces) = '' THEN
+            RAISE EXCEPTION 'replaces must be a JSON array of update IDs' USING ERRCODE = '23514';
+        END IF;
         PERFORM set_config('yjs_replaces.r' || replace(NEW.id::text, '-', ''), NEW.replaces, true);
         NEW.replaces := NULL;
     END IF;

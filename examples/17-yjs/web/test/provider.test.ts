@@ -194,7 +194,7 @@ test('compaction merges only confirmed updates and names exactly those it replac
     const result = await provider.compact();
     assert.equal(result.compacted, true);
     const replacement = r.sent.at(-1);
-    assert.deepEqual(JSON.parse(replacement.replaces), [first, second].sort());
+    assert.deepEqual(JSON.parse(replacement.replaces).sort(), [first, second].sort(), 'a set: the picker orders by size');
     const fresh = new Y.Doc();
     Y.applyUpdate(fresh, replacement.update_data);
     assert.equal(fresh.getText('content').toString(), 'one two ', 'the merge holds exactly its inputs');

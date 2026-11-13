@@ -192,7 +192,7 @@ test('a writer compaction is refused outside its document, twice, or malformed, 
     const self = randomUUID();
     await refused(replace(edge, id, rows, JSON.stringify([rows[0].id, self]), self), /distinct and exclude/);
     await refused(replace(edge, id, rows, JSON.stringify([rows[0].id, rows[0].id])), /distinct and exclude/);
-    for (const bad of ['not json', '{"a":1}', '["x"]', '[1]']) await refused(replace(edge, id, rows, bad), /JSON array of update IDs/);
+    for (const bad of ['', '  ', 'not json', '{"a":1}', '["x"]', '[1]']) await refused(replace(edge, id, rows, bad), /JSON array of update IDs/);
     await refused(replace(edge, id, rows, '[]'), /1 to 256/);
     await refused(replace(edge, id, rows, JSON.stringify(Array.from({ length: 257 }, randomUUID))), /1 to 256/);
     assert.equal((await active(c, id)).length, 3, 'every refusal left the inputs active and added nothing');
