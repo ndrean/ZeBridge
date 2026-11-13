@@ -8,6 +8,7 @@ import { makePgliteStorage } from './pglite-storage.ts';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { decode } from '@msgpack/msgpack';
 
 function fixture(count = 300) {
   const db = new DatabaseSync(':memory:');
@@ -17,7 +18,7 @@ function fixture(count = 300) {
   db.exec(`CREATE TABLE _zebridge_base(tbl TEXT NOT NULL,row_id TEXT NOT NULL,at INTEGER NOT NULL,data TEXT,PRIMARY KEY(tbl,row_id))`);
   for (let i = 0; i < count; i++) db.prepare('INSERT INTO _zebridge_outbox(msg_id,subject,payload,tbl,row_id,created_at) VALUES (?,?,?,?,?,?)')
     .run(`id${i}`, 'mutation.alice.item.insert', '{}', 'item', String(i), i);
-  const gets: string[] = [], sends: string[] = [];
+  const gets: string[] = [], sends: string[] = [], messages: any[] = [];
   let managers = 0, fail = false, stored = '', holding = false;
   const held: Array<() => void> = [];
   const make = () => {
@@ -47,6 +48,7 @@ function fixture(count = 300) {
           } } };
         },
         jetstream: () => ({publish: async (_s: string, _b: Uint8Array, opts: any) => {
+          messages.push(decode(_b));
           sends.push(opts.headers.get('Nats-Msg-Id')); const seq = sends.length;
           if (holding) await new Promise<void>((r) => held.push(r)); // the ack, released by the test
           if (fail) throw new Error('hub unavailable'); return {seq};
@@ -54,9 +56,30 @@ function fixture(count = 300) {
       },
     }); return c;
   };
-  return {db, gets, sends, make, managers: () => managers, fail: (v: boolean) => {fail=v;}, stored: (v: string) => {stored=v;},
+  return {db, gets, sends, messages, make, managers: () => managers, fail: (v: boolean) => {fail=v;}, stored: (v: string) => {stored=v;},
     hold: (v: boolean) => {holding=v;}, held: () => held.length, release: () => {for (const r of held.splice(0)) r();}};
 }
+
+test('binary outbox payloads survive durable JSON storage and publish as MessagePack bin after restart', async () => {
+  const f = fixture(0), c = f.make();
+  c.dialect = sqliteDialect;
+  let restarted: any;
+  try {
+    await c.createOutboxTable();
+    const bytes = Uint8Array.from({ length: 70_003 }, (_, i) => i % 256);
+    await c.outboxPut({ msgId: 'binary', subject: 'mutation.alice.item.insert', table: 'item', id: 'x',
+      payload: { key: { id: 'x' }, data: { bytes, empty: new Uint8Array(0), buffer: Buffer.from([0, 255, 128]) } },
+      before: null, optimistic: { operation: 'INSERT', data: { id: 'x', bytes } } });
+    // A fresh client must read the durable payload, rather than using an in-memory copy.
+    restarted = f.make();
+    await restarted.recoverOutbox();
+    assert.equal(f.messages.length, 1);
+    assert.ok(f.messages[0].data.bytes instanceof Uint8Array);
+    assert.deepEqual(f.messages[0].data.bytes, bytes);
+    assert.deepEqual(f.messages[0].data.empty, new Uint8Array(0));
+    assert.deepEqual(f.messages[0].data.buffer, new Uint8Array([0, 255, 128]));
+  } finally { c.nc = null; if (restarted) { restarted.nc = null; await restarted.outboxWork; } f.db.close(); }
+});
 
 test('PubAcks do not free slots; a verdict immediately clocks the next send', async () => {
   const f=fixture(), c=f.make();
@@ -306,6 +329,30 @@ function undoFixture(path = ':memory:') {
   const title = (id: string) => (db.prepare('SELECT title FROM p WHERE id = ?').get(id) as any)?.title ?? null;
   return { db, c, logs, write, has, title };
 }
+
+test('binary optimistic rows survive reseeding and a rejection restores the server BLOB', async () => {
+  const { db, c } = undoFixture();
+  try {
+    await c.createOutboxTable();
+    db.exec('ALTER TABLE p ADD COLUMN bytes BLOB');
+    c.syncedTables.get('p').columns.push('bytes');
+    const initial = new Uint8Array([0, 255, 1]);
+    const edited = new Uint8Array([0, 128, 254]);
+    const server = new Uint8Array([255, 0, 13]);
+    const before = { id: 'x', title: 'initial', bytes: initial };
+    const data = { id: 'x', title: 'edited', bytes: edited };
+    db.prepare('INSERT INTO p VALUES (?, ?, ?)').run('x', 'initial', initial);
+    await c.outboxPut({ msgId: 'blob', subject: 'mutation.alice.p.update', table: 'p', id: 'x',
+      payload: { key: { id: 'x' }, data }, before, optimistic: { operation: 'UPDATE', data }, authoritative: true });
+    await c.applyEvent('p', { operation: 'UPDATE', data }, c.run);
+    db.prepare('UPDATE p SET title = ?, bytes = ? WHERE id = ?').run('server', server, 'x');
+    await c.reapplyPending('p');
+    assert.deepEqual(db.prepare('SELECT bytes FROM p').get()!.bytes, edited);
+    await c.revertOptimisticWrite('blob', 'restore');
+    assert.deepEqual(db.prepare('SELECT bytes FROM p').get()!.bytes, server);
+    assert.equal(db.prepare('SELECT title FROM p').get()!.title, 'server');
+  } finally { db.close(); }
+});
 
 test('undo: a refused parent\'s undo waits for its child\'s in either order, survives a restart, and spares a row that changed', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'zb-undo-'));

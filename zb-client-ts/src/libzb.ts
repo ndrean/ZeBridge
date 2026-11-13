@@ -21,6 +21,7 @@
 /// path (one sqlocal connection — OPFS sync handles are exclusive, so a second
 /// read-only connection is not available here the way `libzebridge` native has one).
 
+import { parseBinaryJson, stringifyBinaryJson } from './binary-json.ts';
 import { natsTransport } from './transport.ts';
 import { Measure, MeasureAttempt, emptyMeasureCounts, type MeasureCounts } from './measure.ts';
 import { endpointIdentity, identityEndpointUrl, orderedEndpoints } from './endpoints.ts';
@@ -1350,7 +1351,7 @@ export class ZeBridge {
     }
     if (!row && !fallback) return null;
     let sent: any = {};
-    try { sent = row ? JSON.parse(row.payload) : {}; } catch { /* unreadable */ }
+    try { sent = row ? parseBinaryJson(row.payload) : {}; } catch { /* unreadable */ }
     const table = String(row?.tbl ?? fallback?.table ?? '?');
     const vcol = this.syncedTables.get(table)?.versionColumn;
     const data = sent?.data && typeof sent.data === 'object' ? sent.data : {};
@@ -1996,8 +1997,8 @@ export class ZeBridge {
       `INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, basis, created_at, attempts, published, optimistic, authoritative, ordered, predecessor, incarnation)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)
        ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1`,
-      r.msgId, r.subject, JSON.stringify(r.payload), r.table, String(r.id),
-      r.before == null ? null : JSON.stringify(r.before), r.before == null ? null : JSON.stringify(r.before), created, JSON.stringify(r.optimistic), r.authoritative == null ? null : r.authoritative ? 1 : 0,
+      r.msgId, r.subject, stringifyBinaryJson(r.payload), r.table, String(r.id),
+      r.before == null ? null : stringifyBinaryJson(r.before), r.before == null ? null : stringifyBinaryJson(r.before), created, stringifyBinaryJson(r.optimistic), r.authoritative == null ? null : r.authoritative ? 1 : 0,
       r.ordered ? 1 : 0, r.predecessor ?? null, r.incarnation ?? null,
     );
     // A refresh may have run while the insert awaited storage. Mark completion too.
@@ -2039,7 +2040,7 @@ export class ZeBridge {
   private async saveBaseline(exec: Exec, table: string, rowId: string, at: number, row: unknown) {
     await exec(`INSERT INTO _zebridge_base (tbl,row_id,at,data) VALUES (?,?,?,?)
       ON CONFLICT(tbl,row_id) DO UPDATE SET at=excluded.at,data=excluded.data`,
-      table, rowId, at, row == null ? null : JSON.stringify(row));
+      table, rowId, at, row == null ? null : stringifyBinaryJson(row));
     this.baselineActive = true;
   }
 
@@ -2078,7 +2079,7 @@ export class ZeBridge {
   private isEchoOf(state: TableState, data: any, payload: string): boolean {
     if (!state.versionColumn || !state.tiebreakColumn) return false;
     let sent: any;
-    try { sent = JSON.parse(payload); } catch { return false; }
+    try { sent = parseBinaryJson(payload); } catch { return false; }
     const writer = data?.[state.tiebreakColumn];
     if (typeof sent.client_id !== 'string' || !sent.client_id || typeof writer !== 'string' || writer !== sent.client_id) return false;
     const version = data?.[state.versionColumn];
@@ -2118,7 +2119,7 @@ export class ZeBridge {
       UNION ALL SELECT before, created_at FROM _zebridge_undo WHERE tbl=? AND row_id=? AND authoritative=1) p ORDER BY t DESC LIMIT 1`,
       table, rowId, table, rowId, table, rowId))[0];
     if (!r || r.data == null) return null;
-    try { return typeof r.data === 'string' ? JSON.parse(r.data) : r.data; } catch { return null; }
+    try { return typeof r.data === 'string' ? parseBinaryJson(r.data) : r.data; } catch { return null; }
   }
 
   private async ledgerHasRows(): Promise<boolean> {
@@ -2130,7 +2131,7 @@ export class ZeBridge {
   private async requestUndoRecovery(table: string, rowId: string, exec: Exec = this.run) {
     await exec(`INSERT INTO _zebridge_reconcile (msg_id,tbl,reason,since,state)
       VALUES (?,?,'UndoNeedsBaseline',?,'pending') ON CONFLICT(msg_id) DO NOTHING`,
-      `undo:${JSON.stringify([table,rowId])}`, table, Date.now());
+      `undo:${stringifyBinaryJson([table,rowId])}`, table, Date.now());
     if (this.nc && !this.undoRecoveryScheduled) {
       this.undoRecoveryScheduled = true;
       setTimeout(() => { this.undoRecoveryScheduled = false; if (this.nc) void this.reconcile(); }, 0);
@@ -2186,14 +2187,14 @@ export class ZeBridge {
     const rows = await this.run(`SELECT tbl, subject, payload, before, basis, row_id, created_at FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
     const entry = rows[0];
     if (!entry || String(entry.subject).split('.').pop() !== 'update') return;
-    const sent = JSON.parse(entry.payload);
+    const sent = parseBinaryJson(entry.payload);
     const values = sent?.data;
     const key = sent?.key;
     if (!values || typeof values !== 'object' || !key || typeof key !== 'object') return;
     this.rebase.set(msgId, {
       table: entry.tbl, key, values,
-      before: entry.before ? JSON.parse(entry.before) : null,
-      basis: entry.basis ? JSON.parse(entry.basis) : null,
+      before: entry.before ? parseBinaryJson(entry.before) : null,
+      basis: entry.basis ? parseBinaryJson(entry.basis) : null,
       rowId: String(entry.row_id ?? ''), createdAt: Number(entry.created_at ?? 0),
       version: normalizeVersion(String(sent.version ?? '')),
       sentVersion: String(sent.version ?? ''),
@@ -2251,8 +2252,8 @@ export class ZeBridge {
     const mineVersions = new Set([e.version]);
     let base = e.before, baseAt = e.createdAt ?? Number.MAX_SAFE_INTEGER;
     for (const o of await this.run(`SELECT payload, before, created_at FROM _zebridge_outbox WHERE tbl = ? AND row_id = ? AND other_incarnation = 0`, e.table, e.rowId ?? '')) {
-      try { const v = normalizeVersion(String(JSON.parse(o.payload)?.version ?? '')); if (v) mineVersions.add(v); } catch { /* unreadable */ }
-      if (Number(o.created_at) < baseAt) { baseAt = Number(o.created_at); base = o.before ? JSON.parse(o.before) : null; }
+      try { const v = normalizeVersion(String(parseBinaryJson(o.payload)?.version ?? '')); if (v) mineVersions.add(v); } catch { /* unreadable */ }
+      if (Number(o.created_at) < baseAt) { baseAt = Number(o.created_at); base = o.before ? parseBinaryJson(o.before) : null; }
     }
     // An earlier decision on this key may have kept the confirmed row: once the oldest pending
     // edit settled and left the outbox, it is the only place the seeded winner still lives.
@@ -2273,12 +2274,12 @@ export class ZeBridge {
     // (`basis`), which a reseed does not rewrite.
     const basis = e.basis ?? null; // unknown: every column of the edit counts as lost
     const winnerChanged = Object.keys(winner).filter(
-      (c) => c !== state.versionColumn && JSON.stringify(winner[c] ?? null) !== JSON.stringify(basis?.[c] ?? null),
+      (c) => c !== state.versionColumn && stringifyBinaryJson(winner[c] ?? null) !== stringifyBinaryJson(basis?.[c] ?? null),
     );
     // The winner changed one of MY columns, to something other than my value: a real loss.
     // (The winner writing my very value is no loss, and a re-send of it changes nothing.)
     const overlap = basis
-      ? mine.filter((c) => winnerChanged.includes(c) && JSON.stringify(winner[c] ?? null) !== JSON.stringify(e.values[c] ?? null))
+      ? mine.filter((c) => winnerChanged.includes(c) && stringifyBinaryJson(winner[c] ?? null) !== stringifyBinaryJson(e.values[c] ?? null))
       : mine;
     this.rebase.delete(msgId);
     await this.keepConfirmed(e, ckey, base, baseAt);
@@ -2409,9 +2410,9 @@ export class ZeBridge {
   /// used (the `optimistic` event: key, values and version stamp merged; the wire payload for
   /// an entry from before that column), and whether it removed the row.
   private appliedOf(state: { tombstoneColumn: string | null }, w: { payload: string; optimistic?: string | null }) {
-    const sent = JSON.parse(w.payload);
+    const sent = parseBinaryJson(w.payload);
     let opt: any = null;
-    try { opt = w.optimistic ? JSON.parse(w.optimistic) : null; } catch { /* the wire payload */ }
+    try { opt = w.optimistic ? parseBinaryJson(w.optimistic) : null; } catch { /* the wire payload */ }
     const src = opt ?? sent;
     const data = (src?.data ?? null) as Record<string, unknown> | null;
     return {
@@ -2518,7 +2519,7 @@ export class ZeBridge {
           const i = ws.findIndex((w) => Number(w.created_at) >= Number(certified.at));
           from = i < 0 ? ws.length : i;
         }
-        const base = gone || before == null ? null : JSON.parse(before);
+        const base = gone || before == null ? null : parseBinaryJson(before);
         const current = (await txExec(`SELECT * FROM ${table} WHERE ${where}`, ...pkVals))[0] ?? null;
         if (base == null) {
           await this.assertUndoDeleteSafe(table, state, keyObj, txExec);
@@ -2545,7 +2546,7 @@ export class ZeBridge {
           }
           const before = (await txExec(`SELECT * FROM ${table} WHERE ${where}`, ...pkVals))[0] ?? null;
           if (Number(w.owed) === 0) {
-            await txExec(`UPDATE _zebridge_outbox SET before = ?, authoritative = ? WHERE msg_id = ?`, before == null ? null : JSON.stringify(before), first ? 1 : 0, w.msg_id);
+            await txExec(`UPDATE _zebridge_outbox SET before = ?, authoritative = ? WHERE msg_id = ?`, before == null ? null : stringifyBinaryJson(before), first ? 1 : 0, w.msg_id);
             first = false;
           }
           // A pending UPDATE cannot create a row during rollback; its verdict is still
@@ -3207,7 +3208,7 @@ export class ZeBridge {
     try {
       const r = await this.run(
         `INSERT INTO _zebridge_inbox (tbl, lsn, ev, reason, held_at) VALUES (?,?,?,?,?) RETURNING id`,
-        table, lsn, JSON.stringify(ev), reason.slice(0, 300), Date.now(),
+        table, lsn, stringifyBinaryJson(ev), reason.slice(0, 300), Date.now(),
       );
       this.fkHeld.push({ id: r?.[0]?.id, table, ev });
     } catch (err) {
@@ -3224,7 +3225,7 @@ export class ZeBridge {
       const rows = await this.run(`SELECT id, tbl, ev FROM _zebridge_inbox ORDER BY id`);
       if (!rows?.length) return;
       for (const r of rows) {
-        try { this.fkHeld.push({ id: r.id, table: r.tbl, ev: JSON.parse(r.ev) }); } catch { /* unreadable row */ }
+        try { this.fkHeld.push({ id: r.id, table: r.tbl, ev: parseBinaryJson(r.ev) }); } catch { /* unreadable row */ }
       }
       this.appendLog('SYS', `${this.fkHeld.length} held event(s) restored from the inbox — awaiting their parents`, 'INFO');
     } catch { /* table absent on an older replica */ }
@@ -3250,7 +3251,7 @@ export class ZeBridge {
     this.fkHeld = this.fkHeld.filter((h) => !(h.table === table && same(h.ev?.data)));
     try {
       const rows = await exec(`SELECT id, ev FROM _zebridge_inbox WHERE tbl = ?`, table);
-      const ids = (rows ?? []).filter((r: any) => { try { return same(JSON.parse(r.ev)?.data); } catch { return false; } }).map((r: any) => r.id);
+      const ids = (rows ?? []).filter((r: any) => { try { return same(parseBinaryJson(r.ev)?.data); } catch { return false; } }).map((r: any) => r.id);
       if (ids.length) await exec(`DELETE FROM _zebridge_inbox WHERE id IN (${ids.map(() => '?').join(',')})`, ...ids);
       const n = Math.max(ids.length, before - this.fkHeld.length);
       if (n) this.appendLog('SYS', `${table}: ${n} held event(s) for a row deleted upstream discarded`, 'INFO');
@@ -6331,7 +6332,7 @@ export class ZeBridge {
       await txExec(
         `INSERT INTO _zebridge_reconcile (msg_id, tbl, reason, version, data, since, state) VALUES (?, ?, ?, ?, ?, ?, 'pending')
          ON CONFLICT(msg_id) DO NOTHING`,
-        msgId, String(row.tbl), reason, write?.version ?? '', write ? JSON.stringify(write) : null, Date.now(),
+        msgId, String(row.tbl), reason, write?.version ?? '', write ? stringifyBinaryJson(write) : null, Date.now(),
       );
     });
     return true;
@@ -6450,7 +6451,7 @@ export class ZeBridge {
       await this.run(`DELETE FROM _zebridge_reconcile WHERE msg_id = ?`, r.msg_id);
       this.appendLog('SYS', `${r.msg_id} reconciled — the local copy is the authoritative state`, 'INFO');
       let write: any = null;
-      try { write = r.data ? JSON.parse(r.data) : null; } catch { /* unreadable */ }
+      try { write = r.data ? parseBinaryJson(r.data) : null; } catch { /* unreadable */ }
       if (write) this.emitVerdict({ ...write, outcome: 'reconciled' });
     }
     return left > 0;
@@ -6496,7 +6497,7 @@ export class ZeBridge {
     for (const r of rows) {
       if (!r.optimistic || !state?.pkCols.length) { skipped++; continue; }
       let sent: any, ev: any;
-      try { sent = JSON.parse(r.payload); ev = JSON.parse(r.optimistic); } catch { skipped++; continue; }
+      try { sent = parseBinaryJson(r.payload); ev = parseBinaryJson(r.optimistic); } catch { skipped++; continue; }
       const keyObj = sent?.key as Record<string, unknown> | undefined;
       if (!keyObj) { skipped++; continue; }
       await this.transaction(async (txExec) => {
@@ -6505,7 +6506,7 @@ export class ZeBridge {
         const first = !seen.has(String(r.row_id));
         seen.add(String(r.row_id));
         if (first) await this.saveBaseline(txExec, table, String(r.row_id), Number(r.created_at), before);
-        await txExec(`UPDATE _zebridge_outbox SET before = ?, authoritative = ? WHERE msg_id = ?`, before == null ? null : JSON.stringify(before), first ? 1 : 0, r.msg_id);
+        await txExec(`UPDATE _zebridge_outbox SET before = ?, authoritative = ? WHERE msg_id = ?`, before == null ? null : stringifyBinaryJson(before), first ? 1 : 0, r.msg_id);
         await this.applyEvent(table, ev, txExec);
       });
       applied++;
@@ -6847,7 +6848,7 @@ export class ZeBridge {
         this.pendingWrites.set(r.msg_id, { table: r.tbl, id: r.row_id, at: Date.now(), version: outboxVersionOf(r) });
         // Persist before publishing, independently of any CDC transaction.
         await this.transaction(async (exec) => { await exec(`UPDATE _zebridge_outbox SET published = 1 WHERE msg_id = ?`, r.msg_id); });
-        const sent = this.transport.jetstream(nc, this.jsOpts()).publish(r.subject, encode(JSON.parse(r.payload)), { headers: h });
+        const sent = this.transport.jetstream(nc, this.jsOpts()).publish(r.subject, encode(parseBinaryJson(r.payload)), { headers: h });
         // The pass's first write is a probe when it awaits acks: an ambiguous failure stops the
         // pass with its peers still eligible, instead of spending every slot's backoff at once.
         if (awaitAcks && !acks.length) {
