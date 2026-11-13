@@ -11,8 +11,9 @@ export async function compactDocument(client: Client, tenant: string, documentId
     await client.query("SET LOCAL lock_timeout = '5s'");
     // Serialize compactors of this document. Ordinary INSERTs take no such lock
     // and keep flowing while the selected update set is merged.
+    // Serialize with client compactions too: yjs_updates_replace() takes the same key.
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
-      [JSON.stringify(['yjs_updates', tenant, documentId])]);
+      [`yjs_updates/${tenant}/${documentId}`]);
     const { rows } = await client.query<{ id: string; update_data: Buffer }>(
       `SELECT id, update_data FROM public.yjs_updates
        WHERE tenant_id = $1 AND document_id = $2 AND deleted_at IS NULL`, [tenant, documentId]);
