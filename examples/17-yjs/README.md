@@ -14,6 +14,7 @@ the PostgreSQL rows. There is no Yjs server and no change to the bridge's LWW ru
 | `document_id` | Groups updates belonging to one Yjs document |
 | `update_data bytea` | The binary update produced by Yjs |
 | `tenant_id`, `updated_at`, `last_writer`, `deleted_at` | The ordinary ZeBridge scope and write metadata |
+| `replaces` | Only on a [client compaction](#from-the-editor)'s INSERT: the JSON array of IDs it merged. Always NULL once stored |
 
 There is no document table in this minimal example: the `doc` URL parameter selects
 a document UUID. A real application can keep document titles, access rules and workflow
@@ -23,8 +24,8 @@ state in a separate ordinary table.
 writers replacing that row still compete under LWW. Here they insert different rows,
 so both updates survive; the browser's Yjs library determines their combined meaning.
 A PostgreSQL trigger prevents changing an update's bytes or scope. Clients append updates;
-the table owner can retire incorporated rows during compaction, and the existing sweeper
-can physically remove their tombstones. Identical retries may still advance a row's
+rows are retired only by a compaction (from the editor, or by the table owner), and the
+existing sweeper can physically remove their tombstones. Identical retries may still advance a row's
 version/tiebreak.
 
 The TypeScript API sends and receives `Uint8Array`. CDC carries MessagePack binary;
@@ -146,9 +147,51 @@ and requires Yjs on the maintenance host.
 
 ## Compact a document
 
-Editing and reconnecting need no extra steps. An optional maintenance command combines
-accepted updates into one ordinary update row, in the same table. A fresh client then
-loads that merged update plus edits received since compaction.
+Editing and reconnecting need no extra steps. Compaction is optional: it combines accepted
+updates into one ordinary update row, in the same table, and retires the rows it merged. A
+fresh client then loads that merged update plus edits received since compaction. It can run
+from the editor, through the ordinary write path, or as a maintenance command.
+
+### From the editor
+
+**Editor compaction trusts every writer of the tenant.** PostgreSQL can check that the rows a
+compaction names belong to this tenant and document; it cannot check that the merged bytes keep
+their Yjs history, since it does not decode Yjs. It relies on the editor for that, so a buggy
+client could replace history with an incomplete merge. That suits cooperating writers, and it is
+the main difference from the maintenance command below, which runs as the table owner.
+
+**Compact document** merges this document's confirmed updates (those PostgreSQL already holds,
+so not the ones still in the outbox or awaiting their echo) and sends one `INSERT` through
+`mutate`, with the merged bytes and `replaces`, the IDs it merged. It needs no other connection
+and works offline: the replacement waits in the outbox like any edit.
+
+What PostgreSQL enforces, in two triggers (`maintenance.sql`):
+
+- every listed row exists, is active, and has the replacement's tenant and document;
+- only the listed rows are retired, and only if the replacement row is actually inserted, in the
+  same transaction; edits arriving concurrently have other IDs and stay active;
+- 1 to 256 distinct IDs, not including the replacement itself;
+- one compaction of a document at a time, client or maintenance, so a second compaction of
+  the same rows sees them retired and is refused;
+- the list is consumed by the triggers and stored as NULL, so it never replicates.
+
+The retirement runs in an `AFTER INSERT` trigger (`yjs_updates_replace()`, `SECURITY DEFINER`,
+owned by the table owner) because the bridge writes `INSERT … ON CONFLICT (id) DO UPDATE …
+WHERE <version guard>`. A replacement whose ID is already taken by a newer row is declined by
+the guard and inserts nothing: `BEFORE INSERT` triggers have run by then, and only an
+`AFTER INSERT` trigger is sure the row went in. The `BEFORE INSERT` trigger only sets the list
+aside for the transaction and stores NULL.
+
+A refusal is a check violation, so the write gets a final `rejected` verdict: the editor reports
+it and nothing is lost, since the inputs stay active and the document already holds their
+content. A retry of an accepted compaction meets its receipt and cannot retire anything more.
+
+**Size.** A row must fit ZeBridge's row slot (4 KB by default; ZeBridge's width guard refuses a
+wider one). The editor merges the smallest confirmed updates first, up to 3,000 bytes in all, and
+does nothing unless two fit. A large document therefore compacts in several passes, and an update
+over the budget stays as it is.
+
+### As a maintenance command
 
 If this example was set up before compaction was added, upgrade its guard once as the DBA:
 
@@ -210,7 +253,9 @@ The adapter tests use real Yjs documents and SQLite BLOBs with controlled delive
 concurrent offline edits, reversed/duplicate updates, reload, scope filtering, and
 queue/server failures. The client tests separately cover binary outbox replay and
 binary rollback after a reseed. The adapter tests also cover receiving a compacted
-replacement while an older editor has offline edits.
+replacement while an older editor has offline edits, and the editor's compaction: only
+confirmed updates, the size budget (smallest first), and a refused compaction that is reported and not fatal,
+also after a reload.
 
 For an end-to-end test against the running stack after setup:
 
@@ -229,7 +274,9 @@ offline, catch-up of the live client, and initialization of a new replica from o
 merged row before the offline edit returns.
 
 The dedicated compaction tests additionally check concurrent uploads/compactors,
-transaction rollback, tenant/document scope, writer restrictions and actual sweeper
+transaction rollback, tenant/document scope, writer restrictions, the editor's compaction as
+the writer role (exact retirement, every refusal, two writers racing, a replacement the
+version guard declines) and actual sweeper
 cleanup. Run these **only on a disposable test stack**: they temporarily shorten the
 database's GC retention and advance its watermark, scoped to this example's table:
 

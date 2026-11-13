@@ -3,21 +3,24 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import * as Y from 'yjs';
 import type { ZeBridge, Verdict } from '@zebridge/client';
-import { ZeBridgeYjsProvider, TABLE } from '../src/provider.ts';
+import { ZeBridgeYjsProvider, TABLE, COMPACT_INPUT_BYTES } from '../src/provider.ts';
 
 // SQLite replicas exercise the adapter with real binary storage. Transport is
 // controlled here so updates can be delayed, duplicated, and delivered backwards.
 function replica() {
   const db = new DatabaseSync(':memory:');
   db.exec(`CREATE TABLE yjs_updates (id TEXT PRIMARY KEY, document_id TEXT, tenant_id TEXT,
-    update_data BLOB, deleted_at TEXT)`);
+    update_data BLOB, deleted_at TEXT, replaces TEXT)`);
+  // The client's ledgers, as far as compact() reads them: a row named here is unconfirmed.
+  db.exec('CREATE TABLE _zebridge_outbox (tbl TEXT, row_id TEXT); CREATE TABLE _zebridge_undo (tbl TEXT, row_id TEXT)');
   const changes = new Set<() => void>();
   const verdicts = new Set<(v: Verdict) => void>();
   let writes = 0;
   let refuse = false;
+  const sent: any[] = [];
   const insert = (row: any) => {
-    db.prepare('INSERT OR IGNORE INTO yjs_updates VALUES (?, ?, ?, ?, NULL)')
-      .run(row.id, row.document_id, row.tenant_id, row.update_data);
+    db.prepare('INSERT OR IGNORE INTO yjs_updates VALUES (?, ?, ?, ?, NULL, ?)')
+      .run(row.id, row.document_id, row.tenant_id, row.update_data, row.replaces ?? null);
     for (const fn of changes) fn();
   };
   const client: Pick<ZeBridge, 'query' | 'mutateWithId' | 'onChange' | 'onVerdict'> = {
@@ -27,7 +30,7 @@ function replica() {
       assert.equal(key.id, values!.id); assert.equal(opts?.independent, true);
       assert.ok(values!.update_data instanceof Uint8Array);
       if (refuse) throw new Error('disk full: nothing queued');
-      writes++; insert(values);
+      writes++; sent.push(values); insert(values);
       return { version: String(writes), writeId: String(key.id) };
     },
     onChange: (_table, fn) => { changes.add(fn); return () => { changes.delete(fn); }; },
@@ -35,7 +38,8 @@ function replica() {
   };
   return {
     db, client, insert, rows: () => db.prepare('SELECT * FROM yjs_updates ORDER BY rowid').all(),
-    writes: () => writes, refuse: () => { refuse = true; },
+    writes: () => writes, sent, refuse: () => { refuse = true; },
+    pending: (id: string) => db.prepare('INSERT INTO _zebridge_outbox VALUES (?, ?)').run(TABLE, id),
     verdict: (v: Verdict) => { for (const fn of verdicts) fn(v); },
   };
 }
@@ -177,4 +181,88 @@ test('a rejection of an upload queued before a reload still surfaces', async () 
     await assert.rejects(reloaded.flush(), /Copy your text/);
     assert.equal(errors.length, 1);
   } finally { reloaded.destroy(); r.db.close(); }
+});
+
+test('compaction merges only confirmed updates and names exactly those it replaces', async () => {
+  const r = replica();
+  const provider = new ZeBridgeYjsProvider(r.client, 'doc', 'acme', assert.fail);
+  await provider.start();
+  try {
+    for (const word of ['one ', 'two ', 'three']) { provider.text.insert(provider.text.length, word); await provider.flush(); }
+    const [first, second, third] = r.rows().map((row) => row.id as string);
+    r.pending(third); // still in the outbox: PostgreSQL may not hold it yet
+    const result = await provider.compact();
+    assert.equal(result.compacted, true);
+    const replacement = r.sent.at(-1);
+    assert.deepEqual(JSON.parse(replacement.replaces).sort(), [first, second].sort(), 'a set: the picker orders by size');
+    const fresh = new Y.Doc();
+    Y.applyUpdate(fresh, replacement.update_data);
+    assert.equal(fresh.getText('content').toString(), 'one two ', 'the merge holds exactly its inputs');
+    fresh.destroy();
+    assert.equal(provider.text.toString(), 'one two three', 'compaction does not change the live text');
+    assert.equal(r.writes(), 4);
+  } finally { provider.destroy(); r.db.close(); }
+});
+
+test('compaction skips updates over the row budget and needs two that fit', async () => {
+  const r = replica();
+  const provider = new ZeBridgeYjsProvider(r.client, 'doc', 'acme', assert.fail);
+  await provider.start();
+  try {
+    provider.text.insert(0, 'x'.repeat(COMPACT_INPUT_BYTES)); await provider.flush();
+    provider.text.insert(0, 'a'); await provider.flush();
+    const result = await provider.compact();
+    assert.deepEqual(result, { compacted: false, reason: 'no two confirmed updates fit one row' });
+    assert.equal(r.writes(), 2, 'nothing queued');
+  } finally { provider.destroy(); r.db.close(); }
+});
+
+test('a refused compaction is reported, not fatal, also after a reload', async () => {
+  const r = replica();
+  const errors: Error[] = [];
+  const refused: string[] = [];
+  const provider = new ZeBridgeYjsProvider(r.client, 'doc', 'acme', (e) => errors.push(e), (d) => refused.push(d));
+  await provider.start();
+  try {
+    provider.text.insert(0, 'a'); await provider.flush();
+    provider.text.insert(1, 'b'); await provider.flush();
+    const first = await provider.compact();
+    assert.ok(first.compacted);
+    r.verdict({ table: TABLE, version: '1', key: { id: first.id }, columns: ['update_data'],
+      outcome: 'rejected', reason: 'Compaction inputs are missing, already retired, or outside this document' });
+    await provider.flush();
+    assert.equal(refused.length, 1); assert.match(refused[0], /already retired/);
+    provider.text.insert(2, 'c'); await provider.flush();
+    assert.equal(errors.length, 0, 'editing continues');
+    const second = await provider.compact();
+    assert.ok(second.compacted);
+    provider.destroy();
+    // The replica still holds the unconfirmed replacement, with its list: a reload recognizes it.
+    const reloaded = new ZeBridgeYjsProvider(r.client, 'doc', 'acme', (e) => errors.push(e), (d) => refused.push(d));
+    await reloaded.start();
+    r.verdict({ table: TABLE, version: '1', key: { id: second.id }, columns: ['update_data'], outcome: 'rejected', reason: 'retired' });
+    await reloaded.flush();
+    assert.equal(refused.length, 2); assert.equal(errors.length, 0);
+    reloaded.destroy();
+  } finally { provider.destroy(); r.db.close(); }
+});
+
+test('compaction picks the smallest updates first, so two that fit are found', async () => {
+  const r = replica();
+  const source = new Y.Doc(), updates: Uint8Array[] = [];
+  source.on('update', (u: Uint8Array) => updates.push(u));
+  source.getText('content').insert(0, 'x'.repeat(2880));
+  source.getText('content').insert(0, 'a'.repeat(190));
+  source.getText('content').insert(0, 'b'.repeat(190));
+  const [big, small1, small2] = updates.map((u) => u.byteLength);
+  // The case: the first row by ID is large; no small one fits beside it, but the two small ones fit together.
+  assert.ok(big + small1 > COMPACT_INPUT_BYTES && small1 + small2 <= COMPACT_INPUT_BYTES, `sizes ${big}/${small1}/${small2}`);
+  ['a', 'b', 'c'].forEach((id, i) => r.insert({ id, document_id: 'doc', tenant_id: 'acme', update_data: updates[i] }));
+  const provider = new ZeBridgeYjsProvider(r.client, 'doc', 'acme', assert.fail);
+  await provider.start();
+  try {
+    const result = await provider.compact();
+    assert.equal(result.compacted, true);
+    assert.deepEqual(JSON.parse(r.sent.at(-1).replaces), ['b', 'c']);
+  } finally { provider.destroy(); source.destroy(); r.db.close(); }
 });

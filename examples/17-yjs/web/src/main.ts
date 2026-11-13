@@ -9,6 +9,7 @@ import './style.css';
 const qs = new URLSearchParams(location.search);
 const el = (id: string) => document.getElementById(id)!;
 const net = el('network') as HTMLButtonElement;
+const compactButton = el('compact') as HTMLButtonElement;
 const editorName = qs.get('as') ?? 'alice';
 const documentId = qs.get('doc') ?? '11111111-1111-4111-8111-111111111117';
 if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(documentId)) {
@@ -60,6 +61,21 @@ el('download').addEventListener('click', () => {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 });
 
+compactButton.addEventListener('click', () => {
+  void (async () => {
+    if (!provider) return;
+    compactButton.disabled = true;
+    try {
+      const r = await provider.compact();
+      el('status').textContent = r.compacted
+        ? `Compaction queued: ${r.replaced} updates → 1 (${r.bytesBefore} → ${r.bytesAfter} bytes)`
+        : `Nothing compacted: ${r.reason}`;
+      await stats();
+    } catch (e) { fail(e); }
+    finally { compactButton.disabled = fatal; }
+  })();
+});
+
 net.addEventListener('click', () => {
   void (async () => {
     net.disabled = true;
@@ -87,7 +103,8 @@ try {
   await zb.connect();
   tenant = zb.tenant;
   if (!tenant) throw new Error('This example requires a tenant-scoped identity');
-  provider = new ZeBridgeYjsProvider(zb, documentId, tenant, fail);
+  provider = new ZeBridgeYjsProvider(zb, documentId, tenant, fail,
+    (detail) => { el('status').textContent = `Compaction refused, nothing lost: ${detail}`; });
   await provider.start();
   view = new EditorView({
     doc: provider.text.toString(),
@@ -103,6 +120,7 @@ try {
   el('who').textContent = `${editorName} · principal ${zb.principal} · tenant ${tenant}`;
   el('status').textContent = 'Connected';
   net.disabled = false;
+  compactButton.disabled = false;
   await stats();
 } catch (e) {
   fail(e instanceof NotEnrolled

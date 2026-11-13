@@ -149,3 +149,94 @@ test('existing bridge_sweeper retains fresh retirements and reaps them after ret
     await sweep('604800000');
   } finally { ydoc.destroy(); await c.end(); }
 });
+
+// Client compaction: what a `mutate` INSERT with `replaces` does, run here directly as the writer.
+const asAlice = async () => {
+  const edge = await open(writerUrl);
+  await edge.query("SELECT set_config('zb.principal','alice',false), set_config('zb.tenant','acme',false)");
+  return edge;
+};
+const replace = (c: Client, doc: string, inputs: any[], replaces: unknown = JSON.stringify(inputs.map((r) => r.id)), id = randomUUID()) =>
+  c.query('INSERT INTO yjs_updates (id, document_id, tenant_id, update_data, replaces) VALUES ($1,$2,$3,$4,$5)',
+    [id, doc, 'acme', Buffer.from(Y.mergeUpdates(inputs.map((r) => r.update_data))), replaces]).then(() => id);
+const refused = (p: Promise<unknown>, message: RegExp) =>
+  assert.rejects(p, (e: any) => e.code === '23514' && message.test(e.message));
+
+test('a writer compaction retires exactly its inputs and stores no list', async () => {
+  const c = await open(), edge = await asAlice(), id = randomUUID();
+  const { ydoc } = await seed(c, id, 4);
+  try {
+    const rows = await active(c, id);
+    const kept = rows.pop();
+    const replacement = await replace(edge, id, rows);
+    const now = await active(c, id);
+    assert.deepEqual(now.map((r) => r.id).sort(), [replacement, kept.id].sort());
+    assert.equal(now.find((r) => r.id === replacement).replaces, null, 'the list is an input, never stored');
+    assert.equal(textOf(now), ydoc.getText('content').toString());
+    const retired = (await c.query('SELECT id FROM yjs_updates WHERE document_id=$1 AND deleted_at IS NOT NULL', [id])).rows;
+    assert.deepEqual(retired.map((r) => r.id).sort(), rows.map((r) => r.id).sort());
+  } finally { ydoc.destroy(); await c.end(); await edge.end(); }
+});
+
+test('a writer compaction is refused outside its document, twice, or malformed, and changes nothing', async () => {
+  const c = await open(), edge = await asAlice(), id = randomUUID(), other = randomUUID();
+  const { ydoc, updates } = await seed(c, id, 3);
+  try {
+    const rows = await active(c, id);
+    const foreignTenant = { id: await insert(c, id, updates[0], 'globex'), update_data: updates[0] };
+    const foreignDoc = { id: await insert(c, other, updates[0]), update_data: updates[0] };
+    const outside = /missing, already retired, or outside/;
+    await refused(replace(edge, id, [rows[0], foreignTenant]), outside);
+    await refused(replace(edge, id, [rows[0], foreignDoc]), outside);
+    await refused(replace(edge, id, [rows[0], { id: randomUUID(), update_data: updates[0] }]), outside);
+    const self = randomUUID();
+    await refused(replace(edge, id, rows, JSON.stringify([rows[0].id, self]), self), /distinct and exclude/);
+    await refused(replace(edge, id, rows, JSON.stringify([rows[0].id, rows[0].id])), /distinct and exclude/);
+    for (const bad of ['', '  ', 'not json', '{"a":1}', '["x"]', '[1]']) await refused(replace(edge, id, rows, bad), /JSON array of update IDs/);
+    await refused(replace(edge, id, rows, '[]'), /1 to 256/);
+    await refused(replace(edge, id, rows, JSON.stringify(Array.from({ length: 257 }, randomUUID))), /1 to 256/);
+    assert.equal((await active(c, id)).length, 3, 'every refusal left the inputs active and added nothing');
+    await replace(edge, id, rows);
+    await refused(replace(edge, id, rows), outside); // the same inputs again: already retired
+    // Stored rows never carry a list; setting one later is an edit of an immutable update.
+    await assert.rejects(edge.query('UPDATE yjs_updates SET replaces=$2 WHERE id=$1', [(await active(c, id))[0].id, '[]']), /same document and bytes/);
+    await assert.rejects(c.query('UPDATE yjs_updates SET replaces=$2 WHERE id=$1', [foreignDoc.id, '[]']), /same document and bytes/);
+  } finally { ydoc.destroy(); await c.end(); await edge.end(); }
+});
+
+test('two writers compacting overlapping updates: one wins, the other is refused, no deadlock', async () => {
+  const c = await open(), a = await asAlice(), b = await asAlice(), id = randomUUID();
+  const { ydoc } = await seed(c, id, 6);
+  try {
+    const rows = await active(c, id);
+    // Opposite input orders and overlapping sets; the per-document lock makes the second see the first.
+    const results = await Promise.allSettled([replace(a, id, rows.slice(0, 4)), replace(b, id, rows.slice(2).reverse())]);
+    assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
+    const loser = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+    assert.equal(loser.reason.code, '23514');
+    assert.equal(textOf(await active(c, id)), ydoc.getText('content').toString());
+  } finally { ydoc.destroy(); await c.end(); await a.end(); await b.end(); }
+});
+
+test('a replacement the version guard declines retires nothing (the bridge upsert)', async () => {
+  const c = await open(), edge = await asAlice(), id = randomUUID();
+  const { ydoc } = await seed(c, id, 3);
+  try {
+    const rows = await active(c, id);
+    // The replacement's ID is already taken by a newer row of this document.
+    const taken = randomUUID();
+    await c.query(`INSERT INTO yjs_updates (id, document_id, tenant_id, update_data, updated_at)
+      VALUES ($1, $2, 'acme', $3, now() + interval '1 day')`, [taken, id, Buffer.from(Y.encodeStateAsUpdate(new Y.Doc()))]);
+    // The statement the bridge sends for an INSERT (mutation_listener.zig: ON CONFLICT … WHERE version <).
+    const declined = await edge.query(`INSERT INTO yjs_updates (id, document_id, tenant_id, update_data, replaces, updated_at)
+      VALUES ($1, $2, 'acme', $3, $4, now())
+      ON CONFLICT (id) DO UPDATE SET document_id = EXCLUDED.document_id, tenant_id = EXCLUDED.tenant_id,
+        update_data = EXCLUDED.update_data, replaces = EXCLUDED.replaces, updated_at = EXCLUDED.updated_at
+      WHERE yjs_updates.updated_at IS NULL OR yjs_updates.updated_at < EXCLUDED.updated_at`,
+    [taken, id, Buffer.from(Y.mergeUpdates(rows.map((r) => r.update_data))), JSON.stringify(rows.map((r) => r.id))]);
+    assert.equal(declined.rowCount, 0, 'the guard declined: nothing inserted or updated');
+    const now = await active(c, id);
+    assert.equal(now.length, 4, 'every input is still active');
+    assert.equal(textOf(now), ydoc.getText('content').toString(), 'a fresh reader still reconstructs the text');
+  } finally { ydoc.destroy(); await c.end(); await edge.end(); }
+});

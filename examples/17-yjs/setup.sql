@@ -9,7 +9,8 @@ CREATE TABLE public.yjs_updates (
     tenant_id    text NOT NULL,
     updated_at   timestamptz NOT NULL DEFAULT now(),
     last_writer  text,
-    deleted_at   timestamptz
+    deleted_at   timestamptz,
+    replaces     text
 );
 CREATE INDEX yjs_updates_document ON public.yjs_updates (tenant_id, document_id);
 
