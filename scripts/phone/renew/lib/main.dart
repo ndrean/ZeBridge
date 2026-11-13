@@ -16,17 +16,25 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'package:zebridge/zebridge.dart';
 
-const bridgeUrl = String.fromEnvironment('ZB_BRIDGE_URL', defaultValue: 'http://192.168.1.11:27434');
-const natsUrl = String.fromEnvironment('ZB_NATS_URL', defaultValue: 'nats://192.168.1.11:4222');
+const bridgeUrl = String.fromEnvironment(
+  'ZB_BRIDGE_URL',
+  defaultValue: 'http://192.168.1.11:27434',
+);
+const natsUrl = String.fromEnvironment(
+  'ZB_NATS_URL',
+  defaultValue: 'nats://192.168.1.11:4222',
+);
 const invite = String.fromEnvironment('ZB_INVITE');
 const table = 'counter_public';
 
-void main() => runApp(const MaterialApp(debugShowCheckedModeBanner: false, home: RenewScreen()));
+void main() => runApp(
+  const MaterialApp(debugShowCheckedModeBanner: false, home: RenewScreen()),
+);
 
 class RenewScreen extends StatefulWidget {
   const RenewScreen({super.key});
@@ -68,7 +76,8 @@ class _RenewScreenState extends State<RenewScreen> {
 
   void _say(String line) {
     final t = DateTime.now();
-    final hh = '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}:${t.second.toString().padLeft(2, '0')}';
+    final hh =
+        '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}:${t.second.toString().padLeft(2, '0')}';
     setState(() => _log.insert(0, '$hh (phone)  $line'));
   }
 
@@ -85,17 +94,21 @@ class _RenewScreenState extends State<RenewScreen> {
   /// The identity file libzb keeps: the JWT, the key, and the clock offset.
   void _readIdentity() {
     try {
-      final id = jsonDecode(_identityFile.readAsStringSync()) as Map<String, dynamic>;
+      final id =
+          jsonDecode(_identityFile.readAsStringSync()) as Map<String, dynamic>;
       final jwt = (id['creds'] as String).split('\n')[1];
       if (_jwts.isEmpty || _jwts.last != jwt) {
         if (_jwts.isNotEmpty) {
-          _say('🔁 new JWT (#${_jwts.length + 1}), stored offset ${id['clock_offset']} s');
+          _say(
+            '🔁 new JWT (#${_jwts.length + 1}), stored offset ${id['clock_offset']} s',
+          );
           _anchorAt(_iatOf(jwt));
         }
         _jwts.add(jwt);
       }
       _id = id;
-      if (_anchor == null) _anchorAt(_phoneNow + ((id['clock_offset'] as num?)?.toInt() ?? 0));
+      if (_anchor == null)
+        _anchorAt(_phoneNow + ((id['clock_offset'] as num?)?.toInt() ?? 0));
     } catch (_) {
       _id = null;
     }
@@ -103,34 +116,46 @@ class _RenewScreenState extends State<RenewScreen> {
 
   void _anchorAt(int bridgeTime) {
     _anchor = bridgeTime;
-    _sinceAnchor..reset()..start();
+    _sinceAnchor
+      ..reset()
+      ..start();
   }
 
   int _iatOf(String jwt) {
     final p = jwt.split('.')[1];
-    return ((jsonDecode(utf8.decode(base64Url.decode(base64Url.normalize(p)))) as Map)['iat'] as num).toInt();
+    return ((jsonDecode(utf8.decode(base64Url.decode(base64Url.normalize(p))))
+                as Map)['iat']
+            as num)
+        .toInt();
   }
 
   Map<String, dynamic>? get _claims {
     if (_jwts.isEmpty) return null;
     final p = _jwts.last.split('.')[1];
-    return jsonDecode(utf8.decode(base64Url.decode(base64Url.normalize(p)))) as Map<String, dynamic>;
+    return jsonDecode(utf8.decode(base64Url.decode(base64Url.normalize(p))))
+        as Map<String, dynamic>;
   }
 
   int get _phoneNow => DateTime.now().millisecondsSinceEpoch ~/ 1000;
   int get _offset => (_id?['clock_offset'] as num?)?.toInt() ?? 0;
-  int get _bridgeNow => _anchor == null ? _phoneNow + _offset : _anchor! + _sinceAnchor.elapsed.inSeconds;
+  int get _bridgeNow => _anchor == null
+      ? _phoneNow + _offset
+      : _anchor! + _sinceAnchor.elapsed.inSeconds;
 
   Future<void> _open() async {
     if (_opening) return;
     _opening = true;
     final enrolled = _identityFile.existsSync();
     if (!enrolled && invite.isEmpty) {
-      setState(() => _state = 'no identity and no ZB_INVITE: rebuild with an invite');
+      setState(
+        () => _state = 'no identity and no ZB_INVITE: rebuild with an invite',
+      );
       _opening = false;
       return;
     }
-    setState(() => _state = enrolled ? 'opening on the stored identity' : 'enrolling');
+    setState(
+      () => _state = enrolled ? 'opening on the stored identity' : 'enrolling',
+    );
     try {
       final w = await ZeBridgeWorker.spawn({
         'bridgeUrl': bridgeUrl,
@@ -141,7 +166,11 @@ class _RenewScreenState extends State<RenewScreen> {
       });
       _worker = w;
       _readIdentity();
-      _say(enrolled ? 'opened (tenant ${w.tenant})' : 'enrolled as ${_id?['principal']} (tenant ${w.tenant})');
+      _say(
+        enrolled
+            ? 'opened (tenant ${w.tenant})'
+            : 'enrolled as ${_id?['principal']} (tenant ${w.tenant})',
+      );
       setState(() => _state = 'connected');
       _reports = w.reports.listen((r) {
         if (r.error != null) _onError(r.error!);
@@ -188,7 +217,12 @@ class _RenewScreenState extends State<RenewScreen> {
     await _reports?.cancel();
     await _worker?.close();
     _worker = null;
-    for (final f in [_dbPath, '$_dbPath-wal', '$_dbPath-shm', '$_dbPath.identity']) {
+    for (final f in [
+      _dbPath,
+      '$_dbPath-wal',
+      '$_dbPath-shm',
+      '$_dbPath.identity',
+    ]) {
       final file = File(f);
       if (file.existsSync()) file.deleteSync();
     }
@@ -205,7 +239,9 @@ class _RenewScreenState extends State<RenewScreen> {
 
   String _span(int s) => s < 0
       ? '−${_span(-s)}'
-      : (s >= 3600 ? '${s ~/ 3600} h ${(s % 3600) ~/ 60} min' : (s >= 60 ? '${s ~/ 60} min ${s % 60} s' : '$s s'));
+      : (s >= 3600
+            ? '${s ~/ 3600} h ${(s % 3600) ~/ 60} min'
+            : (s >= 60 ? '${s ~/ 60} min ${s % 60} s' : '$s s'));
 
   @override
   Widget build(BuildContext context) {
@@ -215,41 +251,79 @@ class _RenewScreenState extends State<RenewScreen> {
     final dueAt = (iat != null && exp != null) ? exp - (exp - iat) ~/ 4 : null;
     const mono = TextStyle(fontFamily: 'Menlo', fontSize: 13);
     Widget row(String k, String v) => Padding(
-          padding: const EdgeInsets.symmetric(vertical: 2),
-          child: Row(children: [
-            SizedBox(width: 150, child: Text(k, style: mono.copyWith(color: Colors.grey))),
-            Expanded(child: Text(v, style: mono)),
-          ]),
-        );
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 150,
+            child: Text(k, style: mono.copyWith(color: Colors.grey)),
+          ),
+          Expanded(child: Text(v, style: mono)),
+        ],
+      ),
+    );
     return Scaffold(
-      appBar: AppBar(title: const Text('JWT renewal'), actions: [
-        IconButton(icon: const Icon(Icons.refresh), tooltip: 'reopen', onPressed: () => _onError('reopen by hand')),
-        // Long press only: a tap next to "reopen" deleted the identity once (2026-10-01).
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          child: GestureDetector(onLongPress: _forget, child: const Icon(Icons.delete_outline)),
-        ),
-      ]),
+      appBar: AppBar(
+        title: const Text('JWT renewal'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            tooltip: 'reopen',
+            onPressed: () => _onError('reopen by hand'),
+          ),
+          // Long press only: a tap next to "reopen" deleted the identity once (2026-10-01).
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: GestureDetector(
+              onLongPress: _forget,
+              child: const Icon(Icons.delete_outline),
+            ),
+          ),
+        ],
+      ),
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(12),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            row('state', _state),
-            row('principal', '${_id?['principal'] ?? '—'}'),
-            const Divider(),
-            row('phone clock', _hms(_phoneNow)),
-            row('bridge clock (est.)', '${_hms(_bridgeNow)}   phone ${_span(_phoneNow - _bridgeNow)} off'),
-            row('stored offset', '$_offset s (used at the next launch)'),
-            const Divider(),
-            row('JWT issued', iat == null ? '—' : '${_hms(iat)} (bridge)'),
-            row('JWT expires', exp == null ? '—' : '${_hms(exp)}   in ${_span(exp - _bridgeNow)}'),
-            row('renewal due', dueAt == null ? '—' : '${_hms(dueAt)}   in ${_span(dueAt - _bridgeNow)}'),
-            row('JWTs so far', '${_jwts.length}   (reopens $_reopens)'),
-            const Divider(),
-            row('$table.value', '${_value ?? '—'}'),
-            const Divider(),
-            Expanded(child: ListView(children: [for (final l in _log) Text(l, style: mono.copyWith(fontSize: 12))])),
-          ]),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              row('state', _state),
+              row('principal', '${_id?['principal'] ?? '—'}'),
+              const Divider(),
+              row('phone clock', _hms(_phoneNow)),
+              row(
+                'bridge clock (est.)',
+                '${_hms(_bridgeNow)}   phone ${_span(_phoneNow - _bridgeNow)} off',
+              ),
+              row('stored offset', '$_offset s (used at the next launch)'),
+              const Divider(),
+              row('JWT issued', iat == null ? '—' : '${_hms(iat)} (bridge)'),
+              row(
+                'JWT expires',
+                exp == null
+                    ? '—'
+                    : '${_hms(exp)}   in ${_span(exp - _bridgeNow)}',
+              ),
+              row(
+                'renewal due',
+                dueAt == null
+                    ? '—'
+                    : '${_hms(dueAt)}   in ${_span(dueAt - _bridgeNow)}',
+              ),
+              row('JWTs so far', '${_jwts.length}   (reopens $_reopens)'),
+              const Divider(),
+              row('$table.value', '${_value ?? '—'}'),
+              const Divider(),
+              Expanded(
+                child: ListView(
+                  children: [
+                    for (final l in _log)
+                      Text(l, style: mono.copyWith(fontSize: 12)),
+                  ],
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );

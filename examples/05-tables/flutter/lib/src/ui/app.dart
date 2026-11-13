@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:zebridge/zebridge.dart';
 
@@ -104,7 +104,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // transport), and the operator-mode broker takes a creds file, nothing else.
       // Dev copy: the file straight from the repository, like the library path.
       final enrolled = bridgeUrl.isNotEmpty;
-      final dir = enrolled ? (await getApplicationSupportDirectory()).path : Directory.systemTemp.path;
+      final dir = enrolled
+          ? (await getApplicationSupportDirectory()).path
+          : Directory.systemTemp.path;
       final worker = await ZeBridgeWorker.spawn({
         if (enrolled) ...{
           "bridgeUrl": bridgeUrl,
@@ -112,7 +114,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           "dbPath": "$dir/zb-05-tables.sqlite3",
         } else ...{
           "natsUrl": "nats://127.0.0.1:4222",
-          "credsPath": "/Users/nevendrean/code/zig/ZeBridge/scripts/native/creds/$principal.creds",
+          "credsPath":
+              "/Users/nevendrean/code/zig/ZeBridge/scripts/native/creds/$principal.creds",
           "dbPath": "$dir/zb-flutter-$principal.sqlite3",
           "principal": principal,
         },
@@ -122,7 +125,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         // replica — NOTES §10iw) but because it is a type-coverage fixture the
         // benchmarks write into, and a demo of four small tables has no business
         // spending a minute and a gigabyte on it.
-        "tables": ["counter_public", "counter_tenant", "app_users", "app_orders"],
+        "tables": [
+          "counter_public",
+          "counter_tenant",
+          "app_users",
+          "app_orders"
+        ],
         "seedStreaming": true,
       });
       if (!mounted) {
@@ -152,7 +160,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _refreshAll({List<String>? changedTables}) async {
     final w = zb;
     if (w == null) return;
-    bool touched(String t) => changedTables == null || changedTables.contains(t);
+    bool touched(String t) =>
+        changedTables == null || changedTables.contains(t);
 
     Map<String, dynamic>? nextPublic, nextTenant;
     List<dynamic>? nextUsers, nextOrders;
@@ -191,7 +200,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (nextOrders != null) orders = nextOrders;
     });
     if (sqlLive &&
-        (changedTables == null || changedTables.any((t) => sqlText.contains(t)))) {
+        (changedTables == null ||
+            changedTables.any((t) => sqlText.contains(t)))) {
       await _runSql();
     }
   }
@@ -248,7 +258,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final String uid = seeded;
     if (counterTenant.isEmpty) {
       final v = DateTime.now().toUtc().toIso8601String();
-      await w.mutate('counter_tenant', 'INSERT', {'uid': uid}, {
+      await w.mutate('counter_tenant', 'INSERT', {
+        'uid': uid
+      }, {
         'uid': uid,
         'tenant_id': tenant,
         'value': delta,
@@ -274,7 +286,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (existingUser == null) {
       userId = "${DateTime.now().millisecondsSinceEpoch}-user";
       final v = DateTime.now().toUtc().toIso8601String();
-      await w.mutate('app_users', 'INSERT', {'uid': userId}, {
+      await w.mutate('app_users', 'INSERT', {
+        'uid': userId
+      }, {
         'uid': userId,
         'name': formUserName.trim(),
         'tenant_id': tenant,

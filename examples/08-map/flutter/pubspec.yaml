@@ -21,6 +21,7 @@ dependencies:
   vector_map_tiles_pmtiles: ^1.4.0
   vector_tile_renderer: ^5.2.1   # ProvidedThemes.lightTheme(): the OpenMapTiles schema the archive carries
 
+  material_ui: any
 dev_dependencies:
   flutter_test:
     sdk: flutter
