@@ -61,6 +61,8 @@ wait_healthy zb-dev-nats
 # JWTs that GET /enroll signs with the newest key (AuthorizationViolation). A reload reads the conf again; on a server
 # that has just started it changes nothing.
 docker kill -s HUP zb-dev-nats >/dev/null
+# GET /enroll signs device JWTs with the env file's ZB_SIGNING_SEED: it must be one of this account's client keys.
+python3 "$HERE/enroll_key.py"
 
 # The init SQL is the bridge's own (--init-sql, from the same environment the bridge will read),
 # applied through the container's psql: nothing but Docker is needed on this machine for it.
