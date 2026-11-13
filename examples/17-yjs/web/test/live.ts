@@ -14,6 +14,7 @@ if (!process.env.NATS_URL) throw new Error('Set NATS_URL for the running test st
 const dir = mkdtempSync(join(tmpdir(), 'zb-yjs-live-'));
 const documentId = crypto.randomUUID();
 const failures: Error[] = [];
+const refusals: string[] = [];
 const clients: ZeBridge[] = [];
 const providers: ZeBridgeYjsProvider[] = [];
 const makeClient = (name: string) => {
@@ -30,7 +31,7 @@ const makeClient = (name: string) => {
   return c;
 };
 const open = async (c: ZeBridge) => {
-  const p = new ZeBridgeYjsProvider(c, documentId, c.tenant, (e) => failures.push(e));
+  const p = new ZeBridgeYjsProvider(c, documentId, c.tenant, (e) => failures.push(e), (d) => refusals.push(d));
   providers.push(p); await p.start(); return p;
 };
 const until = async (label: string, fn: () => Promise<boolean>) => {
@@ -102,6 +103,35 @@ try {
       restored.text.toString().endsWith(' after compaction') && await b.pending() === 0);
     assert.equal((await reopened.query('SELECT id FROM yjs_updates WHERE document_id=? AND deleted_at IS NULL', documentId)).length, 2);
   }
+  // Compaction from the editor, through mutate: Bob, offline, compacts the same confirmed rows
+  // as Alice. Alice's is applied; Bob's then finds its inputs retired and is refused, not fatal.
+  const active = (c: ZeBridge) => c.query('SELECT id, replaces FROM yjs_updates WHERE document_id=? AND deleted_at IS NULL', documentId);
+  const compacted = async (p: ZeBridgeYjsProvider) => {
+    let r = await p.compact();
+    // Rows whose echo is still owed are not confirmed yet; they become eligible shortly.
+    for (let i = 0; !r.compacted && i < 50; i++) { await sleep(100); r = await p.compact(); }
+    assert.ok(r.compacted, `nothing compacted: ${(r as { reason?: string }).reason}`); return r;
+  };
+  const before = (await active(reopened)).length;
+  await b.close();
+  const bobs = await compacted(bob);
+  const verdicts: string[] = [];
+  reopened.onVerdict((v) => { if (v.table === TABLE) verdicts.push(`${v.key.id}:${v.outcome}`); });
+  const alices = await compacted(restored);
+  assert.equal(alices.replaced, before);
+  await until('editor compaction applied and replicated', async () => {
+    const rows = await active(reopened);
+    return verdicts.includes(`${alices.id}:applied`) && rows.length === 1 && rows[0].id === alices.id && rows[0].replaces === null;
+  });
+  await b.connect(); bob.refresh();
+  await until('the second compaction refused and reported', async () => refusals.length === 1 && await b.pending() === 0);
+  assert.equal(bob.text.toString(), restored.text.toString(), 'a refused compaction loses nothing');
+  assert.deepEqual((await active(b)).map((r) => r.id), [alices.id]);
+  const after = makeClient('after-editor-compaction'); await after.connect();
+  assert.equal((await open(after)).text.toString(), restored.text.toString(), 'a fresh replica loads the one merged row');
+  console.log(JSON.stringify({ editorCompaction: { replaced: alices.replaced, bytesBefore: alices.bytesBefore,
+    bytesAfter: alices.bytesAfter, refused: refusals[0], bobReplaced: bobs.replaced } }));
+
   assert.deepEqual(failures, []);
   console.log(JSON.stringify({ documentId, text: loaded.text.toString(),
     activeUpdates: (await reopened.query('SELECT id FROM yjs_updates WHERE document_id=? AND deleted_at IS NULL', documentId)).length,
