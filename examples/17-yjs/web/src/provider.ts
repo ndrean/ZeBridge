@@ -10,6 +10,10 @@ export class ZeBridgeYjsProvider {
   readonly doc = new Y.Doc();
   readonly text = this.doc.getText('content');
   private seen = new Set<string>();
+  // This session's uploads awaiting a verdict. `seen` alone misses one: a refresh rebuilds
+  // it from the replica, and a rejected row is reverted locally before its verdict. An
+  // upload from before a reload is still in the replica, so `seen` covers that one.
+  private mine = new Set<string>();
   private work: Promise<void> = Promise.resolve();
   private unsubscribe: (() => void)[] = [];
   private stopped = false;
@@ -35,7 +39,9 @@ export class ZeBridgeYjsProvider {
     if (this.unsubscribe.length) throw new Error('Provider already started');
     this.unsubscribe.push(this.client.onChange(TABLE, () => this.refresh()));
     this.unsubscribe.push(this.client.onVerdict((v) => {
-      if (v.table !== TABLE || !this.seen.has(String(v.key.id))) return;
+      if (v.table !== TABLE) return;
+      const id = String(v.key.id);
+      if (!this.mine.delete(id) && !this.seen.has(id)) return;
       if (v.outcome !== 'applied' && v.outcome !== 'reconciled') {
         this.fail(new Error(`Update ${v.key.id}: ${v.outcome}. ${v.detail ?? v.reason ?? ''} ` +
           'Copy your text before reloading; rejected CRDT edits cannot simply be undone.'));
@@ -66,6 +72,7 @@ export class ZeBridgeYjsProvider {
       // mutateWithId rejects if nothing was durably queued. INSERT includes the
       // primary key in values too: PostgreSQL must store this exact update ID.
       this.seen.add(id);
+      this.mine.add(id);
       await this.client.mutateWithId(TABLE, 'INSERT', { id }, {
         id, document_id: this.documentId, tenant_id: this.tenantId, update_data: bytes,
       }, { independent: true });

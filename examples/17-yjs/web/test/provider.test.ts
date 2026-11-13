@@ -146,3 +146,35 @@ test('a rejected update surfaces recovery instead of silently continuing a diver
     assert.equal(r.writes(), 1); assert.equal(errors.length, 1);
   } finally { provider.destroy(); r.db.close(); }
 });
+
+test('a rejection still surfaces when the reverted row left the replica before its verdict', async () => {
+  const r = replica();
+  const errors: Error[] = [];
+  const provider = new ZeBridgeYjsProvider(r.client, 'doc', 'acme', (e) => errors.push(e));
+  await provider.start();
+  try {
+    provider.text.insert(0, 'save me'); await provider.flush();
+    const id = r.rows()[0].id;
+    // The client reverts the optimistic row, and a refresh completes, before the verdict arrives.
+    r.db.prepare('DELETE FROM yjs_updates WHERE id = ?').run(id);
+    provider.refresh(); await provider.flush();
+    r.verdict({ table: TABLE, version: '1', key: { id }, columns: ['update_data'], outcome: 'rejected', reason: 'permission denied' });
+    await assert.rejects(provider.flush(), /Copy your text/);
+    assert.equal(errors.length, 1);
+  } finally { provider.destroy(); r.db.close(); }
+});
+
+test('a rejection of an upload queued before a reload still surfaces', async () => {
+  const r = replica();
+  const first = new ZeBridgeYjsProvider(r.client, 'doc', 'acme', assert.fail);
+  await first.start();
+  first.text.insert(0, 'queued before reload'); await first.flush(); first.destroy();
+  const errors: Error[] = [];
+  const reloaded = new ZeBridgeYjsProvider(r.client, 'doc', 'acme', (e) => errors.push(e));
+  await reloaded.start();
+  try {
+    r.verdict({ table: TABLE, version: '1', key: { id: r.rows()[0].id }, columns: ['update_data'], outcome: 'rejected', reason: 'permission denied' });
+    await assert.rejects(reloaded.flush(), /Copy your text/);
+    assert.equal(errors.length, 1);
+  } finally { reloaded.destroy(); r.db.close(); }
+});
