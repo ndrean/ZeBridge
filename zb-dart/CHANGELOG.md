@@ -1,3 +1,39 @@
+## 0.3.3
+
+- No change in the package: its version follows ZeBridge's releases. This README documents write order: `mutateWith(…, after: …)`, `independent: true`, and the `msgId` that `mutate` returns.
+
+## 0.3.2
+
+- libzb on Android creates its `no_backup/` directory even when there is no identity to move into it.
+
+## 0.3.1
+
+- No change in the package: its version follows ZeBridge's releases. 0.3.1 fixes libzb's DuckDB replicas (a reserved column name) and moves the Flutter examples to Android Gradle Plugin 9.1.1.
+
+## 0.3.0
+
+- libzb speaks ABI 9 (`zbAbi = 9`): the package refuses an older libzb.
+- Write order. `mutate` returns a map with the write's `msgId`. By default a write waits for this device's most recent unsettled write; `mutateWith(table, op, key, values: …, after: parentId)` waits for a named one, and `independent: true` for none. Both `ZeBridge` and `ZeBridgeWorker` offer it.
+- A write belongs to its table's incarnation: a write made against a table since dropped and re-created is answered `rejected` / `TableIncarnationChanged` instead of being applied to the new rows. A new edit can be refused before anything is queued (`TableNotWritable`, `IncarnationUnknown`, `ReplacementIncomplete`).
+- A refused write's local undo is a durable obligation, retried until it is done.
+- A first private tenant assignment reaches a running client without a restart.
+
+## 0.2.11
+
+- `PollReport.floorMarginMs`: how long the oldest waiting write has before the GC floor refuses it (libzb's `floor_margin_ms`).
+
+## 0.2.10
+
+- Fixes in libzb's write path: an echo no longer swallows a verdict, which fires once; a rebase is judged against the winning row; the confirmed row outlives the first stale decision, and a failed settlement is retried.
+
+## 0.2.9
+
+- No change in the package: its version follows ZeBridge's releases. 0.2.9 reads DuckDB results with `duckdb_fetch_chunk` (libzb's DuckDB replicas).
+
+## 0.2.8
+
+- libzb is built with Zig 0.17. No change in the package's API.
+
 ## 0.2.7
 
 - libzb speaks ABI 7 (`zbAbi = 7`): the package refuses an older libzb.
