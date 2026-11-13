@@ -2,7 +2,7 @@
 
 libzb, the ZeBridge C client (Zig inside), as an Expo module: the ZeBridge client for
 React Native, on iOS and Android. `Libzb.connect(opts)` seeds, tails, queries and writes in
-native code; the options are the ones zb-client-ts takes (CLIENTS.md). `mergeRegisters`
+native code; the options are the ones zb-client-ts takes ([CLIENTS.md](https://github.com/ndrean/zebridge/blob/main/CLIENTS.md)). `mergeRegisters`
 is libzb's own register merge, the rule every client applies.
 
 ```ts
@@ -11,6 +11,16 @@ import { Libzb } from '@zebridge/react-native';
 const zb = await Libzb.connect({ natsUrl, creds, principal, tables: ['orders'], dbPath });
 await zb.sync();                                   // schema, seed, positions
 const { rows } = await zb.query('SELECT count(*) FROM orders');
+await zb.mutate('orders', 'UPDATE', { id: 7 }, { status: 'done' });   // applied locally at once, sent when online
+```
+
+On a bridge that offers ordering, a write waits by default for this client's previous unsettled write. `after` names another earlier write instead, and `independent` waits for none. `mutate` resolves with the write's ID (`msgId`), or with `{ error }` for a write refused before it was queued. The rules: [Ordering a write](https://github.com/ndrean/zebridge/blob/main/CLIENTS.md#ordering-a-write).
+
+```ts
+const order = await zb.mutate('orders', 'INSERT', { id: 8 }, { status: 'open' });
+await zb.mutate('orders', 'INSERT', { id: 9 }, { status: 'open' });                          // waits for order 8 (the default)
+await zb.mutate('orders', 'UPDATE', { id: 8 }, { status: 'paid' }, { after: order.msgId });  // waits for order 8 only
+await zb.mutate('orders', 'UPDATE', { id: 7 }, { note: 'gift' }, { independent: true });     // waits for nothing
 ```
 
 ## Install

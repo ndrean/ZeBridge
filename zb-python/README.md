@@ -22,6 +22,15 @@ with ZeBridge(bridge_url="https://zb.example.com", invite=code, tables=["orders"
     zb.mutate("orders", "UPDATE", {"id": 7}, {"status": "done"})
 ```
 
+On a bridge that offers ordering, a write waits by default for this client's previous unsettled write. `after` names another earlier write instead, and `independent` waits for none. `mutate` returns the write's ID (`msgId`); a write refused before it was queued raises instead. The rules: [Ordering a write](https://github.com/ndrean/zebridge/blob/main/CLIENTS.md#ordering-a-write).
+
+```python
+order = zb.mutate("orders", "INSERT", {"id": 8}, {"status": "open"})
+zb.mutate("orders", "INSERT", {"id": 9}, {"status": "open"})                       # waits for order 8 (the default)
+zb.mutate("orders", "UPDATE", {"id": 8}, {"status": "paid"}, after=order["msgId"])  # waits for order 8 only
+zb.mutate("orders", "UPDATE", {"id": 7}, {"note": "gift"}, independent=True)      # waits for nothing
+```
+
 - **The options** are the ones every ZeBridge client reads ([CLIENTS.md](https://github.com/ndrean/zebridge/blob/main/CLIENTS.md)), in camelCase or
   snake_case (`bridge_url` is `bridgeUrl`). A dict works too: `ZeBridge({"bridgeUrl": …})`.
 - **Enrollment.** The first run redeems `invite` at the bridge and keeps the identity next
