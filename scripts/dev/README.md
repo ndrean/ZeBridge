@@ -177,6 +177,7 @@ The scenarios drive `psql` from the host (`ZB_PGBIN`, or `ZB_PSQL`: see the scen
 | a fault-hook scenario is refused (`receipt_faults`, `recreate_recovery` 4/13/15, `walls` E) | the ordinary build carries no hooks | build with `-Dtest-faults=true -p zig-out-faults` (step 1) |
 | `invalid value for parameter "lc_messages": "en_US.utf8"` (`standby`) | the database volume was made before the container used the `C` locale | `scripts/dev/down.sh --clean`, then steps 2, 5, 6 |
 | `AuthorizationViolation` after a manual bootstrap | the running NATS has not loaded the newest signing key | `docker kill -s HUP zb-dev-nats` (`up.sh` does it) |
+| A device enrolled with an invite gets `Authorization Violation`; the NATS log says `account missing` | `ZB_SIGNING_SEED` in `.env.bridge` belongs to another operator | `python3 scripts/dev/enroll_key.py` (`up.sh` runs it), then restart the bridge |
 | `not in the nsc store` (`jwt_expiry`, `revoke_midseed`) | a stack bootstrapped before 2026-10-28 kept its private keys inside the bootstrap container | while `zb-dev-nats-bootstrap` exists: `docker cp zb-dev-nats-bootstrap:/nsc/nkeys/. scripts/dev/state/nsc-store/data/nats/nsc/keys/`; otherwise `down.sh --clean` and the setup steps |
 | `TlsRecordOverflow` | `NATS_URL` is `tls://` (from `.env.bridge`), this NATS is plain | `export NATS_URL=nats://127.0.0.1:4222` after loading the env file |
 
@@ -203,6 +204,7 @@ Unset, every one of these scenarios behaves as before, against the native stack.
 
 `up.sh` re-runs the bootstrap every time, which adds a signing key and rewrites `state/resolver.conf`, and then reloads the running NATS so that it knows the newest key.
 Without that, `GET /enroll` signs with a key the server has not loaded and the enrolled client is refused with `AuthorizationViolation`.
+`up.sh` then runs `enroll_key.py`, which makes `.env.bridge`'s `ZB_SIGNING_SEED` and `ZB_ACCOUNT_PUB` name one of this account's client keys. It changes nothing when they already do, and prints public keys only.
 
 ## Not covered
 
