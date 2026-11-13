@@ -28,7 +28,16 @@ zb.mutate("orders", "UPDATE", mapOf("id" to 7), mapOf("status" to "done"))
 zb.close()
 ```
 
-The options are the ones every ZeBridge client reads (CLIENTS.md). Everything else is
+On a bridge that offers ordering, a write waits by default for this client's previous unsettled write. `after` names another earlier write instead, and `independent` waits for none. `mutate` returns the write's ID (`msgId`); a write refused before it was queued throws instead. The rules: [Ordering a write](https://github.com/ndrean/zebridge/blob/main/CLIENTS.md#ordering-a-write).
+
+```kotlin
+val order = zb.mutate("orders", "INSERT", mapOf("id" to 8), mapOf("status" to "open"))
+zb.mutate("orders", "INSERT", mapOf("id" to 9), mapOf("status" to "open"))                                // waits for order 8 (the default)
+zb.mutate("orders", "UPDATE", mapOf("id" to 8), mapOf("status" to "paid"), after = order.getString("msgId"))  // waits for order 8 only
+zb.mutate("orders", "UPDATE", mapOf("id" to 7), mapOf("note" to "gift"), independent = true)              // waits for nothing
+```
+
+The options are the ones every ZeBridge client reads ([CLIENTS.md](https://github.com/ndrean/zebridge/blob/main/CLIENTS.md)). Everything else is
 the library's job:
 
 - **The thread.** libzb drives a client from one thread. `ZeBridge` owns that thread

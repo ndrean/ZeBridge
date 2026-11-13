@@ -27,6 +27,15 @@ await zb.mutate('orders', 'UPDATE', {'id': 7}, {'status': 'done'});
 await zb.close();
 ```
 
+On a bridge that offers ordering, a write waits by default for this client's previous unsettled write. `after` names another earlier write instead, and `independent` waits for none; both go through `mutateWith`. `mutate` returns the write's ID (`msgId`); a write refused before it was queued throws instead. The rules: [Ordering a write](https://github.com/ndrean/zebridge/blob/main/CLIENTS.md#ordering-a-write).
+
+```dart
+final order = await zb.mutate('orders', 'INSERT', {'id': 8}, {'status': 'open'});
+await zb.mutate('orders', 'INSERT', {'id': 9}, {'status': 'open'});                                     // waits for order 8 (the default)
+await zb.mutateWith('orders', 'UPDATE', {'id': 8}, values: {'status': 'paid'}, after: order['msgId']);  // waits for order 8 only
+await zb.mutateWith('orders', 'UPDATE', {'id': 7}, values: {'note': 'gift'}, independent: true);       // waits for nothing
+```
+
 - **The options** are the ones every ZeBridge client reads ([CLIENTS.md](https://github.com/ndrean/zebridge/blob/main/CLIENTS.md)), passed to libzb
   as they are. The first run enrolls with `invite` and keeps the identity next to the
   replica; later runs need neither, and the JWT renews itself.
