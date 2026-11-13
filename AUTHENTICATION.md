@@ -4,7 +4,7 @@ How users, services and sensors get their access to ZeBridge, and which file hol
 
 ## Table of contents
 
-- [The picture](#the-picture)
+- [How a device gets access](#how-a-device-gets-access)
 - [The files](#the-files)
 - [Users: invites](#users-invites)
 - [Connect and renew](#connect-and-renew)
@@ -14,18 +14,19 @@ How users, services and sensors get their access to ZeBridge, and which file hol
 - [Who holds what](#who-holds-what)
 - [Development](#development)
 
-## The picture
+<a id="the-picture"></a>
 
-ZeBridge does not log users in: your app does, however it likes (OAuth, passwords, biometrics). ZeBridge needs two things about each user: a name, the **principal** (your user id, an email, any name you choose: letters, digits, `_` and `-`), and the **tenants** this name may use.
+## How a device gets access
 
-Two systems then check every access, each on what it holds:
+Your app signs Alice in. Your backend decides that her ZeBridge user ID (her **principal**) is `alice` and that she belongs to tenant `acme`. Enrollment gives Alice’s phone a credential to sync that tenant’s data.
 
-- **NATS** checks which subjects (the message channels) a user may read or write, from the user's JWT;
-- **PostgreSQL** checks which rows a user may read or write: row-level security (RLS) and the tenant guard.
+**Once per deployment.** The administrator runs `bridge --init-nats operator` to establish which credentials NATS will accept. The **operator** is the deployment’s root signing authority. It signs the **account**, which groups the deployment’s NATS subjects and defines the permissions for each role. The account holds one **signing key per role** (the table below). The client key issues device credentials, and the bridge holds it for enrollment and renewal. The administrator keeps the root key offline.
 
-So there are no sync rules to write, and no extra authorization service to run. The user's name travels in the subject of each message, for example `mutation.alice.orders.UPDATE`, and NATS refuses a message whose subject does not match the sender's JWT: the bridge can trust that name, and never trusts a name written inside a message.
+**Once per device.** After Alice signs in, her backend creates a one-time invite for `alice` in `acme` and gives the code to her app. The library generates a key pair on her phone and sends the code and the **public key** to the bridge’s `/enroll` endpoint. In one PostgreSQL transaction, the bridge spends the code, records the membership and registers the public key. It then signs a **NATS user JWT** for that key, naming Alice and tagging her tenants. The private key (the **seed**) stays on the phone. A second device gets its own invite and key pair.
 
-Every identity comes from one chain of signatures, NATS's [operator mode](https://docs.nats.io/learn/security/decentralized-auth): the **operator** signs the **account**; the account lists five **signing keys**, one per role (client, responder, service, archiver, sensor); each signing key signs **users**. A signing key holds the permissions of every user it signs, as a template: when the user connects, `{{name()}}` becomes the user's name and `{{tag(tenant)}}` each of their tenants. A JWT holds no permissions, only a name and one tag per tenant.
+**On later connections.** The library presents the JWT to NATS and proves it holds the device key by signing a challenge. NATS uses the client role, principal and tenant tags to decide which message subjects the device may use. When Alice writes a row, PostgreSQL checks the write under her principal. To renew the JWT, the library signs a request to the bridge’s `/renew` endpoint. The bridge checks revocation and current memberships before issuing a fresh JWT for the same key. Alice can reopen the app without spending another invite.
+
+**Two checks, no sync rules.** NATS checks which subjects a device may read or write, from its JWT. PostgreSQL checks which rows, with row-level security and the tenant guard. The principal travels in the subject of each message, for example `mutation.alice.orders.UPDATE`, and NATS refuses a message whose subject does not match the sender’s JWT: the bridge can trust that name, and never trusts a name written inside a message. The permissions live in the signing keys, as templates: when a device connects, `{{name()}}` becomes its principal and `{{tag(tenant)}}` each of its tenants. The JWT itself holds no permissions, only the name and one tag per tenant.
 
 | role | who | how it gets its identity |
 | --- | --- | --- |
@@ -121,7 +122,8 @@ sequenceDiagram
     A->>A: generate the device key pair (seed stays here)
     A->>B: GET /enroll?code=…&user_pubkey=U…
     B->>PG: one transaction: mark the invite used,<br/>add the mapping principal ∈ tenant,<br/>record the device key
-    B->>B: mint a JWT for this key (tagged with the tenant)
+    B->>B: mint a JWT for this key with the principal’s tenant tags
+    B->>N: publish the current tenant mapping
     B-->>A: JWT + principal + NATS URLs + grammar hash
     A->>A: store the identity (0600 file, localStorage, app storage)
 
