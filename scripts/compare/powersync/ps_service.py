@@ -7,22 +7,25 @@ Three containers, host network, local-only ports, each with a memory cap so a lo
   processes (`start -r api`, 127.0.0.1:18081..), as PowerSync's production layout has them: one per 100
   connections, 1 GB each. Sync Streams: one auto-subscribed stream over storm_items, one nobody subscribes to over
   sensor_events;
-- `zbcmp-postgrest`: PostgREST on 127.0.0.1:13000, the backend `uploadData` writes to, as `zb_writer` with
+- `zbcmp-postgrest`: PostgREST on 127.0.0.1:13000, the backend `uploadData` writes to, as ZeBridge's write role with
   `ps_pre()` (256 MB).
 
 The configuration is written here from ./secrets and copied 0600 to ~/zbcmp/ps on the host (CMP_HOST, from
 powersync.sh). Prints no secret."""
-import base64, os, pathlib, subprocess, textwrap
+import base64, os, pathlib, subprocess, textwrap, urllib.parse as up
 
 SEC = pathlib.Path(__file__).parent / "secrets"
 H = os.environ["CMP_HOST"]
 rd = lambda n: (SEC / n).read_text().strip()
+# PowerSync verifies the source's certificate whatever the URI says; a URI with sslmode=disable (a local database
+# with a self-signed certificate, where the bridge connects without TLS too) turns that off.
+src_tls = "\n          sslmode: disable" if "sslmode=disable" in rd('replication.uri') else ""
 
 config = textwrap.dedent(f"""\
     replication:
       connections:
         - type: postgresql
-          uri: "{rd('replication.uri')}"
+          uri: "{rd('replication.uri')}"{src_tls}
     storage:
       type: postgresql
       uri: "postgresql://postgres:{rd('store.pw')}@127.0.0.1:15432/postgres"
@@ -54,11 +57,13 @@ config = textwrap.dedent(f"""\
 APIS = int(os.environ.get("PS_API_PROCESSES", "5"))
 # PostgREST's connections to PostgreSQL: its default is 10; count them against the database's max_connections.
 POOL = int(os.environ.get("PS_REST_POOL", "10"))
+# ZeBridge's write role, as the bridge reads it: the user of DATABASE_WRITER_URL (db_env exported it).
+WRITER = up.urlparse(os.environ["DATABASE_WRITER_URL"]).username
 ps_env = lambda port: f"POWERSYNC_CONFIG_B64={base64.b64encode(config.replace('PORT_HERE', str(port)).encode()).decode()}\nNODE_OPTIONS=--max-old-space-size-percentage=80\n"
 files = {
     "ps.env": ps_env(18080),
     **{f"ps-api{k}.env": ps_env(18080 + k) for k in range(1, APIS + 1)},
-    "rest.env": f"PGRST_DB_URI={rd('api.uri')}\nPGRST_DB_ANON_ROLE=zb_writer\nPGRST_DB_PRE_REQUEST=public.ps_pre\nPGRST_DB_SCHEMAS=public\nPGRST_SERVER_HOST=127.0.0.1\nPGRST_SERVER_PORT=13000\nPGRST_DB_POOL={POOL}\n",
+    "rest.env": f"PGRST_DB_URI={rd('api.uri')}\nPGRST_DB_ANON_ROLE={WRITER}\nPGRST_DB_PRE_REQUEST=public.ps_pre\nPGRST_DB_SCHEMAS=public\nPGRST_SERVER_HOST=127.0.0.1\nPGRST_SERVER_PORT=13000\nPGRST_DB_POOL={POOL}\n",
     "store.env": f"POSTGRES_PASSWORD={rd('store.pw')}\nPGPORT=15432\n",
 }
 for name, body in files.items():

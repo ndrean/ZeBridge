@@ -20,8 +20,10 @@ init)
   # package that runs it), from the two URLs and the publication only; nothing stays on the host.
   echo "rendered by $(ssh_h '/usr/bin/bridge --version | head -1') on the host"
   trap 'rm -f "$SEC/init.sql" "$SEC/init.out"' EXIT   # the rendered SQL holds the roles' passwords
-  (umask 077; grep -E '^(DATABASE_READER_URL|DATABASE_WRITER_URL|BRIDGE_CDC_PUBLICATION)=' "$DB_ENV_FILE" \
-    | ssh_h 'set -a; . /dev/stdin; set +a; /usr/bin/bridge --init-sql' > "$SEC/init.sql")
+  # The assignments and the command go to a POSIX `sh -s` on stdin, whatever the remote account's login shell
+  # (`. /dev/stdin` and `. <(cat)` each failed on some host).
+  (umask 077; { echo 'set -a'; grep -E '^(DATABASE_READER_URL|DATABASE_WRITER_URL|BRIDGE_CDC_PUBLICATION)=' "$DB_ENV_FILE"; echo 'set +a'; echo 'exec /usr/bin/bridge --init-sql'; } \
+    | ssh_h 'sh -s' > "$SEC/init.sql")
   admin_sql --single-transaction -f "$SEC/init.sql" > "$SEC/init.out"
   if grep -qiE "error|fatal" "$SEC/init.out"; then grep -iE "error|fatal" "$SEC/init.out" | head -3; exit 1; fi
   echo "init SQL applied"

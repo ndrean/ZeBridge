@@ -1,7 +1,7 @@
 """PowerSync's side of the database, run by `powersync.sh roles` (after `db.sh init` and `db.sh table`):
 
 - `powersync_role`, the service's replication login, and the publication `powersync` on the comparison table;
-- `ps_api`, PostgREST's login: it switches to ZeBridge's write role `zb_writer`, so PowerSync's uploads meet the same
+- `ps_api`, PostgREST's login: it switches to ZeBridge's write role (the user of `DATABASE_WRITER_URL`), so PowerSync's uploads meet the same
   tenant policy and triggers as ZeBridge's writes (no BYPASSRLS);
 - `ps_pre()`, PostgREST's pre-request function: it sets `zb.principal` from the request, as the bridge does in each
   write's transaction (the policy checks it), and the principals p000..p499 mapped to tenant `cmp`.
@@ -17,6 +17,8 @@ import os, pathlib, re, secrets, subprocess, urllib.parse as up
 SEC = pathlib.Path(__file__).parent / "secrets"
 SEC.mkdir(mode=0o700, exist_ok=True)
 admin = os.environ["CMP_ADMIN_URL"]
+# ZeBridge's write role, as the bridge reads it: the user of DATABASE_WRITER_URL (db_env exported it).
+writer = up.urlparse(os.environ["DATABASE_WRITER_URL"]).username
 psql = lambda sql: subprocess.run(["psql", admin, "-X", "-tA", "-v", "ON_ERROR_STOP=1", "-c", sql], capture_output=True, text=True)
 
 
@@ -39,9 +41,9 @@ steps = [
     "CREATE PUBLICATION powersync FOR TABLE public.storm_items, public.sensor_events",
     "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ps_api') THEN CREATE ROLE ps_api WITH LOGIN NOINHERIT; END IF; END $$",
     f"ALTER ROLE ps_api WITH PASSWORD '{api_pw}'",
-    "GRANT zb_writer TO ps_api",
+    f"GRANT {writer} TO ps_api",
     "CREATE OR REPLACE FUNCTION public.ps_pre() RETURNS void LANGUAGE sql AS $f$ SELECT set_config('zb.principal', current_setting('request.headers', true)::json->>'x-principal', true) $f$",
-    "GRANT EXECUTE ON FUNCTION public.ps_pre() TO zb_writer",
+    f"GRANT EXECUTE ON FUNCTION public.ps_pre() TO {writer}",
     "INSERT INTO zebridge_user_tenants (principal, tenant_id) SELECT 'p' || lpad(i::text, 3, '0'), 'cmp' FROM generate_series(0, 499) i ON CONFLICT DO NOTHING",
 ]
 failed = 0
