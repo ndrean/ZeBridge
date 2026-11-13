@@ -191,6 +191,24 @@ What to know:
 
 The details are in [Clients: ordering a write](CLIENTS.md#ordering-a-write) and the protocol in [PROTOCOL, Ordered ingress](PROTOCOL.md#ordered-ingress-version-1).
 
+### Write conflicts: who wins
+
+Two devices edit the same row while offline. When they reconnect, PostgreSQL judges each write, and one of three rules decides what survives. You choose it per table, by how you shape the data:
+
+| Rule | Unit that wins | Use it for | Example |
+| --- | --- | --- | --- |
+| **Last writer wins** (the default) | the row | most tables: orders, statuses, settings | every example |
+| **Per-field registers** | each field of a record | one record several people edit at once | [Shared record](examples/15-shared-record/README.md) |
+| **A CRDT in the app** | nothing: no write ever conflicts | collaborative text | [Yjs](examples/17-yjs/README.md) |
+
+**Last writer wins.** Each write carries a version stamp from the library's clock (the table's version column, `updated_at` by default). PostgreSQL accepts a write only if its stamp is newer than the row's; equal stamps are decided by the writer's ID when the table has a tiebreak column. The older write gets the verdict `stale` and the winning row reaches the device through the change stream. The library then retries a losing UPDATE with a fresh stamp when the winner changed none of its columns, and reports it as lost when they overlap. Constraints, triggers and row-level security still apply: any write can be refused on its own.
+
+**Per-field registers.** A `jsonb` column holds one register per field, each with its own stamp. The row still follows last writer wins, but a write merges the fields instead of replacing them: two people editing different fields both keep their edit. See [COOPERATIVE_EDITING](COOPERATIVE_EDITING.md).
+
+**A CRDT in the app.** Each edit is a new, immutable row holding the CRDT library's update as bytes, sent with `independent: true`. Rows never collide, so nothing is `stale`; the library on each device merges the updates (Yjs for text). ZeBridge stores and delivers the bytes without reading them, and PostgreSQL can still enforce the tenant and refuse a write, but it cannot read the document: SQL sees bytes, not text. An optional server job compacts a document's rows into one.
+
+The rules for version columns, clocks and ties are in [PROTOCOL, the version value](PROTOCOL.md#73-the-version-value); what a device does with each verdict is in [Clients](CLIENTS.md).
+
 ### Choose the local database
 
 The replica is a real database on the device, and the app reads it with that database's SQL:
@@ -391,7 +409,7 @@ ZeBridge fits mobile apps, intermittently connected devices, field equipment and
 
 - **Replication is tenant-based.** A followed table brings the tenant's rows into the replica. A local SQL `WHERE` clause filters what the app reads, not what the device receives. One tenant per consumer at B2C scale is outside the intended topology.
 - **PostgreSQL is the authority.** Offline writes are provisional until judged by the server. This is not peer-to-peer or multi-master replication.
-- **Conflict semantics are explicit.** Ordinary writes use last-writer-wins. Cooperative editing can merge per-field registers; it is not collaborative text editing. See [COOPERATIVE_EDITING](COOPERATIVE_EDITING.md).
+- **Conflict semantics are explicit.** Ordinary writes use last-writer-wins; a record several people edit can merge per-field registers; collaborative text needs a CRDT in the app, whose rows PostgreSQL stores but cannot read. See [Write conflicts](#write-conflicts-who-wins).
 - **Recovery has retention requirements.** CDC retention, chain availability, tombstone GC and mutation receipt retention serve different purposes. An offline duration that permits reads to recover does not automatically permit every old pending write to execute: a write stamped before the GC floor is refused, because the tombstone that would have overruled it may be gone. See [catching up](OPERATIONS.md#catching-up-the-chain-and-the-stream) and [indeterminate write recovery](PROTOCOL.md#74c-reconciling-an-indeterminate-write).
 - **Local persistence matters.** Deleting a replica or reinstalling an app can destroy unsent writes. Protect device identity and storage as application data.
 - **Operate NATS and PostgreSQL deliberately.** Credentials, replication slots, disk budgets, backups and restore procedures are part of the deployment.
