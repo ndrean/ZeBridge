@@ -136,15 +136,16 @@ export class ZeBridgeYjsProvider {
       `SELECT id, update_data FROM yjs_updates
        WHERE document_id = ? AND tenant_id = ? AND deleted_at IS NULL AND replaces IS NULL
          AND id NOT IN (SELECT row_id FROM _zebridge_outbox WHERE tbl = ?)
-         AND id NOT IN (SELECT row_id FROM _zebridge_undo WHERE tbl = ?)
-       ORDER BY id`,
+         AND id NOT IN (SELECT row_id FROM _zebridge_undo WHERE tbl = ?)`,
       this.documentId, this.tenantId, TABLE, TABLE,
     );
+    // Smallest first (then by ID, so a retry picks the same set): it merges the most updates
+    // within the budget, and "nothing fits" then means no two of them do.
+    rows.sort((x: any, y: any) => x.update_data.byteLength - y.update_data.byteLength || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
     const inputs: { id: string; update_data: Uint8Array }[] = [];
     let bytesBefore = 0;
     for (const row of rows) {
-      if (inputs.length === COMPACT_MAX_INPUTS) break;
-      if (bytesBefore + row.update_data.byteLength > COMPACT_INPUT_BYTES) continue;
+      if (inputs.length === COMPACT_MAX_INPUTS || bytesBefore + row.update_data.byteLength > COMPACT_INPUT_BYTES) break;
       inputs.push(row); bytesBefore += row.update_data.byteLength;
     }
     if (inputs.length < 2) {

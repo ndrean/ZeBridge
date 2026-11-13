@@ -217,3 +217,26 @@ test('two writers compacting overlapping updates: one wins, the other is refused
     assert.equal(textOf(await active(c, id)), ydoc.getText('content').toString());
   } finally { ydoc.destroy(); await c.end(); await a.end(); await b.end(); }
 });
+
+test('a replacement the version guard declines retires nothing (the bridge upsert)', async () => {
+  const c = await open(), edge = await asAlice(), id = randomUUID();
+  const { ydoc } = await seed(c, id, 3);
+  try {
+    const rows = await active(c, id);
+    // The replacement's ID is already taken by a newer row of this document.
+    const taken = randomUUID();
+    await c.query(`INSERT INTO yjs_updates (id, document_id, tenant_id, update_data, updated_at)
+      VALUES ($1, $2, 'acme', $3, now() + interval '1 day')`, [taken, id, Buffer.from(Y.encodeStateAsUpdate(new Y.Doc()))]);
+    // The statement the bridge sends for an INSERT (mutation_listener.zig: ON CONFLICT … WHERE version <).
+    const declined = await edge.query(`INSERT INTO yjs_updates (id, document_id, tenant_id, update_data, replaces, updated_at)
+      VALUES ($1, $2, 'acme', $3, $4, now())
+      ON CONFLICT (id) DO UPDATE SET document_id = EXCLUDED.document_id, tenant_id = EXCLUDED.tenant_id,
+        update_data = EXCLUDED.update_data, replaces = EXCLUDED.replaces, updated_at = EXCLUDED.updated_at
+      WHERE yjs_updates.updated_at IS NULL OR yjs_updates.updated_at < EXCLUDED.updated_at`,
+    [taken, id, Buffer.from(Y.mergeUpdates(rows.map((r) => r.update_data))), JSON.stringify(rows.map((r) => r.id))]);
+    assert.equal(declined.rowCount, 0, 'the guard declined: nothing inserted or updated');
+    const now = await active(c, id);
+    assert.equal(now.length, 4, 'every input is still active');
+    assert.equal(textOf(now), ydoc.getText('content').toString(), 'a fresh reader still reconstructs the text');
+  } finally { ydoc.destroy(); await c.end(); await edge.end(); }
+});

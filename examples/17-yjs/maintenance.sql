@@ -56,19 +56,40 @@ CREATE TRIGGER yjs_updates_immutable_t BEFORE INSERT OR UPDATE OR DELETE ON publ
 
 -- Client compaction: an ordinary INSERT through mutate, whose `replaces` lists the confirmed
 -- rows it merged. Every authorized writer of a tenant is trusted to merge correctly (PostgreSQL
--- does not decode Yjs); this function enforces only the bookkeeping. SECURITY DEFINER, owned by
--- the table owner, so the retirement passes yjs_updates_immutable's owner check; it therefore
--- checks tenant and document itself. Any refusal is a check violation: a permanent verdict.
+-- does not decode Yjs); these triggers enforce only the bookkeeping. Any refusal is a check
+-- violation: a permanent verdict.
+--
+-- Two steps, because the bridge writes INSERT … ON CONFLICT (id) DO UPDATE … WHERE <version
+-- guard>: BEFORE INSERT triggers run before the conflict is found, so a replacement whose ID is
+-- taken by a newer row would otherwise retire its inputs while inserting nothing. The BEFORE
+-- trigger only sets the list aside, for this transaction, under the new row's ID, and stores
+-- NULL; the AFTER trigger, which fires only for a row actually inserted, retires the inputs.
+CREATE OR REPLACE FUNCTION public.yjs_updates_replace_take() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+BEGIN
+    IF NEW.replaces IS NOT NULL THEN
+        PERFORM set_config('yjs_replaces.r' || replace(NEW.id::text, '-', ''), NEW.replaces, true);
+        NEW.replaces := NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+-- SECURITY DEFINER, owned by the table owner, so the retirement passes yjs_updates_immutable's
+-- owner check; it therefore checks tenant and document itself.
 CREATE OR REPLACE FUNCTION public.yjs_updates_replace() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog SET lock_timeout = '5s' AS $$
 DECLARE
+    stash constant text := 'yjs_replaces.r' || replace(NEW.id::text, '-', '');
+    list text := nullif(current_setting(stash, true), '');
     ids uuid[];
     n integer;
 BEGIN
-    IF NEW.replaces IS NULL THEN RETURN NEW; END IF;
+    IF list IS NULL THEN RETURN NULL; END IF;
+    PERFORM set_config(stash, '', true);
     BEGIN
-        IF jsonb_typeof(NEW.replaces::jsonb) <> 'array' THEN RAISE EXCEPTION 'not an array'; END IF;
-        ids := ARRAY(SELECT e::uuid FROM jsonb_array_elements_text(NEW.replaces::jsonb) e);
+        IF jsonb_typeof(list::jsonb) <> 'array' THEN RAISE EXCEPTION 'not an array'; END IF;
+        ids := ARRAY(SELECT e::uuid FROM jsonb_array_elements_text(list::jsonb) e);
     EXCEPTION WHEN OTHERS THEN
         RAISE EXCEPTION 'replaces must be a JSON array of update IDs' USING ERRCODE = '23514';
     END;
@@ -89,14 +110,16 @@ BEGIN
             USING ERRCODE = '23514';
     END IF;
     UPDATE public.yjs_updates SET deleted_at = clock_timestamp() WHERE id = ANY (ids);
-    NEW.replaces := NULL;
-    RETURN NEW;
+    RETURN NULL;
 END;
 $$;
-REVOKE ALL ON FUNCTION public.yjs_updates_replace() FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.yjs_updates_replace_take(), public.yjs_updates_replace() FROM PUBLIC;
 
--- Fires after yjs_updates_immutable_t and before ZeBridge's width guard (triggers run in name
--- order), so the guard measures the row as stored, without the list.
+-- The BEFORE trigger fires after yjs_updates_immutable_t and before ZeBridge's width guard
+-- (triggers run in name order), so the guard measures the row as stored, without the list.
 DROP TRIGGER IF EXISTS yjs_updates_replace_t ON public.yjs_updates;
-CREATE TRIGGER yjs_updates_replace_t BEFORE INSERT ON public.yjs_updates
+DROP TRIGGER IF EXISTS yjs_updates_replace_take_t ON public.yjs_updates;
+CREATE TRIGGER yjs_updates_replace_take_t BEFORE INSERT ON public.yjs_updates
+    FOR EACH ROW EXECUTE FUNCTION public.yjs_updates_replace_take();
+CREATE TRIGGER yjs_updates_replace_t AFTER INSERT ON public.yjs_updates
     FOR EACH ROW EXECUTE FUNCTION public.yjs_updates_replace();

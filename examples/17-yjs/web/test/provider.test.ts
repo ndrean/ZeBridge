@@ -246,3 +246,23 @@ test('a refused compaction is reported, not fatal, also after a reload', async (
     reloaded.destroy();
   } finally { provider.destroy(); r.db.close(); }
 });
+
+test('compaction picks the smallest updates first, so two that fit are found', async () => {
+  const r = replica();
+  const source = new Y.Doc(), updates: Uint8Array[] = [];
+  source.on('update', (u: Uint8Array) => updates.push(u));
+  source.getText('content').insert(0, 'x'.repeat(2880));
+  source.getText('content').insert(0, 'a'.repeat(190));
+  source.getText('content').insert(0, 'b'.repeat(190));
+  const [big, small1, small2] = updates.map((u) => u.byteLength);
+  // The case: the first row by ID is large; no small one fits beside it, but the two small ones fit together.
+  assert.ok(big + small1 > COMPACT_INPUT_BYTES && small1 + small2 <= COMPACT_INPUT_BYTES, `sizes ${big}/${small1}/${small2}`);
+  ['a', 'b', 'c'].forEach((id, i) => r.insert({ id, document_id: 'doc', tenant_id: 'acme', update_data: updates[i] }));
+  const provider = new ZeBridgeYjsProvider(r.client, 'doc', 'acme', assert.fail);
+  await provider.start();
+  try {
+    const result = await provider.compact();
+    assert.equal(result.compacted, true);
+    assert.deepEqual(JSON.parse(r.sent.at(-1).replaces), ['b', 'c']);
+  } finally { provider.destroy(); source.destroy(); r.db.close(); }
+});
