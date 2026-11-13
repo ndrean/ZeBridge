@@ -286,15 +286,19 @@ The Electric column summarizes its documented architecture. We tested its read-s
 
 On these runs, ZeBridge's median seed time was about **4.2–4.4× lower than PowerSync's** and **3.7–4.1× lower than Electric's**. This is a client-side seeding result, not a general throughput claim. Server-side state was warm for the timed rounds: ZeBridge's snapshot chain was ready, PowerSync had a one-client readiness seed, and Electric's second round reused the shape created in its first. The clients ran on the same 8-core Mac under OrbStack, which exposed about 4 GB to Docker; sync services ran one at a time. PowerSync's test stream used the fixed tenant predicate `tenant_id = 'cmp'`, so this does not compare per-user authorization. Full methodology, versions, checksum and startup sensitivity: [local seed comparison](COMPARISON.md#local-cold-seed-zebridge-powersync-and-electric).
 
-**Measured, same workload:** 500 clients, one Supabase database, the same table rules for both (2026-11-02).
+**Measured, the same workload for both** (ZeBridge 0.3.2, PowerSync 1.28.3 writing through PostgREST under the same table rules):
 
-|                                                                                                      | ZeBridge                                                        | PowerSync                                                       |
-| ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- | --------------------------------------------------------------- |
-| **Delivery:** 500 clients starting cold receive the 10,000-row table, median (excluding local apply) | **5.3–5.7 s**: one shared compressed snapshot, 0.23 MB a client | 61–76 s: every operation of the bucket, 4.63 MB a client        |
-| **Writes,** offered at 1,000/s / 2,000/s                                                             | 990/s, verdict median 0.69 s / 1,572/s                          | 879/s through PostgREST, acknowledgement median 4.8 s / 1,702/s |
-| **A write reaching every client,** one write to each of the 500, median                              | **0.4–0.8 s**                                                   | 0.7–1.6 s                                                       |
+| | ZeBridge | PowerSync |
+| --- | --- | --- |
+| **Delivery:** 500 clients starting cold receive the 10,000-row table, median, excluding local apply (2026-11-02, 23.6 ms from Supabase) | **5.3–5.7 s**: one shared compressed snapshot, 0.23 MB a client | 61–76 s: every operation of the bucket, 4.63 MB a client |
+| **Writes, database 29 ms away:** 500 writers offered 1,000/s / 2,000/s | **1,021/s, verdict median 0.2 s / 1,932–2,001/s, 0.3–0.5 s** | 878–895/s, acknowledgement median 3.8 s / 1,714–1,718/s, 4.0 s |
+| **Writes, database 29 ms away:** 1 client / 10 clients writing as fast as they can | 336–387/s / 2,054–2,210/s | **774–821/s / 5,568–6,911/s** |
+| **Writes, database on the same machine:** 500 writers offered 10,000/s | 9,900/s, median 16 ms | 9,792/s, median 415 ms |
+| **A write reaching another client,** median, database 29 ms away | **143–156 ms** | 212 ms |
 
-The configurations, both servers' figures, what the runs do not measure, and what a disconnect does to a write in each are in [COMPARISON](COMPARISON.md).
+ZeBridge confirms each write with its own verdict, receipt and authorization; PowerSync's SDK uploads up to 200 rows per request, which wins bursts from few clients. At a distance ZeBridge's ceiling is about 2,000 writes/s with 8 lanes, set by round trips to the database, not by its work: **put the bridge as close to PostgreSQL as you can.** On the same machine both take 10,000/s.
+
+The configurations, every run's figures, what the runs do not measure, and what a disconnect does to a write in each are in [COMPARISON](COMPARISON.md).
 
 ## How it works
 
@@ -422,20 +426,17 @@ Measure CDC distribution, snapshot download/apply, mutation commits and outbox r
 
 Each figure is one run on the hardware named, not a capacity guarantee.
 
-**On a production hub, 0.2.10.** The bridge, admission, the sweeper and NATS on one VPS (6 vCPU, 11.7 GB, 4 ingress lanes); PostgreSQL on Supabase in London, 17 ms per query from the hub; the clients on one Mac, 23 ms from the hub, with the published Python package; a table of 10,000 rows of about 200 bytes. Measured 2026-11-02.
+**On the production hub.** The bridge, admission, the sweeper and NATS on one VPS (6 vCPU, 11.7 GB, 4 ingress lanes); PostgreSQL on Supabase in London, 17 ms per query from the hub; the clients on one Mac, 23 ms from the hub, with the published Python package; a table of 10,000 rows of about 200 bytes. Measured 2026-11-02.
 
 | Direction            | What                                                          | Figure                                                                                               |
 | -------------------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | PostgreSQL → clients | 10 clients seeding the table                                  | synced in 0.98 s (median), 0.35 s when their replicas were already seeded                            |
 | PostgreSQL → clients | 100,000 rows inserted in one statement                        | the bridge published them at about 46,700 events/s; one client held them all 2.95 s after the commit |
 | both                 | one client's write reaching all 10 clients through PostgreSQL | median 117–121 ms                                                                                    |
-| clients → PostgreSQL | writes judged and answered, one client                        | 263 writes/s                                                                                         |
-| clients → PostgreSQL | 10 clients                                                    | 1,414 writes/s                                                                                       |
-| clients → PostgreSQL | 50 clients, each sending 400 at once                          | 1,447 writes/s, median verdict 3.2 s                                                                 |
 
-**What the write figures are.** They are the hub's total, shared by every tenant: all writes go through the same ingress lanes, each with one connection to PostgreSQL, so more tenants do not add capacity. More ingress lanes can, until the database's round trips dominate: 8 lanes are measured in the comparison above. The runs used one tenant, which is not the designed topology but shows what one tenant can take when nothing else writes. During them PostgreSQL and the bridge were nearly idle: a batch of writes costs its round trips to the database, so the distance between the bridge and PostgreSQL sets the ceiling. 1,450 writes/s is 14,500 devices each sending one write every 10 seconds.
+**What sets the write ceiling.** All writes go through the same ingress lanes, each with one connection to PostgreSQL, so the ceiling is the hub's total, shared by every tenant: more tenants do not add capacity, more lanes do (8 at most). With the database 29 ms away and 8 lanes it is about 2,000 writes/s ([COMPARISON](COMPARISON.md#writes-the-same-machine-then-29-ms-away)): each lane's batch makes about 18 round trips, so a lane spends about 4 ms a write while PostgreSQL waits for it, with no lock contention. With the database on the same machine the same hub took 10,000 writes/s. So the distance between the bridge and PostgreSQL sets the ceiling: put the bridge next to the database. 2,000 writes/s is 20,000 devices each sending one write every 10 seconds.
 
-**The rate limit sets what one tenant gets.** By default there is none (`MUTATION_RATE_PER_PRINCIPAL=0`), and a tenant can use the whole ceiling, as above. Set, it applies to each principal and to each tenant: at 100 per second (burst 200, this hub's setting) one tenant is held to about 100 writes/s, whatever the hub could take. These runs used 2,000 (burst 4,000) and no write was delayed. See [Write limits, as a client sees them](OPERATIONS.md#write-limits-as-a-client-sees-them).
+**The rate limit sets what one tenant gets.** By default there is none (`MUTATION_RATE_PER_PRINCIPAL=0`), and a tenant can use the whole ceiling. Set, it applies to each principal and to each tenant: at 100 per second (burst 200, this hub's setting) one tenant is held to about 100 writes/s, whatever the hub could take. The comparison's runs had it off. See [Write limits, as a client sees them](OPERATIONS.md#write-limits-as-a-client-sees-them).
 
 **On one machine, and earlier deployments.**
 
@@ -445,16 +446,16 @@ Each figure is one run on the hardware named, not a capacity guarantee.
 | A client applying a busy table live            | libzb ~50k events/s, zb-client-ts ~33k                                                                                                | one Mac, a table under a steady write load                                        |                                                                       |
 | A change reaching a replica                    | median 12 ms                                                                                                                          | dev stack on one Mac, libzb on the DuckDB engine                                  |                                                                       |
 | Seeding a large table on a phone               | libzb 35.0 s (React Native), 70.8 s (Flutter); JavaScript client 725 s                                                                | iPhone 12, the same table                                                         | [Large table](examples/06-large-table/README.md)                      |
-| Client writes into PostgreSQL                  | ~8,500 writes/s on one ingress lane, ~19,500 on four                                                                                  | one Mac, PostgreSQL on the same machine, before 0.2.7's durable mutation receipts | [the ramp](examples/09-event/README.md#the-ramp-how-far-one-mac-goes) |
+| Client writes into PostgreSQL                  | 9,900 writes/s committed from 500 writers, verdict median 16 ms: what the load generator sent, not a ceiling reached | one Linux machine (9 cores), PostgreSQL on it, 8 ingress lanes | [COMPARISON](COMPARISON.md#writes-the-same-machine-then-29-ms-away) |
 | 500 clients starting at once, empty replicas   | all synced, the slowest in 8.6 to 12 s; NATS at 140–165 % CPU, about 1 MB per client; PostgreSQL under 16 % CPU; the bridge near idle | 2-vCPU, 3.7 GB VPS, clients 100 ms away                                           | [storm](storm/README.md)                                              |
 | One write reaching those 500                   | median 288 ms, p95 491 ms (100 ms of it network)                                                                                      | same                                                                              |                                                                       |
 | NATS restarted under the 500                   | none lost; half back within 6 s, the last at 23 s                                                                                     | same                                                                              |                                                                       |
 | 100 clients through a leaf across the Atlantic | cold sync median 13.2 s, slowest 14.7 s; warm 1.7 s; after a NATS restart, longest gap 2.9 s, none lost                               | 0.2.8 test hub in Canada, clients on a Mac in Europe (~100 ms)                    |                                                                       |
 | The bridge's memory under a steady stream      | ~8 MB resident, allocation flat over 70 minutes                                                                                       | 20,246 ticks of insert, update, delete                                            | `scripts/scenarios/drip.py`                                           |
 
-A comparison with PowerSync on the same workload is in [Compared with PowerSync](#compared-with-powersync).
+A comparison with PowerSync on the same workload is in [Compared with PowerSync](#compared-with-powersync-and-electricsql).
 
-**Not measured:** the production hub's write ceiling with more than 4 ingress lanes (8 were measured only on the comparison's server); how long each component may stay down before recovery needs a re-seed; NATS memory at a steady load (it follows recent load, not stored data); a long network partition under load.
+**Not measured:** the production hub's write ceiling (it was measured against a scratch database 29 ms away, never on the hub); how long each component may stay down before recovery needs a re-seed; NATS memory at a steady load (it follows recent load, not stored data); a long network partition under load.
 
 ## Documentation
 
