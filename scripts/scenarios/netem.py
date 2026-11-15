@@ -15,6 +15,7 @@ import argparse, asyncio, signal, time
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--listen", type=int, required=True)
+    ap.add_argument("--bind", default="127.0.0.1", help="the address to listen on (a phone on the LAN: the Mac's LAN address)")
     ap.add_argument("--to", required=True, help="host:port")
     ap.add_argument("--delay-ms", type=float, default=0)
     ap.add_argument("--rate-mbit", type=float, default=0, help="0: unlimited")
@@ -100,7 +101,7 @@ async def main():
     loop = asyncio.get_running_loop()
     loop.add_signal_handler(signal.SIGUSR1, cut)
     loop.add_signal_handler(signal.SIGUSR2, restore)
-    server = await asyncio.start_server(handle, "127.0.0.1", a.listen)
+    server = await asyncio.start_server(handle, a.bind, a.listen)
     print(f"listening {a.listen} → {a.to}, delay {a.delay_ms} ms one way, rate {a.rate_mbit or '∞'} Mbit/s", flush=True)
     async with server:
         await server.serve_forever()
